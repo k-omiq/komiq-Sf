@@ -1,0 +1,168 @@
+name: Native sidecar
+
+# Gates the desktop embedded-Suwayomi sidecar (native plan §11 / §3.5). The
+# always-on CI (ci.yml) never touches the Tauri crate, the bundled JRE, or the
+# pinned Suwayomi jar — this workflow does. It builds a minimal per-target JRE
+# via jlink, SHA-256-verifies the pinned jar, lints/tests the src-tauri crate,
+# and live-boots the sidecar to assert `aboutServer` answers on every desktop
+# runner. Path-filtered so unrelated PRs aren't slowed, but native changes are
+# still gated.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    # Only the native surface. A change here that breaks jlink/jar/boot on any
+    # of the four desktop targets must not merge; everything else skips this.
+    paths:
+      - 'apps/reader/src-tauri/**'
+      - '.github/workflows/native-sidecar.yml'
+
+# Cancel superseded runs on the same ref to save CI minutes (matches ci.yml).
+concurrency:
+  group: native-sidecar-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Per-target sidecar gate. Each desktop target builds its OWN host JRE (jlink
+  # is not a cross-compiler — the runner arch/OS must match the slug), so the
+  # matrix pins each slug to the runner whose native arch produces it:
+  #   aarch64-macos -> macos-14 (Apple Silicon)
+  #   x86_64-macos  -> macos-13 (Intel)
+  #   x86_64-linux  -> ubuntu-latest
+  #   x86_64-windows-> windows-latest
+  # fail-fast:false so one target's failure doesn't mask the others. The shell
+  # is forced to bash everywhere so build-jre.sh / fetch-suwayomi-jar.sh run on
+  # Windows via Git Bash (its `uname -s` reports MINGW*, which build-jre.sh maps
+  # to the "windows" OS slug).
+  # ---------------------------------------------------------------------------
+  sidecar:
+    name: Sidecar (${{ matrix.slug }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: aarch64-macos
+            runner: macos-14
+            java_ext: ''
+          - slug: x86_64-macos
+            runner: macos-13
+            java_ext: ''
+          - slug: x86_64-linux
+            runner: ubuntu-latest
+            java_ext: ''
+          - slug: x86_64-windows
+            runner: windows-latest
+            java_ext: '.exe'
+    defaults:
+      run:
+        # bash on every runner (Git Bash on Windows) so the shell scripts and
+        # their `uname` platform detection work identically. Cargo commands run
+        # from the crate dir; the scripts self-resolve their own paths, so this
+        # working-directory is safe for them too.
+        shell: bash
+        working-directory: apps/reader/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      # JDK 21 with jlink (build-jre.sh needs jlink; the sidecar targets JDK 21).
+      # setup-java exports JAVA_HOME, which build-jre.sh honors over its Homebrew
+      # default — so the same script works on all three OSes unchanged.
+      - name: Setup JDK 21 (Temurin, provides jlink)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Tauri's Linux backend links the system GTK/WebKit stack; without these
+      # dev packages `cargo clippy`/`cargo test` die in glib-sys ("Package
+      # glib-2.0 was not found"). Linux-only — macOS and Windows use native
+      # webviews with no system packages to install.
+      - name: Install Tauri system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev \
+            libayatana-appindicator3-dev libxdo-dev libssl-dev
+
+      # Caches ~/.cargo + the crate's target/ dir, keyed on Cargo.lock.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/reader/src-tauri
+
+      # Build the host-target minimal JRE into jre/<slug>/. The script enforces
+      # its own 150 MB hard ceiling and fails the step if jlink over-produces or
+      # the launcher is missing.
+      - name: Build minimal JRE (jlink)
+        run: bash scripts/build-jre.sh
+
+      # Surface the on-disk JRE size in the run log + job summary so bundle-size
+      # regressions are visible per target without opening the jlink output.
+      - name: Record JRE size
+        run: |
+          size="$(du -sh "jre/${{ matrix.slug }}" | awk '{print $1}')"
+          echo "JRE ${{ matrix.slug }}: ${size}"
+          echo "- \`${{ matrix.slug }}\` JRE on disk: **${size}**" >> "$GITHUB_STEP_SUMMARY"
+
+      # Fetch + SHA-256-verify the pinned jar against suwayomi/VERSION. Fails
+      # loudly on any hash mismatch (supply-chain guard, never fetches :stable).
+      - name: Fetch + verify Suwayomi jar
+        run: bash scripts/fetch-suwayomi-jar.sh
+
+      # Lint the src-tauri crate. This crate is 2-space-indented and NOT
+      # rustfmt-gated (deliberately no `cargo fmt --check` here — it would
+      # false-fail); clippy-as-error is the style/correctness gate instead.
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Offline unit suite (the live-boot test is #[ignore]d and excluded here).
+      - name: Cargo test (offline)
+        run: cargo test --lib
+
+      # Sidecar smoke: boot the freshly built JRE + fetched jar and assert
+      # `aboutServer` returns a non-empty version, then clean-shutdown with no
+      # orphan. This is the #[ignore]d `sidecar_boots_and_reports_about_server`
+      # test, selected by the `sidecar_boots` filter. Absolute paths via
+      # github.workspace so the env vars are unambiguous on every runner; the
+      # windows entry appends `.exe` to the launcher via matrix.java_ext.
+      - name: Sidecar smoke (boot -> aboutServer)
+        env:
+          KOMIKA_JAVA_BIN: ${{ github.workspace }}/apps/reader/src-tauri/jre/${{ matrix.slug }}/bin/java${{ matrix.java_ext }}
+          KOMIKA_SUWAYOMI_JAR: ${{ github.workspace }}/apps/reader/src-tauri/suwayomi/Suwayomi-Server.jar
+        run: cargo test --lib -- --ignored sidecar_boots
+
+      # ---------------------------------------------------------------------
+      # TODO(N2.1): chapter-list smoke — the final rung the native plan wants
+      # ("fetch one known chapter list, assert non-empty"). It is DELIBERATELY
+      # NOT IMPLEMENTED here and asserts nothing today. It requires on-device
+      # extension provisioning that does not exist yet:
+      #   1. addRepo(MangaDex extension repo) via GraphQL
+      #   2. fetchExtensions + installExtension(MangaDex)
+      #   3. fetchSourceManga(query) -> pick a known series
+      #   4. fetchSourceChapters(mangaId) -> assert the list is non-empty
+      # Wire this once N2.1 lands the provisioning flow + a fixture series.
+      # Until then there is intentionally no green step for this rung — do not
+      # add a placeholder that "passes", it would hide the missing coverage.
+      # ---------------------------------------------------------------------
+
+      # Publish the built JRE so a later bundling job can consume it without a
+      # rebuild. if-no-files-found:error catches a silently-missing jlink output.
+      - name: Upload JRE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jre-${{ matrix.slug }}
+          path: apps/reader/src-tauri/jre/${{ matrix.slug }}
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,262 @@
+name: CI
+
+# Runs on every push to main and on all PRs. Three always-on jobs (web, rust,
+# lint) gate merges; two heavier jobs (e2e, lighthouse) are manual-only so the
+# required checks stay reliably green without standing up the full stack.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Keep Node + pnpm pinned to what the repo declares (package.json:
+  # packageManager pnpm@11.9.0, engines.node >=22.13). pnpm 11.9 requires
+  # Node >=22.13 (it uses node:sqlite), so Node 20 fails at install time.
+  NODE_VERSION: '22'
+  PNPM_VERSION: '11.9.0'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Web workspace: typecheck + build the SvelteKit SPAs and their shared pkgs.
+  # ---------------------------------------------------------------------------
+  web:
+    name: Web (typecheck + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          # Built-in pnpm store caching keyed off pnpm-lock.yaml.
+          cache: pnpm
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      # packages/* (types, api, ui) have no build/check scripts today, so guard
+      # the build with `--if-present`; this stays correct if scripts are added.
+      # NOTE: `--if-present` must precede the script name — placed after it, pnpm
+      # forwards it to the script and errors (ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT)
+      # when no selected package has a `build` script.
+      - name: Build shared packages
+        run: pnpm -r --filter "./packages/*" run --if-present build
+
+      # `check` runs svelte-kit sync (generates .svelte-kit) then svelte-check,
+      # so it must precede build. Reader and admin are independent SPAs.
+      - name: Typecheck + build reader
+        run: |
+          pnpm --filter @komika/reader check
+          pnpm --filter @komika/reader build
+
+      - name: Typecheck + build admin
+        run: |
+          pnpm --filter @komika/admin check
+          pnpm --filter @komika/admin build
+
+      # tsc typecheck for the Cloudflare Worker (no build/deploy in CI).
+      - name: Typecheck worker
+        run: pnpm --filter @komika/worker check
+
+      # The default build above targets Cloudflare (edge SSR) and emits to
+      # .svelte-kit/cloudflare — it validates the web target but produces no
+      # `build/` dir. The artifact wants the STATIC output, so build it too
+      # (same target the reader Docker image and Tauri use).
+      - name: Build reader (static)
+        env:
+          KOMIKA_TARGET: tauri
+        run: pnpm --filter @komika/reader build
+
+      # Publish the reader's static output so the e2e job (or a deploy) can
+      # consume it without rebuilding.
+      - name: Upload reader build
+        uses: actions/upload-artifact@v4
+        with:
+          name: reader-build
+          path: apps/reader/build
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Lint / format for the JS/TS side (root prettier).
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint (prettier)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Root `lint` = `prettier --check .` (see package.json). Per-app type
+      # linting runs in the `web` job via `svelte-check`/`tsc`.
+      - name: Lint
+        run: pnpm run lint
+
+  # ---------------------------------------------------------------------------
+  # Rust server: fmt + clippy + release build.
+  # ---------------------------------------------------------------------------
+  rust:
+    name: Rust server (fmt + clippy + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/server
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Caches ~/.cargo registry + git and the target/ dir, keyed on Cargo.lock.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/server
+
+      - name: Format check
+        run: cargo fmt --check
+
+      # Fail the build on any clippy warning.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --release
+
+  # ---------------------------------------------------------------------------
+  # Deploy stack: build both Docker images and validate the compose file so a
+  # broken Dockerfile/compose can't pass CI green. Runs on the same push/PR
+  # triggers as the always-on jobs (image builds are slow but that's the point).
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy (docker build + compose config)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build both images from the repo root (compose uses context: ..).
+      - name: Build server image
+        run: docker build -f deploy/server.Dockerfile -t komika-server:ci .
+
+      - name: Build reader image
+        run: docker build -f deploy/reader.Dockerfile -t komika-reader:ci .
+
+      # Validate the compose file parses (interpolates env, resolves merges).
+      - name: Validate compose config
+        run: docker compose -f deploy/docker-compose.yml config >/dev/null
+
+  # ---------------------------------------------------------------------------
+  # E2E smoke tests (manual). Standing up the full federated stack (Suwayomi +
+  # server) is heavy, and the reader ships a mock fallback so content is always
+  # present — so the smoke run only needs the static reader preview. Gated to
+  # workflow_dispatch to keep required checks fast; run it before releases.
+  # See e2e/README.md.
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: E2E smoke (manual)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    needs: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install reader deps
+        run: pnpm install --frozen-lockfile
+
+      # Reuse the artifact built by the `web` job (adapter-static -> build/).
+      - name: Download reader build
+        uses: actions/download-artifact@v4
+        with:
+          name: reader-build
+          path: apps/reader/build
+
+      # The e2e project is standalone (not in the pnpm workspace); install it
+      # on its own and pull in the Playwright browser binaries.
+      - name: Install e2e deps
+        working-directory: e2e
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+
+      # Serve the static SPA on :5173 (SPA fallback so deep links resolve),
+      # then point Playwright at it. `PW_BASE_URL` overrides the config default.
+      - name: Serve reader + run smoke tests
+        working-directory: e2e
+        env:
+          PW_BASE_URL: http://localhost:5173
+        run: |
+          npx --yes serve -s ../apps/reader/build -l 5173 &
+          npx wait-on http://localhost:5173 --timeout 60000
+          npx playwright test
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: e2e/playwright-report
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Lighthouse / Core Web Vitals budget (stub, manual). Wire a real LHCI config
+  # + budget.json before enforcing. Kept as workflow_dispatch so it never blocks
+  # merges until budgets are agreed.
+  # ---------------------------------------------------------------------------
+  lighthouse:
+    name: Lighthouse CWV budget (stub, manual)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    needs: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Download reader build
+        uses: actions/download-artifact@v4
+        with:
+          name: reader-build
+          path: apps/reader/build
+      # TODO: replace with `npx @lhci/cli autorun` once lighthouserc.json +
+      # a CWV budget.json (LCP/CLS/INP/TBT thresholds) land in the repo.
+      - name: Lighthouse (placeholder)
+        run: |
+          echo "Lighthouse CWV budget not yet configured."
+          echo "Serve apps/reader/build and run @lhci/cli against key routes:"
+          echo "  / (home), /browse, /series/<slug>"

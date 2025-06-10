@@ -1,0 +1,7 @@
+# The Worker needs NO secrets. It is a pure image proxy backed by the
+# Cloudflare edge cache — there is no object-storage tier and nothing to
+# authenticate against.
+#
+# All configuration lives in wrangler.toml [vars] (ALLOWED_SOURCE_HOSTS,
+# ALLOWED_ORIGINS), which are non-secret. `wrangler dev` therefore needs no
+# `.dev.vars` file at all; this example is kept only to document that.

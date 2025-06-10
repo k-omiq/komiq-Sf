@@ -1,0 +1,38 @@
+/* Minimal, opinionated reset shared by both apps. */
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+* {
+	margin: 0;
+}
+html,
+body {
+	height: 100%;
+}
+body {
+	font-family: var(--k-font-sans);
+	font-size: var(--k-font-size-md);
+	line-height: 1.5;
+	color: var(--k-text);
+	background: var(--k-bg);
+	-webkit-font-smoothing: antialiased;
+}
+img,
+picture,
+svg {
+	display: block;
+	max-width: 100%;
+}
+button,
+input,
+select,
+textarea {
+	font: inherit;
+	color: inherit;
+}
+a {
+	color: inherit;
+	text-decoration: none;
+}

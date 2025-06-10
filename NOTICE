@@ -1,0 +1,52 @@
+Komika — NOTICE
+
+Komika (all of it: the reader app, the desktop/mobile shells, komika-server, the
+Cloudflare worker, and every workspace package) is licensed under the GNU Affero
+General Public License, version 3.0 only (AGPL-3.0-only). See the LICENSE file at
+the root of this repository for the full license text. The project ships with its
+Corresponding Source published; there are no closed-source components in what we
+distribute.
+
+Why AGPL: Komika embeds Suwayomi-Server (AGPL-3.0) as its on-device content engine.
+AGPL is "sticky", so the whole project is released under AGPL-3.0 — this is the
+intended, permission-free way to build on AGPL software: the license itself is the
+grant, and we comply rather than seek separate sign-off.
+
+
+Third-party attributions
+========================
+
+Suwayomi-Server
+  License:  AGPL-3.0-only
+  Source:   https://github.com/Suwayomi/Suwayomi-Server
+  Use:      Embedded on-device as Komika's content engine, per the native
+            embedded-Suwayomi plan (docs/plans/native-embedded-suwayomi.md).
+  Note:     We intend to distribute and/or run a modified fork of Suwayomi-Server
+            (for the on-device WebView/Cloudflare bridge). Where we ship that fork
+            or run it network-facing, its Corresponding Source will be published in
+            full, as AGPL-3.0 §13 requires.
+
+FlareSolverr
+  License:  MIT
+  Source:   https://github.com/FlareSolverr/FlareSolverr
+  Use:      Used ONLY in the hosted/web server path. It is never bundled into the
+            desktop or mobile app.
+
+Tachiyomi / Mihon extensions and the Keiyoushi extension repository
+  License:  Each extension is licensed by its own authors under its own terms.
+  Use:      Extensions are third-party code fetched at runtime; Komika does not
+            vendor or redistribute them in this repository. Their individual
+            licenses and terms of service are to be audited per obligation 4 of the
+            licensing plan (docs/plans/native-embedded-suwayomi.md §12).
+
+
+Corresponding Source
+====================
+
+Per AGPL-3.0, the Corresponding Source for each released binary includes the build
+and packaging scripts needed to regenerate it — the jlink JRE assembly steps, the
+vendored and SHA-pinned Suwayomi-Server jar, and the Tauri bundle configuration.
+These will be published alongside each release so that the published source
+corresponds to the distributed build. Much of this native bundling is planned and
+not yet implemented; the commitments above describe what we will publish as each
+piece ships.

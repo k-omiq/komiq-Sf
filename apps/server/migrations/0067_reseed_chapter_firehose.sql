@@ -1,0 +1,75 @@
+-- Force exactly ONE full re-seed of the MangaDex `/chapter` firehose.
+--
+-- WHY A RE-SEED IS NEEDED AT ALL
+-- `MangaDexClient::list_chapters` never sent `contentRating[]`, and MangaDex defaults its
+-- list endpoints to `safe,suggestive,erotica`. So the entire `pornographic` slice of the
+-- firehose has been invisible to this mirror since the day it was written. Measured
+-- upstream 2026-07-26: `/chapter?translatedLanguage[]=en` reports a `total` of 810,292
+-- with the defaults against 876,433 with all four ratings — a 66,141-chapter hole, which
+-- matches the mirror almost exactly (805,307 chapter rows). From the inside: of the
+-- MangaDex works we carry, exactly 4 `pornographic` ones have any chapter versus 19,923
+-- with none, while `erotica` — which the defaults DO include — sits at 4,742 with
+-- chapters vs 4,197 without.
+--
+-- The parameter fix ships in the same change set, but it repairs only the FORWARD path.
+-- `chapters.seed_done = 1`, so the sweep runs the `updatedAtSince` window, which never
+-- revisits an old `createdAt`: those ~66k historical chapters would stay unreachable
+-- forever. Someone has to walk `createdAt` from the beginning one more time, with the
+-- corrected params. That is all this migration arranges.
+--
+-- (Secondary, and repaired by the same walk: `sync_chapters` skips a chapter whose work
+-- was not catalogued yet — `Ok(None) => continue` — and the forward-only cursor never
+-- came back for it. ~4,985 chapters across ~6,051 works. Of the 66,171 MangaDex
+-- source_series with zero chapters, ~45,345 have no English chapter upstream at all and
+-- are not repairable by anything; ~20,826 are.)
+--
+-- WHY A MIGRATION IS THE RIGHT ONE-SHOT
+-- `run_chapter_cycle` already does the entire job when `chapters.seed_done` is 0: it
+-- selects `SyncWindow::Created`, resumes from the stored cursor, `sync_chapters`
+-- checkpoints every window via `set_seed_progress`, and on a pass that lost nothing
+-- `mark_seed_done` flips it back to the incremental window forever. So the only thing
+-- missing is the reset — no new scheduling, no second pass loop cloned from the
+-- catalogue backfill, and above all no new `maintenance_flag` key. That mechanism is
+-- never cleared, which is why `BACKFILL_FLAG` is on its third hand-versioned generation;
+-- a migration is intrinsically once-per-database and leaves no constant to bump.
+--
+-- WHY DELETE AND NOT `seed_done = 0`
+-- `mark_seed_done` / `set_seed_progress` / `set_sync_cursor` are all upserts
+-- (`INSERT ... ON CONFLICT(job) DO UPDATE`), so a missing row is a supported state, not a
+-- crash: `get_sync_state` returns `None`, `run_chapter_cycle` takes its `None =>
+-- (SyncWindow::Created, None)` arm and walks from the very beginning with no `since`
+-- param — which is what the historical `pornographic` rows require. Leaving the row with
+-- `seed_done = 0` would keep `last_synced_at`, and `Some(s) => (Created, Some(cursor))`
+-- would resume from the cursor: today that is 2026-07-26, i.e. the newest end of the
+-- firehose, and the walk would ingest nothing. (This is exactly how `BACKFILL_JOB` had to
+-- be re-keyed twice — see its "BOTH BUMPS ARE MANDATORY" note.) `reset_sync_state`, which
+-- the admin `resyncCatalogue` mutation uses, is this same DELETE.
+--
+-- WHAT IT COSTS WHEN IT RUNS
+-- ~876k chapters at 100 per page is ~8,800 page requests, plus window overlap: ~9-10k
+-- requests through the 4 req/s token bucket, i.e. ~45-70 min of fetching, in ONE cycle
+-- (the chapter sweep has no per-pass wall-clock budget). It starts on the first recurring
+-- tick, ~60 s after the restart that applies this migration, and holds
+-- `CATALOGUE_SYNC_RUNNING` for the whole walk: at the 6 h `CATALOGUE_SYNC_INTERVAL_SECS`
+-- no tick should land inside it, but any that does logs "already running; skipping this
+-- tick" rather than overlapping. The incremental chapter refresh is what is paused
+-- meanwhile, so new chapters lag by up to the seed's duration — once. It is resumable:
+-- `set_seed_progress` checkpoints per
+-- window, so a restart mid-walk continues near where it stopped instead of restarting.
+-- The ~805k chapters already mirrored are presence-checked (`chapter_row_unchanged`) and
+-- skipped without a write, so the walk is read-heavy, not write-heavy — without that,
+-- this would be ~876k autocommit transactions against SQLite's single writer while the
+-- scanner, the cover crawler and Litestream are also writing. On the clean pass,
+-- `mark_seed_done` sets the incremental cursor to the cycle's START time, so nothing
+-- published during the walk is skipped.
+--
+-- ONLY THE `chapters` ROW. The `catalogue` row is deliberately untouched: `/manga` already
+-- sends all four content ratings, its seed is done, and `run_chapter_cycle` REFUSES to
+-- seed chapters while `catalogue.seed_done` is 0 (a chapter whose work is not catalogued
+-- is skipped) — resetting it would stall this re-seed behind a full 113k-work re-walk for
+-- no benefit. The `catalogue_backfill_v*` rows are likewise none of this migration's
+-- business.
+--
+-- Idempotent, and a no-op on a fresh database (nothing has seeded yet, so there is no row).
+
+DELETE FROM catalogue_sync_state WHERE job = 'chapters';

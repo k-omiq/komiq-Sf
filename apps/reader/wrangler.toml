@@ -1,0 +1,38 @@
+# Cloudflare Worker config for the hosted reader (edge SSR).
+#
+# `pnpm --filter @komika/reader build` (the default, web target) runs
+# adapter-cloudflare and emits `.svelte-kit/cloudflare/` — a Worker (`_worker.js`)
+# plus the static client assets. Deploy with:
+#   cd apps/reader && pnpm dlx wrangler deploy      # or `wrangler deploy`
+#
+# Public catalog routes (home, browse, series, updates, support) are
+# server-rendered here; the rest of the app hydrates client-side (see $lib/ssr).
+#
+# NOTE: backend wiring (PUBLIC_KOMIKA_API, PUBLIC_KOMIKA_IMG_WORKER, …) is baked at
+# BUILD time by Vite via `$env/static/public` — the committed apps/reader/.env.production
+# supplies the prod values, inlined into the bundle. It is intentionally NOT read from
+# a Worker `[vars]` block: adapter-cloudflare evaluates $lib/config.ts at edge cold-start
+# with no request context, so a runtime `[vars]`/`$env/dynamic/public` value never
+# reaches the frozen module-scope constants (this is the empty-feeds bug). This Worker
+# needs no secrets: the SSR loads only fetch the public/anonymous catalog.
+name = "komika-reader"
+main = ".svelte-kit/cloudflare/_worker.js"
+compatibility_date = "2024-11-06"
+# SvelteKit's server runtime uses Node built-ins; required on Workers.
+compatibility_flags = ["nodejs_compat"]
+
+# This account has no workers.dev subdomain, so serve on the apex + www custom
+# domains directly. custom_domain = true provisions each host's DNS record + cert.
+workers_dev = false
+routes = [
+  { pattern = "komiq.cc", custom_domain = true },
+  { pattern = "www.komiq.cc", custom_domain = true },
+]
+
+# Static client assets (hashed `_app/immutable/*`, icons, manifest). Wrangler
+# serves these directly from the edge and only invokes the Worker for the
+# SSR/dynamic routes listed in the adapter-generated `_routes.json`. `_worker.js`,
+# `_routes.json` and `_headers` are treated as config, not served as assets.
+[assets]
+binding = "ASSETS"
+directory = ".svelte-kit/cloudflare"

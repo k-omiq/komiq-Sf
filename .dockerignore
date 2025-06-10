@@ -1,0 +1,14 @@
+# Keep the Docker build context small & reproducible. The server and reader
+# Dockerfiles copy source + lockfiles and build from scratch, so none of the
+# local build artifacts, deps, or archives belong in the context.
+**/node_modules
+**/build
+**/dist
+**/.svelte-kit
+apps/server/target
+.git
+*.zip
+*.sqlite3
+*.sqlite3-*
+.env
+**/.env

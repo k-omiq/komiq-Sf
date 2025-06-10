@@ -1,0 +1,28 @@
+# Security headers for the admin console Worker (admin.komiq.cc).
+#
+# The Rust API's X-Frame-Options/nosniff layer only covers the API origin — this
+# static SPA is served by Cloudflare Workers Assets, which sends nothing of its own.
+# `_headers` is copied verbatim into build/ by adapter-static and applied at the edge.
+#
+# There is no XSS sink in the app today (no {@html}, innerHTML or eval anywhere), so
+# this is defence-in-depth around a console that keeps a bearer token in localStorage.
+#
+# script-src: 'unsafe-inline' is required, not preferred. Two inline scripts run on
+# every page: the no-FOUC theme script in src/app.html, and SvelteKit's own bootstrap
+# in index.html (`__sveltekit_… ; import("/_app/immutable/entry/start.<hash>.js")`).
+# The bootstrap embeds per-build content hashes, so its sha256 changes on EVERY build
+# and cannot be hardcoded here — and adding a hash for only the theme script would
+# make the browser ignore 'unsafe-inline' and break the bootstrap. The clean fix is
+# `kit.csp = { mode: 'hash', directives: { … } }` in apps/admin/svelte.config.js,
+# which makes SvelteKit emit a per-build hashed policy in a <meta> tag; once that's in
+# place, move the theme script to an external /theme-init.js (SvelteKit does not hash
+# inline scripts coming from app.html) and tighten script-src here to 'self'.
+#
+# connect-src pins the GraphQL API baked in at build time (PUBLIC_KOMIKA_API).
+/*
+  Content-Security-Policy: default-src 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; font-src 'self' data:; connect-src 'self' https://api.komiq.cc; manifest-src 'self'; worker-src 'self'; upgrade-insecure-requests
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: no-referrer
+  Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), microphone=(), payment=(), usb=()
+  Cross-Origin-Opener-Policy: same-origin

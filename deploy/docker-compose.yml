@@ -1,0 +1,333 @@
+# Komika — full self-hosted public stack ("Mihon/Tachiyomi, but hosted, with a
+# public social layer and an auto-updating catalog").
+#
+# One-command bring-up:   cd deploy && ./deploy.sh
+# (or manually:           docker compose up --build -d  &&  python3 bootstrap.py
+#  — but PREFER ./deploy.sh: it runs a preflight that catches TRUSTED_PROXY_CIDRS
+#  drifting off the bridge gateway, which is otherwise a silent rate-limiter bug.)
+#
+# Services:
+#   suwayomi     — Tachidesk/Suwayomi: runs the source extensions (catalog,
+#                  chapters, page images). Bootstrapped with MangaDex + repos.
+#   flaresolverr — Cloudflare-challenge solver; Suwayomi routes protected sources
+#                  through it (enabled by bootstrap.sh). Internal-only.
+#   server       — komika-server (axum + async-graphql + SQLite): federates
+#                  suwayomi, adds accounts + social + admin, and runs the adaptive
+#                  scan scheduler that keeps the library auto-updated.
+#   reader       — static SvelteKit SPA (nginx), pointed at the server.
+#
+# Public wiring: GraphQL federation stays on the internal network
+# (SUWAYOMI_URL=http://suwayomi:4567). Suwayomi's port is bound to loopback only
+# (its admin API is unauthenticated), so browser images route through the
+# Cloudflare image Worker (reader IMG_MODE=proxy; set KOMIKA_IMG_WORKER_URL).
+# Set PUBLIC_HOST to your domain/IP in deploy/.env for a real deploy.
+
+name: komika
+
+services:
+  suwayomi:
+    # PINNED BY DIGEST to the image that is running today (`:stable`, pulled
+    # 2026-07-13), so this pin is a no-op now and every future update is a
+    # deliberate, reviewed act instead of whatever `docker compose pull` lands.
+    # To update: `docker pull ghcr.io/suwayomi/tachidesk:stable`, read the new
+    # digest out of `docker image inspect ... -f '{{json .RepoDigests}}'`, and
+    # replace the digest below.
+    image: ghcr.io/suwayomi/tachidesk@sha256:e59f212ccf91b26de8676a063a2db90256c148c6261535c7c477d47a43d9751b
+    restart: unless-stopped
+    # Bounded json-file logs. /etc/docker/daemon.json now carries the same cap as
+    # a daemon-wide default, but daemon.json is read only at Docker-daemon start,
+    # and restarting the daemon would bounce every unrelated stack on this box —
+    # so it is NOT in effect yet. The per-service cap here is what actually binds,
+    # and it takes effect on this stack's own next `up -d`.
+    # 20m x 5 = 100 MB ceiling per service (~2 months at komika's ~1.7 MB/day).
+    # For scale: the unbounded clubsite-worker log on this host is already 310 MB.
+    logging:
+      driver: json-file
+      options: { max-size: 20m, max-file: '5' }
+    # ALREADY LIVE — the running container has Memory=8g, NanoCpus=3.0 and this
+    # JAVA_TOOL_OPTIONS today (applied 2026-07-24); these lines only catch the
+    # committed file up. Do not read the numbers below as a pending change.
+    #
+    # Suwayomi was the box's dominant consumer BEFORE the cap (measured then:
+    # 4.4 GiB RSS, 25-30% CPU sustained) and ran with NO limit, so a spike could
+    # OOM the whole host — taking the Rust server and its SQLite writes with it.
+    # Under the cap it has been comfortable: 940 MiB anon / 0.15% CPU at 2 days
+    # uptime, i.e. ~11% of the 8g ceiling.
+    #
+    # The two settings below MUST move together. The JVM launches with no explicit
+    # heap flags (`java -Duser.home=... -jar ...`), so it sizes MaxHeapSize by
+    # ergonomics: 25% of whatever RAM it can see. Unlimited, that is 25% of the
+    # host's 23 GiB = 6.29 GiB (verified via -XX:+PrintFlagsFinal). Imposing
+    # mem_limit alone would make the container-aware JVM re-derive 25% of 8 GiB =
+    # 2 GiB — a 3x heap cut against a process already resident at 4.4 GiB, which
+    # buys GC thrash or an in-app OOM instead of safety.
+    #
+    # JAVA_TOOL_OPTIONS is honored by every HotSpot JVM without the application
+    # needing to support it (the startup script never reads JAVA_OPTS). At 70% of
+    # an 8 GiB limit the heap ceiling is ~5.6 GiB, close to today's effective
+    # 6.29 GiB, while total RSS stays bounded.
+    mem_limit: 8g
+    cpus: 3.0
+    environment:
+      TACHIDESK_SERVER_IP: 0.0.0.0
+      TACHIDESK_SERVER_PORT: '4567'
+      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=70
+    volumes:
+      - suwayomi-data:/home/suwayomi/.local/share/Tachidesk
+    ports:
+      # Bound to LOOPBACK only: Suwayomi's GraphQL admin API is unauthenticated
+      # (add/remove sources, trigger downloads, enumerate library), so it must not
+      # be internet-reachable. The server federates it over the internal network
+      # (SUWAYOMI_URL=http://suwayomi:4567), which is unaffected. Browser images go
+      # through the Cloudflare image Worker (reader IMG_MODE=proxy below), not this
+      # port. Suwayomi-source (non-canonical) images ARE reachable: the server
+      # proxies their cover/page bytes at `/api/v1/manga/...` (SUWAYOMI_PUBLIC_URL
+      # points at the server), so covers load from the API origin and pages ride the
+      # image Worker — alongside the canonical MangaDex path (uploads.mangadex.org /
+      # mangadex.network).
+      - '127.0.0.1:${SUWAYOMI_PORT:-4567}:4567'
+    networks: [komika]
+    healthcheck:
+      # Suwayomi's image ships curl (no wget), so probe with curl.
+      test: ['CMD-SHELL', 'curl -fsS http://localhost:4567/ >/dev/null 2>&1 || exit 1']
+      interval: 20s
+      timeout: 5s
+      retries: 8
+      start_period: 40s
+
+  flaresolverr:
+    # PINNED BY DIGEST. This is the most privileged component in the stack — a
+    # headless Chromium that fetches attacker-influenced pages — and it was on a
+    # floating `:latest`, so any `docker compose pull` could swap in an
+    # unreviewed browser image. The digest below is the image running today
+    # (built 2026-05-26), so pinning changes nothing now; updates become
+    # deliberate. Update the same way as suwayomi above.
+    image: ghcr.io/flaresolverr/flaresolverr@sha256:139dfee1c6f89249c8d665d1333a42e8ec74ec0a86bc6bb1c8461e10d3a66a47
+    restart: unless-stopped
+    # A headless Chromium had NO memory limit on a 23.4 GiB host, so a runaway
+    # render could have made the kernel pick an OOM victim out of an unrelated
+    # stack on this box (clubsite-db / torchy-db). Measured idle RSS is ~12 MiB;
+    # 2g is far above any legitimate single-challenge solve while still bounding
+    # a runaway. Ceilings across the stack: 8g + 6g + 2g = 16g of 23.4 GiB.
+    mem_limit: 2g
+    logging:
+      driver: json-file
+      options: { max-size: 20m, max-file: '5' }
+    environment:
+      LOG_LEVEL: info
+      TZ: ${TZ:-UTC}
+    # Internal-only: Suwayomi reaches it at http://flaresolverr:8191.
+    networks: [komika]
+    healthcheck:
+      # The flaresolverr image ships NEITHER curl NOR wget, so the previous
+      # wget probe could never pass — the container reported "unhealthy" while
+      # FlareSolverr itself was serving 200s perfectly well. It does ship Python
+      # (the app is Python), so probe with urllib.
+      test:
+        [
+          'CMD-SHELL',
+          'python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(''http://localhost:8191/'',timeout=5).status==200 else 1)" || exit 1',
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/server.Dockerfile
+    restart: unless-stopped
+    # Measured baseline (cgroup v2 memory.stat, steady state at 42h uptime):
+    # memory.current 2.14 GiB = 1.73 GiB anon + 0.38 GiB file. Only the ANON part
+    # is unreclaimable, so 6g is ~3.2x the number that can actually OOM us.
+    #
+    # Sized against the 1.5 GiB `mmap_size` the main pool now takes (db.rs). Under
+    # cgroup v2, mmap'd file pages ARE charged to this cgroup — they show up in
+    # memory.stat `file` / `file_mapped` and count toward memory.max. They are not
+    # a hazard here, for three reasons:
+    #   1. It is address space, not an allocation. mmap_size is a ceiling; only
+    #      pages actually touched become resident.
+    #   2. 8 pool connections x 1.5 GiB is NOT 12 GiB. They map the SAME file, so
+    #      the page cache is shared and the charge is bounded by the file itself
+    #      (komika.sqlite3 = 1.28 GiB). The covers pool adds <=256 MiB, likewise
+    #      shared across its 4 connections.
+    #   3. SQLite maps the DB read-only (writes still go through pwrite), so those
+    #      pages are always CLEAN. On hitting memory.max the kernel unmaps and
+    #      evicts them rather than invoking the OOM killer.
+    # Worst case therefore lands near 1.9 GiB anon + ~1.5 GiB mapped file = 3.4
+    # GiB, against a 6 GiB cap.
+    #
+    # Expect `memory.current` to sit much closer to 6g than it does today: page
+    # cache grows to fill whatever headroom a cgroup has. That is normal, not a
+    # leak. `docker stats` subtracts inactive_file, so watch that, or watch
+    # memory.stat `anon`, not memory.current.
+    #
+    # The point of the limit is to stop a runaway from letting the kernel choose
+    # an OOM victim out of an unrelated stack on this host, not to squeeze a
+    # healthy process.
+    mem_limit: 6g
+    logging:
+      driver: json-file
+      options: { max-size: 20m, max-file: '5' }
+    environment:
+      PORT: '8080'
+      DATABASE_URL: sqlite:///data/komika.sqlite3
+      # User avatars are stored as BLOBs in the SQLite DB, so they are
+      # Litestream-replicated with it and any replica can serve any avatar.
+      SUWAYOMI_URL: http://suwayomi:4567
+      # Public base for the Suwayomi cover/page image URLs handed to the browser.
+      # These point at THIS server, which proxies `/api/v1/manga/{id}/thumbnail` and
+      # `/api/v1/manga/{id}/chapter/{ci}/page/{pi}` from the loopback-only Suwayomi
+      # (:4567 is never internet-reachable). Defaults to the server's own public
+      # origin; for the tunneled prod deploy set SUWAYOMI_PUBLIC_URL=https://api.komiq.cc
+      # in deploy/.env. Covers then load straight from this origin, and page images
+      # ride the Cloudflare image Worker (which allowlists this host).
+      SUWAYOMI_PUBLIC_URL: ${SUWAYOMI_PUBLIC_URL:-http://${PUBLIC_HOST:-localhost}:${SERVER_PORT:-8080}}
+      # Public reader origin(s) allowed to call the API. Honors CORS_ORIGINS from
+      # deploy/.env (e.g. https://komiq.cc); falls back to the local reader port.
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://${PUBLIC_HOST:-localhost}:${READER_PORT:-8081}}
+      # CIDRs of trusted reverse proxies. Leave blank when publishing 8080
+      # directly (the default) so the auth rate-limiter keys on the real socket
+      # peer. Set it ONLY if a proxy you control fronts the server and sets
+      # X-Forwarded-For / X-Real-IP -- AND only while `8080` is loopback-bound
+      # below, or a direct-port client can forge the header past the limiter.
+      #
+      # NOTE for the tunneled prod deploy: the value is NOT 127.0.0.1/32. With
+      # userland-proxy on, docker-proxy re-originates the connection from the
+      # bridge gateway, so the server's socket peer is 172.21.0.1. See the long
+      # comment on TRUSTED_PROXY_CIDRS in deploy/.env.
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
+      KOMIKA_ADMIN_USERS: ${KOMIKA_ADMIN_USERS:-admin}
+      # The server provisions the admin account(s) at startup: a configured admin
+      # username is reserved from open registration and created from this password
+      # (or promoted if it already exists). Required to create a fresh admin.
+      KOMIKA_ADMIN_PASSWORD: ${KOMIKA_ADMIN_PASSWORD:-}
+      KOMIKA_ADMIN_EMAIL: ${KOMIKA_ADMIN_EMAIL:-admin@example.com}
+      # GraphiQL IDE + schema introspection. Off by default so the public API
+      # exposes neither; set GRAPHIQL_ENABLED=on in deploy/.env only for dev.
+      GRAPHIQL_ENABLED: ${GRAPHIQL_ENABLED:-off}
+      SCAN_TICK_SECONDS: ${SCAN_TICK_SECONDS:-300}
+      # Canonical catalogue sync (direct MangaDex; CATALOGUE.md). Off by default —
+      # nothing hits MangaDex unless CATALOGUE_SYNC=on. It is opt-in and, because
+      # the rate limiter is in-process, only ONE replica may enable it (see
+      # CATALOGUE.md "Single-replica constraint (M4)"). Set a descriptive
+      # MANGADEX_USER_AGENT when enabling, per MangaDex API etiquette. COVER_PHASH
+      # adds cover perceptual-hashing for dedup on top of the sync.
+      CATALOGUE_SYNC: ${CATALOGUE_SYNC:-off}
+      MANGADEX_USER_AGENT: ${MANGADEX_USER_AGENT:-Komika/0.1 (+https://github.com/komika)}
+      CATALOGUE_SYNC_INTERVAL_SECS: ${CATALOGUE_SYNC_INTERVAL_SECS:-21600}
+      COVER_PHASH: ${COVER_PHASH:-off}
+      RUST_LOG: komika_server=info,tower_http=warn
+      # Continuous backup (Litestream → S3-compatible; Cloudflare R2 reference).
+      # Blank = run without backup. For R2 set LITESTREAM_REGION=auto.
+      LITESTREAM_BUCKET: ${LITESTREAM_BUCKET:-}
+      LITESTREAM_ENDPOINT: ${LITESTREAM_ENDPOINT:-}
+      LITESTREAM_REGION: ${LITESTREAM_REGION:-auto}
+      LITESTREAM_ACCESS_KEY_ID: ${LITESTREAM_ACCESS_KEY_ID:-}
+      LITESTREAM_SECRET_ACCESS_KEY: ${LITESTREAM_SECRET_ACCESS_KEY:-}
+    volumes:
+      - server-data:/data
+    ports:
+      # Bound to LOOPBACK only, like suwayomi above. Production traffic is
+      # unaffected: cloudflared's ingress targets http://localhost:8080
+      # (/etc/cloudflared/config.yml), so this is a no-op for the tunnel.
+      #
+      # What it removes: publishing on 0.0.0.0 AND [::] with no host filtering
+      # in front of it. Docker's DNAT bypasses filter/INPUT entirely, so the
+      # host's `-A INPUT -j REJECT` never applied; DOCKER-USER is empty; and
+      # `ip6tables -P INPUT ACCEPT` has no reject rule at all. The single Oracle
+      # VCN security-list rule was the ONLY control, and whether v6 ingress
+      # reached it was never proven (the v6 publish came from docker-proxy
+      # binding [::]:8080 directly — the ip6tables DOCKER chain is empty — so
+      # no packet filter was involved in it at all).
+      #
+      # It also closes the DNAT-based cross-tenant path. Compare the live rules:
+      #   nat/DOCKER  ! -i br-komika --dport 8080 -j DNAT --to 172.21.0.3:8080
+      #   nat/DOCKER  -d 127.0.0.1/32 ! -i br-komika --dport 4567 -j DNAT ...
+      # The 0.0.0.0 form has no `-d`, so a packet from ANY other bridge to ANY
+      # address on port 8080 is DNAT'd here — containers in the unrelated
+      # clubsite/torchy stacks reach the API. The loopback form pins `-d
+      # 127.0.0.1/32` and they no longer can (that is suwayomi's rule above).
+      #
+      # What it does NOT close: Docker also installs a filter-chain rule
+      #   filter/DOCKER -d 172.21.0.3/32 ! -i br-komika -o br-komika --dport 8080 -j ACCEPT
+      # for every published port, with NO source restriction, and it is installed
+      # for a loopback publish too (suwayomi has the same rule today). So a
+      # sibling-stack container that knows the komika container IP can still
+      # reach 172.21.0.3:8080 directly. Loopback-binding is a real reduction, not
+      # a boundary; closing that residual path needs a DOCKER-USER rule, which is
+      # host firewall state this file does not own.
+      #
+      # This binding is also what makes TRUSTED_PROXY_CIDRS above safe to set.
+      # The two MUST move together -- widening this back to 0.0.0.0 without
+      # blanking TRUSTED_PROXY_CIDRS lets anyone forge X-Forwarded-For.
+      - '127.0.0.1:${SERVER_PORT:-8080}:8080'
+    depends_on:
+      suwayomi:
+        condition: service_healthy
+    networks: [komika]
+    healthcheck:
+      # READINESS, not liveness. `/health` is `async fn health() -> "ok"`: it
+      # only proves the listener accepts a connection, so a wedged SQLite pool
+      # would report healthy forever. `/health/ready` runs `SELECT 1` against
+      # the pool. Measured live: HTTP 200 in ~0.6 ms.
+      #
+      # Timings are widened because this probe now touches the DB: a 10s timeout
+      # (vs 3s) over 5 retries means a transient write-lock has to persist for
+      # ~2.5 min before the container is marked unhealthy, so a checkpoint or a
+      # long scan-tick write can't flap it. start_period covers boot migrations
+      # against the 1.4 GB main DB without those attempts counting as failures.
+      test: ['CMD-SHELL', 'curl -fsS http://localhost:8080/health/ready || exit 1']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  reader:
+    # OPT-IN ONLY. In production the reader is a Cloudflare Worker
+    # (komika-reader, see CLOUDFLARE-RUNBOOK.md) and this container is NOT
+    # running. Without a profile, the documented `./deploy.sh up` would start it
+    # and publish another 0.0.0.0-bound host port for a surface nobody uses.
+    # Self-hosters who DO want the nginx SPA:  ./deploy.sh up --with-reader
+    # (or export COMPOSE_PROFILES=selfhost).
+    profiles: [selfhost]
+    build:
+      context: ..
+      dockerfile: deploy/reader.Dockerfile
+      args:
+        PUBLIC_KOMIKA_BACKEND: 'on'
+        PUBLIC_KOMIKA_BACKEND_KIND: komika
+        PUBLIC_KOMIKA_API: http://${PUBLIC_HOST:-localhost}:${SERVER_PORT:-8080}/graphql
+        # Images route through the Cloudflare image Worker (not the now
+        # loopback-only Suwayomi port). Set KOMIKA_IMG_WORKER_URL in deploy/.env
+        # to your deployed Worker's base URL; images stay broken until it is set.
+        PUBLIC_KOMIKA_IMG_MODE: proxy
+        PUBLIC_KOMIKA_IMG_WORKER: ${KOMIKA_IMG_WORKER_URL:-}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: 20m, max-file: '5' }
+    environment:
+      # CSP origins (nginx templates them at boot). Image mode is `proxy`, so
+      # images load from the image Worker; connect-src is the GraphQL API origin.
+      CSP_IMG_ORIGIN: ${KOMIKA_IMG_WORKER_URL:-}
+      CSP_CONNECT_ORIGIN: http://${PUBLIC_HOST:-localhost}:${SERVER_PORT:-8080}
+    ports:
+      - '${READER_PORT:-8081}:80'
+    depends_on: [server]
+    networks: [komika]
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost/ >/dev/null 2>&1 || exit 1']
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+networks:
+  komika:
+    driver: bridge
+
+volumes:
+  suwayomi-data:
+  server-data:

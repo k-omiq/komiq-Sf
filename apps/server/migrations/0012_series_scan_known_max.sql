@@ -1,0 +1,11 @@
+-- Add the highest observed chapter number to the adaptive scan state, so the
+-- scanner can detect add+remove churn that leaves the chapter *count* unchanged
+-- (upstream drops one chapter and adds another within a single interval) and
+-- number regressions — cases a count-only comparison silently misses [SC4].
+--
+-- Nullable on purpose: existing rows (and any series never scanned since this
+-- migration) have NULL known_max_chapter, which the scanner treats as "unknown"
+-- and seeds as a baseline WITHOUT flagging the series as updated. A NOT NULL
+-- DEFAULT 0 would make every pre-existing series' next scan look like a jump
+-- from 0 to its real max and re-flood the updates feed.
+ALTER TABLE series_scan_state ADD COLUMN known_max_chapter REAL;  -- highest chapter number seen, NULL = not yet observed

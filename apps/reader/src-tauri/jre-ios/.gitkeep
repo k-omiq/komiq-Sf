@@ -1,0 +1,3 @@
+# Placeholder so the iOS runtime bundle dir exists on a fresh checkout.
+# The interpreter-only (Zero) OpenJDK static libs for aarch64-ios are produced by
+# scripts/build-ios-jvm.sh and land in jre-ios/aarch64-ios/ (gitignored, never committed).

@@ -1,0 +1,78 @@
+name = "komika-img"
+main = "src/index.ts"
+compatibility_date = "2024-11-06"
+
+# This account has no workers.dev subdomain, so serve ONLY on the custom domain.
+# custom_domain = true provisions the proxied DNS record + edge cert for the host.
+workers_dev = false
+routes = [
+  { pattern = "img.komiq.cc", custom_domain = true },
+]
+
+# ---------------------------------------------------------------------------
+# Non-secret configuration.
+#
+# All of these are safe to commit. The Worker is a pure proxy backed by the
+# Cloudflare edge cache — it needs no secrets and no object storage.
+# ---------------------------------------------------------------------------
+[vars]
+# Comma-separated allowlist of upstream source hosts the proxy will fetch from.
+# Prevents the Worker from being used as an open proxy. This ships with the
+# MangaDex hosts (the canonical web-reader path) as a safe default. An EMPTY
+# value now FAILS CLOSED (denies every host) — never an open proxy — so add the
+# hosts you need for local dev rather than clearing the list.
+# Hostnames match exactly or as a suffix ("example.com" also allows
+# "cdn.example.com"). MangaDex needs BOTH the cover host and the dynamic
+# MangaDex@Home page hosts: covers are served from `uploads.mangadex.org`, and
+# read-time pages from `*.mangadex.network` nodes (e.g.
+# `cmdxd98sb0x3yprd.mangadex.network`) — the `mangadex.network` suffix entry
+# covers every node. Add more as needed, e.g.:
+#   "uploads.mangadex.org,mangadex.network,mangakakalot.com,cdn.komika.app"
+# `api.komiq.cc` is our own API origin: Suwayomi-source chapter pages are proxied
+# through it (Suwayomi's :4567 is loopback-only), so the reader points page URLs at
+# `api.komiq.cc/api/v1/manga/.../page/...` and this Worker fetches + edge-caches them.
+ALLOWED_SOURCE_HOSTS = "uploads.mangadex.org,mangadex.network,api.komiq.cc"
+
+# Comma-separated allowlist of browser Origin/Referer values permitted to
+# hotlink the proxy. Requests from a browser (i.e. that send an Origin or
+# Referer header) whose origin is not in this list are rejected with 403.
+# Requests with no Origin AND no Referer (native apps, curl, direct hits,
+# cache-fill jobs) are always allowed. Leave empty ("") to disable hotlink
+# protection entirely — dev ONLY.
+#
+# PRODUCTION: this MUST be set to a non-empty value. An empty list disables
+# hotlink protection, letting any site embed images through the proxy (bandwidth
+# theft / cache abuse). Set it to your real front-end origins, e.g.:
+#   "https://komika.app,https://read.komika.app,http://localhost:5173"
+# NOTE: this is a hotlink deterrent, not an abuse cap — the per-IP abuse cap is
+# the IMG_RATE_LIMITER binding below.
+ALLOWED_ORIGINS = "https://komiq.cc,https://www.komiq.cc"
+
+# ---------------------------------------------------------------------------
+# Native per-IP rate limiter (Cloudflare Rate Limiting binding). Caps bandwidth
+# abuse on the upstream-fetch path: the Worker only calls `.limit()` on a cache
+# MISS (see src/index.ts), so hot edge-cached images are never throttled. Keyed
+# on the client IP. `limit` requests are allowed per `period` SECONDS per key
+# (Cloudflare supports period = 10 or 60); a burst beyond that gets a 429.
+# The limit/period live here, so no dashboard/API step is required.
+#
+# SIZING (the number is chapter-aware, not arbitrary): the limiter fires only on a
+# cache MISS, and one read of a cold chapter is ~40 page misses; a reader turns
+# through several chapters a minute, and Suwayomi-source works also miss their
+# cover thumbnails. The old 200/60s throttled ordinary reading the moment the edge
+# cache was cold (e.g. right after a deploy that shifts page URLs to a new host),
+# surfacing as "images get blocked". Worse, the key is CF-Connecting-IP, so an
+# entire NAT/office/campus shares ONE bucket. 600/60s comfortably covers a single
+# reader's cold-cache session while still capping true bandwidth abuse — the host
+# allowlist (ALLOWED_SOURCE_HOSTS) remains the primary open-proxy guard, this is
+# only the egress cap. Raise further if shared-IP populations still see 429s.
+[[unsafe.bindings]]
+name = "IMG_RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 600, period = 60 }
+
+# ---------------------------------------------------------------------------
+# The Worker needs no secrets: it proxies + edge-caches only. There is no
+# object-storage tier, so `wrangler secret put` / .dev.vars are not required.
+# ---------------------------------------------------------------------------

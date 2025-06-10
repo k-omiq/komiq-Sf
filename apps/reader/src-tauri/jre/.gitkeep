@@ -1,0 +1,3 @@
+# Keeps the jre/ resource dir present on a fresh checkout so tauri-build (build.rs)
+# does not error on a missing bundle.resources path before scripts/build-jre.sh runs.
+# The real per-target JRE (jre/<slug>/) is jlink-built and gitignored.

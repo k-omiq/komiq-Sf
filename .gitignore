@@ -1,0 +1,35 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+build/
+.svelte-kit/
+.output/
+
+# tauri / rust
+target/
+apps/reader/src-tauri/gen/
+
+# env & secrets
+.env
+.env.*
+!.env.example
+.dev.vars
+
+# e2e (playwright) + cloudflare worker
+e2e/playwright-report/
+e2e/test-results/
+.wrangler/
+
+# os / editor
+.DS_Store
+*.log
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Local agent tooling state
+.claude/worktrees/
+.claude/settings.local.json

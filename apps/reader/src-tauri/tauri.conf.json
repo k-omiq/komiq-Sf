@@ -1,0 +1,47 @@
+{
+	"$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+	"productName": "Komiq",
+	"version": "0.1.0",
+	"identifier": "app.komika.reader",
+	"build": {
+		"frontendDist": "../build",
+		"devUrl": "http://localhost:5173",
+		"beforeDevCommand": "pnpm dev",
+		"beforeBuildCommand": "bash src-tauri/scripts/fetch-suwayomi-jar.sh && bash src-tauri/scripts/build-jre.sh && pnpm build"
+	},
+	"app": {
+		"windows": [
+			{
+				"title": "Komiq",
+				"width": 1200,
+				"height": 820,
+				"minWidth": 360,
+				"minHeight": 480,
+				"resizable": true,
+				"fullscreen": false
+			}
+		],
+		"security": {
+			"csp": "default-src 'self'; img-src 'self' blob: data: https://api.komiq.cc; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://api.komiq.cc; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+			"devCsp": "default-src 'self'; img-src 'self' blob: data: https://api.komiq.cc http://localhost:8080; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://api.komiq.cc http://localhost:8080 ws://localhost:5173; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+		}
+	},
+	"bundle": {
+		"active": true,
+		"targets": "all",
+		"resources": [],
+		"icon": [
+			"icons/32x32.png",
+			"icons/128x128.png",
+			"icons/128x128@2x.png",
+			"icons/icon.icns",
+			"icons/icon.ico"
+		],
+		"android": {
+			"debugApplicationIdSuffix": ".debug"
+		},
+		"iOS": {
+			"developmentTeam": "KYA5U323MC"
+		}
+	}
+}

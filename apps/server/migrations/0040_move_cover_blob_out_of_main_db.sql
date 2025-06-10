@@ -1,0 +1,16 @@
+-- Move cover BLOBs OUT of the Litestream-replicated main DB.
+--
+-- Cover blobs are the one re-derivable BLOB we store (re-fetchable from MangaDex),
+-- so they do NOT need backup. Migration 0039 put `work_cover_blob` in the main DB
+-- (komika.sqlite3), which Litestream replicates wholesale to R2 — meaning covers
+-- would bloat the backup by ~10-18 GB across the full catalogue. They now live in a
+-- SEPARATE, un-replicated `covers.sqlite3` (created inline by `db::init_covers`),
+-- keeping R2 to catalogue + accounts + social only.
+--
+-- Drop the table from the main DB so the replicated file carries no cover bytes.
+-- `work.cover_cached_version` (added in 0039) STAYS: it's a tiny integer presence/
+-- cache-bust pointer that rides on the `work` row (no extra query on hot paths) and
+-- is cheap to back up. On a DR restore the covers DB is empty while these pointers
+-- survive, so the server clears stale pointers on boot (see `main::main`) — covers
+-- fall back to the Worker proxy until the drainer re-materializes them.
+DROP TABLE IF EXISTS work_cover_blob;

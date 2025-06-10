@@ -1,0 +1,16 @@
+# Build output & deps
+**/build
+**/dist
+**/.svelte-kit
+**/node_modules
+apps/server/target
+
+# Local agent tooling state (worktrees can hold stale copies of anything).
+.claude/
+
+# Lockfiles / generated
+pnpm-lock.yaml
+
+# GraphQL SDL uses `//` header comments (house style); prettier's graphql
+# parser only accepts `#`, so it errors on this file. Skip it.
+packages/api/src/schema/*.graphql

@@ -1,0 +1,816 @@
+// Komika unified backend — GraphQL contract (SDL).
+//
+// This is the schema the client in `@komika/api` codes against. The Komika server
+// implements it by FEDERATING two concerns:
+//   • Catalog / chapters / pages / library / progress  → sourced from a
+//     Suwayomi/Tachidesk-style server (the operator curates enabled sources;
+//     the catalog is auto-served, so there is NO user-facing source picking).
+//   • Social / auth / discovery / adaptive-scan         → Komika's own services.
+//
+// Fields annotated "[suwayomi]" are proxied/derived from Suwayomi's GraphQL
+// (e.g. MangaType.title/thumbnailUrl/genre/status/inLibrary, ChapterType.*,
+// fetchChapterPages). Fields annotated "[komika]" are Komika-native.
+
+schema {
+	query: Query
+	mutation: Mutation
+}
+
+type Query {
+	# catalog
+	discovery: [DiscoveryFeed!]! # [komika] curated feeds over the [suwayomi] catalog
+	updates(page: Int = 1): SeriesPage! # [komika] library series the adaptive scanner found new chapters for, ordered by latestChapterAt (real upstream release time) DESC — the clock the cards display. Membership is the scanner's detection; only the ORDER is upstream's. Undated rows sort last.
+	search(query: String!, page: Int = 1, genres: [String!], minRating: Float, maxRating: Float, types: [ComicType!], status: SeriesStatus, sort: BrowseSort, contentRating: ContentRatingFilter, includeNsfw: Boolean, hasChapters: Boolean): SeriesPage! # [komika] S4: catalogue search + BROWSE. An EMPTY query browses the whole BROWSABLE canonical catalogue (115.6k works, from the materialized `browse_catalogue`) with every filter and sort applied in SQL, so `total`/`hasNextPage` describe the filtered set — it used to browse only the 13.8k-work Suwayomi library subset with one fixed order, then the 48.5k works that have a DATED chapter. A TEXT query runs full-text search over the canonical works instead; `types`/`status`/`sort`/`contentRating` apply to the BROWSE path only. Page size is 30 on both. `genres` matches ANY (capped at 12); `minRating`/`maxRating` filter by aggregate user rating 0–10 (minRating>0 drops unrated). `contentRating` can only NARROW within the viewer's NSFW posture, never widen past it (see ContentRatingFilter). `includeNsfw` is the ADMIN CONSOLE escape hatch: honoured only for an admin (silently ignored for anonymous + ordinary users), it ignores the admin's own show_nsfw so the console can find NSFW-flagged works — including the ~2.5k mainstream titles that are mis-flagged — and unflag them. `hasChapters` (BROWSE only) narrows to works we know a chapter for (`true`) or know none for (`false`); ABSENT means no clause, i.e. the ~67k works whose chapters MangaDex removed on licensing (Boku no Hero Academia, Nausicaä) or that will get them from a Suwayomi source are INCLUDED and sorted last on the recency ordering — hiding them hid exactly what people search for
+	genreFacets: [GenreFacet!]! # [komika] S4: the genre chips for Browse's filter, most common first then alphabetical, gated by the viewer's NSFW posture. Each `count` is now EXACTLY the number of results the same genre filter returns — it previously came from JSON-parsing 13.8k Suwayomi `genre` blobs per request (301 entries, ungated, top entry literally "Japanese") while the filter ran against the canonical catalogue, so the chip's number and its results disagreed. Empty until MangaDex tags are ingested into `work_tag`
+	searchAllSources(query: String!, page: Int = 1): FederatedSearchPage! # [komika] federated multi-extension search — fans out to every installed source, dedupes to one canonical work per series with its per-source translators; NSFW-gated by the viewer's posture. REQUIRES LOGIN (persists mappings); per-user rate-limited (~20/min); errors "Not authenticated" for anonymous callers
+	series(id: ID!): Series! # [suwayomi] MangaType by id
+	chapters(seriesId: ID!): [Chapter!]! # [suwayomi] chapters(condition:{mangaId}) — one source's chapter list (served from the DB cache, S1)
+	aggregatedChapters(workId: ID!): [AggregatedChapter!]! # [komika] S2: a canonical work's chapters aggregated across ALL sources (installed Suwayomi sources + MangaDex mirror), deduped by number, each carrying per-source availability so the reader can pick a translator
+	pages(chapterId: ID!): [Page!]! # [suwayomi] fetchChapterPages -> normalized pages
+	canonicalUpdates(page: Int = 1, includeNsfw: Boolean): [CanonicalUpdate!]! # [komika] MangaDex mirror updates, newest chapter first, NSFW-filtered (data feed). `includeNsfw` is the same admin-console-only escape hatch as on `search` — honoured for admins, ignored for everyone else
+	updatesFeed(page: Int = 1, type: ComicType): UpdateFeedPage! # [komika] the reader's merged Updates feed: the union of `updates` (scanner detections on Suwayomi library series) and `canonicalUpdates` (the MangaDex mirror), taken server-side and keyed by canonical work, newest REAL upstream release first. Supersedes merging page 1 of each in the client, which could not be paginated — a page of the merged list is not page N of either feed, and the client-side title dedupe left short pages that made `total`/`hasNextPage` wrong. `type` filters by format over the WHOLE feed; NSFW-gated by the viewer's own preference (no admin escape hatch — this is a reader surface)
+	# Canonical (MangaDex-mirrored) reader path — workId is the `w_`-prefixed canonical
+	# id (distinct from numeric Suwayomi ids), so the reader routes it here. Returns the
+	# shared Series/Chapter/Page shapes; NSFW-gated by the viewer's preference. CATALOGUE.md §6.
+	canonicalSeries(workId: ID!): Series! # [komika] a MangaDex-mirrored work as a Series
+	canonicalChapters(workId: ID!): [Chapter!]! # [komika] its chapters from the mirror, deduped/ordered
+	canonicalPages(chapterId: ID!): [Page!]! # [komika] page URLs via MangaDex@Home (chapterId = MangaDex chapter uuid)
+	# native-embedded-Suwayomi source routing — per canonical work, the source
+	# mappings + extension coordinates a native client needs to fetch it directly.
+	workSources(workId: ID!): [WorkSource!]! # [komika] source mappings for one canonical work
+	workSourcesBatch(workIds: [ID!]!): [WorkSourceGroup!]! # [komika] source mappings grouped per work
+	# library
+	library: [Series!]! # [suwayomi] mangas(condition:{inLibrary:true})
+	libraryProgress: [SeriesProgress!]! # [komika] per-series read/total for every in-library series, batched — shelves the Library/Profile screens without an N+1 chapters() fan-out
+	# social
+	reviews(seriesId: ID!, page: Int = 1): ReviewPage! # [komika]
+	myReview(seriesId: ID!): Review # [komika] the signed-in viewer's own review for a series, regardless of pagination (null if none / signed out)
+	comments(targetType: String!, targetId: ID!, page: Int = 1): CommentPage! # [komika] chapter thread or series discussion
+	# auth
+	session: Session # [komika] current session or null
+	myActivity(limit: Int = 20): [Activity!]! # [komika] the signed-in user's recent activity feed (empty when signed out)
+	notifications(page: Int = 1): [Notification!]! # [komika] the viewer's inbound bell feed, newest-first (empty when signed out)
+	unreadNotificationCount: Int! # [komika] unread count for the bell badge (0 when signed out)
+	# ops / admin (all require isAdmin)
+	scanStatus: ScanStatus! # [komika] adaptive scan-scheduler health (admin console)
+	users(page: Int = 1): AdminUserPage! # [komika] admin user-management list
+	mergeQueue(page: Int = 1, limit: Int = 50): MergeQueuePage! # [komika] dedup review queue — pending mid-confidence matches, highest score first, PAGINATED (`limit` clamped to 1..=200). Was an unbounded `[MergeCandidate!]!`: the backlog is ~10.4k rows now that refused consolidation pairs land here, so clients must page (requires isAdmin)
+	workReviewDetail(workId: ID!): WorkReviewDetail! # [komika] expand one side of a dedup candidate — metadata, cover, alt titles and source mappings for a single work; reads the canonical work directly so it also resolves the Suwayomi-only / NSFW works `canonicalSeries` refuses (requires isAdmin)
+	coverIssues(page: Int = 1): CoverIssuePage! # [komika] admin "Bugs" panel — works whose cover the crawl could not process, most recent first; each carries the failure reason + a best-effort current cover URL (requires isAdmin)
+	extensions(installedOnly: Boolean = false, lang: String, nsfw: Boolean, refresh: Boolean = false): [ExtensionInfo!]! # [komika] Keiyoushi/Mihon extensions known to the engine; first use seeds the Keiyoushi store; refresh re-fetches the store indexes. NSFW extensions are ALWAYS listed: this is an admin management view, so the admin's reader-side show_nsfw is deliberately ignored — filter explicitly with the `nsfw` argument (requires isAdmin)
+	sources: [SourceInfo!]! # [komika] installed Suwayomi sources — the sourceBrowse picker. Every installed source is listed incl. NSFW ones, regardless of the admin's reader-side show_nsfw; each carries `isNsfw` for the UI to badge (requires isAdmin)
+	sourceBrowse(sourceId: ID!, type: SourceBrowseType!, page: Int = 1, query: String): SourceBrowsePage! # [komika] browse/search one source's catalogue for bulk ingest (requires isAdmin)
+	seriesSourcesBatch(seriesIds: [ID!]!): [SeriesSourceGroup!]! # [komika] catalogue provenance per Suwayomi series — linked work + source mappings, input order, ≤200 ids (requires isAdmin)
+	sourceIngestJobs(active: Boolean = false): [SourceIngestJob!]! # [komika] "add all from source" ingest jobs, newest first; active:true for only running ones — poll for progress (requires isAdmin)
+	seriesAdminMeta(seriesId: ID!): SeriesAdminMeta! # [komika] raw metadata-override state of a series' canonical work (pinned title/description/type/NSFW + curated tags) for the series-detail editor (requires isAdmin)
+	workChaptersAdmin(workId: ID!): [AdminChapter!]! # [komika] a work's aggregated chapters WITH override state (hidden/renamed), unfiltered, for the series-detail editor (requires isAdmin)
+}
+
+type Mutation {
+	mark(seriesId: ID!, marked: Boolean!): Series! # [suwayomi] updateManga inLibrary (+ [komika] scan priority)
+	setLibraryStatus(seriesId: ID!, status: String): Series! # [komika] file a series under an explicit shelf (reading|completed|onhold|plan); null clears to auto-derive; adds to library if absent
+	setFavorite(seriesId: ID!, favorite: Boolean!): Series! # [komika] toggle the viewer's favourite flag; adds to library if absent
+	setProgress(chapterId: ID!, lastPageRead: Int!, read: Boolean!): Boolean! # [suwayomi] updateChapter
+	recordView(seriesId: ID!): Boolean! # [komika] record one view (chapter open) — no auth, counts everyone; the popularity signal behind Trending
+	postReview(input: PostReviewInput!): Review! # [komika]
+	postComment(input: PostCommentInput!): Comment! # [komika] chapter thread or series discussion
+	voteComment(commentId: ID!, value: Int!): CommentVote! # [komika] like (1) / dislike (-1) / clear (0) a comment
+	markNotificationsRead(ids: [ID!]): Int! # [komika] mark given (or all, if omitted) notifications read; returns count changed
+	login(username: String!, password: String!): Session! # [komika]
+	register(input: RegisterInput!): Session! # [komika]
+	logout: Boolean! # [komika]
+	setShowNsfw(value: Boolean!): Boolean! # [komika] set the viewer's NSFW visibility preference (CATALOGUE.md §2)
+	updateProfile(input: UpdateProfileInput!): SessionUser! # [komika] update the viewer's display name + bio (avatar upload is REST: POST /avatar)
+	updateSeriesAdmin(input: SeriesAdminInput!): Series! # [komika] admin "manga DB" overrides (requires isAdmin)
+	triggerScan(seriesId: ID!): Series! # [komika] admin — force an immediate re-scan (requires isAdmin)
+	banUser(userId: ID!, banned: Boolean!): AdminUser! # [komika] admin moderation — suspend/restore an account (requires isAdmin)
+	deleteComment(commentId: ID!): Boolean! # [komika] admin moderation — remove a chapter comment (requires isAdmin)
+	setUserAdmin(userId: ID!, isAdmin: Boolean!): AdminUser! # [komika] admin — grant/revoke admin (requires isAdmin)
+	addSourceSeries(suwayomiMangaId: ID!): MatchResult! # [komika] Tier-2 add flow — run the dedup matcher, wire into the canonical model (requires isAdmin)
+	resolveMergeCandidate(id: ID!, accept: Boolean!): Boolean! # [komika] resolve a dedup review — accept merges, reject keeps distinct (requires isAdmin)
+	mergeWorks(sourceWorkId: ID!, targetWorkId: ID!): MergeWorksResult! # [komika] D1: fold one existing canonical work into another (dedup cleanup) — source's mappings + user data re-point to target, source deleted; pick target as the enriched/MangaDex-anchored one (requires isAdmin)
+	addExtensionRepo(indexUrl: String!): Int! # [komika] register an extension repo (store) + refresh; returns the extension count (requires isAdmin)
+	installExtension(pkgName: String!): ExtensionInfo! # [komika] install a store extension; NSFW-gated by show_nsfw (requires isAdmin)
+	uninstallExtension(pkgName: String!): ExtensionInfo! # [komika] uninstall an extension (requires isAdmin)
+	updateExtension(pkgName: String!): ExtensionInfo! # [komika] update an installed extension; NSFW-gated (requires isAdmin)
+	bulkAddSourceSeries(suwayomiMangaIds: [ID!]!): BulkAddResult! # [komika] bulk Tier-2 catalogue ingest, ≤100 ids; per-id failures don't abort (requires isAdmin)
+	setSeriesPaused(seriesId: ID!, paused: Boolean!): Series! # [komika] targeted pause/unpause of one series' scanning; unpause re-scans immediately (requires isAdmin)
+	startSourceIngest(sourceId: ID!): SourceIngestJob! # [komika] start a background "add all from source" ingest; refused if one already running or NSFW source not opted in (requires isAdmin)
+	cancelSourceIngest(jobId: ID!): SourceIngestJob! # [komika] request cancellation of a running ingest job; preserves progress (requires isAdmin)
+	startExtensionIngest(pkgName: ID!): [SourceIngestJob!]! # [komika] F1: start an ingest job for EVERY installed source of an extension (e.g. MangaDex's per-language sources); skips NSFW sources for opted-out admin + sources with a job already running (returns their existing job); errors only if no source matches (requires isAdmin)
+	cancelExtensionIngest(pkgName: ID!): [SourceIngestJob!]! # [komika] F1: cancel all running ingest jobs for an extension's sources; returns the cancelled jobs (requires isAdmin)
+	setExtensionSubscription(pkgName: ID!, subscribed: Boolean!): Boolean! # [komika] subscribe/unsubscribe an extension for background source-sync (auto-discover new series + reconcile library); enabling kicks an immediate sync pass (requires isAdmin)
+	backfillMangadexMetadata(limit: Int = 200): Int! # [komika] S2 enrichment backfill — processes up to `limit` un-enriched MangaDex-anchored works (all-language alt titles/descriptions + full credits); returns count processed; call until it returns 0 to drain (requires isAdmin)
+	persistCatalogue: Int! # [komika] S1 "save everything to DB" — materialize the whole Suwayomi library (metadata + chapter lists) into the DB cache so reader loads serve from SQLite; returns series persisted; prod maintenance action gated by isAdmin (no extra flag)
+	materializeCatalogueCovers: Int! # [komika] S1 materialize every canonical work's cover into work_cover_blob so the web reader serves covers from /covers/{id}.webp (off the CF image Worker); polite background crawl bounded by the MangaDex limiter, single-flighted + resumable; returns works queued (still uncached) at kick-off; gated by isAdmin
+	updateSeriesMetadata(input: SeriesMetadataInput!): Series! # [komika] admin series-detail editor — edit a work's title/description/type/NSFW/tags as an override layer (source data stays immutable); returns the recomputed series (requires isAdmin)
+	rescanWork(workId: ID!): Int! # [komika] admin — force an immediate re-scan of EVERY installed Suwayomi source of a canonical work; returns how many sources were scanned (requires isAdmin)
+	setChapterOverride(input: ChapterOverrideInput!): Boolean! # [komika] admin series-detail editor — soft-hide (reversible) or rename one chapter of a work by aggregate number; non-destructive (requires isAdmin)
+	addSeriesAltTitle(id: ID!, title: String!): Series! # [komika] admin series-detail editor — add an alternative title to a work's alias index. May trigger an auto-merge of every work sharing the normalized alias (≤8 of them) into the richest survivor, so the returned Series can be a DIFFERENT work than the one edited (requires isAdmin)
+	removeSeriesAltTitle(id: ID!, title: String!): Series! # [komika] admin series-detail editor — drop one alternative title from a work's alias index (requires isAdmin)
+	consolidateExactDuplicates(limit: Int = 100): Int! # [komika] admin dedup sweep — fold canonical works that share an exact normalized alias, gated on corroborating signals; oversized clusters are routed to mergeQueue instead of merged. `limit` bounds the alias GROUPS examined; returns works merged away. Single-flighted against reconcileCatalogue (requires isAdmin)
+	reconcileCatalogue: Int! # [komika] admin — background pass matching every provisional (Suwayomi-only) work against the MangaDex spine; merges confident matches, queues mid-confidence ones for review. Returns the pending count at kickoff, not the result. Single-flighted (requires isAdmin)
+	resyncCatalogue: Boolean! # [komika] admin — force a full catalogue re-seed: clears the catalogue/chapters sync cursors so the next cycle walks the whole createdAt history, and kicks one cycle in the background. Refused while any sync cycle is running (requires isAdmin)
+	markSourceNsfw(sourceId: String!, isNsfw: Boolean!): Int! # [komika] admin — flag/unflag a whole Suwayomi source as adult and re-derive the NSFW flag of every work ingested from it; returns works changed (requires isAdmin)
+	rederiveSuwayomiNsfw: Int! # [komika] admin — recompute the DERIVED is_nsfw for every Suwayomi-ingested work under the current rule (adult genre OR adult source, unless MangaDex rated it safe/suggestive). Conservative: only flips 0 -> 1, never un-flags, and leaves isNsfwOverride alone. Returns works flipped (requires isAdmin)
+	retryCover(workId: ID!): Boolean! # [komika] admin "Bugs" panel — clear a work's cover-issue skip marker and re-attempt the cover fetch/encode (requires isAdmin)
+}
+
+enum ComicType {
+	MANGA
+	MANHWA
+	MANHUA
+	WEBTOON
+	COMIC
+}
+
+# Maps from Suwayomi MangaStatus: UNKNOWN, ONGOING, COMPLETED, LICENSED,
+# PUBLISHING_FINISHED, CANCELLED, ON_HIATUS.
+enum SeriesStatus {
+	ONGOING
+	COMPLETED
+	HIATUS
+	CANCELLED
+	UNKNOWN
+}
+
+# How Browse (`search` with an empty query) orders the catalogue. TRENDING is the
+# default — the only ordering that reflects what people are actually reading — and it
+# degrades to NEWEST for everything with no views in the last 24h, so a cold view
+# table cannot render Browse empty. RATING likewise puts rated works first and falls
+# through to NEWEST for the unrated.
+enum BrowseSort {
+	TRENDING # most-viewed over the last 24h first, then newest release
+	NEWEST # newest upstream chapter release first
+	RATING # highest user-review average first, then newest for the unrated
+	CHAPTERS # most English chapters first (the same number `chapterCount` reports)
+}
+
+# The content-rating ceiling Browse filters by. CUMULATIVE: each value admits
+# everything the milder ones do (SAFE ⊂ SUGGESTIVE ⊂ EROTICA ⊂ PORNOGRAPHIC), and ALL
+# applies no rating clause at all. NSFW_ONLY is the sole exception — see below.
+#
+# THE VIEWER'S NSFW GATE DOMINATES THIS. The filter can only narrow within what the
+# viewer's `show_nsfw` already allows — it never widens past it. Concretely: no
+# NSFW-cleared work carries `erotica` or `pornographic`, so for an opted-out viewer
+# EROTICA and PORNOGRAPHIC return exactly the SUGGESTIVE set rather than revealing
+# anything. Asking for a spicier tier is not a way to opt in.
+enum ContentRatingFilter {
+	ALL
+	SAFE
+	SUGGESTIVE
+	EROTICA
+	PORNOGRAPHIC # admits every stored rating, i.e. equivalent to ALL
+	# Adult-rated works ONLY — the complement of SAFE, not a ceiling above it, and the
+	# only non-cumulative member. Exists because "show me just the adult titles" cannot
+	# be said with a tier (every tier admits `safe`); it is the other half of the control
+	# that replaced Browse's NSFW toggle. Filters the materialized `is_nsfw` flag, so it
+	# follows admin overrides rather than contradicting them. For an opted-out viewer it
+	# returns an EMPTY page — the honest answer — rather than degrading to "everything".
+	NSFW_ONLY
+}
+
+type Series {
+	id: ID!
+	title: String!
+	altTitles: [String!]!
+	author: String
+	artist: String
+	description: String
+	genres: [String!]!
+	type: ComicType! # [komika] classified per source region
+	status: SeriesStatus!
+	coverUrl: String! # [suwayomi] thumbnailUrl (client resolves via ImageProvider)
+	sourceId: String!
+	chapterCount: Int!
+	isMarked: Boolean! # [suwayomi] inLibrary
+	libraryStatus: String # [komika] per-viewer explicit shelf (reading|completed|onhold|plan); null = auto-derive from progress
+	isFavorite: Boolean! # [komika] per-viewer favourite flag
+	isNsfw: Boolean! # [komika] canonical NSFW flag; false until catalogued (drives showNsfw filtering)
+	rating: RatingSummary! # [komika]
+	scan: ScanPolicy! # [komika] adaptive-scan config (admin-overridable)
+	createdAt: String!
+	updatedAt: String! # [komika] last metadata touch — NOT chapter recency; moves on every poll. Use latestChapterAt for "recently updated".
+	latestChapterAt: String! # [komika] real newest-chapter time (ISO); empty when no dated chapter cached. The field feeds/cards should sort and label by.
+	detectedAt: String # [komika] when WE detected that newest chapter (discovery time) — the third clock, distinct from updatedAt (poll touch) and latestChapterAt (upstream publish). Decides Updates-feed MEMBERSHIP but does NOT order it. Always carries a UTC offset, so Date.parse can't read it as local time. Selected opportunistically: see OPTIONAL_SERIES_FIELDS in operations.ts, the client drops it against a server that predates it.
+	views: SeriesViews! # [komika] per-series view (chapter-read) counts — the popularity signal; resolver field, selected only by the series-detail queries
+	workId: ID # [komika] the canonical work this series belongs to (null when uncatalogued). Lets the reader get from a numeric Suwayomi id to the work whose SIBLING source mappings the source picker must offer. Resolver field — one query per series, so like `views` it is selected only by the single-series detail query, never by the shared SeriesFields fragment (per-card N+1)
+	# [komika] S2/F2 enrichment (resolver fields — opt-in; empty for non-canonical/un-enriched works). `id` must be a canonical work id (w_…).
+	localizedDescriptions: [LocalizedDescription!]! # every-language MangaDex descriptions (singular `description` stays the English-preferred primary)
+	credits: [Credit!]! # full author/artist list (singular `author`/`artist` keep only the first of each)
+	covers: [Cover!]! # F2: full per-volume/per-locale cover set, primary first; `coverUrl` remains the single primary. Populated by enrichment/backfill; empty until then
+}
+
+type SeriesViews {
+	total: Int! # all-time views
+	last7d: Int! # views in the last 7 days
+	last24h: Int! # views in the last 24 hours
+}
+
+type LocalizedDescription {
+	lang: String!
+	description: String!
+}
+
+type Credit {
+	role: String! # "author" | "artist"
+	name: String!
+}
+
+type Cover {
+	fileName: String! # covers/{mangadexId}/{fileName} leaf
+	url: String! # proxy-ready full cover URL (client resolves via ImageProvider)
+	thumbnailUrl: String! # proxy-ready 512px thumbnail URL
+	lang: String # cover locale (e.g. "ja")
+	volume: String # volume label (e.g. "1")
+	isPrimary: Boolean! # the main cover mirrored on Series.coverUrl
+}
+
+type RatingSummary {
+	average: Float!
+	count: Int!
+	distribution: [Int!]! # length 10; index 0 => score 1
+}
+
+type GenreFacet { # [komika] S4 search filter facet
+	genre: String!
+	count: Int! # cached series carrying this genre
+}
+
+type ScanPolicy {
+	avgIntervalHours: Float! # rolling average between chapters
+	overrideIntervalHours: Float # admin override (manga DB console)
+	pollEveryMinutes: Int!
+	paused: Boolean! # effective (folded) paused state
+	# Raw admin overrides so the console can tell an explicit choice apart from
+	# the status default even when they coincide. null => no override.
+	statusOverride: SeriesStatus
+	pausedOverride: Boolean
+	# Raw admin poll-interval override (minutes). null => no override, so the
+	# effective pollEveryMinutes above is the folded default.
+	pollEveryMinutesOverride: Int
+	lastScannedAt: String
+	nextScanAt: String
+}
+
+type Chapter {
+	id: ID!
+	seriesId: ID!
+	number: Float!
+	title: String
+	pageCount: Int!
+	uploadedAt: String
+	scanlator: String
+	read: Boolean! # [suwayomi] isRead
+	lastPageRead: Int!
+	bookmarked: Boolean! # [suwayomi] isBookmarked
+	isDownloaded: Boolean!
+}
+
+# Per-series read progress for the whole library, returned by `libraryProgress`
+# in one batched query. read/total are counted from the cached chapter state
+# (the same source `chapters(seriesId)` reads), so they match. Series with no
+# cached chapters are omitted; the client treats those as unread (read = 0).
+type SeriesProgress {
+	id: ID! # [suwayomi] series id (matches Series.id)
+	read: Int!
+	total: Int!
+}
+
+# Upstream image URL; never used directly as <img src> — the client's
+# ImageProvider proxies it via the Cloudflare Worker (web) or fetches it in
+# Rust (native).
+type Page {
+	index: Int!
+	sourceUrl: String!
+	width: Int
+	height: Int
+}
+
+enum DiscoveryFeedKind {
+	POPULAR
+	TRENDING
+	RECENTLY_UPDATED
+	RECENTLY_ADDED
+	GENRE
+}
+
+type DiscoveryFeed {
+	kind: DiscoveryFeedKind!
+	title: String!
+	genre: String
+	items: [Series!]!
+}
+
+type UserRef {
+	id: ID!
+	username: String!
+	avatarUrl: String
+}
+
+type Review {
+	id: ID!
+	seriesId: ID!
+	author: UserRef!
+	score: Int! # 1..10
+	body: String!
+	hasSpoiler: Boolean!
+	createdAt: String!
+	updatedAt: String!
+}
+
+# A comment on a polymorphic target: a chapter thread (targetType="chapter") or a
+# series-level discussion (targetType="series"). Distinct from Review (scored, one/user).
+type Comment {
+	id: ID!
+	targetType: String! # "chapter" | "series"
+	targetId: ID!
+	parentId: ID # [komika] reply parent; null = top-level comment (arbitrary-depth trees)
+	author: UserRef!
+	body: String!
+	hasSpoiler: Boolean!
+	mediaUrl: String # [komika] attached image path (/comment-media/<id>.webp), if any
+	mediaWidth: Int # [komika] attached image dimensions (reserve layout space)
+	mediaHeight: Int
+	createdAt: String!
+	likes: Int! # [komika] like tally
+	dislikes: Int! # [komika] dislike tally
+	myVote: Int! # [komika] the viewer's own vote: 1 like, -1 dislike, 0 none
+}
+
+# [komika] Result of voteComment — a comment's fresh tallies + the viewer's vote.
+type CommentVote {
+	likes: Int!
+	dislikes: Int!
+	myVote: Int!
+}
+
+# [komika] One inbound notification (the bell feed). `actor` is null for an aggregate
+# like_milestone; `commentExcerpt` snippets the viewer's own comment; target* deep-links.
+type Notification {
+	id: ID!
+	kind: String! # 'reply' | 'like_milestone'
+	actor: UserRef
+	commentId: ID
+	commentExcerpt: String
+	targetType: String
+	targetId: ID
+	seriesId: ID # [komika] owning series for a chapter target — deep-links to /read/<seriesId>?ch=<targetId>
+	count: Int # milestone value for like_milestone
+	createdAt: String!
+	read: Boolean!
+}
+
+type Session {
+	token: String!
+	user: SessionUser!
+}
+
+type SessionUser {
+	id: ID!
+	username: String!
+	displayName: String # [komika] editable display name; falls back to username
+	bio: String # [komika] editable "about me" text
+	avatarUrl: String
+	isAdmin: Boolean!
+	showNsfw: Boolean! # [komika] viewer's NSFW visibility preference (CATALOGUE.md §2)
+	joinedAt: String! # [komika] account creation timestamp (profile "joined" date)
+}
+
+# One entry in a user's activity feed, written by the corresponding mutation.
+type Activity {
+	id: ID!
+	kind: String! # "review" | "comment" | "library_add"
+	targetType: String # "series" | "chapter"
+	targetId: ID # series/chapter id acted on; the client resolves a title
+	createdAt: String!
+}
+
+type SeriesPage {
+	items: [Series!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int
+}
+
+type ReviewPage {
+	items: [Review!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int
+}
+
+type CommentPage {
+	items: [Comment!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int
+}
+
+input PostReviewInput {
+	seriesId: ID!
+	score: Int!
+	body: String!
+	hasSpoiler: Boolean!
+}
+
+input PostCommentInput {
+	targetType: String! # "chapter" | "series"
+	targetId: ID!
+	parentId: ID # [komika] reply target; must be a comment on the same target. Omit for top-level.
+	body: String!
+	hasSpoiler: Boolean!
+	mediaId: ID # [komika] a previously-uploaded comment-media id to attach (owned + unlinked)
+}
+
+input RegisterInput {
+	username: String!
+	email: String!
+	password: String!
+}
+
+# Editable profile fields. A null/blank field clears that value (display name
+# then falls back to username).
+input UpdateProfileInput {
+	displayName: String
+	bio: String
+}
+
+# Admin "manga DB" overrides. Whole-state: a null field clears that override, so
+# the console sends the full form on save.
+input SeriesAdminInput {
+	seriesId: ID!
+	overrideIntervalHours: Float # null => derive from avgIntervalHours
+	pollEveryMinutes: Int # null => default (30)
+	paused: Boolean # null => auto-pause by status
+	status: SeriesStatus # null => use source status
+}
+
+# [komika] Admin edits to a canonical work's user-facing metadata (series-detail
+# editor). Each optional field is three-valued: OMITTED => leave unchanged; null =>
+# clear the override (use the derived/source value); a value => set the override.
+input SeriesMetadataInput {
+	seriesId: ID! # numeric Suwayomi id or w_ canonical id — both resolve to the work
+	title: String
+	description: String
+	type: ComicType
+	isNsfw: Boolean
+	tags: [String!] # full curated tag set (whole-list replace); null clears it
+}
+
+# [komika] Raw override state of a work for the series-detail editor (parallels how
+# ScanPolicy exposes its raw overrides), so the console shows pinned vs derived.
+type SeriesAdminMeta {
+	workId: ID # null when the series isn't catalogued yet (nothing to pin)
+	titleOverride: String
+	descriptionOverride: String
+	contentTypeOverride: ComicType
+	isNsfwOverride: Boolean
+	tags: [String!]! # effective genres (curated set if any, else source-derived)
+	hasCuratedTags: Boolean! # true => `tags` is an admin-curated set
+}
+
+# [komika] One chapter of a work in the admin editor: aggregate identity + override
+# state (hidden / renamed).
+type AdminChapter {
+	number: Float!
+	key: String! # aggregate bucket key (the override key)
+	sourceTitle: String
+	titleOverride: String
+	effectiveTitle: String
+	hidden: Boolean!
+	sourceCount: Int! # how many sources provide this chapter number
+}
+
+# [komika] Admin edit to one chapter of a work (soft-hide / rename). Fields are
+# three-valued (OMITTED => unchanged) so toggling one doesn't clobber the other.
+input ChapterOverrideInput {
+	workId: ID!
+	chapterKey: String! # from AdminChapter.key
+	hidden: Boolean
+	title: String
+}
+
+# [komika] Aggregate health of the adaptive scan scheduler (admin console).
+type ScanStatus {
+	librarySize: Int!
+	overdueCount: Int!
+	lastTickAt: String
+	nextDueAt: String
+	scannedOk: Int! # [komika] series that scanned successfully on the last tick
+	scannedFailed: Int! # [komika] series whose scan errored (and were backed off) on the last tick
+	lastSuccessAt: String # [komika] last tick that made real progress — diverging from lastTickAt means the scheduler is ticking without advancing
+	stuckTicks: Int! # [komika] consecutive full batches that advanced nothing; 0 = healthy
+}
+
+# [komika] A user account as shown in the admin user-management console.
+type AdminUser {
+	id: ID!
+	username: String!
+	email: String!
+	avatarUrl: String
+	isAdmin: Boolean!
+	isBanned: Boolean!
+	createdAt: String!
+}
+
+type AdminUserPage {
+	items: [AdminUser!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int
+}
+
+# [komika] Outcome of the Tier-2 dedup matcher (CATALOGUE.md §4).
+# `decision` is one of `auto_merge` | `review` | `new`.
+type MatchResult {
+	decision: String!
+	workId: String!
+	matchedWorkId: String
+	score: Float
+	method: String
+	sourceSeriesId: String!
+}
+
+# [komika] One row of the canonical updates feed (CATALOGUE.md §6): a mirrored
+# MangaDex work + its latest stored chapter, served from the `chapter` mirror. Open
+# it via canonicalSeries(workId) — `workId` is the `w_`-prefixed canonical reader id.
+type CanonicalUpdate {
+	workId: String!
+	mangadexId: String!
+	title: String
+	isNsfw: Boolean!
+	coverUrl: String # proxy-ready MangaDex cover thumbnail (null until the cover is synced)
+	latestChapter: String # latest stored chapter number (string; e.g. "10.5")
+	latestChapterTitle: String
+	latestAt: String # publish time of the latest chapter (falls back to ingest time)
+}
+
+# [komika] One page of the merged Updates feed — the same four-field envelope as
+# SeriesPage. `total` counts the filtered set (NSFW posture + `type`), so the reader's
+# pager can show an honest "Page 3 of N · showing 41-60 of total".
+type UpdateFeedPage {
+	items: [UpdateFeedRow!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int
+}
+
+# [komika] One row of the merged Updates feed: one canonical work, its newest real
+# upstream chapter release. Deliberately not a Series — the feed is ~48k rows and the
+# grid renders six scalars.
+type UpdateFeedRow {
+	id: ID! # the id to OPEN: a `w_` canonical work id when MangaDex-anchored, else the numeric Suwayomi series id (canonicalSeries rejects a work with no MangaDex anchor, so a single-id scheme would produce cards that 404)
+	workId: String! # the canonical work — the feed's dedupe key; differs from `id` for a Suwayomi-only work
+	title: String!
+	coverUrl: String
+	type: ComicType # effective format, materialized so `type` can filter server-side
+	latestChapter: String # chapter NUMBER of the newest mirrored chapter; null on scanner-only rows
+	latestChapterTitle: String
+	chapterCount: Int # total chapters known; null on mirror-only rows
+	releasedAt: String! # real upstream release time — the sort key AND the clock the card labels with
+	detectedAt: String # when OUR scanner noticed; tooltip only, never a sort key
+	rating: Float # aggregate user rating 0-10; null when unrated
+	isNsfw: Boolean!
+}
+
+# [komika] One source mapping for a canonical work: which source (and, for
+# Suwayomi, which extension) a native client uses to fetch it, plus source-local
+# coordinates. The dedup model (CATALOGUE.md §2) may map several to one work.
+type WorkSource {
+	sourceType: String! # "mangadex" | "suwayomi"
+	sourceId: String! # Suwayomi source id
+	sourceKey: String! # manga id/slug within the source
+	sourceUrl: String
+	isNsfw: Boolean!
+	lang: String
+	extension: SourceExtension # null for mangadex-native fetch
+}
+
+# [komika] Extension coordinates for a Suwayomi-backed source: where to get the
+# APK and which package/version a native client loads. Null on a mangadex-native
+# WorkSource.
+type SourceExtension {
+	pkgName: String!
+	repoUrl: String!
+	apkName: String
+	versionCode: Int
+	lang: String
+}
+
+# [komika] All source mappings resolved for one canonical work (batch grouping).
+type WorkSourceGroup {
+	workId: ID!
+	sources: [WorkSource!]!
+}
+
+# [komika] One source/extension that carries a canonical work — a "translator" in
+# the reader UI. For a suwayomi translator, suwayomiMangaId is the id to pass to
+# chapters(seriesId:) for THIS translator's chapters; for the mangadex canonical
+# spine it is null and chapters come from canonicalChapters(workId).
+type Translator {
+	sourceType: String! # "mangadex" (canonical spine) | "suwayomi" (an installed extension)
+	sourceId: String!
+	sourceName: String # display name; null when the source isn't currently installed
+	lang: String
+	suwayomiMangaId: ID # chapters(seriesId:) key; null for the mangadex spine
+	extensionPkgName: String
+	extensionIconUrl: String # browser-reachable store-hosted PNG
+}
+
+# [komika] One consolidated federated-search hit: a canonical work as a Series,
+# plus the per-source translator list gathered across every installed extension.
+type FederatedSeries {
+	series: Series!
+	translators: [Translator!]!
+}
+
+# [komika] A page of federated multi-extension search results.
+type FederatedSearchPage {
+	items: [FederatedSeries!]!
+	page: Int!
+	hasNextPage: Boolean!
+	sourcesQueried: Int! # how many installed sources were queried in the fan-out
+}
+
+# [komika] Admin catalogue provenance for one Suwayomi series: the canonical work
+# it's linked to (null when uncatalogued) and that work's source mappings.
+type SeriesSourceGroup {
+	seriesId: ID!
+	workId: ID
+	sources: [WorkSource!]!
+}
+
+# [komika] One Keiyoushi/Mihon extension as known to the Suwayomi engine (admin
+# management view, installed or not).
+type ExtensionInfo {
+	pkgName: String!
+	name: String!
+	lang: String!
+	versionName: String!
+	isInstalled: Boolean!
+	hasUpdate: Boolean!
+	isNsfw: Boolean!
+	iconUrl: String
+	repo: String
+	subscribed: Boolean!
+}
+
+# [komika] One installed Suwayomi source — the admin picker feeding sourceBrowse.
+type SourceInfo {
+	id: ID!
+	name: String!
+	lang: String!
+	isNsfw: Boolean!
+	iconUrl: String
+	pkgName: String
+}
+
+# [komika] Which listing of a source to browse.
+enum SourceBrowseType {
+	POPULAR
+	LATEST
+	SEARCH
+}
+
+# [komika] One manga returned by browsing a source; suwayomiMangaId is exactly
+# what bulkAddSourceSeries consumes.
+type SourceBrowseEntry {
+	suwayomiMangaId: ID!
+	title: String!
+	thumbnailUrl: String
+	inLibrary: Boolean!
+}
+
+# [komika] A page of source-browse results.
+type SourceBrowsePage {
+	items: [SourceBrowseEntry!]!
+	page: Int!
+	hasNextPage: Boolean!
+}
+
+# [komika] Per-id outcome of bulkAddSourceSeries: MatchResult on success, or the
+# error that made this one id fail (other ids still proceed).
+type BulkAddEntry {
+	suwayomiMangaId: ID!
+	result: MatchResult
+	error: String
+}
+
+# [komika] A background "add all from this source" ingest job (S1): walks a
+# source's listing page by page through the Tier-2 dedup add flow, persisting
+# progress counters. Poll sourceIngestJobs(active:true) for updates.
+type SourceIngestJob {
+	id: ID!
+	sourceId: String!
+	state: String! # running | completed | cancelled | failed
+	pagesDone: Int!
+	itemsSeen: Int!
+	succeeded: Int!
+	failed: Int!
+	newWorks: Int!
+	autoMerged: Int!
+	queuedForReview: Int!
+	alreadyExisting: Int!
+	error: String # set when state = failed
+	startedAt: String!
+	finishedAt: String # set once terminal (completed/cancelled/failed)
+}
+
+# [komika] Result of a bulk catalogue ingest: per-id entries + decision summary.
+type BulkAddResult {
+	entries: [BulkAddEntry!]!
+	total: Int!
+	succeeded: Int!
+	failed: Int!
+	newWorks: Int!
+	autoMerged: Int!
+	queuedForReview: Int!
+	alreadyExisting: Int!
+}
+
+# [komika] A pending mid-confidence match awaiting manual admin review.
+type MergeCandidate {
+	id: String!
+	sourceSeriesId: String! # a source_series row id — NOT a work id; it cannot be looked up as one
+	sourceWorkId: String! # the work that source series belongs to — what the console links/expands on
+	candidateWorkId: String!
+	candidateTitle: String
+	sourceTitle: String
+	sourceCoverUrl: String! # empty when the source work has no cover to show
+	candidateCoverUrl: String! # empty when the candidate work has no cover to show
+	score: Float!
+	method: String!
+	status: String!
+	createdAt: String!
+}
+
+# [komika] One side of a dedup decision, expanded for the review panel. Read straight
+# off the canonical work rather than through canonicalSeries, which refuses a work
+# with no MangaDex anchor and NSFW-gates on viewer prefs — between them that is most
+# of the review queue.
+type WorkReviewDetail {
+	workId: ID!
+	title: String
+	coverUrl: String! # empty when there is no cover to show
+	author: String
+	artist: String
+	year: Int
+	status: String
+	contentRating: String
+	originalLanguage: String
+	isNsfw: Boolean!
+	description: String
+	chapterCount: Int! # distinct mirrored chapter numbers — a coarse completeness signal
+	altTitles: [String!]! # capped server-side
+	sources: [WorkSource!]! # every catalogued mapping, NSFW included (admin-gated)
+}
+
+# [komika] A page of dedup review candidates (mirrors the other admin *Page envelopes).
+type MergeQueuePage {
+	items: [MergeCandidate!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int # the filtered pending count, so the pager's total matches what it lists
+}
+
+# [komika] A work whose cover the crawl couldn't process (admin "Bugs" panel).
+type CoverIssue {
+	workId: ID!
+	title: String
+	coverUrl: String! # current best-effort cover; may be empty for a Suwayomi-only work with no cached cover
+	reason: String! # machine code: too_large | unsupported | empty | encode | store
+	detail: String
+	attempts: Int!
+	firstSeen: String!
+	lastSeen: String!
+}
+
+type CoverIssuePage {
+	items: [CoverIssue!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int
+}
+
+type MergeWorksResult {
+	targetWorkId: ID! # the surviving (target) work
+	movedSourceSeries: Int! # how many source_series mappings re-pointed onto the target
+}
+
+# [komika] S2 cross-source chapter aggregation. `Series.chapterCount` on a canonical
+# work now reflects the AGGREGATE (distinct chapter numbers across all sources), so a
+# work whose MangaDex spine has 0 chapters but whose asurascans source has 201 reports 201.
+type AggregatedChapter {
+	number: Float!
+	title: String
+	sources: [ChapterSource!]! # every source (translator) that provides this chapter number
+}
+
+type ChapterSource {
+	sourceType: String! # "mangadex" | "suwayomi"
+	sourceId: String!
+	suwayomiMangaId: ID # for a Suwayomi source: pass to chapters(seriesId:) to read this source's copy; null for the MangaDex mirror
+	chapterId: ID! # the specific chapter to open (a Suwayomi chapter id, or a MangaDex chapter uuid)
+	scanlator: String
+}

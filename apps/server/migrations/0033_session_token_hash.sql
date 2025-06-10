@@ -1,0 +1,11 @@
+-- Session tokens are now hashed at rest (defense-in-depth): `sessions.token`
+-- stores `sha256(token)` (lowercase hex) instead of the raw 256-bit token, so a
+-- leaked Litestream/R2 DB snapshot no longer yields replayable bearer tokens.
+--
+-- Existing rows hold RAW plaintext tokens. They can't be rehashed in place (the
+-- hash is one-way and we'd need the original to compute it), and a raw-token row
+-- can never match a lookup that now hashes the presented token first — so it would
+-- be dead weight that also (briefly) still leaks a usable token. Clearing them
+-- simply forces every current session to re-login, which is acceptable
+-- pre-production and is the safe default for a credential-hardening change.
+DELETE FROM sessions;

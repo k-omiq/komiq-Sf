@@ -1,0 +1,136 @@
+/* App-global styling that layers on top of @komika/ui reset + tokens.
+   color-scheme is owned by the tokens (per data-theme), so it is not forced here. */
+
+body {
+	font-family: var(--k-font-sans);
+	background: var(--k-bg);
+	color: var(--k-text);
+	-webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+h4 {
+	font-family: var(--k-font-display);
+	font-weight: 700;
+	letter-spacing: -0.02em;
+}
+
+/* thin scrollbars, matching the comps (theme-adaptive via border tokens) */
+::-webkit-scrollbar {
+	height: 8px;
+	width: 8px;
+}
+::-webkit-scrollbar-thumb {
+	background: var(--k-border-4);
+	border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+	background: var(--k-border-strong);
+}
+::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+::selection {
+	background: rgba(224, 131, 105, 0.3);
+}
+
+input[type='range'] {
+	accent-color: var(--k-primary);
+}
+
+/* Visible keyboard focus for every interactive element. Mouse users don't see
+   it (focus-visible), keyboard users always do. Buttons/links opt out of the
+   default UA outline, so provide a consistent, on-brand ring. */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible,
+[role='button']:focus-visible {
+	outline: 2px solid var(--k-accent);
+	outline-offset: 2px;
+	border-radius: var(--k-radius-sm);
+}
+
+/* Skip-to-content link — visually hidden until focused. */
+.k-skip-link {
+	position: fixed;
+	top: 10px;
+	left: 10px;
+	z-index: 200;
+	padding: 10px 16px;
+	border-radius: var(--k-radius);
+	background: var(--k-primary);
+	color: var(--k-on-primary);
+	font-weight: 700;
+	font-size: 13px;
+	text-decoration: none;
+	transform: translateY(-160%);
+	transition: transform 0.16s ease;
+}
+.k-skip-link:focus {
+	transform: translateY(0);
+}
+
+/* Skeleton shimmer used by loading placeholders across screens. */
+.k-skeleton {
+	position: relative;
+	overflow: hidden;
+	background: var(--k-surface-2);
+	border: 1px solid var(--k-border);
+}
+.k-skeleton::after {
+	content: '';
+	position: absolute;
+	inset: 0;
+	background: linear-gradient(
+		90deg,
+		transparent 0%,
+		rgba(255, 255, 255, 0.05) 50%,
+		transparent 100%
+	);
+	transform: translateX(-100%);
+	animation: k-shimmer 1.3s ease-in-out infinite;
+}
+@keyframes k-shimmer {
+	100% {
+		transform: translateX(100%);
+	}
+}
+
+/* Respect users who prefer reduced motion: kill non-essential animation and
+   long transitions (auto-rotating hero, shimmer, hover transforms). */
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.001ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.001ms !important;
+		scroll-behavior: auto !important;
+	}
+}
+
+/* placeholder cover art — the diagonal hatch stands in for real images until
+   the ImageProvider resolves covers from the backend / Worker / B2. */
+.k-cover {
+	background: var(--k-cover);
+	border: 1px solid var(--k-border);
+	background-image: var(--k-hatch);
+	overflow: hidden;
+}
+
+.k-gutter {
+	padding-left: var(--k-gutter);
+	padding-right: var(--k-gutter);
+}
+
+@media (max-width: 640px) {
+	:root {
+		--k-gutter: 20px;
+	}
+}

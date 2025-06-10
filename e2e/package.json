@@ -1,0 +1,17 @@
+{
+	"name": "komika-e2e",
+	"version": "0.0.0",
+	"license": "AGPL-3.0-only",
+	"private": true,
+	"description": "Standalone Playwright smoke tests for the Komika reader. NOT part of the pnpm workspace — install separately (npm install) inside e2e/.",
+	"type": "module",
+	"scripts": {
+		"test": "playwright test",
+		"test:headed": "playwright test --headed",
+		"report": "playwright show-report",
+		"install:browsers": "playwright install --with-deps chromium"
+	},
+	"devDependencies": {
+		"@playwright/test": "^1.49.0"
+	}
+}

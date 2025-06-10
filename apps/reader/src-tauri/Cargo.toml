@@ -1,0 +1,50 @@
+[package]
+name = "komika"
+version = "0.1.0"
+description = "Komika reader"
+authors = ["you"]
+license = "AGPL-3.0-only"
+repository = ""
+edition = "2021"
+# 1.78 is the floor for `cfg(target_abi)`, which src/lib.rs uses to split the REAL-iOS-device
+# engine from the simulator stub. Before 1.78 that cfg name was feature-gated (`cfg_target_abi`)
+# and is a hard E0658 on EVERY target, desktop included — not a silently-false predicate.
+rust-version = "1.78"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.3", features = [] }
+tauri-plugin-log = "2"
+# Native direct-fetch of source images (bypasses the web-only Worker proxy).
+# rustls avoids a system OpenSSL dependency, keeping mobile/desktop builds lean.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Async DNS resolution for the pre-fetch host guard (client-side SSRF defense) and the
+# embedded Suwayomi sidecar supervisor (child process, readiness poll, log pumps).
+tokio = { version = "1", features = ["net", "process", "time", "sync", "rt", "macros", "io-util"] }
+# Tiny sync HTTP listener for the on-device Cloudflare FlareSolverr-v1 shim (N-CF).
+# Chosen over axum/hyper to keep the dep tree small: tiny_http pulls only ascii /
+# chunked_transfer / httpdate / log. It runs on a dedicated thread and bridges to the
+# async WebView solver via `tauri::async_runtime::block_on`.
+tiny_http = "0.12"
+
+# In-process JNI boot of the statically-linked Zero JVM on REAL iOS devices (N4.2).
+# jni-sys is pure FFI declarations (no #[link], nothing to build); JNI_CreateJavaVM
+# resolves from the statically-linked libjvm.a (jre-ios/) at the final Xcode link.
+# Declared for all-of-iOS (cargo target cfg tables can't express target_abi reliably
+# across toolchains); the sim build compiles the stub module and never references it.
+[target.'cfg(target_os = "ios")'.dependencies]
+jni-sys = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "process", "time", "sync", "rt", "macros", "io-util"] }

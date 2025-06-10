@@ -1,0 +1,13 @@
+-- Snapshot of the chapter identity set at the last scan, so new-chapter detection
+-- can use a set-difference of chapter ids rather than only count + max chapter
+-- number. That count+max heuristic silently misses the case where upstream removes
+-- one old chapter and adds a genuinely new one numbered at/below the current max in
+-- the same interval (count flat, max unchanged) — the new chapter was never flagged
+-- and never reached the `updates` feed.
+--
+-- Stored as a sorted, comma-joined list of Suwayomi chapter ids (stable integer
+-- identities). Nullable on purpose: existing rows (and any series not yet re-scanned
+-- since this migration) have NULL, which the scanner treats as "no prior snapshot"
+-- and seeds as a baseline WITHOUT flagging — otherwise the first post-migration scan
+-- would treat every existing chapter as new and re-flood the updates feed [SC3].
+ALTER TABLE series_scan_state ADD COLUMN known_chapter_ids TEXT;  -- sorted, comma-joined chapter ids; NULL = no snapshot yet

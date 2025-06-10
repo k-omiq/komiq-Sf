@@ -1,0 +1,9 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+# esbuild & sharp ship prebuilt binaries; workerd is only for `wrangler dev`.
+# None need their install build scripts run for our checks/builds.
+allowBuilds:
+  esbuild: false
+  sharp: false
+  workerd: false

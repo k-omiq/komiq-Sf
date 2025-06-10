@@ -1,0 +1,29 @@
+node_modules
+
+# Output
+.output
+.vercel
+.netlify
+.wrangler
+/.svelte-kit
+/build
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+# `.env` (dev defaults) and `.env.production` (live komiq.cc endpoints) are
+# COMMITTED: they carry only public, non-secret PUBLIC_* URLs and are required at
+# BUILD time by `$env/static/public` (a missing export is a hard build error).
+# Personal/secret overrides go in `.env.local` / `.env.*.local`, which stay ignored.
+.env
+.env.*
+!.env.example
+!.env.test
+!.env
+!.env.production
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*

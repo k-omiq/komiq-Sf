@@ -1,0 +1,130 @@
+-- Index `chapter.external_id`, the sole WHERE key of four queries — one of which is
+-- on the reader's chapter-open request path.
+--
+--
+-- WHY
+--
+-- `chapter` has 805,253 rows and, before this migration, no index whose LEADING column
+-- is `external_id`. The only structure that mentions the column at all is
+-- `sqlite_autoindex_chapter_2`, i.e. `UNIQUE (source_series_id, external_id)`, where it
+-- is the SECOND column — useless for a lookup keyed on `external_id` alone, because
+-- SQLite cannot seek into a B-tree on a suffix of its key.
+--
+-- Four queries key on it and nothing else:
+--
+--   catalog::chapter_owner_is_nsfw            READER REQUEST PATH. The NSFW gate on
+--     (catalog/mod.rs)                        `canonicalPages` — it runs every time a
+--                                             user opens a MangaDex chapter to read it.
+--   graphql: canonical progress upsert        Reader write path, fires on page turns
+--     (setChapterProgress)                    for canonical chapters.
+--   graphql: notifications.series_id          Correlated subquery, once per chapter-
+--                                             target notification row, 25 rows/page.
+--   graphql::known_chapter_id                 Comment-thread target validation; low
+--                                             traffic, but it fails CLOSED, so a slow
+--                                             query is a user-visible stall.
+--
+-- Without a usable index SQLite fell back to one of two bad plans, both O(table):
+--
+--   * driving from `source_series` on `source_type = 'mangadex'` and probing
+--     `sqlite_autoindex_chapter_2` once per row — 109,246 index probes per call; or
+--   * a skip-scan / full scan of `sqlite_autoindex_chapter_2` itself (77 MB).
+--
+-- Neither short-circuits on a MISS, and MISS is the common case for
+-- `chapter_owner_is_nsfw`: any chapter id not mirrored from MangaDex walks the whole
+-- structure before returning "unknown".
+--
+--
+-- MEASURED (byte-for-byte copy of the 1.37 GB production DB, production pragmas from
+-- db.rs, 25 randomly sampled real chapter uuids for HIT / 15 synthetic uuids for MISS;
+-- random sampling matters — keys taken in index order flatter the old plan by ~4000x)
+--
+-- Against the CURRENT production index set (migrations <= 0055 applied):
+--
+--                            plan before                        HIT       MISS
+--   chapter_owner_is_nsfw    SEARCH ss idx_source_series_type_key
+--                            + SEARCH c autoindex_chapter_2   169.65 ms  257.02 ms
+--   known_chapter_id         SEARCH chapter autoindex_chapter_2
+--                            (ANY(source_series_id))           32.17 ms   59.81 ms
+--
+-- Against the POST-0058 index set (0058 drops idx_chapter_source_series and adds
+-- idx_source_series_type_created), which is what will actually be live — note this is
+-- WORSE, not better, for `known_chapter_id`: losing idx_chapter_source_series costs the
+-- planner its skip-scan and it degrades to a plain SCAN of the 77 MB unique index:
+--
+--   chapter_owner_is_nsfw    SEARCH ss idx_source_series_type_created
+--                            + SEARCH c autoindex_chapter_2   178.83 ms  485.49 ms
+--   known_chapter_id         SCAN chapter USING COVERING INDEX
+--                            sqlite_autoindex_chapter_2        81.54 ms  122.93 ms
+--
+-- After this index, in that same post-0058 state:
+--
+--   chapter_owner_is_nsfw    SEARCH c USING INDEX idx_chapter_external_id (external_id=?)
+--                            + SEARCH ss autoindex_source_series_1
+--                            + SEARCH w autoindex_work_1        0.052 ms   0.005 ms
+--   known_chapter_id         SEARCH chapter USING COVERING INDEX
+--                            idx_chapter_external_id            0.006 ms   0.004 ms
+--
+-- i.e. ~3,400x on the reader's NSFW gate HIT case and ~97,000x on its MISS case; the
+-- other three queries collapse to the same sub-0.06 ms shape.
+--
+--
+-- SHAPE — single column, deliberately NOT covering
+--
+-- The obvious alternative is `(external_id, source_series_id)`, which would let
+-- `chapter_owner_is_nsfw` and the progress upsert read `source_series_id` straight out
+-- of the index instead of fetching the `chapter` row. It was built and measured:
+--
+--   chapter(external_id)                     36.66 MB   nsfw HIT median 0.040 ms
+--   chapter(external_id, source_series_id)   66.03 MB   nsfw HIT median 0.038 ms
+--
+-- 80% more index for a 2 microsecond difference that is inside the noise. The covering
+-- variant cannot help much by construction: both queries still have to join out to
+-- `source_series` and then `work` by primary key, so eliminating the `chapter` row
+-- fetch removes one page read out of three lookups. `known_chapter_id` selects no
+-- column at all, so the single-column index is ALREADY covering for it (the plan above
+-- says `USING COVERING INDEX`). Single column it is.
+--
+--
+-- COST
+--
+-- 36.66 MB (measured via dbstat), on a 1,375 MB file -> 1,412 MB, +2.7%. For scale, the
+-- `chapter` table itself is 165 MB and its other indexes are 104 MB
+-- (idx_chapter_ss_lang_pubdate), 77 MB (the unique autoindex) and 40 MB
+-- (sqlite_autoindex_chapter_1); 0058 frees ~100 MB, so net across the batch this is
+-- still a reduction. It is NOT a prefix of any existing index and no existing index is
+-- a prefix of it, so it does not fall foul of 0058's own dead-index rule.
+--
+-- Write cost: one extra B-tree insert per row inserted into `chapter`. The only writer
+-- is the ingest/scan chapter upsert, which is already paying two (the rowid table and
+-- the unique autoindex) — a third is ~50% more index work on a background path that is
+-- network-bound on upstream fetches, not DB-bound.
+--
+-- RUNTIME: 3.3 s - 4.9 s cold across repeated runs (page cache for the snapshot
+-- explicitly evicted with POSIX_FADV_DONTNEED before each, statement wrapped in one
+-- transaction as sqlx runs it; the spread is the commit fsync against a fully evicted
+-- 1.4 GB file), 0.000 s on a re-run. Budget 5 s. 0056-0061 measure ~25 s together, so
+-- this takes the batch to ~30 s of one-time startup delay on the first boot after
+-- deploy. Migrations run inside
+-- db::init before the HTTP listener binds, so that is pure downtime — still well inside
+-- what a deploy restart already costs, and it is paid once.
+--
+--
+-- SAFETY
+--
+-- `CREATE INDEX IF NOT EXISTS` — idempotent, re-running is a no-op (measured at 0.000 s
+-- on the second pass). Adds no constraint: `external_id` is NOT unique on its own (the
+-- same MangaDex chapter uuid legitimately appears under several `source_series`), so
+-- this is deliberately a plain, non-UNIQUE index and cannot reject any existing or
+-- future row. Touches no user data and drops nothing.
+--
+-- No ANALYZE is needed. Verified against production's actual statistics situation:
+-- `sqlite_stat1` has rows for `chapter` from an old ANALYZE and 0058 Part 3 deliberately
+-- does not re-scan this table, so the new index has NO stat row of its own. The planner
+-- picks it anyway — an equality seek on the leading column of a non-covering index beats
+-- the full-scan alternatives even under SQLite's default estimates. Plan confirmed
+-- identical with stale stats, with fresh stats, and with `idx_chapter_source_series`
+-- dropped (post-0058). Adding `ANALYZE chapter` here would cost 26 s of startup for no
+-- plan change, so it is omitted.
+
+CREATE INDEX IF NOT EXISTS idx_chapter_external_id
+    ON chapter (external_id);

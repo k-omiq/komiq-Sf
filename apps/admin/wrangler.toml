@@ -1,0 +1,30 @@
+# Cloudflare Worker (static assets) config for the Komika admin console.
+#
+# The admin app is an adapter-static SPA (see apps/admin/vite.config.ts:
+# `fallback: 'index.html'`), so — unlike the reader — there is NO `_worker.js`
+# and no `main`. Wrangler serves the prebuilt SPA straight from the edge.
+#
+# Build (bakes the API endpoint at BUILD time — Vite; NOT read here):
+#   PUBLIC_KOMIKA_API=https://api.komiq.cc/graphql pnpm -C apps/admin build
+# Deploy (after `wrangler login`):
+#   cd apps/admin && wrangler deploy
+# Then add the Custom Domain `admin.komiq.cc` in the dashboard.
+#
+# NOTE: because PUBLIC_KOMIKA_API is baked at build time, changing the API domain
+# requires a rebuild + redeploy of this app.
+name = "komika-admin"
+compatibility_date = "2024-11-06"
+
+# This account has no workers.dev subdomain, so serve ONLY on the custom domain.
+# custom_domain = true provisions the proxied DNS record + edge cert for the host.
+workers_dev = false
+routes = [
+  { pattern = "admin.komiq.cc", custom_domain = true },
+]
+
+# Static SPA output from adapter-static. `not_found_handling =
+# "single-page-application" serves index.html for any unmatched path so client-
+# side deep links / refreshes (e.g. /sources) resolve instead of 404-ing.
+[assets]
+directory = "build"
+not_found_handling = "single-page-application"

@@ -1,0 +1,161 @@
+/*
+ * Komika / komiq design tokens — extracted from the Claude Design project.
+ *
+ * Dark-first reader aesthetic. Bricolage Grotesque for display, Manrope for
+ * body. Every app and component consumes these variables — no hard-coded colors.
+ */
+:root {
+	/* Dark is the default theme; the light override lives at the bottom of this
+	   file under :root[data-theme='light']. Each app sets data-theme on <html>
+	   (see its no-FOUC head script + lib/theme.svelte.ts). */
+	color-scheme: dark;
+
+	/* base surfaces (darkest → lightest) */
+	--k-bg: #0c0c0d;
+	--k-surface: #0f0f10;
+	--k-surface-2: #141415;
+	--k-surface-3: #161617;
+	--k-surface-4: #1a1a1b;
+	--k-surface-5: #1f1f21;
+	--k-avatar: #1b1b1c;
+	--k-cover: #141415;
+
+	/* header / glass */
+	--k-glass: rgba(12, 12, 13, 0.78);
+	--k-glass-strong: rgba(12, 12, 13, 0.9);
+
+	/* text ramp */
+	--k-text-bright: #f7f6f3;
+	--k-text: #f2f1ee;
+	--k-text-1: #e7e5e0;
+	--k-text-2: #d4d2cc;
+	--k-text-3: #c9c7c1;
+	--k-text-muted: #b5b3ad;
+	--k-text-dim: #9c9a94;
+	--k-text-dimmer: #87857f;
+	--k-text-faint: #7d7b75;
+	--k-text-fainter: #6f6d68;
+	--k-text-ghost: #5f5d58;
+	--k-text-disabled: #57554f;
+
+	/* borders (white alpha) */
+	--k-border: rgba(255, 255, 255, 0.06);
+	--k-border-1: rgba(255, 255, 255, 0.08);
+	--k-border-2: rgba(255, 255, 255, 0.1);
+	--k-border-3: rgba(255, 255, 255, 0.12);
+	--k-border-4: rgba(255, 255, 255, 0.14);
+	--k-border-strong: rgba(255, 255, 255, 0.28);
+	--k-hover-fill: rgba(255, 255, 255, 0.04);
+
+	/* brand accents */
+	--k-accent: #e0836a; /* coral — accent / manga */
+	--k-accent-purple: #c69cf0; /* manhwa */
+	--k-accent-teal: #5fc8cf; /* manhua */
+	--k-star: #f6b73c; /* rating gold */
+
+	/* status */
+	--k-ongoing: #7fd39a;
+	--k-completed: #8fb8ff;
+	--k-hiatus: #e0b354;
+	--k-cancelled: #e08a8a;
+	--k-dot: #5fbf7e;
+
+	/* "inverted" primary button (light on dark) */
+	--k-primary: #f2f1ee;
+	--k-primary-hover: #ffffff;
+	--k-on-primary: #0c0c0d;
+
+	/* radius */
+	--k-radius-sm: 5px;
+	--k-radius: 8px;
+	--k-radius-md: 9px;
+	--k-radius-lg: 12px;
+	--k-radius-xl: 16px;
+	--k-radius-2xl: 22px;
+	--k-radius-pill: 999px;
+
+	/* spacing (4px base) */
+	--k-space-1: 4px;
+	--k-space-2: 8px;
+	--k-space-3: 12px;
+	--k-space-4: 16px;
+	--k-space-5: 20px;
+	--k-space-6: 24px;
+	--k-space-8: 32px;
+	--k-space-10: 40px;
+	--k-space-14: 56px;
+
+	/* typography */
+	--k-font-display: 'Bricolage Grotesque Variable', 'Bricolage Grotesque', system-ui, sans-serif;
+	--k-font-sans: 'Manrope Variable', 'Manrope', system-ui, -apple-system, sans-serif;
+	--k-font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
+
+	/* layout */
+	--k-header-h: 64px;
+	--k-gutter: 56px;
+	--k-max-content: 1400px;
+
+	/* the placeholder "cover art" hatch used until real images load */
+	--k-hatch: repeating-linear-gradient(
+		135deg,
+		rgba(255, 255, 255, 0.03) 0 2px,
+		transparent 2px 9px
+	);
+}
+
+/*
+ * Light theme — overrides only the color/surface tokens (spacing, radius,
+ * typography and layout are theme-independent). Brand accents (coral/purple/
+ * teal/gold) and the deterministic avatar / flag palettes are intentionally NOT
+ * overridden: they read well on both backgrounds and are identity, not chrome.
+ */
+:root[data-theme='light'] {
+	color-scheme: light;
+
+	--k-bg: #f4f2ee;
+	--k-surface: #ffffff;
+	--k-surface-2: #faf9f6;
+	--k-surface-3: #f4f2ee;
+	--k-surface-4: #ece9e3;
+	--k-surface-5: #e4e1da;
+	--k-avatar: #e7e4dd;
+	--k-cover: #ece9e3;
+
+	--k-glass: rgba(247, 246, 243, 0.82);
+	--k-glass-strong: rgba(247, 246, 243, 0.94);
+
+	--k-text-bright: #0c0c0d;
+	--k-text: #1a1a1b;
+	--k-text-1: #26262a;
+	--k-text-2: #35353a;
+	--k-text-3: #45454b;
+	--k-text-muted: #55555c;
+	--k-text-dim: #6a6a71;
+	--k-text-dimmer: #7d7d84;
+	--k-text-faint: #8a8a91;
+	--k-text-fainter: #9a9aa0;
+	--k-text-ghost: #b0b0b5;
+	--k-text-disabled: #c2c2c7;
+
+	--k-border: rgba(0, 0, 0, 0.08);
+	--k-border-1: rgba(0, 0, 0, 0.1);
+	--k-border-2: rgba(0, 0, 0, 0.12);
+	--k-border-3: rgba(0, 0, 0, 0.14);
+	--k-border-4: rgba(0, 0, 0, 0.16);
+	--k-border-strong: rgba(0, 0, 0, 0.3);
+	--k-hover-fill: rgba(0, 0, 0, 0.04);
+
+	/* inverted primary button flips to dark-on-light */
+	--k-primary: #1a1a1b;
+	--k-primary-hover: #000000;
+	--k-on-primary: #f7f6f3;
+
+	/* status ramp darkened for contrast on a light background */
+	--k-ongoing: #2f9e5b;
+	--k-completed: #3f6fd6;
+	--k-hiatus: #b5842a;
+	--k-cancelled: #c0554f;
+	--k-dot: #2f9e5b;
+
+	--k-hatch: repeating-linear-gradient(135deg, rgba(0, 0, 0, 0.05) 0 2px, transparent 2px 9px);
+}
