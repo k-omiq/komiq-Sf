@@ -9,7 +9,7 @@
 # arbitrary stock jar in interpreter mode. PojavLauncher's iOS JVMs rely on JIT (jailbreak/
 # debugger) and are not interpreter-only. So the only reproducible, license-clean path is to
 # build the HotSpot Zero interpreter from OpenJDK's official Mobile Project. See
-# docs/plans/n4.1-ios-jvm-findings.md and openjdk/mobile README "Build static image for iOS".
+# openjdk/mobile README "Build static image for iOS".
 #
 # OUTPUT: a static-libs image at ../jre-ios/aarch64-ios/ (gitignored, never committed):
 #   lib/zero/libjvm.a           <- the interpreter VM

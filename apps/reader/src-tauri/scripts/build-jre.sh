@@ -18,7 +18,7 @@ SRC_TAURI_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # tauri.conf.json chains this script into `beforeBuildCommand`, which runs for EVERY
 # target — including the mobile ones. jlink emits a HOST-NATIVE runtime, so producing
 # it for an iOS/Android build only risks re-creating the 218 MB mach-o leak recorded in
-# docs/plans/n4-ios-build-attempt.md. Mobile carries its own runtime (jre-ios/, staged
+# Mobile carries its own runtime (jre-ios/, staged
 # by scripts/stage-ios-jvm-runtime.sh), so no-op there. TAURI_ENV_PLATFORM is set by the
 # tauri CLI for build hooks only; a direct or CI invocation leaves it unset and builds.
 case "${TAURI_ENV_PLATFORM:-}" in

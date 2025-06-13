@@ -13,22 +13,39 @@
 		onchange,
 		disabled = false,
 		variant = 'chip',
+		canComplete = true,
 	}: {
 		status?: Shelf | null;
 		onchange: (s: Shelf) => void;
 		disabled?: boolean;
 		variant?: 'chip' | 'button';
+		/**
+		 * Whether "Completed" is an offerable shelf — false for a series that is still
+		 * publishing. Reading everything that exists of an ongoing series is being
+		 * caught up, not being finished, so the option is withheld rather than left to
+		 * mean the wrong thing (the same word already means "the series ended" on the
+		 * series/browse badges).
+		 */
+		canComplete?: boolean;
 	} = $props();
 
 	let open = $state(false);
 	let root = $state<HTMLElement | null>(null);
 
-	const OPTIONS = [
+	const ALL_OPTIONS = [
 		{ key: 'reading', label: 'Reading' },
 		{ key: 'completed', label: 'Completed' },
 		{ key: 'onhold', label: 'On Hold' },
 		{ key: 'plan', label: 'Plan to Read' },
 	] as const;
+
+	// "Completed" survives the gate when it is the CURRENT shelf even on an ongoing
+	// series: rows filed before this gate existed (or filed while the series was
+	// listed as ended, and it later resumed) would otherwise show a checked state the
+	// menu doesn't contain, leaving the reader no visible way to move off it.
+	const OPTIONS = $derived(
+		ALL_OPTIONS.filter((o) => o.key !== 'completed' || canComplete || status === 'completed'),
+	);
 
 	const meta = $derived(status ? SHELF_META[status] : null);
 	const label = $derived(meta ? meta.label : 'SET SHELF');
@@ -146,12 +163,26 @@
 	.trigger.button:not(.set) {
 		color: var(--k-text-3);
 	}
+	/* The popover's SURFACE lives here, on the base rule, so both variants get it.
+	   It used to live entirely in `.sm.chip .menu` below — background, border,
+	   padding, shadow and even the flex column — while the base rule carried only
+	   geometry. `.chip` is applied only for `variant="chip"`, so the series page's
+	   `variant="button"` menu matched none of it and rendered as bare transparent
+	   text floating over the page. Keep this rule about appearance and the `.chip`
+	   override about position only. */
 	.menu {
 		position: absolute;
 		z-index: 40;
 		top: calc(100% + 6px);
 		left: 0;
 		min-width: 176px;
+		display: flex;
+		flex-direction: column;
+		padding: 6px;
+		border-radius: 10px;
+		background: var(--k-surface-3, var(--k-surface));
+		border: 1px solid var(--k-border-3);
+		box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
 	}
 	/* The chip variant sits at the cover's bottom-right corner — open the menu
 	   upward and right-aligned so it stays over the cover and doesn't spill past
@@ -161,13 +192,6 @@
 		bottom: calc(100% + 6px);
 		left: auto;
 		right: 0;
-		display: flex;
-		flex-direction: column;
-		padding: 6px;
-		border-radius: 10px;
-		background: var(--k-surface-3, var(--k-surface));
-		border: 1px solid var(--k-border-3);
-		box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
 	}
 	.item {
 		display: flex;

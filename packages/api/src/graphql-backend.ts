@@ -18,23 +18,31 @@ import type {
 	LibraryStatus,
 	MatchResult,
 	MergeCandidate,
+	MergeCandidateRow,
 	MergeWorksResult,
 	Page,
 	Paginated,
+	Report,
+	ReportInput,
+	ReportKind,
+	ReportPage,
+	ReportStatus,
 	Review,
 	ScanStatus,
 	Series,
-	SeriesPageBundle,
 	SeriesProgress,
 	SeriesSourceGroup,
 	SourceBrowsePage,
 	SourceBrowseType,
 	SourceIngestJob,
 	SourceInfo,
+	SourceScanHealth,
+	SplitSourcesResult,
 	UpdateFeedRow,
 	WorkReviewDetail,
 	WorkSource,
 	WorkSourceGroup,
+	WorkSourceRow,
 } from '@komika/types';
 import type {
 	Activity,
@@ -62,6 +70,23 @@ export interface BackendConfig {
 	/** Optional fetch override (SSR / tests). Defaults to global fetch. */
 	fetch?: typeof fetch;
 }
+
+/**
+ * A page number that is safe to send.
+ *
+ * Every paginated argument is `Int! = 1` SERVER-side but declared `$page: Int` in
+ * `operations.ts` — which is legal (a nullable variable may fill a non-null location that
+ * has a default) right up until someone sends an explicit `null`. GraphQL then rejects the
+ * whole OPERATION, not just the field: one `page: null` and the entire query 400s. The
+ * TypeScript default (`page = 1`) does not catch it, because a default only fires on
+ * `undefined`, and `null` is exactly what a `?page=` URL param, a nullable load-function
+ * property or a JS caller produces.
+ *
+ * Normalising here rather than widening the declaration to `$page: Int!` on purpose: the
+ * server's default is the one that should decide what "no page" means, and making the
+ * variable required would force every caller to state a page it does not care about.
+ */
+const pageArg = (page?: number | null): number => page ?? 1;
 
 /**
  * GraphQL-backed implementation of {@link Backend}, targeting Komika's unified
@@ -144,59 +169,20 @@ export class GraphQLBackend implements Backend {
 		return out;
 	}
 
-	/**
-	 * Whether this API has told us it doesn't serve `GET /graphql` (P3). Process-wide
-	 * for the same deploy-order reason as {@link unsupportedFields}: a 404/405 from one
-	 * GET means every GET would fail, so remember it and go straight to POST.
-	 */
-	private static getUnsupported = false;
-
 	private async gql<T>(
 		query: string,
 		variables?: Record<string, unknown>,
 		retried = false,
 	): Promise<T> {
 		const doFetch = this.config.fetch ?? fetch;
-		const stripped = this.stripUnsupported(query);
-		// Anonymous READS go over GET so Cloudflare and the browser's HTTP cache can
-		// serve them (the server sends Cache-Control + ETag on anonymous GETs; 304
-		// revalidation is the browser's job, no client code needed). An authed viewer
-		// must NEVER take this path: edge caches key on the URL alone, so a cached
-		// response carrying viewer-specific fields (isMarked, myReview…) would be
-		// replayed to other users. Mutations are detected on the document text —
-		// `operations.ts` always writes a top-level `mutation Name(`/`query Name(`
-		// (fragments may come first, hence the newline alternative).
-		const useGet =
-			!this.config.token &&
-			!GraphQLBackend.getUnsupported &&
-			!/(^|\n)\s*mutation[\s(]/.test(stripped);
-		let res: Response;
-		if (useGet) {
-			// Single-operation documents, so no `operationName`; `variables` only when
-			// there are any. No Authorization header by construction (no token here).
-			const params =
-				`query=${encodeURIComponent(stripped)}` +
-				(variables ? `&variables=${encodeURIComponent(JSON.stringify(variables))}` : '');
-			res = await doFetch(`${this.config.endpoint}?${params}`);
-			if (res.status === 404 || res.status === 405) {
-				// The server predates GET /graphql — schema-drift fallback, not an outage.
-				// Memoize and re-enter: the retry re-evaluates the transport and lands on
-				// POST, preserving `retried` so the unknown-field loop is unaffected. Any
-				// OTHER status is NOT memoized — a 500 or a network failure must throw
-				// exactly as it does on POST.
-				GraphQLBackend.getUnsupported = true;
-				return this.gql<T>(query, variables, retried);
-			}
-		} else {
-			res = await doFetch(this.config.endpoint, {
-				method: 'POST',
-				headers: {
-					'content-type': 'application/json',
-					...(this.config.token ? { authorization: `Bearer ${this.config.token}` } : {}),
-				},
-				body: JSON.stringify({ query: stripped, variables }),
-			});
-		}
+		const res = await doFetch(this.config.endpoint, {
+			method: 'POST',
+			headers: {
+				'content-type': 'application/json',
+				...(this.config.token ? { authorization: `Bearer ${this.config.token}` } : {}),
+			},
+			body: JSON.stringify({ query: this.stripUnsupported(query), variables }),
+		});
 		if (!res.ok) throw new Error(`Backend error ${res.status}`);
 		const json = (await res.json()) as { data?: T; errors?: { message: string }[] };
 		if (json.errors?.length) {
@@ -254,7 +240,7 @@ export class GraphQLBackend implements Backend {
 		return d.discovery;
 	}
 	async updates(page = 1): Promise<Paginated<Series>> {
-		const d = await this.gql<{ updates: Paginated<Series> }>(ops.UPDATES, { page });
+		const d = await this.gql<{ updates: Paginated<Series> }>(ops.UPDATES, { page: pageArg(page) });
 		return d.updates;
 	}
 	async search(
@@ -265,7 +251,7 @@ export class GraphQLBackend implements Backend {
 	): Promise<Paginated<Series>> {
 		const d = await this.gql<{ search: Paginated<Series> }>(ops.SEARCH, {
 			query,
-			page,
+			page: pageArg(page),
 			// An EMPTY list is not "match nothing" here, it is "no filter" — send
 			// `undefined` so the server omits the clause entirely. `[]` would reach the
 			// resolver as an empty IN (…) and return zero rows, i.e. selecting no genre
@@ -288,7 +274,7 @@ export class GraphQLBackend implements Backend {
 	async searchAllSources(query: string, page = 1): Promise<FederatedSearchPage> {
 		const d = await this.gql<{ searchAllSources: FederatedSearchPage }>(ops.SEARCH_ALL_SOURCES, {
 			query,
-			page,
+			page: pageArg(page),
 		});
 		return d.searchAllSources;
 	}
@@ -349,7 +335,7 @@ export class GraphQLBackend implements Backend {
 
 	// --- social ---
 	async reviews(seriesId: Id, page = 1): Promise<Paginated<Review>> {
-		const d = await this.gql<{ reviews: Paginated<Review> }>(ops.REVIEWS, { seriesId, page });
+		const d = await this.gql<{ reviews: Paginated<Review> }>(ops.REVIEWS, { seriesId, page: pageArg(page) });
 		return d.reviews;
 	}
 	async myReview(seriesId: Id): Promise<Review | null> {
@@ -360,6 +346,10 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ postReview: Review }>(ops.POST_REVIEW, { input });
 		return d.postReview;
 	}
+	async deleteReview(seriesId: Id): Promise<boolean> {
+		const d = await this.gql<{ deleteReview: boolean }>(ops.DELETE_REVIEW, { seriesId });
+		return d.deleteReview;
+	}
 	async comments(
 		targetType: CommentTargetType,
 		targetId: Id,
@@ -368,7 +358,7 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ comments: Paginated<Comment> }>(ops.COMMENTS, {
 			targetType,
 			targetId,
-			page,
+			page: pageArg(page),
 		});
 		return d.comments;
 	}
@@ -406,7 +396,7 @@ export class GraphQLBackend implements Backend {
 
 	// --- notifications ---
 	async notifications(page = 1): Promise<Notification[]> {
-		const d = await this.gql<{ notifications: Notification[] }>(ops.NOTIFICATIONS, { page });
+		const d = await this.gql<{ notifications: Notification[] }>(ops.NOTIFICATIONS, { page: pageArg(page) });
 		return d.notifications;
 	}
 	async unreadNotificationCount(): Promise<number> {
@@ -508,7 +498,7 @@ export class GraphQLBackend implements Backend {
 
 	// --- admin user management ---
 	async users(page = 1): Promise<Paginated<AdminUser>> {
-		const d = await this.gql<{ users: Paginated<AdminUser> }>(ops.USERS, { page });
+		const d = await this.gql<{ users: Paginated<AdminUser> }>(ops.USERS, { page: pageArg(page) });
 		return d.users;
 	}
 
@@ -520,7 +510,7 @@ export class GraphQLBackend implements Backend {
 	// --- admin dedup review ---
 	async mergeQueue(page = 1, limit?: number): Promise<Paginated<MergeCandidate>> {
 		const d = await this.gql<{ mergeQueue: Paginated<MergeCandidate> }>(ops.MERGE_QUEUE, {
-			page,
+			page: pageArg(page),
 			limit,
 		});
 		return d.mergeQueue;
@@ -548,9 +538,37 @@ export class GraphQLBackend implements Backend {
 		return d.addSourceSeries;
 	}
 
+	// --- reader reports (Support → Report an issue) ---
+	async submitReport(input: ReportInput): Promise<Report> {
+		const d = await this.gql<{ submitReport: Report }>(ops.SUBMIT_REPORT, { input });
+		return d.submitReport;
+	}
+
+	async reports(
+		status: ReportStatus | null = null,
+		kind: ReportKind | null = null,
+		page = 1,
+	): Promise<ReportPage> {
+		const d = await this.gql<{ reports: ReportPage }>(ops.REPORTS, { status, kind, page: pageArg(page) });
+		return d.reports;
+	}
+
+	async resolveReport(
+		reportId: Id,
+		status: ReportStatus,
+		note: string | null = null,
+	): Promise<Report> {
+		const d = await this.gql<{ resolveReport: Report }>(ops.RESOLVE_REPORT, {
+			reportId,
+			status,
+			note,
+		});
+		return d.resolveReport;
+	}
+
 	// --- admin cover issues / "Bugs" panel ---
 	async coverIssues(page = 1): Promise<Paginated<CoverIssue>> {
-		const d = await this.gql<{ coverIssues: Paginated<CoverIssue> }>(ops.COVER_ISSUES, { page });
+		const d = await this.gql<{ coverIssues: Paginated<CoverIssue> }>(ops.COVER_ISSUES, { page: pageArg(page) });
 		return d.coverIssues;
 	}
 
@@ -579,12 +597,38 @@ export class GraphQLBackend implements Backend {
 		return json.coverUrl;
 	}
 
+	async searchForMerge(query: string, page = 1): Promise<Paginated<MergeCandidateRow>> {
+		const d = await this.gql<{ search: Paginated<MergeCandidateRow> }>(ops.SEARCH_FOR_MERGE, {
+			query,
+			page: pageArg(page),
+			// Literal `true`, not a caller flag: the picker always wants the full
+			// catalogue. The server gates it on admin, so this is not an escalation.
+			includeNsfw: true,
+		});
+		return d.search;
+	}
+
 	async mergeWorks(sourceWorkId: Id, targetWorkId: Id): Promise<MergeWorksResult> {
 		const d = await this.gql<{ mergeWorks: MergeWorksResult }>(ops.MERGE_WORKS, {
 			sourceWorkId,
 			targetWorkId,
 		});
 		return d.mergeWorks;
+	}
+
+	async workSourceRows(workId: Id): Promise<WorkSourceRow[]> {
+		const d = await this.gql<{ workSourceRows: WorkSourceRow[] }>(ops.WORK_SOURCE_ROWS, {
+			workId,
+		});
+		return d.workSourceRows;
+	}
+
+	async splitSourceSeries(workId: Id, sourceSeriesIds: Id[]): Promise<SplitSourcesResult> {
+		const d = await this.gql<{ splitSourceSeries: SplitSourcesResult }>(ops.SPLIT_SOURCE_SERIES, {
+			workId,
+			sourceSeriesIds,
+		});
+		return d.splitSourceSeries;
 	}
 
 	// --- admin sources & extensions (EXT-1/EXT-2) ---
@@ -607,7 +651,7 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ sourceBrowse: SourceBrowsePage }>(ops.SOURCE_BROWSE, {
 			sourceId,
 			type,
-			page,
+			page: pageArg(page),
 			query: query ?? null,
 		});
 		return d.sourceBrowse;
@@ -660,6 +704,11 @@ export class GraphQLBackend implements Backend {
 			paused,
 		});
 		return d.setSeriesPaused;
+	}
+
+	async sourceScanHealth(): Promise<SourceScanHealth[]> {
+		const d = await this.gql<{ sourceScanHealth: SourceScanHealth[] }>(ops.SOURCE_SCAN_HEALTH);
+		return d.sourceScanHealth;
 	}
 
 	async sourceIngestJobs(active = false): Promise<SourceIngestJob[]> {
@@ -763,7 +812,7 @@ export class GraphQLBackend implements Backend {
 	// --- canonical catalogue ---
 	async canonicalUpdates(page = 1, includeNsfw?: boolean): Promise<CanonicalUpdate[]> {
 		const d = await this.gql<{ canonicalUpdates: CanonicalUpdate[] }>(ops.CANONICAL_UPDATES, {
-			page,
+			page: pageArg(page),
 			includeNsfw,
 		});
 		return d.canonicalUpdates;
@@ -771,7 +820,7 @@ export class GraphQLBackend implements Backend {
 
 	async updatesFeed(page = 1, type?: ComicType): Promise<Paginated<UpdateFeedRow>> {
 		const d = await this.gql<{ updatesFeed: Paginated<UpdateFeedRow> }>(ops.UPDATES_FEED, {
-			page,
+			page: pageArg(page),
 			type,
 		});
 		return d.updatesFeed;
@@ -796,41 +845,6 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ workSources: WorkSource[] }>(ops.WORK_SOURCES, { workId });
 		return d.workSources;
 	}
-	/**
-	 * Whether the API has told us it predates `seriesPage` (P2.1). Process-wide for
-	 * the same deploy-order reason as {@link unsupportedFields}: once one request
-	 * gets `Unknown field "seriesPage"`, every later call would too — remember it
-	 * and answer `undefined` immediately so callers fall back without a wasted
-	 * round trip per page view.
-	 */
-	private static seriesPageUnsupported = false;
-
-	async seriesPage(
-		workId: Id,
-		withAggregated = false,
-	): Promise<SeriesPageBundle | null | undefined> {
-		if (GraphQLBackend.seriesPageUnsupported) return undefined;
-		try {
-			const d = await this.gql<{ seriesPage: SeriesPageBundle }>(ops.SERIES_PAGE, {
-				workId,
-				withAggregated,
-			});
-			return d.seriesPage;
-		} catch (e) {
-			const msg = e instanceof Error ? e.message : String(e);
-			// The server predates the resolver — schema-drift fallback, not an outage.
-			if (msg.includes('Unknown field "seriesPage"')) {
-				GraphQLBackend.seriesPageUnsupported = true;
-				return undefined;
-			}
-			// The resolver's own not-found (unknown id / NSFW-gated): the page 404s,
-			// exactly as the old fan-out rendering nothing did. Anything else is a real
-			// failure the caller must surface honestly.
-			if (msg.includes('No such work')) return null;
-			throw e;
-		}
-	}
-
 	async workSourcesBatch(workIds: Id[]): Promise<WorkSourceGroup[]> {
 		const d = await this.gql<{ workSourcesBatch: WorkSourceGroup[] }>(ops.WORK_SOURCES_BATCH, {
 			workIds,

@@ -179,6 +179,14 @@
 {/if}
 
 <style>
+	/* CONTRACT: the parent must establish a containing block — `position: relative` (or
+	   any non-static position) AND a size. Both boxes below are `position: absolute`, so
+	   against a STATIC parent they size to the nearest positioned ancestor instead, which
+	   is somewhere further up the page and is never what the call site meant. `overflow:
+	   hidden` on that parent does not save you: it does not clip a descendant whose
+	   containing block is outside it.
+	   This is not hypothetical — MergeDialog's `.thumb` shipped without it and every
+	   candidate's cover rendered at the dialog's full size, on top of the dialog. */
 	.cover-img,
 	.cover-ph {
 		position: absolute;

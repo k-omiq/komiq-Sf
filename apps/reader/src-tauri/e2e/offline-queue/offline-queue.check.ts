@@ -131,10 +131,7 @@ async function main(): Promise<void> {
 		await be.mark('s1', false).catch(() => {});
 		check('duplicate mark for same series collapses (size stays 1)', queue.size() === 1);
 		const head = queue.peekAll()[0];
-		check(
-			'collapsed mark keeps latest value (marked false)',
-			head.kind === 'mark' && head.marked === false,
-		);
+		check('collapsed mark keeps latest value (marked false)', head.kind === 'mark' && head.marked === false);
 	}
 
 	// ---- (3) reconnect → flushQueue replays collapsed writes in order, queue empties ----
@@ -157,9 +154,7 @@ async function main(): Promise<void> {
 			(op) =>
 				op.kind === 'progress'
 					? mockHosted(state, rec).setProgress(op.chapterId, op.lastPageRead, op.read)
-					: mockHosted(state, rec)
-							.mark(op.seriesId, op.marked)
-							.then(() => {}),
+					: mockHosted(state, rec).mark(op.seriesId, op.marked).then(() => {}),
 			'u1',
 		);
 		check('queue empties after online drain', queue.size() === 0);
@@ -184,13 +179,7 @@ async function main(): Promise<void> {
 			},
 		} as unknown as Backend;
 		const queue = new OfflineWriteQueue(createMemoryStorageAdapter());
-		queue.enqueue({
-			kind: 'progress',
-			chapterId: 'poison',
-			lastPageRead: 0,
-			read: false,
-			userId: 'u1',
-		});
+		queue.enqueue({ kind: 'progress', chapterId: 'poison', lastPageRead: 0, read: false, userId: 'u1' });
 
 		// Each drain increments tries by 1 (fails at head, stops). After MAX_TRIES drains
 		// the op is dropped. The queue never grows.
@@ -238,13 +227,7 @@ async function main(): Promise<void> {
 		const rec: Recorded = { progress: [], mark: [] };
 		const queue = new OfflineWriteQueue(createMemoryStorageAdapter());
 		// User A queues a write (offline capture stamps ownership).
-		queue.enqueue({
-			kind: 'progress',
-			chapterId: 'a-secret',
-			lastPageRead: 5,
-			read: true,
-			userId: 'userA',
-		});
+		queue.enqueue({ kind: 'progress', chapterId: 'a-secret', lastPageRead: 5, read: true, userId: 'userA' });
 		check('user A op is queued', queue.size() === 1);
 
 		// User B is now signed in and a drain fires (reconnect / flush).
@@ -252,16 +235,11 @@ async function main(): Promise<void> {
 			(op) =>
 				op.kind === 'progress'
 					? mockHosted(state, rec).setProgress(op.chapterId, op.lastPageRead, op.read)
-					: mockHosted(state, rec)
-							.mark(op.seriesId, op.marked)
-							.then(() => {}),
+					: mockHosted(state, rec).mark(op.seriesId, op.marked).then(() => {}),
 			'userB',
 		);
 		check("user A's op is purged, never replayed under user B", queue.size() === 0);
-		check(
-			'hosted recorded NO write for the foreign op (C1)',
-			rec.progress.length === 0 && rec.mark.length === 0,
-		);
+		check('hosted recorded NO write for the foreign op (C1)', rec.progress.length === 0 && rec.mark.length === 0);
 
 		// Identity-unknown drain defers instead of dropping the rightful owner's ops.
 		queue.enqueue({ kind: 'mark', seriesId: 's-defer', marked: true, userId: 'userA' });

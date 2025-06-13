@@ -169,6 +169,95 @@ export interface MergeWorksResult {
 }
 
 /**
+ * One candidate row in the admin MERGE PICKER (`searchForMerge`).
+ *
+ * A deliberately lean projection of `Series`: enough to recognise a duplicate by eye,
+ * plus the one field the merge actually needs. `mergeWorks` addresses canonical works,
+ * but `Series.id` is the READER id — `w_…` only when the work is MangaDex-anchored, the
+ * numeric Suwayomi id otherwise — so `workId` is what gets sent to the mutation and `id`
+ * is only ever used to LINK to the candidate's detail page.
+ */
+export interface MergeCandidateRow {
+	/** The id to OPEN (reader id). Never pass this to `mergeWorks`. */
+	id: Id;
+	/** The canonical work id — what `mergeWorks` takes. Null when the catalogue has no
+	 *  mapping, in which case the row is not mergeable and the picker disables it. */
+	workId: Id | null;
+	title: string;
+	author: string | null;
+	coverUrl: string | null;
+	chapterCount: number;
+	isNsfw: boolean;
+}
+
+/**
+ * One detachable source mapping on a work — the unit the admin UNMERGE picker
+ * operates on (`workSourceRows`).
+ *
+ * DISTINCT FROM {@link WorkSource}, which describes how a NATIVE client fetches a
+ * source (extension package, repo, apk). This is the admin view of the same
+ * `source_series` row: what it calls the series, how much of it we hold, and — the
+ * part `WorkSource` has no field for — the row's own primary key.
+ *
+ * `id` IS THE `source_series` PRIMARY KEY, and it is what `splitSourceSeries` takes.
+ * Not `(sourceType, sourceKey)`: that pair is only unique across the catalogue in
+ * combination with `sourceId` (the table's UNIQUE is `(source_type, source_id,
+ * source_key)`), so addressing a row by the pair alone is ambiguous the moment one
+ * work carries the same manga id under two different Suwayomi sources.
+ *
+ * `title` is the source's OWN title for the series, not the work's. That is the
+ * whole point of the picker: a work whose sources disagree about the title is
+ * exactly the mis-merge an admin is here to undo, and it is also what names the
+ * detached work (see {@link SplitSourcesResult}).
+ */
+export interface WorkSourceRow {
+	/** `source_series.id` — the detach key passed to `splitSourceSeries`. */
+	id: Id;
+	/** `"mangadex"` or `"suwayomi"`. */
+	sourceType: string;
+	/** Display name for the source, e.g. "MangaDex", "MANGA Plus". */
+	sourceName: string;
+	/** Language code (e.g. `en`), or null when N/A or Suwayomi's catch-all "all". */
+	lang: string | null;
+	/** Extension logo served from our origin; null → the UI renders an initial. */
+	iconUrl: string | null;
+	/** How THIS source titles the series. */
+	title: string;
+	/** How many chapters we hold from this source. */
+	chapterCount: number;
+	/** Canonical URL for the series at the source; null when not available. */
+	sourceUrl: string | null;
+}
+
+/**
+ * The result of detaching source mappings off a work into a new one
+ * (admin `splitSourceSeries`).
+ *
+ * NOT AN UNDO OF {@link MergeWorksResult}, and it cannot be one: `mergeWorks`
+ * deletes the source work row and keeps no record of what it folded, so the
+ * pre-merge state is unrecoverable. This mints a NEW work carrying the detached
+ * sources (and, for free, every chapter they own — `chapter` is keyed by
+ * `source_series_id`, not by work). Reviews, library entries, reading progress and
+ * view counts stay with the ORIGINAL work, because nothing records which side of
+ * the split they came from.
+ */
+export interface SplitSourcesResult {
+	/** The freshly minted canonical work id (`w_…`). */
+	newWorkId: Id;
+	/**
+	 * Where to NAVIGATE for the new work — its reader id, which is the numeric
+	 * Suwayomi id unless the detached set includes a MangaDex source.
+	 * `canonicalSeries` rejects a work with no MangaDex anchor outright, so a
+	 * Suwayomi-only split must never be linked as `/series/w_…`.
+	 */
+	newReaderId: Id;
+	/** The new work's `primary_title` — taken from the detached source's own title. */
+	title: string;
+	/** How many `source_series` rows moved. */
+	movedSources: number;
+}
+
+/**
  * One row of the canonical updates feed (CATALOGUE.md §6): a mirrored MangaDex
  * work with its most recent stored chapter, served from the `chapter` mirror.
  * Openable in the reader via its `workId` (the `w_`-prefixed canonical id) through
@@ -212,10 +301,22 @@ export interface UpdateFeedRow {
 	latestChapterTitle: string | null;
 	/** Total chapters known for the series; null on mirror-only rows. */
 	chapterCount: number | null;
-	/** Real upstream release time of the newest chapter — the feed's sort key AND the
-	 *  instant the card labels with, so order and label can never disagree. */
+	/** Real upstream release time of the newest chapter — what the SOURCE says. No longer
+	 *  the sort key; still what the card's detail line reports. */
 	releasedAt: string;
-	/** When OUR scanner noticed; null on mirror-only rows. Tooltip only, never a sort key. */
+	/**
+	 * When the chapter first became something we could show anyone (migration 0099) — the
+	 * feed's sort key, and therefore the instant the card's primary label prints, so order
+	 * and label can never disagree.
+	 *
+	 * Differs from {@link releasedAt} only where a source held a chapter back (early access,
+	 * paywall, regional delay), and equals it on every row recorded before 0099. Render
+	 * `announcedAt ?? releasedAt`: that is exact rather than approximate, and it is also what
+	 * keeps the reader correct against a server that predates the field.
+	 */
+	announcedAt: string | null;
+	/** When OUR scanner noticed; null on mirror-only rows. Per-SERIES and Suwayomi-only —
+	 *  NOT a substitute for {@link announcedAt}. Tooltip only, never a sort key. */
 	detectedAt: string | null;
 	/** Aggregate user rating 0-10, or null when unrated. */
 	rating: number | null;
@@ -311,6 +412,55 @@ export interface SourceIngestJob {
 	startedAt: string;
 	/** Set once the job reaches a terminal state (completed/cancelled/failed). */
 	finishedAt: string | null;
+}
+
+/**
+ * One source's scan health (Phase E4.3) — the admin answer to "is this source actually
+ * working?".
+ *
+ * There was no honest answer before E4. Every Suwayomi fetch path falls back to reading
+ * Suwayomi's own database when the upstream fetch fails, so a completely broken source
+ * returned data and its scans were recorded as successes: `en.suryascans` 404'd on every
+ * chapter fetch while all 209 of its series reported zero failures and zero chapters.
+ * {@link cachedFallback} is that failure mode made visible.
+ */
+export interface SourceScanHealth {
+	/** Suwayomi source id. */
+	id: Id;
+	/** Display name, when the source is still installed in the engine. */
+	name: string | null;
+	/** Owning extension package; null once the extension is uninstalled (its series and
+	 * their scan state outlive it). */
+	pkgName: string | null;
+	installed: boolean;
+	subscribed: boolean;
+	/** Set when the subscription's circuit breaker has been tripped. */
+	subscriptionDisabledAt: string | null;
+	/** Series of this source that the scanner tracks. */
+	series: number;
+	/** …with any current failure streak. */
+	failing: number;
+	/** …whose streak is long enough, for a source-side reason, to count as an outage. */
+	confirmedFailing: number;
+	/** Failures whose last cause was being served Suwayomi's CACHE — broken while looking
+	 * healthy — versus failing out loud. */
+	cachedFallback: number;
+	fetchError: number;
+	/** Series the scanner has never got a chapter for. Across a whole source, the signature
+	 * of one that has never once worked. */
+	zeroChapterSeries: number;
+	/** Works reachable through no other source, i.e. what goes dark if this stays broken. */
+	exclusiveWorks: number;
+	worstStreak: number;
+	lastFailureAt: string | null;
+	lastScannedAt: string | null;
+	/** Set while a whole-source outage is open. */
+	outageDetectedAt: string | null;
+	outageLastAlertAt: string | null;
+	/** `cached_fallback` | `fetch_error` — the dominant failure kind. */
+	outageKind: string | null;
+	/** How far out this source's series are parked while the outage lasts. */
+	outageParkedUntil: string | null;
 }
 
 /** Result of a bulk catalogue ingest: per-id entries plus a decision summary. */
@@ -509,6 +659,25 @@ export interface Series {
 	 */
 	detectedAt?: string | null;
 	/**
+	 * The newest chapter's LABEL — `"151"`, `"10.5"`, `"Oneshot"`.
+	 *
+	 * **This is not `chapterCount`, and it must never be substituted for it in either
+	 * direction.** `chapterCount` is how MANY chapters we know of; this is what the
+	 * newest one is CALLED. A series with 12 mirrored chapters whose newest is Ch. 151
+	 * is ordinary — mirrors are partial — and printing "Ch. 12" for it is the F4 bug the
+	 * chapter-number contract exists to prevent.
+	 *
+	 * Optional AND nullable, and the absent case is load-bearing: not every deployed
+	 * server exposes it (see `OPTIONAL_SERIES_FIELDS` in `@komika/api`, which strips it
+	 * from the document against an older API), and even on a current server it is only
+	 * populated on the browse/catalogue path. Absent means WE DO NOT KNOW — render the
+	 * count alone (`"12 ch"`), never `"Ch. undefined"` and never `"Ch. " + chapterCount`.
+	 *
+	 * Format it with `chapterChip()`, never by string-concatenating a `"Ch. "` prefix:
+	 * the value can be a WORD (`"Oneshot"`), and `"Ch. Oneshot"` is wrong.
+	 */
+	latestChapter?: string | null;
+	/**
 	 * Per-series view (chapter-read) counts — the popularity signal. Resolved lazily
 	 * server-side and selected only by the series-detail queries, so it's `undefined`
 	 * on series that come from feeds/search (which don't request it).
@@ -578,13 +747,18 @@ export interface GenreFacet {
 }
 
 /** Per-series read progress for the whole library (see `Backend.libraryProgress`).
- *  `read`/`total` are counted from the cached chapter state — the same source
- *  `chapters(seriesId)` reads — so they match. Series with no cached chapters are
- *  omitted from the list; callers treat those as unread. */
+ *  Series the viewer has never opened are omitted; callers treat those as unread. */
 export interface SeriesProgress {
 	id: Id;
+	/** Chapters marked read, summed from the viewer's own per-chapter progress rows. */
 	read: number;
+	/** Always 0 from the server — read it as `p.total || series.chapterCount`. */
 	total: number;
+	/** When the viewer last made progress (RFC 3339), or null if never.
+	 *  Moves on ANY progress, not just finishing a chapter, so a series someone is three
+	 *  pages into sorts ahead of one they finished last month. Orders the Profile's
+	 *  Continue-reading shelf and the Library's "Recently read". */
+	lastReadAt: string | null;
 }
 
 /** One source that provides a given chapter number of a work (S2 aggregation).
@@ -605,46 +779,76 @@ export interface ChapterSource {
 export interface AggregatedChapter {
 	number: number;
 	title: string | null;
+	/**
+	 * When this chapter was FIRST released across ALL of its sources (ISO-8601), or `null`
+	 * when no source dated it (F12).
+	 *
+	 * The EARLIEST source's time, which is the same first-source-wins instant the release
+	 * ledger records — so a chapter's date does not move as the reader switches translator,
+	 * and it agrees with the date the same chapter got on `/updates`.
+	 *
+	 * OPTIONAL because it is opportunistically selected (`OPTIONAL_SERIES_FIELDS`): a reader
+	 * deployed ahead of the API drops it rather than failing the whole series page. Absent
+	 * or null means "we do not know", and the caller must render no date rather than
+	 * inventing one.
+	 */
+	firstReleasedAt?: string | null;
+	/**
+	 * Has the VIEWER read this chapter from ANY of the work's sources?
+	 *
+	 * Read state is stored per source chapter row, so the same chapter carries a different
+	 * id in every source and switching translator used to blank every marker. The server
+	 * derives this from the spine key (`chapter.chapter_key`) the sources share.
+	 *
+	 * OPTIONAL, like {@link firstReleasedAt}: it is opportunistically selected
+	 * (`OPTIONAL_SERIES_FIELDS`), so a reader deployed ahead of the API drops it rather
+	 * than failing the whole series page. Absent/false means "not known to be read" — the
+	 * caller must fall back to the selected source's own `read`, never invert it.
+	 */
+	readAnywhere?: boolean;
 	sources: ChapterSource[];
 }
 
 export interface Chapter {
 	id: Id;
 	seriesId: Id;
-	/** Chapter number as a float (supports 10.5 interludes). */
+	/**
+	 * Chapter number as a float (supports 10.5 interludes), or `0` when the chapter has
+	 * none. **Prefer {@link label}** — a oneshot arrives here as a hard-coded `0` with no
+	 * way to tell it from a real Chapter 0, which is why 21,422 works rendered "Chapter 0".
+	 */
 	number: number;
+	/** What to print: `"45"`, `"10.5"`, `"Oneshot"`. Never a chapter COUNT. */
+	label: string;
+	/**
+	 * Set when the chapter is hosted off-site (MangaPlus, Comikey, NamiComi, BiliBili —
+	 * ~35,000 chapters, 4% of the mirror). The reader must redirect here rather than
+	 * request pages that will never arrive.
+	 *
+	 * `externalUrl != null` is the ONLY valid test. `pageCount === 0` is NOT a substitute:
+	 * this backend returns `pageCount: 0` for ordinary chapters too (verified live).
+	 */
+	externalUrl: string | null;
 	title: string | null;
 	pageCount: number;
+	/** When the SOURCE says the chapter became readable. */
 	uploadedAt: string | null;
+	/**
+	 * When WE first recorded the chapter as available (migration 0099).
+	 *
+	 * `null` means WE DO NOT KNOW and MUST render as an em dash — **never** as
+	 * {@link uploadedAt}. Falling back would assert we found the chapter the instant it was
+	 * published, which is the exact claim this field exists to stop the UI making. Expect
+	 * null for essentially every chapter predating 0099; no discovery time was invented for
+	 * the back catalogue.
+	 */
+	foundAt: string | null;
 	scanlator: string | null;
 	// per-user reading state
 	read: boolean;
 	lastPageRead: number;
 	bookmarked: boolean;
 	isDownloaded: boolean;
-}
-
-/** One source mapping of a {@link SeriesPageBundle}: the mapping plus what the old
- *  per-source round trips fetched — its chapter list and its series metadata.
- *  `chapters` is empty (and `series` null) for the MangaDex mapping (the spine
- *  carries those) and for a source whose server-side fetch failed. */
-export interface SeriesPageSourceEntry {
-	source: WorkSource;
-	chapters: Chapter[];
-	series: Series | null;
-}
-
-/** P2.1: the whole series/reader page in ONE round trip (`seriesPage(workId)`).
- *  Replaces the canonicalSeries + canonicalChapters + workSources fan-out and the
- *  per-translator chapters N+1. `workId` is the EFFECTIVE id after a merge
- *  redirect; `series` is null for a federation-only work (no MangaDex anchor). */
-export interface SeriesPageBundle {
-	workId: Id;
-	series: Series | null;
-	spineChapters: Chapter[];
-	sources: SeriesPageSourceEntry[];
-	/** Cross-source aggregation; present only when requested (`withAggregated`). */
-	aggregated?: AggregatedChapter[];
 }
 
 /**
@@ -757,4 +961,64 @@ export interface Paginated<T> {
 	page: number;
 	hasNextPage: boolean;
 	total: number | null;
+}
+
+// ---- Reader reports ----------------------------------------------------------
+
+/**
+ * What a reader is reporting (Support → Report an issue). These are the catalogue
+ * failures only a reader can see — the server's own queues (`mergeQueue`,
+ * `coverIssues`) cover what the pipeline already knows it got wrong.
+ *
+ *  - `WRONG_MERGE`   two different series folded into one entry
+ *  - `NEEDS_MERGE`   the same series listed twice
+ *  - `MISSING_WORK`  a series absent from the catalogue (no id to point at)
+ *  - `COMMENT_ABUSE` a person in the comments, not a record
+ */
+export type ReportKind = 'WRONG_MERGE' | 'NEEDS_MERGE' | 'MISSING_WORK' | 'COMMENT_ABUSE' | 'OTHER';
+
+/** Triage state. `REJECTED` ("looked at it, not a bug") ≠ `RESOLVED` ("fixed it"). */
+export type ReportStatus = 'OPEN' | 'RESOLVED' | 'REJECTED';
+
+/** One reader-filed report, as the admin queue sees it. */
+export interface Report {
+	id: Id;
+	kind: ReportKind;
+	status: ReportStatus;
+	/** Reporter's username, or null when filed anonymously (allowed by design). */
+	reporter: string | null;
+	/** The series id the reader was looking at, verbatim (numeric or `w_`). */
+	subjectId: string | null;
+	/** The other id, on a merge/unmerge report. */
+	subjectIdSecondary: string | null;
+	/** Free-text title, for a series with no id yet (`MISSING_WORK`). */
+	subjectTitle: string | null;
+	commentId: string | null;
+	/** Snapshotted at submit time, so the report outlives the comment it reports. */
+	reportedUsername: string | null;
+	commentExcerpt: string | null;
+	sourceUrl: string | null;
+	detail: string;
+	adminNote: string | null;
+	createdAt: string;
+	resolvedAt: string | null;
+}
+
+/** The report form's payload. Which optional fields are required depends on `kind`;
+ *  the server enforces that pairing and returns a reader-facing message. */
+export interface ReportInput {
+	kind: ReportKind;
+	detail: string;
+	subjectId?: string | null;
+	subjectIdSecondary?: string | null;
+	subjectTitle?: string | null;
+	commentId?: string | null;
+	reportedUsername?: string | null;
+	sourceUrl?: string | null;
+}
+
+/** A page of reports. `total` counts the filtered set; `openCount` is always the
+ *  global open backlog (what the console badges the nav with). */
+export interface ReportPage extends Paginated<Report> {
+	openCount: number;
 }

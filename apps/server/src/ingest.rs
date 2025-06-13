@@ -1,11 +1,14 @@
 //! "Add all from source" bulk-ingest jobs (EXT-4 / S1).
 //!
-//! A background tokio task that walks one Suwayomi source's POPULAR listing page
-//! by page and runs every entry through the same Tier-2 add flow as
-//! `bulkAddSourceSeries` (ensure-in-library → cover pHash → dedup core). A source
-//! catalogue can be tens of thousands of entries, so this is a persisted job, not
-//! a mutation: progress/state live in `source_ingest_job` and survive restarts
-//! (a job that was `running` when the process died is marked failed at startup).
+//! A background tokio task that walks one Suwayomi source's listings page by page
+//! and runs every entry through the same Tier-2 add flow as `bulkAddSourceSeries`
+//! (ensure-in-library → cover pHash → dedup core). A source catalogue can be tens of
+//! thousands of entries, so this is a persisted job, not a mutation: progress/state
+//! live in `source_ingest_job` and survive restarts (a job that was `running` when
+//! the process died is marked failed at startup).
+//!
+//! "ALL" MEANS EVERY LISTING, AND ONE BAD PAGE IS NOT THE END. Both are hard-won —
+//! see [`LISTINGS`] and [`PAGE_FETCH_ATTEMPTS`] for the production evidence.
 //!
 //! Control plane is the DB row itself: `cancelSourceIngest` flips the row to
 //! `cancelled` and the runner observes it between items — restart-safe with no
@@ -17,6 +20,7 @@
 //! spawned detached, every per-item error is recorded and skipped, and the task
 //! never panics the process.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -24,7 +28,7 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 
 use crate::graphql::AppState;
-use crate::suwayomi::FetchType;
+use crate::suwayomi::{FetchType, SuwayomiClient, SuwayomiManga};
 
 /// Delay between browse pages — polite throttle toward the upstream source
 /// (every page is one upstream fetch through the engine).
@@ -37,9 +41,32 @@ const ITEM_CONCURRENCY: usize = 6;
 /// Flush progress to the job row every this many completed items (S3), so the
 /// admin sees live within-page progress instead of only per-page jumps.
 const PROGRESS_FLUSH_EVERY: i64 = 5;
-/// Hard ceiling on pages walked, so a source with a pathological/looping
-/// pagination can't run a job forever (20k+ items at 20/page).
+/// Hard ceiling on pages walked PER LISTING, so a source with a pathological or
+/// looping pagination can't run a job forever (20k+ items at 20/page).
 const MAX_PAGES: i64 = 1_000;
+/// The listings walked, in order. A source's catalogue is NOT reachable through
+/// POPULAR alone: measured on production, "Eris Scans" answers POPULAR page 1 with
+/// 12 entries and `hasNextPage: false`, while its LATEST listing returns 418 — so a
+/// POPULAR-only walk ingested 12 series, reported `completed`, and looked for all
+/// the world like it had finished the source. "StoneScape" behaves the same way
+/// (20 with no next page vs. a paginating LATEST). Walking both and de-duplicating
+/// by manga id is what makes "add all" mean all.
+const LISTINGS: [(FetchType, &str); 2] = [
+    (FetchType::Popular, "popular"),
+    (FetchType::Latest, "latest"),
+];
+/// Attempts per browse page before giving up on a listing. A page fetch travels
+/// through the engine to a scanlator site — a timeout, a 5xx or a Suwayomi restart
+/// mid-walk is transient, and used to abort the entire job on the first occurrence
+/// (three production jobs died exactly this way, one of them 280 items into a source
+/// with "error sending request for url (http://suwayomi:4567/api/graphql)").
+const PAGE_FETCH_ATTEMPTS: u32 = 3;
+/// First retry backoff; doubles per attempt (2s, then 4s).
+const PAGE_RETRY_BASE_MS: u64 = 2_000;
+/// Consecutive empty pages tolerated while the source still claims a next page.
+/// One blank page in the middle of a catalogue is a hiccup, not the end — but a
+/// source that keeps answering blank forever has to terminate the walk.
+const MAX_EMPTY_PAGES: i64 = 2;
 
 /// Job states. `running` is the only live state; the rest are terminal.
 pub const STATE_RUNNING: &str = "running";
@@ -272,11 +299,17 @@ pub fn spawn_runner(state: Arc<AppState>, job_id: String, source_id: String) {
     tokio::spawn(async move {
         let pool = state.pool.clone();
         match run_job(state.clone(), &job_id, &source_id).await {
-            Ok(RunOutcome::Completed) => {
-                if let Err(e) = finish_job(&pool, &job_id, STATE_COMPLETED, None).await {
+            // `warning` is set when one listing failed but another finished — the walk
+            // covered real ground, so the job is completed rather than failed, and the
+            // note rides along in `error` so the admin can see the coverage is partial
+            // and re-run.
+            Ok(RunOutcome::Completed { warning }) => {
+                if let Err(e) =
+                    finish_job(&pool, &job_id, STATE_COMPLETED, warning.as_deref()).await
+                {
                     tracing::warn!(job_id, error = %e, "ingest: failed to mark job completed");
                 }
-                tracing::info!(job_id, source_id, "ingest: job completed");
+                tracing::info!(job_id, source_id, warning, "ingest: job completed");
             }
             Ok(RunOutcome::Cancelled) => {
                 // The cancel mutation already wrote the terminal state.
@@ -294,54 +327,139 @@ pub fn spawn_runner(state: Arc<AppState>, job_id: String, source_id: String) {
 }
 
 enum RunOutcome {
-    Completed,
+    Completed { warning: Option<String> },
     Cancelled,
 }
 
-/// The page-walk loop (S3: items within a page are processed CONCURRENTLY, bounded
-/// by `ITEM_CONCURRENCY`, and the next page is PREFETCHED while the current page's
-/// items run). Per-ITEM errors are counted and skipped; a PAGE fetch error fails the
-/// job (progress preserved — the admin can restart). Cancel + progress + the
-/// one-job-per-source guarantees are unchanged (cancel is observed between pages;
-/// progress is folded once per page from the concurrent results).
+/// How one listing's page walk ended. `Cancelled` unwinds the whole job.
+enum ListingOutcome {
+    Done,
+    Cancelled,
+}
+
+/// Walk every listing in [`LISTINGS`], sharing one set of progress counters and one
+/// de-duplication set across them.
+///
+/// A single listing is NOT the source's catalogue (see [`LISTINGS`]), and a single
+/// failing page is NOT the end of the job (see [`PAGE_FETCH_ATTEMPTS`]) — those two
+/// assumptions are what made "add all from source" stop after a handful of series. A
+/// listing that fails outright after its retries is recorded and the next one is still
+/// walked; the job only fails if NO listing produced anything.
 async fn run_job(state: Arc<AppState>, job_id: &str, source_id: &str) -> Result<RunOutcome> {
-    let pool = state.pool.clone();
     let mut progress = Progress::default();
+    // Manga ids already dispatched this job. The listings overlap heavily — on a source
+    // whose POPULAR listing paginates the whole catalogue, LATEST is very nearly the same
+    // set — and while `ingest_source_series` is idempotent (it short-circuits on an
+    // already-linked manga before any upstream fetch), counting those repeats would double
+    // `items_seen` and file the whole second pass under "already existing", which reads as
+    // if half the source failed to ingest.
+    let mut seen: HashSet<i64> = HashSet::new();
+    let mut walked = 0usize;
+    let mut warning: Option<String> = None;
+    let mut last_error: Option<anyhow::Error> = None;
+    for (ty, label) in LISTINGS {
+        match walk_listing(&state, job_id, source_id, ty, &mut progress, &mut seen).await {
+            Ok(ListingOutcome::Cancelled) => return Ok(RunOutcome::Cancelled),
+            Ok(ListingOutcome::Done) => walked += 1,
+            Err(e) => {
+                tracing::warn!(job_id, source_id, listing = label, error = %e, "ingest: listing failed");
+                warning = Some(match warning {
+                    Some(prev) => format!("{prev}; {label} listing failed: {e}"),
+                    None => format!("{label} listing failed: {e}"),
+                });
+                last_error = Some(e);
+            }
+        }
+    }
+    if walked == 0 {
+        return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no listing produced any pages")));
+    }
+    Ok(RunOutcome::Completed { warning })
+}
+
+/// Fetch one browse page, retrying transient upstream failures.
+///
+/// The engine reaches a scanlator site over the network; timeouts, 5xx responses and a
+/// Suwayomi container restart mid-walk are all expected and all recoverable by simply
+/// asking again. Only an error that survives [`PAGE_FETCH_ATTEMPTS`] is reported.
+async fn browse_page(
+    client: &SuwayomiClient,
+    source_id: &str,
+    ty: FetchType,
+    page: i64,
+) -> Result<(bool, Vec<SuwayomiManga>)> {
+    let mut attempt = 1;
+    loop {
+        match client.browse_source(source_id, ty, page as i32, None).await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < PAGE_FETCH_ATTEMPTS => {
+                tracing::warn!(
+                    source_id, page, attempt, error = %e,
+                    "ingest: page fetch failed, retrying"
+                );
+                let backoff = PAGE_RETRY_BASE_MS * (1u64 << (attempt - 1));
+                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// The page-walk loop for ONE listing (S3: items within a page are processed
+/// CONCURRENTLY, bounded by `ITEM_CONCURRENCY`, and the next page is PREFETCHED while
+/// the current page's items run). Per-ITEM errors are counted and skipped; a PAGE fetch
+/// error ends this listing after its retries (progress preserved). Cancel + progress +
+/// the one-job-per-source guarantees are unchanged (cancel is observed between pages;
+/// progress is folded once per page from the concurrent results).
+async fn walk_listing(
+    state: &Arc<AppState>,
+    job_id: &str,
+    source_id: &str,
+    ty: FetchType,
+    progress: &mut Progress,
+    seen: &mut HashSet<i64>,
+) -> Result<ListingOutcome> {
+    let pool = state.pool.clone();
     let mut page: i64 = 1;
+    // Consecutive blank pages, so one hiccup mid-catalogue doesn't end the walk.
+    let mut empty_streak: i64 = 0;
     // Prefetch buffer: the browse result for the page we're about to process.
-    let mut pending = Some(
-        state
-            .suwayomi
-            .browse_source(source_id, FetchType::Popular, page as i32, None)
-            .await?,
-    );
+    let mut pending = Some(browse_page(&state.suwayomi, source_id, ty, page).await?);
     loop {
         // Cancellation check between pages (cheap single-row read).
         if job_state(&pool, job_id).await?.as_deref() != Some(STATE_RUNNING) {
-            write_progress(&pool, job_id, &progress).await?;
-            return Ok(RunOutcome::Cancelled);
+            write_progress(&pool, job_id, progress).await?;
+            return Ok(ListingOutcome::Cancelled);
         }
         let (has_next, mangas) = pending.take().expect("page buffered");
+        empty_streak = if mangas.is_empty() {
+            empty_streak + 1
+        } else {
+            0
+        };
 
         // Kick off the NEXT page browse concurrently with processing this page's
         // items, so browse latency overlaps item work.
-        let prefetch = if has_next && !mangas.is_empty() && page < MAX_PAGES {
+        let prefetch = if has_next && page < MAX_PAGES && empty_streak <= MAX_EMPTY_PAGES {
             let st = state.clone();
             let sid = source_id.to_string();
             let next = page + 1;
             Some(tokio::spawn(async move {
-                st.suwayomi
-                    .browse_source(&sid, FetchType::Popular, next as i32, None)
-                    .await
+                browse_page(&st.suwayomi, &sid, ty, next).await
             }))
         } else {
             None
         };
 
-        // Process this page's items with bounded concurrency.
+        // Process this page's items with bounded concurrency, skipping ids an earlier
+        // listing already dispatched.
         let sem = Arc::new(tokio::sync::Semaphore::new(ITEM_CONCURRENCY));
         let mut set = tokio::task::JoinSet::new();
         for m in &mangas {
+            if !seen.insert(m.id) {
+                continue;
+            }
             let st = state.clone();
             let sem = sem.clone();
             let mid = m.id;
@@ -369,11 +487,11 @@ async fn run_job(state: Arc<AppState>, job_id: &str, source_id: &str) -> Result<
             // Flush progress incrementally (every few items) so the admin sees live
             // progress within a page, not just per-page jumps.
             if progress.items_seen % PROGRESS_FLUSH_EVERY == 0 {
-                write_progress(&pool, job_id, &progress).await?;
+                write_progress(&pool, job_id, progress).await?;
             }
         }
         progress.pages_done += 1;
-        write_progress(&pool, job_id, &progress).await?;
+        write_progress(&pool, job_id, progress).await?;
         tracing::info!(
             job_id,
             source_id,
@@ -383,9 +501,9 @@ async fn run_job(state: Arc<AppState>, job_id: &str, source_id: &str) -> Result<
             "ingest: page done"
         );
 
-        // Resolve the prefetched next page (or finish).
+        // Resolve the prefetched next page (or finish this listing).
         match prefetch {
-            None => return Ok(RunOutcome::Completed),
+            None => return Ok(ListingOutcome::Done),
             Some(handle) => match handle.await {
                 Ok(Ok(next)) => pending = Some(next),
                 Ok(Err(e)) => return Err(e),
@@ -401,6 +519,7 @@ async fn run_job(state: Arc<AppState>, job_id: &str, source_id: &str) -> Result<
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     async fn pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -596,6 +715,93 @@ mod tests {
         assert_eq!(
             p.new_works + p.auto_merged + p.queued_for_review + p.already_existing,
             p.succeeded
+        );
+    }
+
+    /// A one-shot Suwayomi GraphQL origin that fails its first `fail_first` requests
+    /// (connection reset, the shape a container restart or a proxy hiccup takes) and
+    /// then answers `fetchSourceManga` normally. Returns (base_url, hit counter).
+    async fn flaky_browse_origin(fail_first: usize) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = h.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    if n < fail_first {
+                        // Hang up without a response.
+                        return;
+                    }
+                    let body = r#"{"data":{"fetchSourceManga":{"hasNextPage":false,"mangas":[{"id":7,"title":"T","thumbnailUrl":null,"author":null,"artist":null,"description":null,"genre":[],"status":"ONGOING","inLibrary":false,"inLibraryAt":null,"lastFetchedAt":null,"sourceId":"src","source":null,"chapters":null}]}}}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), hits)
+    }
+
+    /// REGRESSION: a single transient page fetch failed the ENTIRE ingest job.
+    ///
+    /// Three production jobs died this way mid-walk — one 280 items into a source with
+    /// "error sending request for url (http://suwayomi:4567/api/graphql)", i.e. Suwayomi
+    /// itself blinking. The walk abandoned the rest of the catalogue and the source was
+    /// left partly ingested behind a `failed` row.
+    #[tokio::test]
+    async fn a_transient_page_failure_is_retried_not_fatal() {
+        let (base, hits) = flaky_browse_origin(1).await;
+        let client = SuwayomiClient::new(base, None, Some("src".into()));
+        let (has_next, mangas) = browse_page(&client, "src", FetchType::Popular, 1)
+            .await
+            .expect("retry must recover the page");
+        assert!(!has_next);
+        assert_eq!(mangas.len(), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "failed once, retried once");
+    }
+
+    /// …but an upstream that stays down still surfaces, after the full retry budget.
+    #[tokio::test]
+    async fn a_persistent_page_failure_gives_up_after_the_retry_budget() {
+        let (base, hits) = flaky_browse_origin(usize::MAX).await;
+        let client = SuwayomiClient::new(base, None, Some("src".into()));
+        assert!(browse_page(&client, "src", FetchType::Popular, 1)
+            .await
+            .is_err());
+        assert_eq!(
+            hits.load(Ordering::SeqCst) as u32,
+            PAGE_FETCH_ATTEMPTS,
+            "tried exactly the budget, no more"
+        );
+    }
+
+    /// REGRESSION: "add all from source" walked the POPULAR listing only.
+    ///
+    /// Measured against the live engine: "Eris Scans" answers POPULAR page 1 with 12
+    /// entries and `hasNextPage: false` while its LATEST listing returns 418, and
+    /// "StoneScape" answers 20-with-no-next vs. a paginating LATEST. A POPULAR-only walk
+    /// therefore ingested a dozen series, wrote `completed`, and looked finished — which
+    /// is exactly the "stops after scanning a small amount" report. LATEST must be walked
+    /// too, and it is the ONLY thing standing between those sources and their catalogues.
+    #[test]
+    fn every_listing_is_walked_not_just_popular() {
+        let labels: Vec<&str> = LISTINGS.iter().map(|(_, l)| *l).collect();
+        assert_eq!(labels, vec!["popular", "latest"]);
+        assert!(
+            LISTINGS.iter().any(|(t, _)| matches!(t, FetchType::Latest)),
+            "LATEST reaches catalogues POPULAR cannot"
         );
     }
 }

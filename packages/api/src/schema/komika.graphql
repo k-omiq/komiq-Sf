@@ -39,12 +39,13 @@ type Query {
 	# mappings + extension coordinates a native client needs to fetch it directly.
 	workSources(workId: ID!): [WorkSource!]! # [komika] source mappings for one canonical work
 	workSourcesBatch(workIds: [ID!]!): [WorkSourceGroup!]! # [komika] source mappings grouped per work
+	workSourceRows(workId: ID!): [WorkSourceRow!]! # [komika] the same mappings in ADMIN/detachable shape — each row's own `source_series` primary key, the title THAT source gives the series, and its chapter count. Feeds the split picker; `splitSourceSeries` takes the ids. Ungated by NSFW (hiding a mapping would make it silently un-detachable) — `requires isAdmin` is the access control
 	# library
 	library: [Series!]! # [suwayomi] mangas(condition:{inLibrary:true})
 	libraryProgress: [SeriesProgress!]! # [komika] per-series read/total for every in-library series, batched — shelves the Library/Profile screens without an N+1 chapters() fan-out
 	# social
-	reviews(seriesId: ID!, page: Int = 1): ReviewPage! # [komika]
-	myReview(seriesId: ID!): Review # [komika] the signed-in viewer's own review for a series, regardless of pagination (null if none / signed out)
+	reviews(seriesId: ID!, page: Int = 1): ReviewPage! # [komika] the WORK's reviews, whichever of its ids you ask with (a `w_…` work id or any of its sources' numeric ids). ONE ROW PER AUTHOR — a reader holding a row under each id shape appears once, with their newest
+	myReview(seriesId: ID!): Review # [komika] the signed-in viewer's own review for a series, regardless of pagination (null if none / signed out). Resolved through the WORK, so it is found whichever of the work's ids the caller asks with — asking with the literal id showed a viewer who HAD rated an empty star row
 	comments(targetType: String!, targetId: ID!, page: Int = 1): CommentPage! # [komika] chapter thread or series discussion
 	# auth
 	session: Session # [komika] current session or null
@@ -57,6 +58,7 @@ type Query {
 	mergeQueue(page: Int = 1, limit: Int = 50): MergeQueuePage! # [komika] dedup review queue — pending mid-confidence matches, highest score first, PAGINATED (`limit` clamped to 1..=200). Was an unbounded `[MergeCandidate!]!`: the backlog is ~10.4k rows now that refused consolidation pairs land here, so clients must page (requires isAdmin)
 	workReviewDetail(workId: ID!): WorkReviewDetail! # [komika] expand one side of a dedup candidate — metadata, cover, alt titles and source mappings for a single work; reads the canonical work directly so it also resolves the Suwayomi-only / NSFW works `canonicalSeries` refuses (requires isAdmin)
 	coverIssues(page: Int = 1): CoverIssuePage! # [komika] admin "Bugs" panel — works whose cover the crawl could not process, most recent first; each carries the failure reason + a best-effort current cover URL (requires isAdmin)
+	reports(status: ReportStatus, kind: ReportKind, page: Int = 1): ReportPage! # [komika] reader-report queue (Support → Report an issue), newest first; null status/kind mean "every value". `total` counts the FILTERED set, `openCount` is always the global open backlog (requires isAdmin)
 	extensions(installedOnly: Boolean = false, lang: String, nsfw: Boolean, refresh: Boolean = false): [ExtensionInfo!]! # [komika] Keiyoushi/Mihon extensions known to the engine; first use seeds the Keiyoushi store; refresh re-fetches the store indexes. NSFW extensions are ALWAYS listed: this is an admin management view, so the admin's reader-side show_nsfw is deliberately ignored — filter explicitly with the `nsfw` argument (requires isAdmin)
 	sources: [SourceInfo!]! # [komika] installed Suwayomi sources — the sourceBrowse picker. Every installed source is listed incl. NSFW ones, regardless of the admin's reader-side show_nsfw; each carries `isNsfw` for the UI to badge (requires isAdmin)
 	sourceBrowse(sourceId: ID!, type: SourceBrowseType!, page: Int = 1, query: String): SourceBrowsePage! # [komika] browse/search one source's catalogue for bulk ingest (requires isAdmin)
@@ -71,8 +73,9 @@ type Mutation {
 	setLibraryStatus(seriesId: ID!, status: String): Series! # [komika] file a series under an explicit shelf (reading|completed|onhold|plan); null clears to auto-derive; adds to library if absent
 	setFavorite(seriesId: ID!, favorite: Boolean!): Series! # [komika] toggle the viewer's favourite flag; adds to library if absent
 	setProgress(chapterId: ID!, lastPageRead: Int!, read: Boolean!): Boolean! # [suwayomi] updateChapter
-	recordView(seriesId: ID!): Boolean! # [komika] record one view (chapter open) — no auth, counts everyone; the popularity signal behind Trending
-	postReview(input: PostReviewInput!): Review! # [komika]
+	recordView(seriesId: ID!): Boolean! # [komika] record one view (chapter open) — no auth REQUIRED, counts anonymous + ordinary signed-in readers; an admin viewer's own reads are silently skipped so admin browsing can't move Trending; the popularity signal behind Trending
+	postReview(input: PostReviewInput!): Review! # [komika] upsert the viewer's review, one per (work, user). `seriesId` may be any of the work's ids; the row is FILED under the canonical work id so the rating counts on every surface that work appears on. `score` is 1..10 — to withdraw a rating use `deleteReview`, not score 0
+	deleteReview(seriesId: ID!): Boolean! # [komika] withdraw the viewer's OWN rating (requires auth; scoped to the caller, so it can never touch anyone else's). `seriesId` may be any of the work's ids and the removal covers the work's WHOLE key set — `reviews.series_id` is polymorphic and historical rows keep the shape they were filed under, so deleting only the canonical id would leave a numeric-keyed row still counting. Returns false when there was nothing to remove. DESTRUCTIVE for a review that carries text: `score` is NOT NULL, so a scoreless review cannot exist and withdrawing means deleting the row
 	postComment(input: PostCommentInput!): Comment! # [komika] chapter thread or series discussion
 	voteComment(commentId: ID!, value: Int!): CommentVote! # [komika] like (1) / dislike (-1) / clear (0) a comment
 	markNotificationsRead(ids: [ID!]): Int! # [komika] mark given (or all, if omitted) notifications read; returns count changed
@@ -89,6 +92,7 @@ type Mutation {
 	addSourceSeries(suwayomiMangaId: ID!): MatchResult! # [komika] Tier-2 add flow — run the dedup matcher, wire into the canonical model (requires isAdmin)
 	resolveMergeCandidate(id: ID!, accept: Boolean!): Boolean! # [komika] resolve a dedup review — accept merges, reject keeps distinct (requires isAdmin)
 	mergeWorks(sourceWorkId: ID!, targetWorkId: ID!): MergeWorksResult! # [komika] D1: fold one existing canonical work into another (dedup cleanup) — source's mappings + user data re-point to target, source deleted; pick target as the enriched/MangaDex-anchored one (requires isAdmin)
+	splitSourceSeries(workId: ID!, sourceSeriesIds: [ID!]!): SplitSourcesResult! # [komika] detach source mappings onto a NEW work — the fix for two different series merged together on a shared title. The counterpart to `mergeWorks`, NOT its inverse (that one deletes the losing work row and keeps no record of it). Lossless where it counts: `chapter` is keyed by `source_series_id`, so the mappings carry their whole chapter runs and nothing is deleted; reviews/library/progress/view-counts stay on the original, which has no per-source attribution to route them by. Refuses to detach the LAST source — a work with none vanishes from Browse and search (requires isAdmin)
 	addExtensionRepo(indexUrl: String!): Int! # [komika] register an extension repo (store) + refresh; returns the extension count (requires isAdmin)
 	installExtension(pkgName: String!): ExtensionInfo! # [komika] install a store extension; NSFW-gated by show_nsfw (requires isAdmin)
 	uninstallExtension(pkgName: String!): ExtensionInfo! # [komika] uninstall an extension (requires isAdmin)
@@ -114,6 +118,8 @@ type Mutation {
 	markSourceNsfw(sourceId: String!, isNsfw: Boolean!): Int! # [komika] admin — flag/unflag a whole Suwayomi source as adult and re-derive the NSFW flag of every work ingested from it; returns works changed (requires isAdmin)
 	rederiveSuwayomiNsfw: Int! # [komika] admin — recompute the DERIVED is_nsfw for every Suwayomi-ingested work under the current rule (adult genre OR adult source, unless MangaDex rated it safe/suggestive). Conservative: only flips 0 -> 1, never un-flags, and leaves isNsfwOverride alone. Returns works flipped (requires isAdmin)
 	retryCover(workId: ID!): Boolean! # [komika] admin "Bugs" panel — clear a work's cover-issue skip marker and re-attempt the cover fetch/encode (requires isAdmin)
+	submitReport(input: ReportInput!): Report! # [komika] file a reader report (Support → Report an issue). NO AUTH REQUIRED by design — most catalogue-accuracy reports come from signed-out readers — so it is rate-limited per IP, length-caps every field, enforces the per-kind required fields, requires `subjectId` to name a series we know, and snapshots the reported comment's author/body (the comment may later be hard-deleted)
+	resolveReport(reportId: ID!, status: ReportStatus!, note: String): Report! # [komika] triage a reader report — resolve/reject, or reopen (which clears the resolution stamp); `note` is merged, not cleared, when null (requires isAdmin)
 }
 
 enum ComicType {
@@ -187,12 +193,13 @@ type Series {
 	libraryStatus: String # [komika] per-viewer explicit shelf (reading|completed|onhold|plan); null = auto-derive from progress
 	isFavorite: Boolean! # [komika] per-viewer favourite flag
 	isNsfw: Boolean! # [komika] canonical NSFW flag; false until catalogued (drives showNsfw filtering)
-	rating: RatingSummary! # [komika]
+	rating: RatingSummary! # [komika] the WORK's aggregate, not this id's. `reviews.series_id` holds whichever id the reader was addressing when they rated (a `w_…` work id from the canonical page, the numeric id of a source otherwise), so every rating reader resolves the id onto its work before aggregating — asking with the literal id is what made a work print a rating on one surface and "0 users rated" on another
 	scan: ScanPolicy! # [komika] adaptive-scan config (admin-overridable)
 	createdAt: String!
 	updatedAt: String! # [komika] last metadata touch — NOT chapter recency; moves on every poll. Use latestChapterAt for "recently updated".
 	latestChapterAt: String! # [komika] real newest-chapter time (ISO); empty when no dated chapter cached. The field feeds/cards should sort and label by.
 	detectedAt: String # [komika] when WE detected that newest chapter (discovery time) — the third clock, distinct from updatedAt (poll touch) and latestChapterAt (upstream publish). Decides Updates-feed MEMBERSHIP but does NOT order it. Always carries a UTC offset, so Date.parse can't read it as local time. Selected opportunistically: see OPTIONAL_SERIES_FIELDS in operations.ts, the client drops it against a server that predates it.
+	latestChapter: String # [komika] the newest chapter's LABEL — "151", "10.5", "Oneshot" (migration 0095). NOT chapterCount: that is how MANY chapters we know of, this is what the newest one is CALLED, and a series with 12 mirrored chapters whose newest is Ch. 151 is ordinary. Rendering the count under a "Ch." label is F4, the bug the chapter-number contract exists to prevent — so null means PRINT THE COUNT ALONE, never fall back to chapterCount. Populated on the browse/catalogue path only (browse_catalogue.latest_chapter); null on the Suwayomi-live and canonical-detail paths, which hold no label. Selected opportunistically: see OPTIONAL_SERIES_FIELDS in operations.ts.
 	views: SeriesViews! # [komika] per-series view (chapter-read) counts — the popularity signal; resolver field, selected only by the series-detail queries
 	workId: ID # [komika] the canonical work this series belongs to (null when uncatalogued). Lets the reader get from a numeric Suwayomi id to the work whose SIBLING source mappings the source picker must offer. Resolver field — one query per series, so like `views` it is selected only by the single-series detail query, never by the shared SeriesFields fragment (per-card N+1)
 	# [komika] S2/F2 enrichment (resolver fields — opt-in; empty for non-canonical/un-enriched works). `id` must be a canonical work id (w_…).
@@ -226,6 +233,10 @@ type Cover {
 	isPrimary: Boolean! # the main cover mirrored on Series.coverUrl
 }
 
+# [komika] Per-WORK review aggregate. ONE VOTE PER USER: a reader can hold more than one
+# `reviews` row for a work (historical rows keep the id shape they were filed under, and
+# those are deliberately not rewritten), and only their newest score counts — so `count` is
+# the number of PEOPLE who rated, never the number of rows.
 type RatingSummary {
 	average: Float!
 	count: Int!
@@ -256,10 +267,29 @@ type ScanPolicy {
 type Chapter {
 	id: ID!
 	seriesId: ID!
+	# The chapter's number, or 0 when it has none. PREFER `label`: a oneshot arrives here
+	# as a hard-coded 0 with no way to tell it from a real Chapter 0, which is why the
+	# reader printed "Chapter 0" for 21,422 works (F2).
 	number: Float!
+	# What to print: "45", "10.5", "Oneshot". The one labelling rule, server-side.
+	label: String!
+	# Set when the chapter is hosted off-site (MangaPlus, Comikey, NamiComi, BiliBili —
+	# ~35,000 chapters, 4% of the mirror) and has no pages for us to serve. The reader must
+	# send the user here instead of asking for pages it will never get.
+	# `externalUrl != null` is the ONLY valid test — `pageCount == 0` is NOT: this server
+	# returns pageCount 0 for ordinary chapters too (verified live 2026-07-30).
+	externalUrl: String
 	title: String
 	pageCount: Int!
-	uploadedAt: String
+	uploadedAt: String # when the SOURCE says the chapter became readable
+	# When WE first recorded it as available (`release_event.announce_at`, migration 0099),
+	# joined on (work_id, chapter_key) so it follows the chapter across a translator switch.
+	# NULL means WE DO NOT KNOW and MUST render as "—" — never as `uploadedAt`. Falling back
+	# would assert we found the chapter the instant it was published, which is the precise
+	# claim this field exists to stop the UI making. Expect null for essentially every
+	# chapter predating 0099: there is no record of when those were first seen, and none was
+	# invented.
+	foundAt: String
 	scanlator: String
 	read: Boolean! # [suwayomi] isRead
 	lastPageRead: Int!
@@ -268,13 +298,15 @@ type Chapter {
 }
 
 # Per-series read progress for the whole library, returned by `libraryProgress`
-# in one batched query. read/total are counted from the cached chapter state
-# (the same source `chapters(seriesId)` reads), so they match. Series with no
-# cached chapters are omitted; the client treats those as unread (read = 0).
+# in one batched query. `read` and `total` count the same population (distinct
+# chapters across the series' sources), so `read <= total` always holds.
 type SeriesProgress {
-	id: ID! # [suwayomi] series id (matches Series.id)
-	read: Int!
-	total: Int!
+	id: ID! # [komika] library series id — a canonical `w_` work id or a numeric Suwayomi id (matches Series.id)
+	read: Int! # distinct chapters read, deduped across sources and across both progress stores
+	total: Int! # distinct chapters that exist; 0 only when none are cached — the client reads it as `total || series.chapterCount`
+	lastReadAt: String # RFC 3339, or null. MAX(updated_at) over the viewer's progress rows, so it
+	# moves on ANY progress, not just finishing a chapter. Orders the Profile's
+	# Continue-reading shelf and the Library's "Recently read" sort.
 }
 
 # Upstream image URL; never used directly as <img src> — the client's
@@ -310,7 +342,7 @@ type UserRef {
 
 type Review {
 	id: ID!
-	seriesId: ID!
+	seriesId: ID! # the id the review is FILED under — the canonical work id for anything posted since ratings were made per-work, but older rows keep the numeric source id they were written with. NOT necessarily the id you queried by; treat it as opaque
 	author: UserRef!
 	score: Int! # 1..10
 	body: String!
@@ -568,8 +600,14 @@ type UpdateFeedRow {
 	latestChapter: String # chapter NUMBER of the newest mirrored chapter; null on scanner-only rows
 	latestChapterTitle: String
 	chapterCount: Int # total chapters known; null on mirror-only rows
-	releasedAt: String! # real upstream release time — the sort key AND the clock the card labels with
-	detectedAt: String # when OUR scanner noticed; tooltip only, never a sort key
+	releasedAt: String! # real upstream release time — what the SOURCE says. No longer the sort key; still what the card's detail line reports
+	# When the chapter first became something we could show anyone (`feed_series_updates.announced_at`, migration 0099).
+	# THE sort key of this feed, so it is also the clock the card's primary label prints — order and label must agree.
+	# Differs from releasedAt only where a source held a chapter back (early access, paywall, regional delay); equal to it
+	# everywhere else and on every pre-0099 row. Clients spell `announcedAt ?? releasedAt`, which is also what makes this
+	# safe against a server that predates the field.
+	announcedAt: String
+	detectedAt: String # when OUR scanner noticed; per-SERIES, Suwayomi-only, never stamped on a baseline scan. Tooltip only, never a sort key. NOT a substitute for announcedAt
 	rating: Float # aggregate user rating 0-10; null when unrated
 	isNsfw: Boolean!
 }
@@ -793,9 +831,90 @@ type CoverIssuePage {
 	total: Int
 }
 
+# [komika] What a reader is reporting. These are the catalogue failures only a reader can
+# see — `mergeQueue`/`coverIssues` already cover what the pipeline knows it got wrong.
+enum ReportKind {
+	WRONG_MERGE # two different series folded into one entry
+	NEEDS_MERGE # the same series listed twice
+	MISSING_WORK # a series absent from the catalogue (no id to point at, so `subjectTitle` carries it)
+	COMMENT_ABUSE # a person in the comments, not a record
+	OTHER
+}
+
+# [komika] Triage state. REJECTED ("looked at it, not a bug") is deliberately distinct
+# from RESOLVED ("fixed it") — it is the more common outcome and stops re-triage.
+enum ReportStatus {
+	OPEN
+	RESOLVED
+	REJECTED
+}
+
+# [komika] One reader-filed report, as the admin queue sees it.
+type Report {
+	id: ID!
+	kind: ReportKind!
+	status: ReportStatus!
+	reporter: String # username, or null when filed anonymously (allowed by design)
+	subjectId: String # the series id the reader was looking at, verbatim (numeric Suwayomi id or `w_` canonical id)
+	subjectIdSecondary: String # the OTHER id, on a merge/unmerge report
+	subjectTitle: String # free-text title, for a series with no id yet (MISSING_WORK)
+	commentId: String
+	reportedUsername: String # snapshotted at submit time, so the report outlives the comment
+	commentExcerpt: String # ditto — the comment is hard-deleted when moderated
+	sourceUrl: String
+	detail: String!
+	adminNote: String
+	createdAt: String!
+	resolvedAt: String
+}
+
+# [komika] The report form's payload. Which optional fields are REQUIRED depends on
+# `kind` (merge kinds need subjectId; MISSING_WORK needs subjectTitle; COMMENT_ABUSE needs
+# commentId or reportedUsername) — the server enforces it and returns a reader-facing message.
+input ReportInput {
+	kind: ReportKind!
+	detail: String!
+	subjectId: String
+	subjectIdSecondary: String
+	subjectTitle: String
+	commentId: String
+	reportedUsername: String
+	sourceUrl: String
+}
+
+type ReportPage {
+	items: [Report!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int # the FILTERED count (what the pager needs)
+	openCount: Int! # the GLOBAL open backlog (what the nav badge needs)
+}
+
 type MergeWorksResult {
 	targetWorkId: ID! # the surviving (target) work
 	movedSourceSeries: Int! # how many source_series mappings re-pointed onto the target
+}
+
+# [komika] One detachable source mapping on a work — what the admin SPLIT picker lists.
+# Distinct from `WorkSource`, which says how a NATIVE client fetches a source; this is the
+# admin view of the same `source_series` row, and it is the only one carrying the row's key.
+type WorkSourceRow {
+	id: ID! # `source_series.id` — what `splitSourceSeries` takes. NOT (sourceType, sourceKey): that pair is unique only together with sourceId (UNIQUE (source_type, source_id, source_key)), so it is ambiguous when one work carries the same manga id under two Suwayomi sources
+	sourceType: String! # "mangadex" | "suwayomi"
+	sourceName: String! # display name; falls back to the extension package name, then the raw source id, so the picker always has a label
+	lang: String
+	iconUrl: String # store-hosted extension icon (served from our origin), else the engine's; null → the UI renders an initial
+	title: String! # how THIS source titles the series — the disagreement that identifies a mis-merge, and the name the detached work takes. A MangaDex mapping has no per-source title on disk, so it reports the work's
+	chapterCount: Int! # chapters held from this source; they all move with it
+	sourceUrl: String
+}
+
+# [komika] Result of `splitSourceSeries`. NOT an undo of MergeWorksResult — see the mutation.
+type SplitSourcesResult {
+	newWorkId: ID! # the freshly minted canonical work
+	newReaderId: ID! # where to NAVIGATE for it: the numeric Suwayomi id unless the detached set includes a MangaDex source. `canonicalSeries` rejects a work with no MangaDex anchor, so a Suwayomi-only split must never be linked as /series/w_…
+	title: String! # the new work's primary title, from the detached source's own title
+	movedSources: Int! # how many source_series rows moved
 }
 
 # [komika] S2 cross-source chapter aggregation. `Series.chapterCount` on a canonical
@@ -804,6 +923,8 @@ type MergeWorksResult {
 type AggregatedChapter {
 	number: Float!
 	title: String
+	firstReleasedAt: String # F12: when this chapter was FIRST released across ALL its sources (ISO-8601), or null when no source dated it. The EARLIEST source time, matching `release_event.first_seen_at`'s first-source-wins rule, so a chapter's date does not change as the reader switches translator. Deliberately NOT named `releasedAt` — the client strips unknown fields by NAME across every document, and `UpdateFeedRow.releasedAt` already exists
+	readAnywhere: Boolean! # has the VIEWER read this chapter from ANY of the work's sources? DERIVED (no stored column): progress is keyed per source chapter row, so the same chapter has a different id in every source and a translator switch used to blank every marker; this is set when the viewer has a read row on any source chapter sharing this row's spine key (`chapter.chapter_key`). Named `readAnywhere`, not `read` — the client strips unknown fields by NAME across every document and `Chapter.read` is selected everywhere. False for anonymous viewers, and for oneshots/extras whose key (`x:<id>`) is source-local by construction
 	sources: [ChapterSource!]! # every source (translator) that provides this chapter number
 }
 

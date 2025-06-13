@@ -5,9 +5,6 @@
 **/node_modules
 apps/server/target
 
-# Local agent tooling state (worktrees can hold stale copies of anything).
-.claude/
-
 # Lockfiles / generated
 pnpm-lock.yaml
 

@@ -1,102 +1,105 @@
-<div align="center">
+# komiq
 
-<img src="apps/reader/static/icon-192.png" width="96" height="96" alt="Komika logo" />
+Komiq is an AGPL-licensed manga and comics reader built from one codebase for the
+web, desktop, iOS, and Android. It uses Suwayomi as its content engine and adds a
+social layer. [`komiq.cc`](https://komiq.cc) is a free, work-in-progress demo of
+the apps; it is not an official publisher or content service.
 
-# Komika
+See [`SPEC.md`](./SPEC.md) for the full architecture.
 
-**Self-hostable manga & comics reader, built on [Suwayomi](https://github.com/Suwayomi/Suwayomi-Server).**
+## How content works
 
-_One catalogue, every source — with a social layer on top. Web, desktop, and mobile from a single codebase._
+- Eligible community members can add third-party sources. A source added through
+  that process becomes available globally without the Komiq operator selecting it
+  individually.
+- Covers and pages are retrieved on demand when someone uses the reader. The web
+  path may proxy image responses through Cloudflare and temporarily store them in
+  Cloudflare's edge cache. Native builds may fetch directly from a source or through
+  the app's local Suwayomi engine.
+- Komiq is not intended to operate a permanent central archive of manga or comic
+  image files. Copies can still exist temporarily—or, when a user enables downloads,
+  for longer—in Cloudflare edge caches, Suwayomi/app caches, browser caches, or local
+  device storage. The operated service also stores accounts, authentication sessions,
+  reviews, comments, source and catalog state, and security or operational records.
 
-[![CI](https://github.com/k-omiq/komika/actions/workflows/ci.yml/badge.svg)](https://github.com/k-omiq/komika/actions/workflows/ci.yml)
-[![Native sidecar](https://github.com/k-omiq/komika/actions/workflows/native-sidecar.yml/badge.svg)](https://github.com/k-omiq/komika/actions/workflows/native-sidecar.yml)
-[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-coral.svg)](LICENSE)
+The exact flow depends on the build and deployment configuration. Self-hosters
+control their own sources and infrastructure and are responsible for operating them
+lawfully.
 
-![Rust](https://img.shields.io/badge/Rust-axum%20%2B%20SQLite-orange?logo=rust)
-![SvelteKit](https://img.shields.io/badge/SvelteKit-SPA%20%2B%20edge%20SSR-ff3e00?logo=svelte)
-![Tauri](https://img.shields.io/badge/Tauri-desktop%20%26%20mobile-24C8DB?logo=tauri)
-![Cloudflare](https://img.shields.io/badge/Cloudflare-Workers%20%2B%20edge%20cache-F38020?logo=cloudflare)
+## Third-party content
 
-</div>
+Copyrights and trademarks in third-party works belong to their respective owners.
+Komiq does not claim ownership of that material and is not affiliated with or
+endorsed by any publisher, author, artist, translator, scanlator, source operator,
+Suwayomi, Mihon, or extension author unless expressly stated.
 
----
+Komiq's software license does not grant anyone a license to third-party content.
+Users must add and access only sources and material they are authorized to use and
+must follow applicable law and source terms. See the [Copyright Policy](./COPYRIGHT.md)
+for reporting and enforcement information.
 
-## What it is
+Voluntary donations support development and maintenance of the open-source software.
+They do not purchase content, access, source privileges, or any license to third-party
+works.
 
-Komika is "Mihon as a service": a hosted (or self-hosted) reader where the
-**server** does the heavy lifting — source scanning, a canonical deduplicated
-catalogue, cover caching, update polling — and every client stays thin.
+## Policies
 
-- 📚 **Canonical catalogue** — one entry per series, whatever the source. A
-  MangaDex-anchored spine plus a multi-step matcher folds mirrors together.
-- 🔌 **Suwayomi under the hood** — the battle-tested extension ecosystem powers
-  source fetching; desktop builds embed it as a supervised sidecar.
-- 🫂 **Social layer** — accounts, per-user library, reading progress, reviews,
-  comments, and view-based trending.
-- ⚡ **Built to be cheap to run** — in-process feed caches, one-round-trip
-  series pages, batched writes, `ETag`/`Cache-Control` on public reads so a CDN
-  absorbs anonymous traffic. A 4-core box goes a very long way.
-- 🖥️ **Every platform** — SvelteKit web app (edge-SSR on public pages), Tauri
-  desktop shell, and the same UI headed for iOS/Android.
-- 💝 **Donation-only** — no paywalls, no gating, no ads.
+- [Copyright Policy](./COPYRIGHT.md)
+- [Privacy Policy](./PRIVACY.md)
 
-See [`SPEC.md`](./SPEC.md) for the full architecture and
-[`PERFORMANCE_ROADMAP.md`](./PERFORMANCE_ROADMAP.md) for the measured numbers.
+These policies describe services operated by the Komiq project, including the WIP
+demo. A person who redistributes or self-hosts the software must provide policies and
+processes appropriate to their own deployment.
 
-## Self-hosting
+## Prerequisites
 
-The whole stack is three containers: the Rust API server, the reader SPA
-(nginx), and Suwayomi — orchestrated by
-[`deploy/docker-compose.yml`](./deploy/docker-compose.yml).
+- Node ≥ 20, **pnpm** (`corepack enable`)
+- Rust (stable) — for the desktop/mobile shell
+- Xcode (iOS), Android SDK/NDK (Android)
 
-```sh
-git clone https://github.com/k-omiq/komika.git
-cd komika/deploy
-docker compose up -d
-```
-
-Read [`deploy/GO-LIVE.md`](./deploy/GO-LIVE.md) for the full runbook (volumes,
-backups via Litestream, Cloudflare tunnel, image Worker) and
-[`PRODUCTION.md`](./PRODUCTION.md) for operational notes.
-
-## Developing
-
-Prerequisites: Node ≥ 20 with **pnpm** (`corepack enable`), stable Rust; Xcode /
-Android SDK only for the mobile shells.
+## Setup
 
 ```sh
 pnpm install
-
-pnpm dev:reader          # reader app (web) at http://localhost:5173
-pnpm dev:admin           # admin console at http://localhost:5273
-pnpm --filter @komika/reader desktop:dev    # desktop app (Rust + webview)
-
-cd apps/server && cargo run                 # API server at :8080
 ```
 
-Build everything:
+## Develop
+
+```sh
+pnpm dev:reader          # reader app (web) at http://localhost:5173
+pnpm dev:admin           # admin console at http://localhost:5273
+
+# desktop app (Rust + webview)
+pnpm --filter @komika/reader desktop:dev
+```
+
+## Build
 
 ```sh
 pnpm build               # all packages + apps (static SPAs)
-pnpm --filter @komika/reader desktop:build  # desktop binaries
+pnpm --filter @komika/reader desktop:build   # desktop binaries
 ```
 
 ## Workspace
 
 | Package          | What                                             |
 | ---------------- | ------------------------------------------------ |
-| `apps/server`    | Rust API — axum + async-graphql + SQLite (WAL)   |
 | `@komika/reader` | user app (SvelteKit SPA + `src-tauri` Rust core) |
 | `@komika/admin`  | admin "manga DB" console (web-only SPA)          |
 | `@komika/types`  | shared domain types                              |
 | `@komika/api`    | data layer — `Backend` + `ImageProvider`         |
 | `@komika/ui`     | design tokens + shared components                |
 
+## Status
+
+Work in progress. The hosted web build is a demo of the desktop and mobile apps;
+features, data flows, and deployment details may change before a production release.
+See [`SPEC.md`](./SPEC.md) for current implementation notes and known limitations.
+
 ## License
 
 **AGPL-3.0-only.** See [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE).
 
-Komika embeds [Suwayomi-Server](https://github.com/Suwayomi/Suwayomi-Server)
-(AGPL-3.0) as its content engine, so the whole project is released as AGPL open
-source with public Corresponding Source. Distribution is web / sideload /
-F-Droid / desktop download.
+Komiq embeds [Suwayomi-Server](https://github.com/Suwayomi/Suwayomi-Server)
+(AGPL-3.0) as its on-device content engine, so the whole project is released as
+AGPL open source with public Corresponding Source.

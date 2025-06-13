@@ -226,6 +226,29 @@ pub async fn resolve_ex(
     let Some((scored, work_id)) = best else {
         return Ok(Decision::New);
     };
+
+    // An admin already ruled on this exact pair by SPLITTING it apart (migration 0098):
+    // leave it alone entirely — not merged, and not queued either, because the review
+    // queue asks a question this pair has an answer to.
+    //
+    // This is not belt-and-braces, it is the load-bearing guard for the reconcile sweep.
+    // A split-off work is Suwayomi-only by construction whenever the MangaDex anchor
+    // stayed behind, which is precisely `RECONCILE_PENDING_WHERE`, so the background
+    // post-ingest dedup re-matches it against the spine — where it hits the ORIGINAL on
+    // an exact normalized title (the shared title is what caused the bad merge, and the
+    // original keeps that alias). `exact_auto_merge` below needs NO corroboration, so
+    // without this the sweep silently folds the split back and `merge_works` DELETES the
+    // work an admin just created.
+    //
+    // Returning `New` rather than falling through to the next-best candidate is
+    // deliberate: the runner-up scored lower than a pair we know to be wrong, so
+    // promoting it would be guessing. A genuine duplicate elsewhere is still caught by
+    // `consolidate_exact_duplicates_from` and by the next pass.
+    if let Some(self_id) = exclude_work_id {
+        if catalog::is_split_pair(pool, self_id, &work_id).await? {
+            return Ok(Decision::New);
+        }
+    }
     let score = scored.score;
 
     // 5. Decide. Operator policy (explicit): an UNAMBIGUOUS exact normalized-title
@@ -799,5 +822,81 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve(&pool, &cand).await.unwrap(), Decision::New);
+    }
+
+    #[tokio::test]
+    async fn a_split_pair_is_never_re_matched_to_each_other() {
+        // The reconcile sweep's exact shape: a Suwayomi-only work re-matched against the
+        // spine, hitting a work it shares a normalized title with. That rung auto-merges
+        // with NO corroboration, and `merge_works` deletes the loser — so a work an admin
+        // just split off would be destroyed by the next background pass.
+        let pool = pool().await;
+        let title = "Distinctive Longtitle";
+        let mk = |t: &'static str| {
+            let pool = pool.clone();
+            async move {
+                catalog::create_work(
+                    &pool,
+                    &WorkInput {
+                        primary_title: Some(t.into()),
+                        aliases: vec![Alias {
+                            raw: t.into(),
+                            lang: None,
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let original = mk(title).await;
+        let split_off = mk(title).await;
+        let cand = Candidate {
+            title: title.into(),
+            ..Default::default()
+        };
+
+        // Control: with no split on record this is exactly the destructive auto-merge.
+        match resolve_ex(&pool, &cand, Some(&split_off)).await.unwrap() {
+            Decision::AutoMerge { work_id, .. } => assert_eq!(work_id, original),
+            other => panic!("expected the bare exact-title auto-merge, got {other:?}"),
+        }
+
+        // What `catalog::split_source_series` leaves behind (migration 0098): the pair,
+        // sorted, because the sweep chooses its own survivor.
+        let (a, b) = if original < split_off {
+            (&original, &split_off)
+        } else {
+            (&split_off, &original)
+        };
+        sqlx::query(
+            "INSERT INTO work_split (work_a, work_b, split_at, split_by) \
+             VALUES (?, ?, '2026-08-01T00:00:00Z', 'u_admin')",
+        )
+        .bind(a)
+        .bind(b)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Recorded: left alone entirely — NOT queued for review either, since the queue
+        // asks a question an admin has already answered.
+        assert_eq!(
+            resolve_ex(&pool, &cand, Some(&split_off)).await.unwrap(),
+            Decision::New
+        );
+        // Symmetric: the sweep may reach either half first.
+        assert_eq!(
+            resolve_ex(&pool, &cand, Some(&original)).await.unwrap(),
+            Decision::New
+        );
+        // A third work with the same title is unaffected — the guard is per-PAIR, not a
+        // blanket "this title is untouchable".
+        let third = mk(title).await;
+        assert!(matches!(
+            resolve_ex(&pool, &cand, Some(&third)).await.unwrap(),
+            Decision::AutoMerge { .. } | Decision::Review { .. }
+        ));
     }
 }

@@ -60,7 +60,9 @@ impl Drop for PkgGuard {
 }
 
 /// Polite throttle between browse pages — each page is one upstream fetch.
-const PAGE_DELAY_MS: u64 = 750;
+/// Shared with Phase E5 discovery (`discovery::discovery_pass`), which spaces its
+/// per-source LATEST fetches by the same amount.
+pub(crate) const PAGE_DELAY_MS: u64 = 750;
 /// Polite throttle between reconcile `set_in_library` heal calls, so a first-run mass
 /// drift can't fire thousands of sequential upstream writes back-to-back.
 const HEAL_DELAY_MS: u64 = 50;
@@ -68,6 +70,24 @@ const HEAL_DELAY_MS: u64 = 50;
 /// LATEST is newest/recently-updated first, so a run of all-known pages means we've
 /// caught up; the `max_pages` cap still bounds the walk when this never trips.
 const STOP_AFTER_KNOWN_PAGES: u32 = 2;
+
+/// How many distinct LATEST entries a walk must observe before it is allowed to stop
+/// early (Phase E2).
+///
+/// The walk's job used to be purely DISCOVERY, so stopping at the first couple of
+/// all-known pages was right — everything past that is, by definition, already ours. E2
+/// gives the same listing a second job: an already-known series appearing near the top of
+/// LATEST is a PUSH SIGNAL that its source just published for it, and paused series are
+/// known by definition, so the discovery stop rule would short-circuit the very pages that
+/// carry the signal.
+///
+/// Thirty is calibrated against measured churn: distinct in-library series receiving a
+/// chapter per day is 4 (flamecomics) to 9 (qiscans), so an entry survives in a top-30
+/// window for **3.3–7.5 days** — a daily walk catches it with days to spare. The window is
+/// counted in ENTRIES, not pages, because `browse_source` has no page-size parameter
+/// (`suwayomi.rs:666-700` — `fetchSourceManga` takes only a page number), so "two pages"
+/// is not a guarantee of thirty entries on any given source.
+const LATEST_TRIGGER_WINDOW: usize = 30;
 
 /// Floor on how long a restart-skipped tick defers the next attempt. Without a floor a
 /// pass stamped a fraction of a second ago would re-fire immediately.
@@ -528,10 +548,44 @@ async fn sync_extension_inner(
         );
         return 0;
     };
+    // PHASE F STEP 5 — `all.mangadex` is retired from ENROLMENT (F8, §7 Phase F).
+    //
+    // It mirrors MangaDex through Suwayomi, which we already mirror directly and far
+    // more richly, so every series it discovers is a duplicate that consumes the shared
+    // Suwayomi scan budget and mints a duplicate `w_` work. The extension deliberately
+    // stays INSTALLED and SUBSCRIBED (§7: "Keep the extension installed" — it is a read
+    // fallback for works whose direct spine is empty, and `isRedundantMangadexExt()`
+    // still keys off it); only discovery/enrolment stops here.
+    //
+    // Returning before `mark_subscription_synced` is intentional: this is not a pass
+    // that succeeded or failed, it is a pass that did not run, and stamping either
+    // outcome would either reset a real failure streak or blame the source.
+    if crate::phase_f::is_retired_pkg(pkg_name) {
+        tracing::info!(
+            pkg = pkg_name,
+            "source-sync: extension retired from enrolment (Phase F) — no discovery walk"
+        );
+        return 0;
+    }
+    // Second line of defence, by SOURCE ID rather than package: Phase F's blast radius
+    // is one source id, but `source_extension` registers **61** for this package (60
+    // hold zero rows today), and an empty one is exactly what would silently re-seed
+    // the extension under a renamed package tomorrow. Read from the table rather than
+    // hardcoded, so a 62nd id is covered the day `record_source_extensions` sees it.
+    // A DB failure here must not silently DISABLE the exclusion, so it falls back to
+    // an empty set only after logging — the pkg guard above still holds.
+    let retired_ids = match crate::phase_f::enrolment_excluded_source_ids(&state.pool).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(error = %e, "source-sync: could not load Phase F source-id exclusions");
+            HashSet::new()
+        }
+    };
     let sources = match state.suwayomi.list_sources().await {
         Ok(list) => list
             .into_iter()
             .filter(|s| s.pkg_name.as_deref() == Some(pkg_name))
+            .filter(|s| !retired_ids.contains(&s.id))
             // English-only: a multi-language extension (notably `all.mangadex`)
             // exposes ~70 per-language sources under one pkg. Without this filter,
             // discovery walked EVERY language and enrolled non-English series (with
@@ -633,6 +687,16 @@ async fn sync_source_latest(
     let mut added = 0i64;
     let mut page: i32 = 1;
     let mut consecutive_known = 0u32;
+    // E2: distinct entries seen so far, and how many parked series this walk woke. The
+    // count gates the early stop (see `LATEST_TRIGGER_WINDOW`); the set keeps it honest
+    // when a source repeats an entry across pages.
+    let mut observed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut woken = 0u64;
+    let now = chrono::Utc::now();
+    let parked_after =
+        (now + chrono::Duration::hours(crate::scanner::TRIGGER_PARKED_AFTER_HOURS)).to_rfc3339();
+    let scanned_before =
+        (now - chrono::Duration::hours(crate::scanner::TRIGGER_COOLDOWN_HOURS)).to_rfc3339();
     loop {
         // Per-page shutdown check (P1-4): a walk is `max_pages` upstream fetches with a
         // PAGE_DELAY_MS throttle between them, so it can run for minutes.
@@ -658,9 +722,41 @@ async fn sync_source_latest(
             .map(|m| m.id)
             .collect();
 
+        // E2: the already-known half of this page is the push signal the walk used to
+        // throw away. A PARKED series here — paused by status, or parked by an outage —
+        // is one its source has just published for, so wake it and let the scheduler do
+        // the rest. This is the whole mechanism: no extra upstream fetch, no new timer.
+        observed.extend(keys.iter().cloned());
+        let known_on_page: Vec<String> = keys
+            .iter()
+            .filter(|k| known.contains(*k))
+            .cloned()
+            .collect();
+        match crate::catalog::paused_series_due_for_trigger(
+            &state.pool,
+            &known_on_page,
+            &parked_after,
+            &scanned_before,
+        )
+        .await
+        {
+            Ok(ids) if !ids.is_empty() => {
+                woken += crate::scanner::trigger_due_now(&state.pool, &ids).await;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(source_id, error = %e, "source-sync: latest-trigger lookup failed")
+            }
+        }
+
         if new_ids.is_empty() {
             consecutive_known += 1;
-            if consecutive_known >= STOP_AFTER_KNOWN_PAGES {
+            // The early stop now ALSO requires the trigger window to be covered. Without
+            // that clause a caught-up source stops after two known pages — which is
+            // exactly where the paused series it just published for are sitting.
+            if consecutive_known >= STOP_AFTER_KNOWN_PAGES
+                && observed.len() >= LATEST_TRIGGER_WINDOW
+            {
                 break;
             }
         } else {
@@ -694,6 +790,14 @@ async fn sync_source_latest(
         }
         page += 1;
         tokio::time::sleep(Duration::from_millis(PAGE_DELAY_MS)).await;
+    }
+    if woken > 0 {
+        tracing::info!(
+            source_id,
+            woken,
+            observed = observed.len(),
+            "source-sync: LATEST woke parked series its source just published for"
+        );
     }
     Ok(added)
 }

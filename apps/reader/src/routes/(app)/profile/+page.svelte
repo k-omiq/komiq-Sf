@@ -291,7 +291,10 @@
 				<h2 class="section-label">Currently Reading</h2>
 				<div class="reading-list">
 					{#each profile.reading as r (r.id ?? r.title)}
-						{@const pct = Math.round((r.ch / r.total) * 100)}
+						<!-- Guard `total === 0`: a series whose chapter count hasn't resolved yet
+						     divided to NaN and rendered `style="width:NaN%"`, which the browser
+						     drops — leaving a bar stuck empty with no clue why. -->
+						{@const pct = r.total ? Math.round((r.ch / r.total) * 100) : 0}
 						<a class="reading-row" href={`/series/${r.id ?? slug(r.title)}`}>
 							<div class="mini-cover k-cover">
 								<Cover src={r.cover} alt={r.title} loading="lazy" />

@@ -98,27 +98,6 @@
 		<button class="icon-btn" aria-label="Search" onclick={() => (searchOpen = true)}>
 			<Icon name="search" size={21} />
 		</button>
-		{#if config.sponsorUrl}
-			<a
-				class="icon-btn sponsor"
-				href={config.sponsorUrl}
-				target="_blank"
-				rel="noopener noreferrer"
-				aria-label="Sponsor"
-				title="Sponsor komiq"
-			>
-				<Icon name="heart" size={19} />
-			</a>
-		{/if}
-		<a
-			class="icon-btn support-btn"
-			class:on={isActive('/support')}
-			href="/support"
-			aria-label="Support"
-			title="Help & support"
-		>
-			<Icon name="help" size={19} />
-		</a>
 		{#if !auth.ready && !auth.user}
 			<div class="avatar skeleton" aria-hidden="true"></div>
 		{:else if auth.user}
@@ -153,11 +132,70 @@
 						<a class="menu-item" role="menuitem" href="/library" onclick={() => (menuOpen = false)}
 							>Library</a
 						>
+						<a class="menu-item" role="menuitem" href="/support" onclick={() => (menuOpen = false)}
+							>Support</a
+						>
+						{#if config.donateUrl}
+							<a
+								class="menu-item sponsor"
+								role="menuitem"
+								href={config.donateUrl}
+								target="_blank"
+								rel="noopener noreferrer"
+								onclick={() => (menuOpen = false)}>Donate</a
+							>
+						{/if}
+						<a class="menu-item" role="menuitem" href="/about" onclick={() => (menuOpen = false)}
+							>About</a
+						>
 						<button class="menu-item danger" role="menuitem" onclick={signOut}>Sign out</button>
 					</div>
 				{/if}
 			</div>
 		{:else}
+			<!-- Donate/Support/About used to be header icons. Folding them into the account menu
+			     would have stranded signed-out visitors — the account menu does not exist until you
+			     log in, and there is no footer — so anonymous users get their own menu with the
+			     same entries. Most people who need /support (and the /about takedown route) are
+			     signed out, so these must never become URL-only. -->
+			<div class="account">
+				<button
+					class="icon-btn"
+					class:on={menuOpen}
+					aria-label="More"
+					aria-haspopup="menu"
+					aria-expanded={menuOpen}
+					onclick={() => (menuOpen = !menuOpen)}
+				>
+					<svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+						<circle cx="5" cy="12" r="1.9" />
+						<circle cx="12" cy="12" r="1.9" />
+						<circle cx="19" cy="12" r="1.9" />
+					</svg>
+				</button>
+				{#if menuOpen}
+					<button class="backdrop" aria-label="Close menu" onclick={() => (menuOpen = false)}
+					></button>
+					<div class="menu" role="menu">
+						<a class="menu-item" role="menuitem" href="/support" onclick={() => (menuOpen = false)}
+							>Support</a
+						>
+						{#if config.donateUrl}
+							<a
+								class="menu-item sponsor"
+								role="menuitem"
+								href={config.donateUrl}
+								target="_blank"
+								rel="noopener noreferrer"
+								onclick={() => (menuOpen = false)}>Donate</a
+							>
+						{/if}
+						<a class="menu-item" role="menuitem" href="/about" onclick={() => (menuOpen = false)}
+							>About</a
+						>
+					</div>
+				{/if}
+			</div>
 			<a class="signin" href={loginHref}>Sign in</a>
 		{/if}
 	</div>
@@ -240,10 +278,6 @@
 		border-color: var(--k-border-strong);
 		color: var(--k-text);
 	}
-	.icon-btn.sponsor:hover {
-		border-color: rgba(224, 131, 105, 0.5);
-		color: var(--k-accent);
-	}
 	.icon-btn.on {
 		border-color: var(--k-border-strong);
 		color: var(--k-text);
@@ -279,6 +313,8 @@
 	.signin {
 		display: flex;
 		align-items: center;
+		flex: 0 0 auto;
+		white-space: nowrap;
 		height: 36px;
 		padding: 0 18px;
 		border-radius: var(--k-radius-pill);
@@ -364,6 +400,25 @@
 	.menu-item.danger:hover {
 		color: var(--k-accent);
 	}
+	.menu-item.sponsor:hover {
+		color: var(--k-accent);
+	}
+	/* 641–900px is the one band where EVERYTHING renders at once — brand, the four nav
+	   links, the icon buttons and Sign in — and stops fitting. `justify-content:
+	   space-between` has no slack to give and nothing shrinks, so at 768px `Library` slid
+	   underneath the theme button and `Sign in` wrapped onto two lines. Tightening the two
+	   generous desktop gaps is enough; no control has to be dropped. */
+	@media (min-width: 641px) and (max-width: 900px) {
+		.left {
+			gap: 24px;
+		}
+		nav {
+			gap: 20px;
+		}
+		.right {
+			gap: 10px;
+		}
+	}
 	@media (max-width: 640px) {
 		/* Primary nav moves to the bottom tab bar; keep only the brand on the left. */
 		nav {
@@ -375,11 +430,9 @@
 		.right {
 			gap: 8px;
 		}
-		/* Trim secondary icons on mobile: support lives in the footer/menu. Theme,
-		   search and the account control stay reachable. */
-		.support-btn {
-			display: none;
-		}
+		/* Support/Donate now live in a menu that renders for signed-out visitors too, so
+		   nothing here may hide that menu button: it is the only route to /support and the
+		   /about takedown page for anonymous users. */
 		.icon-btn {
 			width: 38px;
 			height: 38px;

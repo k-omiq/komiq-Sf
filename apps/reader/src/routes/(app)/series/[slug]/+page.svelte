@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import { replaceState } from '$app/navigation';
+	import { goto, replaceState } from '$app/navigation';
 	import { untrack } from 'svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import Stars from '$lib/components/Stars.svelte';
@@ -8,19 +8,19 @@
 	import Cover from '$lib/components/Cover.svelte';
 	import CommentThread from '$lib/components/CommentThread.svelte';
 	import StatusMenu from '$lib/components/StatusMenu.svelte';
-	import { FLAG, type Shelf } from '$lib/data/types';
-	import {
-		setLibraryMark,
-		setFavorite,
-		setLibraryStatus,
-		getSeries,
-		getSeriesNsfwOverride,
-		setSeriesNsfw,
-	} from '$lib/data/source';
+	import MergeDialog from '$lib/components/MergeDialog.svelte';
+	import UnmergeDialog from '$lib/components/UnmergeDialog.svelte';
+	import { deriveShelf, FLAG, type Shelf } from '$lib/data/types';
+	import { setLibraryMark, setFavorite, setLibraryStatus, getSeries } from '$lib/data/source';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
-	import { images } from '$lib/context';
+	import { backend, images } from '$lib/context';
 	import { auth } from '$lib/auth.svelte';
-	import { socialLive, loadSeriesSocial, saveSeriesRating } from '$lib/data/social-repo';
+	import {
+		socialLive,
+		loadSeriesSocial,
+		saveSeriesRating,
+		clearSeriesRating,
+	} from '$lib/data/social-repo';
 
 	import type { SeriesResult } from '$lib/data/source';
 
@@ -90,6 +90,11 @@
 	const rating = $derived(detail?.rating ?? '');
 	const totalCh = $derived(detail?.totalCh ?? 0);
 	const statusLabel = $derived(detail?.statusLabel ?? '');
+	// Publication ended (completed/cancelled) — NOT the viewer's shelf. Gates both the
+	// derived `completed` shelf and whether the picker offers it at all. Defaults to
+	// false while `detail` is still loading, so the option can only ever appear once
+	// we actually know the series has ended.
+	const ended = $derived(detail?.ended ?? false);
 	const continueCh = $derived(detail?.continueCh ?? 1);
 	// All-time views, compactly formatted (1.2K / 3.4M). Only shown once a series has
 	// any recorded reads, so a brand-new/untracked series doesn't display "0 views".
@@ -190,14 +195,12 @@
 		});
 	});
 
-	// The shelf the picker shows: the explicit choice, else derived from progress
-	// (mirrors the library/profile derivation — completed when fully read, plan when
-	// untouched, otherwise reading).
+	// The shelf the picker shows: the explicit choice, else derived from progress via
+	// the SHARED `deriveShelf` — this page used to carry its own inline copy of the
+	// rule, which is how the same series could read "Completed" here and "Reading" on
+	// the library. Catching up on an ongoing series no longer derives to `completed`.
 	const readCount = $derived((view?.chapters ?? []).filter((c) => c.read).length);
-	const effectiveShelf = $derived<Shelf>(
-		libStatus ??
-			(totalCh > 0 && readCount >= totalCh ? 'completed' : readCount === 0 ? 'plan' : 'reading'),
-	);
+	const effectiveShelf = $derived<Shelf>(libStatus ?? deriveShelf(readCount, totalCh, ended));
 
 	// Library writes are optimistic, but a FAILED write now rolls back and says so.
 	// Previously the data layer returned the optimistic argument on error, so an
@@ -205,96 +208,6 @@
 	// discovered nothing had saved by reloading. `WriteResult.ok` makes the two
 	// distinguishable and `.value` is always the state to display.
 	let writeError = $state('');
-
-	// ---- admin: NSFW rating ------------------------------------------------
-	// The catalogue derives NSFW from crawled genres / source flags, and it gets some
-	// works wrong. An admin reading a mis-flagged series can correct it here instead of
-	// leaving the page for the console. `updateSeriesMetadata` is the same mutation the
-	// admin app uses, and the server gates it with `require_admin` — the check below
-	// only decides whether to draw the control.
-	//
-	// Three states, matching the server's three-valued override:
-	//   auto — no override pinned; the crawler's derived value wins
-	//   sfw  — pinned safe
-	//   nsfw — pinned adult (hidden from viewers who haven't opted in)
-	// `undefined` = we could not read the override (not an admin, backend off, or the
-	// series isn't catalogued). The control does not render at all in that case, rather
-	// than offering an edit the server would reject.
-	let nsfwOverride = $state<boolean | null | undefined>(undefined);
-	// Effective flag AFTER the override is applied — what viewers actually get. Seeded
-	// from the loaded series and re-read from the mutation's result, because clearing a
-	// pin can land on either value and only the server knows which.
-	let nsfwEffective = $state<boolean | null>(null);
-	let nsfwBusy = $state(false);
-	let nsfwError = $state('');
-
-	const nsfwChoice = $derived<'auto' | 'sfw' | 'nsfw'>(
-		nsfwOverride == null ? 'auto' : nsfwOverride ? 'nsfw' : 'sfw',
-	);
-
-	// Read the pinned override whenever the admin lands on a different series.
-	//
-	// Two guards, for two different hazards:
-	//  • `cancelled` — a fast A→B navigation must not let A's response populate B's
-	//    control (the same hazard the streaming and social effects guard against).
-	//  • `lastNsfwSeries` — the effect also re-runs when the viewer's admin status
-	//    resolves (auth hydrates AFTER mount, and revalidation republishes the user),
-	//    which is NOT a series change. Resetting unconditionally would throw away a
-	//    just-saved `nsfwEffective` and restore the pre-edit `detail.isNsfw` the page
-	//    still holds. So the reset is keyed on the series id actually changing;
-	//    deliberately a plain variable, not `$state`, so writing it can't re-trigger.
-	let lastNsfwSeries = '';
-	$effect(() => {
-		const id = seriesId;
-		const isAdmin = auth.user?.isAdmin ?? false;
-		let cancelled = false;
-		if (id !== lastNsfwSeries) {
-			lastNsfwSeries = id;
-			nsfwOverride = undefined;
-			nsfwError = '';
-			// Untracked: this effect must not re-run (and reset) every time the loaded
-			// series object is replaced — only when the series itself changes.
-			nsfwEffective = untrack(() => detail?.isNsfw ?? false);
-		}
-		if (!id || !isAdmin) return;
-		void getSeriesNsfwOverride(id).then((ov) => {
-			if (!cancelled) nsfwOverride = ov;
-		});
-		return () => {
-			cancelled = true;
-		};
-	});
-
-	async function chooseNsfw(choice: 'auto' | 'sfw' | 'nsfw'): Promise<void> {
-		if (nsfwBusy || choice === nsfwChoice) return;
-		const next = choice === 'auto' ? null : choice === 'nsfw';
-		const prev = nsfwOverride ?? null;
-		// Pinned before the await: if the admin navigates to another series while the
-		// mutation is in flight, this write belongs to the series they LEFT, and
-		// applying its result would silently mislabel the one now on screen. The
-		// mutation itself still lands server-side — only the UI write is dropped.
-		const forSeries = seriesId;
-		nsfwBusy = true;
-		nsfwError = '';
-		// Optimistic, like every other write on this page: show the choice at once and
-		// roll back to `prev` if the server refuses.
-		nsfwOverride = next;
-		try {
-			const r = await setSeriesNsfw(forSeries, next, prev);
-			if (seriesId !== forSeries) return;
-			nsfwOverride = r.value.override;
-			if (r.ok) {
-				// Only the server can say what clearing a pin fell back to.
-				if (r.value.effective !== null) nsfwEffective = r.value.effective;
-			} else {
-				nsfwError = r.error ?? '';
-			}
-		} finally {
-			// Runs even on the early return above; the control belongs to the new series
-			// by then and must not be left disabled.
-			nsfwBusy = false;
-		}
-	}
 
 	async function toggleLibrary(): Promise<void> {
 		if (marking) return;
@@ -412,12 +325,64 @@
 		}
 	}
 
-	function onRate(v: number): void {
-		if (needsAuth) return;
-		saveSeriesRating(seriesId, socialKey, v, myBody).catch(() => {});
+	// Rating is the one action on this page whose RESULT is rendered from the series
+	// payload rather than from local state: the stars reflect `userRating` immediately,
+	// but "N community ratings" and the average come from `detail`, which `load` fetched
+	// before the vote existed. Without a refetch the page kept saying "0 community
+	// ratings" straight after a successful vote — indistinguishable from the write having
+	// failed, and the exact thing that made people rate the same work twice.
+	//
+	// Refetch AFTER the write resolves (not optimistically) so the number shown is the
+	// server's own aggregate. A failed write leaves the page untouched rather than
+	// inventing a count.
+	//
+	// GUARDED BY A GENERATION COUNTER, not just by the slug. Rating is a row of ten stars:
+	// tapping 7 then 9 is one gesture, and those two refetches race each other on the SAME
+	// slug — the slug pin (which only defends against an A→B navigation) would happily let
+	// the slower 7 response land last and print the count from before the 9. Each tap takes
+	// the next generation and only the LATEST one is allowed to write `override`; the
+	// stale ones resolve into nothing. `getSeries` is the whole series payload, so this
+	// also means a burst of taps repaints once, at the end, instead of flickering through
+	// every intermediate answer. (There is no rating-only query to ask instead:
+	// `canonicalSeries` is not narrower in kind and 404s for the federation-only works
+	// this fix matters most for, and inventing a resolver for one label is not worth it.)
+	//
+	// Shared by rating and CLEARING, which race each other just as readily as two taps do
+	// (rate 9, change your mind, hit Clear) and must not be able to land out of order.
+	// Returns whether the write itself succeeded, so a caller that moved local state
+	// optimistically can put it back.
+	let rateGen = 0;
+	async function applyRatingChange(write: () => Promise<unknown>): Promise<boolean> {
+		const slug = data.slug;
+		const gen = ++rateGen;
+		try {
+			await write();
+		} catch {
+			return false;
+		}
+		const r = await getSeries(slug).catch(() => null);
+		// A newer tap (or a navigation) now owns what this label says.
+		if (gen !== rateGen || data.slug !== slug) return true;
+		if (r?.view) override = r;
+		return true;
 	}
-	function clearRating(): void {
+	async function onRate(v: number): Promise<void> {
+		if (needsAuth) return;
+		await applyRatingChange(() => saveSeriesRating(seriesId, socialKey, v, myBody));
+	}
+	// Clearing withdraws the vote for real (`deleteReview`), so the community count drops
+	// with it. The stars are local state and move immediately — the count they sit next to
+	// cannot, since only the server knows the new average — and they go back if the write
+	// fails, rather than showing an unrated widget over a rating that is still counted.
+	//
+	// `deleteReview` DELETES THE ROW (a review with no score can't exist — `score` is NOT
+	// NULL), so the button is hidden when the viewer's review carries text; see the markup.
+	async function clearRating(): Promise<void> {
+		if (needsAuth) return;
+		const previous = userRating;
 		userRating = 0;
+		const ok = await applyRatingChange(() => clearSeriesRating(seriesId, socialKey));
+		if (!ok) userRating = previous;
 	}
 
 	const chapters = $derived.by(() => {
@@ -434,6 +399,63 @@
 	const selectedTranslatorKey = $derived(view?.selectedTranslatorKey ?? null);
 	const workId = $derived(view?.workId ?? null);
 	let switching = $state(false);
+
+	// --- admin: fold duplicate works into this one ---
+	//
+	// GATED THREE WAYS, and all three are needed. `auth.ready` because the token is read
+	// from localStorage on the client, so `auth.user` is null both when signed out AND
+	// during SSR//first paint — without it the button flashes for nobody and is absent for
+	// admins. `isAdmin` is the actual permission (the server re-checks it in
+	// `require_admin`; this only decides whether to render the affordance). `mergeWorks` /
+	// `searchForMerge` are OPTIONAL backend methods — the Suwayomi adapter and the native
+	// offline backend don't implement them, and calling `!` on an absent method would throw
+	// on click rather than simply not offering it.
+	//
+	// `workId` (not `seriesId`) is what the mutation takes: `seriesId` is the reader id,
+	// which is numeric for a Suwayomi-anchored work. It resolves a beat after the page
+	// does, which is why the button disables rather than hides while it's null — hiding
+	// would make it look like the permission check failed.
+	const canMerge = $derived(
+		auth.ready && !!auth.user?.isAdmin && !!backend.mergeWorks && !!backend.searchForMerge,
+	);
+	let mergeOpen = $state(false);
+
+	// A merge changes this work's sources, aliases and chapter list, so re-read the page
+	// rather than patching state by hand. By `workId` for the same reason
+	// `selectTranslator` uses it.
+	async function afterMerge(): Promise<void> {
+		if (!workId) return;
+		const r = await getSeries(workId);
+		if (r.view) override = r;
+	}
+
+	// --- admin: detach sources that were folded in by mistake ---
+	//
+	// Gated the same three ways as Merge, and for the same reasons; only the optional
+	// backend methods differ. This is NOT an undo for the button above it — see the
+	// header of UnmergeDialog.svelte — so it is offered independently of `canMerge`: a
+	// wrongly-merged work is worth splitting whether or not this backend can merge.
+	const canSplit = $derived(
+		auth.ready && !!auth.user?.isAdmin && !!backend.workSourceRows && !!backend.splitSourceSeries,
+	);
+	let splitOpen = $state(false);
+
+	// Go to what was just created. Confirming the detached run landed where the admin
+	// meant it to is the whole point of the action, and the new work's page is the only
+	// place that shows it.
+	//
+	// `newReaderId`, never `newWorkId`: a work with no MangaDex anchor is addressed by
+	// the numeric Suwayomi source key (0069), and `w_…` 404s for it.
+	//
+	// invalidateAll because the target URL can be THIS one. Detaching the mapping that
+	// gave this work its numeric reader id hands that id to the new work, so
+	// `/series/{id}` now resolves to the other side of the split — and a plain goto to
+	// an unchanged URL would leave the pre-split page on screen. Dropping `override`
+	// first stops the stale local refetch from outliving the navigation.
+	async function afterSplit(r: { newReaderId: string }): Promise<void> {
+		override = undefined;
+		await goto(`/series/${r.newReaderId}`, { invalidateAll: true });
+	}
 
 	// The picker is a POPOVER rather than the flat button list it used to be. With a
 	// handful of sources the flat list pushed the chapter list a screen down the page, and
@@ -718,6 +740,7 @@
 							onchange={chooseStatus}
 							disabled={marking || statusBusy}
 							variant="button"
+							canComplete={ended}
 						/>
 					{/if}
 					<button
@@ -738,51 +761,25 @@
 						title={shareCopied ? 'Link copied' : 'Share'}
 						onclick={shareSeries}><Icon name={shareCopied ? 'check' : 'share'} size={18} /></button
 					>
-					<!-- Admin only, and only once we've actually read the pinned override:
-					     `undefined` means we couldn't (not an admin, backend off, series not
-					     catalogued), and drawing a control whose write the server would
-					     reject is worse than drawing nothing. Never renders during SSR —
-					     `auth.user` is null on the server — so it stays out of the edge
-					     cache this public page shares with signed-out readers. -->
-					{#if auth.user?.isAdmin && nsfwOverride !== undefined}
-						<div class="nsfw-admin" role="group" aria-label="Admin: content rating">
-							<span class="nsfw-tag">RATING</span>
-							<div class="nsfw-seg">
-								<button
-									class:on={nsfwChoice === 'auto'}
-									disabled={nsfwBusy}
-									aria-pressed={nsfwChoice === 'auto'}
-									title={nsfwChoice === 'auto'
-										? `No override — using the crawler's derived rating (currently ${
-												nsfwEffective ? 'NSFW' : 'SFW'
-											})`
-										: 'Clear the pin and fall back to the crawler’s derived rating'}
-									onclick={() => chooseNsfw('auto')}>Auto</button
-								>
-								<button
-									class:on={nsfwChoice === 'sfw'}
-									disabled={nsfwBusy}
-									aria-pressed={nsfwChoice === 'sfw'}
-									title="Pin as safe — shows to everyone"
-									onclick={() => chooseNsfw('sfw')}>SFW</button
-								>
-								<button
-									class:on={nsfwChoice === 'nsfw'}
-									disabled={nsfwBusy}
-									aria-pressed={nsfwChoice === 'nsfw'}
-									title="Pin as adult — hidden from readers who haven't enabled Show NSFW"
-									onclick={() => chooseNsfw('nsfw')}>NSFW</button
-								>
-							</div>
-						</div>
+					{#if canMerge}
+						<button
+							class="merge"
+							disabled={!workId}
+							title={workId ? 'Merge duplicate series into this one' : 'Resolving work…'}
+							onclick={() => (mergeOpen = true)}>Merge</button
+						>
+					{/if}
+					{#if canSplit}
+						<button
+							class="merge"
+							disabled={!workId}
+							title={workId
+								? 'Detach sources that belong to a different series'
+								: 'Resolving work…'}
+							onclick={() => (splitOpen = true)}>Split</button
+						>
 					{/if}
 				</div>
-				{#if nsfwError}
-					<div class="write-error" role="alert">
-						<Icon name="alert" size={15} />
-						<span>{nsfwError}</span>
-					</div>
-				{/if}
 				{#if writeError}
 					<div class="write-error" role="alert">
 						<Icon name="alert" size={15} />
@@ -866,7 +863,12 @@
 			</div>
 			<div class="rate-right">
 				<Stars bind:value={userRating} max={10} size={24} onchange={onRate} />
-				{#if userRating > 0 && !needsAuth}
+				<!-- Only offered when the viewer's review has NO written body. Withdrawing a
+				     rating deletes the review row (the server cannot store a scoreless
+				     review), so on a body-bearing row this button would silently destroy
+				     text the reader wrote. Hiding it beats a confirm dialog for something
+				     nobody expects a "Clear" next to a star row to be able to do. -->
+				{#if userRating > 0 && !needsAuth && !myBody.trim()}
 					<button class="clear" onclick={clearRating}>Clear</button>
 				{/if}
 			</div>
@@ -1013,11 +1015,39 @@
 						<div class="ch-line">
 							<span class="ch-name">{c.title}</span>
 							{#if c.isNew}<span class="new">NEW</span>{/if}
+							<!-- Off-site chapters (~35,000 of them: MangaPlus, Comikey, NamiComi,
+							     BiliBili) have no pages for us to serve — tapping one opens a
+							     "read it on <host>" hand-off. Badged HERE, in the list people
+							     actually browse, because learning it only after you have opened
+							     the chapter is the dead end the badge exists to remove. The
+							     reader's own dropdown badges too, but that is already past the
+							     point of surprise. -->
+							{#if c.external}<span class="ext" title="Hosted on another site"
+									><Icon name="globe" size={11} />OFF-SITE</span
+								>{/if}
 						</div>
-						<!-- Multi-source works can carry a chapter no source we can date
-						     provides (S2 aggregation) — render nothing rather than an empty
-						     line among dated rows. -->
-						{#if c.date}<div class="ch-date">{c.date}</div>{/if}
+						<!-- TWO CLOCKS, NAMED, because they answer different questions and
+						     the gap between them is the point: a source that holds chapters
+						     behind early access publishes days before anyone here can read
+						     them.
+
+						     "Found" is NEVER allowed to fall back to the release date — a
+						     chapter we have no record of finding renders an em dash, which
+						     is what `foundDate` already carries. Expect that dash on most
+						     older chapters: no discovery time was invented for the back
+						     catalogue (migration 0099).
+
+						     Multi-source works can carry a chapter no source we can date
+						     provides (S2 aggregation), so the released half still drops out
+						     entirely rather than leaving an empty line among dated rows. -->
+						<div class="ch-dates">
+							{#if c.date}<span class="ch-date">Released {c.date}</span>{/if}
+							<span
+								class="ch-date ch-found"
+								title="When we first had this chapter available to read"
+								>Found {c.foundDate}</span
+							>
+						</div>
 					</div>
 					{#if c.read}<span class="ch-read"
 							><Icon name="check" size={13} strokeWidth={2.4} />Read</span
@@ -1068,6 +1098,23 @@
 			<a class="nf-ghost" href="/">Go home</a>
 		</div>
 	</div>
+{/if}
+
+<!-- admin merge picker. Mounted only for an admin with a resolved work, so a normal
+     reader never ships its markup or its search handler. -->
+{#if canMerge && workId}
+	<MergeDialog
+		bind:open={mergeOpen}
+		targetWorkId={workId}
+		targetTitle={title}
+		onmerged={afterMerge}
+	/>
+{/if}
+
+<!-- admin source splitter. Same mount conditions as the merge picker: an admin with a
+     resolved work, so its row query never leaves a reader's page. -->
+{#if canSplit && workId}
+	<UnmergeDialog bind:open={splitOpen} {workId} workTitle={title} onsplit={afterSplit} />
 {/if}
 
 <!-- cover lightbox (F2) -->
@@ -1443,6 +1490,29 @@
 		border-color: rgba(95, 191, 126, 0.5);
 		color: #7fd39a;
 	}
+	/* Admin-only, so it is deliberately the quietest thing in the CTA row — an outline
+	   button sized to the others. It sits last, after Share, because it is a maintenance
+	   action and must never compete with Continue / Add to Library. */
+	.merge {
+		height: 50px;
+		padding: 0 16px;
+		flex: 0 0 auto;
+		border-radius: 8px;
+		background: transparent;
+		border: 1px dashed var(--k-border-4);
+		color: var(--k-text-3);
+		font: inherit;
+		font-weight: 600;
+		cursor: pointer;
+	}
+	.merge:hover:not(:disabled) {
+		border-color: rgba(255, 255, 255, 0.34);
+		color: var(--k-text-1);
+	}
+	.merge:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
 	.share {
 		width: 50px;
 		height: 50px;
@@ -1455,52 +1525,6 @@
 		display: flex;
 		align-items: center;
 		justify-content: center;
-	}
-	/* Admin content-rating override. Sized to the 50px CTA buttons it sits beside so
-	   the row keeps one baseline, and visually quieter than them — it is a moderation
-	   tool sharing space with the reader's own actions, not a peer of them. */
-	.nsfw-admin {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		height: 50px;
-		flex: 0 0 auto;
-		padding: 0 10px 0 12px;
-		border-radius: 8px;
-		border: 1px dashed var(--k-border-4);
-	}
-	.nsfw-tag {
-		font-size: 10px;
-		font-weight: 700;
-		letter-spacing: 0.08em;
-		color: var(--k-text-fainter, var(--k-text-3));
-	}
-	.nsfw-seg {
-		display: flex;
-		gap: 2px;
-		padding: 2px;
-		border-radius: 7px;
-		background: var(--k-surface-2, rgba(127, 127, 127, 0.12));
-	}
-	.nsfw-seg button {
-		padding: 5px 10px;
-		border: none;
-		border-radius: 5px;
-		background: transparent;
-		color: var(--k-text-3);
-		font-size: 12px;
-		font-weight: 700;
-		cursor: pointer;
-		transition: all 0.15s;
-	}
-	.nsfw-seg button.on {
-		background: var(--k-surface);
-		color: var(--k-text-1);
-		box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
-	}
-	.nsfw-seg button:disabled {
-		opacity: 0.55;
-		cursor: default;
 	}
 	.share:hover {
 		border-color: rgba(255, 255, 255, 0.34);
@@ -2095,10 +2119,41 @@
 		padding: 2px 7px;
 		border-radius: 5px;
 	}
+	/* Outlined, not filled — unlike `.new`. An off-site chapter is a CAVEAT, not a
+	   highlight, and giving it the same visual weight as NEW would read as a promotion.
+	   Matches the reader dropdown's own `.ext-tag` so the same fact looks the same on both
+	   surfaces. */
+	.ext {
+		flex: 0 0 auto;
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		font-size: 10px;
+		font-weight: 800;
+		letter-spacing: 0.05em;
+		color: var(--k-text-faint);
+		border: 1px solid var(--k-border-4);
+		padding: 2px 6px;
+		border-radius: 5px;
+	}
+	.ch-dates {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		/* Column gap only: the separator between the two halves is space, and on a narrow
+		   screen they wrap onto their own lines rather than being truncated. */
+		gap: 0 8px;
+		margin-top: 3px;
+	}
 	.ch-date {
 		font-size: 12px;
 		color: var(--k-text-fainter);
-		margin-top: 3px;
+	}
+	/* Fainter than the release date on purpose. The release date is what a reader is
+	   looking for; the found date is the explanation for why a chapter is where it is in
+	   /updates, which matters only when the two disagree. */
+	.ch-found {
+		color: var(--k-text-ghost);
 	}
 	.ch-read {
 		flex: 0 0 auto;

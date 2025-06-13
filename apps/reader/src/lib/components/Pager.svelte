@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { afterNavigate } from '$app/navigation';
+	import { tick } from 'svelte';
 	import { FEED_PAGE_SIZE, lastPage } from '$lib/data/paging';
 
 	/**
@@ -23,6 +25,7 @@
 		href,
 		label = 'Pagination',
 		controls = undefined,
+		scrollTarget = undefined,
 	}: {
 		/** 1-based current page. */
 		page: number;
@@ -39,6 +42,11 @@
 		label?: string;
 		/** id of the region this pager pages, for aria-controls. */
 		controls?: string;
+		/**
+		 * id of the element to bring to the top of the viewport after a page change.
+		 * Omit and the page keeps whatever scroll handling it already had.
+		 */
+		scrollTarget?: string;
 	} = $props();
 
 	const pageCount = $derived(total != null ? lastPage(total, pageSize) : null);
@@ -86,12 +94,101 @@
 
 	const showPrev = $derived(page > 1 && !loading);
 	const showNext = $derived(hasNext && !loading);
+
+	// ---------------------------------------------------------------------------
+	// Scroll ownership.
+	//
+	// A page step used to lean entirely on SvelteKit's implicit post-navigation
+	// `scrollTo(0, 0)`. That is one fire-and-forget write, issued two ticks after the
+	// DOM commit — which, on these routes, is the exact moment the document collapses
+	// onto skeletons (measured on /browse: 6116px -> 2675px, with the browser already
+	// having clamped the viewer from y=5277 to y=1836) and several hundred milliseconds
+	// before the real rows land and it grows back. Whether that single write survives
+	// the shrink/regrow depends on the engine's own scroll adjustment, so it held on
+	// desktop, iOS Safari and Chrome Android but not on other Chromium mobile builds
+	// (Brave), where a page step simply left the viewer where they were.
+	//
+	// So the pager owns it now, and asserts it more than once: on the navigation
+	// (over the skeleton) and again when the rows have actually landed and the final
+	// layout is known. `data-sveltekit-noscroll` on the <nav> stands SvelteKit's
+	// version down so the two aren't fighting — and it is the section top we align to,
+	// not the top of the document, since the trending rail / filter rail above the list
+	// is not what a viewer asking for "page 4" wants to look at.
+	let armed = $state(false); // a pager link was clicked; navigation not committed yet
+	let settling = $state(false); // committed; waiting for the rows to land
+
+	function align() {
+		const el = scrollTarget ? document.getElementById(scrollTarget) : null;
+		if (!el) return;
+		// `scrollIntoView` rather than `scrollTo`, so the sticky header is cleared by the
+		// target's own `scroll-margin-top` instead of a hard-coded offset here.
+		void tick().then(() =>
+			requestAnimationFrame(() => {
+				el.scrollIntoView();
+				// Second assert one frame later: the first runs before the browser has
+				// finished laying out the swapped-in content, which is precisely when a
+				// clamp can eat it.
+				requestAnimationFrame(() => el.scrollIntoView());
+			}),
+		);
+	}
+
+	/** Arm on a real left-click of a real link — not a new-tab click, not an inert span. */
+	function armFromClick(event: MouseEvent) {
+		if (!scrollTarget) return;
+		if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)
+			return;
+		if (!(event.target instanceof Element) || !event.target.closest('a.pg')) return;
+		armed = true;
+	}
+
+	afterNavigate(() => {
+		if (!armed) return;
+		armed = false;
+		settling = true;
+		align();
+	});
+
+	// The rows have landed: everything above the section has its final height, so this
+	// is the assert that actually decides where the viewer ends up.
+	$effect(() => {
+		if (!settling || loading) return;
+		settling = false;
+		align();
+	});
+
+	// The viewer scrolling (or typing) mid-load outranks us — never yank a page back
+	// from under someone who has taken over.
+	$effect(() => {
+		if (!armed && !settling) return;
+		const stand_down = () => {
+			armed = false;
+			settling = false;
+		};
+		addEventListener('touchstart', stand_down, { passive: true });
+		addEventListener('wheel', stand_down, { passive: true });
+		addEventListener('keydown', stand_down);
+		return () => {
+			removeEventListener('touchstart', stand_down);
+			removeEventListener('wheel', stand_down);
+			removeEventListener('keydown', stand_down);
+		};
+	});
 </script>
 
 <!-- Hidden entirely when there is nothing to page: page 1 with no next page.
      Mirrors the admin pager's `{#if page > 1 || hasNext}`. -->
 {#if page > 1 || hasNext}
-	<nav class="pager" aria-label={label} aria-controls={controls}>
+	<!-- `data-sveltekit-noscroll` only when we have a target of our own to align to;
+	     without one the framework's scroll-to-top is still the best available behaviour.
+	     See the scroll-ownership block above. -->
+	<nav
+		class="pager"
+		aria-label={label}
+		aria-controls={controls}
+		data-sveltekit-noscroll={scrollTarget ? '' : undefined}
+		onclickcapture={armFromClick}
+	>
 		<div class="row">
 			<!-- Prev/Next are a real link when navigable and an INERT SPAN otherwise.
 			     HTML has no disabled link; `aria-disabled` on a non-focusable span is

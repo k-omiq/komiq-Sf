@@ -247,13 +247,15 @@ pub async fn pending_cover_count(pool: &SqlitePool) -> Result<i64> {
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM work w \
          WHERE w.cover_cached_version IS NULL \
-           AND w.id NOT IN (SELECT work_id FROM work_cover_issue) AND ( \
+           AND NOT EXISTS (SELECT 1 FROM work_cover_issue i WHERE i.work_id = w.id \
+                           AND (i.retry_after IS NULL OR i.retry_after > ?)) AND ( \
              (w.cover_file_name IS NOT NULL \
               AND EXISTS (SELECT 1 FROM source_series ss \
                           WHERE ss.work_id = w.id AND ss.source_type = 'mangadex')) \
              OR EXISTS (SELECT 1 FROM source_series ss \
                         WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi'))",
     )
+    .bind(Utc::now().to_rfc3339())
     .fetch_one(pool)
     .await?;
     Ok(n)
@@ -291,22 +293,58 @@ pub fn is_transient_cover_error(err: &anyhow::Error) -> bool {
 /// Record (or refresh) a cover-processing failure so the crawl stops re-attempting
 /// a deterministically-unprocessable work every tick. Best-effort — a failure to
 /// write the marker only means we retry next tick, never breaks the crawl.
-pub async fn record_cover_issue(pool: &SqlitePool, work_id: &str, reason: &str, detail: &str) {
-    let now = Utc::now().to_rfc3339();
+pub async fn record_cover_issue(
+    pool: &SqlitePool,
+    work_id: &str,
+    reason: &'static str,
+    detail: &str,
+) {
+    // The historical callers of this function all record DETERMINISTIC failures, so the
+    // marker gets the long (permanent) window. Transient failures go through
+    // `record_cover_issue_backoff` instead, which is what stops the crawl re-fetching a
+    // 403ing source every 5 minutes for ever.
+    record_cover_issue_backoff(pool, work_id, CoverFailure::Permanent(reason), detail).await;
+}
+
+/// Record (or refresh) a work cover failure with a `retry_after` computed from the
+/// failure class and the attempt count — the backoff half of the 0043 skip-marker.
+///
+/// Permanent: one long window (the marker still expires, so a decoder/cap improvement is
+/// picked up automatically). Transient: 30 min doubling to a 24 h ceiling, so a 403/429
+/// costs at most one probe a day instead of 288.
+pub async fn record_cover_issue_backoff(
+    pool: &SqlitePool,
+    work_id: &str,
+    failure: CoverFailure,
+    detail: &str,
+) {
+    let now = Utc::now();
+    let ts = now.to_rfc3339();
     // Truncate an over-long error so a pathological message can't bloat the row.
     let detail: String = detail.chars().take(500).collect();
+    let prev: i64 = sqlx::query_scalar("SELECT attempts FROM work_cover_issue WHERE work_id = ?")
+        .bind(work_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let retry_after = failure.retry_after(now, prev + 1);
     if let Err(e) = sqlx::query(
-        "INSERT INTO work_cover_issue (work_id, reason, detail, attempts, first_seen, last_seen) \
-         VALUES (?, ?, ?, 1, ?, ?) \
+        "INSERT INTO work_cover_issue \
+           (work_id, reason, detail, attempts, first_seen, last_seen, retry_after) \
+         VALUES (?, ?, ?, 1, ?, ?, ?) \
          ON CONFLICT(work_id) DO UPDATE SET \
            reason = excluded.reason, detail = excluded.detail, \
-           attempts = work_cover_issue.attempts + 1, last_seen = excluded.last_seen",
+           attempts = work_cover_issue.attempts + 1, last_seen = excluded.last_seen, \
+           retry_after = excluded.retry_after",
     )
     .bind(work_id)
-    .bind(reason)
+    .bind(failure.reason())
     .bind(&detail)
-    .bind(&now)
-    .bind(&now)
+    .bind(&ts)
+    .bind(&ts)
+    .bind(&retry_after)
     .execute(pool)
     .await
     {
@@ -323,6 +361,298 @@ pub async fn clear_cover_issue(pool: &SqlitePool, work_id: &str) {
         .await
     {
         tracing::warn!(work_id, error = %e, "cover issue: failed to clear");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Retry backoff (migration 0100)
+// ---------------------------------------------------------------------------
+
+/// First transient retry window. A source-side failure (403/429/5xx/network) may lapse
+/// on its own, so it must be retried — but not on the next 5-minute tick, which is what
+/// turned 92 permanently-failing covers into ~26k pointless outbound fetches a day.
+pub const TRANSIENT_BACKOFF_BASE_SECS: i64 = 30 * 60;
+
+/// Ceiling for the transient ladder. A cover is never abandoned: at worst it is probed
+/// once a day until it works or its source comes back.
+pub const TRANSIENT_BACKOFF_MAX_SECS: i64 = 24 * 60 * 60;
+
+/// Window for a DETERMINISTIC failure (a `data:` thumbnail, an over-cap GIF, an AVIF we
+/// have no decoder for). Long enough that retrying costs nothing measurable, finite so a
+/// decoder/cap change (or a source that quietly fixed its asset) is picked up without an
+/// operator DELETE.
+pub const PERMANENT_BACKOFF_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// Transient failures from ONE source within a single tick before the whole source is
+/// parked. Per-cover backoff alone is not enough: 28 individually-backed-off covers at
+/// one host still means 28 requests per tick at a host that is banning us.
+pub const SOURCE_BACKOFF_THRESHOLD: usize = 3;
+
+/// First park window for a source, doubled per consecutive park up to
+/// [`SOURCE_BACKOFF_MAX_SECS`].
+pub const SOURCE_BACKOFF_BASE_SECS: i64 = 60 * 60;
+
+/// Ceiling for the per-source park (a WAF ban is measured in days, but we still probe
+/// daily so an unblock is noticed by itself).
+pub const SOURCE_BACKOFF_MAX_SECS: i64 = 24 * 60 * 60;
+
+/// A cover failure and whether it can EVER succeed again unprompted.
+///
+/// `Permanent` = deterministic given the same input bytes/URL (the retry is pure waste
+/// until something changes); `Transient` = the source or the network might behave
+/// differently later. The distinction is the whole point of the backoff: permanent gets
+/// one long window, transient gets an exponential ladder with a ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverFailure {
+    Permanent(&'static str),
+    Transient(&'static str),
+}
+
+impl CoverFailure {
+    /// Stable machine code stored in `*_cover_issue.reason` (admin Bugs panel).
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Permanent(r) | Self::Transient(r) => r,
+        }
+    }
+
+    pub fn is_permanent(self) -> bool {
+        matches!(self, Self::Permanent(_))
+    }
+
+    /// Seconds to wait after the `attempts`-th consecutive failure.
+    pub fn backoff_secs(self, attempts: i64) -> i64 {
+        match self {
+            Self::Permanent(_) => PERMANENT_BACKOFF_SECS,
+            Self::Transient(_) => {
+                // 30m, 1h, 2h, 4h, … capped at 24h. The shift is clamped so a marker
+                // that has been failing for months cannot overflow the shift.
+                let shift = attempts.clamp(1, 20) - 1;
+                TRANSIENT_BACKOFF_BASE_SECS
+                    .saturating_mul(1i64 << shift.min(20))
+                    .min(TRANSIENT_BACKOFF_MAX_SECS)
+            }
+        }
+    }
+
+    fn retry_after(self, now: chrono::DateTime<Utc>, attempts: i64) -> String {
+        (now + chrono::Duration::seconds(self.backoff_secs(attempts))).to_rfc3339()
+    }
+}
+
+/// The HTTP status carried by our own `Suwayomi cover error {status}` message, if any.
+///
+/// Deliberately anchored on that literal prefix rather than "first 3-digit number in the
+/// string": a reqwest transport error Displays the whole URL, and
+/// `/api/v1/manga/404/thumbnail` would otherwise be read as a 404 and freeze a network
+/// blip into a permanent marker.
+fn cover_error_status(msg: &str) -> Option<u16> {
+    let rest = msg.split("cover error ").nth(1)?;
+    rest.split_whitespace()
+        .next()?
+        .parse::<u16>()
+        .ok()
+        .filter(|c| (100..=599).contains(c))
+}
+
+/// Classify an upstream cover FETCH failure (as opposed to a decode/encode failure —
+/// see [`classify_process_failure`]).
+///
+/// Permanent here means "this URL cannot produce an image", not "this work has no
+/// cover": the marker still expires, and a Suwayomi marker is additionally voided the
+/// moment the extension re-fetches the manga.
+pub fn classify_fetch_error(err: &anyhow::Error) -> CoverFailure {
+    let s = err.to_string().to_ascii_lowercase();
+    // Suwayomi answers 400 with this body when the extension stored a `data:` URI as the
+    // manga thumbnail (46 of the 92 permanently-failing covers). Nothing about a later
+    // fetch can change that — only a re-fetch of the manga can.
+    if s.contains("but was 'data'") || s.contains("expected url scheme") {
+        return CoverFailure::Permanent("data_uri");
+    }
+    if s.contains("exceeds cap") || s.contains("source too large") {
+        return CoverFailure::Permanent("too_large");
+    }
+    if s.contains("truncated") {
+        // The image is fine, the download was cut short (see `is_transient_cover_error`).
+        return CoverFailure::Transient("truncated");
+    }
+    match cover_error_status(&s) {
+        // Deterministic for this URL: a malformed/absent upstream reference.
+        Some(400) => CoverFailure::Permanent("bad_request"),
+        Some(404) | Some(410) => CoverFailure::Permanent("not_found"),
+        Some(415) => CoverFailure::Permanent("unsupported_media"),
+        Some(451) => CoverFailure::Permanent("unavailable_legal"),
+        // WAF / auth walls and rate limits DO lapse — Philia's block is expected to.
+        Some(401) | Some(403) => CoverFailure::Transient("blocked"),
+        Some(429) => CoverFailure::Transient("rate_limited"),
+        Some(c) if (500..=599).contains(&c) => CoverFailure::Transient("upstream_5xx"),
+        // Anything else (other 4xx, no status at all: timeouts, DNS, connection refused).
+        _ => CoverFailure::Transient("fetch"),
+    }
+}
+
+/// Classify a `process_cover` (decode/encode) failure, reusing the existing reason codes.
+/// Everything except a truncated download is deterministic for the same bytes.
+pub fn classify_process_failure(err: &anyhow::Error) -> CoverFailure {
+    let reason = classify_cover_error(err);
+    if is_transient_cover_error(err) {
+        CoverFailure::Transient(reason)
+    } else {
+        CoverFailure::Permanent(reason)
+    }
+}
+
+/// Record (or refresh) a Suwayomi-manga cover failure so the warmer stops re-fetching it
+/// every tick.
+///
+/// Keyed by the Suwayomi manga id, NOT by work id: `work_cover_issue` is the precedent
+/// for this whole mechanism, but 10,494 of 16,646 `suwayomi_series` have no `work` row
+/// (Browse / unenrolled), and its `work_id` column is a foreign key into `work` — the
+/// bulk of the failing covers simply cannot be represented there.
+///
+/// `fetched_at` is `suwayomi_series.last_fetched_at` at the time of the failure; storing
+/// it is what makes even a PERMANENT marker self-healing (see
+/// [`warm_candidates`]). Best-effort: failing to write a marker only means we retry.
+pub async fn record_suwayomi_cover_issue(
+    main: &SqlitePool,
+    manga_id: i64,
+    source_id: Option<&str>,
+    fetched_at: Option<&str>,
+    failure: CoverFailure,
+    detail: &str,
+) {
+    let now = Utc::now();
+    let detail: String = detail.chars().take(500).collect();
+    let prev: Option<(i64, Option<String>)> = sqlx::query_as(
+        "SELECT attempts, source_fetched_at FROM suwayomi_cover_issue WHERE manga_id = ?",
+    )
+    .bind(manga_id)
+    .fetch_optional(main)
+    .await
+    .ok()
+    .flatten();
+    // A manga the extension has re-fetched since the last failure is a NEW input: start
+    // the ladder again rather than inheriting a 24h step earned by the old thumbnail.
+    let attempts = match &prev {
+        Some((n, seen)) if seen.as_deref() == fetched_at => n + 1,
+        _ => 1,
+    };
+    let ts = now.to_rfc3339();
+    let retry_after = failure.retry_after(now, attempts);
+    if let Err(e) = sqlx::query(
+        "INSERT INTO suwayomi_cover_issue \
+           (manga_id, source_id, reason, detail, permanent, attempts, first_seen, \
+            last_seen, retry_after, source_fetched_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(manga_id) DO UPDATE SET \
+           source_id = excluded.source_id, reason = excluded.reason, \
+           detail = excluded.detail, permanent = excluded.permanent, \
+           attempts = excluded.attempts, last_seen = excluded.last_seen, \
+           retry_after = excluded.retry_after, \
+           source_fetched_at = excluded.source_fetched_at",
+    )
+    .bind(manga_id)
+    .bind(source_id)
+    .bind(failure.reason())
+    .bind(&detail)
+    .bind(failure.is_permanent() as i64)
+    .bind(attempts)
+    .bind(&ts)
+    .bind(&ts)
+    .bind(&retry_after)
+    .bind(fetched_at)
+    .execute(main)
+    .await
+    {
+        tracing::warn!(manga_id, error = %e, "suwayomi cover issue: failed to record");
+    }
+}
+
+/// Clear a Suwayomi cover marker — a fetch succeeded, so the cover is back in the normal
+/// cached/uncached flow. Best-effort.
+pub async fn clear_suwayomi_cover_issue(main: &SqlitePool, manga_id: i64) {
+    if let Err(e) = sqlx::query("DELETE FROM suwayomi_cover_issue WHERE manga_id = ?")
+        .bind(manga_id)
+        .execute(main)
+        .await
+    {
+        tracing::warn!(manga_id, error = %e, "suwayomi cover issue: failed to clear");
+    }
+}
+
+/// Park a whole SOURCE after a tick in which several of its covers failed transiently and
+/// none succeeded.
+///
+/// This is the per-host half of the mechanism: a Cloudflare WAF ban is a property of the
+/// host, so backing off cover-by-cover still sends one request per cover per tick at a
+/// site that is actively blocking us (28/tick for philiascans.org, ~8k/day). Logged at
+/// WARN — a parked source is exactly the "every cover for a source is failing" signal
+/// that must NOT be silently swallowed by the markers.
+pub async fn record_source_cover_backoff(
+    main: &SqlitePool,
+    source_id: &str,
+    failure: CoverFailure,
+    failed_covers: usize,
+    detail: &str,
+) {
+    let now = Utc::now();
+    let detail: String = detail.chars().take(500).collect();
+    let prev: i64 =
+        sqlx::query_scalar("SELECT failures FROM cover_source_backoff WHERE source_id = ?")
+            .bind(source_id)
+            .fetch_optional(main)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+    let failures = prev + 1;
+    let secs = SOURCE_BACKOFF_BASE_SECS
+        .saturating_mul(1i64 << (failures.clamp(1, 20) - 1).min(20))
+        .min(SOURCE_BACKOFF_MAX_SECS);
+    let retry_after = (now + chrono::Duration::seconds(secs)).to_rfc3339();
+    let ts = now.to_rfc3339();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO cover_source_backoff \
+           (source_id, reason, detail, failures, failed_covers, first_seen, last_seen, retry_after) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(source_id) DO UPDATE SET \
+           reason = excluded.reason, detail = excluded.detail, failures = excluded.failures, \
+           failed_covers = excluded.failed_covers, last_seen = excluded.last_seen, \
+           retry_after = excluded.retry_after",
+    )
+    .bind(source_id)
+    .bind(failure.reason())
+    .bind(&detail)
+    .bind(failures)
+    .bind(failed_covers as i64)
+    .bind(&ts)
+    .bind(&ts)
+    .bind(&retry_after)
+    .execute(main)
+    .await
+    {
+        tracing::warn!(source_id, error = %e, "cover source backoff: failed to record");
+        return;
+    }
+    tracing::warn!(
+        source_id,
+        reason = failure.reason(),
+        failed_covers,
+        consecutive_parks = failures,
+        retry_after = %retry_after,
+        "cover warmer: parking a whole source (every cover attempted this tick failed)"
+    );
+}
+
+/// Un-park a source: one of its covers succeeded, so whatever blocked it has lifted.
+/// Also resets the escalation counter, so the next park starts at the base window again.
+pub async fn clear_source_cover_backoff(main: &SqlitePool, source_id: &str) {
+    if let Err(e) = sqlx::query("DELETE FROM cover_source_backoff WHERE source_id = ?")
+        .bind(source_id)
+        .execute(main)
+        .await
+    {
+        tracing::warn!(source_id, error = %e, "cover source backoff: failed to clear");
     }
 }
 
@@ -431,18 +761,24 @@ pub async fn crawl_uncached_covers(
                 w.cover_file_name \
          FROM work w \
          WHERE w.cover_cached_version IS NULL AND w.cover_file_name IS NOT NULL \
-           AND w.id NOT IN (SELECT work_id FROM work_cover_issue)";
+           AND NOT EXISTS (SELECT 1 FROM work_cover_issue i WHERE i.work_id = w.id \
+                           AND (i.retry_after IS NULL OR i.retry_after > ?))";
+    // A marker only hides a work while its backoff is unexpired (0100), so `now` is
+    // bound into every crawl SELECT rather than the marker being an absolute exclusion.
+    let now = Utc::now().to_rfc3339();
     let loaded = match limit {
         Some(n) => {
             sqlx::query_as::<_, (String, Option<String>, Option<String>)>(&format!(
                 "{BASE} LIMIT ?"
             ))
+            .bind(&now)
             .bind(n)
             .fetch_all(main)
             .await
         }
         None => {
             sqlx::query_as::<_, (String, Option<String>, Option<String>)>(BASE)
+                .bind(&now)
                 .fetch_all(main)
                 .await
         }
@@ -488,28 +824,36 @@ pub async fn crawl_uncached_covers(
                         record_cover_issue(main, &job.work_id, "store", &e.to_string()).await;
                     }
                 },
-                // Deterministic decode/encode/size failure — record it so the crawl
-                // stops re-attempting this work every tick (it would fail identically).
+                // Decode/encode/size failure — record it so the crawl stops re-attempting
+                // this work every tick. A deterministic one gets the long window; a
+                // truncated DOWNLOAD (the image is fine, the transfer was cut short) gets
+                // the transient ladder, so it is retried soon but not 288 times a day.
                 Err(e) => {
                     failed += 1;
                     tracing::warn!(work_id = %job.work_id, error = %e, "cover crawl: encode failed");
-                    // …unless it's a truncated download, which a later tick may fetch whole.
-                    if !is_transient_cover_error(&e) {
-                        record_cover_issue(
-                            main,
-                            &job.work_id,
-                            classify_cover_error(&e),
-                            &e.to_string(),
-                        )
-                        .await;
-                    }
+                    record_cover_issue_backoff(
+                        main,
+                        &job.work_id,
+                        classify_process_failure(&e),
+                        &e.to_string(),
+                    )
+                    .await;
                 }
             },
-            // Upstream fetch failure is TRANSIENT (rate limit / network) — do NOT
-            // record an issue, so the next tick retries it.
+            // Upstream fetch failure is TRANSIENT (rate limit / network). It IS recorded
+            // now — with a 30 min → 24 h backoff, not an exclusion — because "don't
+            // record, just retry next tick" is what had the drainer re-fetching the same
+            // permanently-failing covers every 5 minutes for ever.
             None => {
                 failed += 1;
                 tracing::warn!(work_id = %job.work_id, "cover crawl: upstream fetch failed");
+                record_cover_issue_backoff(
+                    main,
+                    &job.work_id,
+                    CoverFailure::Transient("fetch"),
+                    "upstream cover fetch failed",
+                )
+                .await;
             }
         }
     }
@@ -538,18 +882,21 @@ pub async fn crawl_uncached_covers(
                  ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS thumbnail_url \
          FROM work w \
          WHERE w.cover_cached_version IS NULL \
-           AND w.id NOT IN (SELECT work_id FROM work_cover_issue) \
+           AND NOT EXISTS (SELECT 1 FROM work_cover_issue i WHERE i.work_id = w.id \
+                           AND (i.retry_after IS NULL OR i.retry_after > ?)) \
            AND EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id \
                        AND ss.source_type = 'suwayomi')";
     let suw_loaded = match limit {
         Some(n) => {
             sqlx::query_as::<_, (String, Option<String>)>(&format!("{SUW_BASE} LIMIT ?"))
+                .bind(&now)
                 .bind(n)
                 .fetch_all(main)
                 .await
         }
         None => {
             sqlx::query_as::<_, (String, Option<String>)>(SUW_BASE)
+                .bind(&now)
                 .fetch_all(main)
                 .await
         }
@@ -585,6 +932,16 @@ pub async fn crawl_uncached_covers(
                 Some(b) => b,
                 None => {
                     tracing::warn!(work_id = %work_id, "cover crawl (suwayomi): upstream fetch failed");
+                    // Backed off, not abandoned: these are the same 403ing scanlator
+                    // hosts the warmer hits, and an every-tick retry here is the same
+                    // wasted fetch (and the same ban risk) from a second code path.
+                    record_cover_issue_backoff(
+                        main,
+                        &work_id,
+                        CoverFailure::Transient("fetch"),
+                        "upstream cover fetch failed",
+                    )
+                    .await;
                     return (0usize, 1usize);
                 }
             };
@@ -600,12 +957,11 @@ pub async fn crawl_uncached_covers(
                         (0, 1)
                     }
                 },
-                // Deterministic — record so we stop re-attempting an unprocessable source.
+                // Record so we stop re-attempting an unprocessable source every tick;
+                // the failure CLASS picks the window (see `CoverFailure`).
                 Ok(Err(e)) => {
                     tracing::warn!(work_id = %work_id, error = %e, "cover crawl (suwayomi): encode failed");
-                    if !is_transient_cover_error(&e) {
-                        record_cover_issue(main, &work_id, classify_cover_error(&e), &e.to_string()).await;
-                    }
+                    record_cover_issue_backoff(main, &work_id, classify_process_failure(&e), &e.to_string()).await;
                     (0, 1)
                 }
                 Err(e) => {
@@ -625,6 +981,26 @@ pub async fn crawl_uncached_covers(
         total = suw_total,
         "cover crawl (suwayomi): complete"
     );
+}
+
+/// How much the warmer is currently DEFERRING: (covers held by an un-expired marker,
+/// sources parked). The gauge exists so a backoff can never masquerade as "fully warm" —
+/// [`pending_suwayomi_cover_count`] deliberately excludes deferred covers (that is what
+/// stops the drainer launching a pass for work it will skip), and without this the
+/// operator-facing signal for "an entire source is failing" would be a silent zero.
+pub async fn suwayomi_cover_backoff_stats(main: &SqlitePool) -> Result<(i64, i64)> {
+    let now = Utc::now().to_rfc3339();
+    let covers: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM suwayomi_cover_issue WHERE retry_after > ?")
+            .bind(&now)
+            .fetch_one(main)
+            .await?;
+    let sources: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM cover_source_backoff WHERE retry_after > ?")
+            .bind(&now)
+            .fetch_one(main)
+            .await?;
+    Ok((covers, sources))
 }
 
 /// Cursor value meaning "start from the newest id". See [`warm_suwayomi_covers`].
@@ -649,12 +1025,56 @@ async fn cached_suwayomi_cover_ids(covers: &SqlitePool) -> Result<std::collectio
 /// Cached series that have a usable thumbnail, newest id first, restricted to
 /// `id < before_id` (the warmer's rotating window; [`WARM_CURSOR_START`] = no restriction).
 async fn thumbnailed_series_ids(main: &SqlitePool, before_id: i64) -> Result<Vec<i64>> {
-    Ok(sqlx::query_scalar(
-        "SELECT id FROM suwayomi_series \
-         WHERE thumbnail_url IS NOT NULL AND thumbnail_url <> '' AND id < ? \
-         ORDER BY id DESC",
+    Ok(warm_candidates(main, before_id)
+        .await?
+        .into_iter()
+        .map(|c| c.manga_id)
+        .collect())
+}
+
+/// A warmer candidate: the manga id plus everything the backoff needs — the source it
+/// belongs to (per-host park) and the `last_fetched_at` a marker is fingerprinted
+/// against (self-healing).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WarmCandidate {
+    pub manga_id: i64,
+    pub source_id: String,
+    pub fetched_at: Option<String>,
+    /// A marker row exists (expired or voided — it is not blocking this candidate, or it
+    /// would not be one). Lets a success pay for a DELETE only when there is a row.
+    pub had_issue: bool,
+}
+
+/// Cached series that have a usable thumbnail and are NOT currently backed off, newest
+/// id first, restricted to `id < before_id`.
+///
+/// Three exclusions, in the SELECT rather than in Rust so the "nothing to do" gauge
+/// ([`pending_suwayomi_cover_count`]) sees exactly what the warmer sees:
+///
+/// 1. no per-cover marker whose `retry_after` is still in the future;
+/// 2. …unless the series has been re-fetched since (`source_fetched_at IS
+///    s.last_fetched_at` — SQLite `IS` is null-safe). The extension re-fetching the
+///    manga is precisely the event that can replace a `data:` thumbnail with a real
+///    URL, so the marker is void from that moment, permanent or not;
+/// 3. no un-expired park on the whole source (`cover_source_backoff`).
+async fn warm_candidates(main: &SqlitePool, before_id: i64) -> Result<Vec<WarmCandidate>> {
+    let now = Utc::now().to_rfc3339();
+    Ok(sqlx::query_as::<_, WarmCandidate>(
+        "SELECT s.id AS manga_id, s.source_id AS source_id, \
+                s.last_fetched_at AS fetched_at, \
+                EXISTS (SELECT 1 FROM suwayomi_cover_issue i WHERE i.manga_id = s.id) AS had_issue \
+           FROM suwayomi_series s \
+          WHERE s.thumbnail_url IS NOT NULL AND s.thumbnail_url <> '' AND s.id < ? \
+            AND NOT EXISTS (SELECT 1 FROM suwayomi_cover_issue i \
+                             WHERE i.manga_id = s.id AND i.retry_after > ? \
+                               AND i.source_fetched_at IS s.last_fetched_at) \
+            AND NOT EXISTS (SELECT 1 FROM cover_source_backoff b \
+                             WHERE b.source_id = s.source_id AND b.retry_after > ?) \
+          ORDER BY s.id DESC",
     )
     .bind(before_id)
+    .bind(&now)
+    .bind(&now)
     .fetch_all(main)
     .await?)
 }
@@ -671,17 +1091,35 @@ async fn thumbnailed_series_ids(main: &SqlitePool, before_id: i64) -> Result<Vec
 /// (those are what the "Latest updates" / discovery feeds surface). `before_id` is what
 /// makes successive ticks make progress even when the newest batch *fails* — see
 /// [`warm_suwayomi_covers`].
+#[cfg(test)]
 async fn uncached_suwayomi_cover_ids(
     main: &SqlitePool,
     covers: &SqlitePool,
     limit: i64,
     before_id: i64,
 ) -> Result<Vec<i64>> {
+    Ok(
+        uncached_suwayomi_cover_candidates(main, covers, limit, before_id)
+            .await?
+            .into_iter()
+            .map(|c| c.manga_id)
+            .collect(),
+    )
+}
+
+/// Same set as [`uncached_suwayomi_cover_ids`], carrying the backoff metadata the warmer
+/// needs (source id, fetched-at fingerprint, "has a marker row").
+async fn uncached_suwayomi_cover_candidates(
+    main: &SqlitePool,
+    covers: &SqlitePool,
+    limit: i64,
+    before_id: i64,
+) -> Result<Vec<WarmCandidate>> {
     let cached = cached_suwayomi_cover_ids(covers).await?;
-    Ok(thumbnailed_series_ids(main, before_id)
+    Ok(warm_candidates(main, before_id)
         .await?
         .into_iter()
-        .filter(|id| !cached.contains(id))
+        .filter(|c| !cached.contains(&c.manga_id))
         .take(limit.max(0) as usize)
         .collect())
 }
@@ -749,7 +1187,7 @@ pub async fn warm_suwayomi_covers(
 ) -> (usize, usize) {
     use std::sync::atomic::Ordering as AtomicOrdering;
     let start = cursor.load(AtomicOrdering::Relaxed);
-    let load = |before| uncached_suwayomi_cover_ids(main, covers, limit, before);
+    let load = |before| uncached_suwayomi_cover_candidates(main, covers, limit, before);
     let ids = match load(start).await {
         // Bottom of the scan: wrap and take the newest window again, so a tick that
         // lands on the tail is not wasted.
@@ -772,7 +1210,7 @@ pub async fn warm_suwayomi_covers(
     // next tick whatever happens to them (including a shutdown mid-batch). A short batch
     // means we reached the bottom, so restart from the newest.
     let next = match ids.last() {
-        Some(&lowest) if (ids.len() as i64) >= limit => lowest,
+        Some(last) if (ids.len() as i64) >= limit => last.manga_id,
         _ => WARM_CURSOR_START,
     };
     cursor.store(next, AtomicOrdering::Relaxed);
@@ -788,40 +1226,88 @@ pub async fn warm_suwayomi_covers(
     );
 
     use futures::StreamExt as _;
-    let (saved, failed) = futures::stream::iter(ids)
-        .map(|manga_id| async move {
+    let outcomes: Vec<(String, WarmOutcome)> = futures::stream::iter(ids)
+        .map(|cand| async move {
+            let WarmCandidate {
+                manga_id,
+                source_id,
+                fetched_at,
+                had_issue,
+            } = cand;
+            let fetched = fetched_at.as_deref();
             // Cooperative shutdown: stop taking new work the moment the signal flips,
             // rather than draining a 500-item batch through a shutting-down process.
             if *shutdown.borrow() {
-                return (0usize, 0usize);
+                return (source_id, WarmOutcome::Skipped);
             }
             let path = format!("/api/v1/manga/{manga_id}/thumbnail");
             let bytes = match suwayomi.fetch_cover_background(&path).await {
                 Ok((b, _ct)) => b,
                 Err(e) => {
-                    tracing::debug!(manga_id, error = %e, "suwayomi cover warmer: fetch failed");
-                    return (0, 1);
+                    // The 92-covers-a-tick case: a `data:` thumbnail (400) is permanent,
+                    // a WAF 403 / 429 / 5xx is transient. Both stop being re-fetched
+                    // immediately; only the window differs.
+                    let failure = classify_fetch_error(&e);
+                    tracing::debug!(manga_id, reason = failure.reason(), error = %e, "suwayomi cover warmer: fetch failed");
+                    record_suwayomi_cover_issue(
+                        main,
+                        manga_id,
+                        Some(&source_id),
+                        fetched,
+                        failure,
+                        &e.to_string(),
+                    )
+                    .await;
+                    return (source_id, WarmOutcome::from(failure));
                 }
             };
             match tokio::task::spawn_blocking(move || process_cover(&bytes)).await {
                 Ok(Ok(webp)) => match put_suwayomi_cover(covers, manga_id, &webp).await {
-                    Ok(()) => (1, 0),
+                    Ok(()) => {
+                        if had_issue {
+                            clear_suwayomi_cover_issue(main, manga_id).await;
+                        }
+                        (source_id, WarmOutcome::Saved)
+                    }
                     Err(e) => {
+                        // A local write failure says nothing about the source, so it is
+                        // transient — backed off, never permanent.
                         tracing::warn!(manga_id, error = %e, "suwayomi cover warmer: store failed");
-                        (0, 1)
+                        record_suwayomi_cover_issue(
+                            main,
+                            manga_id,
+                            Some(&source_id),
+                            fetched,
+                            CoverFailure::Transient("store"),
+                            &e.to_string(),
+                        )
+                        .await;
+                        (source_id, WarmOutcome::Transient)
                     }
                 },
                 Ok(Err(e)) => {
-                    // No per-id issue table exists for Suwayomi covers, so an
-                    // unprocessable source is simply retried on a later tick. That is
-                    // acceptable: the candidate list is small and bounded, and the
-                    // alternative (a second issue table) buys little.
-                    tracing::debug!(manga_id, error = %e, "suwayomi cover warmer: encode failed");
-                    (0, 1)
+                    // Undecodable (AVIF with no feature compiled in) or over-cap GIF:
+                    // deterministic for these bytes. Recorded in `suwayomi_cover_issue`
+                    // — the sibling of `work_cover_issue` this warmer never had, which
+                    // is why it re-decoded the same broken source every 5 minutes.
+                    let failure = classify_process_failure(&e);
+                    tracing::debug!(manga_id, reason = failure.reason(), error = %e, "suwayomi cover warmer: encode failed");
+                    record_suwayomi_cover_issue(
+                        main,
+                        manga_id,
+                        Some(&source_id),
+                        fetched,
+                        failure,
+                        &e.to_string(),
+                    )
+                    .await;
+                    (source_id, WarmOutcome::from(failure))
                 }
                 Err(e) => {
+                    // A panic in the blocking pool is not attributable to the cover; no
+                    // marker, let a later tick retry.
                     tracing::warn!(manga_id, error = %e, "suwayomi cover warmer: encode task panicked");
-                    (0, 1)
+                    (source_id, WarmOutcome::Transient)
                 }
             }
         })
@@ -829,12 +1315,88 @@ pub async fn warm_suwayomi_covers(
         // on-demand `<img>` request always finds free permits and never fails fast
         // because of the warmer.
         .buffer_unordered(crate::suwayomi::WARM_COVER_CONCURRENCY)
-        .fold((0usize, 0usize), |(s, f), (ds, df)| async move {
-            (s + ds, f + df)
-        })
+        .collect()
         .await;
+
+    let mut saved = 0usize;
+    let mut failed = 0usize;
+    // Per-source tallies drive the host-level park: per-cover backoff alone would still
+    // send one request per cover per tick at a source that is banning us.
+    let mut by_source: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
+    for (source_id, outcome) in outcomes {
+        let entry = by_source.entry(source_id).or_insert((0, 0));
+        match outcome {
+            WarmOutcome::Saved => {
+                saved += 1;
+                entry.0 += 1;
+            }
+            WarmOutcome::Transient => {
+                failed += 1;
+                entry.1 += 1;
+            }
+            WarmOutcome::Permanent => failed += 1,
+            WarmOutcome::Skipped => {}
+        }
+    }
+    update_source_backoffs(main, &by_source).await;
     tracing::info!(saved, failed, total, "suwayomi cover warmer: complete");
     (saved, failed)
+}
+
+/// What one candidate did this tick. `Permanent` failures deliberately do NOT count
+/// toward the per-source park: a `data:` thumbnail or an AVIF is our problem, not
+/// evidence that the host is refusing us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmOutcome {
+    Saved,
+    Permanent,
+    Transient,
+    Skipped,
+}
+
+impl From<CoverFailure> for WarmOutcome {
+    fn from(f: CoverFailure) -> Self {
+        if f.is_permanent() {
+            Self::Permanent
+        } else {
+            Self::Transient
+        }
+    }
+}
+
+/// Apply one tick's per-source tallies: any success un-parks (and resets the escalation
+/// counter for) a source; [`SOURCE_BACKOFF_THRESHOLD`] transient failures with NO success
+/// parks it.
+async fn update_source_backoffs(
+    main: &SqlitePool,
+    by_source: &std::collections::HashMap<String, (usize, usize)>,
+) {
+    // Which sources actually have a row, so a healthy tick doesn't fire a no-op DELETE
+    // (and a write lock) per source. Tiny table — 22 sources in production.
+    let parked: std::collections::HashSet<String> =
+        sqlx::query_scalar::<_, String>("SELECT source_id FROM cover_source_backoff")
+            .fetch_all(main)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+    for (source_id, (ok, transient)) in by_source {
+        if *ok > 0 {
+            if parked.contains(source_id) {
+                clear_source_cover_backoff(main, source_id).await;
+            }
+        } else if *transient >= SOURCE_BACKOFF_THRESHOLD {
+            record_source_cover_backoff(
+                main,
+                source_id,
+                CoverFailure::Transient("source_failing"),
+                *transient,
+                "every cover attempted for this source failed this tick",
+            )
+            .await;
+        }
+    }
 }
 
 /// Recurring background drainer that keeps the cover cache full with NO manual
@@ -936,7 +1498,20 @@ async fn run_loop(
                 // semaphore so it cannot saturate the pool it exists to relieve.
                 if !*warm_shutdown.borrow() {
                     match pending_suwayomi_cover_count(&main, &covers).await {
-                        Ok(0) => { /* fully warm */ }
+                        Ok(0) => {
+                            // "Nothing to do" now has two causes — genuinely warm, or
+                            // everything left is backed off. Say which, so a source-wide
+                            // failure is visible instead of looking like full coverage.
+                            match suwayomi_cover_backoff_stats(&main).await {
+                                Ok((0, 0)) => { /* genuinely fully warm */ }
+                                Ok((deferred, parked)) => tracing::warn!(
+                                    deferred,
+                                    parked_sources = parked,
+                                    "suwayomi cover warmer: nothing runnable — covers/sources are backed off"
+                                ),
+                                Err(e) => tracing::warn!(error = %e, "suwayomi cover warmer: backoff stats failed"),
+                            }
+                        }
                         Ok(pending) => {
                             tracing::debug!(pending, "suwayomi cover warmer: pending");
                             warm_suwayomi_covers(
@@ -1425,16 +2000,46 @@ mod tests {
     }
 
     async fn insert_series(main: &SqlitePool, id: i64, thumb: Option<&str>) {
+        insert_series_from(main, id, thumb, "1", None).await;
+    }
+
+    /// Same, with the two columns the backoff keys on: the source, and the
+    /// `last_fetched_at` a marker is fingerprinted against.
+    async fn insert_series_from(
+        main: &SqlitePool,
+        id: i64,
+        thumb: Option<&str>,
+        source_id: &str,
+        fetched_at: Option<&str>,
+    ) {
         sqlx::query(
             "INSERT INTO suwayomi_series (id, title, status, source_id, in_library, \
-             thumbnail_url, updated_at) VALUES (?, ?, 'ONGOING', '1', 1, ?, '2026-01-01T00:00:00Z')",
+             thumbnail_url, last_fetched_at, updated_at) \
+             VALUES (?, ?, 'ONGOING', ?, 1, ?, ?, '2026-01-01T00:00:00Z')",
         )
         .bind(id)
         .bind(format!("s{id}"))
+        .bind(source_id)
         .bind(thumb)
+        .bind(fetched_at)
         .execute(main)
         .await
         .unwrap();
+    }
+
+    fn thumb_path(id: i64) -> String {
+        format!("/api/v1/manga/{id}/thumbnail")
+    }
+
+    async fn issue_row(main: &SqlitePool, manga_id: i64) -> Option<(String, i64, i64, String)> {
+        sqlx::query_as(
+            "SELECT reason, permanent, attempts, retry_after FROM suwayomi_cover_issue \
+             WHERE manga_id = ?",
+        )
+        .bind(manga_id)
+        .fetch_optional(main)
+        .await
+        .unwrap()
     }
 
     /// The candidate query is the "LEFT JOIN across two SQLite files" that the missing
@@ -1651,7 +2256,17 @@ mod tests {
                 "the window must slide down even though nothing succeeded"
             );
         }
-        // Bottom reached: the next tick wraps to the newest window instead of idling.
+        // Bottom reached. Since 0100 the wrap does NOT re-fetch immediately: all six now
+        // carry a transient marker, so the tick costs zero requests — the rotation and
+        // the backoff compose (the cursor still slides, there is simply nothing to do).
+        let (_, failed) = warm_suwayomi_covers(&covers, &main, &client, 2, &cursor, &rx).await;
+        assert_eq!(failed, 0, "backed-off ids are not re-fetched on the wrap");
+
+        // Once the backoff elapses the wrap behaves as before: newest window first.
+        sqlx::query("UPDATE suwayomi_cover_issue SET retry_after = '2020-01-01T00:00:00+00:00'")
+            .execute(&main)
+            .await
+            .unwrap();
         let (_, failed) = warm_suwayomi_covers(&covers, &main, &client, 2, &cursor, &rx).await;
         assert_eq!(failed, 2, "wrapped and retried the newest ids");
         assert_eq!(cursor.load(AtomicOrdering::Relaxed), 5);
@@ -1682,6 +2297,393 @@ mod tests {
                 .await
                 .unwrap(),
             vec![32, 31]
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Retry backoff (0100): the warmer must stop re-fetching covers that keep failing
+    // ---------------------------------------------------------------------------
+
+    /// The classification IS the mechanism: a `data:` thumbnail / 400 / 404 can never
+    /// succeed unprompted, while a WAF 403, a 429 and a 5xx are expected to lapse.
+    #[test]
+    fn classify_fetch_error_splits_permanent_from_transient() {
+        use CoverFailure::*;
+        let cases: [(&str, CoverFailure); 9] = [
+            // What Suwayomi actually answers for the 46 `data:` thumbnails.
+            (
+                "Suwayomi cover error 400 Bad Request: Expected URL scheme 'http' or 'https' but was 'data'",
+                Permanent("data_uri"),
+            ),
+            ("Suwayomi cover error 400 Bad Request", Permanent("bad_request")),
+            ("Suwayomi cover error 404 Not Found", Permanent("not_found")),
+            ("response body exceeds cap (26000000)", Permanent("too_large")),
+            // Philia's Cloudflare block — 28 covers, ~8k fetches/day.
+            ("Suwayomi cover error 403 Forbidden", Transient("blocked")),
+            ("Suwayomi cover error 429 Too Many Requests", Transient("rate_limited")),
+            ("Suwayomi cover error 502 Bad Gateway", Transient("upstream_5xx")),
+            ("truncated JPEG (no EOI marker)", Transient("truncated")),
+            ("error sending request for url (http://x/api/v1/manga/404/thumbnail)", Transient("fetch")),
+        ];
+        for (msg, want) in cases {
+            assert_eq!(
+                classify_fetch_error(&anyhow!("{msg}")),
+                want,
+                "misclassified: {msg}"
+            );
+        }
+    }
+
+    /// Transient failures back off exponentially and STOP at a ceiling — a cover is
+    /// slowed down, never abandoned. Permanent ones get one long (but finite) window.
+    #[test]
+    fn transient_backoff_is_exponential_with_a_ceiling() {
+        let t = CoverFailure::Transient("blocked");
+        assert_eq!(t.backoff_secs(1), TRANSIENT_BACKOFF_BASE_SECS);
+        assert_eq!(t.backoff_secs(2), TRANSIENT_BACKOFF_BASE_SECS * 2);
+        assert_eq!(t.backoff_secs(3), TRANSIENT_BACKOFF_BASE_SECS * 4);
+        assert_eq!(
+            t.backoff_secs(50),
+            TRANSIENT_BACKOFF_MAX_SECS,
+            "capped, not overflowing"
+        );
+        assert!(t.backoff_secs(50) <= TRANSIENT_BACKOFF_MAX_SECS);
+        assert_eq!(
+            CoverFailure::Permanent("data_uri").backoff_secs(1),
+            PERMANENT_BACKOFF_SECS
+        );
+    }
+
+    /// THE regression this exists for: `saved=0 failed=92` on every 5-minute tick. A
+    /// deterministically-failing cover (Suwayomi's 400 for a `data:` thumbnail) must be
+    /// fetched ONCE and then skipped on the next cycle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn permanently_failing_cover_is_not_retried_next_cycle() {
+        let (main, covers) = warm_test_pools().await;
+        insert_series(&main, 7, Some(&thumb_path(7))).await;
+        let origin = crate::suwayomi::testsrv::spawn_error(
+            400,
+            "Expected URL scheme 'http' or 'https' but was 'data'",
+        )
+        .await;
+        let client =
+            crate::suwayomi::SuwayomiClient::new(origin.base_url.clone(), None, Some("1".into()));
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let cursor = AtomicI64::new(WARM_CURSOR_START);
+
+        let (saved, failed) = warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await;
+        assert_eq!((saved, failed), (0, 1));
+        let (reason, permanent, attempts, _) = issue_row(&main, 7).await.expect("marker recorded");
+        assert_eq!((reason.as_str(), permanent, attempts), ("data_uri", 1, 1));
+        let after_first = origin.hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(after_first, 1);
+
+        // Next cycle: the candidate is gone, so not one byte leaves the box.
+        let (saved, failed) = warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await;
+        assert_eq!(
+            (saved, failed),
+            (0, 0),
+            "the failing cover is no longer a candidate"
+        );
+        assert_eq!(
+            origin.hits.load(std::sync::atomic::Ordering::SeqCst),
+            after_first,
+            "a permanently-failing cover must not be re-fetched every tick"
+        );
+        assert_eq!(
+            pending_suwayomi_cover_count(&main, &covers).await.unwrap(),
+            0,
+            "the gauge must agree with the warmer, or the drainer runs empty passes"
+        );
+        // …and the deferral is still VISIBLE, not silently counted as full coverage.
+        assert_eq!(suwayomi_cover_backoff_stats(&main).await.unwrap(), (1, 0));
+    }
+
+    /// A transient failure is BACKED OFF, not abandoned: skipped while the window is
+    /// open, retried (with a longer window) once it elapses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transient_failure_is_retried_once_its_backoff_elapses() {
+        let (main, covers) = warm_test_pools().await;
+        // Below SOURCE_BACKOFF_THRESHOLD, so this exercises the per-cover ladder only.
+        insert_series(&main, 8, Some(&thumb_path(8))).await;
+        let origin = crate::suwayomi::testsrv::spawn_error(503, "upstream is sulking").await;
+        let client =
+            crate::suwayomi::SuwayomiClient::new(origin.base_url.clone(), None, Some("1".into()));
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let cursor = AtomicI64::new(WARM_CURSOR_START);
+
+        assert_eq!(
+            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            (0, 1)
+        );
+        let (reason, permanent, attempts, _) = issue_row(&main, 8).await.expect("marker recorded");
+        assert_eq!(
+            (reason.as_str(), permanent, attempts),
+            ("upstream_5xx", 0, 1)
+        );
+        assert_eq!(origin.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Inside the window: skipped.
+        assert_eq!(
+            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            (0, 0)
+        );
+        assert_eq!(origin.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Window elapsed (backdated, so the test doesn't sleep for 30 minutes).
+        sqlx::query("UPDATE suwayomi_cover_issue SET retry_after = '2020-01-01T00:00:00+00:00'")
+            .execute(&main)
+            .await
+            .unwrap();
+        assert_eq!(
+            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            (0, 1),
+            "a transient failure must be retried after its backoff, not abandoned"
+        );
+        assert_eq!(origin.hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let (_, _, attempts, _) = issue_row(&main, 8).await.unwrap();
+        assert_eq!(attempts, 2, "the next window is longer than the last");
+    }
+
+    /// Self-healing #1: a fetch that works clears the marker outright.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_successful_fetch_clears_the_marker() {
+        let (main, covers) = warm_test_pools().await;
+        insert_series(&main, 9, Some(&thumb_path(9))).await;
+        // A marker from an earlier failure whose window has already elapsed.
+        record_suwayomi_cover_issue(
+            &main,
+            9,
+            Some("1"),
+            None,
+            CoverFailure::Transient("blocked"),
+            "403 last week",
+        )
+        .await;
+        sqlx::query("UPDATE suwayomi_cover_issue SET retry_after = '2020-01-01T00:00:00+00:00'")
+            .execute(&main)
+            .await
+            .unwrap();
+
+        let origin = crate::suwayomi::testsrv::spawn(
+            crate::suwayomi::testsrv::jpeg(300, 450),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let client =
+            crate::suwayomi::SuwayomiClient::new(origin.base_url.clone(), None, Some("1".into()));
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let cursor = AtomicI64::new(WARM_CURSOR_START);
+
+        assert_eq!(
+            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            (1, 0)
+        );
+        assert!(
+            issue_row(&main, 9).await.is_none(),
+            "success clears the marker"
+        );
+        assert!(get_suwayomi_cover(&covers, 9).await.is_some());
+    }
+
+    /// Self-healing #2: a PERMANENT marker is void the moment the extension re-fetches
+    /// the manga — that is exactly when a `data:` thumbnail can become a real URL, and
+    /// it must not wait out the 30-day window.
+    #[tokio::test]
+    async fn a_re_fetched_series_voids_even_a_permanent_marker() {
+        let (main, _covers) = warm_test_pools().await;
+        insert_series_from(
+            &main,
+            12,
+            Some(&thumb_path(12)),
+            "1",
+            Some("2026-08-01T00:00:00Z"),
+        )
+        .await;
+        record_suwayomi_cover_issue(
+            &main,
+            12,
+            Some("1"),
+            Some("2026-08-01T00:00:00Z"),
+            CoverFailure::Permanent("data_uri"),
+            "data: thumbnail",
+        )
+        .await;
+        assert!(
+            warm_candidates(&main, WARM_CURSOR_START)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a fresh permanent marker suppresses the candidate"
+        );
+
+        sqlx::query(
+            "UPDATE suwayomi_series SET last_fetched_at = '2026-08-12T00:00:00Z' WHERE id = 12",
+        )
+        .execute(&main)
+        .await
+        .unwrap();
+        let again = warm_candidates(&main, WARM_CURSOR_START).await.unwrap();
+        assert_eq!(again.len(), 1, "a re-fetched series is a candidate again");
+        assert!(
+            again[0].had_issue,
+            "…and the stale marker is cleared on success"
+        );
+
+        // Re-recording against the NEW fetch stamp restarts the ladder rather than
+        // inheriting the old attempt count.
+        record_suwayomi_cover_issue(
+            &main,
+            12,
+            Some("1"),
+            Some("2026-08-12T00:00:00Z"),
+            CoverFailure::Transient("blocked"),
+            "403",
+        )
+        .await;
+        assert_eq!(
+            issue_row(&main, 12).await.unwrap().2,
+            1,
+            "attempts reset on new input"
+        );
+    }
+
+    /// Per-SOURCE park. 28 individually-backed-off covers at one host still means 28
+    /// requests per tick at a host that is banning us, so a source that fails wholesale
+    /// is parked — including covers enrolled AFTER the park, which have no marker of
+    /// their own. A healthy source in the same tick is untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wholly_failing_source_is_parked_for_all_its_covers() {
+        let (main, covers) = warm_test_pools().await;
+        for id in 41..=43 {
+            insert_series_from(&main, id, Some(&thumb_path(id)), "philia", None).await;
+        }
+        let origin = crate::suwayomi::testsrv::spawn_error(403, "blocked by WAF").await;
+        let client =
+            crate::suwayomi::SuwayomiClient::new(origin.base_url.clone(), None, Some("1".into()));
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let cursor = AtomicI64::new(WARM_CURSOR_START);
+
+        assert_eq!(
+            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            (0, 3)
+        );
+        let hits = origin.hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(hits, 3);
+        let (_, parked) = suwayomi_cover_backoff_stats(&main).await.unwrap();
+        assert_eq!(
+            parked, 1,
+            "the source itself is parked, not just its covers"
+        );
+
+        // A brand-new cover from the parked source: no marker of its own, still skipped.
+        insert_series_from(&main, 44, Some(&thumb_path(44)), "philia", None).await;
+        assert_eq!(
+            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            (0, 0)
+        );
+        assert_eq!(
+            origin.hits.load(std::sync::atomic::Ordering::SeqCst),
+            hits,
+            "a parked source must cost zero requests, per-cover markers or not"
+        );
+
+        // A different source is unaffected by the park.
+        insert_series_from(&main, 45, Some(&thumb_path(45)), "healthy", None).await;
+        assert_eq!(
+            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            (0, 1)
+        );
+        assert_eq!(
+            origin.hits.load(std::sync::atomic::Ordering::SeqCst),
+            hits + 1
+        );
+    }
+
+    /// A park is lifted by a single success — no operator action, no manual DELETE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_source_park_lifts_as_soon_as_one_cover_succeeds() {
+        let (main, covers) = warm_test_pools().await;
+        for id in 51..=53 {
+            insert_series_from(&main, id, Some(&thumb_path(id)), "philia", None).await;
+        }
+        let dead = crate::suwayomi::SuwayomiClient::new(
+            "http://127.0.0.1:1".into(),
+            None,
+            Some("1".into()),
+        );
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let cursor = AtomicI64::new(WARM_CURSOR_START);
+        assert_eq!(
+            warm_suwayomi_covers(&covers, &main, &dead, 10, &cursor, &rx).await,
+            (0, 3)
+        );
+        assert_eq!(suwayomi_cover_backoff_stats(&main).await.unwrap().1, 1);
+
+        // The block lifts (window elapsed) and the source answers again.
+        sqlx::query("UPDATE cover_source_backoff SET retry_after = '2020-01-01T00:00:00+00:00'")
+            .execute(&main)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE suwayomi_cover_issue SET retry_after = '2020-01-01T00:00:00+00:00'")
+            .execute(&main)
+            .await
+            .unwrap();
+        let origin = crate::suwayomi::testsrv::spawn(
+            crate::suwayomi::testsrv::jpeg(200, 300),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let client =
+            crate::suwayomi::SuwayomiClient::new(origin.base_url.clone(), None, Some("1".into()));
+        assert_eq!(
+            warm_suwayomi_covers(&covers, &main, &client, 10, &cursor, &rx).await,
+            (3, 0)
+        );
+        assert_eq!(
+            suwayomi_cover_backoff_stats(&main).await.unwrap(),
+            (0, 0),
+            "success clears both the per-cover markers and the source park"
+        );
+    }
+
+    /// The work-side marker (0043) grows the same expiry, so a work is no longer excluded
+    /// from the crawl for ever — a decoder/cap improvement is picked up by itself.
+    #[tokio::test]
+    async fn work_cover_issue_marker_expires_instead_of_excluding_for_ever() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let main = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&main).await.unwrap();
+        sqlx::query(
+            "INSERT INTO work (id, cover_file_name, created_at, updated_at) \
+             VALUES ('w_b', 'c.jpg', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&main)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
+             VALUES ('ss_b', 'w_b', 'mangadex', 'md-b', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&main)
+        .await
+        .unwrap();
+
+        record_cover_issue_backoff(&main, "w_b", CoverFailure::Transient("blocked"), "403").await;
+        assert_eq!(pending_cover_count(&main).await.unwrap(), 0, "backed off");
+
+        sqlx::query("UPDATE work_cover_issue SET retry_after = '2020-01-01T00:00:00+00:00'")
+            .execute(&main)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_cover_count(&main).await.unwrap(),
+            1,
+            "an elapsed backoff makes the work selectable again"
         );
     }
 }

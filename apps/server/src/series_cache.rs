@@ -431,6 +431,77 @@ pub async fn put_chapters(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+
+    // --- and into the canonical spine (Phase B1) -------------------------------------
+    //
+    // DELIBERATELY AFTER THE EARLY-OUT ABOVE, not before it. That early-out is what keeps
+    // a scan that found nothing at zero writes, and its comment records the cost of
+    // getting this wrong: the old unconditional rewrite shipped 1,786 MB/day of WAL.
+    // ≥95% of scans reach it, so putting the spine write ahead of it would hand that bill
+    // straight back — and would write nothing new, because an unchanged chapter list
+    // produces an unchanged spine.
+    //
+    // The consequence is that the spine is only *maintained* here; it is *populated* by
+    // `catalog::spine`'s backfill, which is what covers the 11,797 in-library series whose
+    // chapter list may not change again for weeks.
+    write_chapters_to_spine(pool, manga_id, chapters).await?;
+    Ok(())
+}
+
+/// Mirror a Suwayomi series' chapters into the canonical `chapter` spine.
+///
+/// A failure here is logged and swallowed. The spine is a derived structure with its own
+/// self-healing backfill; letting a spine write fail the whole `put_chapters` call would
+/// take the *scanner* down with it, and the scanner's chapter cache is what the reader
+/// actually serves from.
+pub(crate) async fn write_chapters_to_spine(
+    pool: &SqlitePool,
+    manga_id: i64,
+    chapters: &[SuwayomiChapter],
+) -> Result<()> {
+    // The spine is keyed by `source_series`, which is what carries the link to `work`.
+    // A series with no mapping yet is not catalogued, so it has nowhere to go — the
+    // backfill picks it up once the mapping exists.
+    // `source_key = ?` with the id spelled as TEXT, NOT `CAST(source_key AS INTEGER) = ?`.
+    // A CAST on the COLUMN is not sargable: it defeats `source_series`' unique index on
+    // (source_type, source_id, source_key) and turns a point lookup into a scan of all
+    // 14,103 rows, on a path the scanner takes every time a chapter list changes.
+    let ssid: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM source_series \
+         WHERE source_type = 'suwayomi' AND source_key = ? \
+         ORDER BY last_seen DESC, id ASC LIMIT 1",
+    )
+    .bind(manga_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    let Some(ssid) = ssid else {
+        return Ok(());
+    };
+    let inputs: Vec<crate::catalog::ChapterInput> = chapters
+        .iter()
+        .map(crate::catalog::suwayomi_chapter_input)
+        .collect();
+    if let Err(e) = crate::catalog::replace_source_chapters(pool, &ssid, &inputs).await {
+        tracing::warn!(manga_id, error = %e, "series cache: chapter spine write failed");
+        return Ok(());
+    }
+    // Record what this source just announced (Phase C1) — but only once the spine is
+    // complete. `release_event` is written with `INSERT OR IGNORE`, so the first writer for
+    // a chapter key wins permanently; recording from one source while another source's
+    // chapters are still being materialised would credit the wrong source for chapters it
+    // did not publish first, un-fixably. During the drain window the ledger's own seed
+    // covers these rows instead, reading every source at once.
+    match crate::catalog::spine::remaining(pool).await {
+        Ok((0, 0)) => {
+            if let Err(e) = crate::catalog::ledger::record_source_series(pool, &ssid).await {
+                tracing::warn!(manga_id, error = %e, "series cache: release ledger write failed");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(manga_id, error = %e, "series cache: spine readiness check failed")
+        }
+    }
     Ok(())
 }
 

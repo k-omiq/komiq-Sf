@@ -1,3 +1,72 @@
-# allow crawling everything by default
+# Komika reader crawl policy.
+#
+# WHY THIS FILE IS NOT "Disallow:" ANY MORE
+#
+# It used to be a bare `User-agent: * / Disallow:` — an explicit invitation to crawl
+# everything, with no Crawl-delay. The crawlable surface behind that invitation is
+# ~67,000 server-rendered /series/<slug> pages plus paginated /browse, and every one of
+# those renders on the edge Worker and fans out to api.komiq.cc. On 2026-07-31 the
+# komika-reader Worker took ~104k requests at a flat ~6-7k/hour from US datacentres —
+# the signature of crawlers working politely through the catalogue, not an attack.
+#
+# So: keep the pages that are worth indexing indexable, and stop the two things that
+# turn one site into millions of requests — AI training crawlers, and the combinatorial
+# query-string surface.
+
+# ---------------------------------------------------------------------------
+# AI training / LLM crawlers — blocked outright.
+# These ignore Crawl-delay, crawl breadth-first over every URL they can reach, and
+# return nothing (no referral traffic, no ranking). Named individually because a
+# blanket rule cannot express "block AI, allow search".
+# ---------------------------------------------------------------------------
+User-agent: GPTBot
+User-agent: OAI-SearchBot
+User-agent: ChatGPT-User
+User-agent: ClaudeBot
+User-agent: Claude-Web
+User-agent: anthropic-ai
+User-agent: CCBot
+User-agent: PerplexityBot
+User-agent: Perplexity-User
+User-agent: Bytespider
+User-agent: Amazonbot
+User-agent: Applebot-Extended
+User-agent: Google-Extended
+User-agent: FacebookBot
+User-agent: meta-externalagent
+User-agent: Diffbot
+User-agent: ImagesiftBot
+User-agent: Omgilibot
+User-agent: Timpibot
+User-agent: cohere-ai
+User-agent: YouBot
+User-agent: AI2Bot
+User-agent: Scrapy
+Disallow: /
+
+# ---------------------------------------------------------------------------
+# Everyone else (Googlebot, Bingbot, DuckDuckBot, …).
+#
+# Crawl-delay is honoured by Bing, Yandex, Seznam and most well-behaved crawlers.
+# Google ignores it — control Googlebot's rate in Search Console instead.
+# ---------------------------------------------------------------------------
 User-agent: *
-Disallow:
+Crawl-delay: 10
+
+# Private / per-user surfaces. Nothing to index, and every hit is an SSR render plus
+# an API round trip. `/read/` is excluded deliberately: it is the single most expensive
+# route (page-image fan-out through img.komiq.cc) and has no standalone search value —
+# the series page is the canonical, indexable entry point for a title.
+Disallow: /library
+Disallow: /profile
+Disallow: /login
+Disallow: /read/
+Disallow: /support/report
+
+# The combinatorial surface. /browse is worth indexing; /browse?page=417&sort=…&type=…
+# is the same catalogue re-sliced, and it is unbounded. Crawlers that follow every
+# facet permutation are what turn a 67k-work catalogue into millions of URLs.
+Disallow: /*?
+
+# The canonical entry points stay fully crawlable: /, /browse, /updates,
+# /series/<slug>, /about, /support.

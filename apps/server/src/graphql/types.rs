@@ -243,40 +243,93 @@ pub struct Series {
     /// Empty when the series has no dated chapter cached yet. This is the field feeds
     /// and the reader's "· 4h" label should use.
     pub latest_chapter_at: String,
-    /// When OUR scanner first detected this series' newest chapter
-    /// (`series_scan_state.last_new_chapter_at`, raw ISO). Populated by the BATCHED
-    /// mappers (`map_series_batch`, `map_browse_rows`) so the GraphQL `detectedAt`
-    /// field below resolves without its old per-row query — one grouped SELECT per
-    /// page instead of ~80 on a home render. Skipped by the derive (not part of the
-    /// schema): the public `detectedAt` is the ComplexObject resolver, which reads
-    /// this and normalizes the offset. `None` = not populated / no scan-state row.
-    #[graphql(skip)]
-    pub detected_at: Option<String>,
+    /// The newest chapter's LABEL — "151", "10.5", "Oneshot" (migration 0095).
+    ///
+    /// **This is NOT [`Self::chapter_count`] and the two must never substitute for each
+    /// other.** `chapter_count` is how many chapters we know of; this is what the newest
+    /// one is CALLED. A series with 12 mirrored chapters whose newest is Ch. 151 is
+    /// ordinary — the mirror is partial — and printing "Ch. 12" for it is F4, the specific
+    /// bug the chapter-number contract exists to prevent. Browse renders both:
+    /// `12 ch · Ch. 151`.
+    ///
+    /// `None` means WE DO NOT KNOW, and the client must then print the count alone. It is
+    /// never a licence to fall back to `chapter_count`.
+    ///
+    /// Populated on the BROWSE path (`browse_catalogue.latest_chapter`, itself a verbatim
+    /// copy of `feed_series_updates.latest_chapter`, itself the ledger projection's
+    /// `release_event.label`). The Suwayomi-live path (`map_series`) leaves it `None`: that
+    /// object is assembled from a `SuwayomiManga`, which carries a chapter COUNT and no
+    /// label at all, and inventing one there is exactly the substitution above.
+    pub latest_chapter: Option<String>,
 }
 
 /// Per-series read progress for the whole library, returned by `libraryProgress`
 /// in ONE batched query. Lets the Library and Profile screens shelve every series
 /// by progress without fetching each series' chapter list (the old N+1 that hung
-/// those pages). `read`/`total` are counted from the cached chapter state — the
-/// same source `chapters(seriesId)` reads — so the numbers match exactly.
+/// those pages).
+///
+/// `read` and `total` are two counts over the SAME population — distinct chapter keys
+/// on the chapter spine — so `read <= total` always holds. See the resolver for why
+/// that matters.
 #[derive(SimpleObject, Clone)]
 pub struct SeriesProgress {
-    /// The Suwayomi series id (matches `Series.id` for library series).
+    /// The library series id — a canonical `w_` work id or a numeric Suwayomi id,
+    /// matching `Series.id` for library series.
     pub id: ID,
-    /// Chapters marked read.
+    /// Distinct chapters the viewer has marked read, deduped across sources: a chapter
+    /// carried by two scanlators (or by both MangaDex and a Suwayomi mirror) counts once,
+    /// the same way `total` counts it once.
     pub read: i32,
-    /// Total chapters known for the series (cached chapter count).
+    /// Distinct chapters that exist for this series across all its sources.
+    ///
+    /// 0 only when the series has no cached chapters at all; clients read it as
+    /// `p.total || s.chapterCount` and so fall back to the series' own count there.
     pub total: i32,
+    /// When the viewer last made progress on this series (RFC 3339), or null if never.
+    ///
+    /// `MAX(updated_at)` over their progress rows, so it moves on ANY progress — a
+    /// mid-chapter page position counts, not just finishing one. That is what "last read"
+    /// has to mean for ordering a Continue-reading shelf: a series you are three pages
+    /// into is more current than one you finished a month ago.
+    pub last_read_at: Option<String>,
 }
 
 #[derive(SimpleObject, Clone)]
 pub struct Chapter {
     pub id: ID,
     pub series_id: ID,
+    /// The chapter's number, or `0` when it has none. **Prefer [`Self::label`]** — a
+    /// oneshot used to arrive here as a hard-coded `0.0` with no way to tell it from a
+    /// real `Chapter 0`, which is why the reader printed "Chapter 0" for 21,422 works.
     pub number: f64,
+    /// What to print: "45", "10.5", "Oneshot" (Phase A2).
+    pub label: String,
     pub title: Option<String>,
     pub page_count: i32,
+    /// When the chapter became READABLE — `readableAt` where MangaDex provides it, not the
+    /// `publishAt` that is a 2037 sentinel on external chapters (migration 0073).
+    ///
+    /// This is the SOURCE's clock. For when WE first had it, see [`Self::found_at`].
     pub uploaded_at: Option<String>,
+    /// When WE first recorded this chapter as available — `release_event.announce_at`
+    /// (migration 0099), joined on `(work_id, chapter_key)`.
+    ///
+    /// The two clocks are independent and the gap between them is the point: a source that
+    /// holds a chapter behind early access publishes it (per [`Self::uploaded_at`]) hours or
+    /// days before anyone here can read it, and only this column says when that wait ended.
+    ///
+    /// **`None` MEANS "WE DO NOT KNOW" AND MUST RENDER AS AN EM DASH, NEVER AS
+    /// [`Self::uploaded_at`].** That distinction is the whole value of the field: falling
+    /// back would silently assert we found a chapter the instant it was published, which is
+    /// the exact claim this column exists to stop the UI from making. Expect it to be null
+    /// for essentially every chapter that predates migration 0099 — there is no honest
+    /// record of when we first saw those, and none was invented.
+    pub found_at: Option<String>,
+    /// Set when the chapter is hosted off-site and has no pages for us to serve
+    /// (MangaPlus, Comikey, NamiComi, BiliBili — ~35,000 chapters, 4% of the mirror). The
+    /// reader must send the user here instead of asking for pages it will never get.
+    /// `externalUrl IS NOT NULL` is the only valid test — a `pages` count of 0 is not.
+    pub external_url: Option<String>,
     pub scanlator: Option<String>,
     pub read: bool,
     pub last_page_read: i32,
@@ -699,6 +752,54 @@ impl From<crate::suwayomi::ExtensionListEntry> for ExtensionInfo {
     }
 }
 
+/// One source's scan health (Phase E4.3) — the admin answer to "is this source actually
+/// working?", which before E4 had no honest signal at all: a broken source's scans recorded
+/// as successes because the client silently fell back to Suwayomi's cache (F11).
+///
+/// Per SOURCE rather than per series, because that is the unit a breakage has: an extension
+/// whose site moved or rebranded breaks everything it carries at once.
+#[derive(SimpleObject, Clone)]
+pub struct SourceScanHealth {
+    /// Suwayomi source id.
+    pub id: ID,
+    /// Display name, when the source is still installed in the engine.
+    pub name: Option<String>,
+    /// Owning extension package. `None` once the extension is uninstalled — its series and
+    /// their scan state outlive it, which is a state worth seeing rather than hiding.
+    pub pkg_name: Option<String>,
+    /// Whether the extension is still installed in the Suwayomi engine.
+    pub installed: bool,
+    /// Whether we subscribe to its discovery walk, and whether that subscription's breaker
+    /// has been tripped.
+    pub subscribed: bool,
+    pub subscription_disabled_at: Option<String>,
+    /// Series of this source that the scanner tracks.
+    pub series: i32,
+    /// …with any current failure streak.
+    pub failing: i32,
+    /// …whose streak is long enough, for a source-side reason, to count toward an outage.
+    pub confirmed_failing: i32,
+    /// Of the failures, how many last failed by being served Suwayomi's CACHE (broken while
+    /// looking healthy) versus failing out loud.
+    pub cached_fallback: i32,
+    pub fetch_error: i32,
+    /// Series the scanner has never got a chapter for. Across a whole source, the signature
+    /// of one that has never once worked.
+    pub zero_chapter_series: i32,
+    /// Works that would become unreadable if this source stays broken — i.e. reachable
+    /// through no other source.
+    pub exclusive_works: i32,
+    pub worst_streak: i32,
+    pub last_failure_at: Option<String>,
+    pub last_scanned_at: Option<String>,
+    /// Set while a whole-source outage is open: when it was detected, when it last alerted,
+    /// the dominant failure kind, and how far out the source's series are parked.
+    pub outage_detected_at: Option<String>,
+    pub outage_last_alert_at: Option<String>,
+    pub outage_kind: Option<String>,
+    pub outage_parked_until: Option<String>,
+}
+
 /// One installed Suwayomi source — the admin picker feeding `sourceBrowse(sourceId)`.
 #[derive(SimpleObject, Clone)]
 pub struct SourceInfo {
@@ -864,8 +965,75 @@ pub struct ChapterSource {
 /// so the reader can pick a translator.
 #[derive(SimpleObject, Clone)]
 pub struct AggregatedChapter {
+    /// The chapter's number, or `0` when it has none. **Prefer [`Self::label`]** — this
+    /// stays non-null only so a client built before Phase A keeps working; a oneshot
+    /// reports 0 here and "Oneshot" there.
     pub number: f64,
+    /// What to print: "45", "10.5", "Oneshot". The one label rule, resolved server-side so
+    /// every surface agrees (Phase A2).
+    pub label: String,
+    /// Cross-source grouping key: `round(number * 100)` for numbered chapters — the same
+    /// key `chapter_override` matches on — or `x:<chapter id>` for unnumbered ones.
+    pub key: String,
     pub title: Option<String>,
+    /// When this chapter was FIRST released, across every source that carries it —
+    /// ISO-8601, or null when no source dated it (F12).
+    ///
+    /// `first_released_at`, not `released_at`, and the name is load-bearing on the client:
+    /// the reader strips unknown fields BY NAME across every document, and `UpdateFeedRow`
+    /// already has a `releasedAt` that every deployed server answers. Sharing the name would
+    /// let one older server rejecting this field silently disable the updates feed's date
+    /// too. It is also the more accurate name.
+    ///
+    /// The EARLIEST of the sources' own release times, which is the same rule the release
+    /// ledger stores (`release_event.first_seen_at`, first-source-wins) and therefore the
+    /// same instant `/updates` sorted the work by. Taking the SELECTED source's time instead
+    /// would make the row's date jump around as the reader switches translator, for a
+    /// chapter that was released once.
+    ///
+    /// Why this field exists at all: without it the reader has no honest date for a chapter
+    /// the selected translator does not carry, and `source.ts` rendered those rows with no
+    /// date line — §4.13's "a wrong default traded for a date-less chapter list", which is
+    /// exactly what F12's source picker was told to ship WITH, not before.
+    pub first_released_at: Option<String>,
+    /// Has the VIEWER read this chapter — from ANY of the work's sources?
+    ///
+    /// Read state is stored per source chapter row (`canonical_progress.chapter_id` is a
+    /// MangaDex uuid, `suwayomi_progress.chapter_id` a numeric Suwayomi id), so the two
+    /// sources of one chapter share no key and switching translator used to blank every
+    /// marker the reader had earned. This flag is DERIVED, not stored: it is set when the
+    /// viewer has a `read = 1` row on any source chapter carrying this row's spine
+    /// `key` (`chapter.chapter_key`), which is the identity that already folds a chapter
+    /// across sources (migration 0090).
+    ///
+    /// Matching is pure key equality, scoped to the ONE work. Its residual risk is a source
+    /// that numbers by volume rather than absolutely — its "chapter 3" is a different
+    /// chapter from the other source's, and it would be marked read. No query can prove a
+    /// source is volume-numbered, so what was measured is a PROXY for it: a source pair
+    /// whose chapter counts agree within 25% while their highest numbers differ more than
+    /// threefold. That found 3 works, against 1,335 works with chapters on more than one
+    /// source and 53 whose sources share no key at all (equality there simply matches
+    /// nothing, which is the right answer). Counted on a snapshot of production taken
+    /// 2026-08-12, per `source_series`, over `chapter` rows (`source_type = 'suwayomi' OR
+    /// lang = 'en'`), with `n = COUNT(DISTINCT chapter_key)` and `mx = MAX(CAST(chapter_key
+    /// AS INTEGER)) / 100.0` for numeric keys:
+    ///
+    /// ```sql
+    /// SELECT COUNT(*) FROM (
+    ///   SELECT a.w FROM ss_stat a JOIN ss_stat b ON a.w = b.w AND a.sid < b.sid
+    ///    WHERE a.n >= 10 AND b.n >= 10 AND a.mx > 0 AND b.mx > 0
+    ///      AND CAST(a.n AS REAL) / b.n BETWEEN 0.8 AND 1.25
+    ///      AND (a.mx / b.mx > 3 OR b.mx / a.mx > 3)
+    ///    GROUP BY a.w)
+    /// ```
+    ///
+    /// An overlap-ratio guard over that same shape was considered and rejected: it
+    /// suppresses legitimate matches silently.
+    ///
+    /// False only ever means "not known to be read": anonymous viewers, and chapters whose
+    /// key is source-local by construction (`x:<id>` — oneshots and named extras can never
+    /// be matched across sources) always report false.
+    pub read_anywhere: bool,
     pub sources: Vec<ChapterSource>,
 }
 
@@ -876,6 +1044,65 @@ pub struct MergeWorksResult {
     pub target_work_id: ID,
     /// How many `source_series` mappings were re-pointed onto the target.
     pub moved_source_series: i32,
+}
+
+/// One detachable source mapping on a work — the unit the admin SPLIT picker
+/// (`workSourceRows`) operates on.
+///
+/// DISTINCT FROM `WorkSource`, which describes how a NATIVE client fetches a source
+/// (extension package, repo, apk). This is the admin view of the same `source_series`
+/// row: what it calls the series, how much of it we hold, and — the field `WorkSource`
+/// has none of — the row's own primary key.
+#[derive(SimpleObject, Clone)]
+pub struct WorkSourceRow {
+    /// `source_series.id`, and it is what `splitSourceSeries` takes. NOT
+    /// `(sourceType, sourceKey)`: that pair is unique only in combination with
+    /// `sourceId` (the table's `UNIQUE (source_type, source_id, source_key)`), so it is
+    /// ambiguous the moment one work carries the same manga id under two Suwayomi
+    /// sources.
+    pub id: ID,
+    /// `"mangadex"` or `"suwayomi"`.
+    pub source_type: String,
+    /// The source's display name, e.g. "MangaDex", "MANGA Plus". Never null — falls back
+    /// through the extension package name to the raw source id, because the picker leads
+    /// each row with it.
+    pub source_name: String,
+    /// Language code (`en`), or null when the source declares none.
+    pub lang: Option<String>,
+    /// Extension logo, preferring the store-hosted URL served from our own origin. Null
+    /// for a source with no derivable icon; the UI renders an initial instead.
+    pub icon_url: Option<String>,
+    /// How THIS source titles the series — the disagreement that identifies a mis-merge,
+    /// and the name the detached work takes. A MangaDex mapping has no per-source title
+    /// on disk (the mirror's title IS the work's), so it reports the work's.
+    pub title: String,
+    /// Chapters held from this source; they all move with it.
+    pub chapter_count: i32,
+    /// Canonical URL for the series at the source, when the mapping recorded one.
+    pub source_url: Option<String>,
+}
+
+/// Result of detaching source mappings off a work onto a new one (`splitSourceSeries`).
+///
+/// NOT an undo of `MergeWorksResult` and it cannot be one: `mergeWorks` deletes the
+/// losing work row and keeps no record of what it folded. This mints a NEW work carrying
+/// the detached sources and — for free, since `chapter` is keyed by `source_series_id`
+/// rather than by work — every chapter they own. Reviews, library entries, reading
+/// progress and view counts stay with the ORIGINAL work, which is where they already
+/// were: nothing records which side of the split they came from.
+#[derive(SimpleObject, Clone)]
+pub struct SplitSourcesResult {
+    /// The freshly minted canonical work id (`w_…`).
+    pub new_work_id: ID,
+    /// Where to NAVIGATE for it — the reader id, which is the numeric Suwayomi id unless
+    /// the detached set includes a MangaDex source. `canonicalSeries` rejects a work with
+    /// no MangaDex anchor outright, so a Suwayomi-only split must never be linked as
+    /// `/series/w_…`.
+    pub new_reader_id: ID,
+    /// The new work's `primary_title`, taken from the detached source's own title.
+    pub title: String,
+    /// How many `source_series` rows moved.
+    pub moved_sources: i32,
 }
 
 /// Serialize a `SeriesStatus` to its SDL name (for storage).
@@ -1043,13 +1270,25 @@ pub fn to_iso(v: Option<&str>) -> Option<String> {
 /// canonical `map_canonical_chapter` path).
 pub fn map_chapter(c: SuwayomiChapter, progress: Option<(i32, bool)>) -> Chapter {
     let (last_page_read, read) = progress.unwrap_or((0, false));
+    // Same label rule as every other surface (Phase A2): the structured number when it is
+    // sane, the name's first number as the ~0.15% fallback, "Oneshot" when there is none —
+    // and never `Ch.99999999` from a TEST upload.
+    let label = crate::chapter_label::chapter_display(Some(c.chapter_number), None, Some(&c.name));
     Chapter {
         id: ID(c.id.to_string()),
         series_id: ID(c.manga_id.to_string()),
-        number: c.chapter_number,
+        number: label.number().unwrap_or(c.chapter_number),
+        label: label.text(),
+        // Suwayomi chapters are always served through the engine, never a redirect.
+        external_url: None,
         title: Some(c.name),
         page_count: c.page_count as i32,
         uploaded_at: to_iso(c.upload_date.as_deref()),
+        // Filled in by the `chapters` resolver, which already resolves the owning work and
+        // this row's spine key in order to fold sibling-source read state. Left `None` here
+        // so this mapper stays a pure `SuwayomiChapter` -> `Chapter` projection with no
+        // database of its own.
+        found_at: None,
         scanlator: c.scanlator,
         read,
         last_page_read,

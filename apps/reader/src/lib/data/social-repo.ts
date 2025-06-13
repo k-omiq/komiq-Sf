@@ -13,8 +13,10 @@
  *  - The backend has per-series **reviews** (score 1–10 + body) and per-chapter
  *    **comments**. The Series page's rating widget upserts the user's review
  *    SCORE (body may be empty = a pure rating); its comment thread shows the
- *    body-bearing reviews. The reader's per-chapter 1–5 rating has no backend
- *    field, so it stays local (see the reader screen).
+ *    body-bearing reviews. There is no per-CHAPTER rating: the reader screen used to
+ *    show a 1–5 star row at the end of a chapter that only ever reached localStorage —
+ *    no table, no field, no resolver, nothing that could read it back on another device
+ *    — so it was removed rather than left looking like it counted for something.
  *  - Likes/replies aren't modelled server-side; in live mode they're ephemeral
  *    client-only affordances (reset on reload).
  */
@@ -218,7 +220,8 @@ export async function loadSeriesSocial(seriesId: string, key: string): Promise<S
 	};
 }
 
-/** Upsert the user's rating (score only; preserves any existing body). */
+/** Upsert the user's rating (score only; preserves any existing body). Score 0 is not a
+ *  rating — call {@link clearSeriesRating} to withdraw one. */
 export async function saveSeriesRating(
 	seriesId: string,
 	key: string,
@@ -227,10 +230,31 @@ export async function saveSeriesRating(
 ): Promise<void> {
 	if (socialLive()) {
 		if (score > 0) await backend.postReview({ seriesId, score, body, hasSpoiler: false });
-		// score 0 (clear) has no backend delete; leave the prior rating in place.
 		return;
 	}
 	local.setRating('series', key, score);
+}
+
+/**
+ * Withdraw the user's rating. Resolves to whether a vote was actually removed.
+ *
+ * A DELETE, not a score-0 upsert: the server takes 1..10 only, and `reviews.score` is NOT
+ * NULL, so there is no state a 0 could mean. The delete covers every id shape the work's
+ * reviews may be filed under — clearing only the id this page happens to address would
+ * leave an older row still counting toward the average, which looks exactly like the
+ * button doing nothing.
+ *
+ * Because the row IS the review, withdrawing a rating that carries written text would
+ * destroy the text; the Series page therefore only offers "Clear" when the viewer's review
+ * has no body. Offline/mock mode has no server to ask, so it clears the local store.
+ */
+export async function clearSeriesRating(seriesId: string, key: string): Promise<boolean> {
+	if (socialLive()) {
+		if (!backend.deleteReview) return false;
+		return await backend.deleteReview(seriesId);
+	}
+	local.setRating('series', key, 0);
+	return true;
 }
 
 /** Post or update the user's written review (requires a score). */

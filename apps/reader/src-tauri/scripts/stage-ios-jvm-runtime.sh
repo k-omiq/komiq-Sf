@@ -130,7 +130,7 @@ fi
 
 # ---- Bundle-payload guards ------------------------------------------------------------
 #
-# Regression guard for the 218 MB .ipa (docs/plans/n4-ios-build-attempt.md): the FIRST
+# Regression guard for the 218 MB .ipa: the FIRST
 # `tauri ios init` baked the DESKTOP bundle.resources (jar + jlink JRE) into the Xcode
 # resource-copy phase, and the narrowed `resources` in tauri.ios.conf.json does not
 # rewrite an already-generated project. A staged desktop JRE here means the .ipa is

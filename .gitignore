@@ -30,6 +30,8 @@ e2e/test-results/
 !.vscode/extensions.json
 .idea/
 
-# Local agent tooling state
-.claude/worktrees/
-.claude/settings.local.json
+merge_plan.json
+
+merge_review.json
+
+merge-suwayomi-duplicates.done.log

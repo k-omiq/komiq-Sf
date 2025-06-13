@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# N3.1-PROBE — headless acceptance for docs/plans/n3-android-spike.md §2 (work item N3.1).
+# Headless probe for the stock Android JDK runtime.
 #
 # Proves the STOCK Suwayomi-Server v2.3.2243 fat jar boots and works under a stock
 # GPL+CE OpenJDK 21 (eclipse-temurin:21) on Linux-aarch64 — here, a Docker container on

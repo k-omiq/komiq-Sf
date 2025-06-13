@@ -161,7 +161,9 @@
 	{/if}
 </div>
 
-<div class="updates k-gutter">
+<!-- `id` is the pager's scroll target: a page step aligns THIS section to the top of
+     the viewport, not the top of the document (which would be the trending rail). -->
+<div class="updates k-gutter" id="updates-list">
 	<div class="updates-head">
 		<h2 class="section-label">Updates</h2>
 		<!-- Tabs and format chips are LINKS, not buttons: the facet is URL state now, so a
@@ -273,6 +275,7 @@
 			{loading}
 			href={(p) => withPage(pageState.url, p)}
 			label="Updates pages"
+			scrollTarget="updates-list"
 		/>
 	{/if}
 </div>
@@ -305,6 +308,10 @@
 		padding-bottom: 4px;
 	}
 	.updates {
+		/* Clears the sticky header (and the section's own 48px top padding, which is
+		   part of the section and would otherwise be scrolled off) when the pager aligns
+		   this section to the top of the viewport. */
+		scroll-margin-top: var(--k-header-h);
 		display: flex;
 		flex-direction: column;
 		gap: 20px;

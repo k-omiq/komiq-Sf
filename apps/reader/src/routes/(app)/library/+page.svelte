@@ -35,8 +35,27 @@
 		};
 	});
 
+	/**
+	 * Descending by an RFC-3339 field, with blanks pushed to the end.
+	 *
+	 * The timestamps are RFC 3339 from the server, which sorts correctly as a string, so
+	 * no Date parsing is needed. Ties break on title so the order is stable rather than
+	 * dependent on however the rows happened to arrive.
+	 */
+	function byDateDesc(key: 'latestChapterAt' | 'lastReadAt') {
+		return (a: LibraryRowView, b: LibraryRowView) => {
+			const x = a[key];
+			const y = b[key];
+			if (!x !== !y) return x ? -1 : 1;
+			return y.localeCompare(x) || a.title.localeCompare(b.title);
+		};
+	}
+
 	let shelf = $state<'all' | Shelf | 'favorites'>('all');
-	let sort = $state<'recent' | 'alpha'>('recent');
+	// Default is 'updated' — a library's most useful question is "what has new chapters?".
+	// The old default, 'recent', was a no-op chip that just left the backend's order
+	// (date ADDED) untouched while implying reading recency.
+	let sort = $state<'updated' | 'read' | 'added' | 'alpha'>('updated');
 
 	const counts = $derived({
 		all: rows.length,
@@ -54,12 +73,24 @@
 				: shelf === 'favorites'
 					? rows.filter((c) => c.favorite)
 					: rows.filter((c) => c.shelf === shelf);
+		// 'added' is the order the backend already returns (`user_library.created_at DESC`),
+		// so it sorts nothing. The two timestamp sorts put rows with no timestamp LAST
+		// instead of letting an empty string win a plain descending compare — a series
+		// that has never had a chapter dated, or has never been opened, is the least
+		// recent thing in the shelf, not the most.
 		if (sort === 'alpha') list = [...list].sort((a, b) => a.title.localeCompare(b.title));
+		else if (sort === 'updated') list = [...list].sort(byDateDesc('latestChapterAt'));
+		else if (sort === 'read') list = [...list].sort(byDateDesc('lastReadAt'));
 		return list.map((c) => {
 			const progress = c.total ? Math.round((c.read / c.total) * 100) : 0;
 			let sub: string;
 			if (c.shelf === 'completed') sub = `Completed · ${c.total} ch`;
 			else if (c.shelf === 'plan') sub = `${c.genre} · ${c.total} ch`;
+			// Read every chapter of a series that is STILL PUBLISHING. The shelf stays
+			// "Reading" (see `deriveShelf`) because the series isn't finished, so the
+			// sub-line names the state that actually holds rather than leaving a
+			// full-looking "Ch. 117 / 117" to read as an unlabelled "Completed".
+			else if (c.total > 0 && c.read >= c.total) sub = `Caught up · ${c.total} ch`;
 			else sub = `Ch. ${c.read} / ${c.total}`;
 			return {
 				...c,
@@ -69,6 +100,13 @@
 			};
 		});
 	});
+
+	const sortDefs = [
+		{ key: 'updated', label: 'Latest chapter' },
+		{ key: 'read', label: 'Recently read' },
+		{ key: 'added', label: 'Added' },
+		{ key: 'alpha', label: 'A–Z' },
+	] as const;
 
 	const shelfDefs = [
 		{ key: 'all', label: 'All' },
@@ -177,12 +215,11 @@
 	</div>
 	<div class="sort">
 		<span class="sort-label">Sort</span>
-		<button class="sortchip" class:on={sort === 'recent'} onclick={() => (sort = 'recent')}
-			>Recent</button
-		>
-		<button class="sortchip" class:on={sort === 'alpha'} onclick={() => (sort = 'alpha')}
-			>A–Z</button
-		>
+		{#each sortDefs as d (d.key)}
+			<button class="sortchip" class:on={sort === d.key} onclick={() => (sort = d.key)}
+				>{d.label}</button
+			>
+		{/each}
 	</div>
 </div>
 
@@ -220,6 +257,7 @@
 								status={item.shelf}
 								disabled={!!(item.id && busy[item.id])}
 								onchange={(s) => changeShelf(item.id, s)}
+								canComplete={item.ended}
 							/>
 						</div>
 						{#if item.showBar}

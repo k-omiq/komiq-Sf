@@ -213,6 +213,21 @@
 		}
 	}
 
+	/**
+	 * Deep link to the report form with this comment already attached.
+	 *
+	 * `comment` is the load-bearing one — it is what lets the server verify the author
+	 * and snapshot the body. `by` is display-only (the form shows "a comment by X" so the
+	 * reader can see they picked the right one); the server ignores it and re-derives the
+	 * real author from the id. `series` gives an admin the page to look at, and is only
+	 * meaningful when this thread hangs off a series rather than a chapter.
+	 */
+	function reportHref(c: CommentView): string {
+		const p = new URLSearchParams({ kind: 'COMMENT_ABUSE', comment: c.id, by: c.name });
+		if (targetType === 'series') p.set('series', targetId);
+		return `/support/report?${p}`;
+	}
+
 	// ---- moderation --------------------------------------------------------
 	async function removeComment(id: string) {
 		modError = null;
@@ -396,6 +411,16 @@
 					>
 						<Icon name="reply" size={14} />{replyingTo === c.id ? 'Cancel' : 'Reply'}
 					</button>
+				{/if}
+				{#if !c.mine}
+					<!-- The ONLY way a reader can hand us a comment id: they can't see one, so
+					     without this link an abuse report is just a username they typed, which
+					     an admin cannot verify and which vanishes if the comment is deleted.
+					     With the id the server snapshots the body and takes the author from the
+					     DB. Not shown on your own comments — deleting is what you want there. -->
+					<a class="act" href={reportHref(c)} title="Report this comment to a moderator">
+						<Icon name="flag" size={14} />Report
+					</a>
 				{/if}
 				{#if canMod}
 					<button class="act mod" onclick={() => removeComment(c.id)}>
@@ -750,6 +775,8 @@
 		gap: 16px;
 		margin-top: 10px;
 	}
+	/* Also matches the Report link, which is an <a> (it navigates) among buttons — hence
+	   the font/decoration resets a button gets for free. */
 	.c-actions .act {
 		display: inline-flex;
 		align-items: center;
@@ -757,8 +784,10 @@
 		background: transparent;
 		border: none;
 		color: var(--k-text-faint);
+		font-family: inherit;
 		font-size: 13px;
 		font-weight: 600;
+		text-decoration: none;
 		cursor: pointer;
 		padding: 0;
 	}

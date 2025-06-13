@@ -17,14 +17,19 @@ import type {
 	LibraryStatus,
 	MatchResult,
 	MergeCandidate,
+	MergeCandidateRow,
 	MergeWorksResult,
 	Notification,
 	Page,
 	Paginated,
+	Report,
+	ReportInput,
+	ReportKind,
+	ReportPage,
+	ReportStatus,
 	Review,
 	ScanStatus,
 	Series,
-	SeriesPageBundle,
 	SeriesProgress,
 	SeriesSourceGroup,
 	SeriesStatus,
@@ -32,10 +37,13 @@ import type {
 	SourceBrowseType,
 	SourceIngestJob,
 	SourceInfo,
+	SourceScanHealth,
+	SplitSourcesResult,
 	UpdateFeedRow,
 	WorkReviewDetail,
 	WorkSource,
 	WorkSourceGroup,
+	WorkSourceRow,
 } from '@komika/types';
 
 /**
@@ -200,14 +208,6 @@ export interface Backend {
 	 * a native client's source routing over a list. Optional: only the unified
 	 * Komika API implements it. */
 	workSourcesBatch?(workIds: Id[]): Promise<WorkSourceGroup[]>;
-	/** P2.1: the whole series/reader page in ONE round trip — replaces the
-	 * {@link canonicalSeries} + {@link canonicalChapters} + {@link workSources}
-	 * fan-out and the per-translator {@link chapters} N+1. Resolves to `null` for
-	 * an unknown / NSFW-gated work (the page 404s), and to `undefined` when the
-	 * SERVER predates the resolver — the caller must then fall back to the old
-	 * fan-out (deploy-order safety, same rationale as OPTIONAL_SERIES_FIELDS).
-	 * Optional: only the unified Komika API implements it. */
-	seriesPage?(workId: Id, withAggregated?: boolean): Promise<SeriesPageBundle | null | undefined>;
 
 	// --- social ---
 	reviews(seriesId: Id, page?: number): Promise<Paginated<Review>>;
@@ -215,6 +215,11 @@ export interface Backend {
 	 * (null if none / signed out). Optional: only the unified Komika API implements it. */
 	myReview?(seriesId: Id): Promise<Review | null>;
 	postReview(input: PostReviewInput): Promise<Review>;
+	/** Withdraw the viewer's own rating; resolves to false when there was nothing to
+	 *  remove. `score` is 1..10 server-side, so a rating is withdrawn by deleting the
+	 *  review row — NOT by posting a 0. Optional: only the unified Komika API implements
+	 *  it (Suwayomi/mock have no social layer to delete from). */
+	deleteReview?(seriesId: Id): Promise<boolean>;
 	/** Comments on a chapter thread or a series-level discussion (polymorphic target).
 	 *  Returns a page of root comments plus all their descendants (flat); the client
 	 *  assembles the reply tree via `parentId`. `total`/`hasNextPage` count roots. */
@@ -320,6 +325,60 @@ export interface Backend {
 	 * survives as canonical. Irreversible. Optional: only the unified Komika API
 	 * implements it. */
 	mergeWorks?(sourceWorkId: Id, targetWorkId: Id): Promise<MergeWorksResult>;
+	/**
+	 * Catalogue search for the admin merge picker: the same FTS ranking `search` uses,
+	 * projected to the fields needed to spot a duplicate, plus each row's canonical
+	 * `workId` (which `search` deliberately omits — it is a per-row resolver field).
+	 *
+	 * Pages at the same BROWSE_PAGE_SIZE (30) as `search`, and forces `includeNsfw` —
+	 * honoured by the server for admins only, so a non-admin caller gains nothing.
+	 * Optional: only the unified Komika API implements it.
+	 */
+	searchForMerge?(query: string, page?: number): Promise<Paginated<MergeCandidateRow>>;
+	/**
+	 * The work's own `source_series` mappings, in admin shape — what the UNMERGE
+	 * picker lists. Each row carries its `source_series.id`, the title THAT source
+	 * gives the series, and how many chapters we hold from it.
+	 *
+	 * A separate call from `workSources`, which answers a different question (how a
+	 * native client should FETCH a source) and has no field for the row's own id.
+	 * Optional: only the unified Komika API implements it.
+	 */
+	workSourceRows?(workId: Id): Promise<WorkSourceRow[]>;
+	/**
+	 * Detach source mappings off a work into a NEW canonical work, titled from the
+	 * detached source's own title.
+	 *
+	 * NOT the inverse of {@link mergeWorks} — see {@link SplitSourcesResult}. It is a
+	 * forward-looking split: the moved rows keep every chapter they own (`chapter` is
+	 * keyed by `source_series_id`), and nothing is deleted.
+	 *
+	 * The server refuses to move EVERY source off a work: a work with no
+	 * `source_series` row is excluded from `browse_catalogue` and `work_fts`, i.e. it
+	 * would vanish from the product while still existing in the database.
+	 * Optional: only the unified Komika API implements it.
+	 */
+	splitSourceSeries?(workId: Id, sourceSeriesIds: Id[]): Promise<SplitSourcesResult>;
+
+	// --- reader reports (Support → Report an issue) ---
+	/**
+	 * File a report. Works SIGNED OUT — most catalogue-accuracy reports come from
+	 * readers without accounts — so the server rate-limits it per IP and enforces the
+	 * per-kind required fields, rejecting with a reader-facing message.
+	 * Optional: only the unified Komika API implements it.
+	 */
+	submitReport?(input: ReportInput): Promise<Report>;
+	/** The report queue, newest first; null filters mean "every value". `openCount` is
+	 * the global open backlog, not this page's. Requires an admin session.
+	 * Optional: only the unified Komika API implements it. */
+	reports?(
+		status?: ReportStatus | null,
+		kind?: ReportKind | null,
+		page?: number,
+	): Promise<ReportPage>;
+	/** Triage one report (resolve/reject, or reopen), optionally with a note. Requires
+	 * an admin session. Optional: only the unified Komika API implements it. */
+	resolveReport?(reportId: Id, status: ReportStatus, note?: string | null): Promise<Report>;
 
 	// --- admin cover issues / "Bugs" panel (requires an admin session) ---
 	/** Paginated works whose cover the crawl couldn't process, most recent first.
@@ -373,6 +432,11 @@ export interface Backend {
 	 * `updateSeriesAdmin` is whole-state). Unpausing triggers an immediate
 	 * server-side re-scan; returns the recomputed series. Optional. */
 	setSeriesPaused?(seriesId: Id, paused: boolean): Promise<Series>;
+
+	/** Per-source scan health (Phase E4.3): series tracked, how many are failing, and how
+	 * many of those failed by being served Suwayomi's CACHE rather than the source — the
+	 * failure mode that used to record as a success. Worst source first. Optional. */
+	sourceScanHealth?(): Promise<SourceScanHealth[]>;
 
 	// --- admin background source-ingest jobs (requires an admin session; S1) ---
 	/** The "add all from this source" ingest jobs, newest first. Pass

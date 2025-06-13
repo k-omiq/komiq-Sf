@@ -20,7 +20,7 @@ Suwayomi-Server
   License:  AGPL-3.0-only
   Source:   https://github.com/Suwayomi/Suwayomi-Server
   Use:      Embedded on-device as Komika's content engine, per the native
-            embedded-Suwayomi plan (docs/plans/native-embedded-suwayomi.md).
+            embedded-Suwayomi implementation.
   Note:     We intend to distribute and/or run a modified fork of Suwayomi-Server
             (for the on-device WebView/Cloudflare bridge). Where we ship that fork
             or run it network-facing, its Corresponding Source will be published in
@@ -37,7 +37,7 @@ Tachiyomi / Mihon extensions and the Keiyoushi extension repository
   Use:      Extensions are third-party code fetched at runtime; Komika does not
             vendor or redistribute them in this repository. Their individual
             licenses and terms of service are to be audited per obligation 4 of the
-            licensing plan (docs/plans/native-embedded-suwayomi.md §12).
+            licensing requirements in the embedded-Suwayomi implementation.
 
 
 Corresponding Source

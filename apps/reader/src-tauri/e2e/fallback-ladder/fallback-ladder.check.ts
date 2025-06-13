@@ -121,28 +121,16 @@ async function main(): Promise<void> {
 		const be = new CompositeBackend({ hosted: mockHosted(host), local: fakeLocalFailing(local) });
 
 		const first = await be.canonicalChapters('w_alpha');
-		check(
-			'(a) failing local resolution still returns the hosted chapter list',
-			first.length === 2 && first[0].id === 'c_1',
-		);
-		check(
-			'(a) hosted canonicalChapters was consulted (authoritative return)',
-			host.canonicalChapters === 1,
-		);
+		check('(a) failing local resolution still returns the hosted chapter list', first.length === 2 && first[0].id === 'c_1');
+		check('(a) hosted canonicalChapters was consulted (authoritative return)', host.canonicalChapters === 1);
 		check('(a) local refFor was attempted exactly once on first open', local.refFor === 1);
 
 		const refForAfterFirst = local.refFor;
 		const readyAfterFirst = local.isReady;
 		const second = await be.canonicalChapters('w_alpha');
 		check('(b) second open of the same work still returns the hosted list', second.length === 2);
-		check(
-			'(b) memo short-circuits: local refFor NOT re-invoked on second open',
-			local.refFor === refForAfterFirst,
-		);
-		check(
-			'(b) memo short-circuits before localReady(): isReady NOT re-queried',
-			local.isReady === readyAfterFirst,
-		);
+		check('(b) memo short-circuits: local refFor NOT re-invoked on second open', local.refFor === refForAfterFirst);
+		check('(b) memo short-circuits before localReady(): isReady NOT re-queried', local.isReady === readyAfterFirst);
 		check('(b) hosted still served the second open', host.canonicalChapters === 2);
 	}
 
@@ -178,10 +166,7 @@ async function main(): Promise<void> {
 
 		state.ready = true; // engine comes up
 		await be.canonicalChapters('w_gamma'); // must retry local now (not poisoned by not-ready)
-		check(
-			'(d) once ready, the same work IS retried locally (not-ready not memoed)',
-			rec.refFor === 1,
-		);
+		check('(d) once ready, the same work IS retried locally (not-ready not memoed)', rec.refFor === 1);
 	}
 
 	// ---- (e) no local backend at all → pure hosted passthrough (web/flag-off safety) ----
@@ -189,10 +174,7 @@ async function main(): Promise<void> {
 		const host = { canonicalChapters: 0 };
 		const be = new CompositeBackend({ hosted: mockHosted(host), local: null });
 		const chs = await be.canonicalChapters('w_delta');
-		check(
-			'(e) no local backend → hosted list returned unchanged',
-			chs.length === 2 && host.canonicalChapters === 1,
-		);
+		check('(e) no local backend → hosted list returned unchanged', chs.length === 2 && host.canonicalChapters === 1);
 	}
 
 	console.log('');

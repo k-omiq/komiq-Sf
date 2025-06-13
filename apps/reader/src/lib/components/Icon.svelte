@@ -23,14 +23,16 @@
 		| 'alert'
 		| 'gear'
 		| 'x'
-		| 'card'
-		| 'mail'
 		| 'bookmark'
 		| 'flame'
 		| 'eye'
 		| 'thumbs-up'
 		| 'thumbs-down'
-		| 'bell';
+		| 'bell'
+		| 'globe'
+		| 'wrench'
+		| 'shield'
+		| 'flag';
 
 	const FILLED = new Set<IconName>(['star', 'play', 'flame']);
 </script>
@@ -142,10 +144,6 @@
 		/>
 	{:else if name === 'x'}
 		<line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
-	{:else if name === 'card'}
-		<rect x="3" y="5" width="18" height="14" rx="2" /><line x1="3" y1="10" x2="21" y2="10" />
-	{:else if name === 'mail'}
-		<rect x="3" y="5" width="18" height="14" rx="2" /><path d="M3 7l9 6 9-6" />
 	{:else if name === 'bookmark'}
 		<path d="M17 2H7a2 2 0 0 0-2 2v18l7-4 7 4V4a2 2 0 0 0-2-2z" />
 	{:else if name === 'flame'}
@@ -166,5 +164,17 @@
 	{:else if name === 'bell'}
 		<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
 		<path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+	{:else if name === 'globe'}
+		<circle cx="12" cy="12" r="9" /><path d="M3 12h18" /><path
+			d="M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18z"
+		/>
+	{:else if name === 'wrench'}
+		<path
+			d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"
+		/>
+	{:else if name === 'shield'}
+		<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+	{:else if name === 'flag'}
+		<path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z" /><path d="M4 22v-7" />
 	{/if}
 </svg>

@@ -5,7 +5,7 @@
 //! boots the stock `Suwayomi-Server.jar` INSIDE the app process: it calls
 //! `JNI_CreateJavaVM` against the interpreter-only (Zero, NO-JIT) OpenJDK that
 //! N4.1 built as static libs (`jre-ios/aarch64-ios`, statically linked into the
-//! app binary — see `build.rs` and docs/plans/n4.1-ios-jvm-findings.md §6), then
+//! app binary — see `build.rs`), then
 //! invokes `suwayomi.tachidesk.MainKt.main(String[])` (the jar's manifest
 //! Main-Class) on a dedicated native thread.
 //!

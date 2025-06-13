@@ -15,6 +15,42 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// Aggregate outbound scan concurrency across ALL of Phase E3's per-source loops
+/// (`SCAN_GLOBAL_CONCURRENCY`, default 12).
+///
+/// **Why this is an env var and not a constant.** E3 replaced the single global scan loop
+/// with one loop per source, each running `SCAN_CONCURRENCY = 3`. Per-source concurrency is
+/// what protects an individual scanlator site from being hammered, and it is unchanged; the
+/// *aggregate* is what this bounds. A release build of this server is ~13 minutes, so if
+/// outbound load ever has to come down NOW — a source complaining, a ban warning, an
+/// upstream incident — that must be a restart-level knob, not a rebuild. Setting it to 3
+/// reproduces the pre-E3 aggregate exactly: one loop's worth of in-flight fetches.
+///
+/// Clamped to at least 1. A `Semaphore` with 0 permits never hands one out, so every source
+/// loop would await forever and the scanner would silently stop — indistinguishable, from
+/// the outside, from a healthy idle library.
+///
+/// Read once, when the supervisor starts, and logged there (`global_permits`) so the
+/// effective ceiling is answerable from the logs alone.
+///
+/// A free function rather than a [`Config`] field on purpose: `scanner::supervisor` is handed
+/// an `AppState`, which does not carry `Config`, so a field would have to be threaded through
+/// `main` and `AppState` to reach the only consumer — and a `Config` field nothing reads is
+/// dead weight that the compiler flags. Parsing still lives in this module so every env var
+/// the server reads is documented in one place.
+pub fn scan_global_concurrency() -> usize {
+    env::var("SCAN_GLOBAL_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SCAN_GLOBAL_CONCURRENCY)
+        .max(1)
+}
+
+/// Default for [`scan_global_concurrency`]. Matches `deploy/docker-compose.yml`'s
+/// `SCAN_GLOBAL_CONCURRENCY: ${SCAN_GLOBAL_CONCURRENCY:-12}`; the two must agree, or the
+/// documented default and the effective one differ depending on how the server was started.
+pub const DEFAULT_SCAN_GLOBAL_CONCURRENCY: usize = 12;
+
 /// Runtime configuration, sourced from env vars (see `.env.example`).
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -99,6 +135,13 @@ pub struct Config {
     /// Interval between recurring incremental catalogue/chapter refresh cycles
     /// (`updatedAtSince`). The first cycle seeds on startup; default 6h.
     pub catalogue_sync_interval_secs: u64,
+    /// How often the `/chapter` firehose runs, independent of the catalogue sweep (Phase D).
+    pub chapter_sync_interval_secs: u64,
+    /// How often the wholesale feed chain runs as a drift reconciler (Phase C3).
+    pub feed_reconcile_interval_secs: u64,
+    /// How often LATEST-diff discovery (Phase E5) polls page 1 of each subscribed
+    /// source and enqueues the series that moved up / entered. Default 15 min.
+    pub discovery_interval_secs: u64,
     /// Recurring auto-enrichment drainer (X1). Off by default — it hits MangaDex
     /// (`/manga?ids[]` + one `/cover` per work), so it's opt-in via `METADATA_BACKFILL=on`.
     pub metadata_backfill_enabled: bool,
@@ -257,6 +300,37 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .filter(|&v| v > 0)
             .unwrap_or(6 * 60 * 60);
+        // Phase D. The chapter firehose gets its OWN cadence, decoupled from the catalogue
+        // sweep's. The two halves have wildly different costs — an incremental chapter pass
+        // is ~75 chapters, a catalogue sweep is thousands of records — and tying them
+        // together is why a brand-new chapter could surface already labelled "5h ago".
+        //
+        // 15 MINUTES IS ONLY SAFE BECAUSE OF PHASE C. This tick used to drag the ~20-25 s
+        // wholesale refresh chain behind it; firing that 96×/day instead of 4× would push
+        // the scanner's writes past the pool's 15 s `busy_timeout` into SQLITE_BUSY. C2 gave
+        // both feed halves incremental writers and C3 moved the chain onto its own daily
+        // reconcile tick, so what runs here now is the firehose plus a handful of one-row
+        // upserts.
+        let chapter_sync_interval_secs = env::var("CHAPTER_SYNC_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(15 * 60);
+        // Phase C3. The demoted wholesale chain, now a drift REPORTER rather than the
+        // mechanism. Daily.
+        let feed_reconcile_interval_secs = env::var("FEED_RECONCILE_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(24 * 60 * 60);
+        // Phase E5. LATEST-diff discovery cadence. 15 min = the recommended variant
+        // (~2,643 upstream fetches/day vs ~22,292 polling; §8e). Detection latency is
+        // bounded by this interval.
+        let discovery_interval_secs = env::var("DISCOVERY_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(15 * 60);
         let metadata_backfill_enabled = env::var("METADATA_BACKFILL")
             .map(|v| {
                 let v = v.trim().to_ascii_lowercase();
@@ -318,6 +392,9 @@ impl Config {
             mangadex_user_agent,
             catalogue_cover_phash,
             catalogue_sync_interval_secs,
+            chapter_sync_interval_secs,
+            feed_reconcile_interval_secs,
+            discovery_interval_secs,
             metadata_backfill_enabled,
             metadata_backfill_interval_secs,
             metadata_backfill_batch,

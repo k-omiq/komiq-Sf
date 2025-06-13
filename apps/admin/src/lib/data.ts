@@ -13,6 +13,10 @@ import type {
 	MergeCandidate,
 	MergeWorksResult,
 	Paginated,
+	Report,
+	ReportKind,
+	ReportPage,
+	ReportStatus,
 	Series,
 	SeriesSourceGroup,
 	SeriesStatus,
@@ -20,6 +24,7 @@ import type {
 	SourceBrowseType,
 	SourceIngestJob,
 	SourceInfo,
+	SourceScanHealth,
 	WorkReviewDetail,
 	WorkSource,
 } from '@komika/types';
@@ -110,6 +115,18 @@ export async function setUserBanned(userId: string, banned: boolean): Promise<vo
 	await backend.banUser(userId, banned);
 }
 
+/**
+ * Delete a comment and its whole reply subtree. IRREVERSIBLE — there is no tombstone.
+ *
+ * This is what an abuse report is FOR, so the Reports page needs it; the reader-side
+ * moderator UI had the only other button. The report survives the deletion because it
+ * snapshots the body and author at submit time.
+ */
+export async function deleteComment(commentId: Id): Promise<boolean> {
+	if (!backend.deleteComment) throw new Error('Comment moderation is unavailable on this backend.');
+	return backend.deleteComment(commentId);
+}
+
 /** Grant or revoke a user's admin flag; returns the updated user. */
 export async function setUserAdmin(userId: string, isAdmin: boolean): Promise<AdminUser> {
 	if (!backend.setUserAdmin) throw new Error('User management is unavailable on this backend.');
@@ -167,6 +184,32 @@ export async function loadWorkReviewDetail(workId: string): Promise<WorkReviewDe
 	if (!backend.workReviewDetail)
 		throw new Error('Work review detail is unavailable on this backend.');
 	return backend.workReviewDetail(workId);
+}
+
+/**
+ * Reader-report queue (reader Support → Report an issue), newest first.
+ *
+ * `status`/`kind` null mean "every value". `total` is the FILTERED count (for the pager);
+ * `openCount` on the same envelope is always the global open backlog, so the header can
+ * show the real size of the queue while looking at a filtered slice of it.
+ */
+export async function loadReports(
+	status: ReportStatus | null = 'OPEN',
+	kind: ReportKind | null = null,
+	page = 1,
+): Promise<ReportPage> {
+	if (!backend.reports) throw new Error('Reports are unavailable on this backend.');
+	return backend.reports(status, kind, page);
+}
+
+/** Triage one report: resolve / reject, or reopen. `note` is merged, not cleared. */
+export async function resolveReport(
+	reportId: Id,
+	status: ReportStatus,
+	note: string | null = null,
+): Promise<Report> {
+	if (!backend.resolveReport) throw new Error('Reports are unavailable on this backend.');
+	return backend.resolveReport(reportId, status, note);
 }
 
 /** Cover "Bugs" panel: works whose cover the crawl couldn't process, paginated. */
@@ -308,6 +351,19 @@ export async function loadSeriesSources(seriesIds: Id[]): Promise<SeriesSourceGr
 export async function setSeriesPaused(seriesId: Id, paused: boolean): Promise<Series> {
 	if (!backend.setSeriesPaused) throw new Error('Pause management is unavailable on this backend.');
 	return backend.setSeriesPaused(seriesId, paused);
+}
+
+/**
+ * Per-source scan health (Phase E4.3), worst source first.
+ *
+ * The console had no honest signal for "is this source working?": every Suwayomi fetch
+ * path falls back to reading Suwayomi's own database when the upstream fetch fails, so a
+ * dead source's scans were recorded as successes. `cachedFallback` is that case, now
+ * counted; `zeroChapterSeries` across a whole source means it has never once worked.
+ */
+export async function loadSourceScanHealth(): Promise<SourceScanHealth[]> {
+	if (!backend.sourceScanHealth) throw new Error('Scan health is unavailable on this backend.');
+	return backend.sourceScanHealth();
 }
 
 /**

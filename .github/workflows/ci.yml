@@ -73,15 +73,6 @@ jobs:
       - name: Typecheck worker
         run: pnpm --filter @komika/worker check
 
-      # The default build above targets Cloudflare (edge SSR) and emits to
-      # .svelte-kit/cloudflare — it validates the web target but produces no
-      # `build/` dir. The artifact wants the STATIC output, so build it too
-      # (same target the reader Docker image and Tauri use).
-      - name: Build reader (static)
-        env:
-          KOMIKA_TARGET: tauri
-        run: pnpm --filter @komika/reader build
-
       # Publish the reader's static output so the e2e job (or a deploy) can
       # consume it without rebuilding.
       - name: Upload reader build

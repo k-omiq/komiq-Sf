@@ -39,10 +39,7 @@
 <svelte:head>
 	{#if !ownsMeta}
 		<title>komiq</title>
-		<meta
-			name="description"
-			content="Read manga, together. Track your library, follow updates, and discuss chapters."
-		/>
+		<meta name="description" content="Read manga, together. Track your library, follow updates, and discuss chapters." />
 	{/if}
 
 	<link rel="icon" href="/favicon.ico" sizes="any" />

@@ -22,6 +22,9 @@ use crate::catalog::{self, Alias, Cover, WorkInput};
 const API_BASE: &str = "https://api.mangadex.org";
 const COVERS_BASE: &str = "https://uploads.mangadex.org/covers";
 const PAGE_LIMIT: i64 = 100; // MangaDex list max for /manga
+/// MangaDex's documented `ids[]` ceiling on `/chapter` (and the endpoint's `limit` max).
+/// Asking for more is rejected by the API, not truncated by it.
+const CHAPTER_IDS_LIMIT: usize = 100;
 /// Stop paging a window before the hard `offset + limit <= 10_000` cap and slide
 /// the `since` window instead.
 const WINDOW_OFFSET_CAP: i64 = 9_900;
@@ -442,6 +445,60 @@ impl MangaDexClient {
         })
     }
 
+    /// Fetch specific chapters by MangaDex id (`GET /chapter?ids[]=…`). Powers the A1b
+    /// `readable_at` / `external_url` backfill, which re-asks upstream about chapters the
+    /// mirror already holds rather than re-walking the firehose.
+    ///
+    /// Same conventions as `list_chapters`, and for the same reasons: `get_with_retry` so
+    /// the shared in-process token bucket and the 429/400/5xx ladder apply, and
+    /// `parse_chapter_page` so an unparseable record is COUNTED and attributed rather than
+    /// silently swallowed. `raw_len` is reported separately from `chapters.len()` because
+    /// the caller compares what it ASKED for against what came back — a parse-drop there
+    /// must read as "upstream did not answer for this id", not as "this id does not exist".
+    ///
+    /// ONE REQUEST, NO CHUNKING — deliberately unlike `get_manga_by_ids`, which loops over
+    /// `chunks(100)`. The only caller is a paced drain that sleeps between batches; chunking
+    /// in here would fire N requests back-to-back inside one "batch" and defeat that pacing.
+    /// More than 100 ids is therefore a caller bug and fails loudly: silently truncating to
+    /// the API's `ids[]` ceiling would leave the tail unanswered, and an unanswered row that
+    /// is never written stays in the work-list forever — the one failure mode a cursorless
+    /// drain cannot survive.
+    pub async fn get_chapters_by_ids(&self, ids: &[String]) -> Result<ChapterPage> {
+        if ids.is_empty() {
+            return Ok(ChapterPage {
+                chapters: Vec::new(),
+                total: 0,
+                raw_len: 0,
+                dropped: 0,
+            });
+        }
+        if ids.len() > CHAPTER_IDS_LIMIT {
+            return Err(anyhow!(
+                "MangaDex /chapter?ids accepts at most {CHAPTER_IDS_LIMIT} ids, got {}",
+                ids.len()
+            ));
+        }
+        let params = chapter_ids_params(ids);
+        let res = self
+            .get_with_retry(
+                &format!("{API_BASE}/chapter"),
+                &params,
+                false,
+                "/chapter?ids",
+            )
+            .await?;
+        let body: RawChapterList = res.json().await?;
+        let raw_len = body.data.len();
+        let (chapters, drops) = parse_chapter_page(body.data);
+        log_record_drops(&drops, "chapter", "/chapter?ids");
+        Ok(ChapterPage {
+            chapters,
+            total: body.total,
+            raw_len,
+            dropped: drops.len() as u64,
+        })
+    }
+
     /// Download a work's cover thumbnail and compute its perceptual hash. Uses the
     /// 512px thumbnail (smaller download, always JPEG). Best-effort: returns `None`
     /// on any network/decode failure — a missing hash just means one fewer dedup
@@ -547,6 +604,36 @@ fn chapter_list_params(
     ];
     if let Some(since) = since {
         params.push((window.since_param().into(), since.to_string()));
+    }
+    params
+}
+
+/// The query params for one `/chapter?ids[]=` lookup. Factored out of
+/// `get_chapters_by_ids` for exactly the reason `chapter_list_params` was: the
+/// content-rating omission below is invisible from the outside and cost the firehose the
+/// whole `pornographic` slice for the mirror's entire life.
+///
+/// ALL FOUR CONTENT RATINGS, and this is not cargo-culted from the firehose — `/chapter`
+/// applies its `safe,suggestive,erotica` default to an `ids[]` query too, so without them
+/// every chapter of a `pornographic` work would come back MISSING rather than filtered.
+/// For this caller "missing" is not a no-op: it writes the fallback clock and takes the row
+/// off the work-list permanently, so the omission would burn the one chance those rows get
+/// at a real `readableAt`/`externalUrl`.
+///
+/// NO `translatedLanguage[]`, unlike the firehose. The ids are already exact — every one of
+/// them names a row we mirror — so a language filter can only subtract, and subtracting
+/// here means the same permanent fallback write. Filter nothing that the id has not already
+/// decided.
+fn chapter_ids_params(ids: &[String]) -> Vec<(String, String)> {
+    let mut params: Vec<(String, String)> = vec![
+        ("limit".into(), ids.len().to_string()),
+        ("contentRating[]".into(), "safe".into()),
+        ("contentRating[]".into(), "suggestive".into()),
+        ("contentRating[]".into(), "erotica".into()),
+        ("contentRating[]".into(), "pornographic".into()),
+    ];
+    for id in ids {
+        params.push(("ids[]".into(), id.clone()));
     }
     params
 }
@@ -878,7 +965,21 @@ pub struct MdChapterAttrs {
     pub volume: Option<String>,
     pub title: Option<String>,
     pub translated_language: Option<String>,
+    /// SCHEDULING METADATA, NOT A RELEASE CLOCK. MangaDex stamps external chapters
+    /// `2037-12-31T15:00:00` here as a sentinel, and it can post-date [`Self::readable_at`]
+    /// by weeks on chapters that are perfectly readable now. Never bound or sort a feed on
+    /// it alone — see migration 0073.
     pub publish_at: Option<String>,
+    /// When the chapter actually became readable — the clock MangaDex's own
+    /// latest-updates surface orders by, and the one every feed query here should use.
+    pub readable_at: Option<String>,
+    /// Set when the chapter is hosted somewhere else (MangaPlus, Comikey, NamiComi,
+    /// BiliBili) and has no pages to serve. **The only valid test for an external
+    /// chapter**: `pages` is not — sampled bilibilicomics externals report `pages: 45`.
+    pub external_url: Option<String>,
+    /// Page count as MangaDex reports it. Carried for diagnostics only, precisely because
+    /// it is NOT a usable external-chapter discriminator.
+    pub pages: Option<i64>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
 }
@@ -933,14 +1034,13 @@ const EXTERNAL_LINK_KEYS: &[&str] = &["al", "mal", "mu", "kt", "ap"];
 /// All four groups are kept, deliberately:
 ///   * `genre`  — "Action", "Romance": the browsable axis the genre filter exists for.
 ///   * `theme`  — "Isekai", "Martial Arts": likewise, and what MangaDex users search by.
-///   * `format` — "Long Strip", "Oneshot": kept because `resolve_comic_type` reads
-///     genre STRINGS to tell a manhwa from a manga, so dropping these would make
-///     canonical format detection worse than it already is.
+///   * `format` — "Long Strip", "Oneshot": kept because `resolve_comic_type` reads genre
+///                STRINGS to tell a manhwa from a manga, so dropping these would make
+///                canonical format detection worse than it already is.
 ///   * `content`— "Gore", "Sexual Violence": kept because MangaDex exposes them as
-///     filterable tags and omitting them would silently narrow what the catalogue
-///     can express. They are rare, so they sink in a frequency-ordered facet list
-///     on their own.
-///
+///                filterable tags and omitting them would silently narrow what the
+///                catalogue can express. They are rare, so they sink in a
+///                frequency-ordered facet list on their own.
 /// An unrecognised or missing group sorts last rather than being dropped.
 const TAG_GROUP_ORDER: &[&str] = &["genre", "theme", "format", "content"];
 
@@ -974,7 +1074,7 @@ fn tag_names(m: &MdManga) -> Vec<String> {
             .unwrap_or(TAG_GROUP_ORDER.len());
         ranked.push((rank, i, name.to_string()));
     }
-    ranked.sort_by_key(|a| (a.0, a.1));
+    ranked.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     let mut seen = std::collections::HashSet::new();
     ranked
         .into_iter()
@@ -1306,16 +1406,80 @@ pub struct SweepOutcome {
     /// gated the same way: NON-ZERO MUST NOT LATCH `seed_done`, or the forward-only
     /// `updatedAtSince` window makes the miss permanent.
     ///
-    /// Populated by `sync_chapters` only. The catalogue sweep's equivalent failure is
-    /// deliberately left as-is here (its recovery path is `backfill_missing_catalogue`,
-    /// which re-walks from 2018 on any dirty pass); nothing plays that role for chapters,
-    /// so the chapter seed has to hold its own line.
+    /// Populated by BOTH sweeps. The catalogue sweep's upsert error arm used to only
+    /// `warn!`, so this counter was always zero for it and `seed_done` could latch straight
+    /// over a lost work — half of F9. `catalogue_seed_may_latch` now reads it.
     pub failed: u64,
+    /// Chapters the firehose offered whose WORK is not catalogued yet, so there was nowhere
+    /// to attach them (F9).
+    ///
+    /// This is not a loss and must not be treated as one — but it must not be treated as
+    /// success either. The window is forward-only `updatedAtSince`, so the fix is that a
+    /// skipped chapter DOES NOT ADVANCE THE CURSOR: it stays inside the next window and is
+    /// re-offered once the catalogue sweep (which runs first) has caught up. The counter
+    /// exists so that "the mirror is behind because the catalogue is behind" is visible in
+    /// the log line rather than being indistinguishable from an idle pass.
+    pub skipped: u64,
     /// Chapters already mirrored with every mutable column identical, so no write was
     /// issued (`chapter_row_unchanged`). Counted so the seed's log line can say "876k
     /// examined, 71k written, 805k already correct" instead of reporting a near-zero
     /// `stored` that reads like a broken sweep.
     pub unchanged: u64,
+    /// Works whose merged-feed row this sweep published or refreshed incrementally
+    /// ([`flush_touched_feed_rows`]). Not a loss counter and it gates nothing — it is the
+    /// only visible evidence that the mirror half's incremental writer ran at all, which is
+    /// how it went a whole phase never creating a row without anyone noticing (§8h).
+    pub feed: u64,
+}
+
+/// The MangaDex half's incremental feed writer — one pass over the `source_series` this
+/// firehose PAGE wrote a chapter to.
+///
+/// EXTRACTED FROM `sync_chapters`, and that is the point. It was an inline block whose only
+/// caller was production and which no test could reach (§8h); it was consequently shipped
+/// with a defect that made it a no-op on exactly the case it existed for — see
+/// [`catalog::publish_mirror_feed_row`], which is now the second half of it.
+///
+/// PER PAGE, NOT PER CHAPTER. A page is <=100 chapters and typically touches only a handful
+/// of distinct series, so this collapses ~100 potential writes into a few — while still
+/// bounding staleness by one page (seconds), not by one 6-hourly rebuild (F5, and the direct
+/// cause of the owner's "the moment a new chapter is found by the scanner, it will be sent to
+/// the updates page"). Deduping through the caller's `HashSet` is what makes a re-seed —
+/// which re-offers a series' whole backlog — cost one feed write per series rather than one
+/// per chapter. The set is DRAINED, so the next page starts empty.
+///
+/// BEST-EFFORT, DELIBERATELY, and unchanged from the original: the mirror is the durable
+/// record and the feed is a projection of it that the periodic rebuild reconciles anyway.
+/// Failing a firehose window because a feed row could not be refreshed would trade a
+/// freshness problem for a data-loss one, and `SweepOutcome::failed` is reserved for chapters
+/// that did not get mirrored. What is NOT unchanged is the silence: every arm now counts, and
+/// the return value is the number of works that reached the feed.
+async fn flush_touched_feed_rows(
+    pool: &sqlx::SqlitePool,
+    touched: &mut std::collections::HashSet<String>,
+) -> u64 {
+    let mut published = 0u64;
+    for ssid in touched.drain() {
+        // The ledger first: `publish_mirror_feed_row`'s last pass projects the release clock
+        // FROM it, so recording this page's chapters afterwards would publish the row with
+        // the previous clock and leave the new one for the next rebuild.
+        if let Err(e) = catalog::ledger::record_source_series(pool, &ssid).await {
+            tracing::warn!(error = %e, "mangadex: release-ledger write failed");
+            continue;
+        }
+        match catalog::work_id_for_source_series(pool, &ssid).await {
+            Ok(Some(work_id)) => match catalog::publish_mirror_feed_row(pool, &work_id).await {
+                Ok(true) => published += 1,
+                // Not an error: the work's every English chapter is still unreleased (a
+                // far-future `publishAt`), so it is correctly absent from the feed.
+                Ok(false) => {}
+                Err(e) => tracing::warn!(error = %e, "mangadex: feed publish failed"),
+            },
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "mangadex: feed work lookup failed"),
+        }
+    }
+    published
 }
 
 /// Full/incremental catalogue sweep. Pages `/manga` ordered by `createdAt`, sliding
@@ -1403,7 +1567,18 @@ pub async fn sync_catalogue(
                 }
                 match result {
                     Ok(_) => out.upserted += 1,
-                    Err(e) => tracing::warn!(manga = %id, error = %e, "mangadex: upsert failed"),
+                    // COUNTED, not just warned (F9). `out.failed` is what
+                    // `catalogue_seed_may_latch` consults, and a warn-and-forget here meant
+                    // a seed could lose works to a persistent write error and still latch
+                    // `seed_done` — after which the forward-only `updatedAtSince` window
+                    // never revisits an old `createdAt` and the loss is permanent without a
+                    // manual re-seed. That is exactly how the catalogue's 4,493-record gap
+                    // became permanent, and the chapter half already counts its failures
+                    // for the same reason; this arm was the remaining asymmetry.
+                    Err(e) => {
+                        out.failed += 1;
+                        tracing::warn!(manga = %id, error = %e, "mangadex: upsert failed");
+                    }
                 }
                 if let Some(ts) = manga_window_ts(m, window) {
                     last_created = Some(ts);
@@ -2213,6 +2388,417 @@ pub fn spawn_backfill_if_needed(
     });
 }
 
+// ---- A1b: the `readable_at` / `external_url` backfill --------------------------------
+//
+// Migration 0073 added both columns and deliberately moved no data, on the promise that
+// "existing rows are filled by the resumable backfill in
+// `mangadex::backfill_chapter_external_urls`". This is that backfill; until it was written
+// the promise was false and §7z says so.
+//
+// WHAT IS STUCK WITHOUT IT (measured on the 2026-07-30 21:39 production snapshot, after the
+// C+D deploy):
+//
+//   * 877,868 `chapter` rows have `readable_at IS NULL`, and ALL of them are MangaDex —
+//     0 Suwayomi rows, because the spine writes `readable_at` on the way in. So the
+//     work-list below genuinely drains to empty rather than stalling on a residue it can
+//     never resolve.
+//   * `external_url IS NOT NULL` is at **0 rows**. The firehose's self-heal
+//     (`chapter_row_unchanged` compares both columns) only ever re-offers chapters whose
+//     upstream record CHANGED, so it reaches the head of the feed and nothing else. The
+//     ~35,000-chapter F1 cohort is entirely in the tail.
+//   * 236 chapters across 67 works carry the `publishAt = 2037-12-31` sentinel. 46 of those
+//     works have nothing else, so they are absent from /updates entirely; the other 21 show
+//     a stale older chapter as "latest". Upstream HAS a real `readableAt` for them
+//     (exemplar: *Magical Girl Tsubame* ch. 1, `publishAt 2037-12-31` / `readableAt
+//     2023-10-07`), which is the only thing that can return them to the feed.
+//
+// 877,868 rows at 100 per request is ~8,779 requests against a third party, so it is paced
+// and it never runs on the hot path.
+
+/// Rows per batch, which is also ids per request: MangaDex's `ids[]` ceiling. The two are
+/// deliberately the same number — one work-list query, one upstream request, one
+/// transaction — so there is no partial-batch state to get wrong.
+const READABLE_BACKFILL_BATCH: i64 = 100;
+
+/// Gap between batches, and the whole pacing argument. 877,868 rows ÷ 100 ≈ 8,779 requests;
+/// a 2-second gap is 0.5 req/s against the ~5 req/s per-IP ceiling this process shares with
+/// the firehose, the catalogue sweep and the cover crawler, and spreads the drain over
+/// ~5 hours of background trickle. There is no deadline here worth spending a bigger share
+/// of a fleet-wide budget on: the columns have been NULL since the mirror was built.
+/// It also bounds the write side to ~50 rows/s, gentler than the spine drain's ~1,000/s,
+/// on a database Litestream is replicating and the scanner is writing concurrently.
+const READABLE_BACKFILL_GAP: Duration = Duration::from_secs(2);
+
+/// Stagger behind the boot write burst AND behind the other two background drains, so a
+/// restart does not start three of them at t+0 against one SQLite writer:
+/// `spawn_backfill_if_needed` waits 45s, `catalog::spine::spawn` waits 90s, this waits 120s.
+const READABLE_BACKFILL_BOOT_DELAY: Duration = Duration::from_secs(120);
+
+/// How often to re-check once drained. New MangaDex chapters arrive from the firehose with
+/// `readableAt` already parsed, so a drained work-list only refills if a source starts
+/// producing rows with no release clock at all — rare, and never urgent. The check itself is
+/// a scan of migration 0073's partial index, which is by then empty.
+const READABLE_BACKFILL_IDLE_RECHECK: Duration = Duration::from_secs(60 * 60);
+
+/// Batches between progress lines. ~8,779 batches makes per-batch logging useless noise;
+/// every 500 is ~18 lines across the whole drain, one per ~17 minutes.
+const READABLE_BACKFILL_PROGRESS_EVERY: u64 = 500;
+
+/// One mirrored MangaDex chapter that has no release clock yet.
+///
+/// `published_at` and `created_at` come along because they are the fallback rungs — see
+/// [`resolve_readable_at`]. Reading them here costs nothing (the row is already being
+/// fetched) and saves a second query per row on the termination path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingChapter {
+    /// `chapter.id`. The UPDATE is keyed on this, not on `external_id`: a MangaDex chapter
+    /// uuid can legitimately appear under two `source_series` rows (works that have been
+    /// merged), and the work-list already named the exact rows to write.
+    id: String,
+    /// The MangaDex chapter uuid, i.e. what goes in `ids[]`.
+    external_id: String,
+    published_at: Option<String>,
+    created_at: String,
+}
+
+/// What one row's backfill decided to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedChapter {
+    /// NEVER `Option`. See [`resolve_readable_at`] — a row that leaves here with no value
+    /// stays in the work-list forever.
+    readable_at: String,
+    external_url: Option<String>,
+    /// Whether upstream actually returned this id. Drives whether `external_url` is written
+    /// at all: when upstream said nothing, writing `NULL` would CLOBBER a URL the firehose
+    /// may already have healed onto the row.
+    answered: bool,
+}
+
+/// What one batch moved. `filled == 0` is the drain's only completion signal.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReadableFill {
+    /// Rows taken off the work-list. Equals the batch's size by construction — every
+    /// pending row is written, whatever upstream said — which is what makes the drain
+    /// terminate.
+    pub filled: u64,
+    /// …of which upstream supplied a real `readableAt`. The rest took a fallback.
+    pub from_upstream: u64,
+    /// …of which carry an `externalUrl`: the F1 cohort, ~4% of the mirror.
+    pub external: u64,
+    /// Ids upstream did not answer for at all — deleted chapters, unparseable records, or
+    /// anything else that keeps a record out of the response. Counted separately because a
+    /// non-trivial number means the request is being filtered (a missing `contentRating[]`
+    /// would look exactly like this), not that MangaDex forgot 8,000 chapters.
+    pub unanswered: u64,
+}
+
+/// The rule that guarantees termination, and the reason it is a free function with no
+/// `Option` in its return type.
+///
+/// THE BUG THIS EXISTS TO PREVENT: this drain's work-list is `readable_at IS NULL` and it
+/// keeps no cursor, so a row it declines to write is a row it will be offered again, and
+/// again, forever. The ledger seed hit exactly this — its work-list asked "does this chapter
+/// lack an event?" while its insert additionally refused future-dated chapters, so a work
+/// holding a 2037-sentinel chapter was offered, inserted nothing, and was re-offered until a
+/// test caught the loop (see `catalog::ledger::seedable_where`). The fix there and here is
+/// the same: the work-list and the write must share one predicate. Every row this function
+/// is handed gets a value, so every row leaves the work-list.
+///
+/// THE LADDER, which is §6.4's `released_at := readable_at when present := published_at
+/// otherwise` made concrete:
+///   1. upstream `readableAt` — the real answer, and the point of the whole backfill.
+///   2. upstream `publishAt` — upstream answered but has no readable clock for this chapter.
+///   3. the row's own `published_at` — upstream did not answer at all.
+///   4. the row's own `created_at` — `NOT NULL`, so this rung always terminates.
+///
+/// Rungs 3 and 4 write exactly what every reader already computes: the read path spells the
+/// clock `COALESCE(readable_at, published_at, created_at)`, so materialising that COALESCE
+/// changes no behaviour whatsoever — it only takes the row off the work-list. (Rung 4 was
+/// unreachable on the 2026-07-30 snapshot: 0 of 877,868 MangaDex chapters have a NULL
+/// `published_at`. It is here so that fact does not have to stay true for the drain to end.)
+///
+/// Nothing is lost by taking a fallback. If upstream later publishes a real `readableAt` the
+/// chapter's `updatedAt` moves with it, the firehose re-offers it, and `chapter_row_unchanged`
+/// sees the difference and writes the truth.
+fn resolve_readable_at(row: &PendingChapter, upstream: Option<&MdChapterAttrs>) -> ResolvedChapter {
+    /// MangaDex sends `""` for some absent strings; an empty timestamp is not a timestamp,
+    /// and an empty `externalUrl` would badge a perfectly readable chapter as off-site.
+    fn present(v: Option<&String>) -> Option<String> {
+        v.map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+    let answered = upstream.is_some();
+    let readable_at = present(upstream.and_then(|a| a.readable_at.as_ref()))
+        .or_else(|| present(upstream.and_then(|a| a.publish_at.as_ref())))
+        .or_else(|| present(row.published_at.as_ref()))
+        .unwrap_or_else(|| row.created_at.clone());
+    ResolvedChapter {
+        readable_at,
+        external_url: present(upstream.and_then(|a| a.external_url.as_ref())),
+        answered,
+    }
+}
+
+/// One batch of the work-list.
+///
+/// SCOPED TO MANGADEX, and it has to be: `chapter` is the unified spine since Phase B, so
+/// an unscoped `readable_at IS NULL` would hand Suwayomi rows (numeric `external_id`) to
+/// `/chapter?ids[]=`, which cannot resolve them — and a row that can never be resolved is a
+/// row that is offered forever.
+///
+/// The `EXISTS` form is not stylistic. Written as a JOIN, SQLite drives from `source_series`
+/// (`SEARCH ss USING idx_source_series_suwayomi_nsfw (source_type=?)`) and probes the
+/// partial index once per mangadex `source_series` — 113,876 probes per batch, and worse,
+/// each batch drains the front of that iteration order so the next one must skip further:
+/// quadratic across ~8,779 batches. With `EXISTS` the plan is
+/// `SCAN c USING INDEX idx_chapter_needs_readable_at` + a primary-key probe per row, i.e.
+/// linear in the rows STILL TO DO, which shrinks as the drain runs. That is precisely what
+/// migration 0073's partial index was created for. (Both plans verified with
+/// `EXPLAIN QUERY PLAN` against the migrated schema.)
+async fn chapters_needing_readable_at(
+    pool: &sqlx::SqlitePool,
+    limit: i64,
+) -> Result<Vec<PendingChapter>> {
+    let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT c.id, c.external_id, c.published_at, c.created_at \
+           FROM chapter c \
+          WHERE c.readable_at IS NULL \
+            AND EXISTS (SELECT 1 FROM source_series ss \
+                         WHERE ss.id = c.source_series_id AND ss.source_type = 'mangadex') \
+          LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, external_id, published_at, created_at)| PendingChapter {
+                id,
+                external_id,
+                published_at,
+                created_at,
+            },
+        )
+        .collect())
+}
+
+/// How many rows are still to do, for the completion log line. Same predicate as the
+/// work-list — a `COUNT` that disagreed with the batch query would report "drained" over
+/// rows the drain can still see, or spin over rows it cannot.
+async fn readable_backfill_remaining(pool: &sqlx::SqlitePool) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chapter c \
+          WHERE c.readable_at IS NULL \
+            AND EXISTS (SELECT 1 FROM source_series ss \
+                         WHERE ss.id = c.source_series_id AND ss.source_type = 'mangadex')",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Write one batch's resolutions, in one transaction.
+///
+/// Split out of [`backfill_chapter_external_urls`] with no client in its signature so the
+/// termination and resumability properties are testable without touching MangaDex — this
+/// drain is ~8,779 requests against a third party and a test must never be one of them.
+async fn write_readable_backfill(
+    pool: &sqlx::SqlitePool,
+    pending: &[PendingChapter],
+    upstream: &[MdChapter],
+) -> Result<ReadableFill> {
+    let by_id: HashMap<&str, &MdChapterAttrs> = upstream
+        .iter()
+        .map(|c| (c.id.as_str(), &c.attributes))
+        .collect();
+    let mut out = ReadableFill::default();
+    let mut tx = pool.begin().await?;
+    for row in pending {
+        let resolved = resolve_readable_at(row, by_id.get(row.external_id.as_str()).copied());
+        if resolved.answered {
+            sqlx::query("UPDATE chapter SET readable_at = ?, external_url = ? WHERE id = ?")
+                .bind(&resolved.readable_at)
+                .bind(&resolved.external_url)
+                .bind(&row.id)
+                .execute(&mut *tx)
+                .await?;
+            if by_id[row.external_id.as_str()].readable_at.is_some() {
+                out.from_upstream += 1;
+            }
+            if resolved.external_url.is_some() {
+                out.external += 1;
+            }
+        } else {
+            // `external_url` is left ALONE, not set to NULL. Upstream told us nothing about
+            // this chapter, and the firehose's self-heal may already have written a real URL
+            // onto the row; a blind NULL here would undo it and re-blank the reader.
+            sqlx::query("UPDATE chapter SET readable_at = ? WHERE id = ?")
+                .bind(&resolved.readable_at)
+                .bind(&row.id)
+                .execute(&mut *tx)
+                .await?;
+            out.unanswered += 1;
+        }
+        out.filled += 1;
+    }
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// One batch of the A1b backfill: fill `readable_at` / `external_url` on mirrored MangaDex
+/// chapters that have neither. Returns what moved; `filled == 0` means the backfill is
+/// complete. Call repeatedly — [`spawn_readable_backfill`] is what does.
+///
+/// RESUMABLE WITH NO CURSOR, ON PURPOSE, exactly like `catalog::spine`'s drains. The
+/// work-list is the data itself (`readable_at IS NULL`), so an interrupted run resumes by
+/// asking again, a row that becomes eligible tomorrow is picked up tomorrow, and there is no
+/// second piece of state to go stale across a restart or to reset by hand when the
+/// definition of "done" changes. The cost is one indexed query per batch against migration
+/// 0073's partial index — which exists for this, and which shrinks to empty as the drain
+/// runs. There is deliberately no completion marker: "done" is an empty work-list, and a
+/// marker could latch over rows that were never filled.
+pub async fn backfill_chapter_external_urls(
+    pool: &sqlx::SqlitePool,
+    client: &MangaDexClient,
+) -> Result<ReadableFill> {
+    let pending = chapters_needing_readable_at(pool, READABLE_BACKFILL_BATCH).await?;
+    if pending.is_empty() {
+        return Ok(ReadableFill::default());
+    }
+    let ids: Vec<String> = pending.iter().map(|p| p.external_id.clone()).collect();
+    // The fetch is allowed to fail the whole batch: nothing has been written yet, the rows
+    // stay in the work-list, and the next pass re-offers exactly them. That is the safe
+    // direction — the unsafe one would be writing fallbacks over a transient 503.
+    let page = client.get_chapters_by_ids(&ids).await?;
+    // RAW length vs parsed count, the `ChapterPage` discipline: a record that came back and
+    // failed to parse is not a record upstream lacks. It still gets the fallback (it must,
+    // or it never leaves the work-list), but it must not be counted as though MangaDex had
+    // no answer — that counter is the signal for a wrongly-filtered request.
+    if page.raw_len != page.chapters.len() {
+        tracing::warn!(
+            asked = ids.len(),
+            raw_len = page.raw_len,
+            parsed = page.chapters.len(),
+            "mangadex: readable_at backfill lost records to parse drops"
+        );
+    }
+    write_readable_backfill(pool, &pending, &page.chapters).await
+}
+
+/// Run the A1b backfill to completion in the background, then idle cheaply.
+///
+/// Structured like `catalog::spine::spawn`: boot stagger, interruptible naps, sparse
+/// logging, and an idle re-check rather than an exit — so a row that becomes eligible after
+/// the drain finishes is still picked up, without a restart.
+pub fn spawn_readable_backfill(
+    pool: sqlx::SqlitePool,
+    client: Arc<MangaDexClient>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        /// Sleep unless shutdown fires first. `true` => stop.
+        ///
+        /// A dropped sender makes `changed()` return `Err` instantly and forever; treating
+        /// that as "keep going" would collapse every gap in this loop to a no-op and turn
+        /// the throttle off — i.e. it would fire ~8,779 MangaDex requests as fast as the
+        /// token bucket allows, during shutdown. Both `spawn_backfill_if_needed` and
+        /// `catalog::spine::spawn` document having made exactly that mistake.
+        async fn nap(d: Duration, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+            tokio::select! {
+                _ = tokio::time::sleep(d) => false,
+                r = shutdown.changed() => r.is_err() || *shutdown.borrow(),
+            }
+        }
+        if nap(READABLE_BACKFILL_BOOT_DELAY, &mut shutdown).await {
+            return;
+        }
+        let mut total = ReadableFill::default();
+        let mut batches = 0u64;
+        let mut announced = false;
+        loop {
+            if *shutdown.borrow() {
+                tracing::info!(
+                    batches,
+                    filled = total.filled,
+                    "readable backfill: shutting down mid-drain — the work-list resumes it"
+                );
+                return;
+            }
+            match backfill_chapter_external_urls(&pool, &client).await {
+                Ok(fill) if fill.filled == 0 => {
+                    if !announced {
+                        match readable_backfill_remaining(&pool).await {
+                            // The success line, and the one that says A1b is done: the 46
+                            // sentinel works can now reach /updates and the F1 cohort is
+                            // identifiable by `external_url IS NOT NULL`.
+                            Ok(0) => tracing::info!(
+                                batches,
+                                filled = total.filled,
+                                from_upstream = total.from_upstream,
+                                external = total.external,
+                                unanswered = total.unanswered,
+                                "readable backfill: drained — every mirrored MangaDex \
+                                 chapter has a release clock"
+                            ),
+                            // WARN, not info: "nothing to do but rows remain" means rows are
+                            // unreachable rather than pending, which is a bug in the
+                            // work-list, not a state to wait out.
+                            Ok(remaining) => tracing::warn!(
+                                remaining,
+                                batches,
+                                "readable backfill: reported idle but rows remain — \
+                                 they are unreachable, not merely pending"
+                            ),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "readable backfill: remaining check failed")
+                            }
+                        }
+                        announced = true;
+                    }
+                    if nap(READABLE_BACKFILL_IDLE_RECHECK, &mut shutdown).await {
+                        return;
+                    }
+                }
+                Ok(fill) => {
+                    total.filled += fill.filled;
+                    total.from_upstream += fill.from_upstream;
+                    total.external += fill.external;
+                    total.unanswered += fill.unanswered;
+                    batches += 1;
+                    announced = false;
+                    // Sparse by construction: ~8,779 batches at 2s apart is ~5 hours, so a
+                    // line every 500 batches is roughly one per 17 minutes.
+                    if batches.is_multiple_of(READABLE_BACKFILL_PROGRESS_EVERY) {
+                        tracing::info!(
+                            batches,
+                            filled = total.filled,
+                            from_upstream = total.from_upstream,
+                            external = total.external,
+                            unanswered = total.unanswered,
+                            "readable backfill: progress"
+                        );
+                    }
+                    if nap(READABLE_BACKFILL_GAP, &mut shutdown).await {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    // Nothing was written (the fetch is the only thing that can fail before
+                    // the transaction), so the batch is simply re-offered. Back off to the
+                    // idle interval rather than the batch gap: an error here is usually
+                    // upstream being unhappy, and retrying it every 2s is how a rate-limit
+                    // becomes a ban.
+                    tracing::warn!(error = %e, batches, "readable backfill: batch failed — retrying later");
+                    if nap(READABLE_BACKFILL_IDLE_RECHECK, &mut shutdown).await {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Whether the `chapter` row for `(source_series_id, ch.external_id)` already exists AND
 /// carries every mutable column exactly as `ch` would set it — i.e. `upsert_chapter`
 /// would spend a write transaction to change nothing.
@@ -2241,10 +2827,12 @@ async fn chapter_row_unchanged(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
+        Option<String>,
     );
     let row: Option<MutableCols> = match sqlx::query_as(
-        "SELECT number, volume, lang, title, published_at FROM chapter \
-         WHERE source_series_id = ? AND external_id = ?",
+        "SELECT number, volume, lang, title, published_at, readable_at, external_url \
+         FROM chapter WHERE source_series_id = ? AND external_id = ?",
     )
     .bind(source_series_id)
     .bind(&ch.external_id)
@@ -2261,12 +2849,20 @@ async fn chapter_row_unchanged(
         // Exactly the columns `upsert_chapter`'s DO UPDATE SET touches, compared as
         // `Option<String>` so NULL == absent: if this list ever grows there, it must grow
         // here too, or the re-seed will skip a genuine change.
-        Some((number, volume, lang, title, published_at)) => {
+        Some((number, volume, lang, title, published_at, readable_at, external_url)) => {
             number == ch.number
                 && volume == ch.volume
                 && lang == ch.lang
                 && title == ch.title
                 && published_at == ch.published_at
+                // Added with migration 0073. Comparing them here is what makes the
+                // firehose SELF-HEAL: every existing row has both NULL, so the first pass
+                // that re-offers a chapter now sees a difference and writes the real
+                // `readableAt`/`externalUrl` instead of skipping it as unchanged. (The
+                // firehose only re-offers UPDATED chapters, so the long tail still needs
+                // `backfill_chapter_external_urls`.)
+                && readable_at == ch.readable_at
+                && external_url == ch.external_url
         }
         None => false,
     }
@@ -2290,6 +2886,9 @@ pub async fn sync_chapters(
     let mut out = SweepOutcome::default();
     loop {
         let mut offset = 0i64;
+        // Series this window's pages have written a chapter for, drained at the end of
+        // each page by the incremental feed writer below.
+        let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut last_created: Option<String> = None;
         let mut done = false;
         let mut empty_retries = 0u32;
@@ -2333,15 +2932,38 @@ pub async fn sync_chapters(
             }
             empty_retries = 0;
             for c in &chapters {
-                if let Some(ts) = chapter_window_ts(c, window) {
-                    last_created = Some(ts);
-                }
+                // THE CURSOR IS ADVANCED AT THE END OF THIS BODY, NOT HERE (F9).
+                //
+                // It used to be advanced right here, before the skips below — and the
+                // window is forward-only `updatedAtSince`, so a chapter skipped because its
+                // work is not catalogued yet had the cursor step PAST it and was never
+                // offered again. The chapter was silently and permanently absent from the
+                // mirror, with no counter and no log line to show for it: the same shape as
+                // the catalogue's 4,493-record gap.
+                //
+                // Deliberately not "advance for skipped rows too, but count them": the
+                // point is that the cursor must never move past a record this pass did not
+                // land. A record we skip stays inside the next window, and the catalogue
+                // sweep that runs first will have catalogued its work by then.
+                let window_ts = chapter_window_ts(c, window);
+
                 // English-only mirror: the firehose is already filtered to `en`, but
                 // guard defensively so a stray non-English row is never stored.
                 if c.attributes.translated_language.as_deref() != Some("en") {
+                    // A non-English row is not a loss — we never wanted it — so it may
+                    // advance the cursor.
+                    if let Some(ts) = window_ts {
+                        last_created = Some(ts);
+                    }
                     continue;
                 }
                 let Some(manga_id) = chapter_manga_id(c) else {
+                    // No manga relationship at all: unusable, and re-offering it would
+                    // stall the window forever. Count it as dropped and move on.
+                    out.dropped += 1;
+                    if let Some(ts) = window_ts {
+                        last_created = Some(ts);
+                    }
                     continue;
                 };
                 let ssid = match catalog::find_source_series_id(
@@ -2350,9 +2972,16 @@ pub async fn sync_chapters(
                 .await
                 {
                     Ok(Some(id)) => id,
-                    Ok(None) => continue, // work not catalogued yet
+                    // Work not catalogued yet — DO NOT advance the cursor past it. This is
+                    // the F9 loss. `skipped` holds the window open so the next pass, after
+                    // the catalogue sweep has caught up, sees this chapter again.
+                    Ok(None) => {
+                        out.skipped += 1;
+                        continue;
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "mangadex: chapter source_series lookup failed");
+                        out.failed += 1;
                         continue;
                     }
                 };
@@ -2363,15 +2992,34 @@ pub async fn sync_chapters(
                     lang: c.attributes.translated_language.clone(),
                     title: c.attributes.title.clone(),
                     published_at: c.attributes.publish_at.clone(),
+                    readable_at: c.attributes.readable_at.clone(),
+                    external_url: c.attributes.external_url.clone(),
+                    // MangaDex models translation groups as a relationship, not a string
+                    // on the chapter — the mirror has never carried one and the spine
+                    // leaves it NULL for this half.
+                    scanlator: None,
                 };
                 // Already mirrored and identical → no write. See `chapter_row_unchanged`
                 // for the cost this avoids on the 0067 re-seed.
                 if chapter_row_unchanged(pool, &ssid, &ch).await {
                     out.unchanged += 1;
+                    // Already in the mirror, so nothing is lost by moving past it.
+                    if let Some(ts) = window_ts {
+                        last_created = Some(ts);
+                    }
                     continue;
                 }
                 match catalog::upsert_chapter(pool, &ssid, &ch).await {
-                    Ok(_) => out.upserted += 1,
+                    Ok(_) => {
+                        out.upserted += 1;
+                        // Landed — the cursor may now move past it (F9).
+                        if let Some(ts) = window_ts {
+                            last_created = Some(ts);
+                        }
+                        // Phase C2: this page's writes reach /updates at the end of the
+                        // page, not at the next 6-hourly rebuild.
+                        touched.insert(ssid.clone());
+                    }
                     // COUNTED, not just logged. A warn-and-forget here is how a seed could
                     // lose chapters to SQLITE_BUSY and still flip `seed_done`, after which
                     // the forward-only `updatedAtSince` window never re-offers them —
@@ -2384,6 +3032,7 @@ pub async fn sync_chapters(
                     }
                 }
             }
+            out.feed += flush_touched_feed_rows(pool, &mut touched).await;
             // RAW length, never the parsed count — see `next_offset` / `ChapterPage`.
             offset = next_offset(offset, raw_len);
             // A short page means the API ran out of records for this window. Short of
@@ -2455,6 +3104,11 @@ pub async fn sync_chapters(
         unchanged = out.unchanged,
         dropped = out.dropped,
         failed = out.failed,
+        // How many works this sweep actually pushed to /updates. It reads as noise next to
+        // the loss counters and it is not one — it is the only way to tell "the incremental
+        // feed writer ran" from "the incremental feed writer is inert", which is precisely
+        // the distinction the un-extracted version hid for a whole phase (§8h).
+        feed = out.feed,
         "mangadex: chapter sweep complete"
     );
     Ok(out)
@@ -2566,9 +3220,10 @@ async fn run_one_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_p
             // incremental cursor; an already-seeded run just advances the cursor.
             let res = if catalogue_seeded {
                 catalog::set_sync_cursor(pool, "catalogue", &run_start).await
-            } else if o.dropped > 0 {
-                // A seed that FETCHED records and failed to parse them must not latch
-                // `seed_done`: doing so switches the sweep to the forward-only
+            } else if !catalogue_seed_may_latch(&o) {
+                // A seed that FETCHED records and did not land them must not latch
+                // `seed_done` — whether they failed to PARSE (`dropped`) or failed to WRITE
+                // (`failed`; F9): doing so switches the sweep to the forward-only
                 // `updatedAtSince` window, which never revisits an old `createdAt`, so
                 // those records become unreachable without a full manual re-seed. That is
                 // precisely how the 4,493-record gap became permanent.
@@ -2585,7 +3240,8 @@ async fn run_one_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_p
                 // forever on a single permanently-malformed upstream record.
                 tracing::error!(
                     dropped = o.dropped,
-                    "mangadex: catalogue seed dropped records — withholding seed_done so \
+                    failed = o.failed,
+                    "mangadex: catalogue seed lost records — withholding seed_done so \
                      the seed keeps resuming instead of switching to the forward-only \
                      incremental window"
                 );
@@ -2602,6 +3258,24 @@ async fn run_one_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_p
         }
     }
 
+    // The chapter half USED to run here, on the catalogue's 6-hourly cadence. It has its
+    // own ticker now (Phase D) — see `run_recurring`.
+    let _ = run_start;
+}
+
+/// The chapter half of a cycle, on its own schedule (Phase D). Takes the same single-flight
+/// lock as the catalogue sweep: they write the same tables, and the chapter sweep's
+/// uncatalogued-work skip reads state the catalogue sweep is mutating.
+pub async fn chapter_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient) {
+    if CATALOGUE_SYNC_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        tracing::debug!("mangadex: catalogue sync busy; skipping this chapter tick");
+        return;
+    }
+    let _guard = SyncGuard;
+    let run_start = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     run_chapter_cycle(pool, client, &run_start).await;
 }
 
@@ -2613,6 +3287,23 @@ async fn run_one_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_p
 /// permanent until a human forces another re-seed. One predicate rather than two branches
 /// so a future third loss class can only be added in one place.
 fn chapter_seed_may_latch(o: &SweepOutcome) -> bool {
+    // `skipped` counts too: a chapter whose work is not catalogued yet has not been
+    // mirrored, and latching `seed_done` with any of them outstanding switches the sweep to
+    // the forward-only window while records it never landed are still behind the cursor.
+    o.dropped == 0 && o.failed == 0 && o.skipped == 0
+}
+
+/// The same predicate for the CATALOGUE seed, and it is the same predicate on purpose.
+///
+/// The catalogue half used to latch on `dropped == 0` alone, so a work whose upsert
+/// *errored* — as opposed to failing to parse — did not hold the seed open. Both counters
+/// mean "fetched and not in the spine"; they differ only in where the record died. Letting
+/// one of them latch `seed_done` switches the sweep to the forward-only `updatedAtSince`
+/// window, which never revisits an old `createdAt`, and the loss becomes permanent until a
+/// human forces a re-seed. That asymmetry was half of F9; the other half was that the
+/// upsert's error arm never incremented `failed` at all, so the counter it now consults was
+/// always zero.
+fn catalogue_seed_may_latch(o: &SweepOutcome) -> bool {
     o.dropped == 0 && o.failed == 0
 }
 
@@ -2701,6 +3392,8 @@ pub fn spawn_recurring(
     client: Arc<MangaDexClient>,
     cover_phash: bool,
     interval_secs: u64,
+    chapter_interval_secs: u64,
+    reconcile_interval_secs: u64,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     // Supervisor: run the loop in a child task and, if it panics, restart it after
@@ -2713,6 +3406,8 @@ pub fn spawn_recurring(
                 client.clone(),
                 cover_phash,
                 interval_secs,
+                chapter_interval_secs,
+                reconcile_interval_secs,
                 shutdown.clone(),
             ));
             match handle.await {
@@ -2738,41 +3433,81 @@ async fn run_recurring(
     client: Arc<MangaDexClient>,
     cover_phash: bool,
     interval_secs: u64,
+    chapter_interval_secs: u64,
+    reconcile_interval_secs: u64,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     // Start 60s behind the scanner so the boot burst is spread across the five
     // background loops rather than landing in one instant — see scanner::run_loop.
-    let mut ticker = tokio::time::interval_at(
+    // THREE CADENCES, NOT ONE (Phases C3 + D). They used to be the same tick, which meant
+    // the cheapest and most time-critical of the three — the chapter firehose — ran at the
+    // pace of the most expensive.
+    //
+    //   catalogue   6 h  — thousands of records; genuinely slow-changing.
+    //   chapters   15 m  — ~75 chapters an incremental pass. This is the freshness knob.
+    //   reconcile  24 h  — the demoted wholesale chain, now a drift REPORT (C3).
+    //
+    // Staggered starts so the boot burst is spread rather than landing in one instant, and
+    // `Delay` on all three so a long pass postpones the next tick instead of queueing a
+    // backlog. They share `CATALOGUE_SYNC_RUNNING`, so two sweeps can never interleave.
+    let mut catalogue = tokio::time::interval_at(
         tokio::time::Instant::now() + std::time::Duration::from_secs(60),
         std::time::Duration::from_secs(interval_secs),
     );
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    catalogue.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut chapters = tokio::time::interval_at(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(150),
+        std::time::Duration::from_secs(chapter_interval_secs),
+    );
+    chapters.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut reconcile = tokio::time::interval_at(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+        std::time::Duration::from_secs(reconcile_interval_secs),
+    );
+    reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tracing::info!(
         interval_secs,
+        chapter_interval_secs,
+        reconcile_interval_secs,
         cover_phash,
-        "mangadex: recurring catalogue sync started"
+        "mangadex: recurring sync started"
     );
     loop {
         tokio::select! {
-            _ = ticker.tick() => {
+            _ = catalogue.tick() => {
                 sync_cycle(&pool, &client, cover_phash).await;
-                // New canonical chapters just landed — rebuild the materialized updates
-                // feed so `canonicalUpdates` reflects them (migration 0051). Non-fatal:
-                // a stale feed is better than a crashed sync loop.
-                match crate::catalog::refresh_feed_updates(&pool).await {
-                    Ok(n) => tracing::info!(works = n, "mangadex: feed_updates refreshed"),
-                    Err(e) => tracing::warn!(error = %e, "mangadex: feed_updates refresh failed"),
-                }
-                // AD-5: new/renamed works just landed — rebuild the search index too so
-                // text search reflects them (migration 0052). Non-fatal like above.
-                match crate::catalog::refresh_work_fts(&pool).await {
-                    Ok(n) => tracing::info!(works = n, "mangadex: work_fts refreshed"),
-                    Err(e) => tracing::warn!(error = %e, "mangadex: work_fts refresh failed"),
+            }
+            _ = chapters.tick() => {
+                // The freshness path. What reaches /updates from here is the Phase C2
+                // incremental writer inside `sync_chapters` — one feed upsert per touched
+                // series, per page — NOT the wholesale chain, which is what makes a
+                // 15-minute cadence affordable at all.
+                chapter_cycle(&pool, &client).await;
+            }
+            _ = reconcile.tick() => {
+                // Phase C3: rebuild everything and report what the incremental writers
+                // missed. `drifted == 0` is the healthy answer, and it is the evidence that
+                // the incremental path is actually correct rather than merely present.
+                match crate::catalog::ledger::reconcile_feed(&pool).await {
+                    Ok(r) if r.drifted == 0 => tracing::info!(
+                        rows = r.rows_after,
+                        duration_ms = r.duration_ms,
+                        "feed reconciler: no drift — incremental writers are keeping up"
+                    ),
+                    Ok(r) => tracing::warn!(
+                        rows_before = r.rows_before,
+                        rows_after = r.rows_after,
+                        drifted = r.drifted,
+                        duration_ms = r.duration_ms,
+                        sample = %r.sample.join(" | "),
+                        "feed reconciler: DRIFT — the incremental writers missed rows"
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "feed reconciler: failed"),
                 }
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    tracing::info!("mangadex: catalogue sync stopping");
+                    tracing::info!("mangadex: recurring sync stopping");
                     break;
                 }
             }
@@ -2789,6 +3524,321 @@ mod tests {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    // --- the MangaDex half's incremental feed writer ---------------------------------
+    //
+    // §8h: this path had NO test at all. `scanner::incremental_write_converges_with_the_
+    // periodic_rebuild` drives `touch_feed_series_update`, i.e. the SCANNER half only, so
+    // the mirror half's writer shipped never having created a feed row and nothing failed.
+
+    /// EVERY column of a work's merged-feed row plus the sort key's STORAGE CLASS, as one
+    /// comparable string — the mirror-half twin of `scanner::tests::feed_digest`, and every
+    /// column for the same reason: a row whose contents depend on WHICH writer touched it
+    /// last is a row that appears, disappears or re-sorts depending on firehose timing.
+    /// `~` stands in for NULL so a NULL cannot swallow the concatenation.
+    async fn feed_digest(pool: &sqlx::SqlitePool, work_id: &str) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT work_id || '|' || reader_id || '|' || title \
+                 || '|' || COALESCE(cover_url, '~') || '|' || COALESCE(suwayomi_thumbnail, '~') \
+                 || '|' || COALESCE(comic_type, '~') || '|' || COALESCE(latest_chapter, '~') \
+                 || '|' || COALESCE(latest_chapter_title, '~') \
+                 || '|' || COALESCE(chapter_count, '~') \
+                 || '|' || released_at || '|' || typeof(released_at) \
+                 || '|' || COALESCE(detected_at, '~') || '|' || is_nsfw \
+                 || '|' || COALESCE(status, '~') || '|' || content_rating \
+                 || '|' || en_chapter_count \
+             FROM feed_series_updates WHERE work_id = ?",
+        )
+        .bind(work_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The same for `feed_updates` (migration 0051), which `canonicalUpdates` reads directly
+    /// — the OTHER surface this writer has to keep honest.
+    async fn canonical_digest(pool: &sqlx::SqlitePool, work_id: &str) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT work_id || '|' || COALESCE(mangadex_id, '~') || '|' || title \
+                 || '|' || is_nsfw || '|' || COALESCE(cover_url, '~') \
+                 || '|' || COALESCE(latest_chapter, '~') \
+                 || '|' || COALESCE(latest_chapter_title, '~') || '|' || latest_at \
+             FROM feed_updates WHERE work_id = ?",
+        )
+        .bind(work_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    /// One MangaDex-anchored work, its `source_series` id, and no chapters yet.
+    async fn mirror_work(pool: &sqlx::SqlitePool, uuid: &str, title: &str) -> (String, String) {
+        let work = catalog::upsert_work_from_mangadex(
+            pool,
+            uuid,
+            &catalog::WorkInput {
+                primary_title: Some(title.into()),
+                original_language: Some("ja".into()),
+                status: Some("ONGOING".into()),
+                content_rating: Some("safe".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ssid = catalog::find_source_series_id(pool, "mangadex", "mangadex", uuid)
+            .await
+            .unwrap()
+            .unwrap();
+        (work, ssid)
+    }
+
+    async fn mirror_chapter(pool: &sqlx::SqlitePool, ssid: &str, id: &str, number: &str, at: &str) {
+        catalog::upsert_chapter(
+            pool,
+            ssid,
+            &catalog::ChapterInput {
+                external_id: id.into(),
+                number: Some(number.into()),
+                lang: Some("en".into()),
+                title: Some(format!("Title of {number}")),
+                readable_at: Some(at.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Drive the extracted writer exactly as `sync_chapters` does: a set of the
+    /// `source_series` this page wrote to, drained.
+    async fn flush(pool: &sqlx::SqlitePool, ssid: &str) -> u64 {
+        let mut touched = std::collections::HashSet::new();
+        touched.insert(ssid.to_string());
+        let n = flush_touched_feed_rows(pool, &mut touched).await;
+        assert!(touched.is_empty(), "the set must be drained, not re-walked");
+        n
+    }
+
+    /// THE BUG §8h FOUND, stated as a test: the incremental path must CREATE the feed row.
+    ///
+    /// The old inline block ran only `project_feed_from_ledger_for_work`, an `UPDATE … FROM`.
+    /// An UPDATE matches nothing when there is no row, so a work whose first English chapter
+    /// had just been mirrored stayed invisible on `/updates` until the next 6-hourly rebuild
+    /// — precisely the F5 staleness the block was written to remove. It reported success
+    /// (`0 rows changed`) the whole time.
+    #[tokio::test]
+    async fn the_mirror_half_creates_a_feed_row_it_does_not_only_update_one() {
+        let pool = pool().await;
+        let (work, ssid) = mirror_work(&pool, "md-new", "Brand New Series").await;
+        mirror_chapter(&pool, &ssid, "c1", "1", "2026-06-01T00:00:00Z").await;
+
+        assert!(
+            feed_digest(&pool, &work).await.is_none(),
+            "no row before the write, or this asserts nothing"
+        );
+        assert_eq!(flush(&pool, &ssid).await, 1, "the work must reach the feed");
+
+        let (released_at, typ, label, count): (i64, String, Option<String>, i64) = sqlx::query_as(
+            "SELECT released_at, typeof(released_at), latest_chapter, en_chapter_count \
+             FROM feed_series_updates WHERE work_id = ?",
+        )
+        .bind(&work)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // The sort key must land as INTEGER epoch-millis. A TEXT key sorts every ISO '2…'
+        // row above every millis '1…' row under BINARY collation — migration 0064.
+        assert_eq!(typ, "integer", "released_at must be an INTEGER, not TEXT");
+        assert_eq!(
+            released_at,
+            chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+                .unwrap()
+                .timestamp_millis()
+        );
+        // The chapter NUMBER, never the COUNT (F4).
+        assert_eq!(label.as_deref(), Some("1"));
+        assert_eq!(count, 1);
+        // A brand-new row must not land type-less: `comic_type IS NULL` is invisible to the
+        // reader's format tabs and to Browse's format chips.
+        let typed: Option<String> =
+            sqlx::query_scalar("SELECT comic_type FROM feed_series_updates WHERE work_id = ?")
+                .bind(&work)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(typed.as_deref(), Some("MANGA"));
+    }
+
+    /// THE convergence proof for the mirror half: drive the incremental writer, then hand the
+    /// tables to the REAL periodic rebuild and demand a byte-identical row — the same
+    /// property `scanner::incremental_write_converges_with_the_periodic_rebuild` pins for the
+    /// other half, and the one that makes two writers of one materialized table safe.
+    ///
+    /// Three interleavings, because they exercise different clauses:
+    ///   1. a mirror-only work — the INSERT branch, which is the branch that did not exist;
+    ///   2. a second chapter arriving later — the CONFLICT branch on our own earlier row;
+    ///   3. a work that also has a Suwayomi half, whose row the rebuild has ALREADY settled,
+    ///      with the firehose then arriving on top. That is the interleaving the conflict
+    ///      clause is restated for: the rebuild reaches the settled row as "mirror inserted,
+    ///      then scanner merged", and here the mirror arrives second and must land in the
+    ///      same place — assigning the display fields it owns and leaving `chapter_count`,
+    ///      `detected_at` and `suwayomi_thumbnail` to the half that owns them. Copying the
+    ///      rebuild's clause verbatim would write the mirror's NULL over a real Suwayomi
+    ///      count, and a scanner-half card renders `Ch. {latest_chapter ?? chapter_count}`.
+    #[tokio::test]
+    async fn the_mirror_half_incremental_write_converges_with_the_periodic_rebuild() {
+        let pool = pool().await;
+        let (work, ssid) = mirror_work(&pool, "md-conv", "Convergent Series").await;
+        mirror_chapter(&pool, &ssid, "c1", "1", "2026-06-01T00:00:00Z").await;
+
+        // (1) INSERT branch.
+        flush(&pool, &ssid).await;
+        let incremental = feed_digest(&pool, &work).await.expect("must publish");
+        let incremental_canonical = canonical_digest(&pool, &work).await.expect("must publish");
+        catalog::refresh_feed_updates(&pool).await.unwrap();
+        assert_eq!(
+            incremental,
+            feed_digest(&pool, &work).await.unwrap(),
+            "the incremental writer and the periodic rebuild must not disagree about any \
+             column of the merged feed"
+        );
+        assert_eq!(
+            incremental_canonical,
+            canonical_digest(&pool, &work).await.unwrap(),
+            "nor about any column of `feed_updates`, which `canonicalUpdates` reads"
+        );
+
+        // (2) CONFLICT branch, on a row this path created. The new chapter must move BOTH
+        //     the clock and the label, or the card announces an update it cannot name.
+        mirror_chapter(&pool, &ssid, "c2", "2.5", "2026-06-08T00:00:00Z").await;
+        flush(&pool, &ssid).await;
+        let incremental = feed_digest(&pool, &work).await.unwrap();
+        assert!(
+            incremental.contains("|2.5|"),
+            "the label must follow the newest RELEASE: {incremental}"
+        );
+        catalog::refresh_feed_updates(&pool).await.unwrap();
+        assert_eq!(
+            incremental,
+            feed_digest(&pool, &work).await.unwrap(),
+            "a second incremental write must still converge"
+        );
+
+        // (3) A work with BOTH halves, settled by the rebuild first.
+        let (both, both_ssid) = mirror_work(&pool, "md-both", "Both Halves").await;
+        catalog::upsert_source_series(&pool, &both, "suwayomi", "asura", "7", None, false)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO suwayomi_series \
+                 (id, title, thumbnail_url, status, in_library, source_id, chapter_count, \
+                  latest_chapter_at, updated_at) \
+             VALUES (7, 'Suwayomi Title', '/thumb/7', 'ONGOING', 1, '1', 13, '1780000000000', \
+                     '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO suwayomi_chapter \
+                 (id, manga_id, name, chapter_number, page_count, upload_date, updated_at) \
+             VALUES (1, 7, 'Ch 13', 13.0, 0, '1780000000000', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        mirror_chapter(&pool, &both_ssid, "b1", "12", "2026-06-01T00:00:00Z").await;
+        catalog::refresh_feed_updates(&pool).await.unwrap();
+        let settled: (Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT chapter_count, suwayomi_thumbnail FROM feed_series_updates WHERE work_id = ?",
+        )
+        .bind(&both)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            settled,
+            (Some(13), Some("/thumb/7".into())),
+            "the fixture must really carry both halves, or (3) proves nothing"
+        );
+
+        // The firehose now mirrors a NEWER chapter than either half had.
+        mirror_chapter(&pool, &both_ssid, "b2", "14", "2026-07-01T00:00:00Z").await;
+        flush(&pool, &both_ssid).await;
+        let incremental = feed_digest(&pool, &both).await.unwrap();
+        assert!(
+            incremental.contains("|14|") && incremental.contains("|13|"),
+            "the mirror's label must advance while the Suwayomi chapter_count survives: \
+             {incremental}"
+        );
+        catalog::refresh_feed_updates(&pool).await.unwrap();
+        assert_eq!(
+            incremental,
+            feed_digest(&pool, &both).await.unwrap(),
+            "a mirror write landing on a row the rebuild had already settled with the \
+             scanner half must leave it where the next rebuild puts it"
+        );
+
+        // --- and again with the release ledger ACTIVE ---------------------------------
+        //
+        // Everything above ran with an empty `release_event`, so `ledger::is_complete` was
+        // false and pass (5) was inert in BOTH writers — which proves they agree when the
+        // projection is off and nothing about when it is on.
+        while catalog::spine::drain_chapter_keys(&pool).await.unwrap() > 0 {}
+        catalog::spine::drain_suwayomi_series(&pool).await.unwrap();
+        while catalog::spine::drain_chapter_keys(&pool).await.unwrap() > 0 {}
+        while catalog::ledger::seed_batch(&pool).await.unwrap() > 0 {}
+        assert!(
+            catalog::ledger::is_complete(&pool).await.unwrap(),
+            "the fixture must reach a complete ledger, or this asserts nothing"
+        );
+        mirror_chapter(&pool, &ssid, "c3", "3", "2026-06-20T00:00:00Z").await;
+        flush(&pool, &ssid).await;
+        let incremental = feed_digest(&pool, &work).await.unwrap();
+        assert!(
+            incremental.contains("|3|"),
+            "the ledger projection must relabel to the newest release: {incremental}"
+        );
+        catalog::refresh_feed_updates(&pool).await.unwrap();
+        assert_eq!(
+            incremental,
+            feed_digest(&pool, &work).await.unwrap(),
+            "with the ledger projecting the release clock, the two writers must STILL agree"
+        );
+    }
+
+    /// A work whose every English chapter is scheduled in the FUTURE is not an update, and
+    /// the incremental writer must reach the same answer the rebuild does — including
+    /// RETRACTING a row it published earlier, which is what the rebuild's DELETE + INSERT
+    /// does for free and an upsert-only path would not.
+    #[tokio::test]
+    async fn an_unreleased_chapter_never_reaches_the_feed() {
+        let pool = pool().await;
+        let (work, ssid) = mirror_work(&pool, "md-future", "Scheduled").await;
+        mirror_chapter(&pool, &ssid, "f1", "1", "2099-01-01T00:00:00Z").await;
+
+        assert_eq!(flush(&pool, &ssid).await, 0, "unreleased is not published");
+        assert!(canonical_digest(&pool, &work).await.is_none());
+        assert!(feed_digest(&pool, &work).await.is_none());
+        catalog::refresh_feed_updates(&pool).await.unwrap();
+        assert!(
+            feed_digest(&pool, &work).await.is_none(),
+            "and the rebuild agrees"
+        );
+
+        // Now it releases, and then the upload is WITHDRAWN back to a future date.
+        mirror_chapter(&pool, &ssid, "f1", "1", "2026-06-01T00:00:00Z").await;
+        assert_eq!(flush(&pool, &ssid).await, 1);
+        assert!(canonical_digest(&pool, &work).await.is_some());
+        mirror_chapter(&pool, &ssid, "f1", "1", "2099-01-01T00:00:00Z").await;
+        assert_eq!(flush(&pool, &ssid).await, 0);
+        assert!(
+            canonical_digest(&pool, &work).await.is_none(),
+            "a withdrawn release must not outlive itself on `canonicalUpdates` — the \
+             rebuild's DELETE would have removed it"
+        );
     }
 
     #[test]
@@ -2849,7 +3899,12 @@ mod tests {
             upserted: 71_126,
             dropped: 0,
             failed: 0,
+            skipped: 0,
             unchanged: 805_307,
+            // The feed writer's counter is not a loss counter and deliberately gates
+            // nothing: a feed row is a cache the rebuild reconstructs, whereas every field
+            // above describes a chapter that did or did not reach the durable mirror.
+            feed: 0,
         };
         assert!(chapter_seed_may_latch(&clean));
         assert!(!chapter_seed_may_latch(&SweepOutcome {
@@ -2865,12 +3920,31 @@ mod tests {
             failed: 4,
             ..clean
         }));
+        // F9: a chapter skipped because its work is not catalogued yet has not been
+        // mirrored either, so it must hold the seed open just like a drop or a write error.
+        // Before the fix the cursor advanced past those chapters and they were never
+        // re-offered — a silent, permanent loss with no counter to show for it.
+        assert!(!chapter_seed_may_latch(&SweepOutcome {
+            skipped: 1,
+            ..clean
+        }));
         // `unchanged` is bookkeeping, not loss: a re-seed over an already-complete mirror
         // writes almost nothing and MUST still be allowed to latch, or the seed re-runs
         // its 45-70 minute walk every cycle forever.
         assert!(chapter_seed_may_latch(&SweepOutcome {
             upserted: 0,
             unchanged: 876_433,
+            ..Default::default()
+        }));
+        // And the catalogue half now uses the same predicate — its upsert error arm used to
+        // only warn, so `failed` was always 0 for it and `seed_done` latched over the loss.
+        assert!(catalogue_seed_may_latch(&SweepOutcome {
+            upserted: 113_741,
+            ..Default::default()
+        }));
+        assert!(!catalogue_seed_may_latch(&SweepOutcome {
+            upserted: 113_741,
+            failed: 1,
             ..Default::default()
         }));
     }
@@ -2898,6 +3972,9 @@ mod tests {
             lang: Some("en".into()),
             title: Some("The Storm".into()),
             published_at: Some("2026-07-01T00:00:00+00:00".into()),
+            readable_at: Some("2026-06-30T00:00:00+00:00".into()),
+            external_url: None,
+            scanlator: None,
         };
         // Absent → must be written, never skipped.
         assert!(!chapter_row_unchanged(&pool, &ssid, &ch).await);
@@ -2928,6 +4005,18 @@ mod tests {
                 published_at: Some("2026-07-02T00:00:00+00:00".into()),
                 ..ch.clone()
             },
+            // Migration 0073's two columns. These matter MORE than the others here: every
+            // pre-0073 row has both NULL, so if the presence check ignored them the
+            // firehose would skip its own chance to heal them and the reader would keep
+            // rendering a blank page for an external chapter it already mirrored.
+            catalog::ChapterInput {
+                readable_at: Some("2026-06-29T00:00:00+00:00".into()),
+                ..ch.clone()
+            },
+            catalog::ChapterInput {
+                external_url: Some("https://mangaplus.shueisha.co.jp/viewer/1019123".into()),
+                ..ch.clone()
+            },
         ] {
             assert!(
                 !chapter_row_unchanged(&pool, &ssid, &changed).await,
@@ -2937,6 +4026,315 @@ mod tests {
         // Same external id under a DIFFERENT source_series is a different row: the
         // presence check is keyed on the pair, exactly like the UNIQUE constraint.
         assert!(!chapter_row_unchanged(&pool, "ss_does_not_exist", &ch).await);
+    }
+
+    #[test]
+    fn chapter_id_lookups_ask_for_every_rating_and_filter_nothing_else() {
+        // A1b's request shape. The two things that can go wrong here are both silent and
+        // both permanent: an id MangaDex filters out of the response reads as "upstream has
+        // no answer", so the row takes a fallback clock and leaves the work-list for good.
+        let ids: Vec<String> = (1..=100).map(|i| format!("chapter-uuid-{i}")).collect();
+        let params = chapter_ids_params(&ids);
+
+        // One `ids[]` per id, in order, none dropped or deduped.
+        let sent: Vec<&str> = params
+            .iter()
+            .filter(|(k, _)| k == "ids[]")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(sent.len(), 100);
+        assert_eq!(sent[0], "chapter-uuid-1");
+        assert_eq!(sent[99], "chapter-uuid-100");
+        // `limit` must cover the whole batch: MangaDex defaults `/chapter` to 10, so a
+        // missing limit would answer 10 of the 100 and silently fall back on the other 90.
+        assert!(params.contains(&("limit".into(), "100".into())));
+        // All four ratings — `/chapter` applies its safe,suggestive,erotica default to an
+        // `ids[]` query too, exactly as it does to the firehose.
+        let ratings: Vec<&str> = params
+            .iter()
+            .filter(|(k, _)| k == "contentRating[]")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            ratings,
+            vec!["safe", "suggestive", "erotica", "pornographic"]
+        );
+        // And NOTHING else that can subtract from an already-exact id list.
+        assert!(
+            !params.iter().any(|(k, _)| k == "translatedLanguage[]"),
+            "an id lookup must not carry a language filter — it can only lose rows"
+        );
+        assert!(!params.iter().any(|(k, _)| k.ends_with("Since")));
+        assert!(!params.iter().any(|(k, _)| k == "offset"));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_id_batch_is_rejected_rather_than_truncated() {
+        // Truncating to MangaDex's 100-id ceiling would leave the tail of the batch
+        // unanswered — and an unanswered row that is never written stays in the work-list
+        // forever, which is the one failure mode a cursorless drain cannot survive. Fails
+        // before any request is built, so this test makes no network call.
+        let client = MangaDexClient::new("komika-test", 5.0, 40.0);
+        let ids: Vec<String> = (0..101).map(|i| format!("id-{i}")).collect();
+        let Err(err) = client.get_chapters_by_ids(&ids).await else {
+            panic!("101 ids must be rejected, not silently cut to the API's ceiling");
+        };
+        assert!(err.to_string().contains("at most 100 ids"), "{err}");
+        // Empty is a no-op, not a request for "every chapter on MangaDex".
+        let page = client.get_chapters_by_ids(&[]).await.unwrap();
+        assert_eq!(page.raw_len, 0);
+        assert!(page.chapters.is_empty());
+    }
+
+    #[test]
+    fn a_chapter_with_no_upstream_readable_at_still_leaves_the_work_list() {
+        // THE INFINITE-LOOP GUARD. The work-list is `readable_at IS NULL` and there is no
+        // cursor, so any row this rule declines to fill is a row that is offered again
+        // forever — the exact loop `catalog::ledger::seedable_where` documents having hit
+        // and fixed. Every branch below must produce a value.
+        fn attrs(v: Value) -> MdChapterAttrs {
+            serde_json::from_value(v).unwrap()
+        }
+        let row = PendingChapter {
+            id: "c_1".into(),
+            external_id: "chapter-uuid-1".into(),
+            published_at: Some("2026-01-01T00:00:00+00:00".into()),
+            created_at: "2025-12-01T00:00:00+00:00".into(),
+        };
+
+        // 1. Upstream `readableAt` wins, and it wins even when it PRECEDES `publishAt` —
+        //    sampled bilibili chapters are readable two weeks before their publishAt, so
+        //    these are independent timestamps, not a scheduled/actual pair.
+        let r = resolve_readable_at(
+            &row,
+            Some(&attrs(serde_json::json!({
+                "readableAt": "2022-11-02T00:00:00+00:00",
+                "publishAt": "2022-11-16T00:00:00+00:00",
+            }))),
+        );
+        assert_eq!(r.readable_at, "2022-11-02T00:00:00+00:00");
+        assert!(r.answered);
+
+        // 2. Upstream answered but has no readable clock → `publishAt`, per §6.4's
+        //    `released_at := readable_at when present := published_at otherwise`.
+        let r = resolve_readable_at(
+            &row,
+            Some(&attrs(serde_json::json!({
+                "publishAt": "2037-12-31T15:00:00+00:00",
+            }))),
+        );
+        assert_eq!(r.readable_at, "2037-12-31T15:00:00+00:00");
+
+        // 3. Upstream answered with neither, or did not answer at all → the row's own
+        //    `published_at`. Both must terminate; neither may return an empty string, which
+        //    is what MangaDex sends for some absent fields and which SQLite would happily
+        //    store as a non-NULL non-timestamp.
+        for upstream in [
+            Some(attrs(serde_json::json!({
+                "readableAt": "",
+                "publishAt": "   ",
+            }))),
+            None,
+        ] {
+            let r = resolve_readable_at(&row, upstream.as_ref());
+            assert_eq!(r.readable_at, "2026-01-01T00:00:00+00:00");
+        }
+
+        // 4. Last rung: `created_at` is NOT NULL, so the ladder cannot run out. (Unreachable
+        //    on the 2026-07-30 snapshot — 0 of 877,868 MangaDex chapters have a NULL
+        //    `published_at` — but the drain must not depend on that staying true.)
+        let bare = PendingChapter {
+            published_at: None,
+            ..row.clone()
+        };
+        let r = resolve_readable_at(&bare, None);
+        assert_eq!(r.readable_at, "2025-12-01T00:00:00+00:00");
+        assert!(
+            !r.answered,
+            "an absent upstream record must not read as answered"
+        );
+
+        // `externalUrl` is the ONLY valid external-chapter test — `pages` is not, and a
+        // sampled bilibilicomics external reports `pages: 45`.
+        let r = resolve_readable_at(
+            &row,
+            Some(&attrs(serde_json::json!({
+                "readableAt": "2023-10-07T00:00:00+00:00",
+                "externalUrl": "https://mangaplus.shueisha.co.jp/viewer/1019123",
+                "pages": 45,
+            }))),
+        );
+        assert_eq!(
+            r.external_url.as_deref(),
+            Some("https://mangaplus.shueisha.co.jp/viewer/1019123")
+        );
+        // An empty `externalUrl` must not badge a perfectly readable chapter as off-site.
+        let r = resolve_readable_at(
+            &row,
+            Some(&attrs(serde_json::json!({
+                "readableAt": "2023-10-07T00:00:00+00:00",
+                "externalUrl": "",
+                "pages": 0,
+            }))),
+        );
+        assert_eq!(r.external_url, None);
+    }
+
+    #[tokio::test]
+    async fn the_readable_backfill_drains_scoped_to_mangadex_and_resumes() {
+        let pool = pool().await;
+        let m: MdManga = serde_json::from_value(manga_json()).unwrap();
+        let (work_key, input) = to_work_input(&m);
+        catalog::upsert_work_from_mangadex(&pool, &work_key, &input)
+            .await
+            .unwrap();
+        let ssid = catalog::find_source_series_id(&pool, "mangadex", "mangadex", &work_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let work_id: String = sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
+            .bind(&ssid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let unfilled = |external_id: &str, external_url: Option<&str>| catalog::ChapterInput {
+            external_id: external_id.into(),
+            number: Some("1".into()),
+            lang: Some("en".into()),
+            title: Some("Ch 1".into()),
+            published_at: Some("2037-12-31T15:00:00+00:00".into()),
+            // Every pre-0073 row looks exactly like this.
+            readable_at: None,
+            external_url: external_url.map(str::to_string),
+            ..Default::default()
+        };
+        for id in ["md-1", "md-2", "md-3"] {
+            catalog::upsert_chapter(&pool, &ssid, &unfilled(id, None))
+                .await
+                .unwrap();
+        }
+        // md-4 already carries a URL the firehose healed onto it, and upstream will NOT
+        // answer for it below — the backfill must not blank it.
+        catalog::upsert_chapter(
+            &pool,
+            &ssid,
+            &unfilled("md-4", Some("https://comikey.com/x")),
+        )
+        .await
+        .unwrap();
+
+        // A Suwayomi row with no release clock. `chapter` is the unified spine since Phase
+        // B, so an unscoped work-list would hand this numeric external_id to
+        // `/chapter?ids[]=`, which can never resolve it — offering it forever.
+        let suwa = catalog::upsert_source_series(
+            &pool, &work_id, "suwayomi", "src-1", "4242", None, false,
+        )
+        .await
+        .unwrap();
+        catalog::upsert_chapter(&pool, &suwa, &unfilled("991", None))
+            .await
+            .unwrap();
+
+        let pending = chapters_needing_readable_at(&pool, 100).await.unwrap();
+        let mut got: Vec<&str> = pending.iter().map(|p| p.external_id.as_str()).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec!["md-1", "md-2", "md-3", "md-4"]);
+        assert_eq!(readable_backfill_remaining(&pool).await.unwrap(), 4);
+
+        // --- Batch 1, resumable by construction: take two of the four. ------------------
+        let batch = chapters_needing_readable_at(&pool, 2).await.unwrap();
+        assert_eq!(batch.len(), 2);
+        let asked: Vec<String> = batch.iter().map(|p| p.external_id.clone()).collect();
+        // Upstream answers for the first only, and that one is external — the F1 shape.
+        let upstream: Vec<MdChapter> = vec![serde_json::from_value(serde_json::json!({
+            "id": asked[0],
+            "attributes": {
+                "readableAt": "2023-10-07T00:00:00+00:00",
+                "publishAt": "2037-12-31T15:00:00+00:00",
+                "externalUrl": "https://mangaplus.shueisha.co.jp/viewer/1019123",
+                "pages": 0,
+            },
+        }))
+        .unwrap()];
+        let fill = write_readable_backfill(&pool, &batch, &upstream)
+            .await
+            .unwrap();
+        assert_eq!(fill.filled, 2, "every offered row must be written");
+        assert_eq!(fill.from_upstream, 1);
+        assert_eq!(fill.external, 1);
+        assert_eq!(fill.unanswered, 1);
+        // The 2037 sentinel is gone from the answered row: this is what returns the 46
+        // sentinel works to /updates.
+        let (readable, url): (String, Option<String>) =
+            sqlx::query_as("SELECT readable_at, external_url FROM chapter WHERE external_id = ?")
+                .bind(&asked[0])
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(readable, "2023-10-07T00:00:00+00:00");
+        assert_eq!(
+            url.as_deref(),
+            Some("https://mangaplus.shueisha.co.jp/viewer/1019123")
+        );
+
+        // Resumability: the work-list is the data, so the second pass is offered exactly
+        // the rows the first did not write — no cursor, nothing to go stale across a
+        // restart, and the two already-written rows never come back.
+        let remaining_ids: Vec<String> = chapters_needing_readable_at(&pool, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.external_id)
+            .collect();
+        assert_eq!(remaining_ids.len(), 2);
+        assert!(remaining_ids.iter().all(|id| !asked.contains(id)));
+
+        // --- Batch 2: upstream answers for NOTHING. ------------------------------------
+        // The termination case. If a row upstream has no answer for were left NULL it would
+        // be re-offered forever and the drain would never reach "complete".
+        let batch = chapters_needing_readable_at(&pool, 100).await.unwrap();
+        let fill = write_readable_backfill(&pool, &batch, &[]).await.unwrap();
+        assert_eq!(fill.filled, 2);
+        assert_eq!(fill.unanswered, 2);
+        assert_eq!(fill.from_upstream, 0);
+
+        assert!(chapters_needing_readable_at(&pool, 100)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(readable_backfill_remaining(&pool).await.unwrap(), 0);
+
+        // Fallback rows took their own `published_at` — i.e. the backfill materialised the
+        // `COALESCE(readable_at, published_at, created_at)` the read path already computes,
+        // changing no behaviour and only ending the loop.
+        let sentinels: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chapter WHERE source_series_id = ? \
+               AND readable_at = '2037-12-31T15:00:00+00:00'",
+        )
+        .bind(&ssid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(sentinels, 3);
+        // And an unanswered row keeps the URL the firehose already healed onto it. Writing
+        // NULL there would re-blank a chapter we had already fixed.
+        let url: Option<String> =
+            sqlx::query_scalar("SELECT external_url FROM chapter WHERE external_id = 'md-4'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(url.as_deref(), Some("https://comikey.com/x"));
+
+        // The Suwayomi row was never offered and is untouched — still NULL, still invisible
+        // to a backfill that could not resolve it.
+        let suwa_readable: Option<String> =
+            sqlx::query_scalar("SELECT readable_at FROM chapter WHERE source_series_id = ?")
+                .bind(&suwa)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(suwa_readable, None);
     }
 
     #[test]

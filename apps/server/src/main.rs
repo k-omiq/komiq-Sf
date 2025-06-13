@@ -2,10 +2,12 @@ mod auth;
 mod avatar;
 mod browse;
 mod catalog;
+mod chapter_label;
 mod config;
 mod cover;
 mod db;
 mod dedup;
+mod discovery;
 mod ext_icon;
 mod gc;
 mod graphql;
@@ -13,8 +15,8 @@ mod ingest;
 mod mangadex;
 mod media;
 mod notify;
+mod phase_f;
 mod phash;
-mod rate_limit;
 mod scanner;
 mod series_cache;
 mod suwayomi;
@@ -37,11 +39,6 @@ use axum::{
 };
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
-// Response compression (gzip). The home feed is ~64 KB uncompressed / ~22 KB
-// gzipped, and the cloudflared tunnel bills every byte — see PERFORMANCE_ROADMAP.md.
-// The default predicate skips image/* (covers, avatars) and already-encoded bodies,
-// so the binary routes are untouched.
-use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -51,7 +48,7 @@ use tracing::Level;
 use config::Config;
 use graphql::{
     build_schema, ApiSchema, AppState, ClientIp, KeyedLocks, RateLimiter, RequestAuth,
-    RequestLibraryCache, RequestNsfwPref, RequestUserCache, ScanHealth,
+    RequestLibraryCache, RequestUserCache, ScanHealth,
 };
 use suwayomi::SuwayomiClient;
 
@@ -235,11 +232,10 @@ async fn graphql_handler(
 ) -> GraphQLResponse {
     let auth = RequestAuth(bearer(&headers));
     let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted)));
-    // Fresh per-request caches so `current_user` does at most one session lookup, the
-    // viewer's NSFW preference at most one `users` read, and each series' `user_library`
-    // row is read at most once — even when many resolvers ask (one per feed item).
+    // Fresh per-request caches so `current_user` does at most one session lookup and each
+    // series' `user_library` row is read at most once, even when many resolvers ask (one
+    // per feed item).
     let user_cache = RequestUserCache::default();
-    let nsfw_cache = RequestNsfwPref::default();
     let library_cache = RequestLibraryCache::default();
     schema
         .execute(
@@ -247,152 +243,10 @@ async fn graphql_handler(
                 .data(auth)
                 .data(ip)
                 .data(user_cache)
-                .data(nsfw_cache)
                 .data(library_cache),
         )
         .await
         .into()
-}
-
-/// Browser cache lifetime for anonymous GET /graphql responses. Matches the lower
-/// bound of the in-process feed memo (30–60 s), so an edge/browser hit is never
-/// staler than what the origin would have served from its own cache anyway.
-const GRAPHQL_GET_MAX_AGE_SECS: u32 = 30;
-/// Cloudflare edge lifetime for the same responses (s-maxage).
-const GRAPHQL_GET_S_MAXAGE_SECS: u32 = 60;
-
-/// P3.1: the CACHEABLE query endpoint. Same execution pipeline as
-/// `graphql_handler`, with three differences:
-///
-/// - Only query operations are accepted — a GET must be safe per the
-///   GraphQL-over-HTTP spec, and edge caches replay GET responses, so a mutation
-///   here would be both wrong and dangerous. Rejected with 405.
-/// - ANONYMOUS, error-free responses carry `Cache-Control: public` + a weak
-///   `ETag` (If-None-Match answered with 304), so Cloudflare can absorb repeat
-///   public reads and browsers can revalidate instead of refetching. Anonymous
-///   responses are viewer-invariant by construction (one viewer class), which is
-///   what makes URL-keyed caching sound.
-/// - AUTHENTICATED responses are marked `private, no-store`: edge caches key on
-///   the URL alone, and a cached authed body would leak one viewer's
-///   `isMarked`/progress fields to the next requester of the same URL.
-async fn graphql_get_handler(
-    State(schema): State<ApiSchema>,
-    State(trusted): State<Arc<Vec<Cidr>>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    req: GraphQLRequest,
-) -> axum::response::Response {
-    let inner = req.into_inner();
-    // Reject non-query operations BEFORE execution. An unparseable document falls
-    // through — execution produces the proper GraphQL error body for it.
-    if !get_document_is_query_only(&inner.query) {
-        return (
-            StatusCode::METHOD_NOT_ALLOWED,
-            Json(serde_json::json!({
-                "errors": [{ "message": "Only query operations may use GET; send mutations via POST" }]
-            })),
-        )
-            .into_response();
-    }
-    let anonymous = bearer(&headers).is_none();
-    let auth = RequestAuth(bearer(&headers));
-    let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted)));
-    let user_cache = RequestUserCache::default();
-    let nsfw_cache = RequestNsfwPref::default();
-    let library_cache = RequestLibraryCache::default();
-    let resp = schema
-        .execute(
-            inner
-                .data(auth)
-                .data(ip)
-                .data(user_cache)
-                .data(nsfw_cache)
-                .data(library_cache),
-        )
-        .await;
-    // Only a clean anonymous response is cacheable: errors (rate limits, transient
-    // failures) must never be replayed from an edge cache for 60 s.
-    //
-    // KNOWN, ACCEPTED GAP: resolvers that deliberately swallow an upstream failure
-    // and answer Ok with a degraded result (empty search rows, a seriesPage source
-    // whose fetch failed, …) look clean here and CAN be edge-cached for up to 60 s.
-    // An empty list is also a legitimate answer, so the two are indistinguishable
-    // at this layer; the alternative — surfacing those failures as GraphQL errors —
-    // would break the clients' tolerant-degradation contracts. Bounded (s-maxage)
-    // and self-healing, and no worse than the in-process feed memos already allow.
-    let cacheable = anonymous && resp.is_ok();
-    let body = match serde_json::to_vec(&resp) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!(error = %e, "GET /graphql: response serialization failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    if !cacheable {
-        return (
-            [
-                (header::CONTENT_TYPE, "application/json"),
-                (header::CACHE_CONTROL, "private, no-store"),
-            ],
-            body,
-        )
-            .into_response();
-    }
-    let etag = weak_etag(&body);
-    let cache_control =
-        format!("public, max-age={GRAPHQL_GET_MAX_AGE_SECS}, s-maxage={GRAPHQL_GET_S_MAXAGE_SECS}");
-    let revalidated = if_none_match_matches(
-        headers
-            .get(header::IF_NONE_MATCH)
-            .and_then(|v| v.to_str().ok()),
-        &etag,
-    );
-    if revalidated {
-        return (
-            StatusCode::NOT_MODIFIED,
-            [(header::ETAG, etag), (header::CACHE_CONTROL, cache_control)],
-        )
-            .into_response();
-    }
-    (
-        [
-            (header::CONTENT_TYPE, "application/json".to_string()),
-            (header::ETAG, etag),
-            (header::CACHE_CONTROL, cache_control),
-        ],
-        body,
-    )
-        .into_response()
-}
-
-/// Does a GET /graphql document contain ONLY query operations? An unparseable
-/// document answers `true` — it falls through to execution, which produces the
-/// proper GraphQL error body (a 405 for garbage would be misleading).
-fn get_document_is_query_only(query: &str) -> bool {
-    use async_graphql::parser::types::{DocumentOperations, OperationType};
-    match async_graphql::parser::parse_query(query) {
-        Ok(doc) => match &doc.operations {
-            DocumentOperations::Single(op) => op.node.ty == OperationType::Query,
-            DocumentOperations::Multiple(ops) => {
-                ops.iter().all(|(_, op)| op.node.ty == OperationType::Query)
-            }
-        },
-        Err(_) => true,
-    }
-}
-
-/// Weak ETag from a fast 64-bit hash of the body: a validator, not a security
-/// boundary — a collision only risks one spurious 304 on content that changes
-/// within its own 30 s browser TTL anyway.
-fn weak_etag(body: &[u8]) -> String {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hasher::write(&mut h, body);
-    format!("W/\"{:016x}\"", std::hash::Hasher::finish(&h))
-}
-
-/// RFC 9110 If-None-Match: a comma-separated list of entity tags (or `*`).
-fn if_none_match_matches(header: Option<&str>, etag: &str) -> bool {
-    header.is_some_and(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"))
 }
 
 async fn graphiql() -> impl IntoResponse {
@@ -1335,6 +1189,25 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cfg = Config::from_env();
+
+    // `komika-server phase-f <stage> [--apply] …` — the Phase F (`all.mangadex`
+    // retirement) tool, handled BEFORE any server state is built so it can never
+    // start a listener, a scanner or a sync loop alongside itself. Every stage is a
+    // dry run unless `--apply` is passed, and the destructive one additionally needs
+    // `--confirm <token>`; see `phase_f`. It exits when the stage is done.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("phase-f") {
+        let pool = db::init(&cfg.database_url).await?;
+        let cover_pool = db::init_covers(&cfg.covers_database_url).await?;
+        let result =
+            phase_f::run_cli(&pool, Some(&cover_pool), &cfg.suwayomi_url, &argv[1..]).await;
+        // Close both pools explicitly: a `merge` stage holds a WAL that a still-open
+        // pool would keep pinned, and this process runs alongside the live server.
+        pool.close().await;
+        cover_pool.close().await;
+        return result;
+    }
+
     tracing::info!(?cfg, "starting komika-server");
 
     let pool = db::init(&cfg.database_url).await?;
@@ -1434,13 +1307,10 @@ async fn main() -> anyhow::Result<()> {
                 Ok(n) => tracing::info!(works = n, "feed_updates: initial build complete"),
                 Err(e) => tracing::warn!(error = %e, "feed_updates: initial build failed"),
             }
-            // AD-5: build the full-text search index (migration 0052) alongside the
-            // updates feed — same background slot, same "fresh within a sync interval"
-            // contract. Without this, text search is empty until the first sync.
-            match crate::catalog::refresh_work_fts(&pool).await {
-                Ok(n) => tracing::info!(works = n, "work_fts: initial build complete"),
-                Err(e) => tracing::warn!(error = %e, "work_fts: initial build failed"),
-            }
+            // AD-5's `refresh_work_fts` used to be a second call here. It is now the last
+            // link of the `refresh_feed_updates` chain (with `feed_series_updates` and
+            // `browse_catalogue`), so this slot still builds the search index — search and
+            // Browse just can no longer be wired to different cadences by accident.
         });
     }
 
@@ -1460,6 +1330,18 @@ async fn main() -> anyhow::Result<()> {
         shutdown_tx.subscribe(),
     );
 
+    // Phase E5: LATEST-diff discovery. A tight (~15 min) poll of page 1 of each subscribed
+    // source's LATEST, diffed against a per-source snapshot; series that moved up / entered
+    // are enqueued for a targeted scan via the same `trigger_due_now` sink E2 uses. This is
+    // the fast push signal that makes ~98.8%-wasted timer polling unnecessary (§8e). The
+    // per-series baseline poll still runs underneath it until Phase E slows it to a safety
+    // net.
+    discovery::spawn(
+        state.clone(),
+        cfg.discovery_interval_secs,
+        shutdown_tx.subscribe(),
+    );
+
     // Hourly garbage collection: orphaned staged comment-media uploads (rows the
     // uploader never attached to a comment) plus cover blobs in the separate covers DB
     // whose owning work/series no longer exists — nothing in the main DB can cascade
@@ -1467,15 +1349,18 @@ async fn main() -> anyhow::Result<()> {
     // reclaimer. See `gc::sweep_cover_blobs` for the race-safety argument.
     gc::spawn(pool.clone(), cover_pool.clone(), shutdown_tx.subscribe());
 
-    // View-write coalescing: `views::record` buffers in memory; this flusher batches
-    // the buffered views into one transaction every few seconds. The handle is awaited
-    // after serve() returns so the final on-shutdown flush completes before exit.
-    let views_flusher = views::spawn_flusher(pool.clone(), shutdown_tx.subscribe());
-
     // Keep `sqlite_stat1` current so the planner keeps choosing migration 0058's
     // indexes. Background, not boot-blocking. See `db::spawn_analyze` for why this is
     // an exact per-table ANALYZE rather than `PRAGMA optimize`.
     db::spawn_analyze(pool.clone(), shutdown_tx.subscribe());
+
+    // Chapter-spine drains (Phase B3). Migration 0090 adds `chapter.chapter_key` and
+    // `chapter.scanlator` and moves nothing; this is what backfills the 877,824 existing
+    // rows' keys and materialises the 563,095 Suwayomi chapters that have never had a
+    // canonical `chapter` row at all. Unconditional — the spine is the substrate the
+    // release ledger and the incremental feed are built on, not an opt-in feature — but
+    // paced, staggered behind boot, and self-terminating once drained.
+    catalog::spine::spawn(pool.clone(), shutdown_tx.subscribe());
 
     // Direct-MangaDex catalogue sync — opt-in (CATALOGUE.md §5). Off unless
     // CATALOGUE_SYNC is set, so the default deployment never hits MangaDex. Recurring:
@@ -1491,6 +1376,8 @@ async fn main() -> anyhow::Result<()> {
             mangadex.clone(),
             cfg.catalogue_cover_phash,
             cfg.catalogue_sync_interval_secs,
+            cfg.chapter_sync_interval_secs,
+            cfg.feed_reconcile_interval_secs,
             shutdown_tx.subscribe(),
         );
         // One-time top-up: fill catalogue series the original seed missed (the
@@ -1510,6 +1397,19 @@ async fn main() -> anyhow::Result<()> {
             cfg.catalogue_cover_phash,
             shutdown_tx.subscribe(),
         );
+        // A1b — the backfill migration 0073 promised and nobody had written. Fills
+        // `chapter.readable_at` / `chapter.external_url` on the 877,868 mirrored MangaDex
+        // rows that have neither, by re-asking `/chapter?ids[]=` 100 at a time. That is what
+        // returns the 46 works whose every chapter carries MangaDex's 2037 `publishAt`
+        // sentinel to /updates, and what makes the ~35,000 off-site chapters identifiable
+        // (`external_url IS NOT NULL`) instead of silently unopenable.
+        //
+        // Inside the CATALOGUE_SYNC gate deliberately: it hits MangaDex under the same
+        // in-process rate limiter, so the one-replica rule above applies to it verbatim.
+        // Resumable with no cursor and no completion marker — its work-list is
+        // `readable_at IS NULL`, so an interrupted drain resumes itself and a finished one
+        // costs an hourly scan of an empty partial index.
+        mangadex::spawn_readable_backfill(pool.clone(), mangadex.clone(), shutdown_tx.subscribe());
     } else {
         tracing::info!("catalogue sync disabled (set CATALOGUE_SYNC=on to enable)");
     }
@@ -1558,16 +1458,17 @@ async fn main() -> anyhow::Result<()> {
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
-    // P3.1: GET /graphql is the CACHEABLE query endpoint (anonymous public reads get
-    // Cache-Control + ETag so Cloudflare and browsers can serve/revalidate them —
-    // POST is uncacheable by every CDN). Mutations over GET are rejected in the
-    // handler. GraphiQL moved to its own GET /graphiql when enabled; introspection
-    // stays disabled in the same off state (see build_schema above).
-    let mut app = Router::new().route("/graphql", get(graphql_get_handler).post(graphql_handler));
-    if cfg.graphiql_enabled {
-        app = app.route("/graphiql", get(graphiql));
-    }
-    let app = app
+    // GraphiQL (GET /graphql) is served only when explicitly enabled; otherwise a
+    // GET is a 405 and only the POST endpoint exists. Introspection is disabled in
+    // the same off state (see build_schema above).
+    let graphql_route = if cfg.graphiql_enabled {
+        get(graphiql).post(graphql_handler)
+    } else {
+        post(graphql_handler)
+    };
+
+    let app = Router::new()
+        .route("/graphql", graphql_route)
         .route("/health", get(health))
         .route("/health/ready", get(ready))
         // Operational gauges for scraping (aggregate counts only — no series content,
@@ -1618,11 +1519,6 @@ async fn main() -> anyhow::Result<()> {
                 .layer(DefaultBodyLimit::max(media::MAX_UPLOAD_BYTES + 1024 * 1024)),
         )
         .route("/comment-media/{file}", get(serve_comment_media))
-        // Compress compressible responses (JSON payloads — the home feed alone drops
-        // 64 KB → ~22 KB). Innermost of the middleware so the request-id/trace span
-        // and every outer layer observe the final (encoded) body. The default
-        // predicate leaves image/* and already-encoded responses alone.
-        .layer(CompressionLayer::new())
         // Request-id + access-log span. SetRequestId runs first (generates an
         // x-request-id when the client didn't send one), TraceLayer's span picks
         // it up, and PropagateRequestId echoes it back on the response.
@@ -1672,9 +1568,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(CatchPanicLayer::custom(handle_panic))
         .with_state(RouterState {
             schema,
-            // Cloned (pools are cheap Arc handles): `main` still needs `pool` for
-            // the post-shutdown view flush below.
-            pool: pool.clone(),
+            pool,
             cover_pool,
             trusted_proxies: Arc::new(parse_trusted_proxies(&cfg.trusted_proxy_cidrs)),
             // ~20 uploads/min per user across the avatar + comment-media routes.
@@ -1691,15 +1585,6 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal(shutdown_tx))
     .await?;
-    // Wait for the view flusher's final drain so buffered views hit the DB — then
-    // drain ONCE more: the flusher's shutdown flush races axum's graceful drain, so
-    // a `recordView` served while connections were draining can land in the buffer
-    // AFTER that flush (and if the flusher died in its supervisor backoff, its
-    // shutdown flush never ran at all). This last call catches both.
-    let _ = views_flusher.await;
-    if let Err(e) = views::flush(&pool).await {
-        tracing::warn!(error = %e, "post-shutdown view flush failed; buffered views lost");
-    }
     Ok(())
 }
 
@@ -1792,42 +1677,6 @@ mod tests {
         assert!(!is_suwayomi_image_path("123/chapter/x/page/0")); // non-numeric chapter
         assert!(!is_suwayomi_image_path("")); // empty
         assert!(!is_suwayomi_image_path("123/thumbnail/")); // trailing slash → empty seg
-    }
-
-    /// GET /graphql accepts only query operations — mutations must never be
-    /// reachable through the cacheable/replayable endpoint.
-    #[test]
-    fn get_graphql_rejects_non_query_operations() {
-        assert!(get_document_is_query_only("query Q { health }"));
-        assert!(get_document_is_query_only("{ health }")); // anonymous shorthand
-        assert!(get_document_is_query_only(
-            "fragment F on Series { id } query Q { discovery { key } }"
-        ));
-        assert!(!get_document_is_query_only(
-            "mutation M { recordView(seriesId: \"1\") }"
-        ));
-        assert!(!get_document_is_query_only(
-            // Multi-operation documents: ONE mutation poisons the whole document.
-            "query A { health } mutation B { logout }"
-        ));
-        // Unparseable → allowed through, so execution returns the real parse error.
-        assert!(get_document_is_query_only("not graphql at all {"));
-    }
-
-    #[test]
-    fn graphql_get_etag_is_stable_and_if_none_match_understands_lists() {
-        let a = weak_etag(b"body-one");
-        assert_eq!(a, weak_etag(b"body-one"), "same body, same validator");
-        assert_ne!(a, weak_etag(b"body-two"));
-        assert!(a.starts_with("W/\""), "weak validator form: {a}");
-        assert!(if_none_match_matches(Some(&a), &a));
-        assert!(if_none_match_matches(
-            Some(&format!("\"zzz\", {a}, \"yyy\"")),
-            &a
-        ));
-        assert!(if_none_match_matches(Some("*"), &a));
-        assert!(!if_none_match_matches(Some("W/\"deadbeef\""), &a));
-        assert!(!if_none_match_matches(None, &a));
     }
 
     #[test]

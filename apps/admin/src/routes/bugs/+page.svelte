@@ -110,8 +110,8 @@
 		<div>
 			<h1>Cover issues</h1>
 			<p class="lede">
-				{total ?? issues.length} cover{(total ?? issues.length) === 1 ? '' : 's'} the crawl couldn't process.
-				Retry (re-fetch + re-encode) or upload a replacement.
+				{total ?? issues.length} cover{(total ?? issues.length) === 1 ? '' : 's'} the crawl couldn't
+				process. Retry (re-fetch + re-encode) or upload a replacement.
 			</p>
 		</div>
 		<button class="pg" disabled={loading} onclick={() => refresh()}>Refresh</button>

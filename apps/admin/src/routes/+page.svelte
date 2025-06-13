@@ -1,11 +1,5 @@
 <script lang="ts">
-	import type {
-		MatchResult,
-		Series,
-		SeriesSourceGroup,
-		SeriesStatus,
-		WorkSource,
-	} from '@komika/types';
+	import type { MatchResult, Series, SeriesSourceGroup, SeriesStatus, WorkSource } from '@komika/types';
 	import { untrack } from 'svelte';
 	import { auth } from '$lib/auth.svelte';
 	import { assetSrc } from '$lib/config';
@@ -97,7 +91,8 @@
 			provenance = map;
 		} catch (err) {
 			if (seq !== provSeq) return;
-			provenanceError = err instanceof Error ? err.message : 'Failed to load source provenance.';
+			provenanceError =
+				err instanceof Error ? err.message : 'Failed to load source provenance.';
 		}
 	}
 
@@ -162,7 +157,8 @@
 		const workId = workIdOf(s);
 		if (!workId) return null;
 		const cached = provenance[s.id];
-		if (cached?.workId === workId) return { seriesId: s.id, workId, title: s.title, group: cached };
+		if (cached?.workId === workId)
+			return { seriesId: s.id, workId, title: s.title, group: cached };
 		let sources: WorkSource[] = [];
 		try {
 			sources = await loadWorkSources(workId);
@@ -471,8 +467,8 @@
 			<span>
 				Merging <strong>{mergeSource.title}</strong>
 				<span class="mono">({mergeSource.workId})</span> — pick the <strong>target</strong> row to
-				keep. The source work will be <strong>deleted</strong> and its mappings + reading data moved to
-				the target.
+				keep. The source work will be <strong>deleted</strong> and its mappings + reading data moved
+				to the target.
 			</span>
 			<button class="link-btn" onclick={cancelMerge}>Cancel merge</button>
 		</div>
@@ -519,10 +515,7 @@
 					<span class="col-ch">{s.chapterCount}</span>
 					<span class="col-src">
 						{#if isCanonical(s)}
-							<span
-								class="src-entry"
-								title="Canonical work — text search returns works, not source series"
-							>
+							<span class="src-entry" title="Canonical work — text search returns works, not source series">
 								<span class="src-name">canonical work</span>
 								<span class="src-id">{s.id}</span>
 							</span>
@@ -582,11 +575,7 @@
 								</button>
 							{/if}
 							{#if workIdOf(s)}
-								<button
-									class="merge-btn"
-									onclick={() => startMerge(s)}
-									title="Merge this work into another (delete this duplicate)">Merge…</button
-								>
+								<button class="merge-btn" onclick={() => startMerge(s)} title="Merge this work into another (delete this duplicate)">Merge…</button>
 							{/if}
 							{#if addMsg[s.id]}<span class="add-msg">{addMsg[s.id]}</span>{/if}
 						{/if}
@@ -596,21 +585,21 @@
 		{/if}
 	</div>
 
-	{#if page > 1 || hasNextPage}
-		<div class="pager">
-			<button class="pg" disabled={loading || page <= 1} onclick={() => goPage(-1)}>Prev</button>
-			<span class="page-num">
-				{#if totalPages != null}
-					Page {page} of {totalPages} · showing {rangeStart}–{rangeEnd}{total != null
-						? ` of ${total}`
-						: ''}
-				{:else}
-					Page {page} · showing {rangeStart}–{rangeEnd}
-				{/if}
-			</span>
-			<button class="pg" disabled={loading || !hasNextPage} onclick={() => goPage(1)}>Next</button>
-		</div>
-	{/if}
+		{#if page > 1 || hasNextPage}
+			<div class="pager">
+				<button class="pg" disabled={loading || page <= 1} onclick={() => goPage(-1)}>Prev</button>
+				<span class="page-num">
+					{#if totalPages != null}
+						Page {page} of {totalPages} · showing {rangeStart}–{rangeEnd}{total != null
+							? ` of ${total}`
+							: ''}
+					{:else}
+						Page {page} · showing {rangeStart}–{rangeEnd}
+					{/if}
+				</span>
+				<button class="pg" disabled={loading || !hasNextPage} onclick={() => goPage(1)}>Next</button>
+			</div>
+		{/if}
 </div>
 
 {#if editing}
@@ -691,8 +680,8 @@
 			<h2>Merge duplicate works?</h2>
 		</div>
 		<p class="modal-lede">
-			The <strong>source</strong> work below will be <strong>permanently deleted</strong>. Its
-			source mappings and all user data (library, reading progress, reviews, comments) move to the
+			The <strong>source</strong> work below will be <strong>permanently deleted</strong>. Its source
+			mappings and all user data (library, reading progress, reviews, comments) move to the
 			<strong>target</strong>, which survives as the canonical entry. Confirm both are the same
 			series.
 		</p>
@@ -705,9 +694,7 @@
 				<div class="merge-chips">
 					{#if mergeSource.group.sources.length > 0}
 						{#each mergeSource.group.sources as src (`${src.sourceType}:${src.sourceId}:${src.sourceKey}`)}
-							<span class="chip" title={src.extension?.pkgName ?? src.sourceType}
-								>{extLabel(src)}</span
-							>
+							<span class="chip" title={src.extension?.pkgName ?? src.sourceType}>{extLabel(src)}</span>
 						{/each}
 					{:else}
 						<span class="src-none">no source mappings</span>
@@ -722,9 +709,7 @@
 				<div class="merge-chips">
 					{#if mergeTarget.group.sources.length > 0}
 						{#each mergeTarget.group.sources as src (`${src.sourceType}:${src.sourceId}:${src.sourceKey}`)}
-							<span class="chip" title={src.extension?.pkgName ?? src.sourceType}
-								>{extLabel(src)}</span
-							>
+							<span class="chip" title={src.extension?.pkgName ?? src.sourceType}>{extLabel(src)}</span>
 						{/each}
 					{:else}
 						<span class="src-none">no source mappings</span>

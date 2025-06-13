@@ -21,6 +21,6 @@ dbs:
         endpoint: ${LITESTREAM_ENDPOINT}
         region: ${LITESTREAM_REGION}
         force-path-style: true
-        sync-interval: 10s # fewer WAL PUTs during write bursts; RPO becomes ~10s
-        retention: 24h # bound WAL history kept in R2 (caps storage)
-        snapshot-interval: 24h # one base snapshot/day; keeps restore fast
+        sync-interval: 10s        # fewer WAL PUTs during write bursts; RPO becomes ~10s
+        retention: 24h            # bound WAL history kept in R2 (caps storage)
+        snapshot-interval: 24h    # one base snapshot/day; keeps restore fast

@@ -6,7 +6,6 @@ performance work**: any "this made it faster" claim should be a before/after run
 harness, not an argument.
 
 Baseline results: [`results/2026-07-27-baseline.md`](results/2026-07-27-baseline.md).
-Analysis and the optimisation plan: [`../../../PERFORMANCE_ROADMAP.md`](../../../PERFORMANCE_ROADMAP.md).
 
 ## Why hand-rolled
 
@@ -34,30 +33,30 @@ node loadtest.mjs --scenario mixed --rate 60 --duration 30                # late
 node loadtest.mjs --scenario mixed --vus 1,2,4,8,16,32 --json out.json    # keep the raw data
 ```
 
-| Flag                | Default                 | Meaning                                                              |
-| ------------------- | ----------------------- | -------------------------------------------------------------------- |
-| `--target <url>`    | `http://127.0.0.1:8080` | Base URL                                                             |
-| `--scenario <name>` | `health`                | See table below                                                      |
-| `--vus a,b,c`       | `1,2,4,8,16,32,64`      | Closed-loop ramp steps                                               |
-| `--rate <rps>`      | —                       | Open-loop arrival rate (mutually exclusive with `--vus`)             |
-| `--duration <sec>`  | `10`                    | Measured window per step                                             |
-| `--warmup <sec>`    | `3`                     | Discarded window per step                                            |
-| `--max-p95 <ms>`    | `750`                   | Abort the ramp above this p95                                        |
-| `--think <sec>`     | `5`                     | Seconds between requests per real user, for the rps→users conversion |
-| `--queries <file>`  | —                       | JSON overriding the GraphQL operation text                           |
-| `--json <file>`     | —                       | Write full results as JSON                                           |
+| Flag | Default | Meaning |
+|---|---|---|
+| `--target <url>` | `http://127.0.0.1:8080` | Base URL |
+| `--scenario <name>` | `health` | See table below |
+| `--vus a,b,c` | `1,2,4,8,16,32,64` | Closed-loop ramp steps |
+| `--rate <rps>` | — | Open-loop arrival rate (mutually exclusive with `--vus`) |
+| `--duration <sec>` | `10` | Measured window per step |
+| `--warmup <sec>` | `3` | Discarded window per step |
+| `--max-p95 <ms>` | `750` | Abort the ramp above this p95 |
+| `--think <sec>` | `5` | Seconds between requests per real user, for the rps→users conversion |
+| `--queries <file>` | — | JSON overriding the GraphQL operation text |
+| `--json <file>` | — | Write full results as JSON |
 
 ## Scenarios
 
-| Name        | What it exercises                                                                                                                    |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `health`    | `GET /health` — no DB. The **framework floor**: the ceiling tokio + axum + the kernel impose, which every other number sits under.   |
-| `ready`     | `GET /health/ready` — runs `SELECT 1`, isolating pool-acquire cost from query cost.                                                  |
-| `discovery` | The home feed. Most-requested read in the product, and the current bottleneck.                                                       |
-| `search`    | Browse rows against the materialized `browse_catalogue`. Page is randomized because deep `OFFSET` paging is where it gets expensive. |
-| `facets`    | `genreFacets` — a full catalogue aggregate with no in-process cache.                                                                 |
-| `home`      | `discovery` + `updates`, i.e. roughly one home page view.                                                                            |
-| `mixed`     | Weighted blend (discovery 5, search 3, updates 2, facets 1) — the headline number.                                                   |
+| Name | What it exercises |
+|---|---|
+| `health` | `GET /health` — no DB. The **framework floor**: the ceiling tokio + axum + the kernel impose, which every other number sits under. |
+| `ready` | `GET /health/ready` — runs `SELECT 1`, isolating pool-acquire cost from query cost. |
+| `discovery` | The home feed. Most-requested read in the product, and the current bottleneck. |
+| `search` | Browse rows against the materialized `browse_catalogue`. Page is randomized because deep `OFFSET` paging is where it gets expensive. |
+| `facets` | `genreFacets` — a full catalogue aggregate with no in-process cache. |
+| `home` | `discovery` + `updates`, i.e. roughly one home page view. |
+| `mixed` | Weighted blend (discovery 5, search 3, updates 2, facets 1) — the headline number. |
 
 ## Two load shapes, two questions
 
@@ -66,8 +65,8 @@ previous returns. Finds **saturation**: raise VUs until rps stops rising and lat
 climbs linearly. That knee is real capacity.
 
 **Open-loop (`--rate`)** — fires on a fixed schedule regardless of how fast the server
-answers. Finds **latency under load**, and is the only shape that exposes _coordinated
-omission_: when the server stalls, a closed loop politely stops sending and hides the
+answers. Finds **latency under load**, and is the only shape that exposes *coordinated
+omission*: when the server stalls, a closed loop politely stops sending and hides the
 stall, while an open loop keeps pressure on so queue delay shows up.
 
 **Always confirm a closed-loop capacity figure with an open-loop run at ~80% of it**
@@ -92,7 +91,7 @@ load           rps     ok/s      p50      p90      p95      p99      max      er
 
 ## Safety on this box
 
-This repo _is_ the live VPS, and `api.komiq.cc` serves real traffic from the same
+This repo *is* the live VPS, and `api.komiq.cc` serves real traffic from the same
 container. Three things make the harness safe to run against it:
 
 1. **Read-only scenarios.** No mutations. Nothing is written.
@@ -108,7 +107,7 @@ modest, and prefer off-peak.
 - **The write path is untested.** `RecordView` (3 writes + 1 read per chapter open,
   serialized by SQLite's single writer) and the rate limiter's process-global mutex are
   deliberately not exercised. A clean `mixed` result says nothing about them.
-- **The default target bypasses the edge.** `127.0.0.1:8080` measures _origin_ capacity —
+- **The default target bypasses the edge.** `127.0.0.1:8080` measures *origin* capacity —
   the thing code changes move. It excludes the cloudflared tunnel and Cloudflare's
   cache. Point `--target` at `https://api.komiq.cc` to measure the whole delivery path;
   expect lower numbers, because the tunnel becomes the limit.

@@ -1,0 +1,21 @@
+-- Drop `idx_report_subject`, which no query has ever used.
+--
+-- 0080 created it for "has this series already been reported?" — a question the admin
+-- console never actually asks. `reports` filters on `status` and `kind` only, and there
+-- is no by-subject lookup anywhere in the server or the console, so the index earned
+-- nothing and cost an extra b-tree write on every reader-filed report.
+--
+-- Confirmed by query plans against a scratch copy (3k rows + ANALYZE): both of 0080's
+-- other indexes are now genuinely used by the queue's two shapes, and this one appears
+-- in no plan at all.
+--
+-- WHY A NEW MIGRATION INSTEAD OF FIXING 0080. 0080 is already applied in production
+-- (`_sqlx_migrations` version 80), and `sqlx::migrate!` checksums every applied file at
+-- boot — editing one is a hard startup failure, not a silent no-op. An applied migration
+-- is immutable history; corrections are always a new file.
+--
+-- If a by-subject lookup is ever added (deduping repeat reports for one series is the
+-- obvious candidate), re-create the index in the SAME migration as the query that needs
+-- it, so the two are impossible to separate again.
+
+DROP INDEX IF EXISTS idx_report_subject;

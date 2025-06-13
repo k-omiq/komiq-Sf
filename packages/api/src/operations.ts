@@ -26,7 +26,46 @@
  * unchanged rather than emit invalid GraphQL) but it silently disables the fallback,
  * so the query just fails against an older server.
  */
-export const OPTIONAL_SERIES_FIELDS = ['detectedAt', 'workId'] as const;
+export const OPTIONAL_SERIES_FIELDS = [
+	'detectedAt',
+	'workId',
+	'latestChapter',
+	// F12's per-chapter date on `AggregatedChapter`. Optional for the usual reason: the
+	// reader and the API deploy separately, and a reader that shipped first would
+	// otherwise fail the WHOLE series page rather than lose one date line. Its caller-side
+	// fallback is the pre-F12 behaviour — a row with no date renders without one.
+	//
+	// NOT named `releasedAt`, deliberately: this stripper matches by NAME across every
+	// document, and `UpdateFeedRow.releasedAt` (which every deployed server already has)
+	// is selected in the updates query. Sharing the name would mean one older server
+	// rejecting the aggregated field also silently strips the feed's date for the rest of
+	// the session. The name is also the more honest one — it is the FIRST release across
+	// the chapter's sources, not the selected source's.
+	'firstReleasedAt',
+	// Cross-source read state on `AggregatedChapter`. Optional for the same deploy-ordering
+	// reason, and named `readAnywhere` rather than `read` DELIBERATELY: this stripper
+	// matches by NAME across every document, and `Chapter.read` is selected in the chapter
+	// lists and the reader itself — sharing the name would mean one older server rejecting
+	// this field also silently blanked every real read marker for the rest of the session.
+	'readAnywhere',
+	// `UpdateFeedRow.announcedAt` (migration 0099) — when we could first SHOW a chapter, as
+	// opposed to when its source says it came out. Optional for the usual deploy-ordering
+	// reason, and the caller-side fallback is exact rather than approximate: every render
+	// site spells `announcedAt ?? releasedAt`, and the two are equal on every row that
+	// predates the column, so a stripped document degrades to the old behaviour precisely.
+	//
+	// The name is unique across every document for the reason `firstReleasedAt` and
+	// `readAnywhere` document above: this stripper matches by NAME globally, so reusing
+	// `releasedAt`/`detectedAt` here would let one old server blank a field the feed depends
+	// on for the rest of the session.
+	'announcedAt',
+	// `Chapter.foundAt` (migration 0099) — the per-chapter half of the same clock, on the
+	// series-detail list. Optional so a reader ahead of the server loses one column instead
+	// of the whole chapter list. Its fallback is NOT a substitute value: the column renders
+	// "—", which is what it renders for a null anyway, so stripping it is indistinguishable
+	// from the ordinary no-record case.
+	'foundAt',
+] as const;
 
 /**
  * Query ARGUMENTS the client passes OPPORTUNISTICALLY — same deploy-ordering hazard
@@ -87,6 +126,14 @@ const SERIES_FIELDS = /* GraphQL */ `
 		# line — the unknown-field fallback strips it by line (OPTIONAL_SERIES_FIELDS).
 		latestChapterAt
 		detectedAt
+		# The newest chapter's NUMBER ("151"), which is NOT \`chapterCount\` ("12 ch") —
+		# printing the count under a "Ch." label is the F4 bug the chapter-number contract
+		# exists to prevent, so a null here means print the count ALONE. Own line, no alias
+		# and no arguments, because the unknown-field fallback strips it by line
+		# (OPTIONAL_SERIES_FIELDS) — this field is newer than the deployed API, and without
+		# that entry a reader shipped first would fail EVERY series query rather than lose
+		# one label.
+		latestChapter
 	}
 `;
 
@@ -95,9 +142,16 @@ const CHAPTER_FIELDS = /* GraphQL */ `
 		id
 		seriesId
 		number
+		label
+		externalUrl
 		title
 		pageCount
 		uploadedAt
+		# When WE first had it, as against uploadedAt's "when the source published it". On its
+		# own line, no alias/args/sub-selection, and not the only selection here — the three
+		# conditions the line-based unknown-field fallback needs (OPTIONAL_SERIES_FIELDS).
+		# (No backticks in this comment: it is inside a JS template literal.)
+		foundAt
 		scanlator
 		read
 		lastPageRead
@@ -214,6 +268,11 @@ export const AGGREGATED_CHAPTERS = /* GraphQL */ `
 		aggregatedChapters(workId: $workId) {
 			number
 			title
+			firstReleasedAt
+			# Cross-source read state — true when the viewer read this chapter under ANY
+			# source, not just the selected translator. Own line, no alias: the
+			# unknown-field fallback strips it by line (OPTIONAL_SERIES_FIELDS).
+			readAnywhere
 			sources {
 				sourceType
 				sourceId
@@ -316,6 +375,7 @@ export const LIBRARY_PROGRESS = /* GraphQL */ `
 			id
 			read
 			total
+			lastReadAt
 		}
 	}
 `;
@@ -425,6 +485,15 @@ export const POST_REVIEW = /* GraphQL */ `
 			createdAt
 			updatedAt
 		}
+	}
+`;
+
+// Withdrawing a rating is a DELETE, not a `postReview` with score 0: the server rejects
+// anything outside 1..10, and `reviews.score` is NOT NULL, so there is no "scoreless
+// review" state for a 0 to mean. Returns whether a row was actually removed.
+export const DELETE_REVIEW = /* GraphQL */ `
+	mutation DeleteReview($seriesId: ID!) {
+		deleteReview(seriesId: $seriesId)
 	}
 `;
 
@@ -716,6 +785,63 @@ export const RETRY_COVER = /* GraphQL */ `
 	}
 `;
 
+/** Every field of a report, shared by the submit mutation and the admin queue so the
+ *  two can never drift apart. */
+const REPORT_FIELDS = /* GraphQL */ `
+	fragment ReportFields on Report {
+		id
+		kind
+		status
+		reporter
+		subjectId
+		subjectIdSecondary
+		subjectTitle
+		commentId
+		reportedUsername
+		commentExcerpt
+		sourceUrl
+		detail
+		adminNote
+		createdAt
+		resolvedAt
+	}
+`;
+
+/** Reader-facing: file a report. Works signed out (see `submitReport` on the server). */
+export const SUBMIT_REPORT = /* GraphQL */ `
+	${REPORT_FIELDS}
+	mutation SubmitReport($input: ReportInput!) {
+		submitReport(input: $input) {
+			...ReportFields
+		}
+	}
+`;
+
+/** Admin queue. Null `status`/`kind` mean "every value". */
+export const REPORTS = /* GraphQL */ `
+	${REPORT_FIELDS}
+	query Reports($status: ReportStatus, $kind: ReportKind, $page: Int) {
+		reports(status: $status, kind: $kind, page: $page) {
+			items {
+				...ReportFields
+			}
+			page
+			hasNextPage
+			total
+			openCount
+		}
+	}
+`;
+
+export const RESOLVE_REPORT = /* GraphQL */ `
+	${REPORT_FIELDS}
+	mutation ResolveReport($reportId: ID!, $status: ReportStatus!, $note: String) {
+		resolveReport(reportId: $reportId, status: $status, note: $note) {
+			...ReportFields
+		}
+	}
+`;
+
 export const RESOLVE_MERGE_CANDIDATE = /* GraphQL */ `
 	mutation ResolveMergeCandidate($id: ID!, $accept: Boolean!) {
 		resolveMergeCandidate(id: $id, accept: $accept)
@@ -727,6 +853,78 @@ export const MERGE_WORKS = /* GraphQL */ `
 		mergeWorks(sourceWorkId: $sourceWorkId, targetWorkId: $targetWorkId) {
 			targetWorkId
 			movedSourceSeries
+		}
+	}
+`;
+
+// The admin SPLIT picker's list. A separate document from `WORK_SOURCES` rather than extra
+// fields on it, because that one is fired by every reader on every series page and this one
+// carries `source_series.id` — a row identity no public surface should be handing out.
+export const WORK_SOURCE_ROWS = /* GraphQL */ `
+	query WorkSourceRows($workId: ID!) {
+		workSourceRows(workId: $workId) {
+			id
+			sourceType
+			sourceName
+			lang
+			iconUrl
+			title
+			chapterCount
+			sourceUrl
+		}
+	}
+`;
+
+// Detach sources onto a new work. NOT an "unmerge" — see `Backend.splitSourceSeries`.
+//
+// `newReaderId` is the field the caller navigates with, and it is NOT `newWorkId`: a
+// Suwayomi-only split produces a work with no MangaDex anchor, which `canonicalSeries`
+// refuses to serve, so linking it as `/series/w_…` would 404 on the page we just told the
+// admin we created.
+export const SPLIT_SOURCE_SERIES = /* GraphQL */ `
+	mutation SplitSourceSeries($workId: ID!, $sourceSeriesIds: [ID!]!) {
+		splitSourceSeries(workId: $workId, sourceSeriesIds: $sourceSeriesIds) {
+			newWorkId
+			newReaderId
+			title
+			movedSources
+		}
+	}
+`;
+
+// Catalogue search for the admin MERGE PICKER, which needs a different shape from the
+// reader's `SEARCH` and so gets its own lean document rather than a flag on that one.
+//
+// `workId` IS THE POINT. `mergeWorks` addresses works, but `Series.id` is the reader id —
+// `w_…` only when the work is MangaDex-anchored, and the numeric Suwayomi id otherwise —
+// so passing `id` as `targetWorkId` would send a numeric id to a mutation that only
+// understands `w_…`. It stays off `SeriesFields` because it is a resolver field (one query
+// per row, an N+1 on any grid); paying it on ≤30 admin-only rows is the trade this
+// document exists to make. Kept on its OWN LINE for the unknown-field stripper
+// (OPTIONAL_SERIES_FIELDS).
+//
+// The rest is deliberately minimal — enough to RECOGNISE a duplicate (cover, author,
+// chapter count) and no more; every extra field here is another per-row cost.
+//
+// `includeNsfw: true` because a duplicate is just as likely to be NSFW-flagged, and ~2,500
+// mainstream works are wrongly flagged today — an admin merging duplicates must be able to
+// see them. The server honours the argument for admins only, so this grants nothing to
+// anyone else, and the stripper handles a server that predates it (OPTIONAL_ARGUMENTS).
+export const SEARCH_FOR_MERGE = /* GraphQL */ `
+	query SearchForMerge($query: String!, $page: Int, $includeNsfw: Boolean) {
+		search(query: $query, page: $page, includeNsfw: $includeNsfw) {
+			items {
+				id
+				title
+				author
+				coverUrl
+				chapterCount
+				isNsfw
+				workId
+			}
+			page
+			hasNextPage
+			total
 		}
 	}
 `;
@@ -939,6 +1137,9 @@ export const UPDATES_FEED = /* GraphQL */ `
 				latestChapterTitle
 				chapterCount
 				releasedAt
+				# The feed's sort key, so also the clock the card labels with. Own line for
+				# the unknown-field fallback (OPTIONAL_SERIES_FIELDS).
+				announcedAt
 				detectedAt
 				rating
 				isNsfw
@@ -1049,85 +1250,6 @@ export const WORK_SOURCES_BATCH = /* GraphQL */ `
 `;
 
 /**
- * P2.1: the whole series/reader page in ONE round trip. Replaces the
- * canonicalSeries + canonicalChapters + workSources parallel fan-out AND the
- * per-translator `chapters` N+1 (plus the selected translator's `series`
- * follow-up) with a single `seriesPage(workId)` request. The `series` selection
- * mirrors CANONICAL_SERIES (S2 enrichment included); each source's `series`
- * mirrors the SERIES query so the picker's metadata is byte-compatible with what
- * the old per-source round trips returned. `aggregated` is opt-in via
- * `$withAggregated` — the series page wants it, the reader route does not.
- */
-export const SERIES_PAGE = /* GraphQL */ `
-	${SERIES_FIELDS}
-	${CHAPTER_FIELDS}
-	${WORK_SOURCE_FIELDS}
-	query SeriesPage($workId: ID!, $withAggregated: Boolean! = false) {
-		seriesPage(workId: $workId) {
-			workId
-			series {
-				...SeriesFields
-				libraryStatus
-				isFavorite
-				views {
-					total
-					last7d
-					last24h
-				}
-				localizedDescriptions {
-					lang
-					description
-				}
-				credits {
-					role
-					name
-				}
-				covers {
-					fileName
-					url
-					thumbnailUrl
-					lang
-					volume
-					isPrimary
-				}
-			}
-			spineChapters {
-				...ChapterFields
-			}
-			sources {
-				source {
-					...WorkSourceFields
-				}
-				chapters {
-					...ChapterFields
-				}
-				series {
-					...SeriesFields
-					libraryStatus
-					isFavorite
-					views {
-						total
-						last7d
-						last24h
-					}
-				}
-			}
-			aggregated @include(if: $withAggregated) {
-				number
-				title
-				sources {
-					sourceType
-					sourceId
-					suwayomiMangaId
-					chapterId
-					scanlator
-				}
-			}
-		}
-	}
-`;
-
-/**
  * Admin dedup-review expansion for one side of a candidate row. Lives here, below
  * {@link WORK_SOURCE_FIELDS}, because it reuses that fragment — these consts are
  * interpolated at module-eval time, so it cannot be declared beside MERGE_QUEUE.
@@ -1189,6 +1311,37 @@ const SOURCE_INGEST_JOB_FIELDS = /* GraphQL */ `
 		error
 		startedAt
 		finishedAt
+	}
+`;
+
+/**
+ * Per-source scan health (Phase E4.3). Every field is a count the console renders, so there
+ * is no fragment to share — this query has one caller.
+ */
+export const SOURCE_SCAN_HEALTH = /* GraphQL */ `
+	query SourceScanHealth {
+		sourceScanHealth {
+			id
+			name
+			pkgName
+			installed
+			subscribed
+			subscriptionDisabledAt
+			series
+			failing
+			confirmedFailing
+			cachedFallback
+			fetchError
+			zeroChapterSeries
+			exclusiveWorks
+			worstStreak
+			lastFailureAt
+			lastScannedAt
+			outageDetectedAt
+			outageLastAlertAt
+			outageKind
+			outageParkedUntil
+		}
 	}
 `;
 

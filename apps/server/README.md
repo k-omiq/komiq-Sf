@@ -46,28 +46,27 @@ PUBLIC_KOMIKA_IMG_MODE=direct
 
 ## Layout
 
-| File                   | Responsibility                                             |
-| ---------------------- | ---------------------------------------------------------- |
-| `src/main.rs`          | axum wiring, CORS, GraphiQL, bearer → GraphQL context      |
-| `src/config.rs`        | env config                                                 |
-| `src/db.rs`            | SQLite pool + migrations                                   |
-| `src/auth.rs`          | argon2 hashing, token gen, session→user lookup             |
-| `src/suwayomi.rs`      | federation client (mirrors the TS `SuwayomiBackend`)       |
-| `src/graphql/types.rs` | GraphQL types + Suwayomi→Komika mapping helpers            |
-| `src/graphql/mod.rs`   | `AppState`, Query + Mutation resolvers, rating aggregate   |
-| `migrations/`          | `users`, `sessions`, `reviews`, `comments`                 |
+| File                   | Responsibility                                           |
+| ---------------------- | -------------------------------------------------------- |
+| `src/main.rs`          | axum wiring, CORS, GraphiQL, bearer → GraphQL context    |
+| `src/config.rs`        | env config                                               |
+| `src/db.rs`            | SQLite pool + migrations                                 |
+| `src/auth.rs`          | argon2 hashing, token gen, session→user lookup           |
+| `src/suwayomi.rs`      | federation client (mirrors the TS `SuwayomiBackend`)     |
+| `src/graphql/types.rs` | GraphQL types + Suwayomi→Komika mapping helpers          |
+| `src/graphql/mod.rs`   | `AppState`, Query + Mutation resolvers, rating aggregate |
+| `migrations/`          | `users`, `sessions`, `reviews`, `comments`               |
 | `bench/`               | load-test harness + measured baselines (`bench/README.md`) |
 
 ## Performance
 
 Capacity is measured, not guessed. `bench/loadtest.mjs` is a zero-dependency load
 generator that speaks the reader's real GraphQL operations; `bench/README.md` covers
-usage and — importantly — what a clean run does _not_ prove.
+usage and — importantly — what a clean run does *not* prove.
 
 Baseline 2026-07-27: **~78 origin rps ≈ ~390 concurrent users**. The bottleneck is the
-`discovery` resolver (~63 ms CPU/request, viewer-invariant, uncached). Analysis and the
-phased plan are in `PERFORMANCE_ROADMAP.md`; the investigation write-up is in
-`docs/plans/2026-07-27-performance-investigation.md`.
+`discovery` resolver (~63 ms CPU/request, viewer-invariant, uncached). Benchmark
+instructions and captured results are in `bench/`.
 
 Re-run the `discovery` scenario as the acceptance test for any caching work.
 

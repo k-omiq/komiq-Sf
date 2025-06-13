@@ -26,7 +26,7 @@ admin login: <KOMIKA_ADMIN_USERS> / KOMIKA_ADMIN_PASSWORD
 ```
 
 **Both published ports bind to `127.0.0.1` only.** Docker's DNAT bypasses the host
-firewall's `filter/INPUT` chain entirely, so a `0.0.0.0` publish here is _not_ covered
+firewall's `filter/INPUT` chain entirely, so a `0.0.0.0` publish here is *not* covered
 by your host firewall rules — and it is reachable from containers in unrelated
 compose stacks on the same machine, via any bridge. Put a reverse proxy or a
 Cloudflare Tunnel in front (see `CLOUDFLARE-RUNBOOK.md`) rather than widening these.
@@ -65,7 +65,7 @@ the next daemon restart, not at the next `docker compose up`.
 | **suwayomi**     | Runs the source extensions (MangaDex, …): catalog, chapters, **and page/cover images**.                                                                                                          |
 | **flaresolverr** | Headless-browser sidecar that solves Cloudflare "checking your browser" challenges. Internal-only; Suwayomi calls it at `http://flaresolverr:8191`.                                              |
 | **server**       | `komika-server` — federates Suwayomi + adds accounts/social/admin, and runs the **adaptive scan scheduler** (auto-updates the library on a cadence derived from each series' chapter frequency). |
-| **reader**       | Static SvelteKit SPA (nginx), pointed at the server. **Opt-in** — compose profile `selfhost`; in production the reader is a Cloudflare Worker instead.                                           |
+| **reader**       | Static SvelteKit SPA (nginx), pointed at the server. **Opt-in** — compose profile `selfhost`; in production the reader is a Cloudflare Worker instead.                                            |
 
 ## How it's wired (important gotcha)
 

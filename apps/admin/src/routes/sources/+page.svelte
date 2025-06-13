@@ -6,6 +6,7 @@
 		SourceBrowseType,
 		SourceIngestJob,
 		SourceInfo,
+		SourceScanHealth,
 	} from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
 	import {
@@ -17,6 +18,7 @@
 		installExtension,
 		loadExtensions,
 		loadSourceIngestJobs,
+		loadSourceScanHealth,
 		loadSources,
 		materializeCatalogueCovers,
 		persistCatalogue,
@@ -29,7 +31,7 @@
 
 	// Auth redirect is centralized in +layout.svelte.
 
-	let tab = $state<'extensions' | 'catalogue'>('extensions');
+	let tab = $state<'extensions' | 'catalogue' | 'health'>('extensions');
 
 	// ---- Maintenance: persist whole catalogue to the DB cache -----------------
 	// Materializes the entire Suwayomi library into the DB read-cache that the
@@ -276,6 +278,45 @@
 		if (!auth.user || tab !== 'catalogue' || sourcesLoaded || sourcesLoading) return;
 		void refreshSources();
 	});
+
+	// ---- Scan health (Phase E4.3) ---------------------------------------------
+	// "Is this source actually working?" had no honest answer before E4: every Suwayomi
+	// fetch path falls back to reading Suwayomi's own DB when the upstream fetch fails,
+	// so a dead source's scans were recorded as successes — 209 series on one source sat
+	// at 0 chapters reporting zero failures. `cachedFallback` is that case, now counted.
+	let health = $state<SourceScanHealth[]>([]);
+	let healthLoading = $state(false);
+	let healthLoaded = $state(false);
+	let healthError = $state<string | null>(null);
+
+	async function refreshHealth(): Promise<void> {
+		healthLoading = true;
+		healthError = null;
+		try {
+			health = await loadSourceScanHealth();
+			healthLoaded = true;
+		} catch (err) {
+			healthError = err instanceof Error ? err.message : 'Failed to load scan health.';
+		} finally {
+			healthLoading = false;
+		}
+	}
+
+	$effect(() => {
+		if (!auth.user || tab !== 'health' || healthLoaded || healthLoading) return;
+		void refreshHealth();
+	});
+
+	/** Sources with an open whole-source outage — the loud ones, surfaced above the table. */
+	const outages = $derived(health.filter((h) => h.outageDetectedAt));
+	/** Works that go dark while those outages last. */
+	const outageWorks = $derived(outages.reduce((n, h) => n + h.exclusiveWorks, 0));
+
+	function shortDate(iso: string | null): string {
+		if (!iso) return '—';
+		const d = new Date(iso);
+		return Number.isNaN(d.getTime()) ? '—' : d.toISOString().slice(0, 16).replace('T', ' ');
+	}
 
 	async function browse(page: number): Promise<void> {
 		if (!sourceId) return;
@@ -860,6 +901,16 @@
 				class:on={tab === 'catalogue'}
 				onclick={() => (tab = 'catalogue')}>Catalogue</button
 			>
+			<button
+				role="tab"
+				aria-selected={tab === 'health'}
+				class:on={tab === 'health'}
+				onclick={() => (tab = 'health')}
+			>
+				Scan health{#if outages.length > 0}<span class="tab-alarm" aria-label="sources down"
+						>{outages.length}</span
+					>{/if}
+			</button>
 		</div>
 	</div>
 
@@ -1103,6 +1154,106 @@
 					{/each}
 				</div>
 			{/if}
+		{/if}
+	{:else if tab === 'health'}
+		<!-- Sources → scan health (Phase E4.3) -->
+		{#if healthError && health.length === 0}
+			<div class="notice error">{healthError}</div>
+		{:else if healthLoading && health.length === 0}
+			<div class="notice">Loading scan health…</div>
+		{:else if health.length === 0}
+			<div class="notice">No source has any tracked series yet, so there is nothing to report.</div>
+		{:else}
+			{#if healthError}
+				<div class="notice error">{healthError}</div>
+			{/if}
+			{#if outages.length > 0}
+				<div class="notice error">
+					<p>
+						<strong>{outages.length} source{outages.length === 1 ? '' : 's'} down.</strong>
+						Their series are parked until the source recovers, so they are not being polled every day
+						for nothing.
+						{#if outageWorks > 0}
+							<strong>{outageWorks}</strong> work{outageWorks === 1 ? '' : 's'} reachable through no other
+							source {outageWorks === 1 ? 'is' : 'are'} unreadable while this lasts.
+						{/if}
+					</p>
+					<ul class="outage-list">
+						{#each outages as o (o.id)}
+							<li>
+								<strong>{o.name ?? o.pkgName ?? o.id}</strong>
+								— {o.confirmedFailing}/{o.series} series failing since {shortDate(
+									o.outageDetectedAt,
+								)}
+								{#if o.outageKind === 'cached_fallback'}
+									· serving Suwayomi's cache instead of the source
+								{:else if o.outageKind === 'fetch_error'}
+									· upstream fetch failing
+								{/if}
+								{#if o.outageParkedUntil}· next probe {shortDate(o.outageParkedUntil)}{/if}
+								{#if !o.installed}· <em>extension no longer installed</em>{/if}
+							</li>
+						{/each}
+					</ul>
+				</div>
+			{/if}
+			<div class="toolbar">
+				<span class="scope-label">
+					{health.length} source{health.length === 1 ? '' : 's'} with tracked series · worst first
+				</span>
+				<button class="act" onclick={() => refreshHealth()} disabled={healthLoading}>
+					{healthLoading ? 'Refreshing…' : 'Refresh'}
+				</button>
+			</div>
+			<div class="htable" role="table" aria-label="Per-source scan health">
+				<div class="hrow head" role="row">
+					<span role="columnheader">Source</span>
+					<span role="columnheader" title="Series the scanner tracks for this source">Series</span>
+					<span role="columnheader" title="Series with a live failure streak">Failing</span>
+					<span
+						role="columnheader"
+						title="Failures where Suwayomi served its own cached chapter list because the upstream fetch failed — before E4 these recorded as successes"
+						>Cached</span
+					>
+					<span role="columnheader" title="Failures where the upstream fetch errored outright"
+						>Errors</span
+					>
+					<span
+						role="columnheader"
+						title="Series the scanner has never got a chapter for — across a whole source, the signature of one that has never worked"
+						>0 ch</span
+					>
+					<span role="columnheader" title="Works reachable through no other source">Only here</span>
+					<span role="columnheader">Last scan</span>
+				</div>
+				{#each health as h (h.id)}
+					<div class="hrow" role="row" class:down={!!h.outageDetectedAt}>
+						<span role="cell" class="src-cell">
+							<strong>{h.name ?? h.pkgName ?? h.id}</strong>
+							{#if h.outageDetectedAt}<span class="pill bad">down</span>{/if}
+							{#if !h.installed}<span class="pill warn">uninstalled</span>{/if}
+							{#if h.subscriptionDisabledAt}<span class="pill warn">sync disabled</span>
+							{:else if h.subscribed}<span class="pill">subscribed</span>{/if}
+						</span>
+						<span role="cell">{h.series}</span>
+						<span role="cell" class:bad={h.confirmedFailing > 0}>
+							{h.failing}{#if h.confirmedFailing > 0}<em class="sub"
+									>({h.confirmedFailing} confirmed)</em
+								>{/if}
+						</span>
+						<span role="cell" class:bad={h.cachedFallback > 0}>{h.cachedFallback}</span>
+						<span role="cell" class:bad={h.fetchError > 0}>{h.fetchError}</span>
+						<span role="cell">{h.zeroChapterSeries}</span>
+						<span role="cell">{h.exclusiveWorks}</span>
+						<span role="cell" class="when">{shortDate(h.lastScannedAt)}</span>
+					</div>
+				{/each}
+			</div>
+			<p class="hint">
+				<strong>Cached</strong> is the failure mode this panel exists for: on an upstream error the engine
+				answers from its own database, so the scan used to succeed with stale — or empty — data. A cached
+				answer cannot contain a chapter we have not already seen, so it is now counted as a failed scan.
+			</p>
 		{/if}
 	{:else}
 		<!-- Sources → catalogue -->
@@ -2335,5 +2486,97 @@
 		100% {
 			margin-left: 100%;
 		}
+	}
+
+	/* scan health (E4.3) — its own grid, deliberately not sharing `.rrow`, whose
+	   4-column template belongs to the ingest-outcome table. */
+	.tab-alarm {
+		display: inline-block;
+		margin-left: 6px;
+		min-width: 16px;
+		padding: 0 5px;
+		border-radius: var(--k-radius-pill);
+		background: rgba(240, 128, 138, 0.18);
+		color: #f0808a;
+		font-size: 11px;
+		font-weight: 700;
+	}
+	.outage-list {
+		margin: 8px 0 0;
+		padding-left: 18px;
+		font-size: 12.5px;
+		line-height: 1.6;
+	}
+	.htable {
+		border: 1px solid var(--k-border);
+		border-radius: var(--k-radius-md);
+		overflow: hidden;
+	}
+	.hrow {
+		display: grid;
+		grid-template-columns: minmax(0, 2.4fr) repeat(6, minmax(0, 0.7fr)) minmax(0, 1.2fr);
+		align-items: center;
+		gap: var(--k-space-3, 8px);
+		padding: 9px 14px;
+		border-bottom: 1px solid var(--k-border);
+		font-size: 13px;
+		font-variant-numeric: tabular-nums;
+	}
+	.hrow:last-child {
+		border-bottom: none;
+	}
+	.hrow.head {
+		background: var(--k-surface);
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--k-text-faint);
+	}
+	.hrow.down {
+		background: rgba(240, 128, 138, 0.06);
+	}
+	.src-cell {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		min-width: 0;
+	}
+	.src-cell strong {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.hrow .bad {
+		color: #f0808a;
+		font-weight: 600;
+	}
+	.sub {
+		margin-left: 4px;
+		font-size: 11px;
+		font-style: normal;
+		color: var(--k-text-faint);
+	}
+	.when {
+		font-size: 11.5px;
+		color: var(--k-text-dim);
+		white-space: nowrap;
+	}
+	.pill {
+		flex: none;
+		font-size: 10.5px;
+		font-weight: 700;
+		padding: 2px 7px;
+		border-radius: var(--k-radius-pill);
+		background: var(--k-surface-4);
+		color: var(--k-text-2);
+	}
+	.pill.bad {
+		background: rgba(240, 128, 138, 0.15);
+		color: #f0808a;
+	}
+	.pill.warn {
+		background: rgba(224, 179, 84, 0.15);
+		color: var(--k-hiatus);
 	}
 </style>

@@ -1,13 +1,11 @@
 <script lang="ts">
-	import { goto, beforeNavigate, preloadData } from '$app/navigation';
-	import { navigating } from '$app/state';
+	import { goto, beforeNavigate } from '$app/navigation';
 	import { untrack, onDestroy } from 'svelte';
-	import { getRating, setRating } from '$lib/data/social';
 	import { saveProgress, recordView } from '$lib/data/source';
+	import { externalChapterHost } from '$lib/data/chapter-label';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
 	import { auth } from '$lib/auth.svelte';
 	import Icon from '$lib/components/Icon.svelte';
-	import Stars from '$lib/components/Stars.svelte';
 	import CommentThread from '$lib/components/CommentThread.svelte';
 
 	let { data } = $props();
@@ -18,12 +16,16 @@
 	const total = $derived(data.pages.length);
 	const chNum = $derived(data.chNum);
 	const chTitle = $derived(data.chTitle);
-	// Guarded on `nextChapterId` first: `ReaderChapterRef.id` is optional, so a bare
-	// `find(c => c.id === undefined)` would match an id-less chapter and make "Up next"
-	// truthy on the LAST chapter, which is exactly what it must not do.
-	const nextChapter = $derived(
-		data.nextChapterId ? data.chapters.find((c) => c.id === data.nextChapterId) : undefined,
-	);
+	const nextChapter = $derived(data.chapters.find((c) => c.id === data.nextChapterId));
+
+	// Off-site chapter: the publisher hosts it (MangaPlus, Comikey, NamiComi, BiliBili —
+	// ~35,000 chapters, 4% of the mirror), so we have no pages and never will. This is the
+	// ONE state that must be checked before `!hasPages`: both render zero pages, but only
+	// this one has somewhere to send the reader, and the no-pages copy ("often a licensing
+	// gap at the source") is actively wrong about it. Already validated to http(s) by
+	// `externalChapterHref` in source.ts — never raw upstream text in an href.
+	const externalUrl = $derived(data.externalUrl ?? null);
+	const externalHost = $derived(externalChapterHost(data.externalUrl));
 
 	// Translators (sources) for this work — switchable from reader settings. Picking
 	// a different source persists the preference and reopens the work under it
@@ -51,15 +53,8 @@
 	let chapterListOpen = $state(false);
 	let progressPct = $state(0);
 	let scrolledPage = $state(1);
-	let userRating = $state(0);
 
 	const chKey = $derived(`${data.seriesId}:${data.chNum}`);
-
-	// True while a navigation to a DIFFERENT chapter of this reader is in flight.
-	// SvelteKit blocks a same-route navigation on its load, so without this the old
-	// chapter's pages stay fully painted and the reader looks frozen. Scoped to
-	// `/read/` targets so leaving for the series page or a comment link doesn't fade.
-	const chapterLoading = $derived(navigating.to?.url.pathname.startsWith('/read/') ?? false);
 
 	// Popularity: count ONE view per chapter open — for every reader, signed-in or
 	// anonymous (the product decision is to count everyone). Keyed on the chapter so
@@ -73,20 +68,6 @@
 		if (!data.seriesId || data.pages.length === 0 || key === lastViewedChapter) return;
 		lastViewedChapter = key;
 		void recordView(data.seriesId);
-	});
-
-	// Per-chapter rating (1–5) stays local — the backend has no chapter-rating field.
-	$effect(() => {
-		const k = chKey;
-		untrack(() => (userRating = getRating('chapter', k)));
-	});
-	$effect(() => {
-		const r = userRating;
-		setRating(
-			'chapter',
-			untrack(() => chKey),
-			r,
-		);
 	});
 
 	let lastY = 0;
@@ -166,9 +147,6 @@
 			? `Page ${scrolledPage} of ${total} · ${Math.round(progressPct)}%`
 			: `Page ${pageLabel}`,
 	);
-	const rateLabel = $derived(
-		userRating > 0 ? `You rated this chapter ${userRating}/5` : 'Enjoyed this chapter? Rate it',
-	);
 
 	function persist() {
 		try {
@@ -178,57 +156,18 @@
 		}
 	}
 
-	async function openChapter(id?: string) {
+	function openChapter(id?: string) {
 		chapterListOpen = false;
 		if (!id) return;
 		// Persist how far we got in the chapter we're leaving.
 		void saveProgress(data.chapterId, currentPageIndex(), readMarked);
 		// Keep prev/next on the same source (S2) — chapter ids are per-source.
 		const src = data.readingSrc ? `&src=${data.readingSrc}` : '';
-		await goto(`/read/${data.seriesId}?ch=${id}${src}`);
-		// Jump AFTER the navigation resolves, and instantly. The old code fired a
-		// SMOOTH scroll straight after an un-awaited `goto`, so the animation ran down
-		// the outgoing chapter while its replacement loaded — motion that belonged to
-		// content the reader was already leaving.
-		window.scrollTo({ top: 0, behavior: 'auto' });
+		goto(`/read/${data.seriesId}?ch=${id}${src}`);
+		const reduce =
+			typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+		window.scrollTo({ top: 0, behavior: reduce ? 'auto' : 'smooth' });
 	}
-
-	// ---- next-chapter prefetch ---------------------------------------------
-	// Opening a chapter is a client-side waterfall (chapter list → page list → image
-	// bytes); with nothing warmed, all of it starts on the click, which is the pause
-	// readers feel between chapters. Once the reader is far enough in to probably
-	// continue, run the very load the navigation would run — SvelteKit reuses a
-	// preloaded result for the matching `goto`, so the click resolves from memory —
-	// then warm the first few page images off that result, since decoded bytes are
-	// the part that actually keeps the next chapter blank.
-	const PREFETCH_AT_PCT = 40;
-	const PREFETCH_IMAGES = 3;
-	let prefetchedFor = '';
-	$effect(() => {
-		const id = data.nextChapterId;
-		const deepEnough = progressPct >= PREFETCH_AT_PCT;
-		if (!id || !deepEnough || prefetchedFor === id) return;
-		// Set before awaiting so a burst of scroll frames can't launch it twice.
-		prefetchedFor = id;
-		const src = data.readingSrc ? `&src=${data.readingSrc}` : '';
-		void preloadData(`/read/${data.seriesId}?ch=${id}${src}`)
-			.then((res) => {
-				// `redirect` results carry no data; only a `loaded` one has pages.
-				if (res?.type !== 'loaded') return;
-				const next = (res.data as { pages?: { url?: string }[] } | undefined)?.pages ?? [];
-				for (const pg of next.slice(0, PREFETCH_IMAGES)) {
-					if (!pg?.url) continue;
-					// A detached Image() populates the HTTP cache; the <img> the next
-					// chapter renders then hits that cache instead of the network.
-					const warm = new Image();
-					warm.decoding = 'async';
-					warm.src = pg.url;
-				}
-			})
-			// Best-effort only: a failed prefetch must never surface as an unhandled
-			// rejection, and the real navigation will fetch (and report) for itself.
-			.catch(() => {});
-	});
 
 	$effect(() => {
 		if (!restored) {
@@ -317,6 +256,11 @@
 			n: c.n,
 			title: c.title,
 			current: c.id === data.chapterId,
+			// Badged in the list, not discovered on arrival: ~35,000 chapters (4% of the
+			// mirror) are hosted by MangaPlus/Comikey/NamiComi/BiliBili, and clicking one
+			// leaves the app. Knowing that beforehand is the difference between a link and
+			// a dead end.
+			external: !!c.externalUrl,
 		})),
 	);
 
@@ -382,31 +326,34 @@
 	</div>
 	<div class="top-right">
 		{#if data.chapters.length}
-			<div class="ch-select">
-				<button
-					class="ch-btn"
-					aria-haspopup="menu"
-					aria-expanded={chapterListOpen}
-					onclick={() => {
-						chapterListOpen = !chapterListOpen;
-						settingsOpen = false;
-					}}
-				>
-					Chapter {chNum}<Icon name="chevron-down" size={14} />
-				</button>
-				{#if chapterListOpen}
-					<div class="ch-menu">
-						{#each chapterMenu as c (c.id ?? c.n)}
-							<button class="ch-item" class:current={c.current} onclick={() => openChapter(c.id)}>
-								<div class="ch-item-info">
-									<div class="ch-item-title">Ch. {c.n} · {c.title}</div>
-								</div>
-								{#if c.current}<span class="reading-tag">READING</span>{/if}
-							</button>
-						{/each}
-					</div>
-				{/if}
-			</div>
+		<div class="ch-select">
+			<button
+				class="ch-btn"
+				aria-haspopup="menu"
+				aria-expanded={chapterListOpen}
+				onclick={() => {
+					chapterListOpen = !chapterListOpen;
+					settingsOpen = false;
+				}}
+			>
+				Chapter {chNum}<Icon name="chevron-down" size={14} />
+			</button>
+			{#if chapterListOpen}
+				<div class="ch-menu">
+					{#each chapterMenu as c (c.id ?? c.n)}
+						<button class="ch-item" class:current={c.current} onclick={() => openChapter(c.id)}>
+							<div class="ch-item-info">
+								<div class="ch-item-title">Ch. {c.n} · {c.title}</div>
+							</div>
+							{#if c.external}<span class="ext-tag" title="Hosted on another site"
+									><Icon name="globe" size={11} />OFF-SITE</span
+								>{/if}
+							{#if c.current}<span class="reading-tag">READING</span>{/if}
+						</button>
+					{/each}
+				</div>
+			{/if}
+		</div>
 		{/if}
 		<button
 			class="settings-btn"
@@ -505,7 +452,7 @@
 <button class="chrome-toggle" aria-label="Toggle reader controls" onclick={stageClick}></button>
 
 <!-- reading area -->
-<main style="--w:{width}px" class:loading={chapterLoading}>
+<main style="--w:{width}px">
 	{#if data.chapterId}
 		<!-- Heading only: the kicker above it restated the same chapter number the
 		     heading already carries, one line apart. -->
@@ -514,7 +461,27 @@
 		</div>
 	{/if}
 
-	{#if !hasPages}
+	{#if externalUrl}
+		<!-- An off-site chapter (~35,000 of them: MangaPlus, Comikey, NamiComi, BiliBili).
+		     It has no pages BY DESIGN, so it must not fall through to the no-pages state
+		     below — that message blames "a licensing gap" for a chapter that is licensed
+		     and readable, one hop away. Send the reader there, the way MangaDex does.
+		     `rel="noopener noreferrer"` because the destination is a third party. -->
+		<div class="no-pages">
+			<div class="no-pages-icon"><Icon name="globe" size={26} /></div>
+			<h2>This chapter is read on {externalHost}</h2>
+			<p>
+				The publisher hosts it themselves, so there are no pages for us to show. Open it on
+				{externalHost} to keep reading.
+			</p>
+			<div class="no-pages-btns">
+				<a class="next-ch ext-go" href={externalUrl} target="_blank" rel="noopener noreferrer">
+					Read on {externalHost}<Icon name="arrow-right" size={16} strokeWidth={2.4} />
+				</a>
+				<a class="all-ch" href={seriesHref}><Icon name="list" size={16} />Back to series</a>
+			</div>
+		</div>
+	{:else if !hasPages}
 		<div class="no-pages">
 			<div class="no-pages-icon"><Icon name="alert" size={26} /></div>
 			<h2>No pages available for this chapter</h2>
@@ -533,7 +500,7 @@
 		</div>
 	{:else if isStrip}
 		<div class="strip">
-			{#each pages as p (`${data.chapterId}:${p.index}`)}
+			{#each pages as p (p.index)}
 				<div
 					class="strip-cell"
 					style="aspect-ratio:{pageAspect[p.index] ?? DEFAULT_ASPECT};max-width:{width}px"
@@ -571,18 +538,13 @@
 				style={currentPage?.url ? 'height:74vh' : `height:74vh;aspect-ratio:${currentPage?.ratio}`}
 			>
 				{#if currentPage?.url && !pageError[currentPage.index]}
-					<!-- Keyed on the chapter so a chapter change REMOUNTS the <img> instead
-					     of patching `src` on the existing one, which left the previous
-					     chapter's decoded frame on screen until the new page downloaded. -->
-					{#key data.chapterId}
-						<img
-							class="paged-img"
-							src={currentPage.url}
-							alt={`Page ${currentPage.label}`}
-							decoding="async"
-							onerror={() => onImgError(currentPage.index)}
-						/>
-					{/key}
+					<img
+						class="paged-img"
+						src={currentPage.url}
+						alt={`Page ${currentPage.label}`}
+						decoding="async"
+						onerror={() => onImgError(currentPage.index)}
+					/>
 				{:else if currentPage?.url && pageError[currentPage.index]}
 					<button class="paged-ph strip-err k-cover" onclick={() => retryImage(currentPage.index)}>
 						<span class="err-msg">
@@ -629,25 +591,28 @@
 				<div class="eoc-kicker">END OF CHAPTER {chNum}</div>
 				<h2>{chTitle}</h2>
 			</div>
-			<div class="eoc-rate">
-				<span class="eoc-rate-label">{rateLabel}</span>
-				<Stars bind:value={userRating} max={5} size={30} gap={4} />
-			</div>
+			<!-- On the LAST chapter there is no "Next Chapter" button at all. It used to
+			     render always and merely carry `disabled`, so the end of a series still
+			     said "Next Chapter" — a dead control promising a chapter that doesn't
+			     exist. "All chapters" becomes the primary action instead. -->
 			<div class="eoc-btns">
-				<!-- Only rendered when there IS a next chapter. `disabled` alone was not
-				     enough: `.next-ch` hard-sets its own background/colour/cursor, so a
-				     disabled button looked identical to a live one on the last chapter. -->
 				{#if data.nextChapterId}
 					<button class="next-ch" onclick={() => openChapter(data.nextChapterId)}
 						>Next Chapter<Icon name="arrow-right" size={16} strokeWidth={2.4} /></button
 					>
 				{/if}
-				<a class="all-ch" href={seriesHref}><Icon name="list" size={16} />All chapters</a>
+				<a class="all-ch" class:solo={!data.nextChapterId} href={seriesHref}
+					><Icon name="list" size={16} />All chapters</a
+				>
 			</div>
+			{#if !data.nextChapterId}
+				<p class="eoc-caught-up">You're all caught up — this is the latest chapter we have.</p>
+			{/if}
 			{#if nextChapter}
 				<div class="upnext">
 					<span class="upnext-label">Up next</span>
 					<button class="upnext-card" onclick={() => openChapter(nextChapter.id)}>
+						<div class="upnext-cover k-cover"></div>
 						<div class="upnext-info">
 							<div class="upnext-title">Ch. {nextChapter.n} · {nextChapter.title}</div>
 							<div class="upnext-sub">{seriesTitle}</div>
@@ -672,19 +637,17 @@
 
 <!-- bottom chrome -->
 <div class="chrome bottom" class:hidden={chromeHidden}>
-	<!-- Rendered only when the target chapter exists. The readout below is flex-centred
-	     so dropping either button leaves it in place instead of sliding to an edge. -->
-	{#if data.prevChapterId}
-		<button class="nav-ch" onclick={() => openChapter(data.prevChapterId)}
-			><Icon name="chevron-left" size={15} />Prev</button
-		>
-	{/if}
+	<button
+		class="nav-ch"
+		onclick={() => openChapter(data.prevChapterId)}
+		disabled={!data.prevChapterId}><Icon name="chevron-left" size={15} />Prev</button
+	>
 	<span class="readout">{readout}</span>
-	{#if data.nextChapterId}
-		<button class="nav-ch" onclick={() => openChapter(data.nextChapterId)}
-			>Next<Icon name="chevron-right" size={15} /></button
-		>
-	{/if}
+	<button
+		class="nav-ch"
+		onclick={() => openChapter(data.nextChapterId)}
+		disabled={!data.nextChapterId}>Next<Icon name="chevron-right" size={15} /></button
+	>
 </div>
 
 <style>
@@ -729,22 +692,6 @@
 	}
 	.chrome.bottom.hidden {
 		transform: translateY(100%);
-	}
-	/* Takes the free space so the page readout stays centred whether or not the
-	   Prev/Next buttons flanking it are rendered (they aren't on the first/last
-	   chapter). Without this, `justify-content: space-between` would shove it to
-	   whichever edge lost its button. */
-	.readout {
-		flex: 1;
-		text-align: center;
-	}
-	/* Chapter swap in progress — see `chapterLoading`. Dimming the outgoing chapter is
-	   the whole feedback: the pages themselves cannot change until the load resolves.
-	   `pointer-events: none` stops a second click landing on the stale content. */
-	main.loading {
-		opacity: 0.32;
-		pointer-events: none;
-		transition: opacity 0.12s ease-out;
 	}
 	.top-left {
 		display: flex;
@@ -861,6 +808,26 @@
 		background: var(--k-primary);
 		padding: 2px 7px;
 		border-radius: 5px;
+	}
+	/* Off-site marker in the chapter list. Deliberately NOT the primary colour of
+	   `.reading-tag`: it flags a departure from the app, not a state to seek out. */
+	.ext-tag {
+		flex: 0 0 auto;
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		font-size: 10px;
+		font-weight: 800;
+		letter-spacing: 0.05em;
+		color: var(--k-text-faint);
+		border: 1px solid var(--k-border-4);
+		padding: 2px 6px;
+		border-radius: 5px;
+	}
+	/* `.next-ch` is a <button> rule; the off-site CTA is a real <a> (it leaves the app,
+	   so it must be openable in a new tab and readable as a link by assistive tech). */
+	.ext-go {
+		text-decoration: none;
 	}
 	.settings-btn {
 		width: 38px;
@@ -1331,16 +1298,6 @@
 		margin: 0;
 		color: var(--k-text-bright);
 	}
-	.eoc-rate {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 10px;
-	}
-	.eoc-rate-label {
-		font-size: 13px;
-		color: var(--k-text-dimmer);
-	}
 	.eoc-btns {
 		display: flex;
 		gap: 12px;
@@ -1380,6 +1337,22 @@
 	.all-ch:hover {
 		border-color: rgba(255, 255, 255, 0.34);
 	}
+	/* Last chapter: with no "Next Chapter" beside it, this is the only action left,
+	   so it takes the primary treatment rather than sitting alone as a lone outline. */
+	.all-ch.solo {
+		background: var(--k-primary);
+		border-color: var(--k-primary);
+		color: var(--k-on-primary);
+	}
+	.all-ch.solo:hover {
+		border-color: var(--k-primary);
+		filter: brightness(1.08);
+	}
+	.eoc-caught-up {
+		margin: 14px 0 0;
+		font-size: 13.5px;
+		color: var(--k-text-dimmer);
+	}
 	.upnext {
 		width: 100%;
 		margin-top: 22px;
@@ -1412,6 +1385,12 @@
 	.upnext-card:hover {
 		border-color: rgba(255, 255, 255, 0.22);
 		background: var(--k-surface-2);
+	}
+	.upnext-cover {
+		flex: 0 0 auto;
+		width: 52px;
+		height: 74px;
+		border-radius: 7px;
 	}
 	.upnext-info {
 		flex: 1;

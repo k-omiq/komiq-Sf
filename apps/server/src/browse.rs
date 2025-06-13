@@ -72,13 +72,15 @@ const TRENDING_KEY_LIMIT: i64 = 500;
 /// The per-work review aggregate, keyed by **work id**, for both the RATING sort and the
 /// `minRating`/`maxRating` bounds.
 ///
-/// `reviews.series_id` is POLYMORPHIC — it holds whatever id the reader was looking at
-/// when the review was posted, so a `w_…` for a canonical work and a numeric Suwayomi id
-/// otherwise. All 6 production rows are numeric. Keying on `reader_id` alone (what
-/// `updates_feed` does, which is correct for its purpose) therefore LOSES 2 of the 5
-/// readable ratings: those two works are MangaDex-anchored, so their feed `reader_id` is a
-/// `w_…`, while their review was filed under the numeric Suwayomi id of the source the
-/// reader had open. Verified against production.
+/// `reviews.series_id` is POLYMORPHIC — it holds whatever id the reader was looking at when
+/// the review was posted, so a `w_…` for a canonical work and a numeric Suwayomi id
+/// otherwise. Production holds both shapes (23 `w_…` rows and 8 numeric ones), and 9 of the
+/// canonical ones are on works Browse links by a NUMERIC id. Keying on the literal id
+/// therefore loses ratings in both directions, which is exactly how a rated work printed
+/// "0 community ratings" on the page it was rated from. Every reader now resolves the id
+/// onto its work first — this CTE for the RATING sort and the bounds, and
+/// `graphql::rating_summary_for_series_ids` for the series/feed cards, which is what keeps
+/// the star on a card and the star on that work's page the same number.
 ///
 /// Both arms of the UNION resolve to a WORK id — the `w_…` branch because a `w_` id *is* a
 /// work id, and the numeric branch via `source_series` — so the join key downstream is
@@ -87,15 +89,48 @@ const TRENDING_KEY_LIMIT: i64 = 500;
 ///
 /// `LIKE 'w!_%' ESCAPE '!'` and not `LIKE 'w\_%'`: the `_` has to be escaped or it matches
 /// any character, which would pull ids like `w2` into the canonical arm.
-const RATED_PER_WORK_CTE: &str = "WITH rated_per_work AS ( \
-       SELECT wid, AVG(score) AS avg FROM ( \
-           SELECT r.series_id AS wid, r.score FROM reviews r \
-             WHERE r.series_id LIKE 'w!_%' ESCAPE '!' \
-         UNION ALL \
-           SELECT ss.work_id AS wid, r.score FROM reviews r \
-             JOIN source_series ss ON ss.source_key = r.series_id \
-                                  AND ss.source_type = 'suwayomi' \
-       ) GROUP BY wid) ";
+///
+/// ONE VOTE PER (work, user). Resolving both key shapes onto a work makes it possible for a
+/// single user to hold TWO `reviews` rows for the SAME work — one filed under the `w_…` id
+/// and one under the numeric id of whichever source they had open (production holds two such
+/// pairs, and every future write normalizes to `w_…` while the historical numeric rows stay).
+/// Summing both rows would turn the "0 ratings" bug into a double-counting bug, so the votes
+/// are ranked per (work, user) and only the newest one survives — `updated_at` DESC, with the
+/// row id as a deterministic tiebreak for two writes inside the same second. The same
+/// window also collapses a work that maps the same `source_key` twice.
+///
+/// Exposed as a MACRO rather than a `const` so the aggregate readers in `graphql` can splice
+/// the identical text into their own statements: "sorted by rating" and "the star on the
+/// card" have to be the same arithmetic, and two copies of this SQL is exactly how they
+/// would drift apart.
+macro_rules! rated_votes_sql {
+    () => {
+        "SELECT wid, user_id, score FROM ( \
+             SELECT wid, user_id, score, \
+                    ROW_NUMBER() OVER (PARTITION BY wid, user_id \
+                                       ORDER BY updated_at DESC, rid DESC) AS rn \
+             FROM ( \
+                 SELECT r.series_id AS wid, r.user_id AS user_id, r.score AS score, \
+                        r.updated_at AS updated_at, r.id AS rid \
+                   FROM reviews r \
+                   WHERE r.series_id LIKE 'w!_%' ESCAPE '!' \
+               UNION ALL \
+                 SELECT ss.work_id AS wid, r.user_id AS user_id, r.score AS score, \
+                        r.updated_at AS updated_at, r.id AS rid \
+                   FROM reviews r \
+                   JOIN source_series ss ON ss.source_key = r.series_id \
+                                        AND ss.source_type = 'suwayomi' \
+             ) \
+         ) WHERE rn = 1"
+    };
+}
+pub(crate) use rated_votes_sql;
+
+const RATED_PER_WORK_CTE: &str = concat!(
+    "WITH rated_per_work AS (SELECT wid, AVG(score) AS avg FROM (",
+    rated_votes_sql!(),
+    ") GROUP BY wid) "
+);
 
 /// The columns a Browse card needs that `browse_catalogue` already carries. Everything
 /// else (author, artist, description, genres, rating) is fetched for the whole page in one
@@ -103,7 +138,8 @@ const RATED_PER_WORK_CTE: &str = "WITH rated_per_work AS ( \
 /// `content_rating` is deliberately NOT selected: it is a FILTER key (and index payload),
 /// never a rendered field, so reading it back would cost a wider row for nothing.
 const BROWSE_COLS: &str = "f.work_id, f.reader_id, f.title, f.cover_url, f.suwayomi_thumbnail, \
-     f.comic_type, f.status, f.en_chapter_count, f.released_at, f.is_nsfw, f.created_at";
+     f.comic_type, f.status, f.en_chapter_count, f.latest_chapter, f.released_at, f.is_nsfw, \
+     f.created_at";
 
 /// One `browse_catalogue` row as Browse reads it.
 #[derive(sqlx::FromRow, Clone, Debug)]
@@ -118,6 +154,18 @@ pub struct BrowseRow {
     pub comic_type: Option<String>,
     pub status: Option<String>,
     pub en_chapter_count: i64,
+    /// The newest chapter's LABEL — "151", "10.5", "Oneshot" (migration 0095). A different
+    /// quantity from [`Self::en_chapter_count`], which is how many chapters we know of: the
+    /// card renders both ("12 ch · Ch. 151") precisely because printing one under the
+    /// other's label is F4, the bug this overhaul exists to kill.
+    ///
+    /// `None` for the ~67,000 works with no feed row to copy it from, and for any feed row
+    /// the ledger projection has not labelled. The card must then print the count alone —
+    /// never "Ch. undefined", and never the count wearing a "Ch." prefix.
+    ///
+    /// TEXT, and never parsed back to a float: it is `release_event.label`, whose
+    /// vocabulary is defined once in `chapter_label::ChapterLabel`.
+    pub latest_chapter: Option<String>,
     /// Newest upstream chapter release (epoch millis), or **`None` for a work with no dated
     /// chapter** — 67,000 of the 115,567 rows. NULLABLE is the whole point of migration
     /// 0069; `feed_series_updates.released_at` is NOT NULL by contract.
@@ -224,19 +272,26 @@ pub fn canonical_genres(genres: &[String]) -> Vec<String> {
 }
 
 // ---- the COUNT memo -------------------------------------------------------------------
+//
+// SHARED WITH `graphql::updates`, which memoizes its own `total` through the same static
+// and the same `clear_count_cache` (see `graphql::updates_total`). One memo rather than two
+// because there is exactly one invalidation event for both — `catalog::refresh_browse_catalogue`,
+// which ends the chain that rewrites everything either total counts — and two caches would
+// mean two chances to forget to clear one. The key spaces are kept disjoint by prefix
+// (`v3|` here, `updates:v1|` there).
 
 /// How long a memoized Browse total stays usable. Short enough that a sync cycle's
 /// additions show up within a refresh or two, long enough that a reader paging through
 /// Browse pays the count once rather than once per page.
 #[cfg(not(test))]
-const COUNT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const COUNT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Zero under test: the memo is a process-wide static but every test builds its own
 /// in-memory DB, so two tests whose filters hash to the same key would otherwise read each
 /// other's totals depending on scheduling. A zero TTL makes [`browse_catalogue`] compute
 /// exactly, always. The memo logic itself is covered directly, via [`cached_count_with`].
 #[cfg(test)]
-const COUNT_TTL: std::time::Duration = std::time::Duration::ZERO;
+pub(crate) const COUNT_TTL: std::time::Duration = std::time::Duration::ZERO;
 
 /// Ceiling on distinct memoized filter signatures.
 ///
@@ -329,7 +384,7 @@ fn cached_count(key: &str) -> Option<i64> {
     cached_count_with(key, COUNT_TTL)
 }
 
-fn cached_count_with(key: &str, ttl: std::time::Duration) -> Option<i64> {
+pub(crate) fn cached_count_with(key: &str, ttl: std::time::Duration) -> Option<i64> {
     let cache = COUNT_CACHE.lock().ok()?;
     let (total, at) = cache.get(key)?;
     (at.elapsed() < ttl).then_some(*total)
@@ -348,7 +403,7 @@ fn store_count(key: String, total: i64) {
 /// Dropping expired entries first means a flood slower than [`COUNT_TTL`] never touches a
 /// live entry, and a faster one degrades to "no memo" (each miss still computes exactly)
 /// rather than to something worse. Bounded either way.
-fn store_count_with(key: String, total: i64, ttl: std::time::Duration) {
+pub(crate) fn store_count_with(key: String, total: i64, ttl: std::time::Duration) {
     let Ok(mut cache) = COUNT_CACHE.lock() else {
         return; // poisoned → just stop memoizing; every count is still computed exactly
     };
@@ -361,132 +416,17 @@ fn store_count_with(key: String, total: i64, ttl: std::time::Duration) {
     cache.insert(key, (total, std::time::Instant::now()));
 }
 
-/// Drop every memoized total AND every memoized row page. Called at the end of
-/// `catalog::refresh_browse_catalogue` and from `graphql::clear_feed_caches` (the admin
-/// NSFW mutations).
+/// Drop every memoized total. Called at the end of `catalog::refresh_browse_catalogue`.
 ///
 /// That refresh rewrites the table these totals describe, so a surviving entry can promise a
 /// page that no longer exists — `hasNextPage: true` on the last page, and a pager that
 /// renders "Page 3,853 of 3,853 · showing 115,531-115,560 of 115,530". The window is up to
 /// [`COUNT_TTL`], twice a day, but it costs one `HashMap::clear` to close and the alternative
 /// is a user-visible dead page.
-///
-/// The ROW memo goes with the totals, always: both describe the same generation of the
-/// table, and a row page surviving a rebuild would render cards for works the rebuild
-/// deleted (a merged-away `work_id` 404s) next to a `total` that no longer counts them.
-/// Keeping one `clear` entry point also means every existing invalidation hook — there are
-/// two, and both predate the row memo — invalidates both memos without knowing the row
-/// memo exists.
 pub fn clear_count_cache() {
     if let Ok(mut c) = COUNT_CACHE.lock() {
         c.clear();
     }
-    if let Ok(mut c) = ROW_CACHE.lock() {
-        c.clear();
-    }
-}
-
-// ---- the row-page memo ----------------------------------------------------------------
-
-/// How long a memoized Browse page of ROWS stays usable.
-///
-/// Half of [`COUNT_TTL`], deliberately: the rows are what the reader actually sees, and
-/// unlike the total they also depend on two inputs OUTSIDE the filter signature — the
-/// 24-hour view ranking (TRENDING is the default sort) and the review aggregate (RATING).
-/// Neither is in the key, so a hit serves a ranking up to this much stale. 30 s is
-/// invisible for a popularity ordering aggregated over 24 h, while still collapsing the
-/// request storm the p50 target is about: at the measured 223 rps saturation, one entry
-/// absorbs ~6,700 identical page queries per expiry.
-#[cfg(not(test))]
-const ROW_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Zero under test, for exactly [`COUNT_TTL`]'s reason: the memo is a process-wide static
-/// but every test builds its own in-memory DB, so two tests whose queries hash to the same
-/// key would otherwise read each other's pages depending on scheduling. The memo logic
-/// itself is covered directly, via [`cached_rows_with`] / [`store_rows_with`].
-#[cfg(test)]
-const ROW_TTL: std::time::Duration = std::time::Duration::ZERO;
-
-/// Ceiling on distinct memoized row pages.
-///
-/// Much smaller than [`COUNT_CACHE_CAP`] because the VALUES are three orders of magnitude
-/// bigger: a total is 8 bytes, a page is up to [`BROWSE_PAGE_SIZE`] `BrowseRow`s (~500 B
-/// each), so 256 entries bound the memo at ~4 MiB worst case. And 256 is generous for what
-/// this memo is FOR — the hot head of Browse (the default sort's first pages, per NSFW
-/// posture, per format tab), which is a few dozen combinations; a reader deep in a
-/// long-tail filter combination misses and pays the 6.6 ms query, which was the price for
-/// everyone before.
-const ROW_CACHE_CAP: usize = 256;
-
-/// Memoized Browse row pages, keyed by [`row_key`].
-#[allow(clippy::type_complexity)]
-static ROW_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, (Vec<BrowseRow>, std::time::Instant)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-/// The memo key for one PAGE of rows: the sort and the (clamped) page, then the whole
-/// filter signature.
-///
-/// Built ON [`count_key`] rather than beside it, so a filter dimension added there is
-/// covered here by construction — the count key's own test asserts its completeness, and
-/// everything it separates, this separates. The two extra dimensions are exactly the ones
-/// `count_key` deliberately EXCLUDES (its doc explains why the total must not key on
-/// them): the sort reorders the same set, and the page windows it, so both change the rows.
-///
-/// PREPENDED, not appended: the count key's genre segment is last and self-terminating
-/// only to a decoder ("nothing may be appended after this segment without its own
-/// delimiter, since a tag can contain '|'"). Putting sort and page FIRST sidesteps that
-/// argument entirely — both are fixed vocabulary (`sort_word` is a closed set, the page a
-/// decimal integer) so their `|` boundaries are unforgeable, and the count key keeps its
-/// "genre segment is last" invariant intact.
-///
-/// The page is clamped with the same `max(1)` [`browse_catalogue`] applies, so page 0 and
-/// page -5 share page 1's entry rather than caching duplicate copies of it.
-fn row_key(q: &BrowseQuery<'_>) -> String {
-    format!("{}|{}|{}", sort_word(q.sort), q.page.max(1), count_key(q))
-}
-
-/// One fixed lowercase word per sort, for [`row_key`]. A closed vocabulary (no client
-/// text), so a bare `|` after it cannot be forged into looking like another key.
-fn sort_word(sort: BrowseSort) -> &'static str {
-    match sort {
-        BrowseSort::Trending => "trending",
-        BrowseSort::Newest => "newest",
-        BrowseSort::Rating => "rating",
-        BrowseSort::Chapters => "chapters",
-    }
-}
-
-fn cached_rows(key: &str) -> Option<Vec<BrowseRow>> {
-    cached_rows_with(key, ROW_TTL)
-}
-
-fn cached_rows_with(key: &str, ttl: std::time::Duration) -> Option<Vec<BrowseRow>> {
-    let cache = ROW_CACHE.lock().ok()?;
-    let (rows, at) = cache.get(key)?;
-    (at.elapsed() < ttl).then(|| rows.clone())
-}
-
-fn store_rows(key: String, rows: Vec<BrowseRow>) {
-    store_rows_with(key, rows, ROW_TTL)
-}
-
-/// Same bounded-eviction shape as [`store_count_with`], for the same reason: the key space
-/// is client-controlled (genres, and now page), so an unconditional clear at the cap would
-/// hand anyone a way to evict the hot anonymous page-1 entry on demand. Expired entries go
-/// first; only a flood faster than [`ROW_TTL`] degrades the memo to "no memo", where every
-/// miss still computes exactly.
-fn store_rows_with(key: String, rows: Vec<BrowseRow>, ttl: std::time::Duration) {
-    let Ok(mut cache) = ROW_CACHE.lock() else {
-        return; // poisoned → just stop memoizing; every page is still computed exactly
-    };
-    if cache.len() >= ROW_CACHE_CAP {
-        cache.retain(|_, (_, at)| at.elapsed() < ttl);
-        if cache.len() >= ROW_CACHE_CAP {
-            cache.clear();
-        }
-    }
-    cache.insert(key, (rows, std::time::Instant::now()));
 }
 
 // ---- the query ------------------------------------------------------------------------
@@ -636,9 +576,6 @@ fn order_by(sort: BrowseSort) -> &'static str {
 }
 
 /// Run one page statement.
-// Internal helper mirroring the SQL builder's parameter list one-to-one; folding
-// the arguments into a struct would just move the same eight names one level down.
-#[allow(clippy::too_many_arguments)]
 async fn fetch_page(
     pool: &SqlitePool,
     cte: bool,
@@ -656,6 +593,42 @@ async fn fetch_page(
     );
     let q = bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), binds);
     Ok(q.bind(limit).bind(offset).fetch_all(pool).await?)
+}
+
+/// Fetch `browse_catalogue` rows for an explicit, already-ordered list of work ids,
+/// **preserving the caller's order**. Used by text search, which ranks in `work_fts` and
+/// then needs the same card payload Browse renders — above all `reader_id`, without which a
+/// Suwayomi-only hit would be handed to the client as a bare `w_…` that `canonicalSeries`
+/// rejects (see `graphql::map_browse_rows`).
+///
+/// One indexed `IN` over the PRIMARY KEY, then a reorder in Rust. SQLite has no
+/// `ORDER BY FIELD(...)`, and the alternatives — a `CASE` ladder of `ids.len()` branches, or
+/// a values-CTE join — are both more SQL for a reorder of at most `BROWSE_PAGE_SIZE` rows.
+///
+/// A work in `work_fts` with NO `browse_catalogue` row is DROPPED rather than rendered from
+/// a fallback. Both tables are rebuilt from the same predicate in the same chain
+/// (`refresh_feed_updates`), so a miss means the work lost its last source or its title
+/// between the two rebuilds — exactly the shell Browse also refuses to show. Silent by
+/// design: the caller logs the count difference.
+pub async fn rows_by_work_ids(pool: &SqlitePool, ids: &[String]) -> Result<Vec<BrowseRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT {BROWSE_COLS} FROM browse_catalogue f WHERE f.work_id IN ({})",
+        placeholders(ids.len())
+    );
+    let mut q = sqlx::query_as::<_, BrowseRow>(&sql);
+    for id in ids {
+        q = q.bind(id);
+    }
+    let mut by_id: std::collections::HashMap<String, BrowseRow> = q
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|r| (r.work_id.clone(), r))
+        .collect();
+    Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
 }
 
 /// Catalogue-wide Browse. Returns `(total, page)` where `total` counts exactly the row set
@@ -689,15 +662,6 @@ pub async fn browse_catalogue(
         }
     };
 
-    // The row page, memoized like the total but for [`ROW_TTL`] and per (sort, page).
-    // Checked AFTER the total so a hit still returns a `total` no older than [`COUNT_TTL`]
-    // — the two memos are cleared together (see [`clear_count_cache`]) so they always
-    // describe the same generation of the table.
-    let rkey = row_key(q);
-    if let Some(rows) = cached_rows(&rkey) {
-        return Ok((total, rows));
-    }
-
     let rows = match q.sort {
         BrowseSort::Newest | BrowseSort::Chapters => {
             fetch_page(
@@ -724,7 +688,6 @@ pub async fn browse_catalogue(
             trending_page(pool, &where_sql, &binds, uses_rated, page_size, offset).await?
         }
     };
-    store_rows(rkey, rows.clone());
     Ok((total, rows))
 }
 
@@ -1482,7 +1445,7 @@ mod tests {
                 "safe",
                 0,
                 i,
-                Some(1000 + i),
+                Some(1000 + i as i64),
             )
             .await;
         }
@@ -1830,109 +1793,6 @@ mod tests {
         }
         let len = COUNT_CACHE.lock().unwrap().len();
         assert!(len <= COUNT_CACHE_CAP, "memo must stay bounded (len {len})");
-        clear_count_cache();
-    }
-
-    /// A minimal row for exercising the ROW memo directly (its TTL is zero under test, so
-    /// `browse_catalogue` never reads it end-to-end — same situation as the count memo).
-    fn mem_row(id: &str) -> BrowseRow {
-        BrowseRow {
-            work_id: id.to_string(),
-            reader_id: id.to_string(),
-            title: id.to_string(),
-            cover_url: None,
-            suwayomi_thumbnail: None,
-            comic_type: None,
-            status: None,
-            en_chapter_count: 0,
-            released_at: None,
-            is_nsfw: false,
-            created_at: "2026-01-01T00:00:00Z".into(),
-        }
-    }
-
-    /// The row key must separate everything the count key separates PLUS sort and page —
-    /// the two dimensions `count_key` deliberately excludes, because a sort reorders the
-    /// same set and a page windows it, both of which change the rows but not the total.
-    #[test]
-    fn row_key_separates_sort_and_page_on_top_of_every_count_dimension() {
-        let base = row_key(&q(BrowseSort::Newest, 1));
-        // Sort IS a row-key dimension (unlike the count key, which its own test pins).
-        for sort in [
-            BrowseSort::Chapters,
-            BrowseSort::Rating,
-            BrowseSort::Trending,
-        ] {
-            assert_ne!(base, row_key(&q(sort, 1)), "{sort:?} must get its own page");
-        }
-        // Page too.
-        assert_ne!(base, row_key(&q(BrowseSort::Newest, 2)));
-        // …but clamped exactly as `browse_catalogue` clamps it: page 0 and a negative page
-        // serve page 1, so they must SHARE page 1's entry rather than duplicate it.
-        assert_eq!(base, row_key(&q(BrowseSort::Newest, 0)));
-        assert_eq!(base, row_key(&q(BrowseSort::Newest, -5)));
-        // Every filter dimension flows through from the count key by construction; spot-check
-        // one so a future rewrite away from `count_key` cannot silently drop them.
-        let mut narrowed = q(BrowseSort::Newest, 1);
-        narrowed.has_chapters = Some(true);
-        assert_ne!(base, row_key(&narrowed));
-        // The genre segment stays last and length-prefixed; sort/page live in FRONT of the
-        // filter signature, so a crafted genre cannot reach them.
-        let forged = vec!["x|2".to_string()];
-        let mut with_genre = q(BrowseSort::Newest, 1);
-        with_genre.genres = &forged;
-        let plain = vec!["x".to_string()];
-        let mut with_plain = q(BrowseSort::Newest, 2);
-        with_plain.genres = &plain;
-        assert_ne!(row_key(&with_genre), row_key(&with_plain));
-    }
-
-    /// Row pages are memoized per (sort, page, filter signature), expire on their TTL, and
-    /// are dropped by the SAME clear that drops the totals — the two memos must always
-    /// describe one generation of the table.
-    #[test]
-    fn browse_rows_are_memoized_and_cleared_together_with_the_totals() {
-        let ttl = std::time::Duration::from_secs(60);
-        let k1 = "rows-test|newest|1";
-        let k2 = "rows-test|newest|2";
-        assert!(cached_rows_with(k1, ttl).is_none(), "cold");
-        store_rows_with(k1.to_string(), vec![mem_row("w_1"), mem_row("w_2")], ttl);
-        let hit = cached_rows_with(k1, ttl).expect("stored page must be served");
-        assert_eq!(
-            hit.iter().map(|r| r.work_id.as_str()).collect::<Vec<_>>(),
-            ["w_1", "w_2"]
-        );
-        assert!(cached_rows_with(k2, ttl).is_none(), "pages do not bleed");
-        // An expired entry is ignored rather than served stale.
-        assert!(cached_rows_with(k1, std::time::Duration::ZERO).is_none());
-        // The rebuild's invalidation drops rows and totals in ONE call.
-        store_count(format!("{k1}|count"), 42);
-        clear_count_cache();
-        assert!(cached_rows_with(k1, ttl).is_none());
-        assert_eq!(cached_count_with(&format!("{k1}|count"), ttl), None);
-    }
-
-    /// The row memo is capped like the count memo, and for the same reason must evict
-    /// EXPIRED entries before live ones: (genres, page) come from the request, so a client
-    /// cycling distinct signatures must degrade the memo, not flush the hot page-1 entry.
-    #[test]
-    fn row_cache_evicts_expired_entries_before_live_ones() {
-        let ttl = std::time::Duration::from_secs(60);
-        let hot = "rows-evict-test|hot";
-        for i in 0..ROW_CACHE_CAP + 8 {
-            store_rows_with(format!("rows-evict-test|cold-{i}"), vec![mem_row("w")], ttl);
-        }
-        store_rows_with(hot.to_string(), vec![mem_row("w_hot")], ttl);
-        assert!(cached_rows_with(hot, ttl).is_some());
-        for i in 0..ROW_CACHE_CAP {
-            store_rows_with(
-                format!("rows-evict-test|flood-{i}"),
-                vec![mem_row("w")],
-                ttl,
-            );
-        }
-        let len = ROW_CACHE.lock().unwrap().len();
-        assert!(len <= ROW_CACHE_CAP, "memo must stay bounded (len {len})");
         clear_count_cache();
     }
 

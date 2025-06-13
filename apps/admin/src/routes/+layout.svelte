@@ -63,6 +63,9 @@
 		{ href: '/updates', label: 'Updates' },
 		{ href: '/users', label: 'Users' },
 		{ href: '/bugs', label: 'Bugs' },
+		// Reader-filed reports. Distinct from Bugs (our cover pipeline's own failures) and
+		// from Review (the matcher's own uncertainty) — this is the queue a human filled in.
+		{ href: '/reports', label: 'Reports' },
 	];
 </script>
 

@@ -8,7 +8,7 @@ import { test, expect } from '@playwright/test';
  * links, page headings) rather than specific titles.
  *
  * Structure confirmed from apps/reader/src:
- *   - Header: brand link "YOMU" (a.brand) + nav links Home/Browse/Updates/Library.
+ *   - Header: brand link "komiq" (a.brand) + nav links Home/Browse/Updates/Library.
  *   - Home:   MangaCard renders <a class="card" href="/series/…"> rows.
  *   - Browse: <h1>Browse</h1> + a grid of the same series cards.
  *   - Series: <h1> with the series title.
@@ -19,7 +19,16 @@ test.describe('reader smoke', () => {
 		await page.goto('/');
 
 		// Brand + primary nav render.
-		await expect(page.locator('a.brand')).toHaveText(/YOMU/i);
+		//
+		// Asserted on the ACCESSIBLE NAME, not on text. The brand is a logomark `<img>`
+		// carrying the "k" plus a `<span>omiq</span>`, so its text content is the string
+		// "omiq" — only the half of the wordmark that happens to be a text node today.
+		// `toHaveText` therefore pins the test to that split: it broke once already on the
+		// rename from YOMU (it was still asserting the old name long after the site was
+		// branded komiq), and it would break again the day the logomark absorbs another
+		// letter or the span becomes an SVG. `aria-label` is what a screen reader
+		// announces and what the brand actually promises to be.
+		await expect(page.locator('a.brand')).toHaveAccessibleName('komiq');
 		await expect(page.getByRole('link', { name: 'Browse', exact: true })).toBeVisible();
 		await expect(page.getByRole('link', { name: 'Library', exact: true })).toBeVisible();
 
