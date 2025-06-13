@@ -40,7 +40,14 @@ pub const MAX_COVER_BYTES: usize = 150 * 1024;
 /// dimension bound. With LOSSY encoding the quality ladder does most of the size
 /// control, so the top edge (512) almost always wins; the smaller edges are a
 /// fallback for pathological sources that won't fit even at low quality.
-const CANDIDATE_EDGES: [u32; 3] = [512, 448, 384];
+///
+/// Tried largest first; `process_cover` keeps the first encoding
+/// that fits [`MAX_COVER_BYTES`]. The 320/256 rungs exist for the noisy minority whose
+/// 384px encode still misses the budget at the lowest quality — before they were added
+/// those covers fell through to the "smallest produced" fallback and shipped OVER the
+/// cap (one live cover measured 203 KB at 316x448). A cover that fits at 512 never
+/// reaches these rungs, so nothing that was already in budget gets smaller.
+const CANDIDATE_EDGES: [u32; 5] = [512, 448, 384, 320, 256];
 
 /// Lossy WebP quality ladder (libwebp scale, 0–100), highest first. The first
 /// (edge, quality) pair encoding within [`MAX_COVER_BYTES`] wins, so sharpness is
@@ -100,6 +107,138 @@ pub fn process_cover(bytes: &[u8]) -> Result<Vec<u8>> {
     smallest.ok_or_else(|| anyhow!("no candidate cover size produced"))
 }
 
+/// Widths (px) the `?w=` cover variant is allowed to take. An ALLOWLIST, not a range:
+/// each accepted value mints a stored derivative, so an open parameter would let one
+/// crafted page fill the covers DB with thousands of near-identical encodings.
+///
+/// One entry today. Cards render at 150 CSS px ([`crate::graphql`] feeds them to
+/// `MangaCard`, whose default width is 150), so a 1x viewer needs ~150 px and gets 192,
+/// while a 2x viewer needs ~300 px and is better served by the master (measured 240–360
+/// px wide). Adding a width here is all a new call site needs; nothing is generated
+/// until a request actually asks for it.
+pub const VARIANT_WIDTHS: [u32; 1] = [CARD_VARIANT_WIDTH];
+
+/// The variant width for a card-sized cover — what the reader puts in the `1x` slot of
+/// its `srcset` (mirrored there as `CARD_COVER_WIDTH`). Defined ahead of
+/// [`VARIANT_WIDTHS`] and used to build it, so "the width the reader asks for" and "the
+/// widths we agree to serve" cannot drift apart on this side of the wire.
+pub const CARD_VARIANT_WIDTH: u32 = 192;
+
+/// Concurrency bound on variant generation.
+///
+/// Every other cover resize on this server is bounded IMPLICITLY, by the fetch that has
+/// to happen first: `process_cover` only ever runs after a permit from
+/// `suwayomi::COVER_FETCH_CONCURRENCY`, so at most 12 can be in flight. A variant breaks
+/// that coupling — its input is the already-stored master, so it needs no fetch and
+/// nothing upstream throttles it. A cold grid asks for ~30 covers at once, which without
+/// this would launch ~30 concurrent Lanczos3 resizes on a 4-core box.
+///
+/// Two permits, not more: the resize is short (a card-sized derivative is a fraction of
+/// `process_cover`'s work, which is itself ~130 ms), so a queued request waits
+/// milliseconds, while half the box stays free to answer GraphQL. Callers WAIT for a
+/// permit rather than falling back to the master — under load the master is the more
+/// expensive answer, so shedding here would make a busy server send MORE bytes.
+static VARIANT_RESIZE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// Acquire a variant-resize permit, held for the lifetime of the returned guard.
+pub async fn variant_resize_permit() -> tokio::sync::SemaphorePermit<'static> {
+    VARIANT_RESIZE_LIMIT
+        .acquire()
+        .await
+        .expect("VARIANT_RESIZE_LIMIT is never closed")
+}
+
+/// Parse a `?w=` query value into an allowed variant width. `None` for absent,
+/// unparseable, or non-allowlisted values — every one of which means "serve the
+/// master", never an error: a stale or hand-edited URL must still render a cover.
+pub fn variant_width(raw: Option<&str>) -> Option<u32> {
+    let n: u32 = raw?.parse().ok()?;
+    VARIANT_WIDTHS.contains(&n).then_some(n)
+}
+
+/// Downscale an already-processed cover to `width` px wide and re-encode as lossy WebP.
+///
+/// Takes the STORED master rather than the upstream original on purpose: the master is
+/// local (no refetch, no rate limiter) and already passed the decode-bomb and truncation
+/// gates, so this stays a pure CPU step. A master narrower than `width` is returned
+/// unchanged — upscaling would cost bytes to add no detail.
+pub fn downscale_variant(master: &[u8], width: u32) -> Result<Vec<u8>> {
+    let img = decode_limited(master)?;
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        bail!("cover master has a zero dimension");
+    }
+    if w <= width {
+        return Ok(master.to_vec());
+    }
+    let th = ((h as f32 * (width as f32 / w as f32)).round() as u32).max(1);
+    let resized = imageops::resize(&img.to_rgba8(), width, th, imageops::FilterType::Lanczos3);
+    // A card-sized derivative is ~1/3 the master's pixels, so the master's quality ladder
+    // is unnecessary here — one encode at the ladder's top quality already lands far
+    // under MAX_COVER_BYTES, and at this size the extra sharpness is what the viewer
+    // actually sees.
+    encode_webp_lossy(&resized, COVER_QUALITY_LADDER[0])
+}
+
+/// Read a stored cover derivative, or `None` when it has not been generated yet.
+/// `asset_key` namespaces the two cover families that share this table — canonical
+/// works (`w_…`) and Suwayomi source covers (`s:<manga_id>`) — so one lazy-generate
+/// path serves both.
+pub async fn get_cover_variant(
+    covers: &SqlitePool,
+    asset_key: &str,
+    width: u32,
+) -> Option<Vec<u8>> {
+    sqlx::query_scalar("SELECT webp FROM cover_variant WHERE asset_key = ? AND width = ?")
+        .bind(asset_key)
+        .bind(width)
+        .fetch_optional(covers)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Store (or replace) a cover derivative in the un-replicated covers DB.
+pub async fn put_cover_variant(
+    covers: &SqlitePool,
+    asset_key: &str,
+    width: u32,
+    webp: &[u8],
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO cover_variant (asset_key, width, webp, updated_at) VALUES (?, ?, ?, ?) \
+         ON CONFLICT(asset_key, width) DO UPDATE SET webp = excluded.webp, \
+         updated_at = excluded.updated_at",
+    )
+    .bind(asset_key)
+    .bind(width)
+    .bind(webp)
+    .bind(&ts)
+    .execute(covers)
+    .await?;
+    Ok(())
+}
+
+/// Drop every derivative of one cover. Called whenever a master is (re)written, so a
+/// re-saved cover cannot keep serving a derivative of the OLD art. The public URL is
+/// `?v=`-busted for works, but the Suwayomi cover path has no version token at all —
+/// there, this delete is the only thing keeping the two in step.
+pub async fn clear_cover_variants(covers: &SqlitePool, asset_key: &str) {
+    if let Err(e) = sqlx::query("DELETE FROM cover_variant WHERE asset_key = ?")
+        .bind(asset_key)
+        .execute(covers)
+        .await
+    {
+        tracing::warn!(error = %e, asset_key, "cover variant invalidation failed");
+    }
+}
+
+/// The `cover_variant.asset_key` for a Suwayomi source cover.
+pub fn suwayomi_variant_key(manga_id: i64) -> String {
+    format!("s:{manga_id}")
+}
+
 /// Read a resized, origin-cached Suwayomi source cover (keyed by numeric manga id),
 /// or `None` if it hasn't been materialized yet. Errors are swallowed to `None` so a
 /// transient DB hiccup falls back to a live resize rather than failing the request.
@@ -124,6 +263,9 @@ pub async fn put_suwayomi_cover(covers: &SqlitePool, manga_id: i64, webp: &[u8])
     .bind(&ts)
     .execute(covers)
     .await?;
+    // This path has no `?v=` token in its public URL, so a stale derivative would
+    // outlive its master indefinitely. Dropping them here is the only invalidation.
+    clear_cover_variants(covers, &suwayomi_variant_key(manga_id)).await;
     Ok(())
 }
 
@@ -214,6 +356,10 @@ pub async fn put_work_cover(
     .bind(&ts)
     .execute(covers)
     .await?;
+    // Derivatives of the PREVIOUS master are now wrong art. Drop them here rather than
+    // relying on the `?v=` bust: that only stops browsers and the edge from reusing the
+    // old bytes, it does not touch what we would hand the next cold request.
+    clear_cover_variants(covers, work_id).await;
     // 2) Version pointer second, into the main (replicated) DB.
     sqlx::query("UPDATE work SET cover_cached_version = ? WHERE id = ?")
         .bind(version)
@@ -1545,6 +1691,82 @@ mod tests {
     use image::{DynamicImage, RgbImage};
     use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 
+    #[test]
+    fn the_card_variant_width_is_actually_servable() {
+        // `VARIANT_WIDTHS` is built FROM `CARD_VARIANT_WIDTH`, so containment is structural
+        // rather than asserted here. What is still worth pinning is the round trip: the
+        // reader sends this width as a decimal string, and `variant_width` has to parse
+        // that exact string back. If it did not, every card would silently fall back to
+        // the master and the srcset would stop saving anything, with no error to notice
+        // it by.
+        assert_eq!(
+            variant_width(Some(&CARD_VARIANT_WIDTH.to_string())),
+            Some(CARD_VARIANT_WIDTH)
+        );
+    }
+
+    #[test]
+    fn variant_width_serves_the_master_rather_than_erroring() {
+        // Every rejected shape must mean "serve the master". A hand-edited or stale URL
+        // has to render a cover, and an open parameter would let one page mint unbounded
+        // derivatives into the covers DB.
+        assert_eq!(variant_width(None), None, "absent");
+        assert_eq!(variant_width(Some("")), None, "empty");
+        assert_eq!(variant_width(Some("abc")), None, "not a number");
+        assert_eq!(variant_width(Some("-8")), None, "negative");
+        assert_eq!(variant_width(Some("193")), None, "off the allowlist");
+        assert_eq!(variant_width(Some("99999")), None, "absurd");
+    }
+
+    #[test]
+    fn downscale_variant_narrows_the_master_and_keeps_aspect_ratio() {
+        let master = process_cover(&noisy_png(600, 900)).expect("master encodes");
+        let small = downscale_variant(&master, CARD_VARIANT_WIDTH).expect("variant encodes");
+
+        let dims = |b: &[u8]| {
+            let i = image::load_from_memory(b).expect("decodes");
+            i.dimensions()
+        };
+        let (mw, mh) = dims(&master);
+        let (vw, vh) = dims(&small);
+        assert_eq!(vw, CARD_VARIANT_WIDTH, "variant is exactly the asked width");
+        // 2:3 in, 2:3 out — off-by-one from rounding is fine, a squashed cover is not.
+        let expected_h = (mh as f32 * (vw as f32 / mw as f32)).round() as u32;
+        assert!(
+            vh.abs_diff(expected_h) <= 1,
+            "aspect ratio drifted: {vw}x{vh} from {mw}x{mh}"
+        );
+        assert!(
+            small.len() < master.len(),
+            "a card variant that is not smaller than its master ({} vs {} bytes) buys nothing",
+            small.len(),
+            master.len()
+        );
+    }
+
+    #[test]
+    fn downscale_variant_never_upscales() {
+        // A master already narrower than the card width is returned byte-identical:
+        // enlarging it would cost bytes to add no detail.
+        let master = process_cover(&noisy_png(120, 180)).expect("master encodes");
+        let out = downscale_variant(&master, CARD_VARIANT_WIDTH).expect("passes through");
+        assert_eq!(out, master, "a small master must pass through untouched");
+    }
+
+    #[test]
+    fn the_edge_ladder_bottoms_out_inside_the_byte_budget() {
+        // The pathological case the 320/256 rungs were added for: a cover so noisy that
+        // the 384px encode still misses the budget. Before those rungs it shipped OVER
+        // MAX_COVER_BYTES through the "smallest produced" fallback.
+        let encoded = process_cover(&noisy_png(1400, 2100)).expect("encodes");
+        assert!(
+            encoded.len() <= MAX_COVER_BYTES,
+            "worst-case cover shipped {} bytes, over the {} byte budget",
+            encoded.len(),
+            MAX_COVER_BYTES
+        );
+    }
+
     fn noisy_png(w: u32, h: u32) -> Vec<u8> {
         let mut img = RgbImage::new(w, h);
         for (x, y, px) in img.enumerate_pixels_mut() {
@@ -1759,6 +1981,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn re_saving_a_master_drops_its_stale_derivatives() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let main = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&main).await.unwrap();
+        let covers = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, \
+             version INTEGER NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&covers)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE suwayomi_cover_blob (manga_id INTEGER PRIMARY KEY, \
+             webp BLOB NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&covers)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE cover_variant (asset_key TEXT NOT NULL, width INTEGER NOT NULL, \
+             webp BLOB NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (asset_key, width))",
+        )
+        .execute(&covers)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO work (id, created_at, updated_at) \
+             VALUES ('w_a', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&main)
+        .await
+        .unwrap();
+
+        let old_art = process_cover(&noisy_png(400, 600)).unwrap();
+        let variant = downscale_variant(&old_art, CARD_VARIANT_WIDTH).unwrap();
+        put_cover_variant(&covers, "w_a", CARD_VARIANT_WIDTH, &variant)
+            .await
+            .unwrap();
+        put_cover_variant(&covers, &suwayomi_variant_key(7), CARD_VARIANT_WIDTH, &variant)
+            .await
+            .unwrap();
+        assert!(
+            get_cover_variant(&covers, "w_a", CARD_VARIANT_WIDTH)
+                .await
+                .is_some(),
+            "precondition: the derivative is stored"
+        );
+
+        // New art for the SAME work. Without invalidation the derivative below would keep
+        // serving the old cover to every 1x viewer — and for the Suwayomi family, whose
+        // public URL carries no `?v=` token, it would do so for ever.
+        let new_art = process_cover(&noisy_png(500, 750)).unwrap();
+        put_work_cover(&main, &covers, "w_a", &new_art).await.unwrap();
+        assert!(
+            get_cover_variant(&covers, "w_a", CARD_VARIANT_WIDTH)
+                .await
+                .is_none(),
+            "a re-saved work master must drop its derivatives"
+        );
+
+        put_suwayomi_cover(&covers, 7, &new_art).await.unwrap();
+        assert!(
+            get_cover_variant(&covers, &suwayomi_variant_key(7), CARD_VARIANT_WIDTH)
+                .await
+                .is_none(),
+            "a re-saved Suwayomi master must drop its derivatives"
+        );
+    }
+
+    #[tokio::test]
     async fn put_work_cover_stores_blob_and_flips_version() {
         use sqlx::sqlite::SqlitePoolOptions;
         // Main (replicated) DB: `work` + the `cover_cached_version` pointer. After
@@ -1778,6 +2079,13 @@ mod tests {
         sqlx::query(
             "CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, \
              version INTEGER NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&covers)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE cover_variant (asset_key TEXT NOT NULL, width INTEGER NOT NULL, \
+             webp BLOB NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (asset_key, width))",
         )
         .execute(&covers)
         .await
@@ -1992,6 +2300,16 @@ mod tests {
         sqlx::query(
             "CREATE TABLE suwayomi_cover_blob (manga_id INTEGER PRIMARY KEY, \
              webp BLOB NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&covers)
+        .await
+        .unwrap();
+        // Mirrors `db::init_covers`. Without it, `put_suwayomi_cover`'s invalidation hits
+        // a missing table — and because that failure is deliberately swallowed, every
+        // test through this pool would keep passing while proving less than it looks.
+        sqlx::query(
+            "CREATE TABLE cover_variant (asset_key TEXT NOT NULL, width INTEGER NOT NULL, \
+             webp BLOB NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (asset_key, width))",
         )
         .execute(&covers)
         .await

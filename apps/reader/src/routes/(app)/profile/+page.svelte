@@ -297,7 +297,7 @@
 						{@const pct = r.total ? Math.round((r.ch / r.total) * 100) : 0}
 						<a class="reading-row" href={`/series/${r.id ?? slug(r.title)}`}>
 							<div class="mini-cover k-cover">
-								<Cover src={r.cover} alt={r.title} loading="lazy" />
+								<Cover src={r.cover} alt={r.title} loading="lazy" sizing="card" />
 							</div>
 							<div class="reading-info">
 								<div class="reading-top">
@@ -324,7 +324,7 @@
 					{#each shelfItems as item (item.id ?? item.title + item.shelf)}
 						<a class="shelf-card" href={`/series/${item.id ?? slug(item.title)}`}>
 							<div class="cover k-cover">
-								<Cover src={item.cover} alt={item.title} loading="lazy" />
+								<Cover src={item.cover} alt={item.title} loading="lazy" sizing="card" />
 								<span class="rating"
 									><Icon name="star" size={9} fill="var(--k-star)" />{item.rating}</span
 								>

@@ -23,9 +23,35 @@ export interface ImageProvider {
 	 * during SSR (LCP) instead of waiting for a browser-only async effect.
 	 */
 	resolveCoverSync?(sourceUrl: string): string;
+	/**
+	 * `srcset` for a cover rendered at CARD size (~150 CSS px), or `''` when this
+	 * source cannot be resized and the caller should just use `resolveCoverSync`.
+	 *
+	 * Cover masters measure 240–360 px wide, so a 1x viewer downloads roughly four
+	 * times the pixels a card can show. Our own origin serves an allowlisted `?w=`
+	 * derivative, so for those URLs this hands back a two-candidate set: the narrow
+	 * derivative at 1x, the master at 2x (already the right size there).
+	 *
+	 * Descriptors are `x`, not `w`, on purpose: `w` needs the true intrinsic width of
+	 * every candidate, which varies per cover and is not known client-side, whereas
+	 * `x` is exactly right for a fixed-size box. So this is ONLY valid for card-sized
+	 * renderings — a hero or a poster must keep using the master.
+	 */
+	coverCardSrcSet?(sourceUrl: string): string;
 	/** Release any object URLs created for a page (native blob URLs leak otherwise). */
 	release?(url: string): void;
 }
+
+/**
+ * Width (px) of the card-sized cover derivative. Must stay in the server's
+ * `cover::VARIANT_WIDTHS` allowlist — a value that is not on it is silently served as
+ * the full-size master, so a drift here costs bytes with nothing to notice it by
+ * (`the_card_variant_width_is_actually_servable` guards the other side).
+ */
+export const CARD_COVER_WIDTH = 192;
+
+/** Own-origin cover paths the server can serve at an alternate `?w=` width. */
+const RESIZABLE_COVER_PATHS = [/^\/covers\/[^/]+\.webp$/, /^\/api\/v1\/manga\/\d+\/thumbnail$/];
 
 export interface WebImageProviderConfig {
 	/** Base URL of the Cloudflare Worker image proxy, e.g. https://img.komika.app */
@@ -156,6 +182,31 @@ export class WebImageProvider implements ImageProvider {
 
 	async resolveCover(sourceUrl: string): Promise<string> {
 		return this.resolveCoverSync(sourceUrl);
+	}
+
+	/**
+	 * Two-candidate `srcset` for a card-sized cover. Empty (caller falls back to the
+	 * plain master) whenever the resolved URL is not one our own origin can resize:
+	 * `direct` mode, a Worker-proxied foreign CDN, or any path outside
+	 * `RESIZABLE_COVER_PATHS`. The `?w=` is APPENDED to whatever query the URL already
+	 * carries so a cover's `?v=` cache-bust survives.
+	 */
+	coverCardSrcSet(sourceUrl: string): string {
+		const master = this.resolveCoverSync(sourceUrl);
+		if (!master) return '';
+		let url: URL;
+		try {
+			// A relative `/covers/…` never reaches here — resolveCoverSync has already
+			// made own-origin assets absolute — but parse defensively rather than throw
+			// inside a render.
+			url = new URL(master);
+		} catch {
+			return '';
+		}
+		if (!RESIZABLE_COVER_PATHS.some((re) => re.test(url.pathname))) return '';
+		const small = new URL(url.toString());
+		small.searchParams.set('w', String(CARD_COVER_WIDTH));
+		return `${small.toString()} 1x, ${master} 2x`;
 	}
 }
 

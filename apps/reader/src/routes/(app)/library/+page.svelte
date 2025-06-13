@@ -186,6 +186,9 @@
 			{#each continueRow as item (item.id ?? item.title)}
 				<a class="continue-card" href={`/series/${item.id ?? slug(item.title)}`}>
 					<div class="landscape k-cover">
+						<!-- Deliberately NOT sizing="card": `.landscape` is 300x168, twice the ~150px
+						     box the card derivative is cut for, so a 1x viewer would get a 192px
+						     image stretched to 300px. The master is the right source here. -->
 						<Cover src={item.cover} alt={item.title} loading="lazy" />
 						<span class="resume"><Icon name="play" size={9} fill="currentColor" />Resume</span>
 						<div class="bar"><div class="fill" style="width:{item.progress}%"></div></div>
@@ -235,7 +238,7 @@
 				{@const href = `/series/${item.id ?? slug(item.title)}`}
 				<div class="lib-card">
 					<div class="cover k-cover">
-						<Cover src={item.cover} alt={item.title} loading="lazy" />
+						<Cover src={item.cover} alt={item.title} loading="lazy" sizing="card" />
 						<a class="cover-link" {href} aria-label={item.title}></a>
 						<span class="flag-svg"><FlagBadge type={item.type} /></span>
 						<span class="rating"

@@ -118,6 +118,11 @@ impl LockGuard {
     let _ = self.file.seek(SeekFrom::Start(0));
     let _ = write!(self.file, "{}", std::process::id());
     let _ = self.file.flush();
+    // The heartbeat IS the mtime (see `lock_is_abandoned`), so bump it explicitly.
+    // On Windows a write through an open handle doesn't reliably surface a fresh
+    // LastWriteTime to other opens of the path until the handle closes — the
+    // write above landed but the beat stayed stale and the lock read as abandoned.
+    let _ = self.file.set_modified(std::time::SystemTime::now());
   }
 }
 

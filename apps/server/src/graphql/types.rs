@@ -261,6 +261,15 @@ pub struct Series {
     /// object is assembled from a `SuwayomiManga`, which carries a chapter COUNT and no
     /// label at all, and inventing one there is exactly the substitution above.
     pub latest_chapter: Option<String>,
+    /// When OUR scanner first detected this series' newest chapter
+    /// (`series_scan_state.last_new_chapter_at`, raw ISO). Populated by the BATCHED
+    /// mappers (`map_series_batch`, `map_browse_rows`) so the GraphQL `detectedAt`
+    /// field below resolves without its old per-row query — one grouped SELECT per
+    /// page instead of ~80 on a home render. Skipped by the derive (not part of the
+    /// schema): the public `detectedAt` is the ComplexObject resolver, which reads
+    /// this and normalizes the offset. `None` = not populated / no scan-state row.
+    #[graphql(skip)]
+    pub detected_at: Option<String>,
 }
 
 /// Per-series read progress for the whole library, returned by `libraryProgress`

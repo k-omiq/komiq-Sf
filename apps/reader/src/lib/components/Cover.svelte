@@ -6,6 +6,8 @@
 		alt = '',
 		loading = 'eager',
 		fit = 'cover',
+		sizing = 'full',
+		priority = false,
 	}: {
 		src?: string;
 		alt?: string;
@@ -13,6 +15,20 @@
 		loading?: 'eager' | 'lazy';
 		/** object-fit; 'contain' for a full-cover viewer, 'cover' (default) to fill. */
 		fit?: 'cover' | 'contain';
+		/**
+		 * 'card' opts this cover into the narrow `?w=` derivative at 1x (see
+		 * `coverCardSrcSet`). Only correct for a box around card size (~150 CSS px):
+		 * the srcset uses `x` descriptors, which ignore the CSS box entirely, so a hero
+		 * or a poster marked 'card' would render the small derivative stretched.
+		 * 'full' (default) always loads the master.
+		 */
+		sizing?: 'card' | 'full';
+		/**
+		 * Mark this cover as the LCP candidate — sets `fetchpriority="high"` so it is
+		 * not queued behind the grid's covers. At most ONE per page should set it;
+		 * marking several is the same as marking none.
+		 */
+		priority?: boolean;
 	} = $props();
 
 	// Web: the provider resolves covers synchronously (a pure URL rewrite), so resolve
@@ -22,6 +38,12 @@
 	// fall back to the async effect below.
 	const syncResolve = (s: string): string =>
 		s && images.resolveCoverSync ? images.resolveCoverSync(s) : '';
+
+	// Empty whenever the source can't be resized (native, `direct` mode, a foreign CDN)
+	// or this isn't a card — in which case the <img> falls back to `src` alone.
+	const srcSet = $derived(
+		sizing === 'card' && src && images.coverCardSrcSet ? images.coverCardSrcSet(src) : '',
+	);
 
 	let resolved = $state(syncResolve(src));
 	let broken = $state(false);
@@ -153,10 +175,21 @@
 	// compare and issues no request; only genuinely mismatched slots re-fetch, which is
 	// the whole point. Post-hydration `src` changes are handled by Svelte normally — this
 	// effect just no-ops on them.
+	//
+	// `srcset` gets the same treatment, and it is the MORE important of the two: Svelte's
+	// early return covers it as well, and when both are present the browser picks the
+	// candidate from `srcset` and ignores `src` entirely. Re-asserting only `src` would
+	// therefore fix nothing on a mismatched slot — the stale server `srcset` would still
+	// win. Cleared (not left stale) when client state has no srcset for this cover, so a
+	// slot that hydrated into a non-card rendering cannot keep a card candidate.
 	$effect(() => {
 		const img = el;
 		if (!img || !resolved) return;
 		if (img.getAttribute('src') !== resolved) img.setAttribute('src', resolved);
+		const current = img.getAttribute('srcset') ?? '';
+		if (current === srcSet) return;
+		if (srcSet) img.setAttribute('srcset', srcSet);
+		else img.removeAttribute('srcset');
 	});
 </script>
 
@@ -166,8 +199,10 @@
 			bind:this={el}
 			class="cover-img"
 			src={resolved}
+			srcset={srcSet || undefined}
 			{alt}
 			{loading}
+			fetchpriority={priority ? 'high' : undefined}
 			decoding="async"
 			referrerpolicy="no-referrer"
 			style="object-fit:{fit}"

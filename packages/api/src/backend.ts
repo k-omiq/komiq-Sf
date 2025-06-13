@@ -30,6 +30,7 @@ import type {
 	Review,
 	ScanStatus,
 	Series,
+	SeriesPageBundle,
 	SeriesProgress,
 	SeriesSourceGroup,
 	SeriesStatus,
@@ -208,6 +209,14 @@ export interface Backend {
 	 * a native client's source routing over a list. Optional: only the unified
 	 * Komika API implements it. */
 	workSourcesBatch?(workIds: Id[]): Promise<WorkSourceGroup[]>;
+	/** P2.1: the whole series/reader page in ONE round trip — replaces the
+	 * {@link canonicalSeries} + {@link canonicalChapters} + {@link workSources}
+	 * fan-out and the per-translator {@link chapters} N+1. Resolves to `null` for
+	 * an unknown / NSFW-gated work (the page 404s), and to `undefined` when the
+	 * SERVER predates the resolver — the caller must then fall back to the old
+	 * fan-out (deploy-order safety, same rationale as OPTIONAL_SERIES_FIELDS).
+	 * Optional: only the unified Komika API implements it. */
+	seriesPage?(workId: Id, withAggregated?: boolean): Promise<SeriesPageBundle | null | undefined>;
 
 	// --- social ---
 	reviews(seriesId: Id, page?: number): Promise<Paginated<Review>>;

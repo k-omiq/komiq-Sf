@@ -851,6 +851,29 @@ export interface Chapter {
 	isDownloaded: boolean;
 }
 
+/** One source mapping of a {@link SeriesPageBundle}: the mapping plus what the old
+ *  per-source round trips fetched — its chapter list and its series metadata.
+ *  `chapters` is empty (and `series` null) for the MangaDex mapping (the spine
+ *  carries those) and for a source whose server-side fetch failed. */
+export interface SeriesPageSourceEntry {
+	source: WorkSource;
+	chapters: Chapter[];
+	series: Series | null;
+}
+
+/** P2.1: the whole series/reader page in ONE round trip (`seriesPage(workId)`).
+ *  Replaces the canonicalSeries + canonicalChapters + workSources fan-out and the
+ *  per-translator chapters N+1. `workId` is the EFFECTIVE id after a merge
+ *  redirect; `series` is null for a federation-only work (no MangaDex anchor). */
+export interface SeriesPageBundle {
+	workId: Id;
+	series: Series | null;
+	spineChapters: Chapter[];
+	sources: SeriesPageSourceEntry[];
+	/** Cross-source aggregation; present only when requested (`withAggregated`). */
+	aggregated?: AggregatedChapter[];
+}
+
 /**
  * A single page reference. `sourceUrl` is the upstream image URL supplied by the
  * backend; it is NEVER used as an <img src> directly. An ImageProvider turns it

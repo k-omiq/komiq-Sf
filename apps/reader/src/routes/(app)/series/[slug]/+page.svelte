@@ -11,7 +11,14 @@
 	import MergeDialog from '$lib/components/MergeDialog.svelte';
 	import UnmergeDialog from '$lib/components/UnmergeDialog.svelte';
 	import { deriveShelf, FLAG, type Shelf } from '$lib/data/types';
-	import { setLibraryMark, setFavorite, setLibraryStatus, getSeries } from '$lib/data/source';
+	import {
+		setLibraryMark,
+		setFavorite,
+		setLibraryStatus,
+		getSeries,
+		getSeriesNsfwOverride,
+		setSeriesNsfw,
+	} from '$lib/data/source';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
 	import { backend, images } from '$lib/context';
 	import { auth } from '$lib/auth.svelte';
@@ -457,6 +464,105 @@
 		await goto(`/series/${r.newReaderId}`, { invalidateAll: true });
 	}
 
+	// --- admin: correct a mis-derived NSFW rating ---
+	//
+	// The catalogue DERIVES `isNsfw` from crawled genres and source flags, and it gets
+	// some works wrong — a safe series flagged adult disappears for every reader who
+	// hasn't opted in. An admin reading one can correct it here instead of leaving for
+	// the console. Gated the same three ways as Merge and Split, for the same reasons;
+	// only the optional backend methods differ.
+	const canRate = $derived(
+		auth.ready &&
+			!!auth.user?.isAdmin &&
+			!!backend.seriesAdminMeta &&
+			!!backend.updateSeriesMetadata,
+	);
+
+	// Three states, matching the server's three-valued override:
+	//   auto — nothing pinned; the crawler's derived value wins
+	//   sfw  — pinned safe
+	//   nsfw — pinned adult (hidden from viewers who haven't enabled Show NSFW)
+	// `undefined` = we could not READ the override: not catalogued, or the backend
+	// refused. Unlike Merge/Split — which disable rather than hide while `workId`
+	// resolves, so a missing button never reads as a failed permission check — this one
+	// HIDES, because `undefined` means the underlying mutation would be rejected
+	// outright. A disabled three-way control explains nothing; absence is honest.
+	let nsfwOverride = $state<boolean | null | undefined>(undefined);
+	// The effective flag AFTER the override applies — what viewers actually get. Seeded
+	// from the loaded series and re-read from the mutation, because clearing a pin can
+	// land on either value and only the server knows which.
+	let nsfwEffective = $state<boolean | null>(null);
+	let nsfwBusy = $state(false);
+	let nsfwError = $state('');
+
+	const nsfwChoice = $derived<'auto' | 'sfw' | 'nsfw'>(
+		nsfwOverride == null ? 'auto' : nsfwOverride ? 'nsfw' : 'sfw',
+	);
+
+	// Read the pinned override whenever an admin lands on a different series.
+	//
+	// Two guards, for two different hazards:
+	//  • `cancelled` — a fast A→B navigation must not let A's response populate B's
+	//    control (the same hazard the streaming and social effects guard against).
+	//  • `lastNsfwSeries` — this effect ALSO re-runs when the viewer's admin status
+	//    resolves (`auth.ready` flips after hydration), which is not a series change.
+	//    Resetting unconditionally there would discard a just-saved `nsfwEffective` and
+	//    restore the pre-edit `detail.isNsfw` the page still holds. So the reset is
+	//    keyed on the series id actually changing — deliberately a plain variable, not
+	//    `$state`, so writing it cannot re-trigger the effect.
+	let lastNsfwSeries = '';
+	$effect(() => {
+		const id = seriesId;
+		const allowed = canRate;
+		let cancelled = false;
+		if (id !== lastNsfwSeries) {
+			lastNsfwSeries = id;
+			nsfwOverride = undefined;
+			nsfwError = '';
+			// Untracked: the effect must not re-run (and reset) every time the loaded
+			// series object is replaced — only when the series itself changes.
+			nsfwEffective = untrack(() => detail?.isNsfw ?? false);
+		}
+		if (!id || !allowed) return;
+		void getSeriesNsfwOverride(id).then((ov) => {
+			if (!cancelled) nsfwOverride = ov;
+		});
+		return () => {
+			cancelled = true;
+		};
+	});
+
+	async function chooseNsfw(choice: 'auto' | 'sfw' | 'nsfw'): Promise<void> {
+		if (nsfwBusy || choice === nsfwChoice) return;
+		const next = choice === 'auto' ? null : choice === 'nsfw';
+		const prev = nsfwOverride ?? null;
+		// Pinned before the await: if the admin navigates away while the mutation is in
+		// flight, this write belongs to the series they LEFT, and applying its result
+		// would mislabel the one now on screen. The mutation still lands server-side —
+		// only the UI write is dropped.
+		const forSeries = seriesId;
+		nsfwBusy = true;
+		nsfwError = '';
+		// Optimistic, like every other write on this page: show the choice at once and
+		// roll back to `prev` if the server refuses.
+		nsfwOverride = next;
+		try {
+			const r = await setSeriesNsfw(forSeries, next, prev);
+			if (seriesId !== forSeries) return;
+			nsfwOverride = r.value.override;
+			if (r.ok) {
+				// Only the server can say what clearing a pin fell back to.
+				if (r.value.effective !== null) nsfwEffective = r.value.effective;
+			} else {
+				nsfwError = r.error ?? '';
+			}
+		} finally {
+			// Runs even on the early return above; by then the control belongs to the new
+			// series and must not be left disabled.
+			nsfwBusy = false;
+		}
+	}
+
 	// The picker is a POPOVER rather than the flat button list it used to be. With a
 	// handful of sources the flat list pushed the chapter list a screen down the page, and
 	// it read as a set of tabs rather than "the source this list is coming from" — which
@@ -779,7 +885,45 @@
 							onclick={() => (splitOpen = true)}>Split</button
 						>
 					{/if}
+					{#if canRate && nsfwOverride !== undefined}
+						<div class="rating" role="group" aria-label="Admin: content rating">
+							<span class="rating-tag">RATING</span>
+							<div class="rating-seg">
+								<button
+									class:on={nsfwChoice === 'auto'}
+									disabled={nsfwBusy}
+									aria-pressed={nsfwChoice === 'auto'}
+									title={nsfwChoice === 'auto'
+										? `No override — using the crawler's derived rating (currently ${
+												nsfwEffective ? 'NSFW' : 'SFW'
+											})`
+										: 'Clear the pin and fall back to the crawler’s derived rating'}
+									onclick={() => chooseNsfw('auto')}>Auto</button
+								>
+								<button
+									class:on={nsfwChoice === 'sfw'}
+									disabled={nsfwBusy}
+									aria-pressed={nsfwChoice === 'sfw'}
+									title="Pin as safe — shows to everyone"
+									onclick={() => chooseNsfw('sfw')}>SFW</button
+								>
+								<button
+									class:on={nsfwChoice === 'nsfw'}
+									disabled={nsfwBusy}
+									aria-pressed={nsfwChoice === 'nsfw'}
+									title="Pin as adult — hidden from readers who haven't enabled Show NSFW"
+									onclick={() => chooseNsfw('nsfw')}>NSFW</button
+								>
+							</div>
+						</div>
+					{/if}
 				</div>
+				{#if nsfwError}
+					<div class="write-error" role="alert">
+						<Icon name="alert" size={15} />
+						<span>{nsfwError}</span>
+					</div>
+				{/if}
 				{#if writeError}
 					<div class="write-error" role="alert">
 						<Icon name="alert" size={15} />
@@ -832,7 +976,7 @@
 				{#each covers as c, i (c.url)}
 					<button class="cover-cell" onclick={() => openCover(i)} title={coverLabel(c)}>
 						<div class="cover-thumb">
-							<Cover src={c.thumbnailUrl} alt={coverLabel(c)} loading="lazy" />
+							<Cover src={c.thumbnailUrl} alt={coverLabel(c)} loading="lazy" sizing="card" />
 							{#if c.isPrimary}<span class="cover-primary">Primary</span>{/if}
 						</div>
 						{#if c.volume || c.lang}
@@ -1513,6 +1657,52 @@
 		opacity: 0.5;
 		cursor: not-allowed;
 	}
+	/* Same vocabulary as `.merge` above — admin-only, quiet, sized to the CTA row and
+	   last in it. A segmented group rather than a button because the choice is
+	   three-way and the current state has to be readable at a glance. */
+	.rating {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		height: 50px;
+		flex: 0 0 auto;
+		padding: 0 10px 0 12px;
+		border-radius: 8px;
+		border: 1px dashed var(--k-border-4);
+	}
+	.rating-tag {
+		font-size: 10px;
+		font-weight: 700;
+		letter-spacing: 0.08em;
+		color: var(--k-text-3);
+	}
+	.rating-seg {
+		display: flex;
+		gap: 2px;
+	}
+	.rating-seg button {
+		padding: 6px 10px;
+		border: none;
+		border-radius: 6px;
+		background: transparent;
+		color: var(--k-text-3);
+		font: inherit;
+		font-size: 12px;
+		font-weight: 700;
+		cursor: pointer;
+		transition: all 0.15s;
+	}
+	.rating-seg button:hover:not(:disabled):not(.on) {
+		color: var(--k-text-1);
+	}
+	.rating-seg button.on {
+		background: var(--k-surface);
+		color: var(--k-text-1);
+	}
+	.rating-seg button:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
 	.share {
 		width: 50px;
 		height: 50px;
@@ -1526,6 +1716,9 @@
 		align-items: center;
 		justify-content: center;
 	}
+	/* Admin content-rating override. Sized to the 50px CTA buttons it sits beside so
+	   the row keeps one baseline, and visually quieter than them — it is a moderation
+	   tool sharing space with the reader's own actions, not a peer of them. */
 	.share:hover {
 		border-color: rgba(255, 255, 255, 0.34);
 		color: var(--k-text);

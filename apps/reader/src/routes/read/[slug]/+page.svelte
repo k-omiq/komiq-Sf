@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { goto, beforeNavigate } from '$app/navigation';
+	import { goto, beforeNavigate, preloadData } from '$app/navigation';
+	import { navigating } from '$app/state';
 	import { untrack, onDestroy } from 'svelte';
 	import { saveProgress, recordView } from '$lib/data/source';
 	import { externalChapterHost } from '$lib/data/chapter-label';
@@ -16,7 +17,13 @@
 	const total = $derived(data.pages.length);
 	const chNum = $derived(data.chNum);
 	const chTitle = $derived(data.chTitle);
-	const nextChapter = $derived(data.chapters.find((c) => c.id === data.nextChapterId));
+	// Guarded on `nextChapterId` FIRST: `ReaderChapterRef.id` is optional, so a bare
+	// `find(c => c.id === undefined)` matches the first id-less chapter and makes
+	// "Up next" truthy on the LAST chapter — where the end-of-chapter block is already
+	// rendering "You're all caught up", so the reader got both at once.
+	const nextChapter = $derived(
+		data.nextChapterId ? data.chapters.find((c) => c.id === data.nextChapterId) : undefined,
+	);
 
 	// Off-site chapter: the publisher hosts it (MangaPlus, Comikey, NamiComi, BiliBili —
 	// ~35,000 chapters, 4% of the mirror), so we have no pages and never will. This is the
@@ -55,6 +62,12 @@
 	let scrolledPage = $state(1);
 
 	const chKey = $derived(`${data.seriesId}:${data.chNum}`);
+
+	// True while a navigation to a DIFFERENT chapter of this reader is in flight.
+	// SvelteKit blocks a same-route navigation on its load, so without this the old
+	// chapter's pages stay fully painted and the reader looks frozen. Scoped to
+	// `/read/` targets so leaving for the series page or a comment link doesn't fade.
+	const chapterLoading = $derived(navigating.to?.url.pathname.startsWith('/read/') ?? false);
 
 	// Popularity: count ONE view per chapter open — for every reader, signed-in or
 	// anonymous (the product decision is to count everyone). Keyed on the chapter so
@@ -156,18 +169,60 @@
 		}
 	}
 
-	function openChapter(id?: string) {
+	async function openChapter(id?: string) {
 		chapterListOpen = false;
 		if (!id) return;
 		// Persist how far we got in the chapter we're leaving.
 		void saveProgress(data.chapterId, currentPageIndex(), readMarked);
 		// Keep prev/next on the same source (S2) — chapter ids are per-source.
 		const src = data.readingSrc ? `&src=${data.readingSrc}` : '';
-		goto(`/read/${data.seriesId}?ch=${id}${src}`);
-		const reduce =
-			typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
-		window.scrollTo({ top: 0, behavior: reduce ? 'auto' : 'smooth' });
+		await goto(`/read/${data.seriesId}?ch=${id}${src}`);
+		// Jump AFTER the navigation resolves, and instantly. The old code fired a
+		// SMOOTH scroll straight after an un-awaited `goto`, so the animation ran down
+		// the outgoing chapter while its replacement loaded — motion that belonged to
+		// content the reader was already leaving.
+		window.scrollTo({ top: 0, behavior: 'auto' });
 	}
+
+	// ---- next-chapter prefetch ---------------------------------------------
+	// Opening a chapter is a client-side waterfall (chapter list → page list → image
+	// bytes); with nothing warmed, all of it starts on the click, which is the pause
+	// readers feel between chapters. Once the reader is far enough in to probably
+	// continue, run the very load the navigation would run — SvelteKit reuses a
+	// preloaded result for the matching `goto`, so the click resolves from memory —
+	// then warm the first few page images off that result, since decoded bytes are
+	// the part that actually keeps the next chapter blank.
+	const PREFETCH_AT_PCT = 40;
+	const PREFETCH_IMAGES = 3;
+	let prefetchedFor = '';
+	$effect(() => {
+		const id = data.nextChapterId;
+		const deepEnough = progressPct >= PREFETCH_AT_PCT;
+		// Off-site next chapter (MangaPlus/Comikey/…): its load deliberately returns no
+		// pages, so prefetching it can only ever warm an empty result. Skip the request
+		// rather than spend it — the reader is leaving for the publisher anyway.
+		if (!id || !deepEnough || nextChapter?.externalUrl || prefetchedFor === id) return;
+		// Set before awaiting so a burst of scroll frames can't launch it twice.
+		prefetchedFor = id;
+		const src = data.readingSrc ? `&src=${data.readingSrc}` : '';
+		void preloadData(`/read/${data.seriesId}?ch=${id}${src}`)
+			.then((res) => {
+				// `redirect` results carry no data; only a `loaded` one has pages.
+				if (res?.type !== 'loaded') return;
+				const next = (res.data as { pages?: { url?: string }[] } | undefined)?.pages ?? [];
+				for (const pg of next.slice(0, PREFETCH_IMAGES)) {
+					if (!pg?.url) continue;
+					// A detached Image() populates the HTTP cache; the <img> the next
+					// chapter renders then hits that cache instead of the network.
+					const warm = new Image();
+					warm.decoding = 'async';
+					warm.src = pg.url;
+				}
+			})
+			// Best-effort only: a failed prefetch must never surface as an unhandled
+			// rejection, and the real navigation will fetch (and report) for itself.
+			.catch(() => {});
+	});
 
 	$effect(() => {
 		if (!restored) {
@@ -452,7 +507,7 @@
 <button class="chrome-toggle" aria-label="Toggle reader controls" onclick={stageClick}></button>
 
 <!-- reading area -->
-<main style="--w:{width}px">
+<main style="--w:{width}px" class:loading={chapterLoading}>
 	{#if data.chapterId}
 		<!-- Heading only: the kicker above it restated the same chapter number the
 		     heading already carries, one line apart. -->
@@ -500,7 +555,12 @@
 		</div>
 	{:else if isStrip}
 		<div class="strip">
-			{#each pages as p (p.index)}
+			<!-- Keyed on the CHAPTER as well as the page index: `p.index` alone repeats
+			     across chapters, so Svelte reused each <img> and only patched `src`,
+			     leaving the previous chapter's decoded frame on screen until the new
+			     bytes arrived. `data.chapterId` is fixed for the whole block, so the
+			     composite key stays as unique as `p.index` already was. -->
+			{#each pages as p (`${data.chapterId}:${p.index}`)}
 				<div
 					class="strip-cell"
 					style="aspect-ratio:{pageAspect[p.index] ?? DEFAULT_ASPECT};max-width:{width}px"
@@ -538,13 +598,18 @@
 				style={currentPage?.url ? 'height:74vh' : `height:74vh;aspect-ratio:${currentPage?.ratio}`}
 			>
 				{#if currentPage?.url && !pageError[currentPage.index]}
-					<img
-						class="paged-img"
-						src={currentPage.url}
-						alt={`Page ${currentPage.label}`}
-						decoding="async"
-						onerror={() => onImgError(currentPage.index)}
-					/>
+					<!-- Keyed on the chapter so a chapter change REMOUNTS the <img> instead
+					     of patching `src` on the existing one, which left the previous
+					     chapter's decoded frame on screen until the new page downloaded. -->
+					{#key data.chapterId}
+						<img
+							class="paged-img"
+							src={currentPage.url}
+							alt={`Page ${currentPage.label}`}
+							decoding="async"
+							onerror={() => onImgError(currentPage.index)}
+						/>
+					{/key}
 				{:else if currentPage?.url && pageError[currentPage.index]}
 					<button class="paged-ph strip-err k-cover" onclick={() => retryImage(currentPage.index)}>
 						<span class="err-msg">
@@ -612,7 +677,6 @@
 				<div class="upnext">
 					<span class="upnext-label">Up next</span>
 					<button class="upnext-card" onclick={() => openChapter(nextChapter.id)}>
-						<div class="upnext-cover k-cover"></div>
 						<div class="upnext-info">
 							<div class="upnext-title">Ch. {nextChapter.n} · {nextChapter.title}</div>
 							<div class="upnext-sub">{seriesTitle}</div>
@@ -637,17 +701,21 @@
 
 <!-- bottom chrome -->
 <div class="chrome bottom" class:hidden={chromeHidden}>
-	<button
-		class="nav-ch"
-		onclick={() => openChapter(data.prevChapterId)}
-		disabled={!data.prevChapterId}><Icon name="chevron-left" size={15} />Prev</button
-	>
+	<!-- Rendered only when the target chapter exists. `disabled` was invisible here:
+	     `.nav-ch` has no styling of its own and nothing styles `button:disabled`, so a
+	     dead Prev/Next looked exactly like a live one. The readout below is flex-centred
+	     so dropping either button leaves it in place instead of sliding to an edge. -->
+	{#if data.prevChapterId}
+		<button class="nav-ch" onclick={() => openChapter(data.prevChapterId)}
+			><Icon name="chevron-left" size={15} />Prev</button
+		>
+	{/if}
 	<span class="readout">{readout}</span>
-	<button
-		class="nav-ch"
-		onclick={() => openChapter(data.nextChapterId)}
-		disabled={!data.nextChapterId}>Next<Icon name="chevron-right" size={15} /></button
-	>
+	{#if data.nextChapterId}
+		<button class="nav-ch" onclick={() => openChapter(data.nextChapterId)}
+			>Next<Icon name="chevron-right" size={15} /></button
+		>
+	{/if}
 </div>
 
 <style>
@@ -692,6 +760,14 @@
 	}
 	.chrome.bottom.hidden {
 		transform: translateY(100%);
+	}
+	/* Takes the free space so the page readout stays centred whether or not the
+	   Prev/Next buttons flanking it are rendered (they aren't on the first/last
+	   chapter). Without this, `justify-content: space-between` would shove it to
+	   whichever edge lost its button. */
+	.readout {
+		flex: 1;
+		text-align: center;
 	}
 	.top-left {
 		display: flex;
@@ -1041,6 +1117,20 @@
 	main :global(.c-time) {
 		pointer-events: auto;
 	}
+	/* Chapter swap in progress — see `chapterLoading`. Dimming the outgoing chapter is
+	   the whole feedback: the pages themselves cannot change until the load resolves.
+	   The blocker has to be `:global(*)` rather than the plain `main.loading` of a
+	   simpler reader: the rule right above re-enables pointer events on every link and
+	   button inside `main`, and would out-specify a bare `main.loading`. Targeting the
+	   descendants directly takes the clicks back, so a second click can't land on
+	   content that is already on its way out. */
+	main.loading {
+		opacity: 0.32;
+		transition: opacity 0.12s ease-out;
+	}
+	main.loading :global(*) {
+		pointer-events: none;
+	}
 	.chrome-toggle {
 		position: fixed;
 		inset: 0;
@@ -1385,12 +1475,6 @@
 	.upnext-card:hover {
 		border-color: rgba(255, 255, 255, 0.22);
 		background: var(--k-surface-2);
-	}
-	.upnext-cover {
-		flex: 0 0 auto;
-		width: 52px;
-		height: 74px;
-		border-radius: 7px;
 	}
 	.upnext-info {
 		flex: 1;

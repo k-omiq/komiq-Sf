@@ -116,6 +116,23 @@ pub async fn init_covers(database_url: &str) -> Result<SqlitePool> {
     )
     .execute(&pool)
     .await?;
+    // Card-sized derivatives of the two cover masters above, generated lazily when a
+    // request asks for an allowlisted `?w=` (see `cover::VARIANT_WIDTHS`). `asset_key`
+    // namespaces the families that share this table: `w_…` for a canonical work,
+    // `s:<manga_id>` for a Suwayomi source cover. Purely derived and re-generable from
+    // the master on the next request, so — like the masters — it is deliberately
+    // excluded from Litestream backup, and dropping the table is always safe.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS cover_variant (\
+             asset_key  TEXT NOT NULL,\
+             width      INTEGER NOT NULL,\
+             webp       BLOB NOT NULL,\
+             updated_at TEXT NOT NULL,\
+             PRIMARY KEY (asset_key, width)\
+         )",
+    )
+    .execute(&pool)
+    .await?;
     // Extension icons Keiyoushi published AFTER the vendored snapshot in
     // `assets/ext-icons/` was taken (refreshed by `scripts/fetch-ext-icons.mjs`).
     // The baked-in set is authoritative and answers essentially every request;

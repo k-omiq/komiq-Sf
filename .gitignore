@@ -35,3 +35,6 @@ merge_plan.json
 merge_review.json
 
 merge-suwayomi-duplicates.done.log
+
+# Local agent tooling state (worktrees can hold stale copies of anything).
+.claude/worktrees/

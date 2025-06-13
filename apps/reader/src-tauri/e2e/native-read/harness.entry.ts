@@ -27,7 +27,12 @@ async function gql<T = any>(query: string, variables?: Record<string, unknown>):
 	return json.data;
 }
 
-interface EngineChapter { id: number; chapterNumber: number; scanlator: string | null; name: string }
+interface EngineChapter {
+	id: number;
+	chapterNumber: number;
+	scanlator: string | null;
+	name: string;
+}
 interface Facts {
 	uuid: string;
 	engineMangaId: number;
@@ -38,22 +43,30 @@ interface Facts {
 
 async function bootstrapMangaDex(): Promise<Facts> {
 	// Install MangaDex extension (idempotent).
-	await gql(`mutation{ addExtensionStore(input:{indexUrl:"${KEIYOUSHI}"}){ extensionStore{ indexUrl } } }`).catch(() => {});
+	await gql(
+		`mutation{ addExtensionStore(input:{indexUrl:"${KEIYOUSHI}"}){ extensionStore{ indexUrl } } }`,
+	).catch(() => {});
 	await gql(`mutation{ fetchExtensions(input:{}){ extensions{ pkgName } } }`);
-	await gql(`mutation{ updateExtension(input:{id:"${MANGADEX_PKG}", patch:{install:true}}){ extension{ pkgName isInstalled } } }`);
+	await gql(
+		`mutation{ updateExtension(input:{id:"${MANGADEX_PKG}", patch:{install:true}}){ extension{ pkgName isInstalled } } }`,
+	);
 
 	// Resolve the EN MangaDex source id.
-	const s = await gql<{ sources: { nodes: { id: string; lang: string; extension: { pkgName: string } | null }[] } }>(
-		`query{ sources{ nodes{ id lang extension{ pkgName } } } }`,
-	);
+	const s = await gql<{
+		sources: { nodes: { id: string; lang: string; extension: { pkgName: string } | null }[] };
+	}>(`query{ sources{ nodes{ id lang extension{ pkgName } } } }`);
 	const mdx = s.sources.nodes.filter((n) => n.extension?.pkgName === MANGADEX_PKG);
 	const enSource = mdx.find((n) => n.lang === 'en') ?? mdx[0];
 	if (!enSource) throw new Error('no MangaDex EN source after install');
-	console.log(`[bootstrap] MangaDex EN source id = ${enSource.id} (of ${mdx.length} mangadex sources)`);
+	console.log(
+		`[bootstrap] MangaDex EN source id = ${enSource.id} (of ${mdx.length} mangadex sources)`,
+	);
 
 	// Browse POPULAR and find a manga that actually has EN chapters.
 	for (let page = 1; page <= 3; page++) {
-		const browse = await gql<{ fetchSourceManga: { mangas: { id: number; url: string; title: string }[] } }>(
+		const browse = await gql<{
+			fetchSourceManga: { mangas: { id: number; url: string; title: string }[] };
+		}>(
 			`mutation($src:LongString!,$p:Int!){ fetchSourceManga(input:{source:$src,type:POPULAR,page:$p}){ mangas{ id url title } } }`,
 			{ src: enSource.id, p: page },
 		);
@@ -66,13 +79,19 @@ async function bootstrapMangaDex(): Promise<Facts> {
 					`mutation($id:Int!){ fetchMangaAndChapters(input:{id:$id,fetchManga:false,fetchChapters:true}){ chapters{ id chapterNumber scanlator name } } }`,
 					{ id: m.id },
 				);
-				chapters = (d.fetchMangaAndChapters.chapters ?? []).filter((c) => Number.isFinite(c.chapterNumber) && c.chapterNumber >= 0);
+				chapters = (d.fetchMangaAndChapters.chapters ?? []).filter(
+					(c) => Number.isFinite(c.chapterNumber) && c.chapterNumber >= 0,
+				);
 			} catch (e) {
-				console.log(`[bootstrap]   skip "${m.title}" (chapters fetch failed: ${(e as Error).message})`);
+				console.log(
+					`[bootstrap]   skip "${m.title}" (chapters fetch failed: ${(e as Error).message})`,
+				);
 				continue;
 			}
 			if (chapters.length >= 2) {
-				console.log(`[bootstrap] picked "${m.title}" uuid=${uuid} engineId=${m.id} chapters=${chapters.length}`);
+				console.log(
+					`[bootstrap] picked "${m.title}" uuid=${uuid} engineId=${m.id} chapters=${chapters.length}`,
+				);
 				return { uuid, engineMangaId: m.id, sourceId: enSource.id, title: m.title, chapters };
 			}
 			console.log(`[bootstrap]   "${m.title}" has ${chapters.length} usable chapters, trying next`);
@@ -165,7 +184,9 @@ function makeMockHosted(facts: Facts) {
 		});
 	}
 
-	const notUsed = (m: string) => () => { throw new Error(`mockHosted.${m} not used in this path`); };
+	const notUsed = (m: string) => () => {
+		throw new Error(`mockHosted.${m} not used in this path`);
+	};
 
 	const hosted: any = {
 		workSources: async (_workId: string) => [
@@ -196,22 +217,27 @@ function makeMockHosted(facts: Facts) {
 }
 
 // --- assertion harness ---
-let pass = 0, fail = 0;
+let pass = 0,
+	fail = 0;
 const results: string[] = [];
 function assert(name: string, cond: boolean, evidence: string) {
 	const tag = cond ? 'PASS' : 'FAIL';
-	if (cond) pass++; else fail++;
+	if (cond) pass++;
+	else fail++;
 	const line = `[${tag}] ${name} — ${evidence}`;
 	results.push(line);
 	console.log(line);
 }
 
 function magic(buf: Uint8Array): string {
-	const hex = [...buf.slice(0, 4)].map((b) => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+	const hex = [...buf.slice(0, 4)]
+		.map((b) => b.toString(16).padStart(2, '0').toUpperCase())
+		.join(' ');
 	let kind = 'unknown';
 	if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) kind = 'JPEG';
 	else if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) kind = 'PNG';
-	else if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) kind = 'RIFF/WEBP';
+	else if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46)
+		kind = 'RIFF/WEBP';
 	return `${kind} (${hex})`;
 }
 
@@ -236,7 +262,9 @@ async function main() {
 
 	// ---- B: reconciliation mapped a matched chapter to a LOCAL engine path ----
 	// Pick the first canned chapter that corresponds to a real engine chapter number.
-	const matchable = chapterList.find((c) => c.number !== 999.5 && c.id.startsWith('cuuid-') && !c.id.includes('tiebreak'));
+	const matchable = chapterList.find(
+		(c) => c.number !== 999.5 && c.id.startsWith('cuuid-') && !c.id.includes('tiebreak'),
+	);
 	const pages = await composite.canonicalPages!(matchable.id);
 	const p0 = pages[0]?.sourceUrl ?? '';
 	const isLocal = typeof p0 === 'string' && p0.startsWith('/api/') && p0 !== HOSTED_SENTINEL;
@@ -251,7 +279,8 @@ async function main() {
 		const { invoke } = await import('@tauri-apps/api/core');
 		const ab = (await invoke('suwayomi_image', { path: p0 })) as ArrayBuffer;
 		const bytes = new Uint8Array(ab);
-		const okMagic = (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) ||
+		const okMagic =
+			(bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) ||
 			(bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) ||
 			(bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46); // WEBP tolerated
 		assert(
@@ -285,13 +314,28 @@ async function main() {
 			`num ${tiebreak.number} scanlator="${tiebreak.scanlator}" expected engineChapter=${tiebreak.expectedEngineId}; path=${ep0} (chapterId in path=${chapterIdInPath})`,
 		);
 	} else {
-		results.push('[SKIP] E scanlator-tiebreak — source has no same-number multi-scanlator collision');
+		results.push(
+			'[SKIP] E scanlator-tiebreak — source has no same-number multi-scanlator collision',
+		);
 		console.log(results[results.length - 1]);
 	}
 
 	console.log(`\n[harness] ${pass} passed, ${fail} failed`);
 	// Emit a machine-readable summary for the orchestrator.
-	console.log('HARNESS_RESULT_JSON=' + JSON.stringify({ pass, fail, results, facts: { uuid: facts.uuid, title: facts.title, engineMangaId: facts.engineMangaId, chapterCount: facts.chapters.length } }));
+	console.log(
+		'HARNESS_RESULT_JSON=' +
+			JSON.stringify({
+				pass,
+				fail,
+				results,
+				facts: {
+					uuid: facts.uuid,
+					title: facts.title,
+					engineMangaId: facts.engineMangaId,
+					chapterCount: facts.chapters.length,
+				},
+			}),
+	);
 	process.exit(fail === 0 ? 0 : 1);
 }
 

@@ -223,7 +223,7 @@
 					aria-label={`Open ${current.title}`}
 					tabindex="-1"
 				>
-					<Cover src={current.cover} alt={current.title} />
+					<Cover src={current.cover} alt={current.title} priority />
 					<span class="hero-flag" title={current.type}>{FLAG[current.type]}</span>
 				</a>
 				<div class="hero-text">

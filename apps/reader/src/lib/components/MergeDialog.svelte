@@ -206,7 +206,7 @@
 								<span class="box"
 									>{#if on}<Icon name="check" size={13} strokeWidth={3} />{/if}</span
 								>
-								<span class="thumb"><Cover src={row.coverUrl ?? ''} alt="" loading="lazy" /></span>
+								<span class="thumb"><Cover src={row.coverUrl ?? ''} alt="" loading="lazy" sizing="card" /></span>
 							</button>
 							<div class="meta">
 								<a

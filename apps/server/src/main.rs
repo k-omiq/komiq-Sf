@@ -17,6 +17,7 @@ mod media;
 mod notify;
 mod phase_f;
 mod phash;
+mod rate_limit;
 mod scanner;
 mod series_cache;
 mod suwayomi;
@@ -31,7 +32,9 @@ use std::net::{IpAddr, SocketAddr};
 use async_graphql::http::GraphiQLSource;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{
-    extract::{ConnectInfo, DefaultBodyLimit, FromRef, Multipart, Path as UrlPath, State},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, FromRef, Multipart, Path as UrlPath, RawQuery, State,
+    },
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -39,6 +42,11 @@ use axum::{
 };
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
+// Response compression (gzip). The home feed is ~64 KB uncompressed / ~22 KB
+// gzipped, and the cloudflared tunnel bills every byte — see PERFORMANCE_ROADMAP.md.
+// The default predicate skips image/* (covers, avatars) and already-encoded bodies,
+// so the binary routes are untouched.
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -48,7 +56,7 @@ use tracing::Level;
 use config::Config;
 use graphql::{
     build_schema, ApiSchema, AppState, ClientIp, KeyedLocks, RateLimiter, RequestAuth,
-    RequestLibraryCache, RequestUserCache, ScanHealth,
+    RequestLibraryCache, RequestNsfwPref, RequestUserCache, ScanHealth,
 };
 use suwayomi::SuwayomiClient;
 
@@ -232,10 +240,11 @@ async fn graphql_handler(
 ) -> GraphQLResponse {
     let auth = RequestAuth(bearer(&headers));
     let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted)));
-    // Fresh per-request caches so `current_user` does at most one session lookup and each
-    // series' `user_library` row is read at most once, even when many resolvers ask (one
-    // per feed item).
+    // Fresh per-request caches so `current_user` does at most one session lookup, the
+    // viewer's NSFW preference at most one `users` read, and each series' `user_library`
+    // row is read at most once — even when many resolvers ask (one per feed item).
     let user_cache = RequestUserCache::default();
+    let nsfw_cache = RequestNsfwPref::default();
     let library_cache = RequestLibraryCache::default();
     schema
         .execute(
@@ -243,10 +252,152 @@ async fn graphql_handler(
                 .data(auth)
                 .data(ip)
                 .data(user_cache)
+                .data(nsfw_cache)
                 .data(library_cache),
         )
         .await
         .into()
+}
+
+/// Browser cache lifetime for anonymous GET /graphql responses. Matches the lower
+/// bound of the in-process feed memo (30–60 s), so an edge/browser hit is never
+/// staler than what the origin would have served from its own cache anyway.
+const GRAPHQL_GET_MAX_AGE_SECS: u32 = 30;
+/// Cloudflare edge lifetime for the same responses (s-maxage).
+const GRAPHQL_GET_S_MAXAGE_SECS: u32 = 60;
+
+/// P3.1: the CACHEABLE query endpoint. Same execution pipeline as
+/// `graphql_handler`, with three differences:
+///
+/// - Only query operations are accepted — a GET must be safe per the
+///   GraphQL-over-HTTP spec, and edge caches replay GET responses, so a mutation
+///   here would be both wrong and dangerous. Rejected with 405.
+/// - ANONYMOUS, error-free responses carry `Cache-Control: public` + a weak
+///   `ETag` (If-None-Match answered with 304), so Cloudflare can absorb repeat
+///   public reads and browsers can revalidate instead of refetching. Anonymous
+///   responses are viewer-invariant by construction (one viewer class), which is
+///   what makes URL-keyed caching sound.
+/// - AUTHENTICATED responses are marked `private, no-store`: edge caches key on
+///   the URL alone, and a cached authed body would leak one viewer's
+///   `isMarked`/progress fields to the next requester of the same URL.
+async fn graphql_get_handler(
+    State(schema): State<ApiSchema>,
+    State(trusted): State<Arc<Vec<Cidr>>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    req: GraphQLRequest,
+) -> axum::response::Response {
+    let inner = req.into_inner();
+    // Reject non-query operations BEFORE execution. An unparseable document falls
+    // through — execution produces the proper GraphQL error body for it.
+    if !get_document_is_query_only(&inner.query) {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            Json(serde_json::json!({
+                "errors": [{ "message": "Only query operations may use GET; send mutations via POST" }]
+            })),
+        )
+            .into_response();
+    }
+    let anonymous = bearer(&headers).is_none();
+    let auth = RequestAuth(bearer(&headers));
+    let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted)));
+    let user_cache = RequestUserCache::default();
+    let nsfw_cache = RequestNsfwPref::default();
+    let library_cache = RequestLibraryCache::default();
+    let resp = schema
+        .execute(
+            inner
+                .data(auth)
+                .data(ip)
+                .data(user_cache)
+                .data(nsfw_cache)
+                .data(library_cache),
+        )
+        .await;
+    // Only a clean anonymous response is cacheable: errors (rate limits, transient
+    // failures) must never be replayed from an edge cache for 60 s.
+    //
+    // KNOWN, ACCEPTED GAP: resolvers that deliberately swallow an upstream failure
+    // and answer Ok with a degraded result (empty search rows, a seriesPage source
+    // whose fetch failed, …) look clean here and CAN be edge-cached for up to 60 s.
+    // An empty list is also a legitimate answer, so the two are indistinguishable
+    // at this layer; the alternative — surfacing those failures as GraphQL errors —
+    // would break the clients' tolerant-degradation contracts. Bounded (s-maxage)
+    // and self-healing, and no worse than the in-process feed memos already allow.
+    let cacheable = anonymous && resp.is_ok();
+    let body = match serde_json::to_vec(&resp) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = %e, "GET /graphql: response serialization failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if !cacheable {
+        return (
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::CACHE_CONTROL, "private, no-store"),
+            ],
+            body,
+        )
+            .into_response();
+    }
+    let etag = weak_etag(&body);
+    let cache_control =
+        format!("public, max-age={GRAPHQL_GET_MAX_AGE_SECS}, s-maxage={GRAPHQL_GET_S_MAXAGE_SECS}");
+    let revalidated = if_none_match_matches(
+        headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok()),
+        &etag,
+    );
+    if revalidated {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [(header::ETAG, etag), (header::CACHE_CONTROL, cache_control)],
+        )
+            .into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "application/json".to_string()),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, cache_control),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// Does a GET /graphql document contain ONLY query operations? An unparseable
+/// document answers `true` — it falls through to execution, which produces the
+/// proper GraphQL error body (a 405 for garbage would be misleading).
+fn get_document_is_query_only(query: &str) -> bool {
+    use async_graphql::parser::types::{DocumentOperations, OperationType};
+    match async_graphql::parser::parse_query(query) {
+        Ok(doc) => match &doc.operations {
+            DocumentOperations::Single(op) => op.node.ty == OperationType::Query,
+            DocumentOperations::Multiple(ops) => {
+                ops.iter().all(|(_, op)| op.node.ty == OperationType::Query)
+            }
+        },
+        Err(_) => true,
+    }
+}
+
+/// Weak ETag from a fast 64-bit hash of the body: a validator, not a security
+/// boundary — a collision only risks one spurious 304 on content that changes
+/// within its own 30 s browser TTL anyway.
+fn weak_etag(body: &[u8]) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hasher::write(&mut h, body);
+    format!("W/\"{:016x}\"", std::hash::Hasher::finish(&h))
+}
+
+/// RFC 9110 If-None-Match: a comma-separated list of entity tags (or `*`).
+fn if_none_match_matches(header: Option<&str>, etag: &str) -> bool {
+    header.is_some_and(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"))
 }
 
 async fn graphiql() -> impl IntoResponse {
@@ -570,17 +721,22 @@ async fn serve_cover(
     State(app): State<Arc<graphql::AppState>>,
     State(CoverDb(pool)): State<CoverDb>,
     UrlPath(file): UrlPath<String>,
+    RawQuery(query): RawQuery,
 ) -> axum::response::Response {
     let Some(work_id) = file.strip_suffix(".webp") else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // `?v=` (cache bust) is ignored here; only `?w=` changes what we serve.
+    let width = cover::variant_width(query_param(&query, "w"));
     // Fast path: already-cached blob.
     match sqlx::query_scalar::<_, Vec<u8>>("SELECT webp FROM work_cover_blob WHERE work_id = ?")
         .bind(work_id)
         .fetch_optional(&pool)
         .await
     {
-        Ok(Some(bytes)) => return webp_cover_response(bytes),
+        Ok(Some(bytes)) => {
+            return cover_response_at_width(&pool, work_id, width, bytes).await;
+        }
         Ok(None) => {} // fall through to lazy fetch
         Err(e) => {
             tracing::warn!(error = %e, "cover read failed");
@@ -613,7 +769,7 @@ async fn serve_cover(
                 // admin Bugs panel and stops being excluded from the drainer's SELECTs.
                 cover::clear_cover_issue(&app.pool, work_id).await;
             }
-            webp_cover_response(webp)
+            cover_response_at_width(&pool, work_id, width, webp).await
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, work_id, "lazy cover resize failed; redirecting to CDN");
@@ -656,6 +812,7 @@ async fn serve_suwayomi_image(
     State(app): State<Arc<graphql::AppState>>,
     State(CoverDb(covers)): State<CoverDb>,
     UrlPath(rest): UrlPath<String>,
+    RawQuery(query): RawQuery,
 ) -> axum::response::Response {
     if !is_suwayomi_image_path(&rest) {
         return StatusCode::NOT_FOUND.into_response();
@@ -665,7 +822,8 @@ async fn serve_suwayomi_image(
     // size, so resizing is a ~40x transfer win. Chapter PAGES are served raw: the
     // reader needs full-resolution page images.
     if let Some(manga_id) = thumbnail_manga_id(&rest) {
-        return serve_suwayomi_cover(&app, &covers, manga_id).await;
+        let width = cover::variant_width(query_param(&query, "w"));
+        return serve_suwayomi_cover(&app, &covers, manga_id, width).await;
     }
     let path = format!("/api/v1/manga/{rest}");
     // Bounded + timed page fetch (own pool, page timeout, byte cap). The old path called
@@ -726,9 +884,11 @@ async fn serve_suwayomi_cover(
     app: &graphql::AppState,
     covers: &sqlx::SqlitePool,
     manga_id: i64,
+    width: Option<u32>,
 ) -> axum::response::Response {
+    let variant_key = cover::suwayomi_variant_key(manga_id);
     if let Some(webp) = cover::get_suwayomi_cover(covers, manga_id).await {
-        return webp_cover_response(webp);
+        return cover_response_at_width(covers, &variant_key, width, webp).await;
     }
     let path = format!("/api/v1/manga/{manga_id}/thumbnail");
     // On a MISS the fetch goes through the BOUNDED cover pool (`fetch_cover_now`), which
@@ -773,7 +933,7 @@ async fn serve_suwayomi_cover(
             if let Err(e) = cover::put_suwayomi_cover(covers, manga_id, &webp).await {
                 tracing::warn!(error = %e, manga_id, "suwayomi cover cache store failed");
             }
-            webp_cover_response(webp)
+            cover_response_at_width(covers, &variant_key, width, webp).await
         }
         Ok(Err((err, bytes))) => {
             tracing::warn!(error = %err, manga_id, "suwayomi cover resize failed; serving raw");
@@ -862,6 +1022,73 @@ fn cover_warming_response() -> axum::response::Response {
         ],
     )
         .into_response()
+}
+
+/// First value of `key` in a raw query string, or `None`. Deliberately hand-rolled
+/// rather than a `Query<T>` extractor: a typed extractor REJECTS the whole request on a
+/// value it cannot parse, and a cover URL carrying a stale or hand-edited `?w=` must
+/// still render the cover. Values here are plain integers, so no percent-decoding is
+/// needed — anything that does not parse falls through to the master.
+fn query_param<'a>(raw: &'a Option<String>, key: &str) -> Option<&'a str> {
+    raw.as_deref()?
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v)
+}
+
+/// Serve `master`, or an allowlisted `?w=` derivative of it, generating and caching that
+/// derivative on first request.
+///
+/// A card renders a cover at 150 CSS px; the masters measure 240–360 px wide, so a 1x
+/// viewer downloads roughly four times the pixels it can show. The derivative is what
+/// the reader puts in the `1x` slot of its `srcset` — 2x viewers still get the master,
+/// which is already the right size for them.
+///
+/// Every failure mode falls back to the master: a cover that renders slightly too large
+/// is strictly better than a hole in the grid.
+async fn cover_response_at_width(
+    covers: &sqlx::SqlitePool,
+    asset_key: &str,
+    width: Option<u32>,
+    master: Vec<u8>,
+) -> axum::response::Response {
+    let Some(w) = width else {
+        return webp_cover_response(master);
+    };
+    if let Some(bytes) = cover::get_cover_variant(covers, asset_key, w).await {
+        return webp_cover_response(bytes);
+    }
+    // Bounded: unlike every other resize here, this one has no upstream fetch in front of
+    // it to cap concurrency, so a cold grid would otherwise start ~30 at once. See
+    // `cover::VARIANT_RESIZE_LIMIT`. Held across the resize, released at end of scope.
+    let _permit = cover::variant_resize_permit().await;
+    // Re-check under the permit: while we waited, another request for this same cover may
+    // have generated and stored it. Skips a duplicate resize on exactly the stampede this
+    // bound exists for.
+    if let Some(bytes) = cover::get_cover_variant(covers, asset_key, w).await {
+        return webp_cover_response(bytes);
+    }
+    // Decode + Lanczos3 resize + WebP encode is CPU-bound; keep it off the async runtime
+    // exactly like `process_cover`'s callers do.
+    let source = master.clone();
+    let made = tokio::task::spawn_blocking(move || cover::downscale_variant(&source, w)).await;
+    match made {
+        Ok(Ok(bytes)) => {
+            if let Err(e) = cover::put_cover_variant(covers, asset_key, w, &bytes).await {
+                tracing::warn!(error = %e, asset_key, width = w, "cover variant store failed");
+            }
+            webp_cover_response(bytes)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, asset_key, width = w, "cover variant resize failed");
+            webp_cover_response(master)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, asset_key, width = w, "cover variant task panicked");
+            webp_cover_response(master)
+        }
+    }
 }
 
 /// Immutable-cached response for a resized WebP cover.
@@ -1349,6 +1576,11 @@ async fn main() -> anyhow::Result<()> {
     // reclaimer. See `gc::sweep_cover_blobs` for the race-safety argument.
     gc::spawn(pool.clone(), cover_pool.clone(), shutdown_tx.subscribe());
 
+    // View-write coalescing: `views::record` buffers in memory; this flusher batches
+    // the buffered views into one transaction every few seconds. The handle is awaited
+    // after serve() returns so the final on-shutdown flush completes before exit.
+    let views_flusher = views::spawn_flusher(pool.clone(), shutdown_tx.subscribe());
+
     // Keep `sqlite_stat1` current so the planner keeps choosing migration 0058's
     // indexes. Background, not boot-blocking. See `db::spawn_analyze` for why this is
     // an exact per-table ANALYZE rather than `PRAGMA optimize`.
@@ -1458,17 +1690,16 @@ async fn main() -> anyhow::Result<()> {
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
-    // GraphiQL (GET /graphql) is served only when explicitly enabled; otherwise a
-    // GET is a 405 and only the POST endpoint exists. Introspection is disabled in
-    // the same off state (see build_schema above).
-    let graphql_route = if cfg.graphiql_enabled {
-        get(graphiql).post(graphql_handler)
-    } else {
-        post(graphql_handler)
-    };
-
-    let app = Router::new()
-        .route("/graphql", graphql_route)
+    // P3.1: GET /graphql is the CACHEABLE query endpoint (anonymous public reads get
+    // Cache-Control + ETag so Cloudflare and browsers can serve/revalidate them —
+    // POST is uncacheable by every CDN). Mutations over GET are rejected in the
+    // handler. GraphiQL moved to its own GET /graphiql when enabled; introspection
+    // stays disabled in the same off state (see build_schema above).
+    let mut app = Router::new().route("/graphql", get(graphql_get_handler).post(graphql_handler));
+    if cfg.graphiql_enabled {
+        app = app.route("/graphiql", get(graphiql));
+    }
+    let app = app
         .route("/health", get(health))
         .route("/health/ready", get(ready))
         // Operational gauges for scraping (aggregate counts only — no series content,
@@ -1519,6 +1750,11 @@ async fn main() -> anyhow::Result<()> {
                 .layer(DefaultBodyLimit::max(media::MAX_UPLOAD_BYTES + 1024 * 1024)),
         )
         .route("/comment-media/{file}", get(serve_comment_media))
+        // Compress compressible responses (JSON payloads — the home feed alone drops
+        // 64 KB → ~22 KB). Innermost of the middleware so the request-id/trace span
+        // and every outer layer observe the final (encoded) body. The default
+        // predicate leaves image/* and already-encoded responses alone.
+        .layer(CompressionLayer::new())
         // Request-id + access-log span. SetRequestId runs first (generates an
         // x-request-id when the client didn't send one), TraceLayer's span picks
         // it up, and PropagateRequestId echoes it back on the response.
@@ -1568,7 +1804,9 @@ async fn main() -> anyhow::Result<()> {
         .layer(CatchPanicLayer::custom(handle_panic))
         .with_state(RouterState {
             schema,
-            pool,
+            // Cloned (pools are cheap Arc handles): `main` still needs `pool` for
+            // the post-shutdown view flush below.
+            pool: pool.clone(),
             cover_pool,
             trusted_proxies: Arc::new(parse_trusted_proxies(&cfg.trusted_proxy_cidrs)),
             // ~20 uploads/min per user across the avatar + comment-media routes.
@@ -1585,6 +1823,15 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal(shutdown_tx))
     .await?;
+    // Wait for the view flusher's final drain so buffered views hit the DB — then
+    // drain ONCE more: the flusher's shutdown flush races axum's graceful drain, so
+    // a `recordView` served while connections were draining can land in the buffer
+    // AFTER that flush (and if the flusher died in its supervisor backoff, its
+    // shutdown flush never ran at all). This last call catches both.
+    let _ = views_flusher.await;
+    if let Err(e) = views::flush(&pool).await {
+        tracing::warn!(error = %e, "post-shutdown view flush failed; buffered views lost");
+    }
     Ok(())
 }
 
@@ -1677,6 +1924,42 @@ mod tests {
         assert!(!is_suwayomi_image_path("123/chapter/x/page/0")); // non-numeric chapter
         assert!(!is_suwayomi_image_path("")); // empty
         assert!(!is_suwayomi_image_path("123/thumbnail/")); // trailing slash → empty seg
+    }
+
+    /// GET /graphql accepts only query operations — mutations must never be
+    /// reachable through the cacheable/replayable endpoint.
+    #[test]
+    fn get_graphql_rejects_non_query_operations() {
+        assert!(get_document_is_query_only("query Q { health }"));
+        assert!(get_document_is_query_only("{ health }")); // anonymous shorthand
+        assert!(get_document_is_query_only(
+            "fragment F on Series { id } query Q { discovery { key } }"
+        ));
+        assert!(!get_document_is_query_only(
+            "mutation M { recordView(seriesId: \"1\") }"
+        ));
+        assert!(!get_document_is_query_only(
+            // Multi-operation documents: ONE mutation poisons the whole document.
+            "query A { health } mutation B { logout }"
+        ));
+        // Unparseable → allowed through, so execution returns the real parse error.
+        assert!(get_document_is_query_only("not graphql at all {"));
+    }
+
+    #[test]
+    fn graphql_get_etag_is_stable_and_if_none_match_understands_lists() {
+        let a = weak_etag(b"body-one");
+        assert_eq!(a, weak_etag(b"body-one"), "same body, same validator");
+        assert_ne!(a, weak_etag(b"body-two"));
+        assert!(a.starts_with("W/\""), "weak validator form: {a}");
+        assert!(if_none_match_matches(Some(&a), &a));
+        assert!(if_none_match_matches(
+            Some(&format!("\"zzz\", {a}, \"yyy\"")),
+            &a
+        ));
+        assert!(if_none_match_matches(Some("*"), &a));
+        assert!(!if_none_match_matches(Some("W/\"deadbeef\""), &a));
+        assert!(!if_none_match_matches(None, &a));
     }
 
     #[test]

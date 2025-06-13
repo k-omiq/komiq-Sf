@@ -212,6 +212,28 @@ async fn sweep_cover_blobs(
     }
 }
 
+/// Drop every derivative of the given cover keys. Called right after a master is
+/// reclaimed: `cover_variant` lives in the same file with no foreign key, so nothing
+/// else would ever remove these rows. A no-op on an empty slice.
+async fn purge_cover_variants<K>(covers: &SqlitePool, keys: &[K]) -> anyhow::Result<()>
+where
+    K: AsRef<str>,
+{
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("?", keys.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("DELETE FROM cover_variant WHERE asset_key IN ({placeholders})");
+    let mut q = sqlx::query(&sql);
+    for k in keys {
+        q = q.bind(k.as_ref());
+    }
+    q.execute(covers).await?;
+    Ok(())
+}
+
 async fn sweep_work_cover_blobs(
     pool: &SqlitePool,
     covers: &SqlitePool,
@@ -292,6 +314,13 @@ async fn sweep_work_cover_blobs(
             }
             let res = q.bind(cutoff).execute(covers).await?;
             deleted += res.rows_affected();
+            // Derivatives (`cover_variant`) key off the same work id and have no FK to
+            // follow the master out. Reclaiming the master without them would leave rows
+            // that nothing can ever reach — the work is gone, so no request will ever
+            // ask for its `?w=` again, and no future write will invalidate them.
+            // Unconditional on the master delete's own `updated_at` guard: a derivative
+            // whose master survived is simply re-generated on the next request.
+            purge_cover_variants(covers, &orphans).await?;
             if deleted as usize >= COVER_DELETE_BUDGET {
                 tracing::info!(
                     deleted,
@@ -447,6 +476,12 @@ async fn sweep_suwayomi_cover_blobs(
             .execute(covers)
             .await?;
             deleted += res.rows_affected();
+            // Same orphan rule as the work sweep above, under the Suwayomi key space.
+            let keys: Vec<String> = orphans
+                .iter()
+                .map(|id| crate::cover::suwayomi_variant_key(*id))
+                .collect();
+            purge_cover_variants(covers, &keys).await?;
             if deleted as usize >= COVER_DELETE_BUDGET {
                 break;
             }
@@ -487,6 +522,8 @@ mod tests {
              version INTEGER NOT NULL, updated_at TEXT NOT NULL)",
             "CREATE TABLE suwayomi_cover_blob (manga_id INTEGER PRIMARY KEY, \
              webp BLOB NOT NULL, updated_at TEXT NOT NULL)",
+            "CREATE TABLE cover_variant (asset_key TEXT NOT NULL, width INTEGER NOT NULL, \
+             webp BLOB NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (asset_key, width))",
         ] {
             sqlx::query(ddl).execute(&pool).await.unwrap();
         }
@@ -592,6 +629,75 @@ mod tests {
 
     /// The DR floor: a main DB with implausibly few works must delete NOTHING, even
     /// though every single blob probes as orphaned.
+    #[tokio::test]
+    async fn reclaiming_a_master_takes_its_derivatives_with_it() {
+        let (pool, covers) = (main_pool().await, covers_pool().await);
+        seed_works(&pool, 0, 10_000).await;
+        seed_work_blobs(&covers, 0, 10_000, "2020-01-01T00:00:00+00:00").await;
+        seed_work_blobs(&covers, 90_000, 90_100, "2020-01-01T00:00:00+00:00").await;
+
+        // A derivative for one LIVE work and one aged ORPHAN. `cover_variant` has no
+        // foreign key to the master, so only the sweep can remove the orphan's.
+        for key in ["w_00001", "w_90000"] {
+            sqlx::query(
+                "INSERT INTO cover_variant (asset_key, width, webp, updated_at) \
+                 VALUES (?, 192, X'00', '2020-01-01T00:00:00+00:00')",
+            )
+            .bind(key)
+            .execute(&covers)
+            .await
+            .unwrap();
+        }
+
+        let (_tx, rx) = never_shutdown();
+        sweep_work_cover_blobs(&pool, &covers, &cutoff(), &rx)
+            .await
+            .unwrap();
+
+        let remaining: Vec<String> =
+            sqlx::query_scalar("SELECT asset_key FROM cover_variant ORDER BY asset_key")
+                .fetch_all(&covers)
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining,
+            vec!["w_00001".to_string()],
+            "the orphan's derivative must go with its master, the live work's must stay"
+        );
+    }
+
+    #[tokio::test]
+    async fn suwayomi_sweep_takes_derivatives_under_the_prefixed_key() {
+        let (pool, covers) = (main_pool().await, covers_pool().await);
+        // A Suwayomi derivative is keyed `s:<manga_id>`, not the bare id — a sweep that
+        // reused the work key space would silently purge nothing here.
+        sqlx::query(
+            "INSERT INTO cover_variant (asset_key, width, webp, updated_at) \
+             VALUES ('s:4242', 192, X'00', '2020-01-01T00:00:00+00:00')",
+        )
+        .execute(&covers)
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::cover::suwayomi_variant_key(4242),
+            "s:4242",
+            "the sweep and the serve path must agree on the key shape"
+        );
+
+        let keys = [crate::cover::suwayomi_variant_key(4242)];
+        purge_cover_variants(&covers, &keys).await.unwrap();
+
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cover_variant")
+            .fetch_one(&covers)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "the prefixed key must match what the serve path writes");
+        // Guard the empty case the sweep hits on every clean tick.
+        let none: [String; 0] = [];
+        purge_cover_variants(&covers, &none).await.unwrap();
+        let _ = &pool;
+    }
+
     #[tokio::test]
     async fn work_sweep_refuses_when_the_main_db_looks_empty() {
         let (pool, covers) = (main_pool().await, covers_pool().await);

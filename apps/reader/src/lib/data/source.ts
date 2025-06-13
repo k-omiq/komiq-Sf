@@ -27,6 +27,9 @@ import type {
 // "sort" or "content rating" in the view model), so they travel as the API's own tokens
 // rather than being mirrored into a view type that would only ever be mapped 1:1.
 import type { BrowseSort, ContentRatingFilter } from '@komika/api';
+// Runtime check (not a type): the native build must keep the sequential page-fetch
+// order for canonical chapters — see `canStartPagesEarly`.
+import { isTauri } from '@komika/api';
 import { backend, images } from '$lib/context';
 import { findChapterOwner } from './chapter-owner';
 import type { ChapterCandidate } from './chapter-owner';
@@ -703,6 +706,12 @@ interface ResolvedWork {
 	 * See {@link findChapterOwner}.
 	 */
 	candidates: ChapterCandidate<Chapter>[];
+	/**
+	 * Cross-source aggregation, when it rode along in the single-round-trip
+	 * `seriesPage` bundle (requested via `withAggregated`). Undefined on the
+	 * legacy fan-out path — the caller then fetches `aggregatedChapters` itself.
+	 */
+	aggregated?: AggregatedChapter[];
 }
 
 /**
@@ -714,37 +723,74 @@ interface ResolvedWork {
  * always agree on the default translator. Returns null when the work has no
  * readable source at all.
  */
-async function resolveWork(workId: string, preferredKey?: string): Promise<ResolvedWork | null> {
-	// Source mappings (suwayomi translators) + the canonical spine chapters + the
-	// canonical series (S2 enrichment: credits + localized descriptions), in
-	// parallel. Individual rejections are tolerated (canonicalChapters/canonicalSeries
-	// legitimately 404 for a federation-only work), but if every method that is
-	// actually present rejects the backend is effectively down — rethrow so the caller
-	// surfaces an honest error rather than a false "not found".
-	const hasWorkSources = !!backend.workSources;
-	const hasCanonChapters = !!backend.canonicalChapters;
-	const hasCanonSeries = !!backend.canonicalSeries;
-	const [wsRes, spineRes, canonRes] = await Promise.allSettled([
-		hasWorkSources ? backend.workSources!(workId) : Promise.resolve([] as WorkSource[]),
-		hasCanonChapters ? backend.canonicalChapters!(workId) : Promise.resolve([] as Chapter[]),
-		hasCanonSeries ? backend.canonicalSeries!(workId) : Promise.resolve(null),
-	]);
-	// "Backend fully down" honest-error guard: an ABSENT optional method resolves to a
-	// benign default and must NOT be counted as evidence the backend is up (otherwise a
-	// backend missing e.g. canonicalChapters would mask a real outage of the methods it
-	// DOES have and degrade to a false "not found"). Rethrow only when every method that
-	// was actually present rejected — a true outage — and at least one was present.
-	const present = [
-		{ has: hasWorkSources, res: wsRes },
-		{ has: hasCanonChapters, res: spineRes },
-		{ has: hasCanonSeries, res: canonRes },
-	].filter((m) => m.has);
-	if (present.length > 0 && present.every((m) => m.res.status === 'rejected')) {
-		throw (present.find((m) => m.res.status === 'rejected')!.res as PromiseRejectedResult).reason;
+async function resolveWork(
+	workId: string,
+	preferredKey?: string,
+	opts?: { withAggregated?: boolean },
+): Promise<ResolvedWork | null> {
+	let wsList: WorkSource[];
+	let spineChapters: Chapter[];
+	let canonSeries: Series | null;
+	/** The server-resolved survivor id, when the bundle path supplied one. */
+	let effectiveId: string | null = null;
+	let aggregated: AggregatedChapter[] | undefined;
+	/** Per-source data carried in the bundle — set only on the bundle path; the
+	 *  legacy path leaves these null and fetches per source below. */
+	let chaptersByKey: Map<string, Chapter[]> | null = null;
+	let metaByKey: Map<string, Series | null> | null = null;
+
+	// P2.1 fast path: ONE `seriesPage` round trip carries everything the fan-out
+	// below used to assemble from 3 parallel requests + a per-translator chapters
+	// N+1 + a metadata follow-up. `null` = the work genuinely doesn't resolve
+	// (unknown id / NSFW-gated) — same outcome the fan-out would reach, minus the
+	// wasted requests. `undefined` = the SERVER predates the resolver (deploy-order
+	// drift) — fall through to the fan-out. A genuine outage rejects and propagates,
+	// matching the fan-out's honest-error guard.
+	const bundle = backend.seriesPage
+		? await backend.seriesPage(workId, opts?.withAggregated ?? false)
+		: undefined;
+	if (bundle === null) return null;
+	if (bundle) {
+		wsList = bundle.sources.map((s) => s.source);
+		spineChapters = bundle.spineChapters;
+		canonSeries = bundle.series;
+		effectiveId = bundle.workId;
+		aggregated = bundle.aggregated;
+		chaptersByKey = new Map(bundle.sources.map((s) => [s.source.sourceKey, s.chapters]));
+		metaByKey = new Map(bundle.sources.map((s) => [s.source.sourceKey, s.series]));
+	} else {
+		// Legacy fan-out: source mappings (suwayomi translators) + the canonical spine
+		// chapters + the canonical series (S2 enrichment: credits + localized
+		// descriptions), in parallel. Individual rejections are tolerated
+		// (canonicalChapters/canonicalSeries legitimately 404 for a federation-only
+		// work), but if every method that is actually present rejects the backend is
+		// effectively down — rethrow so the caller surfaces an honest error rather
+		// than a false "not found".
+		const hasWorkSources = !!backend.workSources;
+		const hasCanonChapters = !!backend.canonicalChapters;
+		const hasCanonSeries = !!backend.canonicalSeries;
+		const [wsRes, spineRes, canonRes] = await Promise.allSettled([
+			hasWorkSources ? backend.workSources!(workId) : Promise.resolve([] as WorkSource[]),
+			hasCanonChapters ? backend.canonicalChapters!(workId) : Promise.resolve([] as Chapter[]),
+			hasCanonSeries ? backend.canonicalSeries!(workId) : Promise.resolve(null),
+		]);
+		// "Backend fully down" honest-error guard: an ABSENT optional method resolves to a
+		// benign default and must NOT be counted as evidence the backend is up (otherwise a
+		// backend missing e.g. canonicalChapters would mask a real outage of the methods it
+		// DOES have and degrade to a false "not found"). Rethrow only when every method that
+		// was actually present rejected — a true outage — and at least one was present.
+		const present = [
+			{ has: hasWorkSources, res: wsRes },
+			{ has: hasCanonChapters, res: spineRes },
+			{ has: hasCanonSeries, res: canonRes },
+		].filter((m) => m.has);
+		if (present.length > 0 && present.every((m) => m.res.status === 'rejected')) {
+			throw (present.find((m) => m.res.status === 'rejected')!.res as PromiseRejectedResult).reason;
+		}
+		wsList = wsRes.status === 'fulfilled' ? wsRes.value : [];
+		spineChapters = spineRes.status === 'fulfilled' ? spineRes.value : [];
+		canonSeries = canonRes.status === 'fulfilled' ? canonRes.value : null;
 	}
-	const wsList: WorkSource[] = wsRes.status === 'fulfilled' ? wsRes.value : [];
-	const spineChapters: Chapter[] = spineRes.status === 'fulfilled' ? spineRes.value : [];
-	const canonSeries: Series | null = canonRes.status === 'fulfilled' ? canonRes.value : null;
 
 	// Candidate translators: the canonical spine first, then each distinct suwayomi
 	// source mapping.
@@ -814,12 +860,15 @@ async function resolveWork(workId: string, preferredKey?: string): Promise<Resol
 			redundant: isRedundantMangadexExt(ws.extension?.pkgName, hasReadableSpine),
 		});
 	}
-	// Fetch each suwayomi translator's chapters (bounded — a work has few mappings).
-	const suwChapters = await Promise.all(
-		suwViews.map((v) =>
-			backend.chapters(v.view.suwayomiMangaId as string).catch(() => [] as Chapter[]),
-		),
-	);
+	// Each suwayomi translator's chapters: carried in the bundle on the fast path,
+	// otherwise fetched per translator (bounded — a work has few mappings).
+	const suwChapters = chaptersByKey
+		? suwViews.map((v) => chaptersByKey.get(v.view.suwayomiMangaId as string) ?? [])
+		: await Promise.all(
+				suwViews.map((v) =>
+					backend.chapters(v.view.suwayomiMangaId as string).catch(() => [] as Chapter[]),
+				),
+			);
 	suwViews.forEach((v, i) =>
 		candidates.push({ view: v.view, chapters: suwChapters[i], redundant: v.redundant }),
 	);
@@ -886,6 +935,10 @@ async function resolveWork(workId: string, preferredKey?: string): Promise<Resol
 	let meta: Series | null;
 	if (selected.suwayomiMangaId === null) {
 		meta = canonSeries;
+	} else if (metaByKey) {
+		// Bundle path: the source's series rode along; a server-side fetch failure
+		// arrived as null, exactly what the legacy catch produced.
+		meta = metaByKey.get(selected.suwayomiMangaId) ?? null;
 	} else {
 		meta = await backend.series(selected.suwayomiMangaId).catch(() => null);
 	}
@@ -893,10 +946,17 @@ async function resolveWork(workId: string, preferredKey?: string): Promise<Resol
 	// Only ever adopt a CANONICAL id here: `canonSeries.id` is a `w_` work id, but
 	// guard the shape anyway so a numeric/source id could never leak onto the
 	// canonical path and route a later request to `backend.series()`.
+	//
+	// The bundle path improves on the canonSeries-derived id: `seriesPage` reports
+	// the redirect-resolved survivor id for EVERY work, including federation-only
+	// ones (where canonicalSeries 404s and the legacy path has nothing to learn the
+	// survivor from).
 	const canonicalId =
-		canonSeries && isCanonicalId(canonSeries.id) && canonSeries.id !== workId
-			? canonSeries.id
-			: null;
+		effectiveId && isCanonicalId(effectiveId) && effectiveId !== workId
+			? effectiveId
+			: canonSeries && isCanonicalId(canonSeries.id) && canonSeries.id !== workId
+				? canonSeries.id
+				: null;
 
 	return {
 		translators,
@@ -911,6 +971,7 @@ async function resolveWork(workId: string, preferredKey?: string): Promise<Resol
 			suwayomiMangaId: c.view.suwayomiMangaId,
 			chapters: c.chapters,
 		})),
+		aggregated,
 	};
 }
 
@@ -1581,6 +1642,11 @@ export interface SeriesDetailView {
 	/** The full MangaDex cover set (F2), primary first then volume-ordered; empty
 	 *  for a non-canonical / un-enriched work. The gallery renders only when >1. */
 	covers: CoverView[];
+	/** The work's EFFECTIVE NSFW flag — the admin override when one is pinned, else
+	 *  the crawled/derived value. Read only by the admin content-rating control; the
+	 *  page shows no NSFW badge to ordinary readers, since a series they can see is
+	 *  one their own `show_nsfw` preference already admits. */
+	isNsfw: boolean;
 }
 
 /** One cover in the series-page gallery (F2). URLs are proxy-ready — render via
@@ -1738,6 +1804,7 @@ function mapSeriesView(
 			descriptions,
 			descLang: desc.lang,
 			covers,
+			isNsfw: s.isNsfw,
 		},
 		// Emit chapters in a CANONICAL ascending order (oldest → newest) so the
 		// series page can sort deterministically. Sources deliver chapters in
@@ -1874,15 +1941,19 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 		// (the canonical spine appears as one translator). See {@link resolveWork}.
 		if (isCanonicalId(id)) {
 			const preferred = getPreferredTranslator(id);
-			// The multi-source aggregation only needs the WORK ID, so it goes out
-			// alongside the (much slower, multi-round-trip) translator resolution
-			// instead of waiting for it. Kicked off here, consumed below.
-			const aggP = backend.aggregatedChapters
-				? backend.aggregatedChapters(id).catch(() => [] as AggregatedChapter[])
-				: Promise.resolve([] as AggregatedChapter[]);
-			const resolved = await resolveWork(id, preferred);
+			// The multi-source aggregation rides along in the single `seriesPage` round
+			// trip when the backend supports it (`withAggregated`). Only the LEGACY
+			// fan-out path still wants a separate `aggregatedChapters` request — kicked
+			// off here, alongside the (much slower, multi-round-trip) translator
+			// resolution, and consumed below.
+			const aggP = backend.seriesPage
+				? null
+				: backend.aggregatedChapters
+					? backend.aggregatedChapters(id).catch(() => [] as AggregatedChapter[])
+					: Promise.resolve([] as AggregatedChapter[]);
+			const resolved = await resolveWork(id, preferred, { withAggregated: true });
 			if (!resolved || !resolved.meta) {
-				void aggP.catch(() => {});
+				void aggP?.catch(() => {});
 				return null;
 			}
 			// The detail id must stay a canonical `w_` workId (even though metadata
@@ -1972,7 +2043,16 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 			// PERSISTED preference pointing at a source that has since lost its chapters.
 			// Rather than show an empty chapter list, fall back to everything we know
 			// exists across sources.
-			const agg = await aggP;
+			// Bundle path: aggregation came back inside `seriesPage`. Legacy path: the
+			// parallel request above. Drift corner (seriesPage present but the SERVER
+			// predates it, so resolveWork fell back internally): fetch it now — one
+			// extra round trip, only until the server deploy catches up.
+			const agg =
+				resolved.aggregated ??
+				(await (aggP ??
+					(backend.aggregatedChapters
+						? backend.aggregatedChapters(id).catch(() => [] as AggregatedChapter[])
+						: Promise.resolve([] as AggregatedChapter[]))));
 			if (agg.length && !view.chapters.length) {
 				const rows = buildAggregatedChapters(agg, resolved);
 				view.chapters = rows;
@@ -2134,6 +2214,75 @@ export async function setFavorite(
 			ok: false,
 			value: previous,
 			error: writeError(err, favorite ? 'favourite this series' : 'unfavourite this series'),
+		};
+	}
+}
+
+/**
+ * The admin NSFW override pinned on a series' work, for the reader's admin control.
+ *
+ * Three-valued, and the three values are NOT interchangeable:
+ *  • `true` / `false` — an admin has PINNED the flag; the crawler cannot move it.
+ *  • `null` — no override; the effective flag is whatever the crawler derived.
+ * `undefined` means "couldn't read it" (backend off, not an admin, series not
+ * catalogued) — the caller shows no control rather than guessing a state and
+ * offering an edit that would be rejected.
+ *
+ * `seriesAdminMeta` is admin-guarded server-side (`require_admin`), so this is safe
+ * to call speculatively; a non-admin simply gets `undefined`.
+ */
+export async function getSeriesNsfwOverride(seriesId: string): Promise<boolean | null | undefined> {
+	if (!LIVE || !backend.seriesAdminMeta || !seriesId) return undefined;
+	try {
+		const meta = await backend.seriesAdminMeta(seriesId);
+		// An UNCATALOGUED series resolves successfully with `workId: null` and every
+		// override null — indistinguishable, on `isNsfwOverride` alone, from a
+		// catalogued work with no pin. `workId` is what separates them, and the
+		// difference matters: `updateSeriesMetadata` rejects an uncatalogued series
+		// outright, so reporting `null` here would draw a control whose every option
+		// errors. Report "can't read it" instead, and no control is drawn.
+		if (meta.workId == null) return undefined;
+		return meta.isNsfwOverride;
+	} catch (err) {
+		// Expected for every non-admin viewer — this is the ONLY signal the reader has
+		// that the control shouldn't render, so it is not worth a console warning.
+		console.debug('[komika] seriesAdminMeta unavailable:', err);
+		return undefined;
+	}
+}
+
+/**
+ * Admin: pin a series' NSFW flag, or pass `null` to clear the pin and fall back to
+ * the crawler's derived value. This is the fix for a series the crawler mis-flagged.
+ *
+ * Writes through `updateSeriesMetadata`, which takes either id shape (numeric
+ * Suwayomi or canonical `w_`) and returns the recomputed series, so the caller gets
+ * the new EFFECTIVE flag back rather than having to re-derive it — clearing a pin
+ * can land on either value. `previous` is the override to roll back to on failure.
+ *
+ * Authorization is entirely server-side (`require_admin`); the client gate only
+ * decides whether to render the control.
+ */
+export async function setSeriesNsfw(
+	seriesId: string,
+	override: boolean | null,
+	previous: boolean | null,
+): Promise<WriteResult<{ override: boolean | null; effective: boolean | null }>> {
+	if (!LIVE || !backend.updateSeriesMetadata) {
+		return { ok: true, value: { override, effective: null } };
+	}
+	try {
+		// `isNsfw` is the only key sent: the input is three-valued per FIELD (omitted =
+		// leave alone, null = clear the override, value = pin it), so sending just this
+		// one cannot disturb the title/description/type/tag overrides.
+		const s = await backend.updateSeriesMetadata({ seriesId, isNsfw: override });
+		return { ok: true, value: { override, effective: s.isNsfw ?? null } };
+	} catch (err) {
+		console.warn('[komika] setSeriesNsfw failed:', err);
+		return {
+			ok: false,
+			value: { override: previous, effective: null },
+			error: writeError(err, 'change this series’ NSFW rating'),
 		};
 	}
 }
@@ -2332,12 +2481,84 @@ function buildReaderView(
 	};
 }
 
+/**
+ * Whether a chapter id addresses a Suwayomi chapter (served by `backend.pages`) rather
+ * than a canonical MangaDex one (served by `backend.canonicalPages`).
+ *
+ * The two id spaces are disjoint BY CONSTRUCTION, which is the whole reason the page
+ * fetch can pick its resolver before the chapter list has come back: a Suwayomi chapter
+ * id is the engine's integer row id (the server parses it with `parse::<i64>()` in both
+ * `chapters` and `pages`), while a canonical chapter id is the MangaDex chapter uuid the
+ * mirror stores. Neither resolver can even accept the other's ids.
+ */
+function isSuwayomiChapterId(id: string): boolean {
+	return /^\d+$/.test(id);
+}
+
+/**
+ * Start the page fetch for an ALREADY-KNOWN chapter id so it flies in parallel with the
+ * chapter-list resolution instead of queueing behind it.
+ *
+ * Mirrors the resolver choice the sequential code makes from `activeSpine` — including
+ * its `backend.canonicalPages` presence guard, so a canonical uuid on a backend that has
+ * no `canonicalPages` still goes to `pages` exactly as before (and fails the same way).
+ */
+function startPages(chapterId: string): Promise<Page[]> {
+	return !isSuwayomiChapterId(chapterId) && backend.canonicalPages
+		? backend.canonicalPages(chapterId)
+		: backend.pages(chapterId);
+}
+
+/**
+ * Whether starting {@link startPages} early is guaranteed to return the SAME pages the
+ * sequential order would have. Speculation is a latency trick; it must never change what
+ * comes back.
+ *
+ * A Suwayomi id always resolves through `pages`, which every backend (including the
+ * native composite) forwards straight to the hosted API — no ordering dependency, safe
+ * everywhere. A canonical id resolves through `canonicalPages`, and the native
+ * CompositeBackend serves those from the embedded engine ONLY for chapters a PRECEDING
+ * `canonicalChapters` reconciled into its local chapter map. Jumping that queue would
+ * silently demote the first open of a work to the hosted proxy, so the native build keeps
+ * the sequential order for canonical chapters and simply forgoes the speedup.
+ */
+function canStartPagesEarly(chapterId: string): boolean {
+	return isSuwayomiChapterId(chapterId) || !(config.nativeEngine && isTauri());
+}
+
 export function getReaderChapter(
 	seriesId: string,
 	chParam?: string | null,
 	srcParam?: string | null,
 ): Promise<ReaderView> {
 	return live(async () => {
+		// Pages are the ONLY fetch whose result the reader needs in order to paint a
+		// single image, yet they used to sit LAST, behind the entire chapter-list
+		// resolution — three or four sequential round-trips before the first image was
+		// even requested. When the caller already names the chapter (`?ch=`, which
+		// next-chapter navigation always carries) the id by itself decides which resolver
+		// serves it, so fire it NOW and await it where the sequential version issued it.
+		//
+		// The shape gate keeps the speculation honest for the series kind: a numeric
+		// Suwayomi series has nothing but integer chapter ids, so a uuid `?ch=` there is
+		// garbage and would only buy a pointless `canonicalPages` request.
+		//
+		// KNOWN COST, accepted: whether the chapter is OFF-SITE is a property of the
+		// chapter list, which by definition hasn't resolved yet, so an off-site chapter
+		// does spend one request that the sequential path (`chapterExternalUrl(target)
+		// ? [] : …`) would have skipped. Its result is discarded. That is a few percent
+		// of opens paying one wasted call so the rest save two sequential round-trips.
+		const speculatable =
+			!!chParam &&
+			(isCanonicalId(seriesId) || isSuwayomiChapterId(chParam)) &&
+			canStartPagesEarly(chParam);
+		const speculatedPages = speculatable ? startPages(chParam as string) : null;
+		// A speculation the chosen path ends up NOT using — a `?ch=` no source carries, or
+		// one a numeric series' list doesn't contain — must not surface as an unhandled
+		// rejection. This no-op handler marks the ORIGINAL promise handled without
+		// consuming it: the awaits below still see, and still propagate, the real error on
+		// every path that does use the result.
+		speculatedPages?.catch(() => {});
 		// Canonical (`w_`) works read through the selected translator (persisted
 		// preference or the same default the series page picked — shared resolver).
 		if (isCanonicalId(seriesId)) {
@@ -2364,8 +2585,19 @@ export function getReaderChapter(
 				workId: effectiveId,
 			};
 			const spine = readFromSrc ? false : resolved.selected.suwayomiMangaId === null;
+			// `resolveWork` already fetched every mapped source's chapters into
+			// `resolved.candidates` (same `backend.chapters` call, same degrade-to-`[]`
+			// on failure), so re-requesting the one `?src=` names was a duplicate round
+			// trip on the exact navigation that always carries `src`. The network call
+			// stays as the fallback for a `src` that is NOT one of the work's mappings —
+			// a hand-edited URL, or a mapping dropped since the link was made — which
+			// `candidates` cannot answer for.
+			const cachedSrcChapters = readFromSrc
+				? resolved.candidates.find((c) => c.suwayomiMangaId === srcParam)?.chapters
+				: undefined;
 			const chs = readFromSrc
-				? await backend.chapters(srcParam as string).catch(() => [] as Chapter[])
+				? (cachedSrcChapters ??
+					(await backend.chapters(srcParam as string).catch(() => [] as Chapter[])))
 				: resolved.chapters;
 			// An empty ACTIVE source is only a dead end when there is no `?ch=` for
 			// another source to satisfy — the picker deliberately offers sources that
@@ -2431,9 +2663,15 @@ export function getReaderChapter(
 			const urls = chapterExternalUrl(target)
 				? []
 				: await resolvePageUrls(
-						activeSpine && backend.canonicalPages
-							? await backend.canonicalPages(target.id)
-							: await backend.pages(target.id),
+						// Use the speculation only when the chapter we landed on is the one
+						// it was started for. `target` can be SUBSTITUTED above (an unknown
+						// `?ch=` falls back to the first unread), and those pages belong to a
+						// different chapter entirely.
+						speculatedPages && target.id === chParam
+							? await speculatedPages
+							: activeSpine && backend.canonicalPages
+								? await backend.canonicalPages(target.id)
+								: await backend.pages(target.id),
 					);
 			const readingSrc = activeSrc;
 			// `activeChs`, not `chs`: the list, the prev/next links and the target must
@@ -2460,7 +2698,14 @@ export function getReaderChapter(
 		// host, not by us.
 		const urls = chapterExternalUrl(target)
 			? []
-			: await resolvePageUrls(await backend.pages(target.id));
+			: await resolvePageUrls(
+					// Same substitution guard as the canonical branch above: on this path an
+					// unknown `?ch=` silently falls back to the first unread chapter, so the
+					// id check is what keeps the speculated pages from being shown for it.
+					speculatedPages && target.id === chParam
+						? await speculatedPages
+						: await backend.pages(target.id),
+				);
 		const series = await backend.series(seriesId).catch(() => null);
 		return buildReaderView(
 			seriesId,

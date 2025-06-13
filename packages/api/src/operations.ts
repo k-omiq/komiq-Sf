@@ -1250,6 +1250,85 @@ export const WORK_SOURCES_BATCH = /* GraphQL */ `
 `;
 
 /**
+ * P2.1: the whole series/reader page in ONE round trip. Replaces the
+ * canonicalSeries + canonicalChapters + workSources parallel fan-out AND the
+ * per-translator `chapters` N+1 (plus the selected translator's `series`
+ * follow-up) with a single `seriesPage(workId)` request. The `series` selection
+ * mirrors CANONICAL_SERIES (S2 enrichment included); each source's `series`
+ * mirrors the SERIES query so the picker's metadata is byte-compatible with what
+ * the old per-source round trips returned. `aggregated` is opt-in via
+ * `$withAggregated` — the series page wants it, the reader route does not.
+ */
+export const SERIES_PAGE = /* GraphQL */ `
+	${SERIES_FIELDS}
+	${CHAPTER_FIELDS}
+	${WORK_SOURCE_FIELDS}
+	query SeriesPage($workId: ID!, $withAggregated: Boolean! = false) {
+		seriesPage(workId: $workId) {
+			workId
+			series {
+				...SeriesFields
+				libraryStatus
+				isFavorite
+				views {
+					total
+					last7d
+					last24h
+				}
+				localizedDescriptions {
+					lang
+					description
+				}
+				credits {
+					role
+					name
+				}
+				covers {
+					fileName
+					url
+					thumbnailUrl
+					lang
+					volume
+					isPrimary
+				}
+			}
+			spineChapters {
+				...ChapterFields
+			}
+			sources {
+				source {
+					...WorkSourceFields
+				}
+				chapters {
+					...ChapterFields
+				}
+				series {
+					...SeriesFields
+					libraryStatus
+					isFavorite
+					views {
+						total
+						last7d
+						last24h
+					}
+				}
+			}
+			aggregated @include(if: $withAggregated) {
+				number
+				title
+				sources {
+					sourceType
+					sourceId
+					suwayomiMangaId
+					chapterId
+					scanlator
+				}
+			}
+		}
+	}
+`;
+
+/**
  * Admin dedup-review expansion for one side of a candidate row. Lives here, below
  * {@link WORK_SOURCE_FIELDS}, because it reuses that fragment — these consts are
  * interpolated at module-eval time, so it cannot be declared beside MERGE_QUEUE.

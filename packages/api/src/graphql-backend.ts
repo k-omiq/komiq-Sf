@@ -30,6 +30,7 @@ import type {
 	Review,
 	ScanStatus,
 	Series,
+	SeriesPageBundle,
 	SeriesProgress,
 	SeriesSourceGroup,
 	SourceBrowsePage,
@@ -169,20 +170,59 @@ export class GraphQLBackend implements Backend {
 		return out;
 	}
 
+	/**
+	 * Whether this API has told us it doesn't serve `GET /graphql` (P3). Process-wide
+	 * for the same deploy-order reason as {@link unsupportedFields}: a 404/405 from one
+	 * GET means every GET would fail, so remember it and go straight to POST.
+	 */
+	private static getUnsupported = false;
+
 	private async gql<T>(
 		query: string,
 		variables?: Record<string, unknown>,
 		retried = false,
 	): Promise<T> {
 		const doFetch = this.config.fetch ?? fetch;
-		const res = await doFetch(this.config.endpoint, {
-			method: 'POST',
-			headers: {
-				'content-type': 'application/json',
-				...(this.config.token ? { authorization: `Bearer ${this.config.token}` } : {}),
-			},
-			body: JSON.stringify({ query: this.stripUnsupported(query), variables }),
-		});
+		const stripped = this.stripUnsupported(query);
+		// Anonymous READS go over GET so Cloudflare and the browser's HTTP cache can
+		// serve them (the server sends Cache-Control + ETag on anonymous GETs; 304
+		// revalidation is the browser's job, no client code needed). An authed viewer
+		// must NEVER take this path: edge caches key on the URL alone, so a cached
+		// response carrying viewer-specific fields (isMarked, myReview…) would be
+		// replayed to other users. Mutations are detected on the document text —
+		// `operations.ts` always writes a top-level `mutation Name(`/`query Name(`
+		// (fragments may come first, hence the newline alternative).
+		const useGet =
+			!this.config.token &&
+			!GraphQLBackend.getUnsupported &&
+			!/(^|\n)\s*mutation[\s(]/.test(stripped);
+		let res: Response;
+		if (useGet) {
+			// Single-operation documents, so no `operationName`; `variables` only when
+			// there are any. No Authorization header by construction (no token here).
+			const params =
+				`query=${encodeURIComponent(stripped)}` +
+				(variables ? `&variables=${encodeURIComponent(JSON.stringify(variables))}` : '');
+			res = await doFetch(`${this.config.endpoint}?${params}`);
+			if (res.status === 404 || res.status === 405) {
+				// The server predates GET /graphql — schema-drift fallback, not an outage.
+				// Memoize and re-enter: the retry re-evaluates the transport and lands on
+				// POST, preserving `retried` so the unknown-field loop is unaffected. Any
+				// OTHER status is NOT memoized — a 500 or a network failure must throw
+				// exactly as it does on POST.
+				GraphQLBackend.getUnsupported = true;
+				return this.gql<T>(query, variables, retried);
+			}
+		} else {
+			res = await doFetch(this.config.endpoint, {
+				method: 'POST',
+				headers: {
+					'content-type': 'application/json',
+					...(this.config.token ? { authorization: `Bearer ${this.config.token}` } : {}),
+				},
+				body: JSON.stringify({ query: stripped, variables }),
+			});
+		}
 		if (!res.ok) throw new Error(`Backend error ${res.status}`);
 		const json = (await res.json()) as { data?: T; errors?: { message: string }[] };
 		if (json.errors?.length) {
@@ -845,6 +885,41 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ workSources: WorkSource[] }>(ops.WORK_SOURCES, { workId });
 		return d.workSources;
 	}
+	/**
+	 * Whether the API has told us it predates `seriesPage` (P2.1). Process-wide for
+	 * the same deploy-order reason as {@link unsupportedFields}: once one request
+	 * gets `Unknown field "seriesPage"`, every later call would too — remember it
+	 * and answer `undefined` immediately so callers fall back without a wasted
+	 * round trip per page view.
+	 */
+	private static seriesPageUnsupported = false;
+
+	async seriesPage(
+		workId: Id,
+		withAggregated = false,
+	): Promise<SeriesPageBundle | null | undefined> {
+		if (GraphQLBackend.seriesPageUnsupported) return undefined;
+		try {
+			const d = await this.gql<{ seriesPage: SeriesPageBundle }>(ops.SERIES_PAGE, {
+				workId,
+				withAggregated,
+			});
+			return d.seriesPage;
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			// The server predates the resolver — schema-drift fallback, not an outage.
+			if (msg.includes('Unknown field "seriesPage"')) {
+				GraphQLBackend.seriesPageUnsupported = true;
+				return undefined;
+			}
+			// The resolver's own not-found (unknown id / NSFW-gated): the page 404s,
+			// exactly as the old fan-out rendering nothing did. Anything else is a real
+			// failure the caller must surface honestly.
+			if (msg.includes('No such work')) return null;
+			throw e;
+		}
+	}
+
 	async workSourcesBatch(workIds: Id[]): Promise<WorkSourceGroup[]> {
 		const d = await this.gql<{ workSourcesBatch: WorkSourceGroup[] }>(ops.WORK_SOURCES_BATCH, {
 			workIds,

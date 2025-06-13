@@ -2,9 +2,11 @@ pub mod types;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use async_graphql::{Context, EmptySubscription, Error, Object, Result, Schema, SimpleObject, ID};
+use async_graphql::{
+    ComplexObject, Context, EmptySubscription, Error, Object, Result, Schema, SimpleObject, ID,
+};
 use chrono::Utc;
 use sqlx::SqlitePool;
 
@@ -35,76 +37,11 @@ pub struct ScanHealth {
     pub consecutive_stuck_ticks: usize,
 }
 
-/// A dependency-light sliding-window rate limiter, keyed by an arbitrary string
-/// (e.g. `login:<username>`). Prunes stale timestamps on each check.
-#[derive(Default)]
-pub struct RateLimiter {
-    hits: Mutex<HashMap<String, Vec<Instant>>>,
-    max: u32,
-    window: Duration,
-}
-
-impl RateLimiter {
-    pub fn new(max: u32, window_secs: u64) -> Self {
-        Self {
-            hits: Mutex::new(HashMap::new()),
-            max,
-            window: Duration::from_secs(window_secs),
-        }
-    }
-
-    /// Read-only: is `key` already at the limit within the window? Returns the
-    /// retry-after seconds if so. Prunes stale timestamps but does NOT record a
-    /// new hit — callers that want to count an attempt call `record` explicitly.
-    pub fn is_limited(&self, key: &str) -> Option<u64> {
-        let now = Instant::now();
-        // Recover from a poisoned lock rather than propagating the panic — a single
-        // panic-while-held must not brick login/register for the process lifetime.
-        let mut map = self.hits.lock().unwrap_or_else(|e| e.into_inner());
-        // Only inspect an existing entry — never insert on a read, or every
-        // distinct client IP would leave a permanent key (unbounded RSS growth).
-        let entry = map.get_mut(key)?;
-        entry.retain(|t| now.duration_since(*t) < self.window);
-        if entry.is_empty() {
-            map.remove(key);
-            return None;
-        }
-        if entry.len() as u32 >= self.max {
-            let oldest = entry.first().copied().unwrap_or(now);
-            let retry = self.window.saturating_sub(now.duration_since(oldest));
-            Some(retry.as_secs().max(1))
-        } else {
-            None
-        }
-    }
-
-    /// Record one attempt against `key` (prunes stale timestamps first).
-    pub fn record(&self, key: &str) {
-        let now = Instant::now();
-        let mut map = self.hits.lock().unwrap_or_else(|e| e.into_inner());
-        // Opportunistic sweep: when the map is large, drop keys whose window has
-        // fully elapsed so a churn of distinct client IPs can't grow it without
-        // bound (there is no background reaper).
-        if map.len() >= 4096 {
-            map.retain(|_, v| {
-                v.retain(|t| now.duration_since(*t) < self.window);
-                !v.is_empty()
-            });
-        }
-        let entry = map.entry(key.to_string()).or_default();
-        entry.retain(|t| now.duration_since(*t) < self.window);
-        entry.push(now);
-    }
-
-    /// Check-and-record: `Err(retry)` if already at the limit, else records a hit.
-    pub fn check(&self, key: &str) -> std::result::Result<(), u64> {
-        if let Some(retry) = self.is_limited(key) {
-            return Err(retry);
-        }
-        self.record(key);
-        Ok(())
-    }
-}
+/// The sliding-window rate limiter now lives in [`crate::rate_limit`] as a sharded
+/// implementation (one lock acquisition per check, per-shard sweeps instead of a
+/// global O(n) scan). Re-exported here so `AppState`, the statics below, and
+/// `main.rs`'s `use crate::graphql::RateLimiter` all keep working unchanged.
+pub use crate::rate_limit::RateLimiter;
 
 /// Sliding-window budget for the unauthenticated `recordView` write, keyed
 /// `view:{client_ip}:{series_id}`. A process-global (rather than an `AppState` field)
@@ -119,6 +56,132 @@ impl RateLimiter {
 /// HTTP layer.
 static VIEW_LIMITER: std::sync::LazyLock<RateLimiter> =
     std::sync::LazyLock::new(|| RateLimiter::new(10, 60));
+
+/// How long a memoized `discovery` / `genreFacets` payload stays usable.
+///
+/// These payloads are viewer-invariant given one input — the NSFW posture (see the
+/// key below) — yet cost tens of ms of CPU each and dominate home-feed traffic, so
+/// they were being recomputed per request for identical output. The TTL bounds how
+/// stale a feed can be: a new catalogue entry or view-count shift lands within a
+/// minute, which matches how often the underlying data actually moves.
+///
+/// Zero under test: like `browse::COUNT_TTL`, the memo is a process-wide static but
+/// every test builds its own in-memory DB, so two tests whose viewer has the same
+/// NSFW posture would otherwise read each other's feeds depending on scheduling. A
+/// zero TTL makes every resolver compute exactly, always; the memo logic itself is
+/// directly testable via [`cached_feed`] / [`store_feed`], which take the TTL as an
+/// argument.
+#[cfg(not(test))]
+const FEED_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+#[cfg(test)]
+const FEED_TTL: std::time::Duration = std::time::Duration::ZERO;
+
+/// The memo key for the viewer-invariant feed caches: the viewer's NSFW posture,
+/// and NOTHING else.
+///
+/// This must stay exactly one dimension wide. Every other input to `compute_discovery`
+/// / `browse::genre_facets` is global state (the SQLite catalogue), and every per-viewer
+/// field on the cached objects (`isMarked`, `libraryStatus`, `isFavorite`) is resolved
+/// lazily per request by ComplexObject resolvers against the CALLER's own session — it
+/// is not captured in the stored value. So two viewers who agree on `show_nsfw` get
+/// byte-identical payloads, and keying on anything more (user id, token) would only
+/// shred the hit rate. Conversely, OMITTING the NSFW posture would leak an opted-out
+/// viewer a feed computed for an opted-in one — the gate runs inside the computation
+/// (`filter_nsfw` + the SQL predicates), which is why it must be part of the key.
+///
+/// A bool keys the map to at most 2 live entries; no eviction is possible or needed.
+fn feed_cache_key(show_nsfw: bool) -> bool {
+    show_nsfw
+}
+
+/// Memoized viewer-invariant reads, keyed by [`feed_cache_key`]. Shape follows
+/// `browse::COUNT_CACHE`: a process-wide `Mutex<HashMap<key, (value, when)>>`.
+#[allow(clippy::type_complexity)]
+type FeedCache<T> =
+    std::sync::Mutex<std::collections::HashMap<bool, (std::sync::Arc<T>, std::time::Instant)>>;
+
+/// The curated home-feed rails (`discovery`).
+static DISCOVERY_CACHE: std::sync::LazyLock<FeedCache<Vec<DiscoveryFeed>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+/// Browse's genre chips (`genreFacets`).
+static GENRE_FACETS_CACHE: std::sync::LazyLock<FeedCache<Vec<(String, i64)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Single-flight locks collapsing concurrent refills of [`DISCOVERY_CACHE`] (S1
+/// pattern). Keyed 0/1 by NSFW posture — a separate keyspace from
+/// [`GENRE_FACETS_INFLIGHT`] and from the AppState locks, whose keys are series ids,
+/// so a feed refill can never serialize behind a series refresh.
+static DISCOVERY_INFLIGHT: std::sync::LazyLock<KeyedLocks> =
+    std::sync::LazyLock::new(KeyedLocks::default);
+/// Single-flight locks collapsing concurrent refills of [`GENRE_FACETS_CACHE`].
+static GENRE_FACETS_INFLIGHT: std::sync::LazyLock<KeyedLocks> =
+    std::sync::LazyLock::new(KeyedLocks::default);
+
+/// Fresh hit out of a feed memo, if any. Poisoned lock ⇒ "no memo" rather than an
+/// error: the caller recomputes exactly, matching `browse::cached_count_with`.
+fn cached_feed<T>(cache: &FeedCache<T>, key: bool, ttl: Duration) -> Option<std::sync::Arc<T>> {
+    let map = cache.lock().ok()?;
+    let (value, at) = map.get(&key)?;
+    (at.elapsed() < ttl).then(|| value.clone())
+}
+
+/// Store one computed payload. The map is keyed by a bool, so it is bounded at 2
+/// entries by construction — no cap/evict logic to maintain (unlike COUNT_CACHE,
+/// whose client-controlled key space needs one). Expiry is enforced at READ time
+/// against the stored `Instant`, so storing needs no TTL.
+fn store_feed<T>(cache: &FeedCache<T>, key: bool, value: T) {
+    let Ok(mut map) = cache.lock() else {
+        return; // poisoned → just stop memoizing; every read still computes exactly
+    };
+    map.insert(key, (std::sync::Arc::new(value), std::time::Instant::now()));
+}
+
+/// Drop every memoized feed payload, so the next `discovery` / `genreFacets` recomputes.
+///
+/// Both posture keys go, always: one admin edit can move a work in EITHER direction
+/// (pinning it NSFW removes it from the `show_nsfw = false` feed; clearing the pin puts
+/// it back), and the rails are also keyed on title/type/tags, which the same mutation
+/// can change. Two entries — clearing both is cheaper than reasoning about which moved.
+///
+/// `browse::clear_count_cache()` goes with them, and its blast radius here is WIDER than
+/// Browse: that one cache now backs both Browse's row `COUNT(*)` and `updates_total`
+/// (the `updates` feed's `total`, see `updates_count_key`), and BOTH are memoized on the
+/// same NSFW posture these edits can flip. Clearing all of them is strictly conservative
+/// — the alternative is a pager promising a page whose rows the filter no longer matches.
+///
+/// Deliberately NOT called from `resync_feed_nsfw`, even though that runs on every write
+/// to the flag. Two of that function's five call sites live in `add_source_series_core_ex`
+/// — the Suwayomi→MangaDex link and the `auto_merge` N4 escalation — and BOTH run once
+/// PER SERIES through a catalogue crawl (`bulkAddSourceSeries`, the source/extension
+/// ingest jobs, federated search consolidation). Busting there would throw the home feed
+/// away thousands of times in a row: the exact recomputation the memo exists to stop, and
+/// it would also flatten `browse::COUNT_CACHE` — which now also backs `updates_total` —
+/// on every single ingested row. The admin mutations that call this do so themselves,
+/// once per REQUEST rather than once per series: `updateSeriesMetadata`,
+/// `markSourceNsfw` and `rederiveSuwayomiNsfw` (which change the NSFW posture of
+/// existing rows), plus `addSourceSeries`, `bulkAddSourceSeries` and `persistCatalogue`
+/// (which write new `series_cache` rows — the table `compute_discovery` reads for
+/// `recentlyAdded`). `bulkAddSourceSeries` appears in both lists without contradiction:
+/// the per-series bust inside its loop is what would thrash, so it busts once after the
+/// whole batch instead.
+///
+/// Still deliberately NOT busted: `mergeWorks`, `resolveMergeCandidate`,
+/// `consolidateExactDuplicates` and the auto-merge branch of `addSeriesAltTitle`.
+/// They all fold works through `merge_works_ex`, which
+/// does not resync the feed tables or the browse counts either, so dropping the memo
+/// alone would only rebuild the same pre-merge payload from unchanged rows. Fixing
+/// those means fixing the resync first. The detached ingest jobs
+/// (`startSourceIngest` / `startExtensionIngest`) are also left alone: they are the
+/// per-series crawl described above, and the feed catches up within one `FEED_TTL`.
+fn clear_feed_caches() {
+    if let Ok(mut map) = DISCOVERY_CACHE.lock() {
+        map.clear();
+    }
+    if let Ok(mut map) = GENRE_FACETS_CACHE.lock() {
+        map.clear();
+    }
+    crate::browse::clear_count_cache();
+}
 
 /// Per-key single-flight locks (S1 TTL refresh). N concurrent misses/refreshes for
 /// the same series/chapter id collapse onto ONE upstream fetch instead of
@@ -206,6 +269,15 @@ pub struct ClientIp(pub Option<String>);
 #[derive(Clone, Default)]
 pub struct RequestUserCache(pub std::sync::Arc<tokio::sync::OnceCell<Option<User>>>);
 
+/// Per-request memoization of the viewer's `show_nsfw` preference. `viewer_show_nsfw`
+/// is consulted by nearly every feed resolver (`discovery`, `updates`, `search`,
+/// per-series NSFW gates on `series`/`chapters`), and each call used to re-run a
+/// `users` SELECT even though the session lookup feeding it is already memoized —
+/// so one home render paid it several times over. A fresh cell is attached per HTTP
+/// request; the flag is request-stable, so one query suffices.
+#[derive(Clone, Default)]
+pub struct RequestNsfwPref(pub std::sync::Arc<tokio::sync::OnceCell<bool>>);
+
 /// One viewer's `user_library` row for a series — the shared payload behind the
 /// `is_marked` / `library_status` / `is_favorite` resolvers.
 #[derive(Clone)]
@@ -220,14 +292,10 @@ pub struct LibraryRow {
 /// a single feed does 3 SELECTs per item on the same row. A per-key `OnceCell` (guarded by a
 /// short std-Mutex critical section that only swaps `Arc`s, never awaits) dedupes even the
 /// concurrent reads down to one query per series. A fresh map is attached per HTTP request.
+type LibraryCellMap = HashMap<String, std::sync::Arc<tokio::sync::OnceCell<Option<LibraryRow>>>>;
+
 #[derive(Clone, Default)]
-pub struct RequestLibraryCache(
-    pub  std::sync::Arc<
-        std::sync::Mutex<
-            HashMap<String, std::sync::Arc<tokio::sync::OnceCell<Option<LibraryRow>>>>,
-        >,
-    >,
-);
+pub struct RequestLibraryCache(pub std::sync::Arc<std::sync::Mutex<LibraryCellMap>>);
 
 /// Upper bound on password length accepted by `login`/`register`, enforced
 /// before hashing so an over-long password can't amplify Argon2 CPU cost (A7).
@@ -377,18 +445,15 @@ impl Series {
     /// misreport a week-old chapter as an hour old. Null for a series the scanner has
     /// never seen gain a chapter (including every canonical `w_` work, which has no
     /// `series_scan_state` row).
-    async fn detected_at(&self, ctx: &Context<'_>) -> Result<Option<String>> {
-        let raw: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT last_new_chapter_at FROM series_scan_state WHERE series_id = ?",
-        )
-        .bind(&self.id.0)
-        .fetch_optional(&state(ctx).pool)
-        .await
-        .map_err(gql_err)?
-        .flatten();
+    ///
+    /// Reads the value the batched mappers (`map_series_batch` / `map_browse_rows`)
+    /// already fetched for the whole page — one grouped SELECT per render instead of
+    /// one query per card (a home render used to pay ~80 of these). Only this
+    /// single-series fallback shape could not batch: there is none any more.
+    async fn detected_at(&self, _ctx: &Context<'_>) -> Result<Option<String>> {
         // Guaranteed to leave the server with a UTC offset, so the reader's `Date.parse`
         // cannot read it as LOCAL time and shift the tooltip by the viewer's offset.
-        Ok(raw.as_deref().map(ensure_utc_offset))
+        Ok(self.detected_at.as_deref().map(ensure_utc_offset))
     }
 
     /// Whether the signed-in viewer has this series in THEIR library (`user_library`).
@@ -853,7 +918,22 @@ struct SuwayomiWorkOverrides {
 }
 
 /// The viewer's NSFW preference (default false, including for anonymous requests).
+///
+/// Memoized per request via [`RequestNsfwPref`] — this is read by every feed resolver
+/// and per-series gate, and the underlying `users` lookup must run once per request,
+/// not once per resolver. The fallback path (no cache attached) still computes.
 async fn viewer_show_nsfw(ctx: &Context<'_>) -> bool {
+    if let Some(cache) = ctx.data_opt::<RequestNsfwPref>() {
+        return *cache
+            .0
+            .get_or_init(|| async { resolve_viewer_show_nsfw(ctx).await })
+            .await;
+    }
+    resolve_viewer_show_nsfw(ctx).await
+}
+
+/// The unmemoized body of [`viewer_show_nsfw`].
+async fn resolve_viewer_show_nsfw(ctx: &Context<'_>) -> bool {
     match current_user(ctx).await {
         Some(u) => user_show_nsfw(&state(ctx).pool, &u.id).await,
         None => false,
@@ -960,6 +1040,7 @@ fn assemble_series(
     Series {
         cover_url: st.suwayomi.abs(m.thumbnail_url.as_deref()),
         rating,
+        detected_at: None,
         scan: ScanPolicy {
             // Derived scan state (from the background scheduler) wins when present;
             // else fall back to Suwayomi's lastFetchedAt for last_scanned_at.
@@ -1123,9 +1204,15 @@ async fn map_series_batch(st: &AppState, list: Vec<SuwayomiManga>) -> Vec<Series
             Some(wid) => genres_by_work.get(wid).cloned().unwrap_or_default(),
             None => m.genre.clone(),
         };
+        // The scanner's detection time for this series, off the SAME batched scan-state
+        // read that feeds `ScanPolicy` — no extra query. `detectedAt` used to re-query
+        // `series_scan_state` per card at resolve time (~80 point queries per home
+        // render); it now resolves from this field (see the `Series.detected_at` doc).
+        let detected_at = scans.get(&id).and_then(|s| s.last_new_chapter_at.clone());
         let mut s = assemble_series(
             st, m, rating, ov, scan, alt_titles, is_nsfw, ov_meta, genres,
         );
+        s.detected_at = detected_at;
         // Empty here means the manga came off the WIRE (a cache-read manga already
         // carries the column). Never overwrite a value the manga brought with it — that
         // one came from this same column and is what a single-series load would show.
@@ -2311,6 +2398,10 @@ async fn map_canonical_series(
         // slow one (see `map_browse_rows`' doc comment). Browse is the surface that asked
         // for it, and Browse reads the materialized column instead.
         latest_chapter: None,
+        // `series_scan_state` is keyed on numeric Suwayomi ids; a canonical `w_` work
+        // never has one, so detection time is always null here. Matches what the old
+        // per-row resolver returned for these ids.
+        detected_at: None,
     }
 }
 
@@ -2416,6 +2507,37 @@ async fn map_browse_rows(st: &AppState, rows: Vec<crate::browse::BrowseRow>) -> 
     {
         alts.entry(wid).or_default().push(raw);
     }
+    // (5) The scanner's detection time for the numeric cards. `series_scan_state` is
+    //     keyed on the NUMERIC Suwayomi id, so only non-`w_` reader_ids can match — a
+    //     canonical card's `detectedAt` was always null under the per-row resolver and
+    //     stays null here. One grouped SELECT replaces one query per card whenever the
+    //     grid selects `detectedAt`.
+    let detected: HashMap<String, String> = {
+        let scan_ids: Vec<String> = rows
+            .iter()
+            .filter(|r| !r.reader_id.starts_with("w_"))
+            .map(|r| r.reader_id.clone())
+            .collect();
+        if scan_ids.is_empty() {
+            HashMap::new()
+        } else {
+            let sql = format!(
+                "SELECT series_id, last_new_chapter_at FROM series_scan_state \
+                 WHERE last_new_chapter_at IS NOT NULL AND series_id IN ({})",
+                in_placeholders(scan_ids.len())
+            );
+            let mut qs = sqlx::query_as::<_, (String, String)>(&sql);
+            for id in &scan_ids {
+                qs = qs.bind(id);
+            }
+            qs.fetch_all(&st.pool)
+                .await
+                .inspect_err(|e| tracing::warn!(error = %e, "browse: detected_at query failed"))
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        }
+    };
 
     rows.into_iter()
         .map(|r| {
@@ -2521,6 +2643,7 @@ async fn map_browse_rows(st: &AppState, rows: Vec<crate::browse::BrowseRow>) -> 
                 // the reader's `chapterChip('')` returns `''`, but normalizing it here
                 // means every client gets the same signal.
                 latest_chapter: r.latest_chapter.filter(|s| !s.trim().is_empty()),
+                detected_at: detected.get(&r.reader_id).cloned(),
             }
         })
         .collect()
@@ -3466,6 +3589,201 @@ fn report_field(v: Option<String>, max: usize) -> Option<String> {
     Some(v.chars().take(max).collect())
 }
 
+/// Compute the home-feed rails from scratch — the [`DISCOVERY_CACHE`] miss handler.
+///
+/// Split from the resolver so the read-through logic (key choice, single-flight,
+/// store) sits directly beside the NSFW-posture resolution it must agree with. Every
+/// input here is GLOBAL state — the persisted catalogue (`series_cache`), the view
+/// tables behind Trending, the live Suwayomi fallback for a fresh install — and the
+/// only viewer-dependent input is `show_nsfw`, passed explicitly because it is BOTH a
+/// compute input and the cache key.
+///
+/// NSFW GATING: the SQL predicates below and the `filter_nsfw` backstops all derive
+/// from this one parameter. A caller that computed with one posture but cached under
+/// another would be the leak scenario — impossible while the resolver passes the same
+/// bound variable to both (see `feed_cache_key`).
+async fn compute_discovery(st: &AppState, show_nsfw: bool) -> Result<Vec<DiscoveryFeed>> {
+    // S1: serve from the DB cache once the catalogue has been persisted (the
+    // admin "save everything" / ingest / scan populate it), so the home page
+    // reads from SQLite instead of a live source browse. Fall back to a live
+    // browse only while the cache is still empty (fresh install), caching what
+    // it fetches so the next load is fast.
+    // `recent` = titles most recently ADDED to our catalogue (ordered by
+    // first-persist time), distinct from `latest` (upstream recently-updated).
+    // Resolved BEFORE the queries so the NSFW gate can be pushed into SQL ahead of
+    // LIMIT, rather than trimming an already-truncated page (see series_cache).
+    let (popular, latest, recent) = if crate::series_cache::count(&st.pool)
+        .await
+        .map_err(gql_err)?
+        > 0
+    {
+        let lib = crate::series_cache::library(&st.pool, PAGE_SIZE, show_nsfw)
+            .await
+            .map_err(gql_err)?;
+        let recent = crate::series_cache::recently_added(&st.pool, PAGE_SIZE, show_nsfw)
+            .await
+            .map_err(gql_err)?;
+        (lib, Vec::new(), recent)
+    } else {
+        // Cold path (pre-cache, fresh install only): overlap the two independent
+        // source fetches — Popular still propagates its error via `?`, Latest stays
+        // best-effort. The catalogue is normally populated, so this branch is rare.
+        let (popular_res, latest_res) = tokio::join!(
+            st.suwayomi.fetch_source(FetchType::Popular, 1, None),
+            st.suwayomi.fetch_source(FetchType::Latest, 1, None),
+        );
+        let popular = popular_res.map_err(gql_err)?.1;
+        for m in &popular {
+            let _ = crate::series_cache::put_series(&st.pool, m).await;
+        }
+        let latest = latest_res.map(|r| r.1).unwrap_or_default();
+        // Pre-cache (fresh install) there's no catalogue-insertion history yet;
+        // the source "Latest" is the best available proxy for "newly added".
+        let recent = latest.clone();
+        (popular, latest, recent)
+    };
+
+    // `show_nsfw` is resolved above, before the cached queries. The cached path has
+    // already gated in SQL; these calls are what protect the COLD path (a live
+    // source browse on a fresh install), where no SQL gate ran. Re-filtering an
+    // already-filtered list is a no-op, so both paths stay safe.
+    let popular = filter_nsfw(show_nsfw, map_series_list(st, popular).await);
+    let latest = filter_nsfw(show_nsfw, map_series_list(st, latest).await);
+    let recent = filter_nsfw(show_nsfw, map_series_list(st, recent).await);
+
+    // Trending = the 10 most-viewed series over the LAST 24 HOURS (the real
+    // popularity signal from `recordView`, replacing the old "first 6 of Popular").
+    // During cold start — before reads accumulate — this is empty, so pad with
+    // Popular to keep the row populated; it becomes fully view-ranked as views come
+    // in. Dedup by id AND title: a series whose views split across two identities
+    // (its `w_` work and its numeric source — see `views::view_key`) would otherwise
+    // resolve to two cards with the same title, so title-dedup collapses them.
+    let trending = {
+        let keys: Vec<String> = crate::views::trending_keys(&st.pool, 10)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let ranked = filter_nsfw(show_nsfw, series_by_keys(st, &keys).await);
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_titles: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut items: Vec<Series> = Vec::with_capacity(10);
+        for s in ranked.into_iter().chain(popular.iter().cloned()) {
+            if items.len() >= 10 {
+                break;
+            }
+            let title_key = s.title.trim().to_lowercase();
+            let dup = seen_ids.contains(&s.id.0)
+                || (!title_key.is_empty() && seen_titles.contains(&title_key));
+            if dup {
+                continue;
+            }
+            seen_ids.insert(s.id.0.clone());
+            if !title_key.is_empty() {
+                seen_titles.insert(title_key);
+            }
+            items.push(s);
+        }
+        items
+    };
+
+    let mut feeds = vec![
+        DiscoveryFeed {
+            kind: DiscoveryFeedKind::Popular,
+            title: "Popular".into(),
+            genre: None,
+            items: popular.clone(),
+        },
+        DiscoveryFeed {
+            kind: DiscoveryFeedKind::Trending,
+            title: "Trending".into(),
+            genre: None,
+            items: trending,
+        },
+    ];
+    if !latest.is_empty() {
+        feeds.push(DiscoveryFeed {
+            kind: DiscoveryFeedKind::RecentlyUpdated,
+            title: "Latest Updates".into(),
+            genre: None,
+            items: latest.clone(),
+        });
+    }
+    if !recent.is_empty() {
+        feeds.push(DiscoveryFeed {
+            kind: DiscoveryFeedKind::RecentlyAdded,
+            title: "Latest Added".into(),
+            genre: None,
+            items: recent,
+        });
+    }
+    Ok(feeds)
+}
+
+/// P2.1: the whole series/reader page in ONE round trip. The reader used to fire
+/// `canonicalSeries` + `canonicalChapters` + `workSources` in parallel and then a
+/// per-translator `chapters` N+1 (6–12 sequential HTTP round trips per page view),
+/// with `load_work_following_redirect` re-run by every one of them. This bundle
+/// follows the redirect ONCE and answers everything from the effective work.
+///
+/// Declared here rather than in `types.rs` because the name `SeriesPage` is taken
+/// there by the pagination envelope; this is the page-view bundle.
+#[derive(SimpleObject)]
+#[graphql(complex)]
+pub struct SeriesPageBundle {
+    /// The EFFECTIVE canonical id (the survivor after a `work_redirect` merge) —
+    /// every id-keyed write the client does next must use this, not the requested id.
+    pub work_id: ID,
+    /// The canonical (MangaDex-mirrored) series. Null for a federation-only work
+    /// (no MangaDex anchor) — the page then renders from a source's own series.
+    pub series: Option<Series>,
+    /// The canonical spine's chapters (empty when `series` is null).
+    pub spine_chapters: Vec<Chapter>,
+    /// Every catalogued source mapping WITH its chapters and source-series metadata,
+    /// so the translator picker needs no follow-up requests.
+    pub sources: Vec<SeriesPageSourceEntry>,
+}
+
+/// One source mapping of a [`SeriesPageBundle`], carrying what the old per-source
+/// round trips fetched: the mapping itself, its chapter list, and its series row.
+#[derive(SimpleObject)]
+pub struct SeriesPageSourceEntry {
+    pub source: WorkSource,
+    /// The source's own chapters. Empty for the MangaDex mapping (the spine carries
+    /// those) and for a source whose fetch failed — the old client treated a
+    /// per-source failure as an empty list, and the bundle keeps that contract.
+    pub chapters: Vec<Chapter>,
+    /// The source's series metadata; null when unavailable (fetch failure, or the
+    /// non-English serve guard) — the old `series(id)` catch-to-null, server-side.
+    pub series: Option<Series>,
+}
+
+#[ComplexObject]
+impl SeriesPageBundle {
+    /// S2 cross-source aggregation (same rows as `aggregatedChapters`), resolved
+    /// lazily so the reader route can skip it. No redirect re-follow and no NSFW
+    /// re-gate: the bundle only exists for a work that already passed both.
+    async fn aggregated(&self, ctx: &Context<'_>) -> Result<Vec<AggregatedChapter>> {
+        let st = state(ctx);
+        let rows = catalog::work_source_chapters(&st.pool, &self.work_id.0)
+            .await
+            .map_err(gql_err)?;
+        let mut chapters = group_aggregated_chapters(rows);
+        let ov = chapter_overrides(&st.pool, &self.work_id.0).await;
+        if !ov.is_empty() {
+            chapters.retain(|c| !matches!(ov.get(&chapter_key(c.number)), Some((true, _))));
+            for c in &mut chapters {
+                if let Some((_, Some(t))) = ov.get(&chapter_key(c.number)) {
+                    c.title = Some(t.clone());
+                }
+            }
+        }
+        Ok(chapters)
+    }
+}
+
 // ---- Query -----------------------------------------------------------------
 
 pub struct QueryRoot;
@@ -3473,125 +3791,32 @@ pub struct QueryRoot;
 #[Object]
 impl QueryRoot {
     /// Curated discovery feeds over the federated catalog.
+    ///
+    /// Read-through over the process-wide [`DISCOVERY_CACHE`]: the payload is
+    /// viewer-invariant given the NSFW posture (the cache key), yet cost tens of ms of
+    /// CPU per render, so it was the dominant origin cost. Per-viewer fields on the
+    /// cards (`isMarked`, `libraryStatus`, `isFavorite`) are resolved lazily per
+    /// request AFTER this returns, so a cached rail still reflects the signed-in
+    /// viewer's own library. A cold/expired key refills under a single-flight lock
+    /// ([`DISCOVERY_INFLIGHT`]) so concurrent misses collapse onto one computation.
     async fn discovery(&self, ctx: &Context<'_>) -> Result<Vec<DiscoveryFeed>> {
         let st = state(ctx);
-        // S1: serve from the DB cache once the catalogue has been persisted (the
-        // admin "save everything" / ingest / scan populate it), so the home page
-        // reads from SQLite instead of a live source browse. Fall back to a live
-        // browse only while the cache is still empty (fresh install), caching what
-        // it fetches so the next load is fast.
-        // `recent` = titles most recently ADDED to our catalogue (ordered by
-        // first-persist time), distinct from `latest` (upstream recently-updated).
-        // Resolved BEFORE the queries so the NSFW gate can be pushed into SQL ahead of
-        // LIMIT, rather than trimming an already-truncated page (see series_cache).
+        // The NSFW posture is BOTH a compute input (SQL gates + `filter_nsfw`) and the
+        // cache key — resolving it once here keeps the two from ever disagreeing.
         let show_nsfw = viewer_show_nsfw(ctx).await;
-        let (popular, latest, recent) = if crate::series_cache::count(&st.pool)
-            .await
-            .map_err(gql_err)?
-            > 0
-        {
-            let lib = crate::series_cache::library(&st.pool, PAGE_SIZE, show_nsfw)
-                .await
-                .map_err(gql_err)?;
-            let recent = crate::series_cache::recently_added(&st.pool, PAGE_SIZE, show_nsfw)
-                .await
-                .map_err(gql_err)?;
-            (lib, Vec::new(), recent)
-        } else {
-            // Cold path (pre-cache, fresh install only): overlap the two independent
-            // source fetches — Popular still propagates its error via `?`, Latest stays
-            // best-effort. The catalogue is normally populated, so this branch is rare.
-            let (popular_res, latest_res) = tokio::join!(
-                st.suwayomi.fetch_source(FetchType::Popular, 1, None),
-                st.suwayomi.fetch_source(FetchType::Latest, 1, None),
-            );
-            let popular = popular_res.map_err(gql_err)?.1;
-            for m in &popular {
-                let _ = crate::series_cache::put_series(&st.pool, m).await;
-            }
-            let latest = latest_res.map(|r| r.1).unwrap_or_default();
-            // Pre-cache (fresh install) there's no catalogue-insertion history yet;
-            // the source "Latest" is the best available proxy for "newly added".
-            let recent = latest.clone();
-            (popular, latest, recent)
-        };
-
-        // `show_nsfw` is resolved above, before the cached queries. The cached path has
-        // already gated in SQL; these calls are what protect the COLD path (a live
-        // source browse on a fresh install), where no SQL gate ran. Re-filtering an
-        // already-filtered list is a no-op, so both paths stay safe.
-        let popular = filter_nsfw(show_nsfw, map_series_list(st, popular).await);
-        let latest = filter_nsfw(show_nsfw, map_series_list(st, latest).await);
-        let recent = filter_nsfw(show_nsfw, map_series_list(st, recent).await);
-
-        // Trending = the 10 most-viewed series over the LAST 24 HOURS (the real
-        // popularity signal from `recordView`, replacing the old "first 6 of Popular").
-        // During cold start — before reads accumulate — this is empty, so pad with
-        // Popular to keep the row populated; it becomes fully view-ranked as views come
-        // in. Dedup by id AND title: a series whose views split across two identities
-        // (its `w_` work and its numeric source — see `views::view_key`) would otherwise
-        // resolve to two cards with the same title, so title-dedup collapses them.
-        let trending = {
-            let keys: Vec<String> = crate::views::trending_keys(&st.pool, 10)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(k, _)| k)
-                .collect();
-            let ranked = filter_nsfw(show_nsfw, series_by_keys(st, &keys).await);
-            let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut seen_titles: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let mut items: Vec<Series> = Vec::with_capacity(10);
-            for s in ranked.into_iter().chain(popular.iter().cloned()) {
-                if items.len() >= 10 {
-                    break;
-                }
-                let title_key = s.title.trim().to_lowercase();
-                let dup = seen_ids.contains(&s.id.0)
-                    || (!title_key.is_empty() && seen_titles.contains(&title_key));
-                if dup {
-                    continue;
-                }
-                seen_ids.insert(s.id.0.clone());
-                if !title_key.is_empty() {
-                    seen_titles.insert(title_key);
-                }
-                items.push(s);
-            }
-            items
-        };
-
-        let mut feeds = vec![
-            DiscoveryFeed {
-                kind: DiscoveryFeedKind::Popular,
-                title: "Popular".into(),
-                genre: None,
-                items: popular.clone(),
-            },
-            DiscoveryFeed {
-                kind: DiscoveryFeedKind::Trending,
-                title: "Trending".into(),
-                genre: None,
-                items: trending,
-            },
-        ];
-        if !latest.is_empty() {
-            feeds.push(DiscoveryFeed {
-                kind: DiscoveryFeedKind::RecentlyUpdated,
-                title: "Latest Updates".into(),
-                genre: None,
-                items: latest.clone(),
-            });
+        let key = feed_cache_key(show_nsfw);
+        if let Some(hit) = cached_feed(&DISCOVERY_CACHE, key, FEED_TTL) {
+            return Ok((*hit).clone());
         }
-        if !recent.is_empty() {
-            feeds.push(DiscoveryFeed {
-                kind: DiscoveryFeedKind::RecentlyAdded,
-                title: "Latest Added".into(),
-                genre: None,
-                items: recent,
-            });
+        // Single-flight the refill: every task that missed awaits ONE per-key lock,
+        // then re-checks — exactly one recomputation serves the whole burst.
+        let lock = DISCOVERY_INFLIGHT.lock_handle(i64::from(show_nsfw));
+        let _guard = lock.lock().await;
+        if let Some(hit) = cached_feed(&DISCOVERY_CACHE, key, FEED_TTL) {
+            return Ok((*hit).clone());
         }
+        let feeds = compute_discovery(st, show_nsfw).await?;
+        store_feed(&DISCOVERY_CACHE, key, feeds.clone());
         Ok(feeds)
     }
 
@@ -4134,6 +4359,125 @@ impl QueryRoot {
         Ok(chapters)
     }
 
+    /// P2.1: the series/reader page in ONE round trip — see [`SeriesPageBundle`].
+    /// Follows `work_redirect` once, applies the NSFW gate once, and returns the
+    /// canonical series + spine chapters + every source mapping with its chapters
+    /// and metadata. Errors "No such work" exactly where `canonicalSeries` +
+    /// `workSources` together would have rendered nothing: unknown id, or an NSFW
+    /// work for an opted-out viewer. A federation-only work (no MangaDex anchor)
+    /// IS served, with `series: null` — unlike `canonicalSeries`, which 404s it —
+    /// because its source mappings are still readable.
+    async fn series_page(&self, ctx: &Context<'_>, work_id: ID) -> Result<SeriesPageBundle> {
+        let st = state(ctx);
+        let work = load_work_following_redirect(&st.pool, &work_id.0)
+            .await?
+            .ok_or_else(|| Error::new("No such work"))?;
+        let effective_id = work.work_id.clone();
+        if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await {
+            return Err(Error::new("No such work"));
+        }
+        let show_nsfw = viewer_show_nsfw(ctx).await;
+        let user = current_user(ctx).await;
+        let user_id = user.as_ref().map(|u| u.id.as_str());
+
+        // Canonical spine — only when MangaDex-anchored. `load_canonical_chapters` is
+        // loaded ONCE and feeds both the chapter list and the series' chapterCount
+        // (the old resolvers each loaded it independently).
+        let (series, spine_chapters) = if work.mangadex_id.is_some() {
+            let chapters = catalog::load_canonical_chapters(&st.pool, &effective_id)
+                .await
+                .map_err(gql_err)?;
+            let count = catalog::main_chapter_count_str(&chapters) as i32;
+            let progress = canonical_progress_map(&st.pool, user_id, &effective_id).await;
+            let mapped: Vec<Chapter> = chapters
+                .into_iter()
+                .map(|c| {
+                    let p = progress.get(&c.external_id).copied();
+                    map_canonical_chapter(&effective_id, c, p)
+                })
+                .collect();
+            let s = map_canonical_series(&st.pool, user_id, work, count).await;
+            (Some(s), mapped)
+        } else {
+            (None, Vec::new())
+        };
+
+        // Source mappings (already redirect-resolved, so no re-follow needed) with
+        // each one's chapters + metadata — this replaces the client's per-translator
+        // `chapters` N+1 and the selected translator's `series` follow-up. A work has
+        // few mappings, so the loop is bounded; per-source failures degrade to
+        // empty/null exactly as the client's old catch handlers did.
+        let source_rows = load_work_sources(&st.pool, &effective_id, show_nsfw).await?;
+        // First pass: per-source chapters + the raw cached series row. The series
+        // row comes FIRST because the non-English serve guard (same as `series(id)`)
+        // must veto the chapters too — the old `chapters(seriesId)` path happened to
+        // serve a non-English source's chapters, but only because it couldn't see
+        // the language; here we can, so nothing of such a source is served.
+        let mut assembled: Vec<(WorkSource, Vec<Chapter>, Option<SuwayomiManga>)> =
+            Vec::with_capacity(source_rows.len());
+        for src in source_rows {
+            let mut chapters: Vec<Chapter> = Vec::new();
+            let mut manga: Option<SuwayomiManga> = None;
+            // The MangaDex mapping's content is the spine; duplicating it per-source
+            // would double the payload for nothing.
+            if src.source_type != "mangadex" {
+                if let Ok(n) = src.source_key.parse::<i64>() {
+                    // A failed series fetch keeps meta None but still serves the
+                    // chapters (fail open, matching the old client's independent
+                    // per-source requests); a non-English source serves neither.
+                    let non_english = match resolve_series_cached(st, n).await {
+                        Ok(m) => {
+                            let ne = m
+                                .source
+                                .as_ref()
+                                .and_then(|s| s.lang.as_deref())
+                                .is_some_and(|l| l != "en");
+                            if !ne {
+                                manga = Some(m);
+                            }
+                            ne
+                        }
+                        Err(_) => false,
+                    };
+                    if !non_english {
+                        if let Ok(list) = resolve_chapters_cached(st, n).await {
+                            let progress = suwayomi_progress_map(&st.pool, user_id, n).await;
+                            chapters = list
+                                .into_iter()
+                                .map(|c| {
+                                    let p = progress.get(&c.id).copied();
+                                    map_chapter(c, p)
+                                })
+                                .collect();
+                        }
+                    }
+                }
+            }
+            assembled.push((src, chapters, manga));
+        }
+        // Second pass: ONE batched metadata mapping across every source. Mapping
+        // each source through `map_series` individually would run ~9 point queries
+        // per source; `map_series_batch` does grouped queries once for the lot.
+        let mangas: Vec<SuwayomiManga> =
+            assembled.iter().filter_map(|(_, _, m)| m.clone()).collect();
+        let mut metas = map_series_batch(st, mangas).await.into_iter();
+        let sources = assembled
+            .into_iter()
+            .map(|(source, chapters, manga)| SeriesPageSourceEntry {
+                source,
+                chapters,
+                series: manga.and_then(|_| metas.next()),
+            })
+            .collect();
+
+        Ok(SeriesPageBundle {
+            work_id: ID(effective_id),
+            series,
+            spine_chapters,
+            sources,
+        })
+    }
+
     /// Admin: the raw metadata-override state of a series' canonical work, so the
     /// series-detail editor can show what is pinned vs derived. `workId` is null when
     /// the series isn't catalogued yet (nothing can be pinned without a work).
@@ -4671,10 +5015,27 @@ impl QueryRoot {
     /// chip list is the deliberate choice over 301 wrong ones.
     async fn genre_facets(&self, ctx: &Context<'_>) -> Result<Vec<GenreFacet>> {
         let st = state(ctx);
+        // Same read-through shape as `discovery`: the facet table is viewer-invariant
+        // given the NSFW posture, which is the whole cache key (see [`GENRE_FACETS_CACHE`]).
         let show_nsfw = viewer_show_nsfw(ctx).await;
-        Ok(crate::browse::genre_facets(&st.pool, show_nsfw)
-            .await
-            .map_err(gql_err)?
+        let key = feed_cache_key(show_nsfw);
+        let facets = if let Some(hit) = cached_feed(&GENRE_FACETS_CACHE, key, FEED_TTL) {
+            (*hit).clone()
+        } else {
+            // Single-flight the refill so a cold key under load recomputes once.
+            let lock = GENRE_FACETS_INFLIGHT.lock_handle(i64::from(show_nsfw));
+            let _guard = lock.lock().await;
+            if let Some(hit) = cached_feed(&GENRE_FACETS_CACHE, key, FEED_TTL) {
+                (*hit).clone()
+            } else {
+                let facets = crate::browse::genre_facets(&st.pool, show_nsfw)
+                    .await
+                    .map_err(gql_err)?;
+                store_feed(&GENRE_FACETS_CACHE, key, facets.clone());
+                facets
+            }
+        };
+        Ok(facets
             .into_iter()
             .map(|(genre, count)| GenreFacet {
                 genre,
@@ -4706,13 +5067,14 @@ impl QueryRoot {
         }
         let st = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
         // C1: per-user rate limit so an authed client can't hammer the engine /
-        // MangaDex through the fan-out + persist path.
-        if let Some(retry) = st.federated_limiter.is_limited(&format!("fed:{}", user.id)) {
+        // MangaDex through the fan-out + persist path. Atomic check-and-record:
+        // the old separate is_limited + record pair let N concurrent searches all
+        // pass the read before any hit landed (TOCTOU over-admission).
+        if let Err(retry) = st.federated_limiter.check(&format!("fed:{}", user.id)) {
             return Err(Error::new(format!(
                 "Too many source searches — retry in {retry}s"
             )));
         }
-        st.federated_limiter.record(&format!("fed:{}", user.id));
         let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
         federated_search(&st, &trimmed, page.max(1), show_nsfw, Some(user)).await
     }
@@ -7922,7 +8284,7 @@ impl MutationRoot {
             return Err(Error::new("This username is reserved."));
         }
         // Case-insensitive uniqueness pre-check (L): the DB `UNIQUE` is byte-exact,
-        // so without this `alice` and `Alice` register as distinct accounts and one
+        // so without this `mika` and `Mika` register as distinct accounts and one
         // can impersonate the other. (Residual race: two concurrent registrations of
         // case-variant names can still both pass this check; the byte-exact UNIQUE
         // only stops exact-duplicate inserts. A COLLATE NOCASE unique index would
@@ -8302,6 +8664,11 @@ impl MutationRoot {
         // feed tables that store a COPY of it, or `updatesFeed` keeps serving this work to
         // opted-out viewers until the next feed rebuild. See `resync_feed_nsfw`.
         resync_feed_nsfw(&st.pool, std::slice::from_ref(&work_id)).await;
+        // The home rails and Browse's genre chips memoize their payloads for
+        // `FEED_TTL`, and this edit can change title, type, tags OR the NSFW gate that
+        // keys them. Without this the admin's correction is invisible for up to a
+        // minute, which reads as "the toggle didn't work" and invites a double-edit.
+        clear_feed_caches();
 
         // Recompute the series in the caller's id shape so the console updates in place.
         if input.series_id.0.starts_with("w_") {
@@ -8542,6 +8909,7 @@ impl MutationRoot {
         .await
         .unwrap_or_default();
         resync_feed_nsfw(&st.pool, &touched).await;
+        clear_feed_caches();
         tracing::info!(source_id, is_nsfw, updated = n, "markSourceNsfw");
         Ok(n)
     }
@@ -8625,6 +8993,7 @@ impl MutationRoot {
         // Push the newly-derived flags into the two feed tables that store a COPY of them
         // (see `resync_feed_nsfw`). Only the flipped works can have changed.
         resync_feed_nsfw(&st.pool, &to_flip).await;
+        clear_feed_caches();
         for (src, n) in &per_source {
             tracing::info!(source_id = %src, flipped = n, "rederiveSuwayomiNsfw: source flagged");
         }
@@ -8960,6 +9329,10 @@ impl MutationRoot {
                 "immediate scan after enrol failed; will retry on next tick"
             );
         }
+        // The enrol wrote a `series_cache` row (via `scan_series`), which is exactly
+        // what `compute_discovery` reads for `recentlyAdded`. Without this the admin
+        // watches their own addition stay invisible for up to one `FEED_TTL`.
+        clear_feed_caches();
         Ok(result)
     }
 
@@ -9320,6 +9693,10 @@ impl MutationRoot {
             refused,
             "persistCatalogue: metadata materialized; chapters filling in background"
         );
+        // The foreground pass has already written every `series_cache` row; the
+        // background task only fills chapters. Bust here so the newly materialized
+        // catalogue is on the home page immediately rather than after `FEED_TTL`.
+        clear_feed_caches();
         Ok(persisted)
     }
 
@@ -9636,6 +10013,10 @@ impl MutationRoot {
             };
             entries.push(entry);
         }
+        // Same reason as `add_source_series` — every successful entry wrote a
+        // `series_cache` row the discovery memo would otherwise hide. Once for the
+        // whole batch, not per id, so a 100-id call still busts a single time.
+        clear_feed_caches();
         Ok(summarize_bulk(entries))
     }
 }
@@ -10997,56 +11378,105 @@ mod tests {
         assert!(mangadex_uuid("/manga/zzzzzzzz-befd-49a4-bff5-1ad4e6b0ef7b").is_none());
     }
 
-    // ---- RateLimiter unit tests ----
+    // RateLimiter unit tests moved to crate::rate_limit alongside the sharded impl.
 
-    #[test]
-    fn limiter_blocks_only_after_max_records() {
-        let rl = RateLimiter::new(2, 60);
-        assert!(rl.is_limited("k").is_none(), "fresh key is not limited");
-        rl.record("k");
-        assert!(rl.is_limited("k").is_none(), "1 < max still allowed");
-        rl.record("k");
-        assert!(rl.is_limited("k").is_some(), "2 >= max is limited");
-        // a different key has its own budget
-        assert!(rl.is_limited("other").is_none());
-    }
+    // ---- viewer-invariant feed memo ----
 
-    #[test]
-    fn limiter_is_read_only_until_record() {
-        let rl = RateLimiter::new(1, 60);
-        // repeated reads never trip the limit on their own
-        for _ in 0..5 {
-            assert!(rl.is_limited("k").is_none());
-        }
-        rl.record("k");
-        assert!(rl.is_limited("k").is_some());
-    }
+    // ---- viewer-invariant feed memo ----
 
+    /// The feed memos are keyed on the NSFW posture ALONE. This pins the three
+    /// properties the NSFW gate depends on: a stored entry comes back only within its
+    /// TTL, only under the key it was stored under (an opted-out viewer must never be
+    /// served the opted-in payload or vice versa), and a fresh store replaces an
+    /// expired one. Uses a LOCAL map — the process-wide statics stay untouched, so
+    /// this can't leak into the end-to-end resolver tests regardless of scheduling.
     #[test]
-    fn limiter_does_not_leak_keys() {
-        // A read on an unknown key must not insert a map entry (A4) — otherwise
-        // every distinct client IP would grow the map without bound.
-        let rl = RateLimiter::new(3, 60);
-        for i in 0..100 {
-            assert!(rl.is_limited(&format!("k{i}")).is_none());
-        }
+    fn feed_memo_is_key_isolated_and_ttl_bounded() {
+        let cache: FeedCache<Vec<u8>> = std::sync::Mutex::new(std::collections::HashMap::new());
+        let long = Duration::from_secs(60);
+        let zero = Duration::from_secs(0);
+
+        store_feed(&cache, false, vec![1u8]);
+        // hit under its own key within TTL…
         assert_eq!(
-            rl.hits.lock().unwrap().len(),
-            0,
-            "reads must not insert keys"
+            cached_feed(&cache, false, long),
+            Some(std::sync::Arc::new(vec![1u8])),
+            "a fresh entry is served"
+        );
+        // …and NEVER under the other posture — the property that keeps an
+        // opted-out viewer from receiving an opted-in computation.
+        assert!(
+            cached_feed(&cache, true, long).is_none(),
+            "the other NSFW posture must miss"
         );
 
-        // A key whose window has fully elapsed is evicted on the next read.
-        let rl0 = RateLimiter::new(3, 0); // zero-length window → immediately stale
-        rl0.record("k");
-        assert_eq!(rl0.hits.lock().unwrap().len(), 1);
-        assert!(rl0.is_limited("k").is_none());
+        // expired → recomputed; the replacement lands under the SAME single key.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(cached_feed(&cache, false, zero).is_none(), "TTL expired");
+        store_feed(&cache, true, vec![2u8]);
         assert_eq!(
-            rl0.hits.lock().unwrap().len(),
-            0,
-            "a fully-stale key is evicted on read"
+            cached_feed(&cache, true, long),
+            Some(std::sync::Arc::new(vec![2u8]))
+        );
+        // Overwriting one posture leaves the sibling payload untouched.
+        store_feed(&cache, false, vec![9u8]);
+        assert_eq!(
+            cached_feed(&cache, false, long),
+            Some(std::sync::Arc::new(vec![9u8])),
+            "a fresh store replaces the entry"
+        );
+        assert_eq!(
+            cached_feed(&cache, true, long),
+            Some(std::sync::Arc::new(vec![2u8])),
+            "the other NSFW posture's entry is unaffected"
         );
     }
+
+    /// The admin invalidation really drops a live memo entry, for BOTH posture keys.
+    /// Nothing end-to-end can catch a regression here: [`FEED_TTL`] is zero under
+    /// `cfg(test)`, so no resolver ever reads the memo — the only way to observe a live
+    /// hit at all is to pass an explicit non-zero TTL, which is what this does.
+    ///
+    /// Unlike [`feed_memo_is_key_isolated_and_ttl_bounded`] this MUST use the real
+    /// statics, because that is what `clear_feed_caches` reaches for. Two consequences,
+    /// both deliberate: nothing this test writes can be served to another test (every
+    /// resolver reads with the zero `FEED_TTL` and therefore always misses), and nothing
+    /// another test writes can fail this one — `DISCOVERY_CACHE` has no other writer in
+    /// the suite, and `GENRE_FACETS_CACHE` does (the `genreFacets` resolver test), so
+    /// that half asserts the SENTINEL is gone rather than that the map is empty.
+    #[test]
+    fn clear_feed_caches_drops_a_live_memo_entry() {
+        let long = Duration::from_secs(60);
+        let sentinel = vec![("__clear_feed_caches_probe__".to_string(), 1i64)];
+
+        for key in [feed_cache_key(false), feed_cache_key(true)] {
+            store_feed(&DISCOVERY_CACHE, key, Vec::<DiscoveryFeed>::new());
+            store_feed(&GENRE_FACETS_CACHE, key, sentinel.clone());
+            assert!(
+                cached_feed(&DISCOVERY_CACHE, key, long).is_some(),
+                "the memo holds a live entry before the bust (key {key})"
+            );
+            assert!(
+                cached_feed(&GENRE_FACETS_CACHE, key, long).is_some(),
+                "the memo holds a live entry before the bust (key {key})"
+            );
+        }
+
+        clear_feed_caches();
+
+        for key in [feed_cache_key(false), feed_cache_key(true)] {
+            assert!(
+                cached_feed(&DISCOVERY_CACHE, key, long).is_none(),
+                "the home rails recompute after an admin edit (key {key})"
+            );
+            assert_ne!(
+                cached_feed(&GENRE_FACETS_CACHE, key, long).as_deref(),
+                Some(&sentinel),
+                "the genre chips recompute after an admin edit (key {key})"
+            );
+        }
+    }
+
 
     // ---- Tier-2 add-source-series core (DD2/DD1/N1) -----------------------
 
@@ -15867,6 +16297,209 @@ mod tests {
         assert!(data_json(&r).contains("Spicy Work"));
     }
 
+    /// P2.1: `seriesPage` bundles in ONE request what the reader used to assemble
+    /// from `canonicalSeries` + `canonicalChapters` + `workSources` + a per-source
+    /// `chapters`/`series` N+1: the canonical series, the spine chapters, every
+    /// source mapping WITH its chapters and metadata, and (opt-in) the aggregation.
+    #[tokio::test]
+    async fn series_page_bundles_series_chapters_sources_and_aggregation() {
+        let (s, pool) = setup_full(100).await;
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-bundle",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Bundled Work".into()),
+                cover_file_name: Some("cover.jpg".into()),
+                is_nsfw: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ssid =
+            crate::catalog::find_source_series_id(&pool, "mangadex", "mangadex", "md-bundle")
+                .await
+                .unwrap()
+                .unwrap();
+        for (ext, num) in [("bd-ch-2", "2"), ("bd-ch-1", "1")] {
+            crate::catalog::upsert_chapter(
+                &pool,
+                &ssid,
+                &crate::catalog::ChapterInput {
+                    external_id: ext.into(),
+                    number: Some(num.into()),
+                    lang: Some("en".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-bundle'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // A Suwayomi mirror with a cached series row + cached chapters, so the bundle
+        // can carry the per-source data without a live Suwayomi round trip.
+        sqlx::query(
+            "INSERT INTO suwayomi_series (id, title, status, source_id, chapter_count, updated_at) \
+             VALUES (777, 'Mirror Source', 'ONGOING', 'src-a', 1, '2020-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::series_cache::put_chapters(
+            &pool,
+            777,
+            &[crate::suwayomi::SuwayomiChapter {
+                id: 9001,
+                manga_id: 777,
+                name: "Ch 1".into(),
+                chapter_number: 1.0,
+                scanlator: None,
+                upload_date: None,
+                is_read: false,
+                is_bookmarked: false,
+                is_downloaded: false,
+                last_page_read: 0,
+                page_count: 20,
+            }],
+        )
+        .await
+        .unwrap();
+        crate::catalog::upsert_source_series(
+            &pool, &work_id, "suwayomi", "src-a", "777", None, false,
+        )
+        .await
+        .unwrap();
+
+        let q = format!(
+            r#"{{ seriesPage(workId: "{work_id}") {{
+                workId
+                series {{ title chapterCount }}
+                spineChapters {{ id number }}
+                sources {{
+                    source {{ sourceType sourceKey }}
+                    chapters {{ id number }}
+                    series {{ title }}
+                }}
+                aggregated {{ number }}
+            }} }}"#
+        );
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let page = r.data.into_json().unwrap()["seriesPage"].clone();
+        assert_eq!(page["workId"], serde_json::json!(work_id));
+        assert_eq!(page["series"]["title"], serde_json::json!("Bundled Work"));
+        assert_eq!(page["series"]["chapterCount"], serde_json::json!(2));
+        // Spine chapters arrive ordered ascending, exactly as `canonicalChapters`.
+        let spine = page["spineChapters"].as_array().unwrap();
+        assert_eq!(spine.len(), 2);
+        assert_eq!(spine[0]["id"], serde_json::json!("bd-ch-1"));
+        assert_eq!(spine[1]["id"], serde_json::json!("bd-ch-2"));
+        // MangaDex mapping first (spine carries its content: no duplicate payload),
+        // then the Suwayomi mapping WITH its cached chapters and series metadata.
+        let sources = page["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources[0]["source"]["sourceType"],
+            serde_json::json!("mangadex")
+        );
+        assert_eq!(sources[0]["chapters"].as_array().unwrap().len(), 0);
+        assert_eq!(sources[0]["series"], serde_json::Value::Null);
+        assert_eq!(sources[1]["source"]["sourceKey"], serde_json::json!("777"));
+        let suw_chs = sources[1]["chapters"].as_array().unwrap();
+        assert_eq!(suw_chs.len(), 1, "cached per-source chapters ride along");
+        assert_eq!(suw_chs[0]["number"], serde_json::json!(1.0));
+        assert_eq!(
+            sources[1]["series"]["title"],
+            serde_json::json!("Mirror Source")
+        );
+        // The opt-in aggregation carries every mirrored chapter number, deduped and
+        // ascending — the same contract as `aggregatedChapters`.
+        let agg = page["aggregated"].as_array().unwrap();
+        let numbers: Vec<f64> = agg.iter().map(|c| c["number"].as_f64().unwrap()).collect();
+        assert_eq!(numbers, vec![1.0, 2.0], "{agg:?}");
+    }
+
+    /// P2.1: the single-round-trip resolver must apply the same NSFW gate as the
+    /// resolvers it replaces, follow a merge redirect to the survivor (reporting the
+    /// EFFECTIVE id), and — unlike `canonicalSeries` (CR3) — serve a federation-only
+    /// work with `series: null`, because its source mappings are still readable.
+    #[tokio::test]
+    async fn series_page_gates_nsfw_follows_redirects_and_serves_federation_only() {
+        let (s, pool) = setup_full(100).await;
+
+        // NSFW gate: hidden until the viewer opts in.
+        seed_canonical(&pool, "md-sp-nsfw", "Spicy Bundle", true, "1").await;
+        let nsfw_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-sp-nsfw'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let q = format!(r#"{{ seriesPage(workId: "{nsfw_id}") {{ workId }} }}"#);
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert_eq!(first_error(&r), "No such work");
+
+        // Redirect: a merged-away id answers with the SURVIVOR's bundle and id.
+        seed_canonical(&pool, "md-sp-keep", "Surviving Bundle", false, "1").await;
+        seed_canonical(&pool, "md-sp-gone", "Folded Bundle", false, "2").await;
+        let survivor: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-sp-keep'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let retired: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-sp-gone'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        catalog::merge_works_ex(&pool, None, &retired, &survivor)
+            .await
+            .unwrap();
+        let q = format!(r#"{{ seriesPage(workId: "{retired}") {{ workId series {{ title }} }} }}"#);
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "redirect must resolve: {:?}", r.errors);
+        let page = r.data.into_json().unwrap()["seriesPage"].clone();
+        assert_eq!(
+            page["workId"],
+            serde_json::json!(survivor),
+            "the EFFECTIVE id is the survivor's — every downstream write keys on it"
+        );
+        assert_eq!(
+            page["series"]["title"],
+            serde_json::json!("Surviving Bundle")
+        );
+
+        // Federation-only: no MangaDex anchor → series null, sources still served.
+        sqlx::query("INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) VALUES ('w_fed', 'Fed Only', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) VALUES ('ss_fed', 'w_fed', 'suwayomi', 'src-a', '4242', '2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let q = r#"{ seriesPage(workId: "w_fed") { workId series { title } spineChapters { id } sources { source { sourceKey } } aggregated { number } } }"#;
+        let r = exec(&s, q, Some("bobtok"), "1.1.1.1").await;
+        assert!(
+            r.errors.is_empty(),
+            "federation-only must serve: {:?}",
+            r.errors
+        );
+        let page = r.data.into_json().unwrap()["seriesPage"].clone();
+        assert_eq!(page["workId"], serde_json::json!("w_fed"));
+        assert_eq!(page["series"], serde_json::Value::Null);
+        // No MangaDex anchor: an empty spine and an empty (not erroring) aggregation.
+        assert_eq!(page["spineChapters"].as_array().unwrap().len(), 0);
+        assert_eq!(page["aggregated"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            page["sources"][0]["source"]["sourceKey"],
+            serde_json::json!("4242")
+        );
+    }
+
     #[tokio::test]
     async fn nsfw_override_flips_gating_both_directions() {
         // The admin editor's is_nsfw_override must win over the source flag on EVERY
@@ -19268,6 +19901,7 @@ mod tests {
             updated_at: String::new(),
             latest_chapter_at: String::new(),
             latest_chapter: None,
+            detected_at: None,
         };
         let items = vec![
             mk("Action8", &["Action", "Comedy"], 8.0, 3),
