@@ -27,10 +27,15 @@ export interface ImageProvider {
 	 * `srcset` for a cover rendered at CARD size (~150 CSS px), or `''` when this
 	 * source cannot be resized and the caller should just use `resolveCoverSync`.
 	 *
-	 * Cover masters measure 240–360 px wide, so a 1x viewer downloads roughly four
-	 * times the pixels a card can show. Our own origin serves an allowlisted `?w=`
-	 * derivative, so for those URLs this hands back a two-candidate set: the narrow
-	 * derivative at 1x, the master at 2x (already the right size there).
+	 * Cover masters measure 240–364 px wide, so a 1x viewer downloads roughly four
+	 * times the pixels a card can show. Our own origin serves allowlisted `?w=`
+	 * derivatives, so for those URLs this hands back a three-candidate set: the narrow
+	 * derivative at 1x, a mid derivative at 2x, and only then the master at 3x — which
+	 * is the widest cover we hold, so there is nothing sharper to offer above it.
+	 *
+	 * The 2x rung is the one that matters in the field. Phones run at DPR 1.75–3, so
+	 * WITHOUT it every phone fell through to the master: Lighthouse measured a 360x510
+	 * master painted into a 263x373 device-pixel box on every card of the home page.
 	 *
 	 * Descriptors are `x`, not `w`, on purpose: `w` needs the true intrinsic width of
 	 * every candidate, which varies per cover and is not known client-side, whereas
@@ -43,12 +48,20 @@ export interface ImageProvider {
 }
 
 /**
- * Width (px) of the card-sized cover derivative. Must stay in the server's
+ * Width (px) of the card-sized cover derivative at 1x. Must stay in the server's
  * `cover::VARIANT_WIDTHS` allowlist — a value that is not on it is silently served as
  * the full-size master, so a drift here costs bytes with nothing to notice it by
  * (`the_card_variant_width_is_actually_servable` guards the other side).
  */
 export const CARD_COVER_WIDTH = 192;
+
+/**
+ * Width (px) of the card-sized cover derivative at 2x. A 150 CSS px card needs 300
+ * device px at DPR 2 and 263 at DPR 1.75, and the widest auto-fill grid column reaches
+ * ~200 CSS px; 320 covers that band and stays under every master. Mirrors the server's
+ * `cover::CARD_VARIANT_WIDTH_2X` and carries the same allowlist obligation.
+ */
+export const CARD_COVER_WIDTH_2X = 320;
 
 /** Own-origin cover paths the server can serve at an alternate `?w=` width. */
 const RESIZABLE_COVER_PATHS = [/^\/covers\/[^/]+\.webp$/, /^\/api\/v1\/manga\/\d+\/thumbnail$/];
@@ -185,7 +198,7 @@ export class WebImageProvider implements ImageProvider {
 	}
 
 	/**
-	 * Two-candidate `srcset` for a card-sized cover. Empty (caller falls back to the
+	 * Three-candidate `srcset` for a card-sized cover. Empty (caller falls back to the
 	 * plain master) whenever the resolved URL is not one our own origin can resize:
 	 * `direct` mode, a Worker-proxied foreign CDN, or any path outside
 	 * `RESIZABLE_COVER_PATHS`. The `?w=` is APPENDED to whatever query the URL already
@@ -204,9 +217,15 @@ export class WebImageProvider implements ImageProvider {
 			return '';
 		}
 		if (!RESIZABLE_COVER_PATHS.some((re) => re.test(url.pathname))) return '';
-		const small = new URL(url.toString());
-		small.searchParams.set('w', String(CARD_COVER_WIDTH));
-		return `${small.toString()} 1x, ${master} 2x`;
+		const at = (w: number): string => {
+			const variant = new URL(url.toString());
+			variant.searchParams.set('w', String(w));
+			return variant.toString();
+		};
+		// The master stays the 3x candidate rather than another derivative: at 240–364 px
+		// wide it is already narrower than a 3x card wants, so a `?w=` above it would just
+		// hand back the master's own bytes under a second URL.
+		return `${at(CARD_COVER_WIDTH)} 1x, ${at(CARD_COVER_WIDTH_2X)} 2x, ${master} 3x`;
 	}
 }
 

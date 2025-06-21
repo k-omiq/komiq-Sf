@@ -30,7 +30,9 @@ import type { BrowseSort, ContentRatingFilter } from '@komika/api';
 // Runtime check (not a type): the native build must keep the sequential page-fetch
 // order for canonical chapters — see `canStartPagesEarly`.
 import { isTauri } from '@komika/api';
+import type { Backend } from '@komika/api';
 import { backend, images } from '$lib/context';
+import { api, type LoadFetch } from './load-fetch';
 import { findChapterOwner } from './chapter-owner';
 import type { ChapterCandidate } from './chapter-owner';
 import { chapterChip, externalChapterHref } from './chapter-label';
@@ -345,8 +347,7 @@ function toFeedCard(u: UpdateFeedRow): Card {
 		timeAt: epochMs(u.announcedAt ?? u.releasedAt),
 		// The source's own release time, but ONLY when it disagrees with what is on screen —
 		// otherwise the tooltip would read "We found it 4h · the source released it 4h".
-		released:
-			u.announcedAt && u.announcedAt !== u.releasedAt ? relTime(u.releasedAt) : undefined,
+		released: u.announcedAt && u.announcedAt !== u.releasedAt ? relTime(u.releasedAt) : undefined,
 		// Our detection time, hover-only, and null on mirror-only rows.
 		detected: relTime(u.detectedAt),
 		rating: u.rating != null ? u.rating.toFixed(1) : '',
@@ -727,6 +728,7 @@ async function resolveWork(
 	workId: string,
 	preferredKey?: string,
 	opts?: { withAggregated?: boolean },
+	b: Backend = backend,
 ): Promise<ResolvedWork | null> {
 	let wsList: WorkSource[];
 	let spineChapters: Chapter[];
@@ -746,8 +748,8 @@ async function resolveWork(
 	// wasted requests. `undefined` = the SERVER predates the resolver (deploy-order
 	// drift) — fall through to the fan-out. A genuine outage rejects and propagates,
 	// matching the fan-out's honest-error guard.
-	const bundle = backend.seriesPage
-		? await backend.seriesPage(workId, opts?.withAggregated ?? false)
+	const bundle = b.seriesPage
+		? await b.seriesPage(workId, opts?.withAggregated ?? false)
 		: undefined;
 	if (bundle === null) return null;
 	if (bundle) {
@@ -766,13 +768,13 @@ async function resolveWork(
 		// work), but if every method that is actually present rejects the backend is
 		// effectively down — rethrow so the caller surfaces an honest error rather
 		// than a false "not found".
-		const hasWorkSources = !!backend.workSources;
-		const hasCanonChapters = !!backend.canonicalChapters;
-		const hasCanonSeries = !!backend.canonicalSeries;
+		const hasWorkSources = !!b.workSources;
+		const hasCanonChapters = !!b.canonicalChapters;
+		const hasCanonSeries = !!b.canonicalSeries;
 		const [wsRes, spineRes, canonRes] = await Promise.allSettled([
-			hasWorkSources ? backend.workSources!(workId) : Promise.resolve([] as WorkSource[]),
-			hasCanonChapters ? backend.canonicalChapters!(workId) : Promise.resolve([] as Chapter[]),
-			hasCanonSeries ? backend.canonicalSeries!(workId) : Promise.resolve(null),
+			hasWorkSources ? b.workSources!(workId) : Promise.resolve([] as WorkSource[]),
+			hasCanonChapters ? b.canonicalChapters!(workId) : Promise.resolve([] as Chapter[]),
+			hasCanonSeries ? b.canonicalSeries!(workId) : Promise.resolve(null),
 		]);
 		// "Backend fully down" honest-error guard: an ABSENT optional method resolves to a
 		// benign default and must NOT be counted as evidence the backend is up (otherwise a
@@ -866,7 +868,7 @@ async function resolveWork(
 		? suwViews.map((v) => chaptersByKey.get(v.view.suwayomiMangaId as string) ?? [])
 		: await Promise.all(
 				suwViews.map((v) =>
-					backend.chapters(v.view.suwayomiMangaId as string).catch(() => [] as Chapter[]),
+					b.chapters(v.view.suwayomiMangaId as string).catch(() => [] as Chapter[]),
 				),
 			);
 	suwViews.forEach((v, i) =>
@@ -940,7 +942,7 @@ async function resolveWork(
 		// arrived as null, exactly what the legacy catch produced.
 		meta = metaByKey.get(selected.suwayomiMangaId) ?? null;
 	} else {
-		meta = await backend.series(selected.suwayomiMangaId).catch(() => null);
+		meta = await b.series(selected.suwayomiMangaId).catch(() => null);
 	}
 
 	// Only ever adopt a CANONICAL id here: `canonSeries.id` is a `w_` work id, but
@@ -1119,10 +1121,11 @@ export async function getNativeSearch(
 
 /** The full genre facet set for the search filter (S4), most-common first. Never
  *  rejects; resolves to an empty list on failure/backend-off. */
-export function getGenreFacets(): Promise<{ genre: string; count: number }[]> {
+export function getGenreFacets(fetch?: LoadFetch): Promise<{ genre: string; count: number }[]> {
+	const b = api(fetch);
 	return live(async () => {
-		if (!backend.genreFacets) return [];
-		return backend.genreFacets();
+		if (!b.genreFacets) return [];
+		return b.genreFacets();
 	}, []);
 }
 
@@ -1144,7 +1147,8 @@ function toCatalogEntryFull(
 
 // ---- per-screen getters ----------------------------------------------------
 
-export function getHome() {
+export function getHome(fetch?: LoadFetch) {
+	const b = api(fetch);
 	const fallback = {
 		featured: [] as FeaturedView[],
 		latestUpdates: [] as Card[],
@@ -1158,9 +1162,9 @@ export function getHome() {
 		// fills even while the scanner is still warming up). The hero is the top of the
 		// live Popular feed (first feed as fallback) — empty when nothing is live.
 		const [feeds, latest] = await Promise.all([
-			backend.discovery(),
+			b.discovery(),
 			// ONE feed, not two merged client-side — see `latestUpdates` below.
-			fetchUpdatesFeed(1, null).catch(() => ({
+			fetchUpdatesFeed(1, null, b).catch(() => ({
 				items: [] as UpdateFeedRow[],
 				page: 1,
 				hasNextPage: false,
@@ -1270,7 +1274,9 @@ export interface UpdatesView {
  */
 export function getUpdates(
 	opts: { page?: number; tab?: 'new' | 'hot'; type?: ComicType | null } = {},
+	fetch?: LoadFetch,
 ): Promise<UpdatesView> {
+	const b = api(fetch);
 	const page = Math.max(1, Math.trunc(opts.page ?? 1));
 	const tab = opts.tab ?? 'new';
 	const type = opts.type ?? null;
@@ -1287,8 +1293,8 @@ export function getUpdates(
 		// Each feed is caught independently (mirrors getHome): one outage — e.g. the
 		// merged updates feed — must not collapse the whole screen (incl. Trending).
 		const [feeds, feed] = await Promise.all([
-			backend.discovery().catch(() => [] as DiscoveryFeed[]),
-			tab === 'hot' ? Promise.resolve(null) : fetchUpdatesFeed(page, type).catch(() => null),
+			b.discovery().catch(() => [] as DiscoveryFeed[]),
+			tab === 'hot' ? Promise.resolve(null) : fetchUpdatesFeed(page, type, b).catch(() => null),
 		]);
 		const byKind = (k: string) => feeds.find((f) => f.kind === k)?.items ?? [];
 		// Trending still needs the title dedupe: the catalogue carries same-title rows
@@ -1331,23 +1337,24 @@ export function getUpdates(
 async function fetchUpdatesFeed(
 	page: number,
 	type: ComicType | null,
+	b: Backend = backend,
 ): Promise<{
 	items: UpdateFeedRow[];
 	page: number;
 	hasNextPage: boolean;
 	total: number | null;
 }> {
-	if (backend.updatesFeed) {
+	if (b.updatesFeed) {
 		try {
-			return await backend.updatesFeed(page, type ? VIEW_TO_DOMAIN_TYPE[type] : undefined);
+			return await b.updatesFeed(page, type ? VIEW_TO_DOMAIN_TYPE[type] : undefined);
 		} catch {
 			// Fall through. Deliberately silent: `live()` already reports backend failure
 			// to the screen, and this path is a successful degradation, not an error.
 		}
 	}
 	const [updates, canonical] = await Promise.all([
-		backend.updates().catch(() => ({ items: [] as Series[] })),
-		backend.canonicalUpdates?.().catch(() => [] as CanonicalUpdate[]) ??
+		b.updates().catch(() => ({ items: [] as Series[] })),
+		b.canonicalUpdates?.().catch(() => [] as CanonicalUpdate[]) ??
 			Promise.resolve([] as CanonicalUpdate[]),
 	]);
 	// Legacy shape: merge by release time, dedupe by title, cap, and project onto the
@@ -1933,7 +1940,8 @@ export interface SeriesResult {
 	error: boolean;
 }
 
-export async function getSeries(id: string): Promise<SeriesResult> {
+export async function getSeries(id: string, fetch?: LoadFetch): Promise<SeriesResult> {
+	const b = api(fetch);
 	const r = await liveResult<SeriesView | null>(async () => {
 		// Canonical (`w_`) works: resolve the selected translator (persisted
 		// preference or a sensible default) and render ITS chapters + metadata. This
@@ -1946,12 +1954,12 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 			// fan-out path still wants a separate `aggregatedChapters` request — kicked
 			// off here, alongside the (much slower, multi-round-trip) translator
 			// resolution, and consumed below.
-			const aggP = backend.seriesPage
+			const aggP = b.seriesPage
 				? null
-				: backend.aggregatedChapters
-					? backend.aggregatedChapters(id).catch(() => [] as AggregatedChapter[])
+				: b.aggregatedChapters
+					? b.aggregatedChapters(id).catch(() => [] as AggregatedChapter[])
 					: Promise.resolve([] as AggregatedChapter[]);
-			const resolved = await resolveWork(id, preferred, { withAggregated: true });
+			const resolved = await resolveWork(id, preferred, { withAggregated: true }, b);
 			if (!resolved || !resolved.meta) {
 				void aggP?.catch(() => {});
 				return null;
@@ -2050,8 +2058,8 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 			const agg =
 				resolved.aggregated ??
 				(await (aggP ??
-					(backend.aggregatedChapters
-						? backend.aggregatedChapters(id).catch(() => [] as AggregatedChapter[])
+					(b.aggregatedChapters
+						? b.aggregatedChapters(id).catch(() => [] as AggregatedChapter[])
 						: Promise.resolve([] as AggregatedChapter[]))));
 			if (agg.length && !view.chapters.length) {
 				const rows = buildAggregatedChapters(agg, resolved);
@@ -2087,7 +2095,7 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 		// Falling THROUGH on a null/failed canonical view is deliberate: a work we can't
 		// resolve is still a series we can render from this one source. The picker is
 		// worth a round trip, never the page.
-		const chaptersP = backend.chapters(id);
+		const chaptersP = b.chapters(id);
 		// A DISCARDED rejection (delegate path) must not surface as an unhandled one —
 		// but this must not become a `.catch(() => [])` fallback either: on the
 		// fall-through path a chapters outage still has to fail the page honestly rather
@@ -2106,13 +2114,13 @@ export async function getSeries(id: string): Promise<SeriesResult> {
 		// the default. NEWEST is deterministic over a fixed catalogue. (Page size is the
 		// server's to choose: this path now receives 30 rows rather than 20, which only
 		// widens the pool `relatedFor` picks its 8 from.)
-		const poolP = backend
+		const poolP = b
 			.search('', 1, { sort: 'NEWEST' })
 			.then((r) => r.items)
 			.catch(() => [] as Series[]);
-		const s = await backend.series(id);
+		const s = await b.series(id);
 		if (s.workId && isCanonicalId(s.workId)) {
-			const canonical = await getSeries(s.workId);
+			const canonical = await getSeries(s.workId, fetch);
 			if (canonical.view) return canonical.view;
 		}
 		const [chs, pool] = await Promise.all([chaptersP, poolP]);

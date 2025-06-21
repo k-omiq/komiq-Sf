@@ -90,15 +90,64 @@ export interface BackendConfig {
 const pageArg = (page?: number | null): number => page ?? 1;
 
 /**
+ * A URL string in its WHATWG-normalized form — what `new URL(s).href` produces.
+ *
+ * This exists for ONE reason, and it is not cosmetic. SvelteKit's SSR serializes each
+ * `load` fetch into the HTML keyed on `new URL(input, event.url).href`, and the hydration
+ * re-run looks that key up using the string the caller passed, VERBATIM. Any character the
+ * two disagree about means a miss — the response is inlined in the page, the client cannot
+ * find it, and it refetches over the network.
+ *
+ * Our GET query string is built with `encodeURIComponent`, whose "do not encode" set
+ * includes `!'()*`; WHATWG's query percent-encode set does not spare `'`. So a document
+ * containing an apostrophe — every one of them does, in a comment like "the newest
+ * chapter's NUMBER" — is sent with a literal `'` and serialized with `%27`, and the lookup
+ * misses on exactly the queries this optimization is for. Normalizing before the request
+ * makes both sides agree, and is idempotent, so it costs nothing anywhere else.
+ *
+ * Falls back to the input if it will not parse (a relative endpoint in some future
+ * config): a request that still works uncached beats one that throws.
+ */
+function canonicalUrl(url: string): string {
+	try {
+		return new URL(url).href;
+	} catch {
+		return url;
+	}
+}
+
+/**
  * GraphQL-backed implementation of {@link Backend}, targeting Komika's unified
  * API. Operations are domain-shaped (see `operations.ts` + `schema/komika.graphql`),
  * so responses map 1:1 onto `@komika/types` with no translation layer.
  */
 export class GraphQLBackend implements Backend {
-	constructor(private config: BackendConfig) {}
+	/**
+	 * The bearer token, in a cell SHARED with every {@link withFetch} view of this
+	 * backend rather than copied into each one.
+	 *
+	 * A view is created inside a `load` and used across `await`s; a login or a session
+	 * restore landing in that window must reach it, and a token it captured at
+	 * construction would go stale in exactly the direction that matters — a view still
+	 * sending anonymous GETs after the viewer signed in would be served (and could cache)
+	 * another viewer's answer.
+	 */
+	private readonly auth: { token: string | null };
+
+	/** `auth` is passed only by {@link withFetch}, to share the parent's cell. */
+	constructor(
+		private config: BackendConfig,
+		auth?: { token: string | null },
+	) {
+		this.auth = auth ?? { token: config.token ?? null };
+	}
+
+	withFetch(fetch: typeof globalThis.fetch): Backend {
+		return new GraphQLBackend({ ...this.config, fetch }, this.auth);
+	}
 
 	setToken(token: string | null): void {
-		this.config = { ...this.config, token };
+		this.auth.token = token;
 	}
 
 	/**
@@ -193,7 +242,7 @@ export class GraphQLBackend implements Backend {
 		// `operations.ts` always writes a top-level `mutation Name(`/`query Name(`
 		// (fragments may come first, hence the newline alternative).
 		const useGet =
-			!this.config.token &&
+			!this.auth.token &&
 			!GraphQLBackend.getUnsupported &&
 			!/(^|\n)\s*mutation[\s(]/.test(stripped);
 		let res: Response;
@@ -203,7 +252,7 @@ export class GraphQLBackend implements Backend {
 			const params =
 				`query=${encodeURIComponent(stripped)}` +
 				(variables ? `&variables=${encodeURIComponent(JSON.stringify(variables))}` : '');
-			res = await doFetch(`${this.config.endpoint}?${params}`);
+			res = await doFetch(canonicalUrl(`${this.config.endpoint}?${params}`));
 			if (res.status === 404 || res.status === 405) {
 				// The server predates GET /graphql — schema-drift fallback, not an outage.
 				// Memoize and re-enter: the retry re-evaluates the transport and lands on
@@ -218,7 +267,7 @@ export class GraphQLBackend implements Backend {
 				method: 'POST',
 				headers: {
 					'content-type': 'application/json',
-					...(this.config.token ? { authorization: `Bearer ${this.config.token}` } : {}),
+					...(this.auth.token ? { authorization: `Bearer ${this.auth.token}` } : {}),
 				},
 				body: JSON.stringify({ query: stripped, variables }),
 			});
@@ -375,7 +424,10 @@ export class GraphQLBackend implements Backend {
 
 	// --- social ---
 	async reviews(seriesId: Id, page = 1): Promise<Paginated<Review>> {
-		const d = await this.gql<{ reviews: Paginated<Review> }>(ops.REVIEWS, { seriesId, page: pageArg(page) });
+		const d = await this.gql<{ reviews: Paginated<Review> }>(ops.REVIEWS, {
+			seriesId,
+			page: pageArg(page),
+		});
 		return d.reviews;
 	}
 	async myReview(seriesId: Id): Promise<Review | null> {
@@ -409,7 +461,7 @@ export class GraphQLBackend implements Backend {
 		form.append('image', file);
 		const res = await doFetch(url, {
 			method: 'POST',
-			headers: this.config.token ? { authorization: `Bearer ${this.config.token}` } : {},
+			headers: this.auth.token ? { authorization: `Bearer ${this.auth.token}` } : {},
 			body: form,
 		});
 		const json = (await res.json().catch(() => null)) as
@@ -436,7 +488,9 @@ export class GraphQLBackend implements Backend {
 
 	// --- notifications ---
 	async notifications(page = 1): Promise<Notification[]> {
-		const d = await this.gql<{ notifications: Notification[] }>(ops.NOTIFICATIONS, { page: pageArg(page) });
+		const d = await this.gql<{ notifications: Notification[] }>(ops.NOTIFICATIONS, {
+			page: pageArg(page),
+		});
 		return d.notifications;
 	}
 	async unreadNotificationCount(): Promise<number> {
@@ -589,7 +643,11 @@ export class GraphQLBackend implements Backend {
 		kind: ReportKind | null = null,
 		page = 1,
 	): Promise<ReportPage> {
-		const d = await this.gql<{ reports: ReportPage }>(ops.REPORTS, { status, kind, page: pageArg(page) });
+		const d = await this.gql<{ reports: ReportPage }>(ops.REPORTS, {
+			status,
+			kind,
+			page: pageArg(page),
+		});
 		return d.reports;
 	}
 
@@ -608,7 +666,9 @@ export class GraphQLBackend implements Backend {
 
 	// --- admin cover issues / "Bugs" panel ---
 	async coverIssues(page = 1): Promise<Paginated<CoverIssue>> {
-		const d = await this.gql<{ coverIssues: Paginated<CoverIssue> }>(ops.COVER_ISSUES, { page: pageArg(page) });
+		const d = await this.gql<{ coverIssues: Paginated<CoverIssue> }>(ops.COVER_ISSUES, {
+			page: pageArg(page),
+		});
 		return d.coverIssues;
 	}
 
@@ -625,7 +685,7 @@ export class GraphQLBackend implements Backend {
 		form.append('cover', file);
 		const res = await doFetch(url, {
 			method: 'POST',
-			headers: this.config.token ? { authorization: `Bearer ${this.config.token}` } : {},
+			headers: this.auth.token ? { authorization: `Bearer ${this.auth.token}` } : {},
 			body: form,
 		});
 		const json = (await res.json().catch(() => null)) as {
@@ -837,7 +897,7 @@ export class GraphQLBackend implements Backend {
 		form.append('avatar', file);
 		const res = await doFetch(url, {
 			method: 'POST',
-			headers: this.config.token ? { authorization: `Bearer ${this.config.token}` } : {},
+			headers: this.auth.token ? { authorization: `Bearer ${this.auth.token}` } : {},
 			body: form,
 		});
 		const json = (await res.json().catch(() => null)) as {

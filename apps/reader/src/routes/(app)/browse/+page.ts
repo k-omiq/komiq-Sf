@@ -14,9 +14,11 @@ export const ssr = SSR_PUBLIC;
 // every query — so reading `url` here would refetch the whole genre facet payload on
 // each pager click for no benefit. The page number is read in the component, straight
 // off `page.url` (see `pageNum` in +page.svelte). Don't "fix" this.
-export const load: PageLoad = ({ setHeaders }) => {
+// `fetch` is threaded into the data layer so the SSR response is inlined in the HTML and
+// the hydration re-run replays it instead of refetching — see $lib/data/load-fetch.
+export const load: PageLoad = ({ fetch, setHeaders }) => {
 	// Facets change rarely; cache them longer than the feed pages. Rows are fetched
 	// client-side, so only this facet payload is edge-cached.
 	setHeaders({ 'cache-control': 'public, max-age=0, s-maxage=300' });
-	return { facets: getGenreFacets() };
+	return { facets: getGenreFacets(fetch) };
 };

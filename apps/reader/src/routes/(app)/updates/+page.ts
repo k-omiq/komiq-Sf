@@ -43,7 +43,9 @@ function parseType(raw: string | null): ComicType | null {
 // Consequence worth knowing: `s-maxage=30` now keys on the query string, so `?page=2` is
 // its own edge-cache entry. That is correct (different content, different key) and
 // bounded in practice — crawlers aside, real viewers see the first few pages.
-export const load: PageLoad = async ({ url, setHeaders }) => {
+// `fetch` is threaded into the data layer so the SSR responses are inlined in the HTML and
+// the hydration re-run replays them instead of refetching — see $lib/data/load-fetch.
+export const load: PageLoad = async ({ url, fetch, setHeaders }) => {
 	// Shortest TTL of the public pages — this is the "what's new" surface.
 	setHeaders({ 'cache-control': 'public, max-age=0, s-maxage=30' });
 	const sp = url.searchParams;
@@ -55,6 +57,6 @@ export const load: PageLoad = async ({ url, setHeaders }) => {
 	// "Hot" is a curated top-N with no pagination in the stack, so it never carries a
 	// page (the screen also strips `page` from the URL when switching to it).
 	const page = tab === 'hot' ? 1 : pageParam(sp);
-	const updates = getUpdates({ page, tab, type });
+	const updates = getUpdates({ page, tab, type }, fetch);
 	return { page, tab, type, updates: shouldStream() ? updates : await updates };
 };

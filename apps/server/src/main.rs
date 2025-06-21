@@ -5,6 +5,7 @@ mod catalog;
 mod chapter_label;
 mod config;
 mod cover;
+mod cover_recompress;
 mod db;
 mod dedup;
 mod discovery;
@@ -284,6 +285,56 @@ async fn graphql_get_handler(
     State(schema): State<ApiSchema>,
     State(trusted): State<Arc<Vec<Cidr>>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    req: GraphQLRequest,
+) -> axum::response::Response {
+    let anonymous = bearer(&headers).is_none();
+    let mut res = graphql_get_response(schema, trusted, peer, headers, req).await;
+    if anonymous {
+        allow_any_origin(res.headers_mut());
+    }
+    res
+}
+
+/// Answer an ANONYMOUS `GET /graphql` with `Access-Control-Allow-Origin: *`, replacing the
+/// allowlisted echo `CorsLayer` would otherwise put there.
+///
+/// WHAT THIS DOES AND DOES NOT WIDEN. It applies to one method on one route, and only when
+/// the request carries no bearer token — the same condition that already makes the
+/// response publicly cacheable (`cacheable` below). The bytes behind it are the anonymous
+/// public catalogue, viewer-invariant by construction and served from a shared edge cache
+/// to anyone who asks. `*` also FORBIDS credentialed requests, and this layer never sets
+/// `Access-Control-Allow-Credentials`, so no cookie or authenticated read becomes readable
+/// by another site: authenticated reads carry a token, take the POST path, and keep the
+/// strict allowlist untouched.
+///
+/// WHY IT IS NEEDED. The reader's edge SSR fetches this endpoint through SvelteKit's
+/// `load({ fetch })`, which SIMULATES CORS server-side "for consistency with client-side
+/// behaviour": it throws unless the response's ACAO is `*` or EXACTLY the page's origin.
+/// Using that fetch is what lets SvelteKit inline the SSR response into the HTML so
+/// hydration replays it instead of refetching — the two GraphQL round trips that sat on
+/// the home page's critical path at 706 ms and 963 ms.
+///
+/// An echo cannot satisfy that check reliably, which is why this is `*` and not something
+/// narrower. Workers synthesize their OWN `Origin` on a subrequest — measured, it is the
+/// worker's route host (`http://komiq.cc`), not the origin of the page being rendered
+/// (`https://www.komiq.cc`) — so the echo we would send back is a value SvelteKit rejects
+/// as "Incorrect", and the SSR degrades every public page to empty feeds behind a 60 s
+/// edge cache. `*` is the only answer that is correct for every host the reader is served
+/// on, today and after any future domain change.
+fn allow_any_origin(headers: &mut HeaderMap) {
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+}
+
+/// The GET /graphql pipeline proper. Split out of [`graphql_get_handler`] only so the
+/// wrapper can post-process every one of its exit paths in one place.
+async fn graphql_get_response(
+    schema: ApiSchema,
+    trusted: Arc<Vec<Cidr>>,
+    peer: SocketAddr,
     headers: HeaderMap,
     req: GraphQLRequest,
 ) -> axum::response::Response {
@@ -1040,10 +1091,15 @@ fn query_param<'a>(raw: &'a Option<String>, key: &str) -> Option<&'a str> {
 /// Serve `master`, or an allowlisted `?w=` derivative of it, generating and caching that
 /// derivative on first request.
 ///
-/// A card renders a cover at 150 CSS px; the masters measure 240–360 px wide, so a 1x
-/// viewer downloads roughly four times the pixels it can show. The derivative is what
-/// the reader puts in the `1x` slot of its `srcset` — 2x viewers still get the master,
-/// which is already the right size for them.
+/// A card renders a cover at 150–200 CSS px; the masters measure 240–364 px wide, so a
+/// 1x viewer downloads roughly four times the pixels it can show and a 2x viewer still
+/// downloads more than it can show. The derivatives are what the reader puts in the `1x`
+/// and `2x` slots of its `srcset` (see `cover::VARIANT_WIDTHS`); only a 3x viewer gets
+/// the master, which is the largest cover we hold.
+///
+/// A master already at or under the asked width yields no derivative — it is served
+/// as-is and NOTHING is stored, so the 320 rung does not mint a byte-identical copy of
+/// every narrow master.
 ///
 /// Every failure mode falls back to the master: a cover that renders slightly too large
 /// is strictly better than a hole in the grid.
@@ -1074,7 +1130,9 @@ async fn cover_response_at_width(
     let source = master.clone();
     let made = tokio::task::spawn_blocking(move || cover::downscale_variant(&source, w)).await;
     match made {
-        Ok(Ok(bytes)) => {
+        // The master is already at or under `w` — serve it, store nothing.
+        Ok(Ok(None)) => webp_cover_response(master),
+        Ok(Ok(Some(bytes))) => {
             if let Err(e) = cover::put_cover_variant(covers, asset_key, w, &bytes).await {
                 tracing::warn!(error = %e, asset_key, width = w, "cover variant store failed");
             }
@@ -1678,6 +1736,22 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("cover cache drainer disabled (COVER_CACHE=off)");
     }
 
+    // One-shot recompression of pre-switch LOSSLESS cover masters (150–200 KB each) into
+    // the lossy encoding the pipeline produces today (20–40 KB). Pure local CPU — it
+    // re-encodes the blob we already hold rather than refetching from MangaDex — so it
+    // runs on every replica and stops by itself once the walk completes.
+    if cfg.cover_recompress_enabled {
+        cover_recompress::spawn(
+            pool.clone(),
+            cover_pool.clone(),
+            cfg.cover_recompress_interval_secs,
+            cfg.cover_recompress_batch,
+            shutdown_tx.subscribe(),
+        );
+    } else {
+        tracing::info!("cover recompress pass disabled (COVER_RECOMPRESS=off)");
+    }
+
     let schema = build_schema(state.clone(), !cfg.graphiql_enabled);
 
     let origins: Vec<_> = cfg
@@ -1889,6 +1963,42 @@ mod tests {
 
     fn peer(ip: &str) -> SocketAddr {
         SocketAddr::new(ip.parse().unwrap(), 12345)
+    }
+
+    /// The reader's edge SSR reaches this endpoint through SvelteKit's `load({ fetch })`,
+    /// which simulates CORS server-side and accepts only `*` or the page's exact origin.
+    /// A Worker subrequest carries the WORKER's origin, not the page's, so the allowlist
+    /// echo is a value that check rejects — and every public page would then SSR to empty
+    /// feeds behind a 60 s edge cache.
+    #[test]
+    fn an_anonymous_get_is_readable_from_any_origin() {
+        let mut h = HeaderMap::new();
+        allow_any_origin(&mut h);
+        assert_eq!(
+            h.get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+    }
+
+    /// It REPLACES the allowlist echo rather than deferring to it — the echo is exactly the
+    /// value that fails the check above, so leaving it in place would be the bug.
+    #[test]
+    fn the_allowlist_echo_is_replaced_not_kept() {
+        let mut h = hdrs(&[("access-control-allow-origin", "http://komiq.cc")]);
+        allow_any_origin(&mut h);
+        assert_eq!(
+            h.get_all(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .iter()
+                .count(),
+            1,
+            "two ACAO headers is the same as none — every browser rejects it"
+        );
+        assert_eq!(
+            h.get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
     }
 
     /// The saturated-pool answer must be a FAST 5xx that no cache will keep. A 200

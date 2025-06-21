@@ -691,7 +691,10 @@ mod tests {
             .fetch_one(&covers)
             .await
             .unwrap();
-        assert_eq!(left, 0, "the prefixed key must match what the serve path writes");
+        assert_eq!(
+            left, 0,
+            "the prefixed key must match what the serve path writes"
+        );
         // Guard the empty case the sweep hits on every clean tick.
         let none: [String; 0] = [];
         purge_cover_variants(&covers, &none).await.unwrap();

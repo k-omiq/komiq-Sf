@@ -133,6 +133,21 @@ pub async fn init_covers(database_url: &str) -> Result<SqlitePool> {
     )
     .execute(&pool)
     .await?;
+    // Durable cursors for one-shot maintenance passes over this DB. One row per pass,
+    // holding the highest key it has already handled, so a restart resumes instead of
+    // re-scanning 20 GB of blobs. Lives here (not the main DB) because both the data it
+    // walks and the progress marker are cover-cache state: dropping this file loses the
+    // cursor and the covers together, which is consistent, and neither needs backup.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS cover_maintenance (\
+             key        TEXT PRIMARY KEY,\
+             cursor     TEXT NOT NULL,\
+             done       INTEGER NOT NULL DEFAULT 0,\
+             updated_at TEXT NOT NULL\
+         )",
+    )
+    .execute(&pool)
+    .await?;
     // Extension icons Keiyoushi published AFTER the vendored snapshot in
     // `assets/ext-icons/` was taken (refreshed by `scripts/fetch-ext-icons.mjs`).
     // The baked-in set is authoritative and answers essentially every request;

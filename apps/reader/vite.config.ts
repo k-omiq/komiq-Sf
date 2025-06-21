@@ -26,6 +26,20 @@ export default defineConfig({
 	},
 	plugins: [
 		sveltekit({
+			// Inline every stylesheet at or under this size into the <head> instead of
+			// linking it. SvelteKit code-splits CSS per component and per route, so the
+			// home page shipped EIGHT render-blocking <link rel="stylesheet"> requests
+			// (layout, route, MangaCard, Cover, Avatar, FlagBadge, CardRowSkeleton …) —
+			// Lighthouse measured 500 ms of blocked render for 14.7 KiB of transfer, i.e.
+			// almost all latency and almost no bytes.
+			//
+			// 12 KiB is chosen off the built output: it covers every file on the public
+			// pages' critical path (the largest is the root layout at ~11 KiB raw, which
+			// gzips to ~5.5 KiB in the document) while leaving the two heavy route-only
+			// sheets — the reader at 26 KiB and one admin-ish route at 13 KiB — external,
+			// where they are fetched once and cached across navigations rather than
+			// re-sent inside every SSR'd HTML response.
+			inlineStyleThreshold: 12 * 1024,
 			compilerOptions: {
 				// Force runes mode for the project, except for libraries. Can be removed in svelte 6.
 				runes: ({ filename }) =>

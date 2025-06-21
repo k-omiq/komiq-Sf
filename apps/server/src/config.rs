@@ -160,6 +160,16 @@ pub struct Config {
     /// Covers fetched + stored per drainer tick. Bounded so a tick stays polite
     /// (each is one MangaDex-CDN fetch under the shared limiter). Default 500.
     pub cover_cache_batch: i64,
+    /// One-shot recompression of cover masters still stored in the pre-switch LOSSLESS
+    /// encoding (see `cover_recompress`). Defaults ON; it terminates by itself once the
+    /// walk completes, so leaving it on costs nothing after the first pass. Set
+    /// COVER_RECOMPRESS=off to keep the CPU free (e.g. during an incident).
+    pub cover_recompress_enabled: bool,
+    /// Interval between recompress ticks (seconds).
+    pub cover_recompress_interval_secs: u64,
+    /// Masters examined per recompress tick. Sized so a tick's CPU stays a fraction of
+    /// its interval: a re-encode is ~60 ms, so 200 per 60 s is ~20% of one core.
+    pub cover_recompress_batch: i64,
 }
 
 impl Config {
@@ -366,6 +376,25 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .filter(|&v: &i64| v > 0)
             .unwrap_or(500);
+        // Cover recompression defaults ON for the same reason as the drainer: it is
+        // maintenance nobody should have to remember to trigger. It hits no external
+        // service, so unlike the drainer it is safe on every replica.
+        let cover_recompress_enabled = env::var("COVER_RECOMPRESS")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "off" || v == "0" || v == "false")
+            })
+            .unwrap_or(true);
+        let cover_recompress_interval_secs = env::var("COVER_RECOMPRESS_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(60);
+        let cover_recompress_batch = env::var("COVER_RECOMPRESS_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &i64| v > 0)
+            .unwrap_or(200);
         Self {
             port,
             database_url,
@@ -401,6 +430,9 @@ impl Config {
             cover_cache_enabled,
             cover_cache_interval_secs,
             cover_cache_batch,
+            cover_recompress_enabled,
+            cover_recompress_interval_secs,
+            cover_recompress_batch,
             covers_database_url,
             ext_icons_dir,
         }

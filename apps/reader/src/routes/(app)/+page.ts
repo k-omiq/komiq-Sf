@@ -24,8 +24,13 @@ export const ssr = SSR_PUBLIC;
 // On later CLIENT-SIDE navigations we return the promise UNawaited so the page
 // shows skeleton placeholders via `{#await}` while the backend resolves. The page
 // renders both shapes (see +page.svelte): a resolved object, or a promise.
-export const load: PageLoad = async ({ setHeaders }) => {
+// `fetch` IS DESTRUCTURED ON PURPOSE, and passed all the way down to the GraphQL calls.
+// Requests made with SvelteKit's own `fetch` during edge SSR are serialized into the HTML,
+// so the hydration re-run of this load replays them instead of repeating them over the
+// network — see $lib/data/load-fetch. Anonymous visits therefore fetch the home feeds
+// once, on the server, rather than once there and again on the browser's critical path.
+export const load: PageLoad = async ({ fetch, setHeaders }) => {
 	setHeaders({ 'cache-control': 'public, max-age=0, s-maxage=60' });
-	const home = getHome();
+	const home = getHome(fetch);
 	return { home: shouldStream() ? home : await home };
 };

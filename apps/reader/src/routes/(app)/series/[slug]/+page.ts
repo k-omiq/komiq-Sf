@@ -21,9 +21,11 @@ export const ssr = SSR_PUBLIC;
 // So: await on the server AND on hydration (see $lib/stream — `browser` alone
 // can't tell hydration from a client-side navigation), and stream only on later
 // client-side navigations, where a skeleton is the right thing to show.
-export const load: PageLoad = async ({ params, setHeaders }) => {
+// `fetch` is threaded into the data layer so the SSR responses are inlined in the HTML and
+// the hydration re-run replays them instead of refetching — see $lib/data/load-fetch.
+export const load: PageLoad = async ({ params, fetch, setHeaders }) => {
 	setHeaders({ 'cache-control': 'public, max-age=0, s-maxage=60' });
-	const series = getSeries(params.slug);
+	const series = getSeries(params.slug, fetch);
 	return {
 		slug: params.slug,
 		series: shouldStream() ? series : await series,

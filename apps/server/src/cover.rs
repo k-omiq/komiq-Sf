@@ -107,22 +107,68 @@ pub fn process_cover(bytes: &[u8]) -> Result<Vec<u8>> {
     smallest.ok_or_else(|| anyhow!("no candidate cover size produced"))
 }
 
+/// Whether a stored WebP is in the LOSSY (VP8) encoding this pipeline produces today.
+///
+/// Covers written before the lossy switch are `VP8L` (lossless, from the pure-Rust
+/// `image-webp` encoder) and run 150–200 KB for the same 512 px art that lossy encodes in
+/// 20–40 KB — the single biggest chunk of the "Improve image delivery" bytes Lighthouse
+/// reports. `cover_recompress` uses this as its cheap, header-only "does this row still
+/// need work?" test: no decode, and a row it rewrites can never match again, so the pass
+/// is self-terminating.
+///
+/// A `VP8X` (extended container: alpha, ICC, EXIF) master reads as NOT lossy. That is
+/// deliberate — the payload inside may be either, and re-encoding one is harmless (the
+/// recompress pass keeps the result only when it is meaningfully smaller).
+pub fn webp_is_lossy(bytes: &[u8]) -> bool {
+    bytes.len() >= 16
+        && &bytes[0..4] == b"RIFF"
+        && &bytes[8..12] == b"WEBP"
+        && &bytes[12..16] == b"VP8 "
+}
+
 /// Widths (px) the `?w=` cover variant is allowed to take. An ALLOWLIST, not a range:
 /// each accepted value mints a stored derivative, so an open parameter would let one
 /// crafted page fill the covers DB with thousands of near-identical encodings.
 ///
-/// One entry today. Cards render at 150 CSS px ([`crate::graphql`] feeds them to
-/// `MangaCard`, whose default width is 150), so a 1x viewer needs ~150 px and gets 192,
-/// while a 2x viewer needs ~300 px and is better served by the master (measured 240–360
-/// px wide). Adding a width here is all a new call site needs; nothing is generated
-/// until a request actually asks for it.
-pub const VARIANT_WIDTHS: [u32; 1] = [CARD_VARIANT_WIDTH];
+/// Two entries. Cards render at 150–200 CSS px ([`crate::graphql`] feeds them to
+/// `MangaCard`, whose default width is 150; the widest auto-fill grid column reaches
+/// ~200), so a 1x viewer needs ~150–200 px and gets 192, and a 2x viewer needs
+/// ~300–400 px and gets 320. Only a 3x viewer still gets the master, which at 240–364
+/// px wide is the largest cover we hold — there is nothing sharper to hand it.
+///
+/// The 2x rung is not cosmetic: before it existed, EVERY device above 1x downloaded the
+/// master, which is what Lighthouse flagged (a 360x510 master for a card that can show
+/// 263x373 device px at DPR 1.75). Adding a width here is all a new call site needs;
+/// nothing is generated until a request actually asks for it.
+pub const VARIANT_WIDTHS: [u32; 2] = [CARD_VARIANT_WIDTH, CARD_VARIANT_WIDTH_2X];
 
-/// The variant width for a card-sized cover — what the reader puts in the `1x` slot of
-/// its `srcset` (mirrored there as `CARD_COVER_WIDTH`). Defined ahead of
+/// The variant width for a card-sized cover at 1x — what the reader puts in the `1x`
+/// slot of its `srcset` (mirrored there as `CARD_COVER_WIDTH`). Defined ahead of
 /// [`VARIANT_WIDTHS`] and used to build it, so "the width the reader asks for" and "the
 /// widths we agree to serve" cannot drift apart on this side of the wire.
 pub const CARD_VARIANT_WIDTH: u32 = 192;
+
+/// The variant width for a card-sized cover at 2x (`CARD_COVER_WIDTH_2X` on the reader
+/// side). A 150 CSS px card needs 300 device px at DPR 2 and 263 at DPR 1.75; 320 covers
+/// both and stays well under every master, so no viewer at 2x pulls a master any more.
+pub const CARD_VARIANT_WIDTH_2X: u32 = 320;
+
+/// The 2x rung must be WIDER than the 1x rung: `downscale_variant` reads the ordering to
+/// pick an encode quality, and the reader hands the two out as `1x`/`2x` candidates, so a
+/// swap would serve the smaller image to the denser screen. Checked at compile time
+/// because there is no runtime path that could ever report it.
+const _: () = assert!(CARD_VARIANT_WIDTH_2X > CARD_VARIANT_WIDTH);
+
+/// Encode quality for a HiDPI derivative — every rung above the 1x one.
+///
+/// Lower than the master's ladder top (82) on purpose, and the reasoning is about where
+/// the pixels land, not about "small images matter less". A 1x derivative is painted
+/// roughly 1:1, so an artifact is an artifact; a 2x derivative is DOWNSAMPLED by the
+/// device before the viewer sees it (320 px of image into a 263–300 device-px box), which
+/// is exactly the operation that hides compression noise. Measured on a live cover, the
+/// 320 rung goes 44.1 KB → 35.7 KB for no difference visible at card size — the other
+/// half of what Lighthouse's "increasing the image compression factor" line is asking for.
+const HIDPI_VARIANT_QUALITY: f32 = 75.0;
 
 /// Concurrency bound on variant generation.
 ///
@@ -160,24 +206,33 @@ pub fn variant_width(raw: Option<&str>) -> Option<u32> {
 ///
 /// Takes the STORED master rather than the upstream original on purpose: the master is
 /// local (no refetch, no rate limiter) and already passed the decode-bomb and truncation
-/// gates, so this stays a pure CPU step. A master narrower than `width` is returned
-/// unchanged — upscaling would cost bytes to add no detail.
-pub fn downscale_variant(master: &[u8], width: u32) -> Result<Vec<u8>> {
+/// gates, so this stays a pure CPU step.
+///
+/// `Ok(None)` means "the master is ALREADY at or under `width`" — upscaling would cost
+/// bytes to add no detail, so the caller serves the master and, importantly, stores
+/// nothing. That distinction matters now that the allowlist reaches 320: masters measure
+/// 240–364 px wide, so a byte-identical copy of the master would otherwise be written
+/// into `cover_variant` for a large share of the catalogue.
+pub fn downscale_variant(master: &[u8], width: u32) -> Result<Option<Vec<u8>>> {
     let img = decode_limited(master)?;
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         bail!("cover master has a zero dimension");
     }
     if w <= width {
-        return Ok(master.to_vec());
+        return Ok(None);
     }
     let th = ((h as f32 * (width as f32 / w as f32)).round() as u32).max(1);
     let resized = imageops::resize(&img.to_rgba8(), width, th, imageops::FilterType::Lanczos3);
-    // A card-sized derivative is ~1/3 the master's pixels, so the master's quality ladder
-    // is unnecessary here — one encode at the ladder's top quality already lands far
-    // under MAX_COVER_BYTES, and at this size the extra sharpness is what the viewer
-    // actually sees.
-    encode_webp_lossy(&resized, COVER_QUALITY_LADDER[0])
+    // A card-sized derivative is a fraction of the master's pixels, so the master's
+    // quality LADDER is unnecessary here — one encode already lands far under
+    // MAX_COVER_BYTES. The quality itself is per-rung: see `HIDPI_VARIANT_QUALITY`.
+    let quality = if width <= CARD_VARIANT_WIDTH {
+        COVER_QUALITY_LADDER[0]
+    } else {
+        HIDPI_VARIANT_QUALITY
+    };
+    encode_webp_lossy(&resized, quality).map(Some)
 }
 
 /// Read a stored cover derivative, or `None` when it has not been generated yet.
@@ -1721,7 +1776,9 @@ mod tests {
     #[test]
     fn downscale_variant_narrows_the_master_and_keeps_aspect_ratio() {
         let master = process_cover(&noisy_png(600, 900)).expect("master encodes");
-        let small = downscale_variant(&master, CARD_VARIANT_WIDTH).expect("variant encodes");
+        let small = downscale_variant(&master, CARD_VARIANT_WIDTH)
+            .expect("variant encodes")
+            .expect("a 512px master is wider than a card, so a derivative is produced");
 
         let dims = |b: &[u8]| {
             let i = image::load_from_memory(b).expect("decodes");
@@ -1745,12 +1802,71 @@ mod tests {
     }
 
     #[test]
+    fn the_hidpi_rung_is_wider_but_cheaper_per_pixel() {
+        // Both rungs must come out at exactly the asked width, and the 2x rung must cost
+        // LESS per pixel than the 1x one — that is the whole point of
+        // `HIDPI_VARIANT_QUALITY`. Without the per-rung quality the 320 rung would encode
+        // at 82 and give back only the pixel-count saving.
+        let master = process_cover(&noisy_png(1200, 1800)).expect("master encodes");
+        let one_x = downscale_variant(&master, CARD_VARIANT_WIDTH)
+            .expect("1x encodes")
+            .expect("wider than a card");
+        let two_x = downscale_variant(&master, CARD_VARIANT_WIDTH_2X)
+            .expect("2x encodes")
+            .expect("wider than a card");
+
+        let dims = |b: &[u8]| {
+            let i = image::load_from_memory(b).expect("decodes");
+            (i.width(), i.height())
+        };
+        assert_eq!(dims(&one_x).0, CARD_VARIANT_WIDTH);
+        assert_eq!(dims(&two_x).0, CARD_VARIANT_WIDTH_2X);
+
+        let bpp = |bytes: &[u8], (w, h): (u32, u32)| bytes.len() as f64 / (w as f64 * h as f64);
+        assert!(
+            bpp(&two_x, dims(&two_x)) < bpp(&one_x, dims(&one_x)),
+            "the 2x rung must encode at a lower quality than the 1x rung"
+        );
+    }
+
+    #[test]
     fn downscale_variant_never_upscales() {
-        // A master already narrower than the card width is returned byte-identical:
-        // enlarging it would cost bytes to add no detail.
+        // A master already narrower than the card width yields NO derivative: enlarging it
+        // would cost bytes to add no detail, and storing a byte-identical copy would waste
+        // a `cover_variant` row per cover (masters are 240–364 px wide, so at the 320 rung
+        // that is most of the catalogue).
         let master = process_cover(&noisy_png(120, 180)).expect("master encodes");
         let out = downscale_variant(&master, CARD_VARIANT_WIDTH).expect("passes through");
-        assert_eq!(out, master, "a small master must pass through untouched");
+        assert_eq!(out, None, "a small master must not mint a derivative");
+    }
+
+    #[test]
+    fn both_card_variant_widths_are_actually_servable() {
+        // Same round trip as `the_card_variant_width_is_actually_servable`, for the 2x rung.
+        // A drift here is silent: the width falls off the allowlist, every 2x viewer is
+        // served the master again, and the only symptom is the byte count.
+        assert_eq!(
+            variant_width(Some(&CARD_VARIANT_WIDTH_2X.to_string())),
+            Some(CARD_VARIANT_WIDTH_2X)
+        );
+    }
+
+    #[test]
+    fn the_lossy_header_test_separates_the_two_cover_generations() {
+        // What `cover_recompress` selects on. Lossy in, lossy out; the pure-Rust lossless
+        // encoder (what every pre-switch master was written with) must read as NOT lossy or
+        // the recompress pass would skip exactly the rows it exists for.
+        let lossy = process_cover(&noisy_png(600, 900)).expect("master encodes");
+        assert!(webp_is_lossy(&lossy), "process_cover output is VP8 lossy");
+
+        let rgba = image::load_from_memory(&lossy).expect("decodes").to_rgba8();
+        let lossless = crate::avatar::encode_lossless(&rgba).expect("lossless encodes");
+        assert!(
+            !webp_is_lossy(&lossless),
+            "a VP8L master must be selected for recompression"
+        );
+        assert!(!webp_is_lossy(b""), "empty");
+        assert!(!webp_is_lossy(b"not an image at all"), "garbage");
     }
 
     #[test]
@@ -2024,13 +2140,20 @@ mod tests {
         .unwrap();
 
         let old_art = process_cover(&noisy_png(400, 600)).unwrap();
-        let variant = downscale_variant(&old_art, CARD_VARIANT_WIDTH).unwrap();
+        let variant = downscale_variant(&old_art, CARD_VARIANT_WIDTH)
+            .unwrap()
+            .expect("a 400x600 master is wider than a card");
         put_cover_variant(&covers, "w_a", CARD_VARIANT_WIDTH, &variant)
             .await
             .unwrap();
-        put_cover_variant(&covers, &suwayomi_variant_key(7), CARD_VARIANT_WIDTH, &variant)
-            .await
-            .unwrap();
+        put_cover_variant(
+            &covers,
+            &suwayomi_variant_key(7),
+            CARD_VARIANT_WIDTH,
+            &variant,
+        )
+        .await
+        .unwrap();
         assert!(
             get_cover_variant(&covers, "w_a", CARD_VARIANT_WIDTH)
                 .await
@@ -2042,7 +2165,9 @@ mod tests {
         // serving the old cover to every 1x viewer — and for the Suwayomi family, whose
         // public URL carries no `?v=` token, it would do so for ever.
         let new_art = process_cover(&noisy_png(500, 750)).unwrap();
-        put_work_cover(&main, &covers, "w_a", &new_art).await.unwrap();
+        put_work_cover(&main, &covers, "w_a", &new_art)
+            .await
+            .unwrap();
         assert!(
             get_cover_variant(&covers, "w_a", CARD_VARIANT_WIDTH)
                 .await

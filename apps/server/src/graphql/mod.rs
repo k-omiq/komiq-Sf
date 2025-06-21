@@ -173,7 +173,14 @@ fn store_feed<T>(cache: &FeedCache<T>, key: bool, value: T) {
 /// those means fixing the resync first. The detached ingest jobs
 /// (`startSourceIngest` / `startExtensionIngest`) are also left alone: they are the
 /// per-series crawl described above, and the feed catches up within one `FEED_TTL`.
-fn clear_feed_caches() {
+///
+/// One NON-admin caller: `cover_recompress`, once per batch. It changes no rows the feed
+/// selects on — only `work.cover_cached_version`, i.e. the `?v=` in every memoized
+/// `coverUrl`. A memo entry minted before the rewrite keeps handing out the OLD versioned
+/// URL, which the browser and the edge already hold under a one-year `immutable` entry, so
+/// until it expires the viewer keeps downloading the fat pre-recompress bytes we just
+/// replaced. Busting per BATCH (not per cover) keeps that to one clear every tick.
+pub(crate) fn clear_feed_caches() {
     if let Ok(mut map) = DISCOVERY_CACHE.lock() {
         map.clear();
     }
@@ -3667,8 +3674,7 @@ async fn compute_discovery(st: &AppState, show_nsfw: bool) -> Result<Vec<Discove
             .collect();
         let ranked = filter_nsfw(show_nsfw, series_by_keys(st, &keys).await);
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut seen_titles: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut seen_titles: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut items: Vec<Series> = Vec::with_capacity(10);
         for s in ranked.into_iter().chain(popular.iter().cloned()) {
             if items.len() >= 10 {
@@ -11476,7 +11482,6 @@ mod tests {
             );
         }
     }
-
 
     // ---- Tier-2 add-source-series core (DD2/DD1/N1) -----------------------
 

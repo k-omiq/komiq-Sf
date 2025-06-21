@@ -79,6 +79,22 @@ export interface Backend {
 	 * restore / logout, before the token is dropped.
 	 */
 	setCurrentUser?(userId: Id | null): void;
+	/**
+	 * A view of this backend that issues its requests through `fetch` instead of the
+	 * global one, sharing all of this backend's mutable state (the bearer token above
+	 * included). Optional: only the GraphQL backend implements it; callers fall back to
+	 * the backend itself.
+	 *
+	 * The caller this exists for is a SvelteKit `load`, which is handed a special
+	 * `fetch`. Requests made with it during edge SSR are serialized into the HTML, and
+	 * the hydration re-run of the same load replays them from there instead of going
+	 * back over the network. On the home page that is the difference between two
+	 * cross-origin GraphQL round trips on the critical path and none.
+	 *
+	 * The returned view is for the duration of ONE load and nothing else: hold it past
+	 * that and it keeps a `fetch` bound to a request that has finished.
+	 */
+	withFetch?(fetch: typeof globalThis.fetch): Backend;
 
 	// --- discovery / catalog (auto-served, no source picking) ---
 	discovery(): Promise<DiscoveryFeed[]>;
