@@ -4386,6 +4386,21 @@ impl QueryRoot {
         let user = current_user(ctx).await;
         let user_id = user.as_ref().map(|u| u.id.as_str());
 
+        // WORK-LEVEL ENRICHMENT, ONCE, FOR EVERY ARM BELOW.
+        //
+        // The row mappers (`map_canonical_chapter`, `map_chapter`) are pure projections
+        // that own no database, so the resolver has always been the thing that finishes a
+        // `Chapter`: `canonicalChapters` and `chapters` each do exactly these two lookups.
+        // This bundle replaced BOTH of them on the series page, so omitting them here does
+        // not degrade — it silently deletes a column ("Found —" on every row) and every
+        // read marker earned under a sibling source. Two queries per bundle, not per
+        // source, so the whole point of the single round trip survives.
+        //
+        // Both are keyed on the SPINE KEY, which is what makes one lookup serve every arm:
+        // the same chapter number carries the same key whichever source it came from.
+        let found = announce_map_for_work(&st.pool, &effective_id).await;
+        let read_keys = work_read_keys(&st.pool, user_id, &effective_id).await;
+
         // Canonical spine — only when MangaDex-anchored. `load_canonical_chapters` is
         // loaded ONCE and feeds both the chapter list and the series' chapterCount
         // (the old resolvers each loaded it independently).
@@ -4399,7 +4414,11 @@ impl QueryRoot {
                 .into_iter()
                 .map(|c| {
                     let p = progress.get(&c.external_id).copied();
-                    map_canonical_chapter(&effective_id, c, p)
+                    let key = canonical_chapter_key(&c);
+                    let mut ch = map_canonical_chapter(&effective_id, c, p);
+                    ch.read = ch.read || read_keys.contains(&key);
+                    ch.found_at = found.get(&key).cloned();
+                    ch
                 })
                 .collect();
             let s = map_canonical_series(&st.pool, user_id, work, count).await;
@@ -4452,7 +4471,17 @@ impl QueryRoot {
                                 .into_iter()
                                 .map(|c| {
                                     let p = progress.get(&c.id).copied();
-                                    map_chapter(c, p)
+                                    // The key the spine stores for THIS row, from the very
+                                    // input the spine writer binds — the same rule
+                                    // `chapters` uses, never a second one.
+                                    let key = catalog::spine_key_and_label(
+                                        &catalog::suwayomi_chapter_input(&c),
+                                    )
+                                    .0;
+                                    let mut ch = map_chapter(c, p);
+                                    ch.read = ch.read || read_keys.contains(&key);
+                                    ch.found_at = found.get(&key).cloned();
+                                    ch
                                 })
                                 .collect();
                         }
@@ -16426,6 +16455,216 @@ mod tests {
         let agg = page["aggregated"].as_array().unwrap();
         let numbers: Vec<f64> = agg.iter().map(|c| c["number"].as_f64().unwrap()).collect();
         assert_eq!(numbers, vec![1.0, 2.0], "{agg:?}");
+    }
+
+    /// P2.1 REGRESSION GUARD: the bundle must carry the WORK-level enrichment, not only
+    /// what the row mappers can produce on their own.
+    ///
+    /// `canonicalChapters` and `chapters` both finish their rows with two lookups the
+    /// pure `CanonicalChapter`/`SuwayomiChapter` -> `Chapter` mappers deliberately cannot
+    /// do (they own no database): the announce ledger's found date, and read state folded
+    /// onto the spine key across sibling sources. A bundle that calls only the mappers
+    /// answers `foundAt: null` on every row — the series page then prints "Found —" on
+    /// every chapter — and reports a series read under another translator as untouched.
+    /// Both shipped: for chapter 110 of source 4113, `chapters` answered
+    /// `foundAt 2026-09-01T14:54:36Z` while `seriesPage` answered null for the same row.
+    ///
+    /// Asserted on BOTH arms, because they map through different functions: the canonical
+    /// spine and the per-source Suwayomi lists.
+    #[tokio::test]
+    async fn series_page_carries_found_dates_and_cross_source_read_state() {
+        let (s, pool) = setup_full(100).await;
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-found",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Found Clock".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let md_ssid =
+            crate::catalog::find_source_series_id(&pool, "mangadex", "mangadex", "md-found")
+                .await
+                .unwrap()
+                .unwrap();
+        for (ext, num) in [("fc-ch-1", "1"), ("fc-ch-2", "2")] {
+            crate::catalog::upsert_chapter(
+                &pool,
+                &md_ssid,
+                &crate::catalog::ChapterInput {
+                    external_id: ext.into(),
+                    number: Some(num.into()),
+                    lang: Some("en".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-found'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // A Suwayomi mirror of the SAME two chapters: same numbers, different ids. Cached
+        // (so the bundle needs no live Suwayomi round trip) AND mirrored into `chapter`
+        // (so the cross-source fold has a spine key to match on).
+        sqlx::query(
+            "INSERT INTO suwayomi_series (id, title, status, source_id, chapter_count, updated_at) \
+             VALUES (778, 'Mirror Source', 'ONGOING', 'src-b', 2, '2020-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::series_cache::put_chapters(
+            &pool,
+            778,
+            &[9001i64, 9002]
+                .iter()
+                .enumerate()
+                .map(|(i, id)| crate::suwayomi::SuwayomiChapter {
+                    id: *id,
+                    manga_id: 778,
+                    name: format!("Ch {}", i + 1),
+                    chapter_number: (i + 1) as f64,
+                    scanlator: None,
+                    upload_date: None,
+                    is_read: false,
+                    is_bookmarked: false,
+                    is_downloaded: false,
+                    last_page_read: 0,
+                    page_count: 20,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+        let suw_ssid = crate::catalog::upsert_source_series(
+            &pool, &work_id, "suwayomi", "suwayomi", "778", None, false,
+        )
+        .await
+        .unwrap();
+        for (ext, num) in [("9001", "1"), ("9002", "2")] {
+            crate::catalog::upsert_chapter(
+                &pool,
+                &suw_ssid,
+                &crate::catalog::ChapterInput {
+                    external_id: ext.into(),
+                    number: Some(num.into()),
+                    lang: Some("en".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // The announce ledger — when WE first had each chapter — keyed by spine key
+        // (`round(number * 100)`), which both sources share.
+        for (key, ms) in [("100", 1_785_073_611_000i64), ("200", 1_785_160_011_000)] {
+            sqlx::query(
+                "INSERT INTO release_event \
+                   (work_id, chapter_key, first_seen_at, first_source_series_id, label, announce_at) \
+                 VALUES (?, ?, ?, NULL, ?, ?)",
+            )
+            .bind(&work_id)
+            .bind(key)
+            .bind(ms)
+            .bind(key)
+            .bind(ms)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Chapter 1 read on the MANGADEX spine only — the Suwayomi copy has no progress
+        // row of its own, so its `read` can only come from the cross-source fold.
+        sqlx::query(
+            "INSERT INTO canonical_progress \
+               (user_id, work_id, chapter_id, last_page_read, read, updated_at) \
+             VALUES ('bob-id', ?, 'fc-ch-1', 0, 1, '2026-01-02T00:00:00Z')",
+        )
+        .bind(&work_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let q = format!(
+            r#"{{ seriesPage(workId: "{work_id}") {{
+                spineChapters {{ id number foundAt read }}
+                sources {{
+                    source {{ sourceKey }}
+                    chapters {{ id number foundAt read }}
+                }}
+            }} }}"#
+        );
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let page = r.data.into_json().unwrap()["seriesPage"].clone();
+
+        let spine = page["spineChapters"].as_array().unwrap();
+        assert_eq!(spine.len(), 2);
+        assert_eq!(
+            spine[0]["foundAt"],
+            serde_json::json!("2026-07-26T13:46:51+00:00"),
+            "spine ch 1 found date: {spine:?}"
+        );
+        assert_eq!(
+            spine[1]["foundAt"],
+            serde_json::json!("2026-07-27T13:46:51+00:00"),
+            "spine ch 2 found date: {spine:?}"
+        );
+        assert_eq!(spine[0]["read"], serde_json::json!(true));
+        assert_eq!(spine[1]["read"], serde_json::json!(false));
+
+        let suw = page["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["source"]["sourceKey"] == serde_json::json!("778"))
+            .expect("suwayomi mapping present")
+            .clone();
+        let suw_chs = suw["chapters"].as_array().unwrap();
+        assert_eq!(suw_chs.len(), 2);
+        let by_number = |n: f64| {
+            suw_chs
+                .iter()
+                .find(|c| c["number"] == serde_json::json!(n))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            by_number(1.0)["foundAt"],
+            serde_json::json!("2026-07-26T13:46:51+00:00"),
+            "the found date belongs to the CHAPTER, not to the source it is read from"
+        );
+        assert_eq!(
+            by_number(2.0)["foundAt"],
+            serde_json::json!("2026-07-27T13:46:51+00:00")
+        );
+        assert_eq!(
+            by_number(1.0)["read"],
+            serde_json::json!(true),
+            "read under the sibling MangaDex source"
+        );
+        assert_eq!(by_number(2.0)["read"], serde_json::json!(false));
+
+        // Anonymous viewers get the found dates (a fact about the chapter) and NOBODY's
+        // read state.
+        let r = exec(&s, &q, None, "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let page = r.data.into_json().unwrap()["seriesPage"].clone();
+        let spine = page["spineChapters"].as_array().unwrap();
+        assert_eq!(
+            spine[0]["foundAt"],
+            serde_json::json!("2026-07-26T13:46:51+00:00")
+        );
+        assert!(
+            spine.iter().all(|c| c["read"] == serde_json::json!(false)),
+            "anonymous: {spine:?}"
+        );
     }
 
     /// P2.1: the single-round-trip resolver must apply the same NSFW gate as the
