@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 use crate::catalog::{self, Alias, Cover, WorkInput};
 
@@ -178,8 +178,83 @@ async fn read_capped(mut res: reqwest::Response, cap: usize, label: &str) -> Opt
 }
 
 /// The direct MangaDex API client. Cheap to clone-share via `Arc`.
+/// How long a `/at-home` answer is reused. MangaDex documents the returned base URL
+/// as valid for 15 minutes; 10 leaves a reader who fetched at the end of the window
+/// time to actually load the pages (the Worker refetches only on an edge miss, and a
+/// browser that already holds the page list keeps using it).
+const ATHOME_MEMO_TTL: Duration = Duration::from_secs(10 * 60);
+/// Upper bound on memoised chapters. ~40 URLs of ~120 bytes each per entry, so the
+/// cap is a few MB — the memo protects the 40 req/min `/at-home` budget, not memory.
+const ATHOME_MEMO_CAP: usize = 4096;
+
+/// A TTL memo with single-flight initialisation: concurrent callers for the same key
+/// share ONE in-flight fetch instead of each spending a request. A slot expires `ttl`
+/// after its fetch was *started*, and the value arrives later than that, so no caller
+/// ever sees a value the upstream issued more than `ttl` ago. A failed init leaves the
+/// slot uninitialised; waiters and later callers retry one at a time.
+///
+/// `tokio::time::Instant` rather than `std`: identical in production, but it obeys
+/// `tokio::time::pause`/`advance`, which is what lets the expiry test be exact.
+struct TtlMemo<V> {
+    ttl: Duration,
+    cap: usize,
+    slots: std::sync::Mutex<HashMap<String, MemoSlot<V>>>,
+}
+
+/// When the slot's fetch was started, and the cell its value lands in (shared by
+/// every caller that joined while the fetch was in flight).
+type MemoSlot<V> = (tokio::time::Instant, Arc<OnceCell<V>>);
+
+impl<V: Clone> TtlMemo<V> {
+    fn new(ttl: Duration, cap: usize) -> Self {
+        Self {
+            ttl,
+            cap,
+            slots: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The live slot for `key`, replacing an expired one. The lock is never held
+    /// across an await, so a slow upstream fetch blocks only its own key's waiters.
+    fn slot(&self, key: &str) -> Arc<OnceCell<V>> {
+        let now = tokio::time::Instant::now();
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((started, cell)) = slots.get(key) {
+            if now.duration_since(*started) < self.ttl {
+                return cell.clone();
+            }
+        }
+        if slots.len() >= self.cap {
+            let ttl = self.ttl;
+            slots.retain(|_, (started, _)| now.duration_since(*started) < ttl);
+            if slots.len() >= self.cap {
+                // Every entry is live and the memo is still full: the working set is
+                // larger than the cap. Start over rather than grow without bound — one
+                // extra upstream round per chapter is the cost, never wrong data.
+                slots.clear();
+            }
+        }
+        let cell = Arc::new(OnceCell::new());
+        slots.insert(key.to_string(), (now, cell.clone()));
+        cell
+    }
+
+    async fn get_or_try_init<F, Fut>(&self, key: &str, init: F) -> Result<V>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<V>>,
+    {
+        let cell = self.slot(key);
+        Ok(cell.get_or_try_init(init).await?.clone())
+    }
+}
+
 pub struct MangaDexClient {
     http: reqwest::Client,
+    /// `/at-home` answers by chapter id, so N readers opening the same chapter inside
+    /// the base URL's lifetime cost ONE request from the 40/min budget, and a reader
+    /// whose next-chapter prefetch already ran opens it without a MangaDex round-trip.
+    athome_memo: TtlMemo<Vec<String>>,
     /// Global budget shared by every MangaDex call (~5 req/s per-IP ceiling).
     limiter: TokenBucket,
     /// Dedicated budget for `/at-home`, whose own limit (~40/min) is far tighter
@@ -202,6 +277,7 @@ impl MangaDexClient {
             .expect("reqwest client builds");
         Self {
             http,
+            athome_memo: TtlMemo::new(ATHOME_MEMO_TTL, ATHOME_MEMO_CAP),
             limiter: TokenBucket::new(rate_per_sec),
             athome_limiter: TokenBucket::new(athome_per_min / 60.0),
         }
@@ -542,7 +618,17 @@ impl MangaDexClient {
     /// wrong response). This endpoint is capped at ~40/min — far below the global
     /// ~5 req/s (300/min) budget — so it takes a dedicated `athome_limiter` in
     /// addition to the global one. CATALOGUE.md §5, §9.
+    ///
+    /// Memoised for `ATHOME_MEMO_TTL` per chapter (single-flight): the page list is
+    /// the one step of the reader's open-chapter waterfall that waits on MangaDex, and
+    /// the endpoint's budget is the tightest we have.
     pub async fn at_home(&self, chapter_id: &str) -> Result<Vec<String>> {
+        self.athome_memo
+            .get_or_try_init(chapter_id, || self.fetch_at_home(chapter_id))
+            .await
+    }
+
+    async fn fetch_at_home(&self, chapter_id: &str) -> Result<Vec<String>> {
         let res = self
             .get_with_retry(
                 &format!("{API_BASE}/at-home/server/{chapter_id}"),
@@ -4066,6 +4152,64 @@ mod tests {
         );
         assert!(!params.iter().any(|(k, _)| k.ends_with("Since")));
         assert!(!params.iter().any(|(k, _)| k == "offset"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn athome_memo_shares_one_fetch_and_expires() {
+        use std::sync::atomic::AtomicUsize;
+        // Paused time: `advance` moves the clock exactly, so the TTL edge is a fact
+        // of the test, not of how loaded the runner is.
+        let ttl = Duration::from_secs(600);
+        let memo = TtlMemo::<Vec<String>>::new(ttl, 2);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch = |calls: Arc<AtomicUsize>| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(vec!["u".to_string()])
+        };
+
+        // Concurrent openers of one chapter share a single upstream request.
+        let (a, b) = tokio::join!(
+            memo.get_or_try_init("ch", || fetch(calls.clone())),
+            memo.get_or_try_init("ch", || fetch(calls.clone()))
+        );
+        assert_eq!(a.unwrap(), ["u"]);
+        assert_eq!(b.unwrap(), ["u"]);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second caller must join the first"
+        );
+
+        // Inside the TTL the answer is served from memory — right up to the edge.
+        tokio::time::advance(ttl - Duration::from_millis(11)).await;
+        memo.get_or_try_init("ch", || fetch(calls.clone()))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // At the TTL the base URL may be dead, so the next caller refetches.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        memo.get_or_try_init("ch", || fetch(calls.clone()))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // A failed init leaves nothing behind: the next caller retries, not errors.
+        let failing = memo.get_or_try_init("bad", || async { Err(anyhow!("upstream 5xx")) });
+        assert!(failing.await.is_err());
+        memo.get_or_try_init("bad", || fetch(calls.clone()))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // Cap 2, both slots live, a third chapter arrives: the memo resets to hold
+        // only the newcomer rather than grow past its cap.
+        memo.get_or_try_init("third", || fetch(calls.clone()))
+            .await
+            .unwrap();
+        let keys: Vec<String> = memo.slots.lock().unwrap().keys().cloned().collect();
+        assert_eq!(keys, ["third"]);
     }
 
     #[tokio::test]

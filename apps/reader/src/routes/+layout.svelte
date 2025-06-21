@@ -8,6 +8,7 @@
 	import { initAuth } from '$lib/auth.svelte';
 	import { initTheme } from '$lib/theme.svelte';
 	import { markHydrated } from '$lib/stream';
+	import { config } from '$lib/config';
 
 	let { children } = $props();
 
@@ -39,9 +40,18 @@
 <svelte:head>
 	{#if !ownsMeta}
 		<title>komiq</title>
-		<meta name="description" content="Read manga, together. Track your library, follow updates, and discuss chapters." />
+		<meta
+			name="description"
+			content="Read manga, together. Track your library, follow updates, and discuss chapters."
+		/>
 	{/if}
 
+	<!-- Page images and covers come from the image Worker on its own host, so the
+	     first image fetch otherwise pays DNS + TCP + TLS before a byte moves. Open
+	     that connection while the document is still parsing. -->
+	{#if !config.imgDirect && config.imgWorkerBaseUrl}
+		<link rel="preconnect" href={config.imgWorkerBaseUrl} />
+	{/if}
 	<link rel="icon" href="/favicon.ico" sizes="any" />
 	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
 	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />

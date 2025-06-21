@@ -55,3 +55,7 @@ strip = true
 # `unwind` (not `abort`) so the tower_http CatchPanic layer can turn a panicking
 # resolver into a 500 instead of taking down the whole worker process.
 panic = "unwind"
+
+[dev-dependencies]
+# `test-util` unlocks paused/advanced time so TTL tests are deterministic, not timed.
+tokio = { version = "1", features = ["test-util"] }

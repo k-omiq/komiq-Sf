@@ -60,6 +60,8 @@
 	let chapterListOpen = $state(false);
 	let progressPct = $state(0);
 	let scrolledPage = $state(1);
+	let maxScrolledPage = $state(1);
+	const warmedUrls = new Set<string>();
 
 	const chKey = $derived(`${data.seriesId}:${data.chNum}`);
 
@@ -93,9 +95,11 @@
 		untrack(() => {
 			pageIdx = 0;
 			scrolledPage = 1;
+			maxScrolledPage = 1;
 			readMarked = false;
 			pageAspect = {};
 			pageError = {};
+			warmedUrls.clear();
 		});
 	});
 
@@ -248,6 +252,9 @@
 			const pct = max > 0 ? Math.min(100, Math.max(0, (y / max) * 100)) : 0;
 			progressPct = pct;
 			scrolledPage = Math.min(total, Math.max(1, Math.round((pct / 100) * (total - 1)) + 1));
+			if (scrolledPage > maxScrolledPage) {
+				maxScrolledPage = scrolledPage;
+			}
 			maybeMarkRead();
 			if (!lockChrome) {
 				const dy = y - lastY;
@@ -274,14 +281,25 @@
 		return () => window.removeEventListener('scroll', onScroll);
 	});
 
-	// ---- long-strip rendering ----------------------------------------------
+	// ---- lookahead prefetch & long-strip rendering -------------------------
 	// A chapter can be 37+ full-size images. We DON'T hand-virtualize with an
 	// IntersectionObserver — mounting/unmounting <img> on scroll thrashes the DOM
 	// and is what caused the visible scroll bumps. Instead every page stays in the
-	// DOM and we lean on native `loading="lazy"`, so off-screen images aren't
-	// fetched/decoded and memory stays bounded with zero scroll-time JS. Each cell
-	// reserves its space from the image's REAL aspect-ratio (measured on load) so
-	// pages neither letterbox (gaps) nor shift once loaded.
+	// DOM. But native `loading="lazy"` uses the browser's fixed distance threshold
+	// (Chrome is ~1250px), which is too small for tall manga pages: the fetch only
+	// starts when the page is nearly on screen, so scrolling down forces readers to
+	// wait seconds for images to decode.
+	//
+	// We compute `loading` reactively per image: EAGER_FIRST pages load eagerly on
+	// initial paint, and scrolling down advances a lookahead window keeping
+	// EAGER_AHEAD pages in flight ahead of the reader. Browsers start fetching
+	// immediately when `loading` flips from 'lazy' to 'eager', avoiding detached
+	// Image allocations in strip mode. A monotonically non-decreasing high-water
+	// mark ensures scrolling back up never flips an image back to lazy.
+	const EAGER_AHEAD = 6;
+	const EAGER_FIRST = 4;
+	const eagerUntil = $derived(Math.max(EAGER_FIRST, maxScrolledPage + EAGER_AHEAD));
+
 	let pageAspect = $state<Record<number, string>>({});
 	// A neutral manga default (~2:3) used only until a page's real ratio is known.
 	const DEFAULT_ASPECT = '800 / 1200';
@@ -304,6 +322,25 @@
 		delete next[index];
 		pageError = next;
 	}
+
+	// ---- paged mode prefetch -----------------------------------------------
+	// Single-page mode renders only the active page in the DOM. When `pageIdx`
+	// advances, warm the next 3 pages into the HTTP cache with detached Image()
+	// objects (matching the next-chapter prefetch pattern) so page turns feel
+	// instantaneous. `warmedUrls` keeps each URL to one warm per chapter; the
+	// chapter-change effect above clears it.
+	const PAGED_PREFETCH = 3;
+	$effect(() => {
+		if (mode !== 'page') return;
+		const next = pages.slice(pageIdx + 1, pageIdx + 1 + PAGED_PREFETCH);
+		for (const pg of next) {
+			if (!pg?.url || warmedUrls.has(pg.url)) continue;
+			warmedUrls.add(pg.url);
+			const warm = new Image();
+			warm.decoding = 'async';
+			warm.src = pg.url;
+		}
+	});
 
 	const chapterMenu = $derived(
 		data.chapters.map((c) => ({
@@ -381,34 +418,34 @@
 	</div>
 	<div class="top-right">
 		{#if data.chapters.length}
-		<div class="ch-select">
-			<button
-				class="ch-btn"
-				aria-haspopup="menu"
-				aria-expanded={chapterListOpen}
-				onclick={() => {
-					chapterListOpen = !chapterListOpen;
-					settingsOpen = false;
-				}}
-			>
-				Chapter {chNum}<Icon name="chevron-down" size={14} />
-			</button>
-			{#if chapterListOpen}
-				<div class="ch-menu">
-					{#each chapterMenu as c (c.id ?? c.n)}
-						<button class="ch-item" class:current={c.current} onclick={() => openChapter(c.id)}>
-							<div class="ch-item-info">
-								<div class="ch-item-title">Ch. {c.n} · {c.title}</div>
-							</div>
-							{#if c.external}<span class="ext-tag" title="Hosted on another site"
-									><Icon name="globe" size={11} />OFF-SITE</span
-								>{/if}
-							{#if c.current}<span class="reading-tag">READING</span>{/if}
-						</button>
-					{/each}
-				</div>
-			{/if}
-		</div>
+			<div class="ch-select">
+				<button
+					class="ch-btn"
+					aria-haspopup="menu"
+					aria-expanded={chapterListOpen}
+					onclick={() => {
+						chapterListOpen = !chapterListOpen;
+						settingsOpen = false;
+					}}
+				>
+					Chapter {chNum}<Icon name="chevron-down" size={14} />
+				</button>
+				{#if chapterListOpen}
+					<div class="ch-menu">
+						{#each chapterMenu as c (c.id ?? c.n)}
+							<button class="ch-item" class:current={c.current} onclick={() => openChapter(c.id)}>
+								<div class="ch-item-info">
+									<div class="ch-item-title">Ch. {c.n} · {c.title}</div>
+								</div>
+								{#if c.external}<span class="ext-tag" title="Hosted on another site"
+										><Icon name="globe" size={11} />OFF-SITE</span
+									>{/if}
+								{#if c.current}<span class="reading-tag">READING</span>{/if}
+							</button>
+						{/each}
+					</div>
+				{/if}
+			</div>
 		{/if}
 		<button
 			class="settings-btn"
@@ -570,7 +607,7 @@
 							class="strip-img"
 							src={p.url}
 							alt={`Page ${p.label}`}
-							loading="lazy"
+							loading={p.index < eagerUntil ? 'eager' : 'lazy'}
 							decoding="async"
 							onload={(e) => onImgLoad(e, p.index)}
 							onerror={() => onImgError(p.index)}
