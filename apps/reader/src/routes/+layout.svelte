@@ -13,7 +13,7 @@
 	let { children } = $props();
 
 	// Site-wide head defaults. A route that describes ITSELF (the series page) sets
-	// `ownsMeta` in its `load`, and we stand down for the overridable tags — <head>
+	// `ownsMeta` in its `load`, and we stand down for the overridable meta tags — <head>
 	// is not last-one-wins for og:*/twitter:*, so emitting both sets would leave a
 	// crawler free to unfurl the generic "komiq / Read manga, together" instead of
 	// the series. Route data is loaded before render, so this resolves during SSR.
@@ -38,8 +38,9 @@
 </script>
 
 <svelte:head>
+	<!-- No default <title>: every route sets its own, so history and tabs name the
+	     page (a chapter, a series, a search) instead of a wall of "komiq". -->
 	{#if !ownsMeta}
-		<title>komiq</title>
 		<meta
 			name="description"
 			content="Read manga, together. Track your library, follow updates, and discuss chapters."

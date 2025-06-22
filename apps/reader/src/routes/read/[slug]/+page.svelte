@@ -100,6 +100,8 @@
 			pageAspect = {};
 			pageError = {};
 			warmedUrls.clear();
+			settledPages.clear();
+			queueUntil = STARTER_PAGES;
 		});
 	});
 
@@ -290,15 +292,48 @@
 	// starts when the page is nearly on screen, so scrolling down forces readers to
 	// wait seconds for images to decode.
 	//
-	// We compute `loading` reactively per image: EAGER_FIRST pages load eagerly on
-	// initial paint, and scrolling down advances a lookahead window keeping
-	// EAGER_AHEAD pages in flight ahead of the reader. Browsers start fetching
-	// immediately when `loading` flips from 'lazy' to 'eager', avoiding detached
-	// Image allocations in strip mode. A monotonically non-decreasing high-water
-	// mark ensures scrolling back up never flips an image back to lazy.
+	// We compute `loading` reactively per image and the browser starts fetching
+	// the moment `loading` flips from 'lazy' to 'eager', so no detached Image
+	// allocations are needed in strip mode. Three things can flip a page eager:
+	//
+	// 1. STARTERS — the first STARTER_PAGES pages fetch at once from first paint
+	//    with `fetchpriority="high"`, so the reader sees something as fast as the
+	//    connection allows. Nothing else is in flight while they download.
+	// 2. BACKGROUND QUEUE — every remaining page is auto-loaded in order WITHOUT
+	//    waiting for a scroll trigger, but only QUEUE_CONCURRENCY at a time and
+	//    with `fetchpriority="low"`. Firing the whole chapter at once made the
+	//    starters share bandwidth with 30+ pages the reader hadn't reached yet,
+	//    which on slow wifi meant a long blank first screen. The queue only
+	//    advances as pages settle (load or error), so it cannot start until the
+	//    starters are nearly done and it never fans out.
+	// 3. SCROLL LOOKAHEAD — when the reader outruns the queue, the window keeps
+	//    EAGER_AHEAD pages in flight ahead of the scroll position so they never
+	//    wait on the queue, at normal priority. A monotonically non-decreasing
+	//    high-water mark ensures scrolling back up never flips an image back to lazy.
+	const STARTER_PAGES = 3;
+	const QUEUE_CONCURRENCY = 2;
 	const EAGER_AHEAD = 6;
-	const EAGER_FIRST = 4;
-	const eagerUntil = $derived(Math.max(EAGER_FIRST, maxScrolledPage + EAGER_AHEAD));
+	let queueUntil = $state(STARTER_PAGES);
+	const settledPages = new Set<number>();
+	const eagerUntil = $derived(Math.max(queueUntil, maxScrolledPage + EAGER_AHEAD));
+
+	// Pages the queue has released that have not settled yet count as in flight;
+	// pages the lookahead already loaded are skipped over rather than re-counted.
+	function advanceQueue(): void {
+		let inFlight = 0;
+		for (let i = 0; i < queueUntil; i++) if (!settledPages.has(i)) inFlight++;
+		let next = queueUntil;
+		while (next < total && inFlight < QUEUE_CONCURRENCY) {
+			if (!settledPages.has(next)) inFlight++;
+			next++;
+		}
+		if (next !== queueUntil) queueUntil = next;
+	}
+	function settlePage(index: number): void {
+		if (settledPages.has(index)) return;
+		settledPages.add(index);
+		advanceQueue();
+	}
 
 	let pageAspect = $state<Record<number, string>>({});
 	// A neutral manga default (~2:3) used only until a page's real ratio is known.
@@ -312,9 +347,11 @@
 		if (img.naturalWidth > 0 && img.naturalHeight > 0) {
 			pageAspect = { ...pageAspect, [index]: `${img.naturalWidth} / ${img.naturalHeight}` };
 		}
+		settlePage(index);
 	}
 	function onImgError(index: number): void {
 		pageError = { ...pageError, [index]: true };
+		settlePage(index);
 	}
 	// Clearing the flag remounts a fresh <img> for that page, re-fetching the URL.
 	function retryImage(index: number): void {
@@ -397,6 +434,10 @@
 		}
 	}
 </script>
+
+<svelte:head>
+	<title>{seriesTitle ? `Ch. ${chNum} · ${seriesTitle} · komiq` : `Ch. ${chNum} · komiq`}</title>
+</svelte:head>
 
 <svelte:window onkeydown={onKeydown} />
 
@@ -608,6 +649,11 @@
 							src={p.url}
 							alt={`Page ${p.label}`}
 							loading={p.index < eagerUntil ? 'eager' : 'lazy'}
+							fetchpriority={p.index < STARTER_PAGES
+								? 'high'
+								: p.index < maxScrolledPage + EAGER_AHEAD
+									? 'auto'
+									: 'low'}
 							decoding="async"
 							onload={(e) => onImgLoad(e, p.index)}
 							onerror={() => onImgError(p.index)}

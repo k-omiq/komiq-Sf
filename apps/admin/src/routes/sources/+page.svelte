@@ -8,6 +8,8 @@
 		SourceInfo,
 		SourceScanHealth,
 	} from '@komika/types';
+	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import { auth } from '$lib/auth.svelte';
 	import {
 		addExtensionRepo,
@@ -31,7 +33,27 @@
 
 	// Auth redirect is centralized in +layout.svelte.
 
-	let tab = $state<'extensions' | 'catalogue' | 'health'>('extensions');
+	const MAX_SOURCE_PAGE = 100_000;
+
+	function sourcePageFromUrl(raw: string | null): number {
+		if (raw == null || raw.trim() === '') return 1;
+		const parsed = Number(raw);
+		return Number.isInteger(parsed) && parsed >= 1 && parsed <= MAX_SOURCE_PAGE ? parsed : 1;
+	}
+
+	const tabParam = $derived(page.url.searchParams.get('tab'));
+	const currentTab = $derived<'extensions' | 'catalogue' | 'health'>(
+		tabParam === 'catalogue' || tabParam === 'health' ? tabParam : 'extensions',
+	);
+	const extParam = $derived(page.url.searchParams.get('extension'));
+	const sourceParam = $derived(page.url.searchParams.get('source') ?? '');
+	const listingParam = $derived(page.url.searchParams.get('listing'));
+	const currentBrowseType = $derived<SourceBrowseType>(
+		listingParam === 'latest' ? 'LATEST' : listingParam === 'search' ? 'SEARCH' : 'POPULAR',
+	);
+	const qParam = $derived((page.url.searchParams.get('q') ?? '').trim());
+	const pageParamRaw = $derived(page.url.searchParams.get('page'));
+	const currentPageNum = $derived(sourcePageFromUrl(pageParamRaw));
 
 	// ---- Maintenance: persist whole catalogue to the DB cache -----------------
 	// Materializes the entire Suwayomi library into the DB read-cache that the
@@ -129,7 +151,7 @@
 	}
 
 	$effect(() => {
-		if (!auth.user || extsLoaded || extsLoading) return;
+		if (!auth.user || currentTab !== 'extensions' || extsLoaded || extsLoading) return;
 		void refreshExtensions();
 	});
 
@@ -239,16 +261,27 @@
 	let sourcesLoading = $state(false);
 	let sourcesLoaded = $state(false);
 	let sourcesError = $state<string | null>(null);
-	let sourceId = $state('');
 
-	let browseType = $state<SourceBrowseType>('POPULAR');
-	let searchQuery = $state('');
-	let pageNum = $state(1);
+	const validSource = $derived(
+		sourceParam
+			? sources.find((s) => String(s.id) === sourceParam && (!extParam || s.pkgName === extParam))
+			: null,
+	);
+	const validSourceId = $derived(validSource ? String(validSource.id) : '');
+
+	let searchDraft = $state('');
+	$effect(() => {
+		searchDraft = qParam;
+	});
+
 	let hasNext = $state(false);
 	let items = $state<SourceBrowseEntry[]>([]);
 	let browsing = $state(false);
 	let browsed = $state(false);
 	let browseError = $state<string | null>(null);
+
+	/** Monotonic token guard for browse requests so stale responses cannot overwrite state. */
+	let browseGen = 0;
 
 	/** Selected suwayomiMangaIds (insertion-ordered). */
 	let picked = $state<string[]>([]);
@@ -259,13 +292,121 @@
 	let addError = $state<string | null>(null);
 	let bulkResult = $state<BulkAddResult | null>(null);
 
+	function buildSourcesUrl(opts: {
+		tab?: 'extensions' | 'catalogue' | 'health';
+		extension?: string | null;
+		source?: string | null;
+		listing?: SourceBrowseType;
+		q?: string | null;
+		page?: number | null;
+	}): string {
+		const sp = new URLSearchParams();
+		const t = opts.tab ?? 'extensions';
+		if (t !== 'extensions') {
+			sp.set('tab', t);
+		}
+		if (opts.extension) {
+			sp.set('extension', opts.extension);
+		}
+		if (opts.source) {
+			sp.set('source', opts.source);
+		}
+		if (opts.listing === 'LATEST') {
+			sp.set('listing', 'latest');
+		} else if (opts.listing === 'SEARCH') {
+			sp.set('listing', 'search');
+			if (opts.q && opts.q.trim()) {
+				sp.set('q', opts.q.trim());
+			}
+		}
+		if (opts.page && opts.page > 1) {
+			sp.set('page', String(opts.page));
+		}
+		const qs = sp.toString();
+		return qs ? `/sources?${qs}` : '/sources';
+	}
+
+	function setTab(t: 'extensions' | 'catalogue' | 'health'): void {
+		if (t === currentTab) return;
+		// Tab changes keep the catalogue context dormant in the URL so switching back
+		// resumes the same source/listing/page instead of starting over.
+		const url = buildSourcesUrl({
+			tab: t,
+			extension: extParam,
+			source: sourceParam || null,
+			listing: currentBrowseType,
+			q: currentBrowseType === 'SEARCH' ? qParam : null,
+			page: currentBrowseType !== 'SEARCH' || qParam ? currentPageNum : 1,
+		});
+		void goto(url);
+	}
+
+	function onSourceChange(ev: Event): void {
+		const target = ev.target as HTMLSelectElement;
+		const nextSourceId = target.value;
+		const url = buildSourcesUrl({
+			tab: 'catalogue',
+			extension: extParam,
+			source: nextSourceId || undefined,
+			listing: currentBrowseType,
+			q: currentBrowseType === 'SEARCH' ? qParam : undefined,
+			page: 1,
+		});
+		void goto(url);
+	}
+
+	function onPickListing(type: SourceBrowseType): void {
+		if (type === currentBrowseType && currentPageNum === 1) return;
+		const url = buildSourcesUrl({
+			tab: 'catalogue',
+			extension: extParam,
+			source: validSourceId || undefined,
+			listing: type,
+			q: type === 'SEARCH' ? qParam : undefined,
+			page: 1,
+		});
+		void goto(url);
+	}
+
+	function onSearch(ev: SubmitEvent): void {
+		ev.preventDefault();
+		const query = searchDraft.trim();
+		if (!query || !validSourceId) return;
+		const url = buildSourcesUrl({
+			tab: 'catalogue',
+			extension: extParam,
+			source: validSourceId,
+			listing: 'SEARCH',
+			q: query,
+			page: 1,
+		});
+		if (url === `${page.url.pathname}${page.url.search}`) {
+			// Re-submitting the active search doubles as a retry after a failed request.
+			void runBrowse(validSourceId, 'SEARCH', 1, query);
+		} else {
+			void goto(url);
+		}
+	}
+
+	function goToPage(targetPage: number): void {
+		if (browsing || targetPage < 1) return;
+		const url = buildSourcesUrl({
+			tab: 'catalogue',
+			extension: extParam,
+			source: validSourceId || undefined,
+			listing: currentBrowseType,
+			q: currentBrowseType === 'SEARCH' ? qParam : undefined,
+			page: targetPage,
+		});
+		void goto(url, { keepFocus: true, noScroll: true });
+	}
+
 	async function refreshSources(): Promise<void> {
 		sourcesLoading = true;
 		sourcesError = null;
 		try {
 			sources = await loadSources();
 			sourcesLoaded = true;
-			if (sourceId && !sources.some((s) => String(s.id) === sourceId)) sourceId = '';
 		} catch (err) {
 			sourcesError = err instanceof Error ? err.message : 'Failed to load sources.';
 			sources = [];
@@ -273,11 +414,6 @@
 			sourcesLoading = false;
 		}
 	}
-
-	$effect(() => {
-		if (!auth.user || tab !== 'catalogue' || sourcesLoaded || sourcesLoading) return;
-		void refreshSources();
-	});
 
 	// ---- Scan health (Phase E4.3) ---------------------------------------------
 	// "Is this source actually working?" had no honest answer before E4: every Suwayomi
@@ -302,11 +438,6 @@
 		}
 	}
 
-	$effect(() => {
-		if (!auth.user || tab !== 'health' || healthLoaded || healthLoading) return;
-		void refreshHealth();
-	});
-
 	/** Sources with an open whole-source outage — the loud ones, surfaced above the table. */
 	const outages = $derived(health.filter((h) => h.outageDetectedAt));
 	/** Works that go dark while those outages last. */
@@ -318,53 +449,58 @@
 		return Number.isNaN(d.getTime()) ? '—' : d.toISOString().slice(0, 16).replace('T', ' ');
 	}
 
-	async function browse(page: number): Promise<void> {
-		if (!sourceId) return;
+	async function runBrowse(
+		srcId: string,
+		bType: SourceBrowseType,
+		p: number,
+		query?: string,
+	): Promise<void> {
+		if (!srcId) {
+			browseGen++;
+			items = [];
+			browsed = false;
+			browseError = null;
+			browsing = false;
+			hasNext = false;
+			return;
+		}
+		if (bType === 'SEARCH' && !query?.trim()) {
+			browseGen++;
+			items = [];
+			browsed = false;
+			browseError = null;
+			browsing = false;
+			hasNext = false;
+			return;
+		}
+		const gen = ++browseGen;
 		browsing = true;
 		browseError = null;
 		try {
 			const res = await browseSource(
-				sourceId,
-				browseType,
-				page,
-				browseType === 'SEARCH' ? searchQuery.trim() : undefined,
+				srcId,
+				bType,
+				p,
+				bType === 'SEARCH' ? query?.trim() : undefined,
 			);
+			if (gen !== browseGen) return;
 			items = res.items;
-			pageNum = res.page;
 			hasNext = res.hasNextPage;
 			browsed = true;
 			const t = { ...titles };
 			for (const it of res.items) t[String(it.suwayomiMangaId)] = it.title;
 			titles = t;
 		} catch (err) {
+			if (gen !== browseGen) return;
 			browseError = err instanceof Error ? err.message : 'Failed to browse the source.';
 			items = [];
 			hasNext = false;
+			browsed = true;
 		} finally {
-			browsing = false;
+			if (gen === browseGen) {
+				browsing = false;
+			}
 		}
-	}
-
-	function startBrowse(type: SourceBrowseType): void {
-		browseType = type;
-		items = [];
-		browsed = false;
-		if (type !== 'SEARCH') void browse(1);
-	}
-
-	function onPickSource(): void {
-		items = [];
-		browsed = false;
-		browseError = null;
-		picked = [];
-		bulkResult = null;
-		void checkActiveJob();
-		if (sourceId && browseType !== 'SEARCH') void browse(1);
-	}
-
-	function onSearch(ev: SubmitEvent): void {
-		ev.preventDefault();
-		if (searchQuery.trim()) void browse(1);
 	}
 
 	function togglePick(id: string): void {
@@ -447,26 +583,15 @@
 		try {
 			if (!sourcesLoaded) await refreshSources();
 			const matches = sources.filter((s) => s.pkgName === e.pkgName);
-			extScope = { pkgName: e.pkgName, name: e.name };
-			tab = 'catalogue';
-			resetCatalogueView();
-			// Resume an already-running extension-wide ingest for this extension
-			// (or clear a stale panel from a different one).
-			void syncExtPanel(
-				e.pkgName,
-				e.name,
-				matches.map((s) => String(s.id)),
-			);
-			if (matches.length === 1) {
-				sourceId = String(matches[0].id);
-				browseType = 'POPULAR';
-				await checkActiveJob();
-				void browse(1);
-			} else {
-				// Zero (engine hasn't exposed them yet — honest empty picker) or several:
-				// let the scoped picker prompt.
-				sourceId = '';
-			}
+			const singleSrc = matches.length === 1 ? String(matches[0].id) : undefined;
+			const url = buildSourcesUrl({
+				tab: 'catalogue',
+				extension: e.pkgName,
+				source: singleSrc,
+				listing: 'POPULAR',
+				page: 1,
+			});
+			void goto(url);
 		} catch (err) {
 			rowMsg = {
 				...rowMsg,
@@ -478,23 +603,14 @@
 	}
 
 	function clearScope(): void {
-		extScope = null;
-		sourceId = '';
-		resetCatalogueView();
-		stopPolling();
-		job = null;
-		// Invalidate any in-flight job lookup/start so it can't repopulate the panel.
-		jobGen++;
-	}
-
-	/** Reset the browse listing + selection state (not the source pick). */
-	function resetCatalogueView(): void {
-		items = [];
-		browsed = false;
-		browseError = null;
-		picked = [];
-		bulkResult = null;
-		addError = null;
+		const url = buildSourcesUrl({
+			tab: 'catalogue',
+			extension: null,
+			source: undefined,
+			listing: 'POPULAR',
+			page: 1,
+		});
+		void goto(url);
 	}
 
 	// ---- "Add all from this source" background ingest (S1) -----------------------
@@ -594,12 +710,11 @@
 	}
 
 	/** On (re)selecting a source, resume showing any job already running for it. */
-	async function checkActiveJob(): Promise<void> {
+	async function checkActiveJob(forSource: string): Promise<void> {
 		stopPolling();
 		job = null;
 		jobError = null;
 		const gen = ++jobGen;
-		const forSource = sourceId;
 		if (!forSource) return;
 		try {
 			const active = await loadSourceIngestJobs(true);
@@ -617,12 +732,12 @@
 	}
 
 	async function addAllFromSource(): Promise<void> {
-		if (!sourceId || jobStarting || job?.state === 'running') return;
+		if (!validSourceId || jobStarting || job?.state === 'running') return;
 		jobStarting = true;
 		jobError = null;
 		const gen = jobGen;
 		try {
-			const started = await startSourceIngest(sourceId);
+			const started = await startSourceIngest(validSourceId);
 			// If the source changed mid-request, don't show/poll this job for the
 			// now-selected source (it's still running server-side and resumes on
 			// re-selecting its source).
@@ -845,18 +960,20 @@
 	 * ingest for it (survives navigation), and clear a stale panel left over from
 	 * a *different* extension.
 	 */
-	async function syncExtPanel(pkgName: string, name: string, srcIds: string[]): Promise<void> {
-		// Snapshot the gen but DON'T claim it yet — only take over if we actually
-		// find a running ingest for this extension, so browsing extension B can't
-		// freeze extension A's still-running poller.
-		const gen = extGen;
+	async function syncExtPanel(
+		pkgName: string,
+		name: string,
+		srcIds: string[],
+		scopeGen: number,
+	): Promise<void> {
+		const ingestGen = extGen;
 		try {
 			const active = await loadSourceIngestJobs(true);
-			if (gen !== extGen) return;
+			if (scopeGen !== extScopeGen || ingestGen !== extGen) return;
 			const idSet = new Set(srcIds);
 			const mine = active.filter((j) => idSet.has(String(j.sourceId)));
 			if (mine.length > 0) {
-				extGen++; // claim: supersede any prior run's poll loop
+				extGen++; // supersede any prior extension poll loop
 				extIngest = { pkgName, name };
 				extJobs = mine;
 				extVisibleSources = srcIds.length;
@@ -871,6 +988,114 @@
 			/* non-fatal — resume is best-effort */
 		}
 	}
+
+	$effect(() => {
+		if (!auth.user || currentTab !== 'health' || healthLoaded || healthLoading) return;
+		void refreshHealth();
+	});
+
+	$effect(() => {
+		if (!auth.user || currentTab !== 'catalogue' || sourcesLoaded || sourcesLoading) return;
+		void refreshSources();
+	});
+
+	// Keep hand-edited/deep-linked URLs canonical once source ids can be validated.
+	// Waiting for `sourcesLoaded` avoids deleting a valid source while the picker is
+	// still loading. Defaults and invalid values are repaired in place.
+	$effect(() => {
+		if (!auth.user) return;
+		if (currentTab === 'catalogue' && !sourcesLoaded) return;
+
+		const source = currentTab === 'catalogue' ? validSourceId : sourceParam;
+		const canPage = !!source && (currentBrowseType !== 'SEARCH' || qParam.length > 0);
+		const href = buildSourcesUrl({
+			tab: currentTab,
+			extension: extParam,
+			source: source || null,
+			listing: currentBrowseType,
+			q: source ? qParam : null,
+			page: canPage ? currentPageNum : 1,
+		});
+		if (href !== `${page.url.pathname}${page.url.search}`) {
+			void goto(href, { replaceState: true, noScroll: true, keepFocus: true });
+		}
+	});
+
+	let lastCheckedJobSource = '';
+	let lastTrackedSourceId = '';
+	let lastExtScopeKey = '';
+	let lastSyncedExtScopeKey = '';
+	let extScopeGen = 0;
+
+	$effect(() => {
+		const extScopeKey = currentTab === 'catalogue' ? (extParam ?? '') : '';
+		const extScopeChanged = extScopeKey !== lastExtScopeKey;
+		if (extScopeChanged) {
+			lastExtScopeKey = extScopeKey;
+			extScopeGen++;
+		}
+		if (!auth.user || currentTab !== 'catalogue' || !sourcesLoaded) return;
+
+		// Sync extension scope if extension query param is present
+		if (extParam) {
+			const matches = sources.filter((s) => s.pkgName === extParam);
+			const extName =
+				matches[0]?.name ?? exts.find((e) => e.pkgName === extParam)?.name ?? extParam;
+			extScope = { pkgName: extParam, name: extName };
+			if (extScopeKey !== lastSyncedExtScopeKey) {
+				lastSyncedExtScopeKey = extScopeKey;
+				void syncExtPanel(
+					extParam,
+					extName,
+					matches.map((s) => String(s.id)),
+					extScopeGen,
+				);
+			}
+		} else {
+			extScope = null;
+			lastSyncedExtScopeKey = '';
+		}
+
+		const currentValidId = validSourceId;
+
+		if (currentValidId !== lastTrackedSourceId) {
+			lastTrackedSourceId = currentValidId;
+			browseGen++;
+			items = [];
+			browsed = false;
+			browseError = null;
+			hasNext = false;
+			picked = [];
+			bulkResult = null;
+			addError = null;
+		}
+
+		if (!currentValidId) {
+			browseGen++;
+			items = [];
+			browsed = false;
+			browseError = null;
+			browsing = false;
+			hasNext = false;
+			stopPolling();
+			job = null;
+			jobGen++;
+			lastCheckedJobSource = '';
+			return;
+		}
+
+		if (currentValidId !== lastCheckedJobSource) {
+			lastCheckedJobSource = currentValidId;
+			void checkActiveJob(currentValidId);
+		}
+
+		void runBrowse(
+			currentValidId,
+			currentBrowseType,
+			currentPageNum,
+			currentBrowseType === 'SEARCH' ? qParam : undefined,
+		);
+	});
 
 	// Stop both pollers when the component unmounts.
 	$effect(() => () => {
@@ -891,21 +1116,21 @@
 		<div class="tabs" role="tablist" aria-label="Sources console">
 			<button
 				role="tab"
-				aria-selected={tab === 'extensions'}
-				class:on={tab === 'extensions'}
-				onclick={() => (tab = 'extensions')}>Extensions</button
+				aria-selected={currentTab === 'extensions'}
+				class:on={currentTab === 'extensions'}
+				onclick={() => setTab('extensions')}>Extensions</button
 			>
 			<button
 				role="tab"
-				aria-selected={tab === 'catalogue'}
-				class:on={tab === 'catalogue'}
-				onclick={() => (tab = 'catalogue')}>Catalogue</button
+				aria-selected={currentTab === 'catalogue'}
+				class:on={currentTab === 'catalogue'}
+				onclick={() => setTab('catalogue')}>Catalogue</button
 			>
 			<button
 				role="tab"
-				aria-selected={tab === 'health'}
-				class:on={tab === 'health'}
-				onclick={() => (tab = 'health')}
+				aria-selected={currentTab === 'health'}
+				class:on={currentTab === 'health'}
+				onclick={() => setTab('health')}
 			>
 				Scan health{#if outages.length > 0}<span class="tab-alarm" aria-label="sources down"
 						>{outages.length}</span
@@ -1006,7 +1231,7 @@
 		</div>
 	</section>
 
-	{#if tab === 'extensions'}
+	{#if currentTab === 'extensions'}
 		{#if extsError && exts.length === 0}
 			<div class="notice error">{extsError}</div>
 		{:else if extsLoading && exts.length === 0}
@@ -1155,7 +1380,7 @@
 				</div>
 			{/if}
 		{/if}
-	{:else if tab === 'health'}
+	{:else if currentTab === 'health'}
 		<!-- Sources → scan health (Phase E4.3) -->
 		{#if healthError && health.length === 0}
 			<div class="notice error">{healthError}</div>
@@ -1370,8 +1595,8 @@
 				</div>
 			{/if}
 			<div class="toolbar">
-				<select bind:value={sourceId} onchange={onPickSource} aria-label="Pick a source">
-					<option value="" disabled>
+				<select value={validSourceId} onchange={onSourceChange} aria-label="Pick a source">
+					<option value="" disabled selected={!validSourceId}>
 						{extScope && scopedSources.length !== 1 ? 'Pick a language…' : 'Pick a source…'}
 					</option>
 					{#each scopedSources as s (s.id)}
@@ -1379,28 +1604,29 @@
 					{/each}
 				</select>
 				<div class="segmented">
-					<button class:on={browseType === 'POPULAR'} onclick={() => startBrowse('POPULAR')}
-						>Popular</button
+					<button
+						class:on={currentBrowseType === 'POPULAR'}
+						onclick={() => onPickListing('POPULAR')}>Popular</button
 					>
-					<button class:on={browseType === 'LATEST'} onclick={() => startBrowse('LATEST')}
+					<button class:on={currentBrowseType === 'LATEST'} onclick={() => onPickListing('LATEST')}
 						>Latest</button
 					>
-					<button class:on={browseType === 'SEARCH'} onclick={() => startBrowse('SEARCH')}
+					<button class:on={currentBrowseType === 'SEARCH'} onclick={() => onPickListing('SEARCH')}
 						>Search</button
 					>
 				</div>
-				{#if browseType === 'SEARCH'}
+				{#if currentBrowseType === 'SEARCH'}
 					<form class="search-form" onsubmit={onSearch}>
 						<input
 							type="search"
 							placeholder="Search this source…"
-							bind:value={searchQuery}
+							bind:value={searchDraft}
 							aria-label="Search the source"
 						/>
-						<button type="submit" disabled={browsing || !sourceId}>Search</button>
+						<button type="submit" disabled={browsing || !validSourceId}>Search</button>
 					</form>
 				{/if}
-				{#if sourceId}
+				{#if validSourceId}
 					<button
 						class="act primary add-all"
 						disabled={jobStarting || job?.state === 'running'}
@@ -1557,7 +1783,7 @@
 
 			{#if browseError}
 				<div class="notice error">{browseError}</div>
-			{:else if !sourceId}
+			{:else if !validSourceId}
 				{#if extScope && scopedSources.length === 0}
 					<div class="notice">
 						{extScope.name} is installed but the engine hasn't exposed any sources for it yet. Try again
@@ -1569,12 +1795,14 @@
 					<div class="notice">Pick a source above to browse its catalogue.</div>
 				{/if}
 			{:else if browsing && items.length === 0}
-				<div class="notice">Loading {browseType.toLowerCase()}…</div>
+				<div class="notice">Loading {currentBrowseType.toLowerCase()}…</div>
 			{:else if browsed && items.length === 0}
 				<div class="notice">
-					{browseType === 'SEARCH' ? 'No results for this search.' : 'This listing is empty.'}
+					{currentBrowseType === 'SEARCH'
+						? 'No results for this search.'
+						: 'This listing is empty.'}
 				</div>
-			{:else if !browsed && browseType === 'SEARCH'}
+			{:else if !browsed && currentBrowseType === 'SEARCH'}
 				<div class="notice">Enter a search above to browse this source.</div>
 			{:else if items.length > 0}
 				<div class="grid" class:dim={browsing}>
@@ -1607,12 +1835,14 @@
 				<div class="pager">
 					<button
 						class="act"
-						disabled={browsing || pageNum <= 1}
-						onclick={() => browse(pageNum - 1)}>Prev</button
+						disabled={browsing || currentPageNum <= 1}
+						onclick={() => goToPage(currentPageNum - 1)}>Prev</button
 					>
-					<span class="page-no">Page {pageNum}</span>
-					<button class="act" disabled={browsing || !hasNext} onclick={() => browse(pageNum + 1)}
-						>Next</button
+					<span class="page-no">Page {currentPageNum}</span>
+					<button
+						class="act"
+						disabled={browsing || !hasNext}
+						onclick={() => goToPage(currentPageNum + 1)}>Next</button
 					>
 				</div>
 			{/if}

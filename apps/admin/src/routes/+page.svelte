@@ -1,6 +1,14 @@
 <script lang="ts">
-	import type { MatchResult, Series, SeriesSourceGroup, SeriesStatus, WorkSource } from '@komika/types';
+	import type {
+		MatchResult,
+		Series,
+		SeriesSourceGroup,
+		SeriesStatus,
+		WorkSource,
+	} from '@komika/types';
 	import { untrack } from 'svelte';
+	import { goto } from '$app/navigation';
+	import { page as pageState } from '$app/state';
 	import { auth } from '$lib/auth.svelte';
 	import { assetSrc } from '$lib/config';
 	import {
@@ -26,7 +34,36 @@
 		return s.id.startsWith('w_');
 	}
 
-	let query = $state('');
+	const MAX_CATALOG_PAGE = 100_000;
+
+	/** A safe 1-based page from the URL; malformed or absurd offsets fall back to page 1. */
+	function pageFromUrl(params: URLSearchParams): number {
+		const raw = params.get('page');
+		if (raw == null || raw.trim() === '') return 1;
+		const parsed = Number(raw);
+		return Number.isInteger(parsed) && parsed >= 1 && parsed <= MAX_CATALOG_PAGE ? parsed : 1;
+	}
+
+	/** Build the canonical catalogue URL while preserving params owned by other features. */
+	function catalogueHref(q: string, toPage: number): string {
+		const params = new URLSearchParams(pageState.url.searchParams);
+		const committed = q.trim();
+		if (committed) params.set('q', committed);
+		else params.delete('q');
+		if (toPage > 1) params.set('page', String(toPage));
+		else params.delete('page');
+		const search = params.toString();
+		return search ? `${pageState.url.pathname}?${search}` : pageState.url.pathname;
+	}
+
+	const appliedQuery = $derived(pageState.url.searchParams.get('q')?.trim() ?? '');
+	const page = $derived(pageFromUrl(pageState.url.searchParams));
+	// The text box is a draft. Results, labels and pagination continue to use the
+	// committed URL query until the form is submitted.
+	let searchDraft = $state('');
+	$effect(() => {
+		searchDraft = appliedQuery;
+	});
 	// `series` holds ONLY the current SERVER page (≤ the server's page size, itself far
 	// under the 200-id provenance cap) — never the whole catalogue. loadCatalog() pulls
 	// exactly one page from backend.search(query, page); the pager below requests the
@@ -40,7 +77,6 @@
 	// come straight from the search envelope. An empty-query (catalogue) search reports
 	// a real `total`; a live text search reports `total: null`, so we fall back to
 	// driving the Next button off `hasNextPage` alone.
-	let page = $state(1);
 	let total = $state<number | null>(null);
 	let hasNextPage = $state(false);
 	// The server's page size, learned from a full page (when more pages follow, the page
@@ -91,8 +127,7 @@
 			provenance = map;
 		} catch (err) {
 			if (seq !== provSeq) return;
-			provenanceError =
-				err instanceof Error ? err.message : 'Failed to load source provenance.';
+			provenanceError = err instanceof Error ? err.message : 'Failed to load source provenance.';
 		}
 	}
 
@@ -157,8 +192,7 @@
 		const workId = workIdOf(s);
 		if (!workId) return null;
 		const cached = provenance[s.id];
-		if (cached?.workId === workId)
-			return { seriesId: s.id, workId, title: s.title, group: cached };
+		if (cached?.workId === workId) return { seriesId: s.id, workId, title: s.title, group: cached };
 		let sources: WorkSource[] = [];
 		try {
 			sources = await loadWorkSources(workId);
@@ -201,7 +235,7 @@
 			mergeSource = null;
 			mergeTarget = null;
 			// Re-fetch the current server page so the deleted work's phantom row is gone.
-			await refresh(query, page);
+			await refresh(appliedQuery, page);
 			// Provenance too, explicitly: the page's id list usually survives a merge
 			// unchanged (source-series rows don't disappear when their work is folded),
 			// and the provenance effect is keyed on that id list — so it wouldn't re-fire
@@ -216,10 +250,20 @@
 
 	// Auth redirect is centralized in +layout.svelte.
 
-	// Initial load once authed.
+	// Canonicalise invalid/default URL values without adding a history entry. Generated
+	// URLs likewise omit an empty query and page 1.
+	$effect(() => {
+		const href = catalogueHref(appliedQuery, page);
+		if (href !== `${pageState.url.pathname}${pageState.url.search}`) {
+			void goto(href, { replaceState: true, noScroll: true, keepFocus: true });
+		}
+	});
+
+	// One fetch driver for initial load, reload, Back/Forward and our own navigations.
+	// Event handlers only update the URL, so a transition cannot issue a duplicate fetch.
 	$effect(() => {
 		if (!auth.user) return;
-		void refresh('', 1);
+		void refresh(appliedQuery, page);
 	});
 
 	// Fetch provenance for only the rows on the current server page (≤ the 200-id batch
@@ -247,7 +291,6 @@
 			const res = await loadCatalog(q, toPage);
 			if (seq !== loadSeq) return; // a newer request superseded this one
 			series = res.items;
-			page = res.page;
 			total = res.total;
 			hasNextPage = res.hasNextPage;
 			// Learn the server's page size from any full page (a page with more to
@@ -269,7 +312,21 @@
 
 	function onSearch(e: SubmitEvent): void {
 		e.preventDefault();
-		void refresh(query, 1);
+		const href = catalogueHref(searchDraft, 1);
+		if (href !== `${pageState.url.pathname}${pageState.url.search}`) {
+			void goto(href, { noScroll: true, keepFocus: true });
+		} else {
+			// Re-submitting the active search is also the manual retry affordance.
+			void refresh(appliedQuery, page);
+		}
+	}
+
+	function clearSearch(): void {
+		searchDraft = '';
+		const href = catalogueHref('', 1);
+		if (href !== `${pageState.url.pathname}${pageState.url.search}`) {
+			void goto(href, { noScroll: true, keepFocus: true });
+		}
 	}
 
 	/** Move by ±1 SERVER page, refetching that page from the server. */
@@ -279,7 +336,10 @@
 		if (next < 1) return;
 		if (delta > 0 && !hasNextPage) return;
 		if (totalPages != null && next > totalPages) return;
-		void refresh(query, next);
+		const href = catalogueHref(appliedQuery, next);
+		if (href !== `${pageState.url.pathname}${pageState.url.search}`) {
+			void goto(href, { noScroll: true, keepFocus: true });
+		}
 	}
 
 	// ---- add to canonical catalogue (Tier-2 dedup add flow) ----
@@ -419,9 +479,9 @@
 		<div>
 			<h1>Catalog</h1>
 			<p class="lede">
-				{query.trim() ? 'Search results' : 'Library'} · {total != null
+				{appliedQuery ? 'Search results' : 'Library'} · {total != null
 					? `${total} series`
-					: `${series.length}${hasNextPage ? '+' : ''} series`} · {query.trim()
+					: `${series.length}${hasNextPage ? '+' : ''} series`} · {appliedQuery
 					? 'canonical works from the catalogue index'
 					: 'source series'} · manage scan cadence and status ·
 				<span
@@ -432,17 +492,10 @@
 			</p>
 		</div>
 		<form class="search" onsubmit={onSearch}>
-			<input placeholder="Search the catalog…" bind:value={query} />
+			<input placeholder="Search the catalog…" bind:value={searchDraft} />
 			<button type="submit">Search</button>
-			{#if query.trim()}
-				<button
-					type="button"
-					class="clear"
-					onclick={() => {
-						query = '';
-						void refresh('');
-					}}>Clear</button
-				>
+			{#if searchDraft.trim() || appliedQuery}
+				<button type="button" class="clear" onclick={clearSearch}>Clear</button>
 			{/if}
 		</form>
 	</div>
@@ -467,8 +520,8 @@
 			<span>
 				Merging <strong>{mergeSource.title}</strong>
 				<span class="mono">({mergeSource.workId})</span> — pick the <strong>target</strong> row to
-				keep. The source work will be <strong>deleted</strong> and its mappings + reading data moved
-				to the target.
+				keep. The source work will be <strong>deleted</strong> and its mappings + reading data moved to
+				the target.
 			</span>
 			<button class="link-btn" onclick={cancelMerge}>Cancel merge</button>
 		</div>
@@ -515,7 +568,10 @@
 					<span class="col-ch">{s.chapterCount}</span>
 					<span class="col-src">
 						{#if isCanonical(s)}
-							<span class="src-entry" title="Canonical work — text search returns works, not source series">
+							<span
+								class="src-entry"
+								title="Canonical work — text search returns works, not source series"
+							>
 								<span class="src-name">canonical work</span>
 								<span class="src-id">{s.id}</span>
 							</span>
@@ -575,7 +631,11 @@
 								</button>
 							{/if}
 							{#if workIdOf(s)}
-								<button class="merge-btn" onclick={() => startMerge(s)} title="Merge this work into another (delete this duplicate)">Merge…</button>
+								<button
+									class="merge-btn"
+									onclick={() => startMerge(s)}
+									title="Merge this work into another (delete this duplicate)">Merge…</button
+								>
 							{/if}
 							{#if addMsg[s.id]}<span class="add-msg">{addMsg[s.id]}</span>{/if}
 						{/if}
@@ -585,21 +645,21 @@
 		{/if}
 	</div>
 
-		{#if page > 1 || hasNextPage}
-			<div class="pager">
-				<button class="pg" disabled={loading || page <= 1} onclick={() => goPage(-1)}>Prev</button>
-				<span class="page-num">
-					{#if totalPages != null}
-						Page {page} of {totalPages} · showing {rangeStart}–{rangeEnd}{total != null
-							? ` of ${total}`
-							: ''}
-					{:else}
-						Page {page} · showing {rangeStart}–{rangeEnd}
-					{/if}
-				</span>
-				<button class="pg" disabled={loading || !hasNextPage} onclick={() => goPage(1)}>Next</button>
-			</div>
-		{/if}
+	{#if page > 1 || hasNextPage}
+		<div class="pager">
+			<button class="pg" disabled={loading || page <= 1} onclick={() => goPage(-1)}>Prev</button>
+			<span class="page-num">
+				{#if totalPages != null}
+					Page {page} of {totalPages} · showing {rangeStart}–{rangeEnd}{total != null
+						? ` of ${total}`
+						: ''}
+				{:else}
+					Page {page} · showing {rangeStart}–{rangeEnd}
+				{/if}
+			</span>
+			<button class="pg" disabled={loading || !hasNextPage} onclick={() => goPage(1)}>Next</button>
+		</div>
+	{/if}
 </div>
 
 {#if editing}
@@ -680,8 +740,8 @@
 			<h2>Merge duplicate works?</h2>
 		</div>
 		<p class="modal-lede">
-			The <strong>source</strong> work below will be <strong>permanently deleted</strong>. Its source
-			mappings and all user data (library, reading progress, reviews, comments) move to the
+			The <strong>source</strong> work below will be <strong>permanently deleted</strong>. Its
+			source mappings and all user data (library, reading progress, reviews, comments) move to the
 			<strong>target</strong>, which survives as the canonical entry. Confirm both are the same
 			series.
 		</p>
@@ -694,7 +754,9 @@
 				<div class="merge-chips">
 					{#if mergeSource.group.sources.length > 0}
 						{#each mergeSource.group.sources as src (`${src.sourceType}:${src.sourceId}:${src.sourceKey}`)}
-							<span class="chip" title={src.extension?.pkgName ?? src.sourceType}>{extLabel(src)}</span>
+							<span class="chip" title={src.extension?.pkgName ?? src.sourceType}
+								>{extLabel(src)}</span
+							>
 						{/each}
 					{:else}
 						<span class="src-none">no source mappings</span>
@@ -709,7 +771,9 @@
 				<div class="merge-chips">
 					{#if mergeTarget.group.sources.length > 0}
 						{#each mergeTarget.group.sources as src (`${src.sourceType}:${src.sourceId}:${src.sourceKey}`)}
-							<span class="chip" title={src.extension?.pkgName ?? src.sourceType}>{extLabel(src)}</span>
+							<span class="chip" title={src.extension?.pkgName ?? src.sourceType}
+								>{extLabel(src)}</span
+							>
 						{/each}
 					{:else}
 						<span class="src-none">no source mappings</span>

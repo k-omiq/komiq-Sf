@@ -153,6 +153,10 @@
 	);
 </script>
 
+<svelte:head>
+	<title>{profile?.name ? `${profile.name} · komiq` : 'Profile · komiq'}</title>
+</svelte:head>
+
 {#if loadingProfile}
 	<!-- Auth restoring or the profile fetch is in flight — show a skeleton, never
 	     the sign-in CTA (which would misrepresent a signed-in user as signed out). -->

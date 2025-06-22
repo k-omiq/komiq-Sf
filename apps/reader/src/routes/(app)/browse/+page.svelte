@@ -858,6 +858,10 @@
 	}
 </script>
 
+<svelte:head>
+	<title>{query.trim() ? `${query.trim()} · Browse · komiq` : 'Browse · komiq'}</title>
+</svelte:head>
+
 <div class="head k-gutter">
 	<div class="head-inner">
 		<h1>Browse</h1>

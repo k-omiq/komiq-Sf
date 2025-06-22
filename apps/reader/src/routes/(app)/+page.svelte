@@ -146,6 +146,10 @@
 	});
 </script>
 
+<svelte:head>
+	<title>komiq · Read manga, together</title>
+</svelte:head>
+
 <!-- Resolved object on the server (SSR renders cards) vs pending Promise on the
      client (skeletons via {#await}). Both feed the same `content` snippet. -->
 {#if data.home instanceof Promise}

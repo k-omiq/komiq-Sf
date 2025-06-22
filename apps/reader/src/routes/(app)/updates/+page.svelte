@@ -133,6 +133,10 @@
 	});
 </script>
 
+<svelte:head>
+	<title>Updates · komiq</title>
+</svelte:head>
+
 <div class="trending k-gutter">
 	{#if loading}
 		<section class="tgroup">

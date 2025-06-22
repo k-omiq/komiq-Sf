@@ -161,6 +161,10 @@
 	}
 </script>
 
+<svelte:head>
+	<title>Library · komiq</title>
+</svelte:head>
+
 <div class="head k-gutter">
 	<div>
 		<h1>Your Library</h1>
