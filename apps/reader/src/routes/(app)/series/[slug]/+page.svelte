@@ -776,7 +776,7 @@
 					>
 				</div>
 				<div class="cta">
-					<a class="read" href={readHref}
+					<a class="cta-read" href={readHref}
 						><Icon name="play" size={14} fill="currentColor" />Continue Ch. {continueCh}</a
 					>
 					<button class="lib" class:in={inLibrary} disabled={marking} onclick={toggleLibrary}>
@@ -1514,7 +1514,7 @@
 		font-size: 13px;
 		font-weight: 600;
 	}
-	.read {
+	.cta-read {
 		height: 50px;
 		padding: 0 30px;
 		border: none;
@@ -1529,7 +1529,7 @@
 		gap: 9px;
 		text-decoration: none;
 	}
-	.read:hover {
+	.cta-read:hover {
 		background: var(--k-primary-hover);
 	}
 	.lib {
@@ -2324,7 +2324,7 @@
 		.cta {
 			flex-wrap: wrap;
 		}
-		.read {
+		.cta-read {
 			flex: 1 1 auto;
 			justify-content: center;
 			min-width: 160px;
@@ -2351,6 +2351,50 @@
 		.rate-left {
 			flex-wrap: wrap;
 			gap: 16px;
+		}
+		/* Chapter rows: four lanes (number, provenance cluster, title + dates, chevron)
+		   do not fit in 375px — the cluster alone is 94px for two sources, and the title
+		   was truncating to "Ch…" with the dates wrapping to four lines. Stack instead:
+		   the main link keeps the top line beside the number, and the cluster drops to
+		   its own line beneath it, where 44px touch targets have room. The row carries
+		   the padding here since the two links no longer split it. */
+		.ch-row {
+			display: grid;
+			grid-template-columns: auto minmax(0, 1fr);
+			grid-template-areas:
+				'num main'
+				'num srcs';
+			column-gap: 12px;
+			padding: 12px 16px;
+		}
+		.ch-numlink {
+			grid-area: num;
+			align-self: start;
+			padding: 0;
+		}
+		.ch-num {
+			width: auto;
+			min-width: 32px;
+		}
+		.ch-main {
+			grid-area: main;
+			gap: 12px;
+			padding: 0;
+		}
+		.ch-srcs {
+			grid-area: srcs;
+			max-width: none;
+			/* The gap lives here, not on the grid: a single-source (legacy) row has no
+			   cluster and must not carry an empty second line. */
+			margin-top: 6px;
+			/* Line up the logos under the title, not under the number. */
+			margin-left: -6px;
+		}
+		.ch-src {
+			width: 40px;
+			height: 40px;
+			/* Boxes touch; the 12px of transparent padding inside each is the gap. */
+			margin-right: -4px;
 		}
 	}
 </style>
