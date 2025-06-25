@@ -836,11 +836,11 @@ export interface Chapter {
 	/**
 	 * When WE first recorded the chapter as available (migration 0099).
 	 *
-	 * `null` means WE DO NOT KNOW and MUST render as an em dash — **never** as
-	 * {@link uploadedAt}. Falling back would assert we found the chapter the instant it was
-	 * published, which is the exact claim this field exists to stop the UI making. Expect
-	 * null for essentially every chapter predating 0099; no discovery time was invented for
-	 * the back catalogue.
+	 * `null` means WE DO NOT KNOW and MUST be omitted — **never** rendered as
+	 * {@link uploadedAt} or a placeholder. Falling back would assert we found the chapter the
+	 * instant it was published, which is the exact claim this field exists to stop the UI
+	 * making. Expect null for essentially every chapter predating 0099; no discovery time was
+	 * invented for the back catalogue.
 	 */
 	foundAt: string | null;
 	scanlator: string | null;

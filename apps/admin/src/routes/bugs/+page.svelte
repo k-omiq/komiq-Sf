@@ -110,8 +110,8 @@
 		<div>
 			<h1>Cover issues</h1>
 			<p class="lede">
-				{total ?? issues.length} cover{(total ?? issues.length) === 1 ? '' : 's'} the crawl couldn't
-				process. Retry (re-fetch + re-encode) or upload a replacement.
+				{total ?? issues.length} cover{(total ?? issues.length) === 1 ? '' : 's'} the crawl couldn't process.
+				Retry (re-fetch + re-encode) or upload a replacement.
 			</p>
 		</div>
 		<button class="pg" disabled={loading} onclick={() => refresh()}>Refresh</button>
@@ -355,5 +355,39 @@
 	.pg:disabled {
 		opacity: 0.4;
 		cursor: default;
+	}
+	@media (max-width: 720px) {
+		.page-head {
+			flex-wrap: wrap;
+		}
+		.row {
+			grid-template-columns: 1fr;
+			gap: 6px;
+		}
+		.row.head {
+			display: none;
+		}
+		.row > [role='cell']:nth-child(4)::before,
+		.row > [role='cell']:nth-child(5)::before {
+			font-weight: 700;
+			color: var(--k-text-faint);
+		}
+		.row > [role='cell']:nth-child(4)::before {
+			content: 'Tries · ';
+		}
+		.row > [role='cell']:nth-child(5)::before {
+			content: 'Last attempt · ';
+		}
+		.actions {
+			justify-content: flex-start;
+			flex-wrap: wrap;
+		}
+		.act,
+		.pg {
+			height: 40px;
+		}
+		.pager {
+			justify-content: flex-start;
+		}
 	}
 </style>

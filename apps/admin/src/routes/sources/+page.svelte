@@ -2054,6 +2054,7 @@
 		color: var(--k-text);
 		font-family: var(--k-font-sans);
 		font-size: 13.5px;
+		max-width: 100%;
 	}
 	.toolbar select:focus,
 	.filter-q:focus,
@@ -2063,13 +2064,17 @@
 	}
 	.filter-q {
 		width: 220px;
+		max-width: 100%;
 	}
 	.search-form {
 		display: flex;
 		gap: 8px;
+		flex-wrap: wrap;
 	}
 	.search-form input {
 		width: 240px;
+		max-width: 100%;
+		min-width: 0;
 	}
 	.search-form button {
 		height: 40px;
@@ -2808,5 +2813,136 @@
 	.pill.warn {
 		background: rgba(224, 179, 84, 0.15);
 		color: var(--k-hiatus);
+	}
+
+	/* Dense grids (extensions, ingest results, scan health) become stacked rows
+	   below 720px; hidden column headers come back as inline labels so a stacked
+	   value keeps its column context. */
+	@media (max-width: 720px) {
+		.thead {
+			display: none;
+		}
+		.row {
+			grid-template-columns: 1fr;
+			gap: 8px;
+		}
+		.row:hover {
+			background: none;
+		}
+		.row > [class]:nth-child(2)::before {
+			content: 'Lang · ';
+		}
+		.row > [class]:nth-child(3)::before {
+			content: 'Version · ';
+		}
+		.row > .lang::before,
+		.row > .version::before {
+			font-weight: 700;
+			color: var(--k-text-faint);
+		}
+		.actions {
+			justify-content: flex-start;
+		}
+		.act {
+			height: 40px;
+		}
+
+		.hrow {
+			grid-template-columns: 1fr 1fr;
+			row-gap: 6px;
+		}
+		.hrow.head {
+			display: none;
+		}
+		.hrow > [role='cell']:nth-child(1) {
+			grid-column: 1 / -1;
+		}
+		.hrow > [role='cell']::before {
+			font-weight: 700;
+			color: var(--k-text-faint);
+		}
+		.hrow > [role='cell']:nth-child(2)::before {
+			content: 'Series · ';
+		}
+		.hrow > [role='cell']:nth-child(3)::before {
+			content: 'Failing · ';
+		}
+		.hrow > [role='cell']:nth-child(4)::before {
+			content: 'Cached · ';
+		}
+		.hrow > [role='cell']:nth-child(5)::before {
+			content: 'Errors · ';
+		}
+		.hrow > [role='cell']:nth-child(6)::before {
+			content: '0 ch · ';
+		}
+		.hrow > [role='cell']:nth-child(7)::before {
+			content: 'Only here · ';
+		}
+		.hrow > [role='cell']:nth-child(8)::before {
+			content: 'Last scan · ';
+		}
+		.hrow > [role='cell']:nth-child(8) {
+			grid-column: 1 / -1;
+		}
+
+		.rrow {
+			grid-template-columns: 1fr;
+			gap: 6px;
+		}
+		.rrow.head {
+			display: none;
+		}
+		.rrow > [role='cell']:nth-child(2)::before,
+		.rrow > [role='cell']:nth-child(3)::before,
+		.rrow > [role='cell']:nth-child(4)::before {
+			font-weight: 700;
+			color: var(--k-text-faint);
+		}
+		.rrow > [role='cell']:nth-child(2)::before {
+			content: 'Decision · ';
+		}
+		.rrow > [role='cell']:nth-child(3)::before {
+			content: 'Work · ';
+		}
+		.rrow > [role='cell']:nth-child(4)::before {
+			content: 'Signal · ';
+		}
+
+		.ext-row {
+			grid-template-columns: 1fr;
+			gap: 2px;
+		}
+		.ext-row-state {
+			text-align: left;
+			display: inline-block;
+			align-self: start;
+		}
+
+		.segmented {
+			flex-wrap: wrap;
+		}
+		.scope-bar,
+		.bulk-bar,
+		.job-head,
+		.poll-error,
+		.maint-actions {
+			flex-wrap: wrap;
+		}
+		.add-all {
+			margin-left: 0;
+		}
+		.repo-form {
+			flex-wrap: wrap;
+		}
+		.repo-form input {
+			min-width: 0;
+		}
+		.tabs button {
+			height: 40px;
+		}
+		.pager {
+			flex-wrap: wrap;
+		}
 	}
 </style>

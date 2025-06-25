@@ -259,5 +259,23 @@
 		.row.head {
 			display: none;
 		}
+		.row > [role='cell']:nth-child(2)::before,
+		.row > [role='cell']:nth-child(3)::before {
+			font-weight: 700;
+			color: var(--k-text-faint);
+		}
+		.row > [role='cell']:nth-child(2)::before {
+			content: 'Latest chapter · ';
+		}
+		.row > [role='cell']:nth-child(3)::before {
+			content: 'Updated · ';
+		}
+		.pager {
+			flex-wrap: wrap;
+			justify-content: flex-start;
+		}
+		.pg {
+			height: 42px;
+		}
 	}
 </style>

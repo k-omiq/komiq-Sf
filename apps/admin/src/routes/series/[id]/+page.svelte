@@ -276,8 +276,8 @@
 
 		{#if !meta?.workId}
 			<p class="notice">
-				This series isn't catalogued yet, so its metadata can't be edited. Add it to the
-				canonical catalogue from the <a href="/">Catalog</a> page first.
+				This series isn't catalogued yet, so its metadata can't be edited. Add it to the canonical
+				catalogue from the <a href="/">Catalog</a> page first.
 			</p>
 		{:else}
 			<!-- ---- Metadata editor ---- -->
@@ -362,8 +362,7 @@
 								></span
 							>
 						{/each}
-						{#if series.altTitles.length === 0}<span class="muted">No alternative titles</span
-							>{/if}
+						{#if series.altTitles.length === 0}<span class="muted">No alternative titles</span>{/if}
 					</div>
 					<div class="tag-add">
 						<input
@@ -432,7 +431,9 @@
 									<input class="rename" type="text" bind:value={editTitle} />
 									<button
 										onclick={() =>
-										commitChapter(c, { title: editTitle.trim() === '' ? null : editTitle.trim() })}
+											commitChapter(c, {
+												title: editTitle.trim() === '' ? null : editTitle.trim(),
+											})}
 										disabled={chapBusyKey === c.key}>Save</button
 									>
 									<button class="ghost" onclick={() => (editingKey = null)}>Cancel</button>
@@ -610,9 +611,11 @@
 	.tag-add {
 		display: flex;
 		gap: 0.4rem;
+		flex-wrap: wrap;
 	}
 	.tag-add input {
 		flex: 1;
+		min-width: 160px;
 		background: var(--k-surface-2);
 		border: 1px solid var(--k-border);
 		border-radius: 6px;
@@ -697,5 +700,55 @@
 	}
 	.src-name {
 		font-weight: 600;
+	}
+
+	@media (max-width: 720px) {
+		.wrap {
+			padding: 0.75rem;
+		}
+		.cover {
+			width: 72px;
+			height: 102px;
+		}
+		.head-meta h1 {
+			font-size: 1.15rem;
+			overflow-wrap: anywhere;
+		}
+		.head-meta {
+			min-width: 0;
+		}
+		.card-head {
+			flex-wrap: wrap;
+			gap: 0.5rem;
+		}
+		.sources li,
+		.chapters li {
+			flex-wrap: wrap;
+		}
+		.ch-title {
+			flex: 1 1 100%;
+			min-width: 0;
+			white-space: normal;
+			overflow-wrap: anywhere;
+		}
+		.rename {
+			flex: 1 1 100%;
+			min-width: 0;
+		}
+		.actions {
+			flex-wrap: wrap;
+		}
+		button {
+			min-height: 40px;
+		}
+		.tag-x {
+			min-height: 0;
+			min-width: 32px;
+			padding: 4px 8px;
+		}
+		.row .field {
+			min-width: 0;
+			flex: 1 1 100%;
+		}
 	}
 </style>

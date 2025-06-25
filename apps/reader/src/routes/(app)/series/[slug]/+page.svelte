@@ -19,7 +19,6 @@
 		getSeriesNsfwOverride,
 		setSeriesNsfw,
 	} from '$lib/data/source';
-	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
 	import { backend, images } from '$lib/context';
 	import { auth } from '$lib/auth.svelte';
 	import {
@@ -401,11 +400,10 @@
 		return sort === 'newest' ? asc.reverse() : asc;
 	});
 
-	// Translators (sources) available for this work, and switching between them.
+	// The sources available for this work — a static provenance list (no picker: the
+	// chapter list below is the cross-source union, one row per chapter number).
 	const translators = $derived(view?.translators ?? []);
-	const selectedTranslatorKey = $derived(view?.selectedTranslatorKey ?? null);
 	const workId = $derived(view?.workId ?? null);
-	let switching = $state(false);
 
 	// --- admin: fold duplicate works into this one ---
 	//
@@ -560,58 +558,6 @@
 			// Runs even on the early return above; by then the control belongs to the new
 			// series and must not be left disabled.
 			nsfwBusy = false;
-		}
-	}
-
-	// The picker is a POPOVER rather than the flat button list it used to be. With a
-	// handful of sources the flat list pushed the chapter list a screen down the page, and
-	// it read as a set of tabs rather than "the source this list is coming from" — which
-	// is what it now literally controls (see `getSeries`: the selected source owns the
-	// chapter list). Same dismissal contract as `StatusMenu`: outside click on the capture
-	// phase, plus Escape.
-	let pickerOpen = $state(false);
-	let pickerRoot = $state<HTMLElement | null>(null);
-	const selectedTranslator = $derived(
-		translators.find((t) => t.key === selectedTranslatorKey) ?? translators[0] ?? null,
-	);
-	// One source is not a choice — render it as a static label, not a dead dropdown.
-	const pickerInteractive = $derived(translators.length > 1);
-
-	function togglePicker(): void {
-		if (switching || !pickerInteractive) return;
-		pickerOpen = !pickerOpen;
-	}
-
-	$effect(() => {
-		if (!pickerOpen) return;
-		const onDoc = (e: MouseEvent) => {
-			if (pickerRoot && !pickerRoot.contains(e.target as Node)) pickerOpen = false;
-		};
-		const onKey = (e: KeyboardEvent) => {
-			if (e.key === 'Escape') pickerOpen = false;
-		};
-		window.addEventListener('click', onDoc, true);
-		window.addEventListener('keydown', onKey);
-		return () => {
-			window.removeEventListener('click', onDoc, true);
-			window.removeEventListener('keydown', onKey);
-		};
-	});
-
-	async function selectTranslator(key: string): Promise<void> {
-		pickerOpen = false;
-		if (!workId || switching || key === selectedTranslatorKey) return;
-		setPreferredTranslator(workId, key);
-		switching = true;
-		try {
-			// Refetch by `workId`, NOT `data.slug`: after a `work_redirect` the two are
-			// different ids, and getSeries() re-reads the preference we just stored
-			// under `workId` — asking with the retired id would look up a preference
-			// that isn't there and silently ignore the reader's choice.
-			const r = await getSeries(workId);
-			if (r.view) override = r;
-		} finally {
-			switching = false;
 		}
 	}
 
@@ -991,6 +937,45 @@
 		</div>
 	{/if}
 
+	<!-- available sources: a static provenance list (no picker). The chapter list
+	     below is the cross-source union straight after this, so there is nothing to
+	     switch — each source's icon, name, language and chapter count is the whole
+	     answer to "where can this be read from". -->
+	{#if translators.length}
+		<div class="sources k-gutter">
+			<div class="src-head">
+				<h2>Available sources</h2>
+				<span class="src-sub"
+					>{translators.length === 1 ? '1 source' : `${translators.length} sources`}</span
+				>
+			</div>
+			<ul class="src-list">
+				{#each translators as t (t.key)}
+					<li class="src-item">
+						{#if t.iconUrl}
+							<img
+								class="src-logo"
+								src={t.iconUrl}
+								alt=""
+								loading="lazy"
+								decoding="async"
+								referrerpolicy="no-referrer"
+							/>
+						{:else}
+							<span class="src-logo src-initial">{t.name.charAt(0).toUpperCase()}</span>
+						{/if}
+						<span class="src-name"
+							>{t.name}{#if t.lang}<span class="src-lang">{t.lang.toUpperCase()}</span>{/if}</span
+						>
+						<span class="src-count"
+							>{t.chapterCount} {t.chapterCount === 1 ? 'chapter' : 'chapters'}</span
+						>
+					</li>
+				{/each}
+			</ul>
+		</div>
+	{/if}
+
 	<!-- rate -->
 	<div class="rate-wrap k-gutter">
 		<div class="rate">
@@ -1019,105 +1004,8 @@
 		</div>
 	</div>
 
-	<!-- source picker — chooses WHICH source's chapters the list below shows -->
-	{#if translators.length}
-		<div class="translators k-gutter">
-			<div class="tr-head">
-				<span class="tr-label">Source</span>
-				<span class="tr-sub"
-					>{translators.length === 1
-						? 'Only one source available'
-						: `${translators.length} sources · switch to re-list chapters`}</span
-				>
-			</div>
-			<div class="tr-picker" class:open={pickerOpen} bind:this={pickerRoot}>
-				<button
-					type="button"
-					class="tr-trigger"
-					class:static={!pickerInteractive}
-					disabled={switching}
-					aria-haspopup="listbox"
-					aria-expanded={pickerOpen}
-					aria-label="Change source"
-					onclick={togglePicker}
-				>
-					{#if selectedTranslator}
-						{#if selectedTranslator.iconUrl}
-							<img
-								class="tr-logo"
-								src={selectedTranslator.iconUrl}
-								alt=""
-								loading="lazy"
-								decoding="async"
-								referrerpolicy="no-referrer"
-							/>
-						{:else}
-							<span class="tr-logo tr-initial"
-								>{selectedTranslator.name.charAt(0).toUpperCase()}</span
-							>
-						{/if}
-						<span class="tr-name">
-							<span class="tr-name-main"
-								>{selectedTranslator.name}{#if selectedTranslator.lang}<span class="tr-lang"
-										>{selectedTranslator.lang.toUpperCase()}</span
-									>{/if}</span
-							>
-							<span class="tr-count"
-								>{selectedTranslator.chapterCount}
-								{selectedTranslator.chapterCount === 1 ? 'chapter' : 'chapters'}</span
-							>
-						</span>
-					{/if}
-					{#if pickerInteractive}
-						<Icon name="chevron-down" size={16} />
-					{/if}
-				</button>
-				{#if pickerOpen}
-					<div class="tr-menu" role="listbox" aria-label="Sources">
-						{#each translators as t (t.key)}
-							<button
-								type="button"
-								role="option"
-								aria-selected={t.key === selectedTranslatorKey}
-								class="tr-opt"
-								class:on={t.key === selectedTranslatorKey}
-								disabled={switching}
-								onclick={() => selectTranslator(t.key)}
-								title={t.lang ? `${t.name} · ${t.lang.toUpperCase()}` : t.name}
-							>
-								{#if t.iconUrl}
-									<img
-										class="tr-logo"
-										src={t.iconUrl}
-										alt=""
-										loading="lazy"
-										decoding="async"
-										referrerpolicy="no-referrer"
-									/>
-								{:else}
-									<span class="tr-logo tr-initial">{t.name.charAt(0).toUpperCase()}</span>
-								{/if}
-								<span class="tr-name">
-									<span class="tr-name-main"
-										>{t.name}{#if t.lang}<span class="tr-lang">{t.lang.toUpperCase()}</span
-											>{/if}</span
-									>
-									<span class="tr-count"
-										>{t.chapterCount} {t.chapterCount === 1 ? 'chapter' : 'chapters'}</span
-									>
-								</span>
-								{#if t.key === selectedTranslatorKey}
-									<Icon name="check" size={15} strokeWidth={2.6} />
-								{/if}
-							</button>
-						{/each}
-					</div>
-				{/if}
-			</div>
-		</div>
-	{/if}
-
 	<!-- chapters -->
+
 	<div class="chapters k-gutter">
 		<div class="ch-head">
 			<div class="ch-title">
@@ -1139,65 +1027,98 @@
 			     reachable in bulk now that Browse pages the whole catalogue (~67k works have
 			     no chapter yet), and the honest wording matters — MangaDex REMOVES chapters
 			     when a series is licensed or claimed, so this is usually a popular series
-			     whose chapters live on another source, not a broken one. The source picker
-			     above is the actual next step when there is more than one source, so the copy
-			     points at it only when it exists. -->
+			     whose chapters live on another source, not a broken one. -->
 			{#if chapters.length === 0}
 				<div class="ch-empty">
 					<div class="ch-empty-title">No chapters from any source yet</div>
 					<div class="ch-empty-desc">
-						{pickerInteractive
-							? 'Nothing is available from this source. Try another source above.'
-							: 'Nothing is available to read here yet — it may arrive from another source, or be licensed elsewhere.'}
+						{translators.length
+							? 'Nothing is available to read here yet. It may arrive from one of the sources above, or be licensed elsewhere.'
+							: 'Nothing is available to read here yet. It may arrive from another source, or be licensed elsewhere.'}
 					</div>
 				</div>
 			{/if}
 			{#each chapters as c (c.id ?? c.n)}
-				<a class="ch-row" class:read={c.read} href={chapterHref(c.id, c.src)}>
-					<span class="ch-num">{c.n}</span>
-					<div class="ch-info">
-						<div class="ch-line">
-							<span class="ch-name">{c.title}</span>
-							{#if c.isNew}<span class="new">NEW</span>{/if}
-							<!-- Off-site chapters (~35,000 of them: MangaPlus, Comikey, NamiComi,
-							     BiliBili) have no pages for us to serve — tapping one opens a
-							     "read it on <host>" hand-off. Badged HERE, in the list people
-							     actually browse, because learning it only after you have opened
-							     the chapter is the dead end the badge exists to remove. The
-							     reader's own dropdown badges too, but that is already past the
-							     point of surprise. -->
-							{#if c.external}<span class="ext" title="Hosted on another site"
-									><Icon name="globe" size={11} />OFF-SITE</span
-								>{/if}
-						</div>
-						<!-- TWO CLOCKS, NAMED, because they answer different questions and
-						     the gap between them is the point: a source that holds chapters
-						     behind early access publishes days before anyone here can read
-						     them.
+				<!-- One row per chapter NUMBER (the cross-source union), with no nested
+				     interactive elements: the chapter number and the main body are two sibling
+				     links to the row's sensible default source, and the provenance cluster of
+				     per-source links sits between them — never inside either one. -->
+				<div class="ch-row" class:read={c.read}>
+					<a class="ch-numlink" href={chapterHref(c.id, c.src)}>
+						<span class="ch-num">{c.n}</span>
+					</a>
+					{#if c.sources?.length}
+						<span class="ch-srcs">
+							{#each c.sources as s (s.src ?? 'spine')}
+								<a
+									class="ch-src"
+									href={chapterHref(s.id, s.src)}
+									title={`Read Chapter ${c.n} on ${s.name}`}
+									aria-label={`Read Chapter ${c.n} on ${s.name}`}
+								>
+									{#if s.iconUrl}
+										<img
+											class="ch-src-logo"
+											src={s.iconUrl}
+											alt=""
+											loading="lazy"
+											decoding="async"
+											referrerpolicy="no-referrer"
+										/>
+									{:else}
+										<span class="ch-src-initial">{s.name.charAt(0).toUpperCase()}</span>
+									{/if}
+								</a>
+							{/each}
+						</span>
+					{/if}
+					<a class="ch-main" href={chapterHref(c.id, c.src)}>
+						<div class="ch-info">
+							<div class="ch-line">
+								<span class="ch-name">{c.title}</span>
+								{#if c.isNew}<span class="new">NEW</span>{/if}
+								<!-- Off-site chapters (~35,000 of them: MangaPlus, Comikey, NamiComi,
+								     BiliBili) have no pages for us to serve — tapping one opens a
+								     "read it on <host>" hand-off. Badged HERE, in the list people
+								     actually browse, because learning it only after you have opened
+								     the chapter is the dead end the badge exists to remove. The
+								     reader's own dropdown badges too, but that is already past the
+								     point of surprise. -->
+								{#if c.external}<span class="ext" title="Hosted on another site"
+										><Icon name="globe" size={11} />OFF-SITE</span
+									>{/if}
+							</div>
+							<!-- TWO CLOCKS, NAMED, because they answer different questions and
+							     the gap between them is the point: a source that holds chapters
+							     behind early access publishes days before anyone here can read
+							     them.
 
-						     "Found" is NEVER allowed to fall back to the release date — a
-						     chapter we have no record of finding renders an em dash, which
-						     is what `foundDate` already carries. Expect that dash on most
-						     older chapters: no discovery time was invented for the back
-						     catalogue (migration 0099).
+							     "Found" is secondary, so it renders only where it can say
+							     something the release clock cannot: chapters whose discovery
+							     is within the last 30 days, plus the three newest chapters.
+							     Older rows and rows with no recorded discovery time omit it —
+							     never a placeholder date (the data layer already returns '').
 
-						     Multi-source works can carry a chapter no source we can date
-						     provides (S2 aggregation), so the released half still drops out
-						     entirely rather than leaving an empty line among dated rows. -->
-						<div class="ch-dates">
-							{#if c.date}<span class="ch-date">Released {c.date}</span>{/if}
-							<span
-								class="ch-date ch-found"
-								title="When we first had this chapter available to read"
-								>Found {c.foundDate}</span
-							>
+							     A multi-source work can carry a chapter no source dated (S2
+							     aggregation), so the Released half drops out too rather than
+							     leaving an empty line among dated rows. -->
+							<div class="ch-dates">
+								{#if c.date}<span class="ch-date">Released {c.date}</span>{/if}
+								{#if c.foundDate}
+									<span
+										class="ch-date ch-found"
+										title="When we first had this chapter available to read"
+										>Found {c.foundDate}</span
+									>
+								{/if}
+							</div>
 						</div>
-					</div>
-					{#if c.read}<span class="ch-read"
-							><Icon name="check" size={13} strokeWidth={2.4} />Read</span
-						>{/if}
-					<Icon name="chevron-right" size={16} stroke="#57554f" />
-				</a>
+						{#if c.read}<span class="ch-read"
+								><Icon name="check" size={13} strokeWidth={2.4} />Read</span
+							>{/if}
+						<Icon name="chevron-right" size={16} stroke="#57554f" />
+					</a>
+				</div>
 			{/each}
 		</div>
 	</div>
@@ -2028,154 +1949,81 @@
 	.clear:hover {
 		color: var(--k-text);
 	}
-	.translators {
+	/* Available sources: a static provenance list, deliberately quiet. It answers
+	   "where can this be read from" and nothing else — the interaction it replaces
+	   (the per-source picker) now lives in the per-chapter provenance cluster below
+	   and in the reader's own settings. */
+	.sources {
 		padding-top: 44px;
 		display: flex;
 		flex-direction: column;
-		gap: 16px;
+		gap: 14px;
 	}
-	.tr-head {
+	.src-head {
 		display: flex;
 		align-items: baseline;
 		gap: 12px;
 		flex-wrap: wrap;
 	}
-	.tr-label {
+	.src-head h2 {
 		font-size: 21px;
 		font-weight: 700;
 		font-family: var(--k-font-display);
 		color: var(--k-text);
+		margin: 0;
 	}
-	.tr-sub {
+	.src-sub {
 		font-size: 13px;
 		color: var(--k-text-faint);
 	}
-	.tr-picker {
-		position: relative;
-		display: inline-flex;
-		align-self: flex-start;
-	}
-	/* The trigger displays the CURRENT source, so it carries the same accent the chosen
-	   row in the menu does — control and value read as one thing, rather than a neutral
-	   button sitting above a highlighted list. */
-	.tr-trigger {
-		display: inline-flex;
-		align-items: center;
-		gap: 12px;
-		padding: 10px 14px 10px 12px;
-		border-radius: 12px;
-		background: rgba(224, 131, 105, 0.1);
-		border: 1px solid var(--k-primary);
-		color: var(--k-text-bright);
-		cursor: pointer;
-		transition: filter 0.15s;
-		text-align: left;
-		font-family: inherit;
-		min-width: 260px;
-	}
-	.tr-trigger:not(:disabled):hover {
-		filter: brightness(1.1);
-	}
-	.tr-trigger:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-	/* One source is not a choice: drop the accent and the affordance both. */
-	.tr-trigger.static {
-		cursor: default;
-		background: var(--k-surface);
-		border-color: var(--k-border-2);
-		color: var(--k-text-2);
-	}
-	.tr-trigger.static:hover {
-		filter: none;
-	}
-	/* The chevron/check are the only <svg> here; push the chevron to the far edge. */
-	.tr-trigger :global(svg) {
-		margin-left: auto;
-		flex: 0 0 auto;
-	}
-	.tr-menu {
-		position: absolute;
-		z-index: 40;
-		top: calc(100% + 6px);
-		left: 0;
-		min-width: 100%;
+	.src-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
 		display: flex;
 		flex-direction: column;
-		gap: 4px;
-		padding: 6px;
-		border-radius: 12px;
-		background: var(--k-surface-3, var(--k-surface));
-		border: 1px solid var(--k-border-3);
-		box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
-		/* A work can carry a dozen sources; cap the popover and scroll rather than
-		   running it off the bottom of the viewport. */
-		max-height: 320px;
-		overflow-y: auto;
+		gap: 8px;
+		max-width: 560px;
 	}
-	.tr-opt {
-		display: inline-flex;
+	.src-item {
+		display: flex;
 		align-items: center;
 		gap: 12px;
-		width: 100%;
-		padding: 9px 12px;
-		border-radius: 9px;
-		background: transparent;
-		border: 1px solid transparent;
-		color: var(--k-text-2);
-		cursor: pointer;
-		transition: all 0.15s;
-		text-align: left;
-		font-family: inherit;
+		padding: 8px 14px 8px 10px;
+		border-radius: 12px;
+		background: var(--k-surface);
+		border: 1px solid var(--k-border-2);
 	}
-	.tr-opt:hover {
-		background: var(--k-hover-fill, rgba(255, 255, 255, 0.06));
-	}
-	.tr-opt.on {
-		border-color: var(--k-primary);
-		background: rgba(224, 131, 105, 0.1);
-		color: var(--k-text-bright);
-	}
-	.tr-opt:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-	.tr-opt :global(svg) {
-		margin-left: auto;
-		flex: 0 0 auto;
-	}
-	.tr-logo {
-		width: 34px;
-		height: 34px;
+	.src-logo {
+		width: 30px;
+		height: 30px;
 		flex: 0 0 auto;
 		border-radius: 8px;
 		object-fit: cover;
 		background: var(--k-surface-3);
 		border: 1px solid var(--k-border-2);
 	}
-	.tr-initial {
+	.src-initial {
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		font-size: 16px;
+		font-size: 14px;
 		font-weight: 800;
 		color: var(--k-text-2);
 	}
-	.tr-name {
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-		min-width: 0;
-	}
-	.tr-name-main {
+	.src-name {
 		display: inline-flex;
 		align-items: center;
 		gap: 7px;
+		min-width: 0;
 		font-size: 14px;
 		font-weight: 700;
+		color: var(--k-text-2);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
-	.tr-lang {
+	.src-lang {
 		font-size: 9.5px;
 		font-weight: 800;
 		letter-spacing: 0.04em;
@@ -2185,9 +2033,12 @@
 		border-radius: 4px;
 		padding: 1px 5px;
 	}
-	.tr-count {
+	.src-count {
+		margin-left: auto;
+		flex: 0 0 auto;
 		font-size: 12px;
 		color: var(--k-text-faint);
+		white-space: nowrap;
 	}
 	.ch-empty {
 		display: flex;
@@ -2262,14 +2113,86 @@
 	.ch-row {
 		display: flex;
 		align-items: center;
-		gap: 18px;
-		padding: 15px 20px;
+		gap: 12px;
 		border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-		text-decoration: none;
 		transition: background 0.12s;
 	}
 	.ch-row:hover {
 		background: rgba(255, 255, 255, 0.035);
+	}
+	/* The row is not one link (that would nest the provenance cluster inside it);
+	   the number link and the main link are siblings, each carrying its half of
+	   the old row padding so the between-links cluster keeps a clean click lane. */
+	.ch-numlink {
+		flex: 0 0 auto;
+		display: flex;
+		align-items: center;
+		padding: 15px 0 15px 20px;
+		text-decoration: none;
+	}
+	.ch-main {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		align-items: center;
+		gap: 18px;
+		padding: 15px 20px 15px 0;
+		text-decoration: none;
+	}
+	/* Provenance cluster: every source that carries this chapter number, as a row
+	   of small square links. Icons keep the extension-logo language the settings
+	   and the source list use (logo, initial fallback); a cluster of three links
+	   is the usual case and wraps rather than crushing the title on mobile. */
+	.ch-srcs {
+		flex: 0 0 auto;
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		max-width: 34%;
+		flex-wrap: wrap;
+	}
+	.ch-src {
+		width: 44px;
+		height: 44px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border-radius: 7px;
+		background: transparent;
+		border: none;
+		text-decoration: none;
+		overflow: hidden;
+		transition: border-color 0.12s;
+	}
+	.ch-src:hover .ch-src-logo,
+	.ch-src:hover .ch-src-initial {
+		border-color: var(--k-border-strong);
+	}
+	.ch-src:focus-visible,
+	.ch-numlink:focus-visible,
+	.ch-main:focus-visible {
+		outline: 2px solid var(--k-primary);
+		outline-offset: -2px;
+	}
+	.ch-src-logo {
+		width: 28px;
+		height: 28px;
+		object-fit: cover;
+		border: 1px solid var(--k-border-2);
+		border-radius: 7px;
+	}
+	.ch-src-initial {
+		width: 28px;
+		height: 28px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border: 1px solid var(--k-border-2);
+		border-radius: 7px;
+		background: var(--k-surface-3);
+		font-size: 12px;
+		font-weight: 800;
+		color: var(--k-text-2);
 	}
 	.ch-num {
 		flex: 0 0 auto;
@@ -2406,12 +2329,10 @@
 			justify-content: center;
 			min-width: 160px;
 		}
-		/* Give the source picker a full-width one-handed target; the popover it opens
-		   inherits the width via `.tr-menu { min-width: 100% }`. */
-		.tr-picker,
-		.tr-trigger {
-			width: 100%;
-			min-width: 0;
+		/* Keep the source rows and the provenance cluster readable on a small screen:
+		   rows stay single-line, clusters wrap inside their lane. */
+		.src-list {
+			max-width: none;
 		}
 		.covers-strip {
 			gap: 12px;

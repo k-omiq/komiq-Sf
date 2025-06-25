@@ -674,6 +674,7 @@
 		display: flex;
 		align-items: center;
 		gap: 10px;
+		flex-wrap: wrap;
 	}
 	.cmsg {
 		font-size: 12.5px;
@@ -857,5 +858,53 @@
 	}
 	.editor-link:hover {
 		text-decoration: underline;
+	}
+
+	@media (max-width: 720px) {
+		.page-head {
+			flex-wrap: wrap;
+		}
+		.row {
+			grid-template-columns: 1fr;
+			gap: 8px;
+		}
+		.row.head {
+			display: none;
+		}
+		/* Confidence / Signal / Queued get their head-row labels back inline. */
+		.row > [role='cell']:nth-child(3)::before,
+		.row > [role='cell']:nth-child(4)::before,
+		.row > [role='cell']:nth-child(5)::before {
+			font-weight: 700;
+			color: var(--k-text-faint);
+		}
+		.row > [role='cell']:nth-child(3)::before {
+			content: 'Confidence · ';
+		}
+		.row > [role='cell']:nth-child(4)::before {
+			content: 'Signal · ';
+		}
+		.row > [role='cell']:nth-child(5)::before {
+			content: 'Queued · ';
+		}
+		.actions {
+			justify-content: flex-start;
+			flex-wrap: wrap;
+		}
+		.head-actions .pg,
+		.act,
+		.pager .pg {
+			height: 40px;
+		}
+		.detail {
+			grid-template-columns: 1fr;
+		}
+		.cover {
+			width: 110px;
+		}
+		.pager {
+			flex-wrap: wrap;
+			justify-content: flex-start;
+		}
 	}
 </style>

@@ -158,4 +158,15 @@
 		opacity: 0.6;
 		cursor: default;
 	}
+	@media (max-width: 480px) {
+		.wrap {
+			padding: var(--k-space-4);
+		}
+		.card {
+			padding: var(--k-space-5);
+		}
+		input {
+			height: 44px;
+		}
+	}
 </style>

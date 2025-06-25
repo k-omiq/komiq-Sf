@@ -401,18 +401,47 @@
 		pageIdx = 0;
 		persist();
 	}
+	// Page turns hop chapters at the volume edges: forward on the LAST page opens
+	// the next chapter when one exists, backward on the FIRST page opens the
+	// previous one. The data model knows chapter adjacency, so "next" always means
+	// the next chapter. `openChapter` handles the src pinning itself.
 	function nextPage() {
-		pageIdx = Math.min(total - 1, pageIdx + 1);
-		maybeMarkRead();
-		persist();
+		if (pageIdx < total - 1) {
+			pageIdx = pageIdx + 1;
+			maybeMarkRead();
+			persist();
+		} else if (data.nextChapterId) {
+			void openChapter(data.nextChapterId);
+		}
 	}
 	function prevPage() {
-		pageIdx = Math.max(0, pageIdx - 1);
-		persist();
+		if (pageIdx > 0) {
+			pageIdx = pageIdx - 1;
+			persist();
+		} else if (data.prevChapterId) {
+			void openChapter(data.prevChapterId);
+		}
 	}
 
-	// Keyboard operability: arrows/space page through single-page mode, Escape
-	// closes any open overlay. Ignore when typing in the comment box.
+	// Long-strip directional navigation is only allowed at the relevant READING
+	// edge: forward once the final strip page is visible, backward at document top.
+	// The end-of-chapter panel and comments sit below the strip, so document bottom
+	// would make readers scroll past the manga before the key worked. Mid-strip the
+	// same keys retain normal scrolling. 2px tolerance handles sub-pixel positions.
+	function atDocTop(): boolean {
+		return window.scrollY <= 2;
+	}
+	let stripEl = $state<HTMLElement | null>(null);
+	function atStripEnd(): boolean {
+		return !!stripEl && stripEl.getBoundingClientRect().bottom <= window.innerHeight + 2;
+	}
+
+	// Keyboard operability: in single-page mode, arrows/PageUp/PageDown (and space)
+	// turn pages, hopping chapters at the volume edges (see nextPage/prevPage). In
+	// long-strip mode, forward keys at the end of the manga strip open the next chapter
+	// and backward keys at the document top open the previous one; elsewhere they
+	// keep their default scroll behaviour. Escape closes any open overlay. Ignore
+	// when typing in the comment box.
 	function onKeydown(e: KeyboardEvent) {
 		const el = e.target as HTMLElement | null;
 		if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) return;
@@ -424,13 +453,26 @@
 			}
 			return;
 		}
-		if (mode !== 'page') return;
-		if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') {
+		const forward = e.key === 'ArrowRight' || e.key === 'PageDown';
+		const backward = e.key === 'ArrowLeft' || e.key === 'PageUp';
+		if (mode === 'page') {
+			if (forward || e.key === ' ') {
+				e.preventDefault();
+				nextPage();
+			} else if (backward) {
+				e.preventDefault();
+				prevPage();
+			}
+			return;
+		}
+		// Long strip: hop only at the reading edge that matches the direction, and
+		// only when a chapter exists there; otherwise let the keys scroll naturally.
+		if (forward && atStripEnd() && data.nextChapterId) {
 			e.preventDefault();
-			nextPage();
-		} else if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+			void openChapter(data.nextChapterId);
+		} else if (backward && atDocTop() && data.prevChapterId) {
 			e.preventDefault();
-			prevPage();
+			void openChapter(data.prevChapterId);
 		}
 	}
 </script>
@@ -632,7 +674,7 @@
 			</div>
 		</div>
 	{:else if isStrip}
-		<div class="strip">
+		<div class="strip" bind:this={stripEl}>
 			<!-- Keyed on the CHAPTER as well as the page index: `p.index` alone repeats
 			     across chapters, so Svelte reused each <img> and only patched `src`,
 			     leaving the previous chapter's decoded frame on screen until the new
@@ -1397,11 +1439,14 @@
 			transparent 2px 12px
 		);
 	}
+	/* Single-page click zones: EXACTLY 30% each edge, leaving the middle 40% to the
+	   chrome-toggle button underneath. The zones stopPropagation, so a tap never
+	   both turns a page and toggles the chrome. */
 	.zone {
 		position: absolute;
 		top: 0;
 		bottom: 0;
-		width: 38%;
+		width: 30%;
 		background: transparent;
 		border: none;
 		cursor: pointer;

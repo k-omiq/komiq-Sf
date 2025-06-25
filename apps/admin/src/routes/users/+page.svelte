@@ -312,4 +312,41 @@
 		font-size: 13px;
 		color: var(--k-text-dim);
 	}
+	@media (max-width: 720px) {
+		.row {
+			grid-template-columns: 1fr;
+			gap: 6px;
+		}
+		.row.head {
+			display: none;
+		}
+		.row > [role='cell']:nth-child(2)::before,
+		.row > [role='cell']:nth-child(3)::before,
+		.row > [role='cell']:nth-child(4)::before {
+			font-weight: 700;
+			color: var(--k-text-faint);
+		}
+		.row > [role='cell']:nth-child(2)::before {
+			content: 'Joined · ';
+		}
+		.row > [role='cell']:nth-child(3)::before {
+			content: 'Role · ';
+		}
+		.row > [role='cell']:nth-child(4)::before {
+			content: 'Status · ';
+		}
+		.actions {
+			justify-content: flex-start;
+			flex-wrap: wrap;
+		}
+		.act {
+			height: 40px;
+		}
+		.pg {
+			height: 40px;
+		}
+		.pager {
+			flex-wrap: wrap;
+		}
+	}
 </style>

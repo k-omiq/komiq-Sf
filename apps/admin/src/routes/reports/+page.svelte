@@ -825,8 +825,33 @@
 		.row.head {
 			display: none;
 		}
+		/* Reporter / Filed lose their column context when the head row hides. */
+		.row > [role='cell']:nth-child(3)::before,
+		.row > [role='cell']:nth-child(4)::before {
+			font-weight: 700;
+			color: var(--k-text-faint);
+		}
+		.row > [role='cell']:nth-child(3)::before {
+			content: 'Reporter · ';
+		}
+		.row > [role='cell']:nth-child(4)::before {
+			content: 'Filed · ';
+		}
 		.actions {
 			justify-content: flex-start;
+			flex-wrap: wrap;
+		}
+		.tabs {
+			flex-wrap: wrap;
+		}
+		.tab {
+			min-height: 40px;
+		}
+		.act,
+		.pg {
+			min-height: 40px;
+		}
+		.pager {
 			flex-wrap: wrap;
 		}
 	}

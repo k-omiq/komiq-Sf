@@ -36,6 +36,7 @@ import { api, type LoadFetch } from './load-fetch';
 import { findChapterOwner } from './chapter-owner';
 import type { ChapterCandidate } from './chapter-owner';
 import { chapterChip, externalChapterHref } from './chapter-label';
+import { chapterDateLabel, chapterFoundLabel } from './chapter-date';
 import {
 	isRedundantMangadexExt,
 	maxSaneChapterNumber,
@@ -705,8 +706,12 @@ interface ResolvedWork {
 	 * so exposing them is free — and it is what lets the reader open a `?ch=` that
 	 * belongs to a source other than the default instead of rendering an empty view.
 	 * See {@link findChapterOwner}.
+	 *
+	 * `name`/`iconUrl` mirror the candidate's picker metadata (including entries the
+	 * picker HIDES, like the redundant all.mangadex extension) so the series page's
+	 * per-chapter provenance cluster can label every source the aggregation reports.
 	 */
-	candidates: ChapterCandidate<Chapter>[];
+	candidates: (ChapterCandidate<Chapter> & { name: string; iconUrl: string | null })[];
 	/**
 	 * Cross-source aggregation, when it rode along in the single-round-trip
 	 * `seriesPage` bundle (requested via `withAggregated`). Undefined on the
@@ -971,6 +976,8 @@ async function resolveWork(
 		candidates: ordered.map((c) => ({
 			key: c.view.key,
 			suwayomiMangaId: c.view.suwayomiMangaId,
+			name: c.view.name,
+			iconUrl: c.view.iconUrl,
 			chapters: c.chapters,
 		})),
 		aggregated,
@@ -1556,27 +1563,43 @@ export interface SeriesChapterView {
 	id?: string;
 	n: number;
 	title: string;
+	/**
+	 * The chapter's RELEASE time, already formatted as natural English ("3 hours
+	 * ago", "March 2023"), or '' when unknown. Rendered as "Released <date>". Both
+	 * clocks now go through {@link chapterDateLabel}: the terse chip format was a card
+	 * convention, and a "Released 3d" line read as decoration, not a date.
+	 */
 	date: string;
 	/**
-	 * When WE first had this chapter, already formatted — or `'\u2014'` (an em dash) when we
-	 * have no record.
+	 * When WE first had this chapter, already formatted, or '' when the row must
+	 * not carry a "Found" line at all.
 	 *
-	 * NEVER falls back to {@link date}. The two answer different questions ("when did the
-	 * source publish it" vs "when could I first read it here"), and the gap between them is
-	 * the entire reason the column exists — a source that holds chapters behind early access
-	 * publishes days before anyone here can read them. Substituting one for the other would
-	 * assert we had it the instant it was published.
-	 *
-	 * Expect the dash for essentially every chapter that predates migration 0099: no
-	 * discovery time was invented for the back catalogue.
+	 * NEVER a placeholder. The eligibility rules (last-30-days ∪ newest-3) live in
+	 * {@link chapterFoundLabel}, and an em dash would assert "we looked and did not
+	 * find it" when the truth is "not recorded" — migration 0099 invented no
+	 * discovery time for the back catalogue.
 	 */
 	foundDate: string;
 	isNew: boolean;
 	read: boolean;
-	/** The Suwayomi manga id of the source that provides this chapter (S2
-	 *  aggregation), so the reader opens it from the right source; null = the
-	 *  MangaDex mirror; undefined for a single-source (numeric) series. */
+	/** The Suwayomi manga id of the source that the WHOLE row opens (the reader's
+	 *  sensible default: the preferred translator when it carries the chapter, else
+	 *  a deterministic fallback), null = the MangaDex mirror; undefined for a
+	 *  single-source (numeric) series. */
 	src?: string | null;
+	/**
+	 * Every source that carries this chapter number — the provenance cluster shown
+	 * next to the chapter number. Each entry links to that exact source's copy
+	 * (`id` + `src`); `name`/`iconUrl` come from the resolved translator metadata
+	 * (the extension icon URL, with an initial-letter fallback rendered by the
+	 * template), so the cluster never fabricates either. Deduped by name: the
+	 * hidden redundant MangaDex extension and the direct spine are one source to
+	 * the reader.
+	 *
+	 * Undefined on the legacy path — a numeric Suwayomi series has one implicit
+	 * source and nothing to pick between.
+	 */
+	sources?: ChapterSourceLink[];
 	/**
 	 * The chapter is hosted OFF-SITE (`Chapter.externalUrl != null`) — MangaPlus, Comikey,
 	 * NamiComi, BiliBili, ~35,000 chapters. Opening it shows a "read it on <host>" hand-off
@@ -1595,6 +1618,19 @@ export interface SeriesChapterView {
 	 */
 	external?: boolean;
 }
+/** One source's copy of a chapter, for the series-page provenance cluster. */
+export interface ChapterSourceLink {
+	/** The source's own chapter id to open (`?ch=`); opened WITHOUT it when
+	 *  absent, mirroring {@link SeriesChapterView.id}. */
+	id?: string;
+	/** Suwayomi manga id to pin the reader to (`?src=`); null = the MangaDex mirror. */
+	src: string | null;
+	/** Display name, resolved from the translator metadata. */
+	name: string;
+	/** Extension icon URL, or null → the template renders an initial letter. */
+	iconUrl: string | null;
+}
+
 export interface SeriesDetailView {
 	id: string;
 	title: string;
@@ -1818,15 +1854,14 @@ function mapSeriesView(
 		// inconsistent orders (some newest-first, some oldest-first), so we don't
 		// trust arrival order: map `asc` (sorted by number), and mark the highest 3
 		// numbers as "new" (matching the aggregated path in buildAggregatedChapters).
+		// Those same last-three are the "newest" half of the Found eligibility union
+		// (last-30-days ∪ newest-3) — see `chapterFoundLabel`.
 		chapters: asc.map((c, i) => ({
 			id: c.id,
 			n: c.number,
 			title: c.title || `Chapter ${c.number}`,
-			date: relTime(c.uploadedAt),
-			// Em dash, not '' and not the release date — see `SeriesChapterView.foundDate`.
-			// `relTime` already renders '' for an absent value, so the `||` catches both the
-			// null column and an unparseable one.
-			foundDate: relTime(c.foundAt) || '\u2014',
+			date: chapterDateLabel(c.uploadedAt),
+			foundDate: chapterFoundLabel(c.foundAt, i >= asc.length - 3),
 			isNew: i >= asc.length - 3,
 			read: c.read,
 			// Through the same validator the reader itself uses, so the badge and the
@@ -1871,6 +1906,22 @@ function buildAggregatedChapters(
 	// (readable via `chapters()`), else the MangaDex mirror.
 	const pickSource = (sources: AggregatedChapter['sources']) =>
 		sources.find((s) => s.suwayomiMangaId) ?? sources[0];
+	// Provenance metadata for the per-chapter source cluster, keyed by Suwayomi
+	// manga id ('spine' = the MangaDex mirror). Every candidate carries it —
+	// including sources the picker hides, so the cluster never falls back to a
+	// generic label for a chapter a hidden source serves.
+	const metaBySrc = new Map(
+		resolved.candidates.map((c) => [
+			c.suwayomiMangaId ?? 'spine',
+			{ name: c.name, iconUrl: c.iconUrl },
+		]),
+	);
+	const chaptersBySrc = new Map(
+		resolved.candidates.map((candidate) => [
+			candidate.suwayomiMangaId ?? 'spine',
+			new Map(candidate.chapters.map((chapter) => [chapter.id, chapter])),
+		]),
+	);
 	const asc = [...agg].sort((a, b) => a.number - b.number);
 	return asc.map((c, i) => {
 		const own = readable.get(c.number);
@@ -1880,23 +1931,25 @@ function buildAggregatedChapters(
 		// source's own row only knows what was read from THAT source, and the ids differ
 		// per source. `readAnywhere` is opportunistically selected, so an older API leaves
 		// it undefined and this degrades to exactly the old per-source behaviour.
-		// NOT the main path: this whole function only runs when the selected source has NO
-		// chapters (see the `!view.chapters.length` fallback in `getSeries`) — the ordinary
-		// list is `resolved.chapters`, whose `read` the server already answers cross-source.
 		let read = c.readAnywhere === true;
 		let date = '';
-		// Only the selected translator's real `Chapter` carries a found date. The aggregated
-		// shape has no equivalent — `AggregatedChapter` exposes `firstReleasedAt` (the
-		// earliest RELEASE across sources) and nothing about when we first held it — so a
-		// chapter this translator does not carry keeps the dash rather than borrowing a clock
-		// that answers a different question.
-		let foundDate = '\u2014';
+		// Aggregation has no discovery timestamp, but the resolver already fetched each
+		// source's concrete Chapter. Use the earliest valid `foundAt` among the copies:
+		// "Found" means when Komika first had this chapter anywhere, not when the reader's
+		// preferred source happened to acquire its copy.
+		const foundAt = c.sources
+			.map(
+				(source) =>
+					chaptersBySrc.get(source.suwayomiMangaId ?? 'spine')?.get(source.chapterId)?.foundAt,
+			)
+			.filter((value): value is string => !!value && !Number.isNaN(Date.parse(value)))
+			.sort((a, b) => Date.parse(a) - Date.parse(b))[0];
+		const foundDate = chapterFoundLabel(foundAt, i >= asc.length - 3);
 		if (own) {
 			id = own.id;
 			src = selectedSuw;
 			read = read || own.read;
-			date = relTime(own.uploadedAt);
-			foundDate = relTime(own.foundAt) || '\u2014';
+			date = chapterDateLabel(c.firstReleasedAt ?? own.uploadedAt);
 		} else {
 			// A chapter the selected translator doesn't carry — read from whichever source
 			// does, and date it from the aggregation's own clock (F12 / §4.13).
@@ -1904,15 +1957,29 @@ function buildAggregatedChapters(
 			// `firstReleasedAt` is the EARLIEST release across the chapter's sources, so the
 			// date does not shift as the reader switches translator and it agrees with the
 			// date `/updates` gave the same chapter. It is opportunistically selected, so an
-			// older API returns nothing for it — `relTime` renders '' for an absent or
-			// unparseable value and the row falls back to the pre-F12 behaviour of no date
-			// line, rather than to a guess. That fallback is the whole reason §4.13 said to
-			// ship the source picker WITH this and not before it: without a date the picker
-			// trades a wrong default for a date-less chapter list.
+			// older API returns nothing for it — `chapterDateLabel` renders '' for an absent or
+			// unparseable value and the row omits the date line rather than rendering a guess.
 			const chosen = pickSource(c.sources);
 			id = chosen?.chapterId;
 			src = chosen?.suwayomiMangaId ?? null;
-			date = relTime(c.firstReleasedAt);
+			date = chapterDateLabel(c.firstReleasedAt);
+		}
+		// The provenance cluster: every source the aggregation says carries this number,
+		// deduped by name in first-seen order (the direct spine and its redundant
+		// all.mangadex extension shadow are one source to the reader).
+		const seenNames = new Set<string>();
+		const sources: ChapterSourceLink[] = [];
+		for (const s of c.sources) {
+			const idKey = s.suwayomiMangaId ?? 'spine';
+			const meta = metaBySrc.get(idKey) ?? { name: 'Source', iconUrl: null };
+			if (seenNames.has(meta.name)) continue;
+			seenNames.add(meta.name);
+			sources.push({
+				id: s.chapterId,
+				src: s.suwayomiMangaId ?? null,
+				name: meta.name,
+				iconUrl: meta.iconUrl,
+			});
 		}
 		return {
 			id,
@@ -1920,10 +1987,12 @@ function buildAggregatedChapters(
 			title: c.title || `Chapter ${c.number}`,
 			date,
 			foundDate,
-			// "New" = the highest-numbered chapters (shown first when sorted newest).
+			// "New" = the highest-numbered chapters (shown first when sorted newest), and
+			// the "newest" half of the Found eligibility union — see `chapterFoundLabel`.
 			isNew: i >= asc.length - 3,
 			read,
 			src,
+			sources,
 			// Only knowable from `own` — the selected translator's real `Chapter`.
 			// `AggregatedChapter` carries no `externalUrl`, so a chapter this translator
 			// does not have loses the badge rather than gaining a guessed one.
@@ -2031,26 +2100,14 @@ export async function getSeries(id: string, fetch?: LoadFetch): Promise<SeriesRe
 				},
 				resolved.canonSeries,
 			);
-			// THE SELECTED SOURCE OWNS THE CHAPTER LIST. `mapSeriesView` above was
-			// already given `resolved.chapters` — the selected translator's OWN chapters
-			// — so switching source in the picker now visibly re-lists.
+			// THE CROSS-SOURCE UNION OWNS THE CHAPTER LIST. The series page has no
+			// per-source re-listing any more: one row per chapter number across ALL
+			// sources, each row opening its sensible default source (the preferred
+			// translator when it carries that chapter, otherwise a deterministic
+			// fallback) plus a per-source provenance cluster for the exact targets.
+			// `mapSeriesView` above gets look-in only when aggregation is unavailable
+			// (a backend without `aggregatedChapters`), i.e. the safe legacy fallback.
 			//
-			// This used to unconditionally overwrite `view.chapters` with the cross-source
-			// UNION (S2), which made the picker look broken: you could switch between
-			// sources with 201 and 7 chapters and the list never changed, because the
-			// union won every time. The source picker is the control the reader reaches
-			// for to answer "show me THIS source's chapters", and it has to actually do
-			// that.
-			//
-			// S2's motivating case survives without the union: it was works whose MangaDex
-			// spine has 0 chapters while another source has them (Solo Leveling → Asura's
-			// 201), and `resolveWork` already DEFAULTS the selection to the source with
-			// the most chapters, so that work still opens on Asura's 201.
-			//
-			// The union is kept as a FALLBACK for the one case the default can't cover: a
-			// PERSISTED preference pointing at a source that has since lost its chapters.
-			// Rather than show an empty chapter list, fall back to everything we know
-			// exists across sources.
 			// Bundle path: aggregation came back inside `seriesPage`. Legacy path: the
 			// parallel request above. Drift corner (seriesPage present but the SERVER
 			// predates it, so resolveWork fell back internally): fetch it now — one
@@ -2061,7 +2118,7 @@ export async function getSeries(id: string, fetch?: LoadFetch): Promise<SeriesRe
 					(b.aggregatedChapters
 						? b.aggregatedChapters(id).catch(() => [] as AggregatedChapter[])
 						: Promise.resolve([] as AggregatedChapter[]))));
-			if (agg.length && !view.chapters.length) {
+			if (agg.length) {
 				const rows = buildAggregatedChapters(agg, resolved);
 				view.chapters = rows;
 				view.detail.totalCh = rows.length;

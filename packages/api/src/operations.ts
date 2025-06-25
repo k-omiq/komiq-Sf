@@ -61,9 +61,9 @@ export const OPTIONAL_SERIES_FIELDS = [
 	'announcedAt',
 	// `Chapter.foundAt` (migration 0099) — the per-chapter half of the same clock, on the
 	// series-detail list. Optional so a reader ahead of the server loses one column instead
-	// of the whole chapter list. Its fallback is NOT a substitute value: the column renders
-	// "—", which is what it renders for a null anyway, so stripping it is indistinguishable
-	// from the ordinary no-record case.
+	// of the whole chapter list. Its fallback is NOT a substitute value: the UI omits the
+	// Found line, just as it does for null, so stripping it is indistinguishable from the
+	// ordinary no-record case.
 	'foundAt',
 ] as const;
 

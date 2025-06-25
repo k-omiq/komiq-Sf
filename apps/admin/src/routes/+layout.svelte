@@ -291,4 +291,47 @@
 		max-width: none;
 		padding: 0;
 	}
+
+	/* Below ~720px the single-row header (brand + nav + account controls) would
+	   overflow the viewport: let it wrap into stacked, unhidden rows and enlarge
+	   touch targets. Every destination stays reachable; active state kept. */
+	@media (max-width: 720px) {
+		.admin-header {
+			height: auto;
+			flex-wrap: wrap;
+			row-gap: 10px;
+			padding: 8px var(--k-space-4) 12px;
+		}
+		.brand {
+			flex: 1 1 100%;
+			gap: 10px;
+			flex-wrap: wrap;
+			min-width: 0;
+		}
+		.nav {
+			flex: 1 1 100%;
+			gap: 2px;
+			flex-wrap: wrap;
+			min-width: 0;
+		}
+		.nav-link {
+			display: inline-flex;
+			align-items: center;
+			min-height: 40px;
+			padding: 8px 12px;
+		}
+		.who {
+			flex: 1 1 100%;
+			gap: 8px;
+			flex-wrap: wrap;
+		}
+		.theme-toggle,
+		.nsfw-toggle,
+		.signout {
+			height: 40px;
+		}
+		main {
+			padding: var(--k-space-6) var(--k-space-4);
+		}
+	}
 </style>

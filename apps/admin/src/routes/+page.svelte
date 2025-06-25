@@ -832,9 +832,11 @@
 	.search {
 		display: flex;
 		gap: 8px;
+		flex-wrap: wrap;
 	}
 	.search input {
 		width: 280px;
+		max-width: 100%;
 		height: 40px;
 		padding: 0 14px;
 		background: var(--k-surface-2);
@@ -1545,6 +1547,61 @@
 		}
 		.merge-arrow {
 			transform: rotate(90deg);
+		}
+	}
+
+	/* The 7-column grid table becomes stacked rows; each cell keeps its column
+	   context via an inline label (the .thead is hidden). */
+	@media (max-width: 720px) {
+		.thead {
+			display: none;
+		}
+		.row {
+			grid-template-columns: 1fr;
+			gap: 8px;
+			padding: 14px 16px;
+		}
+		.row:hover {
+			background: none;
+		}
+		.col-type::before,
+		.col-ch::before,
+		.col-src::before,
+		.col-scan::before {
+			font-weight: 700;
+			color: var(--k-text-faint);
+			font-size: 11px;
+			letter-spacing: 0.06em;
+			text-transform: uppercase;
+		}
+		.col-type::before {
+			content: 'Type · ';
+		}
+		.col-ch::before {
+			content: 'Chapters · ';
+		}
+		.col-src::before {
+			content: 'Source';
+			display: block;
+			margin-bottom: 2px;
+		}
+		.col-scan::before {
+			content: 'Scan';
+			display: block;
+		}
+		.col-actions {
+			justify-content: flex-start;
+		}
+		.edit,
+		.add,
+		.merge-btn,
+		.merge-target,
+		.unpause,
+		.pager .pg {
+			height: 40px;
+		}
+		.pager {
+			flex-wrap: wrap;
 		}
 	}
 </style>
