@@ -11,6 +11,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { auth } from '$lib/auth.svelte';
+	import SourceReader from '$lib/components/SourceReader.svelte';
 	import {
 		addExtensionRepo,
 		browseSource,
@@ -291,6 +292,8 @@
 	let adding = $state(false);
 	let addError = $state<string | null>(null);
 	let bulkResult = $state<BulkAddResult | null>(null);
+	/** Source comic opened in the non-mutating admin reader preview. */
+	let reading = $state<{ id: string; title: string } | null>(null);
 
 	function buildSourcesUrl(opts: {
 		tab?: 'extensions' | 'catalogue' | 'health';
@@ -1808,28 +1811,31 @@
 				<div class="grid" class:dim={browsing}>
 					{#each items as it (it.suwayomiMangaId)}
 						{@const id = String(it.suwayomiMangaId)}
-						<button
-							class="card"
-							class:picked={picked.includes(id)}
-							onclick={() => togglePick(id)}
-							aria-pressed={picked.includes(id)}
-							title={it.title}
-						>
-							{#if it.thumbnailUrl}
-								<img
-									class="thumb"
-									src={it.thumbnailUrl}
-									alt=""
-									loading="lazy"
-									referrerpolicy="no-referrer"
-								/>
-							{:else}
-								<div class="thumb placeholder"></div>
-							{/if}
-							<span class="card-title">{it.title}</span>
+						<article class="card" class:picked={picked.includes(id)} title={it.title}>
+							<button class="card-open" onclick={() => (reading = { id, title: it.title })}>
+								{#if it.thumbnailUrl}
+									<img
+										class="thumb"
+										src={it.thumbnailUrl}
+										alt=""
+										loading="lazy"
+										referrerpolicy="no-referrer"
+									/>
+								{:else}
+									<div class="thumb placeholder"></div>
+								{/if}
+								<span class="card-title">{it.title}</span>
+							</button>
 							{#if it.inLibrary}<span class="lib-badge">in library</span>{/if}
-							<span class="check" aria-hidden="true">{picked.includes(id) ? '✓' : ''}</span>
-						</button>
+							<button
+								class="check"
+								onclick={() => togglePick(id)}
+								aria-label={picked.includes(id)
+									? `Remove ${it.title} from selection`
+									: `Select ${it.title} for catalogue ingest`}
+								aria-pressed={picked.includes(id)}>{picked.includes(id) ? '✓' : '+'}</button
+							>
+						</article>
 					{/each}
 				</div>
 				<div class="pager">
@@ -1849,6 +1855,10 @@
 		{/if}
 	{/if}
 </div>
+
+{#if reading}
+	<SourceReader seriesId={reading.id} title={reading.title} onclose={() => (reading = null)} />
+{/if}
 
 <style>
 	.page {
@@ -2285,9 +2295,23 @@
 		background: transparent;
 		border: 2px solid transparent;
 		border-radius: var(--k-radius-md);
-		cursor: pointer;
 		text-align: left;
 		font-family: var(--k-font-sans);
+	}
+	.card-open {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		padding: 0;
+		border: 0;
+		background: transparent;
+		text-align: left;
+		cursor: pointer;
+	}
+	.card-open:focus-visible {
+		outline: 2px solid var(--k-accent-teal);
+		outline-offset: 3px;
+		border-radius: var(--k-radius);
 	}
 	.card.picked {
 		border-color: var(--k-accent-teal);
@@ -2340,8 +2364,9 @@
 		background: rgba(6, 6, 7, 0.65);
 		border: 1px solid var(--k-border-strong);
 		color: var(--k-accent-teal);
-		font-size: 13px;
+		font-size: 14px;
 		font-weight: 800;
+		cursor: pointer;
 	}
 	.card.picked .check {
 		background: var(--k-accent-teal);

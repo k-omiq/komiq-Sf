@@ -7,6 +7,7 @@ import type {
 	CoverIssue,
 	BulkAddResult,
 	CanonicalUpdate,
+	Chapter,
 	ExtensionInfo,
 	Id,
 	MatchResult,
@@ -36,6 +37,7 @@ import type {
 	SeriesMetadataInput,
 } from '@komika/api';
 import { backend } from './context';
+import { assetSrc } from './config';
 
 /**
  * Fail a long admin mutation client-side after `ms` so a stalled connection can't pin
@@ -320,6 +322,61 @@ export async function browseSource(
 ): Promise<SourceBrowsePage> {
 	if (!backend.sourceBrowse) throw new Error('Source browsing is unavailable on this backend.');
 	return backend.sourceBrowse(sourceId, type, page, query);
+}
+
+/**
+ * The deliberately small reader used from Sources → Catalogue. It reads the
+ * source entry directly by its Suwayomi manga id, so previewing a comic does not
+ * add it to the canonical catalogue or mutate any library state.
+ */
+export interface SourceReaderView {
+	seriesId: string;
+	title: string;
+	chapters: Chapter[];
+	chapter: Chapter | null;
+	externalUrl: string | null;
+	pages: { index: number; url: string }[];
+}
+
+/** Only allow the same ordinary web links the reader app accepts for off-site chapters. */
+function externalChapterUrl(value: string | null | undefined): string | null {
+	if (!value) return null;
+	try {
+		const url = new URL(value);
+		return url.protocol === 'http:' || url.protocol === 'https:' ? url.toString() : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Load one source chapter for the admin preview. The chapter choice matches the
+ * reader app: an explicit id wins, otherwise the first unread chapter (then the
+ * first chapter) is opened. Suwayomi page URLs normally point at the API's image
+ * proxy; {@link assetSrc} also makes a root-relative URL resolve to that origin.
+ */
+export async function loadSourceReader(
+	seriesId: string,
+	title: string,
+	chapterId?: string | null,
+): Promise<SourceReaderView> {
+	const chapters = [...(await backend.chapters(seriesId))].sort((a, b) => a.number - b.number);
+	const chapter =
+		(chapterId ? chapters.find((candidate) => String(candidate.id) === chapterId) : null) ??
+		chapters.find((candidate) => !candidate.read) ??
+		chapters[0] ??
+		null;
+	const externalUrl = externalChapterUrl(chapter?.externalUrl);
+	const domainPages = externalUrl ? [] : chapter ? await backend.pages(chapter.id) : [];
+
+	return {
+		seriesId,
+		title,
+		chapters,
+		chapter,
+		externalUrl,
+		pages: domainPages.map((page) => ({ index: page.index, url: assetSrc(page.sourceUrl) })),
+	};
 }
 
 /**

@@ -1,11 +1,17 @@
-import { env } from '$env/dynamic/public';
+import { PUBLIC_KOMIKA_API } from '$env/static/public';
 
 /**
  * Admin console config. The console only makes sense against the unified Komika
  * API (it needs the admin mutations + auth), so it always targets that endpoint.
+ *
+ * Resolved at BUILD time from `$env/static/public`, so Vite inlines the value into
+ * the bundle. This must NOT use `$env/dynamic/public`: the console ships as an
+ * adapter-static SPA served straight off the edge with no SvelteKit server, so the
+ * runtime `env` object is always empty there and every request silently fell back to
+ * the localhost default. `apps/admin/.env.production` supplies the prod endpoint.
  */
 export const config = {
-	apiEndpoint: env.PUBLIC_KOMIKA_API ?? 'http://localhost:8080/graphql',
+	apiEndpoint: PUBLIC_KOMIKA_API || 'http://localhost:8080/graphql',
 };
 
 /** Origin serving the API's own static assets (`/covers/…`, `/avatars/…`). */
