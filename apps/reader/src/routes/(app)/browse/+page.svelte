@@ -61,7 +61,7 @@
 	// not a hoist.
 	const TYPES: ComicType[] = ['Manga', 'Manhwa', 'Manhua'];
 	const VALID_STATUS = ['ongoing', 'completed', 'hiatus', 'cancelled'];
-	const VALID_SORT = ['trending', 'rating', 'newest', 'chapters'];
+	const VALID_SORT = ['trending', 'rating', 'newest', 'added', 'chapters'];
 	/**
 	 * The content-rating tiers this rail offers, a deliberate SUBSET of the server's
 	 * `ContentRatingFilter`. The intermediate cumulative tiers (SUGGESTIVE, EROTICA,
@@ -97,7 +97,7 @@
 	// no control at all. Hiding it is the honest interim state; the facet returns
 	// on real data (rating_bayesian), it is not being dropped.
 	const RATING_FILTER_ENABLED = false;
-	let sort = $state<'trending' | 'rating' | 'newest' | 'chapters'>('trending');
+	let sort = $state<'trending' | 'rating' | 'newest' | 'added' | 'chapters'>('trending');
 	// The wire enum is what the SERVER orders by; the lowercase word is what the URL has
 	// always carried and what the chips key off, so shared `?sort=` links keep working.
 	// One map, one direction — the reverse never needs to exist.
@@ -105,6 +105,7 @@
 		trending: 'TRENDING',
 		rating: 'RATING',
 		newest: 'NEWEST',
+		added: 'LATEST_ADDED',
 		chapters: 'CHAPTERS',
 	};
 	let contentRating = $state<RailContentRating>('ALL');
@@ -793,6 +794,7 @@
 		// chapter this morning sits at the top. Labelled "Newest" the chip and its own
 		// ordering disagreed on screen, which reads as a bug in the sort.
 		{ key: 'newest', label: 'Recently updated' },
+		{ key: 'added', label: 'Latest added' },
 		{ key: 'chapters', label: 'Most chapters' },
 	] as const;
 

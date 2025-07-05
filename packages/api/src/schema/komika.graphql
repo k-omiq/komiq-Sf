@@ -144,10 +144,12 @@ enum SeriesStatus {
 # default — the only ordering that reflects what people are actually reading — and it
 # degrades to NEWEST for everything with no views in the last 24h, so a cold view
 # table cannot render Browse empty. RATING likewise puts rated works first and falls
-# through to NEWEST for the unrated.
+# through to NEWEST for the unrated. LATEST_ADDED uses Komiq's first-available clock,
+# not the source's release date.
 enum BrowseSort {
 	TRENDING # most-viewed over the last 24h first, then newest release
 	NEWEST # newest upstream chapter release first
+	LATEST_ADDED # chapters Komiq most recently made available first
 	RATING # highest user-review average first, then newest for the unrated
 	CHAPTERS # most English chapters first (the same number `chapterCount` reports)
 }

@@ -1736,10 +1736,11 @@ async fn mirror_feed_row_into_browse_catalogue(
     sqlx::query(&format!(
         "INSERT INTO browse_catalogue \
              (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, status, \
-              content_rating, is_nsfw, en_chapter_count, latest_chapter, released_at, created_at) \
+              content_rating, is_nsfw, en_chapter_count, latest_chapter, released_at, \
+              announced_at, created_at) \
          SELECT f.work_id, f.reader_id, f.title, f.cover_url, f.suwayomi_thumbnail, \
                 f.comic_type, f.status, f.content_rating, f.is_nsfw, f.en_chapter_count, \
-                f.latest_chapter, f.released_at, w.created_at \
+                f.latest_chapter, f.released_at, f.announced_at, w.created_at \
            FROM feed_series_updates f \
            JOIN work w ON w.id = f.work_id \
           WHERE f.work_id IN (SELECT work_id FROM source_series \

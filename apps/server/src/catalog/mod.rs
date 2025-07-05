@@ -1493,6 +1493,7 @@ fn browse_catalogue_select_for(scope: &str) -> String {
             MAX(COALESCE(en.n, 0), COALESCE(swc.n, 0)), \
             f.latest_chapter, \
             f.released_at, \
+            f.announced_at, \
             w.created_at \
        FROM work w \
        LEFT JOIN feed_series_updates f ON f.work_id = w.id \
@@ -1523,7 +1524,7 @@ fn browse_catalogue_select_for(scope: &str) -> String {
 /// `comic_type` is absent on purpose — see [`fill_comic_types`].
 const BROWSE_CATALOGUE_COLUMNS: &str = "work_id, reader_id, title, cover_url, \
      suwayomi_thumbnail, status, content_rating, is_nsfw, en_chapter_count, latest_chapter, \
-     released_at, created_at";
+     released_at, announced_at, created_at";
 
 /// The columns the UPSERT re-assigns on conflict, i.e. everything except the primary key and
 /// `comic_type`.
@@ -1548,6 +1549,7 @@ pub(crate) const BROWSE_CATALOGUE_MUTABLE: &[&str] = &[
     // drift away from the same work's Updates card.
     "latest_chapter",
     "released_at",
+    "announced_at",
     "created_at",
 ];
 

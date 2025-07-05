@@ -507,6 +507,7 @@ fn sort_word(sort: BrowseSort) -> &'static str {
     match sort {
         BrowseSort::Trending => "trending",
         BrowseSort::Newest => "newest",
+        BrowseSort::LatestAdded => "latest-added",
         BrowseSort::Rating => "rating",
         BrowseSort::Chapters => "chapters",
     }
@@ -684,6 +685,7 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
 fn order_by(sort: BrowseSort) -> &'static str {
     match sort {
         BrowseSort::Chapters => "f.en_chapter_count DESC, f.work_id DESC",
+        BrowseSort::LatestAdded => "f.announced_at DESC, f.work_id DESC",
         // NEWEST, and the second phase of RATING/TRENDING, which page their unranked
         // remainder on this same key.
         _ => "f.released_at DESC, f.work_id DESC",
@@ -790,7 +792,7 @@ pub async fn browse_catalogue(
     }
 
     let rows = match q.sort {
-        BrowseSort::Newest | BrowseSort::Chapters => {
+        BrowseSort::Newest | BrowseSort::LatestAdded | BrowseSort::Chapters => {
             fetch_page(
                 pool,
                 uses_rated,
@@ -1224,12 +1226,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn newest_and_chapters_sorts_order_the_whole_catalogue() {
+    async fn chapter_clock_and_count_sorts_order_the_whole_catalogue() {
         let pool = pool().await;
         fixture(&pool).await;
         let (total, t) = titles(&pool, &q(BrowseSort::Newest, 1)).await;
         assert_eq!(total, 5);
         assert_eq!(t, ["A", "B", "C", "D", "E"], "newest release first");
+
+        // Deliberately disagree with release order: this is when Komiq first made each
+        // newest chapter available, not when its source says it was published. B has no
+        // announce clock and therefore sorts last without being dropped.
+        for (work_id, announced_at) in [
+            ("w_a", Some(1000_i64)),
+            ("w_b", None),
+            ("w_c", Some(3000)),
+            ("w_d", Some(2000)),
+            ("w_e", Some(4000)),
+        ] {
+            sqlx::query("UPDATE browse_catalogue SET announced_at = ? WHERE work_id = ?")
+                .bind(announced_at)
+                .bind(work_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let (_, t) = titles(&pool, &q(BrowseSort::LatestAdded, 1)).await;
+        assert_eq!(
+            t,
+            ["E", "C", "D", "A", "B"],
+            "latest Komiq availability first, unknown last"
+        );
+
         let (_, t) = titles(&pool, &q(BrowseSort::Chapters, 1)).await;
         assert_eq!(t, ["E", "B", "D", "C", "A"], "most chapters first");
     }
@@ -1254,7 +1281,11 @@ mod tests {
             )
             .await;
         }
-        for sort in [BrowseSort::Newest, BrowseSort::Chapters] {
+        for sort in [
+            BrowseSort::Newest,
+            BrowseSort::LatestAdded,
+            BrowseSort::Chapters,
+        ] {
             let (_, t) = titles(&pool, &q(sort, 1)).await;
             assert_eq!(
                 t,
@@ -1530,6 +1561,7 @@ mod tests {
 
         for sort in [
             BrowseSort::Newest,
+            BrowseSort::LatestAdded,
             BrowseSort::Chapters,
             BrowseSort::Rating,
             BrowseSort::Trending,
@@ -1650,6 +1682,7 @@ mod tests {
         fixture(&pool).await;
         for sort in [
             BrowseSort::Newest,
+            BrowseSort::LatestAdded,
             BrowseSort::Chapters,
             BrowseSort::Rating,
             BrowseSort::Trending,
@@ -1858,6 +1891,7 @@ mod tests {
         );
         // Sort and page must NOT appear.
         for sort in [
+            BrowseSort::LatestAdded,
             BrowseSort::Chapters,
             BrowseSort::Rating,
             BrowseSort::Trending,
@@ -1953,6 +1987,7 @@ mod tests {
         let base = row_key(&q(BrowseSort::Newest, 1));
         // Sort IS a row-key dimension (unlike the count key, which its own test pins).
         for sort in [
+            BrowseSort::LatestAdded,
             BrowseSort::Chapters,
             BrowseSort::Rating,
             BrowseSort::Trending,

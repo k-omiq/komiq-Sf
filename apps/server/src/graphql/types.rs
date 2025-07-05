@@ -23,7 +23,7 @@ pub enum SeriesStatus {
 }
 
 /// How Browse orders the catalogue. `TRENDING` is the default because it is the only
-/// ordering that reflects what people are actually reading; the other three are the
+/// ordering that reflects what people are actually reading; the other four are the
 /// deterministic ones a user reaches for when they want a specific slice.
 ///
 /// `RATING` and `TRENDING` are implemented as two-phase queries (see
@@ -35,6 +35,8 @@ pub enum BrowseSort {
     Trending,
     /// Newest upstream chapter release first.
     Newest,
+    /// Chapters Komiq most recently made available first.
+    LatestAdded,
     /// Highest user-review average first, then newest release for the unrated.
     Rating,
     /// Most English chapters first.

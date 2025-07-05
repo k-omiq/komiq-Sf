@@ -2203,7 +2203,7 @@
 		color: var(--k-text);
 	}
 	.ch-row.read .ch-num {
-		color: var(--k-text-ghost);
+		color: var(--k-text-bright);
 	}
 	.ch-info {
 		flex: 1;
@@ -2223,7 +2223,7 @@
 		text-overflow: ellipsis;
 	}
 	.ch-row.read .ch-name {
-		color: var(--k-text-dim);
+		color: var(--k-text-bright);
 	}
 	.new {
 		flex: 0 0 auto;
@@ -2274,7 +2274,7 @@
 	.ch-read {
 		flex: 0 0 auto;
 		font-size: 11.5px;
-		color: var(--k-text-ghost);
+		color: var(--k-text-bright);
 		display: inline-flex;
 		align-items: center;
 		gap: 5px;
