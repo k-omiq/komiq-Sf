@@ -1,6 +1,5 @@
 <script lang="ts">
 	import Icon from '$lib/components/Icon.svelte';
-	import { config } from '$lib/config';
 </script>
 
 <svelte:head>
@@ -114,27 +113,6 @@
 			<Icon name="flag" size={16} /> Send us a request
 		</a>
 	</section>
-
-	<!-- The whole section is gated on `donateUrl`: with it unset there is no Donate block on
-	     /support either, so "See where donations go" would scroll to an anchor that isn't
-	     rendered — dumping the reader at the top of a page that never mentions donations —
-	     and "it runs on donations" would be a claim about someone else's server. -->
-	{#if config.donateUrl}
-		<section class="sec">
-			<h2>Who pays for it</h2>
-			<p>
-				Fetching and serving images costs money even when nothing is stored — that is bandwidth and
-				worker time, and it grows with every reader. komiq is free and ad-free, so it runs on
-				donations.
-			</p>
-			<div class="btns">
-				<a class="btn" href="/support#donate">See where donations go</a>
-				<a class="btn ghost" href={config.donateUrl} target="_blank" rel="noopener noreferrer">
-					<Icon name="heart" size={16} /> Ko-fi
-				</a>
-			</div>
-		</section>
-	{/if}
 </div>
 
 <style>
@@ -220,12 +198,6 @@
 		color: var(--k-text-1);
 		font-weight: 700;
 	}
-	.btns {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 12px;
-		margin-top: 22px;
-	}
 	.btn {
 		display: inline-flex;
 		align-items: center;
@@ -242,18 +214,6 @@
 	}
 	.btn:hover {
 		background: var(--k-primary-hover);
-	}
-	.btns .btn {
-		margin-top: 0;
-	}
-	.btn.ghost {
-		background: transparent;
-		border: 1px solid var(--k-border-3);
-		color: var(--k-text);
-	}
-	.btn.ghost:hover {
-		border-color: var(--k-border-strong);
-		color: var(--k-text-bright);
 	}
 	@media (max-width: 640px) {
 		.wrap {

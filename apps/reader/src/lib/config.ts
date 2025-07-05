@@ -6,7 +6,6 @@ import {
 	PUBLIC_SUWAYOMI_URL,
 	PUBLIC_KOMIKA_IMG_MODE,
 	PUBLIC_KOMIKA_NATIVE_ENGINE,
-	PUBLIC_KOMIKA_DONATE_URL,
 } from '$env/static/public';
 
 /**
@@ -58,17 +57,6 @@ export const config = {
 	 * transport itself lands later — this flag only selects the composite wrapper.
 	 */
 	nativeEngine: PUBLIC_KOMIKA_NATIVE_ENGINE === 'on',
-	/**
-	 * External donation link — a Ko-fi page, NOT GitHub Sponsors.
-	 *
-	 * The distinction is deliberate: what donations pay for is the running cost of the
-	 * hosted service (image workers, bandwidth, domains, maintenance — see the Support
-	 * page), which is a tip jar rather than sponsorship of an open-source project, and
-	 * Ko-fi is where a reader with no GitHub account can actually leave one.
-	 *
-	 * Set PUBLIC_KOMIKA_DONATE_URL empty to hide every donate link (self-hosters).
-	 */
-	donateUrl: PUBLIC_KOMIKA_DONATE_URL,
 };
 
 /**

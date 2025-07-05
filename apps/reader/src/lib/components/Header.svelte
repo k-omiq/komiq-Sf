@@ -3,7 +3,6 @@
 	import { goto } from '$app/navigation';
 	import mark from '$lib/assets/mark.png';
 	import { auth, logout } from '$lib/auth.svelte';
-	import { config } from '$lib/config';
 	import { theme, cycleTheme, resolvedTheme } from '$lib/theme.svelte';
 	import Icon from './Icon.svelte';
 	import Avatar from './Avatar.svelte';
@@ -135,16 +134,6 @@
 						<a class="menu-item" role="menuitem" href="/support" onclick={() => (menuOpen = false)}
 							>Support</a
 						>
-						{#if config.donateUrl}
-							<a
-								class="menu-item sponsor"
-								role="menuitem"
-								href={config.donateUrl}
-								target="_blank"
-								rel="noopener noreferrer"
-								onclick={() => (menuOpen = false)}>Donate</a
-							>
-						{/if}
 						<a class="menu-item" role="menuitem" href="/about" onclick={() => (menuOpen = false)}
 							>About</a
 						>
@@ -153,7 +142,7 @@
 				{/if}
 			</div>
 		{:else}
-			<!-- Donate/Support/About used to be header icons. Folding them into the account menu
+			<!-- Support/About used to be header icons. Folding them into the account menu
 			     would have stranded signed-out visitors — the account menu does not exist until you
 			     log in, and there is no footer — so anonymous users get their own menu with the
 			     same entries. Most people who need /support (and the /about takedown route) are
@@ -180,16 +169,6 @@
 						<a class="menu-item" role="menuitem" href="/support" onclick={() => (menuOpen = false)}
 							>Support</a
 						>
-						{#if config.donateUrl}
-							<a
-								class="menu-item sponsor"
-								role="menuitem"
-								href={config.donateUrl}
-								target="_blank"
-								rel="noopener noreferrer"
-								onclick={() => (menuOpen = false)}>Donate</a
-							>
-						{/if}
 						<a class="menu-item" role="menuitem" href="/about" onclick={() => (menuOpen = false)}
 							>About</a
 						>
@@ -400,9 +379,6 @@
 	.menu-item.danger:hover {
 		color: var(--k-accent);
 	}
-	.menu-item.sponsor:hover {
-		color: var(--k-accent);
-	}
 	/* 641–900px is the one band where EVERYTHING renders at once — brand, the four nav
 	   links, the icon buttons and Sign in — and stops fitting. `justify-content:
 	   space-between` has no slack to give and nothing shrinks, so at 768px `Library` slid
@@ -430,7 +406,7 @@
 		.right {
 			gap: 8px;
 		}
-		/* Support/Donate now live in a menu that renders for signed-out visitors too, so
+		/* Support/About now live in a menu that renders for signed-out visitors too, so
 		   nothing here may hide that menu button: it is the only route to /support and the
 		   /about takedown page for anonymous users. */
 		.icon-btn {

@@ -1,5 +1,5 @@
 /**
- * Editorial copy for the Support / Report / About pages.
+ * Editorial copy for the Report pages.
  *
  * Every string here is a factual claim about how this service actually runs, so it
  * lives in one module rather than being scattered across three templates — if a claim
@@ -10,32 +10,6 @@
  */
 
 import type { ReportKind } from '@komika/types';
-
-/**
- * Where donations go. Deliberately coarse — the point is that the money covers
- * infrastructure, not that a reader can audit the invoices.
- *
- * One clause each: /support renders these as a plain list, not as cards, so a
- * paragraph here reads as filler rather than as an answer.
- */
-export const EXPENSES: { title: string; desc: string }[] = [
-	{
-		title: 'Image workers',
-		desc: 'Fetching each page from its source and handing it to your reader. The biggest line, and it grows with how much everyone reads.',
-	},
-	{
-		title: 'Bandwidth',
-		desc: 'Every page and cover crosses the network to reach you. Nothing is pre-uploaded, so it is billed as it happens.',
-	},
-	{
-		title: 'Domains',
-		desc: 'The komiq.cc names and their certificates — the reader, the API and the image workers each need one.',
-	},
-	{
-		title: 'Maintenance',
-		desc: 'Servers, monitoring, and the unglamorous hours spent fixing whatever broke.',
-	},
-];
 
 /**
  * Whether a field is shown at all, and if so whether the reader may leave it blank.

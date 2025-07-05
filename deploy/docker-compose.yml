@@ -329,9 +329,6 @@ services:
         # to your deployed Worker's base URL; images stay broken until it is set.
         PUBLIC_KOMIKA_IMG_MODE: proxy
         PUBLIC_KOMIKA_IMG_WORKER: ${KOMIKA_IMG_WORKER_URL:-}
-        # Empty unless you set KOMIKA_DONATE_URL in deploy/.env — a self-hosted
-        # instance must not ship komiq's donation link. Empty hides every donate link.
-        PUBLIC_KOMIKA_DONATE_URL: ${KOMIKA_DONATE_URL:-}
     restart: unless-stopped
     logging:
       driver: json-file

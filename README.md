@@ -38,9 +38,8 @@ Users must add and access only sources and material they are authorized to use a
 must follow applicable law and source terms. See the [Copyright Policy](./COPYRIGHT.md)
 for reporting and enforcement information.
 
-Voluntary donations support development and maintenance of the open-source software.
-They do not purchase content, access, source privileges, or any license to third-party
-works.
+Komiq accepts no donations, subscriptions, or payments of any kind, and carries no
+advertising. Nothing here is monetized.
 
 ## Policies
 

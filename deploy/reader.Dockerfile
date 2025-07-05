@@ -34,11 +34,6 @@ ARG PUBLIC_KOMIKA_API=http://localhost:8080/graphql
 ARG PUBLIC_KOMIKA_IMG_MODE=direct
 # Base URL of the deployed Cloudflare image Worker (used when IMG_MODE=proxy).
 ARG PUBLIC_KOMIKA_IMG_WORKER=http://localhost:8787
-# Donation link. EMPTY BY DEFAULT, unlike the committed `apps/reader/.env`: that file
-# carries komiq's own Ko-fi URL, and Vite loads it in every mode, so without this ARG a
-# self-hosted image would ship a header button and a Support-page section soliciting
-# donations to komiq. Empty hides every donate link (see apps/reader/src/lib/config.ts).
-ARG PUBLIC_KOMIKA_DONATE_URL=
 # The remaining PUBLIC_* config consumed by `$env/static/public` (config.ts).
 # `.dockerignore` excludes every .env file from the build context, so a missing ARG
 # here is a HARD BUILD ERROR (a missing export), not a silent default — every var
@@ -50,7 +45,6 @@ ENV PUBLIC_KOMIKA_BACKEND=$PUBLIC_KOMIKA_BACKEND \
     PUBLIC_KOMIKA_API=$PUBLIC_KOMIKA_API \
     PUBLIC_KOMIKA_IMG_MODE=$PUBLIC_KOMIKA_IMG_MODE \
     PUBLIC_KOMIKA_IMG_WORKER=$PUBLIC_KOMIKA_IMG_WORKER \
-    PUBLIC_KOMIKA_DONATE_URL=$PUBLIC_KOMIKA_DONATE_URL \
     PUBLIC_SUWAYOMI_URL=$PUBLIC_SUWAYOMI_URL \
     PUBLIC_KOMIKA_NATIVE_ENGINE=$PUBLIC_KOMIKA_NATIVE_ENGINE
 

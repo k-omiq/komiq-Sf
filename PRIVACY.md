@@ -53,11 +53,9 @@ Komiq may use the information above to:
 - respond to support, privacy, copyright, and legal requests; and
 - comply with law and enforce project policies.
 
-Komiq does not sell personal information. Donations support software development and
-are not tied to reader activity, source access, or content access. A third-party
-donation provider, if used, processes payment and account information under its own
-privacy terms. The current repository links to an external donation page rather than
-implementing payment-card processing inside Komiq.
+Komiq does not sell personal information. Komiq also takes no payments of any kind —
+no donations, subscriptions, or advertising — so there is no payment processor, no
+billing data, and no payment-card processing anywhere in the service.
 
 ## Third-party sources and service providers
 
@@ -139,7 +137,7 @@ requirements**:
       processor/subprocessor inventory.
 - [ ] Create authenticated privacy-request tracking and identity-verification procedures.
 - [ ] Verify production data flows for Cloudflare, Suwayomi, source extensions, hosting,
-      backups, donations, logging, and analytics before launch.
+      backups, logging, and analytics before launch.
 - [ ] Review children's privacy, state privacy laws, and breach-response obligations
       with qualified U.S. privacy counsel before public production use.
 - [ ] Add a private security reporting channel and incident-response procedure.
