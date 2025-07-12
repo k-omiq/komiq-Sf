@@ -15,12 +15,13 @@
 <style>
 	main {
 		min-height: calc(100vh - var(--k-header-h));
+		min-height: calc(100dvh - var(--k-header-h));
 	}
 	/* Clear the fixed mobile bottom-nav (56px + home-indicator safe area) so page
 	   content / footer isn't hidden behind it. */
 	@media (max-width: 640px) {
 		main {
-			padding-bottom: calc(56px + env(safe-area-inset-bottom));
+			padding-bottom: calc(56px + env(safe-area-inset-bottom, 0px));
 		}
 	}
 </style>

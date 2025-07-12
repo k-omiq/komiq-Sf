@@ -50,9 +50,14 @@
 			display: grid;
 			grid-template-columns: repeat(4, 1fr);
 			background: var(--k-glass-strong, var(--k-glass));
+			-webkit-backdrop-filter: blur(16px);
 			backdrop-filter: blur(16px);
 			border-top: 1px solid var(--k-border);
-			padding-bottom: env(safe-area-inset-bottom);
+			padding-bottom: env(safe-area-inset-bottom, 0px);
+			/* Keep WebKit's fixed bar in its own layer during momentum scrolling. */
+			transform: translateZ(0);
+			-webkit-transform: translateZ(0);
+			will-change: transform;
 		}
 		.tab {
 			display: flex;
