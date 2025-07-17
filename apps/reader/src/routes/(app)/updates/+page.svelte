@@ -9,7 +9,13 @@
 	import { FEED_PAGE_SIZE, lastPage, withPage } from '$lib/data/paging';
 	// The card's visible label is the CHAPTER RELEASE time; our detection time (when
 	// the backend reports it) goes in the hover title — see cardTimeTooltip.
-	import { FLAG, cardSub, cardTimeTooltip as timeTooltip, type ComicType } from '$lib/data/types';
+	import {
+		FLAG,
+		cardSub,
+		cardTimeTooltip as timeTooltip,
+		type ComicType,
+		STATUS_META,
+	} from '$lib/data/types';
 
 	type UpdatesData = Awaited<ReturnType<typeof import('$lib/data/source').getUpdates>>;
 
@@ -156,6 +162,8 @@
 							rating={item.rating}
 							cover={item.cover}
 							id={item.id}
+							flagType={item.type ?? null}
+							status={item.status ? STATUS_META[item.status] : null}
 							fixed
 						/>
 					{/each}
@@ -235,7 +243,8 @@
 					rating={item.rating}
 					cover={item.cover}
 					id={item.id}
-					flagEmoji={item.type ? FLAG[item.type] : ''}
+					flagType={item.type ?? null}
+					status={item.status ? STATUS_META[item.status] : null}
 				/>
 			{/each}
 		</div>

@@ -296,6 +296,12 @@ export interface UpdateFeedRow {
 	coverUrl: string | null;
 	/** Effective format, filtered server-side via the `type` argument. */
 	type: ComicType | null;
+	/**
+	 * Publication status, materialized on `feed_series_updates` (migration 0068) and
+	 * normalized to this vocabulary at write time. Null from a server that predates
+	 * the field; the card hides its status badge rather than guessing.
+	 */
+	status: SeriesStatus | null;
 	/** Chapter NUMBER of the newest mirrored chapter ("10.5"); null on scanner-only rows. */
 	latestChapter: string | null;
 	latestChapterTitle: string | null;

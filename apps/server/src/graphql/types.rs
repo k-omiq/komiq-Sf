@@ -35,7 +35,8 @@ pub enum BrowseSort {
     Trending,
     /// Newest upstream chapter release first.
     Newest,
-    /// Chapters Komiq most recently made available first.
+    /// Works Komiq most recently added to the catalogue first — ordered by
+    /// `browse_catalogue.created_at`, the verbatim copy of `work.created_at`.
     LatestAdded,
     /// Highest user-review average first, then newest release for the unrated.
     Rating,

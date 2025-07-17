@@ -3,7 +3,8 @@
 	import Avatar from '$lib/components/Avatar.svelte';
 	import Cover from '$lib/components/Cover.svelte';
 	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
-	import { slug } from '$lib/data/types';
+	import MangaCard from '$lib/components/MangaCard.svelte';
+	import { slug, STATUS_META } from '$lib/data/types';
 	import { getProfile, updateProfile, uploadAvatar, type ProfileView } from '$lib/data/source';
 	import { auth, revalidateSession } from '$lib/auth.svelte';
 	import { backend } from '$lib/context';
@@ -182,7 +183,7 @@
 		<div class="left">
 			<div class="section">
 				<div class="k-skeleton sk-line sk-section"></div>
-				<CardGridSkeleton count={8} min={120} />
+				<CardGridSkeleton count={8} min={158} />
 			</div>
 		</div>
 		<div class="right">
@@ -326,16 +327,15 @@
 				</div>
 				<div class="shelf-grid">
 					{#each shelfItems as item (item.id ?? item.title + item.shelf)}
-						<a class="shelf-card" href={`/series/${item.id ?? slug(item.title)}`}>
-							<div class="cover k-cover">
-								<Cover src={item.cover} alt={item.title} loading="lazy" sizing="card" />
-								<span class="rating"
-									><Icon name="star" size={9} fill="var(--k-star)" />{item.rating}</span
-								>
-							</div>
-							<div class="shelf-title">{item.title}</div>
-							<div class="shelf-sub">{item.sub}</div>
-						</a>
+						<MangaCard
+							title={item.title}
+							sub={item.sub}
+							rating={item.rating}
+							cover={item.cover}
+							id={item.id}
+							flagType={item.type}
+							status={STATUS_META[item.status]}
+						/>
 					{/each}
 				</div>
 			</div>
@@ -863,48 +863,8 @@
 	}
 	.shelf-grid {
 		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-		gap: 22px 18px;
-	}
-	.shelf-card {
-		display: flex;
-		flex-direction: column;
-		gap: 9px;
-		text-decoration: none;
-	}
-	.cover {
-		position: relative;
-		width: 100%;
-		aspect-ratio: 2 / 3;
-		border-radius: 8px;
-		transition: opacity 0.15s;
-	}
-	.shelf-card:hover .cover {
-		opacity: 0.82;
-	}
-	.rating {
-		position: absolute;
-		top: 8px;
-		right: 8px;
-		display: inline-flex;
-		align-items: center;
-		gap: 3px;
-		font-weight: 700;
-		font-size: 11px;
-		color: var(--k-text);
-		background: rgba(12, 12, 13, 0.72);
-		border-radius: 5px;
-		padding: 3px 6px;
-	}
-	.shelf-title {
-		font-weight: 600;
-		font-size: 13px;
-		color: var(--k-text-1);
-		line-height: 1.25;
-	}
-	.shelf-sub {
-		font-size: 11.5px;
-		color: var(--k-text-faint);
+		grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+		gap: 30px 22px;
 	}
 	.card {
 		border: 1px solid var(--k-border-1);

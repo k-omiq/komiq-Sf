@@ -599,6 +599,7 @@ type UpdateFeedRow {
 	title: String!
 	coverUrl: String
 	type: ComicType # effective format, materialized so `type` can filter server-side
+	status: SeriesStatus # publication status, materialized on feed_series_updates (migration 0068); feeds the card's status badge
 	latestChapter: String # chapter NUMBER of the newest mirrored chapter; null on scanner-only rows
 	latestChapterTitle: String
 	chapterCount: Int # total chapters known; null on mirror-only rows

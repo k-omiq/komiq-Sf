@@ -1133,6 +1133,7 @@ export const UPDATES_FEED = /* GraphQL */ `
 				title
 				coverUrl
 				type
+				status
 				latestChapter
 				latestChapterTitle
 				chapterCount

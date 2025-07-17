@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto, beforeNavigate, preloadData } from '$app/navigation';
 	import { navigating } from '$app/state';
-	import { untrack, onDestroy } from 'svelte';
+	import { untrack, onDestroy, tick } from 'svelte';
 	import { saveProgress, recordView } from '$lib/data/source';
 	import { externalChapterHost } from '$lib/data/chapter-label';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
@@ -89,6 +89,28 @@
 	let restored = false;
 	let readMarked = $state(false);
 
+	// Jump the window to y=0 and assert it again after layout. A single
+	// fire-and-forget `scrollTo` loses the race against strip cells collapsing
+	// onto DEFAULT_ASPECT then growing as images load — the same clamp Pager
+	// documents — and against the browser's overflow-anchor keeping the
+	// end-of-chapter block in view when the strip above it is replaced.
+	let scrollResetting = false;
+	function resetWindowScroll() {
+		scrollResetting = true;
+		lastY = 0;
+		progressPct = 0;
+		window.scrollTo({ top: 0, behavior: 'auto' });
+		void tick().then(() =>
+			requestAnimationFrame(() => {
+				window.scrollTo({ top: 0, behavior: 'auto' });
+				requestAnimationFrame(() => {
+					window.scrollTo({ top: 0, behavior: 'auto' });
+					scrollResetting = false;
+				});
+			}),
+		);
+	}
+
 	// Reset page + scroll position whenever the loaded chapter changes.
 	$effect(() => {
 		data.chapterId;
@@ -102,6 +124,7 @@
 			warmedUrls.clear();
 			settledPages.clear();
 			queueUntil = STARTER_PAGES;
+			resetWindowScroll();
 		});
 	});
 
@@ -183,11 +206,10 @@
 		// Keep prev/next on the same source (S2) — chapter ids are per-source.
 		const src = data.readingSrc ? `&src=${data.readingSrc}` : '';
 		await goto(`/read/${data.seriesId}?ch=${id}${src}`);
-		// Jump AFTER the navigation resolves, and instantly. The old code fired a
-		// SMOOTH scroll straight after an un-awaited `goto`, so the animation ran down
-		// the outgoing chapter while its replacement loaded — motion that belonged to
-		// content the reader was already leaving.
-		window.scrollTo({ top: 0, behavior: 'auto' });
+		// Immediate jump so a same-chapter re-open (chapterId unchanged, the
+		// reset effect does not re-run) still lands on the first image. The
+		// chapter-change effect re-asserts after layout when the id DID change.
+		resetWindowScroll();
 	}
 
 	// ---- next-chapter prefetch ---------------------------------------------
@@ -248,6 +270,10 @@
 		let ticking = false;
 		const update = () => {
 			ticking = false;
+			if (scrollResetting) {
+				lastY = 0;
+				return;
+			}
 			const doc = document.documentElement;
 			const max = doc.scrollHeight - window.innerHeight;
 			const y = window.scrollY;
@@ -400,6 +426,7 @@
 		mode = m;
 		pageIdx = 0;
 		persist();
+		resetWindowScroll();
 	}
 	// Page turns hop chapters at the volume edges: forward on the LAST page opens
 	// the next chapter when one exists, backward on the FIRST page opens the
@@ -410,6 +437,7 @@
 			pageIdx = pageIdx + 1;
 			maybeMarkRead();
 			persist();
+			resetWindowScroll();
 		} else if (data.nextChapterId) {
 			void openChapter(data.nextChapterId);
 		}
@@ -418,9 +446,31 @@
 		if (pageIdx > 0) {
 			pageIdx = pageIdx - 1;
 			persist();
+			resetWindowScroll();
 		} else if (data.prevChapterId) {
 			void openChapter(data.prevChapterId);
 		}
+	}
+
+	function goToFirstPage() {
+		if (!hasPages) return;
+		if (mode === 'page') pageIdx = 0;
+		else scrolledPage = 1;
+		resetWindowScroll();
+	}
+	function goToLastPage() {
+		if (!hasPages) return;
+		if (mode === 'page') {
+			pageIdx = total - 1;
+			maybeMarkRead();
+			resetWindowScroll();
+			return;
+		}
+		const last = stripEl?.lastElementChild as HTMLElement | undefined;
+		if (!last) return;
+		const top = last.getBoundingClientRect().top + window.scrollY - 60;
+		window.scrollTo({ top: Math.max(0, top), behavior: 'auto' });
+		maybeMarkRead();
 	}
 
 	// Long-strip directional navigation is only allowed at the relevant READING
@@ -766,9 +816,15 @@
 				></button>
 			</div>
 			<div class="paged-nav">
+				<button class="nav-skip" aria-label="First page" onclick={goToFirstPage}
+					><Icon name="chevrons-left" size={15} /></button
+				>
 				<button class="pg-btn" onclick={prevPage}>← Prev</button>
 				<span class="pg-label">{pageLabel}</span>
 				<button class="pg-btn" onclick={nextPage}>Next →</button>
+				<button class="nav-skip" aria-label="Last page" onclick={goToLastPage}
+					><Icon name="chevrons-right" size={15} /></button
+				>
 			</div>
 		</div>
 	{/if}
@@ -828,19 +884,34 @@
 <div class="chrome bottom" class:hidden={chromeHidden}>
 	<!-- Rendered only when the target chapter exists. `disabled` was invisible here:
 	     `.nav-ch` has no styling of its own and nothing styles `button:disabled`, so a
-	     dead Prev/Next looked exactly like a live one. The readout below is flex-centred
-	     so dropping either button leaves it in place instead of sliding to an edge. -->
-	{#if data.prevChapterId}
-		<button class="nav-ch" onclick={() => openChapter(data.prevChapterId)}
-			><Icon name="chevron-left" size={15} />Prev</button
-		>
-	{/if}
+	     dead Prev/Next looked exactly like a live one. Equal-flex `.nav-side`s keep
+	     the readout centred when either chapter button or the desktop skip arrows
+	     are missing. -->
+	<div class="nav-side left">
+		{#if hasPages && isStrip}
+			<button class="nav-skip" aria-label="First page" onclick={goToFirstPage}
+				><Icon name="chevrons-up" size={15} /></button
+			>
+		{/if}
+		{#if data.prevChapterId}
+			<button class="nav-ch" onclick={() => openChapter(data.prevChapterId)}
+				><Icon name="chevron-left" size={15} />Prev</button
+			>
+		{/if}
+	</div>
 	<span class="readout">{readout}</span>
-	{#if data.nextChapterId}
-		<button class="nav-ch" onclick={() => openChapter(data.nextChapterId)}
-			>Next<Icon name="chevron-right" size={15} /></button
-		>
-	{/if}
+	<div class="nav-side right">
+		{#if data.nextChapterId}
+			<button class="nav-ch" onclick={() => openChapter(data.nextChapterId)}
+				>Next<Icon name="chevron-right" size={15} /></button
+			>
+		{/if}
+		{#if hasPages && isStrip}
+			<button class="nav-skip" aria-label="Last page" onclick={goToLastPage}
+				><Icon name="chevrons-down" size={15} /></button
+			>
+		{/if}
+	</div>
 </div>
 
 <style>
@@ -886,13 +957,42 @@
 	.chrome.bottom.hidden {
 		transform: translateY(100%);
 	}
-	/* Takes the free space so the page readout stays centred whether or not the
-	   Prev/Next buttons flanking it are rendered (they aren't on the first/last
-	   chapter). Without this, `justify-content: space-between` would shove it to
-	   whichever edge lost its button. */
-	.readout {
+	/* Equal-flex sides keep the readout centred whether Prev, Next, or the
+	   desktop skip-to-first/last arrows are present. */
+	.nav-side {
+		display: flex;
+		align-items: center;
+		gap: 8px;
 		flex: 1;
+		min-width: 0;
+	}
+	.nav-side.left {
+		justify-content: flex-start;
+	}
+	.nav-side.right {
+		justify-content: flex-end;
+	}
+	.readout {
+		flex: 0 0 auto;
 		text-align: center;
+	}
+	.nav-skip {
+		width: 32px;
+		height: 32px;
+		flex: 0 0 auto;
+		padding: 0;
+		border-radius: 8px;
+		background: transparent;
+		border: 1px solid var(--k-border-3);
+		color: var(--k-text-3);
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+	.nav-skip:hover {
+		border-color: rgba(255, 255, 255, 0.34);
+		color: var(--k-text);
 	}
 	.top-left {
 		display: flex;
@@ -1223,6 +1323,7 @@
 		flex-direction: column;
 		align-items: center;
 		pointer-events: none;
+		overflow-anchor: none;
 	}
 	/* Re-enable pointer events on interactive controls and readable text, so the
 	   chrome-toggle button underneath only receives taps on the page images,
@@ -1633,6 +1734,9 @@
 		/* Tighten top/bottom chrome padding for narrow screens. */
 		.chrome {
 			padding: 0 14px;
+		}
+		.nav-skip {
+			display: none;
 		}
 		.top-left {
 			gap: 12px;

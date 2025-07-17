@@ -685,7 +685,24 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
 fn order_by(sort: BrowseSort) -> &'static str {
     match sort {
         BrowseSort::Chapters => "f.en_chapter_count DESC, f.work_id DESC",
-        BrowseSort::LatestAdded => "f.announced_at DESC, f.work_id DESC",
+        // The WORK clock, not the chapter clock. `announced_at` (0101's key) is
+        // `MAX(COALESCE(announce_at, first_seen_at))` over the work's release events, so
+        // every new chapter of an already-tracked series bumps it to ~now — the /updates
+        // order, which filled "Latest added" with actively-updating (and therefore
+        // trending) works while genuinely new intake sat pages deep. `created_at` is
+        // `work.created_at` verbatim: when the work entered OUR catalogue, the same field
+        // `Series.createdAt` and the reader's `addedAt` resolve from.
+        //
+        // TEXT ISO-8601 under BINARY collation, which is chronological here: every
+        // production writer stamps either chrono `to_rfc3339()` ("…+00:00") or the
+        // schema's strftime("…Z"), and the date-time digits decide every comparison
+        // before the suffix. The two suffix encodings can mis-order two rows that fall
+        // in the SAME second ('Z' sorts above both '+' and '.'), by at most that one
+        // second; every "Z" row shares 0005's single backfill instant, so in practice
+        // this touches nothing, and the ordering stays deterministic either way.
+        // NOT NULL on every row (0069), so there is no NULLS-last case. Index shapes:
+        // migration 0102.
+        BrowseSort::LatestAdded => "f.created_at DESC, f.work_id DESC",
         // NEWEST, and the second phase of RATING/TRENDING, which page their unranked
         // remainder on this same key.
         _ => "f.released_at DESC, f.work_id DESC",
@@ -1233,9 +1250,11 @@ mod tests {
         assert_eq!(total, 5);
         assert_eq!(t, ["A", "B", "C", "D", "E"], "newest release first");
 
-        // Deliberately disagree with release order: this is when Komiq first made each
-        // newest chapter available, not when its source says it was published. B has no
-        // announce clock and therefore sorts last without being dropped.
+        // Two clocks, deliberately disagreeing, so the assert below proves WHICH one the
+        // sort reads. `announced_at` is the chapter clock (the /updates order, and 0101's
+        // wrong key): set to imply E, C, D, A, B. `created_at` is the work clock (when the
+        // work entered our catalogue): set to imply A, C, D, E, B. LatestAdded must follow
+        // the WORK clock — the bug this regression-tests is exactly the opposite order.
         for (work_id, announced_at) in [
             ("w_a", Some(1000_i64)),
             ("w_b", None),
@@ -1250,11 +1269,25 @@ mod tests {
                 .await
                 .unwrap();
         }
+        for (work_id, created_at) in [
+            ("w_a", "2026-05-05T00:00:00Z"),
+            ("w_b", "2026-05-01T00:00:00Z"),
+            ("w_c", "2026-05-04T00:00:00Z"),
+            ("w_d", "2026-05-03T00:00:00Z"),
+            ("w_e", "2026-05-02T00:00:00Z"),
+        ] {
+            sqlx::query("UPDATE browse_catalogue SET created_at = ? WHERE work_id = ?")
+                .bind(created_at)
+                .bind(work_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
         let (_, t) = titles(&pool, &q(BrowseSort::LatestAdded, 1)).await;
         assert_eq!(
             t,
-            ["E", "C", "D", "A", "B"],
-            "latest Komiq availability first, unknown last"
+            ["A", "C", "D", "E", "B"],
+            "catalogue-add time first, ignoring the announce clock entirely"
         );
 
         let (_, t) = titles(&pool, &q(BrowseSort::Chapters, 1)).await;

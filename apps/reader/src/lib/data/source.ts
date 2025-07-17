@@ -277,6 +277,7 @@ function toCard(s: Series): Card {
 		cover: s.coverUrl,
 		id: s.id,
 		type: toViewType(s.type),
+		status: toViewStatus(s.status),
 	};
 }
 
@@ -362,6 +363,10 @@ function toFeedCard(u: UpdateFeedRow): Card {
 		// Falling through to the title is safe: that list is title-deduped.
 		id: u.id || undefined,
 		type: u.type ? toViewType(u.type) : undefined,
+		// The column is normalized to the enum's vocabulary at write time (0068), so
+		// the same `toViewStatus` fold `Series` rows get applies. `UNKNOWN` → ongoing,
+		// matching every other surface; null (pre-field server) hides the badge.
+		status: u.status ? toViewStatus(u.status) : undefined,
 	};
 }
 
@@ -1385,6 +1390,7 @@ async function fetchUpdatesFeed(
 		title: c.title,
 		coverUrl: c.cover ?? null,
 		type: c.type ? VIEW_TO_DOMAIN_TYPE[c.type] : null,
+		status: c.status ? VIEW_TO_DOMAIN_STATUS[c.status] : null,
 		latestChapter: c.ch ? c.ch.replace(/^Ch\.\s*/, '') : null,
 		latestChapterTitle: null,
 		chapterCount: null,
@@ -2812,6 +2818,8 @@ export interface ProfileView {
 		cover: string;
 		genre: string;
 		rating: string;
+		type: ComicType;
+		status: Status;
 		shelf: string;
 		favorite: boolean;
 		ch: number;
@@ -2893,6 +2901,11 @@ export function getProfile(): Promise<ProfileView | null> {
 			cover: s.coverUrl,
 			genre: s.genres[0] ?? '',
 			rating: s.rating.average.toFixed(1),
+			// Format + publication status for the shared MangaCard's flag and status
+			// badges — the same two overlays Browse renders, so a shelf card is the
+			// same card everywhere.
+			type: toViewType(s.type),
+			status: toViewStatus(s.status),
 			// Explicit shelf wins; else derive. Shares {@link deriveShelf} with the library
 			// and the series page — this used to be its own near-copy with no `plan`
 			// branch and no ongoing-series gate, so an untouched series read "Reading"

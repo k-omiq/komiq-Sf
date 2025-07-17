@@ -3,7 +3,13 @@
 	import Cover from '$lib/components/Cover.svelte';
 	import CardRowSkeleton from '$lib/components/CardRowSkeleton.svelte';
 	import Icon from '$lib/components/Icon.svelte';
-	import { slug, cardSub, cardTimeTooltip as timeTooltip, FLAG } from '$lib/data/types';
+	import {
+		slug,
+		cardSub,
+		cardTimeTooltip as timeTooltip,
+		FLAG,
+		STATUS_META,
+	} from '$lib/data/types';
 	import type { FeaturedView } from '$lib/data/source';
 
 	let { data } = $props();
@@ -297,6 +303,8 @@
 							rating={item.rating}
 							cover={item.cover}
 							id={item.id}
+							flagType={item.type ?? null}
+							status={item.status ? STATUS_META[item.status] : null}
 							fixed
 						/>
 					{/each}
@@ -317,6 +325,8 @@
 							rating={item.rating}
 							cover={item.cover}
 							id={item.id}
+							flagType={item.type ?? null}
+							status={item.status ? STATUS_META[item.status] : null}
 							fixed
 						/>
 					{/each}
@@ -336,6 +346,8 @@
 							rating={item.rating}
 							cover={item.cover}
 							id={item.id}
+							flagType={item.type ?? null}
+							status={item.status ? STATUS_META[item.status] : null}
 							fixed
 						/>
 					{/each}

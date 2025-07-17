@@ -125,6 +125,14 @@ export interface Card {
 	id?: string;
 	/** Format of the series, when the source feed knows it. */
 	type?: ComicType;
+	/**
+	 * Publication status, when the feed knows it — the card renders it through
+	 * {@link STATUS_META} exactly as Browse does. Absent (`undefined`) only on feeds
+	 * that don't carry the field (the legacy two-feed merge's canonical half); the
+	 * badge is hidden there. An explicit `UNKNOWN` folds to `ongoing`, the same
+	 * fold every surface applies.
+	 */
+	status?: Status;
 }
 
 /**

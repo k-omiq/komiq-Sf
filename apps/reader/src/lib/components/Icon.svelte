@@ -13,6 +13,10 @@
 		| 'chevron-right'
 		| 'chevron-left'
 		| 'chevron-down'
+		| 'chevrons-up'
+		| 'chevrons-down'
+		| 'chevrons-left'
+		| 'chevrons-right'
 		| 'sliders'
 		| 'sliders-h'
 		| 'list'
@@ -99,6 +103,14 @@
 		<path d="M15 18l-6-6 6-6" />
 	{:else if name === 'chevron-down'}
 		<path d="M6 9l6 6 6-6" />
+	{:else if name === 'chevrons-up'}
+		<path d="M17 11l-5-5-5 5" /><path d="M17 18l-5-5-5 5" />
+	{:else if name === 'chevrons-down'}
+		<path d="M7 13l5 5 5-5" /><path d="M7 6l5 5 5-5" />
+	{:else if name === 'chevrons-left'}
+		<path d="M11 17l-5-5 5-5" /><path d="M18 17l-5-5 5-5" />
+	{:else if name === 'chevrons-right'}
+		<path d="M13 17l5-5-5-5" /><path d="M6 17l5-5-5-5" />
 	{:else if name === 'sliders'}
 		<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6" />
 	{:else if name === 'sliders-h'}

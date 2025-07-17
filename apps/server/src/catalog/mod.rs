@@ -1549,6 +1549,11 @@ pub(crate) const BROWSE_CATALOGUE_MUTABLE: &[&str] = &[
     // drift away from the same work's Updates card.
     "latest_chapter",
     "released_at",
+    // No longer a sort key: migration 0102 moved Browse's LATEST_ADDED ordering to
+    // `created_at` and dropped this column's indices (it tracked the newest CHAPTER's
+    // announce clock, so "Latest added" filled with actively-updating works). Still
+    // written: it keeps this row a verbatim copy of the feed row, and a Browse card must
+    // not disagree with the same work's Updates card.
     "announced_at",
     "created_at",
 ];

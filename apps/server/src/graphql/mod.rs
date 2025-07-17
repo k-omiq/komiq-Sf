@@ -3121,6 +3121,11 @@ pub struct UpdateFeedRow {
     /// Effective format, materialized at refresh time so the format facet is a server
     /// filter over the whole feed rather than over the 20 rows of one page.
     pub r#type: Option<ComicType>,
+    /// The work's publication status, materialized on `feed_series_updates` by migration
+    /// 0068 (normalized to this enum's vocabulary at WRITE time — see the migration's
+    /// `ON_HIATUS`/`PUBLISHING_FINISHED` fold). Pure cache, rewritten wholesale by the
+    /// catalog refresh; the card renders it through the reader's `STATUS_META`.
+    pub status: Option<SeriesStatus>,
     /// Chapter NUMBER of the newest mirrored chapter ("10.5"); null on scanner-only rows.
     pub latest_chapter: Option<String>,
     pub latest_chapter_title: Option<String>,
@@ -3174,6 +3179,7 @@ struct FeedSeriesUpdateRow {
     cover_url: Option<String>,
     suwayomi_thumbnail: Option<String>,
     comic_type: Option<String>,
+    status: Option<String>,
     latest_chapter: Option<String>,
     latest_chapter_title: Option<String>,
     chapter_count: Option<i64>,
@@ -4133,7 +4139,7 @@ impl QueryRoot {
         // recorded before 0099 — so this ORDER BY is byte-identical to the old one until
         // real announce clocks start landing.
         let sql = format!(
-            "SELECT work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, \
+            "SELECT work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, status, \
                     latest_chapter, latest_chapter_title, chapter_count, released_at, \
                     announced_at, detected_at, is_nsfw \
              FROM feed_series_updates {where_sql} \
@@ -4194,6 +4200,12 @@ impl QueryRoot {
                     title: r.title,
                     cover_url,
                     r#type: r.comic_type.as_deref().and_then(comic_type_from_word),
+                    // The column is already normalized to this enum's vocabulary at
+                    // write time (0068's backfill + the refresh's `status_from` fold),
+                    // so `komika_status` — the only parser for those five words —
+                    // round-trips it exactly. UNKNOWN parses too, and the card treats
+                    // it as ongoing, matching `toViewStatus`.
+                    status: r.status.as_deref().and_then(komika_status),
                     latest_chapter: r.latest_chapter,
                     latest_chapter_title: r.latest_chapter_title,
                     chapter_count: r.chapter_count.map(|n| n as i32),
