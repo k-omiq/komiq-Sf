@@ -221,6 +221,14 @@ services:
       # ever needs to come down NOW, this is the lever, and it takes a restart, not a
       # rebuild. Lower it to 3 to reproduce exactly the pre-E3 aggregate behaviour.
       SCAN_GLOBAL_CONCURRENCY: ${SCAN_GLOBAL_CONCURRENCY:-12}
+      # Per-source outbound REQUEST caps: `source_id=requests/window_seconds[@requests_per_scan]`,
+      # comma-separated. Concurrency bounds parallelism, not rate — three back-to-back 1 s
+      # scans are 180 requests a minute — and a site's WAF rule counts requests per window.
+      # One series scan is two site requests (details + chapter list), the default cost.
+      # The shipped default is Eris Scans (source 8358420357808595754): unbanned 2026-09-05
+      # on the explicit condition of <= 10 requests per 5 minutes, which the scanner honours
+      # as one scan every 60 s, never a burst (scanner::SourceThrottle). Restart-level knob.
+      SCAN_SOURCE_RATE_LIMITS: ${SCAN_SOURCE_RATE_LIMITS:-8358420357808595754=10/300}
       # E5 LATEST-diff discovery: how often each subscribed source's page-1 LATEST is
       # polled and diffed. This is the mechanism that replaces polling every series, so
       # it is also the detection-latency knob (900s => <=15 min detection).

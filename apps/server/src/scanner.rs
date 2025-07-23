@@ -2488,10 +2488,92 @@ const UNASSIGNED_KEY: &str = "__unassigned__";
 const HEALTH_CHECK_MIN_SECONDS: u64 = 300;
 
 /// Shared across every source loop: the global concurrency ceiling, plus a failure counter
-/// the supervisor drains to decide whether to run the (library-wide) E4.3 health check.
+/// the supervisor drains to decide whether to run the (library-wide) E4.3 health check, plus
+/// the per-source request throttles (`SCAN_SOURCE_RATE_LIMITS`), keyed by `source_id`.
 struct ScanCoord {
     sem: Semaphore,
     failures_since_health: AtomicUsize,
+    throttles: HashMap<String, Arc<SourceThrottle>>,
+}
+
+/// A hard per-source cap on outbound scan rate: at most `scans_per_window` series scans in
+/// any rolling `window`, AND at least `min_gap` between consecutive scan starts.
+///
+/// Both halves matter. The window cap alone lets a loop fire its whole budget in the first
+/// second of every window — five scans at once, then silence, which is exactly the burst a
+/// WAF rule catches. The gap alone would let a window overflow after a restart? No — but it
+/// would not survive clock skew between the site's window and ours, so the count is kept
+/// too. Together: one scan every `window / scans_per_window`, never more than the budget in
+/// any window however the site aligns its own.
+///
+/// The deque of recent starts lives behind an async mutex that is HELD across the wait, so
+/// concurrent callers queue behind one another instead of all computing the same "next free
+/// slot" and firing together. `tick_source` additionally runs a throttled source at
+/// concurrency 1, so in practice there is one caller.
+///
+/// In-process, not persisted: a restart starts an empty window, so the first scan after boot
+/// is immediate and the rest follow at `min_gap` — a restart never produces a burst.
+pub(crate) struct SourceThrottle {
+    scans_per_window: u32,
+    window: Duration,
+    min_gap: Duration,
+    starts: tokio::sync::Mutex<std::collections::VecDeque<tokio::time::Instant>>,
+}
+
+impl SourceThrottle {
+    pub(crate) fn new(limit: &crate::config::SourceRateLimit) -> Self {
+        let scans_per_window = limit.scans_per_window();
+        let window = Duration::from_secs(limit.window_secs);
+        Self {
+            scans_per_window,
+            window,
+            min_gap: window / scans_per_window,
+            starts: tokio::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+                scans_per_window as usize + 1,
+            )),
+        }
+    }
+
+    /// Series scans this throttle admits per window — the per-tick batch size for its loop.
+    pub(crate) fn scans_per_window(&self) -> u32 {
+        self.scans_per_window
+    }
+
+    /// Wait until one scan may start, then record it. Returns `false` (without recording)
+    /// if `shutdown` fired first, so a stop request is not held up by a 60 s pacing sleep.
+    pub(crate) async fn acquire(&self, shutdown: &tokio::sync::watch::Receiver<bool>) -> bool {
+        let mut shutdown = shutdown.clone();
+        let mut starts = self.starts.lock().await;
+        loop {
+            if *shutdown.borrow() {
+                return false;
+            }
+            let now = tokio::time::Instant::now();
+            while starts
+                .front()
+                .is_some_and(|t| now.duration_since(*t) >= self.window)
+            {
+                starts.pop_front();
+            }
+            let mut wait = Duration::ZERO;
+            if starts.len() >= self.scans_per_window as usize {
+                if let Some(oldest) = starts.front() {
+                    wait = wait.max(self.window.saturating_sub(now.duration_since(*oldest)));
+                }
+            }
+            if let Some(last) = starts.back() {
+                wait = wait.max(self.min_gap.saturating_sub(now.duration_since(*last)));
+            }
+            if wait.is_zero() {
+                starts.push_back(now);
+                return true;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = shutdown.changed() => {}
+            }
+        }
+    }
 }
 
 /// The slice of `series_scan_state` one loop owns.
@@ -2622,20 +2704,40 @@ async fn tick_source(
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> TickOutcome {
     use futures::StreamExt as _;
-    let due =
-        due_series_ids_for_source(&state.pool, sel, &Utc::now().to_rfc3339(), DUE_BATCH_LIMIT)
-            .await;
+    // A rate-limited source (`SCAN_SOURCE_RATE_LIMITS`) is scanned strictly one at a time,
+    // and a tick takes no more than one window's budget from the due-set — so one tick is at
+    // most one window long and the health snapshot keeps moving. The due-query is ordered by
+    // `next_scan_at`, so a permanently over-subscribed source round-robins oldest-due first
+    // rather than starving the tail.
+    let throttle = match sel {
+        SourceSel::Id(id) => coord.throttles.get(id).cloned(),
+        SourceSel::Unassigned { .. } => None,
+    };
+    let (limit, concurrency) = match &throttle {
+        Some(t) => (t.scans_per_window() as i64, 1),
+        None => (DUE_BATCH_LIMIT, SCAN_CONCURRENCY),
+    };
+    let due = due_series_ids_for_source(&state.pool, sel, &Utc::now().to_rfc3339(), limit).await;
     let due_count = due.len();
     let ok = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     futures::stream::iter(due)
-        .for_each_concurrent(SCAN_CONCURRENCY, |series_id| {
+        .for_each_concurrent(concurrency, |series_id| {
             let ok = &ok;
             let failed = &failed;
             let coord = coord.clone();
+            let throttle = throttle.clone();
             async move {
                 if *shutdown.borrow() {
                     return;
+                }
+                // Per-source rate cap FIRST, before taking a global permit: a throttled
+                // source waiting out its pacing gap must not sit on one of the 12 aggregate
+                // slots while it does.
+                if let Some(t) = &throttle {
+                    if !t.acquire(shutdown).await {
+                        return;
+                    }
                 }
                 // Global aggregate ceiling: hold a permit across the upstream fetch.
                 // `acquire` only errors if the semaphore is closed, which it never is.
@@ -2904,9 +3006,39 @@ async fn supervisor(state: Arc<AppState>, mut shutdown: tokio::sync::watch::Rece
     // Read ONCE, here: the permit count is fixed for the life of the semaphore, so re-reading
     // it per loop could only produce loops that disagree about the ceiling.
     let permits = crate::config::scan_global_concurrency();
+    let limits = crate::config::scan_source_rate_limits();
+    let mut throttles: HashMap<String, Arc<SourceThrottle>> = HashMap::new();
+    for l in &limits {
+        // Logged per source so the effective cap is answerable from the logs alone (the same
+        // reason `global_permits` is logged below): a throttle that silently did not apply is
+        // the failure mode that gets a source banned twice.
+        tracing::info!(
+            source_id = %l.source_id,
+            requests = l.requests,
+            window_secs = l.window_secs,
+            requests_per_scan = l.requests_per_scan,
+            scans_per_window = l.scans_per_window(),
+            gap_secs = l.window_secs / l.scans_per_window() as u64,
+            "scan supervisor: per-source rate limit active"
+        );
+        throttles.insert(l.source_id.clone(), Arc::new(SourceThrottle::new(l)));
+    }
+    if let Ok(raw) = std::env::var("SCAN_SOURCE_RATE_LIMITS") {
+        let declared = raw.split(',').filter(|e| !e.trim().is_empty()).count();
+        if declared != limits.len() {
+            tracing::error!(
+                declared,
+                parsed = limits.len(),
+                raw = %raw,
+                "scan supervisor: SCAN_SOURCE_RATE_LIMITS has malformed entries — those \
+                 sources are running UNTHROTTLED"
+            );
+        }
+    }
     let coord = Arc::new(ScanCoord {
         sem: Semaphore::new(permits),
         failures_since_health: AtomicUsize::new(0),
+        throttles,
     });
     let mut children: HashMap<String, Child> = HashMap::new();
     // The sweeper always runs, so a row with no `source_id` yet (or an unmappable one, or one
@@ -3240,6 +3372,110 @@ mod tests {
             "a negative parses as garbage → default"
         );
         std::env::remove_var("SCAN_GLOBAL_CONCURRENCY");
+    }
+
+    /// `SCAN_SOURCE_RATE_LIMITS` parsing: the documented form, the per-scan cost override,
+    /// whitespace, and every malformed shape degrading to "skipped" rather than a panic or a
+    /// zero that would stall a loop.
+    #[test]
+    fn the_source_rate_limit_knob_parses_and_skips_garbage() {
+        use crate::config::{parse_scan_source_rate_limits, DEFAULT_REQUESTS_PER_SCAN};
+        let v = parse_scan_source_rate_limits("8358420357808595754=10/300");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].source_id, "8358420357808595754");
+        assert_eq!((v[0].requests, v[0].window_secs), (10, 300));
+        assert_eq!(v[0].requests_per_scan, DEFAULT_REQUESTS_PER_SCAN);
+        assert_eq!(
+            v[0].scans_per_window(),
+            5,
+            "10 requests at 2 per scan is 5 scans per window"
+        );
+
+        let v = parse_scan_source_rate_limits(" a = 6 / 60 @ 1 , b=1/10, ,c=3/30@4");
+        assert_eq!(v.len(), 3, "whitespace and empty entries are tolerated");
+        assert_eq!((v[0].requests, v[0].window_secs, v[0].requests_per_scan), (6, 60, 1));
+        assert_eq!(v[0].scans_per_window(), 6);
+        assert_eq!(
+            v[1].scans_per_window(),
+            1,
+            "a budget below one scan still admits one scan per window (never 0)"
+        );
+        assert_eq!(v[2].scans_per_window(), 1, "3 requests at 4 per scan floors at 1");
+
+        for bad in [
+            "", "x", "x=", "x=10", "x=10/", "x=/300", "x=0/300", "x=10/0", "x=ten/300",
+            "x=10/300@0", "x=10/300@two", "=10/300",
+        ] {
+            assert!(
+                parse_scan_source_rate_limits(bad).is_empty(),
+                "{bad:?} must be skipped, not parsed"
+            );
+        }
+        let v = parse_scan_source_rate_limits("bad, good=4/120");
+        assert_eq!(v.len(), 1, "one bad entry does not poison its neighbours");
+        assert_eq!(v[0].source_id, "good");
+    }
+
+    /// The throttle paces evenly AND caps the window. 10 requests / 300 s at 2 per scan:
+    /// five scans admitted one every 60 s, and the sixth waits for the first to age out of
+    /// the window — never a burst, never more than the budget in any 300 s.
+    #[tokio::test(start_paused = true)]
+    async fn the_source_throttle_spaces_scans_and_caps_the_window() {
+        let limit = crate::config::parse_scan_source_rate_limits("s=10/300")
+            .pop()
+            .unwrap();
+        let t = SourceThrottle::new(&limit);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let t0 = tokio::time::Instant::now();
+        let mut at = Vec::new();
+        for _ in 0..7 {
+            assert!(t.acquire(&rx).await);
+            at.push(tokio::time::Instant::now().duration_since(t0).as_secs());
+        }
+        assert_eq!(at, vec![0, 60, 120, 180, 240, 300, 360]);
+        // Any 300 s window holds at most 5 starts: [0,300) has 5, the 6th lands at 300.
+        for w in 0..=360 {
+            let n = at.iter().filter(|s| **s >= w && **s < w + 300).count();
+            assert!(n <= 5, "window starting at {w}s holds {n} scans");
+        }
+    }
+
+    /// A stop request must not wait out a pacing sleep, and a refused acquire records nothing.
+    #[tokio::test(start_paused = true)]
+    async fn the_source_throttle_yields_to_shutdown() {
+        let limit = crate::config::parse_scan_source_rate_limits("s=2/600@1")
+            .pop()
+            .unwrap();
+        let t = SourceThrottle::new(&limit);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        assert!(t.acquire(&rx).await, "first scan is immediate");
+        let t0 = tokio::time::Instant::now();
+        // The next scan owes a 300 s gap. Signal shutdown: the acquire must return false at
+        // once instead of sleeping that gap out.
+        tx.send(true).unwrap();
+        assert!(!t.acquire(&rx).await);
+        assert!(
+            tokio::time::Instant::now().duration_since(t0) < Duration::from_secs(1),
+            "shutdown must short-circuit the pacing sleep"
+        );
+    }
+
+    /// `SCAN_SOURCE_RATE_LIMITS` must be wired through `deploy/docker-compose.yml`, with the
+    /// Eris Scans cap as the shipped default — the WAF unban of 2026-09-05 came with an
+    /// explicit 10 requests / 5 minutes condition, so the default in the file IS the promise.
+    #[test]
+    fn the_source_rate_limit_knob_matches_the_compose_wiring() {
+        let compose = include_str!("../../../deploy/docker-compose.yml");
+        assert!(
+            compose.contains(
+                "SCAN_SOURCE_RATE_LIMITS: ${SCAN_SOURCE_RATE_LIMITS:-8358420357808595754=10/300}"
+            ),
+            "deploy/docker-compose.yml must pass SCAN_SOURCE_RATE_LIMITS with the Eris Scans \
+             default, or the cap is unreachable in production"
+        );
+        let v = crate::config::parse_scan_source_rate_limits("8358420357808595754=10/300");
+        assert_eq!(v[0].scans_per_window(), 5);
+        assert_eq!(SourceThrottle::new(&v[0]).min_gap, Duration::from_secs(60));
     }
 
     /// Unit A wiring: the env var name must match `deploy/docker-compose.yml` exactly, and so

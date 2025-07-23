@@ -51,6 +51,90 @@ pub fn scan_global_concurrency() -> usize {
 /// documented default and the effective one differ depending on how the server was started.
 pub const DEFAULT_SCAN_GLOBAL_CONCURRENCY: usize = 12;
 
+/// One entry of [`scan_source_rate_limits`]: a hard cap on the outbound HTTP requests the
+/// scanner may send to ONE source in a rolling window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceRateLimit {
+    /// The Suwayomi `source_id` (the same value carried on `source_series.source_id` and
+    /// `series_scan_state.source_id`), never a package or display name.
+    pub source_id: String,
+    /// Upstream HTTP requests allowed per `window_secs`.
+    pub requests: u32,
+    /// Rolling window length, seconds.
+    pub window_secs: u64,
+    /// How many upstream requests ONE series scan costs. A scan is Suwayomi's
+    /// `fetchMangaAndChapters(fetchManga: true, fetchChapters: true)`, which the extension
+    /// serves as a details request plus a chapter-list request — two site hits, even when
+    /// both land on the same URL. Overridable per entry for a source known to answer both
+    /// from one page.
+    pub requests_per_scan: u32,
+}
+
+impl SourceRateLimit {
+    /// Series scans that fit in one window, never below 1 (a cap smaller than a single scan
+    /// still lets one scan through per window — the loop must not deadlock on a typo).
+    pub fn scans_per_window(&self) -> u32 {
+        (self.requests / self.requests_per_scan.max(1)).max(1)
+    }
+}
+
+/// Default [`SourceRateLimit::requests_per_scan`] when an entry does not spell it out.
+pub const DEFAULT_REQUESTS_PER_SCAN: u32 = 2;
+
+/// Per-source outbound scan rate limits (`SCAN_SOURCE_RATE_LIMITS`).
+///
+/// Format: comma-separated `source_id=requests/window_seconds[@requests_per_scan]`, e.g.
+/// `8358420357808595754=10/300` — at most 10 HTTP requests to that source per rolling
+/// 5 minutes, i.e. 5 series scans, which `scanner::SourceThrottle` additionally spaces
+/// evenly (one scan every 60 s) rather than bunching at the start of each window.
+///
+/// This exists because a WAF rule at a scanlator site counts requests per window, and the
+/// per-source concurrency cap (`SCAN_CONCURRENCY = 3`) bounds parallelism, not rate: three
+/// back-to-back 1 s scans are 180 requests a minute. Like `SCAN_GLOBAL_CONCURRENCY` it is a
+/// restart-level knob, not a rebuild, because a ban warning cannot wait 13 minutes.
+///
+/// Malformed entries are skipped (and logged by the supervisor), never fatal: a typo must
+/// degrade to "that one source is unthrottled", not "the server does not boot".
+pub fn scan_source_rate_limits() -> Vec<SourceRateLimit> {
+    env::var("SCAN_SOURCE_RATE_LIMITS")
+        .ok()
+        .map(|v| parse_scan_source_rate_limits(&v))
+        .unwrap_or_default()
+}
+
+/// Pure parser behind [`scan_source_rate_limits`], split out so it is testable without
+/// racing sibling tests over a process-global env var.
+pub fn parse_scan_source_rate_limits(raw: &str) -> Vec<SourceRateLimit> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .filter_map(|entry| {
+            let (source_id, rest) = entry.split_once('=')?;
+            let source_id = source_id.trim();
+            if source_id.is_empty() {
+                return None;
+            }
+            let (rate, cost) = match rest.split_once('@') {
+                Some((r, c)) => (r, Some(c)),
+                None => (rest, None),
+            };
+            let (requests, window) = rate.split_once('/')?;
+            let requests: u32 = requests.trim().parse().ok().filter(|r| *r > 0)?;
+            let window_secs: u64 = window.trim().parse().ok().filter(|w| *w > 0)?;
+            let requests_per_scan: u32 = match cost {
+                Some(c) => c.trim().parse().ok().filter(|c| *c > 0)?,
+                None => DEFAULT_REQUESTS_PER_SCAN,
+            };
+            Some(SourceRateLimit {
+                source_id: source_id.to_string(),
+                requests,
+                window_secs,
+                requests_per_scan,
+            })
+        })
+        .collect()
+}
+
 /// Runtime configuration, sourced from env vars (see `.env.example`).
 #[derive(Clone, Debug)]
 pub struct Config {
