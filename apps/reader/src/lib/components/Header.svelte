@@ -14,6 +14,8 @@
 
 	let searchOpen = $state(false);
 	let menuOpen = $state(false);
+	let signOutWarning = $state(false);
+	let signOutWarnTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const nav = [
 		{ href: '/', label: 'Home' },
@@ -38,7 +40,12 @@
 
 	async function signOut(): Promise<void> {
 		menuOpen = false;
-		await logout();
+		const r = await logout();
+		if (!r.revoked) {
+			signOutWarning = true;
+			clearTimeout(signOutWarnTimer);
+			signOutWarnTimer = setTimeout(() => (signOutWarning = false), 8000);
+		}
 		if (path === '/profile' || path === '/library') await goto('/');
 	}
 </script>
@@ -180,6 +187,15 @@
 	</div>
 </header>
 
+{#if signOutWarning}
+	<!-- Non-blocking: the local sign-out DID happen; this only warns that the
+	     server could not confirm revoking the token. -->
+	<div class="logout-warn" role="status">
+		Signed out on this device, but the server could not be reached to revoke the session — it may
+		still be valid there.
+	</div>
+{/if}
+
 <SearchOverlay bind:open={searchOpen} placeholder={searchPlaceholder} />
 
 <style>
@@ -306,6 +322,21 @@
 	}
 	.signin:hover {
 		background: var(--k-primary-hover);
+	}
+	.logout-warn {
+		position: fixed;
+		top: calc(var(--k-header-h) + 10px);
+		left: 50%;
+		transform: translateX(-50%);
+		z-index: 30;
+		max-width: min(90vw, 480px);
+		padding: 10px 16px;
+		background: var(--k-surface-3);
+		border: 1px solid rgba(224, 179, 84, 0.45);
+		border-radius: var(--k-radius);
+		color: var(--k-text-1);
+		font-size: 13px;
+		box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
 	}
 	.account {
 		position: relative;

@@ -36,10 +36,13 @@ command -v python3 >/dev/null 2>&1 || die "python3 is required to run the bootst
 
 # ---- config -------------------------------------------------------------------
 if [ ! -f .env ]; then
-  cp .env.example .env
+  ( umask 077 && cp .env.example .env )
   printf "${yl}! created deploy/.env from the template.${z}\n"
   die "review deploy/.env before deploying — set a real KOMIKA_ADMIN_PASSWORD (the template ships a public placeholder) and PUBLIC_HOST, then re-run ./deploy.sh."
 fi
+# .env holds KOMIKA_ADMIN_PASSWORD and the LITESTREAM_* credentials: enforce
+# owner-only permissions (a template-copied file inherits the repo's mode).
+[ "$(stat -c '%a' .env)" = "600" ] || { chmod 600 .env; printf "${yl}! tightened deploy/.env permissions to 0600.${z}\n"; }
 set -a; . ./.env 2>/dev/null || true; set +a
 PUBLIC_HOST="${PUBLIC_HOST:-localhost}"
 READER_PORT="${READER_PORT:-8081}"; SERVER_PORT="${SERVER_PORT:-8080}"; SUWAYOMI_PORT="${SUWAYOMI_PORT:-4567}"

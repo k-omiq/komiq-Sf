@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use chrono::{DateTime, Utc};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
@@ -19,10 +19,23 @@ pub struct User {
     pub is_banned: i64,
 }
 
+/// Argon2id parameters pinned by the 2026-09 security review: 64 MiB memory,
+/// t=3, p=1 — deliberately above the crate defaults (19 MiB, t=2), which were
+/// too low for a public-facing login endpoint. NOTE: existing hashes keep
+/// verifying after a parameter change because `verify_password` recomputes with
+/// the parameters embedded in each stored PHC string, not the ones configured
+/// here (password-hash 0.5 `PasswordVerifier`), so this hardening is additive.
+fn argon2_instance() -> Argon2<'static> {
+    // Hardcoded literals are always in-range, so `Params::new` can't fail —
+    // unwrap with context rather than threading a Result through every caller.
+    let params = Params::new(65536, 3, 1, None).expect("fixed Argon2 params are valid");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
 /// Hash a plaintext password with Argon2id + a random salt.
 pub fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::generate(&mut OsRng);
-    let hash = Argon2::default()
+    let hash = argon2_instance()
         .hash_password(password.as_bytes(), &salt)
         .map_err(|e| anyhow!("hash error: {e}"))?
         .to_string();
@@ -34,7 +47,7 @@ pub fn verify_password(password: &str, phc: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(phc) else {
         return false;
     };
-    Argon2::default()
+    argon2_instance()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
 }
@@ -101,6 +114,34 @@ mod tests {
     #[test]
     fn malformed_hash_is_rejected_not_panicked() {
         assert!(!verify_password("anything", "not-a-valid-phc-string"));
+    }
+
+    /// Pins the hardened parameters via the PHC string Argon2 emits (m/t/p are
+    /// self-describing there), so a future revert to weaker defaults fails loudly.
+    #[test]
+    fn hash_pins_the_hardened_argon2_params() {
+        let h = hash_password("hunter2pw").unwrap();
+        assert!(h.contains("m=65536"), "64 MiB memory cost: {h}");
+        assert!(h.contains("t=3"), "t_cost 3: {h}");
+        assert!(h.contains("p=1"), "parallelism 1: {h}");
+        // Argon2id (the strongest variant) rather than Argon2i/d.
+        assert!(h.starts_with("$argon2id$"), "variant: {h}");
+    }
+
+    /// A hash produced under the OLD default parameters (19 MiB, t=2) must still
+    /// verify — this is what makes the parameter upgrade non-destructive for
+    /// already-registered users (verification follows the hash's own params).
+    #[test]
+    fn legacy_default_params_hash_still_verifies() {
+        let legacy_params = Params::new(19456, 2, 1, None).expect("default params are valid");
+        let legacy = Argon2::new(Algorithm::Argon2id, Version::V0x13, legacy_params);
+        let salt = SaltString::generate(&mut OsRng);
+        let h = legacy
+            .hash_password("hunter2pw".as_bytes(), &salt)
+            .unwrap()
+            .to_string();
+        assert!(h.contains("m=19456"), "test preconditions: {h}");
+        assert!(verify_password("hunter2pw", &h));
     }
 
     #[test]

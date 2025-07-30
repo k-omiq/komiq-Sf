@@ -139,6 +139,10 @@ pub fn parse_scan_source_rate_limits(raw: &str) -> Vec<SourceRateLimit> {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub port: u16,
+    /// Port for the `/metrics` scrape endpoint, served on its own listener
+    /// bound to 127.0.0.1 (never the public router). Default 9090, the de-facto
+    /// Prometheus sidecar convention. Override with `KOMIKA_METRICS_PORT`.
+    pub metrics_port: u16,
     pub database_url: String,
     /// SQLite URL for the SEPARATE cover-cache DB. Kept out of `database_url` on
     /// purpose: cover blobs are large and re-derivable from MangaDex, so this DB is
@@ -262,6 +266,11 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8080);
+        let metrics_port = env::var("KOMIKA_METRICS_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(9090);
         let database_url =
             env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://komika.sqlite3".to_string());
         // Cover-cache DB lives next to the main DB by default (a `covers.sqlite3`
@@ -481,6 +490,7 @@ impl Config {
             .unwrap_or(200);
         Self {
             port,
+            metrics_port,
             database_url,
             suwayomi_url,
             suwayomi_public_url,

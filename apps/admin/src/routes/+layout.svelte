@@ -23,6 +23,15 @@
 	let nsfwBusy = $state(false);
 	let nsfwError = $state<string | null>(null);
 
+	// The route guard bounces the signed-out admin to /login immediately, so this
+	// warning is rendered OUTSIDE the header if-block to survive that redirect.
+	let signoutWarning = $state(false);
+
+	async function onSignOut(): Promise<void> {
+		const r = await logout();
+		if (!r.revoked) signoutWarning = true;
+	}
+
 	async function onToggleNsfw(): Promise<void> {
 		if (!auth.user || nsfwBusy) return;
 		nsfwBusy = true;
@@ -117,12 +126,18 @@
 				>
 				<span class="username">{auth.user.username}</span>
 				<span class="admin-badge">Admin</span>
-				<button class="signout" onclick={logout}>Sign out</button>
+				<button class="signout" onclick={onSignOut}>Sign out</button>
 			</div>
 		</header>
 		{#if nsfwError}
 			<p class="nsfw-error">{nsfwError}</p>
 		{/if}
+	{/if}
+	{#if signoutWarning}
+		<p class="signout-warning" role="status">
+			Signed out on this device, but the server could not be reached to revoke the session — it may
+			still be valid there.
+		</p>
 	{/if}
 	<main class:full={!auth.user || onLogin}>
 		{@render children()}
@@ -230,6 +245,14 @@
 		font-family: var(--k-font-sans);
 		font-size: 13px;
 		color: #f0808a;
+	}
+	.signout-warning {
+		margin: 0 auto;
+		padding: 10px var(--k-space-6) 0;
+		max-width: var(--k-max-content);
+		font-family: var(--k-font-sans);
+		font-size: 13px;
+		color: var(--k-hiatus);
 	}
 	.mark {
 		font-family: var(--k-font-display);

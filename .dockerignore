@@ -1,6 +1,8 @@
 # Keep the Docker build context small & reproducible. The server and reader
 # Dockerfiles copy source + lockfiles and build from scratch, so none of the
 # local build artifacts, deps, or archives belong in the context.
+# Credential-bearing files (env files, backups, worker secrets) must never
+# enter the build context — the reader image does `COPY . .` at build time.
 **/node_modules
 **/build
 **/dist
@@ -12,3 +14,11 @@ apps/server/target
 *.sqlite3-*
 .env
 **/.env
+.env.*
+**/.env.*
+*.bak
+**/*.bak
+.dev.vars
+**/.dev.vars
+.wrangler
+**/.wrangler

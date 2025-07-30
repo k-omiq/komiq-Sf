@@ -20,6 +20,7 @@
 	// admin discover it afterwards.
 	import Icon from '$lib/components/Icon.svelte';
 	import { backend } from '$lib/context';
+	import { externalChapterHref } from '$lib/data/chapter-label';
 	import type { WorkSourceRow } from '@komika/types';
 
 	let {
@@ -173,6 +174,7 @@
 					{#each rows as row (row.id)}
 						{@const on = pickedIds.has(row.id)}
 						{@const last = on && wouldEmpty}
+						{@const sourceHref = externalChapterHref(row.sourceUrl)}
 						<div class="row" class:on>
 							<button
 								class="pick"
@@ -199,8 +201,13 @@
 									<span class="src">{row.sourceName}</span>
 									{#if row.lang}<span>{row.lang}</span>{/if}
 									<span>{row.chapterCount} ch</span>
-									{#if row.sourceUrl}
-										<a href={row.sourceUrl} target="_blank" rel="noopener noreferrer">source ↗</a>
+									<!-- Svelte does not escape href schemes, and sourceUrl is
+								     upstream-mirrored text — only an http/https URL may become
+								     a link; anything else renders as inert text. -->
+									{#if sourceHref}
+										<a href={sourceHref} target="_blank" rel="noopener noreferrer">source ↗</a>
+									{:else if row.sourceUrl}
+										<span>{row.sourceUrl}</span>
 									{/if}
 								</div>
 							</div>

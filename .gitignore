@@ -18,6 +18,9 @@ apps/reader/src-tauri/gen/
 !.env.example
 .dev.vars
 
+# deployment access metadata (VPS host, SSH user, key path)
+.credmanager.json
+
 # e2e (playwright) + cloudflare worker
 e2e/playwright-report/
 e2e/test-results/

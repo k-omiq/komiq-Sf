@@ -173,6 +173,12 @@ services:
     environment:
       PORT: '8080'
       DATABASE_URL: sqlite:///data/komika.sqlite3
+      # Port for the /metrics scrape endpoint. It is served on a SEPARATE listener
+      # bound to 127.0.0.1 INSIDE the container (never on the public router), and
+      # the publish below maps it to the HOST loopback only — so the endpoint is
+      # reachable for scraping but not off-host. Default 9090; keep this in sync
+      # with the publish line under `ports:` if you change it.
+      KOMIKA_METRICS_PORT: ${KOMIKA_METRICS_PORT:-9090}
       # User avatars are stored as BLOBs in the SQLite DB, so they are
       # Litestream-replicated with it and any replica can serve any avatar.
       SUWAYOMI_URL: http://suwayomi:4567
@@ -296,6 +302,11 @@ services:
       # The two MUST move together -- widening this back to 0.0.0.0 without
       # blanking TRUSTED_PROXY_CIDRS lets anyone forge X-Forwarded-For.
       - '127.0.0.1:${SERVER_PORT:-8080}:8080'
+      # The metrics endpoint, host-loopback-only like the API port above. Inside
+      # the container it is bound to the container's own 127.0.0.1 (never the
+      # public router), so the only way in from the host is this loopback
+      # publish — scrape with curl http://127.0.0.1:${KOMIKA_METRICS_PORT:-9090}/metrics.
+      - '127.0.0.1:${KOMIKA_METRICS_PORT:-9090}:9090'
     depends_on:
       suwayomi:
         condition: service_healthy

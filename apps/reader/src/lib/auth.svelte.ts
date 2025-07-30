@@ -110,15 +110,20 @@ export async function register(input: RegisterInput): Promise<void> {
 	backend.setCurrentUser?.(session.user.id); // (C1) bind offline queue
 }
 
-export async function logout(): Promise<void> {
+export async function logout(): Promise<{ revoked: boolean }> {
+	// Server revocation is best-effort: the local session is ALWAYS dropped, even
+	// when the request fails — but the caller learns the token may still be live
+	// server-side, so the UI can warn instead of implying revocation succeeded.
+	let revoked = true;
 	try {
 		await backend.logout();
 	} catch {
-		/* even if the server call fails, drop the local session */
+		revoked = false;
 	}
 	// Clear/scope the offline write-queue for this identity BEFORE the token is
 	// dropped (C1), so a queued write can never replay under the next account.
 	backend.setCurrentUser?.(null);
 	persist(null);
 	auth.user = null;
+	return { revoked };
 }

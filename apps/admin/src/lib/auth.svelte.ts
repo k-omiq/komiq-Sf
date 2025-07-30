@@ -88,12 +88,17 @@ export async function toggleNsfwVisibility(value: boolean): Promise<void> {
 	if (auth.user) auth.user = { ...auth.user, showNsfw: next };
 }
 
-export async function logout(): Promise<void> {
+export async function logout(): Promise<{ revoked: boolean }> {
+	// Server revocation is best-effort: the local session is ALWAYS dropped, even
+	// when the request fails — but the caller learns the token may still be live
+	// server-side, so the UI can warn instead of implying revocation succeeded.
+	let revoked = true;
 	try {
 		await backend.logout();
 	} catch {
-		/* ignore */
+		revoked = false;
 	}
 	persist(null);
 	auth.user = null;
+	return { revoked };
 }

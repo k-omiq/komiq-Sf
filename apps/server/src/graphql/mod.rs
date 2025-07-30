@@ -8404,6 +8404,25 @@ impl MutationRoot {
         Ok(true)
     }
 
+    /// "Sign out other devices": revoke EVERY session of the signed-in user
+    /// EXCEPT the one presenting this call — the current device stays logged in,
+    /// matching typical UX for a revoke-all action.
+    async fn revoke_all_sessions(&self, ctx: &Context<'_>) -> Result<bool> {
+        let user = require_user(ctx).await?;
+        let st = state(ctx);
+        // Stored column is sha256(token) — hash the presented token to exempt it.
+        let sql = match token(ctx) {
+            Some(tok) => sqlx::query("DELETE FROM sessions WHERE user_id = ? AND token != ?")
+                .bind(&user.id)
+                .bind(auth::hash_token(&tok)),
+            // Token resolved the user but isn't in ctx form (defensive) — nothing
+            // to exempt, so revoke all of the user's rows.
+            None => sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(&user.id),
+        };
+        sql.execute(&st.pool).await.map_err(gql_err)?;
+        Ok(true)
+    }
+
     /// Update the signed-in user's editable profile (display name + bio).
     /// A blank/`null` field clears that value (display falls back to username).
     /// Returns the refreshed `SessionUser`.
@@ -9268,6 +9287,8 @@ impl MutationRoot {
 
     /// Admin user-management: grant or revoke a user's admin flag. An admin can't
     /// revoke their own access (that could lock every admin out of the console).
+    /// Revoking the flag purges the demoted user's sessions at once, so any
+    /// device that stayed signed in loses its now-stale elevated context.
     async fn set_user_admin(
         &self,
         ctx: &Context<'_>,
@@ -9287,6 +9308,15 @@ impl MutationRoot {
             .map_err(gql_err)?;
         if res.rows_affected() == 0 {
             return Err(Error::new("No such user."));
+        }
+        if !is_admin {
+            // Revoke active sessions so the demotion takes effect at once —
+            // defense-in-depth, matching the ban path above.
+            sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+                .bind(&user_id.0)
+                .execute(&st.pool)
+                .await
+                .map_err(gql_err)?;
         }
         let row: AdminUserRow = sqlx::query_as(
             "SELECT id, username, email, avatar_url, is_admin, is_banned, created_at \
@@ -19008,6 +19038,76 @@ mod tests {
             r.data.into_json().unwrap()["setUserAdmin"]["isAdmin"],
             serde_json::json!(true)
         );
+    }
+
+    #[tokio::test]
+    async fn set_user_admin_demotion_purges_sessions() {
+        let (s, pool) = setup_full(100).await;
+        // Demote bob (already flagged non-admin — the UPDATE still matches the
+        // row, so the purge branch must run the same way it does for a real
+        // demotion).
+        let r = exec(
+            &s,
+            r#"mutation { setUserAdmin(userId:"bob-id", isAdmin:false) { isAdmin } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "demote failed: {:?}", r.errors);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = 'bob-id'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "demotion purged bob's sessions");
+        // admin's own sessions are untouched.
+        let admin_n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = 'admin-id'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(admin_n, 1);
+    }
+
+    #[tokio::test]
+    async fn revoke_all_sessions_spares_the_current_device() {
+        let (s, pool) = setup_full(100).await;
+        // An anonymous caller is rejected like any signed-in mutation.
+        let q = r#"mutation { revokeAllSessions }"#;
+        assert_eq!(
+            first_error(&exec(&s, q, None, "1.1.1.1").await),
+            "Not authenticated"
+        );
+
+        // Bob holds a SECOND live session besides the presented "bobtok".
+        sqlx::query(
+            "INSERT INTO sessions (token, user_id, created_at, expires_at) \
+             VALUES (?, 'bob-id', '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
+        )
+        .bind(auth::hash_token("bobtok2"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let r = exec(&s, q, Some("bobtok"), "1.1.1.1").await;
+        assert!(
+            r.errors.is_empty(),
+            "revokeAllSessions failed: {:?}",
+            r.errors
+        );
+        assert_eq!(
+            r.data.into_json().unwrap()["revokeAllSessions"],
+            serde_json::json!(true)
+        );
+
+        // The presented token's row survives (current device stays logged in);
+        // every other session of bob's is gone.
+        let tok = auth::user_for_token(&pool, "bobtok").await.unwrap();
+        assert!(tok.is_some(), "the current session must stay valid");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = 'bob-id'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "other sessions purged");
     }
 
     /// `total` must count EXACTLY the rows the pages return — the property this test was

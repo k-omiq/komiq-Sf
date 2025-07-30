@@ -1346,9 +1346,9 @@ async fn health() -> &'static str {
 /// the resolvers — a separate change. What's here is what the plan's verification
 /// steps actually need to read without grepping `docker logs`: scan-scheduler health
 /// (the herd/backoff signals), the subscription circuit breaker, and updates-feed
-/// freshness. NOTE: this shares the public 0.0.0.0:{port} router, so the cloudflared
-/// ingress MUST exclude `/metrics` (deploy step) to keep it off api.komiq.cc — it is
-/// not loopback-bound. Even leaked it discloses only aggregate counts, not user data.
+/// freshness. Served on its OWN listener bound to 127.0.0.1:{metrics_port}, so it
+/// is unreachable from outside the host by construction (no reliance on ingress
+/// filtering). Even leaked it discloses only aggregate counts, not user data.
 async fn metrics(State(pool): State<sqlx::SqlitePool>) -> impl IntoResponse {
     // One helper so a single failed query degrades to a `-1` gauge rather than 500ing
     // the whole scrape (a metrics endpoint that fails is worse than one with a hole).
@@ -1776,12 +1776,10 @@ async fn main() -> anyhow::Result<()> {
     let app = app
         .route("/health", get(health))
         .route("/health/ready", get(ready))
-        // Operational gauges for scraping (aggregate counts only — no series content,
-        // no user data). Intended to be scraped on the VPS via localhost:8080/metrics;
-        // the cloudflared ingress must exclude `/metrics` so it is not reachable at
-        // api.komiq.cc/metrics (deploy step). Even if leaked it discloses only row
-        // counts and ages, but it is not meant to be public.
-        .route("/metrics", get(metrics))
+        // Operational gauges for scraping are NOT on this router: `/metrics` is
+        // served on a separate 127.0.0.1-bound listener below, so the scrape
+        // endpoint is unreachable from outside the host by construction
+        // (aggregate counts only — no series content, no user data).
         // Authenticated avatar upload + public serve (VM data volume). The upload
         // route raises the body limit above the raw-image cap enforced in
         // `avatar::process_avatar` (axum's default is 2 MB).
@@ -1887,6 +1885,22 @@ async fn main() -> anyhow::Result<()> {
             upload_limiter: Arc::new(RateLimiter::new(20, 60)),
             app_state: state,
         });
+
+    // Loopback-only metrics listener, separate from the public router: binding to
+    // 127.0.0.1 makes the scrape endpoint unreachable off-host by construction.
+    // The handler extracts `State<SqlitePool>`, so a minimal router over the main
+    // pool is all it needs. No graceful shutdown of its own — a detached task lets
+    // the process exit when `axum::serve` on the public port returns (an in-flight
+    // metrics scrape dying at shutdown is immaterial).
+    let metrics_app = Router::new()
+        .route("/metrics", get(metrics))
+        .with_state(pool.clone());
+    let metrics_addr = format!("127.0.0.1:{}", cfg.metrics_port);
+    let metrics_listener = tokio::net::TcpListener::bind(&metrics_addr).await?;
+    tracing::info!("metrics listening on http://{metrics_addr}/metrics (loopback only)");
+    tokio::spawn(async move {
+        let _ = axum::serve(metrics_listener, metrics_app).await;
+    });
 
     let addr = format!("0.0.0.0:{}", cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

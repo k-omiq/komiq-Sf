@@ -39,6 +39,15 @@ would publish an unused world-bound port. To run it:
 ./deploy.sh up --with-reader     # or: export COMPOSE_PROFILES=selfhost
 ```
 
+> **Plain-HTTP warning for the self-host path:** with `--with-reader`, the reader SPA
+> is served over plain HTTP (`nginx.conf` has no TLS listener) and calls the API with
+> an `http://` URL. Every session token (`Authorization: Bearer …`) then crosses the
+> network in cleartext — anyone on the path (LAN, public Wi-Fi) can capture a token and
+> replay it for 30 days. This path is meant for a *loopback or trusted-LAN evaluation*,
+> not public exposure. On an untrusted network, put TLS in front (Caddy/nginx + LE, or
+> a Cloudflare Tunnel) and flip the API URL + CSP `connect-src` in `docker-compose.yml`
+> to `https://`. Production (Cloudflare Worker reader) already terminates TLS at the edge.
+
 Other commands: `./deploy.sh logs`, `./deploy.sh bootstrap` (re-run bootstrap only),
 `./deploy.sh down` (stop, keep data), `./deploy.sh destroy` (stop + delete volumes).
 
