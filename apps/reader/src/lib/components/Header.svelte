@@ -53,7 +53,7 @@
 <header>
 	<div class="left">
 		<a class="brand" href="/" aria-label="komiq">
-			<img class="brand-mark" src={mark} alt="" />
+			<img class="brand-mark" width="32" height="32" src={mark} alt="" />
 			<span>omiq</span>
 		</a>
 		<nav>
@@ -199,6 +199,10 @@
 <SearchOverlay bind:open={searchOpen} placeholder={searchPlaceholder} />
 
 <style>
+	/* Sticky (not fixed) so it keeps its slot in the flow and pages need no top offset.
+	   Its containing block is <body>, which must be allowed to grow with the content —
+	   see the `body` rule in app.css; a fixed-height body is what used to let the
+	   header scroll away mid-page. */
 	header {
 		position: sticky;
 		top: 0;
@@ -207,8 +211,11 @@
 		align-items: center;
 		justify-content: space-between;
 		height: var(--k-header-h);
-		padding: 0 var(--k-gutter);
+		/* viewport-fit=cover lets landscape notches overlap the edges. */
+		padding: 0 max(var(--k-gutter), env(safe-area-inset-right, 0px)) 0
+			max(var(--k-gutter), env(safe-area-inset-left, 0px));
 		background: var(--k-glass);
+		-webkit-backdrop-filter: blur(14px);
 		backdrop-filter: blur(14px);
 		border-bottom: 1px solid var(--k-border);
 	}
@@ -267,7 +274,11 @@
 		color: var(--k-text-dim);
 		cursor: pointer;
 		text-decoration: none;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s,
+			opacity 0.15s;
 	}
 	.icon-btn:hover {
 		border-color: var(--k-border-strong);
@@ -294,7 +305,11 @@
 		color: var(--k-text-3);
 		text-decoration: none;
 		cursor: pointer;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s,
+			opacity 0.15s;
 	}
 	.avatar:hover,
 	.avatar.on {

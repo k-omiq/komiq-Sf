@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { modalFocus } from '$lib/modal-focus';
 	// Admin-only duplicate merger for the series page.
 	//
 	// DIRECTION IS FIXED AND ONE-WAY: the series whose page you opened is the TARGET and
@@ -142,7 +143,7 @@
 </script>
 
 {#if open}
-	<div class="scrim-wrap" role="dialog" aria-modal="true" aria-label="Merge series">
+	<div class="scrim-wrap" use:modalFocus role="dialog" aria-modal="true" aria-label="Merge series">
 		<button class="scrim" aria-label="Close" onclick={close} disabled={merging}></button>
 		<div class="panel">
 			<header>
@@ -206,7 +207,9 @@
 								<span class="box"
 									>{#if on}<Icon name="check" size={13} strokeWidth={3} />{/if}</span
 								>
-								<span class="thumb"><Cover src={row.coverUrl ?? ''} alt="" loading="lazy" sizing="card" /></span>
+								<span class="thumb"
+									><Cover src={row.coverUrl ?? ''} alt="" loading="lazy" sizing="card" /></span
+								>
 							</button>
 							<div class="meta">
 								<a
@@ -291,6 +294,7 @@
 		backdrop-filter: blur(6px);
 	}
 	.panel {
+		overscroll-behavior: contain;
 		position: relative;
 		display: flex;
 		flex-direction: column;

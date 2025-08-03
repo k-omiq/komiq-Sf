@@ -1,6 +1,7 @@
 <script lang="ts">
 	import '@komika/ui/reset.css';
 	import '@komika/ui/tokens.css';
+	import '$lib/admin.css';
 	import mark from '$lib/assets/mark.png';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
@@ -89,29 +90,22 @@
 </svelte:head>
 
 {#if !auth.ready}
-	<div class="boot">Loading…</div>
+	<div class="boot" role="status">Loading admin console…</div>
 {:else}
+	<a class="skip-link" href="#main-content">Skip to main content</a>
 	{#if auth.user && !onLogin}
 		<header class="admin-header">
 			<div class="brand">
-				<img class="brand-mark" src={mark} alt="" />
-				<span class="mark">KOMIQ</span>
-				<span class="sub">manga DB</span>
-				<nav class="nav">
-					{#each nav as item (item.href)}
-						<a
-							href={item.href}
-							class="nav-link"
-							aria-current={page.url.pathname === item.href ? 'page' : undefined}>{item.label}</a
-						>
-					{/each}
-				</nav>
+				<img class="brand-mark" src={mark} alt="" width="24" height="18" />
+				<a href="/" class="mark" translate="no" aria-label="Komiq admin home">KOMIQ</a>
+				<span class="sub">Admin console</span>
 			</div>
 			<div class="who">
 				<button
 					class="nsfw-toggle"
 					class:off={!auth.user.showNsfw}
 					disabled={nsfwBusy}
+					aria-pressed={auth.user.showNsfw}
 					onclick={onToggleNsfw}
 					title={auth.user.showNsfw
 						? 'Your ACCOUNT preference — NSFW visible: source browsing, extension install and source ingest are unblocked. Click to opt out. (Catalog and Updates list NSFW-flagged works in this console either way.)'
@@ -128,9 +122,18 @@
 				<span class="admin-badge">Admin</span>
 				<button class="signout" onclick={onSignOut}>Sign out</button>
 			</div>
+			<nav class="nav" aria-label="Admin navigation">
+				{#each nav as item (item.href)}
+					<a
+						href={item.href}
+						class="nav-link"
+						aria-current={page.url.pathname === item.href ? 'page' : undefined}>{item.label}</a
+					>
+				{/each}
+			</nav>
 		</header>
 		{#if nsfwError}
-			<p class="nsfw-error">{nsfwError}</p>
+			<p class="nsfw-error" role="alert">{nsfwError}</p>
 		{/if}
 	{/if}
 	{#if signoutWarning}
@@ -139,14 +142,14 @@
 			still be valid there.
 		</p>
 	{/if}
-	<main class:full={!auth.user || onLogin}>
+	<main id="main-content" class="admin-main" tabindex="-1" class:full={!auth.user || onLogin}>
 		{@render children()}
 	</main>
 {/if}
 
 <style>
 	.boot {
-		min-height: 100vh;
+		min-height: 100dvh;
 		display: grid;
 		place-items: center;
 		color: var(--k-text-dim);
@@ -156,15 +159,14 @@
 		position: sticky;
 		top: 0;
 		z-index: 20;
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		height: 60px;
-		padding: 0 var(--k-space-6);
-		background: var(--k-glass);
-		backdrop-filter: blur(14px);
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto;
+		gap: 14px 24px;
+		padding: 18px max(var(--k-space-6), calc((100% - 1440px) / 2)) 0;
+		background: var(--k-bg);
 		border-bottom: 1px solid var(--k-border);
 	}
+
 	.brand {
 		display: flex;
 		align-items: center;
@@ -176,18 +178,25 @@
 		height: 18px;
 	}
 	.nav {
+		grid-column: 1 / -1;
+		min-width: 0;
+		overflow-x: auto;
+		padding-bottom: 10px;
 		display: flex;
 		align-items: center;
 		gap: 4px;
 	}
 	.nav-link {
-		padding: 6px 12px;
-		border-radius: var(--k-radius-pill);
+		padding: 9px 15px;
+		border-radius: var(--k-radius-md);
 		font-size: 13px;
 		font-weight: 600;
 		color: var(--k-text-dim);
 		text-decoration: none;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s;
 	}
 	.nav-link:hover {
 		color: var(--k-text);
@@ -198,9 +207,9 @@
 		background: var(--k-surface-4);
 	}
 	.theme-toggle {
-		height: 32px;
+		height: 36px;
 		padding: 0 14px;
-		border-radius: var(--k-radius-pill);
+		border-radius: var(--k-radius-md);
 		background: transparent;
 		border: 1px solid var(--k-border-4);
 		color: var(--k-text-2);
@@ -208,16 +217,19 @@
 		font-size: 12.5px;
 		font-weight: 600;
 		cursor: pointer;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s;
 	}
 	.theme-toggle:hover {
 		border-color: var(--k-border-strong);
 		color: var(--k-text);
 	}
 	.nsfw-toggle {
-		height: 32px;
+		height: 36px;
 		padding: 0 14px;
-		border-radius: var(--k-radius-pill);
+		border-radius: var(--k-radius-md);
 		background: transparent;
 		border: 1px solid rgba(95, 200, 207, 0.4);
 		color: var(--k-accent-teal);
@@ -225,7 +237,10 @@
 		font-size: 12.5px;
 		font-weight: 600;
 		cursor: pointer;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s;
 	}
 	.nsfw-toggle.off {
 		border-color: rgba(224, 179, 84, 0.45);
@@ -289,9 +304,9 @@
 		padding: 2px 6px;
 	}
 	.signout {
-		height: 32px;
+		height: 36px;
 		padding: 0 14px;
-		border-radius: var(--k-radius-pill);
+		border-radius: var(--k-radius-md);
 		background: transparent;
 		border: 1px solid var(--k-border-4);
 		color: var(--k-text-2);
@@ -299,16 +314,19 @@
 		font-size: 12.5px;
 		font-weight: 600;
 		cursor: pointer;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s;
 	}
 	.signout:hover {
 		border-color: var(--k-border-strong);
 		color: var(--k-text);
 	}
 	main {
-		max-width: var(--k-max-content);
+		max-width: 1440px;
 		margin: 0 auto;
-		padding: var(--k-space-8) var(--k-space-6);
+		padding: 40px var(--k-space-6) 64px;
 	}
 	main.full {
 		max-width: none;
@@ -318,8 +336,10 @@
 	/* Below ~720px the single-row header (brand + nav + account controls) would
 	   overflow the viewport: let it wrap into stacked, unhidden rows and enlarge
 	   touch targets. Every destination stays reachable; active state kept. */
-	@media (max-width: 720px) {
+	@media (max-width: 900px) {
 		.admin-header {
+			position: static;
+			display: flex;
 			height: auto;
 			flex-wrap: wrap;
 			row-gap: 10px;
@@ -332,15 +352,17 @@
 			min-width: 0;
 		}
 		.nav {
+			order: 3;
 			flex: 1 1 100%;
 			gap: 2px;
-			flex-wrap: wrap;
+			flex-wrap: nowrap;
 			min-width: 0;
 		}
 		.nav-link {
 			display: inline-flex;
 			align-items: center;
-			min-height: 40px;
+			min-height: 44px;
+			white-space: nowrap;
 			padding: 8px 12px;
 		}
 		.who {

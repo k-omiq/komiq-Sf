@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tick } from 'svelte';
 	import Icon from './Icon.svelte';
 	import { SHELF_META, type Shelf } from '$lib/data/types';
 
@@ -31,6 +32,9 @@
 
 	let open = $state(false);
 	let root = $state<HTMLElement | null>(null);
+	let trigger = $state<HTMLButtonElement | null>(null);
+	const itemElements = $state<HTMLButtonElement[]>([]);
+	let activeIndex = $state(0);
 
 	const ALL_OPTIONS = [
 		{ key: 'reading', label: 'Reading' },
@@ -50,16 +54,45 @@
 	const meta = $derived(status ? SHELF_META[status] : null);
 	const label = $derived(meta ? meta.label : 'SET SHELF');
 
-	function toggle(e: MouseEvent): void {
+	async function toggle(e: MouseEvent): Promise<void> {
 		e.preventDefault();
 		e.stopPropagation();
 		if (disabled) return;
-		open = !open;
+		if (open) { open = false; return; }
+		await openMenu();
+	}
+	async function openMenu(last = false): Promise<void> {
+		if (disabled) return;
+		activeIndex = last ? OPTIONS.length - 1 : Math.max(0, OPTIONS.findIndex((o) => o.key === status));
+		open = true;
+		await tick();
+		itemElements[activeIndex]?.focus();
+	}
+	function triggerKey(event: KeyboardEvent): void {
+		if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+		event.preventDefault();
+		event.stopPropagation();
+		void openMenu(event.key === 'ArrowUp');
+	}
+	function menuKey(event: KeyboardEvent): void {
+		let next = activeIndex;
+		if (event.key === 'ArrowDown') next = (activeIndex + 1) % OPTIONS.length;
+		else if (event.key === 'ArrowUp') next = (activeIndex + OPTIONS.length - 1) % OPTIONS.length;
+		else if (event.key === 'Home') next = 0;
+		else if (event.key === 'End') next = OPTIONS.length - 1;
+		else if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); open = false; trigger?.focus(); return; }
+		else if (event.key === 'Tab') { open = false; return; }
+		else return;
+		event.preventDefault();
+		event.stopPropagation();
+		activeIndex = next;
+		itemElements[next]?.focus();
 	}
 	function pick(e: MouseEvent, s: Shelf): void {
 		e.preventDefault();
 		e.stopPropagation();
 		open = false;
+		trigger?.focus();
 		if (s !== status) onchange(s);
 	}
 	// Dismiss on outside click (capture phase, so it beats card links) or Escape.
@@ -69,7 +102,7 @@
 			if (root && !root.contains(e.target as Node)) open = false;
 		};
 		const onKey = (e: KeyboardEvent) => {
-			if (e.key === 'Escape') open = false;
+			if (e.key === 'Escape') { open = false; trigger?.focus(); }
 		};
 		window.addEventListener('click', onDoc, true);
 		window.addEventListener('keydown', onKey);
@@ -84,6 +117,9 @@
 	<button
 		type="button"
 		class="trigger {variant}"
+		bind:this={trigger}
+		onkeydown={triggerKey}
+		aria-label={`Change shelf: ${label}`}
 		class:set={!!meta}
 		{disabled}
 		aria-haspopup="menu"
@@ -98,11 +134,14 @@
 		<Icon name="chevron-down" size={variant === 'chip' ? 11 : 14} />
 	</button>
 	{#if open}
-		<div class="menu" role="menu">
-			{#each OPTIONS as o (o.key)}
+		<div class="menu" role="menu" tabindex="-1" aria-label="Library shelf" onkeydown={menuKey}>
+			{#each OPTIONS as o, i (o.key)}
 				<button
 					type="button"
 					role="menuitemradio"
+					bind:this={itemElements[i]}
+					tabindex={i === activeIndex ? 0 : -1}
+					onfocus={() => (activeIndex = i)}
 					aria-checked={status === o.key}
 					class="item"
 					class:sel={status === o.key}

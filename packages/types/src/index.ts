@@ -264,6 +264,8 @@ export interface SplitSourcesResult {
  * the `canonicalSeries` path.
  */
 export interface CanonicalUpdate {
+	averageRating?: number | null;
+	ratingCount?: number;
 	workId: Id;
 	mangadexId: string;
 	title: string | null;
@@ -704,6 +706,17 @@ export interface Series {
 	 * non-canonical/un-enriched work.
 	 */
 	covers?: Cover[];
+	/** Imported publication facts, effective taxonomy and validated tracker links. */
+	metadata?: SeriesMetadata | null;
+}
+
+export interface SeriesMetadata {
+	year: number | null;
+	originalLanguage: string | null;
+	demographic: string | null;
+	contentRating: string | null;
+	tags: { id: string | null; name: string; group: string }[];
+	trackers: { provider: string; externalId: string; url: string }[];
 }
 
 /** Per-series view counts across the three windows (the popularity signal). */
@@ -776,7 +789,22 @@ export interface ChapterSource {
 	sourceId: string;
 	suwayomiMangaId: Id | null;
 	chapterId: Id;
+	/**
+	 * The scanlation group(s) of THIS copy — MangaDex group names joined with `" & "`, or
+	 * `"No Group"` when MangaDex lists none. `null` = unknown (a MangaDex row the group
+	 * backfill has not reached yet, or a source that reports no scanlator).
+	 */
 	scanlator: string | null;
+	/**
+	 * When THIS copy was released (ISO-8601). OPTIONAL — opportunistically selected
+	 * (`OPTIONAL_SERIES_FIELDS`); absent/null means undated and must render no date.
+	 */
+	copyReleasedAt?: string | null;
+	/**
+	 * Set when THIS copy is hosted off-site. OPTIONAL like {@link copyReleasedAt}; absent
+	 * means "not known to be off-site", never "proven local".
+	 */
+	copyExternalUrl?: string | null;
 }
 
 /** One aggregated chapter of a work — a chapter NUMBER available across one or
@@ -784,6 +812,9 @@ export interface ChapterSource {
  *  so the reader can pick which translator/source to read it from. */
 export interface AggregatedChapter {
 	number: number;
+	/** What to print (`"45"`, `"10.5"`, `"Oneshot"`). Optional only because older documents
+	 *  did not select it; the server has always provided it. */
+	label?: string;
 	title: string | null;
 	/**
 	 * When this chapter was FIRST released across ALL of its sources (ISO-8601), or `null`
@@ -812,6 +843,7 @@ export interface AggregatedChapter {
 	 * caller must fall back to the selected source's own `read`, never invert it.
 	 */
 	readAnywhere?: boolean;
+	/** Every COPY of this number — one entry per (source, scanlation group) upload. */
 	sources: ChapterSource[];
 }
 

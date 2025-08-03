@@ -203,3 +203,10 @@ docker build -f deploy/server.Dockerfile -t komika-server .
 docker build -f deploy/reader.Dockerfile -t komika-reader \
   --build-arg PUBLIC_KOMIKA_API=https://komika.example.com/graphql .
 ```
+
+The self-host reader Docker build generates hashes of its final static bootstrap
+scripts into the nginx CSP template (`deploy/static-csp.mjs`). Deploy the generated
+template with its matching HTML; copying `deploy/nginx.conf` directly omits the
+build step. Script policy allows same-origin external scripts and these exact
+hashes; inline style attributes still require `unsafe-inline`. Runtime image/API
+origins remain configured through the existing `CSP_*` variables.

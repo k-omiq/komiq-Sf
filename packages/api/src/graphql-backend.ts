@@ -195,6 +195,13 @@ export class GraphQLBackend implements Backend {
 			return query;
 		let out = query;
 		for (const field of GraphQLBackend.unsupportedFields) {
+			// Metadata has only field selections with two levels of child objects.
+			// Remove the balanced complete selection, including formatted multiline
+			// children, so a newer reader still works against an older server.
+			if (field === 'metadata') {
+				out = out.replace(/^[\t ]*metadata[\t ]*\{(?:[^{}]|\{[^{}]*\})*\}[\t ]*\r?\n/gm, '');
+				continue;
+			}
 			out = out.replace(new RegExp(`^[\\t ]*${field}[\\t ]*\\r?\\n`, 'gm'), '');
 		}
 		for (const arg of GraphQLBackend.unsupportedArgs) {

@@ -1,0 +1,104 @@
+/* Shared console rhythm. Route styles still own their data layout. */
+.skip-link {
+	position: fixed;
+	top: 8px;
+	left: 8px;
+	z-index: 1000;
+	padding: 12px 18px;
+	background: var(--k-primary);
+	color: var(--k-on-primary);
+	border-radius: var(--k-radius-md);
+	transform: translateY(-160%);
+}
+.skip-link:focus {
+	transform: translateY(0);
+}
+.admin-main {
+	min-width: 0;
+	scroll-margin-top: 132px;
+}
+.admin-main .page {
+	gap: 28px;
+}
+.admin-main .page-head {
+	align-items: center;
+	gap: 20px;
+}
+.admin-main .page-head > div {
+	min-width: 0;
+}
+.admin-main .page-head h1 {
+	font-size: clamp(28px, 2.5vw, 34px);
+	letter-spacing: -0.03em;
+}
+.admin-main .lede {
+	max-width: 76ch;
+	line-height: 1.7;
+}
+.admin-main .table {
+	background: var(--k-surface);
+}
+.admin-main .table .row {
+	border-bottom-color: var(--k-border);
+}
+.admin-main .table .row > * {
+	min-width: 0;
+}
+.admin-main .table .row:not(.head):focus-within {
+	background: var(--k-hover-fill);
+}
+.admin-main .empty {
+	padding: 48px 24px;
+	text-align: center;
+}
+.admin-main .pager {
+	gap: 16px;
+	flex-wrap: wrap;
+	font-variant-numeric: tabular-nums;
+}
+.admin-main :is(.toolbar, .head-actions, .actions, .search) {
+	min-width: 0;
+}
+.admin-main :is(input, select, textarea) {
+	max-width: 100%;
+}
+.admin-main :is(.drawer, .modal, .reader-shell) {
+	overscroll-behavior: contain;
+}
+.admin-main :is(.drawer, .modal) {
+	max-height: calc(100dvh - 32px);
+	overflow-y: auto;
+}
+.admin-main .drawer {
+	padding-bottom: max(24px, env(safe-area-inset-bottom));
+}
+.admin-main :is(.page-num, .page-no, .num, .mono) {
+	font-variant-numeric: tabular-nums;
+}
+.admin-main .notice {
+	line-height: 1.65;
+	overflow-wrap: anywhere;
+}
+@media (max-width: 900px) {
+	.admin-main {
+		scroll-margin-top: 16px;
+	}
+	.admin-main .page-head {
+		align-items: stretch;
+	}
+	.admin-main .page-head > div {
+		width: 100%;
+	}
+	.admin-main :is(.toolbar, .head-actions) {
+		flex-wrap: wrap;
+	}
+}
+@media (pointer: coarse) {
+	.admin-main button,
+	.admin-main select {
+		min-height: 44px;
+	}
+	.admin-main input:not([type='checkbox'], [type='radio'], [type='range']) {
+		min-height: 44px;
+	}
+}

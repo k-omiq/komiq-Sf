@@ -9,6 +9,7 @@
 		SourceScanHealth,
 	} from '@komika/types';
 	import { goto } from '$app/navigation';
+	import { queueNavigate } from '$lib/url-state';
 	import { page } from '$app/state';
 	import { auth } from '$lib/auth.svelte';
 	import SourceReader from '$lib/components/SourceReader.svelte';
@@ -113,9 +114,15 @@
 	let extsLoading = $state(false);
 	let extsLoaded = $state(false);
 	let extsError = $state<string | null>(null);
-	let extFilter = $state<'all' | 'installed' | 'available'>('all');
-	let extLang = $state('all');
-	let extQuery = $state('');
+	const extFilter = $derived<'all' | 'installed' | 'available'>(
+		page.url.searchParams.get('extFilter') === 'installed'
+			? 'installed'
+			: page.url.searchParams.get('extFilter') === 'available'
+				? 'available'
+				: 'all',
+	);
+	const extLang = $derived(page.url.searchParams.get('extLang') ?? 'all');
+	const extQuery = $derived(page.url.searchParams.get('extQuery') ?? '');
 	/** pkgName of the row with an in-flight action (one at a time). */
 	let busyPkg = $state<string | null>(null);
 	/** Per-row action outcome (success note or error). */
@@ -147,6 +154,7 @@
 			// Keep any already-listed extensions on a failed on-demand refresh; only
 			// a failed initial load leaves the list empty.
 		} finally {
+			extsLoaded = true;
 			extsLoading = false;
 		}
 	}
@@ -303,7 +311,8 @@
 		q?: string | null;
 		page?: number | null;
 	}): string {
-		const sp = new URLSearchParams();
+		const sp = new URLSearchParams(page.url.searchParams);
+		for (const key of ['tab', 'extension', 'source', 'listing', 'q', 'page']) sp.delete(key);
 		const t = opts.tab ?? 'extensions';
 		if (t !== 'extensions') {
 			sp.set('tab', t);
@@ -414,6 +423,7 @@
 			sourcesError = err instanceof Error ? err.message : 'Failed to load sources.';
 			sources = [];
 		} finally {
+			sourcesLoaded = true;
 			sourcesLoading = false;
 		}
 	}
@@ -437,6 +447,7 @@
 		} catch (err) {
 			healthError = err instanceof Error ? err.message : 'Failed to load scan health.';
 		} finally {
+			healthLoaded = true; // A failed attempt waits for explicit retry.
 			healthLoading = false;
 		}
 	}
@@ -1007,7 +1018,7 @@
 	// still loading. Defaults and invalid values are repaired in place.
 	$effect(() => {
 		if (!auth.user) return;
-		if (currentTab === 'catalogue' && !sourcesLoaded) return;
+		if (currentTab === 'catalogue' && (!sourcesLoaded || sourcesLoading || sourcesError)) return;
 
 		const source = currentTab === 'catalogue' ? validSourceId : sourceParam;
 		const canPage = !!source && (currentBrowseType !== 'SEARCH' || qParam.length > 0);
@@ -1236,14 +1247,25 @@
 
 	{#if currentTab === 'extensions'}
 		{#if extsError && exts.length === 0}
-			<div class="notice error">{extsError}</div>
+			<div class="notice error" role="alert">{extsError}</div>
+			<button class="act" onclick={() => refreshExtensions(true)} disabled={extsLoading}
+				>Retry</button
+			>
 		{:else if extsLoading && exts.length === 0}
 			<div class="notice">Loading extensions… (first load fetches the Keiyoushi index)</div>
 		{:else if exts.length === 0}
 			<div class="notice">
 				<p>No extensions are known to the engine — the extension store may not be seeded yet.</p>
 				<form class="repo-form" onsubmit={onAddRepo}>
-					<input type="url" bind:value={repoUrl} placeholder="Extension repo index URL" required />
+					<input
+						type="url"
+						name="repository"
+						aria-label="Extension repository URL"
+						autocomplete="off"
+						bind:value={repoUrl}
+						placeholder="Extension repo index URL"
+						required
+					/>
 					<button type="submit" disabled={addingRepo}>
 						{addingRepo ? 'Adding…' : 'Add Keiyoushi repo'}
 					</button>
@@ -1252,31 +1274,49 @@
 			</div>
 		{:else}
 			{#if extsError}
-				<div class="notice error">{extsError}</div>
+				<div class="notice error" role="alert">{extsError}</div>
 			{/if}
 			<div class="toolbar">
 				<div class="segmented">
-					<button class:on={extFilter === 'all'} onclick={() => (extFilter = 'all')}
-						>All ({exts.length})</button
+					<button
+						class:on={extFilter === 'all'}
+						onclick={() => queueNavigate(page.url, { extFilter: null })}>All ({exts.length})</button
 					>
-					<button class:on={extFilter === 'installed'} onclick={() => (extFilter = 'installed')}
+					<button
+						class:on={extFilter === 'installed'}
+						onclick={() => queueNavigate(page.url, { extFilter: 'installed' })}
 						>Installed ({installedCount})</button
 					>
-					<button class:on={extFilter === 'available'} onclick={() => (extFilter = 'available')}
+					<button
+						class:on={extFilter === 'available'}
+						onclick={() => queueNavigate(page.url, { extFilter: 'available' })}
 						>Available ({exts.length - installedCount})</button
 					>
 				</div>
-				<select bind:value={extLang} aria-label="Filter by language">
+				<select
+					autocomplete="off"
+					name="extLang"
+					value={extLang}
+					onchange={(event) =>
+						queueNavigate(page.url, {
+							extLang: event.currentTarget.value === 'all' ? null : event.currentTarget.value,
+						})}
+					aria-label="Filter by language"
+				>
 					<option value="all">All languages</option>
 					{#each extLangs as l (l)}
 						<option value={l}>{l}</option>
 					{/each}
 				</select>
 				<input
+					autocomplete="off"
+					name="extQuery"
 					class="filter-q"
 					type="search"
 					placeholder="Filter extensions…"
-					bind:value={extQuery}
+					value={extQuery}
+					oninput={(event) =>
+						queueNavigate(page.url, { extQuery: event.currentTarget.value || null }, true)}
 					aria-label="Filter extensions by name"
 				/>
 				<button
@@ -1295,21 +1335,26 @@
 			{#if filteredExts.length === 0}
 				<div class="notice">No extensions match the current filter.</div>
 			{:else}
-				<div class="table" class:dim={extsLoading}>
-					<div class="thead">
-						<span>Extension</span>
-						<span>Lang</span>
-						<span>Version</span>
-						<span class="right">Actions</span>
+				<div
+					class="table"
+					role="table"
+					aria-label="Extensions"
+					aria-busy={extsLoading}
+					class:dim={extsLoading}
+				>
+					<div class="thead" role="row">
+						<span role="columnheader">Extension</span>
+						<span role="columnheader">Lang</span>
+						<span role="columnheader">Version</span>
+						<span class="right" role="columnheader">Actions</span>
 					</div>
 					{#each filteredExts as e (e.pkgName)}
-						<!-- Double-click is a pointer affordance for discoverability; the Browse
-						     button below is the keyboard/a11y-accessible path to the same action. -->
-						<!-- svelte-ignore a11y_no_static_element_interactions -->
-						<div class="row" class:clickable={e.isInstalled} ondblclick={() => browseExtension(e)}>
-							<div class="cell-ext">
+						<div class="row" role="row" class:clickable={e.isInstalled}>
+							<div class="cell-ext" role="cell">
 								{#if e.iconUrl && !failedIcons[e.pkgName]}
 									<img
+										width="32"
+										height="32"
 										class="icon"
 										src={e.iconUrl}
 										alt=""
@@ -1329,12 +1374,12 @@
 									<span class="meta">{e.pkgName}</span>
 								</div>
 							</div>
-							<span class="lang">{e.lang}</span>
-							<span class="version">
+							<span class="lang" role="cell">{e.lang}</span>
+							<span class="version" role="cell">
 								{e.versionName}
 								{#if e.hasUpdate}<span class="update-badge">update available</span>{/if}
 							</span>
-							<span class="actions">
+							<span class="actions" role="cell">
 								{#if rowMsg[e.pkgName]}<span class="row-msg">{rowMsg[e.pkgName]}</span>{/if}
 								{#if e.isInstalled}
 									<button
@@ -1386,17 +1431,18 @@
 	{:else if currentTab === 'health'}
 		<!-- Sources → scan health (Phase E4.3) -->
 		{#if healthError && health.length === 0}
-			<div class="notice error">{healthError}</div>
+			<div class="notice error" role="alert">{healthError}</div>
+			<button class="act" onclick={() => refreshHealth()} disabled={healthLoading}>Retry</button>
 		{:else if healthLoading && health.length === 0}
-			<div class="notice">Loading scan health…</div>
+			<div class="notice" role="status">Loading scan health…</div>
 		{:else if health.length === 0}
 			<div class="notice">No source has any tracked series yet, so there is nothing to report.</div>
 		{:else}
 			{#if healthError}
-				<div class="notice error">{healthError}</div>
+				<div class="notice error" role="alert">{healthError}</div>
 			{/if}
 			{#if outages.length > 0}
-				<div class="notice error">
+				<div class="notice error" role="alert">
 					<p>
 						<strong>{outages.length} source{outages.length === 1 ? '' : 's'} down.</strong>
 						Their series are parked until the source recovers, so they are not being polled every day
@@ -1433,7 +1479,12 @@
 					{healthLoading ? 'Refreshing…' : 'Refresh'}
 				</button>
 			</div>
-			<div class="htable" role="table" aria-label="Per-source scan health">
+			<div
+				class="htable"
+				role="table"
+				aria-label="Per-source scan health"
+				aria-busy={healthLoading}
+			>
 				<div class="hrow head" role="row">
 					<span role="columnheader">Source</span>
 					<span role="columnheader" title="Series the scanner tracks for this source">Series</span>
@@ -1486,7 +1537,8 @@
 	{:else}
 		<!-- Sources → catalogue -->
 		{#if sourcesError}
-			<div class="notice error">{sourcesError}</div>
+			<div class="notice error" role="alert">{sourcesError}</div>
+			<button class="act" onclick={() => refreshSources()} disabled={sourcesLoading}>Retry</button>
 		{:else if sourcesLoading && sources.length === 0}
 			<div class="notice">Loading sources…</div>
 		{:else if sources.length === 0}
@@ -1524,7 +1576,7 @@
 			{/if}
 
 			{#if extError}
-				<div class="notice error poll-error">
+				<div class="notice error poll-error" role="alert">
 					<span>
 						{extError}{extPollStopped ? ' — progress updates paused after repeated failures.' : ''}
 					</span>
@@ -1603,7 +1655,9 @@
 						{extScope && scopedSources.length !== 1 ? 'Pick a language…' : 'Pick a source…'}
 					</option>
 					{#each scopedSources as s (s.id)}
-						<option value={String(s.id)}>{s.name} ({s.lang}){s.isNsfw ? ' · NSFW' : ''}</option>
+						<option value={String(s.id)} selected={String(s.id) === validSourceId}
+							>{s.name} ({s.lang}){s.isNsfw ? ' · NSFW' : ''}</option
+						>
 					{/each}
 				</select>
 				<div class="segmented">
@@ -1621,6 +1675,8 @@
 				{#if currentBrowseType === 'SEARCH'}
 					<form class="search-form" onsubmit={onSearch}>
 						<input
+							autocomplete="off"
+							name="searchDraft"
 							type="search"
 							placeholder="Search this source…"
 							bind:value={searchDraft}
@@ -1646,7 +1702,7 @@
 			</div>
 
 			{#if jobError}
-				<div class="notice error poll-error">
+				<div class="notice error poll-error" role="alert">
 					<span>
 						{jobError}{pollStopped ? ' — progress updates paused after repeated failures.' : ''}
 					</span>
@@ -1671,7 +1727,7 @@
 							<button class="act" onclick={dismissJob}>Dismiss</button>
 						{/if}
 					</div>
-					{#if job.error}<p class="job-err">{job.error}</p>{/if}
+					{#if job.error}<p class="job-err" role="alert">{job.error}</p>{/if}
 					<div class="job-stats">
 						<span class="jstat"><b>{job.pagesDone}</b> pages</span>
 						<span class="jstat"><b>{job.itemsSeen}</b> seen</span>
@@ -1712,7 +1768,7 @@
 				</div>
 			{/if}
 
-			{#if addError}<div class="notice error">{addError}</div>{/if}
+			{#if addError}<div class="notice error" role="alert">{addError}</div>{/if}
 
 			{#if bulkResult}
 				<div class="result">
@@ -1735,7 +1791,12 @@
 								>{bulkResult.alreadyExisting} already existing</span
 							>{/if}
 					</div>
-					<div class="rtable" role="table" aria-label="Per-series ingest outcome">
+					<div
+						class="rtable"
+						role="table"
+						aria-label="Per-series ingest outcome"
+						aria-busy={jobStarting}
+					>
 						<div class="rrow head" role="row">
 							<span role="columnheader">Series</span>
 							<span role="columnheader">Decision</span>
@@ -1785,7 +1846,7 @@
 			{/if}
 
 			{#if browseError}
-				<div class="notice error">{browseError}</div>
+				<div class="notice error" role="alert">{browseError}</div>
 			{:else if !validSourceId}
 				{#if extScope && scopedSources.length === 0}
 					<div class="notice">
@@ -1815,6 +1876,8 @@
 							<button class="card-open" onclick={() => (reading = { id, title: it.title })}>
 								{#if it.thumbnailUrl}
 									<img
+										width="80"
+										height="112"
 										class="thumb"
 										src={it.thumbnailUrl}
 										alt=""
@@ -2069,7 +2132,8 @@
 	.toolbar select:focus,
 	.filter-q:focus,
 	.search-form input:focus {
-		outline: none;
+		outline: 2px solid var(--k-accent);
+		outline-offset: 2px;
 		border-color: var(--k-border-strong);
 	}
 	.filter-q {
@@ -2246,7 +2310,10 @@
 		font-weight: 600;
 		font-size: 12.5px;
 		cursor: pointer;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s;
 		white-space: nowrap;
 	}
 	.act:hover:not(:disabled) {

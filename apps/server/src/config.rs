@@ -171,11 +171,11 @@ pub struct Config {
     /// the shipped compose that publishes the server port directly.
     pub trusted_proxy_cidrs: Vec<String>,
     /// Usernames that are granted admin (for the "manga DB" console). These names
-    /// are reserved from open registration and provisioned/promoted at startup.
+    /// are reserved from registration; existing non-admin promotion requires password proof.
     pub admin_users: Vec<String>,
     /// Password used to CREATE a configured admin account at startup when it does
-    /// not yet exist (existing accounts are only promoted, never re-passworded).
-    /// None disables account creation — admins must already exist to be promoted.
+    /// not yet exist, or to prove ownership before promoting an existing non-admin.
+    /// None disables creation and promotion. Existing admins are never re-passworded.
     pub admin_password: Secret,
     /// Email for the primary provisioned admin account. Others get a synthesized
     /// `<username>@admin.local`. Only used when creating a missing admin account.
@@ -186,6 +186,8 @@ pub struct Config {
     /// How often the source-sync scheduler re-walks subscribed extensions to discover
     /// new series and reconcile library membership (default 1 day).
     pub source_sync_interval_seconds: u64,
+    /// Extension store refresh/update cadence; 0 disables updates (default 6h).
+    pub extension_auto_update_interval_seconds: u64,
     /// Max LATEST pages walked per source per sync pass (bounds a capped/looping walk).
     pub source_sync_max_pages: i64,
     /// Max failed login/register attempts per key within the rate-limit window
@@ -333,6 +335,11 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .filter(|&v| v > 0)
             .unwrap_or(86400);
+        let extension_auto_update_interval_seconds =
+            env::var("EXTENSION_AUTO_UPDATE_INTERVAL_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(21600);
         let source_sync_max_pages = env::var("SOURCE_SYNC_MAX_PAGES")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -502,6 +509,7 @@ impl Config {
             admin_email,
             scan_tick_seconds,
             source_sync_interval_seconds,
+            extension_auto_update_interval_seconds,
             source_sync_max_pages,
             auth_rate_limit_max,
             auth_rate_limit_window_secs,

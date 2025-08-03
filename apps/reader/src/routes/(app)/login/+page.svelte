@@ -59,16 +59,14 @@
 			</p>
 		</div>
 
-		<div class="tabs" role="tablist">
+		<div class="tabs" role="group" aria-label="Account access">
 			<button
-				role="tab"
-				aria-selected={mode === 'login'}
+				aria-pressed={mode === 'login'}
 				class:active={mode === 'login'}
 				onclick={() => switchMode('login')}>Sign in</button
 			>
 			<button
-				role="tab"
-				aria-selected={mode === 'register'}
+				aria-pressed={mode === 'register'}
 				class:active={mode === 'register'}
 				onclick={() => switchMode('register')}>Create account</button
 			>
@@ -79,9 +77,12 @@
 				<span>Username</span>
 				<input
 					type="text"
+					name="username"
+					spellcheck="false"
+					autocapitalize="none"
 					bind:value={username}
 					autocomplete="username"
-					placeholder="your_handle"
+					placeholder="your_handle…"
 					required
 				/>
 			</label>
@@ -91,9 +92,11 @@
 					<span>Email</span>
 					<input
 						type="email"
+						name="email"
+						spellcheck="false"
 						bind:value={email}
 						autocomplete="email"
-						placeholder="you@example.com"
+						placeholder="you@example.com…"
 						required
 					/>
 				</label>
@@ -103,6 +106,7 @@
 				<span>Password</span>
 				<input
 					type="password"
+					name="password"
 					bind:value={password}
 					autocomplete={mode === 'login' ? 'current-password' : 'new-password'}
 					placeholder={mode === 'register' ? 'At least 8 characters' : '••••••••'}
@@ -188,7 +192,11 @@
 		font-size: 13px;
 		font-weight: 600;
 		cursor: pointer;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s,
+			opacity 0.15s;
 	}
 	.tabs button.active {
 		background: var(--k-primary);

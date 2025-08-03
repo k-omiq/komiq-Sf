@@ -51,6 +51,7 @@ ENV PUBLIC_KOMIKA_BACKEND=$PUBLIC_KOMIKA_BACKEND \
 # Force the static SPA target (adapter-static → apps/reader/build). Without this,
 # the default build targets Cloudflare and would not emit `build/`.
 RUN KOMIKA_TARGET=tauri pnpm --filter @komika/reader build
+RUN node deploy/static-csp.mjs apps/reader/build/index.html deploy/nginx.conf /repo/nginx.conf.template
 
 # ---- runtime ----------------------------------------------------------------
 FROM nginx:1.27-alpine AS runtime
@@ -64,7 +65,7 @@ FROM nginx:1.27-alpine AS runtime
 ENV NGINX_ENVSUBST_FILTER="^CSP_" \
     CSP_IMG_ORIGIN="" \
     CSP_CONNECT_ORIGIN=""
-COPY deploy/nginx.conf /etc/nginx/templates/default.conf.template
+COPY --from=builder /repo/nginx.conf.template /etc/nginx/templates/default.conf.template
 COPY --from=builder /repo/apps/reader/build /usr/share/nginx/html
 
 EXPOSE 80

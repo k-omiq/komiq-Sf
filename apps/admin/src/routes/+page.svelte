@@ -7,7 +7,8 @@
 		WorkSource,
 	} from '@komika/types';
 	import { untrack } from 'svelte';
-	import { goto } from '$app/navigation';
+	import { goto, beforeNavigate } from '$app/navigation';
+	import { modal } from '$lib/modal';
 	import { page as pageState } from '$app/state';
 	import { auth } from '$lib/auth.svelte';
 	import { assetSrc } from '$lib/config';
@@ -411,7 +412,35 @@
 			s.scan.pausedOverride == null ? 'auto' : s.scan.pausedOverride ? 'paused' : 'running';
 	}
 
+	const editorDirty = $derived(
+		!!editing &&
+			(fStatus !== (editing.scan.statusOverride ?? 'source') ||
+				fInterval !==
+					(editing.scan.overrideIntervalHours != null
+						? String(editing.scan.overrideIntervalHours)
+						: '') ||
+				fPoll !==
+					(editing.scan.pollEveryMinutesOverride != null
+						? String(editing.scan.pollEveryMinutesOverride)
+						: '') ||
+				fScanner !==
+					(editing.scan.pausedOverride == null
+						? 'auto'
+						: editing.scan.pausedOverride
+							? 'paused'
+							: 'running')),
+	);
+	beforeNavigate(({ cancel }) => {
+		if (
+			(editorDirty || saving) &&
+			!confirm(
+				'Leave this page? Unsaved changes will be lost; a save already in progress may still complete.',
+			)
+		)
+			cancel();
+	});
 	function closeEditor(): void {
+		if (saving || (editorDirty && !confirm('Discard your unsaved scan settings?'))) return;
 		editing = null;
 	}
 
@@ -492,7 +521,14 @@
 			</p>
 		</div>
 		<form class="search" onsubmit={onSearch}>
-			<input placeholder="Search the catalog…" bind:value={searchDraft} />
+			<input
+				type="search"
+				name="q"
+				aria-label="Search the catalog"
+				autocomplete="off"
+				placeholder="Search the catalog…"
+				bind:value={searchDraft}
+			/>
 			<button type="submit">Search</button>
 			{#if searchDraft.trim() || appliedQuery}
 				<button type="button" class="clear" onclick={clearSearch}>Clear</button>
@@ -501,14 +537,14 @@
 	</div>
 
 	{#if loadError}
-		<div class="notice error">{loadError}</div>
+		<div class="notice error" role="alert">{loadError}</div>
 	{/if}
 	{#if provenanceError}
-		<div class="notice error">Source provenance unavailable: {provenanceError}</div>
+		<div class="notice error" role="alert">Source provenance unavailable: {provenanceError}</div>
 	{/if}
 
 	{#if mergeResult}
-		<div class="notice success">
+		<div class="notice success" role="status">
 			Merged into <strong>{mergeResult.targetTitle}</strong> · {mergeResult.movedSourceSeries} source
 			mapping{mergeResult.movedSourceSeries === 1 ? '' : 's'} moved. The duplicate work was deleted.
 			<button class="link-btn" onclick={() => (mergeResult = null)}>Dismiss</button>
@@ -527,15 +563,15 @@
 		</div>
 	{/if}
 
-	<div class="table" class:dim={loading}>
-		<div class="thead">
-			<span class="col-series">Series</span>
-			<span class="col-type">Type</span>
-			<span class="col-status">Status</span>
-			<span class="col-ch">Chapters</span>
-			<span class="col-src">Source</span>
-			<span class="col-scan">Scan</span>
-			<span class="col-actions"></span>
+	<div class="table" role="table" aria-label="Catalog" aria-busy={loading} class:dim={loading}>
+		<div class="thead" role="row">
+			<span role="columnheader" class="col-series">Series</span>
+			<span role="columnheader" class="col-type">Type</span>
+			<span role="columnheader" class="col-status">Status</span>
+			<span role="columnheader" class="col-ch">Chapters</span>
+			<span role="columnheader" class="col-src">Source</span>
+			<span role="columnheader" class="col-scan">Scan</span>
+			<span role="columnheader" class="col-actions">Actions</span>
 		</div>
 		{#if loading && series.length === 0}
 			<div class="empty">Loading…</div>
@@ -543,10 +579,12 @@
 			<div class="empty">No series. Add some to the library in the reader, or search above.</div>
 		{:else}
 			{#each series as s (s.id)}
-				<div class="row">
-					<div class="col-series cell-series">
+				<div class="row" role="row">
+					<div role="cell" class="col-series cell-series">
 						{#if s.coverUrl}
 							<img
+								width="80"
+								height="112"
 								class="cover"
 								src={assetSrc(s.coverUrl)}
 								alt=""
@@ -561,12 +599,12 @@
 							<span class="meta">#{s.id}{s.author ? ` · ${s.author}` : ''}</span>
 						</div>
 					</div>
-					<span class="col-type">{s.type}</span>
-					<span class="col-status">
+					<span role="cell" class="col-type">{s.type}</span>
+					<span role="cell" class="col-status">
 						<span class="badge {STATUS_CLASS[s.status]}">{s.status}</span>
 					</span>
-					<span class="col-ch">{s.chapterCount}</span>
-					<span class="col-src">
+					<span role="cell" class="col-ch">{s.chapterCount}</span>
+					<span role="cell" class="col-src">
 						{#if isCanonical(s)}
 							<span
 								class="src-entry"
@@ -593,7 +631,7 @@
 							<span class="src-none">—</span>
 						{/if}
 					</span>
-					<span class="col-scan">
+					<span role="cell" class="col-scan">
 						<span class="cadence">{cadence(s)}</span>
 						{#if s.scan.paused}
 							<span class="paused-badge">Paused</span>
@@ -605,7 +643,7 @@
 						{/if}
 						{#if pauseMsg[s.id]}<span class="pause-err">{pauseMsg[s.id]}</span>{/if}
 					</span>
-					<span class="col-actions">
+					<span role="cell" class="col-actions">
 						{#if mergeSource}
 							{#if mergeSource.seriesId === s.id}
 								<span class="merge-source-badge">Source · will delete</span>
@@ -663,8 +701,20 @@
 </div>
 
 {#if editing}
-	<button class="scrim" aria-label="Close editor" onclick={closeEditor}></button>
-	<aside class="drawer">
+	<button
+		data-modal-backdrop
+		tabindex="-1"
+		class="scrim"
+		aria-label="Close editor"
+		onclick={closeEditor}
+	></button>
+	<div
+		class="drawer"
+		role="dialog"
+		aria-modal="true"
+		aria-label="Edit scan settings"
+		use:modal={closeEditor}
+	>
 		<div class="drawer-head">
 			<div>
 				<div class="drawer-kicker">EDIT · #{editing.id}</div>
@@ -674,8 +724,8 @@
 		</div>
 
 		<div class="field">
-			<span class="label">Status flag</span>
-			<select bind:value={fStatus}>
+			<label class="label" for="scan-status">Status flag</label>
+			<select autocomplete="off" id="scan-status" name="status" bind:value={fStatus}>
 				<option value="source">Source default</option>
 				{#each STATUS_OPTIONS as opt (opt)}
 					<option value={opt}>{opt}</option>
@@ -699,14 +749,30 @@
 		</div>
 
 		<div class="field">
-			<span class="label">Scan interval override (hours)</span>
-			<input type="text" inputmode="decimal" placeholder="auto (from avg)" bind:value={fInterval} />
+			<label class="label" for="scan-interval">Scan interval override (hours)</label>
+			<input
+				id="scan-interval"
+				name="interval"
+				autocomplete="off"
+				type="text"
+				inputmode="decimal"
+				placeholder="auto (from avg)"
+				bind:value={fInterval}
+			/>
 			<span class="help">Blank = derive cadence from average time between chapters.</span>
 		</div>
 
 		<div class="field">
-			<span class="label">Poll cadence when overdue (minutes)</span>
-			<input type="text" inputmode="numeric" placeholder="30" bind:value={fPoll} />
+			<label class="label" for="scan-poll">Poll cadence when overdue (minutes)</label>
+			<input
+				id="scan-poll"
+				name="poll"
+				autocomplete="off"
+				type="text"
+				inputmode="numeric"
+				placeholder="30"
+				bind:value={fPoll}
+			/>
 		</div>
 
 		<div class="field">
@@ -723,18 +789,35 @@
 			{#if scanMsg}<span class="help scan-msg">{scanMsg}</span>{/if}
 		</div>
 
-		{#if saveError}<div class="notice error">{saveError}</div>{/if}
+		{#if saveError}<div class="notice error" role="alert">{saveError}</div>{/if}
 
 		<div class="drawer-actions">
 			<button class="cancel" onclick={closeEditor}>Cancel</button>
-			<button class="save" onclick={save} disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>
+			<button class="save" onclick={save} disabled={saving}
+				>{saving ? 'Saving…' : 'Save settings'}</button
+			>
 		</div>
-	</aside>
+	</div>
 {/if}
 
 {#if mergeSource && mergeTarget}
-	<button class="scrim" aria-label="Cancel merge" onclick={() => (mergeTarget = null)}></button>
-	<div class="modal" role="dialog" aria-modal="true" aria-label="Confirm work merge">
+	<button
+		data-modal-backdrop
+		tabindex="-1"
+		class="scrim"
+		disabled={merging}
+		aria-label="Cancel merge"
+		onclick={() => (mergeTarget = null)}
+	></button>
+	<div
+		class="modal"
+		role="dialog"
+		aria-modal="true"
+		aria-label="Confirm work merge"
+		use:modal={() => {
+			if (!merging) mergeTarget = null;
+		}}
+	>
 		<div class="modal-head">
 			<div class="modal-kicker">DESTRUCTIVE · IRREVERSIBLE</div>
 			<h2>Merge duplicate works?</h2>
@@ -782,7 +865,7 @@
 			</div>
 		</div>
 
-		{#if mergeError}<div class="notice error">{mergeError}</div>{/if}
+		{#if mergeError}<div class="notice error" role="alert">{mergeError}</div>{/if}
 
 		<div class="modal-actions">
 			<button class="cancel" onclick={() => (mergeTarget = null)} disabled={merging}>Back</button>
@@ -847,7 +930,8 @@
 		font-size: 14px;
 	}
 	.search input:focus {
-		outline: none;
+		outline: 2px solid var(--k-accent);
+		outline-offset: 2px;
 		border-color: var(--k-border-strong);
 	}
 	.search button {
@@ -889,7 +973,7 @@
 	.thead,
 	.row {
 		display: grid;
-		grid-template-columns: minmax(220px, 3fr) 80px 120px 80px minmax(130px, 1.6fr) 150px 80px;
+		grid-template-columns: minmax(220px, 2.5fr) 70px 100px 70px minmax(110px, 1fr) 110px 210px;
 		align-items: center;
 		gap: 16px;
 		padding: 12px 20px;
@@ -1063,7 +1147,10 @@
 		font-weight: 600;
 		font-size: 11.5px;
 		cursor: pointer;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s;
 	}
 	.unpause:hover:not(:disabled) {
 		border-color: var(--k-border-strong);
@@ -1096,7 +1183,10 @@
 		font-weight: 600;
 		font-size: 12.5px;
 		cursor: pointer;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s;
 	}
 	.edit:hover,
 	.add:hover {
@@ -1241,7 +1331,8 @@
 	}
 	select:focus,
 	.field input:focus {
-		outline: none;
+		outline: 2px solid var(--k-accent);
+		outline-offset: 2px;
 		border-color: var(--k-border-strong);
 	}
 	.scan-now {
@@ -1374,7 +1465,10 @@
 		font-weight: 600;
 		font-size: 12.5px;
 		cursor: pointer;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s;
 	}
 	.merge-btn:hover {
 		border-color: rgba(95, 200, 207, 0.5);
@@ -1552,7 +1646,7 @@
 
 	/* The 7-column grid table becomes stacked rows; each cell keeps its column
 	   context via an inline label (the .thead is hidden). */
-	@media (max-width: 720px) {
+	@media (max-width: 1100px) {
 		.thead {
 			display: none;
 		}
@@ -1602,6 +1696,19 @@
 		}
 		.pager {
 			flex-wrap: wrap;
+		}
+	}
+	@media (min-width: 601px) and (max-width: 1100px) {
+		.row {
+			grid-template-columns: repeat(3, minmax(0, 1fr));
+			gap: 16px;
+		}
+		.col-series,
+		.col-actions {
+			grid-column: 1 / -1;
+		}
+		.col-src {
+			grid-column: span 2;
 		}
 	}
 </style>

@@ -133,9 +133,10 @@ pub async fn drain_suwayomi_series(pool: &SqlitePool) -> Result<u64> {
     if pending.is_empty() {
         return Ok(0);
     }
+    type CachedChapterRow = (i64, String, f64, Option<String>, Option<String>);
     let mut done = 0u64;
     for (ssid, manga_id) in pending {
-        let chapters: Vec<(i64, String, f64, Option<String>, Option<String>)> = sqlx::query_as(
+        let chapters: Vec<CachedChapterRow> = sqlx::query_as(
             "SELECT id, name, chapter_number, scanlator, upload_date \
              FROM suwayomi_chapter WHERE manga_id = ?",
         )

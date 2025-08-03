@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { modal } from '$lib/modal';
 	import { loadSourceReader, type SourceReaderView } from '$lib/data';
 
 	let { seriesId, title, onclose } = $props<{
@@ -16,7 +17,6 @@
 	let width = $state(720);
 	let retryNonce = $state(0);
 	let requestGeneration = 0;
-	let dialog: HTMLDivElement;
 
 	const chapters = $derived(view?.chapters ?? []);
 	const chapter = $derived(view?.chapter ?? null);
@@ -68,6 +68,17 @@
 			onclose();
 			return;
 		}
+		if (
+			event.target instanceof HTMLElement &&
+			event.target.closest('input, select, textarea, [contenteditable="true"]')
+		)
+			return;
+		if (
+			event.key === ' ' &&
+			event.target instanceof HTMLElement &&
+			event.target.closest('button, a')
+		)
+			return;
 		if (mode !== 'page' || loading) return;
 		if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
 			event.preventDefault();
@@ -79,13 +90,9 @@
 	}
 
 	onMount(() => {
-		const previousOverflow = document.body.style.overflow;
-		document.body.style.overflow = 'hidden';
-		dialog.focus();
 		void load();
 		return () => {
 			requestGeneration += 1;
-			document.body.style.overflow = previousOverflow;
 		};
 	});
 </script>
@@ -93,14 +100,20 @@
 <svelte:window onkeydown={onKeydown} />
 
 <div class="reader-backdrop">
-	<button class="reader-scrim" onclick={onclose} aria-label="Close reader"></button>
+	<button
+		data-modal-backdrop
+		tabindex="-1"
+		class="reader-scrim"
+		onclick={onclose}
+		aria-label="Close reader"
+	></button>
 	<div
 		class="reader-shell"
 		role="dialog"
 		aria-modal="true"
 		aria-label={`Read ${title}`}
 		tabindex="-1"
-		bind:this={dialog}
+		use:modal={onclose}
 	>
 		<header class="reader-toolbar">
 			<div class="reader-title">
@@ -123,7 +136,15 @@
 				</div>
 				<label class="width-control">
 					<span>Width {width}px</span>
-					<input type="range" min="420" max="1000" step="20" bind:value={width} />
+					<input
+						autocomplete="off"
+						name="width"
+						type="range"
+						min="420"
+						max="1000"
+						step="20"
+						bind:value={width}
+					/>
 				</label>
 				<button class="close" onclick={onclose} aria-label="Close reader">×</button>
 			</div>

@@ -1,10 +1,13 @@
 <script lang="ts">
+	import { page as pageState } from '$app/state';
+	import { queuePage, queueNavigate } from '$lib/url-state';
 	import type { Report, ReportKind, ReportStatus } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
+	import { beforeNavigate } from '$app/navigation';
 	import { deleteComment, loadReports, resolveReport } from '$lib/data';
 
 	let reports = $state<Report[]>([]);
-	let page = $state(1);
+	const page = $derived(queuePage(pageState.url));
 	let hasNext = $state(false);
 	let total = $state<number | null>(null);
 	let openCount = $state(0);
@@ -13,10 +16,33 @@
 	let actionError = $state<string | null>(null);
 	let busy = $state<string | null>(null); // report id currently acting
 
-	let status = $state<ReportStatus | null>('OPEN');
-	let kind = $state<ReportKind | null>(null);
+	const status = $derived<ReportStatus | null>(
+		pageState.url.searchParams.get('status') === 'all'
+			? null
+			: pageState.url.searchParams.get('status') === 'RESOLVED'
+				? 'RESOLVED'
+				: pageState.url.searchParams.get('status') === 'REJECTED'
+					? 'REJECTED'
+					: 'OPEN',
+	);
+	const kind = $derived<ReportKind | null>(
+		['WRONG_MERGE', 'NEEDS_MERGE', 'MISSING_WORK', 'COMMENT_ABUSE', 'OTHER'].includes(
+			pageState.url.searchParams.get('kind') ?? '',
+		)
+			? (pageState.url.searchParams.get('kind') as ReportKind)
+			: null,
+	);
 	/** Per-row triage note, only sent for the row it was typed on. */
 	let notes = $state<Record<string, string>>({});
+	beforeNavigate(({ cancel, to, willUnload }) => {
+		// Query-only queue navigation preserves note drafts in this component.
+		if (!willUnload && to?.url.pathname === pageState.url.pathname) return;
+		if (
+			Object.values(notes).some((note) => note.trim()) &&
+			!confirm('Leave this page and discard your unsaved report notes?')
+		)
+			cancel();
+	});
 	/** Which row's detail/note panel is expanded. */
 	let openRow = $state<string | null>(null);
 
@@ -41,8 +67,7 @@
 	];
 
 	// Auth redirect is centralized in +layout.svelte. This effect is the SINGLE fetch
-	// driver (the `users` page convention): the filters and the pager only assign state,
-	// and the effect re-fires exactly once — `refresh` never writes `page`.
+	// driver: filters and pager update the URL, then its derived values refetch the queue.
 	$effect(() => {
 		if (!auth.user) return;
 		void refresh(status, kind, page);
@@ -80,20 +105,18 @@
 
 	function setStatus(v: ReportStatus | null): void {
 		if (v === status) return;
-		status = v;
-		page = 1;
+		void queueNavigate(pageState.url, { status: v === 'OPEN' ? null : (v ?? 'all'), page: 1 });
 	}
 
 	function setKind(v: ReportKind | null): void {
 		if (v === kind) return;
-		kind = v;
-		page = 1;
+		void queueNavigate(pageState.url, { kind: v, page: 1 });
 	}
 
 	function go(delta: number): void {
 		const next = Math.max(1, page + delta);
 		if (next === page) return;
-		page = next;
+		void queueNavigate(pageState.url, { page: next });
 	}
 
 	/**
@@ -108,7 +131,7 @@
 			// Assigning `page` re-fires the driving effect; only refresh directly when the
 			// page number does not change (otherwise both would fire).
 			if (target === page) await refresh(status, kind, page);
-			else page = target;
+			else await queueNavigate(pageState.url, { page: target }, true);
 		}
 	}
 
@@ -289,12 +312,12 @@
 		Always visible: an action can fail on the LAST row of a page, and when the list it
 		used to sit inside is gone with it the only explanation would go with it too.
 	-->
-	{#if actionError}<div class="notice error">{actionError}</div>{/if}
+	{#if actionError}<div class="notice error" role="alert">{actionError}</div>{/if}
 
 	{#if loadError}
-		<div class="notice error">{loadError}</div>
+		<div class="notice error" role="alert">{loadError}</div>
 	{:else if loading && reports.length === 0}
-		<div class="notice">Loading…</div>
+		<div class="notice" role="status">Loading…</div>
 	{:else}
 		{#if reports.length === 0}
 			<!--
@@ -802,7 +825,8 @@
 		color: var(--k-text);
 		font-family: inherit;
 		font-size: 13.5px;
-		outline: none;
+		outline: 2px solid var(--k-accent);
+		outline-offset: 2px;
 	}
 	.note input:focus {
 		border-color: var(--k-border-strong);

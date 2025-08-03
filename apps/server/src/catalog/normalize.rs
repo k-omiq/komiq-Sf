@@ -60,7 +60,7 @@ fn fold_diacritic(c: char) -> char {
 pub fn normalize_title(raw: &str) -> String {
     // Spell out `&` (and its full-width form) before folding so "Fist of the North &
     // South" and "…and South" share a key. Done pre-lowercase; the tokens are ASCII.
-    let expanded = raw.replace('&', " and ").replace('＆', " and ");
+    let expanded = raw.replace(['&', '＆'], " and ");
     let lowered = expanded.to_lowercase();
     let spaced: String = lowered
         .chars()

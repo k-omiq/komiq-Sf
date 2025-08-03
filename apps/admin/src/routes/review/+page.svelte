@@ -1,4 +1,7 @@
 <script lang="ts">
+	import { page as pageState } from '$app/state';
+	import { queuePage, queueNavigate } from '$lib/url-state';
+	import { modal } from '$lib/modal';
 	import type { MergeCandidate, WorkReviewDetail } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
 	import { assetSrc } from '$lib/config';
@@ -14,7 +17,7 @@
 	// `mergeQueue` is paginated on the server (page/limit, `total` = the pending
 	// count). The backlog is ~10k rows, so only the current page is ever held here.
 	let queue = $state<MergeCandidate[]>([]);
-	let page = $state(1);
+	const page = $derived(queuePage(pageState.url));
 	let hasNext = $state(false);
 	let total = $state<number | null>(null);
 	let loading = $state(false);
@@ -114,10 +117,16 @@
 
 	$effect(() => {
 		if (!auth.user) return;
-		void refresh(1);
+		void refresh(page);
 	});
 
+	let loadSeq = 0;
 	async function refresh(p = page): Promise<void> {
+		if (p !== page) {
+			await queueNavigate(pageState.url, { page: p });
+			return;
+		}
+		const seq = ++loadSeq;
 		loading = true;
 		loadError = null;
 		try {
@@ -132,17 +141,22 @@
 				const last = Math.max(1, Math.ceil((res.total ?? 1) / MERGE_QUEUE_PAGE_SIZE));
 				if (last < res.page) res = await loadMergeQueue(last);
 			}
+			if (seq !== loadSeq) return;
 			queue = res.items;
-			page = res.page;
+			if (res.page !== p) {
+				void queueNavigate(pageState.url, { page: res.page }, true);
+				return;
+			}
 			hasNext = res.hasNextPage;
 			total = res.total ?? null;
 			resolvedOnPage = 0;
 		} catch (err) {
+			if (seq !== loadSeq) return;
 			loadError = err instanceof Error ? err.message : 'Failed to load the review queue.';
 			queue = [];
 			hasNext = false;
 		} finally {
-			loading = false;
+			if (seq === loadSeq) loading = false;
 		}
 	}
 
@@ -151,7 +165,8 @@
 	 * this page has drifted, `page + 1` is the wrong window and `page` is the right one.
 	 */
 	function nextPage(): void {
-		void refresh(resolvedOnPage > 0 ? page : page + 1);
+		if (resolvedOnPage > 0) void refresh(page);
+		else void queueNavigate(pageState.url, { page: page + 1 });
 	}
 
 	/** 1-based index of the first row on this page, within the whole backlog. */
@@ -304,13 +319,13 @@
 	</div>
 
 	{#if loadError}
-		<div class="notice error">{loadError}</div>
+		<div class="notice error" role="alert">{loadError}</div>
 	{:else if loading && queue.length === 0}
-		<div class="notice">Loading…</div>
+		<div class="notice" role="status">Loading…</div>
 	{:else if queue.length === 0}
 		<div class="notice">No matches awaiting review — the queue is clear.</div>
 	{:else}
-		{#if actionError}<div class="notice error">{actionError}</div>{/if}
+		{#if actionError}<div class="notice error" role="alert">{actionError}</div>{/if}
 		<div class="table" role="table" aria-label="Dedup review queue">
 			<div class="row head" role="row">
 				<span role="columnheader">Source series</span>
@@ -330,6 +345,8 @@
 						>
 							{#if c.sourceCoverUrl}
 								<img
+									width="80"
+									height="112"
 									class="thumb"
 									src={assetSrc(c.sourceCoverUrl)}
 									alt=""
@@ -354,6 +371,8 @@
 						>
 							{#if c.candidateCoverUrl}
 								<img
+									width="80"
+									height="112"
 									class="thumb"
 									src={assetSrc(c.candidateCoverUrl)}
 									alt=""
@@ -387,7 +406,11 @@
 		</div>
 		{#if page > 1 || hasNext}
 			<div class="pager">
-				<button class="pg" disabled={page <= 1 || loading} onclick={() => refresh(page - 1)}>
+				<button
+					class="pg"
+					disabled={page <= 1 || loading}
+					onclick={() => queueNavigate(pageState.url, { page: Math.max(1, page - 1) })}
+				>
 					Prev
 				</button>
 				<span class="page-num">
@@ -414,8 +437,20 @@
 />
 
 {#if detailFor}
-	<button class="scrim" aria-label="Close details" onclick={closeDetail}></button>
-	<div class="modal" role="dialog" aria-modal="true" aria-label="Work details">
+	<button
+		data-modal-backdrop
+		tabindex="-1"
+		class="scrim"
+		aria-label="Close details"
+		onclick={closeDetail}
+	></button>
+	<div
+		class="modal"
+		role="dialog"
+		aria-modal="true"
+		aria-label="Work details"
+		use:modal={closeDetail}
+	>
 		<div class="modal-head">
 			<div class="modal-kicker">
 				{detailFor.side === 'source' ? 'SOURCE SERIES' : 'CANDIDATE WORK'}
@@ -425,13 +460,15 @@
 		</div>
 
 		{#if detailError}
-			<div class="notice error">{detailError}</div>
+			<div class="notice error" role="alert">{detailError}</div>
 		{:else if detailLoading || !detail}
-			<div class="notice">Loading…</div>
+			<div class="notice" role="status">Loading…</div>
 		{:else}
 			<div class="detail">
 				{#if detail.coverUrl}
 					<img
+						width="80"
+						height="112"
 						class="cover"
 						src={assetSrc(detail.coverUrl)}
 						alt="Cover of {detail.title ?? 'this work'}"
@@ -656,7 +693,10 @@
 		font-weight: 600;
 		cursor: pointer;
 		white-space: nowrap;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s;
 	}
 	.act:hover:not(:disabled) {
 		border-color: var(--k-border-strong);

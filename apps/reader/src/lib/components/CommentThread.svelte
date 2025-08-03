@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { protectUnsaved } from '$lib/unsaved.svelte';
 	import { page } from '$app/state';
 	import { auth } from '$lib/auth.svelte';
 	import {
@@ -53,6 +54,10 @@
 	// Reply composer state (only one reply box is open at a time).
 	let replyingTo = $state<string | null>(null);
 	let replyDraft = $state('');
+	protectUnsaved(
+		() => !!draft.trim() || !!media || !!(replyingTo && (replyDraft.trim() || replyMedia)),
+		'Leave this page and discard your comment draft?',
+	);
 	let replySpoiler = $state(false);
 	let replyPosting = $state(false);
 	let replyError = $state<string | null>(null);
@@ -291,16 +296,22 @@
 			/>
 		</div>
 		<div class="composer-body">
-			<textarea bind:value={draft} placeholder={prompt} rows="3"></textarea>
+			<textarea
+				aria-label="Your comment"
+				name="comment"
+				bind:value={draft}
+				placeholder={prompt}
+				rows="3"
+			></textarea>
 			{#if media}
 				<div class="media-preview">
-					<img src={media.url} alt="Attachment preview" />
+					<img src={media.url} width={media.width} height={media.height} alt="Attachment preview" />
 					<button class="media-remove" onclick={() => (media = null)} aria-label="Remove image">
 						<Icon name="x" size={15} />
 					</button>
 				</div>
 			{/if}
-			{#if postError}<p class="post-error">{postError}</p>{/if}
+			{#if postError}<p class="post-error" role="alert">{postError}</p>{/if}
 			<div class="composer-foot">
 				<label class="spoiler-toggle">
 					<input type="checkbox" bind:checked={spoiler} />
@@ -337,7 +348,7 @@
 	</div>
 {/if}
 
-{#if modError}<p class="post-error">{modError}</p>{/if}
+{#if modError}<p class="post-error" role="alert">{modError}</p>{/if}
 
 <div class="c-list">
 	{#each tree.roots as c (c.id)}
@@ -369,13 +380,13 @@
 			{:else}
 				{#if c.body}<p class="c-text">{c.body}</p>{/if}
 				{#if c.mediaUrl}
-					<a class="c-media" href={c.mediaUrl} target="_blank" rel="noopener noreferrer">
+					<a class="c-media" class:legacy={!c.mediaWidth || !c.mediaHeight} aria-label="Open comment attachment in a new tab" href={c.mediaUrl} target="_blank" rel="noopener noreferrer">
 						<img
 							src={c.mediaUrl}
 							alt="Comment attachment"
 							loading="lazy"
-							width={c.mediaWidth ?? undefined}
-							height={c.mediaHeight ?? undefined}
+							width={c.mediaWidth || 360}
+							height={c.mediaHeight || 270}
 							style={c.mediaWidth && c.mediaHeight
 								? `aspect-ratio:${c.mediaWidth}/${c.mediaHeight}`
 								: undefined}
@@ -436,10 +447,21 @@
 
 			{#if replyingTo === c.id}
 				<div class="reply-composer">
-					<textarea bind:value={replyDraft} placeholder={`Reply to ${c.name}…`} rows="2"></textarea>
+					<textarea
+						aria-label={`Reply to ${c.name}`}
+						name="reply"
+						bind:value={replyDraft}
+						placeholder={`Reply to ${c.name}…`}
+						rows="2"
+					></textarea>
 					{#if replyMedia}
 						<div class="media-preview">
-							<img src={replyMedia.url} alt="Attachment preview" />
+							<img
+								src={replyMedia.url}
+								width={replyMedia.width}
+								height={replyMedia.height}
+								alt="Attachment preview"
+							/>
 							<button
 								class="media-remove"
 								onclick={() => (replyMedia = null)}
@@ -449,7 +471,7 @@
 							</button>
 						</div>
 					{/if}
-					{#if replyError}<p class="post-error">{replyError}</p>{/if}
+					{#if replyError}<p class="post-error" role="alert">{replyError}</p>{/if}
 					<div class="composer-foot">
 						<label class="spoiler-toggle">
 							<input type="checkbox" bind:checked={replySpoiler} />
@@ -756,6 +778,10 @@
 		border: 1px solid var(--k-border-1);
 		background: var(--k-surface);
 	}
+	/* Old uploads have no stored dimensions. Reserve a stable preview frame and
+	   contain the full image; opening the attachment preserves its native size. */
+	.c-media.legacy { display: block; width: min(360px, 100%); aspect-ratio: 4 / 3; border-radius: 12px; background: var(--k-surface); }
+	.c-media.legacy img { width: 100%; height: 100%; max-height: none; object-fit: contain; }
 	.spoiler-veil {
 		display: inline-flex;
 		align-items: center;

@@ -63,9 +63,9 @@
 		{:else if flagEmoji}
 			<span class="flag-emoji">{flagEmoji}</span>
 		{/if}
-		{#if rating}
-			<span class="rating"><Icon name="star" size={10} fill="var(--k-star)" />{rating}</span>
-		{/if}
+		<span class="rating" aria-label={rating ? `Rating ${rating} out of 10` : 'Not rated yet'}
+			><Icon name="star" size={10} fill="var(--k-star)" />{rating || 'Unrated'}</span
+		>
 		{#if status}
 			<span class="status" style="color:{status.color}">
 				<span class="dot" style="background:{status.color}"></span>{status.label}
@@ -85,7 +85,7 @@
 	.card {
 		display: flex;
 		flex-direction: column;
-		gap: 9px;
+		gap: 12px;
 		text-decoration: none;
 		cursor: pointer;
 		min-width: 0;
@@ -97,7 +97,8 @@
 		position: relative;
 		width: 100%;
 		aspect-ratio: 2 / 3;
-		border-radius: 8px;
+		border-radius: var(--k-radius-md);
+		box-shadow: 0 2px 8px rgb(0 0 0 / 0.12);
 		overflow: hidden;
 		transition:
 			transform 0.18s,
@@ -107,7 +108,7 @@
 		aspect-ratio: auto;
 	}
 	.card:hover .cover {
-		opacity: 0.82;
+		transform: translateY(-2px);
 	}
 	.rating {
 		position: absolute;
@@ -118,8 +119,9 @@
 		gap: 3px;
 		font-weight: 700;
 		font-size: 11.5px;
-		color: var(--k-text);
-		background: rgba(12, 12, 13, 0.72);
+		color: #f7f6f3;
+		font-variant-numeric: tabular-nums;
+		background: rgba(12, 12, 13, 0.88);
 		border-radius: 5px;
 		padding: 3px 7px;
 	}
@@ -152,7 +154,8 @@
 		font-size: 10px;
 		font-weight: 700;
 		letter-spacing: 0.02em;
-		background: rgba(12, 12, 13, 0.72);
+		background: var(--k-surface);
+		border: 1px solid var(--k-border-3);
 		border-radius: 5px;
 		padding: 3px 7px;
 	}
@@ -165,11 +168,18 @@
 		font-weight: 600;
 		font-size: 13.5px;
 		color: var(--k-text-1);
-		line-height: 1.25;
+		line-height: 1.45;
+		display: -webkit-box;
+		-webkit-box-orient: vertical;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
+		overflow: hidden;
+		overflow-wrap: anywhere;
 	}
 	.sub {
 		font-size: 12px;
-		color: var(--k-text-faint);
+		color: var(--k-text-dim);
+		line-height: 1.5;
 		margin-top: 3px;
 	}
 	.tchips {

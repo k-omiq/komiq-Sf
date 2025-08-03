@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { page as pageState } from '$app/state';
+	import { queuePage, queueNavigate } from '$lib/url-state';
 	import type { CanonicalUpdate } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
 	import { loadCanonicalUpdates } from '$lib/data';
@@ -8,7 +10,7 @@
 	const PAGE_SIZE = 20;
 
 	let updates = $state<CanonicalUpdate[]>([]);
-	let page = $state(1);
+	const page = $derived(queuePage(pageState.url));
 	let loading = $state(false);
 	let loadError = $state<string | null>(null);
 
@@ -19,23 +21,28 @@
 		void refresh(page);
 	});
 
+	let loadSeq = 0;
 	async function refresh(p: number): Promise<void> {
+		const seq = ++loadSeq;
 		loading = true;
 		loadError = null;
 		try {
-			updates = await loadCanonicalUpdates(p);
+			const result = await loadCanonicalUpdates(p);
+			if (seq !== loadSeq) return;
+			updates = result;
 		} catch (err) {
+			if (seq !== loadSeq) return;
 			loadError = err instanceof Error ? err.message : 'Failed to load catalogue updates.';
 			updates = [];
 		} finally {
-			loading = false;
+			if (seq === loadSeq) loading = false;
 		}
 	}
 
 	function go(delta: number): void {
 		const next = Math.max(1, page + delta);
 		if (next === page) return;
-		page = next;
+		void queueNavigate(pageState.url, { page: next });
 	}
 
 	function fmtDate(iso: string | null): string {
@@ -50,8 +57,7 @@
 		<div>
 			<h1>Catalogue updates</h1>
 			<p class="lede">
-				Recently-updated MangaDex works from the canonical mirror, newest chapter first. A
-				monitoring feed — these works are not reader-openable yet. ·
+				Latest chapter releases, newest first. Open a title to review its metadata. ·
 				<span
 					class="nsfw-note"
 					title="This console always requests NSFW-inclusive results (an admin-only per-request override), independent of the NSFW on/off preference in the header. The reader still honours each viewer's own preference."
@@ -69,9 +75,9 @@
 	</div>
 
 	{#if loadError}
-		<div class="notice error">{loadError}</div>
+		<div class="notice error" role="alert">{loadError}</div>
 	{:else if loading && updates.length === 0}
-		<div class="notice">Loading…</div>
+		<div class="notice" role="status">Loading…</div>
 	{:else if updates.length === 0}
 		<div class="notice">
 			No catalogue updates yet — the MangaDex mirror is empty (enable <code>CATALOGUE_SYNC</code>).
@@ -86,10 +92,10 @@
 			{#each updates as u (u.workId)}
 				<div class="row" role="row">
 					<span class="work" role="cell">
-						<span class="wtitle">
+						<a class="wtitle" href="/series/{u.workId}">
 							{u.title ?? '(untitled)'}
 							{#if u.isNsfw}<span class="badge nsfw">NSFW</span>{/if}
-						</span>
+						</a>
 						<span class="wid">md:{u.mangadexId}</span>
 					</span>
 					<span role="cell">

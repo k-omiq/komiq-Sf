@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import { images } from '$lib/context';
 
 	let {
@@ -45,7 +46,8 @@
 		sizing === 'card' && src && images.coverCardSrcSet ? images.coverCardSrcSet(src) : '',
 	);
 
-	let resolved = $state(syncResolve(src));
+	// Snapshot only the initial source; the effect below owns later source changes.
+	let resolved = $state(untrack(() => syncResolve(src)));
 	let broken = $state(false);
 	let el = $state<HTMLImageElement | undefined>(undefined);
 
@@ -198,6 +200,8 @@
 		<img
 			bind:this={el}
 			class="cover-img"
+			width="300"
+			height="450"
 			src={resolved}
 			srcset={srcSet || undefined}
 			{alt}
@@ -210,7 +214,11 @@
 		/>
 	{/key}
 {:else}
-	<div class="cover-ph k-cover"></div>
+	<div
+		class="cover-ph k-cover"
+		role={alt ? 'img' : undefined}
+		aria-label={alt ? `${alt}: cover unavailable` : undefined}
+	></div>
 {/if}
 
 <style>

@@ -2,6 +2,7 @@
 	import type { Series, WorkSource } from '@komika/types';
 	import type { AdminChapter, SeriesAdminMeta, SeriesMetadataInput } from '@komika/api';
 	import { page } from '$app/state';
+	import { beforeNavigate } from '$app/navigation';
 	import { assetSrc } from '$lib/config';
 	import {
 		COMIC_TYPE_OPTIONS,
@@ -18,8 +19,49 @@
 	} from '$lib/data';
 
 	const id = $derived(page.params.id ?? '');
-
 	let series = $state<Series | null>(null);
+	const trackerProviders: Record<string, { label: string; hosts: string[] }> = {
+		mangadex: { label: 'MangaDex', hosts: ['mangadex.org'] },
+		al: { label: 'AniList', hosts: ['anilist.co'] },
+		mal: { label: 'MyAnimeList', hosts: ['myanimelist.net'] },
+		mu: { label: 'MangaUpdates', hosts: ['www.mangaupdates.com', 'mangaupdates.com'] },
+		kt: { label: 'Kitsu', hosts: ['kitsu.io', 'kitsu.app'] },
+		ap: { label: 'Anime-Planet', hosts: ['www.anime-planet.com', 'anime-planet.com'] },
+		nu: { label: 'Novel Updates', hosts: ['www.novelupdates.com', 'novelupdates.com'] },
+	};
+	function trustedTracker(provider: string, href: string): boolean {
+		try {
+			const url = new URL(href);
+			return (
+				url.protocol === 'https:' &&
+				!url.username &&
+				!url.password &&
+				!url.port &&
+				(trackerProviders[provider]?.hosts.includes(url.hostname) ?? false)
+			);
+		} catch {
+			return false;
+		}
+	}
+	const importedTrackers = $derived(
+		(series?.metadata?.trackers ?? []).filter((link) => trustedTracker(link.provider, link.url)),
+	);
+	const tagGroups = $derived.by(() => {
+		const labels: Record<string, string> = {
+			genre: 'Genres',
+			theme: 'Themes',
+			format: 'Format',
+			content: 'Content',
+			custom: 'Curated tags',
+		};
+		const grouped = new Map<string, string[]>();
+		for (const tag of series?.metadata?.tags ?? []) {
+			const label = labels[tag.group] ?? 'Other tags';
+			grouped.set(label, [...(grouped.get(label) ?? []), tag.name]);
+		}
+		return [...grouped].map(([label, tags]) => ({ label, tags }));
+	});
+
 	let meta = $state<SeriesAdminMeta | null>(null);
 	let sources = $state<WorkSource[]>([]);
 	let chapters = $state<AdminChapter[]>([]);
@@ -44,6 +86,18 @@
 	// Monotonic token so a slow load(A) can't clobber a newer load(B) after fast nav.
 	let loadSeq = 0;
 
+	let formBaseline = $state('');
+	const formSnapshot = () => JSON.stringify([fTitle, fDescription, fType, fNsfw, fTags]);
+	const metadataDirty = $derived(!!meta && formBaseline !== formSnapshot());
+	beforeNavigate(({ cancel }) => {
+		if (
+			(metadataDirty || saving || editingKey !== null || newAltTitle.trim() || newTag.trim()) &&
+			!confirm(
+				'Leave this page? Unsaved edits will be lost; a save already in progress may still complete.',
+			)
+		)
+			cancel();
+	});
 	function seedForm(m: SeriesAdminMeta): void {
 		fTitle = m.titleOverride ?? '';
 		fDescription = m.descriptionOverride ?? '';
@@ -51,6 +105,7 @@
 		fNsfw = m.isNsfwOverride === null ? 'auto' : m.isNsfwOverride ? 'nsfw' : 'sfw';
 		fTags = [...m.tags];
 		tagsDirty = false;
+		formBaseline = formSnapshot();
 	}
 
 	async function load(seriesId: string): Promise<void> {
@@ -108,7 +163,8 @@
 		try {
 			// Returns the recomputed series — reflects the new title AND any auto-merge of
 			// other works that shared it.
-			series = await addSeriesAltTitle(series.id, t);
+			const updated = await addSeriesAltTitle(series.id, t);
+			series = await loadSeriesDetail(updated.id);
 			newAltTitle = '';
 			altMsg = 'Added.';
 		} catch (err) {
@@ -123,7 +179,8 @@
 		altBusy = true;
 		altMsg = null;
 		try {
-			series = await removeSeriesAltTitle(series.id, title);
+			const updated = await removeSeriesAltTitle(series.id, title);
+			series = await loadSeriesDetail(updated.id);
 		} catch (err) {
 			altMsg = err instanceof Error ? err.message : 'Failed to remove alt title.';
 		} finally {
@@ -136,7 +193,8 @@
 		saving = true;
 		saveMsg = null;
 		try {
-			series = await saveSeriesMetadata(input);
+			const updated = await saveSeriesMetadata(input);
+			series = await loadSeriesDetail(updated.id);
 			// Re-pull the raw override state and RE-SEED the form so the fields reflect
 			// exactly what persisted (server-side trims/dedupes included).
 			meta = await loadSeriesAdminMeta(series.id);
@@ -245,13 +303,15 @@
 	<a class="back" href="/">← Catalog</a>
 
 	{#if loading}
-		<p class="status">Loading…</p>
+		<p class="status" role="status">Loading…</p>
 	{:else if loadError}
-		<p class="status error">{loadError}</p>
+		<p class="status error" role="alert">{loadError}</p>
 	{:else if series}
 		<header class="head">
 			{#if series.coverUrl}
 				<img
+					width="80"
+					height="112"
 					class="cover"
 					src={assetSrc(series.coverUrl)}
 					alt=""
@@ -274,6 +334,54 @@
 			</div>
 		</header>
 
+		{#if series.metadata && (series.metadata.year || series.metadata.originalLanguage || series.metadata.demographic || series.metadata.contentRating || tagGroups.length || importedTrackers.length)}
+			<section class="card source-details" aria-labelledby="source-details-title">
+				<h2 id="source-details-title">Source details</h2>
+				<p class="muted">
+					Imported publication details and tracker links. Your metadata overrides take priority.
+				</p>
+				<dl class="source-facts">
+					{#if series.metadata.year}<div>
+							<dt>Publication year</dt>
+							<dd>{series.metadata.year}</dd>
+						</div>{/if}
+					{#if series.metadata.originalLanguage}<div>
+							<dt>Original language</dt>
+							<dd>{series.metadata.originalLanguage}</dd>
+						</div>{/if}
+					{#if series.metadata.demographic}<div>
+							<dt>Demographic</dt>
+							<dd>{series.metadata.demographic}</dd>
+						</div>{/if}
+					{#if series.metadata.contentRating}<div>
+							<dt>Content rating</dt>
+							<dd>{series.metadata.contentRating}</dd>
+						</div>{/if}
+				</dl>
+				{#each tagGroups as group (group.label)}
+					<div class="source-tags">
+						<h3>{group.label}</h3>
+						<ul>
+							{#each group.tags as tag (tag)}<li>{tag}</li>{/each}
+						</ul>
+					</div>
+				{/each}
+				{#if importedTrackers.length}
+					<nav class="tracker-links" aria-label="External trackers">
+						{#each importedTrackers as link (`${link.provider}:${link.externalId}`)}
+							<a
+								href={link.url}
+								target="_blank"
+								rel="noopener noreferrer"
+								aria-label={`${trackerProviders[link.provider].label} (opens in a new tab)`}
+								>{trackerProviders[link.provider].label} <span aria-hidden="true">↗</span></a
+							>
+						{/each}
+					</nav>
+				{/if}
+			</section>
+		{/if}
+
 		{#if !meta?.workId}
 			<p class="notice">
 				This series isn't catalogued yet, so its metadata can't be edited. Add it to the canonical
@@ -285,19 +393,30 @@
 				<h2>Metadata</h2>
 				<label class="field">
 					<span>Title override</span>
-					<input type="text" bind:value={fTitle} placeholder={series.title} />
+					<input
+						autocomplete="off"
+						name="fTitle"
+						type="text"
+						bind:value={fTitle}
+						placeholder={series.title}
+					/>
 					<small>Empty = use the source title.</small>
 				</label>
 				<label class="field">
 					<span>Description override</span>
-					<textarea rows="5" bind:value={fDescription} placeholder="Use source description…"
+					<textarea
+						autocomplete="off"
+						name="fDescription"
+						rows="5"
+						bind:value={fDescription}
+						placeholder="Use source description…"
 					></textarea>
 					<small>Empty = use the source description.</small>
 				</label>
 				<div class="row">
 					<label class="field">
 						<span>Type</span>
-						<select bind:value={fType}>
+						<select autocomplete="off" name="fType" bind:value={fType}>
 							<option value="">Auto (derived — {series.type})</option>
 							{#each COMIC_TYPE_OPTIONS as t (t)}
 								<option value={t}>{t}</option>
@@ -306,7 +425,7 @@
 					</label>
 					<label class="field">
 						<span>NSFW</span>
-						<select bind:value={fNsfw}>
+						<select autocomplete="off" name="fNsfw" bind:value={fNsfw}>
 							<option value="auto">Auto (derived — {series.isNsfw ? 'NSFW' : 'SFW'})</option>
 							<option value="sfw">SFW</option>
 							<option value="nsfw">NSFW — requires viewer's Show NSFW</option>
@@ -331,6 +450,9 @@
 					<div class="tag-add">
 						<input
 							type="text"
+							aria-label="New tag"
+							name="tag"
+							autocomplete="off"
 							bind:value={newTag}
 							placeholder="Add tag…"
 							onkeydown={(e) => e.key === 'Enter' && (e.preventDefault(), addTag())}
@@ -367,6 +489,9 @@
 					<div class="tag-add">
 						<input
 							type="text"
+							aria-label="Alternative title"
+							name="alternative-title"
+							autocomplete="off"
 							bind:value={newAltTitle}
 							placeholder="Add alt title…"
 							disabled={altBusy}
@@ -376,7 +501,8 @@
 						{#if altMsg}<span class="msg">{altMsg}</span>{/if}
 					</div>
 					<small
-						>Adding a title that exactly matches another entry auto-merges them into this one.</small
+						>A matching title and at least 90% similar author names can auto-merge duplicate
+						entries.</small
 					>
 				</div>
 				<div class="actions">
@@ -428,7 +554,14 @@
 							<li class:hidden={c.hidden}>
 								<span class="num">#{c.number}</span>
 								{#if editingKey === c.key}
-									<input class="rename" type="text" bind:value={editTitle} />
+									<input
+										class="rename"
+										aria-label="Chapter title"
+										name="chapter-title"
+										autocomplete="off"
+										type="text"
+										bind:value={editTitle}
+									/>
 									<button
 										onclick={() =>
 											commitChapter(c, {
@@ -749,6 +882,59 @@
 		.row .field {
 			min-width: 0;
 			flex: 1 1 100%;
+		}
+	}
+	.source-details {
+		gap: 18px;
+	}
+	.source-facts {
+		display: grid;
+		grid-template-columns: repeat(4, minmax(0, 1fr));
+		gap: 18px;
+	}
+	.source-facts dt,
+	.source-tags h3 {
+		color: var(--k-text-dim);
+		font-size: 12px;
+		font-weight: 600;
+	}
+	.source-facts dd {
+		margin: 4px 0 0;
+		overflow-wrap: anywhere;
+		text-transform: capitalize;
+	}
+	.source-tags ul {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
+		margin: 8px 0 0;
+		padding: 0;
+		list-style: none;
+	}
+	.source-tags li {
+		padding: 4px 9px;
+		background: var(--k-surface-3);
+		border-radius: var(--k-radius-sm);
+		font-size: 12px;
+	}
+	.tracker-links {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 10px;
+	}
+	.tracker-links a {
+		padding: 8px 12px;
+		border: 1px solid var(--k-border-3);
+		border-radius: var(--k-radius-md);
+		font-size: 13px;
+	}
+	.tracker-links a:hover {
+		background: var(--k-hover-fill);
+		border-color: var(--k-border-strong);
+	}
+	@media (max-width: 640px) {
+		.source-facts {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
 		}
 	}
 </style>

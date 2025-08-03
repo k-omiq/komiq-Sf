@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { page } from '$app/state';
+	import { protectUnsaved } from '$lib/unsaved.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import Cover from '$lib/components/Cover.svelte';
@@ -77,6 +79,12 @@
 	let editing = $state(false);
 	let editName = $state('');
 	let editBio = $state('');
+	protectUnsaved(
+		() =>
+			editing &&
+			(editName !== (auth.user?.displayName ?? '') || editBio !== (auth.user?.bio ?? '')),
+		'Leave this page and discard your profile changes?',
+	);
 	let savingProfile = $state(false);
 	let profileError = $state('');
 	let uploadingAvatar = $state(false);
@@ -130,7 +138,18 @@
 		}
 	}
 
-	let tab = $state<'reading' | 'completed' | 'favorites'>('reading');
+	const tab = $derived<'reading' | 'completed' | 'favorites'>(
+		page.url.searchParams.get('shelf') === 'completed'
+			? 'completed'
+			: page.url.searchParams.get('shelf') === 'favorites'
+				? 'favorites'
+				: 'reading',
+	);
+	const shelfHref = (shelf: string) => {
+		const url = new URL(page.url);
+		url.searchParams.set('shelf', shelf);
+		return url.pathname + url.search + url.hash;
+	};
 
 	const counts = $derived({
 		reading: (profile?.shelves ?? []).filter((c) => c.shelf === 'reading').length,
@@ -227,6 +246,7 @@
 						type="file"
 						accept="image/png,image/jpeg,image/webp"
 						class="visually-hidden"
+						aria-label="Upload profile photo"
 						onchange={onAvatarPicked}
 					/>
 				{/if}
@@ -238,12 +258,14 @@
 				</div>
 				<div class="handle">{profile.handle} · {profile.since}</div>
 				<p class="bio">{profile.bio}</p>
-				{#if avatarError}<p class="setting-error">{avatarError}</p>{/if}
+				{#if avatarError}<p class="setting-error" role="alert">{avatarError}</p>{/if}
 			</div>
 			{#if canEdit}
 				<div class="actions">
 					<button class="edit" onclick={openEditor}>Edit profile</button>
-					<button class="gear" aria-label="Settings"><Icon name="gear" size={18} /></button>
+					<a class="gear" href="#profile-preferences" aria-label="Profile preferences"
+						><Icon name="gear" size={18} /></a
+					>
 				</div>
 			{/if}
 		</div>
@@ -254,6 +276,8 @@
 					<span>Display name</span>
 					<input
 						type="text"
+						name="displayName"
+						autocomplete="nickname"
 						bind:value={editName}
 						maxlength="50"
 						placeholder={auth.user?.username}
@@ -262,13 +286,15 @@
 				<label class="field">
 					<span>Bio</span>
 					<textarea
+						name="bio"
+						autocomplete="off"
 						bind:value={editBio}
 						maxlength="500"
 						rows="3"
 						placeholder="Tell readers about yourself…"
 					></textarea>
 				</label>
-				{#if profileError}<p class="setting-error">{profileError}</p>{/if}
+				{#if profileError}<p class="setting-error" role="alert">{profileError}</p>{/if}
 				<div class="editor-actions">
 					<button class="cancel" onclick={() => (editing = false)} disabled={savingProfile}
 						>Cancel</button
@@ -320,9 +346,14 @@
 			<div class="section">
 				<div class="tabs">
 					{#each tabDefs as t (t.key)}
-						<button class="tab" class:on={tab === t.key} onclick={() => (tab = t.key)}>
+						<a
+							class="tab"
+							class:on={tab === t.key}
+							href={shelfHref(t.key)}
+							aria-current={tab === t.key ? 'page' : undefined}
+						>
 							{t.label}<span class="count">{counts[t.key]}</span>
-						</button>
+						</a>
 					{/each}
 				</div>
 				<div class="shelf-grid">
@@ -344,7 +375,7 @@
 		<div class="right">
 			{#if auth.user}
 				<div class="card">
-					<h3 class="card-title">Content Settings</h3>
+					<h2 class="card-title" id="profile-preferences">Content Settings</h2>
 					<div class="setting-row">
 						<div class="setting-text">
 							<span class="setting-label">Show NSFW content</span>
@@ -365,7 +396,7 @@
 							<span class="knob"></span>
 						</button>
 					</div>
-					{#if nsfwError}<p class="setting-error">{nsfwError}</p>{/if}
+					{#if nsfwError}<p class="setting-error" role="alert">{nsfwError}</p>{/if}
 				</div>
 			{/if}
 
@@ -850,7 +881,11 @@
 		background: transparent;
 		color: var(--k-text-dimmer);
 		border: 1px solid var(--k-border-4);
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s,
+			opacity 0.15s;
 	}
 	.tab.on {
 		background: var(--k-primary);

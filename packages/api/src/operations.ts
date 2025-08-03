@@ -27,6 +27,10 @@
  * so the query just fails against an older server.
  */
 export const OPTIONAL_SERIES_FIELDS = [
+	// Metadata is the sole nested optional selection (balanced child stripping).
+	'metadata',
+	'averageRating',
+	'ratingCount',
 	'detectedAt',
 	'workId',
 	'latestChapter',
@@ -65,6 +69,15 @@ export const OPTIONAL_SERIES_FIELDS = [
 	// Found line, just as it does for null, so stripping it is indistinguishable from the
 	// ordinary no-record case.
 	'foundAt',
+	// Per-COPY fields on `ChapterSource` (one entry per (source, scanlation group) upload of
+	// a chapter number). Optional for the usual deploy-ordering reason: without them a reader
+	// that shipped first would fail the whole series page and reader. Fallbacks: a copy with
+	// no `copyReleasedAt` renders without a date; a copy with no `copyExternalUrl` is opened
+	// as ordinary pages (exactly the pre-field behaviour). Prefixed `copy…` because this
+	// stripper matches by NAME across every document, and `releasedAt` / `externalUrl` are
+	// load-bearing elsewhere (`UpdateFeedRow.releasedAt`, `Chapter.externalUrl`).
+	'copyReleasedAt',
+	'copyExternalUrl',
 ] as const;
 
 /**
@@ -267,18 +280,22 @@ export const AGGREGATED_CHAPTERS = /* GraphQL */ `
 	query AggregatedChapters($workId: ID!) {
 		aggregatedChapters(workId: $workId) {
 			number
+			label
 			title
 			firstReleasedAt
 			# Cross-source read state — true when the viewer read this chapter under ANY
 			# source, not just the selected translator. Own line, no alias: the
 			# unknown-field fallback strips it by line (OPTIONAL_SERIES_FIELDS).
 			readAnywhere
+			# One entry per COPY: every (source, scanlation group) upload of the number.
 			sources {
 				sourceType
 				sourceId
 				suwayomiMangaId
 				chapterId
 				scanlator
+				copyReleasedAt
+				copyExternalUrl
 			}
 		}
 	}
@@ -289,6 +306,22 @@ export const SERIES = /* GraphQL */ `
 	query Series($id: ID!) {
 		series(id: $id) {
 			...SeriesFields
+			metadata {
+				year
+				originalLanguage
+				demographic
+				contentRating
+				tags {
+					id
+					name
+					group
+				}
+				trackers {
+					provider
+					externalId
+					url
+				}
+			}
 			libraryStatus
 			isFavorite
 			# The canonical work behind a numeric Suwayomi id — how the reader finds the
@@ -1106,6 +1139,8 @@ export const MY_ACTIVITY = /* GraphQL */ `
 export const CANONICAL_UPDATES = /* GraphQL */ `
 	query CanonicalUpdates($page: Int, $includeNsfw: Boolean) {
 		canonicalUpdates(page: $page, includeNsfw: $includeNsfw) {
+			averageRating
+			ratingCount
 			workId
 			mangadexId
 			title
@@ -1162,6 +1197,22 @@ export const CANONICAL_SERIES = /* GraphQL */ `
 	query CanonicalSeries($workId: ID!) {
 		canonicalSeries(workId: $workId) {
 			...SeriesFields
+			metadata {
+				year
+				originalLanguage
+				demographic
+				contentRating
+				tags {
+					id
+					name
+					group
+				}
+				trackers {
+					provider
+					externalId
+					url
+				}
+			}
 			libraryStatus
 			isFavorite
 			views {
@@ -1269,6 +1320,22 @@ export const SERIES_PAGE = /* GraphQL */ `
 			workId
 			series {
 				...SeriesFields
+				metadata {
+					year
+					originalLanguage
+					demographic
+					contentRating
+					tags {
+						id
+						name
+						group
+					}
+					trackers {
+						provider
+						externalId
+						url
+					}
+				}
 				libraryStatus
 				isFavorite
 				views {
@@ -1316,13 +1383,20 @@ export const SERIES_PAGE = /* GraphQL */ `
 			}
 			aggregated @include(if: $withAggregated) {
 				number
+				label
 				title
+				# Own line, no alias — the unknown-field fallback strips it by line.
+				firstReleasedAt
+				# One entry per COPY: every (source, scanlation group) upload of the number.
+				# The two copy… fields are opportunistic (OPTIONAL_SERIES_FIELDS).
 				sources {
 					sourceType
 					sourceId
 					suwayomiMangaId
 					chapterId
 					scanlator
+					copyReleasedAt
+					copyExternalUrl
 				}
 			}
 		}

@@ -1162,7 +1162,7 @@ async fn record_scan_failure(
                     "scan: backoff write lock contention; retrying transaction"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                let spread = (rand_core::OsRng.next_u64() % (delay_ms / 2).max(1)) as u64;
+                let spread = rand_core::OsRng.next_u64() % (delay_ms / 2).max(1);
                 delay_ms = (delay_ms * 2 + spread).min(2_000);
             }
             Err(e) => return Err(e),
@@ -1954,7 +1954,7 @@ async fn record_scan_policy(
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 // Exponential with a small jittered spread, so several scan workers
                 // that collided do not line up and collide again on the same beat.
-                let spread = (rand_core::OsRng.next_u64() % (delay_ms / 2).max(1)) as u64;
+                let spread = rand_core::OsRng.next_u64() % (delay_ms / 2).max(1);
                 delay_ms = (delay_ms * 2 + spread).min(2_000);
             }
             Err(e) => return Err(e),
@@ -3271,18 +3271,27 @@ mod tests {
     fn every_park_writer_stays_below_the_absurd_horizon() {
         // The declared ceiling really is below the horizon (the const assertion, restated
         // so a failure names the numbers).
-        assert!(
-            MAX_SCHEDULED_HOURS < ABSURD_HORIZON_HOURS,
-            "max scheduled {MAX_SCHEDULED_HOURS}h must stay strictly below the \
-             {ABSURD_HORIZON_HOURS}h reclaim horizon, or every park is undone"
-        );
+        const {
+            assert!(
+                MAX_SCHEDULED_HOURS < ABSURD_HORIZON_HOURS,
+                "max scheduled hours must stay below the reclaim horizon, or every park is undone"
+            );
+        }
         // Each writer's declared worst case is under the horizon on its own...
-        assert!(MAX_PARKED_HOURS < ABSURD_HORIZON_HOURS);
-        assert!(MAX_OUTAGE_PARKED_HOURS < ABSURD_HORIZON_HOURS);
+        const {
+            assert!(MAX_PARKED_HOURS < ABSURD_HORIZON_HOURS);
+        }
+        const {
+            assert!(MAX_OUTAGE_PARKED_HOURS < ABSURD_HORIZON_HOURS);
+        }
         assert!(MAX_SCHEDULED_INTERVAL_HOURS < ABSURD_HORIZON_HOURS as f64);
         // ...and `MAX_SCHEDULED_HOURS` really is the max of the three.
-        assert!(MAX_SCHEDULED_HOURS >= MAX_PARKED_HOURS);
-        assert!(MAX_SCHEDULED_HOURS >= MAX_OUTAGE_PARKED_HOURS);
+        const {
+            assert!(MAX_SCHEDULED_HOURS >= MAX_PARKED_HOURS);
+        }
+        const {
+            assert!(MAX_SCHEDULED_HOURS >= MAX_OUTAGE_PARKED_HOURS);
+        }
         assert!(MAX_SCHEDULED_HOURS as f64 >= MAX_SCHEDULED_INTERVAL_HOURS);
 
         // The LIVE park path: sample the real RNG-backed function, not a copy of its
@@ -3330,7 +3339,9 @@ mod tests {
         assert_eq!(SCAN_CONCURRENCY, 3);
         // The aggregate knob is a separate, larger, env-overridable ceiling — never a
         // substitute for the per-source one.
-        assert!(crate::config::DEFAULT_SCAN_GLOBAL_CONCURRENCY >= SCAN_CONCURRENCY);
+        const {
+            assert!(crate::config::DEFAULT_SCAN_GLOBAL_CONCURRENCY >= SCAN_CONCURRENCY);
+        }
     }
 
     /// Unit A: the aggregate ceiling is a restart-level knob (a release build is ~13 min), and
@@ -3393,18 +3404,35 @@ mod tests {
 
         let v = parse_scan_source_rate_limits(" a = 6 / 60 @ 1 , b=1/10, ,c=3/30@4");
         assert_eq!(v.len(), 3, "whitespace and empty entries are tolerated");
-        assert_eq!((v[0].requests, v[0].window_secs, v[0].requests_per_scan), (6, 60, 1));
+        assert_eq!(
+            (v[0].requests, v[0].window_secs, v[0].requests_per_scan),
+            (6, 60, 1)
+        );
         assert_eq!(v[0].scans_per_window(), 6);
         assert_eq!(
             v[1].scans_per_window(),
             1,
             "a budget below one scan still admits one scan per window (never 0)"
         );
-        assert_eq!(v[2].scans_per_window(), 1, "3 requests at 4 per scan floors at 1");
+        assert_eq!(
+            v[2].scans_per_window(),
+            1,
+            "3 requests at 4 per scan floors at 1"
+        );
 
         for bad in [
-            "", "x", "x=", "x=10", "x=10/", "x=/300", "x=0/300", "x=10/0", "x=ten/300",
-            "x=10/300@0", "x=10/300@two", "=10/300",
+            "",
+            "x",
+            "x=",
+            "x=10",
+            "x=10/",
+            "x=/300",
+            "x=0/300",
+            "x=10/0",
+            "x=ten/300",
+            "x=10/300@0",
+            "x=10/300@two",
+            "=10/300",
         ] {
             assert!(
                 parse_scan_source_rate_limits(bad).is_empty(),
@@ -3527,24 +3555,30 @@ mod tests {
     #[test]
     fn the_drift_and_saturation_thresholds_match_the_spec() {
         assert_eq!(TIER_DRIFT_WARN_FRACTION, 0.10);
-        assert!(
-            SATURATED_TICK_ALERT >= 2,
-            "a single saturated batch is an ordinary drain, not an alert"
-        );
-        assert!(
-            TIER_DRIFT_MIN_SAMPLES > 0,
-            "reporting a mean over zero samples would divide by zero"
-        );
+        const {
+            assert!(
+                SATURATED_TICK_ALERT >= 2,
+                "a single saturated batch is an ordinary drain, not an alert"
+            );
+        }
+        const {
+            assert!(
+                TIER_DRIFT_MIN_SAMPLES > 0,
+                "reporting a mean over zero samples would divide by zero"
+            );
+        }
     }
 
     /// Handoff constraint 3, at the constant: the park jitter window can never be zero-width
     /// (a `% 0` would also panic), regardless of how small `PAUSED_PARK_HOURS` becomes.
     #[test]
     fn park_jitter_is_never_degenerate() {
-        assert!(
-            PARK_JITTER_SPREAD_HOURS >= 1,
-            "park jitter spread must be >= 1h; zero spread re-creates the thundering herd"
-        );
+        const {
+            assert!(
+                PARK_JITTER_SPREAD_HOURS >= 1,
+                "park jitter spread must be >= 1h; zero spread re-creates the thundering herd"
+            );
+        }
         // ...and at the current park it is a real ±10% window, not the degenerate floor.
         assert_eq!(PARK_JITTER_SPREAD_HOURS, PAUSED_PARK_HOURS / 5);
     }
@@ -3559,10 +3593,12 @@ mod tests {
             TRIGGER_PARKED_AFTER_HOURS as f64 > TIER_FAST_DORMANT_HOURS,
             "the trigger would wake dormant-tier series, not parked ones"
         );
-        assert!(
-            TRIGGER_PARKED_AFTER_HOURS < PAUSED_PARK_HOURS - PARK_JITTER_SPREAD_HOURS / 2,
-            "the trigger must select every parked row, including the shortest jitter draw"
-        );
+        const {
+            assert!(
+                TRIGGER_PARKED_AFTER_HOURS < PAUSED_PARK_HOURS - PARK_JITTER_SPREAD_HOURS / 2,
+                "the trigger must select every parked row, including the shortest jitter draw"
+            );
+        }
     }
 
     fn at(iso: &str) -> DateTime<Utc> {
@@ -3702,7 +3738,9 @@ mod tests {
         assert_eq!(resolve_interval(None, 8.0), 8.0);
         // The long ceiling stays reachable for a DELIBERATE admin override only.
         assert_eq!(resolve_interval(Some(336.0), 6.0), 336.0);
-        assert!(ACTIVE_MAX_INTERVAL_HOURS < MAX_INTERVAL_HOURS);
+        const {
+            assert!(ACTIVE_MAX_INTERVAL_HOURS < MAX_INTERVAL_HOURS);
+        }
     }
 
     /// P1-1: "awaiting" must mean genuinely late, not merely "a scheduled scan found

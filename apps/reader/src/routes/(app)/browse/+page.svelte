@@ -33,6 +33,7 @@
 </script>
 
 <script lang="ts">
+	import { mobileModalFocus } from '$lib/modal-focus';
 	import { page } from '$app/state';
 	import { beforeNavigate, goto } from '$app/navigation';
 	import { tick } from 'svelte';
@@ -869,7 +870,14 @@
 		<h1>Browse</h1>
 		<div class="searchbar">
 			<Icon name="search" size={20} stroke="#87857f" />
-			<input bind:value={query} placeholder="Search series, authors, genres…" />
+			<input
+				type="search"
+				name="q"
+				autocomplete="off"
+				aria-label="Search series, authors, and genres"
+				bind:value={query}
+				placeholder="Search series, authors, genres…"
+			/>
 			{#if query}
 				<button class="clear" aria-label="Clear" onclick={() => (query = '')}
 					><Icon name="x" size={18} /></button
@@ -881,10 +889,15 @@
 
 <div class="body k-gutter">
 	{#if filtersOpen}
-		<button class="filter-scrim" aria-label="Close filters" onclick={() => (filtersOpen = false)}
+		<button
+			class="filter-scrim"
+			data-modal-backdrop
+			tabindex="-1"
+			aria-label="Close filters"
+			onclick={() => (filtersOpen = false)}
 		></button>
 	{/if}
-	<aside class="rail" class:open={filtersOpen}>
+	<aside class="rail" class:open={filtersOpen} use:mobileModalFocus={filtersOpen}>
 		<div class="rail-head">
 			<span class="rail-title">Filters</span>
 			<div class="rail-head-right">
@@ -1319,7 +1332,11 @@
 		background: var(--k-hover-fill);
 		border: 1px solid var(--k-border-3);
 		color: var(--k-text-3);
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s,
+			opacity 0.15s;
 	}
 	.chip.on {
 		background: var(--k-primary);
@@ -1568,7 +1585,11 @@
 		background: transparent;
 		border: 1px solid var(--k-border-4);
 		color: var(--k-text-dimmer);
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s,
+			opacity 0.15s;
 	}
 	.sortchip.on {
 		background: var(--k-primary);
@@ -1767,7 +1788,8 @@
 			bottom: 0;
 			top: auto;
 			z-index: 60;
-			max-height: 84vh;
+			max-height: 84dvh;
+			overscroll-behavior: contain;
 			overflow-y: auto;
 			gap: 22px;
 			padding: 18px 20px calc(24px + env(safe-area-inset-bottom));

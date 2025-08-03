@@ -7,16 +7,12 @@
 # There is no XSS sink in the app today (no {@html}, innerHTML or eval anywhere), so
 # this is defence-in-depth around a console that keeps a bearer token in localStorage.
 #
-# script-src: 'unsafe-inline' is required, not preferred. Two inline scripts run on
-# every page: the no-FOUC theme script in src/app.html, and SvelteKit's own bootstrap
-# in index.html (`__sveltekit_… ; import("/_app/immutable/entry/start.<hash>.js")`).
-# The bootstrap embeds per-build content hashes, so its sha256 changes on EVERY build
-# and cannot be hardcoded here — and adding a hash for only the theme script would
-# make the browser ignore 'unsafe-inline' and break the bootstrap. The clean fix is
-# `kit.csp = { mode: 'hash', directives: { … } }` in apps/admin/svelte.config.js,
-# which makes SvelteKit emit a per-build hashed policy in a <meta> tag; once that's in
-# place, move the theme script to an external /theme-init.js (SvelteKit does not hash
-# inline scripts coming from app.html) and tighten script-src here to 'self'.
+# SvelteKit generates a hash-based CSP meta policy in the fallback HTML.
+# That policy excludes unsafe-inline scripts. This complementary response header
+# retains its bootstrap allowance because CSP policies intersect: the generated
+# hashes would otherwise also have to be duplicated into this static header.
+# Theme initialization is external (/theme-init.js), authorized by self.
+# frame-ancestors remains a response header (meta policies cannot enforce it).
 #
 # connect-src pins the GraphQL API baked in at build time (PUBLIC_KOMIKA_API).
 /*

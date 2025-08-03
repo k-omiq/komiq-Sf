@@ -511,8 +511,8 @@ export interface Backend {
  * TRENDING is the server's default and degrades to newest-release for everything with
  * no recent views, so a cold view table cannot render Browse empty; RATING likewise
  * puts rated works first and falls through to newest for the unrated. NEWEST orders by
- * newest upstream CHAPTER release. LATEST_ADDED orders by when Komiq first made the
- * newest chapter available, which may be later than the source's release date.
+ * newest upstream CHAPTER release. LATEST_ADDED orders by when the work entered Komiq's
+ * catalogue, with work identity breaking ties.
  */
 export type BrowseSort = 'TRENDING' | 'NEWEST' | 'LATEST_ADDED' | 'RATING' | 'CHAPTERS';
 

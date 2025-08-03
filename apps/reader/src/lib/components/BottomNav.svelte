@@ -19,16 +19,54 @@
 
 <nav class="bottom-nav" aria-label="Primary">
 	{#each tabs as t (t.href)}
-		<a href={t.href} class="tab" class:active={isActive(t.href)} aria-current={isActive(t.href) ? 'page' : undefined}>
+		<a
+			href={t.href}
+			class="tab"
+			class:active={isActive(t.href)}
+			aria-current={isActive(t.href) ? 'page' : undefined}
+		>
 			<span class="ic" aria-hidden="true">
 				{#if t.icon === 'home'}
-					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5" /><path d="M5 9.5V21h5v-6h4v6h5V9.5" /></svg>
+					<svg
+						viewBox="0 0 24 24"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+						><path d="M3 10.5 12 3l9 7.5" /><path d="M5 9.5V21h5v-6h4v6h5V9.5" /></svg
+					>
 				{:else if t.icon === 'browse'}
-					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7" /><path d="m21 21-4.3-4.3" /></svg>
+					<svg
+						viewBox="0 0 24 24"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2"
+						stroke-linecap="round"
+						stroke-linejoin="round"><circle cx="11" cy="11" r="7" /><path d="m21 21-4.3-4.3" /></svg
+					>
 				{:else if t.icon === 'updates'}
-					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></svg>
+					<svg
+						viewBox="0 0 24 24"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+						><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" /><path
+							d="M13.7 21a2 2 0 0 1-3.4 0"
+						/></svg
+					>
 				{:else}
-					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z" /></svg>
+					<svg
+						viewBox="0 0 24 24"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+						><path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z" /></svg
+					>
 				{/if}
 			</span>
 			<span class="lbl">{t.label}</span>
@@ -53,11 +91,50 @@
 			-webkit-backdrop-filter: blur(16px);
 			backdrop-filter: blur(16px);
 			border-top: 1px solid var(--k-border);
-			padding-bottom: env(safe-area-inset-bottom, 0px);
-			/* Keep WebKit's fixed bar in its own layer during momentum scrolling. */
-			transform: translateZ(0);
-			-webkit-transform: translateZ(0);
-			will-change: transform;
+			/* Home-indicator inset is padding INSIDE the bar, so the glass reaches the
+			   physical bottom edge (needs viewport-fit=cover, set in app.html). The side
+			   insets keep the outer tabs clear of the notch in landscape. */
+			padding: 0 env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px)
+				env(safe-area-inset-left, 0px);
+		}
+		/* A skirt of bar background hanging below the bar. iOS Safari re-anchors fixed
+		   elements a frame late while its toolbar collapses/expands and during the bottom
+		   rubber-band, which briefly opened a strip of page content under the bar. The
+		   skirt is off-screen whenever the bar is where it belongs. */
+		.bottom-nav::after {
+			content: '';
+			position: absolute;
+			left: 0;
+			right: 0;
+			top: 100%;
+			height: 120px;
+			background: var(--k-glass-strong, var(--k-glass));
+			pointer-events: none;
+		}
+		/* A fixed bar is laid out against the LAYOUT viewport. When the on-screen keyboard
+		   opens, iOS shrinks only the visual viewport, so the bar ends up floating above
+		   the keyboard / mid-screen as soon as the page scrolls. Native tab bars hide while
+		   typing; do the same while a text field has focus. */
+		:global(
+				html:has(
+					:is(
+						input:not(
+							[type='checkbox'],
+							[type='radio'],
+							[type='range'],
+							[type='button'],
+							[type='submit'],
+							[type='reset'],
+							[type='file'],
+							[type='color']
+						),
+						textarea,
+						[contenteditable='true']
+					):focus
+				)
+			)
+			.bottom-nav {
+			display: none;
 		}
 		.tab {
 			display: flex;

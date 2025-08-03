@@ -84,8 +84,8 @@ export default {
 		} catch {
 			return errorResponse(400, 'Invalid ?src URL');
 		}
-		if (upstream.protocol !== 'http:' && upstream.protocol !== 'https:') {
-			return errorResponse(400, 'src must be http(s)');
+		if (!safeUpstreamUrl(upstream)) {
+			return errorResponse(400, 'src must be http(s) without credentials or nonstandard ports');
 		}
 		if (!hostAllowed(upstream.hostname, env.ALLOWED_SOURCE_HOSTS)) {
 			return errorResponse(400, 'src host not allowed');
@@ -127,26 +127,24 @@ export default {
 			originResp = await fetchFollowingRedirects(upstream, env.ALLOWED_SOURCE_HOSTS);
 		} catch (err) {
 			if (err instanceof ProxyError) {
-				console.error(`img proxy: ${err.message} for ${upstream.toString()}`);
+				console.error(`img proxy: ${err.message} for ${upstream.origin}`);
 				return errorResponse(err.status, err.message);
 			}
-			console.error(`img proxy: upstream fetch failed for ${upstream.toString()}:`, err);
+			console.error(`img proxy: upstream fetch failed for ${upstream.origin}`);
 			return errorResponse(502, 'Upstream fetch failed');
 		}
 		if (!originResp.ok || !originResp.body) {
-			console.error(`img proxy: upstream ${originResp.status} for ${upstream.toString()}`);
+			console.error(`img proxy: upstream ${originResp.status} for ${upstream.origin}`);
 			return errorResponse(502, `Upstream ${originResp.status}`);
 		}
 
 		// Only ever re-serve actual images. Without this, an upstream `text/html`
 		// (or any non-image) body would be laundered under our trusted origin with
 		// permissive CORS + a 7-day immutable cache (content laundering / cache
-		// poisoning) — see I3. Reject anything that isn't `image/*`.
+		// poisoning) — see I3. Accept only recognized raster media types.
 		const contentType = originResp.headers.get('Content-Type') ?? '';
 		if (!isImageContentType(contentType)) {
-			console.error(
-				`img proxy: non-image Content-Type "${contentType}" for ${upstream.toString()}`,
-			);
+			console.error(`img proxy: non-image Content-Type "${contentType}" for ${upstream.origin}`);
 			return errorResponse(502, 'Upstream is not an image');
 		}
 
@@ -156,7 +154,7 @@ export default {
 		const declaredLen = originResp.headers.get('Content-Length');
 		if (declaredLen && Number(declaredLen) > MAX_IMAGE_BYTES) {
 			console.error(
-				`img proxy: upstream Content-Length ${declaredLen} exceeds cap for ${upstream.toString()}`,
+				`img proxy: upstream Content-Length ${declaredLen} exceeds cap for ${upstream.origin}`,
 			);
 			return errorResponse(502, 'Upstream image too large');
 		}
@@ -190,6 +188,7 @@ async function fetchFollowingRedirects(
 				Accept: 'image/*,*/*;q=0.8',
 			},
 			redirect: 'manual',
+			signal: AbortSignal.timeout(15_000),
 		});
 
 		if (!isRedirectStatus(resp.status)) return resp;
@@ -203,8 +202,11 @@ async function fetchFollowingRedirects(
 		} catch {
 			throw new ProxyError(502, 'Upstream redirect to an invalid Location');
 		}
-		if (next.protocol !== 'http:' && next.protocol !== 'https:') {
-			throw new ProxyError(400, 'redirect target must be http(s)');
+		if (!safeUpstreamUrl(next)) {
+			throw new ProxyError(
+				400,
+				'redirect target must be http(s) without credentials or nonstandard ports',
+			);
 		}
 		if (!hostAllowed(next.hostname, allowRaw)) {
 			throw new ProxyError(400, 'redirect host not allowed');
@@ -299,10 +301,28 @@ function errorResponse(status: number, message: string): Response {
  * event handlers) and re-serving it under our permissive-CORS origin is a stored
  * XSS vector, so it must never be laundered through the proxy.
  */
-function isImageContentType(contentType: string): boolean {
+export function isImageContentType(contentType: string): boolean {
 	const type = contentType.split(';', 1)[0].trim().toLowerCase();
-	if (type === 'image/svg+xml' || type === 'image/svg') return false;
-	return /^image\//i.test(type);
+	return [
+		'image/jpeg',
+		'image/png',
+		'image/webp',
+		'image/gif',
+		'image/avif',
+		'image/bmp',
+		'image/x-icon',
+		'image/vnd.microsoft.icon',
+	].includes(type);
+}
+
+/** Restrict source URLs to the public web service of an allowed host. */
+export function safeUpstreamUrl(url: URL): boolean {
+	return (
+		(url.protocol === 'http:' || url.protocol === 'https:') &&
+		url.username === '' &&
+		url.password === '' &&
+		url.port === ''
+	);
 }
 
 /** Parse a comma-separated allowlist var into a trimmed, non-empty list. */

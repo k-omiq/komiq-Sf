@@ -24,7 +24,11 @@ export function resolvedTheme(pref: ThemePref = theme.pref): 'light' | 'dark' {
 
 function apply(pref: ThemePref): void {
 	if (typeof document === 'undefined') return;
-	document.documentElement.dataset.theme = resolvedTheme(pref);
+	const resolved = resolvedTheme(pref);
+	document.documentElement.dataset.theme = resolved;
+	document
+		.querySelector('meta[name="theme-color"]')
+		?.setAttribute('content', resolved === 'dark' ? '#0c0c0d' : '#f4f2ee');
 }
 
 /** Restore the saved preference and start tracking OS changes. Call once on mount. */

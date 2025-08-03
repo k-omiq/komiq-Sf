@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { modalFocus } from '$lib/modal-focus';
 	// Admin-only source SPLITTER for the series page — the counterpart to MergeDialog.
 	//
 	// IT IS NOT AN "UNDO MERGE", AND IT CANNOT BE. `mergeWorks` deletes the losing work
@@ -141,7 +142,7 @@
 </script>
 
 {#if open}
-	<div class="scrim-wrap" role="dialog" aria-modal="true" aria-label="Split sources">
+	<div class="scrim-wrap" use:modalFocus role="dialog" aria-modal="true" aria-label="Split sources">
 		<button class="scrim" onclick={close} tabindex="-1" aria-hidden="true"></button>
 		<div class="panel">
 			<header>
@@ -189,7 +190,7 @@
 								</span>
 								<span class="logo">
 									{#if row.iconUrl}
-										<img src={row.iconUrl} alt="" loading="lazy" />
+										<img width="32" height="32" src={row.iconUrl} alt="" loading="lazy" />
 									{:else}
 										<span class="initial">{row.sourceName.charAt(0)}</span>
 									{/if}
@@ -291,6 +292,7 @@
 		backdrop-filter: blur(6px);
 	}
 	.panel {
+		overscroll-behavior: contain;
 		position: relative;
 		display: flex;
 		flex-direction: column;

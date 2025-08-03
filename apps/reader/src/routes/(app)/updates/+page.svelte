@@ -144,6 +144,7 @@
 </svelte:head>
 
 <div class="trending k-gutter">
+	<h1 class="page-title">Updates</h1>
 	{#if loading}
 		<section class="tgroup">
 			<div class="k-skeleton head-sk"></div>
@@ -177,7 +178,7 @@
      the viewport, not the top of the document (which would be the trending rail). -->
 <div class="updates k-gutter" id="updates-list">
 	<div class="updates-head">
-		<h2 class="section-label">Updates</h2>
+		<h2 class="section-label">Latest Chapters</h2>
 		<!-- Tabs and format chips are LINKS, not buttons: the facet is URL state now, so a
 		     link is the honest control — shareable, middle/ctrl-clickable, crawlable — and
 		     SvelteKit still intercepts the click for a client-side navigation. Each href
@@ -294,6 +295,11 @@
 </div>
 
 <style>
+	.page-title {
+		font-size: 34px;
+		line-height: 1.15;
+		color: var(--k-text-bright);
+	}
 	.trending {
 		display: flex;
 		flex-direction: column;
@@ -303,11 +309,10 @@
 	.section-label {
 		font-family: var(--k-font-display);
 		font-weight: 700;
-		font-size: 16px;
-		letter-spacing: 0.04em;
-		text-transform: uppercase;
+		font-size: 20px;
+		letter-spacing: -0.02em;
 		margin: 0;
-		color: var(--k-text-dimmer);
+		color: var(--k-text-2);
 	}
 	.tgroup {
 		display: flex;
@@ -318,7 +323,7 @@
 		display: flex;
 		gap: 22px;
 		overflow-x: auto;
-		padding-bottom: 4px;
+		padding: 4px 4px 12px;
 	}
 	.updates {
 		/* Clears the sticky header (and the section's own 48px top padding, which is
@@ -358,7 +363,11 @@
 		color: var(--k-text-dimmer);
 		border: 1px solid var(--k-border-4);
 		text-decoration: none;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s,
+			opacity 0.15s;
 	}
 	.tab:focus-visible,
 	.ttab:focus-visible,
@@ -389,7 +398,11 @@
 		border: 1px solid var(--k-border-4);
 		color: var(--k-text-dimmer);
 		text-decoration: none;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s,
+			opacity 0.15s;
 	}
 	.ttab.on {
 		background: var(--k-primary);

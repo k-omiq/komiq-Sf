@@ -5,16 +5,11 @@
 //!   2. normalized-title exact      -> candidate
 //!   3. fuzzy title (token block)   -> candidate shortlist
 //!   4. corroborate (description / cover pHash / author / year) -> confidence score
-//!   5. decide: external-ID OR unambiguous exact-title -> auto-merge; fuzzy high
-//!      (cover-corroborated) -> auto-merge; mid -> manual review queue; low -> new work
+//!   5. exact title + >=90% author characters -> auto-merge; fuzzy high
+//!      (cover-corroborated) -> auto-merge; mid -> manual review queue.
 //!
-//! Runs at add-time for Tier-2 series, where a human reviews the mid band. Operator
-//! policy: an EXACT normalized-title match auto-merges (identical titles = same work)
-//! PROVIDED the title identifies exactly one work and is not a short common phrase
-//! (`EXACT_MERGE_MIN_TITLE_CHARS`); otherwise it drops to `Review`. A FUZZY
-//! (token-block) match reaches `AutoMerge` only when cover-corroborated at HIGH, else it
-//! lands in `Review` — so a shared common token can't silently merge distinct works
-//! (prequels/sequels/seasons carry distinct titles and stay separate).
+//! Author names ignore case, punctuation and word order. Missing authors remain
+//! in review. External identities and admin split decisions retain precedence.
 
 use std::collections::HashSet;
 
@@ -61,19 +56,11 @@ pub enum Decision {
 }
 
 /// Fuzzy-match bands: a cover-corroborated fuzzy match >= HIGH auto-merges; >= MID
-/// goes to the manual review queue; below is a new work. (An EXACT normalized-title
-/// match bypasses these bands and auto-merges outright — see `resolve`.)
+/// goes to review; below is a new work. Exact titles with matching authors bypass
+/// these bands — see `resolve`.
 pub const HIGH: f64 = 0.85;
 pub const MID: f64 = 0.6;
 const FUZZY_BLOCK_LIMIT: i64 = 50;
-/// Minimum normalized-title length for an EXACT-title auto-merge. Mirrors
-/// `graphql::FEDERATED_MIN_TITLE_CHARS`, which guards the federated consolidation
-/// path for exactly this reason: below it a title is a common phrase rather than an
-/// identity. Live catalogue evidence — "first love" resolves to 18 distinct works,
-/// "love letter" 13, "change" 12, "confession" 12, and 1,624 works carry a colliding
-/// normalized title under 5 characters. Auto-merging on one of those physically
-/// DELETES an unrelated work, so they go to the review queue instead.
-const EXACT_MERGE_MIN_TITLE_CHARS: usize = 5;
 /// How many of the longest title tokens the fuzzy block keys on (DD4). Keying on
 /// only the single longest token missed a merge whenever the discriminating token
 /// wasn't the longest; unioning the top-N candidate sets closes that recall gap.
@@ -143,39 +130,16 @@ pub async fn resolve_ex(
         return Ok(Decision::New);
     }
 
-    // 2. Normalized-title exact -> candidate ids. `exact_norm_hits` records WHICH
-    //    normalized titles hit, so the auto-merge guard below can reject a hit that
-    //    rests only on a too-short (common-phrase) title.
+    // 2. Exact normalized aliases shortlist candidates; author names disambiguate them.
     let mut candidate_ids: HashSet<String> = HashSet::new();
-    let mut exact_hit = false;
-    let mut exact_norm_hits: Vec<&str> = Vec::new();
     for nt in &norm_titles {
-        let ids = catalog::find_works_by_alias(pool, nt).await?;
-        // Only a title that matched some work OTHER than the one being reconciled is
-        // evidence of a duplicate. Counting a self-match here let a distinctive title
-        // that hit ONLY the work itself satisfy the length guard below, while the actual
-        // link to the other work rested entirely on a short common phrase — precisely the
-        // auto-merge the guard exists to refuse. (`exact_hit` is corrected for the same
-        // reason a few lines down, once the excluded id has been removed from the set.)
-        if ids.iter().any(|id| Some(id.as_str()) != exclude_work_id) {
-            exact_hit = true;
-            exact_norm_hits.push(nt.as_str());
-        }
-        candidate_ids.extend(ids);
+        candidate_ids.extend(catalog::find_works_by_alias(pool, nt).await?);
     }
-    // Drop the work being reconciled (it matches its own aliases). If that leaves no
-    // exact candidate, there was no OTHER exact match → clear exact_hit so the fuzzy
-    // fallback still runs and a title-only self-match can't force an auto-merge.
     if let Some(ex) = exclude_work_id {
         candidate_ids.remove(ex);
-        if candidate_ids.is_empty() {
-            exact_hit = false;
-        }
     }
-    // How many DISTINCT works the exact-title lookup returned. Captured here because
-    // `candidate_ids` is refilled from the fuzzy block below when it is empty; more
-    // than one means the title does not identify a single work.
-    let exact_candidates = candidate_ids.len();
+    let exact_hit = !candidate_ids.is_empty();
+    let exact_ids = candidate_ids.clone();
 
     // 3. Fuzzy blocking when no exact hit: block on the top-N longest title tokens
     //    (union), so the discriminating token being shorter than a generic one
@@ -210,10 +174,19 @@ pub async fn resolve_ex(
     let cand_desc_shingles: Option<DescShingles> =
         cand.description.as_deref().map(description_shingles);
     let mut best: Option<(Scored, String)> = None;
+    let mut author_hits = Vec::new();
     for wid in &candidate_ids {
         let Some(md) = match_data.get(wid) else {
             continue;
         };
+        if exact_ids.contains(wid)
+            && crate::catalog::similarity::authors_match(
+                cand.author.as_deref(),
+                md.author.as_deref(),
+            )
+        {
+            author_hits.push(wid.clone());
+        }
         let scored = score_candidate(cand, &cand_title_shingles, cand_desc_shingles.as_ref(), md);
         let replace = match best.as_ref() {
             None => true,
@@ -223,45 +196,41 @@ pub async fn resolve_ex(
             best = Some((scored, wid.clone()));
         }
     }
+    // Author corroboration disambiguates unrelated namesakes. When several copies
+    // qualify, attach to the richest one; the consolidation sweep folds the others.
+    if !author_hits.is_empty() {
+        let wid = catalog::pick_survivor(pool, &author_hits).await?;
+        let md = &match_data[&wid];
+        best = Some((
+            score_candidate(cand, &cand_title_shingles, cand_desc_shingles.as_ref(), md),
+            wid,
+        ));
+    }
     let Some((scored, work_id)) = best else {
         return Ok(Decision::New);
     };
 
-    // An admin already ruled on this exact pair by SPLITTING it apart (migration 0098):
-    // leave it alone entirely — not merged, and not queued either, because the review
-    // queue asks a question this pair has an answer to.
-    //
-    // This is not belt-and-braces, it is the load-bearing guard for the reconcile sweep.
-    // A split-off work is Suwayomi-only by construction whenever the MangaDex anchor
-    // stayed behind, which is precisely `RECONCILE_PENDING_WHERE`, so the background
-    // post-ingest dedup re-matches it against the spine — where it hits the ORIGINAL on
-    // an exact normalized title (the shared title is what caused the bad merge, and the
-    // original keeps that alias). `exact_auto_merge` below needs NO corroboration, so
-    // without this the sweep silently folds the split back and `merge_works` DELETES the
-    // work an admin just created.
-    //
-    // Returning `New` rather than falling through to the next-best candidate is
-    // deliberate: the runner-up scored lower than a pair we know to be wrong, so
-    // promoting it would be guessing. A genuine duplicate elsewhere is still caught by
-    // `consolidate_exact_duplicates_from` and by the next pass.
+    // A rejected review or an admin split takes precedence over automatic matching.
     if let Some(self_id) = exclude_work_id {
-        if catalog::is_split_pair(pool, self_id, &work_id).await? {
+        let rejected: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM merge_candidate mc JOIN source_series ss \
+             ON ss.id = mc.source_series_id WHERE mc.status = 'rejected' AND \
+             ((ss.work_id = ? AND mc.candidate_work_id = ?) OR \
+              (ss.work_id = ? AND mc.candidate_work_id = ?)))",
+        )
+        .bind(self_id)
+        .bind(&work_id)
+        .bind(&work_id)
+        .bind(self_id)
+        .fetch_one(pool)
+        .await?;
+        if rejected || catalog::is_split_pair(pool, self_id, &work_id).await? {
             return Ok(Decision::New);
         }
     }
     let score = scored.score;
 
-    // 5. Decide. Operator policy (explicit): an UNAMBIGUOUS exact normalized-title
-    //    match auto-merges outright — identical titles are treated as the same work
-    //    (this is what consolidates the existing Suwayomi catalogue into the MangaDex
-    //    spine on reconcile). A FUZZY (token-block) match is riskier — a shared common
-    //    token can span distinct works — so it still auto-merges ONLY with cover
-    //    corroboration at HIGH, otherwise it lands in Review. (Prequels/sequels/seasons
-    //    carry distinct titles, so they don't exact-match and stay separate / queued.)
-    // `method` labels align to the documented `merge_candidate.method` enum
-    // (migration 0005): external_id / title_exact / fuzzy / description / cover. The
-    // scored path emits title_exact (exact alias hit) or fuzzy (token-block hit); the
-    // finer description/cover distinction isn't surfaced separately (DD6).
+    // Exact titles require author corroboration. Fuzzy matches retain the cover gate.
     let method = if exact_hit { "title_exact" } else { "fuzzy" };
     // Require both a tight pHash match AND that the candidate's own cover hash is
     // discriminative — a near-uniform hash must not corroborate an auto-merge.
@@ -274,21 +243,7 @@ pub async fn resolve_ex(
             .as_deref()
             .map(is_discriminative_phash)
             .unwrap_or(false);
-    // The exact-title rung auto-merges only when the title actually IDENTIFIES one
-    // work. Two guards, both of which the federated path already applies
-    // (`graphql::federated_consolidate_ok`) and this rung previously skipped entirely:
-    //   * exactly one candidate — `find_works_by_alias` routinely returns many ids for
-    //     a common phrase, and the tie-break above then picks the lowest work_id, i.e.
-    //     an arbitrary one of 18 unrelated "first love" works;
-    //   * a normalized title of at least `EXACT_MERGE_MIN_TITLE_CHARS`.
-    // Neither can be rescued by cover corroboration in production, where
-    // `COVER_PHASH=off` leaves `phash_sim` permanently `None`. A hit that fails either
-    // guard is DOWNGRADED to `Review` (an exact hit always scores >= MID) rather than
-    // irreversibly merged — a human resolves it from the queue.
-    let exact_title_long_enough = exact_norm_hits
-        .iter()
-        .any(|t| t.chars().count() >= EXACT_MERGE_MIN_TITLE_CHARS);
-    let exact_auto_merge = exact_hit && exact_candidates == 1 && exact_title_long_enough;
+    let exact_auto_merge = exact_hit && !author_hits.is_empty();
     let decision = if exact_auto_merge || (score >= HIGH && cover_corroborated) {
         Decision::AutoMerge {
             work_id,
@@ -362,29 +317,8 @@ fn score_candidate(
     }
 }
 
-/// Order-insensitive author-name key: lowercased word tokens, sorted (D1). Folds
-/// "Masashi Kishimoto" and "Kishimoto Masashi" to the same key so a cross-source
-/// name-order variance doesn't defeat author corroboration.
-fn author_key(name: &str) -> Vec<String> {
-    let mut toks: Vec<String> = name
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
-    toks.sort();
-    toks
-}
-
 fn author_matches(a: &Option<String>, b: &Option<String>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => {
-            let ka = author_key(a);
-            // Non-empty and equal as a sorted token multiset (order-insensitive).
-            !ka.is_empty() && ka == author_key(b)
-        }
-        _ => false,
-    }
+    crate::catalog::similarity::authors_match(a.as_deref(), b.as_deref())
 }
 
 fn year_close(a: Option<i64>, b: Option<i64>) -> bool {
@@ -447,6 +381,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_title_and_fuzzy_author_auto_merge_even_for_short_names() {
+        let pool = pool().await;
+        let mut matching = String::new();
+        for author in ["Masashi Kishimoto", "Different Person"] {
+            let id = catalog::create_work(
+                &pool,
+                &WorkInput {
+                    primary_title: Some("Ao".into()),
+                    author: Some(author.into()),
+                    aliases: vec![Alias {
+                        raw: "Ao".into(),
+                        lang: None,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            if author == "Masashi Kishimoto" {
+                matching = id;
+            }
+        }
+        let cand = Candidate {
+            title: "AO!".into(),
+            author: Some("Kishimot, Masashi".into()),
+            ..Default::default()
+        };
+        match resolve(&pool, &cand).await.unwrap() {
+            Decision::AutoMerge {
+                work_id, method, ..
+            } => {
+                assert_eq!(work_id, matching);
+                assert_eq!(method, "title_exact");
+            }
+            other => panic!("expected author-corroborated merge, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn external_id_auto_merges() {
         let pool = pool().await;
         let w = seed_slime(&pool).await;
@@ -470,33 +443,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_title_only_auto_merges() {
+    async fn exact_title_without_author_requires_review() {
         let pool = pool().await;
         let w = seed_slime(&pool).await;
-        // Same alt-title, no description/cover — an exact normalized-title hit, which
-        // now auto-merges outright under the exact-title policy.
+        // Title alone supplies no author corroboration.
         let cand = Candidate {
             title: "Tensei Shitara Slime Datta Ken".into(),
             ..Default::default()
         };
         match resolve(&pool, &cand).await.unwrap() {
-            Decision::AutoMerge { work_id, .. } => assert_eq!(work_id, w),
-            other => panic!("expected auto-merge (exact title), got {other:?}"),
+            Decision::Review { work_id, .. } => assert_eq!(work_id, w),
+            other => panic!("expected review without an author, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn exact_title_auto_merges_without_cover() {
-        // Operator policy: an EXACT normalized-title match auto-merges outright, even
-        // without a corroborating cover — identical titles are treated as the same work
-        // (this is what folds the Suwayomi catalogue into the MangaDex spine on
-        // reconcile). Distinct works with a genuinely identical title are the accepted
-        // trade-off of this policy; near-matches (sequels/seasons) carry distinct titles
-        // and take the fuzzy path instead.
+        // Matching authors authorize an exact-title merge without a cover.
         let pool = pool().await;
         let w = seed_slime(&pool).await;
         let cand = Candidate {
             title: "Tensei Shitara Slime Datta Ken".into(),
+            author: Some("Fuse".into()),
             description: Some(
                 "The ordinary Mikami Satoru found himself dying after being stabbed by a slasher."
                     .into(),
@@ -731,13 +699,14 @@ mod tests {
         // its localized alt titles (here the romaji `ja-ro`). A series arriving
         // from another extension under only that localized title — with no shared
         // description or cover — must still resolve to the same work. Under the
-        // exact-title policy this now auto-merges outright (an exact alt-title alias
+        // exact-title and author policy this auto-merges (an exact alt-title alias
         // hit), consolidating the same series across extensions automatically.
         let pool = pool().await;
         let w = seed_slime(&pool).await; // primary "That Time..."; alt "Tensei Shitara Slime Datta Ken"
         let localized = Candidate {
             // A different extension only knows the romaji title.
             title: "Tensei Shitara Slime Datta Ken".into(),
+            author: Some("Fuse".into()),
             ..Default::default()
         };
         match resolve(&pool, &localized).await.unwrap() {
@@ -795,21 +764,19 @@ mod tests {
             other => panic!("expected an exact-title auto-merge above MID, got {other:?}"),
         }
 
-        // A bare title-only hit with NO author still SCORES exactly MID (the C2 guard's
-        // floor) — corroboration genuinely absent, no false lift — though the exact
-        // title still auto-merges it.
+        // Missing authors stay in review and score at MID.
         let bare = Candidate {
             title: "Naruto".into(),
             ..Default::default()
         };
         match resolve(&pool, &bare).await.unwrap() {
-            Decision::AutoMerge { score, .. } => {
+            Decision::Review { score, .. } => {
                 assert!(
                     (score - MID).abs() < 1e-9,
                     "bare title-only must stay at MID; got {score}"
                 );
             }
-            other => panic!("expected bare-title auto-merge at MID, got {other:?}"),
+            other => panic!("expected bare-title review at MID, got {other:?}"),
         }
     }
 
@@ -839,6 +806,7 @@ mod tests {
                     &pool,
                     &WorkInput {
                         primary_title: Some(t.into()),
+                        author: Some("Known Author".into()),
                         aliases: vec![Alias {
                             raw: t.into(),
                             lang: None,
@@ -854,13 +822,16 @@ mod tests {
         let split_off = mk(title).await;
         let cand = Candidate {
             title: title.into(),
+            author: Some("Known Author".into()),
             ..Default::default()
         };
 
         // Control: with no split on record this is exactly the destructive auto-merge.
         match resolve_ex(&pool, &cand, Some(&split_off)).await.unwrap() {
             Decision::AutoMerge { work_id, .. } => assert_eq!(work_id, original),
-            other => panic!("expected the bare exact-title auto-merge, got {other:?}"),
+            other => {
+                panic!("expected the author-corroborated exact-title auto-merge, got {other:?}")
+            }
         }
 
         // What `catalog::split_source_series` leaves behind (migration 0098): the pair,

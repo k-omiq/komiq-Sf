@@ -234,6 +234,8 @@ pub struct AppState {
     pub scan_health: Mutex<ScanHealth>,
     /// Per-key sliding-window limiter for `login` / `register`.
     pub auth_limiter: RateLimiter,
+    /// Bound concurrent 64 MiB password jobs across all client IPs.
+    pub password_work: std::sync::Arc<tokio::sync::Semaphore>,
     /// Per-user sliding-window limiter for `searchAllSources` (C1). That endpoint
     /// fans out to many sources and performs writes (library enrollment + dedup
     /// persist), so an authenticated client must not be able to hammer it.
@@ -522,6 +524,65 @@ impl Series {
             .collect())
     }
 
+    /// Imported metadata resolves through the canonical work for every ID shape.
+    async fn metadata(&self, ctx: &Context<'_>) -> Result<Option<SeriesMetadata>> {
+        let pool = &state(ctx).pool;
+        let Some(work_id) = resolve_work_id(pool, &self.id.0).await else {
+            return Ok(None);
+        };
+        let facts = sqlx::query_as::<
+            _,
+            (Option<i64>, Option<String>, Option<String>, Option<String>),
+        >(
+            "SELECT year, original_language, demographic, content_rating FROM work WHERE id = ?",
+        )
+        .bind(&work_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(gql_err)?;
+        let Some((year, original_language, demographic, content_rating)) = facts else {
+            return Ok(None);
+        };
+        let curated: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM work_tag WHERE work_id = ? AND source = 'admin')",
+        )
+        .bind(&work_id)
+        .fetch_one(pool)
+        .await
+        .map_err(gql_err)?;
+        let tags = sqlx::query_as::<_, (Option<String>, String, Option<String>)>(
+            "SELECT tag_id, tag, tag_group FROM work_tag WHERE work_id = ? AND source = ? ORDER BY ord, tag"
+        ).bind(&work_id).bind(if curated { "admin" } else { "mangadex" })
+            .fetch_all(pool).await.map_err(gql_err)?.into_iter()
+            .map(|(id, name, group)| MetadataTag { id: if curated { None } else { id }, name,
+                group: if curated { "custom".into() } else { group.unwrap_or_else(|| "other".into()) } }).collect();
+        let mut rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT provider, external_id FROM work_tracker_link WHERE work_id = ? ORDER BY provider"
+        ).bind(&work_id).fetch_all(pool).await.map_err(gql_err)?;
+        if let Some(id) = sqlx::query_scalar::<_, String>("SELECT source_key FROM source_series WHERE work_id = ? AND source_type = 'mangadex' ORDER BY source_key LIMIT 1")
+            .bind(&work_id).fetch_optional(pool).await.map_err(gql_err)? {
+            rows.insert(0, ("mangadex".into(), id));
+        }
+        let trackers = rows
+            .into_iter()
+            .filter_map(|(provider, external_id)| {
+                crate::mangadex::tracker_url(&provider, &external_id).map(|url| TrackerLink {
+                    provider,
+                    external_id,
+                    url,
+                })
+            })
+            .collect();
+        Ok(Some(SeriesMetadata {
+            year: year.and_then(|n| i32::try_from(n).ok()),
+            original_language,
+            demographic,
+            content_rating,
+            tags,
+            trackers,
+        }))
+    }
+
     /// The work's full cover set (F2), primary first then by volume. Empty for a
     /// work with no covers stored yet or a non-canonical series. `coverUrl` (the
     /// primary) keeps working independently.
@@ -693,6 +754,7 @@ fn parse_chapter_number(raw: &str) -> Option<f64> {
 ///  - `WHERE canonical_progress.read = 0` on the conflict — a chapter already marked read
 ///    keeps its stored `updated_at`, so replaying a finish doesn't restamp a whole series
 ///    and shove it to the top of the "Recently read" sort.
+///
 /// `last_page_read` is only ever written on INSERT, so a chapter the viewer had genuinely
 /// stopped partway through keeps the position it stopped at.
 async fn catch_up_canonical(
@@ -1804,9 +1866,29 @@ fn group_aggregated_chapters(rows: Vec<catalog::WorkChapterRow>) -> Vec<Aggregat
             suwayomi_manga_id: r.suwayomi_manga_id.map(ID),
             chapter_id: ID(r.chapter_id),
             scanlator: r.scanlator,
+            copy_released_at: r.released_at,
+            copy_external_url: r.external_url,
         });
     }
-    by_key.into_values().collect()
+    // A DETERMINISTIC copy order within each number. `sources` now carries every upload of
+    // the number (several MangaDex groups' copies, not one per source), and the spine query
+    // has no ORDER BY inside a source — so without this the reader's version list, and the
+    // series page's "first copy" fallback, would reshuffle between two loads of the same
+    // page. Source order is the query's own (Suwayomi before the mirror, then by source id);
+    // within a source, oldest release first (the order the uploads appeared upstream), then
+    // the chapter id as the final tiebreak. `None` dates sort first under `Option`'s order,
+    // which is harmless — it only has to be stable.
+    let mut out: Vec<AggregatedChapter> = by_key.into_values().collect();
+    for c in &mut out {
+        c.sources.sort_by(|a, b| {
+            b.source_type
+                .cmp(&a.source_type)
+                .then_with(|| a.source_id.cmp(&b.source_id))
+                .then_with(|| a.copy_released_at.cmp(&b.copy_released_at))
+                .then_with(|| a.chapter_id.0.cmp(&b.chapter_id.0))
+        });
+    }
+    out
 }
 
 /// `Option<f64>` that can be a `BTreeMap` key: numbered chapters ascend, and unnumbered
@@ -2684,7 +2766,10 @@ fn map_canonical_chapter(
         // by anything this row carries. See `announce_map_for_work`.
         found_at: None,
         external_url: c.external_url,
-        scanlator: None,
+        // The group behind THIS copy (the spine's default copy of its number). Used to be a
+        // hard-coded `None` — the mirror never recorded a group — which is why the reader
+        // could not say who translated what it was showing.
+        scanlator: c.scanlator,
         read,
         last_page_read,
         bookmarked: false,
@@ -3083,6 +3168,10 @@ pub struct MatchResult {
 /// path (`canonicalSeries`); `cover_url` is a proxy-ready MangaDex cover thumbnail.
 #[derive(SimpleObject, sqlx::FromRow)]
 pub struct CanonicalUpdate {
+    #[sqlx(skip)]
+    pub average_rating: Option<f64>,
+    #[sqlx(skip)]
+    pub rating_count: i32,
     pub work_id: String,
     pub mangadex_id: String,
     pub title: Option<String>,
@@ -3662,7 +3751,33 @@ async fn compute_discovery(st: &AppState, show_nsfw: bool) -> Result<Vec<Discove
     // already-filtered list is a no-op, so both paths stay safe.
     let popular = filter_nsfw(show_nsfw, map_series_list(st, popular).await);
     let latest = filter_nsfw(show_nsfw, map_series_list(st, latest).await);
-    let recent = filter_nsfw(show_nsfw, map_series_list(st, recent).await);
+    // Home and Browse must use the same catalogue and ordering. Source-cache intake
+    // timestamps are unrelated to canonical work creation and previously made the
+    // two "Latest added" lists disagree entirely.
+    let latest_added = crate::browse::BrowseQuery {
+        show_nsfw,
+        type_word: None,
+        status_word: None,
+        ratings: None,
+        nsfw_only: false,
+        genres: &[],
+        has_chapters: None,
+        min_rating: None,
+        max_rating: None,
+        sort: BrowseSort::LatestAdded,
+        page: 1,
+    };
+    let (_, recent_rows) = crate::browse::browse_catalogue(&st.pool, &latest_added)
+        .await
+        .map_err(gql_err)?;
+    let recent = if recent_rows.is_empty() {
+        filter_nsfw(show_nsfw, map_series_list(st, recent).await)
+    } else {
+        filter_nsfw(show_nsfw, map_browse_rows(st, recent_rows).await)
+            .into_iter()
+            .take(PAGE_SIZE as usize)
+            .collect()
+    };
 
     // Trending = the 10 most-viewed series over the LAST 24 HOURS (the real
     // popularity signal from `recordView`, replacing the old "first 6 of Popular").
@@ -4052,12 +4167,20 @@ impl QueryRoot {
                 "{base} WHERE is_nsfw = 0 ORDER BY latest_at DESC, work_id DESC LIMIT ? OFFSET ?"
             )
         };
-        let rows = sqlx::query_as::<_, CanonicalUpdate>(&sql)
+        let mut rows = sqlx::query_as::<_, CanonicalUpdate>(&sql)
             .bind(PAGE_SIZE)
             .bind(offset)
             .fetch_all(&st.pool)
             .await
             .map_err(gql_err)?;
+        let ids: Vec<String> = rows.iter().map(|r| r.work_id.clone()).collect();
+        let ratings = rating_summary_by_work_batch(&st.pool, &ids).await;
+        for row in &mut rows {
+            if let Some(summary) = ratings.get(&row.work_id).filter(|r| r.count > 0) {
+                row.average_rating = Some(summary.average);
+                row.rating_count = summary.count;
+            }
+        }
         Ok(rows)
     }
 
@@ -5286,7 +5409,27 @@ impl QueryRoot {
         for (idx, series) in indices.into_iter().zip(map_series_batch(st, mangas).await) {
             out[idx] = Some(series);
         }
-        let out: Vec<Series> = out.into_iter().flatten().collect();
+        let mut out: Vec<Series> = out.into_iter().flatten().collect();
+        // A numeric library entry represents the same work as its canonical entry.
+        // Use the work feed's newest release so updates from a sibling source move
+        // the library card as well, rather than leaving it on this source's stale clock.
+        let work_recency: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
+            "SELECT ul.series_id, MAX(f.released_at) FROM user_library ul \
+             LEFT JOIN source_series ss ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
+             JOIN feed_series_updates f ON f.work_id = COALESCE(ss.work_id, ul.series_id) \
+             WHERE ul.user_id = ? GROUP BY ul.series_id",
+        )
+        .bind(&user.id)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?
+        .into_iter()
+        .collect();
+        for series in &mut out {
+            if let Some(at) = work_recency.get(&series.id.0) {
+                series.latest_chapter_at = epoch_ms_to_iso(*at);
+            }
+        }
         // Hide NSFW series from the library too, unless the viewer opted in (N2).
         Ok(filter_nsfw(viewer_show_nsfw(ctx).await, out))
     }
@@ -7695,7 +7838,7 @@ impl MutationRoot {
                    (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
                  VALUES (?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-                   last_page_read = excluded.last_page_read, read = excluded.read, \
+                   last_page_read = excluded.last_page_read, read = MAX(canonical_progress.read, excluded.read), \
                    work_id = excluded.work_id, updated_at = excluded.updated_at",
             )
             .bind(&user.id)
@@ -7739,7 +7882,7 @@ impl MutationRoot {
                (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?) \
              ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-               last_page_read = excluded.last_page_read, read = excluded.read, \
+               last_page_read = excluded.last_page_read, read = MAX(suwayomi_progress.read, excluded.read), \
                series_id = excluded.series_id, updated_at = excluded.updated_at",
         )
         .bind(&user.id)
@@ -8212,11 +8355,13 @@ impl MutationRoot {
         password: String,
     ) -> Result<Session> {
         let st = state(ctx);
-        // Rate-limit by client IP (not username, which would let an attacker lock
-        // out a victim). Check before verifying, but only *record* failed attempts
-        // below — successful logins must not consume the budget.
+        // Reserve the attempt atomically before expensive verification. Checking
+        // now and recording only after failure lets concurrent requests all pass
+        // an empty bucket, bypassing the limit and allocating Argon2 memory.
+        // Successful attempts consume budget too: valid credentials must not
+        // become an unlimited CPU/memory exhaustion primitive.
         let key = format!("login:{}", client_ip(ctx));
-        if let Some(retry) = st.auth_limiter.is_limited(&key) {
+        if let Err(retry) = st.auth_limiter.check(&key) {
             return Err(Error::new(format!(
                 "Too many login attempts — try again in {retry}s"
             )));
@@ -8225,7 +8370,6 @@ impl MutationRoot {
         // can never be valid (registration caps at the same length), so this is
         // just the wrong-credentials path.
         if password.len() > MAX_PASSWORD_LEN {
-            st.auth_limiter.record(&key);
             return Err(Error::new("Invalid username or password"));
         }
         let row = sqlx::query_as::<_, User>(
@@ -8245,10 +8389,16 @@ impl MutationRoot {
             None => DUMMY_PASSWORD_HASH.clone(),
         };
         let password_ok = {
+            let permit = st
+                .password_work
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| Error::new("Sign-in is busy — please try again shortly"))?;
             let password = password.clone();
             tokio::task::spawn_blocking(move || {
                 // Always compute the verify (constant-time-ish across exists/not-exists);
                 // only a real user with a matching hash counts as success.
+                let _permit = permit;
                 let verified = auth::verify_password(&password, &phc);
                 has_user && verified
             })
@@ -8258,12 +8408,11 @@ impl MutationRoot {
         let user = match row {
             Some(u) if password_ok => u,
             _ => {
-                st.auth_limiter.record(&key); // count only failed attempts
                 return Err(Error::new("Invalid username or password"));
             }
         };
         // A suspended account can't sign in even with the right password. This
-        // is not a failed credential attempt, so it doesn't consume the budget.
+        // still consumes the attempt budget, like every credential check.
         if user.is_banned != 0 {
             return Err(Error::new("This account has been suspended."));
         }
@@ -8330,12 +8479,9 @@ impl MutationRoot {
         {
             return Err(Error::new("This username is reserved."));
         }
-        // Case-insensitive uniqueness pre-check (L): the DB `UNIQUE` is byte-exact,
-        // so without this `mika` and `Mika` register as distinct accounts and one
-        // can impersonate the other. (Residual race: two concurrent registrations of
-        // case-variant names can still both pass this check; the byte-exact UNIQUE
-        // only stops exact-duplicate inserts. A COLLATE NOCASE unique index would
-        // close it fully but needs a migration owned elsewhere.)
+        // Friendly case-insensitive pre-check. The database triggers installed
+        // by migration 0103 enforce this atomically for simultaneous writers,
+        // while preserving legacy identities that already have case collisions.
         let taken: Option<i64> =
             sqlx::query_scalar("SELECT 1 FROM users WHERE username = ? COLLATE NOCASE")
                 .bind(username)
@@ -8347,11 +8493,19 @@ impl MutationRoot {
         }
         // Argon2 hashing is CPU-bound (~10-50ms): keep it off the async runtime.
         let hash = {
+            let permit = st
+                .password_work
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| Error::new("Sign-in is busy — please try again shortly"))?;
             let pw = input.password.clone();
-            tokio::task::spawn_blocking(move || auth::hash_password(&pw))
-                .await
-                .map_err(gql_err)?
-                .map_err(gql_err)?
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                auth::hash_password(&pw)
+            })
+            .await
+            .map_err(gql_err)?
+            .map_err(gql_err)?
         };
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -8761,9 +8915,8 @@ impl MutationRoot {
     }
 
     /// Admin: add an alternative title to a work. The title is indexed into the alias
-    /// set (so it drives dedup + search), and — per operator policy that identical
-    /// titles are the same work — if it exactly matches ANY OTHER work, those works are
-    /// auto-merged INTO this one. Returns the updated series in the caller's id shape.
+    /// set for dedup and search. Exact aliases with >=90% matching authors may merge
+    /// into the richest work. Returns the survivor in the caller's id shape.
     async fn add_series_alt_title(
         &self,
         ctx: &Context<'_>,
@@ -8799,6 +8952,17 @@ impl MutationRoot {
             if !involved.contains(&work_id) {
                 involved.push(work_id.clone());
             }
+            let match_data = catalog::load_match_data_batch(&st.pool, &involved)
+                .await
+                .map_err(gql_err)?;
+            let edited_author = match_data.get(&work_id).and_then(|m| m.author.as_deref());
+            involved.retain(|wid| {
+                wid == &work_id
+                    || crate::catalog::similarity::authors_match(
+                        edited_author,
+                        match_data.get(wid).and_then(|m| m.author.as_deref()),
+                    )
+            });
             if involved.len() >= 2 && involved.len() <= MAX_AUTO_MERGE {
                 survivor = catalog::pick_survivor(&st.pool, &involved)
                     .await
@@ -8819,14 +8983,47 @@ impl MutationRoot {
                         );
                         continue;
                     }
-                    // `_ex` + the covers pool: the loser's cached cover BLOB lives in a
-                    // separate database with no FK to `work`, so the plain entry point
-                    // orphans it forever (8,868 orphans / 1.53 GB measured in prod).
-                    catalog::merge_works_ex(&st.pool, Some(&st.cover_pool), other, &survivor)
-                        .await
-                        .map_err(gql_err)?;
+                    let pair: Vec<ConsolidateWork> = sqlx::query_as(
+                        "SELECT id, primary_title, year, author, cover_phash FROM work WHERE id IN (?, ?)")
+                        .bind(other).bind(&survivor).fetch_all(&st.pool).await.map_err(gql_err)?;
+                    let Some(source) = pair.iter().find(|w| &w.id == other) else {
+                        continue;
+                    };
+                    let Some(target) = pair.iter().find(|w| w.id == survivor) else {
+                        continue;
+                    };
+                    if !crate::catalog::similarity::authors_match(
+                        source.author.as_deref(),
+                        target.author.as_deref(),
+                    ) {
+                        continue;
+                    }
+                    match catalog::merge_works_checked(
+                        &st.pool,
+                        Some(&st.cover_pool),
+                        other,
+                        &survivor,
+                        Some((&source.identity(), &target.identity())),
+                    )
+                    .await
+                    {
+                        Ok(_) => {}
+                        Err(e) if is_precondition_failure(&e) => continue,
+                        Err(e) => return Err(gql_err(e)),
+                    }
                 }
             }
+        }
+        // A blocked pair may leave the edited work intact even if another survivor
+        // was selected. Keep the editor on that work until it actually merges away.
+        let edited_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work WHERE id = ?)")
+                .bind(&work_id)
+                .fetch_one(&st.pool)
+                .await
+                .map_err(gql_err)?;
+        if edited_exists {
+            survivor = work_id.clone();
         }
         // Return the survivor — if a merge picked a different canonical work, the edited
         // id may no longer exist, so reload the survivor by its own `w_` shape.
@@ -10286,7 +10483,7 @@ async fn works_needing_enrichment(pool: &SqlitePool, batch: i64) -> Result<Vec<S
         "SELECT ss.source_key FROM source_series ss \
          WHERE ss.source_type = 'mangadex' \
            AND EXISTS (SELECT 1 FROM work w WHERE w.id = ss.work_id \
-                       AND (w.metadata_synced_at IS NULL OR w.covers_synced_at IS NULL)) \
+                       AND (w.metadata_synced_at IS NULL OR w.covers_synced_at IS NULL OR w.mangadex_details_synced_at IS NULL)) \
          ORDER BY ss.created_at ASC LIMIT ?",
     )
     .bind(batch)
@@ -10468,6 +10665,18 @@ async fn federated_ingest(st: &AppState, raw_id: &str) -> anyhow::Result<MatchRe
 
 /// Create a session row and return its opaque token.
 async fn new_session(pool: &SqlitePool, user_id: &str, ttl_secs: i64) -> Result<String> {
+    let (is_admin,): (i64,) = sqlx::query_as("SELECT is_admin FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .map_err(gql_err)?;
+    // Privileged bearer tokens have a shorter exposure window. Existing tokens
+    // are not silently rotated; incident response must revoke them explicitly.
+    let ttl_secs = if is_admin != 0 {
+        ttl_secs.min(8 * 60 * 60)
+    } else {
+        ttl_secs
+    };
     let tok = auth::generate_token();
     // Store only sha256(token) at rest (defense-in-depth): a leaked DB snapshot
     // never yields a replayable bearer token. The plaintext `tok` is returned to
@@ -10620,10 +10829,8 @@ fn consolidate_phash_is_discriminative(hex: &str) -> bool {
     (12..=52).contains(&ones)
 }
 
-/// Hard ceiling on how many works may share one normalized alias and still be treated
-/// as duplicates. An alias shared by three or more works is a GENERIC-TITLE signal, not
-/// a duplicate signal: MangaDex alt-titles give every JoJo part the alias
-/// `ジョジョの奇妙な冒険`, and "first love" is the alias of 18 unrelated series.
+/// Alias groups wider than a pair need matching authors as well as matching primary
+/// titles. A shared franchise alias alone never permits consolidation.
 const CONSOLIDATE_MAX_CLUSTER: usize = 2;
 
 /// One work's identity metadata inside an exact-alias cluster — everything the
@@ -10659,20 +10866,6 @@ fn is_precondition_failure(e: &anyhow::Error) -> bool {
     e.to_string().starts_with("merge precondition failed")
 }
 
-/// Order-insensitive author-name key (mirrors `dedup::author_key`, private there):
-/// lowercased word tokens, sorted, so "Masashi Kishimoto" and "Kishimoto Masashi"
-/// fold together.
-fn consolidate_author_key(name: &str) -> Vec<String> {
-    let mut toks: Vec<String> = name
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
-    toks.sort();
-    toks
-}
-
 /// The ambiguity gate for an exact-alias consolidation. `Ok(())` means the pair is
 /// safe to fold irreversibly; `Err(reason)` is a short machine-friendly label used in
 /// the log line and to route the pair to the review queue instead.
@@ -10682,10 +10875,9 @@ fn consolidate_author_key(name: &str) -> Vec<String> {
 /// one franchise routinely share one. Every condition below must hold:
 ///
 ///  1. the shared alias is the PRIMARY title of both works (not merely an alt-title);
-///  2. the normalized title is at least `FEDERATED_MIN_TITLE_CHARS` long (same reason
-///     `federated_consolidate_ok` requires it — short common titles collide);
-///  3. corroboration beyond the title: equal-or-adjacent `year`, OR an equal author
-///     key, OR cover-pHash similarity >= `CONSOLIDATE_PHASH_CORROBORATION` between two
+///  2. short titles require >=90% author similarity;
+///  3. corroboration beyond the title: >=90% author similarity, equal-or-adjacent
+///     `year`, OR cover-pHash similarity >= `CONSOLIDATE_PHASH_CORROBORATION` between two
 ///     DISCRIMINATIVE hashes (`consolidate_phash_is_discriminative` — the guard
 ///     `dedup` applies alongside the same threshold).
 ///
@@ -10696,7 +10888,9 @@ fn consolidate_gate(
     a: &ConsolidateWork,
     b: &ConsolidateWork,
 ) -> std::result::Result<(), &'static str> {
-    if norm.chars().count() < FEDERATED_MIN_TITLE_CHARS {
+    let author_ok =
+        crate::catalog::similarity::authors_match(a.author.as_deref(), b.author.as_deref());
+    if norm.chars().count() < FEDERATED_MIN_TITLE_CHARS && !author_ok {
         return Err("short_title");
     }
     let is_primary = |w: &ConsolidateWork| {
@@ -10709,13 +10903,6 @@ fn consolidate_gate(
         return Err("alt_title_only");
     }
     let year_ok = matches!((a.year, b.year), (Some(x), Some(y)) if (x - y).abs() <= 1);
-    let author_ok = match (a.author.as_deref(), b.author.as_deref()) {
-        (Some(x), Some(y)) => {
-            let kx = consolidate_author_key(x);
-            !kx.is_empty() && kx == consolidate_author_key(y)
-        }
-        _ => false,
-    };
     // BOTH hashes must carry signal before their similarity means anything — see
     // `consolidate_phash_is_discriminative`. Checked before the comparison so a pair of
     // blank covers is not even scored.
@@ -10813,11 +11000,22 @@ async fn consolidate_exact_duplicates_from(
         if works.len() < 2 {
             continue;
         }
-        let survivor = works[0].clone();
-        // A cluster wider than a pair is a generic-title signal: refuse the WHOLE
-        // cluster (never "merge the first two"), and queue each member for review.
         let oversized = works.len() > CONSOLIDATE_MAX_CLUSTER;
+        let mut survivors = vec![works[0].clone()];
         for other in &works[1..] {
+            // A common title can contain several authors' works. Compare against
+            // the richest surviving representative for this author, not only the
+            // first work in the whole alias group.
+            let survivor = survivors
+                .iter()
+                .find(|candidate| {
+                    crate::catalog::similarity::authors_match(
+                        candidate.author.as_deref(),
+                        other.author.as_deref(),
+                    ) && consolidate_gate(&norm, candidate, other).is_ok()
+                })
+                .unwrap_or(&survivors[0])
+                .clone();
             // An admin already ruled on this pair by SPLITTING it apart (migration 0098).
             // Skip it outright — not queued for review either, because the review queue is
             // a question and this pair has an answer. Checked BEFORE the gate for the
@@ -10835,7 +11033,11 @@ async fn consolidate_exact_duplicates_from(
                 );
                 continue;
             }
-            let verdict = if oversized {
+            let verdict = if oversized
+                && !crate::catalog::similarity::authors_match(
+                    survivor.author.as_deref(),
+                    other.author.as_deref(),
+                ) {
                 Err("cluster_too_large")
             } else {
                 consolidate_gate(&norm, &survivor, other)
@@ -10879,6 +11081,7 @@ async fn consolidate_exact_duplicates_from(
                     }
                 }
                 Err(reason) => {
+                    survivors.push(other.clone());
                     match queue_consolidate_review(pool, &other.id, &survivor.id).await? {
                         true => out.queued += 1,
                         false => out.unqueueable += 1,
@@ -10927,6 +11130,89 @@ async fn queue_consolidate_review(
     Ok(true)
 }
 
+/// Revisit every waiting review using current primary titles and the author rule.
+/// Keyset pagination avoids starving later jobs when earlier rows remain in review.
+pub(crate) async fn auto_merge_pending_reviews(
+    pool: &SqlitePool,
+    covers: Option<&SqlitePool>,
+) -> anyhow::Result<u64> {
+    let mut cursor = String::new();
+    let mut merged = 0;
+    loop {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT mc.id, ss.work_id, mc.candidate_work_id FROM merge_candidate mc \
+             JOIN source_series ss ON ss.id = mc.source_series_id \
+             WHERE mc.status = 'pending' AND mc.id > ? ORDER BY mc.id LIMIT 200",
+        )
+        .bind(&cursor)
+        .fetch_all(pool)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for (id, source, target) in rows {
+            cursor = id.clone();
+            if source == target {
+                continue;
+            }
+            let mut identities: Vec<ConsolidateWork> = sqlx::query_as(
+                "SELECT id, primary_title, year, author, cover_phash FROM work WHERE id IN (?, ?)",
+            )
+            .bind(&source)
+            .bind(&target)
+            .fetch_all(pool)
+            .await?;
+            if identities.len() != 2 {
+                continue;
+            }
+            identities.sort_by_key(|w| w.id != source);
+            let (a, b) = (&identities[0], &identities[1]);
+            let norm = a
+                .primary_title
+                .as_deref()
+                .map(crate::catalog::normalize::normalize_title)
+                .unwrap_or_default();
+            if norm.is_empty()
+                || b.primary_title
+                    .as_deref()
+                    .map(crate::catalog::normalize::normalize_title)
+                    .as_deref()
+                    != Some(norm.as_str())
+                || !crate::catalog::similarity::authors_match(
+                    a.author.as_deref(),
+                    b.author.as_deref(),
+                )
+            {
+                continue;
+            }
+            match catalog::merge_pending_candidate_checked(
+                pool,
+                covers,
+                &source,
+                &target,
+                (&a.identity(), &b.identity()),
+                &id,
+            )
+            .await
+            {
+                Ok(_) => {
+                    merged += 1;
+                    tracing::info!(candidate_id = %id, loser = %source, survivor = %target, "auto-merged waiting review");
+                }
+                Err(e) if is_precondition_failure(&e) => {}
+                Err(e) => {
+                    tracing::warn!(candidate_id = %id, error = %e, "waiting review merge failed; will retry")
+                }
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    if merged > 0 {
+        clear_feed_caches();
+    }
+    Ok(merged)
+}
+
 /// Post-ingest dedup sweep: fold Suwayomi-only provisionals into the MangaDex spine
 /// (exact + fuzzy, over aliases — which include every MangaDex `altTitle`), then
 /// consolidate any remaining exact-alias duplicate clusters until none are left.
@@ -10953,6 +11239,9 @@ pub(crate) async fn run_post_ingest_dedup_ex(pool: &SqlitePool, covers: Option<&
         return;
     }
     tracing::info!("post-ingest dedup: starting");
+    if let Err(e) = auto_merge_pending_reviews(pool, covers).await {
+        tracing::warn!(error = %e, "post-ingest dedup: pending review sweep failed");
+    }
     match reconcile_provisional_works(pool, covers).await {
         Ok((merged, queued, skipped)) => {
             tracing::info!(merged, queued, skipped, "post-ingest dedup: reconcile done")
@@ -11256,13 +11545,18 @@ async fn add_source_series_core_ex(
             work_id,
             score,
             method,
-        } if consolidate && federated_consolidate_ok(*score, &m.title) => (
-            "review_consolidated",
-            Some(work_id.clone()),
-            Some(*score),
-            Some(method.clone()),
-            work_id.clone(),
-        ),
+        } if consolidate
+            && method != "title_exact"
+            && federated_consolidate_ok(*score, &m.title) =>
+        {
+            (
+                "review_consolidated",
+                Some(work_id.clone()),
+                Some(*score),
+                Some(method.clone()),
+                work_id.clone(),
+            )
+        }
         Decision::Review {
             work_id,
             score,
@@ -11363,12 +11657,9 @@ async fn add_source_series_core_ex(
     })
 }
 
-/// Ensure every configured admin username exists and is an admin. An existing
-/// account is promoted (never re-passworded); a missing one is CREATED from
-/// `admin_password` (with `is_admin = 1`). When no password is configured, a
-/// missing admin can only be logged — it cannot self-register, since admin names
-/// are reserved from open registration (A5). This is the sole path to admin
-/// status: `register` never grants it.
+/// Create configured admins, or promote an existing unprivileged account only
+/// after verifying its current password. Existing admins are never re-passworded.
+/// Ambiguous legacy usernames fail closed; provisioning does not merge identities.
 pub async fn provision_admins(
     pool: &SqlitePool,
     admin_users: &[String],
@@ -11376,17 +11667,50 @@ pub async fn provision_admins(
     admin_email: Option<&str>,
 ) -> anyhow::Result<()> {
     for (idx, username) in admin_users.iter().enumerate() {
-        let existing: Option<(String,)> =
-            sqlx::query_as("SELECT id FROM users WHERE username = ? COLLATE NOCASE")
-                .bind(username)
-                .fetch_optional(pool)
-                .await?;
-        if let Some((id,)) = existing {
-            sqlx::query("UPDATE users SET is_admin = 1 WHERE id = ?")
-                .bind(&id)
-                .execute(pool)
-                .await?;
-            tracing::info!(username, "ensured admin (promoted existing account)");
+        let existing: Vec<(String, String, i64, i64)> = sqlx::query_as(
+            "SELECT id, password_hash, is_admin, is_banned FROM users WHERE username = ? COLLATE NOCASE",
+        )
+        .bind(username)
+        .fetch_all(pool)
+        .await?;
+        if existing.len() > 1 {
+            tracing::warn!(
+                username,
+                "admin provisioning refused: ambiguous existing username"
+            );
+            continue;
+        }
+        if let Some((id, hash, is_admin, is_banned)) = existing.first() {
+            if *is_admin != 0 {
+                continue;
+            }
+            if *is_banned != 0
+                || !admin_password.is_some_and(|password| auth::verify_password(password, hash))
+            {
+                tracing::warn!(username, "admin promotion refused: current account password proof required and account must not be suspended");
+                continue;
+            }
+            let mut tx = pool.begin().await?;
+            // Guard against a password/ban change between proof and promotion.
+            let promoted = sqlx::query(
+                "UPDATE users SET is_admin = 1 WHERE id = ? AND password_hash = ? AND is_admin = 0 AND is_banned = 0",
+            )
+            .bind(id)
+            .bind(hash)
+            .execute(&mut *tx)
+            .await?;
+            if promoted.rows_affected() != 0 {
+                // Old regular-user bearer sessions must not gain admin powers.
+                sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                tracing::info!(
+                    username,
+                    "promoted admin after password proof; prior sessions revoked"
+                );
+            }
+            tx.commit().await?;
             continue;
         }
         let Some(pw) = admin_password else {
@@ -11668,8 +11992,7 @@ mod tests {
     #[tokio::test]
     async fn add_source_series_review_does_not_duplicate_on_re_add() {
         let pool = migrated_pool().await;
-        // Pre-seed a work with a title so a same-titled add auto-merges into it under
-        // the exact-title policy (exact normalized-title hit).
+        // An exact title without an author waits for review; re-adding is idempotent.
         let existing = crate::catalog::create_work(
             &pool,
             &crate::catalog::WorkInput {
@@ -11686,7 +12009,7 @@ mod tests {
 
         let m = suwayomi_manga(7, "Twin Star Exorcists", &["Action"], "src1");
         let r1 = add_source_series_core(&pool, &m, None).await.unwrap();
-        assert_eq!(r1.decision, "auto_merge", "exact title auto-merges");
+        assert_eq!(r1.decision, "review", "missing author requires review");
         assert_eq!(r1.matched_work_id.as_deref(), Some(existing.as_str()));
 
         let works_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
@@ -11697,7 +12020,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(mc_before, 0, "exact-title match auto-merged; no review row");
+        assert_eq!(mc_before, 1, "one waiting review");
 
         // DD2: re-add → existing; neither an orphan work nor a merge_candidate is
         // created.
@@ -11729,9 +12052,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn federated_corroborated_match_consolidates_to_existing_work() {
-        // C2: a mid-confidence match CORROBORATED beyond the title (here a shared
-        // description) links DIRECTLY to the existing work — one work, no review row.
+    async fn federated_exact_title_with_description_but_no_author_waits_for_review() {
+        // A shared description cannot bypass the author requirement for an exact title.
         let pool = migrated_pool().await;
         let blurb = "Twin exorcists destined to marry and birth the Miko.";
         let existing = crate::catalog::create_work(
@@ -11754,20 +12076,202 @@ mod tests {
         let r = add_source_series_core_ex(&pool, &m, None, true)
             .await
             .unwrap();
-        // Exact normalized-title hit → auto-merges outright (the exact-title policy
-        // supersedes the review-consolidate path for identical titles).
-        assert_eq!(r.decision, "auto_merge");
-        assert_eq!(r.work_id, existing, "links to the existing work");
+        assert_eq!(r.decision, "review");
+        assert_eq!(r.matched_work_id, Some(existing));
         let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(works, 1, "no provisional work created");
+        assert_eq!(works, 2, "keeps a provisional work pending review");
         let mc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(mc, 0, "corroborated consolidation enqueues no review row");
+        assert_eq!(mc, 1, "one waiting review");
+    }
+
+    async fn waiting_pair(
+        pool: &SqlitePool,
+        title: &str,
+        other_title: &str,
+        author: Option<&str>,
+        other_author: Option<&str>,
+        status: &str,
+    ) -> (String, String, String) {
+        let mut ids = Vec::new();
+        for (title, author) in [(title, author), (other_title, other_author)] {
+            ids.push(
+                catalog::create_work(
+                    pool,
+                    &catalog::WorkInput {
+                        primary_title: Some(title.into()),
+                        author: author.map(str::to_string),
+                        aliases: vec![catalog::Alias {
+                            raw: title.into(),
+                            lang: None,
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let ssid = format!("ss_{}", uuid::Uuid::new_v4());
+        sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
+            VALUES (?, ?, 'suwayomi', 'src', ?, '2020-01-01T00:00:00Z')")
+            .bind(&ssid).bind(&ids[0]).bind(&ssid).execute(pool).await.unwrap();
+        let review = catalog::insert_merge_candidate(pool, &ssid, &ids[1], 0.6, "title_exact")
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE merge_candidate SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(&review)
+            .execute(pool)
+            .await
+            .unwrap();
+        (ids[0].clone(), ids[1].clone(), review)
+    }
+
+    #[tokio::test]
+    async fn waiting_reviews_auto_merge_only_matching_names_and_authors() {
+        let pool = migrated_pool().await;
+        let (source, target, review) = waiting_pair(
+            &pool,
+            "Ao",
+            "AO!",
+            Some("Masashi Kishimoto"),
+            Some("Kishimot Masashi"),
+            "pending",
+        )
+        .await;
+        let mut untouched = Vec::new();
+        for (other_title, author, other_author, status) in [
+            ("Ao", Some("One Person"), Some("Another Person"), "pending"),
+            ("Ao", None, None, "pending"),
+            (
+                "Ao Sequel",
+                Some("Masashi Kishimoto"),
+                Some("Masashi Kishimoto"),
+                "pending",
+            ),
+            (
+                "Ao",
+                Some("Masashi Kishimoto"),
+                Some("Masashi Kishimoto"),
+                "rejected",
+            ),
+            (
+                "Ao",
+                Some("Masashi Kishimoto"),
+                Some("Masashi Kishimoto"),
+                "confirmed",
+            ),
+        ] {
+            untouched
+                .push(waiting_pair(&pool, "Ao", other_title, author, other_author, status).await);
+        }
+        let split = waiting_pair(
+            &pool,
+            "Ao",
+            "Ao",
+            Some("Same Author"),
+            Some("Same Author"),
+            "pending",
+        )
+        .await;
+        sqlx::query("INSERT INTO work_split (work_a, work_b, split_at) VALUES (MIN(?, ?), MAX(?, ?), '2026-10-03')")
+            .bind(&split.0).bind(&split.1).bind(&split.0).bind(&split.1).execute(&pool).await.unwrap();
+        untouched.push(split);
+        assert_eq!(auto_merge_pending_reviews(&pool, None).await.unwrap(), 1);
+        assert_eq!(
+            catalog::redirect_work_id(&pool, &source).await.unwrap(),
+            Some(target)
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM merge_candidate WHERE id = ?")
+            .bind(&review)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "confirmed");
+        for (a, b, _) in untouched {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id IN (?, ?)")
+                .bind(a)
+                .bind(b)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 2);
+        }
+        assert_eq!(auto_merge_pending_reviews(&pool, None).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn waiting_review_claim_rolls_back_when_identity_changes_or_review_is_rejected() {
+        let pool = migrated_pool().await;
+        let (source, target, review) = waiting_pair(
+            &pool,
+            "Naruto",
+            "Naruto",
+            Some("Masashi Kishimoto"),
+            Some("Masashi Kishimoto"),
+            "pending",
+        )
+        .await;
+        let identity = catalog::WorkIdentity {
+            primary_title: Some("Naruto".into()),
+            author: Some("Masashi Kishimoto".into()),
+            ..Default::default()
+        };
+        sqlx::query("UPDATE work SET author = 'Another Person' WHERE id = ?")
+            .bind(&source)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let result = catalog::merge_pending_candidate_checked(
+            &pool,
+            None,
+            &source,
+            &target,
+            (&identity, &identity),
+            &review,
+        )
+        .await;
+        assert!(is_precondition_failure(&result.unwrap_err()));
+        let status: String = sqlx::query_scalar("SELECT status FROM merge_candidate WHERE id = ?")
+            .bind(&review)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending");
+        sqlx::query("UPDATE work SET author = 'Masashi Kishimoto' WHERE id = ?")
+            .bind(&source)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE merge_candidate SET status = 'rejected' WHERE id = ?")
+            .bind(&review)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let result = catalog::merge_pending_candidate_checked(
+            &pool,
+            None,
+            &source,
+            &target,
+            (&identity, &identity),
+            &review,
+        )
+        .await;
+        assert!(is_precondition_failure(&result.unwrap_err()));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id IN (?, ?)")
+            .bind(source)
+            .bind(target)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     /// Build a `ConsolidateWork` for the gate unit tests.
@@ -11839,6 +12343,61 @@ mod tests {
             ),
             Err("short_title")
         );
+    }
+
+    #[tokio::test]
+    async fn consolidate_merges_matching_authors_inside_a_larger_namesake_group() {
+        let pool = migrated_pool().await;
+        let (other_author, canonical, _) = waiting_pair(
+            &pool,
+            "Ao",
+            "Ao",
+            Some("Different Person"),
+            Some("Masashi Kishimoto"),
+            "pending",
+        )
+        .await;
+        let (duplicate, extra, _) = waiting_pair(
+            &pool,
+            "Ao",
+            "Another Title",
+            Some("Kishimot Masashi"),
+            Some("Unrelated Person"),
+            "pending",
+        )
+        .await;
+        // Force the unrelated namesake to be the first survivor by giving it more sources.
+        for key in ["extra-1", "extra-2"] {
+            catalog::upsert_source_series(
+                &pool,
+                &other_author,
+                "suwayomi",
+                "src",
+                key,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        let out = consolidate_exact_duplicates_from(&pool, None, 100, "")
+            .await
+            .unwrap();
+        assert_eq!(out.merged.len(), 1);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id IN (?, ?)")
+            .bind(&canonical)
+            .bind(&duplicate)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "same author copies collapse");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id IN (?, ?)")
+            .bind(other_author)
+            .bind(extra)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "unrelated namesakes survive");
     }
 
     /// P0-1 end-to-end: three works sharing one alias is a GENERIC-TITLE cluster, not a
@@ -12188,19 +12747,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn federated_exact_title_collision_auto_merges() {
-        // Exact-title policy (explicit operator decision): a bare exact-title match —
-        // zero corroboration, exactly MID — now AUTO-MERGES into the existing work
-        // rather than minting a provisional + a merge_candidate. Treating identical
-        // normalized titles as the same work is what folds the Suwayomi catalogue into
-        // the MangaDex spine; the accepted trade-off is that two genuinely distinct
-        // same-titled series will merge. (FUZZY title-only collisions still take the
-        // cautious provisional + review path — see `federated_consolidate_ok`.)
+    async fn federated_exact_title_and_author_auto_merge() {
+        // Matching title and author links directly to the canonical work.
         let pool = migrated_pool().await;
         let existing = crate::catalog::create_work(
             &pool,
             &crate::catalog::WorkInput {
                 primary_title: Some("Twin Star Exorcists".into()),
+                author: Some("Yoshiaki Sukeno".into()),
                 aliases: vec![crate::catalog::Alias {
                     raw: "Twin Star Exorcists".into(),
                     lang: None,
@@ -12211,8 +12765,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Same title, NO description/cover → exact title-only hit.
-        let m = suwayomi_manga(7, "Twin Star Exorcists", &["Action"], "src-ext2");
+        let mut m = suwayomi_manga(7, "Twin Star Exorcists", &["Action"], "src-ext2");
+        m.author = Some("Sukeno Yoshiak".into());
         let r = add_source_series_core_ex(&pool, &m, None, true)
             .await
             .unwrap();
@@ -12249,7 +12803,8 @@ mod tests {
         let pool = migrated_pool().await;
         // 1. A Suwayomi series enrolled BEFORE any MangaDex spine → its own provisional
         //    work (nothing to match against yet).
-        let m = suwayomi_manga(42, "Reconcile Target", &["Action"], "src-suw");
+        let mut m = suwayomi_manga(42, "Reconcile Target", &["Action"], "src-suw");
+        m.author = Some("Known Author".into());
         let r = add_source_series_core(&pool, &m, None).await.unwrap();
         assert_eq!(r.decision, "new", "no spine yet → provisional work");
         let provisional = r.work_id.clone();
@@ -12260,6 +12815,7 @@ mod tests {
             &pool,
             &crate::catalog::WorkInput {
                 primary_title: Some("Reconcile Target".into()),
+                author: Some("Known Author".into()),
                 aliases: vec![crate::catalog::Alias {
                     raw: "Reconcile Target".into(),
                     lang: None,
@@ -12470,6 +13026,11 @@ mod tests {
     }
 
     async fn setup_full(max: u32) -> (ApiSchema, SqlitePool) {
+        let (schema, pool, _) = setup_with_state(max).await;
+        (schema, pool)
+    }
+
+    async fn setup_with_state(max: u32) -> (ApiSchema, SqlitePool, std::sync::Arc<AppState>) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -12524,6 +13085,7 @@ mod tests {
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(max, 60),
+            password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
             series_inflight: KeyedLocks::default(),
@@ -12532,7 +13094,7 @@ mod tests {
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
         });
-        (build_schema(state, false), pool)
+        (build_schema(state.clone(), false), pool, state)
     }
 
     async fn exec(
@@ -13902,6 +14464,7 @@ mod tests {
                 admin_users: vec![],
                 scan_health: Mutex::new(ScanHealth::default()),
                 auth_limiter: RateLimiter::new(100, 60),
+                password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
                 federated_limiter: RateLimiter::new(100, 60),
                 session_ttl_secs: 30 * 24 * 60 * 60,
                 series_inflight: KeyedLocks::default(),
@@ -13981,7 +14544,7 @@ mod tests {
             "existing password preserved, not reset"
         );
 
-        // Existing non-admin gets promoted; no password required.
+        // Existing non-admin requires proof of its current password.
         seed_user(&pool, "bob-id", "bob", 0, 0).await;
         provision_admins(&pool, &["bob".into()], None, None)
             .await
@@ -13991,7 +14554,96 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(bob_admin, 1, "existing account promoted");
+        assert_eq!(
+            bob_admin, 0,
+            "a configured name alone cannot grant privileges"
+        );
+        provision_admins(&pool, &["BOB".into()], Some("wrong-password"), None)
+            .await
+            .unwrap();
+        let (before_proof,): (i64,) =
+            sqlx::query_as("SELECT is_admin FROM users WHERE id = 'bob-id'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(before_proof, 0, "wrong password cannot promote");
+        let token = new_session(&pool, "bob-id", 30 * 24 * 60 * 60)
+            .await
+            .unwrap();
+        provision_admins(&pool, &["BOB".into()], Some("password123"), None)
+            .await
+            .unwrap();
+        let (bob_admin, hash): (i64, String) =
+            sqlx::query_as("SELECT is_admin, password_hash FROM users WHERE id = 'bob-id'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(bob_admin, 1, "current password proves account ownership");
+        assert!(auth::verify_password("password123", &hash));
+        let (sessions,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sessions WHERE token = ?")
+            .bind(auth::hash_token(&token))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sessions, 0, "pre-promotion sessions are revoked atomically");
+    }
+
+    #[tokio::test]
+    async fn provisioning_refuses_suspended_and_ambiguous_accounts() {
+        let (_, pool) = setup_full(100).await;
+        seed_user(&pool, "suspended-admin", "suspended", 0, 1).await;
+        provision_admins(&pool, &["suspended".into()], Some("password123"), None)
+            .await
+            .unwrap();
+        let (privileged,): (i64,) =
+            sqlx::query_as("SELECT is_admin FROM users WHERE id = 'suspended-admin'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(privileged, 0);
+        // Model a collision predating the guard migration, without merging IDs.
+        sqlx::query("DROP TRIGGER users_username_nocase_insert")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_user(&pool, "legacy-a", "legacy", 0, 0).await;
+        seed_user(&pool, "legacy-b", "LEGACY", 0, 0).await;
+        provision_admins(&pool, &["legacy".into()], Some("password123"), None)
+            .await
+            .unwrap();
+        let (privileged,): (i64,) = sqlx::query_as(
+            "SELECT SUM(is_admin) FROM users WHERE username = 'legacy' COLLATE NOCASE",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(privileged, 0, "no arbitrary legacy identity promoted");
+    }
+
+    #[tokio::test]
+    async fn admin_session_lifetime_is_bounded_and_respects_shorter_setting() {
+        let (_, pool) = setup_full(100).await;
+        seed_user(&pool, "session-admin", "session-admin", 1, 0).await;
+        seed_user(&pool, "session-reader", "session-reader", 0, 0).await;
+        for (id, configured, expected) in [
+            ("session-admin", 30 * 24 * 60 * 60, 8 * 60 * 60),
+            ("session-admin", 120, 120),
+            ("session-reader", 30 * 24 * 60 * 60, 30 * 24 * 60 * 60),
+        ] {
+            let token = new_session(&pool, id, configured).await.unwrap();
+            let (created, expires): (String, String) =
+                sqlx::query_as("SELECT created_at, expires_at FROM sessions WHERE token = ?")
+                    .bind(auth::hash_token(&token))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let elapsed = chrono::DateTime::parse_from_rfc3339(&expires).unwrap()
+                - chrono::DateTime::parse_from_rfc3339(&created).unwrap();
+            // Expiry serialization truncates fractional seconds; the duration
+            // must remain within one second of the selected lifetime.
+            assert!(elapsed.num_milliseconds() <= expected * 1000);
+            assert!(elapsed.num_milliseconds() > (expected - 1) * 1000);
+        }
     }
 
     #[tokio::test]
@@ -14012,6 +14664,7 @@ mod tests {
             admin_users: vec!["admin".into()],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
+            password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
             series_inflight: KeyedLocks::default(),
@@ -14504,6 +15157,43 @@ mod tests {
     /// dedupe by lowercased TITLE. That dedupe is why nothing could be paged: it removed
     /// rows AFTER both pages arrived, so pages under-filled and `total`/`hasNextPage`
     /// became fiction. Here the dedupe is by work IDENTITY and happens once, at refresh.
+    #[tokio::test]
+    async fn updates_ratings_preserve_votes_from_canonical_and_source_ids() {
+        let (s, pool) = setup_full(100).await;
+        seed_canonical(&pool, "md-feed-rating", "Rated work", false, "3").await;
+        seed_canonical(&pool, "md-feed-unrated", "Unrated work", false, "1").await;
+        let wid = work_id_of(&pool, "md-feed-rating").await;
+        seed_suwayomi_half(&pool, &wid, 778, "Rated work", Some("1784937600000"), None).await;
+        for (id, sid, user, score) in [
+            ("rate-work", wid.as_str(), "bob-id", 6),
+            ("rate-source", "778", "admin-id", 8),
+        ] {
+            sqlx::query("INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) VALUES (?, ?, ?, ?, '', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+                .bind(id).bind(sid).bind(user).bind(score).execute(&pool).await.unwrap();
+        }
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+        let response = exec(&s, "{ updatesFeed { items { title rating } } canonicalUpdates { title averageRating ratingCount } }", None, "1.1.1.1").await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let data = response.data.into_json().unwrap();
+        let merged = data["updatesFeed"]["items"].as_array().unwrap();
+        let canonical = data["canonicalUpdates"].as_array().unwrap();
+        assert_eq!(
+            merged.iter().find(|r| r["title"] == "Rated work").unwrap()["rating"],
+            7.0
+        );
+        assert!(merged
+            .iter()
+            .find(|r| r["title"] == "Unrated work")
+            .unwrap()["rating"]
+            .is_null());
+        let rated = canonical
+            .iter()
+            .find(|r| r["title"] == "Rated work")
+            .unwrap();
+        assert_eq!(rated["averageRating"], 7.0);
+        assert_eq!(rated["ratingCount"], 2);
+    }
+
     #[tokio::test]
     async fn updates_feed_folds_both_halves_into_one_row_per_work() {
         let (s, pool) = setup_full(100).await;
@@ -15562,6 +16252,82 @@ mod tests {
     ///
     /// The second work is the "count but no known latest number" case the reader has to
     /// degrade for: `latestChapter` must be `null`, NOT `0`, NOT `""`, and NOT the count.
+    #[tokio::test]
+    async fn latest_added_home_matches_browse_and_library_uses_work_recency() {
+        let (s, pool) = setup_full(100).await;
+        seed_feed_member(
+            &pool,
+            991,
+            "Source intake",
+            Some("1752969600000"),
+            "2026-07-26T00:00:00Z",
+            1,
+        )
+        .await;
+        seed_canonical(&pool, "md-home-a", "Older work", false, "1").await;
+        seed_canonical(&pool, "md-home-b", "Newest work", false, "1").await;
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+        sqlx::query("UPDATE browse_catalogue SET created_at = CASE title WHEN 'Newest work' THEN '2026-10-03T00:00:00Z' ELSE '2020-01-01T00:00:00Z' END")
+            .execute(&pool).await.unwrap();
+        let home = exec(
+            &s,
+            "{ discovery { kind items { id title } } }",
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert!(home.errors.is_empty(), "{:?}", home.errors);
+        let home = home.data.into_json().unwrap();
+        let added = home["discovery"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rail| rail["kind"] == "RECENTLY_ADDED")
+            .unwrap();
+        let browse = exec(
+            &s,
+            "{ search(query: \"\", sort: LATEST_ADDED) { items { id title } } }",
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert!(browse.errors.is_empty(), "{:?}", browse.errors);
+        let browse = browse.data.into_json().unwrap();
+        assert_eq!(added["items"], browse["search"]["items"]);
+        assert_eq!(added["items"][0]["title"], "Newest work");
+
+        let work_id: String =
+            sqlx::query_scalar("SELECT id FROM work WHERE primary_title = 'Newest work'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        crate::catalog::upsert_source_series(
+            &pool, &work_id, "suwayomi", "src", "991", None, false,
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO user_library (user_id, series_id, created_at) VALUES ('bob-id', '991', '2026-10-03T00:00:00Z')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE feed_series_updates SET released_at = 1790985600000 WHERE work_id = ?")
+            .bind(&work_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let lib = exec(
+            &s,
+            "{ library { id latestChapterAt } }",
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(lib.errors.is_empty(), "{:?}", lib.errors);
+        let lib = lib.data.into_json().unwrap();
+        assert_eq!(
+            lib["library"][0]["latestChapterAt"],
+            epoch_ms_to_iso(1790985600000)
+        );
+    }
+
     #[tokio::test]
     async fn browse_cards_carry_the_latest_chapter_number_beside_the_count() {
         let (s, pool) = setup_full(100).await;
@@ -16982,6 +17748,110 @@ mod tests {
     ///
     /// Asserts the whole bridge, not just the field: numeric id → work → siblings.
     #[tokio::test]
+    async fn mangadex_metadata_resolves_both_ids_and_refresh_preserves_curation() {
+        let (s, pool) = setup_full(100).await;
+        let mid = "a77742b1-befd-49a4-bff5-1ad4e6b0ef7b";
+        let mut input = catalog::WorkInput {
+            primary_title: Some("Imported title".into()),
+            year: Some(2020),
+            original_language: Some("ja".into()),
+            demographic: Some("shounen".into()),
+            content_rating: Some("safe".into()),
+            tags: vec!["Action".into()],
+            tag_details: vec![catalog::SourceTag {
+                id: Some("391b0423-d847-456f-aff0-8b0cfc03066b".into()),
+                name: "Action".into(),
+                group: "genre".into(),
+            }],
+            external_ids: vec![
+                ("al".into(), "123".into()),
+                ("mu".into(), "abc123x".into()),
+                ("ap".into(), "../../evil".into()),
+            ],
+            ..Default::default()
+        };
+        let work = catalog::upsert_work_from_mangadex(&pool, mid, &input)
+            .await
+            .unwrap();
+        catalog::upsert_source_series(&pool, &work, "suwayomi", "src-a", "42", None, false)
+            .await
+            .unwrap();
+        let fields = "metadata { year originalLanguage demographic contentRating tags { id name group } trackers { provider externalId url } }";
+        let q = format!(
+            r#"{{ canonicalSeries(workId: "{work}") {{ {fields} }} series(id: "42") {{ {fields} }} }}"#
+        );
+        let result = exec(&s, &q, Some("bobtok"), "md-metadata").await;
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let data = result.data.into_json().unwrap();
+        assert_eq!(
+            data["canonicalSeries"]["metadata"],
+            data["series"]["metadata"]
+        );
+        let metadata = &data["canonicalSeries"]["metadata"];
+        assert_eq!(metadata["year"], 2020);
+        assert_eq!(metadata["tags"][0]["group"], "genre");
+        assert_eq!(metadata["trackers"].as_array().unwrap().len(), 3);
+        assert!(metadata["trackers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["url"].as_str().unwrap().starts_with("https://")));
+        sqlx::query("UPDATE work SET title_override = 'Curated title' WHERE id = ?")
+            .bind(&work)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO work_tag (work_id, tag, ord, source) VALUES (?, 'My custom tag', 0, 'admin')").bind(&work).execute(&pool).await.unwrap();
+        input.external_ids = vec![("al".into(), "456".into())];
+        input.tags.clear();
+        input.tag_details.clear();
+        input.year = Some(2021);
+        catalog::upsert_work_from_mangadex(&pool, mid, &input)
+            .await
+            .unwrap();
+        let q = format!(r#"{{ canonicalSeries(workId: "{work}") {{ title {fields} }} }}"#);
+        let result = exec(&s, &q, Some("bobtok"), "md-metadata").await;
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let series = result.data.into_json().unwrap()["canonicalSeries"].clone();
+        assert_eq!(series["title"], "Curated title");
+        assert_eq!(series["metadata"]["year"], 2021);
+        assert_eq!(series["metadata"]["tags"][0]["group"], "custom");
+        assert_eq!(series["metadata"]["tags"][0]["name"], "My custom tag");
+        let trackers = series["metadata"]["trackers"].as_array().unwrap();
+        assert_eq!(
+            trackers.len(),
+            2,
+            "removed upstream links leave the current snapshot"
+        );
+        assert!(trackers
+            .iter()
+            .any(|t| t["provider"] == "al" && t["externalId"] == "456"));
+        let historical: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_external_id WHERE work_id = ? AND provider = 'al'",
+        )
+        .bind(&work)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            historical, 2,
+            "display refresh must preserve historical identity keys"
+        );
+        sqlx::query("UPDATE work SET metadata_synced_at = 'done', covers_synced_at = 'done', mangadex_details_synced_at = NULL WHERE id = ?").bind(&work).execute(&pool).await.unwrap();
+        assert!(works_needing_enrichment(&pool, 100)
+            .await
+            .unwrap()
+            .contains(&mid.to_string()));
+        catalog::refresh_mangadex_details(&pool, &work, &input)
+            .await
+            .unwrap();
+        assert!(!works_needing_enrichment(&pool, 100)
+            .await
+            .unwrap()
+            .contains(&mid.to_string()));
+    }
+
+    #[tokio::test]
     async fn series_work_id_bridges_a_numeric_id_to_its_sibling_sources() {
         let (s, pool) = setup_full(100).await;
         // Cached, so `series(id:)` resolves without a Suwayomi round trip.
@@ -17553,7 +18423,11 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!((cnt, lpr, rd), (1, 30, 0), "upsert in place");
+        assert_eq!(
+            (cnt, lpr, rd),
+            (1, 30, 1),
+            "rereading changes resume position without erasing completion"
+        );
         // An anonymous viewer sees the chapter as unread.
         let r = exec(&s, &chapters_q, None, "1.1.1.1").await;
         let data = r.data.into_json().unwrap();
@@ -17723,7 +18597,7 @@ mod tests {
         // …and the reviews thread lists each AUTHOR once, not once per key shape.
         let r = exec(
             &s,
-            &format!(r#"{{ reviews(seriesId: "4242") {{ total items {{ score }} }} }}"#),
+            r#"{ reviews(seriesId: "4242") { total items { score } } }"#,
             Some("bobtok"),
             "1.1.1.1",
         )
@@ -17798,9 +18672,7 @@ mod tests {
         // Admin rates too — a bystander whose vote must survive bob's withdrawal.
         let r = exec(
             &s,
-            &format!(
-                r#"mutation {{ postReview(input: {{ seriesId: "7777", score: 5, body: "", hasSpoiler: false }}) {{ score }} }}"#
-            ),
+            r#"mutation { postReview(input: { seriesId: "7777", score: 5, body: "", hasSpoiler: false }) { score } }"#,
             Some("admintok"),
             "1.1.1.1",
         )
@@ -17819,7 +18691,7 @@ mod tests {
         // Bob withdraws, asking with the NUMERIC id — the work's other shape.
         let r = exec(
             &s,
-            &format!(r#"mutation {{ deleteReview(seriesId: "7777") }}"#),
+            r#"mutation { deleteReview(seriesId: "7777") }"#,
             Some("bobtok"),
             "1.1.1.1",
         )
@@ -18004,7 +18876,11 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!((cnt, lpr, rd), (1, 5, 0), "upsert in place");
+        assert_eq!(
+            (cnt, lpr, rd),
+            (1, 5, 1),
+            "rereading changes resume position without erasing completion"
+        );
     }
 
     /// REGRESSION: `libraryProgress` reported `read > total`, and lost Suwayomi reads on
@@ -18509,7 +19385,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limit_keys_on_ip_and_ignores_successes() {
+    async fn simultaneous_guesses_cannot_bypass_login_budget() {
+        let s = setup_with_limit(2).await;
+        let wrong = r#"mutation { login(username:"bob", password:"wrong") { token } }"#;
+        let (a, b, c) = tokio::join!(
+            exec(&s, wrong, None, "concurrent-login"),
+            exec(&s, wrong, None, "concurrent-login"),
+            exec(&s, wrong, None, "concurrent-login")
+        );
+        let errors = [first_error(&a), first_error(&b), first_error(&c)];
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|e| e.as_str() == "Invalid username or password")
+                .count(),
+            2
+        );
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|e| e.contains("Too many login attempts"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn password_jobs_reject_when_all_memory_slots_are_busy() {
+        let (s, _, app) = setup_with_state(100).await;
+        let permits = app
+            .password_work
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let right = r#"mutation { login(username:"bob", password:"password123") { token } }"#;
+        let blocked = exec(&s, right, None, "password-busy").await;
+        assert!(first_error(&blocked).contains("Sign-in is busy"));
+        drop(permits);
+        assert!(exec(&s, right, None, "password-ready")
+            .await
+            .errors
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn rate_limit_keys_on_ip_and_counts_successes() {
         let s = setup_with_limit(2).await;
         let wrong = r#"mutation { login(username:"bob", password:"nope") { token } }"#;
         let right = r#"mutation { login(username:"bob", password:"password123") { token } }"#;
@@ -18532,15 +19453,13 @@ mod tests {
             "cross-IP lockout: {:?}",
             victim.errors
         );
-        // and repeated *successful* logins never trip the limit (M2)
-        for _ in 0..5 {
+        // Valid credentials cannot bypass the expensive-verification budget.
+        for _ in 0..2 {
             let r = exec(&s, right, None, "7.7.7.7").await;
-            assert!(
-                r.errors.is_empty(),
-                "success counted against limit: {:?}",
-                r.errors
-            );
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
         }
+        let blocked = exec(&s, right, None, "7.7.7.7").await;
+        assert!(first_error(&blocked).contains("Too many login attempts"));
     }
 
     #[tokio::test]
@@ -19169,6 +20088,7 @@ mod tests {
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
+            password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
             series_inflight: KeyedLocks::default(),
@@ -19683,6 +20603,7 @@ mod tests {
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
+            password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
             series_inflight: KeyedLocks::default(),
@@ -20309,6 +21230,7 @@ mod tests {
             suwayomi_manga_id: mid.map(Into::into),
             chapter_id: cid.into(),
             scanlator: None,
+            external_url: None,
             released_at: released.map(Into::into),
         }
     }

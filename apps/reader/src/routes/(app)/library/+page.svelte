@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
+	import { invalidate } from '$app/navigation';
 	import Icon from '$lib/components/Icon.svelte';
 	import Cover from '$lib/components/Cover.svelte';
 	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
@@ -13,6 +15,21 @@
 	import { slug, type Shelf } from '$lib/data/types';
 
 	let { data } = $props();
+	// Refresh releases and progress when returning to a tab left open during a scan.
+	onMount(() => {
+		let lastRefresh = Date.now();
+		const refresh = () => {
+			if (document.visibilityState !== 'visible' || Date.now() - lastRefresh < 30_000) return;
+			lastRefresh = Date.now();
+			void invalidate('komika:library');
+		};
+		window.addEventListener('focus', refresh);
+		document.addEventListener('visibilitychange', refresh);
+		return () => {
+			window.removeEventListener('focus', refresh);
+			document.removeEventListener('visibilitychange', refresh);
+		};
+	});
 	// `data.library` is a PROMISE (see +page.ts): awaiting it in `load` blocked the
 	// navigation with zero feedback. Copy the catalogue into local state once it
 	// lands, so shelf/favourite edits reflect immediately (optimistic) and re-sync
@@ -38,8 +55,8 @@
 	/**
 	 * Descending by an RFC-3339 field, with blanks pushed to the end.
 	 *
-	 * The timestamps are RFC 3339 from the server, which sorts correctly as a string, so
-	 * no Date parsing is needed. Ties break on title so the order is stable rather than
+	 * Parse RFC 3339 timestamps to compare instants across timezone offsets and
+	 * fractional-second precision. Ties break on title so the order is stable rather than
 	 * dependent on however the rows happened to arrive.
 	 */
 	function byDateDesc(key: 'latestChapterAt' | 'lastReadAt') {
@@ -47,7 +64,7 @@
 			const x = a[key];
 			const y = b[key];
 			if (!x !== !y) return x ? -1 : 1;
-			return y.localeCompare(x) || a.title.localeCompare(b.title);
+			return (Date.parse(y) || 0) - (Date.parse(x) || 0) || a.title.localeCompare(b.title);
 		};
 	}
 
@@ -234,7 +251,7 @@
 	{#if loading}
 		<CardGridSkeleton count={12} />
 	{:else if items.length}
-		<div class="grid">
+		<div class="grid" class:large={items.length > 50}>
 			<!-- The fallback key must NOT contain `shelf`: it's mutable, so re-shelving a
 			     card changed its key, destroying and recreating the whole card — including
 			     the <img> — which visibly re-flashed the cover on every shelf change. -->
@@ -245,7 +262,7 @@
 						<Cover src={item.cover} alt={item.title} loading="lazy" sizing="card" />
 						<a class="cover-link" {href} aria-label={item.title}></a>
 						<span class="flag-svg"><FlagBadge type={item.type} /></span>
-						<span class="rating"
+						<span class="rating" aria-label={item.rating ? `Rating ${item.rating} out of 10` : 'Not rated yet'}
 							><Icon name="star" size={10} fill="var(--k-star)" />{item.rating}</span
 						>
 						<button
@@ -435,7 +452,11 @@
 		background: transparent;
 		color: var(--k-text-dimmer);
 		border: 1px solid var(--k-border-4);
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s,
+			opacity 0.15s;
 	}
 	.shelf-tab.on {
 		background: var(--k-primary);
@@ -465,7 +486,11 @@
 		background: transparent;
 		color: var(--k-text-dimmer);
 		border: 1px solid var(--k-border-2);
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s,
+			opacity 0.15s;
 	}
 	.sortchip.on {
 		background: rgba(255, 255, 255, 0.1);
@@ -527,6 +552,11 @@
 		text-decoration: none;
 		cursor: pointer;
 	}
+	/* Covers have a definite aspect ratio, so skipping offscreen artwork never
+	   guesses card height. Open shelf menus opt out of paint containment. */
+	.grid.large .cover { content-visibility: auto; }
+	.grid.large .cover:has(:global(.sm.open)) { content-visibility: visible; }
+	.lib-card:has(:global(.sm.open)) { position: relative; z-index: 5; }
 	.lib-card {
 		display: flex;
 		flex-direction: column;
@@ -567,11 +597,14 @@
 		justify-content: center;
 		border-radius: 7px;
 		cursor: pointer;
-		color: var(--k-text);
-		background: rgba(12, 12, 13, 0.72);
+		color: #f7f6f3;
+		background: rgba(12, 12, 13, 0.88);
 		border: 1px solid var(--k-border-3);
 		backdrop-filter: blur(3px);
-		transition: all 0.12s;
+		transition:
+			color 0.12s,
+			background-color 0.12s,
+			border-color 0.12s;
 	}
 	.fav-chip:hover:not(:disabled) {
 		color: #e96e6e;
@@ -626,8 +659,8 @@
 		gap: 3px;
 		font-weight: 700;
 		font-size: 11.5px;
-		color: var(--k-text);
-		background: rgba(12, 12, 13, 0.72);
+		color: #f7f6f3;
+		background: rgba(12, 12, 13, 0.88);
 		border-radius: 5px;
 		padding: 3px 7px;
 	}

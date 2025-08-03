@@ -182,6 +182,7 @@ services:
       # User avatars are stored as BLOBs in the SQLite DB, so they are
       # Litestream-replicated with it and any replica can serve any avatar.
       SUWAYOMI_URL: http://suwayomi:4567
+      EXTENSION_AUTO_UPDATE_INTERVAL_SECONDS: ${EXTENSION_AUTO_UPDATE_INTERVAL_SECONDS:-21600}
       # Public base for the Suwayomi cover/page image URLs handed to the browser.
       # These point at THIS server, which proxies `/api/v1/manga/{id}/thumbnail` and
       # `/api/v1/manga/{id}/chapter/{ci}/page/{pi}` from the loopback-only Suwayomi

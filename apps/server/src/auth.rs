@@ -103,6 +103,51 @@ pub async fn user_for_token(pool: &SqlitePool, token: &str) -> Result<Option<Use
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn username_guard_closes_races_without_merging_legacy_accounts() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT UNIQUE); INSERT INTO users VALUES ('legacy-a', 'Alice'), ('legacy-b', 'ALICE');")
+            .execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0103_username_case_guard.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (a, b) = tokio::join!(
+            sqlx::query("INSERT INTO users VALUES ('new-a', 'Bob')").execute(&pool),
+            sqlx::query("INSERT INTO users VALUES ('new-b', 'BOB')").execute(&pool)
+        );
+        assert_ne!(
+            a.is_ok(),
+            b.is_ok(),
+            "exactly one case variant must be admitted"
+        );
+        assert!(sqlx::query("INSERT INTO users VALUES ('new-c', 'alice')")
+            .execute(&pool)
+            .await
+            .is_err());
+        assert!(
+            sqlx::query("UPDATE users SET username = 'Alice' WHERE id = 'legacy-a'")
+                .execute(&pool)
+                .await
+                .is_ok()
+        );
+        assert!(
+            sqlx::query("UPDATE users SET username = 'bob' WHERE id = 'legacy-a'")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        let legacy: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id LIKE 'legacy-%'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(legacy, 2, "migration must preserve both legacy identities");
+    }
+
     #[test]
     fn hash_roundtrips_and_rejects_wrong() {
         let h = hash_password("hunter2pw").unwrap();

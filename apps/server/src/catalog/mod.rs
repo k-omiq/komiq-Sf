@@ -37,6 +37,14 @@ pub struct Cover {
     pub is_primary: bool,
 }
 
+/// A named upstream taxonomy tag. IDs are optional for legacy API records.
+#[derive(Debug, Clone)]
+pub struct SourceTag {
+    pub id: Option<String>,
+    pub name: String,
+    pub group: String,
+}
+
 /// Everything needed to upsert one canonical work. Built from a MangaDex manga, or
 /// synthesized for a first-class non-MangaDex work added via a Tier-2 source.
 #[derive(Debug, Clone, Default)]
@@ -70,6 +78,7 @@ pub struct WorkInput {
     /// touched. Empty for a Tier-2 work with no upstream tag list, which is a
     /// legitimate state — see `replace_source_tags`.
     pub tags: Vec<String>,
+    pub tag_details: Vec<SourceTag>,
     /// Covers to store for this work (F2). Empty leaves any existing covers
     /// untouched; non-empty REPLACES the work's cover set (the sweep passes just
     /// the primary, the enrichment path passes the full `/cover` set).
@@ -272,8 +281,7 @@ pub async fn load_match_data_batch(
     let mut ids: Vec<&String> = work_ids.iter().collect();
     ids.sort();
     ids.dedup();
-    let placeholders = std::iter::repeat("?")
-        .take(ids.len())
+    let placeholders = std::iter::repeat_n("?", ids.len())
         .collect::<Vec<_>>()
         .join(",");
 
@@ -381,6 +389,10 @@ pub struct CanonicalChapter {
     /// and has no pages for us to serve — the reader must send the user there instead of
     /// rendering an empty page. ~35,000 mirrored chapters, 4% of the mirror.
     pub external_url: Option<String>,
+    /// The scanlation group(s) of THIS copy — `"No Group"` when MangaDex lists none, NULL
+    /// when unknown (not backfilled yet, or the backfill's `''` "asked, could not learn",
+    /// which the query folds to NULL so no surface ever prints an empty label).
+    pub scanlator: Option<String>,
 }
 
 /// The effective genre/tag list for a canonical work, in strict precedence order:
@@ -388,6 +400,7 @@ pub struct CanonicalChapter {
 ///   2. the upstream MangaDex half (`source = 'mangadex'`, migration 0066),
 ///   3. the distinct genres of its linked Suwayomi source series (parsed from the
 ///      cached JSON `genre` arrays).
+///
 /// Empty when none exists. Best-effort — any query/parse failure just contributes
 /// nothing.
 ///
@@ -641,7 +654,8 @@ pub async fn load_canonical_chapters(
         // real readable time by weeks, so ordering by it alone puts unreleased-looking
         // chapters at the top of a series' list and buries readable ones.
         "SELECT c.external_id, c.number, c.volume, c.lang, c.title, \
-                COALESCE(c.readable_at, c.published_at) AS published_at, c.external_url \
+                COALESCE(c.readable_at, c.published_at) AS published_at, c.external_url, \
+                NULLIF(c.scanlator, '') AS scanlator \
          FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
          WHERE ss.work_id = ? AND ss.source_type = 'mangadex' AND c.lang = 'en' \
          ORDER BY COALESCE(c.readable_at, c.published_at) DESC, c.external_id ASC",
@@ -2021,14 +2035,12 @@ fn fts_match_query(raw: &str) -> Option<String> {
     if !cur.is_empty() {
         terms.push(cur);
     }
-    let Some((last, head)) = terms.split_last() else {
-        return None;
-    };
+    let (last, head) = terms.split_last()?;
     // Too-short queries are refused rather than served slowly — EXCEPT when the query
     // carries a non-ASCII character, where a short token is a whole CJK word rather
     // than a one-letter prefix over the entire catalogue.
     let chars: usize = terms.iter().map(|t| t.chars().count()).sum();
-    let has_non_ascii = terms.iter().any(|t| t.chars().any(|c| !c.is_ascii()));
+    let has_non_ascii = terms.iter().any(|t| !t.is_ascii());
     if chars < MIN_FTS_QUERY_CHARS && !has_non_ascii {
         return None;
     }
@@ -2364,7 +2376,7 @@ pub async fn upsert_work_from_mangadex(
 
     insert_aliases(&mut tx, &work_id, &input.aliases).await?;
     insert_descriptions_and_credits(&mut tx, &work_id, input).await?;
-    replace_source_tags(&mut tx, &work_id, &input.tags).await?;
+    replace_mangadex_details(&mut tx, &work_id, input).await?;
     ensure_source_series(
         &mut tx,
         &work_id,
@@ -2450,6 +2462,7 @@ pub async fn delete_work_cascade(pool: &SqlitePool, work_id: &str) -> Result<()>
         "work_alias",
         "work_alias_token",
         "work_external_id",
+        "work_tracker_link",
         "work_description",
         "work_credit",
         "work_cover",
@@ -2576,21 +2589,46 @@ async fn replace_source_tags(
     Ok(())
 }
 
-/// Rewrite just the upstream (`source = 'mangadex'`) half of an EXISTING work's tags
-/// (migration 0066), in a transaction of its own.
-///
-/// The backfill's genre top-up path: a work already in the spine is skipped for the full
-/// `upsert_work_from_mangadex`, but its genres may never have been written at all, and
-/// re-running the whole upsert to get them would rewrite every column, every alias, every
-/// credit and every cover for 113k works — vastly more write amplification (and
-/// SQLITE_BUSY exposure) than the one thing that is actually missing.
-///
-/// IMMEDIATE for the same reason the other write paths take it: this shares the single
-/// writer with the sync/scan/cover tasks, and grabbing the lock up front keeps a
-/// contended run out of the un-retryable `SQLITE_BUSY_SNAPSHOT` class.
-pub async fn refresh_source_tags(pool: &SqlitePool, work_id: &str, tags: &[String]) -> Result<()> {
+/// Refresh imported fields without changing admin overrides or historical IDs.
+async fn replace_mangadex_details(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    work_id: &str,
+    input: &WorkInput,
+) -> Result<()> {
+    replace_source_tags(tx, work_id, &input.tags).await?;
+    for tag in &input.tag_details {
+        sqlx::query("UPDATE work_tag SET tag_id = ?, tag_group = ? WHERE work_id = ? AND tag = ? AND source = 'mangadex'")
+            .bind(&tag.id).bind(&tag.group).bind(work_id).bind(&tag.name)
+            .execute(&mut **tx).await?;
+    }
+    sqlx::query("DELETE FROM work_tracker_link WHERE work_id = ?")
+        .bind(work_id)
+        .execute(&mut **tx)
+        .await?;
+    for (provider, external_id) in &input.external_ids {
+        if crate::mangadex::tracker_url(provider, external_id).is_some() {
+            sqlx::query("INSERT OR REPLACE INTO work_tracker_link (work_id, provider, external_id) VALUES (?, ?, ?)")
+                .bind(work_id).bind(provider).bind(external_id).execute(&mut **tx).await?;
+        }
+    }
+    sqlx::query("UPDATE work SET mangadex_details_synced_at = ? WHERE id = ?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(work_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Existing entries visited by the catalogue top-up also refresh their current
+/// taxonomy/tracker snapshot. Publication facts follow the normal full upsert
+/// so NSFW/source/materialized projections keep their existing refresh semantics.
+pub async fn refresh_mangadex_details(
+    pool: &SqlitePool,
+    work_id: &str,
+    input: &WorkInput,
+) -> Result<()> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    replace_source_tags(&mut tx, work_id, tags).await?;
+    replace_mangadex_details(&mut tx, work_id, input).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -2858,9 +2896,10 @@ pub async fn mark_metadata_synced(pool: &SqlitePool, mangadex_ids: &[String]) ->
     let now = Utc::now().to_rfc3339();
     for mid in mangadex_ids {
         sqlx::query(
-            "UPDATE work SET metadata_synced_at = ? WHERE id IN \
+            "UPDATE work SET metadata_synced_at = ?, mangadex_details_synced_at = ? WHERE id IN \
              (SELECT work_id FROM source_series WHERE source_type = 'mangadex' AND source_key = ?)",
         )
+        .bind(&now)
         .bind(&now)
         .bind(mid)
         .execute(pool)
@@ -2995,6 +3034,38 @@ pub async fn merge_works_checked(
     target_work: &str,
     expected: Option<(&WorkIdentity, &WorkIdentity)>,
 ) -> Result<MergeOutcome> {
+    merge_works_guarded(pool, covers, source_work, target_work, expected, None).await
+}
+
+/// Claim a waiting review and merge under the same write lock. A rejection or
+/// metadata edit that wins the lock prevents the automatic merge.
+pub async fn merge_pending_candidate_checked(
+    pool: &SqlitePool,
+    covers: Option<&SqlitePool>,
+    source_work: &str,
+    target_work: &str,
+    expected: (&WorkIdentity, &WorkIdentity),
+    candidate_id: &str,
+) -> Result<MergeOutcome> {
+    merge_works_guarded(
+        pool,
+        covers,
+        source_work,
+        target_work,
+        Some(expected),
+        Some(candidate_id),
+    )
+    .await
+}
+
+async fn merge_works_guarded(
+    pool: &SqlitePool,
+    covers: Option<&SqlitePool>,
+    source_work: &str,
+    target_work: &str,
+    expected: Option<(&WorkIdentity, &WorkIdentity)>,
+    candidate_id: Option<&str>,
+) -> Result<MergeOutcome> {
     if source_work == target_work {
         anyhow::bail!("cannot merge a work into itself");
     }
@@ -3027,6 +3098,36 @@ pub async fn merge_works_checked(
             if now != *want {
                 anyhow::bail!("merge precondition failed: work {id} changed under the gate");
             }
+        }
+    }
+
+    if expected.is_some() {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM work_split WHERE work_a = MIN(?, ?) AND work_b = MAX(?, ?)) \
+             OR EXISTS(SELECT 1 FROM merge_candidate mc JOIN source_series ss ON ss.id = mc.source_series_id \
+             WHERE mc.status = 'rejected' AND ((ss.work_id = ? AND mc.candidate_work_id = ?) \
+             OR (ss.work_id = ? AND mc.candidate_work_id = ?)))")
+            .bind(source_work).bind(target_work).bind(source_work).bind(target_work)
+            .bind(source_work).bind(target_work).bind(target_work).bind(source_work)
+            .fetch_one(&mut *tx).await?;
+        if blocked {
+            anyhow::bail!("merge precondition failed: pair was rejected or split");
+        }
+    }
+    if let Some(id) = candidate_id {
+        let claim = sqlx::query(
+            "UPDATE merge_candidate SET status = 'confirmed', resolved_at = ? \
+             WHERE id = ? AND status = 'pending' AND candidate_work_id = ? \
+             AND source_series_id IN (SELECT id FROM source_series WHERE work_id = ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(id)
+        .bind(target_work)
+        .bind(source_work)
+        .execute(&mut *tx)
+        .await?;
+        if claim.rows_affected() != 1 {
+            anyhow::bail!("merge precondition failed: review is no longer pending for this pair");
         }
     }
 
@@ -3070,6 +3171,8 @@ pub async fn merge_works_checked(
         .bind(source_work)
         .execute(&mut *tx)
         .await?;
+    sqlx::query("INSERT OR IGNORE INTO work_tracker_link (work_id, provider, external_id) SELECT ?, provider, external_id FROM work_tracker_link WHERE work_id = ? AND NOT EXISTS (SELECT 1 FROM work WHERE id = ? AND mangadex_details_synced_at IS NOT NULL)")
+        .bind(target_work).bind(source_work).bind(target_work).execute(&mut *tx).await?;
     // Fold the source's METADATA child rows into the target instead of dropping them.
     // Every one of these tables is keyed by (work_id, …), so `INSERT OR IGNORE …
     // SELECT` adds only what the target is missing and the target's own row always
@@ -3331,6 +3434,7 @@ pub async fn merge_works_checked(
         "work_alias",
         "work_alias_token",
         "work_external_id",
+        "work_tracker_link",
         "work_description",
         "work_credit",
         "work_cover",
@@ -3977,7 +4081,16 @@ pub struct WorkChapterRow {
     pub source_id: String,
     pub suwayomi_manga_id: Option<String>,
     pub chapter_id: String,
+    /// The scanlation group(s) of THIS copy. For the MangaDex half: the group names joined
+    /// with `" & "`, `"No Group"` when MangaDex lists none, or `None` when unknown — the
+    /// backfill's `''` ("asked, could not learn") is folded to `None` in SQL so no surface
+    /// prints an empty label. Several rows sharing one `key` are several uploads of the same
+    /// chapter, and this is what tells them apart.
     pub scanlator: Option<String>,
+    /// Set when THIS copy is hosted off-site (MangaDex externals; always `None` for
+    /// Suwayomi). Per copy, not per number: one group's upload of a chapter can be a
+    /// MangaPlus redirect while another group's is ordinary pages.
+    pub external_url: Option<String>,
 }
 
 /// One reconciled Suwayomi mapping for a work (F1): the authoritative
@@ -4075,6 +4188,7 @@ async fn work_source_chapters_two_branch(
                 suwayomi_manga_id: Some(m.source_key.clone()),
                 chapter_id,
                 scanlator,
+                external_url: None,
                 // Converted here rather than read from the spine, so this stays a genuinely
                 // INDEPENDENT implementation: it goes epoch-millis → ISO through the same
                 // helper `spine::drain_suwayomi_series` uses, which is exactly what the
@@ -4096,10 +4210,12 @@ async fn work_source_chapters_two_branch(
             String,
             String,
             Option<String>,
+            Option<String>,
+            Option<String>,
         ),
     >(
         "SELECT c.number, c.title, ss.source_id, c.external_id, \
-                COALESCE(c.readable_at, c.published_at) \
+                COALESCE(c.readable_at, c.published_at), c.scanlator, c.external_url \
          FROM source_series ss \
          JOIN chapter c ON c.source_series_id = ss.id \
          WHERE ss.work_id = ? AND ss.source_type = 'mangadex' AND c.lang = 'en'",
@@ -4107,7 +4223,7 @@ async fn work_source_chapters_two_branch(
     .bind(work_id)
     .fetch_all(pool)
     .await?;
-    for (number, title, source_id, external_id, released_at) in md {
+    for (number, title, source_id, external_id, released_at, scanlator, external_url) in md {
         let label =
             crate::chapter_label::chapter_display(None, number.as_deref(), title.as_deref());
         rows.push(WorkChapterRow {
@@ -4119,7 +4235,10 @@ async fn work_source_chapters_two_branch(
             source_id,
             suwayomi_manga_id: None,
             chapter_id: external_id,
-            scanlator: None,
+            // The `''` → None fold, done in Rust here and in SQL in the live query, so the
+            // equivalence test checks the two spellings agree.
+            scanlator: scanlator.filter(|s| !s.is_empty()),
+            external_url,
             released_at,
         });
     }
@@ -4198,15 +4317,16 @@ pub async fn work_source_chapters(pool: &SqlitePool, work_id: &str) -> Result<Ve
               WHERE ss.work_id = ?1 AND ss.source_type = 'suwayomi' \
          ) \
          SELECT c.number, c.title, a.source_id, c.external_id, c.chapter_key, c.label, \
-                'suwayomi' AS source_type, a.source_key, c.scanlator, \
-                COALESCE(c.readable_at, c.published_at) AS released_at \
+                'suwayomi' AS source_type, a.source_key, NULLIF(c.scanlator, '') AS scanlator, \
+                COALESCE(c.readable_at, c.published_at) AS released_at, \
+                c.external_url \
            FROM authoritative a \
            JOIN chapter c ON c.source_series_id = a.ssid \
           WHERE a.rn = 1 \
          UNION ALL \
          SELECT c.number, c.title, ss.source_id, c.external_id, c.chapter_key, c.label, \
-                'mangadex' AS source_type, NULL, NULL, \
-                COALESCE(c.readable_at, c.published_at) \
+                'mangadex' AS source_type, NULL, NULLIF(c.scanlator, ''), \
+                COALESCE(c.readable_at, c.published_at), c.external_url \
            FROM source_series ss \
            JOIN chapter c ON c.source_series_id = ss.id \
           WHERE ss.work_id = ?1 AND ss.source_type = 'mangadex' AND c.lang = 'en' \
@@ -4244,6 +4364,7 @@ pub async fn work_source_chapters(pool: &SqlitePool, work_id: &str) -> Result<Ve
                 suwayomi_manga_id: r.source_key,
                 chapter_id: r.external_id,
                 scanlator: r.scanlator,
+                external_url: r.external_url,
                 released_at: r.released_at,
             }
         })
@@ -4264,6 +4385,7 @@ struct SpineChapterRow {
     source_key: Option<String>,
     scanlator: Option<String>,
     released_at: Option<String>,
+    external_url: Option<String>,
 }
 
 /// The count of "main" chapters to display for a series: the number of DISTINCT
@@ -5501,8 +5623,7 @@ pub async fn existing_source_keys(
     const CHUNK: usize = 500;
     let mut found = std::collections::HashSet::new();
     for chunk in keys.chunks(CHUNK) {
-        let placeholders = std::iter::repeat("?")
-            .take(chunk.len())
+        let placeholders = std::iter::repeat_n("?", chunk.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
@@ -5564,6 +5685,70 @@ mod tests {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn tracker_snapshots_respect_target_authority_and_survive_provisional_merges() {
+        let pool = pool().await;
+        let target = upsert_work_from_mangadex(
+            &pool,
+            "md-tracker-target",
+            &WorkInput {
+                external_ids: vec![("al".into(), "200".into())],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let source = upsert_work_from_mangadex(
+            &pool,
+            "md-tracker-source",
+            &WorkInput {
+                external_ids: vec![("al".into(), "100".into()), ("mal".into(), "300".into())],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        merge_works(&pool, &source, &target).await.unwrap();
+        let links: Vec<(String, String)> = sqlx::query_as("SELECT provider, external_id FROM work_tracker_link WHERE work_id = ? ORDER BY provider")
+            .bind(&target).fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            links,
+            vec![("al".into(), "200".into())],
+            "a refreshed target snapshot must not mix in another snapshot's omitted providers"
+        );
+        let provisional = create_work(&pool, &WorkInput::default()).await.unwrap();
+        let rich = upsert_work_from_mangadex(
+            &pool,
+            "md-tracker-rich",
+            &WorkInput {
+                external_ids: vec![("al".into(), "400".into())],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        merge_works(&pool, &rich, &provisional).await.unwrap();
+        let id: String = sqlx::query_scalar(
+            "SELECT external_id FROM work_tracker_link WHERE work_id = ? AND provider = 'al'",
+        )
+        .bind(&provisional)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            id, "400",
+            "a provisional survivor inherits imported tracker details"
+        );
+        delete_work_cascade(&pool, &provisional).await.unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM work_tracker_link WHERE work_id = ?")
+                .bind(provisional)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -6351,6 +6536,7 @@ mod tests {
             title: None,
             published_at: None,
             external_url: None,
+            scanlator: None,
         }
     }
 
@@ -6876,7 +7062,7 @@ mod tests {
             .into_iter()
             .map(|r| {
                 format!(
-                    "{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                    "{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
                     r.source_type,
                     r.source_id,
                     r.chapter_id,
@@ -6888,6 +7074,9 @@ mod tests {
                     // F12: the two implementations must also agree about WHEN, or the
                     // series page's dates would depend on which query served them.
                     r.released_at,
+                    // Per-copy hand-off: a copy the reader opens from the series page must
+                    // redirect off-site exactly when the spine says it is external.
+                    r.external_url,
                 )
             })
             .collect();
@@ -6923,11 +7112,27 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        for (ext, number, title) in [
-            ("u-1", Some("1"), Some("The Start")),
-            ("u-15", Some("1.5"), Some("An Interlude")),
-            ("u-one", Some("Oneshot"), Some("A Day Out")),
-            ("u-null", None, Some("Chapter 3: The 100 Kings")),
+        // Every scanlator state a MangaDex row can be in (named, "No Group", the backfill's
+        // `''`, never-asked NULL) plus an off-site copy, so the two versions must also agree
+        // per COPY — what the series page's version list and the reader's switcher read.
+        for (ext, number, title, scanlator, external_url) in [
+            (
+                "u-1",
+                Some("1"),
+                Some("The Start"),
+                Some("Uwaki Scans"),
+                None,
+            ),
+            ("u-1b", Some("1"), Some("The Start"), Some("No Group"), None),
+            ("u-15", Some("1.5"), Some("An Interlude"), Some(""), None),
+            (
+                "u-one",
+                Some("Oneshot"),
+                Some("A Day Out"),
+                None,
+                Some("https://mangaplus.shueisha.co.jp/viewer/1"),
+            ),
+            ("u-null", None, Some("Chapter 3: The 100 Kings"), None, None),
         ] {
             upsert_chapter(
                 &pool,
@@ -6938,6 +7143,8 @@ mod tests {
                     lang: Some("en".into()),
                     title: title.map(Into::into),
                     published_at: Some("2026-01-01T00:00:00Z".into()),
+                    scanlator: scanlator.map(Into::into),
+                    external_url: external_url.map(Into::into),
                     ..Default::default()
                 },
             )
@@ -6996,6 +7203,22 @@ mod tests {
 
         let legacy = work_source_chapters_two_branch(&pool, &work).await.unwrap();
         let spine_rows = work_source_chapters(&pool, &work).await.unwrap();
+        // The `''` sentinel never reaches a caller as a label, and a real group does.
+        let group_of = |ext: &str| {
+            spine_rows
+                .iter()
+                .find(|r| r.chapter_id == ext)
+                .map(|r| r.scanlator.clone())
+                .expect("row present")
+        };
+        assert_eq!(group_of("u-1").as_deref(), Some("Uwaki Scans"));
+        assert_eq!(group_of("u-1b").as_deref(), Some("No Group"));
+        assert_eq!(
+            group_of("u-15"),
+            None,
+            "the backfill's '' must read as unknown"
+        );
+        assert_eq!(group_of("u-null"), None);
         assert_eq!(
             comparable(spine_rows),
             comparable(legacy),

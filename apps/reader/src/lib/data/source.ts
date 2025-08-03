@@ -32,9 +32,13 @@ import type { BrowseSort, ContentRatingFilter } from '@komika/api';
 import { isTauri } from '@komika/api';
 import type { Backend } from '@komika/api';
 import { backend, images } from '$lib/context';
+import { invalidate } from '$app/navigation';
 import { api, type LoadFetch } from './load-fetch';
+import { homeLatestAdded } from './home-latest-added';
 import { findChapterOwner } from './chapter-owner';
 import type { ChapterCandidate } from './chapter-owner';
+import { adjacentChapters, copiesOf, normalizeGroup, sortChaptersAsc } from './chapter-versions';
+import { loadFirstReadable } from './reader-pages';
 import { chapterChip, externalChapterHref } from './chapter-label';
 import { chapterDateLabel, chapterFoundLabel } from './chapter-date';
 import {
@@ -306,7 +310,7 @@ function toCanonicalCard(u: CanonicalUpdate): Card {
 		time: relTime(u.latestAt),
 		timeAt: epochMs(u.latestAt),
 		detected: '',
-		rating: '',
+		rating: u.averageRating != null ? u.averageRating.toFixed(1) : '',
 		cover: u.coverUrl ?? '',
 		id: u.workId,
 	};
@@ -716,7 +720,17 @@ interface ResolvedWork {
 	 * picker HIDES, like the redundant all.mangadex extension) so the series page's
 	 * per-chapter provenance cluster can label every source the aggregation reports.
 	 */
-	candidates: (ChapterCandidate<Chapter> & { name: string; iconUrl: string | null })[];
+	candidates: (ChapterCandidate<Chapter> & {
+		name: string;
+		iconUrl: string | null;
+		/**
+		 * The all.mangadex extension shadowing a readable direct spine (see
+		 * `isRedundantMangadexExt`). Its copies are the spine's copies served by the slow
+		 * route, so per-copy lists (the series page's provenance cluster, the reader's
+		 * version switcher) drop them wherever the spine carries the same number.
+		 */
+		redundant: boolean;
+	})[];
 	/**
 	 * Cross-source aggregation, when it rode along in the single-round-trip
 	 * `seriesPage` bundle (requested via `withAggregated`). Undefined on the
@@ -984,6 +998,7 @@ async function resolveWork(
 			name: c.view.name,
 			iconUrl: c.view.iconUrl,
 			chapters: c.chapters,
+			redundant: !!c.redundant,
 		})),
 		aggregated,
 	};
@@ -1173,8 +1188,13 @@ export function getHome(fetch?: LoadFetch) {
 		// new-chapter detections with the MangaDex mirror's freshest works (so the row
 		// fills even while the scanner is still warming up). The hero is the top of the
 		// live Popular feed (first feed as fallback) — empty when nothing is live.
-		const [feeds, latest] = await Promise.all([
-			b.discovery(),
+		const [feeds, added, latest] = await Promise.all([
+			b.discovery().catch(() => [] as DiscoveryFeed[]),
+			// Use Browse's endpoint even while discovery is served by an older API.
+			homeLatestAdded(b).catch((err) => {
+				console.warn('[komika] Latest Added search failed:', err);
+				return [] as Series[];
+			}),
 			// ONE feed, not two merged client-side — see `latestUpdates` below.
 			fetchUpdatesFeed(1, null, b).catch(() => ({
 				items: [] as UpdateFeedRow[],
@@ -1221,7 +1241,7 @@ export function getHome(fetch?: LoadFetch) {
 			// (per-language sources, and a series under both its numeric + `w_` identity),
 			// which would collide on the home row's `{#each}` key and could show twice.
 			trending: dedupeCardsByTitle(byKind('TRENDING').map(toCard)).slice(0, 10),
-			latestAdded: dedupeCardsByTitle(byKind('RECENTLY_ADDED').map(toAddedCard)).slice(0, 10),
+			latestAdded: added.map(toAddedCard),
 			homeGenres: deriveGenres(pool),
 		};
 	}, fallback);
@@ -1618,11 +1638,13 @@ export interface SeriesChapterView {
 	 *
 	 * `false` means "not known to be off-site", not "proven local". On the aggregated
 	 * (multi-source) path a chapter the selected translator does not carry comes from an
-	 * `AggregatedChapter`, which exposes no `externalUrl`, so the flag degrades to `false`
-	 * and the row simply loses its badge. `externalUrl != null` is the ONLY valid test —
+	 * `AggregatedChapter` copy, whose `copyExternalUrl` an older API does not send — the
+	 * flag then degrades to `false` and the row simply loses its badge. `externalUrl != null` is the ONLY valid test —
 	 * `pageCount === 0` is not (this backend returns 0 for ordinary chapters too).
 	 */
 	external?: boolean;
+	/** Scanlation group of the default copy (`id`/`src`); null when unknown. */
+	group?: string | null;
 }
 /** One source's copy of a chapter, for the series-page provenance cluster. */
 export interface ChapterSourceLink {
@@ -1635,9 +1657,34 @@ export interface ChapterSourceLink {
 	name: string;
 	/** Extension icon URL, or null → the template renders an initial letter. */
 	iconUrl: string | null;
+	/**
+	 * The scanlation group(s) behind THIS copy, e.g. "Uwaki Scans" or
+	 * "Uwaki Scans & Sahel Scans"; "No Group" when MangaDex lists none. null when unknown
+	 * (not backfilled yet, or a source that does not report one).
+	 */
+	group?: string | null;
+	/** Release date of THIS copy, formatted like {@link SeriesChapterView.date}; '' when unknown. */
+	date?: string;
+}
+
+/** One copy of the open chapter number — a (source, scanlation group) upload. */
+export interface ReaderChapterVersion {
+	/** Chapter id to open (`?ch=`). */
+	id: string;
+	/** Suwayomi manga id to pin (`?src=`); null = the MangaDex mirror. */
+	src: string | null;
+	/** Source display name ("MangaDex", an extension name, …). */
+	source: string;
+	iconUrl: string | null;
+	/** Scanlation group label; null when unknown. */
+	group: string | null;
+	/** This is the copy currently open. */
+	current: boolean;
 }
 
 export interface SeriesDetailView {
+	/** Optional detail-only MangaDex metadata; null for older APIs and un-enriched works. */
+	metadata?: Series['metadata'] | null;
 	id: string;
 	title: string;
 	/** Alternative / localized titles for the work (S2), excluding the display title.
@@ -1849,6 +1896,7 @@ function mapSeriesView(
 			isMarked: s.isMarked,
 			isFavorite: s.isFavorite ?? false,
 			libraryStatus: (s.libraryStatus as Shelf | null) ?? null,
+			metadata: enrich?.metadata ?? s.metadata ?? null,
 			credits,
 			descriptions,
 			descLang: desc.lang,
@@ -1875,11 +1923,75 @@ function mapSeriesView(
 			// `chapterExternalUrl` and the chapter falls back to the ordinary page path —
 			// badging it would promise a hand-off that never happens.
 			external: !!chapterExternalUrl(c),
+			// One row per chapter ROW on this path, so the row's own group is the copy's.
+			group: normalizeGroup(c.scanlator),
 		})),
 		related: relatedFor(s, pool),
 		translators: tmeta.translators,
 		selectedTranslatorKey: tmeta.selectedTranslatorKey,
 		workId: tmeta.workId,
+	};
+}
+
+/** One COPY of an aggregated chapter number — a (source, scanlation group) upload — with
+ *  the picker metadata of the source it lives on. */
+interface ChapterCopy {
+	source: AggregatedChapter['sources'][number];
+	/** Suwayomi manga id to pin (`?src=`); null = the MangaDex mirror. */
+	src: string | null;
+	name: string;
+	iconUrl: string | null;
+	/** Scanlation group, normalised (`''` → null). */
+	group: string | null;
+	/** The source's own `Chapter` for this copy, when the resolver fetched it. */
+	chapter?: Chapter;
+}
+
+/**
+ * Expand aggregated chapters into their COPIES, labelled with the source each lives on.
+ *
+ * EVERY COPY SURVIVES, which is the point: `AggregatedChapter.sources` carries one entry per
+ * upload (MangaDex's three groups' "Ch. 3" are three entries), and the series page and the
+ * reader both offer every one of them by group name.
+ *
+ * ONE exclusion: copies on the all.mangadex extension that shadows a readable direct spine
+ * (`candidates[].redundant`), whenever the spine itself carries that number. They are the
+ * spine's own uploads reached by the slow route, so listing them would show every MangaDex
+ * group twice and could open one over `api.komiq.cc`. Where the spine LACKS the number
+ * they are kept — then they are the only way to read it.
+ *
+ * Built once per work (index maps, not a scan per copy): a long series is ~1,000 numbers ×
+ * several copies, and a per-copy `find` over each source's chapter list was quadratic.
+ */
+function makeCopyResolver(resolved: ResolvedWork): (c: AggregatedChapter) => ChapterCopy[] {
+	const byKey = new Map(
+		resolved.candidates.map((cand) => [
+			cand.suwayomiMangaId ?? 'spine',
+			{ cand, chapters: new Map(cand.chapters.map((ch) => [ch.id, ch])) },
+		]),
+	);
+	return (c) => {
+		const spineCarries = c.sources.some((s) => !s.suwayomiMangaId);
+		const seen = new Set<string>();
+		const out: ChapterCopy[] = [];
+		for (const s of c.sources) {
+			const src = s.suwayomiMangaId ?? null;
+			const entry = byKey.get(src ?? 'spine');
+			if (entry?.cand.redundant && spineCarries) continue;
+			const k = `${src ?? 'spine'}:${s.chapterId}`;
+			if (seen.has(k)) continue;
+			seen.add(k);
+			const chapter = entry?.chapters.get(s.chapterId);
+			out.push({
+				source: s,
+				src,
+				name: entry?.cand.name ?? 'Source',
+				iconUrl: entry?.cand.iconUrl ?? null,
+				group: normalizeGroup(s.scanlator ?? chapter?.scanlator),
+				chapter,
+			});
+		}
+		return out;
 	};
 }
 
@@ -1912,16 +2024,10 @@ function buildAggregatedChapters(
 	// (readable via `chapters()`), else the MangaDex mirror.
 	const pickSource = (sources: AggregatedChapter['sources']) =>
 		sources.find((s) => s.suwayomiMangaId) ?? sources[0];
-	// Provenance metadata for the per-chapter source cluster, keyed by Suwayomi
-	// manga id ('spine' = the MangaDex mirror). Every candidate carries it —
-	// including sources the picker hides, so the cluster never falls back to a
-	// generic label for a chapter a hidden source serves.
-	const metaBySrc = new Map(
-		resolved.candidates.map((c) => [
-			c.suwayomiMangaId ?? 'spine',
-			{ name: c.name, iconUrl: c.iconUrl },
-		]),
-	);
+	// Per-copy expansion for the provenance cluster. Source metadata comes from every
+	// candidate — including sources the picker hides — so the cluster never falls back to
+	// a generic label for a chapter a hidden source serves.
+	const copiesFor = makeCopyResolver(resolved);
 	const chaptersBySrc = new Map(
 		resolved.candidates.map((candidate) => [
 			candidate.suwayomiMangaId ?? 'spine',
@@ -1931,8 +2037,11 @@ function buildAggregatedChapters(
 	const asc = [...agg].sort((a, b) => a.number - b.number);
 	return asc.map((c, i) => {
 		const own = readable.get(c.number);
+		const copies = copiesFor(c);
 		let id: string | undefined;
 		let src: string | null;
+		let group: string | null = null;
+		let external = false;
 		// Cross-source read state FIRST, so it survives a translator switch: the selected
 		// source's own row only knows what was read from THAT source, and the ids differ
 		// per source. `readAnywhere` is opportunistically selected, so an older API leaves
@@ -1956,6 +2065,8 @@ function buildAggregatedChapters(
 			src = selectedSuw;
 			read = read || own.read;
 			date = chapterDateLabel(c.firstReleasedAt ?? own.uploadedAt);
+			group = normalizeGroup(own.scanlator);
+			external = !!chapterExternalUrl(own);
 		} else {
 			// A chapter the selected translator doesn't carry — read from whichever source
 			// does, and date it from the aggregation's own clock (F12 / §4.13).
@@ -1969,24 +2080,28 @@ function buildAggregatedChapters(
 			id = chosen?.chapterId;
 			src = chosen?.suwayomiMangaId ?? null;
 			date = chapterDateLabel(c.firstReleasedAt);
+			group = normalizeGroup(chosen?.scanlator);
+			// Per-copy now (`copyExternalUrl`), so a chapter this translator does not carry
+			// keeps its off-site badge. Absent on an older API → `false`, i.e. "not known to
+			// be off-site", the pre-field behaviour.
+			external = !!externalChapterHref(chosen?.copyExternalUrl);
 		}
-		// The provenance cluster: every source the aggregation says carries this number,
-		// deduped by name in first-seen order (the direct spine and its redundant
-		// all.mangadex extension shadow are one source to the reader).
-		const seenNames = new Set<string>();
-		const sources: ChapterSourceLink[] = [];
-		for (const s of c.sources) {
-			const idKey = s.suwayomiMangaId ?? 'spine';
-			const meta = metaBySrc.get(idKey) ?? { name: 'Source', iconUrl: null };
-			if (seenNames.has(meta.name)) continue;
-			seenNames.add(meta.name);
-			sources.push({
-				id: s.chapterId,
-				src: s.suwayomiMangaId ?? null,
-				name: meta.name,
-				iconUrl: meta.iconUrl,
-			});
-		}
+		// The provenance cluster: ONE ENTRY PER COPY — every (source, scanlation group)
+		// upload of this number, each opening its own chapter id. This used to dedupe by
+		// source NAME, which collapsed MangaDex's several groups' uploads into a single
+		// "MangaDex" link and made every copy but one unreachable from this page. The only
+		// copies dropped now are the redundant all.mangadex shadows of spine uploads (see
+		// `makeCopyResolver`). Each copy's date is its OWN release, through the same
+		// formatter as the row's date, falling back to the source chapter's `uploadedAt`
+		// for an API that predates `copyReleasedAt`.
+		const sources: ChapterSourceLink[] = copies.map((cp) => ({
+			id: cp.source.chapterId,
+			src: cp.src,
+			name: cp.name,
+			iconUrl: cp.iconUrl,
+			group: cp.group,
+			date: chapterDateLabel(cp.source.copyReleasedAt ?? cp.chapter?.uploadedAt),
+		}));
 		return {
 			id,
 			n: c.number,
@@ -1999,10 +2114,10 @@ function buildAggregatedChapters(
 			read,
 			src,
 			sources,
-			// Only knowable from `own` — the selected translator's real `Chapter`.
-			// `AggregatedChapter` carries no `externalUrl`, so a chapter this translator
-			// does not have loses the badge rather than gaining a guessed one.
-			external: !!(own && chapterExternalUrl(own)),
+			// The copy the row OPENS: the selected translator's real `Chapter` when it carries
+			// the number, else the chosen fallback copy's `copyExternalUrl` — never a guess.
+			external,
+			group,
 		};
 	});
 }
@@ -2370,6 +2485,7 @@ export async function saveProgress(
 	// non-empty guard above is the only shape check the client needs.
 	try {
 		await backend.setProgress(chapterId, lastPageRead, read);
+		await invalidate('komika:library');
 	} catch (err) {
 		console.warn('[komika] setProgress failed:', err);
 	}
@@ -2410,6 +2526,8 @@ export interface ReaderChapterRef {
 	externalUrl?: string | null;
 }
 export interface ReaderView {
+	/** Completion survives reopening a chapter, including native backends. */
+	chapterRead?: boolean;
 	seriesId: string;
 	seriesTitle: string;
 	chapterId?: string;
@@ -2438,6 +2556,10 @@ export interface ReaderView {
 	 * null — never raw upstream text in an `href`.
 	 */
 	externalUrl?: string | null;
+	/** Every copy of the OPEN chapter number across sources and scanlation groups. */
+	versions?: ReaderChapterVersion[];
+	/** Scanlation group of the open copy; null when unknown. */
+	group?: string | null;
 }
 
 /** Honest empty reader view — no chapter/pages available for this series. */
@@ -2507,23 +2629,79 @@ function chapterExternalUrl(c: Chapter): string | null {
 	return externalChapterHref(c.externalUrl);
 }
 
-/** Assemble a ReaderView from a resolved chapter list + target chapter's pages. */
+/**
+ * Extra inputs {@link buildReaderView} needs when the open chapter number has more than
+ * one copy. All optional: the single-source path passes none and gets versions built from
+ * its own list.
+ */
+interface ReaderCopyContext {
+	/**
+	 * Every copy the reader can open from the ACTIVE source, for prev/next. Defaults to the
+	 * list itself. On the MangaDex spine this is wider than the list: `canonicalChapters`
+	 * keeps ONE copy per number, the other groups' uploads exist only in the aggregation,
+	 * and "next chapter, same group" can only find them here.
+	 */
+	pool?: Chapter[];
+	/** Every copy of the OPEN number across sources and groups (the version switcher). */
+	versions?: ReaderChapterVersion[];
+	/** Name/icon of the active source, for versions built from the list alone. */
+	sourceName?: string;
+	iconUrl?: string | null;
+}
+
+/**
+ * Assemble a ReaderView from a resolved chapter list + target chapter's pages.
+ *
+ * ORDER IS REBUILT HERE, NEVER TRUSTED. This used to take a `preserveOrder` flag and
+ * compute prev/next as `list[idx ± 1]` over the list as it arrived. That is only right
+ * while every list is ascending with one row per number, and neither holds in general:
+ * Suwayomi sources deliver newest-first (so an unsorted path swaps prev and next), a
+ * Suwayomi list holds one row per scanlator (so "next" from one group's ch. 3 was another
+ * group's ch. 3), and the spine's ascending order is a property of one server function
+ * (`select_reader_chapters`), not of the query under it, which is ordered newest-FIRST.
+ * {@link sortChaptersAsc} rebuilds ascending order from the labels (oneshots last, never
+ * as "chapter 0") and {@link adjacentChapters} steps to the adjacent DISTINCT number,
+ * preferring the open copy's scanlation group.
+ */
 function buildReaderView(
 	seriesId: string,
 	chs: Chapter[],
-	preserveOrder: boolean,
 	target: Chapter,
 	urls: string[],
 	seriesTitle: string,
 	tmeta: TranslatorMeta,
 	readingSrc: string | null,
+	ctx: ReaderCopyContext = {},
 ): ReaderView {
-	const asc = preserveOrder ? chs : [...chs].sort((a, b) => a.number - b.number);
-	const idx = asc.findIndex((c) => c.id === target.id);
+	// The dropdown lists one row per entry of the source's own list. When the open copy is
+	// NOT in that list (a non-default spine copy, opened by id from the version switcher),
+	// it stands in for its number's default copy, so the dropdown still highlights what is
+	// actually open instead of a sibling upload.
+	const listed = chs.some((c) => c.id === target.id)
+		? chs
+		: (() => {
+				const sameNumber = new Set(copiesOf(chs, target).map((c) => c.id));
+				return [...chs.filter((c) => !sameNumber.has(c.id)), target];
+			})();
+	const asc = sortChaptersAsc(listed);
+	const listIds = new Set(chs.map((c) => c.id));
+	const { prev, next } = adjacentChapters(ctx.pool ?? chs, target, (c) => listIds.has(c.id));
+	const group = normalizeGroup(target.scanlator);
+	const versions: ReaderChapterVersion[] =
+		ctx.versions ??
+		copiesOf(asc, target).map((c) => ({
+			id: c.id,
+			src: readingSrc,
+			source: ctx.sourceName ?? 'Source',
+			iconUrl: ctx.iconUrl ?? null,
+			group: normalizeGroup(c.scanlator),
+			current: c.id === target.id,
+		}));
 	return {
 		seriesId,
 		seriesTitle: seriesTitle || 'Reader',
 		chapterId: target.id,
+		chapterRead: target.read,
 		chNum: target.number,
 		chTitle: target.title || `Chapter ${target.number}`,
 		pages: urls.map((url, index) => ({
@@ -2542,13 +2720,50 @@ function buildReaderView(
 				title: c.title || `Chapter ${c.number}`,
 				externalUrl: chapterExternalUrl(c),
 			})),
-		prevChapterId: idx > 0 ? asc[idx - 1].id : undefined,
-		nextChapterId: idx >= 0 && idx < asc.length - 1 ? asc[idx + 1].id : undefined,
+		prevChapterId: prev?.id,
+		nextChapterId: next?.id,
 		translators: tmeta.translators,
 		selectedTranslatorKey: tmeta.selectedTranslatorKey,
 		workId: tmeta.workId,
 		readingSrc,
 		externalUrl: chapterExternalUrl(target),
+		versions,
+		group: group ?? versions.find((v) => v.current)?.group ?? null,
+	};
+}
+
+/**
+ * A reader-openable `Chapter` for one aggregated COPY the source's own list does not
+ * carry — in practice a MangaDex upload other than the one `canonicalChapters` picked for
+ * its number (the spine keeps one copy per number; the aggregation keeps them all).
+ *
+ * Everything here is what the aggregation actually reports, never a guess: the number,
+ * label and title of the number, THIS copy's group, release clock and off-site URL. `read`
+ * comes from the cross-source state — `readAnywhere`, or the spine's own copy of the same
+ * number, whose `read` the server already folds across every copy (spine key) — because
+ * read state is per NUMBER to a reader, not per upload.
+ */
+function chapterFromCopy(
+	seriesId: string,
+	agg: AggregatedChapter,
+	copy: AggregatedChapter['sources'][number],
+	sibling: Chapter | undefined,
+): Chapter {
+	return {
+		id: copy.chapterId,
+		seriesId,
+		number: agg.number,
+		label: agg.label ?? sibling?.label ?? String(agg.number),
+		externalUrl: copy.copyExternalUrl ?? null,
+		title: agg.title ?? sibling?.title ?? null,
+		pageCount: 0,
+		uploadedAt: copy.copyReleasedAt ?? null,
+		foundAt: null,
+		scanlator: copy.scanlator,
+		read: agg.readAnywhere === true || !!sibling?.read,
+		lastPageRead: 0,
+		bookmarked: false,
+		isDownloaded: false,
 	};
 }
 
@@ -2597,6 +2812,88 @@ function canStartPagesEarly(chapterId: string): boolean {
 	return isSuwayomiChapterId(chapterId) || !(config.nativeEngine && isTauri());
 }
 
+/** The aggregated copy a `?ch=` names: the one on `src` when several sources happen to share
+ *  the id, else the first. Id-exact — never a number match. */
+function findAggregatedCopy(
+	agg: AggregatedChapter[],
+	chapterId: string,
+	src: string | null,
+): { agg: AggregatedChapter; copy: AggregatedChapter['sources'][number] } | null {
+	let fallback: { agg: AggregatedChapter; copy: AggregatedChapter['sources'][number] } | null =
+		null;
+	for (const a of agg) {
+		for (const copy of a.sources) {
+			if (copy.chapterId !== chapterId) continue;
+			if ((copy.suwayomiMangaId ?? null) === src) return { agg: a, copy };
+			fallback ??= { agg: a, copy };
+		}
+	}
+	return fallback;
+}
+
+/**
+ * Every copy openable from ONE source: its own list plus the aggregation's copies on that
+ * source the list lacks. For the spine that is every MangaDex group's upload, not only the
+ * one `canonicalChapters` picked per number.
+ */
+function copyPool(
+	seriesId: string,
+	agg: AggregatedChapter[],
+	list: Chapter[],
+	src: string | null,
+): Chapter[] {
+	const have = new Set(list.map((c) => c.id));
+	const extra: Chapter[] = [];
+	for (const a of agg) {
+		for (const copy of a.sources) {
+			if ((copy.suwayomiMangaId ?? null) !== src || have.has(copy.chapterId)) continue;
+			have.add(copy.chapterId);
+			extra.push(chapterFromCopy(seriesId, a, copy, undefined));
+		}
+	}
+	return extra.length ? [...list, ...extra] : list;
+}
+
+/**
+ * The version switcher: every copy of the OPEN chapter number across sources and groups,
+ * with `current` on the one being read. Undefined when the aggregation does not know the
+ * open copy (an older API, a source outside it) — `buildReaderView` then lists the open
+ * source's own copies instead.
+ *
+ * The open copy is always present and always `current`: if the aggregation listed the
+ * number but not this exact upload (a redundant-extension copy `makeCopyResolver` drops),
+ * it is added rather than leaving the switcher with nothing selected.
+ */
+function readerVersions(
+	agg: AggregatedChapter[],
+	resolved: ResolvedWork,
+	target: Chapter,
+	src: string | null,
+	activeCand: { name: string; iconUrl: string | null } | undefined,
+): ReaderChapterVersion[] | undefined {
+	const entry = agg.find((a) => a.sources.some((s) => s.chapterId === target.id));
+	if (!entry) return undefined;
+	const versions: ReaderChapterVersion[] = makeCopyResolver(resolved)(entry).map((cp) => ({
+		id: cp.source.chapterId,
+		src: cp.src,
+		source: cp.name,
+		iconUrl: cp.iconUrl,
+		group: cp.group,
+		current: cp.source.chapterId === target.id && cp.src === src,
+	}));
+	if (!versions.some((v) => v.current)) {
+		versions.unshift({
+			id: target.id,
+			src,
+			source: activeCand?.name ?? 'Source',
+			iconUrl: activeCand?.iconUrl ?? null,
+			group: normalizeGroup(target.scanlator),
+			current: true,
+		});
+	}
+	return versions;
+}
+
 export function getReaderChapter(
 	seriesId: string,
 	chParam?: string | null,
@@ -2634,8 +2931,21 @@ export function getReaderChapter(
 		// preference or the same default the series page picked — shared resolver).
 		if (isCanonicalId(seriesId)) {
 			const preferred = getPreferredTranslator(seriesId);
-			const resolved = await resolveWork(seriesId, preferred);
+			// The cross-source aggregation rides along (`withAggregated`): it is the ONLY
+			// list that carries every copy of a number — `canonicalChapters` keeps one
+			// MangaDex upload per number — so it is what the version switcher lists, what
+			// resolves a `?ch=` naming a non-default upload, and what lets prev/next stay
+			// with the open copy's scanlation group. A backend without the bundle fetches
+			// it alongside the translator fan-out instead of after it.
+			const aggP =
+				!backend.seriesPage && backend.aggregatedChapters
+					? backend.aggregatedChapters(seriesId).catch(() => [] as AggregatedChapter[])
+					: null;
+			const resolved = await resolveWork(seriesId, preferred, { withAggregated: true });
 			if (!resolved) return emptyReader(seriesId);
+			// Absent on an API that predates the per-copy fields or the bundle: the reader
+			// then degrades to exactly its old single-copy behaviour.
+			const agg: AggregatedChapter[] = resolved.aggregated ?? (aggP ? await aggP : []);
 			// Same `work_redirect` healing as getSeries: a reader URL bookmarked before
 			// a merge resolves to the SURVIVOR, so the back-to-series link and the
 			// translator switch (which does a real `goto(/read/<workId>)`) address the
@@ -2679,7 +2989,6 @@ export function getReaderChapter(
 				const empty = emptyReader(effectiveId, tmeta);
 				return { ...empty, seriesTitle: resolved.meta?.title ?? '' };
 			}
-			let preserveOrder = readFromSrc ? false : resolved.preserveOrder;
 			let activeChs = chs;
 			let activeSpine = spine;
 			let activeSrc = readFromSrc
@@ -2703,85 +3012,183 @@ export function getReaderChapter(
 					chParam,
 					readFromSrc ? (srcTranslator?.key ?? null) : resolved.selected.key,
 				);
-				// Genuinely unknown to every source — stay honest and render empty.
 				if (!owner) {
-					const empty = emptyReader(effectiveId, tmeta);
-					return { ...empty, seriesTitle: resolved.meta?.title ?? '' };
+					// Not in any source's LIST — but possibly one of the MangaDex uploads the
+					// spine list does not carry: `canonicalChapters` keeps ONE copy per number,
+					// and the version switcher links the others by id. The aggregation knows
+					// every copy, so open that exact upload from the spine. Still matched by
+					// ID, never by number: this cannot open a different chapter than asked.
+					const hit = findAggregatedCopy(agg, chParam, srcParam ?? null);
+					const spineCand = resolved.candidates.find((c) => c.suwayomiMangaId === null);
+					// Genuinely unknown to every source — stay honest and render empty. (A
+					// Suwayomi copy missing from its own source's list means that list failed
+					// to load; there is nothing to read it from.)
+					if (!hit || hit.copy.suwayomiMangaId || !spineCand) {
+						const empty = emptyReader(effectiveId, tmeta);
+						return { ...empty, seriesTitle: resolved.meta?.title ?? '' };
+					}
+					const provisional = chapterFromCopy(effectiveId, hit.agg, hit.copy, undefined);
+					const sibling = copiesOf(spineCand.chapters, provisional)[0];
+					target = chapterFromCopy(effectiveId, hit.agg, hit.copy, sibling);
+					activeChs = spineCand.chapters;
+					activeSrc = null;
+					activeSpine = true;
+					tmeta.selectedTranslatorKey = translatorKey('mangadex', null);
+				} else {
+					target = owner.chapter;
+					activeChs = owner.candidate.chapters;
+					activeSrc = owner.candidate.suwayomiMangaId;
+					// Only the spine reads through `canonicalPages` — track the source we
+					// actually landed on.
+					activeSpine = owner.candidate.suwayomiMangaId === null;
+					// Reflect the real source in the picker, so the switcher doesn't claim a
+					// source that isn't the one being read. If the owning source is HIDDEN from
+					// the picker — a redundant all.mangadex extension the direct spine stands in
+					// for — highlight the spine instead of a key the picker never renders (else no
+					// chip shows as selected). The content is MangaDex either way, so the spine is
+					// the honest highlight.
+					const ownerKey = owner.candidate.key;
+					const ownerVisible = resolved.translators.some((t) => t.key === ownerKey);
+					tmeta.selectedTranslatorKey = ownerVisible ? ownerKey : translatorKey('mangadex', null);
 				}
-				target = owner.chapter;
-				activeChs = owner.candidate.chapters;
-				activeSrc = owner.candidate.suwayomiMangaId;
-				// The spine is the only server-ordered list, and only IT reads through
-				// `canonicalPages` — both track the source we actually landed on.
-				activeSpine = owner.candidate.suwayomiMangaId === null;
-				preserveOrder = activeSpine;
-				// Reflect the real source in the picker, so the switcher doesn't claim a
-				// source that isn't the one being read. If the owning source is HIDDEN from
-				// the picker — a redundant all.mangadex extension the direct spine stands in
-				// for — highlight the spine instead of a key the picker never renders (else no
-				// chip shows as selected). The content is MangaDex either way, so the spine is
-				// the honest highlight.
-				const ownerKey = owner.candidate.key;
-				const ownerVisible = resolved.translators.some((t) => t.key === ownerKey);
-				tmeta.selectedTranslatorKey = ownerVisible ? ownerKey : translatorKey('mangadex', null);
 			}
-			const asc = preserveOrder ? activeChs : [...activeChs].sort((a, b) => a.number - b.number);
-			if (!target) target = asc.find((c) => !c.read) ?? asc[0];
+			const asc = sortChaptersAsc(activeChs);
+			const chosen: Chapter = target ?? asc.find((c) => !c.read) ?? asc[0];
+			// The page fetch must NOT be able to blank the reader. It used to run bare here,
+			// so one rejection — a dead Suwayomi engine answering `pages` with "Internal
+			// error", a MangaDex upload taken down upstream — escaped to `live()`, which
+			// discarded the resolved title, list, versions and prev/next for `emptyReader`
+			// ("Ch. 0", no pickers, nothing to switch to). Now a copy that fails or comes
+			// back empty falls through to the other sources' copies of the SAME number
+			// (spine first, `resolveWork`'s order), and if none reads, the chosen chapter
+			// still opens with its full chrome and no pages. See {@link loadFirstReadable}.
+			//
 			// An off-site chapter has no pages to ask for, so don't ask: the request would
 			// spend a round trip to come back empty and land the reader in the no-pages
 			// state, which blames a licensing gap for a chapter that reads fine one hop
-			// away. `buildReaderView` carries the URL through and the reader links out.
-			const urls = chapterExternalUrl(target)
+			// away. `buildReaderView` carries the URL through and the reader links out. It
+			// gets no fallbacks either: off-site is an answer, not a failure.
+			type PageAttempt = {
+				chapter: Chapter;
+				chs: Chapter[];
+				src: string | null;
+				spine: boolean;
+				key: string | null;
+			};
+			const primary: PageAttempt = {
+				chapter: chosen,
+				chs: activeChs,
+				src: activeSrc,
+				spine: activeSpine,
+				key: null,
+			};
+			const fallbacks: PageAttempt[] = chapterExternalUrl(chosen)
 				? []
-				: await resolvePageUrls(
-						// Use the speculation only when the chapter we landed on is the one
-						// it was started for. `target` can be SUBSTITUTED above (an unknown
-						// `?ch=` falls back to the first unread), and those pages belong to a
-						// different chapter entirely.
-						speculatedPages && target.id === chParam
-							? await speculatedPages
-							: activeSpine && backend.canonicalPages
-								? await backend.canonicalPages(target.id)
-								: await backend.pages(target.id),
-					);
+				: resolved.candidates
+						.filter((cand) => cand.suwayomiMangaId !== activeSrc)
+						.flatMap((cand) =>
+							// The POOL, not the list: the spine's list keeps ONE copy per
+							// number, and that one is often the off-site upload while another
+							// group's readable upload exists only in the aggregation.
+							copiesOf(copyPool(effectiveId, agg, cand.chapters, cand.suwayomiMangaId), chosen)
+								.filter((c) => c.id !== chosen.id && !chapterExternalUrl(c))
+								.map((c) => ({
+									chapter: c,
+									chs: cand.chapters,
+									src: cand.suwayomiMangaId,
+									spine: cand.suwayomiMangaId === null,
+									key: cand.key,
+								})),
+						);
+			const opened = await loadFirstReadable<PageAttempt, Page>(
+				[primary, ...fallbacks],
+				(a) =>
+					chapterExternalUrl(a.chapter)
+						? Promise.resolve([])
+						: // Use the speculation only when the chapter we landed on is the one
+							// it was started for. `target` can be SUBSTITUTED above (an unknown
+							// `?ch=` falls back to the first unread), and those pages belong to
+							// a different chapter entirely.
+							speculatedPages && a.chapter.id === chParam
+							? speculatedPages
+							: a.spine && backend.canonicalPages
+								? backend.canonicalPages(a.chapter.id)
+								: backend.pages(a.chapter.id),
+				(a, err) =>
+					console.warn(
+						`[komika] pages failed for chapter ${a.chapter.id} (${a.src ?? 'mangadex'}):`,
+						err,
+					),
+			);
+			target = opened.copy.chapter;
+			if (opened.copy !== primary) {
+				// Read from the copy that actually loaded — list, prev/next and the picker
+				// all describe ITS source, exactly like the owner switch above.
+				activeChs = opened.copy.chs;
+				activeSrc = opened.copy.src;
+				const key = opened.copy.key;
+				tmeta.selectedTranslatorKey =
+					key && resolved.translators.some((t) => t.key === key)
+						? key
+						: translatorKey('mangadex', null);
+			}
+			const urls = opened.pages.length ? await resolvePageUrls(opened.pages) : [];
 			const readingSrc = activeSrc;
+			const activeCand = resolved.candidates.find((c) => c.suwayomiMangaId === activeSrc);
 			// `activeChs`, not `chs`: the list, the prev/next links and the target must
 			// all describe the SAME source, or navigation walks a list the reader is
-			// not actually on.
+			// not actually on. The POOL widens that same source by the copies only the
+			// aggregation carries (the spine's other groups' uploads), so "next chapter"
+			// can stay with the open group; a Suwayomi source's list already holds all of
+			// its copies, so nothing is added for it.
 			return buildReaderView(
 				effectiveId,
 				activeChs,
-				preserveOrder,
 				target,
 				urls,
 				resolved.meta?.title ?? 'Reader',
 				tmeta,
 				readingSrc,
+				{
+					pool: copyPool(effectiveId, agg, activeChs, readingSrc),
+					versions: readerVersions(agg, resolved, target, readingSrc, activeCand),
+					sourceName: activeCand?.name,
+					iconUrl: activeCand?.iconUrl ?? null,
+				},
 			);
 		}
-		// Numeric Suwayomi series — single source, no translator picker.
+		// Numeric Suwayomi series — single source, no translator picker. Its list holds
+		// every copy (one row per scanlator), so versions and group-preferring prev/next
+		// come from the list itself.
 		const chs = await backend.chapters(seriesId);
 		if (!chs.length) return emptyReader(seriesId);
-		const asc = [...chs].sort((a, b) => a.number - b.number);
+		const asc = sortChaptersAsc(chs);
 		let target = chParam ? chs.find((c) => c.id === chParam) : undefined;
 		if (!target) target = asc.find((c) => !c.read) ?? asc[0];
 		// Same skip as the canonical path above — an off-site chapter is served by its
 		// host, not by us.
-		const urls = chapterExternalUrl(target)
-			? []
-			: await resolvePageUrls(
-					// Same substitution guard as the canonical branch above: on this path an
-					// unknown `?ch=` silently falls back to the first unread chapter, so the
-					// id check is what keeps the speculated pages from being shown for it.
-					speculatedPages && target.id === chParam
-						? await speculatedPages
-						: await backend.pages(target.id),
-				);
+		// Same no-blanking rule as the canonical branch: a failed page fetch opens the
+		// chapter with its list and pickers and no pages, never `emptyReader`. A single
+		// source has no other copy to fall back to.
+		const open = target;
+		const { pages } = await loadFirstReadable<Chapter, Page>(
+			[open],
+			(c) =>
+				chapterExternalUrl(c)
+					? Promise.resolve([])
+					: // Same substitution guard as the canonical branch above: on this path an
+						// unknown `?ch=` silently falls back to the first unread chapter, so the
+						// id check is what keeps the speculated pages from being shown for it.
+						speculatedPages && c.id === chParam
+						? speculatedPages
+						: backend.pages(c.id),
+			(c, err) => console.warn(`[komika] pages failed for chapter ${c.id}:`, err),
+		);
+		const urls = pages.length ? await resolvePageUrls(pages) : [];
 		const series = await backend.series(seriesId).catch(() => null);
 		return buildReaderView(
 			seriesId,
 			chs,
-			false,
 			target,
 			urls,
 			series?.title ?? 'Reader',

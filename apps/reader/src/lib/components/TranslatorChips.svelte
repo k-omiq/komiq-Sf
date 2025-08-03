@@ -41,6 +41,8 @@
 			{#if c.iconUrl && !broken[chipId(c)]}
 				<img
 					class="logo"
+					width={size}
+					height={size}
 					src={c.iconUrl}
 					alt={label(c)}
 					loading="lazy"

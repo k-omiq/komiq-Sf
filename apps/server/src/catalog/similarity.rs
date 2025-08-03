@@ -13,6 +13,48 @@
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
+/// Minimum character similarity for author-corroborated exact-title merges.
+pub const AUTHOR_MATCH_THRESHOLD: f64 = 0.90;
+
+/// Unicode character edit similarity after folding case, punctuation and name order.
+/// Missing or blank names supply no evidence, even when both are missing.
+pub fn author_similarity(a: Option<&str>, b: Option<&str>) -> f64 {
+    fn key(name: &str) -> Vec<char> {
+        let lower = name.to_lowercase();
+        let mut tokens: Vec<&str> = lower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .collect();
+        tokens.sort_unstable();
+        tokens.concat().chars().collect()
+    }
+    let (Some(a), Some(b)) = (a, b) else {
+        return 0.0;
+    };
+    let (a, b) = (key(a), key(b));
+    let length = a.len().max(b.len());
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ac) in a.iter().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, bc) in b.iter().enumerate() {
+            let previous = row[j + 1];
+            row[j + 1] = (diagonal + usize::from(ac != bc))
+                .min(row[j] + 1)
+                .min(previous + 1);
+            diagonal = previous;
+        }
+    }
+    1.0 - row[b.len()] as f64 / length as f64
+}
+
+pub fn authors_match(a: Option<&str>, b: Option<&str>) -> bool {
+    author_similarity(a, b) >= AUTHOR_MATCH_THRESHOLD
+}
+
 /// Precomputed shingle set for one description — so a candidate whose description is
 /// compared against many works (the dedup scoring loop) is shingled ONCE instead of once
 /// per comparison. [`description_similarity`] is the string-in convenience wrapper.
@@ -166,6 +208,29 @@ pub fn phash_similarity(a: Option<&str>, b: Option<&str>) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn author_character_similarity_threshold_and_normalization() {
+        assert_eq!(
+            author_similarity(Some("Masashi Kishimoto"), Some("KISHIMOTO, Masashi")),
+            1.0
+        );
+        assert!(authors_match(
+            Some("Masashi Kishimoto"),
+            Some("Masashi Kishimot")
+        ));
+        assert!(authors_match(Some("abcdefghij"), Some("abcdefghiX"))); // exactly 90%
+        assert!(!authors_match(Some("abcdefghij"), Some("abcdefghXY")));
+        assert!(authors_match(Some("山田 太郎"), Some("太郎 山田")));
+        for missing in [None, Some(""), Some(" , ")] {
+            assert!(!authors_match(missing, missing));
+            assert!(!authors_match(missing, Some("Known Author")));
+        }
+        assert!(!authors_match(
+            Some("Masashi Kishimoto"),
+            Some("Eiichiro Oda")
+        ));
+    }
 
     #[test]
     fn identical_descriptions_score_one() {

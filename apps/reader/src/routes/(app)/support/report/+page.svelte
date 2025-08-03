@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { protectUnsaved } from '$lib/unsaved.svelte';
 	import { tick, untrack } from 'svelte';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
@@ -96,6 +97,10 @@
 	let busy = $state(false);
 	let error = $state<string | null>(null);
 	let done = $state<Report | null>(null);
+	protectUnsaved(
+		() => !done && !!(detail.trim() || title.trim() || username.trim() || sourceUrl.trim()),
+		'Leave this page and discard your report draft?',
+	);
 
 	/** The radio buttons, for roving focus. Indexes match `REPORT_TOPICS`. */
 	const pickEls = $state<(HTMLButtonElement | null)[]>([]);
@@ -324,6 +329,7 @@
 						{#if topic.needs.subject === 'optional'}<em>optional</em>{/if}
 					</span>
 					<input
+						name="subject"
 						bind:value={subject}
 						placeholder="https://komiq.cc/series/…"
 						autocomplete="off"
@@ -340,6 +346,7 @@
 						{#if topic.needs.secondary === 'optional'}<em>optional</em>{/if}
 					</span>
 					<input
+						name="secondary"
 						bind:value={secondary}
 						placeholder="https://komiq.cc/series/…"
 						autocomplete="off"
@@ -356,8 +363,9 @@
 						{#if topic.needs.title === 'optional'}<em>optional</em>{/if}
 					</span>
 					<input
+						name="title"
 						bind:value={title}
-						placeholder="Exact title, romanised or original"
+						placeholder="Exact title, romanised or original…"
 						required={topic.needs.title === 'required'}
 					/>
 				</label>
@@ -383,8 +391,11 @@
 							{#if topic.needs.user === 'optional'}<em>optional</em>{/if}
 						</span>
 						<input
+							name="username"
+							spellcheck="false"
+							autocapitalize="none"
 							bind:value={username}
-							placeholder="Their username"
+							placeholder="Their username…"
 							autocomplete="off"
 							required={topic.needs.user === 'required'}
 						/>
@@ -399,6 +410,7 @@
 			<label>
 				<span>What's wrong?</span>
 				<textarea
+					name="detail"
 					bind:value={detail}
 					rows="6"
 					maxlength={DETAIL_MAX}
@@ -412,8 +424,10 @@
 			<label>
 				<span>A link that helps <em>optional</em></span>
 				<input
+					type="url"
+					name="sourceUrl"
 					bind:value={sourceUrl}
-					placeholder="A page elsewhere that shows the correct information"
+					placeholder="https://example.com/correct-information…"
 					autocomplete="off"
 				/>
 			</label>

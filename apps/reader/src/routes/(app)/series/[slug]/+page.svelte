@@ -1,12 +1,15 @@
 <script lang="ts">
+	import { modalFocus } from '$lib/modal-focus';
 	import { page } from '$app/state';
 	import { goto, replaceState } from '$app/navigation';
-	import { untrack } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import Stars from '$lib/components/Stars.svelte';
 	import MangaCard from '$lib/components/MangaCard.svelte';
+	import SeriesMetadata from '$lib/components/SeriesMetadata.svelte';
 	import Cover from '$lib/components/Cover.svelte';
 	import CommentThread from '$lib/components/CommentThread.svelte';
+	import Pager from '$lib/components/Pager.svelte';
 	import StatusMenu from '$lib/components/StatusMenu.svelte';
 	import MergeDialog from '$lib/components/MergeDialog.svelte';
 	import UnmergeDialog from '$lib/components/UnmergeDialog.svelte';
@@ -134,7 +137,20 @@
 	// is preserved so a rating upsert doesn't wipe any review body already on record.
 	let userRating = $state(0);
 	let myBody = $state('');
-	let sort = $state<'newest' | 'oldest'>('newest');
+	const sort = $derived<'newest' | 'oldest'>(
+		page.url.searchParams.get('order') === 'oldest' ? 'oldest' : 'newest',
+	);
+	const orderHref = (order: string) => {
+		const url = new URL(page.url);
+		url.searchParams.set('order', order);
+		// A new order starts from its first page of chapters.
+		url.searchParams.delete('cpage');
+		return url.pathname + url.search + '#chapters';
+	};
+	const SORTS = [
+		{ value: 'newest', label: 'Newest first' },
+		{ value: 'oldest', label: 'Oldest first' },
+	] as const;
 
 	// EVERY id-keyed action on this page (library mark, favourite, shelf, ratings,
 	// reviews, chapter links) goes through `detail.id` — which is the id the BACKEND
@@ -688,7 +704,166 @@
 		u.pathname = `/series/${id}`;
 		return u.href;
 	});
+	// ---- page layout state ------------------------------------------------------
+	// Tabs split the long single column into Chapters / Discussion / Covers / Related.
+	// Chapters is the default and the only one rendered during SSR, so crawlers and
+	// link previews still get the chapter list; the others mount on demand (the
+	// discussion thread doesn't load until someone opens it).
+	type Tab = 'chapters' | 'discussion' | 'covers' | 'related';
+	let tab = $state<Tab>('chapters');
+	let aboutOpen = $state(false);
+	let rateOpen = $state(false);
+	let sortOpen = $state(false);
+	$effect(() => {
+		seriesId; // a different series starts fresh
+		untrack(() => {
+			tab = 'chapters';
+			aboutOpen = false;
+			rateOpen = false;
+			sortOpen = false;
+		});
+	});
+	// The rating popover closes on an outside press or Escape.
+	$effect(() => {
+		if (!rateOpen) return;
+		const onDown = (e: PointerEvent) => {
+			if (!(e.target as Element | null)?.closest?.('.rate-wrap')) rateOpen = false;
+		};
+		const onKey = (e: KeyboardEvent) => {
+			if (e.key === 'Escape') rateOpen = false;
+		};
+		window.addEventListener('pointerdown', onDown);
+		window.addEventListener('keydown', onKey);
+		return () => {
+			window.removeEventListener('pointerdown', onDown);
+			window.removeEventListener('keydown', onKey);
+		};
+	});
+
+	// ---- chapter sort menu ------------------------------------------------------
+	// A menu-button: the options are REAL links (`orderHref`) rendered even while closed
+	// (`hidden`), so the order is crawlable and works as plain navigation; the script
+	// only adds the open/close + arrow-key behaviour of an ARIA menu on top.
+	let sortBtn = $state<HTMLButtonElement | null>(null);
+	let sortMenu = $state<HTMLElement | null>(null);
+	function sortItems(): HTMLElement[] {
+		return [...(sortMenu?.querySelectorAll<HTMLElement>('[role="menuitemradio"]') ?? [])];
+	}
+	// Open and move focus into the menu: the checked option by default, or the
+	// first / last one when opened with ArrowDown / ArrowUp.
+	async function openSort(focus: 'checked' | 'first' | 'last' = 'checked') {
+		sortOpen = true;
+		await tick();
+		const items = sortItems();
+		const target =
+			focus === 'first'
+				? items[0]
+				: focus === 'last'
+					? items.at(-1)
+					: (items.find((el) => el.getAttribute('aria-checked') === 'true') ?? items[0]);
+		target?.focus();
+	}
+	function closeSort(returnFocus: boolean) {
+		sortOpen = false;
+		if (returnFocus) sortBtn?.focus();
+	}
+	// Choosing an order is still a real navigation, just one that keeps focus on the
+	// sort button (a plain link click would drop it on <body>). Modified clicks
+	// (new tab/window) are left to the browser.
+	async function pickSort(e: MouseEvent, href: string) {
+		if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+		e.preventDefault();
+		closeSort(false);
+		await goto(href, { keepFocus: true });
+		sortBtn?.focus();
+	}
+	function onSortBtnKey(e: KeyboardEvent) {
+		if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+			e.preventDefault();
+			void openSort(e.key === 'ArrowDown' ? 'first' : 'last');
+		}
+	}
+	function onSortMenuKey(e: KeyboardEvent) {
+		const items = sortItems();
+		const i = items.indexOf(document.activeElement as HTMLElement);
+		if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+			e.preventDefault();
+			const step = e.key === 'ArrowDown' ? 1 : -1;
+			items[(i + step + items.length) % items.length]?.focus();
+		} else if (e.key === 'Home' || e.key === 'End') {
+			e.preventDefault();
+			(e.key === 'Home' ? items[0] : items.at(-1))?.focus();
+		} else if (e.key === 'Escape') {
+			e.preventDefault();
+			e.stopPropagation();
+			closeSort(true);
+		} else if (e.key === 'Tab') {
+			closeSort(false);
+		} else if (e.key === ' ' && i >= 0) {
+			// Links only activate on Enter natively; menu items take Space too.
+			e.preventDefault();
+			items[i].click();
+		}
+	}
+	// Outside press closes without stealing focus (the press is moving it anyway).
+	$effect(() => {
+		if (!sortOpen) return;
+		const onDown = (e: PointerEvent) => {
+			if (!(e.target as Element | null)?.closest?.('.sort-wrap')) closeSort(false);
+		};
+		window.addEventListener('pointerdown', onDown);
+		return () => window.removeEventListener('pointerdown', onDown);
+	});
+
+	// Long-running series carry 1,000+ chapters; render them 100 at a time. The page
+	// lives in the URL (`?cpage=`) so it survives Back and can be linked. `load` does
+	// not read the URL, so flipping pages never refetches the series.
+	const CH_PAGE = 100;
+	const chPageCount = $derived(Math.max(1, Math.ceil(chapters.length / CH_PAGE)));
+	const chPage = $derived(
+		Math.min(chPageCount, Math.max(1, Math.floor(Number(page.url.searchParams.get('cpage'))) || 1)),
+	);
+	const pagedChapters = $derived(chapters.slice((chPage - 1) * CH_PAGE, chPage * CH_PAGE));
+	function chPageHref(p: number): string {
+		const url = new URL(page.url);
+		if (p <= 1) url.searchParams.delete('cpage');
+		else url.searchParams.set('cpage', String(p));
+		return url.pathname + url.search;
+	}
+
+	// Hero tag pills: the curated MangaDex genre/theme tags when the work has them,
+	// else the plain genre list. Capped so the hero stays a summary — the full set is
+	// under "More info".
+	const heroTags = $derived.by(() => {
+		const tags = seriesDetail?.metadata?.tags ?? [];
+		const names = tags.length
+			? [...tags]
+					.sort((a, b) => Number(b.group === 'genre') - Number(a.group === 'genre'))
+					.map((t) => t.name)
+			: (seriesDetail?.genres ?? []);
+		return [...new Set(names.filter((n) => n.trim()))].slice(0, 8);
+	});
+	const altTitle = $derived(seriesDetail?.altTitles?.[0] ?? '');
+	const pubYear = $derived(seriesDetail?.metadata?.year ?? null);
+	const isRead = $derived(continueCh > 1 || readCount > 0);
 </script>
+
+{#snippet srcLogo(iconUrl: string | null, name: string)}
+	{#if iconUrl}
+		<img
+			class="ch-src-logo"
+			width="16"
+			height="16"
+			src={iconUrl}
+			alt=""
+			loading="lazy"
+			decoding="async"
+			referrerpolicy="no-referrer"
+		/>
+	{:else}
+		<span class="ch-src-logo ch-src-initial">{name.charAt(0).toUpperCase()}</span>
+	{/if}
+{/snippet}
 
 <!--
 	`load` sets `ownsMeta: true` for this route, which makes the root layout stand
@@ -719,206 +894,541 @@
 
 {#if loading}
 	<!-- LOADING -->
+	<div class="banner banner-empty" aria-hidden="true"></div>
 	<div class="hero k-gutter">
-		<div class="hero-row">
+		<div class="hero-grid">
 			<div class="poster k-skeleton"></div>
-			<div class="info skel-info">
-				<div class="k-skeleton sk-badges"></div>
+			<div class="head skel-info">
 				<div class="k-skeleton sk-h1"></div>
 				<div class="k-skeleton sk-creators"></div>
-				<div class="k-skeleton sk-facts"></div>
+			</div>
+			<div class="actions skel-info">
 				<div class="k-skeleton sk-cta"></div>
+			</div>
+			<div class="meta skel-info">
+				<div class="k-skeleton sk-facts"></div>
 			</div>
 		</div>
 	</div>
 {:else if detail && seriesDetail}
-	<!-- hero info -->
-	<div class="hero k-gutter">
-		<div class="hero-row">
-			<div class="poster"><Cover src={detail.cover} alt={title} /></div>
-			<div class="info">
-				<div class="badges">
-					<span class="badge status"><span class="status-dot"></span>{statusLabel}</span>
-					<span class="badge type"><span class="type-flag">{FLAG[type]}</span>{type}</span>
-				</div>
+	<!-- Blurred cover backdrop. Decorative, so hidden from assistive tech. -->
+	<div class="banner" aria-hidden="true">
+		<div class="banner-img"><Cover src={detail.cover} alt="" sizing="card" /></div>
+	</div>
+
+	<!-- hero -->
+	<section class="hero k-gutter">
+		<div class="hero-grid">
+			<button
+				class="poster"
+				onclick={() => (covers.length ? openCover(0) : undefined)}
+				disabled={!covers.length}
+				aria-label={covers.length ? `View covers for ${title}` : title}
+			>
+				<Cover src={detail.cover} alt={title} priority />
+			</button>
+
+			<div class="head">
 				<h1>{title}</h1>
-				<div class="creators">
+				{#if altTitle}<p class="alt-title">{altTitle}</p>{/if}
+				<p class="creators">
 					{#if creditList.length}
 						{#each creditList as c, i (c.name)}
-							{#if i > 0}<span class="cr-sep">·</span>{/if}<span class="cr-name">{c.name}</span
-							>{#if c.label}<span class="cr-role">{c.label}</span>{/if}
+							{#if i > 0}<span class="cr-sep">,</span>{/if}<span class="cr-name">{c.name}</span>
 						{/each}
 					{:else}
-						{seriesDetail.author} · {seriesDetail.artist}
+						{[seriesDetail.author, seriesDetail.artist].filter(Boolean).join(', ')}
+					{/if}
+				</p>
+			</div>
+
+			<div class="actions">
+				<button class="lib" class:in={inLibrary} disabled={marking} onclick={toggleLibrary}>
+					{#if inLibrary}
+						<Icon name="check" size={16} strokeWidth={2.4} />In library
+					{:else}
+						<Icon name="plus" size={16} strokeWidth={2.4} />Add to library
+					{/if}
+				</button>
+				{#if inLibrary}
+					<StatusMenu
+						status={effectiveShelf}
+						onchange={chooseStatus}
+						disabled={marking || statusBusy}
+						variant="button"
+						canComplete={ended}
+					/>
+				{/if}
+				<a class="read" href={readHref}
+					><Icon name="book-open" size={16} />{isRead
+						? `Continue Ch. ${continueCh}`
+						: 'Start reading'}</a
+				>
+				<div class="rate-wrap">
+					<button
+						class="sq rate-btn"
+						class:on={userRating > 0}
+						aria-haspopup="dialog"
+						aria-expanded={rateOpen}
+						aria-label={userRating > 0 ? `Your rating: ${userRating} of 10` : 'Rate this series'}
+						title={userRating > 0 ? `You rated ${userRating}/10` : 'Rate'}
+						onclick={() => (rateOpen = !rateOpen)}
+					>
+						<Icon name="star" size={17} fill={userRating > 0 ? 'var(--k-star)' : 'none'} />
+						{#if userRating > 0}<span class="rate-mine">{userRating}</span>{/if}
+					</button>
+					{#if rateOpen}
+						<div class="rate-pop" role="dialog" aria-label="Rate this series">
+							<div class="rate-pop-head">
+								<span class="rate-pop-title">Your rating</span>
+								<span class="rate-pop-val">{userRating > 0 ? `${userRating} / 10` : '—'}</span>
+							</div>
+							<Stars bind:value={userRating} max={10} size={22} onchange={onRate} />
+							<div class="rate-pop-foot">
+								<span class="rate-label">{ratingLabel}</span>
+								<!-- Only offered when the viewer's review has NO written body.
+								     Withdrawing a rating deletes the review row (the server cannot
+								     store a scoreless review), so on a body-bearing row this would
+								     silently destroy text the reader wrote. -->
+								{#if userRating > 0 && !needsAuth && !myBody.trim()}
+									<button class="clear" onclick={clearRating}>Remove</button>
+								{/if}
+							</div>
+						</div>
 					{/if}
 				</div>
-				<div class="facts">
-					<span class="fact rating"
-						><Icon name="star" size={16} fill="var(--k-star)" />{rating}<span class="votes"
+				<button
+					class="sq fav"
+					class:on={isFavorite}
+					disabled={favBusy}
+					aria-pressed={isFavorite}
+					aria-label={isFavorite ? 'Remove from favourites' : 'Add to favourites'}
+					title={isFavorite ? 'Favourited' : 'Add to favourites'}
+					onclick={toggleFavorite}
+				>
+					<Icon name="heart" size={17} fill={isFavorite ? 'currentColor' : 'none'} />
+				</button>
+				<button
+					class="sq share"
+					class:copied={shareCopied}
+					aria-label={shareCopied ? 'Link copied' : 'Share'}
+					title={shareCopied ? 'Link copied' : 'Share'}
+					onclick={shareSeries}><Icon name={shareCopied ? 'check' : 'share'} size={17} /></button
+				>
+				{#if canMerge}
+					<button
+						class="merge"
+						disabled={!workId}
+						title={workId ? 'Merge duplicate series into this one' : 'Resolving work…'}
+						onclick={() => (mergeOpen = true)}>Merge</button
+					>
+				{/if}
+				{#if canSplit}
+					<button
+						class="merge"
+						disabled={!workId}
+						title={workId ? 'Detach sources that belong to a different series' : 'Resolving work…'}
+						onclick={() => (splitOpen = true)}>Split</button
+					>
+				{/if}
+				{#if canRate && nsfwOverride !== undefined}
+					<div class="rating" role="group" aria-label="Admin: content rating">
+						<span class="rating-tag">RATING</span>
+						<div class="rating-seg">
+							<button
+								class:on={nsfwChoice === 'auto'}
+								disabled={nsfwBusy}
+								aria-pressed={nsfwChoice === 'auto'}
+								title={nsfwChoice === 'auto'
+									? `No override — using the crawler's derived rating (currently ${
+											nsfwEffective ? 'NSFW' : 'SFW'
+										})`
+									: 'Clear the pin and fall back to the crawler’s derived rating'}
+								onclick={() => chooseNsfw('auto')}>Auto</button
+							>
+							<button
+								class:on={nsfwChoice === 'sfw'}
+								disabled={nsfwBusy}
+								aria-pressed={nsfwChoice === 'sfw'}
+								title="Pin as safe — shows to everyone"
+								onclick={() => chooseNsfw('sfw')}>SFW</button
+							>
+							<button
+								class:on={nsfwChoice === 'nsfw'}
+								disabled={nsfwBusy}
+								aria-pressed={nsfwChoice === 'nsfw'}
+								title="Pin as adult — hidden from readers who haven't enabled Show NSFW"
+								onclick={() => chooseNsfw('nsfw')}>NSFW</button
+							>
+						</div>
+					</div>
+				{/if}
+			</div>
+
+			<div class="meta">
+				<div class="pills">
+					<span class="pill type"><span class="type-flag">{FLAG[type]}</span>{type}</span>
+					{#each heroTags as t (t)}<span class="pill">{t}</span>{/each}
+				</div>
+				<div class="pub">
+					<span class="status-dot"></span>
+					Publication: {pubYear ? `${pubYear}, ` : ''}{statusLabel}
+				</div>
+				<div class="stats">
+					<span class="stat rating-stat" title={`${seriesDetail.votes} community ratings`}
+						><Icon name="star" size={15} fill="var(--k-star)" />{rating}<span class="votes"
 							>({seriesDetail.votes})</span
 						></span
 					>
-					<span class="sep"></span>
-					<span class="fact">{totalCh} chapters</span>
+					<span class="stat"><Icon name="list" size={15} />{totalCh} ch</span>
 					{#if viewsTotal > 0}
-						<span class="sep"></span>
-						<span class="fact"><Icon name="eye" size={15} />{viewsLabel} views</span>
+						<span class="stat"><Icon name="eye" size={15} />{viewsLabel}</span>
 					{/if}
-					<span class="sep"></span>
 					<!-- Chapter RELEASE time (the same clock the feed cards use), with our
 					     detection time on hover when the backend reports it. -->
 					<span
-						class="fact"
+						class="stat"
 						title={seriesDetail.detected
 							? `Newest chapter released ${seriesDetail.updated} · we detected it ${seriesDetail.detected}`
 							: `Newest chapter released ${seriesDetail.updated}`}
 						>Updated {seriesDetail.updated}</span
 					>
 				</div>
-				<div class="cta">
-					<a class="cta-read" href={readHref}
-						><Icon name="play" size={14} fill="currentColor" />Continue Ch. {continueCh}</a
-					>
-					<button class="lib" class:in={inLibrary} disabled={marking} onclick={toggleLibrary}>
-						{#if inLibrary}
-							<Icon name="check" size={16} strokeWidth={2.4} />In Library
-						{:else}
-							<Icon name="plus" size={16} strokeWidth={2.2} />Add to Library
-						{/if}
-					</button>
-					{#if inLibrary}
-						<StatusMenu
-							status={effectiveShelf}
-							onchange={chooseStatus}
-							disabled={marking || statusBusy}
-							variant="button"
-							canComplete={ended}
-						/>
-					{/if}
-					<button
-						class="fav"
-						class:on={isFavorite}
-						disabled={favBusy}
-						aria-pressed={isFavorite}
-						aria-label={isFavorite ? 'Remove from favourites' : 'Add to favourites'}
-						title={isFavorite ? 'Favourited' : 'Add to favourites'}
-						onclick={toggleFavorite}
-					>
-						<Icon name="heart" size={18} fill={isFavorite ? 'currentColor' : 'none'} />
-					</button>
-					<button
-						class="share"
-						class:copied={shareCopied}
-						aria-label={shareCopied ? 'Link copied' : 'Share'}
-						title={shareCopied ? 'Link copied' : 'Share'}
-						onclick={shareSeries}><Icon name={shareCopied ? 'check' : 'share'} size={18} /></button
-					>
-					{#if canMerge}
-						<button
-							class="merge"
-							disabled={!workId}
-							title={workId ? 'Merge duplicate series into this one' : 'Resolving work…'}
-							onclick={() => (mergeOpen = true)}>Merge</button
-						>
-					{/if}
-					{#if canSplit}
-						<button
-							class="merge"
-							disabled={!workId}
-							title={workId
-								? 'Detach sources that belong to a different series'
-								: 'Resolving work…'}
-							onclick={() => (splitOpen = true)}>Split</button
-						>
-					{/if}
-					{#if canRate && nsfwOverride !== undefined}
-						<div class="rating" role="group" aria-label="Admin: content rating">
-							<span class="rating-tag">RATING</span>
-							<div class="rating-seg">
-								<button
-									class:on={nsfwChoice === 'auto'}
-									disabled={nsfwBusy}
-									aria-pressed={nsfwChoice === 'auto'}
-									title={nsfwChoice === 'auto'
-										? `No override — using the crawler's derived rating (currently ${
-												nsfwEffective ? 'NSFW' : 'SFW'
-											})`
-										: 'Clear the pin and fall back to the crawler’s derived rating'}
-									onclick={() => chooseNsfw('auto')}>Auto</button
+			</div>
+		</div>
+		{#if nsfwError}
+			<div class="write-error" role="alert">
+				<Icon name="alert" size={15} />
+				<span>{nsfwError}</span>
+			</div>
+		{/if}
+		{#if writeError}
+			<div class="write-error" role="alert">
+				<Icon name="alert" size={15} />
+				<span>{writeError}</span>
+			</div>
+		{/if}
+	</section>
+
+	<!-- synopsis + details, collapsed to a preview until "More info" -->
+	<section class="about k-gutter">
+		<div class="about-box" class:open={aboutOpen} id="series-about">
+			{#if descriptions.length > 1}
+				<div class="desc-lang">
+					<span class="desc-lang-label">Language</span>
+					<select bind:value={descLangSel} aria-label="Description language">
+						<option value={null}>Default ({(seriesDetail.descLang ?? 'en').toUpperCase()})</option>
+						{#each descriptions as d (d.lang)}
+							<option value={d.lang}>{langName(d.lang)}</option>
+						{/each}
+					</select>
+				</div>
+			{/if}
+			{#if synopsisText}<p class="synopsis">{synopsisText}</p>{/if}
+
+			<div class="info-grid">
+				{#if creditList.length}
+					<div class="info">
+						<h3>Creators</h3>
+						<div class="chips">
+							{#each creditList as c (c.name)}
+								<span class="chip"
+									>{c.name}{#if c.label}<span class="chip-sub">{c.label}</span>{/if}</span
 								>
-								<button
-									class:on={nsfwChoice === 'sfw'}
-									disabled={nsfwBusy}
-									aria-pressed={nsfwChoice === 'sfw'}
-									title="Pin as safe — shows to everyone"
-									onclick={() => chooseNsfw('sfw')}>SFW</button
-								>
-								<button
-									class:on={nsfwChoice === 'nsfw'}
-									disabled={nsfwBusy}
-									aria-pressed={nsfwChoice === 'nsfw'}
-									title="Pin as adult — hidden from readers who haven't enabled Show NSFW"
-									onclick={() => chooseNsfw('nsfw')}>NSFW</button
-								>
-							</div>
+							{/each}
 						</div>
-					{/if}
-				</div>
-				{#if nsfwError}
-					<div class="write-error" role="alert">
-						<Icon name="alert" size={15} />
-						<span>{nsfwError}</span>
 					</div>
 				{/if}
-				{#if writeError}
-					<div class="write-error" role="alert">
-						<Icon name="alert" size={15} />
-						<span>{writeError}</span>
+				{#if !seriesDetail.metadata?.tags?.length && seriesDetail.genres.length}
+					<div class="info">
+						<h3>Genres</h3>
+						<div class="chips">
+							{#each seriesDetail.genres as g (g)}<span class="chip">{g}</span>{/each}
+						</div>
+					</div>
+				{/if}
+				{#if translators.length}
+					<!-- A static provenance list (no picker): the chapter list is the
+					     cross-source union, so each source's name, language and chapter
+					     count is the whole answer to "where can this be read from". -->
+					<div class="info">
+						<h3>Sources</h3>
+						<div class="chips">
+							{#each translators as t (t.key)}
+								<span class="chip src-chip">
+									{#if t.iconUrl}
+										<img
+											class="src-logo"
+											width="18"
+											height="18"
+											src={t.iconUrl}
+											alt=""
+											loading="lazy"
+											decoding="async"
+											referrerpolicy="no-referrer"
+										/>
+									{:else}
+										<span class="src-logo src-initial">{t.name.charAt(0).toUpperCase()}</span>
+									{/if}
+									{t.name}{#if t.lang}<span class="chip-sub">{t.lang.toUpperCase()}</span>{/if}
+									<span class="chip-sub">{t.chapterCount} ch</span>
+								</span>
+							{/each}
+						</div>
 					</div>
 				{/if}
 			</div>
+
+			<div class="about-meta">
+				<SeriesMetadata metadata={seriesDetail.metadata} />
+			</div>
+
+			{#if seriesDetail.altTitles.length}
+				<div class="info alt-block">
+					<h3>Alternative titles</h3>
+					<ul class="alt-list">
+						{#each seriesDetail.altTitles as t (t)}<li>{t}</li>{/each}
+					</ul>
+				</div>
+			{/if}
+		</div>
+		<button
+			class="more"
+			aria-expanded={aboutOpen}
+			aria-controls="series-about"
+			onclick={() => (aboutOpen = !aboutOpen)}
+		>
+			{aboutOpen ? 'Show less' : 'More info'}
+			<span class="more-icon" class:flip={aboutOpen}><Icon name="chevron-down" size={14} /></span>
+		</button>
+	</section>
+
+	<!-- tabs -->
+	<div class="tabs-wrap k-gutter" id="chapters">
+		<div class="tabs" role="tablist" aria-label="Series sections">
+			<button
+				role="tab"
+				id="tab-chapters"
+				aria-selected={tab === 'chapters'}
+				aria-controls="panel"
+				class:on={tab === 'chapters'}
+				onclick={() => (tab = 'chapters')}>Chapters<span class="tab-n">{totalCh}</span></button
+			>
+			<button
+				role="tab"
+				id="tab-discussion"
+				aria-selected={tab === 'discussion'}
+				aria-controls="panel"
+				class:on={tab === 'discussion'}
+				onclick={() => (tab = 'discussion')}>Discussion</button
+			>
+			{#if covers.length > 1}
+				<button
+					role="tab"
+					id="tab-covers"
+					aria-selected={tab === 'covers'}
+					aria-controls="panel"
+					class:on={tab === 'covers'}
+					onclick={() => (tab = 'covers')}>Covers<span class="tab-n">{covers.length}</span></button
+				>
+			{/if}
+			{#if relatedSeries.length}
+				<button
+					role="tab"
+					id="tab-related"
+					aria-selected={tab === 'related'}
+					aria-controls="panel"
+					class:on={tab === 'related'}
+					onclick={() => (tab = 'related')}>Related</button
+				>
+			{/if}
 		</div>
 	</div>
 
-	<!-- genres + synopsis -->
-	<div class="genres-syn k-gutter">
-		<div class="genre-chips">
-			{#each seriesDetail.genres as g (g)}
-				<span class="gchip">{g}</span>
-			{/each}
-		</div>
-		{#if seriesDetail.altTitles.length}
-			<div class="alt-titles">
-				<span class="alt-label">Also known as</span>
-				<div class="alt-chips">
-					{#each seriesDetail.altTitles as t (t)}
-						<span class="alt-chip">{t}</span>
-					{/each}
+	<div class="panel k-gutter" id="panel" role="tabpanel" aria-labelledby={`tab-${tab}`}>
+		{#if tab === 'chapters'}
+			<div class="ch-tools">
+				<div class="sort-wrap">
+					<button
+						class="tool"
+						bind:this={sortBtn}
+						aria-haspopup="menu"
+						aria-expanded={sortOpen}
+						aria-controls="sort-menu"
+						aria-label={`Sort chapters: ${sort === 'newest' ? 'Newest first' : 'Oldest first'}`}
+						onclick={() => (sortOpen ? closeSort(false) : openSort())}
+						onkeydown={onSortBtnKey}
+					>
+						<Icon name="arrow-up-down" size={15} />
+						{sort === 'newest' ? 'Newest first' : 'Oldest first'}
+						<span class="sort-icon" class:flip={sortOpen}
+							><Icon name="chevron-down" size={15} /></span
+						>
+					</button>
+					<!-- Rendered while closed too (`hidden`) so both orders stay real,
+					     crawlable links in the SSR markup. -->
+					<div
+						class="sort-pop"
+						id="sort-menu"
+						role="menu"
+						tabindex="-1"
+						aria-label="Sort chapters"
+						hidden={!sortOpen}
+						bind:this={sortMenu}
+						onkeydown={onSortMenuKey}
+					>
+						{#each SORTS as o (o.value)}
+							<a
+								class="sort-opt"
+								role="menuitemradio"
+								aria-checked={sort === o.value}
+								tabindex="-1"
+								href={orderHref(o.value)}
+								onclick={(e) => pickSort(e, orderHref(o.value))}
+							>
+								<span class="sort-check"
+									>{#if sort === o.value}<Icon
+											name="check"
+											size={14}
+											strokeWidth={2.6}
+										/>{/if}</span
+								>
+								{o.label}
+							</a>
+						{/each}
+					</div>
 				</div>
+				{#if chapters.length}
+					<span class="ch-count"
+						>{chapters.length}
+						{chapters.length === 1 ? 'chapter' : 'chapters'}{chPageCount > 1
+							? ` · page ${chPage} of ${chPageCount}`
+							: ''}</span
+					>
+				{/if}
 			</div>
-		{/if}
-		{#if descriptions.length > 1}
-			<div class="desc-lang">
-				<span class="desc-lang-label">Description language</span>
-				<select bind:value={descLangSel} aria-label="Description language">
-					<option value={null}>Default ({(seriesDetail.descLang ?? 'en').toUpperCase()})</option>
-					{#each descriptions as d (d.lang)}
-						<option value={d.lang}>{langName(d.lang)}</option>
-					{/each}
-				</select>
-			</div>
-		{/if}
-		<p class="synopsis">{synopsisText}</p>
-	</div>
 
-	<!-- covers (F2): additional per-volume/locale covers; hidden for ≤1 cover -->
-	{#if covers.length > 1}
-		<div class="covers k-gutter">
-			<div class="covers-head">
-				<h2>Covers</h2>
-				<span class="covers-count">{covers.length}</span>
-			</div>
-			<div class="covers-strip">
+			<!-- EMPTY STATE. MangaDex REMOVES chapters when a series is licensed or
+			     claimed, so this is usually a popular series whose chapters live on
+			     another source, not a broken one. -->
+			{#if chapters.length === 0}
+				<div class="ch-empty">
+					<div class="ch-empty-title">No chapters from any source yet</div>
+					<div class="ch-empty-desc">
+						{translators.length
+							? 'Nothing is available to read here yet. It may arrive from one of this series’ sources, or be licensed elsewhere.'
+							: 'Nothing is available to read here yet. It may arrive from another source, or be licensed elsewhere.'}
+					</div>
+				</div>
+			{/if}
+
+			<ol class="ch-list" id="chapter-list">
+				{#each pagedChapters as c (c.id ?? c.n)}
+					<!-- One card per chapter NUMBER (the cross-source union). No nested
+					     interactive elements: the main row links to the sensible default
+					     source, and each per-source copy below is a sibling link. -->
+					{@const multi = (c.sources?.length ?? 0) > 1}
+					<li class="ch-card" class:read={c.read} class:multi>
+						<a class="ch-main" href={chapterHref(c.id, c.src)}>
+							<span class="ch-mark" title={c.read ? 'Read' : 'Unread'}
+								>{#if c.read}<Icon name="check" size={13} strokeWidth={2.6} />{/if}</span
+							>
+							<span class="ch-text">
+								<span class="ch-line">
+									<span class="ch-num">Ch. {c.n}</span>
+									{#if c.title && c.title !== `Chapter ${c.n}`}<span class="ch-name">{c.title}</span
+										>{/if}
+									{#if c.isNew}<span class="new">NEW</span>{/if}
+									<!-- Off-site chapters (~35,000: MangaPlus, Comikey, NamiComi,
+									     BiliBili) have no pages for us to serve — badged here so
+									     the reader knows before tapping. -->
+									{#if c.external}<span class="ext" title="Hosted on another site"
+											><Icon name="globe" size={11} />OFF-SITE</span
+										>{/if}
+								</span>
+							</span>
+							<!-- One copy: the group (else the source) sits in the compact row. Several
+							     copies: each gets its own sub-row below instead. -->
+							{#if c.sources?.length === 1}
+								{@const s = c.sources[0]}
+								<span class="ch-by" title={s.group ? `${s.group} · ${s.name}` : s.name}>
+									{@render srcLogo(s.iconUrl, s.name)}
+									<span class="ch-src-name">{s.group || s.name}</span>
+								</span>
+							{:else if !c.sources?.length && c.group}
+								<span class="ch-by"
+									><Icon name="users" size={14} /><span class="ch-src-name">{c.group}</span></span
+								>
+							{/if}
+							<!-- TWO CLOCKS, NAMED: a source that holds chapters behind early
+							     access publishes days before anyone here can read them. "Found"
+							     only renders where the data layer allows it (recent or
+							     newest-3); never a placeholder date. -->
+							<span class="ch-dates">
+								<!-- With per-copy rows the release dates live on those rows. -->
+								{#if c.date && !(multi && c.sources?.some((s) => s.date))}<span
+										>Released {c.date}</span
+									>{/if}
+								{#if c.foundDate}<span
+										class="ch-found"
+										title="When we first had this chapter available to read"
+										>Found {c.foundDate}</span
+									>{/if}
+							</span>
+							<Icon name="chevron-right" size={16} />
+						</a>
+						{#if multi && c.sources}
+							<!-- MangaDex-style: one sub-row per (source, group) copy, each a
+							     sibling link to exactly that upload. -->
+							<ul class="ch-copies" aria-label={`Chapter ${c.n} versions`}>
+								{#each c.sources as s, i (`${s.src ?? 'spine'}:${s.id ?? i}`)}
+									<li>
+										<a
+											class="ch-copy"
+											href={chapterHref(s.id, s.src)}
+											aria-label={`Read Chapter ${c.n} by ${s.group || s.name} on ${s.name}`}
+										>
+											{@render srcLogo(s.iconUrl, s.name)}
+											<span class="cp-text">
+												<span class="cp-group">{s.group || s.name}</span>
+												{#if s.group}<span class="cp-src">{s.name}</span>{/if}
+											</span>
+											{#if s.date}<span class="cp-date">{s.date}</span>{/if}
+										</a>
+									</li>
+								{/each}
+							</ul>
+						{/if}
+					</li>
+				{/each}
+			</ol>
+
+			{#if chPageCount > 1}
+				<Pager
+					page={chPage}
+					hasNext={chPage < chPageCount}
+					total={chapters.length}
+					pageSize={CH_PAGE}
+					count={pagedChapters.length}
+					href={chPageHref}
+					label="Chapter pages"
+					controls="chapter-list"
+					scrollTarget="chapters"
+				/>
+			{/if}
+		{:else if tab === 'discussion'}
+			<!-- The single unified comment engine (replies + image attachments). The star
+			     rating in the hero is the series' score; written discussion lives here. -->
+			{#if seriesId}
+				<CommentThread
+					targetType="series"
+					targetId={seriesId}
+					storageKey={socialKey}
+					prompt="Share your thoughts on this series…"
+				/>
+			{/if}
+		{:else if tab === 'covers'}
+			<div class="covers-grid">
 				{#each covers as c, i (c.url)}
 					<button class="cover-cell" onclick={() => openCover(i)} title={coverLabel(c)}>
 						<div class="cover-thumb">
@@ -934,200 +1444,9 @@
 					</button>
 				{/each}
 			</div>
-		</div>
-	{/if}
-
-	<!-- available sources: a static provenance list (no picker). The chapter list
-	     below is the cross-source union straight after this, so there is nothing to
-	     switch — each source's icon, name, language and chapter count is the whole
-	     answer to "where can this be read from". -->
-	{#if translators.length}
-		<div class="sources k-gutter">
-			<div class="src-head">
-				<h2>Available sources</h2>
-				<span class="src-sub"
-					>{translators.length === 1 ? '1 source' : `${translators.length} sources`}</span
-				>
-			</div>
-			<ul class="src-list">
-				{#each translators as t (t.key)}
-					<li class="src-item">
-						{#if t.iconUrl}
-							<img
-								class="src-logo"
-								src={t.iconUrl}
-								alt=""
-								loading="lazy"
-								decoding="async"
-								referrerpolicy="no-referrer"
-							/>
-						{:else}
-							<span class="src-logo src-initial">{t.name.charAt(0).toUpperCase()}</span>
-						{/if}
-						<span class="src-name"
-							>{t.name}{#if t.lang}<span class="src-lang">{t.lang.toUpperCase()}</span>{/if}</span
-						>
-						<span class="src-count"
-							>{t.chapterCount} {t.chapterCount === 1 ? 'chapter' : 'chapters'}</span
-						>
-					</li>
-				{/each}
-			</ul>
-		</div>
-	{/if}
-
-	<!-- rate -->
-	<div class="rate-wrap k-gutter">
-		<div class="rate">
-			<div class="rate-left">
-				<div class="score">
-					<span class="score-num"><Icon name="star" size={26} fill="var(--k-star)" />{rating}</span>
-					<span class="score-sub">{seriesDetail.votes} community ratings</span>
-				</div>
-				<div class="divider"></div>
-				<div>
-					<div class="rate-title">Rate this series</div>
-					<div class="rate-label">{ratingLabel}</div>
-				</div>
-			</div>
-			<div class="rate-right">
-				<Stars bind:value={userRating} max={10} size={24} onchange={onRate} />
-				<!-- Only offered when the viewer's review has NO written body. Withdrawing a
-				     rating deletes the review row (the server cannot store a scoreless
-				     review), so on a body-bearing row this button would silently destroy
-				     text the reader wrote. Hiding it beats a confirm dialog for something
-				     nobody expects a "Clear" next to a star row to be able to do. -->
-				{#if userRating > 0 && !needsAuth && !myBody.trim()}
-					<button class="clear" onclick={clearRating}>Clear</button>
-				{/if}
-			</div>
-		</div>
-	</div>
-
-	<!-- chapters -->
-
-	<div class="chapters k-gutter">
-		<div class="ch-head">
-			<div class="ch-title">
-				<h2>Chapters</h2>
-				<span class="ch-total">{totalCh} total</span>
-			</div>
-			<div class="ch-sort">
-				<button class="sortchip" class:on={sort === 'newest'} onclick={() => (sort = 'newest')}
-					>Newest</button
-				>
-				<button class="sortchip" class:on={sort === 'oldest'} onclick={() => (sort = 'oldest')}
-					>Oldest</button
-				>
-			</div>
-		</div>
-		<div class="ch-list">
-			<!-- EMPTY STATE. There was none: the list simply rendered nothing under a
-			     "Chapters · 0 total" header, which reads as a page that failed to load. It is
-			     reachable in bulk now that Browse pages the whole catalogue (~67k works have
-			     no chapter yet), and the honest wording matters — MangaDex REMOVES chapters
-			     when a series is licensed or claimed, so this is usually a popular series
-			     whose chapters live on another source, not a broken one. -->
-			{#if chapters.length === 0}
-				<div class="ch-empty">
-					<div class="ch-empty-title">No chapters from any source yet</div>
-					<div class="ch-empty-desc">
-						{translators.length
-							? 'Nothing is available to read here yet. It may arrive from one of the sources above, or be licensed elsewhere.'
-							: 'Nothing is available to read here yet. It may arrive from another source, or be licensed elsewhere.'}
-					</div>
-				</div>
-			{/if}
-			{#each chapters as c (c.id ?? c.n)}
-				<!-- One row per chapter NUMBER (the cross-source union), with no nested
-				     interactive elements: the chapter number and the main body are two sibling
-				     links to the row's sensible default source, and the provenance cluster of
-				     per-source links sits between them — never inside either one. -->
-				<div class="ch-row" class:read={c.read}>
-					<a class="ch-numlink" href={chapterHref(c.id, c.src)}>
-						<span class="ch-num">{c.n}</span>
-					</a>
-					{#if c.sources?.length}
-						<span class="ch-srcs">
-							{#each c.sources as s (s.src ?? 'spine')}
-								<a
-									class="ch-src"
-									href={chapterHref(s.id, s.src)}
-									title={`Read Chapter ${c.n} on ${s.name}`}
-									aria-label={`Read Chapter ${c.n} on ${s.name}`}
-								>
-									{#if s.iconUrl}
-										<img
-											class="ch-src-logo"
-											src={s.iconUrl}
-											alt=""
-											loading="lazy"
-											decoding="async"
-											referrerpolicy="no-referrer"
-										/>
-									{:else}
-										<span class="ch-src-initial">{s.name.charAt(0).toUpperCase()}</span>
-									{/if}
-								</a>
-							{/each}
-						</span>
-					{/if}
-					<a class="ch-main" href={chapterHref(c.id, c.src)}>
-						<div class="ch-info">
-							<div class="ch-line">
-								<span class="ch-name">{c.title}</span>
-								{#if c.isNew}<span class="new">NEW</span>{/if}
-								<!-- Off-site chapters (~35,000 of them: MangaPlus, Comikey, NamiComi,
-								     BiliBili) have no pages for us to serve — tapping one opens a
-								     "read it on <host>" hand-off. Badged HERE, in the list people
-								     actually browse, because learning it only after you have opened
-								     the chapter is the dead end the badge exists to remove. The
-								     reader's own dropdown badges too, but that is already past the
-								     point of surprise. -->
-								{#if c.external}<span class="ext" title="Hosted on another site"
-										><Icon name="globe" size={11} />OFF-SITE</span
-									>{/if}
-							</div>
-							<!-- TWO CLOCKS, NAMED, because they answer different questions and
-							     the gap between them is the point: a source that holds chapters
-							     behind early access publishes days before anyone here can read
-							     them.
-
-							     "Found" is secondary, so it renders only where it can say
-							     something the release clock cannot: chapters whose discovery
-							     is within the last 30 days, plus the three newest chapters.
-							     Older rows and rows with no recorded discovery time omit it —
-							     never a placeholder date (the data layer already returns '').
-
-							     A multi-source work can carry a chapter no source dated (S2
-							     aggregation), so the Released half drops out too rather than
-							     leaving an empty line among dated rows. -->
-							<div class="ch-dates">
-								{#if c.date}<span class="ch-date">Released {c.date}</span>{/if}
-								{#if c.foundDate}
-									<span
-										class="ch-date ch-found"
-										title="When we first had this chapter available to read"
-										>Found {c.foundDate}</span
-									>
-								{/if}
-							</div>
-						</div>
-						{#if c.read}<span class="ch-read"
-								><Icon name="check" size={13} strokeWidth={2.4} />Read</span
-							>{/if}
-						<Icon name="chevron-right" size={16} stroke="#57554f" />
-					</a>
-				</div>
-			{/each}
-		</div>
-	</div>
-
-	<!-- related -->
-	{#if relatedSeries.length}
-		<div class="related k-gutter">
-			<h2>Readers Also Enjoyed</h2>
-			<div class="related-row">
+		{:else if tab === 'related'}
+			<h2 class="sr-only">Readers also enjoyed</h2>
+			<div class="related-grid">
 				{#each relatedSeries as item (item.id ?? item.title)}
 					<MangaCard
 						title={item.title}
@@ -1135,12 +1454,11 @@
 						rating={item.rating}
 						cover={item.cover}
 						id={item.id}
-						fixed
 					/>
 				{/each}
 			</div>
-		</div>
-	{/if}
+		{/if}
+	</div>
 {:else if loadError}
 	<!-- LOAD ERROR (backend outage) — distinct from a genuinely missing series -->
 	<div class="not-found k-gutter">
@@ -1176,8 +1494,7 @@
 	/>
 {/if}
 
-<!-- admin source splitter. Same mount conditions as the merge picker: an admin with a
-     resolved work, so its row query never leaves a reader's page. -->
+<!-- admin source splitter. Same mount conditions as the merge picker. -->
 {#if canSplit && workId}
 	<UnmergeDialog bind:open={splitOpen} {workId} workTitle={title} onsplit={afterSplit} />
 {/if}
@@ -1186,6 +1503,7 @@
 {#if activeCover}
 	<div
 		class="lightbox"
+		use:modalFocus
 		role="dialog"
 		aria-modal="true"
 		aria-label={coverLabel(activeCover)}
@@ -1206,363 +1524,250 @@
 	</div>
 {/if}
 
-<!-- discussion — the single unified comment engine (replies + image attachments).
-     The old bespoke "Reviews" comment list was removed; the star rating above is
-     the series' score, and all written discussion lives in this one thread. -->
-<div class="discussion k-gutter">
-	<h2 class="discussion-title">Discussion</h2>
-	{#if seriesId}
-		<CommentThread
-			targetType="series"
-			targetId={seriesId}
-			storageKey={socialKey}
-			prompt="Share your thoughts on this series…"
-		/>
-	{/if}
-</div>
-
 <style>
-	.discussion {
-		margin-top: 40px;
-		padding-bottom: 8px;
+	/* ---- banner ---- */
+	.banner {
+		position: absolute;
+		top: var(--k-header-h);
+		left: 0;
+		right: 0;
+		height: 300px;
+		overflow: hidden;
+		z-index: 0;
+		pointer-events: none;
 	}
-	.discussion-title {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 22px;
-		color: var(--k-text-bright);
-		margin: 0 0 20px;
+	.banner-img {
+		position: absolute;
+		inset: -40px;
+		filter: blur(28px) saturate(1.15);
+		opacity: 0.55;
+		transform: scale(1.08);
 	}
+	.banner::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		background: linear-gradient(
+			180deg,
+			color-mix(in srgb, var(--k-bg) 35%, transparent) 0%,
+			color-mix(in srgb, var(--k-bg) 70%, transparent) 55%,
+			var(--k-bg) 100%
+		);
+	}
+	.banner-empty {
+		background: var(--k-surface-2);
+	}
+
+	/* ---- hero ---- */
 	.hero {
 		position: relative;
-		padding-top: 48px;
-		z-index: 5;
+		z-index: 1;
+		padding-top: 40px;
 	}
-	/* Centred stacked hero: cover on top, metadata column beneath it. */
-	.hero-row {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 28px;
-		text-align: center;
+	.hero-grid {
+		display: grid;
+		grid-template-columns: 210px minmax(0, 1fr);
+		grid-template-areas:
+			'poster head'
+			'poster actions'
+			'poster meta';
+		grid-template-rows: auto auto 1fr;
+		column-gap: 32px;
+		row-gap: 18px;
 	}
 	.poster {
+		grid-area: poster;
 		position: relative;
-		flex: 0 0 auto;
-		width: 224px;
-		height: 328px;
-		border-radius: 12px;
+		width: 210px;
+		aspect-ratio: 2 / 3;
+		align-self: start;
+		padding: 0;
+		border-radius: var(--k-radius-lg);
 		overflow: hidden;
 		border: 1px solid var(--k-border-2);
-		box-shadow: 0 26px 60px rgba(0, 0, 0, 0.6);
+		background: var(--k-cover);
+		box-shadow: 0 22px 50px rgba(0, 0, 0, 0.45);
+		cursor: zoom-in;
 	}
-	.info {
-		width: 100%;
-		max-width: 720px;
+	.poster:disabled {
+		cursor: default;
+	}
+	.head {
+		grid-area: head;
 		min-width: 0;
-	}
-	/* loading skeleton */
-	.poster.k-skeleton {
-		border-radius: 12px;
-	}
-	.skel-info {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 16px;
-	}
-	.skel-info .k-skeleton {
-		border-radius: 8px;
-	}
-	.sk-badges {
-		width: 180px;
-		height: 24px;
-	}
-	.sk-h1 {
-		width: 60%;
-		max-width: 460px;
-		height: 54px;
-	}
-	.sk-creators {
-		width: 220px;
-		height: 16px;
-	}
-	.sk-facts {
-		width: 80%;
-		max-width: 520px;
-		height: 16px;
-	}
-	.sk-cta {
-		width: 340px;
-		height: 50px;
-		margin-top: 6px;
-	}
-	/* not-found */
-	.not-found {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 14px;
-		padding: 120px 20px;
-		text-align: center;
-	}
-	.nf-icon {
-		width: 64px;
-		height: 64px;
-		border-radius: 50%;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		background: var(--k-surface-3);
-		border: 1px solid var(--k-border-2);
-		color: var(--k-hiatus);
-	}
-	.not-found h1 {
-		font-size: 34px;
-		margin: 0;
-		color: var(--k-text-bright);
-	}
-	.not-found p {
-		margin: 0;
-		max-width: 380px;
-		font-size: 14.5px;
-		line-height: 1.6;
-		color: var(--k-text-dim);
-	}
-	.nf-btns {
-		display: flex;
-		gap: 12px;
-		margin-top: 10px;
-		flex-wrap: wrap;
-		justify-content: center;
-	}
-	.nf-primary,
-	.nf-ghost {
-		height: 46px;
-		padding: 0 24px;
-		display: inline-flex;
-		align-items: center;
-		border-radius: 8px;
-		font-weight: 700;
-		font-size: 14px;
-		text-decoration: none;
-	}
-	.nf-primary {
-		background: var(--k-primary);
-		color: var(--k-on-primary);
-		border: none;
-		cursor: pointer;
-		font-family: inherit;
-	}
-	.nf-ghost {
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text);
-	}
-	.nf-ghost:hover {
-		border-color: rgba(255, 255, 255, 0.34);
-	}
-	.badges {
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		gap: 10px;
-		margin-bottom: 16px;
-	}
-	.badge {
-		display: inline-flex;
-		align-items: center;
-		gap: 8px;
-		border-radius: var(--k-radius-pill);
-		font-size: 11.5px;
-		font-weight: 700;
-	}
-	.badge.status {
-		padding: 5px 12px;
-		background: rgba(255, 255, 255, 0.06);
-		border: 1px solid var(--k-border-2);
-		letter-spacing: 0.05em;
-		color: var(--k-text-2);
-	}
-	.status-dot {
-		width: 7px;
-		height: 7px;
-		border-radius: 50%;
-		background: var(--k-dot);
-	}
-	.badge.type {
-		padding: 5px 13px 5px 10px;
-		background: rgba(224, 131, 105, 0.12);
-		border: 1px solid rgba(224, 131, 105, 0.4);
-		font-weight: 800;
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-		color: var(--k-accent);
-	}
-	.type-flag {
-		font-size: 15px;
-		line-height: 1;
+		align-self: end;
+		padding-top: 24px;
 	}
 	h1 {
-		font-size: 58px;
-		line-height: 1;
-		letter-spacing: -0.03em;
-		margin: 0 0 8px;
+		margin: 0;
+		font-size: clamp(30px, 4vw, 52px);
+		line-height: 1.05;
 		color: var(--k-text-bright);
+		overflow-wrap: anywhere;
+	}
+	.alt-title {
+		margin: 8px 0 0;
+		font-size: 17px;
+		font-weight: 600;
+		color: var(--k-text-2);
+		line-height: 1.35;
 	}
 	.creators {
-		font-size: 15px;
-		color: var(--k-text-dim);
-		margin-bottom: 22px;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		gap: 8px;
-		flex-wrap: wrap;
-	}
-	.cr-name {
-		color: var(--k-text-2);
+		margin: 10px 0 0;
+		font-size: 14px;
 		font-weight: 600;
-	}
-	.cr-role {
-		font-size: 10.5px;
-		font-weight: 800;
-		letter-spacing: 0.04em;
-		text-transform: uppercase;
-		color: var(--k-text-faint);
-		background: var(--k-hover-fill);
-		border: 1px solid var(--k-border-3);
-		border-radius: 5px;
-		padding: 1px 6px;
-		margin-left: 5px;
+		color: var(--k-text-dim);
 	}
 	.cr-sep {
-		color: var(--k-text-disabled);
+		margin-right: 6px;
 	}
-	.desc-lang {
+	.actions {
+		grid-area: actions;
 		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
 		gap: 10px;
 	}
-	.desc-lang-label {
-		font-size: 11px;
-		font-weight: 700;
-		letter-spacing: 0.09em;
-		text-transform: uppercase;
-		color: var(--k-text-faint);
-	}
-	.desc-lang select {
-		height: 34px;
-		padding: 0 10px;
-		border-radius: 8px;
-		background: var(--k-surface-2);
-		border: 1px solid var(--k-border-3);
-		color: var(--k-text-2);
-		font-size: 13px;
-		font-weight: 600;
-		cursor: pointer;
-	}
-	.facts {
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		gap: 22px;
-		flex-wrap: wrap;
-		margin-bottom: 24px;
-	}
-	.fact {
-		font-size: 14px;
-		color: var(--k-text-muted);
-	}
-	.fact.rating {
-		display: inline-flex;
-		align-items: center;
-		gap: 6px;
-		font-weight: 700;
-		font-size: 15px;
-		color: var(--k-text);
-	}
-	.votes {
-		color: var(--k-text-faint);
-		font-weight: 500;
-		font-size: 13px;
-	}
-	.sep {
-		width: 4px;
-		height: 4px;
-		border-radius: 50%;
-		background: #403f3b;
-	}
-	.cta {
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		gap: 12px;
-		flex-wrap: wrap;
-	}
-	.write-error {
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		gap: 8px;
-		margin-top: 12px;
-		padding: 9px 14px;
-		border-radius: 8px;
-		background: rgba(246, 183, 60, 0.1);
-		border: 1px solid rgba(246, 183, 60, 0.34);
-		color: var(--k-text-2);
-		font-size: 13px;
-		font-weight: 600;
-	}
-	.cta-read {
-		height: 50px;
-		padding: 0 30px;
-		border: none;
-		border-radius: 8px;
-		background: var(--k-primary);
-		color: var(--k-on-primary);
-		font-weight: 700;
-		font-size: 15px;
-		cursor: pointer;
+	.lib,
+	.read {
+		height: 46px;
+		padding: 0 22px;
+		border-radius: var(--k-radius-md);
 		display: inline-flex;
 		align-items: center;
 		gap: 9px;
+		font-weight: 700;
+		font-size: 14.5px;
+		cursor: pointer;
 		text-decoration: none;
-	}
-	.cta-read:hover {
-		background: var(--k-primary-hover);
+		white-space: nowrap;
 	}
 	.lib {
-		height: 50px;
-		padding: 0 22px;
-		border-radius: 8px;
-		font-weight: 700;
-		font-size: 14px;
-		cursor: pointer;
-		display: inline-flex;
-		align-items: center;
-		gap: 9px;
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text);
-		transition: all 0.15s;
+		border: none;
+		background: var(--k-accent);
+		color: #fff;
+		transition: filter 0.15s;
 	}
-	.lib:hover {
-		border-color: rgba(255, 255, 255, 0.34);
+	.lib:hover:not(:disabled) {
+		filter: brightness(1.08);
 	}
 	.lib.in {
-		background: rgba(95, 191, 126, 0.12);
-		border-color: rgba(95, 191, 126, 0.5);
-		color: #7fd39a;
+		background: rgba(95, 191, 126, 0.14);
+		box-shadow: inset 0 0 0 1px rgba(95, 191, 126, 0.5);
+		color: var(--k-ongoing);
 	}
-	/* Admin-only, so it is deliberately the quietest thing in the CTA row — an outline
-	   button sized to the others. It sits last, after Share, because it is a maintenance
-	   action and must never compete with Continue / Add to Library. */
+	.read {
+		background: var(--k-primary);
+		color: var(--k-on-primary);
+	}
+	.read:hover {
+		background: var(--k-primary-hover);
+	}
+	.actions :global(.sm-btn),
+	.actions :global(button.sm-trigger) {
+		height: 46px;
+	}
+	.sq {
+		position: relative;
+		height: 46px;
+		min-width: 46px;
+		padding: 0 12px;
+		flex: 0 0 auto;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 6px;
+		border-radius: var(--k-radius-md);
+		background: var(--k-surface-4);
+		border: 1px solid var(--k-border-3);
+		color: var(--k-text-3);
+		cursor: pointer;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s;
+	}
+	.sq:hover:not(:disabled) {
+		border-color: var(--k-border-strong);
+		color: var(--k-text);
+	}
+	.sq:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	.fav.on {
+		background: rgba(233, 110, 110, 0.12);
+		border-color: rgba(233, 110, 110, 0.5);
+		color: #e96e6e;
+	}
+	.share.copied {
+		border-color: rgba(95, 191, 126, 0.5);
+		color: var(--k-ongoing);
+	}
+	.rate-btn.on {
+		border-color: rgba(246, 183, 60, 0.5);
+		color: var(--k-text);
+	}
+	.rate-mine {
+		font-weight: 800;
+		font-size: 14px;
+	}
+	.rate-wrap {
+		position: relative;
+	}
+	.rate-pop {
+		position: absolute;
+		top: calc(100% + 8px);
+		left: 50%;
+		transform: translateX(-50%);
+		z-index: 30;
+		width: max-content;
+		max-width: calc(100vw - 32px);
+		padding: 14px 16px;
+		border-radius: var(--k-radius-lg);
+		background: var(--k-surface-3);
+		border: 1px solid var(--k-border-3);
+		box-shadow: 0 22px 60px rgba(0, 0, 0, 0.5);
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+	}
+	.rate-pop-head,
+	.rate-pop-foot {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+	}
+	.rate-pop-title {
+		font-weight: 700;
+		font-size: 13.5px;
+		color: var(--k-text);
+	}
+	.rate-pop-val {
+		font-weight: 800;
+		font-size: 13.5px;
+		color: var(--k-star);
+	}
+	.rate-label {
+		font-size: 12px;
+		color: var(--k-text-dim);
+	}
+	.clear {
+		border: none;
+		background: none;
+		padding: 0;
+		font: inherit;
+		font-size: 12px;
+		font-weight: 700;
+		color: var(--k-cancelled);
+		cursor: pointer;
+	}
 	.merge {
-		height: 50px;
+		height: 46px;
 		padding: 0 16px;
 		flex: 0 0 auto;
-		border-radius: 8px;
+		border-radius: var(--k-radius-md);
 		background: transparent;
 		border: 1px dashed var(--k-border-4);
 		color: var(--k-text-3);
@@ -1571,24 +1776,21 @@
 		cursor: pointer;
 	}
 	.merge:hover:not(:disabled) {
-		border-color: rgba(255, 255, 255, 0.34);
+		border-color: var(--k-border-strong);
 		color: var(--k-text-1);
 	}
 	.merge:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
 	}
-	/* Same vocabulary as `.merge` above — admin-only, quiet, sized to the CTA row and
-	   last in it. A segmented group rather than a button because the choice is
-	   three-way and the current state has to be readable at a glance. */
 	.rating {
 		display: flex;
 		align-items: center;
 		gap: 8px;
-		height: 50px;
+		height: 46px;
 		flex: 0 0 auto;
 		padding: 0 10px 0 12px;
-		border-radius: 8px;
+		border-radius: var(--k-radius-md);
 		border: 1px dashed var(--k-border-4);
 	}
 	.rating-tag {
@@ -1611,10 +1813,6 @@
 		font-size: 12px;
 		font-weight: 700;
 		cursor: pointer;
-		transition: all 0.15s;
-	}
-	.rating-seg button:hover:not(:disabled):not(.on) {
-		color: var(--k-text-1);
 	}
 	.rating-seg button.on {
 		background: var(--k-surface);
@@ -1624,139 +1822,608 @@
 		opacity: 0.5;
 		cursor: not-allowed;
 	}
-	.share {
-		width: 50px;
-		height: 50px;
-		flex: 0 0 auto;
-		border-radius: 8px;
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-3);
-		cursor: pointer;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-	}
-	/* Admin content-rating override. Sized to the 50px CTA buttons it sits beside so
-	   the row keeps one baseline, and visually quieter than them — it is a moderation
-	   tool sharing space with the reader's own actions, not a peer of them. */
-	.share:hover {
-		border-color: rgba(255, 255, 255, 0.34);
-		color: var(--k-text);
-	}
-	.share.copied {
-		border-color: rgba(95, 191, 126, 0.5);
-		color: #7fd39a;
-	}
-	.fav {
-		width: 50px;
-		height: 50px;
-		flex: 0 0 auto;
-		border-radius: 8px;
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-3);
-		cursor: pointer;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		transition: all 0.15s;
-	}
-	.fav:hover:not(:disabled) {
-		border-color: rgba(233, 110, 110, 0.5);
-		color: #e96e6e;
-	}
-	.fav.on {
-		background: rgba(233, 110, 110, 0.12);
-		border-color: rgba(233, 110, 110, 0.5);
-		color: #e96e6e;
-	}
-	.fav:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-	.genres-syn {
-		padding-top: 44px;
-		padding-bottom: 8px;
+	.meta {
+		grid-area: meta;
 		display: flex;
 		flex-direction: column;
-		gap: 22px;
+		gap: 12px;
+		min-width: 0;
 	}
-	.genre-chips {
+	.pills {
 		display: flex;
-		gap: 9px;
 		flex-wrap: wrap;
+		gap: 6px;
 	}
-	.gchip {
-		font-size: 13px;
-		color: var(--k-text-3);
-		padding: 7px 15px;
-		border-radius: var(--k-radius-pill);
-		border: 1px solid var(--k-border-3);
+	.pill {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		padding: 3px 9px;
+		border-radius: 6px;
+		background: var(--k-surface-4);
+		border: 1px solid var(--k-border-2);
+		font-size: 11px;
+		font-weight: 800;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		color: var(--k-text-2);
 	}
-	.alt-titles {
+	.pill.type {
+		color: var(--k-text-bright);
+		border-color: var(--k-border-4);
+	}
+	.type-flag {
+		font-size: 12px;
+	}
+	.pub {
 		display: flex;
-		flex-direction: column;
-		gap: 7px;
+		align-items: center;
+		gap: 8px;
+		font-size: 12px;
+		font-weight: 800;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		color: var(--k-text-2);
 	}
-	.alt-label {
-		font-size: 11.5px;
+	.status-dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--k-dot);
+	}
+	.stats {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px 18px;
+	}
+	.stat {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 13.5px;
+		font-weight: 600;
+		color: var(--k-text-dim);
+	}
+	.rating-stat {
+		font-weight: 800;
+		color: var(--k-star);
+	}
+	.votes {
+		font-weight: 600;
+		color: var(--k-text-faint);
+	}
+	.write-error {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin-top: 14px;
+		padding: 9px 14px;
+		border-radius: var(--k-radius);
+		background: rgba(246, 183, 60, 0.1);
+		border: 1px solid rgba(246, 183, 60, 0.34);
+		color: var(--k-text-2);
+		font-size: 13px;
+		font-weight: 600;
+	}
+
+	/* ---- about (synopsis + details) ---- */
+	.about {
+		position: relative;
+		z-index: 1;
+		margin-top: 28px;
+	}
+	.about-box {
+		position: relative;
+		max-height: 132px;
+		overflow: hidden;
+	}
+	.about-box:not(.open)::after {
+		content: '';
+		position: absolute;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		height: 64px;
+		background: linear-gradient(transparent, var(--k-bg));
+		pointer-events: none;
+	}
+	.about-box.open {
+		max-height: none;
+	}
+	.synopsis {
+		margin: 0;
+		max-width: 920px;
+		font-size: 15px;
+		line-height: 1.7;
+		color: var(--k-text-2);
+		white-space: pre-line;
+	}
+	.desc-lang {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		margin-bottom: 10px;
+	}
+	.desc-lang-label {
+		font-size: 11px;
 		font-weight: 700;
-		letter-spacing: 0.06em;
+		letter-spacing: 0.09em;
 		text-transform: uppercase;
 		color: var(--k-text-faint);
 	}
-	.alt-chips {
-		display: flex;
-		gap: 8px;
-		flex-wrap: wrap;
-	}
-	.alt-chip {
-		font-size: 12.5px;
-		color: var(--k-text-muted);
-		padding: 5px 12px;
-		border-radius: var(--k-radius-pill);
+	.desc-lang select {
+		height: 32px;
+		padding: 0 10px;
+		border-radius: var(--k-radius);
 		background: var(--k-surface-2);
-		border: 1px solid var(--k-border-1);
+		border: 1px solid var(--k-border-3);
+		color: var(--k-text-2);
+		font-size: 13px;
+		font-weight: 600;
+		cursor: pointer;
 	}
-	.synopsis {
-		max-width: 820px;
-		font-size: 15.5px;
-		line-height: 1.7;
-		color: var(--k-text-muted);
-		margin: 0;
-	}
-	/* covers (F2) */
-	.covers {
-		padding-top: 44px;
+	.info-grid {
 		display: flex;
-		flex-direction: column;
-		gap: 16px;
+		flex-wrap: wrap;
+		gap: 22px 36px;
+		margin-top: 22px;
 	}
-	.covers-head {
-		display: flex;
-		align-items: baseline;
-		gap: 12px;
-	}
-	.covers-head h2 {
-		font-size: 21px;
-		margin: 0;
+	.info h3 {
+		margin: 0 0 8px;
+		font-size: 14px;
 		color: var(--k-text);
 	}
-	.covers-count {
-		font-size: 13px;
+	.chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+	}
+	.chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		padding: 5px 10px;
+		border-radius: 6px;
+		background: var(--k-surface-4);
+		border: 1px solid var(--k-border-2);
+		font-size: 12.5px;
+		font-weight: 600;
+		color: var(--k-text-2);
+	}
+	.chip-sub {
+		font-size: 11px;
+		font-weight: 700;
 		color: var(--k-text-faint);
 	}
-	.covers-strip {
+	.src-logo {
+		width: 18px;
+		height: 18px;
+		border-radius: 4px;
+		object-fit: cover;
+		background: var(--k-surface-5);
+	}
+	.src-initial {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 10px;
+		font-weight: 800;
+	}
+	.about-meta :global(.metadata) {
+		padding-inline: 0;
+		margin-top: 22px;
+	}
+	.alt-block {
+		margin-top: 22px;
+	}
+	.alt-list {
+		margin: 0;
+		padding: 0;
+		list-style: none;
 		display: flex;
-		gap: 14px;
+		flex-direction: column;
+		gap: 4px;
+		font-size: 13.5px;
+		color: var(--k-text-dim);
+	}
+	.more {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 6px;
+		width: 100%;
+		margin-top: 6px;
+		padding: 6px 0;
+		border: none;
+		border-top: 1px solid var(--k-border-2);
+		background: none;
+		color: var(--k-accent);
+		font: inherit;
+		font-size: 12.5px;
+		font-weight: 800;
+		cursor: pointer;
+	}
+	.more-icon,
+	.sort-icon {
+		display: inline-flex;
+		transition: transform 0.18s;
+	}
+	.more-icon.flip,
+	.sort-icon.flip {
+		transform: rotate(180deg);
+	}
+
+	/* ---- tabs ---- */
+	.tabs-wrap {
+		margin-top: 30px;
+		scroll-margin-top: calc(var(--k-header-h) + 12px);
+	}
+	.tabs {
+		display: inline-flex;
+		max-width: 100%;
 		overflow-x: auto;
-		padding-bottom: 8px;
-		scroll-snap-type: x proximity;
+		gap: 4px;
+		padding: 4px;
+		border-radius: var(--k-radius-lg);
+		background: var(--k-surface-2);
+		border: 1px solid var(--k-border-1);
+		scrollbar-width: none;
+	}
+	.tabs button {
+		flex: 0 0 auto;
+		display: inline-flex;
+		align-items: center;
+		gap: 7px;
+		height: 36px;
+		padding: 0 16px;
+		border: none;
+		border-radius: var(--k-radius);
+		background: transparent;
+		color: var(--k-text-dim);
+		font: inherit;
+		font-size: 14px;
+		font-weight: 700;
+		cursor: pointer;
+	}
+	.tabs button:hover {
+		color: var(--k-text);
+	}
+	.tabs button.on {
+		background: var(--k-surface-5);
+		color: var(--k-text-bright);
+		box-shadow: 0 1px 0 var(--k-border-3) inset;
+	}
+	.tab-n {
+		font-size: 11px;
+		font-weight: 800;
+		color: var(--k-text-faint);
+	}
+	.panel {
+		padding-top: 18px;
+		padding-bottom: 56px;
+	}
+
+	/* ---- chapters ---- */
+	.ch-tools {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		margin-bottom: 12px;
+	}
+	.sort-wrap {
+		position: relative;
+		flex: 0 0 auto;
+	}
+	.tool {
+		display: inline-flex;
+		align-items: center;
+		gap: 7px;
+		height: 34px;
+		padding: 0 10px 0 12px;
+		border-radius: var(--k-radius);
+		background: var(--k-surface-4);
+		border: 1px solid var(--k-border-2);
+		color: var(--k-text-2);
+		font: inherit;
+		font-size: 13px;
+		font-weight: 700;
+		cursor: pointer;
+	}
+	.tool:hover,
+	.tool[aria-expanded='true'] {
+		border-color: var(--k-border-strong);
+		color: var(--k-text);
+	}
+	/* Same surface as the rating popover. Anchored to the button's LEFT edge — the
+	   button sits at the start of the toolbar, so the menu always opens inward and
+	   can't run off a phone screen. */
+	.sort-pop {
+		position: absolute;
+		top: calc(100% + 6px);
+		left: 0;
+		z-index: 30;
+		min-width: 100%;
+		width: max-content;
+		max-width: calc(100vw - 32px);
+		padding: 5px;
+		border-radius: var(--k-radius-lg);
+		background: var(--k-surface-3);
+		border: 1px solid var(--k-border-3);
+		box-shadow: 0 22px 60px rgba(0, 0, 0, 0.5);
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+	.sort-pop[hidden] {
+		display: none;
+	}
+	.sort-opt {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		min-height: 36px;
+		padding: 0 12px 0 8px;
+		border-radius: var(--k-radius);
+		color: var(--k-text-2);
+		font-size: 13px;
+		font-weight: 700;
+		text-decoration: none;
+		white-space: nowrap;
+	}
+	.sort-opt:hover,
+	.sort-opt:focus-visible {
+		background: var(--k-hover-fill);
+		color: var(--k-text);
+	}
+	.sort-opt:focus-visible {
+		outline: 2px solid var(--k-accent);
+		outline-offset: -2px;
+	}
+	.sort-opt[aria-checked='true'] {
+		color: var(--k-text-bright);
+	}
+	.sort-check {
+		width: 16px;
+		display: inline-flex;
+		justify-content: center;
+		color: var(--k-accent);
+	}
+	.ch-count {
+		font-size: 12.5px;
+		font-weight: 600;
+		color: var(--k-text-faint);
+	}
+	.ch-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+	}
+	.ch-card {
+		border-radius: var(--k-radius-md);
+		background: var(--k-surface-2);
+		border: 1px solid var(--k-border-1);
+		overflow: hidden;
+	}
+	.ch-card:hover {
+		border-color: var(--k-border-3);
+	}
+	.ch-main {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		padding: 10px 14px;
+		color: var(--k-text-ghost);
+		text-decoration: none;
+	}
+	.ch-main:hover {
+		background: var(--k-hover-fill);
+	}
+	.ch-mark {
+		width: 20px;
+		height: 20px;
+		flex: 0 0 auto;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border-radius: 50%;
+		border: 1.5px solid var(--k-border-4);
+		color: var(--k-on-primary);
+	}
+	.read .ch-mark {
+		background: var(--k-ongoing);
+		border-color: var(--k-ongoing);
+		color: #0c0c0d;
+	}
+	.ch-text {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+	.ch-line {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		min-width: 0;
+	}
+	.ch-num {
+		flex: 0 0 auto;
+		font-weight: 800;
+		font-size: 14px;
+		color: var(--k-text-bright);
+	}
+	.ch-name {
+		min-width: 0;
+		font-weight: 600;
+		font-size: 14px;
+		color: var(--k-text-2);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.read .ch-num,
+	.read .ch-name {
+		color: var(--k-text-faint);
+	}
+	.new {
+		flex: 0 0 auto;
+		font-size: 9.5px;
+		font-weight: 800;
+		letter-spacing: 0.06em;
+		padding: 2px 6px;
+		border-radius: 4px;
+		background: var(--k-accent);
+		color: #fff;
+	}
+	.ext {
+		flex: 0 0 auto;
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		font-size: 9.5px;
+		font-weight: 800;
+		letter-spacing: 0.05em;
+		color: var(--k-text-faint);
+		border: 1px solid var(--k-border-4);
+		padding: 1px 6px;
+		border-radius: 4px;
+	}
+	.ch-by {
+		flex: 0 0 170px;
+		display: inline-flex;
+		align-items: center;
+		gap: 7px;
+		min-width: 0;
+		font-size: 12.5px;
+		font-weight: 600;
+		color: var(--k-text-dim);
+	}
+	.ch-dates {
+		flex: 0 0 150px;
+		display: flex;
+		flex-direction: column;
+		align-items: flex-end;
+		gap: 2px;
+		font-size: 12px;
+		color: var(--k-text-faint);
+		text-align: right;
+	}
+	.ch-found {
+		color: var(--k-text-ghost);
+	}
+	/* Per-copy sub-rows (a chapter with more than one source/group upload). */
+	.ch-copies {
+		list-style: none;
+		margin: 0;
+		padding: 0 0 4px;
+	}
+	.ch-copy {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		min-height: 36px;
+		padding: 6px 14px 6px 46px;
+		border-top: 1px solid var(--k-border-1);
+		color: var(--k-text-dim);
+		font-size: 12.5px;
+		text-decoration: none;
+	}
+	.ch-copy:hover {
+		background: var(--k-hover-fill);
+		color: var(--k-text);
+	}
+	.cp-text {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		align-items: baseline;
+		gap: 8px;
+		white-space: nowrap;
+	}
+	.cp-group,
+	.cp-src {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.cp-group {
+		flex: 0 1 auto;
+		font-weight: 700;
+		color: var(--k-text-2);
+	}
+	/* The source name gives way before the group does. */
+	.cp-src {
+		flex: 0 100 auto;
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--k-text-faint);
+	}
+	.ch-copy:hover .cp-group {
+		color: var(--k-text);
+	}
+	.cp-date {
+		flex: 0 0 auto;
+		font-size: 12px;
+		color: var(--k-text-faint);
+		font-variant-numeric: tabular-nums;
+	}
+	.read .cp-group {
+		color: var(--k-text-faint);
+	}
+	.ch-src-logo {
+		width: 16px;
+		height: 16px;
+		flex: 0 0 auto;
+		border-radius: 4px;
+		object-fit: cover;
+	}
+	.ch-src-initial {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 9px;
+		font-weight: 800;
+		background: var(--k-surface-5);
+	}
+	.ch-src-name {
+		min-width: 0;
+		max-width: 180px;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.ch-empty {
+		padding: 40px 20px;
+		text-align: center;
+		border-radius: var(--k-radius-lg);
+		border: 1px dashed var(--k-border-3);
+	}
+	.ch-empty-title {
+		font-weight: 700;
+		font-size: 15px;
+		color: var(--k-text);
+	}
+	.ch-empty-desc {
+		margin: 6px auto 0;
+		max-width: 420px;
+		font-size: 13.5px;
+		line-height: 1.6;
+		color: var(--k-text-dim);
+	}
+
+	/* ---- covers + related ---- */
+	.covers-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+		gap: 18px 14px;
 	}
 	.cover-cell {
-		flex: 0 0 auto;
-		width: 120px;
 		display: flex;
 		flex-direction: column;
 		gap: 8px;
@@ -1765,17 +2432,15 @@
 		border: none;
 		cursor: pointer;
 		text-align: left;
-		scroll-snap-align: start;
 	}
 	.cover-thumb {
 		position: relative;
-		width: 120px;
-		height: 180px;
-		border-radius: 9px;
+		width: 100%;
+		aspect-ratio: 2 / 3;
+		border-radius: var(--k-radius-md);
 		overflow: hidden;
 		border: 1px solid var(--k-border-2);
 		background: var(--k-surface-2);
-		transition: border-color 0.15s;
 	}
 	.cover-cell:hover .cover-thumb {
 		border-color: var(--k-border-strong);
@@ -1807,14 +2472,26 @@
 	.cover-lang {
 		font-size: 9.5px;
 		font-weight: 800;
-		letter-spacing: 0.04em;
 		color: var(--k-text-faint);
-		background: var(--k-hover-fill);
 		border: 1px solid var(--k-border-3);
 		border-radius: 4px;
 		padding: 1px 5px;
 	}
-	/* cover lightbox */
+	.related-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+		gap: 22px 16px;
+	}
+	.sr-only {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		overflow: hidden;
+		clip: rect(0 0 0 0);
+		white-space: nowrap;
+	}
+
+	/* ---- lightbox ---- */
 	.lightbox {
 		position: fixed;
 		inset: 0;
@@ -1847,7 +2524,7 @@
 		flex: 1 1 auto;
 		min-height: 0;
 		aspect-ratio: 2 / 3;
-		border-radius: 12px;
+		border-radius: var(--k-radius-lg);
 		overflow: hidden;
 		box-shadow: 0 30px 80px rgba(0, 0, 0, 0.7);
 	}
@@ -1860,13 +2537,13 @@
 	.lb-label {
 		font-size: 14px;
 		font-weight: 700;
-		color: var(--k-text-bright);
+		color: #f7f6f3;
 	}
 	.lb-close {
 		width: 40px;
 		height: 40px;
 		flex: 0 0 auto;
-		border-radius: 9px;
+		border-radius: var(--k-radius-md);
 		background: var(--k-surface-3);
 		border: 1px solid var(--k-border-3);
 		color: var(--k-text);
@@ -1875,526 +2552,195 @@
 		align-items: center;
 		justify-content: center;
 	}
-	.lb-close:hover {
-		border-color: var(--k-border-strong);
+
+	/* ---- loading + not found ---- */
+	.poster.k-skeleton {
+		box-shadow: none;
 	}
-	.rate-wrap {
-		padding-top: 40px;
-	}
-	.rate {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 28px;
-		align-items: center;
-		justify-content: space-between;
-		border: 1px solid var(--k-border);
-		border-radius: 12px;
-		padding: 24px 30px;
-		background: var(--k-surface);
-	}
-	.rate-left {
-		display: flex;
-		align-items: center;
-		gap: 24px;
-	}
-	.score {
+	.skel-info {
 		display: flex;
 		flex-direction: column;
+		gap: 12px;
 	}
-	.score-num {
-		display: inline-flex;
-		align-items: center;
-		gap: 7px;
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 38px;
-		line-height: 1;
-		color: var(--k-text-bright);
+	.skel-info .k-skeleton {
+		border-radius: var(--k-radius);
 	}
-	.score-sub {
-		font-size: 12px;
-		color: var(--k-text-faint);
-		margin-top: 6px;
+	.sk-h1 {
+		width: min(460px, 80%);
+		height: 48px;
 	}
-	.divider {
-		width: 1px;
-		height: 52px;
-		background: var(--k-border-2);
+	.sk-creators {
+		width: 200px;
+		height: 16px;
 	}
-	.rate-title {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 16px;
-		color: var(--k-text);
+	.sk-cta {
+		width: min(340px, 100%);
+		height: 46px;
 	}
-	.rate-label {
-		font-size: 13px;
-		color: var(--k-text-dimmer);
-		margin-top: 4px;
+	.sk-facts {
+		width: min(420px, 90%);
+		height: 16px;
 	}
-	.rate-right {
-		display: flex;
-		align-items: center;
-		gap: 16px;
-	}
-	.clear {
-		background: none;
-		border: none;
-		font-size: 12.5px;
-		font-weight: 700;
-		color: var(--k-text-dimmer);
-		cursor: pointer;
-		white-space: nowrap;
-	}
-	.clear:hover {
-		color: var(--k-text);
-	}
-	/* Available sources: a static provenance list, deliberately quiet. It answers
-	   "where can this be read from" and nothing else — the interaction it replaces
-	   (the per-source picker) now lives in the per-chapter provenance cluster below
-	   and in the reader's own settings. */
-	.sources {
-		padding-top: 44px;
+	.not-found {
 		display: flex;
 		flex-direction: column;
+		align-items: center;
 		gap: 14px;
+		padding: 120px 20px;
+		text-align: center;
 	}
-	.src-head {
+	.nf-icon {
+		width: 64px;
+		height: 64px;
+		border-radius: 50%;
 		display: flex;
-		align-items: baseline;
-		gap: 12px;
-		flex-wrap: wrap;
-	}
-	.src-head h2 {
-		font-size: 21px;
-		font-weight: 700;
-		font-family: var(--k-font-display);
-		color: var(--k-text);
-		margin: 0;
-	}
-	.src-sub {
-		font-size: 13px;
-		color: var(--k-text-faint);
-	}
-	.src-list {
-		list-style: none;
-		margin: 0;
-		padding: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-		max-width: 560px;
-	}
-	.src-item {
-		display: flex;
-		align-items: center;
-		gap: 12px;
-		padding: 8px 14px 8px 10px;
-		border-radius: 12px;
-		background: var(--k-surface);
-		border: 1px solid var(--k-border-2);
-	}
-	.src-logo {
-		width: 30px;
-		height: 30px;
-		flex: 0 0 auto;
-		border-radius: 8px;
-		object-fit: cover;
-		background: var(--k-surface-3);
-		border: 1px solid var(--k-border-2);
-	}
-	.src-initial {
-		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		font-size: 14px;
-		font-weight: 800;
-		color: var(--k-text-2);
+		background: var(--k-surface-3);
+		border: 1px solid var(--k-border-2);
+		color: var(--k-hiatus);
 	}
-	.src-name {
+	.not-found h1 {
+		font-size: 34px;
+	}
+	.not-found p {
+		margin: 0;
+		max-width: 380px;
+		font-size: 14.5px;
+		line-height: 1.6;
+		color: var(--k-text-dim);
+	}
+	.nf-btns {
+		display: flex;
+		gap: 12px;
+		margin-top: 10px;
+		flex-wrap: wrap;
+		justify-content: center;
+	}
+	.nf-primary,
+	.nf-ghost {
+		height: 46px;
+		padding: 0 24px;
 		display: inline-flex;
 		align-items: center;
-		gap: 7px;
-		min-width: 0;
-		font-size: 14px;
+		border-radius: var(--k-radius);
 		font-weight: 700;
-		color: var(--k-text-2);
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.src-lang {
-		font-size: 9.5px;
-		font-weight: 800;
-		letter-spacing: 0.04em;
-		color: var(--k-text-3);
-		background: var(--k-hover-fill);
-		border: 1px solid var(--k-border-3);
-		border-radius: 4px;
-		padding: 1px 5px;
-	}
-	.src-count {
-		margin-left: auto;
-		flex: 0 0 auto;
-		font-size: 12px;
-		color: var(--k-text-faint);
-		white-space: nowrap;
-	}
-	.ch-empty {
-		display: flex;
-		flex-direction: column;
-		gap: 6px;
-		padding: 22px 2px;
-	}
-	.ch-empty-title {
 		font-size: 14px;
-		font-weight: 600;
-		color: var(--k-text-1);
+		text-decoration: none;
 	}
-	.ch-empty-desc {
-		font-size: 12.5px;
-		line-height: 1.5;
-		color: var(--k-text-faint);
-	}
-	.chapters {
-		padding-top: 48px;
-		display: flex;
-		flex-direction: column;
-		gap: 20px;
-	}
-	.ch-head {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 20px;
-		flex-wrap: wrap;
-	}
-	.ch-title {
-		display: flex;
-		align-items: baseline;
-		gap: 12px;
-	}
-	.ch-title h2 {
-		font-size: 21px;
-		margin: 0;
-		color: var(--k-text);
-	}
-	.ch-total {
-		font-size: 13px;
-		color: var(--k-text-faint);
-	}
-	.ch-sort {
-		display: flex;
-		gap: 8px;
-	}
-	.sortchip {
-		font-size: 13px;
-		font-weight: 700;
-		padding: 7px 15px;
-		border-radius: var(--k-radius-pill);
-		cursor: pointer;
-		background: transparent;
-		color: var(--k-text-dimmer);
-		border: 1px solid var(--k-border-4);
-		transition: all 0.15s;
-	}
-	.sortchip.on {
+	.nf-primary {
 		background: var(--k-primary);
 		color: var(--k-on-primary);
-		border-color: var(--k-primary);
-	}
-	.ch-list {
-		border: 1px solid var(--k-border);
-		border-radius: 12px;
-		overflow: hidden;
-		max-height: 560px;
-		overflow-y: auto;
-	}
-	.ch-row {
-		display: flex;
-		align-items: center;
-		gap: 12px;
-		border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-		transition: background 0.12s;
-	}
-	.ch-row:hover {
-		background: rgba(255, 255, 255, 0.035);
-	}
-	/* The row is not one link (that would nest the provenance cluster inside it);
-	   the number link and the main link are siblings, each carrying its half of
-	   the old row padding so the between-links cluster keeps a clean click lane. */
-	.ch-numlink {
-		flex: 0 0 auto;
-		display: flex;
-		align-items: center;
-		padding: 15px 0 15px 20px;
-		text-decoration: none;
-	}
-	.ch-main {
-		flex: 1;
-		min-width: 0;
-		display: flex;
-		align-items: center;
-		gap: 18px;
-		padding: 15px 20px 15px 0;
-		text-decoration: none;
-	}
-	/* Provenance cluster: every source that carries this chapter number, as a row
-	   of small square links. Icons keep the extension-logo language the settings
-	   and the source list use (logo, initial fallback); a cluster of three links
-	   is the usual case and wraps rather than crushing the title on mobile. */
-	.ch-srcs {
-		flex: 0 0 auto;
-		display: inline-flex;
-		align-items: center;
-		gap: 6px;
-		max-width: 34%;
-		flex-wrap: wrap;
-	}
-	.ch-src {
-		width: 44px;
-		height: 44px;
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		border-radius: 7px;
-		background: transparent;
 		border: none;
-		text-decoration: none;
-		overflow: hidden;
-		transition: border-color 0.12s;
+		cursor: pointer;
+		font-family: inherit;
 	}
-	.ch-src:hover .ch-src-logo,
-	.ch-src:hover .ch-src-initial {
-		border-color: var(--k-border-strong);
-	}
-	.ch-src:focus-visible,
-	.ch-numlink:focus-visible,
-	.ch-main:focus-visible {
-		outline: 2px solid var(--k-primary);
-		outline-offset: -2px;
-	}
-	.ch-src-logo {
-		width: 28px;
-		height: 28px;
-		object-fit: cover;
-		border: 1px solid var(--k-border-2);
-		border-radius: 7px;
-	}
-	.ch-src-initial {
-		width: 28px;
-		height: 28px;
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		border: 1px solid var(--k-border-2);
-		border-radius: 7px;
-		background: var(--k-surface-3);
-		font-size: 12px;
-		font-weight: 800;
-		color: var(--k-text-2);
-	}
-	.ch-num {
-		flex: 0 0 auto;
-		width: 52px;
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 16px;
-		color: var(--k-text);
-	}
-	.ch-row.read .ch-num {
-		color: var(--k-text-bright);
-	}
-	.ch-info {
-		flex: 1;
-		min-width: 0;
-	}
-	.ch-line {
-		display: flex;
-		align-items: center;
-		gap: 10px;
-	}
-	.ch-name {
-		font-weight: 600;
-		font-size: 14.5px;
-		color: var(--k-text-1);
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.ch-row.read .ch-name {
-		color: var(--k-text-bright);
-	}
-	.new {
-		flex: 0 0 auto;
-		font-size: 10px;
-		font-weight: 800;
-		letter-spacing: 0.06em;
-		color: var(--k-on-primary);
-		background: var(--k-star);
-		padding: 2px 7px;
-		border-radius: 5px;
-	}
-	/* Outlined, not filled — unlike `.new`. An off-site chapter is a CAVEAT, not a
-	   highlight, and giving it the same visual weight as NEW would read as a promotion.
-	   Matches the reader dropdown's own `.ext-tag` so the same fact looks the same on both
-	   surfaces. */
-	.ext {
-		flex: 0 0 auto;
-		display: inline-flex;
-		align-items: center;
-		gap: 4px;
-		font-size: 10px;
-		font-weight: 800;
-		letter-spacing: 0.05em;
-		color: var(--k-text-faint);
+	.nf-ghost {
+		background: transparent;
 		border: 1px solid var(--k-border-4);
-		padding: 2px 6px;
-		border-radius: 5px;
-	}
-	.ch-dates {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		/* Column gap only: the separator between the two halves is space, and on a narrow
-		   screen they wrap onto their own lines rather than being truncated. */
-		gap: 0 8px;
-		margin-top: 3px;
-	}
-	.ch-date {
-		font-size: 12px;
-		color: var(--k-text-fainter);
-	}
-	/* Fainter than the release date on purpose. The release date is what a reader is
-	   looking for; the found date is the explanation for why a chapter is where it is in
-	   /updates, which matters only when the two disagree. */
-	.ch-found {
-		color: var(--k-text-ghost);
-	}
-	.ch-read {
-		flex: 0 0 auto;
-		font-size: 11.5px;
-		color: var(--k-text-bright);
-		display: inline-flex;
-		align-items: center;
-		gap: 5px;
-	}
-	.related {
-		display: flex;
-		flex-direction: column;
-		gap: 20px;
-		padding-top: 56px;
-	}
-	.related h2 {
-		font-size: 21px;
-		margin: 0;
 		color: var(--k-text);
 	}
-	.related-row {
-		display: flex;
-		gap: 22px;
-		overflow-x: auto;
-		padding-bottom: 4px;
-	}
-	@media (max-width: 640px) {
-		.hero {
-			padding-top: 28px;
-		}
-		/* Keep the centred stack; just tighten spacing and shrink the cover. */
-		.hero-row {
-			gap: 18px;
+
+	/* ---- tablet / phone ---- */
+	@media (max-width: 900px) {
+		.hero-grid {
+			grid-template-columns: 150px minmax(0, 1fr);
+			column-gap: 22px;
 		}
 		.poster {
-			width: 132px;
-			height: 194px;
+			width: 150px;
 		}
-		.info {
-			width: 100%;
+		.head {
+			padding-top: 0;
 		}
-		.badges {
-			flex-wrap: wrap;
+	}
+	@media (max-width: 640px) {
+		.banner {
+			height: 240px;
+		}
+		.hero {
+			padding-top: 20px;
+		}
+		/* Phone: small cover beside the title, actions + meta full width below. */
+		.hero-grid {
+			grid-template-columns: 108px minmax(0, 1fr);
+			grid-template-areas:
+				'poster head'
+				'actions actions'
+				'meta meta';
+			grid-template-rows: auto;
+			column-gap: 16px;
+			row-gap: 16px;
+		}
+		.poster {
+			width: 108px;
+		}
+		.head {
+			align-self: end;
 		}
 		h1 {
-			font-size: 30px;
+			font-size: 24px;
+		}
+		.alt-title {
+			font-size: 14px;
 		}
 		.creators {
-			font-size: 13.5px;
+			font-size: 13px;
 		}
-		/* CTA row wraps so Continue / Library / Share never overflow; primary grows. */
-		.cta {
-			flex-wrap: wrap;
+		.actions {
+			gap: 8px;
 		}
-		.cta-read {
-			flex: 1 1 auto;
+		.lib,
+		.read {
+			flex: 1 1 140px;
 			justify-content: center;
-			min-width: 160px;
+			padding: 0 14px;
 		}
-		/* Keep the source rows and the provenance cluster readable on a small screen:
-		   rows stay single-line, clusters wrap inside their lane. */
-		.src-list {
-			max-width: none;
-		}
-		.covers-strip {
-			gap: 12px;
-		}
-		.cover-cell,
-		.cover-thumb {
-			width: 104px;
-		}
-		.cover-thumb {
-			height: 156px;
-		}
-		/* Rate panel stacks so the stars aren't cramped beside the score. */
-		.rate {
-			padding: 20px;
-		}
-		.rate-left {
-			flex-wrap: wrap;
-			gap: 16px;
-		}
-		/* Chapter rows: four lanes (number, provenance cluster, title + dates, chevron)
-		   do not fit in 375px — the cluster alone is 94px for two sources, and the title
-		   was truncating to "Ch…" with the dates wrapping to four lines. Stack instead:
-		   the main link keeps the top line beside the number, and the cluster drops to
-		   its own line beneath it, where 44px touch targets have room. The row carries
-		   the padding here since the two links no longer split it. */
-		.ch-row {
-			display: grid;
-			grid-template-columns: auto minmax(0, 1fr);
-			grid-template-areas:
-				'num main'
-				'num srcs';
-			column-gap: 12px;
-			padding: 12px 16px;
-		}
-		.ch-numlink {
-			grid-area: num;
-			align-self: start;
-			padding: 0;
-		}
-		.ch-num {
+		/* Phone: the popover docks above the bottom nav, full width, so it can
+		   never run off either edge whatever row the star button wrapped onto. */
+		.rate-pop {
+			position: fixed;
+			top: auto;
+			left: 16px;
+			right: 16px;
+			bottom: calc(72px + env(safe-area-inset-bottom, 0px));
 			width: auto;
-			min-width: 32px;
+			transform: none;
 		}
+		/* Phone: number + title on the first line, source and date beneath. */
 		.ch-main {
-			grid-area: main;
-			gap: 12px;
-			padding: 0;
+			flex-wrap: wrap;
+			row-gap: 4px;
+			padding: 10px 12px;
 		}
-		.ch-srcs {
-			grid-area: srcs;
-			max-width: none;
-			/* The gap lives here, not on the grid: a single-source (legacy) row has no
-			   cluster and must not carry an empty second line. */
-			margin-top: 6px;
-			/* Line up the logos under the title, not under the number. */
-			margin-left: -6px;
+		.ch-text {
+			flex-basis: calc(100% - 60px);
 		}
-		.ch-src {
-			width: 40px;
-			height: 40px;
-			/* Boxes touch; the 12px of transparent padding inside each is the gap. */
-			margin-right: -4px;
+		.ch-main > :global(svg) {
+			display: none;
+		}
+		.ch-by {
+			flex: 0 1 auto;
+			margin-left: 32px;
+		}
+		.ch-dates {
+			flex: 1 1 auto;
+			flex-direction: row;
+			justify-content: flex-end;
+			gap: 10px;
+		}
+		.ch-copy {
+			padding: 6px 12px 6px 44px;
+		}
+		.tabs {
+			display: flex;
+		}
+		.tabs button {
+			flex: 1 0 auto;
+			justify-content: center;
+		}
+		.lightbox {
+			padding: 16px;
 		}
 	}
 </style>

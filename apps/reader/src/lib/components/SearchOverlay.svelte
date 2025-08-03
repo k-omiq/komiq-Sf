@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { modalFocus } from '$lib/modal-focus';
 	import { goto } from '$app/navigation';
 	import Icon from './Icon.svelte';
 
@@ -20,6 +21,15 @@
 		}
 	});
 
+	$effect(() => {
+		if (!open) return;
+		const escape = (event: KeyboardEvent) => {
+			if (event.key === 'Escape') close();
+		};
+		window.addEventListener('keydown', escape);
+		return () => window.removeEventListener('keydown', escape);
+	});
+
 	function close() {
 		open = false;
 	}
@@ -35,14 +45,25 @@
 </script>
 
 {#if open}
-	<button class="scrim" aria-label="Close search" onclick={close}></button>
-	<div class="panel">
-		<div class="bar">
-			<button class="search-btn" aria-label="Search" onclick={submit}>
-				<Icon name="search" size={21} stroke="#87857f" />
-			</button>
-			<input bind:this={inputEl} bind:value={q} {placeholder} onkeydown={onkey} />
-			<button class="esc" onclick={close}>ESC</button>
+	<div use:modalFocus role="dialog" aria-modal="true" aria-label="Search catalogue">
+		<button class="scrim" aria-label="Close search" onclick={close}></button>
+		<div class="panel">
+			<div class="bar">
+				<button class="search-btn" aria-label="Search" onclick={submit}>
+					<Icon name="search" size={21} stroke="var(--k-text-dim)" />
+				</button>
+				<input
+					type="search"
+					name="q"
+					aria-label="Search series, authors, and genres"
+					autocomplete="off"
+					bind:this={inputEl}
+					bind:value={q}
+					{placeholder}
+					onkeydown={onkey}
+				/>
+				<button class="esc" onclick={close}>ESC</button>
+			</div>
 		</div>
 	</div>
 {/if}
@@ -58,6 +79,7 @@
 		cursor: default;
 	}
 	.panel {
+		overscroll-behavior: contain;
 		position: fixed;
 		z-index: 50;
 		top: 84px;
@@ -80,6 +102,8 @@
 		box-shadow: 0 26px 70px rgba(0, 0, 0, 0.55);
 	}
 	.search-btn {
+		min-width: 40px;
+		min-height: 44px;
 		flex: 0 0 auto;
 		display: flex;
 		align-items: center;
@@ -99,6 +123,7 @@
 		font-size: 16px;
 	}
 	.esc {
+		min-height: 44px;
 		font-size: 12px;
 		font-weight: 700;
 		color: var(--k-text-faint);

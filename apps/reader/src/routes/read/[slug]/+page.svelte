@@ -1,12 +1,12 @@
 <script lang="ts">
+	import { modalFocus } from '$lib/modal-focus';
 	import { goto, beforeNavigate, preloadData } from '$app/navigation';
 	import { navigating } from '$app/state';
 	import { untrack, onDestroy, tick } from 'svelte';
 	import { saveProgress, recordView } from '$lib/data/source';
 	import { externalChapterHost } from '$lib/data/chapter-label';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
-	import { auth } from '$lib/auth.svelte';
-	import Icon from '$lib/components/Icon.svelte';
+	import Icon, { type IconName } from '$lib/components/Icon.svelte';
 	import CommentThread from '$lib/components/CommentThread.svelte';
 
 	let { data } = $props();
@@ -34,34 +34,147 @@
 	const externalUrl = $derived(data.externalUrl ?? null);
 	const externalHost = $derived(externalChapterHost(data.externalUrl));
 
-	// Translators (sources) for this work — switchable from reader settings. Picking
+	// Translators (sources) for this work — switchable from the reader menu. Picking
 	// a different source persists the preference and reopens the work under it
 	// (chapter ids differ per source, so we land on the new source's first/unread
 	// chapter rather than a stale ch param).
 	const translators = $derived(data.translators ?? []);
+	const activeTranslator = $derived(
+		translators.find((t) => t.key === data.selectedTranslatorKey) ?? null,
+	);
 	function switchTranslator(key: string): void {
 		if (!data.workId || key === data.selectedTranslatorKey) return;
 		setPreferredTranslator(data.workId, key);
 		void saveProgress(data.chapterId, currentPageIndex(), readMarked);
-		settingsOpen = false;
+		closeMenu();
 		// Drop any `?ch=` (chapter ids differ per source) and force the load to re-run
 		// even when we're already at the bare `/read/<workId>` URL — otherwise
 		// SvelteKit treats it as the same URL and the source wouldn't actually swap.
 		goto(`/read/${data.workId}`, { invalidateAll: true });
 	}
 
-	let mode = $state<'strip' | 'page'>('strip');
-	let pageIdx = $state(0);
+	// Copies of the OPEN chapter number — one per (source, scanlation group) upload, so
+	// a chapter two groups translated can be swapped without leaving the reader. Unlike
+	// the translator switch above this is a one-off pick: it opens that exact copy and
+	// does not change the series' default source.
+	const versions = $derived(data.versions ?? []);
+	const currentVersion = $derived(versions.find((v) => v.current) ?? null);
+	// The open copy's group: the view's own field first, else the current version row.
+	const openGroup = $derived(data.group ?? currentVersion?.group ?? null);
+	// "No Group" is a real MangaDex value but says nothing in a one-line header.
+	const headerGroup = $derived(openGroup && openGroup !== 'No Group' ? openGroup : null);
+	function versionHref(v: { id: string; src: string | null }): string {
+		const src = v.src ? `&src=${encodeURIComponent(v.src)}` : '';
+		return `/read/${data.seriesId}?ch=${encodeURIComponent(v.id)}${src}`;
+	}
+	async function openVersion(v: { id: string; src: string | null; current: boolean }) {
+		if (v.current) return;
+		void saveProgress(data.chapterId, currentPageIndex(), readMarked);
+		if (!docked) closeMenu();
+		await goto(versionHref(v));
+		resetWindowScroll();
+	}
+
+	// ---- reader preferences --------------------------------------------------
+	// Every display choice lives in one persisted object. Each control in the menu is a
+	// cycle button (tap to step to the next value), so the option lists below are also
+	// the cycle order and the source of each button's label + icon.
+	type Mode = 'strip' | 'page' | 'double';
+	type Fit = 'both' | 'width' | 'height' | 'none';
+	type Dir = 'ltr' | 'rtl';
+	type HeaderMode = 'auto' | 'shown' | 'hidden';
+	type Bar = 'segments' | 'thin' | 'hidden';
+	type Opt<T> = { value: T; label: string; icon: IconName };
+
+	const MODES: Opt<Mode>[] = [
+		{ value: 'strip', label: 'Long strip', icon: 'list' },
+		{ value: 'page', label: 'Single page', icon: 'file' },
+		{ value: 'double', label: 'Double page', icon: 'columns' },
+	];
+	const FITS: Opt<Fit>[] = [
+		{ value: 'both', label: 'Fit to screen', icon: 'maximize' },
+		{ value: 'width', label: 'Fit width', icon: 'arrow-left-right' },
+		{ value: 'height', label: 'Fit height', icon: 'chevrons-down' },
+		{ value: 'none', label: 'Original size', icon: 'image' },
+	];
+	const DIRS: Opt<Dir>[] = [
+		{ value: 'ltr', label: 'Left to right', icon: 'arrow-right' },
+		{ value: 'rtl', label: 'Right to left', icon: 'chevron-left' },
+	];
+	const HEADERS: Opt<HeaderMode>[] = [
+		{ value: 'auto', label: 'Header auto-hides', icon: 'panel-top' },
+		{ value: 'shown', label: 'Header always shown', icon: 'panel-top' },
+		{ value: 'hidden', label: 'Header hidden', icon: 'x' },
+	];
+	const BARS: Opt<Bar>[] = [
+		{ value: 'segments', label: 'Page bar', icon: 'progress' },
+		{ value: 'thin', label: 'Thin progress line', icon: 'progress' },
+		{ value: 'hidden', label: 'Progress hidden', icon: 'x' },
+	];
+
+	let mode = $state<Mode>('strip');
+	let fit = $state<Fit>('both');
+	let dir = $state<Dir>('ltr');
+	let headerMode = $state<HeaderMode>('auto');
+	let bar = $state<Bar>('segments');
 	let width = $state(720);
+	let gaps = $state(false);
+	let pinned = $state(false);
+
+	function pick<T>(list: Opt<T>[], v: unknown, fallback: T): T {
+		return list.some((o) => o.value === v) ? (v as T) : fallback;
+	}
+	function optOf<T>(list: Opt<T>[], v: T): Opt<T> {
+		return list.find((o) => o.value === v) ?? list[0];
+	}
+	function nextOf<T>(list: Opt<T>[], v: T): T {
+		const i = list.findIndex((o) => o.value === v);
+		return list[(i + 1) % list.length].value;
+	}
+
+	function persist() {
+		try {
+			localStorage.setItem(
+				'komiq-reader',
+				JSON.stringify({ mode, fit, dir, header: headerMode, bar, width, gaps, pinned }),
+			);
+		} catch {
+			/* ignore */
+		}
+	}
+
+	let pageIdx = $state(0);
 	const hasPages = $derived(total > 0);
 	let chromeVisible = $state(true);
-	let lockChrome = $state(false);
-	let settingsOpen = $state(false);
-	let chapterListOpen = $state(false);
-	let progressPct = $state(0);
+	let menuOpen = $state(false);
 	let scrolledPage = $state(1);
 	let maxScrolledPage = $state(1);
 	const warmedUrls = new Set<string>();
+
+	// The menu can dock beside the pages on wide screens (pin). On narrow screens a pin
+	// is ignored and the menu is always an overlay sheet.
+	let wide = $state(false);
+	$effect(() => {
+		const mq = window.matchMedia('(min-width: 1024px)');
+		const sync = () => (wide = mq.matches);
+		sync();
+		mq.addEventListener('change', sync);
+		return () => mq.removeEventListener('change', sync);
+	});
+	const docked = $derived(pinned && wide);
+	const drawerShown = $derived(menuOpen || docked);
+
+	function openMenu() {
+		menuOpen = true;
+	}
+	function closeMenu() {
+		menuOpen = false;
+	}
+	function togglePin() {
+		pinned = !pinned;
+		if (!pinned) menuOpen = false;
+		persist();
+	}
 
 	const chKey = $derived(`${data.seriesId}:${data.chNum}`);
 
@@ -91,14 +204,13 @@
 
 	// Jump the window to y=0 and assert it again after layout. A single
 	// fire-and-forget `scrollTo` loses the race against strip cells collapsing
-	// onto DEFAULT_ASPECT then growing as images load — the same clamp Pager
-	// documents — and against the browser's overflow-anchor keeping the
-	// end-of-chapter block in view when the strip above it is replaced.
+	// onto DEFAULT_RATIO then growing as images load, and against the browser's
+	// overflow-anchor keeping the end-of-chapter block in view when the strip
+	// above it is replaced.
 	let scrollResetting = false;
 	function resetWindowScroll() {
 		scrollResetting = true;
 		lastY = 0;
-		progressPct = 0;
 		window.scrollTo({ top: 0, behavior: 'auto' });
 		void tick().then(() =>
 			requestAnimationFrame(() => {
@@ -118,8 +230,8 @@
 			pageIdx = 0;
 			scrolledPage = 1;
 			maxScrolledPage = 1;
-			readMarked = false;
-			pageAspect = {};
+			readMarked = data.chapterRead ?? false;
+			pageRatio = {};
 			pageError = {};
 			warmedUrls.clear();
 			settledPages.clear();
@@ -133,9 +245,7 @@
 	// chapter) leaks. Track the current chapter's page URLs and revoke the blob
 	// ones when the chapter changes (this effect's cleanup runs before it re-runs
 	// with the next chapter's pages) and on teardown. Web/proxy pages are plain
-	// http(s) strings — the `blob:` guard leaves those untouched. Because `pages`
-	// is derived from the loaded chapter, the URLs captured here are only revoked
-	// once the DOM has moved on to a different chapter, so nothing in view breaks.
+	// http(s) strings — the `blob:` guard leaves those untouched.
 	$effect(() => {
 		const current = pages;
 		return () => {
@@ -147,15 +257,51 @@
 		};
 	});
 
+	const isStrip = $derived(mode === 'strip');
+	const chromeHidden = $derived(
+		headerMode === 'hidden' || (headerMode === 'auto' && !chromeVisible),
+	);
+
+	// ---- page geometry ---------------------------------------------------------
+	// Real width/height ratios, learned as pages load (or as paged-mode prefetches
+	// decode). Strip cells reserve their height from it; double-page mode uses it to
+	// show a wide spread on its own instead of squeezing it next to another page.
+	let pageRatio = $state<Record<number, number>>({});
+	// A neutral manga default (~2:3) used only until a page's real ratio is known.
+	const DEFAULT_RATIO = 2 / 3;
+	function isWide(i: number): boolean {
+		return (pageRatio[i] ?? 0) > 1;
+	}
+	// How many pages the double-page view shows starting at `i`: two, unless this is
+	// the last page or either page is a wide spread (spreads always stand alone).
+	function spreadSize(i: number): number {
+		if (mode !== 'double') return 1;
+		if (i >= total - 1 || isWide(i) || isWide(i + 1)) return 1;
+		return 2;
+	}
+	const pagedIdx = $derived(Math.min(pageIdx, Math.max(0, total - 1)));
+	const visiblePages = $derived(pages.slice(pagedIdx, pagedIdx + spreadSize(pagedIdx)));
+
 	// The current 0-indexed page, however the chapter is being read.
 	function currentPageIndex(): number {
-		return mode === 'strip' ? Math.max(0, scrolledPage - 1) : pageIdx;
+		return isStrip ? Math.max(0, scrolledPage - 1) : pagedIdx;
 	}
+	const currentIdx = $derived(isStrip ? Math.max(0, scrolledPage - 1) : pagedIdx);
+	// Last page index currently on screen (a double spread covers two).
+	const currentEnd = $derived(isStrip ? currentIdx : pagedIdx + visiblePages.length - 1);
+	const pageReadout = $derived(
+		currentEnd > currentIdx
+			? `${currentIdx + 1}–${currentEnd + 1} / ${total}`
+			: `${currentIdx + 1} / ${total}`,
+	);
+	const readPct = $derived(total ? ((currentEnd + 1) / total) * 100 : 0);
 
 	// Mark the chapter read once the reader reaches the end (idempotent per chapter).
+	// Strip mode: the bottom of the final page is on screen — NOT a document %, since
+	// the end-of-chapter block and the comments sit below the pages.
 	function maybeMarkRead(): void {
-		if (readMarked || !data.chapterId) return;
-		const atEnd = mode === 'strip' ? progressPct >= 98 : pageIdx >= total - 1;
+		if (readMarked || !data.chapterId || !hasPages) return;
+		const atEnd = isStrip ? atStripEnd() : currentEnd >= total - 1;
 		if (atEnd) {
 			readMarked = true;
 			void saveProgress(data.chapterId, Math.max(0, total - 1), true);
@@ -163,8 +309,8 @@
 	}
 
 	// Persist the current reading position. Reading otherwise only saves on in-app
-	// Prev/Next and at ≥98%, so a browser-back or header-link exit would drop a
-	// mid-chapter position. Save on navigation away, on tab-hide, and on unmount.
+	// chapter changes and at the end, so a browser-back or header-link exit would drop
+	// a mid-chapter position. Save on navigation away, on tab-hide, and on unmount.
 	// saveProgress is idempotent latest-wins, so overlapping triggers are harmless.
 	function saveCurrentProgress(): void {
 		if (!data.chapterId) return;
@@ -180,32 +326,18 @@
 	});
 	onDestroy(() => saveCurrentProgress());
 
-	const isStrip = $derived(mode === 'strip');
-	const chromeHidden = $derived(!chromeVisible && !lockChrome);
-	const currentPage = $derived(pages[Math.min(pageIdx, total - 1)]);
-	const pageLabel = $derived(`${Math.min(pageIdx, total - 1) + 1} / ${total}`);
-	const readout = $derived(
-		isStrip
-			? `Page ${scrolledPage} of ${total} · ${Math.round(progressPct)}%`
-			: `Page ${pageLabel}`,
-	);
-
-	function persist() {
-		try {
-			localStorage.setItem('komiq-reader', JSON.stringify({ mode, width }));
-		} catch {
-			/* ignore */
-		}
+	function chapterHref(id: string) {
+		// Keep prev/next on the same source (S2) — chapter ids are per-source.
+		const src = data.readingSrc ? `&src=${data.readingSrc}` : '';
+		return `/read/${data.seriesId}?ch=${id}${src}`;
 	}
 
 	async function openChapter(id?: string) {
-		chapterListOpen = false;
+		if (!docked) menuOpen = false;
 		if (!id) return;
 		// Persist how far we got in the chapter we're leaving.
 		void saveProgress(data.chapterId, currentPageIndex(), readMarked);
-		// Keep prev/next on the same source (S2) — chapter ids are per-source.
-		const src = data.readingSrc ? `&src=${data.readingSrc}` : '';
-		await goto(`/read/${data.seriesId}?ch=${id}${src}`);
+		await goto(chapterHref(id));
 		// Immediate jump so a same-chapter re-open (chapterId unchanged, the
 		// reset effect does not re-run) still lands on the first image. The
 		// chapter-change effect re-asserts after layout when the id DID change.
@@ -218,30 +350,25 @@
 	// readers feel between chapters. Once the reader is far enough in to probably
 	// continue, run the very load the navigation would run — SvelteKit reuses a
 	// preloaded result for the matching `goto`, so the click resolves from memory —
-	// then warm the first few page images off that result, since decoded bytes are
-	// the part that actually keeps the next chapter blank.
+	// then warm the first few page images off that result.
 	const PREFETCH_AT_PCT = 40;
 	const PREFETCH_IMAGES = 3;
 	let prefetchedFor = '';
 	$effect(() => {
 		const id = data.nextChapterId;
-		const deepEnough = progressPct >= PREFETCH_AT_PCT;
+		const deepEnough = readPct >= PREFETCH_AT_PCT;
 		// Off-site next chapter (MangaPlus/Comikey/…): its load deliberately returns no
-		// pages, so prefetching it can only ever warm an empty result. Skip the request
-		// rather than spend it — the reader is leaving for the publisher anyway.
+		// pages, so prefetching it can only ever warm an empty result.
 		if (!id || !deepEnough || nextChapter?.externalUrl || prefetchedFor === id) return;
 		// Set before awaiting so a burst of scroll frames can't launch it twice.
 		prefetchedFor = id;
-		const src = data.readingSrc ? `&src=${data.readingSrc}` : '';
-		void preloadData(`/read/${data.seriesId}?ch=${id}${src}`)
+		void preloadData(chapterHref(id))
 			.then((res) => {
 				// `redirect` results carry no data; only a `loaded` one has pages.
 				if (res?.type !== 'loaded') return;
 				const next = (res.data as { pages?: { url?: string }[] } | undefined)?.pages ?? [];
 				for (const pg of next.slice(0, PREFETCH_IMAGES)) {
 					if (!pg?.url) continue;
-					// A detached Image() populates the HTTP cache; the <img> the next
-					// chapter renders then hits that cache instead of the network.
 					const warm = new Image();
 					warm.decoding = 'async';
 					warm.src = pg.url;
@@ -252,15 +379,45 @@
 			.catch(() => {});
 	});
 
+	// ---- strip position --------------------------------------------------------
+	let stripEl = $state<HTMLElement | null>(null);
+	// The reading line: a page is "current" once its top passes 40% of the viewport.
+	function stripPageAtLine(): number {
+		const cells = stripEl?.children;
+		if (!cells || cells.length === 0) return 1;
+		const line = window.innerHeight * 0.4;
+		let lo = 0;
+		let hi = cells.length - 1;
+		let found = 0;
+		while (lo <= hi) {
+			const mid = (lo + hi) >> 1;
+			if ((cells[mid] as HTMLElement).getBoundingClientRect().top <= line) {
+				found = mid;
+				lo = mid + 1;
+			} else hi = mid - 1;
+		}
+		return found + 1;
+	}
+	function atDocTop(): boolean {
+		return window.scrollY <= 2;
+	}
+	function atStripEnd(): boolean {
+		return !!stripEl && stripEl.getBoundingClientRect().bottom <= window.innerHeight + 2;
+	}
+
 	$effect(() => {
 		if (!restored) {
 			restored = true;
 			try {
-				const saved = JSON.parse(localStorage.getItem('komiq-reader') || '{}');
-				if (saved) {
-					mode = saved.mode || 'strip';
-					width = saved.width || 720;
-				}
+				const saved = JSON.parse(localStorage.getItem('komiq-reader') || '{}') ?? {};
+				mode = pick(MODES, saved.mode, 'strip');
+				fit = pick(FITS, saved.fit, 'both');
+				dir = pick(DIRS, saved.dir, 'ltr');
+				headerMode = pick(HEADERS, saved.header, 'auto');
+				bar = pick(BARS, saved.bar, 'segments');
+				width = typeof saved.width === 'number' ? saved.width : 720;
+				gaps = saved.gaps === true;
+				pinned = saved.pinned === true;
 			} catch {
 				/* ignore */
 			}
@@ -274,24 +431,16 @@
 				lastY = 0;
 				return;
 			}
-			const doc = document.documentElement;
-			const max = doc.scrollHeight - window.innerHeight;
 			const y = window.scrollY;
-			const pct = max > 0 ? Math.min(100, Math.max(0, (y / max) * 100)) : 0;
-			progressPct = pct;
-			scrolledPage = Math.min(total, Math.max(1, Math.round((pct / 100) * (total - 1)) + 1));
-			if (scrolledPage > maxScrolledPage) {
-				maxScrolledPage = scrolledPage;
+			if (mode === 'strip') {
+				scrolledPage = Math.min(total, stripPageAtLine());
+				if (scrolledPage > maxScrolledPage) maxScrolledPage = scrolledPage;
 			}
 			maybeMarkRead();
-			if (!lockChrome) {
-				const dy = y - lastY;
-				if (y < 80) chromeVisible = true;
-				else if (dy > 6) chromeVisible = false;
-				else if (dy < -6) chromeVisible = true;
-			} else {
-				chromeVisible = true;
-			}
+			const dy = y - lastY;
+			if (y < 80) chromeVisible = true;
+			else if (dy > 6) chromeVisible = false;
+			else if (dy < -6) chromeVisible = true;
 			lastY = y;
 		};
 		const onScroll = () => {
@@ -300,42 +449,25 @@
 			requestAnimationFrame(update);
 		};
 		window.addEventListener('scroll', onScroll, { passive: true });
-		// The priming call reads `total`/`lockChrome` (and, via maybeMarkRead, more
-		// reactive state). Without untrack those become deps of THIS effect, so every
-		// chrome-lock toggle / chapter change would tear down and re-add the scroll
-		// listener. The listener only needs binding once for the component's life;
-		// scroll-time invocations of `update` run outside any tracking scope already.
+		// The priming call reads reactive state; untrack keeps those reads from
+		// becoming deps that would tear down and re-add the listener.
 		untrack(() => update());
 		return () => window.removeEventListener('scroll', onScroll);
 	});
 
 	// ---- lookahead prefetch & long-strip rendering -------------------------
-	// A chapter can be 37+ full-size images. We DON'T hand-virtualize with an
-	// IntersectionObserver — mounting/unmounting <img> on scroll thrashes the DOM
-	// and is what caused the visible scroll bumps. Instead every page stays in the
-	// DOM. But native `loading="lazy"` uses the browser's fixed distance threshold
-	// (Chrome is ~1250px), which is too small for tall manga pages: the fetch only
-	// starts when the page is nearly on screen, so scrolling down forces readers to
-	// wait seconds for images to decode.
+	// Every page stays in the DOM (no IntersectionObserver mount/unmount — that
+	// thrashed the DOM and caused scroll bumps). `loading` is computed per image and
+	// the browser starts fetching the moment it flips from 'lazy' to 'eager':
 	//
-	// We compute `loading` reactively per image and the browser starts fetching
-	// the moment `loading` flips from 'lazy' to 'eager', so no detached Image
-	// allocations are needed in strip mode. Three things can flip a page eager:
-	//
-	// 1. STARTERS — the first STARTER_PAGES pages fetch at once from first paint
-	//    with `fetchpriority="high"`, so the reader sees something as fast as the
-	//    connection allows. Nothing else is in flight while they download.
-	// 2. BACKGROUND QUEUE — every remaining page is auto-loaded in order WITHOUT
-	//    waiting for a scroll trigger, but only QUEUE_CONCURRENCY at a time and
-	//    with `fetchpriority="low"`. Firing the whole chapter at once made the
-	//    starters share bandwidth with 30+ pages the reader hadn't reached yet,
-	//    which on slow wifi meant a long blank first screen. The queue only
-	//    advances as pages settle (load or error), so it cannot start until the
-	//    starters are nearly done and it never fans out.
-	// 3. SCROLL LOOKAHEAD — when the reader outruns the queue, the window keeps
-	//    EAGER_AHEAD pages in flight ahead of the scroll position so they never
-	//    wait on the queue, at normal priority. A monotonically non-decreasing
-	//    high-water mark ensures scrolling back up never flips an image back to lazy.
+	// 1. STARTERS — the first STARTER_PAGES pages fetch at once with
+	//    `fetchpriority="high"`.
+	// 2. BACKGROUND QUEUE — every remaining page auto-loads in order, only
+	//    QUEUE_CONCURRENCY at a time and at low priority, advancing as pages settle,
+	//    so it never competes with the starters.
+	// 3. SCROLL LOOKAHEAD — EAGER_AHEAD pages ahead of the furthest page reached
+	//    stay in flight, so a reader who outruns the queue (or jumps from the page
+	//    bar) never waits on it. The high-water mark never moves back.
 	const STARTER_PAGES = 3;
 	const QUEUE_CONCURRENCY = 2;
 	const EAGER_AHEAD = 6;
@@ -343,8 +475,6 @@
 	const settledPages = new Set<number>();
 	const eagerUntil = $derived(Math.max(queueUntil, maxScrolledPage + EAGER_AHEAD));
 
-	// Pages the queue has released that have not settled yet count as in flight;
-	// pages the lookahead already loaded are skipped over rather than re-counted.
 	function advanceQueue(): void {
 		let inFlight = 0;
 		for (let i = 0; i < queueUntil; i++) if (!settledPages.has(i)) inFlight++;
@@ -361,17 +491,29 @@
 		advanceQueue();
 	}
 
-	let pageAspect = $state<Record<number, string>>({});
-	// A neutral manga default (~2:3) used only until a page's real ratio is known.
-	const DEFAULT_ASPECT = '800 / 1200';
 	// Per-page load failures — a failed <img> otherwise leaves a permanent
 	// full-height gap with the browser's broken-image glyph and no way to retry.
 	let pageError = $state<Record<number, boolean>>({});
 
+	function learnRatio(index: number, w: number, h: number): void {
+		if (w > 0 && h > 0 && pageRatio[index] !== w / h) {
+			pageRatio = { ...pageRatio, [index]: w / h };
+		}
+	}
+
+	// A page that finishes loading ABOVE the viewport changes height from the 2:3
+	// reservation to its real one. Main opts out of browser scroll anchoring (it
+	// fought the chapter-swap reset), so compensate by hand: shift the scroll by the
+	// growth so the page being read stays put. Matters most after a page-bar jump,
+	// where the background queue keeps finishing pages behind the reader.
 	function onImgLoad(e: Event, index: number): void {
 		const img = e.currentTarget as HTMLImageElement;
-		if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-			pageAspect = { ...pageAspect, [index]: `${img.naturalWidth} / ${img.naturalHeight}` };
+		const cell = img.parentElement;
+		const rect = isStrip && !scrollResetting ? cell?.getBoundingClientRect() : undefined;
+		learnRatio(index, img.naturalWidth, img.naturalHeight);
+		if (rect && rect.bottom <= 0 && img.naturalWidth > 0) {
+			const grown = (rect.width * img.naturalHeight) / img.naturalWidth - rect.height;
+			if (Math.abs(grown) > 1) void tick().then(() => window.scrollBy(0, grown));
 		}
 		settlePage(index);
 	}
@@ -387,144 +529,197 @@
 	}
 
 	// ---- paged mode prefetch -----------------------------------------------
-	// Single-page mode renders only the active page in the DOM. When `pageIdx`
-	// advances, warm the next 3 pages into the HTTP cache with detached Image()
-	// objects (matching the next-chapter prefetch pattern) so page turns feel
-	// instantaneous. `warmedUrls` keeps each URL to one warm per chapter; the
-	// chapter-change effect above clears it.
-	const PAGED_PREFETCH = 3;
+	// Paged modes render only the visible page(s). Warm the next few into the HTTP
+	// cache with detached Image() objects so page turns feel instant, and learn their
+	// ratios on the way so double-page mode knows about spreads before it reaches them.
+	const PAGED_PREFETCH = 4;
 	$effect(() => {
-		if (mode !== 'page') return;
-		const next = pages.slice(pageIdx + 1, pageIdx + 1 + PAGED_PREFETCH);
-		for (const pg of next) {
+		if (mode === 'strip') return;
+		const from = pagedIdx + visiblePages.length;
+		for (let i = from; i < Math.min(total, from + PAGED_PREFETCH); i++) {
+			const pg = pages[i];
 			if (!pg?.url || warmedUrls.has(pg.url)) continue;
 			warmedUrls.add(pg.url);
 			const warm = new Image();
 			warm.decoding = 'async';
+			warm.onload = () => learnRatio(i, warm.naturalWidth, warm.naturalHeight);
 			warm.src = pg.url;
 		}
 	});
 
-	const chapterMenu = $derived(
-		data.chapters.map((c) => ({
-			id: c.id,
-			n: c.n,
-			title: c.title,
-			current: c.id === data.chapterId,
-			// Badged in the list, not discovered on arrival: ~35,000 chapters (4% of the
-			// mirror) are hosted by MangaPlus/Comikey/NamiComi/BiliBili, and clicking one
-			// leaves the app. Knowing that beforehand is the difference between a link and
-			// a dead end.
-			external: !!c.externalUrl,
-		})),
-	);
+	function chapterLabel(c: { n: number; title: string }): string {
+		const t = c.title?.trim();
+		return t && t !== `Chapter ${c.n}` ? `Ch. ${c.n} · ${t}` : `Chapter ${c.n}`;
+	}
 
-	function stageClick() {
-		if (!lockChrome) chromeVisible = !chromeVisible;
-	}
-	function setMode(m: 'strip' | 'page') {
-		mode = m;
-		pageIdx = 0;
-		persist();
-		resetWindowScroll();
-	}
-	// Page turns hop chapters at the volume edges: forward on the LAST page opens
-	// the next chapter when one exists, backward on the FIRST page opens the
-	// previous one. The data model knows chapter adjacency, so "next" always means
-	// the next chapter. `openChapter` handles the src pinning itself.
+	// ---- navigation ------------------------------------------------------------
+	// Page turns hop chapters at the edges: forward on the LAST page opens the next
+	// chapter when one exists, backward on the FIRST page opens the previous one.
 	function nextPage() {
-		if (pageIdx < total - 1) {
-			pageIdx = pageIdx + 1;
-			maybeMarkRead();
-			persist();
+		const step = spreadSize(pagedIdx);
+		if (pagedIdx + step <= total - 1) {
+			pageIdx = pagedIdx + step;
 			resetWindowScroll();
+			void tick().then(maybeMarkRead);
 		} else if (data.nextChapterId) {
 			void openChapter(data.nextChapterId);
 		}
 	}
 	function prevPage() {
-		if (pageIdx > 0) {
-			pageIdx = pageIdx - 1;
-			persist();
+		if (pagedIdx > 0) {
+			// Step back over a full pair unless either page is a lone spread.
+			const back =
+				mode === 'double' && pagedIdx >= 2 && !isWide(pagedIdx - 1) && !isWide(pagedIdx - 2)
+					? 2
+					: 1;
+			pageIdx = pagedIdx - back;
 			resetWindowScroll();
 		} else if (data.prevChapterId) {
 			void openChapter(data.prevChapterId);
 		}
 	}
-
-	function goToFirstPage() {
-		if (!hasPages) return;
-		if (mode === 'page') pageIdx = 0;
-		else scrolledPage = 1;
-		resetWindowScroll();
+	// Visual left/right (tap zones + arrow keys) map onto prev/next by direction.
+	function goLeft() {
+		if (dir === 'rtl') nextPage();
+		else prevPage();
 	}
-	function goToLastPage() {
+	function goRight() {
+		if (dir === 'rtl') prevPage();
+		else nextPage();
+	}
+
+	function jumpTo(i: number) {
 		if (!hasPages) return;
-		if (mode === 'page') {
-			pageIdx = total - 1;
-			maybeMarkRead();
+		const target = Math.max(0, Math.min(total - 1, i));
+		if (!isStrip) {
+			pageIdx = target;
 			resetWindowScroll();
+			void tick().then(maybeMarkRead);
 			return;
 		}
-		const last = stripEl?.lastElementChild as HTMLElement | undefined;
-		if (!last) return;
-		const top = last.getBoundingClientRect().top + window.scrollY - 60;
+		const cell = stripEl?.children[target] as HTMLElement | undefined;
+		if (!cell) return;
+		const offset = chromeHidden ? 0 : 56;
+		const top = target === 0 ? 0 : cell.getBoundingClientRect().top + window.scrollY - offset;
 		window.scrollTo({ top: Math.max(0, top), behavior: 'auto' });
-		maybeMarkRead();
+		scrolledPage = target + 1;
+		if (scrolledPage > maxScrolledPage) maxScrolledPage = scrolledPage;
 	}
 
-	// Long-strip directional navigation is only allowed at the relevant READING
-	// edge: forward once the final strip page is visible, backward at document top.
-	// The end-of-chapter panel and comments sit below the strip, so document bottom
-	// would make readers scroll past the manga before the key worked. Mid-strip the
-	// same keys retain normal scrolling. 2px tolerance handles sub-pixel positions.
-	function atDocTop(): boolean {
-		return window.scrollY <= 2;
-	}
-	let stripEl = $state<HTMLElement | null>(null);
-	function atStripEnd(): boolean {
-		return !!stripEl && stripEl.getBoundingClientRect().bottom <= window.innerHeight + 2;
+	function setMode(m: Mode) {
+		const at = currentPageIndex();
+		mode = m;
+		persist();
+		// Keep the reader on the same page across a mode switch.
+		void tick().then(() => {
+			if (m === 'strip') {
+				jumpTo(at);
+			} else {
+				pageIdx = at;
+				resetWindowScroll();
+			}
+		});
 	}
 
-	// Keyboard operability: in single-page mode, arrows/PageUp/PageDown (and space)
-	// turn pages, hopping chapters at the volume edges (see nextPage/prevPage). In
-	// long-strip mode, forward keys at the end of the manga strip open the next chapter
-	// and backward keys at the document top open the previous one; elsewhere they
-	// keep their default scroll behaviour. Escape closes any open overlay. Ignore
-	// when typing in the comment box.
+	// Tap on the reading surface (not a page-turn zone).
+	function stageClick() {
+		if (headerMode === 'auto') chromeVisible = !chromeVisible;
+		// With no header to reveal, the tap is the way to the menu. In an always-shown
+		// header, strip taps stay inert so reading isn't interrupted.
+		else if (headerMode === 'hidden' || !isStrip) openMenu();
+	}
+
+	// ---- page bar ---------------------------------------------------------------
+	let barHover = $state<{ i: number; x: number } | null>(null);
+	function barIndexAt(e: PointerEvent | MouseEvent): number {
+		const el = e.currentTarget as HTMLElement;
+		const r = el.getBoundingClientRect();
+		let f = (e.clientX - r.left) / r.width;
+		if (dir === 'rtl' && !isStrip) f = 1 - f;
+		return Math.max(0, Math.min(total - 1, Math.floor(f * total)));
+	}
+	function onBarMove(e: PointerEvent) {
+		const el = e.currentTarget as HTMLElement;
+		barHover = { i: barIndexAt(e), x: e.clientX - el.getBoundingClientRect().left };
+	}
+	function onBarKey(e: KeyboardEvent) {
+		const fwd = dir === 'rtl' && !isStrip ? 'ArrowLeft' : 'ArrowRight';
+		const back = dir === 'rtl' && !isStrip ? 'ArrowRight' : 'ArrowLeft';
+		if (e.key === fwd) jumpTo(currentEnd + 1);
+		else if (e.key === back) jumpTo(currentIdx - 1);
+		else if (e.key === 'Home') jumpTo(0);
+		else if (e.key === 'End') jumpTo(total - 1);
+		else return;
+		e.preventDefault();
+		e.stopPropagation();
+	}
+
+	// Keyboard: M toggles the menu; Escape closes it. Paged modes turn pages with
+	// arrows / PageUp / PageDown / space (arrows follow the reading direction) and hop
+	// chapters at the edges. Long strip keeps native scrolling, except forward keys at
+	// the end of the strip open the next chapter and backward keys at the very top
+	// open the previous one. Ignored while typing.
 	function onKeydown(e: KeyboardEvent) {
 		const el = e.target as HTMLElement | null;
-		if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) return;
+		if (
+			el &&
+			(el.tagName === 'TEXTAREA' ||
+				el.tagName === 'INPUT' ||
+				el.tagName === 'SELECT' ||
+				el.isContentEditable)
+		)
+			return;
+		if (e.metaKey || e.ctrlKey || e.altKey) return;
 		if (e.key === 'Escape') {
-			if (settingsOpen || chapterListOpen) {
+			if (menuOpen) {
 				e.preventDefault();
-				settingsOpen = false;
-				chapterListOpen = false;
+				menuOpen = false;
 			}
 			return;
 		}
-		const forward = e.key === 'ArrowRight' || e.key === 'PageDown';
-		const backward = e.key === 'ArrowLeft' || e.key === 'PageUp';
-		if (mode === 'page') {
-			if (forward || e.key === ' ') {
+		if (e.key === 'm' || e.key === 'M') {
+			e.preventDefault();
+			if (docked) togglePin();
+			else menuOpen = !menuOpen;
+			return;
+		}
+		if (menuOpen && !docked) return;
+		if (!isStrip) {
+			if (e.key === 'ArrowRight') {
+				e.preventDefault();
+				goRight();
+			} else if (e.key === 'ArrowLeft') {
+				e.preventDefault();
+				goLeft();
+			} else if (e.key === 'PageDown' || e.key === ' ') {
 				e.preventDefault();
 				nextPage();
-			} else if (backward) {
+			} else if (e.key === 'PageUp') {
 				e.preventDefault();
 				prevPage();
 			}
 			return;
 		}
-		// Long strip: hop only at the reading edge that matches the direction, and
-		// only when a chapter exists there; otherwise let the keys scroll naturally.
+		const forward = e.key === 'ArrowRight' || e.key === 'PageDown';
+		const backward = e.key === 'ArrowLeft' || e.key === 'PageUp';
 		if (forward && atStripEnd() && data.nextChapterId) {
 			e.preventDefault();
 			void openChapter(data.nextChapterId);
 		} else if (backward && atDocTop() && data.prevChapterId) {
 			e.preventDefault();
 			void openChapter(data.prevChapterId);
+		} else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+			// Mid-strip, left/right step a whole page (up/down still scroll freely).
+			e.preventDefault();
+			jumpTo(e.key === 'ArrowRight' ? currentIdx + 1 : currentIdx - 1);
 		}
 	}
+
+	const reportHref = $derived(
+		`/support/report?kind=OTHER&series=${encodeURIComponent(
+			`${seriesTitle || data.seriesId} — Chapter ${chNum}`,
+		)}`,
+	);
 </script>
 
 <svelte:head>
@@ -533,98 +728,200 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-<!-- progress bar -->
-<div class="progress"><div class="progress-fill" style="width:{progressPct}%"></div></div>
+{#snippet cycle<T>(list: Opt<T>[], value: T, onpick: (v: T) => void, caption: string)}
+	{@const o = optOf(list, value)}
+	<button
+		class="cycle"
+		aria-label={`${caption}: ${o.label}. Change`}
+		onclick={() => onpick(nextOf(list, value))}
+	>
+		<Icon name={o.icon} size={16} />
+		<span class="cycle-text">
+			<span class="cycle-cap">{caption}</span>
+			<span class="cycle-val">{o.label}</span>
+		</span>
+		<Icon name="chevron-right" size={14} />
+	</button>
+{/snippet}
 
-<!-- top chrome -->
-<header class="chrome top" class:hidden={chromeHidden}>
-	<div class="top-left">
-		<a class="back" href={seriesHref} aria-label="Back to series"
-			><Icon name="chevron-left" size={18} /></a
+{#snippet srcLogo(iconUrl: string | null, name: string)}
+	{#if iconUrl}
+		<img
+			class="tr-logo"
+			src={iconUrl}
+			alt=""
+			loading="lazy"
+			decoding="async"
+			referrerpolicy="no-referrer"
+		/>
+	{:else}
+		<span class="tr-logo tr-initial">{name.charAt(0).toUpperCase()}</span>
+	{/if}
+{/snippet}
+
+{#snippet menu()}
+	<div class="dr-head">
+		<button
+			class="icon-btn"
+			aria-label="Close menu"
+			onclick={() => (docked ? togglePin() : closeMenu())}><Icon name="x" size={18} /></button
 		>
-		<div class="titlebox">
-			<a class="series" href={seriesHref}>{seriesTitle || 'Back to series'}</a>
-			<!-- Series title only. The chapter is already named twice on this screen —
-			     the picker at top-right and the chapter heading below — so repeating it
-			     under the series title was pure noise. -->
-		</div>
+		<span class="dr-title">Reader</span>
+		{#if wide}
+			<button
+				class="icon-btn"
+				class:on={pinned}
+				aria-pressed={pinned}
+				aria-label={pinned ? 'Unpin menu' : 'Pin menu beside the pages'}
+				title={pinned ? 'Unpin' : 'Pin beside the pages'}
+				onclick={togglePin}><Icon name="pin" size={17} /></button
+			>
+		{/if}
 	</div>
-	<div class="top-right">
-		{#if data.chapters.length}
-			<div class="ch-select">
+
+	<div class="dr-body">
+		<a class="dr-series" href={seriesHref}>
+			<Icon name="book-open" size={16} />
+			<span>{seriesTitle || 'Back to series'}</span>
+		</a>
+		{#if data.chapterId}
+			<div class="dr-chapter">
+				<Icon name="file" size={16} /><span>{chapterLabel({ n: chNum, title: chTitle })}</span>
+			</div>
+			{#if openGroup}
+				<div class="dr-uploader">
+					<Icon name="users" size={15} /><span
+						><span class="dr-up-cap">Uploaded by</span> {openGroup}</span
+					>
+				</div>
+			{/if}
+		{/if}
+
+		{#if hasPages}
+			<div class="stepper">
 				<button
-					class="ch-btn"
-					aria-haspopup="menu"
-					aria-expanded={chapterListOpen}
-					onclick={() => {
-						chapterListOpen = !chapterListOpen;
-						settingsOpen = false;
-					}}
+					class="step"
+					aria-label="Previous page"
+					disabled={currentIdx === 0 && !data.prevChapterId}
+					onclick={() => (isStrip ? jumpTo(currentIdx - 1) : prevPage())}
+					><Icon name="chevron-left" size={16} /></button
 				>
-					Chapter {chNum}<Icon name="chevron-down" size={14} />
-				</button>
-				{#if chapterListOpen}
-					<div class="ch-menu">
-						{#each chapterMenu as c (c.id ?? c.n)}
-							<button class="ch-item" class:current={c.current} onclick={() => openChapter(c.id)}>
-								<div class="ch-item-info">
-									<div class="ch-item-title">Ch. {c.n} · {c.title}</div>
-								</div>
-								{#if c.external}<span class="ext-tag" title="Hosted on another site"
-										><Icon name="globe" size={11} />OFF-SITE</span
-									>{/if}
-								{#if c.current}<span class="reading-tag">READING</span>{/if}
-							</button>
+				<label class="sel">
+					<span class="sel-cap">Page</span>
+					<select
+						aria-label="Jump to page"
+						value={currentIdx}
+						onchange={(e) => jumpTo(Number((e.currentTarget as HTMLSelectElement).value))}
+					>
+						{#each pages as p (p.index)}
+							<option value={p.index}>{p.index + 1} of {total}</option>
 						{/each}
-					</div>
-				{/if}
+					</select>
+					<Icon name="chevron-down" size={14} />
+				</label>
+				<button
+					class="step"
+					aria-label="Next page"
+					disabled={currentEnd >= total - 1 && !data.nextChapterId}
+					onclick={() => (isStrip ? jumpTo(currentIdx + 1) : nextPage())}
+					><Icon name="chevron-right" size={16} /></button
+				>
 			</div>
 		{/if}
-		<button
-			class="settings-btn"
-			class:on={settingsOpen}
-			aria-label="Reader settings"
-			aria-haspopup="dialog"
-			aria-expanded={settingsOpen}
-			onclick={() => {
-				settingsOpen = !settingsOpen;
-				chapterListOpen = false;
-			}}
-		>
-			<Icon name="sliders" size={18} />
-		</button>
-	</div>
-</header>
 
-<!-- settings panel -->
-{#if settingsOpen}
-	<button class="settings-scrim" aria-label="Close settings" onclick={() => (settingsOpen = false)}
-	></button>
-	<div class="settings">
-		<div class="settings-title">Reader settings</div>
+		{#if data.chapters.length}
+			<div class="stepper">
+				<button
+					class="step"
+					aria-label="Previous chapter"
+					disabled={!data.prevChapterId}
+					onclick={() => openChapter(data.prevChapterId)}
+					><Icon name="chevron-left" size={16} /></button
+				>
+				<label class="sel">
+					<span class="sel-cap">Chapter</span>
+					<select
+						aria-label="Jump to chapter"
+						value={data.chapterId ?? ''}
+						onchange={(e) => openChapter((e.currentTarget as HTMLSelectElement).value || undefined)}
+					>
+						{#each data.chapters as c (c.id ?? c.n)}
+							<option value={c.id ?? ''} disabled={!c.id}
+								>{chapterLabel(c)}{c.externalUrl ? ' (off-site)' : ''}</option
+							>
+						{/each}
+					</select>
+					<Icon name="chevron-down" size={14} />
+				</label>
+				<button
+					class="step"
+					aria-label="Next chapter"
+					disabled={!data.nextChapterId}
+					onclick={() => openChapter(data.nextChapterId)}
+					><Icon name="chevron-right" size={16} /></button
+				>
+			</div>
+		{/if}
+
+		<!-- Every copy of this chapter number, one row per (source, group) upload. Always
+		     present when a chapter is open, so the reader can see WHO translated what
+		     they are reading even when there is nothing to switch to. -->
+		{#if data.chapterId}
+			<div class="dr-sec">
+				<span class="dr-label">Group &amp; source</span>
+				<div class="tr-opts">
+					{#if versions.length}
+						{#each versions as v (`${v.src ?? 'spine'}:${v.id}`)}
+							{@const label = v.group || v.source}
+							<button
+								class="tr-opt ver"
+								class:on={v.current}
+								aria-pressed={v.current}
+								aria-label={v.current
+									? `${label} on ${v.source} (reading now)`
+									: `Read this chapter from ${label} on ${v.source}`}
+								onclick={() => openVersion(v)}
+							>
+								{@render srcLogo(v.iconUrl, v.source)}
+								<span class="ver-text">
+									<span class="tr-name">{label}</span>
+									{#if v.group}<span class="ver-src">{v.source}</span>{/if}
+								</span>
+								{#if v.current}<Icon name="check" size={14} strokeWidth={2.6} />{/if}
+							</button>
+						{/each}
+					{:else}
+						<!-- No per-copy data (older API / not backfilled): describe the open
+						     copy only, without pretending there is anything to switch to. -->
+						{@const srcName = activeTranslator?.name ?? null}
+						<div class="tr-opt ver on static">
+							{@render srcLogo(activeTranslator?.iconUrl ?? null, srcName ?? openGroup ?? '?')}
+							<span class="ver-text">
+								<span class="tr-name">{openGroup || srcName || 'Unknown group'}</span>
+								{#if openGroup && srcName}<span class="ver-src">{srcName}</span>{/if}
+							</span>
+							<Icon name="check" size={14} strokeWidth={2.6} />
+						</div>
+					{/if}
+				</div>
+			</div>
+		{/if}
+
+		<!-- The series-wide preference: which source chapters open from by default (and
+		     where prev/next go). Distinct from the one-off copy pick above. -->
 		{#if translators.length > 1}
-			<div class="setting">
-				<span class="setting-label">Translation source</span>
+			<div class="dr-sec">
+				<span class="dr-label">Default source for this series</span>
 				<div class="tr-opts">
 					{#each translators as t (t.key)}
 						<button
 							class="tr-opt"
 							class:on={t.key === data.selectedTranslatorKey}
+							aria-pressed={t.key === data.selectedTranslatorKey}
 							onclick={() => switchTranslator(t.key)}
 							title={t.lang ? `${t.name} · ${t.lang.toUpperCase()}` : t.name}
 						>
-							{#if t.iconUrl}
-								<img
-									class="tr-logo"
-									src={t.iconUrl}
-									alt=""
-									loading="lazy"
-									decoding="async"
-									referrerpolicy="no-referrer"
-								/>
-							{:else}
-								<span class="tr-logo tr-initial">{t.name.charAt(0).toUpperCase()}</span>
-							{/if}
+							{@render srcLogo(t.iconUrl, t.name)}
 							<span class="tr-name">{t.name}</span>
 							<span class="tr-count">{t.chapterCount}</span>
 							{#if t.key === data.selectedTranslatorKey}
@@ -635,620 +932,779 @@
 				</div>
 			</div>
 		{/if}
-		<div class="setting">
-			<span class="setting-label">Reading mode</span>
-			<div class="mode-btns">
-				<button class="mode" class:on={mode === 'strip'} onclick={() => setMode('strip')}
-					>Long strip</button
+
+		<div class="dr-sec">
+			<span class="dr-label">Display</span>
+			{@render cycle(MODES, mode, setMode, 'Mode')}
+			{#if isStrip}
+				<div class="width-row">
+					<div class="width-head">
+						<span>Page width</span><span class="width-val">{width}px</span>
+					</div>
+					<input
+						type="range"
+						name="pageWidth"
+						aria-label="Page width"
+						min="480"
+						max="1400"
+						step="20"
+						bind:value={width}
+						oninput={persist}
+					/>
+				</div>
+				<button
+					class="cycle"
+					aria-pressed={gaps}
+					onclick={() => {
+						gaps = !gaps;
+						persist();
+					}}
 				>
-				<button class="mode" class:on={mode === 'page'} onclick={() => setMode('page')}
-					>Single page</button
-				>
-			</div>
-		</div>
-		<div class="setting">
-			<div class="setting-row">
-				<span class="setting-label">Page width</span>
-				<span class="setting-val">{width}px</span>
-			</div>
-			<input type="range" min="480" max="1000" step="20" bind:value={width} oninput={persist} />
-		</div>
-		<div class="setting toggle-row">
-			<span class="toggle-label">Keep chrome visible</span>
-			<button
-				class="toggle"
-				class:on={lockChrome}
-				aria-label="Toggle chrome lock"
-				onclick={() => {
-					lockChrome = !lockChrome;
+					<Icon name="sliders-h" size={16} />
+					<span class="cycle-text">
+						<span class="cycle-cap">Page gaps</span>
+						<span class="cycle-val">{gaps ? 'Space between pages' : 'Seamless'}</span>
+					</span>
+					<span class="switch" class:on={gaps}><span class="knob"></span></span>
+				</button>
+			{:else}
+				{@render cycle(
+					FITS,
+					fit,
+					(v) => {
+						fit = v;
+						persist();
+					},
+					'Fit',
+				)}
+				{@render cycle(
+					DIRS,
+					dir,
+					(v) => {
+						dir = v;
+						persist();
+					},
+					'Direction',
+				)}
+			{/if}
+			{@render cycle(
+				HEADERS,
+				headerMode,
+				(v) => {
+					headerMode = v;
 					chromeVisible = true;
-				}}
-			>
-				<span class="knob"></span>
-			</button>
+					persist();
+				},
+				'Header',
+			)}
+			{@render cycle(
+				BARS,
+				bar,
+				(v) => {
+					bar = v;
+					persist();
+				},
+				'Progress',
+			)}
 		</div>
+
+		<a class="dr-report" href={reportHref}><Icon name="flag" size={14} />Report a problem</a>
+		<p class="dr-keys">
+			<kbd>M</kbd> menu · <kbd>←</kbd><kbd>→</kbd> turn pages · <kbd>Esc</kbd> close
+		</p>
 	</div>
-{/if}
+{/snippet}
 
-<!-- Tap/keyboard target that toggles the reader chrome. A real <button> keeps
-     this operable by keyboard and screen readers (the reading <main> stays a
-     landmark, not an interactive element). It sits behind the page content so
-     links/paging zones still take clicks. -->
-<button class="chrome-toggle" aria-label="Toggle reader controls" onclick={stageClick}></button>
+<div
+	class="reader"
+	class:docked
+	class:gaps
+	class:header-off={headerMode === 'hidden'}
+	style="--w:{width}px"
+>
+	<!-- top header -->
+	<header class="chrome" class:hidden={chromeHidden}>
+		<a class="icon-btn" href={seriesHref} aria-label="Back to series"
+			><Icon name="chevron-left" size={18} /></a
+		>
+		<div class="titlebox">
+			<a class="series" href={seriesHref}>{seriesTitle || 'Back to series'}</a>
+			<!-- The group shrinks (and ellipsises) before the chapter label does. -->
+			{#if data.chapterId}<span class="chapter"
+					><span class="ch-label">{chapterLabel({ n: chNum, title: chTitle })}</span
+					>{#if headerGroup}<span class="ch-group" title={headerGroup}>· {headerGroup}</span
+						>{/if}</span
+				>{/if}
+		</div>
+		<div class="head-right">
+			{#if hasPages}<span class="pg-chip" aria-live="polite">Pg. {pageReadout}</span>{/if}
+			<!-- Prev/next chapter stay on phones (icon-only): going BACK a chapter must
+			     never depend on finding the chapter picker inside the menu. -->
+			<button
+				class="icon-btn"
+				aria-label="Previous chapter"
+				title="Previous chapter"
+				disabled={!data.prevChapterId}
+				onclick={() => openChapter(data.prevChapterId)}
+				><Icon name="chevrons-left" size={16} /></button
+			>
+			<button
+				class="icon-btn"
+				aria-label="Next chapter"
+				title="Next chapter"
+				disabled={!data.nextChapterId}
+				onclick={() => openChapter(data.nextChapterId)}
+				><Icon name="chevrons-right" size={16} /></button
+			>
+			{#if !docked}
+				<button class="menu-btn" aria-haspopup="dialog" aria-expanded={menuOpen} onclick={openMenu}
+					><Icon name="sliders" size={16} /><span class="hide-sm">Menu</span></button
+				>
+			{/if}
+		</div>
+	</header>
 
-<!-- reading area -->
-<main style="--w:{width}px" class:loading={chapterLoading}>
-	{#if data.chapterId}
-		<!-- Heading only: the kicker above it restated the same chapter number the
-		     heading already carries, one line apart. -->
-		<div class="chapter-header">
-			<h1>{chTitle}</h1>
+	<!-- menu: docked beside the pages (pinned, wide screens) or an overlay sheet -->
+	{#if docked}
+		<aside class="drawer" aria-label="Reader menu">{@render menu()}</aside>
+	{:else if menuOpen}
+		<div use:modalFocus role="dialog" aria-modal="true" aria-label="Reader menu">
+			<button class="scrim" aria-label="Close menu" onclick={closeMenu}></button>
+			<aside class="drawer floating">{@render menu()}</aside>
 		</div>
 	{/if}
 
-	{#if externalUrl}
-		<!-- An off-site chapter (~35,000 of them: MangaPlus, Comikey, NamiComi, BiliBili).
-		     It has no pages BY DESIGN, so it must not fall through to the no-pages state
-		     below — that message blames "a licensing gap" for a chapter that is licensed
-		     and readable, one hop away. Send the reader there, the way MangaDex does.
-		     `rel="noopener noreferrer"` because the destination is a third party. -->
-		<div class="no-pages">
-			<div class="no-pages-icon"><Icon name="globe" size={26} /></div>
-			<h2>This chapter is read on {externalHost}</h2>
-			<p>
-				The publisher hosts it themselves, so there are no pages for us to show. Open it on
-				{externalHost} to keep reading.
-			</p>
-			<div class="no-pages-btns">
-				<a class="next-ch ext-go" href={externalUrl} target="_blank" rel="noopener noreferrer">
-					Read on {externalHost}<Icon name="arrow-right" size={16} strokeWidth={2.4} />
-				</a>
-				<a class="all-ch" href={seriesHref}><Icon name="list" size={16} />Back to series</a>
+	<!-- Tap/keyboard target behind the pages: toggles the header (or opens the menu
+	     when there is no header). A real <button> keeps it operable by keyboard and
+	     screen readers; links and page-turn zones above it still take their clicks. -->
+	<button class="chrome-toggle" aria-label="Toggle reader controls" onclick={stageClick}></button>
+
+	<!-- reading area -->
+	<main class:loading={chapterLoading}>
+		{#if externalUrl}
+			<!-- An off-site chapter. It has no pages BY DESIGN, so it must not fall
+			     through to the no-pages state below. `rel="noopener noreferrer"` because
+			     the destination is a third party. -->
+			<div class="no-pages">
+				<div class="no-pages-icon"><Icon name="globe" size={26} /></div>
+				<h2>This chapter is read on {externalHost}</h2>
+				<p>
+					The publisher hosts it themselves, so there are no pages for us to show. Open it on
+					{externalHost} to keep reading.
+				</p>
+				<div class="no-pages-btns">
+					<a class="next-ch" href={externalUrl} target="_blank" rel="noopener noreferrer">
+						Read on {externalHost}<Icon name="arrow-right" size={16} strokeWidth={2.4} />
+					</a>
+					<a class="all-ch" href={seriesHref}><Icon name="list" size={16} />Back to series</a>
+				</div>
 			</div>
-		</div>
-	{:else if !hasPages}
-		<div class="no-pages">
-			<div class="no-pages-icon"><Icon name="alert" size={26} /></div>
-			<h2>No pages available for this chapter</h2>
-			<p>
-				This chapter has no readable pages yet — often a licensing gap at the source. Try another
-				chapter or head back to the series.
-			</p>
-			<div class="no-pages-btns">
-				{#if data.nextChapterId}
-					<button class="next-ch" onclick={() => openChapter(data.nextChapterId)}
-						>Next Chapter<Icon name="arrow-right" size={16} strokeWidth={2.4} /></button
-					>
-				{/if}
-				<a class="all-ch" href={seriesHref}><Icon name="list" size={16} />Back to series</a>
+		{:else if !hasPages}
+			<div class="no-pages">
+				<div class="no-pages-icon"><Icon name="alert" size={26} /></div>
+				<h2>No pages available for this chapter</h2>
+				<p>
+					This chapter has no readable pages yet — often a licensing gap at the source. Try another
+					chapter or head back to the series.
+				</p>
+				<div class="no-pages-btns">
+					{#if data.prevChapterId}
+						<button class="prev-ch" onclick={() => openChapter(data.prevChapterId)}
+							><Icon name="chevron-left" size={16} strokeWidth={2.4} />Previous chapter</button
+						>
+					{/if}
+					{#if data.nextChapterId}
+						<button class="next-ch" onclick={() => openChapter(data.nextChapterId)}
+							>Next chapter<Icon name="arrow-right" size={16} strokeWidth={2.4} /></button
+						>
+					{/if}
+					<a class="all-ch" href={seriesHref}><Icon name="list" size={16} />Back to series</a>
+				</div>
 			</div>
-		</div>
-	{:else if isStrip}
-		<div class="strip" bind:this={stripEl}>
-			<!-- Keyed on the CHAPTER as well as the page index: `p.index` alone repeats
-			     across chapters, so Svelte reused each <img> and only patched `src`,
-			     leaving the previous chapter's decoded frame on screen until the new
-			     bytes arrived. `data.chapterId` is fixed for the whole block, so the
-			     composite key stays as unique as `p.index` already was. -->
-			{#each pages as p (`${data.chapterId}:${p.index}`)}
-				<div
-					class="strip-cell"
-					style="aspect-ratio:{pageAspect[p.index] ?? DEFAULT_ASPECT};max-width:{width}px"
-				>
+		{:else if isStrip}
+			<div class="strip" bind:this={stripEl}>
+				<!-- Keyed on the CHAPTER as well as the page index: `p.index` alone repeats
+				     across chapters, so Svelte reused each <img> and only patched `src`,
+				     leaving the previous chapter's decoded frame on screen. -->
+				{#each pages as p (`${data.chapterId}:${p.index}`)}
+					<div class="strip-cell" style="aspect-ratio:{pageRatio[p.index] ?? DEFAULT_RATIO}">
+						{#if p.url && !pageError[p.index]}
+							<img
+								class="strip-img"
+								src={p.url}
+								alt={`Page ${p.label}`}
+								loading={p.index < eagerUntil ? 'eager' : 'lazy'}
+								fetchpriority={p.index < STARTER_PAGES
+									? 'high'
+									: p.index < maxScrolledPage + EAGER_AHEAD
+										? 'auto'
+										: 'low'}
+								decoding="async"
+								onload={(e) => onImgLoad(e, p.index)}
+								onerror={() => onImgError(p.index)}
+							/>
+						{:else if p.url && pageError[p.index]}
+							<button class="page-ph page-err" onclick={() => retryImage(p.index)}>
+								<span class="err-msg">
+									<Icon name="alert" size={18} />
+									<span>Page {p.label} failed — tap to retry</span>
+								</span>
+							</button>
+						{:else}
+							<div class="page-ph"><span class="page-tag">PAGE {p.label}</span></div>
+						{/if}
+					</div>
+				{/each}
+			</div>
+		{:else}
+			<div class="paged fit-{fit}" class:double={visiblePages.length > 1} class:rtl={dir === 'rtl'}>
+				<!-- Keyed on the chapter so a chapter change REMOUNTS each <img> instead of
+				     patching `src`, which left the previous chapter's frame on screen. -->
+				{#each visiblePages as p (`${data.chapterId}:${p.index}`)}
 					{#if p.url && !pageError[p.index]}
 						<img
-							class="strip-img"
+							class="paged-img"
 							src={p.url}
 							alt={`Page ${p.label}`}
-							loading={p.index < eagerUntil ? 'eager' : 'lazy'}
-							fetchpriority={p.index < STARTER_PAGES
-								? 'high'
-								: p.index < maxScrolledPage + EAGER_AHEAD
-									? 'auto'
-									: 'low'}
 							decoding="async"
 							onload={(e) => onImgLoad(e, p.index)}
 							onerror={() => onImgError(p.index)}
 						/>
 					{:else if p.url && pageError[p.index]}
-						<button class="strip-ph strip-err k-cover" onclick={() => retryImage(p.index)}>
+						<button class="page-ph paged-ph page-err" onclick={() => retryImage(p.index)}>
 							<span class="err-msg">
 								<Icon name="alert" size={18} />
 								<span>Page {p.label} failed — tap to retry</span>
 							</span>
 						</button>
 					{:else}
-						<div class="strip-ph k-cover">
-							<span class="page-tag">PAGE {p.label} · {p.dim}</span>
-							<span class="panel-tag">MANGA PANEL</span>
-						</div>
+						<div class="page-ph paged-ph"><span class="page-tag">PAGE {p.label}</span></div>
+					{/if}
+				{/each}
+			</div>
+			<!-- Turn zones span the whole screen edge (not just the image), 35% each side;
+			     the middle stays with the chrome toggle underneath. -->
+			<button
+				class="zone left"
+				aria-label={dir === 'rtl' ? 'Next page' : 'Previous page'}
+				onclick={goLeft}
+			></button>
+			<button
+				class="zone right"
+				aria-label={dir === 'rtl' ? 'Previous page' : 'Next page'}
+				onclick={goRight}
+			></button>
+		{/if}
+
+		<!-- end of chapter -->
+		{#if hasPages}
+			<div class="eoc">
+				<div class="eoc-kicker">End of chapter {chNum}</div>
+				<h2>{chTitle}</h2>
+				<!-- On the LAST chapter there is no "Next Chapter" button at all: "All
+				     chapters" becomes the primary action instead of a dead control. -->
+				<div class="eoc-btns">
+					{#if data.prevChapterId}
+						<button class="prev-ch" onclick={() => openChapter(data.prevChapterId)}
+							><Icon name="chevron-left" size={16} strokeWidth={2.4} />Previous chapter</button
+						>
+					{/if}
+					{#if data.nextChapterId}
+						<button class="next-ch" onclick={() => openChapter(data.nextChapterId)}
+							>Next chapter<Icon name="arrow-right" size={16} strokeWidth={2.4} /></button
+						>
+					{/if}
+					<a class="all-ch" class:solo={!data.nextChapterId} href={seriesHref}
+						><Icon name="list" size={16} />All chapters</a
+					>
+				</div>
+				{#if !data.nextChapterId}
+					<p class="eoc-caught-up">You're all caught up — this is the latest chapter we have.</p>
+				{:else if nextChapter}
+					<p class="eoc-next">Up next: {chapterLabel(nextChapter)}</p>
+				{/if}
+			</div>
+		{/if}
+
+		<!-- comments (shared thread component; series discussion uses the same one) -->
+		<section class="comments" id="comments">
+			<CommentThread
+				targetType="chapter"
+				targetId={data.chapterId ?? ''}
+				storageKey={chKey}
+				prompt="Share your thoughts on this chapter…"
+			/>
+		</section>
+	</main>
+
+	<!-- page progress: one segment per page, click or drag to jump -->
+	{#if hasPages && bar !== 'hidden'}
+		<div class="pbar-wrap" class:thin={bar === 'thin'} class:rtl={dir === 'rtl' && !isStrip}>
+			{#if bar === 'thin'}
+				<div class="pthin"><div class="pthin-fill" style="transform:scaleX({readPct / 100})"></div></div>
+			{:else}
+				<div
+					class="pbar"
+					role="slider"
+					tabindex="0"
+					aria-label="Page"
+					aria-valuemin={1}
+					aria-valuemax={total}
+					aria-valuenow={currentIdx + 1}
+					aria-valuetext={`Page ${pageReadout}`}
+					onclick={(e) => jumpTo(barIndexAt(e))}
+					onpointermove={onBarMove}
+					onpointerleave={() => (barHover = null)}
+					onkeydown={onBarKey}
+				>
+					{#each pages as p (p.index)}
+						<span
+							class="seg"
+							class:done={p.index < currentIdx}
+							class:cur={p.index >= currentIdx && p.index <= currentEnd}
+						></span>
+					{/each}
+					{#if barHover}
+						<span class="ptip" style="left:{barHover.x}px">{barHover.i + 1}</span>
 					{/if}
 				</div>
-			{/each}
-		</div>
-	{:else}
-		<div class="paged">
-			<div
-				class="paged-view"
-				style={currentPage?.url ? 'height:74vh' : `height:74vh;aspect-ratio:${currentPage?.ratio}`}
-			>
-				{#if currentPage?.url && !pageError[currentPage.index]}
-					<!-- Keyed on the chapter so a chapter change REMOUNTS the <img> instead
-					     of patching `src` on the existing one, which left the previous
-					     chapter's decoded frame on screen until the new page downloaded. -->
-					{#key data.chapterId}
-						<img
-							class="paged-img"
-							src={currentPage.url}
-							alt={`Page ${currentPage.label}`}
-							decoding="async"
-							onerror={() => onImgError(currentPage.index)}
-						/>
-					{/key}
-				{:else if currentPage?.url && pageError[currentPage.index]}
-					<button class="paged-ph strip-err k-cover" onclick={() => retryImage(currentPage.index)}>
-						<span class="err-msg">
-							<Icon name="alert" size={18} />
-							<span>Page {currentPage.label} failed — tap to retry</span>
-						</span>
-					</button>
-				{:else}
-					<div class="paged-ph k-cover">
-						<span class="page-tag">PAGE {currentPage?.label} · {currentPage?.dim}</span>
-						<span class="panel-tag">MANGA PANEL</span>
-					</div>
-				{/if}
-				<button
-					class="zone left"
-					aria-label="Previous page"
-					onclick={(e) => {
-						e.stopPropagation();
-						prevPage();
-					}}
-				></button>
-				<button
-					class="zone right"
-					aria-label="Next page"
-					onclick={(e) => {
-						e.stopPropagation();
-						nextPage();
-					}}
-				></button>
-			</div>
-			<div class="paged-nav">
-				<button class="nav-skip" aria-label="First page" onclick={goToFirstPage}
-					><Icon name="chevrons-left" size={15} /></button
-				>
-				<button class="pg-btn" onclick={prevPage}>← Prev</button>
-				<span class="pg-label">{pageLabel}</span>
-				<button class="pg-btn" onclick={nextPage}>Next →</button>
-				<button class="nav-skip" aria-label="Last page" onclick={goToLastPage}
-					><Icon name="chevrons-right" size={15} /></button
-				>
-			</div>
-		</div>
-	{/if}
-
-	<!-- end of chapter -->
-	{#if hasPages}
-		<div class="eoc">
-			<div class="eoc-check"><Icon name="check" size={24} strokeWidth={2.4} /></div>
-			<div>
-				<div class="eoc-kicker">END OF CHAPTER {chNum}</div>
-				<h2>{chTitle}</h2>
-			</div>
-			<!-- On the LAST chapter there is no "Next Chapter" button at all. It used to
-			     render always and merely carry `disabled`, so the end of a series still
-			     said "Next Chapter" — a dead control promising a chapter that doesn't
-			     exist. "All chapters" becomes the primary action instead. -->
-			<div class="eoc-btns">
-				{#if data.nextChapterId}
-					<button class="next-ch" onclick={() => openChapter(data.nextChapterId)}
-						>Next Chapter<Icon name="arrow-right" size={16} strokeWidth={2.4} /></button
-					>
-				{/if}
-				<a class="all-ch" class:solo={!data.nextChapterId} href={seriesHref}
-					><Icon name="list" size={16} />All chapters</a
-				>
-			</div>
-			{#if !data.nextChapterId}
-				<p class="eoc-caught-up">You're all caught up — this is the latest chapter we have.</p>
-			{/if}
-			{#if nextChapter}
-				<div class="upnext">
-					<span class="upnext-label">Up next</span>
-					<button class="upnext-card" onclick={() => openChapter(nextChapter.id)}>
-						<div class="upnext-info">
-							<div class="upnext-title">Ch. {nextChapter.n} · {nextChapter.title}</div>
-							<div class="upnext-sub">{seriesTitle}</div>
-						</div>
-						<Icon name="chevron-right" size={18} stroke="#57554f" />
-					</button>
-				</div>
 			{/if}
 		</div>
 	{/if}
-
-	<!-- comments (shared thread component; series discussion uses the same one) -->
-	<section class="comments">
-		<CommentThread
-			targetType="chapter"
-			targetId={data.chapterId ?? ''}
-			storageKey={chKey}
-			prompt="Share your thoughts on this chapter…"
-		/>
-	</section>
-</main>
-
-<!-- bottom chrome -->
-<div class="chrome bottom" class:hidden={chromeHidden}>
-	<!-- Rendered only when the target chapter exists. `disabled` was invisible here:
-	     `.nav-ch` has no styling of its own and nothing styles `button:disabled`, so a
-	     dead Prev/Next looked exactly like a live one. Equal-flex `.nav-side`s keep
-	     the readout centred when either chapter button or the desktop skip arrows
-	     are missing. -->
-	<div class="nav-side left">
-		{#if hasPages && isStrip}
-			<button class="nav-skip" aria-label="First page" onclick={goToFirstPage}
-				><Icon name="chevrons-up" size={15} /></button
-			>
-		{/if}
-		{#if data.prevChapterId}
-			<button class="nav-ch" onclick={() => openChapter(data.prevChapterId)}
-				><Icon name="chevron-left" size={15} />Prev</button
-			>
-		{/if}
-	</div>
-	<span class="readout">{readout}</span>
-	<div class="nav-side right">
-		{#if data.nextChapterId}
-			<button class="nav-ch" onclick={() => openChapter(data.nextChapterId)}
-				>Next<Icon name="chevron-right" size={15} /></button
-			>
-		{/if}
-		{#if hasPages && isStrip}
-			<button class="nav-skip" aria-label="Last page" onclick={goToLastPage}
-				><Icon name="chevrons-down" size={15} /></button
-			>
-		{/if}
-	</div>
 </div>
 
 <style>
-	.progress {
-		position: fixed;
-		top: 0;
-		left: 0;
-		right: 0;
-		height: 3px;
-		z-index: 60;
-		background: var(--k-border);
+	.reader {
+		--dock: 0px;
+		--head: 56px;
+		--bar: 22px;
+		min-height: 100vh;
+		min-height: 100dvh;
 	}
-	.progress-fill {
-		height: 100%;
-		background: var(--k-primary);
-		transition: width 0.12s linear;
+	@media (min-width: 1024px) {
+		.reader.docked {
+			--dock: 320px;
+		}
 	}
+	.reader.header-off {
+		--head: 0px;
+	}
+
+	/* ---- header ---- */
 	.chrome {
 		position: fixed;
+		top: 0;
 		left: 0;
-		right: 0;
+		right: var(--dock);
 		z-index: 50;
-		height: 60px;
+		height: 56px;
 		display: flex;
 		align-items: center;
-		justify-content: space-between;
-		padding: 0 24px;
+		gap: 12px;
+		padding: 0 16px;
 		background: var(--k-glass-strong);
 		backdrop-filter: blur(16px);
-		transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
-	}
-	.chrome.top {
-		top: 0;
 		border-bottom: 1px solid var(--k-border);
+		transition: transform 0.26s cubic-bezier(0.4, 0, 0.2, 1);
 	}
-	.chrome.bottom {
-		bottom: 0;
-		border-top: 1px solid var(--k-border);
-	}
-	.chrome.top.hidden {
+	.chrome.hidden {
 		transform: translateY(-100%);
 	}
-	.chrome.bottom.hidden {
-		transform: translateY(100%);
+	.titlebox {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		line-height: 1.25;
 	}
-	/* Equal-flex sides keep the readout centred whether Prev, Next, or the
-	   desktop skip-to-first/last arrows are present. */
-	.nav-side {
+	.series {
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--k-text-dim);
+		text-decoration: none;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.series:hover {
+		color: var(--k-accent);
+	}
+	.chapter {
+		display: flex;
+		gap: 5px;
+		min-width: 0;
+		font-family: var(--k-font-display);
+		font-weight: 700;
+		font-size: 15px;
+		color: var(--k-text-bright);
+		white-space: nowrap;
+	}
+	.ch-label,
+	.ch-group {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.ch-label {
+		flex: 0 1 auto;
+	}
+	/* Shrinks far faster than the label, so a long group name gives way first. */
+	.ch-group {
+		flex: 0 100 auto;
+		font-weight: 600;
+		color: var(--k-text-dim);
+	}
+	.head-right {
 		display: flex;
 		align-items: center;
 		gap: 8px;
-		flex: 1;
-		min-width: 0;
-	}
-	.nav-side.left {
-		justify-content: flex-start;
-	}
-	.nav-side.right {
-		justify-content: flex-end;
-	}
-	.readout {
 		flex: 0 0 auto;
-		text-align: center;
 	}
-	.nav-skip {
-		width: 32px;
-		height: 32px;
-		flex: 0 0 auto;
-		padding: 0;
-		border-radius: 8px;
-		background: transparent;
-		border: 1px solid var(--k-border-3);
-		color: var(--k-text-3);
-		cursor: pointer;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-	}
-	.nav-skip:hover {
-		border-color: rgba(255, 255, 255, 0.34);
-		color: var(--k-text);
-	}
-	.top-left {
-		display: flex;
-		align-items: center;
-		gap: 18px;
-		min-width: 0;
-	}
-	.back {
-		flex: 0 0 auto;
-		width: 38px;
-		height: 38px;
-		border-radius: 9px;
-		background: transparent;
-		border: 1px solid var(--k-border-3);
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		color: var(--k-text-3);
-		text-decoration: none;
-	}
-	.back:hover {
-		border-color: rgba(255, 255, 255, 0.34);
-		color: var(--k-text);
-	}
-	.titlebox {
-		min-width: 0;
-	}
-	.series {
-		display: block;
+	.pg-chip {
+		font-size: 12px;
 		font-weight: 700;
-		font-size: 14.5px;
-		color: var(--k-text);
-		text-decoration: none;
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.top-right {
-		display: flex;
-		align-items: center;
-		gap: 10px;
-		flex: 0 0 auto;
-	}
-	.ch-select {
-		position: relative;
-	}
-	.ch-btn {
-		display: inline-flex;
-		align-items: center;
-		gap: 9px;
-		height: 38px;
-		padding: 0 14px;
-		border-radius: 9px;
+		font-variant-numeric: tabular-nums;
+		color: var(--k-text-3);
+		padding: 6px 10px;
+		border-radius: var(--k-radius-pill);
 		background: var(--k-surface-4);
 		border: 1px solid var(--k-border-2);
-		color: var(--k-text-1);
-		font-weight: 700;
-		font-size: 13px;
-		cursor: pointer;
-	}
-	.ch-btn:hover {
-		border-color: var(--k-border-strong);
-	}
-	.ch-menu {
-		position: absolute;
-		top: 46px;
-		right: 0;
-		width: 280px;
-		max-height: 360px;
-		overflow-y: auto;
-		background: var(--k-surface-3);
-		border: 1px solid var(--k-border-3);
-		border-radius: 12px;
-		box-shadow: 0 26px 70px rgba(0, 0, 0, 0.6);
-		padding: 6px;
-		z-index: 70;
-	}
-	.ch-item {
-		width: 100%;
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 10px;
-		padding: 10px 12px;
-		border-radius: 8px;
-		cursor: pointer;
-		background: transparent;
-		border: none;
-		text-align: left;
-	}
-	.ch-item:hover {
-		background: rgba(255, 255, 255, 0.05);
-	}
-	.ch-item.current {
-		background: rgba(255, 255, 255, 0.05);
-	}
-	.ch-item-title {
-		font-weight: 700;
-		font-size: 13px;
-		color: var(--k-text-2);
 		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
 	}
-	.ch-item.current .ch-item-title {
-		color: var(--k-text-bright);
-	}
-	.reading-tag {
-		flex: 0 0 auto;
-		font-size: 10px;
-		font-weight: 800;
-		letter-spacing: 0.05em;
-		color: var(--k-on-primary);
-		background: var(--k-primary);
-		padding: 2px 7px;
-		border-radius: 5px;
-	}
-	/* Off-site marker in the chapter list. Deliberately NOT the primary colour of
-	   `.reading-tag`: it flags a departure from the app, not a state to seek out. */
-	.ext-tag {
+	.icon-btn {
+		width: 36px;
+		height: 36px;
 		flex: 0 0 auto;
 		display: inline-flex;
 		align-items: center;
-		gap: 4px;
-		font-size: 10px;
-		font-weight: 800;
-		letter-spacing: 0.05em;
-		color: var(--k-text-faint);
-		border: 1px solid var(--k-border-4);
-		padding: 2px 6px;
-		border-radius: 5px;
-	}
-	/* `.next-ch` is a <button> rule; the off-site CTA is a real <a> (it leaves the app,
-	   so it must be openable in a new tab and readable as a link by assistive tech). */
-	.ext-go {
-		text-decoration: none;
-	}
-	.settings-btn {
-		width: 38px;
-		height: 38px;
-		flex: 0 0 auto;
-		border-radius: 9px;
+		justify-content: center;
+		border-radius: var(--k-radius-md);
 		background: transparent;
 		border: 1px solid var(--k-border-3);
 		color: var(--k-text-3);
 		cursor: pointer;
-		display: flex;
-		align-items: center;
-		justify-content: center;
+		text-decoration: none;
+		padding: 0;
 	}
-	.settings-btn.on {
-		background: var(--k-primary);
-		border-color: var(--k-primary);
-		color: var(--k-on-primary);
+	.icon-btn:hover:not(:disabled) {
+		border-color: var(--k-border-strong);
+		color: var(--k-text);
 	}
-	.settings-scrim {
-		position: fixed;
-		inset: 0;
-		z-index: 55;
-		border: none;
-		background: rgba(8, 8, 9, 0.4);
+	.icon-btn:disabled {
+		opacity: 0.35;
 		cursor: default;
 	}
-	.settings {
+	.icon-btn.on {
+		background: var(--k-accent);
+		border-color: var(--k-accent);
+		color: #fff;
+	}
+	.menu-btn {
+		height: 36px;
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+		padding: 0 14px;
+		border-radius: var(--k-radius-md);
+		background: var(--k-primary);
+		color: var(--k-on-primary);
+		border: none;
+		font-weight: 700;
+		font-size: 13px;
+		cursor: pointer;
+	}
+	.menu-btn:hover {
+		background: var(--k-primary-hover);
+	}
+
+	/* ---- drawer ---- */
+	.scrim {
 		position: fixed;
-		z-index: 56;
-		top: 68px;
-		right: 24px;
-		width: 300px;
-		background: var(--k-surface-3);
-		border: 1px solid var(--k-border-3);
-		border-radius: 16px;
-		box-shadow: 0 26px 70px rgba(0, 0, 0, 0.6);
-		padding: 22px;
+		inset: 0;
+		z-index: 70;
+		border: none;
+		background: rgba(8, 8, 9, 0.5);
+		cursor: default;
+		animation: fade 0.18s ease-out;
+	}
+	.drawer {
+		position: fixed;
+		top: 0;
+		right: 0;
+		bottom: 0;
+		width: 320px;
+		z-index: 71;
 		display: flex;
 		flex-direction: column;
-		gap: 22px;
+		background: var(--k-surface-3);
+		border-left: 1px solid var(--k-border-3);
 	}
-	.settings-title {
+	.drawer.floating {
+		box-shadow: -24px 0 70px rgba(0, 0, 0, 0.5);
+		animation: slide-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+	}
+	@keyframes slide-in {
+		from {
+			transform: translateX(100%);
+		}
+	}
+	@keyframes fade {
+		from {
+			opacity: 0;
+		}
+	}
+	.dr-head {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 12px 14px;
+		border-bottom: 1px solid var(--k-border);
+	}
+	.dr-title {
+		flex: 1;
 		font-family: var(--k-font-display);
 		font-weight: 700;
 		font-size: 15px;
 		color: var(--k-text);
 	}
-	.setting {
+	.dr-body {
+		flex: 1;
+		overflow-y: auto;
+		overscroll-behavior: contain;
+		padding: 16px 14px calc(20px + env(safe-area-inset-bottom));
 		display: flex;
 		flex-direction: column;
-		gap: 10px;
+		gap: 12px;
 	}
-	.setting-label {
-		font-size: 11px;
+	.dr-series,
+	.dr-chapter {
+		display: flex;
+		align-items: flex-start;
+		gap: 10px;
+		font-size: 14px;
+		line-height: 1.35;
+	}
+	.dr-series {
 		font-weight: 700;
-		letter-spacing: 0.09em;
-		text-transform: uppercase;
+		color: var(--k-accent);
+		text-decoration: none;
+	}
+	.dr-series:hover span {
+		text-decoration: underline;
+	}
+	.dr-chapter {
+		color: var(--k-text-2);
+		font-weight: 600;
+		margin-bottom: 4px;
+	}
+	.dr-uploader {
+		display: flex;
+		align-items: flex-start;
+		gap: 10px;
+		margin: -6px 0 4px;
+		font-size: 13px;
+		font-weight: 600;
+		line-height: 1.35;
+		color: var(--k-text-2);
+	}
+	.dr-up-cap {
 		color: var(--k-text-faint);
 	}
-	.setting-row {
+	.dr-series :global(svg),
+	.dr-chapter :global(svg),
+	.dr-uploader :global(svg) {
+		flex: 0 0 auto;
+		margin-top: 1px;
+	}
+	.stepper {
+		display: flex;
+		gap: 6px;
+		align-items: stretch;
+	}
+	.step {
+		width: 34px;
+		flex: 0 0 auto;
 		display: flex;
 		align-items: center;
-		justify-content: space-between;
+		justify-content: center;
+		border-radius: var(--k-radius);
+		background: var(--k-surface-5);
+		border: 1px solid var(--k-border-2);
+		color: var(--k-text-2);
+		cursor: pointer;
+		padding: 0;
 	}
-	.setting-val {
+	.step:hover:not(:disabled) {
+		border-color: var(--k-border-strong);
+		color: var(--k-text);
+	}
+	.step:disabled {
+		opacity: 0.35;
+		cursor: default;
+	}
+	.sel {
+		position: relative;
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		padding: 6px 30px 6px 12px;
+		border-radius: var(--k-radius);
+		background: var(--k-surface-5);
+		border: 1px solid var(--k-border-2);
+		cursor: pointer;
+	}
+	.sel:focus-within {
+		border-color: var(--k-accent);
+	}
+	.sel-cap {
+		font-size: 10.5px;
+		font-weight: 700;
+		color: var(--k-text-faint);
+	}
+	.sel select {
+		appearance: none;
+		background: transparent;
+		border: none;
+		color: var(--k-text);
+		font: inherit;
+		font-size: 13.5px;
+		font-weight: 700;
+		padding: 0;
+		width: 100%;
+		cursor: pointer;
+		outline: none;
+		text-overflow: ellipsis;
+	}
+	.sel select option {
+		background: var(--k-surface-3);
+		color: var(--k-text);
+	}
+	.sel :global(svg) {
+		position: absolute;
+		right: 10px;
+		top: 50%;
+		transform: translateY(-50%);
+		color: var(--k-text-dim);
+		pointer-events: none;
+	}
+	.dr-sec {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		padding-top: 12px;
+		border-top: 1px solid var(--k-border);
+	}
+	.dr-label {
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--k-text-faint);
+		margin-bottom: 2px;
+	}
+	.cycle {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		width: 100%;
+		padding: 9px 12px;
+		border-radius: var(--k-radius);
+		background: var(--k-surface-5);
+		border: 1px solid var(--k-border-2);
+		color: var(--k-text-2);
+		cursor: pointer;
+		text-align: left;
+	}
+	.cycle:hover {
+		border-color: var(--k-border-strong);
+		color: var(--k-text);
+	}
+	.cycle-text {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+	}
+	.cycle-cap {
+		font-size: 10.5px;
+		font-weight: 700;
+		color: var(--k-text-faint);
+	}
+	.cycle-val {
+		font-size: 13.5px;
+		font-weight: 700;
+		color: var(--k-text);
+	}
+	.switch {
+		width: 34px;
+		height: 20px;
+		border-radius: 999px;
+		padding: 2px;
+		display: flex;
+		background: var(--k-border-4);
+		transition: background 0.18s;
+	}
+	.switch.on {
+		justify-content: flex-end;
+		background: var(--k-accent);
+	}
+	.knob {
+		width: 16px;
+		height: 16px;
+		border-radius: 50%;
+		background: #fff;
+	}
+	.width-row {
+		padding: 8px 12px 10px;
+		border-radius: var(--k-radius);
+		background: var(--k-surface-5);
+		border: 1px solid var(--k-border-2);
+	}
+	.width-head {
+		display: flex;
+		justify-content: space-between;
 		font-size: 12px;
 		font-weight: 700;
-		color: var(--k-text-3);
+		color: var(--k-text-faint);
+		margin-bottom: 4px;
 	}
-	.mode-btns {
-		display: flex;
-		gap: 8px;
+	.width-val {
+		color: var(--k-text-2);
+		font-variant-numeric: tabular-nums;
 	}
-	.mode {
-		flex: 1;
-		height: 40px;
-		border-radius: 9px;
-		font-weight: 700;
-		font-size: 13px;
+	.width-row input {
+		width: 100%;
 		cursor: pointer;
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-3);
-		transition: all 0.15s;
-	}
-	.mode.on {
-		background: var(--k-primary);
-		border-color: var(--k-primary);
-		color: var(--k-on-primary);
 	}
 	.tr-opts {
 		display: flex;
 		flex-direction: column;
-		gap: 8px;
+		gap: 6px;
 	}
 	.tr-opt {
 		display: flex;
 		align-items: center;
 		gap: 10px;
-		padding: 8px 12px;
-		border-radius: 10px;
-		background: transparent;
-		border: 1px solid var(--k-border-4);
+		padding: 7px 10px;
+		border-radius: var(--k-radius);
+		background: var(--k-surface-5);
+		border: 1px solid var(--k-border-2);
 		color: var(--k-text-2);
 		cursor: pointer;
-		transition: all 0.15s;
 		text-align: left;
 	}
 	.tr-opt:hover {
 		border-color: var(--k-border-strong);
 	}
 	.tr-opt.on {
-		border-color: var(--k-primary);
+		border-color: var(--k-accent);
 		background: rgba(224, 131, 105, 0.12);
 		color: var(--k-text-bright);
 	}
 	.tr-logo {
-		width: 26px;
-		height: 26px;
+		width: 24px;
+		height: 24px;
 		flex: 0 0 auto;
 		border-radius: 6px;
 		object-fit: cover;
@@ -1271,54 +1727,75 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 	}
+	/* Group & source rows: group on top, source beneath. */
+	.ver-text {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+	}
+	.ver-text .tr-name {
+		flex: none;
+	}
+	.ver-src {
+		font-size: 11.5px;
+		font-weight: 600;
+		color: var(--k-text-faint);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.tr-opt.ver.on,
+	.tr-opt.static {
+		cursor: default;
+	}
+	.tr-opt.static:hover {
+		border-color: var(--k-accent);
+	}
 	.tr-count {
 		font-size: 11px;
 		font-weight: 700;
 		color: var(--k-text-faint);
 	}
-	.setting input[type='range'] {
-		width: 100%;
-		cursor: pointer;
-	}
-	.toggle-row {
-		flex-direction: row;
+	.dr-report {
+		display: inline-flex;
 		align-items: center;
-		justify-content: space-between;
-		padding-top: 4px;
-		border-top: 1px solid var(--k-border);
-	}
-	.toggle-label {
-		font-size: 13px;
-		color: var(--k-text-2);
+		gap: 8px;
+		margin-top: 6px;
+		font-size: 12.5px;
 		font-weight: 600;
+		color: var(--k-text-dim);
+		text-decoration: none;
 	}
-	.toggle {
-		width: 44px;
-		height: 26px;
-		border-radius: 999px;
-		border: none;
-		cursor: pointer;
-		padding: 3px;
-		display: flex;
-		justify-content: flex-start;
-		background: var(--k-border-4);
-		transition: background 0.18s;
+	.dr-report:hover {
+		color: var(--k-cancelled);
 	}
-	.toggle.on {
-		justify-content: flex-end;
-		background: var(--k-ongoing);
+	.dr-keys {
+		margin: 0;
+		font-size: 11.5px;
+		color: var(--k-text-faint);
 	}
-	.knob {
-		width: 20px;
-		height: 20px;
-		border-radius: 50%;
-		background: var(--k-bg);
+	kbd {
+		display: inline-block;
+		min-width: 18px;
+		padding: 1px 5px;
+		margin: 0 1px;
+		border-radius: 4px;
+		border: 1px solid var(--k-border-4);
+		font-family: var(--k-font-mono);
+		font-size: 10.5px;
+		text-align: center;
+		color: var(--k-text-2);
 	}
+
+	/* ---- reading surface ---- */
 	main {
 		position: relative;
 		z-index: 1;
 		min-height: 100vh;
-		padding: 60px 0 0;
+		margin-right: var(--dock);
+		padding: var(--head) 0 var(--bar);
 		display: flex;
 		flex-direction: column;
 		align-items: center;
@@ -1326,9 +1803,8 @@
 		overflow-anchor: none;
 	}
 	/* Re-enable pointer events on interactive controls and readable text, so the
-	   chrome-toggle button underneath only receives taps on the page images,
-	   gaps and margins (preserving tap-anywhere-to-toggle in strip mode) while
-	   links work and comment/synopsis text stays selectable. */
+	   chrome-toggle button underneath only receives taps on the pages, gaps and
+	   margins while links work and comment text stays selectable. */
 	main :global(a),
 	main :global(button),
 	main :global(input),
@@ -1343,13 +1819,9 @@
 	main :global(.c-time) {
 		pointer-events: auto;
 	}
-	/* Chapter swap in progress — see `chapterLoading`. Dimming the outgoing chapter is
-	   the whole feedback: the pages themselves cannot change until the load resolves.
-	   The blocker has to be `:global(*)` rather than the plain `main.loading` of a
-	   simpler reader: the rule right above re-enables pointer events on every link and
-	   button inside `main`, and would out-specify a bare `main.loading`. Targeting the
-	   descendants directly takes the clicks back, so a second click can't land on
-	   content that is already on its way out. */
+	/* Chapter swap in progress — see `chapterLoading`. `:global(*)` because the rule
+	   above re-enables pointer events on every link/button and would out-specify a
+	   bare `main.loading`. */
 	main.loading {
 		opacity: 0.32;
 		transition: opacity 0.12s ease-out;
@@ -1359,27 +1831,20 @@
 	}
 	.chrome-toggle {
 		position: fixed;
-		inset: 0;
+		top: 0;
+		left: 0;
+		bottom: 0;
+		right: var(--dock);
 		z-index: 0;
-		width: 100%;
-		height: 100%;
 		border: none;
 		background: transparent;
-		cursor: pointer;
+		cursor: default;
 		padding: 0;
 	}
-	.chapter-header {
-		width: 100%;
-		max-width: var(--w);
-		padding: 32px 20px 22px;
-		text-align: center;
+	.chrome-toggle:focus-visible {
+		outline-offset: -4px;
 	}
-	.chapter-header h1 {
-		font-size: 30px;
-		letter-spacing: -0.02em;
-		margin: 0;
-		color: var(--k-text-bright);
-	}
+
 	.no-pages {
 		width: 100%;
 		max-width: 480px;
@@ -1404,7 +1869,6 @@
 	}
 	.no-pages h2 {
 		font-size: 22px;
-		letter-spacing: -0.02em;
 		margin: 0;
 		color: var(--k-text-bright);
 	}
@@ -1422,55 +1886,46 @@
 		justify-content: center;
 		margin-top: 10px;
 	}
+
+	/* long strip */
 	.strip {
 		display: flex;
 		flex-direction: column;
 		align-items: center;
 		width: 100%;
 	}
-	/* Each cell reserves its page's space via the image's real aspect-ratio, so
-	   scroll geometry stays stable while offscreen images are torn down. Pages
-	   stack seamlessly — no borders/margins between them. */
+	.gaps .strip {
+		gap: 14px;
+	}
+	/* Each cell reserves its page's space from the real ratio once known (2:3
+	   before), so scroll geometry stays stable. Seamless by default. */
 	.strip-cell {
 		position: relative;
 		display: block;
 		width: 100%;
+		max-width: var(--w);
 		background: var(--k-bg);
-		/* The cell's aspect-ratio is only a pre-load *reservation* (DEFAULT until the
-		   real ratio is measured on load). A loaded image renders at its natural
-		   height (see .strip-img), which for the ~1 frame before the measured ratio is
-		   applied can be taller than the DEFAULT 2:3 box — clip that overflow so it
-		   never overlaps the next page. Once the real ratio lands the box matches the
-		   image exactly and nothing is clipped. */
+		/* The pre-load 2:3 reservation can be shorter than the natural image for the
+		   frame before the measured ratio applies — clip so it never overlaps. */
 		overflow: hidden;
-	}
-	.strip-ph {
-		position: absolute;
-		inset: 0;
-		background-image: repeating-linear-gradient(
-			135deg,
-			rgba(255, 255, 255, 0.028) 0 2px,
-			transparent 2px 12px
-		);
 	}
 	.strip-img {
 		display: block;
 		width: 100%;
-		/* Fill the cell width and let intrinsic height govern. The previous
-		   `height:100%; object-fit:contain` fitted every page into the cell's
-		   *reserved* 2:3 box — so a taller-than-2:3 page (most manga/webtoon pages)
-		   was shrunk to a narrow, letterboxed column until the real ratio was measured
-		   and the box reshaped ("zoomed out for a couple seconds"). Sizing by width
-		   with natural height renders the page correctly the instant it paints. */
 		height: auto;
 	}
-	/* Failed-page retry target (strip + paged share the look). */
-	.strip-err {
+	.page-ph {
+		position: absolute;
+		inset: 0;
+		border: none;
+		background: var(--k-cover);
+		background-image: var(--k-hatch);
+	}
+	.page-err {
 		display: flex;
 		align-items: center;
 		justify-content: center;
 		cursor: pointer;
-		color: var(--k-text-dim);
 	}
 	.err-msg {
 		display: inline-flex;
@@ -1482,7 +1937,7 @@
 		padding: 0 16px;
 		text-align: center;
 	}
-	.strip-err:hover .err-msg {
+	.page-err:hover .err-msg {
 		color: var(--k-text);
 	}
 	.page-tag {
@@ -1492,128 +1947,108 @@
 		font-family: var(--k-font-mono);
 		font-size: 10.5px;
 		letter-spacing: 0.16em;
-		color: #54545c;
+		color: var(--k-text-ghost);
 	}
-	.panel-tag {
-		position: absolute;
-		inset: 0;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		font-family: var(--k-font-mono);
-		font-size: 11px;
-		letter-spacing: 0.24em;
-		color: #33333a;
-	}
+
+	/* paged (single + double). The view height excludes the header (when it holds
+	   space) and the page bar, so "fit to screen" really fits. */
 	.paged {
+		--view-h: calc(100dvh - var(--head) - var(--bar));
 		width: 100%;
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 16px;
-		padding: 4px 0 20px;
-	}
-	.paged-view {
-		position: relative;
-		width: 100%;
-		height: 74vh;
+		min-height: var(--view-h);
 		display: flex;
 		align-items: center;
 		justify-content: center;
+		overflow-x: auto;
+	}
+	.paged.rtl {
+		flex-direction: row-reverse;
 	}
 	.paged-img {
-		height: 100%;
-		width: auto;
+		display: block;
+		flex: 0 1 auto;
+		min-width: 0;
+	}
+	.fit-both .paged-img {
+		max-height: var(--view-h);
 		max-width: 100%;
 		object-fit: contain;
-		border-radius: 6px;
+	}
+	.fit-both.double .paged-img {
+		max-width: 50%;
+	}
+	.fit-width .paged-img {
+		width: 100%;
+		height: auto;
+	}
+	.fit-width.double .paged-img {
+		width: 50%;
+	}
+	.fit-height .paged-img {
+		height: var(--view-h);
+		width: auto;
+		max-width: none;
+		flex-shrink: 0;
+	}
+	.fit-none .paged-img {
+		max-width: none;
+		flex-shrink: 0;
+	}
+	/* Overflowing pages (fit height / original) start at the reading edge. */
+	.fit-height,
+	.fit-none {
+		justify-content: safe center;
 	}
 	.paged-ph {
 		position: relative;
-		height: 100%;
-		aspect-ratio: 800 / 1200;
-		border: 1px solid var(--k-border);
-		border-radius: 6px;
-		background-image: repeating-linear-gradient(
-			135deg,
-			rgba(255, 255, 255, 0.028) 0 2px,
-			transparent 2px 12px
-		);
+		height: var(--view-h);
+		aspect-ratio: 2 / 3;
+		max-width: 100%;
 	}
-	/* Single-page click zones: EXACTLY 30% each edge, leaving the middle 40% to the
-	   chrome-toggle button underneath. The zones stopPropagation, so a tap never
-	   both turns a page and toggles the chrome. */
 	.zone {
-		position: absolute;
-		top: 0;
-		bottom: 0;
-		width: 30%;
+		position: fixed;
+		top: var(--head);
+		bottom: var(--bar);
+		width: calc((100% - var(--dock)) * 0.35);
+		z-index: 2;
 		background: transparent;
 		border: none;
-		cursor: pointer;
+		padding: 0;
 	}
 	.zone.left {
 		left: 0;
 		cursor: w-resize;
 	}
 	.zone.right {
-		right: 0;
+		right: var(--dock);
 		cursor: e-resize;
 	}
-	.paged-nav {
-		display: flex;
-		align-items: center;
-		gap: 20px;
+	.zone:focus-visible {
+		outline-offset: -4px;
 	}
-	.pg-btn {
-		height: 36px;
-		padding: 0 16px;
-		border-radius: 8px;
-		background: var(--k-surface-4);
-		border: 1px solid var(--k-border-2);
-		color: var(--k-text-1);
-		font-weight: 700;
-		font-size: 13px;
-		cursor: pointer;
-	}
-	.pg-btn:hover {
-		border-color: var(--k-border-strong);
-	}
-	.pg-label {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		color: var(--k-text);
-	}
+
+	/* end of chapter */
 	.eoc {
+		position: relative;
+		z-index: 3;
 		width: 100%;
 		max-width: 640px;
-		padding: 64px 20px 96px;
+		padding: 56px 20px 64px;
 		display: flex;
 		flex-direction: column;
 		align-items: center;
-		gap: 26px;
+		gap: 14px;
 		text-align: center;
 	}
-	.eoc-check {
-		width: 52px;
-		height: 52px;
-		border-radius: 50%;
-		background: rgba(95, 191, 126, 0.14);
-		border: 1px solid rgba(95, 191, 126, 0.4);
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		color: #7fd39a;
-	}
 	.eoc-kicker {
-		font-size: 13px;
-		letter-spacing: 0.14em;
-		color: var(--k-text-disabled);
-		margin-bottom: 8px;
+		font-size: 12px;
+		font-weight: 700;
+		letter-spacing: 0.12em;
+		text-transform: uppercase;
+		color: var(--k-accent);
 	}
 	.eoc h2 {
 		font-size: 26px;
-		letter-spacing: -0.02em;
 		margin: 0;
 		color: var(--k-text-bright);
 	}
@@ -1622,149 +2057,210 @@
 		gap: 12px;
 		flex-wrap: wrap;
 		justify-content: center;
-		margin-top: 4px;
+		margin-top: 10px;
 	}
-	.next-ch {
-		height: 50px;
-		padding: 0 28px;
-		border: none;
-		border-radius: 9px;
-		background: var(--k-primary);
-		color: var(--k-on-primary);
-		font-weight: 700;
-		font-size: 15px;
-		cursor: pointer;
-		display: inline-flex;
-		align-items: center;
-		gap: 9px;
-	}
+	.next-ch,
+	.prev-ch,
 	.all-ch {
-		height: 50px;
+		height: 48px;
+		justify-content: center;
 		padding: 0 24px;
-		border-radius: 9px;
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text);
+		border-radius: var(--k-radius-md);
 		font-weight: 700;
-		font-size: 14px;
+		font-size: 14.5px;
 		cursor: pointer;
 		display: inline-flex;
 		align-items: center;
 		gap: 9px;
 		text-decoration: none;
 	}
-	.all-ch:hover {
-		border-color: rgba(255, 255, 255, 0.34);
+	.next-ch {
+		border: none;
+		background: var(--k-primary);
+		color: var(--k-on-primary);
 	}
-	/* Last chapter: with no "Next Chapter" beside it, this is the only action left,
-	   so it takes the primary treatment rather than sitting alone as a lone outline. */
+	.next-ch:hover {
+		background: var(--k-primary-hover);
+	}
+	.prev-ch,
+	.all-ch {
+		background: transparent;
+		border: 1px solid var(--k-border-4);
+		color: var(--k-text);
+	}
+	.prev-ch:hover,
+	.all-ch:hover {
+		border-color: var(--k-border-strong);
+	}
 	.all-ch.solo {
 		background: var(--k-primary);
 		border-color: var(--k-primary);
 		color: var(--k-on-primary);
 	}
-	.all-ch.solo:hover {
-		border-color: var(--k-primary);
-		filter: brightness(1.08);
-	}
-	.eoc-caught-up {
-		margin: 14px 0 0;
+	.eoc-caught-up,
+	.eoc-next {
+		margin: 6px 0 0;
 		font-size: 13.5px;
 		color: var(--k-text-dimmer);
 	}
-	.upnext {
-		width: 100%;
-		margin-top: 22px;
-		padding-top: 26px;
-		border-top: 1px solid var(--k-border);
-		display: flex;
-		flex-direction: column;
-		gap: 14px;
-	}
-	.upnext-label {
-		font-size: 11px;
-		font-weight: 700;
-		letter-spacing: 0.09em;
-		text-transform: uppercase;
-		color: var(--k-text-faint);
-		text-align: left;
-	}
-	.upnext-card {
-		display: flex;
-		align-items: center;
-		gap: 16px;
-		padding: 14px;
-		border-radius: 12px;
-		border: 1px solid var(--k-border-1);
-		background: var(--k-surface);
-		cursor: pointer;
-		text-align: left;
-		transition: all 0.15s;
-	}
-	.upnext-card:hover {
-		border-color: rgba(255, 255, 255, 0.22);
-		background: var(--k-surface-2);
-	}
-	.upnext-info {
-		flex: 1;
-		min-width: 0;
-	}
-	.upnext-title {
-		font-weight: 700;
-		font-size: 14.5px;
-		color: var(--k-text-1);
-	}
-	.upnext-sub {
-		font-size: 12px;
-		color: var(--k-text-fainter);
-		margin-top: 3px;
-	}
 	.comments {
+		position: relative;
+		z-index: 3;
 		width: 100%;
 		max-width: 720px;
-		padding: 12px 20px 120px;
+		padding: 12px 20px 96px;
 		display: flex;
 		flex-direction: column;
 		gap: 22px;
+		scroll-margin-top: calc(var(--head) + 12px);
 	}
+
+	/* ---- page bar ---- */
+	.pbar-wrap {
+		position: fixed;
+		left: 0;
+		right: var(--dock);
+		bottom: 0;
+		z-index: 45;
+		padding: 0 12px calc(6px + env(safe-area-inset-bottom));
+		pointer-events: none;
+	}
+	.pbar-wrap.thin {
+		padding: 0;
+	}
+	.pbar {
+		position: relative;
+		height: 16px;
+		display: flex;
+		align-items: flex-end;
+		gap: 3px;
+		cursor: pointer;
+		pointer-events: auto;
+		touch-action: none;
+	}
+	.pbar-wrap.rtl .pbar {
+		flex-direction: row-reverse;
+	}
+	/* A fixed 10px box shown at 40% height (4px) and grown on hover with a transform:
+	   animating `height` on 100+ segments re-ran layout every frame. Bottom origin
+	   keeps the bar anchored to the screen edge. The radius is 2px across / 5px down
+	   so that, squashed to 0.4, the resting corners still read as the old 2px. */
+	.seg {
+		flex: 1;
+		height: 10px;
+		border-radius: 2px / 5px;
+		background: var(--k-border-4);
+		transform: scaleY(0.4);
+		transform-origin: bottom;
+		transition:
+			transform 0.15s ease,
+			background-color 0.15s;
+	}
+	.pbar:hover .seg,
+	.pbar:focus-visible .seg {
+		transform: scaleY(1);
+	}
+	.seg.done {
+		background: color-mix(in srgb, var(--k-accent) 55%, transparent);
+	}
+	.seg.cur {
+		background: var(--k-accent);
+	}
+	.ptip {
+		position: absolute;
+		bottom: 20px;
+		transform: translateX(-50%);
+		padding: 3px 8px;
+		border-radius: 6px;
+		background: var(--k-surface-5);
+		border: 1px solid var(--k-border-3);
+		font-size: 12px;
+		font-weight: 700;
+		color: var(--k-text);
+		pointer-events: none;
+		white-space: nowrap;
+	}
+	.pthin {
+		height: 3px;
+		background: var(--k-border);
+	}
+	/* Full-width fill scaled to the read fraction: a transform, so moving it never
+	   re-runs layout. */
+	.pthin-fill {
+		height: 100%;
+		background: var(--k-accent);
+		transform-origin: left;
+		transition: transform 0.12s linear;
+	}
+	.pbar-wrap.rtl .pthin-fill {
+		transform-origin: right;
+	}
+
 	@media (max-width: 640px) {
-		.chapter-header h1 {
-			font-size: 24px;
-		}
-		/* Tighten top/bottom chrome padding for narrow screens. */
 		.chrome {
-			padding: 0 14px;
+			padding: 0 10px;
+			gap: 8px;
 		}
-		.nav-skip {
+		.head-right {
+			gap: 6px;
+		}
+		.chapter {
+			font-size: 14px;
+		}
+		.hide-sm {
 			display: none;
 		}
-		.top-left {
-			gap: 12px;
+		.menu-btn {
+			width: 36px;
+			padding: 0;
+			justify-content: center;
 		}
-		/* The chapter dropdown must never exceed the viewport width. */
-		.ch-menu {
-			width: min(280px, calc(100vw - 28px));
-		}
-		/* Reader settings become a full-width bottom sheet (thumb-reachable), with
-		   the translator switcher, reading mode, width + chrome-lock all inside. */
-		.settings {
+		.drawer.floating {
+			width: 100%;
 			top: auto;
-			bottom: 0;
-			left: 0;
-			right: 0;
-			width: auto;
-			max-height: 82vh;
-			overflow-y: auto;
+			max-height: 86dvh;
+			border-left: none;
+			border-top: 1px solid var(--k-border-3);
 			border-radius: 18px 18px 0 0;
-			padding: 22px 20px calc(24px + env(safe-area-inset-bottom));
-			box-shadow: 0 -20px 60px rgba(0, 0, 0, 0.6);
+			animation-name: slide-up;
 		}
-		/* Larger, one-handed tap targets for the reading-mode + page-width controls. */
-		.mode {
-			height: 46px;
+		.dr-keys {
+			display: none;
 		}
-		.tr-opt {
-			padding: 10px 12px;
+		.eoc h2 {
+			font-size: 22px;
+		}
+		/* Phone: the primary "Next chapter" takes its own full-width row on top;
+		   "Previous chapter" and "All chapters" share the row beneath. */
+		.eoc-btns .next-ch {
+			order: -1;
+			flex: 1 1 100%;
+		}
+		.eoc-btns .prev-ch,
+		.eoc-btns .all-ch {
+			flex: 1 1 0;
+			min-width: 0;
+			padding: 0 12px;
+			font-size: 14px;
+		}
+		.pbar-wrap {
+			padding-left: 8px;
+			padding-right: 8px;
+		}
+		.pbar {
+			gap: 2px;
+		}
+	}
+	/* Very narrow phones: the page chip goes first so the title keeps room — the page
+	   bar at the bottom still shows progress, and the menu has the page picker. */
+	@media (max-width: 480px) {
+		.pg-chip {
+			display: none;
+		}
+	}
+	@keyframes slide-up {
+		from {
+			transform: translateY(100%);
 		}
 	}
 </style>

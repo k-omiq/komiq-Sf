@@ -182,6 +182,28 @@ pub struct Credit {
     pub name: String,
 }
 
+#[derive(SimpleObject, Clone)]
+pub struct MetadataTag {
+    pub id: Option<String>,
+    pub name: String,
+    pub group: String,
+}
+#[derive(SimpleObject, Clone)]
+pub struct TrackerLink {
+    pub provider: String,
+    pub external_id: String,
+    pub url: String,
+}
+#[derive(SimpleObject, Clone)]
+pub struct SeriesMetadata {
+    pub year: Option<i32>,
+    pub original_language: Option<String>,
+    pub demographic: Option<String>,
+    pub content_rating: Option<String>,
+    pub tags: Vec<MetadataTag>,
+    pub trackers: Vec<TrackerLink>,
+}
+
 /// One cover of a work (F2). `url` is a proxy-ready MangaDex cover URL (the client
 /// resolves it through the Worker, like `coverUrl`); `isPrimary` marks the main
 /// cover mirrored on `Series.coverUrl`.
@@ -959,7 +981,11 @@ pub struct GenreFacet {
     pub count: i32,
 }
 
-/// One source that provides a given chapter number of a work (S2 aggregation).
+/// One COPY of a given chapter number of a work (S2 aggregation): one upload, by one
+/// scanlation group, on one source. A number MangaDex carries from three groups has three
+/// of these, each with its own `chapterId` — nothing is collapsed per source, which is what
+/// lets the reader offer every group's copy by name the way MangaDex does.
+///
 /// `suwayomiMangaId` (for a Suwayomi source) is the id the reader passes to
 /// `chapters(seriesId:)` to read this source's copy; `chapterId` is the specific
 /// chapter to open (a Suwayomi chapter id, or a MangaDex chapter uuid).
@@ -969,7 +995,22 @@ pub struct ChapterSource {
     pub source_id: String,
     pub suwayomi_manga_id: Option<ID>,
     pub chapter_id: ID,
+    /// Who translated THIS copy. For MangaDex: the group name(s) joined with `" & "`, or
+    /// `"No Group"` when MangaDex lists none. `null` means unknown — a MangaDex row the
+    /// group backfill has not reached yet, or a Suwayomi source that reports no scanlator.
     pub scanlator: Option<String>,
+    /// When THIS copy was released (ISO-8601) — `COALESCE(readable_at, published_at)`, the
+    /// same clock as `AggregatedChapter.firstReleasedAt`, which is the MIN of these.
+    ///
+    /// NAMED `copyReleasedAt`, NOT `releasedAt`, for the reason `firstReleasedAt` gives: the
+    /// client strips opportunistic fields by NAME across every document, and
+    /// `UpdateFeedRow.releasedAt` must never be collateral damage.
+    pub copy_released_at: Option<String>,
+    /// Set when THIS copy is hosted off-site (MangaPlus, Comikey…), so a reader opening a
+    /// non-default copy hands off instead of requesting pages that do not exist. Per copy,
+    /// because one group's upload can be a redirect while another's is pages. Named
+    /// `copyExternalUrl` so the name-based stripper never touches `Chapter.externalUrl`.
+    pub copy_external_url: Option<String>,
 }
 
 /// One aggregated chapter of a work — a chapter NUMBER available across one or

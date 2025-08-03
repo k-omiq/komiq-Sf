@@ -25,6 +25,7 @@
 	let heroIndex = $state(0);
 	// Once the reader picks a slide, stop auto-rotating so their choice sticks.
 	let heroPicked = $state(false);
+	let heroStopped = $state(false);
 	// …and hold the rotation while they are actually AT the hero (pointer over it, or
 	// keyboard focus inside it). Without this the banner swaps the slide out from under
 	// whatever they are doing: mid-synopsis it is merely rude, but with focus on the
@@ -34,7 +35,7 @@
 	// "pause, stop, hide" mechanism for a 5s auto-advancing region.)
 	let heroHeld = $state(false);
 	/** Auto-rotation is stopped — either pinned by a click or held by the reader. */
-	const heroPaused = $derived(heroPicked || heroHeld);
+	const heroPaused = $derived(heroPicked || heroHeld || heroStopped);
 
 	/** Step the carousel by ±1, wrapping, and pin it to the reader's choice. */
 	function stepHero(delta: number): void {
@@ -202,6 +203,18 @@
 {/snippet}
 
 {#snippet content(home: HomeData)}
+	{#if !home.featured.length && !home.latestUpdates.length && !home.trending.length && !home.latestAdded.length}
+		<section class="empty-home k-gutter">
+			<span class="eyebrow">Your Next Read</span>
+			<h1>The Catalogue Is Unavailable</h1>
+			<p>
+				We couldn’t load series right now. Try browsing again in a moment, or open your library.
+			</p>
+			<div class="empty-actions">
+				<a href="/browse">Browse Series</a><a href="/library">Open Library</a>
+			</div>
+		</section>
+	{/if}
 	<!-- HERO. Rendered only when there IS a slide: an empty `featured` (backend down, or
 	     every discovery feed empty) would otherwise leave a 120px band containing the word
 	     "trending" and nothing else — a header for content that does not exist. The rows
@@ -237,6 +250,7 @@
 					<span class="hero-flag" title={current.type}>{FLAG[current.type]}</span>
 				</a>
 				<div class="hero-text">
+					<span class="eyebrow">Featured Series</span>
 					<h1><a href={seriesHref(current)}>{current.title}</a></h1>
 					{#if current.genres.length}
 						<div class="hero-tags">
@@ -257,6 +271,16 @@
 						<span class="hero-author">{current.author}</span>
 					{/if}
 					<div class="hero-nav">
+						{#if featured.length > 1}
+							<button
+								class="hero-pause"
+								aria-pressed={heroStopped || heroPicked}
+								onclick={() => {
+									heroStopped = !(heroStopped || heroPicked);
+									heroPicked = false;
+								}}>{heroStopped || heroPicked ? 'Play' : 'Pause'}</button
+							>
+						{/if}
 						{#if chapterMeta}
 							<span class="hero-chapters">{chapterMeta}</span>
 						{/if}
@@ -337,7 +361,10 @@
 		<!-- LATEST ADDED -->
 		{#if home.latestAdded.length}
 			<section class="block">
-				<h2>Latest Added</h2>
+				<div class="row-head">
+					<h2>Latest Added</h2>
+					<a class="view-all" href="/browse?sort=added">View all</a>
+				</div>
 				<div class="row">
 					{#each home.latestAdded as item (item.id ?? item.title + item.ch)}
 						<MangaCard
@@ -370,6 +397,61 @@
 {/snippet}
 
 <style>
+	.empty-home {
+		padding-top: 80px;
+		padding-bottom: 80px;
+		min-height: 380px;
+	}
+	.empty-home h1 {
+		font-size: clamp(28px, 4vw, 42px);
+		margin-block: 12px 16px;
+	}
+	.empty-home p {
+		color: var(--k-text-muted);
+		max-width: 52ch;
+		font-size: 15px;
+		line-height: 1.7;
+	}
+	.empty-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 12px;
+		margin-top: 24px;
+	}
+	.empty-actions a {
+		padding: 12px 18px;
+		border: 1px solid var(--k-border-3);
+		border-radius: var(--k-radius);
+		background: var(--k-surface-2);
+		font-weight: 700;
+	}
+	.empty-actions a:hover {
+		border-color: var(--k-accent);
+		color: var(--k-accent);
+	}
+
+	.eyebrow {
+		font-size: 11px;
+		font-weight: 800;
+		letter-spacing: 0.12em;
+		text-transform: uppercase;
+		color: var(--k-accent);
+	}
+	.hero-pause {
+		padding: 0 8px;
+		min-height: 44px;
+		background: transparent;
+		border: 1px solid var(--k-border-2);
+		border-radius: var(--k-radius-sm);
+		color: var(--k-text-muted);
+		font-size: 12px;
+		cursor: pointer;
+	}
+	.hero-pause:hover {
+		background: var(--k-hover-fill);
+		color: var(--k-text);
+	}
+
 	/* SOLID, not the slide's cover blurred into a colour field. The wash was the only
 	   thing tinting the banner, but it was also what every piece of hero text had its
 	   contrast computed against — and the art behind it is arbitrary, so the dimmest
@@ -379,6 +461,10 @@
 	   supplies the banner's colour — it is just the real cover now, bled to the edge,
 	   rather than a 48px-blurred copy of it behind glass. */
 	.hero {
+		max-width: var(--k-max-content);
+		margin: 24px auto 0;
+		border: 1px solid var(--k-border-1);
+		border-radius: var(--k-radius-xl);
 		position: relative;
 		/* The cover bleeds to the left/top/bottom edges; clip it to the banner. */
 		overflow: hidden;
@@ -417,8 +503,8 @@
 		min-height: var(--hero-h);
 		/* 2:3 against `--hero-h`, because the cover spans BOTH rows here — see the
 		   breakpoints, where the phone layout drops it to row 1 and re-derives this. */
-		--hero-cover-w: 320px;
-		--hero-h: 480px;
+		--hero-cover-w: 280px;
+		--hero-h: 420px;
 		/* Gap between the cover and the text column — the text's own left padding,
 		   kept as a variable because the foot has to match it exactly. */
 		--hero-pad-l: 40px;
@@ -457,7 +543,7 @@
 		padding: 40px var(--k-gutter) 0 var(--hero-pad-l);
 	}
 	.hero-text h1 {
-		font-size: 46px;
+		font-size: clamp(32px, 3.5vw, 46px);
 		line-height: 1.04;
 		letter-spacing: -0.03em;
 		margin: 0;
@@ -552,8 +638,8 @@
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		width: 34px;
-		height: 34px;
+		width: 44px;
+		height: 44px;
 		padding: 0;
 		border: none;
 		border-radius: var(--k-radius-sm);
@@ -585,8 +671,8 @@
 	.sections {
 		display: flex;
 		flex-direction: column;
-		gap: 60px;
-		padding-top: 64px;
+		gap: 48px;
+		padding-top: 48px;
 		padding-bottom: 80px;
 	}
 	.block {
@@ -616,19 +702,22 @@
 		display: flex;
 		gap: 22px;
 		overflow-x: auto;
-		padding-bottom: 4px;
+		padding: 4px 4px 12px;
+		scroll-padding-inline: 4px;
 	}
 	.genres {
 		display: flex;
-		gap: 28px;
+		gap: 10px;
 		flex-wrap: wrap;
 	}
 	.genre {
 		font-size: 15px;
 		color: var(--k-text-muted);
 		text-decoration: none;
-		padding-bottom: 2px;
-		border-bottom: 1px solid transparent;
+		padding: 9px 14px;
+		border: 1px solid var(--k-border-2);
+		border-radius: var(--k-radius-pill);
+		background: var(--k-surface-2);
 	}
 	.genre:hover {
 		color: var(--k-text);
@@ -668,6 +757,11 @@
 		}
 	}
 	@media (max-width: 640px) {
+		.hero {
+			margin-top: 0;
+			border-radius: 0;
+			border-inline: 0;
+		}
 		/* PHONE. The foot leaves the text column and spans the banner's full width —
 		   a ~190px column beside the cover cannot hold a credit, a chapter line and two
 		   34px arrows without the arrows falling off the screen. The cover keeps its
@@ -731,8 +825,8 @@
 			margin-right: 2px;
 		}
 		.hero-arrow {
-			width: 30px;
-			height: 30px;
+			width: 40px;
+			height: 44px;
 		}
 		.sections {
 			gap: 40px;
@@ -749,7 +843,7 @@
 			-webkit-overflow-scrolling: touch;
 		}
 		.genres {
-			gap: 18px 22px;
+			gap: 8px;
 		}
 	}
 </style>

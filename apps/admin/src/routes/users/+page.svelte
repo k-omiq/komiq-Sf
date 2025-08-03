@@ -1,10 +1,12 @@
 <script lang="ts">
+	import { page as pageState } from '$app/state';
+	import { queuePage, queueNavigate } from '$lib/url-state';
 	import type { AdminUser } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
 	import { loadUsers, setUserBanned, setUserAdmin } from '$lib/data';
 
 	let users = $state<AdminUser[]>([]);
-	let page = $state(1);
+	const page = $derived(queuePage(pageState.url));
 	let hasNext = $state(false);
 	let total = $state<number | null>(null);
 	let loading = $state(false);
@@ -19,28 +21,31 @@
 		void refresh(page);
 	});
 
-	// The load effect above is the single fetch driver: pager buttons only move `page`
-	// and the effect re-fires exactly once. `refresh` no longer reassigns `page` (which
-	// previously caused a second fetch per navigation).
+	// The load effect is the single fetch driver: pager buttons update the URL,
+	// and refresh never changes pagination state.
 	function go(delta: number): void {
 		const next = Math.max(1, page + delta);
 		if (next === page) return;
-		page = next;
+		void queueNavigate(pageState.url, { page: next });
 	}
 
+	let loadSeq = 0;
 	async function refresh(p: number): Promise<void> {
+		const seq = ++loadSeq;
 		loading = true;
 		loadError = null;
 		try {
 			const res = await loadUsers(p);
+			if (seq !== loadSeq) return;
 			users = res.items;
 			hasNext = res.hasNextPage;
 			total = res.total;
 		} catch (err) {
+			if (seq !== loadSeq) return;
 			loadError = err instanceof Error ? err.message : 'Failed to load users.';
 			users = [];
 		} finally {
-			loading = false;
+			if (seq === loadSeq) loading = false;
 		}
 	}
 
@@ -93,11 +98,11 @@
 	</div>
 
 	{#if loadError}
-		<div class="notice error">{loadError}</div>
+		<div class="notice error" role="alert">{loadError}</div>
 	{:else if loading && users.length === 0}
-		<div class="notice">Loading…</div>
+		<div class="notice" role="status">Loading…</div>
 	{:else}
-		{#if actionError}<div class="notice error">{actionError}</div>{/if}
+		{#if actionError}<div class="notice error" role="alert">{actionError}</div>{/if}
 		<div class="table" role="table" aria-label="Users">
 			<div class="row head" role="row">
 				<span role="columnheader">User</span>
@@ -272,7 +277,10 @@
 		font-weight: 600;
 		cursor: pointer;
 		white-space: nowrap;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s;
 	}
 	.act:hover:not(:disabled) {
 		border-color: var(--k-border-strong);

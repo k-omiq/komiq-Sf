@@ -1,11 +1,13 @@
 <script lang="ts">
+	import { page as pageState } from '$app/state';
+	import { queuePage, queueNavigate } from '$lib/url-state';
 	import type { CoverIssue } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
 	import { assetSrc } from '$lib/config';
 	import { loadCoverIssues, retryCover, uploadCover } from '$lib/data';
 
 	let issues = $state<CoverIssue[]>([]);
-	let page = $state(1);
+	const page = $derived(queuePage(pageState.url));
 	let hasNext = $state(false);
 	let total = $state<number | null>(null);
 	let loading = $state(false);
@@ -13,7 +15,7 @@
 	let actionError = $state<string | null>(null);
 	let busy = $state<string | null>(null); // workId currently acting
 	// Hidden file inputs keyed by workId, so each row's "Upload" button opens its own.
-	let fileInputs: Record<string, HTMLInputElement> = {};
+	let fileInputs = $state<Record<string, HTMLInputElement>>({});
 
 	const REASON_LABEL: Record<string, string> = {
 		too_large: 'Source too large',
@@ -26,23 +28,34 @@
 	// Auth redirect is centralized in +layout.svelte.
 	$effect(() => {
 		if (!auth.user) return;
-		void refresh(1);
+		void refresh(page);
 	});
 
+	let loadSeq = 0;
 	async function refresh(p = page): Promise<void> {
+		if (p !== page) {
+			await queueNavigate(pageState.url, { page: p });
+			return;
+		}
+		const seq = ++loadSeq;
 		loading = true;
 		loadError = null;
 		try {
 			const res = await loadCoverIssues(p);
+			if (seq !== loadSeq) return;
 			issues = res.items;
-			page = res.page;
+			if (res.page !== p) {
+				void queueNavigate(pageState.url, { page: res.page }, true);
+				return;
+			}
 			hasNext = res.hasNextPage;
 			total = res.total ?? null;
 		} catch (err) {
+			if (seq !== loadSeq) return;
 			loadError = err instanceof Error ? err.message : 'Failed to load cover issues.';
 			issues = [];
 		} finally {
-			loading = false;
+			if (seq === loadSeq) loading = false;
 		}
 	}
 
@@ -57,7 +70,9 @@
 	// (server backfills from the next page), else step back a page.
 	async function settleAfterFix(): Promise<void> {
 		if (issues.length === 0 && total != null && total > 0) {
-			await refresh(hasNext ? page : Math.max(1, page - 1));
+			const next = hasNext ? page : Math.max(1, page - 1);
+			if (next === page) await refresh(page);
+			else await queueNavigate(pageState.url, { page: next }, true);
 		}
 	}
 
@@ -118,13 +133,13 @@
 	</div>
 
 	{#if loadError}
-		<div class="notice error">{loadError}</div>
+		<div class="notice error" role="alert">{loadError}</div>
 	{:else if loading && issues.length === 0}
-		<div class="notice">Loading…</div>
+		<div class="notice" role="status">Loading…</div>
 	{:else if issues.length === 0}
 		<div class="notice">No cover issues — every cover processed cleanly. 🎉</div>
 	{:else}
-		{#if actionError}<div class="notice error">{actionError}</div>{/if}
+		{#if actionError}<div class="notice error" role="alert">{actionError}</div>{/if}
 		<div class="table" role="table" aria-label="Cover issues">
 			<div class="row head" role="row">
 				<span role="columnheader">Cover</span>
@@ -138,7 +153,14 @@
 				<div class="row" role="row">
 					<span role="cell">
 						{#if assetSrc(w.coverUrl)}
-							<img class="cover" src={assetSrc(w.coverUrl)} alt="" loading="lazy" />
+							<img
+								width="80"
+								height="112"
+								class="cover"
+								src={assetSrc(w.coverUrl)}
+								alt=""
+								loading="lazy"
+							/>
 						{:else}
 							<span class="cover placeholder" aria-hidden="true">?</span>
 						{/if}
@@ -165,6 +187,7 @@
 						</button>
 						<input
 							class="hidden-file"
+							aria-label={`Upload cover for ${w.title ?? w.workId}`}
 							type="file"
 							accept="image/*"
 							bind:this={fileInputs[w.workId]}
@@ -176,11 +199,19 @@
 		</div>
 
 		<div class="pager">
-			<button class="pg" disabled={page <= 1 || loading} onclick={() => refresh(page - 1)}>
+			<button
+				class="pg"
+				disabled={page <= 1 || loading}
+				onclick={() => queueNavigate(pageState.url, { page: Math.max(1, page - 1) })}
+			>
 				← Prev
 			</button>
 			<span class="muted">Page {page}</span>
-			<button class="pg" disabled={!hasNext || loading} onclick={() => refresh(page + 1)}>
+			<button
+				class="pg"
+				disabled={!hasNext || loading}
+				onclick={() => queueNavigate(pageState.url, { page: page + 1 })}
+			>
 				Next →
 			</button>
 		</div>
@@ -317,7 +348,10 @@
 		font-weight: 600;
 		cursor: pointer;
 		white-space: nowrap;
-		transition: all 0.15s;
+		transition:
+			color 0.15s,
+			background-color 0.15s,
+			border-color 0.15s;
 	}
 	.act:hover:not(:disabled) {
 		border-color: var(--k-border-strong);

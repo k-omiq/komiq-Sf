@@ -13,6 +13,7 @@ mod ext_icon;
 mod gc;
 mod graphql;
 mod ingest;
+mod maintenance;
 mod mangadex;
 mod media;
 mod notify;
@@ -156,23 +157,20 @@ fn resolve_client_ip(headers: &HeaderMap, peer: SocketAddr, trusted: &[Cidr]) ->
             .get("cf-connecting-ip")
             .and_then(|v| v.to_str().ok())
         {
-            let ip = cf.trim();
-            if !ip.is_empty() {
-                return ip.to_string();
+            if let Ok(ip) = cf.trim().parse::<IpAddr>() {
+                return ip.to_canonical().to_string();
             }
         }
         if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
             if let Some(last) = xff.split(',').next_back() {
-                let ip = last.trim();
-                if !ip.is_empty() {
-                    return ip.to_string();
+                if let Ok(ip) = last.trim().parse::<IpAddr>() {
+                    return ip.to_canonical().to_string();
                 }
             }
         }
         if let Some(rip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-            let ip = rip.trim();
-            if !ip.is_empty() {
-                return ip.to_string();
+            if let Ok(ip) = rip.trim().parse::<IpAddr>() {
+                return ip.to_canonical().to_string();
             }
         }
     }
@@ -1551,6 +1549,7 @@ async fn main() -> anyhow::Result<()> {
         admin_users: cfg.admin_users.clone(),
         scan_health: std::sync::Mutex::new(ScanHealth::default()),
         auth_limiter: RateLimiter::new(cfg.auth_rate_limit_max, cfg.auth_rate_limit_window_secs),
+        password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         federated_limiter: RateLimiter::new(
             cfg.federated_rate_limit_max,
             cfg.federated_rate_limit_window_secs,
@@ -1602,6 +1601,11 @@ async fn main() -> anyhow::Result<()> {
     // Background adaptive scan scheduler, sharing the same AppState.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     scanner::spawn(state.clone(), cfg.scan_tick_seconds, shutdown_rx);
+    maintenance::spawn(
+        state.clone(),
+        cfg.extension_auto_update_interval_seconds,
+        shutdown_tx.subscribe(),
+    );
 
     // Extension-level source-sync scheduler: re-walks *subscribed* extensions (LATEST)
     // to auto-discover newly-added series, and (independently of subscriptions) reconciles
@@ -1700,6 +1704,11 @@ async fn main() -> anyhow::Result<()> {
         // `readable_at IS NULL`, so an interrupted drain resumes itself and a finished one
         // costs an hourly scan of an empty partial index.
         mangadex::spawn_readable_backfill(pool.clone(), mangadex.clone(), shutdown_tx.subscribe());
+        // Same gate, same limiter, same shape: fills `chapter.scanlator` (the scanlation
+        // group) on MangaDex chapters mirrored before the firehose asked for groups. Its
+        // work-list is `scanlator IS NULL` on a MangaDex row (migration 0105's partial
+        // index), so it resumes itself and costs an hourly empty-index probe once drained.
+        mangadex::spawn_group_backfill(pool.clone(), mangadex.clone(), shutdown_tx.subscribe());
     } else {
         tracing::info!("catalogue sync disabled (set CATALOGUE_SYNC=on to enable)");
     }
@@ -2117,6 +2126,25 @@ mod tests {
         assert!(Cidr::parse("not-an-ip").is_none());
         assert!(Cidr::parse("10.0.0.0/33").is_none());
         assert!(Cidr::parse("::1/129").is_none());
+    }
+
+    #[test]
+    fn trusted_headers_require_canonical_ip_addresses() {
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let trusted = vec![Cidr::parse("127.0.0.1").unwrap()];
+        let a = hdrs(&[("cf-connecting-ip", "2001:0db8:0:0:0:0:0:1")]);
+        let b = hdrs(&[("cf-connecting-ip", "2001:db8::1")]);
+        assert_eq!(
+            resolve_client_ip(&a, peer, &trusted),
+            resolve_client_ip(&b, peer, &trusted)
+        );
+        let invalid = hdrs(&[
+            ("cf-connecting-ip", "arbitrary-bucket"),
+            ("x-real-ip", "::ffff:192.0.2.1"),
+        ]);
+        assert_eq!(resolve_client_ip(&invalid, peer, &trusted), "192.0.2.1");
+        let invalid = hdrs(&[("x-forwarded-for", "client, forged-bucket")]);
+        assert_eq!(resolve_client_ip(&invalid, peer, &trusted), "127.0.0.1");
     }
 
     #[test]

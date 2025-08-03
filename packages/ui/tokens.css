@@ -32,9 +32,9 @@
 	--k-text-3: #c9c7c1;
 	--k-text-muted: #b5b3ad;
 	--k-text-dim: #9c9a94;
-	--k-text-dimmer: #87857f;
-	--k-text-faint: #7d7b75;
-	--k-text-fainter: #6f6d68;
+	--k-text-dimmer: #a09e98;
+	--k-text-faint: #999790;
+	--k-text-fainter: #999790;
 	--k-text-ghost: #5f5d58;
 	--k-text-disabled: #57554f;
 
@@ -88,6 +88,7 @@
 	/* typography */
 	--k-font-display: 'Bricolage Grotesque Variable', 'Bricolage Grotesque', system-ui, sans-serif;
 	--k-font-sans: 'Manrope Variable', 'Manrope', system-ui, -apple-system, sans-serif;
+	--k-font-size-md: 14px;
 	--k-font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
 
 	/* layout */
@@ -131,9 +132,9 @@
 	--k-text-3: #45454b;
 	--k-text-muted: #55555c;
 	--k-text-dim: #6a6a71;
-	--k-text-dimmer: #7d7d84;
-	--k-text-faint: #8a8a91;
-	--k-text-fainter: #9a9aa0;
+	--k-text-dimmer: #626269;
+	--k-text-faint: #626269;
+	--k-text-fainter: #626269;
 	--k-text-ghost: #b0b0b5;
 	--k-text-disabled: #c2c2c7;
 

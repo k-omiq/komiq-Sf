@@ -1,0 +1,39 @@
+-- The work-list index for the scanlation-group backfill
+-- (`mangadex::backfill_chapter_groups`).
+--
+-- WHY THERE IS A BACKFILL AT ALL. MangaDex models translation groups as a relationship,
+-- not a string on the chapter, and until `includes[]=scanlation_group` was added to both
+-- `/chapter` queries the mirror wrote `chapter.scanlator = NULL` for every MangaDex row —
+-- ~877k chapters. So a series with three uploads of "Ch. 3" by three groups showed three
+-- anonymous rows, and the reader could not offer a choice between them. New chapters now
+-- arrive with their group, and the firehose self-heals rows it re-offers
+-- (`chapter_row_unchanged` compares `scanlator`), but it only re-offers chapters whose
+-- upstream record CHANGED. The long tail needs the drain.
+--
+-- WHAT THE COLUMN MEANS FOR A MANGADEX ROW AFTER THIS:
+--   NULL        never asked — the drain's work-list
+--   'No Group'  upstream lists no scanlation group (MangaDex's own wording; renderable)
+--   ''          asked, could not learn (deleted upstream / unnamed relationship) — the
+--               read path renders it as unknown
+--   anything    the group name(s), sorted, joined with ' & '
+-- Every value the drain writes is non-NULL, which is what makes it terminate.
+--
+-- WHY THE GLOB. `scanlator IS NULL` alone is not a MangaDex predicate: Suwayomi spine rows
+-- carry NULL whenever their source reports no scanlator (92% of them in a local snapshot),
+-- and they will never be filled, so an index on that alone would hold ~500k rows forever
+-- and every 100-row batch would wade through them. MangaDex chapter ids are uuids and
+-- Suwayomi ones are integer row ids, so `external_id GLOB '*-*'` selects exactly the
+-- MangaDex half without a join — and the index then empties as the drain runs, costing
+-- nothing once it is done. SQLite uses a partial index only when the query repeats its
+-- WHERE terms, so `mangadex::GROUP_WORKLIST_WHERE` spells both terms verbatim.
+--
+-- Keyed on `source_series_id` so the drain's read-first priority half (works in a library,
+-- with progress, or most-viewed) is one index probe per hot work, and the plain sweep walks
+-- the mirror a work at a time. Verified with EXPLAIN QUERY PLAN against a copy of the
+-- local database: `SCAN c USING INDEX idx_chapter_needs_group` for the sweep and
+-- `SEARCH c USING INDEX idx_chapter_needs_group (source_series_id=?)` for the priority half.
+--
+-- NO DATA IS MOVED HERE: the drain does it, paced, against the live API.
+CREATE INDEX IF NOT EXISTS idx_chapter_needs_group
+    ON chapter (source_series_id)
+    WHERE scanlator IS NULL AND external_id GLOB '*-*';

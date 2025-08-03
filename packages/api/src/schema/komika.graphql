@@ -110,7 +110,7 @@ type Mutation {
 	updateSeriesMetadata(input: SeriesMetadataInput!): Series! # [komika] admin series-detail editor — edit a work's title/description/type/NSFW/tags as an override layer (source data stays immutable); returns the recomputed series (requires isAdmin)
 	rescanWork(workId: ID!): Int! # [komika] admin — force an immediate re-scan of EVERY installed Suwayomi source of a canonical work; returns how many sources were scanned (requires isAdmin)
 	setChapterOverride(input: ChapterOverrideInput!): Boolean! # [komika] admin series-detail editor — soft-hide (reversible) or rename one chapter of a work by aggregate number; non-destructive (requires isAdmin)
-	addSeriesAltTitle(id: ID!, title: String!): Series! # [komika] admin series-detail editor — add an alternative title to a work's alias index. May trigger an auto-merge of every work sharing the normalized alias (≤8 of them) into the richest survivor, so the returned Series can be a DIFFERENT work than the one edited (requires isAdmin)
+	addSeriesAltTitle(id: ID!, title: String!): Series! # [komika] admin series-detail editor — add an alternative title to a work's alias index. May trigger an auto-merge of works sharing the normalized alias and at least 90% similar author names (≤8 of them) into the richest survivor, so the returned Series can be a DIFFERENT work than the one edited (requires isAdmin)
 	removeSeriesAltTitle(id: ID!, title: String!): Series! # [komika] admin series-detail editor — drop one alternative title from a work's alias index (requires isAdmin)
 	consolidateExactDuplicates(limit: Int = 100): Int! # [komika] admin dedup sweep — fold canonical works that share an exact normalized alias, gated on corroborating signals; oversized clusters are routed to mergeQueue instead of merged. `limit` bounds the alias GROUPS examined; returns works merged away. Single-flighted against reconcileCatalogue (requires isAdmin)
 	reconcileCatalogue: Int! # [komika] admin — background pass matching every provisional (Suwayomi-only) work against the MangaDex spine; merges confident matches, queues mid-confidence ones for review. Returns the pending count at kickoff, not the result. Single-flighted (requires isAdmin)
@@ -144,12 +144,12 @@ enum SeriesStatus {
 # default — the only ordering that reflects what people are actually reading — and it
 # degrades to NEWEST for everything with no views in the last 24h, so a cold view
 # table cannot render Browse empty. RATING likewise puts rated works first and falls
-# through to NEWEST for the unrated. LATEST_ADDED uses Komiq's first-available clock,
-# not the source's release date.
+# through to NEWEST for the unrated. LATEST_ADDED uses the work's catalogue-add time,
+# with work identity breaking ties.
 enum BrowseSort {
 	TRENDING # most-viewed over the last 24h first, then newest release
 	NEWEST # newest upstream chapter release first
-	LATEST_ADDED # chapters Komiq most recently made available first
+	LATEST_ADDED # works most recently added to the catalogue first
 	RATING # highest user-review average first, then newest for the unrated
 	CHAPTERS # most English chapters first (the same number `chapterCount` reports)
 }
@@ -179,6 +179,7 @@ enum ContentRatingFilter {
 }
 
 type Series {
+	metadata: SeriesMetadata
 	id: ID!
 	title: String!
 	altTitles: [String!]!
@@ -220,6 +221,17 @@ type LocalizedDescription {
 	lang: String!
 	description: String!
 }
+
+type SeriesMetadata {
+	year: Int
+	originalLanguage: String
+	demographic: String
+	contentRating: String
+	tags: [MetadataTag!]!
+	trackers: [TrackerLink!]!
+}
+type MetadataTag { id: String, name: String!, group: String! }
+type TrackerLink { provider: String!, externalId: String!, url: String! }
 
 type Credit {
 	role: String! # "author" | "artist"
@@ -570,6 +582,8 @@ type MatchResult {
 # MangaDex work + its latest stored chapter, served from the `chapter` mirror. Open
 # it via canonicalSeries(workId) — `workId` is the `w_`-prefixed canonical reader id.
 type CanonicalUpdate {
+	averageRating: Float
+	ratingCount: Int!
 	workId: String!
 	mangadexId: String!
 	title: String
@@ -925,10 +939,11 @@ type SplitSourcesResult {
 # work whose MangaDex spine has 0 chapters but whose asurascans source has 201 reports 201.
 type AggregatedChapter {
 	number: Float!
+	label: String! # what to print: "45", "10.5", "Oneshot" — the one server-side label rule (Phase A2)
 	title: String
 	firstReleasedAt: String # F12: when this chapter was FIRST released across ALL its sources (ISO-8601), or null when no source dated it. The EARLIEST source time, matching `release_event.first_seen_at`'s first-source-wins rule, so a chapter's date does not change as the reader switches translator. Deliberately NOT named `releasedAt` — the client strips unknown fields by NAME across every document, and `UpdateFeedRow.releasedAt` already exists
 	readAnywhere: Boolean! # has the VIEWER read this chapter from ANY of the work's sources? DERIVED (no stored column): progress is keyed per source chapter row, so the same chapter has a different id in every source and a translator switch used to blank every marker; this is set when the viewer has a read row on any source chapter sharing this row's spine key (`chapter.chapter_key`). Named `readAnywhere`, not `read` — the client strips unknown fields by NAME across every document and `Chapter.read` is selected everywhere. False for anonymous viewers, and for oneshots/extras whose key (`x:<id>`) is source-local by construction
-	sources: [ChapterSource!]! # every source (translator) that provides this chapter number
+	sources: [ChapterSource!]! # every COPY of this chapter number: one entry per (source, scanlation group) upload, never collapsed per source — MangaDex carrying "Ch. 3" from two groups yields two entries. Deterministic order: Suwayomi sources then the mirror, oldest copy first
 }
 
 type ChapterSource {
@@ -936,5 +951,7 @@ type ChapterSource {
 	sourceId: String!
 	suwayomiMangaId: ID # for a Suwayomi source: pass to chapters(seriesId:) to read this source's copy; null for the MangaDex mirror
 	chapterId: ID! # the specific chapter to open (a Suwayomi chapter id, or a MangaDex chapter uuid)
-	scanlator: String
+	scanlator: String # the scanlation group(s) of THIS copy: MangaDex group names joined with " & ", or "No Group" when MangaDex lists none; null = unknown (not backfilled yet / the source reports none)
+	copyReleasedAt: String # when THIS copy was released (ISO-8601, readable_at else published_at); null when undated. Named copy… so the client's by-name stripper never touches UpdateFeedRow.releasedAt
+	copyExternalUrl: String # set when THIS copy is hosted off-site (MangaPlus, Comikey…) — open it as a hand-off, not as pages
 }

@@ -28,20 +28,34 @@
 </script>
 
 <div class="wrap">
-	<form class="card" onsubmit={submit}>
+	<form class="card" onsubmit={submit} aria-busy={busy}>
 		<div class="head">
-			<div class="brand"><span class="mark">KOMIQ</span><span class="sub">manga DB</span></div>
+			<div class="brand"><span class="mark">KOMIQ</span><span class="sub">Admin console</span></div>
 			<h1>Admin sign in</h1>
 			<p class="hint">Catalog management, scan overrides, and status flags.</p>
 		</div>
 
 		<label>
 			<span>Username</span>
-			<input type="text" bind:value={username} autocomplete="username" required />
+			<input
+				type="text"
+				bind:value={username}
+				name="username"
+				autocomplete="username"
+				autocapitalize="none"
+				spellcheck={false}
+				required
+			/>
 		</label>
 		<label>
 			<span>Password</span>
-			<input type="password" bind:value={password} autocomplete="current-password" required />
+			<input
+				type="password"
+				bind:value={password}
+				name="password"
+				autocomplete="current-password"
+				required
+			/>
 		</label>
 
 		{#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -54,7 +68,7 @@
 
 <style>
 	.wrap {
-		min-height: 100vh;
+		min-height: 100dvh;
 		display: flex;
 		align-items: center;
 		justify-content: center;
@@ -62,7 +76,7 @@
 	}
 	.card {
 		width: 100%;
-		max-width: 380px;
+		max-width: 420px;
 		display: flex;
 		flex-direction: column;
 		gap: var(--k-space-4);
@@ -97,7 +111,7 @@
 	h1 {
 		font-family: var(--k-font-display);
 		font-weight: 700;
-		font-size: 22px;
+		font-size: 30px;
 		letter-spacing: -0.02em;
 		color: var(--k-text-bright);
 	}
@@ -127,7 +141,8 @@
 		font-size: 14px;
 	}
 	input:focus {
-		outline: none;
+		outline: 2px solid var(--k-accent);
+		outline-offset: 2px;
 		border-color: var(--k-border-strong);
 	}
 	.error {

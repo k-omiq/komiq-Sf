@@ -678,6 +678,12 @@ fn chapter_list_params(
         ("offset".into(), offset.to_string()),
         (window.order_key().into(), "asc".into()),
         ("includes[]".into(), "manga".into()),
+        // The translation group(s) behind each chapter, WITH their attributes: MangaDex
+        // models groups as relationships, and only an `includes[]` expands one from a bare
+        // `{id, type}` into something that carries a `name`. Without it every chapter's
+        // group is unknowable and a series with three uploads of "Ch. 3" shows three
+        // anonymous rows. See `scanlation_group_label`.
+        ("includes[]".into(), "scanlation_group".into()),
         // English-only: Komika serves only English chapters, so filter the firehose
         // at the source (smaller pages, no non-English rows to mirror).
         ("translatedLanguage[]".into(), "en".into()),
@@ -710,9 +716,15 @@ fn chapter_list_params(
 /// them names a row we mirror — so a language filter can only subtract, and subtracting
 /// here means the same permanent fallback write. Filter nothing that the id has not already
 /// decided.
+///
+/// `includes[]=scanlation_group` is ADDITIVE, unlike every filter above: an include only
+/// expands relationships on the records that come back, it never removes one, so it is
+/// safe on an exact id list. It is what lets the group backfill (`backfill_chapter_groups`)
+/// ride this exact request shape, and it costs the `readable_at` drain nothing.
 fn chapter_ids_params(ids: &[String]) -> Vec<(String, String)> {
     let mut params: Vec<(String, String)> = vec![
         ("limit".into(), ids.len().to_string()),
+        ("includes[]".into(), "scanlation_group".into()),
         ("contentRating[]".into(), "safe".into()),
         ("contentRating[]".into(), "suggestive".into()),
         ("contentRating[]".into(), "erotica".into()),
@@ -880,6 +892,8 @@ pub struct MdAttrs {
 /// than the work it hangs off.
 #[derive(Debug, Deserialize)]
 pub struct MdTag {
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub attributes: Option<MdTagAttrs>,
 }
@@ -1112,7 +1126,37 @@ fn parse_chapter_page(raw: Vec<Value>) -> (Vec<MdChapter>, Vec<(String, String)>
 
 // ---- Mapping ---------------------------------------------------------------
 
-const EXTERNAL_LINK_KEYS: &[&str] = &["al", "mal", "mu", "kt", "ap"];
+const EXTERNAL_LINK_KEYS: &[&str] = &["al", "mal", "mu", "kt", "ap", "nu"];
+
+/// Construct only known HTTPS tracker destinations, never upstream raw URLs.
+/// MangaDex stores provider IDs/slugs (documented in its links enumeration).
+pub fn tracker_url(provider: &str, value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 {
+        return None;
+    }
+    let numeric = value.bytes().all(|b| b.is_ascii_digit())
+        && value.parse::<u64>().ok().is_some_and(|n| n > 0);
+    let slug = value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && value.bytes().any(|b| b.is_ascii_alphanumeric());
+    let url = match provider {
+        "mangadex" => format!(
+            "https://mangadex.org/title/{}",
+            uuid::Uuid::parse_str(value).ok()?
+        ),
+        "al" if numeric => format!("https://anilist.co/manga/{value}"),
+        "mal" if numeric => format!("https://myanimelist.net/manga/{value}"),
+        "mu" if numeric => format!("https://www.mangaupdates.com/series.html?id={value}"),
+        "mu" if slug => format!("https://www.mangaupdates.com/series/{value}"),
+        "kt" if slug => format!("https://kitsu.io/manga/{value}"),
+        "ap" if slug => format!("https://www.anime-planet.com/manga/{value}"),
+        "nu" if slug => format!("https://www.novelupdates.com/series/{value}"),
+        _ => return None,
+    };
+    Some(url)
+}
 
 /// Tag groups in the order they are STORED, so `work_tag.ord` puts the tags a reader
 /// actually browses by first and the noisier axes last.
@@ -1121,12 +1165,13 @@ const EXTERNAL_LINK_KEYS: &[&str] = &["al", "mal", "mu", "kt", "ap"];
 ///   * `genre`  — "Action", "Romance": the browsable axis the genre filter exists for.
 ///   * `theme`  — "Isekai", "Martial Arts": likewise, and what MangaDex users search by.
 ///   * `format` — "Long Strip", "Oneshot": kept because `resolve_comic_type` reads genre
-///                STRINGS to tell a manhwa from a manga, so dropping these would make
-///                canonical format detection worse than it already is.
+///     STRINGS to tell a manhwa from a manga, so dropping these would make
+///     canonical format detection worse than it already is.
 ///   * `content`— "Gore", "Sexual Violence": kept because MangaDex exposes them as
-///                filterable tags and omitting them would silently narrow what the
-///                catalogue can express. They are rare, so they sink in a
-///                frequency-ordered facet list on their own.
+///     filterable tags and omitting them would silently narrow what the
+///     catalogue can express. They are rare, so they sink in a
+///     frequency-ordered facet list on their own.
+///
 /// An unrecognised or missing group sorts last rather than being dropped.
 const TAG_GROUP_ORDER: &[&str] = &["genre", "theme", "format", "content"];
 
@@ -1140,33 +1185,55 @@ const TAG_GROUP_ORDER: &[&str] = &["genre", "theme", "format", "content"];
 /// Deduped by name, keeping the first (highest-precedence group) occurrence.
 /// `work_tag`'s primary key is (work_id, tag), so a duplicate would be silently dropped
 /// at insert anyway — doing it here keeps `ord` contiguous and the count honest.
-fn tag_names(m: &MdManga) -> Vec<String> {
-    let mut ranked: Vec<(usize, usize, String)> = Vec::new();
-    for (i, t) in m.attributes.tags.iter().enumerate() {
-        let Some(a) = t.attributes.as_ref() else {
+fn tag_details(m: &MdManga) -> Vec<catalog::SourceTag> {
+    let mut ranked = Vec::new();
+    for (i, tag) in m.attributes.tags.iter().enumerate() {
+        let Some(attrs) = tag.attributes.as_ref() else {
             continue;
         };
-        let Some(name) = a.name.get("en") else {
+        let Some(name) = attrs
+            .name
+            .get("en")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        else {
             continue;
         };
-        let name = name.trim();
-        if name.is_empty() {
-            continue;
-        }
-        let group = a.group.as_deref().unwrap_or("");
+        let group = attrs
+            .group
+            .as_deref()
+            .filter(|g| TAG_GROUP_ORDER.contains(g))
+            .unwrap_or("other");
         let rank = TAG_GROUP_ORDER
             .iter()
             .position(|g| *g == group)
             .unwrap_or(TAG_GROUP_ORDER.len());
-        ranked.push((rank, i, name.to_string()));
+        let id = tag
+            .id
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .map(|id| id.to_string());
+        ranked.push((
+            rank,
+            i,
+            catalog::SourceTag {
+                id,
+                name: name.to_string(),
+                group: group.into(),
+            },
+        ));
     }
-    ranked.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    ranked.sort_by_key(|(rank, index, _)| (*rank, *index));
     let mut seen = std::collections::HashSet::new();
     ranked
         .into_iter()
-        .filter(|(_, _, n)| seen.insert(n.clone()))
-        .map(|(_, _, n)| n)
+        .filter(|(_, _, tag)| seen.insert(tag.name.clone()))
+        .map(|(_, _, tag)| tag)
         .collect()
+}
+
+fn tag_names(m: &MdManga) -> Vec<String> {
+    tag_details(m).into_iter().map(|t| t.name).collect()
 }
 
 /// Map a MangaDex manga to `(mangadex_id, WorkInput)` for the canonical spine.
@@ -1196,8 +1263,8 @@ pub fn to_work_input(m: &MdManga) -> (String, WorkInput) {
     let mut external_ids: Vec<(String, String)> = Vec::new();
     for key in EXTERNAL_LINK_KEYS {
         if let Some(v) = a.links.get(*key) {
-            if !v.is_empty() {
-                external_ids.push(((*key).to_string(), v.clone()));
+            if tracker_url(key, v).is_some() {
+                external_ids.push(((*key).to_string(), v.trim().to_string()));
             }
         }
     }
@@ -1249,6 +1316,7 @@ pub fn to_work_input(m: &MdManga) -> (String, WorkInput) {
             // Upstream genres (migration 0066). Written as the `source = 'mangadex'`
             // half of `work_tag`, so admin curation still wins outright.
             tags: tag_names(m),
+            tag_details: tag_details(m),
             // ALL cover_art relationships the manga response carries (F2). In
             // practice the manga endpoint expands only the primary (one entry) —
             // the full per-volume set is fetched separately via `/cover` in the
@@ -1389,6 +1457,70 @@ pub fn chapter_manga_id(c: &MdChapter) -> Option<String> {
         .iter()
         .find(|r| r.kind == "manga")
         .map(|r| r.id.clone())
+}
+
+/// What `chapter.scanlator` holds for a MangaDex chapter whose upstream record lists NO
+/// scanlation group — the upload MangaDex itself labels "No Group".
+///
+/// A real, renderable value rather than NULL, because NULL already means something else on
+/// this column: "never asked". The group backfill's work-list is `scanlator IS NULL`, so if
+/// "upstream says nobody" were also stored as NULL those rows would be offered to it
+/// forever — the one failure a cursorless drain cannot survive (see
+/// [`resolve_readable_at`]). The string is exactly MangaDex's own wording, so the read path
+/// can print it as-is and match what a reader sees on mangadex.org.
+pub const NO_GROUP: &str = "No Group";
+
+/// What `chapter.scanlator` holds when we ASKED and could not learn a group: the id was
+/// missing from the `/chapter?ids[]=` answer (deleted upstream, or filtered), or the group
+/// relationship came back without a name. Terminal for the backfill's work-list, exactly
+/// like `NO_GROUP`, but it asserts nothing — the read path maps it to `null`
+/// ("unknown"), never to a label. Kept distinct from `NO_GROUP` because "MangaDex says no
+/// group" and "we could not find out" are different claims and only one is true.
+pub const GROUP_UNKNOWN: &str = "";
+
+/// The scanlation group label for one MangaDex chapter, from its `scanlation_group`
+/// relationships (which carry `attributes.name` only when the request asked for
+/// `includes[]=scanlation_group` — both chapter queries do).
+///
+///   * no group relationship at all → [`NO_GROUP`] (upstream's own "No Group");
+///   * one or more NAMED groups     → the names, de-duplicated, joined with `" & "`;
+///   * groups present but none named → [`GROUP_UNKNOWN`] (an include that did not expand).
+///
+/// SORTED (case-insensitively, then exactly), not in relationship order. The value is
+/// compared by `chapter_row_unchanged` on every firehose pass; a label that followed
+/// whatever order MangaDex happened to serialise the relationships in could flip
+/// "A & B" ↔ "B & A" between passes and turn a no-op into a rewrite. `" & "` is also the
+/// joiner Tachiyomi's MangaDex extension uses, so a joint release reads the same whether
+/// it reached us through the mirror or through that extension.
+///
+/// Never `None`: every chapter that passes through here gets a terminal value, which is
+/// what lets the backfill and the firehose share one rule.
+pub fn scanlation_group_label(c: &MdChapter) -> String {
+    let groups: Vec<&MdRel> = c
+        .relationships
+        .iter()
+        .filter(|r| r.kind == "scanlation_group")
+        .collect();
+    if groups.is_empty() {
+        return NO_GROUP.to_string();
+    }
+    let mut names: Vec<String> = groups
+        .iter()
+        .filter_map(|r| r.attributes.as_ref()?.name.as_deref())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        return GROUP_UNKNOWN.to_string();
+    }
+    names.sort_by(|a, b| {
+        a.to_lowercase()
+            .cmp(&b.to_lowercase())
+            .then_with(|| a.cmp(b))
+    });
+    names.dedup();
+    names.join(" & ")
 }
 
 /// Coerce an ISO-8601 timestamp (e.g. `2018-10-04T22:16:00+00:00`) into the
@@ -1835,7 +1967,8 @@ pub async fn sync_catalogue(
 /// record CHANGED, so without a new generation the ~113k works catalogued before 0066
 /// would wait years to acquire a genre. `_v3` re-walks the catalogue with the genre
 /// top-up branch active (see `refresh_source_tags` at the presence check).
-const BACKFILL_FLAG: &str = "mangadex_catalogue_backfill_v3";
+// v4 revisits existing works for structured tags and current tracker snapshots.
+const BACKFILL_FLAG: &str = "mangadex_catalogue_backfill_v4";
 
 /// The `catalogue_sync_state` job key holding the backfill's window cursor. A key of its
 /// own so it never disturbs the `catalogue`/`chapters` rows the recurring sweep reads;
@@ -1854,7 +1987,7 @@ const BACKFILL_FLAG: &str = "mangadex_catalogue_backfill_v3";
 /// completion, so its cursor sits at the NEWEST end of the catalogue, and renaming only
 /// the flag would resume there and skip every work that needs genres. A fresh job key has
 /// no row, so `since` stays `None` and the walk restarts from 2018-01.
-const BACKFILL_JOB: &str = "catalogue_backfill_v3";
+const BACKFILL_JOB: &str = "catalogue_backfill_v4";
 
 /// How many extra times a backfill page fetch that already survived `get_with_retry`'s
 /// own four attempts is re-tried, after a much longer cool-down, before the window is
@@ -2103,20 +2236,12 @@ pub async fn backfill_missing_catalogue(
                     }
                 };
                 if let Some(work_id) = present {
-                    // GENRE TOP-UP (migration 0066). The full upsert is still skipped —
-                    // this is a top-up, not a re-seed — but `work_tag` was introduced
-                    // EMPTY and is only written by ingest from this deploy onward, so the
-                    // ~113k works catalogued before it each need exactly one visit to
-                    // gain the tags this very `/manga` page is already carrying. Without
-                    // this branch a generation bump would walk the whole catalogue, skip
-                    // every record, and write zero genres.
-                    //
-                    // Costs no extra upstream request and one small transaction. Skipped
-                    // entirely when upstream sent no tags, so a work with no tags is not
-                    // rewritten on every generation for nothing.
-                    if !input.tags.is_empty() {
+                    // Refresh current structured taxonomy and tracker links for
+                    // existing works, including removal of now-empty upstream lists.
+                    // Curated tags and admin override columns remain untouched.
+                    {
                         let mut res =
-                            catalog::refresh_source_tags(pool, &work_id, &input.tags).await;
+                            catalog::refresh_mangadex_details(pool, &work_id, &input).await;
                         let mut lock_retry = 0u32;
                         while let Err(e) = &res {
                             if lock_retry >= UPSERT_LOCK_RETRIES || !is_locked_error(e) {
@@ -2125,7 +2250,7 @@ pub async fn backfill_missing_catalogue(
                             lock_retry += 1;
                             tokio::time::sleep(Duration::from_millis(150 * lock_retry as u64))
                                 .await;
-                            res = catalog::refresh_source_tags(pool, &work_id, &input.tags).await;
+                            res = catalog::refresh_mangadex_details(pool, &work_id, &input).await;
                         }
                         match res {
                             Ok(()) => out.tagged += 1,
@@ -2885,6 +3010,345 @@ pub fn spawn_readable_backfill(
     });
 }
 
+// ---- The scanlation-group backfill ---------------------------------------------------
+//
+// MangaDex routinely carries several uploads of one chapter number by different groups
+// ("Ch. 3" by Uwaki Scans AND by duaduapertujuh), and the reader can only offer the reader
+// a choice between them if it can NAME them. Until `includes[]=scanlation_group` was added
+// to both chapter queries the mirror wrote `scanlator: None` for every MangaDex row, so
+// ~877k chapters (every MangaDex row in the spine) have no group recorded. The firehose now
+// writes the group on the way in and `chapter_row_unchanged` compares it, but — exactly as
+// with `readable_at` — the firehose only re-offers chapters whose upstream record CHANGED,
+// so it heals the head of the feed and nothing else. This drains the tail.
+//
+// SAME SHAPE AS THE A1b DRAIN ABOVE, on purpose: a cursorless work-list that is the data
+// itself (`scanlator IS NULL` on a MangaDex row), one `/chapter?ids[]=` request per batch of
+// 100 through the shared rate limiter, every offered row written whatever upstream said,
+// paced, interruptible, idle re-check instead of exit. Read that section for the reasoning;
+// only what differs is spelled out here.
+//
+// WHAT DIFFERS:
+//   * The terminal values. NULL is "never asked", so every write must be non-NULL or the
+//     row is offered forever. Upstream answered → `scanlation_group_label` (names, or
+//     `NO_GROUP`). Upstream did not answer → `GROUP_UNKNOWN` (`''`), which the read path
+//     renders as unknown. Neither can be NULL, so the drain ends.
+//   * The work-list cannot lean on another table to exclude Suwayomi rows cheaply. Their
+//     `scanlator` is legitimately NULL whenever the source reports no scanlator (92% of
+//     them locally), so a `scanlator IS NULL` index alone would hold ~500k Suwayomi rows
+//     forever and every batch would wade through them. Migration 0105's partial index adds
+//     `external_id GLOB '*-*'` — MangaDex ids are uuids, Suwayomi ids are integer row ids,
+//     so the index holds exactly the MangaDex rows still to do and empties as they drain.
+//   * Read-first priority. Before the plain index-order sweep, each batch first takes rows
+//     from works people actually use — anything in a library, anything with reading
+//     progress, and the most-viewed series — so the groups appear where they are looked at
+//     within the first minutes, not somewhere in a ~5-hour walk. That costs one indexed
+//     probe per hot work per batch and stops finding anything once they are done.
+
+/// Rows per batch = ids per request, MangaDex's `ids[]` ceiling (see
+/// [`READABLE_BACKFILL_BATCH`] for why the two are deliberately one number).
+const GROUP_BACKFILL_BATCH: i64 = 100;
+
+/// Gap between batches. ~877k rows ÷ 100 ≈ 8,780 requests; 2 s apart is 0.5 req/s against
+/// the ~5 req/s per-IP ceiling this process shares with the firehose, the catalogue sweep,
+/// the cover crawler and the A1b drain — ~5 hours of background trickle, and ~50 row
+/// writes/s on the single SQLite writer. Same budget as A1b, for the same reasons.
+const GROUP_BACKFILL_GAP: Duration = Duration::from_secs(2);
+
+/// Staggered behind every other boot-time drain (45 s catalogue backfill, 90 s spine, 120 s
+/// A1b) so a restart never starts two of them against one writer at the same instant.
+const GROUP_BACKFILL_BOOT_DELAY: Duration = Duration::from_secs(150);
+
+/// Re-check interval once drained, and the back-off after a failed batch. New MangaDex
+/// chapters arrive from the firehose WITH a group, so a drained work-list only refills from
+/// a path that writes MangaDex rows without one — never urgent. The idle check is a probe
+/// of an empty partial index.
+const GROUP_BACKFILL_IDLE_RECHECK: Duration = Duration::from_secs(60 * 60);
+
+/// Batches between progress lines: ~8,780 batches → ~18 lines, one per ~17 minutes.
+const GROUP_BACKFILL_PROGRESS_EVERY: u64 = 500;
+
+/// How many of the most-viewed series join the priority set. A cap, not a threshold: the
+/// point is "what people look at", and the head of `series_views` is that. Library and
+/// progress rows are uncapped — they are per-user and small.
+const GROUP_BACKFILL_HOT_VIEWED: i64 = 2_000;
+
+/// The work-list predicate, ONE string shared by the batch query, the priority query and
+/// the remaining-count, so they cannot disagree about what "still to do" means (the
+/// ledger-seed loop that `resolve_readable_at` describes is what disagreement costs).
+///
+/// The first two terms are migration 0105's partial-index predicate VERBATIM — SQLite only
+/// uses a partial index when the query repeats its WHERE terms — and the `EXISTS` keeps the
+/// scope honest if a uuid-shaped id ever appeared under a non-MangaDex source (it costs one
+/// primary-key probe per row and is always true today).
+const GROUP_WORKLIST_WHERE: &str = "c.scanlator IS NULL AND c.external_id GLOB '*-*' \
+     AND EXISTS (SELECT 1 FROM source_series ss \
+                  WHERE ss.id = c.source_series_id AND ss.source_type = 'mangadex')";
+
+/// One mirrored MangaDex chapter with no scanlation group recorded yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingGroupChapter {
+    /// `chapter.id` — the UPDATE key, for the reason `PendingChapter::id` gives.
+    id: String,
+    /// The MangaDex chapter uuid, i.e. what goes in `ids[]`.
+    external_id: String,
+}
+
+/// What one group-backfill batch moved. `filled == 0` is the only completion signal.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GroupFill {
+    /// Rows taken off the work-list — the batch size, by construction.
+    pub filled: u64,
+    /// …of which upstream named at least one group.
+    pub named: u64,
+    /// …of which upstream lists no group at all (stored as [`NO_GROUP`]).
+    pub no_group: u64,
+    /// Ids upstream did not answer for (stored as [`GROUP_UNKNOWN`]). A large number means
+    /// the request is being filtered, not that MangaDex forgot the chapters — the same
+    /// diagnostic as `ReadableFill::unanswered`.
+    pub unanswered: u64,
+}
+
+/// One batch of the work-list: priority rows first, topped up from the plain sweep.
+///
+/// Both halves read migration 0105's partial index. The plain half is
+/// `SCAN c USING INDEX idx_chapter_needs_group` + one primary-key probe per row (verified
+/// with `EXPLAIN QUERY PLAN`), linear in the rows still to do. The priority half drives from
+/// the hot work set — `source_series(work_id)` then the same partial index keyed on
+/// `source_series_id` — so a drained hot work costs one empty index probe.
+///
+/// The hot set resolves numeric (Suwayomi) series ids to their work through
+/// `source_series`, because `user_library.series_id` and `series_views.series_key` hold
+/// either kind of id; an unmapped key simply matches nothing.
+async fn chapters_needing_group(
+    pool: &sqlx::SqlitePool,
+    limit: i64,
+) -> Result<Vec<PendingGroupChapter>> {
+    const HOT_SQL: &str = "WITH keys(k) AS ( \
+             SELECT series_id FROM user_library \
+             UNION SELECT work_id FROM canonical_library \
+             UNION SELECT work_id FROM canonical_progress \
+             UNION SELECT k FROM (SELECT series_key AS k FROM series_views \
+                                   ORDER BY total DESC LIMIT ?) \
+         ), \
+         hot(work_id) AS ( \
+             SELECT COALESCE((SELECT s2.work_id FROM source_series s2 \
+                               WHERE s2.source_type = 'suwayomi' AND s2.source_key = keys.k \
+                               LIMIT 1), keys.k) \
+               FROM keys \
+         ) \
+         SELECT c.id, c.external_id \
+           FROM hot \
+           JOIN source_series ss ON ss.work_id = hot.work_id AND ss.source_type = 'mangadex' \
+           JOIN chapter c ON c.source_series_id = ss.id \
+          WHERE c.scanlator IS NULL AND c.external_id GLOB '*-*' \
+          LIMIT ?";
+    let mut rows: Vec<(String, String)> = sqlx::query_as(HOT_SQL)
+        .bind(GROUP_BACKFILL_HOT_VIEWED)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    if (rows.len() as i64) < limit {
+        let plain_sql = format!(
+            "SELECT c.id, c.external_id FROM chapter c WHERE {GROUP_WORKLIST_WHERE} LIMIT ?"
+        );
+        // Asked for `limit` rather than the shortfall: the plain sweep can return rows the
+        // priority half already took (they are still NULL until this batch writes them), and
+        // the de-dup below must still be able to fill the batch.
+        let plain: Vec<(String, String)> = sqlx::query_as(&plain_sql)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?;
+        let mut seen: std::collections::HashSet<String> =
+            rows.iter().map(|(id, _)| id.clone()).collect();
+        for row in plain {
+            if rows.len() as i64 >= limit {
+                break;
+            }
+            if seen.insert(row.0.clone()) {
+                rows.push(row);
+            }
+        }
+    }
+    Ok(rows
+        .into_iter()
+        .map(|(id, external_id)| PendingGroupChapter { id, external_id })
+        .collect())
+}
+
+/// Rows still to do, for the completion line. Same predicate as the work-list.
+async fn group_backfill_remaining(pool: &sqlx::SqlitePool) -> Result<i64> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM chapter c WHERE {GROUP_WORKLIST_WHERE}"
+    ))
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Write one batch's groups, in one transaction. Client-free so termination and
+/// resumability are testable without touching MangaDex.
+///
+/// EVERY pending row is written with a non-NULL value — that is the termination argument.
+/// The `AND scanlator IS NULL` guard only ever SKIPS a row the firehose filled between our
+/// SELECT and this UPDATE; that row has left the work-list anyway, and its value is fresher
+/// than ours, so not overwriting it is the correct outcome and the drain still terminates.
+async fn write_group_backfill(
+    pool: &sqlx::SqlitePool,
+    pending: &[PendingGroupChapter],
+    upstream: &[MdChapter],
+) -> Result<GroupFill> {
+    let by_id: HashMap<&str, &MdChapter> = upstream.iter().map(|c| (c.id.as_str(), c)).collect();
+    let mut out = GroupFill::default();
+    let mut tx = pool.begin().await?;
+    for row in pending {
+        let label = match by_id.get(row.external_id.as_str()) {
+            Some(c) => {
+                let label = scanlation_group_label(c);
+                if label == NO_GROUP {
+                    out.no_group += 1;
+                } else if label != GROUP_UNKNOWN {
+                    out.named += 1;
+                }
+                label
+            }
+            None => {
+                out.unanswered += 1;
+                GROUP_UNKNOWN.to_string()
+            }
+        };
+        sqlx::query("UPDATE chapter SET scanlator = ? WHERE id = ? AND scanlator IS NULL")
+            .bind(&label)
+            .bind(&row.id)
+            .execute(&mut *tx)
+            .await?;
+        out.filled += 1;
+    }
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// One batch of the scanlation-group backfill. `filled == 0` means done. Resumable with no
+/// cursor and no completion marker, exactly like [`backfill_chapter_external_urls`].
+pub async fn backfill_chapter_groups(
+    pool: &sqlx::SqlitePool,
+    client: &MangaDexClient,
+) -> Result<GroupFill> {
+    let pending = chapters_needing_group(pool, GROUP_BACKFILL_BATCH).await?;
+    if pending.is_empty() {
+        return Ok(GroupFill::default());
+    }
+    let ids: Vec<String> = pending.iter().map(|p| p.external_id.clone()).collect();
+    // A failed fetch fails the whole batch with nothing written: the rows stay in the
+    // work-list and the next pass re-offers exactly them. Writing `GROUP_UNKNOWN` over a
+    // transient 503 would be the unsafe direction — it is terminal.
+    let page = client.get_chapters_by_ids(&ids).await?;
+    if page.raw_len != page.chapters.len() {
+        tracing::warn!(
+            asked = ids.len(),
+            raw_len = page.raw_len,
+            parsed = page.chapters.len(),
+            "mangadex: group backfill lost records to parse drops"
+        );
+    }
+    write_group_backfill(pool, &pending, &page.chapters).await
+}
+
+/// Sleep unless shutdown fires first; `true` => stop. A dropped sender counts as shutdown —
+/// treating `changed()`'s instant `Err` as "keep going" would collapse every gap to zero and
+/// fire the drain at the token bucket's full rate (see `spawn_readable_backfill`).
+async fn nap_or_shutdown(d: Duration, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(d) => false,
+        r = shutdown.changed() => r.is_err() || *shutdown.borrow(),
+    }
+}
+
+/// Run the scanlation-group backfill to completion in the background, then idle cheaply.
+/// Structured exactly like [`spawn_readable_backfill`].
+pub fn spawn_group_backfill(
+    pool: sqlx::SqlitePool,
+    client: Arc<MangaDexClient>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        if nap_or_shutdown(GROUP_BACKFILL_BOOT_DELAY, &mut shutdown).await {
+            return;
+        }
+        let mut total = GroupFill::default();
+        let mut batches = 0u64;
+        let mut announced = false;
+        loop {
+            if *shutdown.borrow() {
+                tracing::info!(
+                    batches,
+                    filled = total.filled,
+                    "group backfill: shutting down mid-drain — the work-list resumes it"
+                );
+                return;
+            }
+            match backfill_chapter_groups(&pool, &client).await {
+                Ok(fill) if fill.filled == 0 => {
+                    if !announced {
+                        match group_backfill_remaining(&pool).await {
+                            Ok(0) => tracing::info!(
+                                batches,
+                                filled = total.filled,
+                                named = total.named,
+                                no_group = total.no_group,
+                                unanswered = total.unanswered,
+                                "group backfill: drained — every mirrored MangaDex chapter \
+                                 has a scanlation group recorded"
+                            ),
+                            Ok(remaining) => tracing::warn!(
+                                remaining,
+                                batches,
+                                "group backfill: reported idle but rows remain — they are \
+                                 unreachable, not merely pending"
+                            ),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "group backfill: remaining check failed")
+                            }
+                        }
+                        announced = true;
+                    }
+                    if nap_or_shutdown(GROUP_BACKFILL_IDLE_RECHECK, &mut shutdown).await {
+                        return;
+                    }
+                }
+                Ok(fill) => {
+                    total.filled += fill.filled;
+                    total.named += fill.named;
+                    total.no_group += fill.no_group;
+                    total.unanswered += fill.unanswered;
+                    batches += 1;
+                    announced = false;
+                    if batches.is_multiple_of(GROUP_BACKFILL_PROGRESS_EVERY) {
+                        tracing::info!(
+                            batches,
+                            filled = total.filled,
+                            named = total.named,
+                            no_group = total.no_group,
+                            unanswered = total.unanswered,
+                            "group backfill: progress"
+                        );
+                    }
+                    if nap_or_shutdown(GROUP_BACKFILL_GAP, &mut shutdown).await {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    // Nothing was written; the batch is simply re-offered. Back off to the
+                    // idle interval — retrying an unhappy upstream every 2 s is how a
+                    // rate-limit becomes a ban.
+                    tracing::warn!(error = %e, batches, "group backfill: batch failed — retrying later");
+                    if nap_or_shutdown(GROUP_BACKFILL_IDLE_RECHECK, &mut shutdown).await {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Whether the `chapter` row for `(source_series_id, ch.external_id)` already exists AND
 /// carries every mutable column exactly as `ch` would set it — i.e. `upsert_chapter`
 /// would spend a write transaction to change nothing.
@@ -2915,9 +3379,11 @@ async fn chapter_row_unchanged(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
     );
     let row: Option<MutableCols> = match sqlx::query_as(
-        "SELECT number, volume, lang, title, published_at, readable_at, external_url \
+        "SELECT number, volume, lang, title, published_at, readable_at, external_url, \
+                scanlator \
          FROM chapter WHERE source_series_id = ? AND external_id = ?",
     )
     .bind(source_series_id)
@@ -2935,7 +3401,7 @@ async fn chapter_row_unchanged(
         // Exactly the columns `upsert_chapter`'s DO UPDATE SET touches, compared as
         // `Option<String>` so NULL == absent: if this list ever grows there, it must grow
         // here too, or the re-seed will skip a genuine change.
-        Some((number, volume, lang, title, published_at, readable_at, external_url)) => {
+        Some((number, volume, lang, title, published_at, readable_at, external_url, scanlator)) => {
             number == ch.number
                 && volume == ch.volume
                 && lang == ch.lang
@@ -2949,6 +3415,11 @@ async fn chapter_row_unchanged(
                 // `backfill_chapter_external_urls`.)
                 && readable_at == ch.readable_at
                 && external_url == ch.external_url
+                // The scanlation group, for the same self-heal reason as the two above:
+                // every row mirrored before `includes[]=scanlation_group` has it NULL, and
+                // a group that changes upstream (a group renamed, a co-credit added) must
+                // reach the spine rather than be skipped as "unchanged".
+                && scanlator == ch.scanlator
         }
         None => false,
     }
@@ -3081,9 +3552,14 @@ pub async fn sync_chapters(
                     readable_at: c.attributes.readable_at.clone(),
                     external_url: c.attributes.external_url.clone(),
                     // MangaDex models translation groups as a relationship, not a string
-                    // on the chapter — the mirror has never carried one and the spine
-                    // leaves it NULL for this half.
-                    scanlator: None,
+                    // on the chapter; the request asks for them expanded
+                    // (`includes[]=scanlation_group`) and this folds them into the one
+                    // string the spine stores. ALWAYS `Some`: `upsert_chapter` writes
+                    // `scanlator = excluded.scanlator`, so a `None` here would wipe a group
+                    // the backfill had already filled. `chapter_row_unchanged` compares it,
+                    // so the ~877k pre-existing NULL rows also self-heal as the firehose
+                    // re-offers them.
+                    scanlator: Some(scanlation_group_label(c)),
                 };
                 // Already mirrored and identical → no write. See `chapter_row_unchanged`
                 // for the cost this avoids on the 0067 re-seed.
@@ -3951,6 +4427,10 @@ mod tests {
         // window's own order/since keys.
         assert!(params.contains(&("translatedLanguage[]".into(), "en".into())));
         assert!(params.contains(&("includes[]".into(), "manga".into())));
+        // …and the scanlation groups, EXPANDED. Without the include a chapter's group
+        // relationship is a bare `{id, type}` with no name, and every upload of a number
+        // reaches the reader anonymous.
+        assert!(params.contains(&("includes[]".into(), "scanlation_group".into())));
         assert!(params.contains(&("order[createdAt]".into(), "asc".into())));
         assert!(
             !params.iter().any(|(k, _)| k.ends_with("Since")),
@@ -4103,6 +4583,13 @@ mod tests {
                 external_url: Some("https://mangaplus.shueisha.co.jp/viewer/1019123".into()),
                 ..ch.clone()
             },
+            // The scanlation group: every row mirrored before `includes[]=scanlation_group`
+            // has it NULL, so a skip that ignored it would leave the firehose unable to heal
+            // the group onto a chapter it re-offers.
+            catalog::ChapterInput {
+                scanlator: Some("Uwaki Scans".into()),
+                ..ch.clone()
+            },
         ] {
             assert!(
                 !chapter_row_unchanged(&pool, &ssid, &changed).await,
@@ -4134,6 +4621,9 @@ mod tests {
         // `limit` must cover the whole batch: MangaDex defaults `/chapter` to 10, so a
         // missing limit would answer 10 of the 100 and silently fall back on the other 90.
         assert!(params.contains(&("limit".into(), "100".into())));
+        // The group backfill rides this exact request, so it must expand the groups. An
+        // include only adds attributes to returned records — it can never subtract an id.
+        assert!(params.contains(&("includes[]".into(), "scanlation_group".into())));
         // All four ratings — `/chapter` applies its safe,suggestive,erotica default to an
         // `ids[]` query too, exactly as it does to the firehose.
         let ratings: Vec<&str> = params
@@ -4481,6 +4971,216 @@ mod tests {
         assert_eq!(suwa_readable, None);
     }
 
+    fn md_chapter(id: &str, groups: Value) -> MdChapter {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "attributes": {},
+            "relationships": groups,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn scanlation_group_label_names_every_group_and_never_returns_nothing() {
+        // No group relationship at all is MangaDex's own "No Group" — a REAL answer, stored
+        // as a renderable value so it can never be confused with "never asked" (NULL).
+        let c = md_chapter("c", serde_json::json!([{ "id": "m", "type": "manga" }]));
+        assert_eq!(scanlation_group_label(&c), NO_GROUP);
+        // A joint release: both names, " & "-joined, in a SORTED order — relationship order
+        // is whatever MangaDex serialised, and a label that followed it could flip between
+        // firehose passes and turn every no-op into a rewrite.
+        for rels in [
+            serde_json::json!([
+                { "id": "g2", "type": "scanlation_group", "attributes": { "name": "Uwaki Scans" } },
+                { "id": "g1", "type": "scanlation_group", "attributes": { "name": "duaduapertujuh" } },
+                { "id": "u", "type": "user", "attributes": { "username": "uploader" } },
+            ]),
+            serde_json::json!([
+                { "id": "g1", "type": "scanlation_group", "attributes": { "name": "duaduapertujuh" } },
+                { "id": "g2", "type": "scanlation_group", "attributes": { "name": " Uwaki Scans " } },
+            ]),
+        ] {
+            assert_eq!(
+                scanlation_group_label(&md_chapter("c", rels)),
+                "duaduapertujuh & Uwaki Scans"
+            );
+        }
+        // A duplicated relationship names the group once.
+        let dup = md_chapter(
+            "c",
+            serde_json::json!([
+                { "id": "g1", "type": "scanlation_group", "attributes": { "name": "Solo" } },
+                { "id": "g1", "type": "scanlation_group", "attributes": { "name": "Solo" } },
+            ]),
+        );
+        assert_eq!(scanlation_group_label(&dup), "Solo");
+        // A group relationship that did not expand (no attributes / blank name) is NOT
+        // "No Group" — a group exists, we just cannot name it. Terminal, but unknown.
+        let bare = md_chapter(
+            "c",
+            serde_json::json!([
+                { "id": "g1", "type": "scanlation_group" },
+                { "id": "g2", "type": "scanlation_group", "attributes": { "name": "  " } },
+            ]),
+        );
+        assert_eq!(scanlation_group_label(&bare), GROUP_UNKNOWN);
+    }
+
+    #[tokio::test]
+    async fn the_group_backfill_reads_hot_works_first_and_always_terminates() {
+        let pool = pool().await;
+        // A cold work (nobody reads it) and a hot one (most-viewed).
+        let m: MdManga = serde_json::from_value(manga_json()).unwrap();
+        let (cold_key, input) = to_work_input(&m);
+        catalog::upsert_work_from_mangadex(&pool, &cold_key, &input)
+            .await
+            .unwrap();
+        let cold = catalog::find_source_series_id(&pool, "mangadex", "mangadex", &cold_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let hot_work = catalog::upsert_work_from_mangadex(
+            &pool,
+            "hot-manga-uuid",
+            &catalog::WorkInput {
+                primary_title: Some("Hot".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let hot = catalog::find_source_series_id(&pool, "mangadex", "mangadex", "hot-manga-uuid")
+            .await
+            .unwrap()
+            .unwrap();
+        let cold_work: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
+                .bind(&cold)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let row =
+            |external_id: &str, number: &str, scanlator: Option<&str>| catalog::ChapterInput {
+                external_id: external_id.into(),
+                number: Some(number.into()),
+                lang: Some("en".into()),
+                // Every row mirrored before the include looks like this: no group.
+                scanlator: scanlator.map(str::to_string),
+                ..Default::default()
+            };
+        for (ext, n) in [("md-c1", "1"), ("md-c2", "2")] {
+            catalog::upsert_chapter(&pool, &cold, &row(ext, n, None))
+                .await
+                .unwrap();
+        }
+        // Already carries a group (the firehose wrote it) — not on the work-list.
+        catalog::upsert_chapter(&pool, &cold, &row("md-c3", "3", Some("Already Known")))
+            .await
+            .unwrap();
+        catalog::upsert_chapter(&pool, &hot, &row("md-h1", "1", None))
+            .await
+            .unwrap();
+        // A Suwayomi row with no scanlator: legitimately NULL forever. If the work-list did
+        // not exclude it, `/chapter?ids[]=991` could never resolve it and — worse — every
+        // batch would wade through ~500k of these in production.
+        let suwa = catalog::upsert_source_series(
+            &pool, &cold_work, "suwayomi", "src-1", "4242", None, false,
+        )
+        .await
+        .unwrap();
+        catalog::upsert_chapter(&pool, &suwa, &row("991", "1", None))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO series_views (series_key, total, updated_at) VALUES (?, 50, 'x')")
+            .bind(&hot_work)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(group_backfill_remaining(&pool).await.unwrap(), 3);
+
+        // --- Batch 1: the hot work's chapter comes first, whatever the index order. ----
+        let batch = chapters_needing_group(&pool, 1).await.unwrap();
+        assert_eq!(
+            batch
+                .iter()
+                .map(|p| p.external_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["md-h1"],
+            "a most-viewed work's chapters must be filled before the cold sweep"
+        );
+        let upstream = vec![md_chapter(
+            "md-h1",
+            serde_json::json!([
+                { "id": "g2", "type": "scanlation_group", "attributes": { "name": "Uwaki Scans" } },
+                { "id": "g1", "type": "scanlation_group", "attributes": { "name": "Sahel Scans" } },
+            ]),
+        )];
+        let fill = write_group_backfill(&pool, &batch, &upstream)
+            .await
+            .unwrap();
+        assert_eq!((fill.filled, fill.named), (1, 1));
+
+        // --- Batch 2: the cold sweep. One upstream says "no group", one unanswered. -----
+        let batch = chapters_needing_group(&pool, 100).await.unwrap();
+        let mut got: Vec<&str> = batch.iter().map(|p| p.external_id.as_str()).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec!["md-c1", "md-c2"],
+            "resumes with exactly the rows left"
+        );
+        let upstream = vec![md_chapter("md-c1", serde_json::json!([]))];
+        let fill = write_group_backfill(&pool, &batch, &upstream)
+            .await
+            .unwrap();
+        assert_eq!(fill.filled, 2, "every offered row must be written");
+        assert_eq!(fill.no_group, 1);
+        assert_eq!(fill.unanswered, 1);
+
+        // THE TERMINATION PROPERTY: an id upstream did not answer for still left the list.
+        assert!(chapters_needing_group(&pool, 100).await.unwrap().is_empty());
+        assert_eq!(group_backfill_remaining(&pool).await.unwrap(), 0);
+
+        let group = |ext: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT scanlator FROM chapter WHERE external_id = ?",
+                )
+                .bind(ext)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(
+            group("md-h1").await.as_deref(),
+            Some("Sahel Scans & Uwaki Scans")
+        );
+        assert_eq!(group("md-c1").await.as_deref(), Some(NO_GROUP));
+        assert_eq!(group("md-c2").await.as_deref(), Some(GROUP_UNKNOWN));
+        assert_eq!(group("md-c3").await.as_deref(), Some("Already Known"));
+        assert_eq!(
+            group("991").await,
+            None,
+            "the Suwayomi row is never touched"
+        );
+
+        // A row the firehose filled between the SELECT and the UPDATE keeps the firehose's
+        // (fresher) value — and has still left the work-list, so nothing loops.
+        let stale = vec![PendingGroupChapter {
+            id: sqlx::query_scalar("SELECT id FROM chapter WHERE external_id = 'md-c3'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            external_id: "md-c3".into(),
+        }];
+        write_group_backfill(&pool, &stale, &[]).await.unwrap();
+        assert_eq!(group("md-c3").await.as_deref(), Some("Already Known"));
+    }
+
     #[test]
     fn classify_page_non_empty_always_processes() {
         // The regression guard: a full RAW page whose PARSED count fell below
@@ -4825,6 +5525,76 @@ mod tests {
         );
         assert!(covers[0].is_primary);
         assert_eq!(covers.iter().filter(|c| c.is_primary).count(), 1);
+    }
+
+    #[test]
+    fn tracker_destinations_reject_raw_urls_and_unsafe_ids() {
+        for provider in [
+            "al", "mal", "mu", "kt", "ap", "nu", "mangadex", "raw", "engtl",
+        ] {
+            for invalid in [
+                "javascript:alert(1)",
+                "https://evil.example",
+                "../private",
+                "123?token=secret",
+                "a#fragment",
+                "x/y",
+                "a%2fb",
+            ] {
+                assert!(
+                    tracker_url(provider, invalid).is_none(),
+                    "{provider}: {invalid}"
+                );
+            }
+        }
+        assert_eq!(
+            tracker_url("mu", "abc123x").unwrap(),
+            "https://www.mangaupdates.com/series/abc123x"
+        );
+        assert_eq!(
+            tracker_url("mu", "123").unwrap(),
+            "https://www.mangaupdates.com/series.html?id=123"
+        );
+        assert_eq!(
+            tracker_url("kt", "slug-name").unwrap(),
+            "https://kitsu.io/manga/slug-name"
+        );
+        assert_eq!(
+            tracker_url("mal", "123").unwrap(),
+            "https://myanimelist.net/manga/123"
+        );
+        assert!(tracker_url("al", "not-numeric").is_none());
+        let mut json = manga_json();
+        json["attributes"]["links"] = serde_json::json!({"al": "123", "mal": "https://evil.example", "nu": "novel-name", "raw": "https://publisher.example"});
+        let (_, input) = to_work_input(&serde_json::from_value::<MdManga>(json).unwrap());
+        assert_eq!(
+            input.external_ids,
+            vec![
+                ("al".into(), "123".into()),
+                ("nu".into(), "novel-name".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn structured_tags_keep_group_ids_and_group_precedence() {
+        let mut json = manga_json();
+        json["attributes"]["tags"] = serde_json::json!([
+            {"id":"a77742b1-befd-49a4-bff5-1ad4e6b0ef7b", "attributes":{"group":"content","name":{"en":"Action"}}},
+            {"id":"391b0423-d847-456f-aff0-8b0cfc03066b", "attributes":{"group":"genre","name":{"en":"Action"}}},
+            {"attributes":{"group":"format","name":{"en":"Long Strip"}}},
+            {"attributes":{"group":"unknown","name":{"en":"Experimental"}}},
+            {"attributes":{"group":"genre","name":{"ja":"日本語"}}}
+        ]);
+        let (_, input) = to_work_input(&serde_json::from_value::<MdManga>(json).unwrap());
+        assert_eq!(input.tags, vec!["Action", "Long Strip", "Experimental"]);
+        assert_eq!(input.tag_details[0].group, "genre");
+        assert_eq!(
+            input.tag_details[0].id.as_deref(),
+            Some("391b0423-d847-456f-aff0-8b0cfc03066b")
+        );
+        assert_eq!(input.tag_details[1].group, "format");
+        assert_eq!(input.tag_details[2].group, "other");
     }
 
     /// `manga_json()` plus a realistic `attributes.tags[]`, in deliberately SHUFFLED

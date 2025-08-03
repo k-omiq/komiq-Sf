@@ -8,4 +8,7 @@ import { getLibrary } from '$lib/data/source';
 // the round trip took. Hand the page the promise instead and let it render its own
 // loading state. `getLibrary()` never rejects — it resolves to an empty library on
 // error.
-export const load: PageLoad = () => ({ library: getLibrary() });
+export const load: PageLoad = ({ depends }) => {
+	depends('komika:library');
+	return { library: getLibrary() };
+};

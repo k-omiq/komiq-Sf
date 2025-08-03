@@ -6,6 +6,15 @@ body {
 	background: var(--k-bg);
 	color: var(--k-text);
 	-webkit-font-smoothing: antialiased;
+	/* The shared reset sets `html, body { height: 100% }`, which clamps <body> to one
+	   viewport while the page overflows it. <body> is the parent — and therefore the
+	   sticky containing block — of the app <Header> (the %sveltekit.body% wrapper is
+	   `display: contents`), and a sticky box can never leave its containing block: once
+	   you scrolled further than one screen the header slid off the top and its bottom
+	   edge parked wherever <body> ended, i.e. "in the middle of the page". Let <body>
+	   grow with its content; min-height keeps short pages filling the viewport. */
+	height: auto;
+	min-height: 100%;
 }
 
 h1,
@@ -132,5 +141,38 @@ select:focus-visible,
 @media (max-width: 640px) {
 	:root {
 		--k-gutter: 20px;
+	}
+}
+
+/* Stable reading rhythm across discovery, account and support surfaces. */
+.k-gutter {
+	max-width: var(--k-max-content);
+	margin-inline: auto;
+}
+h1,
+h2,
+h3,
+h4 {
+	scroll-margin-top: calc(var(--k-header-h) + 24px);
+}
+p {
+	overflow-wrap: anywhere;
+}
+@media (min-width: 641px) and (max-width: 1024px) {
+	:root {
+		--k-gutter: 32px;
+	}
+}
+@media (max-width: 640px) {
+	input,
+	textarea,
+	select {
+		font-size: max(16px, 1em);
+	}
+}
+@media (prefers-reduced-transparency: reduce) {
+	:root {
+		--k-glass: var(--k-bg);
+		--k-glass-strong: var(--k-bg);
 	}
 }

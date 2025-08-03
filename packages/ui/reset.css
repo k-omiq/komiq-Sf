@@ -36,3 +36,44 @@ a {
 	color: inherit;
 	text-decoration: none;
 }
+
+/* Shared interaction and long-content defaults. */
+html {
+	scroll-padding-top: calc(var(--k-header-h) + 20px);
+}
+h1,
+h2,
+h3,
+h4 {
+	text-wrap: balance;
+	overflow-wrap: anywhere;
+}
+button,
+a,
+input,
+select,
+textarea {
+	touch-action: manipulation;
+}
+button,
+a {
+	-webkit-tap-highlight-color: transparent;
+}
+select,
+option {
+	background-color: var(--k-surface);
+	color: var(--k-text);
+}
+input,
+textarea {
+	accent-color: var(--k-accent);
+}
+button:disabled {
+	cursor: not-allowed;
+}
+
+input::placeholder,
+textarea::placeholder {
+	color: var(--k-text-dim);
+	opacity: 1;
+}
