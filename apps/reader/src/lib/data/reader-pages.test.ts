@@ -279,3 +279,25 @@ test('a `?ch=` unknown to every list AND the aggregation stays an honest empty r
 	assert.deepEqual(view.pages, []);
 	assert.equal(view.seriesTitle, 'Fixture Work');
 });
+
+test('a failed aggregation (degraded to []) still opens the chapter from the list alone', async () => {
+	// `GraphQLBackend.seriesPage` turns a failing `aggregated` into `[]` rather than failing
+	// the bundle; the reader must then behave exactly like its single-copy self.
+	fakeBackend({ mdPages: { 'md-5a': ['a1.webp'] }, aggregated: [] });
+	const view = await getReaderChapter(WORK, 'md-5a', null);
+	assert.equal(view.seriesTitle, 'Fixture Work');
+	assert.equal(view.chapterId, 'md-5a');
+	assert.deepEqual(
+		view.pages.map((p) => p.url),
+		['a1.webp'],
+	);
+	assert.deepEqual(
+		view.chapters.map((c) => c.id),
+		['md-5a', 'md-4'],
+	);
+	// Versions fall back to the open source's own copies of the number.
+	assert.deepEqual(
+		view.versions?.map((v) => v.id),
+		['md-5a'],
+	);
+});

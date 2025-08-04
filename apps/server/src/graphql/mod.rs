@@ -3892,7 +3892,16 @@ impl SeriesPageBundle {
     /// S2 cross-source aggregation (same rows as `aggregatedChapters`), resolved
     /// lazily so the reader route can skip it. No redirect re-follow and no NSFW
     /// re-gate: the bundle only exists for a work that already passed both.
-    async fn aggregated(&self, ctx: &Context<'_>) -> Result<Vec<AggregatedChapter>> {
+    ///
+    /// NULLABLE ON PURPOSE, although it is never `Ok(None)`. A resolver error on a
+    /// NON-null field propagates to the nearest nullable ancestor, and `seriesPage` is
+    /// non-null too — so one failing aggregation query used to null the whole `data` and
+    /// take the series, spine and every source list down with it, i.e. a blank reader for
+    /// what is an optional enrichment. Nullable, the failure stays on this field: the
+    /// response carries the bundle plus one error at `["seriesPage","aggregated"]`, which
+    /// the client tolerates and reads as an empty aggregation (single-copy behaviour).
+    /// Widening non-null to nullable is backward compatible for every existing document.
+    async fn aggregated(&self, ctx: &Context<'_>) -> Result<Option<Vec<AggregatedChapter>>> {
         let st = state(ctx);
         let rows = catalog::work_source_chapters(&st.pool, &self.work_id.0)
             .await
@@ -3907,7 +3916,7 @@ impl SeriesPageBundle {
                 }
             }
         }
-        Ok(chapters)
+        Ok(Some(chapters))
     }
 }
 
@@ -17263,6 +17272,29 @@ mod tests {
         let agg = page["aggregated"].as_array().unwrap();
         let numbers: Vec<f64> = agg.iter().map(|c| c["number"].as_f64().unwrap()).collect();
         assert_eq!(numbers, vec![1.0, 2.0], "{agg:?}");
+    }
+
+    /// `SeriesPageBundle.aggregated` must stay NULLABLE. Under GraphQL's null propagation
+    /// a resolver error on a non-null field nulls the nearest nullable ancestor, and every
+    /// ancestor here (`seriesPage`, `data`) is non-null — so a failing aggregation query
+    /// blanked the series, spine and source lists with it, and the reader rendered
+    /// "Ch. 0". Nullable, the error stays on the field and the client degrades it to an
+    /// empty aggregation (`graphql-backend.ts`, `tolerablePartialErrors`).
+    #[tokio::test]
+    async fn series_page_aggregated_is_nullable_so_its_failure_cannot_blank_the_bundle() {
+        let (s, _pool) = setup_full(100).await;
+        let sdl = s.sdl();
+        let bundle = sdl
+            .split("type SeriesPageBundle {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("SeriesPageBundle in the SDL");
+        let field = bundle
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("aggregated:"))
+            .expect("aggregated field");
+        assert_eq!(field, "aggregated: [AggregatedChapter!]", "{bundle}");
     }
 
     /// P2.1 REGRESSION GUARD: the bundle must carry the WORK-level enrichment, not only

@@ -62,6 +62,8 @@ import type {
 	UpdateProfileInput,
 } from './backend.js';
 import * as ops from './operations.js';
+import { failedOnlyAt, GraphQLRequestError, tolerablePartialErrors } from './partial-errors.js';
+import type { GraphQLErrorLike, PathSegment } from './partial-errors.js';
 
 export interface BackendConfig {
 	/** GraphQL endpoint of the unified backend, e.g. https://api.komika.app/graphql */
@@ -233,10 +235,16 @@ export class GraphQLBackend implements Backend {
 	 */
 	private static getUnsupported = false;
 
+	/**
+	 * @param tolerate Response paths this caller can render WITHOUT. A response whose every
+	 *   error sits at or under one of them returns its `data` (those fields null) instead of
+	 *   throwing. See {@link tolerablePartialErrors}; omit it and any error throws, as before.
+	 */
 	private async gql<T>(
 		query: string,
 		variables?: Record<string, unknown>,
 		retried = false,
+		tolerate?: readonly (readonly PathSegment[])[],
 	): Promise<T> {
 		const doFetch = this.config.fetch ?? fetch;
 		const stripped = this.stripUnsupported(query);
@@ -267,7 +275,7 @@ export class GraphQLBackend implements Backend {
 				// OTHER status is NOT memoized — a 500 or a network failure must throw
 				// exactly as it does on POST.
 				GraphQLBackend.getUnsupported = true;
-				return this.gql<T>(query, variables, retried);
+				return this.gql<T>(query, variables, retried, tolerate);
 			}
 		} else {
 			res = await doFetch(this.config.endpoint, {
@@ -280,7 +288,16 @@ export class GraphQLBackend implements Backend {
 			});
 		}
 		if (!res.ok) throw new Error(`Backend error ${res.status}`);
-		const json = (await res.json()) as { data?: T; errors?: { message: string }[] };
+		const json = (await res.json()) as { data?: T; errors?: GraphQLErrorLike[] };
+		if (tolerablePartialErrors(json.data, json.errors, tolerate)) {
+			// A partial result the caller opted into: the named fields came back null and
+			// everything else is real. Logged, never silent — the null is a failure, not data.
+			console.warn(
+				'[komika] partial GraphQL result:',
+				json.errors!.map((e) => e.message),
+			);
+			return json.data as T;
+		}
 		if (json.errors?.length) {
 			const messages = json.errors.map((e) => e.message);
 			// An unknown field fails the WHOLE document, so a server that predates an
@@ -304,10 +321,10 @@ export class GraphQLBackend implements Backend {
 				if (dropped.length || droppedArgs.length) {
 					for (const f of dropped) GraphQLBackend.unsupportedFields.add(f);
 					for (const a of droppedArgs) GraphQLBackend.unsupportedArgs.add(a);
-					return this.gql<T>(query, variables, true);
+					return this.gql<T>(query, variables, true, tolerate);
 				}
 			}
-			throw new Error(messages.join('; '));
+			throw new GraphQLRequestError(json.errors);
 		}
 		if (json.data == null) throw new Error('Backend returned no data');
 		return json.data;
@@ -967,12 +984,30 @@ export class GraphQLBackend implements Backend {
 	): Promise<SeriesPageBundle | null | undefined> {
 		if (GraphQLBackend.seriesPageUnsupported) return undefined;
 		try {
-			const d = await this.gql<{ seriesPage: SeriesPageBundle }>(ops.SERIES_PAGE, {
-				workId,
-				withAggregated,
-			});
+			// The aggregation is an optional enrichment the reader can open a chapter without
+			// (it lists one copy per number instead of every group's), so ITS failure must
+			// not take the series, spine and source lists down with it. The server types the
+			// field nullable for exactly this; here a null from a failure reads as an empty
+			// aggregation — the bundle was ASKED for it, so `undefined` would send the reader
+			// on a pointless second `aggregatedChapters` round trip to the same failing query.
+			const d = await this.gql<{ seriesPage: SeriesPageBundle }>(
+				ops.SERIES_PAGE,
+				{ workId, withAggregated },
+				false,
+				[SERIES_PAGE_AGGREGATED],
+			);
+			if (withAggregated && d.seriesPage && d.seriesPage.aggregated == null) {
+				return { ...d.seriesPage, aggregated: [] };
+			}
 			return d.seriesPage;
 		} catch (e) {
+			// An API that still types `aggregated` NON-null: the same failure nulls all of
+			// `data`, but its error path still names the field. Ask once more without it.
+			if (withAggregated && failedOnlyAt(e, [SERIES_PAGE_AGGREGATED])) {
+				console.warn('[komika] seriesPage aggregation failed; retrying without it:', e.message);
+				const bundle = await this.seriesPage(workId, false);
+				return bundle ? { ...bundle, aggregated: [] } : bundle;
+			}
 			const msg = e instanceof Error ? e.message : String(e);
 			// The server predates the resolver — schema-drift fallback, not an outage.
 			if (msg.includes('Unknown field "seriesPage"')) {
@@ -994,6 +1029,9 @@ export class GraphQLBackend implements Backend {
 		return d.workSourcesBatch;
 	}
 }
+
+/** The bundle's optional aggregation — the one field a `seriesPage` read survives losing. */
+const SERIES_PAGE_AGGREGATED = ['seriesPage', 'aggregated'] as const;
 
 export function createBackend(config: BackendConfig): Backend {
 	return new GraphQLBackend(config);
