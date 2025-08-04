@@ -3119,6 +3119,19 @@ pub struct GroupFill {
 /// The hot set resolves numeric (Suwayomi) series ids to their work through
 /// `source_series`, because `user_library.series_id` and `series_views.series_key` hold
 /// either kind of id; an unmapped key simply matches nothing.
+///
+/// THE HOT SET IS A SET OF WORKS, NOT OF KEYS. The `UNION` in `keys` de-dups KEYS, but two
+/// different keys routinely name one work: a reader who opened a series through its
+/// Suwayomi id ("4242" in `series_views` / `user_library`) and then read it (its `w_` id in
+/// `canonical_progress`) puts both in `keys`, and both resolve to the same `work_id`.
+/// Without the `DISTINCT` on `hot`, that work joins to its chapters once per key and every
+/// chapter is offered twice — `ids[]` then repeats a uuid, MangaDex answers 400, a failed
+/// batch writes nothing, and the next pass re-offers EXACTLY the same batch: the drain
+/// stalls forever on the first doubly-hot work, which is precisely the work most likely to
+/// be looked at. The `DISTINCT` on the final select is belt-and-braces for the same
+/// property (a chapter row reached twice for any reason not foreseen here), and the merge
+/// below routes the priority rows through the same `seen` set as the sweep, so the batch is
+/// unique by `chapter.id` whatever either query returns.
 async fn chapters_needing_group(
     pool: &sqlx::SqlitePool,
     limit: i64,
@@ -3131,22 +3144,29 @@ async fn chapters_needing_group(
                                    ORDER BY total DESC LIMIT ?) \
          ), \
          hot(work_id) AS ( \
-             SELECT COALESCE((SELECT s2.work_id FROM source_series s2 \
+             SELECT DISTINCT COALESCE((SELECT s2.work_id FROM source_series s2 \
                                WHERE s2.source_type = 'suwayomi' AND s2.source_key = keys.k \
                                LIMIT 1), keys.k) \
                FROM keys \
          ) \
-         SELECT c.id, c.external_id \
+         SELECT DISTINCT c.id, c.external_id \
            FROM hot \
            JOIN source_series ss ON ss.work_id = hot.work_id AND ss.source_type = 'mangadex' \
            JOIN chapter c ON c.source_series_id = ss.id \
           WHERE c.scanlator IS NULL AND c.external_id GLOB '*-*' \
           LIMIT ?";
-    let mut rows: Vec<(String, String)> = sqlx::query_as(HOT_SQL)
+    let hot: Vec<(String, String)> = sqlx::query_as(HOT_SQL)
         .bind(GROUP_BACKFILL_HOT_VIEWED)
         .bind(limit)
         .fetch_all(pool)
         .await?;
+    let mut rows: Vec<(String, String)> = Vec::with_capacity(hot.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in hot {
+        if seen.insert(row.0.clone()) {
+            rows.push(row);
+        }
+    }
     if (rows.len() as i64) < limit {
         let plain_sql = format!(
             "SELECT c.id, c.external_id FROM chapter c WHERE {GROUP_WORKLIST_WHERE} LIMIT ?"
@@ -3158,8 +3178,6 @@ async fn chapters_needing_group(
             .bind(limit)
             .fetch_all(pool)
             .await?;
-        let mut seen: std::collections::HashSet<String> =
-            rows.iter().map(|(id, _)| id.clone()).collect();
         for row in plain {
             if rows.len() as i64 >= limit {
                 break;
@@ -3173,6 +3191,22 @@ async fn chapters_needing_group(
         .into_iter()
         .map(|(id, external_id)| PendingGroupChapter { id, external_id })
         .collect())
+}
+
+/// The `ids[]` for one batch: each external id once, in work-list order. The work-list is
+/// already unique by `chapter.id`, but `ids[]` is keyed by the MangaDex uuid, and two
+/// chapter rows carrying one uuid (two mangadex `source_series` rows that both mirrored the
+/// same chapter) would still repeat it — and a repeated id is a 400 that fails the batch
+/// and so re-offers it forever (see [`chapters_needing_group`]). Nothing is lost by
+/// collapsing them: `write_group_backfill` looks each pending row up by uuid, so both rows
+/// receive the one answer.
+fn group_batch_ids(pending: &[PendingGroupChapter]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::with_capacity(pending.len());
+    pending
+        .iter()
+        .filter(|p| seen.insert(p.external_id.as_str()))
+        .map(|p| p.external_id.clone())
+        .collect()
 }
 
 /// Rows still to do, for the completion line. Same predicate as the work-list.
@@ -3236,7 +3270,7 @@ pub async fn backfill_chapter_groups(
     if pending.is_empty() {
         return Ok(GroupFill::default());
     }
-    let ids: Vec<String> = pending.iter().map(|p| p.external_id.clone()).collect();
+    let ids = group_batch_ids(&pending);
     // A failed fetch fails the whole batch with nothing written: the rows stay in the
     // work-list and the next pass re-offers exactly them. Writing `GROUP_UNKNOWN` over a
     // transient 503 would be the unsafe direction — it is terminal.
@@ -5179,6 +5213,108 @@ mod tests {
         }];
         write_group_backfill(&pool, &stale, &[]).await.unwrap();
         assert_eq!(group("md-c3").await.as_deref(), Some("Already Known"));
+    }
+
+    /// One work, hot under TWO keys: the Suwayomi series id a reader opened it by
+    /// (`series_views` / `user_library` hold numeric ids) and its `w_` canonical id
+    /// (`canonical_progress` holds those). Both resolve to the same work, and the work's
+    /// chapters must still be offered ONCE — a repeated id in `ids[]` is a MangaDex 400, a
+    /// failed batch writes nothing, and the next pass re-offers exactly the same batch.
+    #[tokio::test]
+    async fn the_group_backfill_offers_a_work_hot_under_two_keys_once() {
+        let pool = pool().await;
+        let work = catalog::upsert_work_from_mangadex(
+            &pool,
+            "twice-hot-uuid",
+            &catalog::WorkInput {
+                primary_title: Some("Twice Hot".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let md = catalog::find_source_series_id(&pool, "mangadex", "mangadex", "twice-hot-uuid")
+            .await
+            .unwrap()
+            .unwrap();
+        for (ext, n) in [("md-t1", "1"), ("md-t2", "2"), ("md-t3", "3")] {
+            catalog::upsert_chapter(
+                &pool,
+                &md,
+                &catalog::ChapterInput {
+                    external_id: ext.into(),
+                    number: Some(n.into()),
+                    lang: Some("en".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // The same work as a Suwayomi series, numeric key "4242".
+        catalog::upsert_source_series(&pool, &work, "suwayomi", "src-1", "4242", None, false)
+            .await
+            .unwrap();
+        // Viewed under BOTH keys, and read under the canonical one.
+        for key in ["4242", work.as_str()] {
+            sqlx::query(
+                "INSERT INTO series_views (series_key, total, updated_at) VALUES (?, 10, 'x')",
+            )
+            .bind(key)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, created_at) \
+             VALUES ('u1','u1','u1@x','h','now')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO canonical_progress (user_id, chapter_id, work_id, updated_at) \
+             VALUES ('u1', 'md-t1', ?, 'now')",
+        )
+        .bind(&work)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let batch = chapters_needing_group(&pool, 100).await.unwrap();
+        let ids: Vec<&str> = batch.iter().map(|p| p.id.as_str()).collect();
+        let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "a work hot under two keys offered its chapters twice: {ids:?}"
+        );
+        let mut got: Vec<&str> = batch.iter().map(|p| p.external_id.as_str()).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec!["md-t1", "md-t2", "md-t3"]);
+        // A batch smaller than the work must not be eaten by the duplicate either: two
+        // DISTINCT chapters, not one chapter twice.
+        let batch = chapters_needing_group(&pool, 2).await.unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_ne!(batch[0].id, batch[1].id);
+    }
+
+    #[test]
+    fn group_batch_ids_never_repeat_an_id_and_keep_work_list_order() {
+        let p = |id: &str, ext: &str| PendingGroupChapter {
+            id: id.into(),
+            external_id: ext.into(),
+        };
+        // Two chapter rows carrying one uuid collapse to one `ids[]` entry, at the place
+        // the first one stood.
+        let pending = [
+            p("ch_1", "b"),
+            p("ch_2", "a"),
+            p("ch_3", "b"),
+            p("ch_4", "c"),
+        ];
+        assert_eq!(group_batch_ids(&pending), vec!["b", "a", "c"]);
+        assert!(group_batch_ids(&[]).is_empty());
     }
 
     #[test]
