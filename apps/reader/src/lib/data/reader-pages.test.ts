@@ -64,3 +64,218 @@ test('an empty copy falls through, but an all-empty chapter is not reported as a
 	assert.equal(allEmpty.copy, MANGA_PLUS);
 	assert.equal(allEmpty.failed, false);
 });
+
+// ---------------------------------------------------------------------------------------
+// `getReaderChapter` end to end, against a fake backend. These drive the REAL reader data
+// path (resolveWork → copy pool → loadFirstReadable → buildReaderView) through
+// `node-test-hooks.ts`, which stubs the SvelteKit-only imports, so they guard the wiring in
+// `source.ts` that the pure tests above cannot see.
+//
+// The fixture work: a MangaDex spine whose list keeps ONE upload per number (Group A's),
+// a second MangaDex upload of ch. 5 by Group B that ONLY the aggregation carries, and a
+// Suwayomi source ("MANGA Plus", manga 777) with its own copies of ch. 4 and 5.
+// ---------------------------------------------------------------------------------------
+import { testGlobals } from './node-test-hooks.ts';
+
+const { getReaderChapter } = await import('./source.ts');
+
+const WORK = 'w_fixture';
+const SUW = '777';
+
+function chapter(id: string, number: number, scanlator: string | null) {
+	return {
+		id,
+		seriesId: WORK,
+		number,
+		label: String(number),
+		title: null,
+		externalUrl: null,
+		pageCount: 0,
+		uploadedAt: null,
+		foundAt: null,
+		scanlator,
+		read: false,
+		lastPageRead: 0,
+		bookmarked: false,
+		isDownloaded: false,
+	};
+}
+function copy(chapterId: string, suwayomiMangaId: string | null, scanlator: string) {
+	return {
+		sourceType: suwayomiMangaId ? 'suwayomi' : 'mangadex',
+		sourceId: suwayomiMangaId ? '1998944621602463790' : 'mangadex',
+		suwayomiMangaId,
+		chapterId,
+		scanlator,
+		copyReleasedAt: null,
+		copyExternalUrl: null,
+	};
+}
+
+const SPINE = [chapter('md-4', 4, 'Group A'), chapter('md-5a', 5, 'Group A')];
+const SUW_CHAPTERS = [chapter('9004', 4, 'MANGA Plus'), chapter('9005', 5, 'MANGA Plus')];
+const AGGREGATED = [
+	{
+		number: 4,
+		label: '4',
+		title: null,
+		sources: [copy('md-4', null, 'Group A'), copy('9004', SUW, 'MANGA Plus')],
+	},
+	{
+		number: 5,
+		label: '5',
+		title: null,
+		sources: [
+			copy('md-5a', null, 'Group A'),
+			// Not in the spine's list: reachable only through the aggregation.
+			copy('md-5b', null, 'Group B'),
+			copy('9005', SUW, 'MANGA Plus'),
+		],
+	},
+];
+
+interface FakeOpts {
+	/** Pages per MangaDex chapter id; an id not listed REJECTS (taken down upstream). */
+	mdPages?: Record<string, string[]>;
+	/** The Suwayomi source's chapter list as the server reports it (`[]` = engine down). */
+	suwChapters?: ReturnType<typeof chapter>[];
+	/** The aggregation as the bundle carries it. */
+	aggregated?: unknown[];
+}
+
+const DEAD_ENGINE = 'Internal error';
+
+/** Installs a fake backend and records every page request it answers. */
+function fakeBackend(opts: FakeOpts = {}) {
+	const asked: string[] = [];
+	const md = opts.mdPages ?? {};
+	const toPages = (urls: string[]) => urls.map((sourceUrl, index) => ({ index, sourceUrl }));
+	const b = testGlobals.backend;
+	for (const k of Object.keys(b)) delete b[k];
+	Object.assign(b, {
+		seriesPage: async (workId: string) => ({
+			workId,
+			series: { id: WORK, title: 'Fixture Work' },
+			spineChapters: SPINE,
+			sources: [
+				{
+					source: {
+						sourceType: 'suwayomi',
+						sourceId: '1998944621602463790',
+						sourceKey: SUW,
+						sourceUrl: null,
+						isNsfw: false,
+						lang: 'en',
+						extension: { pkgName: 'eu.kanade.tachiyomi.extension.all.mangaplus' },
+					},
+					chapters: opts.suwChapters ?? SUW_CHAPTERS,
+					series: null,
+				},
+			],
+			aggregated: opts.aggregated ?? AGGREGATED,
+		}),
+		canonicalPages: async (id: string) => {
+			asked.push(id);
+			if (!md[id]) throw new Error(`MangaDex 404 for ${id}`);
+			return toPages(md[id]);
+		},
+		// The Suwayomi engine is down for every test here: Suwayomi is not reachable in this
+		// environment, and a dead engine is a real production failure mode.
+		pages: async (id: string) => {
+			asked.push(id);
+			throw new Error(DEAD_ENGINE);
+		},
+		chapters: async () => {
+			throw new Error(DEAD_ENGINE);
+		},
+		series: async () => {
+			throw new Error(DEAD_ENGINE);
+		},
+	});
+	return { asked };
+}
+
+// The reader logs every failed copy on purpose; keep the test output readable.
+console.warn = () => {};
+
+test('(a) the open copy fails and a MangaDex upload that ONLY the aggregation carries loads', async () => {
+	const { asked } = fakeBackend({ mdPages: { 'md-5b': ['b1.webp', 'b2.webp'] } });
+	const view = await getReaderChapter(WORK, 'md-5a', null);
+	assert.equal(view.chapterId, 'md-5b');
+	assert.deepEqual(
+		view.pages.map((p) => p.url),
+		['b1.webp', 'b2.webp'],
+	);
+	assert.equal(view.group, 'Group B');
+	assert.equal(view.readingSrc, null);
+	// The switcher marks the copy actually being read, and still offers all three.
+	assert.deepEqual(
+		view.versions?.map((v) => [v.id, v.current]),
+		[
+			['md-5a', false],
+			['md-5b', true],
+			['9005', false],
+		],
+	);
+	// The open copy was tried first; the aggregation-only sibling rescued it.
+	assert.equal(asked[0], 'md-5a');
+	assert.ok(asked.includes('md-5b'));
+});
+
+test('(b) when every copy fails the view keeps its title, chapter list and versions', async () => {
+	const { asked } = fakeBackend({ mdPages: {} });
+	const view = await getReaderChapter(WORK, 'md-5a', null);
+	// Not `emptyReader`: the chapter that was asked for opens, with its chrome, and no pages.
+	assert.equal(view.seriesTitle, 'Fixture Work');
+	assert.equal(view.chapterId, 'md-5a');
+	assert.equal(view.chNum, 5);
+	assert.deepEqual(view.pages, []);
+	assert.deepEqual(
+		view.chapters.map((c) => c.id),
+		['md-5a', 'md-4'],
+	);
+	assert.equal(view.prevChapterId, 'md-4');
+	assert.deepEqual(
+		view.versions?.map((v) => v.id),
+		['md-5a', 'md-5b', '9005'],
+	);
+	assert.ok(view.translators.length >= 2, 'the source picker survives');
+	// Every copy of ch. 5 was tried exactly once before giving up.
+	assert.deepEqual([...new Set(asked)].sort(), ['9005', 'md-5a', 'md-5b']);
+});
+
+test('(c) Suwayomi is down: its copy falls back to the MangaDex copy of the same chapter', async () => {
+	fakeBackend({ mdPages: { 'md-5a': ['a1.webp'] } });
+	const view = await getReaderChapter(WORK, '9005', SUW);
+	assert.equal(view.chapterId, 'md-5a');
+	assert.deepEqual(
+		view.pages.map((p) => p.url),
+		['a1.webp'],
+	);
+	// Reading from the spine now — the list, prev/next and the picker describe IT.
+	assert.equal(view.readingSrc, null);
+	assert.equal(view.versions?.find((v) => v.current)?.id, 'md-5a');
+});
+
+test('(c) Suwayomi is down and its list came back EMPTY: a `?ch=` naming its copy still opens', async () => {
+	// The server answers a dead source's chapter list with `[]`, so the Suwayomi copy the URL
+	// names is in no list at all — only in the aggregation. This used to render emptyReader.
+	fakeBackend({ mdPages: { 'md-5a': ['a1.webp'] }, suwChapters: [] });
+	const view = await getReaderChapter(WORK, '9005', SUW);
+	assert.equal(view.seriesTitle, 'Fixture Work');
+	assert.equal(view.chapterId, 'md-5a');
+	assert.equal(view.chNum, 5);
+	assert.deepEqual(
+		view.pages.map((p) => p.url),
+		['a1.webp'],
+	);
+	assert.equal(view.readingSrc, null);
+});
+
+test('a `?ch=` unknown to every list AND the aggregation stays an honest empty reader', async () => {
+	fakeBackend({ mdPages: { 'md-5a': ['a1.webp'] } });
+	const view = await getReaderChapter(WORK, 'not-a-chapter', null);
+	assert.equal(view.chapterId, undefined);
+	assert.deepEqual(view.pages, []);
+	assert.equal(view.seriesTitle, 'Fixture Work');
+});

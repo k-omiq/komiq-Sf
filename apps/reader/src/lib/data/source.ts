@@ -3020,16 +3020,30 @@ export function getReaderChapter(
 					// ID, never by number: this cannot open a different chapter than asked.
 					const hit = findAggregatedCopy(agg, chParam, srcParam ?? null);
 					const spineCand = resolved.candidates.find((c) => c.suwayomiMangaId === null);
-					// Genuinely unknown to every source — stay honest and render empty. (A
-					// Suwayomi copy missing from its own source's list means that list failed
-					// to load; there is nothing to read it from.)
-					if (!hit || hit.copy.suwayomiMangaId || !spineCand) {
+					// A Suwayomi copy missing from its own source's list means that list failed
+					// to load — the engine is down (the server answers a dead source with `[]`).
+					// There is nothing to read THAT copy from, but the aggregation entry it
+					// belongs to is the same chapter, so open the spine's copy of it instead of
+					// a blank reader. Every Suwayomi source rides the same engine, so the spine
+					// is the only candidate worth trying; `loadFirstReadable` below still walks
+					// the spine's other groups if this one fails too.
+					const spineCopy =
+						hit && hit.copy.suwayomiMangaId
+							? hit.agg.sources.find((s) => !s.suwayomiMangaId && !s.copyExternalUrl)
+							: hit?.copy;
+					// Genuinely unknown to every source — stay honest and render empty.
+					if (!hit || !spineCopy || !spineCand) {
 						const empty = emptyReader(effectiveId, tmeta);
 						return { ...empty, seriesTitle: resolved.meta?.title ?? '' };
 					}
-					const provisional = chapterFromCopy(effectiveId, hit.agg, hit.copy, undefined);
+					const provisional = chapterFromCopy(effectiveId, hit.agg, spineCopy, undefined);
 					const sibling = copiesOf(spineCand.chapters, provisional)[0];
-					target = chapterFromCopy(effectiveId, hit.agg, hit.copy, sibling);
+					// The spine's OWN row for the copy when it lists it (that row carries the
+					// real read state and page count); a synthesized one only for an upload
+					// the aggregation alone knows.
+					target =
+						spineCand.chapters.find((c) => c.id === spineCopy.chapterId) ??
+						chapterFromCopy(effectiveId, hit.agg, spineCopy, sibling);
 					activeChs = spineCand.chapters;
 					activeSrc = null;
 					activeSpine = true;
@@ -3082,24 +3096,28 @@ export function getReaderChapter(
 				spine: activeSpine,
 				key: null,
 			};
+			// Every OTHER copy of the chosen number, in `resolveWork`'s candidate order (spine
+			// first) — the ACTIVE source included: on the spine, the open group's upload and
+			// another group's readable upload of the same number are both "MangaDex", and
+			// skipping the active source here is exactly what left a taken-down spine copy
+			// with no fallback while a sibling upload read fine.
 			const fallbacks: PageAttempt[] = chapterExternalUrl(chosen)
 				? []
-				: resolved.candidates
-						.filter((cand) => cand.suwayomiMangaId !== activeSrc)
-						.flatMap((cand) =>
-							// The POOL, not the list: the spine's list keeps ONE copy per
-							// number, and that one is often the off-site upload while another
-							// group's readable upload exists only in the aggregation.
-							copiesOf(copyPool(effectiveId, agg, cand.chapters, cand.suwayomiMangaId), chosen)
-								.filter((c) => c.id !== chosen.id && !chapterExternalUrl(c))
-								.map((c) => ({
-									chapter: c,
-									chs: cand.chapters,
-									src: cand.suwayomiMangaId,
-									spine: cand.suwayomiMangaId === null,
-									key: cand.key,
-								})),
-						);
+				: resolved.candidates.flatMap((cand) => {
+						// The POOL, not the list: the spine's list keeps ONE copy per number, and
+						// that one is often the off-site upload while another group's readable
+						// upload exists only in the aggregation.
+						const pool = copyPool(effectiveId, agg, cand.chapters, cand.suwayomiMangaId);
+						return copiesOf(pool, chosen)
+							.filter((c) => c.id !== chosen.id && !chapterExternalUrl(c))
+							.map((c) => ({
+								chapter: c,
+								chs: cand.chapters,
+								src: cand.suwayomiMangaId,
+								spine: cand.suwayomiMangaId === null,
+								key: cand.key,
+							}));
+					});
 			const opened = await loadFirstReadable<PageAttempt, Page>(
 				[primary, ...fallbacks],
 				(a) =>
