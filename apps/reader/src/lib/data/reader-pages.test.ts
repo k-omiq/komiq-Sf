@@ -301,3 +301,24 @@ test('a failed aggregation (degraded to []) still opens the chapter from the lis
 		['md-5a'],
 	);
 });
+
+test('"Read on source": the view and each version carry their copy\'s original-site URL', async () => {
+	const uuid = 'e9fb431b-5a4d-4bf8-9c4a-0510c5eca6d0';
+	const spine = [chapter(uuid, 5, 'Group A')];
+	fakeBackend({ mdPages: { [uuid]: ['a1.webp'] }, aggregated: [] });
+	// Re-point the fixture's spine at a real MangaDex-shaped id for this case.
+	const seriesPage = testGlobals.backend.seriesPage as (id: string) => Promise<object>;
+	testGlobals.backend.seriesPage = async (id: string) => ({
+		...(await seriesPage(id)),
+		spineChapters: spine,
+	});
+	const view = await getReaderChapter(WORK, uuid, null);
+	assert.equal(view.sourceUrl, `https://mangadex.org/chapter/${uuid}`);
+	assert.equal(view.versions?.[0].sourceUrl, `https://mangadex.org/chapter/${uuid}`);
+
+	// A Suwayomi copy (engine reachable here only in the sense that the list loaded): no URL.
+	fakeBackend({ mdPages: {}, aggregated: [] });
+	const suw = await getReaderChapter(WORK, '9005', SUW);
+	assert.equal(suw.readingSrc, SUW);
+	assert.equal(suw.sourceUrl, null);
+});

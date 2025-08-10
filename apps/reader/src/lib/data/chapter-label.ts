@@ -91,3 +91,30 @@ export function externalChapterHost(raw: string | null | undefined): string {
 	if (!href) return '';
 	return new URL(href).hostname.replace(/^www\./, '');
 }
+
+/** A MangaDex chapter id: the uuid the mirror stores as the spine chapter's id. */
+const MANGADEX_CHAPTER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Where ONE copy of a chapter lives on its original site — the reader menu's "Read on
+ * <host>" link — or `null` when we cannot say.
+ *
+ *   - An off-site copy (MangaPlus, Comikey, …) IS its external URL.
+ *   - A MangaDex copy (`src === null`, the spine) is `mangadex.org/chapter/<uuid>`. The id
+ *     shape is checked, not assumed: a numeric Suwayomi-only series also reads with no
+ *     `src`, and its integer ids must not become a dead MangaDex link.
+ *   - A Suwayomi copy is `null`. The engine knows a `realUrl`, but the server neither
+ *     fetches nor caches it (`SuwayomiChapter` has no URL field), and a link built from
+ *     the source's manga page would name the wrong page — so the button hides.
+ *
+ * Every result goes through {@link externalChapterHref}: http(s) only, absolute only.
+ */
+export function chapterSourceUrl(
+	copy: { id: string; externalUrl?: string | null },
+	src: string | null,
+): string | null {
+	const external = externalChapterHref(copy.externalUrl);
+	if (external) return external;
+	if (src !== null || !MANGADEX_CHAPTER_ID.test(copy.id)) return null;
+	return externalChapterHref(`https://mangadex.org/chapter/${copy.id.toLowerCase()}`);
+}

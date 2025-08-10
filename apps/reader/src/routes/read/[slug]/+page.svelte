@@ -4,7 +4,7 @@
 	import { navigating } from '$app/state';
 	import { untrack, onDestroy, tick } from 'svelte';
 	import { saveProgress, recordView } from '$lib/data/source';
-	import { externalChapterHost } from '$lib/data/chapter-label';
+	import { externalChapterHost, externalChapterHref } from '$lib/data/chapter-label';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
 	import Icon, { type IconName } from '$lib/components/Icon.svelte';
 	import CommentThread from '$lib/components/CommentThread.svelte';
@@ -33,6 +33,13 @@
 	// `externalChapterHref` in source.ts — never raw upstream text in an href.
 	const externalUrl = $derived(data.externalUrl ?? null);
 	const externalHost = $derived(externalChapterHost(data.externalUrl));
+	// The open copy on its original site ("Read on mangadex.org"). The data layer already
+	// validated it; re-checked here because this string becomes an `href` and the check is
+	// the whole XSS defence. Null (a Suwayomi copy, an unknown id shape) hides the link.
+	const readOnSource = $derived.by(() => {
+		const href = externalChapterHref(data.sourceUrl);
+		return href ? { href, host: externalChapterHost(href) } : null;
+	});
 
 	// Translators (sources) for this work — switchable from the reader menu. Picking
 	// a different source persists the preference and reopens the work under it
@@ -904,6 +911,20 @@
 						</div>
 					{/if}
 				</div>
+				{#if readOnSource}
+					<!-- New tab, no opener and no referrer: the destination is a third-party
+					     site and gets neither a handle on this window nor the reader URL. -->
+					<a
+						class="dr-source"
+						href={readOnSource.href}
+						target="_blank"
+						rel="noopener noreferrer"
+						title={readOnSource.href}
+					>
+						<Icon name="globe" size={14} />
+						<span>Read on {readOnSource.host}</span>
+					</a>
+				{/if}
 			</div>
 		{/if}
 
@@ -1241,7 +1262,9 @@
 	{#if hasPages && bar !== 'hidden'}
 		<div class="pbar-wrap" class:thin={bar === 'thin'} class:rtl={dir === 'rtl' && !isStrip}>
 			{#if bar === 'thin'}
-				<div class="pthin"><div class="pthin-fill" style="transform:scaleX({readPct / 100})"></div></div>
+				<div class="pthin">
+					<div class="pthin-fill" style="transform:scaleX({readPct / 100})"></div>
+				</div>
 			{:else}
 				<div
 					class="pbar"
@@ -1757,6 +1780,31 @@
 		font-size: 11px;
 		font-weight: 700;
 		color: var(--k-text-faint);
+	}
+	.dr-source {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		min-width: 0;
+		margin-top: 8px;
+		padding: 9px 12px;
+		border-radius: 10px;
+		border: 1px solid var(--k-border-2);
+		font-size: 12.5px;
+		font-weight: 700;
+		color: var(--k-text-2);
+		text-decoration: none;
+	}
+	.dr-source span {
+		min-width: 0;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.dr-source:hover,
+	.dr-source:focus-visible {
+		border-color: var(--k-accent);
+		color: var(--k-text-bright);
 	}
 	.dr-report {
 		display: inline-flex;

@@ -39,7 +39,7 @@ import { findChapterOwner } from './chapter-owner';
 import type { ChapterCandidate } from './chapter-owner';
 import { adjacentChapters, copiesOf, normalizeGroup, sortChaptersAsc } from './chapter-versions';
 import { loadFirstReadable } from './reader-pages';
-import { chapterChip, externalChapterHref } from './chapter-label';
+import { chapterChip, chapterSourceUrl, externalChapterHref } from './chapter-label';
 import { chapterDateLabel, chapterFoundLabel } from './chapter-date';
 import {
 	isRedundantMangadexExt,
@@ -1680,6 +1680,9 @@ export interface ReaderChapterVersion {
 	group: string | null;
 	/** This is the copy currently open. */
 	current: boolean;
+	/** This copy on its original site (validated http/s), or null when unknown — see
+	 *  {@link chapterSourceUrl}. Optional so hand-built versions need not carry it. */
+	sourceUrl?: string | null;
 }
 
 export interface SeriesDetailView {
@@ -2560,6 +2563,9 @@ export interface ReaderView {
 	versions?: ReaderChapterVersion[];
 	/** Scanlation group of the open copy; null when unknown. */
 	group?: string | null;
+	/** The OPEN copy on its original site — the menu's "Read on <host>" link; null hides
+	 *  it. Validated http/s, see {@link chapterSourceUrl}. */
+	sourceUrl?: string | null;
 }
 
 /** Honest empty reader view — no chapter/pages available for this series. */
@@ -2696,6 +2702,7 @@ function buildReaderView(
 			iconUrl: ctx.iconUrl ?? null,
 			group: normalizeGroup(c.scanlator),
 			current: c.id === target.id,
+			sourceUrl: chapterSourceUrl(c, readingSrc),
 		}));
 	return {
 		seriesId,
@@ -2729,6 +2736,7 @@ function buildReaderView(
 		externalUrl: chapterExternalUrl(target),
 		versions,
 		group: group ?? versions.find((v) => v.current)?.group ?? null,
+		sourceUrl: chapterSourceUrl(target, readingSrc),
 	};
 }
 
@@ -2880,6 +2888,10 @@ function readerVersions(
 		iconUrl: cp.iconUrl,
 		group: cp.group,
 		current: cp.source.chapterId === target.id && cp.src === src,
+		sourceUrl: chapterSourceUrl(
+			{ id: cp.source.chapterId, externalUrl: cp.source.copyExternalUrl },
+			cp.src,
+		),
 	}));
 	if (!versions.some((v) => v.current)) {
 		versions.unshift({
@@ -2889,6 +2901,7 @@ function readerVersions(
 			iconUrl: activeCand?.iconUrl ?? null,
 			group: normalizeGroup(target.scanlator),
 			current: true,
+			sourceUrl: chapterSourceUrl(target, src),
 		});
 	}
 	return versions;
