@@ -33,6 +33,7 @@ import type {
 	SourceInfo,
 	SourceScanHealth,
 	SplitSourcesResult,
+	TagInfo,
 	UpdateFeedRow,
 	WorkSource,
 	WorkSourceGroup,
@@ -230,6 +231,12 @@ export class CompositeBackend implements Backend {
 	}
 	genreFacets(): Promise<GenreFacet[]> {
 		return this.opts.hosted.genreFacets!();
+	}
+	tags(): Promise<TagInfo[]> {
+		return this.opts.hosted.tags?.() ?? Promise.resolve([]);
+	}
+	browseFilterSupported(): boolean {
+		return this.opts.hosted.browseFilterSupported?.() ?? false;
 	}
 	series(id: Id): Promise<Series> {
 		// Always hosted. Local serving for canonical works happens in the `canonical*`
