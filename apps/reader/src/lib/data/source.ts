@@ -2495,6 +2495,27 @@ export async function saveProgress(
 }
 
 /**
+ * Mark ONE chapter read or unread from the series list. Unlike {@link saveProgress} (the
+ * reader's fire-and-forget page sync) this reports whether the write landed, because the
+ * list paints the new state optimistically and must undo it on failure.
+ *
+ * `lastPageRead` is 0 either way: the list knows nothing about pages, and the reader's own
+ * progress write supersedes it on the next open. The server routes on id shape (a
+ * MangaDex uuid → `canonical_progress`, which read-state folds across a number's copies).
+ */
+export async function setChapterRead(chapterId: string, read: boolean): Promise<boolean> {
+	if (!LIVE || !chapterId) return false;
+	try {
+		await backend.setProgress(chapterId, 0, read);
+		await invalidate('komika:library');
+		return true;
+	} catch (err) {
+		console.warn('[komika] setChapterRead failed:', err);
+		return false;
+	}
+}
+
+/**
  * Record one view (a chapter open) for a series — the popularity signal behind
  * Trending and the series-page view count. Fire-and-forget: no auth (anonymous reads
  * count too), and a failure never affects reading. `seriesId` is the reader's series

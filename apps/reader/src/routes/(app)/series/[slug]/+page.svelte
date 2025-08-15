@@ -21,6 +21,7 @@
 		getSeries,
 		getSeriesNsfwOverride,
 		setSeriesNsfw,
+		setChapterRead,
 	} from '$lib/data/source';
 	import { backend, images } from '$lib/context';
 	import { auth } from '$lib/auth.svelte';
@@ -163,6 +164,37 @@
 	// under an offline reader; there is no server to merge works in that mode.
 	const socialKey = $derived(data.slug ?? page.params.slug ?? '');
 	const needsAuth = $derived(socialLive() && !auth.user);
+
+	// Per-chapter read/unread from the list. Read state lives on the server per viewer, so
+	// the toggle exists only for a signed-in reader; signed out, the mark stays a static
+	// indicator. Optimistic: the override paints at once and is dropped again if the write
+	// fails, so the mark never claims a state the server did not take. Keyed by chapter id
+	// and cleared when the series changes — `view.chapters` is the truth after a reload.
+	let readOverride = $state<Record<string, boolean>>({});
+	let readPending = $state<Record<string, boolean>>({});
+	$effect(() => {
+		void seriesId;
+		readOverride = {};
+		readPending = {};
+	});
+	const canMarkRead = $derived(auth.ready && !!auth.user);
+	function isChapterRead(c: { id?: string; read: boolean }): boolean {
+		return c.id && c.id in readOverride ? readOverride[c.id] : c.read;
+	}
+	async function toggleChapterRead(c: { id?: string; read: boolean }) {
+		const id = c.id;
+		if (!id || readPending[id]) return;
+		const next = !isChapterRead(c);
+		readOverride = { ...readOverride, [id]: next };
+		readPending = { ...readPending, [id]: true };
+		const ok = await setChapterRead(id, next);
+		const { [id]: _done, ...rest } = readPending;
+		readPending = rest;
+		if (!ok) {
+			const { [id]: _undo, ...kept } = readOverride;
+			readOverride = kept;
+		}
+	}
 
 	// Heal the address bar when the id we asked for is not the id we got back.
 	//
@@ -1328,55 +1360,78 @@
 					     interactive elements: the main row links to the sensible default
 					     source, and each per-source copy below is a sibling link. -->
 					{@const multi = (c.sources?.length ?? 0) > 1}
-					<li class="ch-card" class:read={c.read} class:multi>
-						<a class="ch-main" href={chapterHref(c.id, c.src)}>
-							<span class="ch-mark" title={c.read ? 'Read' : 'Unread'}
-								>{#if c.read}<Icon name="check" size={13} strokeWidth={2.6} />{/if}</span
-							>
-							<span class="ch-text">
-								<span class="ch-line">
-									<span class="ch-num">Ch. {c.n}</span>
-									{#if c.title && c.title !== `Chapter ${c.n}`}<span class="ch-name">{c.title}</span
-										>{/if}
-									{#if c.isNew}<span class="new">NEW</span>{/if}
-									<!-- Off-site chapters (~35,000: MangaPlus, Comikey, NamiComi,
-									     BiliBili) have no pages for us to serve — badged here so
-									     the reader knows before tapping. -->
-									{#if c.external}<span class="ext" title="Hosted on another site"
-											><Icon name="globe" size={11} />OFF-SITE</span
-										>{/if}
-								</span>
-							</span>
-							<!-- One copy: the group (else the source) sits in the compact row. Several
-							     copies: each gets its own sub-row below instead. -->
-							{#if c.sources?.length === 1}
-								{@const s = c.sources[0]}
-								<span class="ch-by" title={s.group ? `${s.group} · ${s.name}` : s.name}>
-									{@render srcLogo(s.iconUrl, s.name)}
-									<span class="ch-src-name">{s.group || s.name}</span>
-								</span>
-							{:else if !c.sources?.length && c.group}
-								<span class="ch-by"
-									><Icon name="users" size={14} /><span class="ch-src-name">{c.group}</span></span
+					{@const isRead = isChapterRead(c)}
+					<li class="ch-card" class:read={isRead} class:multi>
+						<!-- The read mark is a SIBLING of the row link, never inside it: a button
+						     nested in an <a> is invalid and screen readers announce it badly. -->
+						<div class="ch-head">
+							{#if canMarkRead && c.id}
+								<button
+									class="ch-mark-btn"
+									aria-pressed={isRead}
+									aria-label={isRead
+										? `Mark chapter ${c.n} as unread`
+										: `Mark chapter ${c.n} as read`}
+									title={isRead ? 'Mark as unread' : 'Mark as read'}
+									disabled={!!readPending[c.id]}
+									onclick={() => toggleChapterRead(c)}
+								>
+									<span class="ch-mark"
+										>{#if isRead}<Icon name="check" size={13} strokeWidth={2.6} />{/if}</span
+									>
+								</button>
+							{:else}
+								<span class="ch-mark" title={isRead ? 'Read' : 'Unread'}
+									>{#if isRead}<Icon name="check" size={13} strokeWidth={2.6} />{/if}</span
 								>
 							{/if}
-							<!-- TWO CLOCKS, NAMED: a source that holds chapters behind early
+							<a class="ch-main" href={chapterHref(c.id, c.src)}>
+								<span class="ch-text">
+									<span class="ch-line">
+										<span class="ch-num">Ch. {c.n}</span>
+										{#if c.title && c.title !== `Chapter ${c.n}`}<span class="ch-name"
+												>{c.title}</span
+											>{/if}
+										{#if c.isNew}<span class="new">NEW</span>{/if}
+										<!-- Off-site chapters (~35,000: MangaPlus, Comikey, NamiComi,
+									     BiliBili) have no pages for us to serve — badged here so
+									     the reader knows before tapping. -->
+										{#if c.external}<span class="ext" title="Hosted on another site"
+												><Icon name="globe" size={11} />OFF-SITE</span
+											>{/if}
+									</span>
+								</span>
+								<!-- One copy: the group (else the source) sits in the compact row. Several
+							     copies: each gets its own sub-row below instead. -->
+								{#if c.sources?.length === 1}
+									{@const s = c.sources[0]}
+									<span class="ch-by" title={s.group ? `${s.group} · ${s.name}` : s.name}>
+										{@render srcLogo(s.iconUrl, s.name)}
+										<span class="ch-src-name">{s.group || s.name}</span>
+									</span>
+								{:else if !c.sources?.length && c.group}
+									<span class="ch-by"
+										><Icon name="users" size={14} /><span class="ch-src-name">{c.group}</span></span
+									>
+								{/if}
+								<!-- TWO CLOCKS, NAMED: a source that holds chapters behind early
 							     access publishes days before anyone here can read them. "Found"
 							     only renders where the data layer allows it (recent or
 							     newest-3); never a placeholder date. -->
-							<span class="ch-dates">
-								<!-- With per-copy rows the release dates live on those rows. -->
-								{#if c.date && !(multi && c.sources?.some((s) => s.date))}<span
-										>Released {c.date}</span
-									>{/if}
-								{#if c.foundDate}<span
-										class="ch-found"
-										title="When we first had this chapter available to read"
-										>Found {c.foundDate}</span
-									>{/if}
-							</span>
-							<Icon name="chevron-right" size={16} />
-						</a>
+								<span class="ch-dates">
+									<!-- With per-copy rows the release dates live on those rows. -->
+									{#if c.date && !(multi && c.sources?.some((s) => s.date))}<span
+											>Released {c.date}</span
+										>{/if}
+									{#if c.foundDate}<span
+											class="ch-found"
+											title="When we first had this chapter available to read"
+											>Found {c.foundDate}</span
+										>{/if}
+								</span>
+								<Icon name="chevron-right" size={16} />
+							</a>
+						</div>
 						{#if multi && c.sources}
 							<!-- MangaDex-style: one sub-row per (source, group) copy, each a
 							     sibling link to exactly that upload. -->
@@ -2212,16 +2267,51 @@
 	.ch-card:hover {
 		border-color: var(--k-border-3);
 	}
+	/* Mark + row link side by side: the mark is its own control (see the markup). */
+	.ch-head {
+		display: flex;
+		align-items: center;
+		padding-left: 14px;
+	}
+	.ch-head:hover {
+		background: var(--k-hover-fill);
+	}
 	.ch-main {
+		flex: 1;
+		min-width: 0;
 		display: flex;
 		align-items: center;
 		gap: 12px;
-		padding: 10px 14px;
+		padding: 10px 14px 10px 12px;
 		color: var(--k-text-ghost);
 		text-decoration: none;
 	}
-	.ch-main:hover {
-		background: var(--k-hover-fill);
+	/* A 32px hit area around the 20px mark; negative margins keep the row's rhythm. */
+	.ch-mark-btn {
+		flex: 0 0 auto;
+		width: 32px;
+		height: 32px;
+		margin: 0 -6px;
+		padding: 0;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border: 0;
+		border-radius: 50%;
+		background: none;
+		cursor: pointer;
+	}
+	.ch-mark-btn:hover .ch-mark,
+	.ch-mark-btn:focus-visible .ch-mark {
+		border-color: var(--k-ongoing);
+	}
+	.ch-mark-btn:focus-visible {
+		outline: 2px solid var(--k-accent);
+		outline-offset: 1px;
+	}
+	.ch-mark-btn:disabled {
+		cursor: progress;
+		opacity: 0.6;
 	}
 	.ch-mark {
 		width: 20px;
@@ -2708,20 +2798,30 @@
 			transform: none;
 		}
 		/* Phone: number + title on the first line, source and date beneath. */
+		/* The mark sits beside the FIRST line (number + title), not centred on both. */
+		.ch-head {
+			align-items: flex-start;
+			padding-left: 12px;
+		}
+		.ch-head > .ch-mark {
+			margin-top: 10px;
+		}
+		.ch-mark-btn {
+			margin-top: 4px;
+		}
 		.ch-main {
 			flex-wrap: wrap;
 			row-gap: 4px;
 			padding: 10px 12px;
 		}
 		.ch-text {
-			flex-basis: calc(100% - 60px);
+			flex-basis: 100%;
 		}
 		.ch-main > :global(svg) {
 			display: none;
 		}
 		.ch-by {
 			flex: 0 1 auto;
-			margin-left: 32px;
 		}
 		.ch-dates {
 			flex: 1 1 auto;
