@@ -19,6 +19,7 @@ import type {
 	Series,
 	SeriesProgress,
 	SeriesStatus,
+	TagInfo,
 	Translator,
 	UpdateFeedRow,
 	WorkSource,
@@ -35,6 +36,12 @@ import { backend, images } from '$lib/context';
 import { invalidate } from '$app/navigation';
 import { api, type LoadFetch } from './load-fetch';
 import { homeLatestAdded } from './home-latest-added';
+import {
+	tagsFromGenreFacets,
+	toFilterInput,
+	toLegacyFilters,
+	type BrowseState,
+} from './browse-filters';
 import { findChapterOwner } from './chapter-owner';
 import type { ChapterCandidate } from './chapter-owner';
 import { adjacentChapters, copiesOf, normalizeGroup, sortChaptersAsc } from './chapter-versions';
@@ -1154,6 +1161,75 @@ export function getGenreFacets(fetch?: LoadFetch): Promise<{ genre: string; coun
 		if (!b.genreFacets) return [];
 		return b.genreFacets();
 	}, []);
+}
+
+// ---- Browse v2 -----------------------------------------------------------------
+
+/**
+ * Browse's tag vocabulary, and where it came from.
+ *
+ * `'tags'` is the v2 `tags` query (grouped, include/exclude-able). Against a server that
+ * predates it — or one whose tag table is still empty — this falls back to the legacy
+ * genre facets as a flat GENRE shelf (`'genres'`), which the page offers include-only:
+ * on such a server the only tag clause that can reach SQL is the legacy `genres`
+ * argument, and it matches ANY. Never rejects; an outage on both is an empty list.
+ */
+export async function getBrowseTags(
+	fetch?: LoadFetch,
+): Promise<{ tags: TagInfo[]; source: 'tags' | 'genres' }> {
+	const b = api(fetch);
+	const tags = await live(async () => (b.tags ? b.tags() : []), [] as TagInfo[]);
+	if (tags.length) return { tags, source: 'tags' };
+	const facets = await live(async () => (b.genreFacets ? b.genreFacets() : []), []);
+	return { tags: tagsFromGenreFacets(facets), source: 'genres' };
+}
+
+/** One Browse v2 result page. */
+export interface BrowseSearchResult {
+	items: FederatedResultView[];
+	/** A genuine backend failure — never an honest empty page, never mock mode. */
+	error: boolean;
+	hasNext: boolean;
+	total: number | null;
+	/**
+	 * False when the server predates `search(filter:)` and stripped it: the page then
+	 * reflects only the legacy arguments ({@link toLegacyFilters}), and the screen must
+	 * say which filters did not apply rather than show wider results under live chips.
+	 */
+	filterApplied: boolean;
+}
+
+/**
+ * Browse v2 search: text query + `BrowseFilter`, server-side, paged at 30.
+ *
+ * The legacy arguments ride along on every request (see {@link toLegacyFilters}): a
+ * current server ignores them because `filter` wins, and an older one — which strips
+ * `filter` — applies them, so a reader deployed first degrades to the subset the old
+ * API can express instead of to an unfiltered catalogue.
+ */
+export async function getBrowseSearch(
+	state: BrowseState,
+	tagName: (id: string) => string,
+): Promise<BrowseSearchResult> {
+	let hasNext = false;
+	let total: number | null = null;
+	let filterApplied = true;
+	const r = await liveResult(async () => {
+		const res = await backend.search(state.q, state.page, {
+			...toLegacyFilters(state, tagName),
+			filter: toFilterInput(state),
+		});
+		// Read AFTER the call: the first rejection is what flips it (strip + retry happen
+		// inside that same request).
+		filterApplied = backend.browseFilterSupported?.() ?? false;
+		hasNext = res.hasNextPage ?? false;
+		total = res.total ?? null;
+		return res.items.map((s, i) => ({
+			...toCatalogEntryFull(s, i),
+			translators: [] as TranslatorChip[],
+		}));
+	}, [] as FederatedResultView[]);
+	return { items: r.data, error: r.error, hasNext, total, filterApplied };
 }
 
 /** A federated search row for the Browse grid: a catalog entry + translator tags
