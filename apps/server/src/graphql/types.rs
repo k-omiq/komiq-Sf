@@ -1049,6 +1049,13 @@ pub struct AggregatedChapter {
     /// date line — §4.13's "a wrong default traded for a date-less chapter list", which is
     /// exactly what F12's source picker was told to ship WITH, not before.
     pub first_released_at: Option<String>,
+    /// The volume this chapter belongs to ("3", "12.5"), or null when no copy says — the
+    /// series page's volume headers. A MangaDex copy's label wins over any other source's
+    /// (Suwayomi exposes none today; the rule keeps a future one from overriding the
+    /// mirror). Named `chapterVolume`, not `volume`, for the same reason as
+    /// `firstReleasedAt`: the reader strips an unknown field BY NAME across every document,
+    /// and `Cover.volume` is selected on the series page.
+    pub chapter_volume: Option<String>,
     /// Has the VIEWER read this chapter — from ANY of the work's sources?
     ///
     /// Read state is stored per source chapter row (`canonical_progress.chapter_id` is a

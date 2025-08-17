@@ -1645,6 +1645,8 @@ export interface SeriesChapterView {
 	external?: boolean;
 	/** Scanlation group of the default copy (`id`/`src`); null when unknown. */
 	group?: string | null;
+	/** Volume label ("3"), null when unknown; undefined on paths with no aggregation. */
+	volume?: string | null;
 }
 /** One source's copy of a chapter, for the series-page provenance cluster. */
 export interface ChapterSourceLink {
@@ -2121,6 +2123,7 @@ function buildAggregatedChapters(
 			// the number, else the chosen fallback copy's `copyExternalUrl` — never a guess.
 			external,
 			group,
+			volume: c.chapterVolume?.trim() || null,
 		};
 	});
 }

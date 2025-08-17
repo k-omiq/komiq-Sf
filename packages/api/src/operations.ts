@@ -52,6 +52,11 @@ export const OPTIONAL_SERIES_FIELDS = [
 	// lists and the reader itself — sharing the name would mean one older server rejecting
 	// this field also silently blanked every real read marker for the rest of the session.
 	'readAnywhere',
+	// `AggregatedChapter.chapterVolume` — the series page's volume headers. Optional for the
+	// deploy-ordering reason; stripped, the list simply renders without headers. Not named
+	// `volume`: this stripper matches by NAME across every document and `Cover.volume` is
+	// selected on the same page.
+	'chapterVolume',
 	// `UpdateFeedRow.announcedAt` (migration 0099) — when we could first SHOW a chapter, as
 	// opposed to when its source says it came out. Optional for the usual deploy-ordering
 	// reason, and the caller-side fallback is exact rather than approximate: every render
@@ -287,6 +292,9 @@ export const AGGREGATED_CHAPTERS = /* GraphQL */ `
 			# source, not just the selected translator. Own line, no alias: the
 			# unknown-field fallback strips it by line (OPTIONAL_SERIES_FIELDS).
 			readAnywhere
+			# The volume label (MangaDex's), for the series page's volume headers. Own line,
+			# no alias — the unknown-field fallback strips it by line.
+			chapterVolume
 			# One entry per COPY: every (source, scanlation group) upload of the number.
 			sources {
 				sourceType
@@ -1387,6 +1395,7 @@ export const SERIES_PAGE = /* GraphQL */ `
 				title
 				# Own line, no alias — the unknown-field fallback strips it by line.
 				firstReleasedAt
+				chapterVolume
 				# One entry per COPY: every (source, scanlation group) upload of the number.
 				# The two copy… fields are opportunistic (OPTIONAL_SERIES_FIELDS).
 				sources {

@@ -1827,6 +1827,11 @@ fn group_aggregated_chapters(rows: Vec<catalog::WorkChapterRow>) -> Vec<Aggregat
     // interleaving arbitrarily — and, crucially, keep one row each rather than all
     // collapsing onto 0 the way a numeric-only key forced them to (F2).
     let mut by_key: BTreeMap<(OrderedNumber, String), AggregatedChapter> = BTreeMap::new();
+    // Numbers whose `chapter_volume` came from a MangaDex copy, which no later copy may
+    // replace. The query yields the Suwayomi half FIRST, so first-seen alone would let a
+    // source's label beat the mirror's.
+    let mut volume_from_mirror: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for r in rows {
         let key = (OrderedNumber(r.number), r.key.clone());
         let entry = by_key.entry(key).or_insert_with(|| AggregatedChapter {
@@ -1838,6 +1843,7 @@ fn group_aggregated_chapters(rows: Vec<catalog::WorkChapterRow>) -> Vec<Aggregat
             key: r.key.clone(),
             title: r.title.clone(),
             first_released_at: None,
+            chapter_volume: None,
             // Filled by the resolver, which is where the viewer is known. Grouping stays
             // pure and viewer-independent.
             read_anywhere: false,
@@ -1858,6 +1864,15 @@ fn group_aggregated_chapters(rows: Vec<catalog::WorkChapterRow>) -> Vec<Aggregat
         if let Some(t) = r.released_at.as_deref() {
             if entry.first_released_at.as_deref().is_none_or(|cur| t < cur) {
                 entry.first_released_at = Some(t.to_string());
+            }
+        }
+        if let Some(v) = r.volume.as_deref().filter(|v| !v.is_empty()) {
+            let mirror = r.source_type == "mangadex";
+            if entry.chapter_volume.is_none() || (mirror && !volume_from_mirror.contains(&r.key)) {
+                entry.chapter_volume = Some(v.to_string());
+                if mirror {
+                    volume_from_mirror.insert(r.key.clone());
+                }
             }
         }
         entry.sources.push(ChapterSource {
@@ -21264,7 +21279,31 @@ mod tests {
             scanlator: None,
             external_url: None,
             released_at: released.map(Into::into),
+            volume: None,
         }
+    }
+
+    /// The series page's volume headers read `chapterVolume`: the MangaDex copy's label
+    /// wins even though the query yields the Suwayomi half first, and a number whose copies
+    /// carry no volume reports none rather than borrowing a neighbour's.
+    #[test]
+    fn group_aggregated_chapters_takes_the_mirror_volume_per_number() {
+        let with_vol = |num: f64, st: &str, cid: &str, vol: Option<&str>| {
+            let mut r = agg_row(num, st, "s", (st == "suwayomi").then_some("777"), cid, None);
+            r.volume = vol.map(Into::into);
+            r
+        };
+        let out = group_aggregated_chapters(vec![
+            with_vol(1.0, "suwayomi", "9001", Some("9")),
+            with_vol(1.0, "mangadex", "md-1", Some("1")),
+            with_vol(1.0, "mangadex", "md-1b", Some("2")),
+            with_vol(2.0, "suwayomi", "9002", Some("4")),
+            with_vol(3.0, "mangadex", "md-3", None),
+        ]);
+        let vols: Vec<Option<&str>> = out.iter().map(|c| c.chapter_volume.as_deref()).collect();
+        // ch.1: the FIRST mirror copy's label, never the source's, never a later group's.
+        // ch.2: only a non-mirror label exists, so it stands. ch.3: unknown stays unknown.
+        assert_eq!(vols, vec![Some("1"), Some("4"), None]);
     }
 
     #[test]

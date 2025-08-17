@@ -33,6 +33,7 @@
 	} from '$lib/data/social-repo';
 
 	import type { SeriesResult } from '$lib/data/source';
+	import { volumeHeaders } from '$lib/data/chapter-volumes';
 
 	let { data } = $props();
 
@@ -856,6 +857,9 @@
 		Math.min(chPageCount, Math.max(1, Math.floor(Number(page.url.searchParams.get('cpage'))) || 1)),
 	);
 	const pagedChapters = $derived(chapters.slice((chPage - 1) * CH_PAGE, chPage * CH_PAGE));
+	// "Volume 3" headers where the volume changes between consecutive rows of THIS page, in
+	// the reader's chosen sort — see `volumeHeaders` for why adjacency, not regrouping.
+	const pagedVolumeHeaders = $derived(volumeHeaders(pagedChapters.map((c) => c.volume)));
 	function chPageHref(p: number): string {
 		const url = new URL(page.url);
 		if (p <= 1) url.searchParams.delete('cpage');
@@ -1355,7 +1359,10 @@
 			{/if}
 
 			<ol class="ch-list" id="chapter-list">
-				{#each pagedChapters as c (c.id ?? c.n)}
+				{#each pagedChapters as c, ci (c.id ?? c.n)}
+					{#if pagedVolumeHeaders[ci]}
+						<li class="ch-vol">{pagedVolumeHeaders[ci]}</li>
+					{/if}
 					<!-- One card per chapter NUMBER (the cross-source union). No nested
 					     interactive elements: the main row links to the sensible default
 					     source, and each per-source copy below is a sibling link. -->
@@ -2257,6 +2264,18 @@
 		display: flex;
 		flex-direction: column;
 		gap: 6px;
+	}
+	/* Volume header: a quiet label row, not a card — it groups, it is not a chapter. */
+	.ch-vol {
+		margin: 10px 2px 0;
+		font-size: 12px;
+		font-weight: 800;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--k-text-faint);
+	}
+	.ch-vol:first-child {
+		margin-top: 0;
 	}
 	.ch-card {
 		border-radius: var(--k-radius-md);

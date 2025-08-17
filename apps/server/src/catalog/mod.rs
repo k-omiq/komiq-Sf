@@ -4091,6 +4091,11 @@ pub struct WorkChapterRow {
     /// Suwayomi). Per copy, not per number: one group's upload of a chapter can be a
     /// MangaPlus redirect while another group's is ordinary pages.
     pub external_url: Option<String>,
+    /// The volume THIS copy was published in ("3", "12.5"), as MangaDex labels it; `None`
+    /// when unknown. Suwayomi sources expose no volume, so their half is always `None`.
+    /// Blank is folded to `None` (SQL `NULLIF(TRIM(…), '')`) so no surface prints
+    /// "Volume ".
+    pub volume: Option<String>,
 }
 
 /// One reconciled Suwayomi mapping for a work (F1): the authoritative
@@ -4194,6 +4199,7 @@ async fn work_source_chapters_two_branch(
                 // helper `spine::drain_suwayomi_series` uses, which is exactly what the
                 // equivalence assertion is meant to check the drain got right.
                 released_at: suwayomi_upload_date_to_iso(upload_date.as_deref()),
+                volume: None,
             });
         }
     }
@@ -4212,10 +4218,12 @@ async fn work_source_chapters_two_branch(
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
         ),
     >(
         "SELECT c.number, c.title, ss.source_id, c.external_id, \
-                COALESCE(c.readable_at, c.published_at), c.scanlator, c.external_url \
+                COALESCE(c.readable_at, c.published_at), c.scanlator, c.external_url, \
+                c.volume \
          FROM source_series ss \
          JOIN chapter c ON c.source_series_id = ss.id \
          WHERE ss.work_id = ? AND ss.source_type = 'mangadex' AND c.lang = 'en'",
@@ -4223,7 +4231,8 @@ async fn work_source_chapters_two_branch(
     .bind(work_id)
     .fetch_all(pool)
     .await?;
-    for (number, title, source_id, external_id, released_at, scanlator, external_url) in md {
+    for (number, title, source_id, external_id, released_at, scanlator, external_url, volume) in md
+    {
         let label =
             crate::chapter_label::chapter_display(None, number.as_deref(), title.as_deref());
         rows.push(WorkChapterRow {
@@ -4240,6 +4249,9 @@ async fn work_source_chapters_two_branch(
             scanlator: scanlator.filter(|s| !s.is_empty()),
             external_url,
             released_at,
+            volume: volume
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
         });
     }
     Ok(rows)
@@ -4319,14 +4331,15 @@ pub async fn work_source_chapters(pool: &SqlitePool, work_id: &str) -> Result<Ve
          SELECT c.number, c.title, a.source_id, c.external_id, c.chapter_key, c.label, \
                 'suwayomi' AS source_type, a.source_key, NULLIF(c.scanlator, '') AS scanlator, \
                 COALESCE(c.readable_at, c.published_at) AS released_at, \
-                c.external_url \
+                c.external_url, NULLIF(TRIM(c.volume), '') AS volume \
            FROM authoritative a \
            JOIN chapter c ON c.source_series_id = a.ssid \
           WHERE a.rn = 1 \
          UNION ALL \
          SELECT c.number, c.title, ss.source_id, c.external_id, c.chapter_key, c.label, \
                 'mangadex' AS source_type, NULL, NULLIF(c.scanlator, ''), \
-                COALESCE(c.readable_at, c.published_at), c.external_url \
+                COALESCE(c.readable_at, c.published_at), c.external_url, \
+                NULLIF(TRIM(c.volume), '') \
            FROM source_series ss \
            JOIN chapter c ON c.source_series_id = ss.id \
           WHERE ss.work_id = ?1 AND ss.source_type = 'mangadex' AND c.lang = 'en' \
@@ -4366,6 +4379,7 @@ pub async fn work_source_chapters(pool: &SqlitePool, work_id: &str) -> Result<Ve
                 scanlator: r.scanlator,
                 external_url: r.external_url,
                 released_at: r.released_at,
+                volume: r.volume,
             }
         })
         .collect())
@@ -4386,6 +4400,7 @@ struct SpineChapterRow {
     scanlator: Option<String>,
     released_at: Option<String>,
     external_url: Option<String>,
+    volume: Option<String>,
 }
 
 /// The count of "main" chapters to display for a series: the number of DISTINCT
@@ -7062,7 +7077,7 @@ mod tests {
             .into_iter()
             .map(|r| {
                 format!(
-                    "{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                    "{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
                     r.source_type,
                     r.source_id,
                     r.chapter_id,
@@ -7077,6 +7092,8 @@ mod tests {
                     // Per-copy hand-off: a copy the reader opens from the series page must
                     // redirect off-site exactly when the spine says it is external.
                     r.external_url,
+                    // The series page's volume headers: same label, same blank fold.
+                    r.volume,
                 )
             })
             .collect();
@@ -7145,6 +7162,12 @@ mod tests {
                     published_at: Some("2026-01-01T00:00:00Z".into()),
                     scanlator: scanlator.map(Into::into),
                     external_url: external_url.map(Into::into),
+                    // A real volume label, and a blank one both versions must fold to None.
+                    volume: match ext {
+                        "u-1" => Some("3".into()),
+                        "u-15" => Some("  ".into()),
+                        _ => None,
+                    },
                     ..Default::default()
                 },
             )
@@ -7219,6 +7242,14 @@ mod tests {
             "the backfill's '' must read as unknown"
         );
         assert_eq!(group_of("u-null"), None);
+        let volume_of = |ext: &str| {
+            spine_rows
+                .iter()
+                .find(|r| r.chapter_id == ext)
+                .and_then(|r| r.volume.clone())
+        };
+        assert_eq!(volume_of("u-1").as_deref(), Some("3"));
+        assert_eq!(volume_of("u-15"), None, "a blank volume reads as unknown");
         assert_eq!(
             comparable(spine_rows),
             comparable(legacy),
