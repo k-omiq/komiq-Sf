@@ -102,7 +102,26 @@ export const OPTIONAL_SERIES_FIELDS = [
  * `includeNsfw: $wantNsfw`, is not removed), and must be safe to omit — omitting it
  * just falls back to the server's default behaviour.
  */
-export const OPTIONAL_ARGUMENTS = ['includeNsfw'] as const;
+export const OPTIONAL_ARGUMENTS = [
+	'includeNsfw',
+	// Browse v2's `search(filter: BrowseFilter)`. Optional by the definition above — it is
+	// safe to omit, and the caller can tell that it was (`Backend.browseFilterSupported`).
+	// Against a server that predates it the filter is stripped and the SAME request
+	// carries the legacy arguments the reader derives from it (`toLegacyFilters` in the
+	// reader's `$lib/data/browse-filters`), so an old server degrades to the subset it
+	// understands — genres/format/single status/hasChapters — instead of failing Browse.
+	//
+	// Unlike `sort` (see the note above SEARCH) stripping this does not silently lie: the
+	// reader checks `browseFilterSupported()` after the call and says which filters did
+	// not apply. The variable's TYPE (`BrowseFilter`) is unknown to such a server as
+	// well, which async-graphql reports as a separate `Unknown type` error in the SAME
+	// validation pass, so the `Unknown argument "filter"` match below still fires.
+	//
+	// The name is now matched globally (token-based, see above): no other document may
+	// pass an argument called `filter` as `$filter`, or one old server would strip it there
+	// too.
+	'filter',
+] as const;
 
 const SERIES_FIELDS = /* GraphQL */ `
 	fragment SeriesFields on Series {
@@ -230,6 +249,10 @@ export const UPDATES = /* GraphQL */ `
 // the server first. (Listing them in OPTIONAL_ARGUMENTS would be worse than useless:
 // stripping `sort` silently returns TRENDING under a "Top rated" chip, i.e. a lie
 // instead of an error.)
+//
+// `filter` (Browse v2) is the exception, and it IS in OPTIONAL_ARGUMENTS: it supersedes
+// every argument above (filters apply WITH a text query too), and its absence is
+// detectable by the caller — see the note on its OPTIONAL_ARGUMENTS entry.
 export const SEARCH = /* GraphQL */ `
 	${SERIES_FIELDS}
 	query Search(
@@ -244,6 +267,7 @@ export const SEARCH = /* GraphQL */ `
 		$contentRating: ContentRatingFilter
 		$includeNsfw: Boolean
 		$hasChapters: Boolean
+		$filter: BrowseFilter
 	) {
 		search(
 			query: $query
@@ -257,6 +281,7 @@ export const SEARCH = /* GraphQL */ `
 			contentRating: $contentRating
 			includeNsfw: $includeNsfw
 			hasChapters: $hasChapters
+			filter: $filter
 		) {
 			items {
 				...SeriesFields
@@ -264,6 +289,22 @@ export const SEARCH = /* GraphQL */ `
 			page
 			hasNextPage
 			total
+		}
+	}
+`;
+
+// Browse v2's tag vocabulary. NOT strippable by the unknown-field fallback — `tags` is
+// the document's only root selection, so removing it would leave `{ }` and
+// `stripUnsupported` bails (by design) — so a server that predates it is handled by
+// the caller instead: `GraphQLBackend.tags()` maps its `Unknown field "tags"` to `[]`,
+// and the reader then shows the legacy genre facets.
+export const TAGS = /* GraphQL */ `
+	query Tags {
+		tags {
+			id
+			name
+			group
+			count
 		}
 	}
 `;

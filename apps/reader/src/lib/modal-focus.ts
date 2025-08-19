@@ -50,11 +50,24 @@ export function modalFocus(node: HTMLElement) {
 	};
 }
 
-/** Desktop filter rails stay in normal tab order; mobile sheets behave as dialogs. */
-export function mobileModalFocus(node: HTMLElement, open: boolean) {
+/**
+ * Desktop filter rails stay in normal tab order; below `query` the same element is a
+ * sheet and behaves as a modal dialog (focus contained, background inert).
+ *
+ * Takes either a bare `open` flag (the 640px phone breakpoint) or an options object, so
+ * a screen whose rail collapses earlier — Browse turns it into a sheet on tablets too —
+ * can say where. The dialog role is applied ONLY while it is open below the breakpoint:
+ * on desktop the rail is ordinary page content and must not announce itself as a dialog.
+ */
+export function mobileModalFocus(
+	node: HTMLElement,
+	param: boolean | { open: boolean; query?: string; label?: string },
+) {
+	const opts = typeof param === 'boolean' ? { open: param } : param;
+	const label = opts.label ?? 'Browse filters';
 	let active: ReturnType<typeof modalFocus> | undefined;
-	let current = open;
-	const mobile = matchMedia('(max-width: 640px)');
+	let current = opts.open;
+	const mobile = matchMedia(opts.query ?? '(max-width: 640px)');
 	const update = (next: boolean) => {
 		current = next;
 		active?.destroy();
@@ -63,7 +76,7 @@ export function mobileModalFocus(node: HTMLElement, open: boolean) {
 		if (next && mobile.matches) {
 			node.setAttribute('role', 'dialog');
 			node.setAttribute('aria-modal', 'true');
-			node.setAttribute('aria-label', 'Browse filters');
+			node.setAttribute('aria-label', label);
 			active = modalFocus(node);
 		} else {
 			node.removeAttribute('role');
@@ -73,9 +86,11 @@ export function mobileModalFocus(node: HTMLElement, open: boolean) {
 	};
 	const resize = () => update(current);
 	mobile.addEventListener('change', resize);
-	update(open);
+	update(current);
 	return {
-		update,
+		update(p: boolean | { open: boolean }) {
+			update(typeof p === 'boolean' ? p : p.open);
+		},
 		destroy() {
 			mobile.removeEventListener('change', resize);
 			active?.destroy();

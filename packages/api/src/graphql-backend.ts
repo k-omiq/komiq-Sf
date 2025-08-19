@@ -39,6 +39,7 @@ import type {
 	SourceInfo,
 	SourceScanHealth,
 	SplitSourcesResult,
+	TagInfo,
 	UpdateFeedRow,
 	WorkReviewDetail,
 	WorkSource,
@@ -381,6 +382,9 @@ export class GraphQLBackend implements Backend {
 			// (only works with no chapters), so coercing an absent filter to it would
 			// hide the entire readable catalogue.
 			hasChapters: filters?.hasChapters,
+			// Browse v2. OPTIONAL_ARGUMENTS: stripped (with its `$filter` declaration) once a
+			// server rejects it, leaving the legacy arguments above to carry what they can.
+			filter: filters?.filter,
 		});
 		return d.search;
 	}
@@ -394,6 +398,29 @@ export class GraphQLBackend implements Backend {
 	async genreFacets(): Promise<GenreFacet[]> {
 		const d = await this.gql<{ genreFacets: GenreFacet[] }>(ops.GENRE_FACETS);
 		return d.genreFacets;
+	}
+	/**
+	 * Set once the API answers `Unknown field "tags"`, so a server that predates Browse
+	 * v2 costs one rejected request per process rather than one per Browse visit. Same
+	 * lifetime and rationale as {@link unsupportedFields}.
+	 */
+	private static tagsUnsupported = false;
+	async tags(): Promise<TagInfo[]> {
+		if (GraphQLBackend.tagsUnsupported) return [];
+		try {
+			const d = await this.gql<{ tags: TagInfo[] }>(ops.TAGS);
+			return d.tags;
+		} catch (err) {
+			// ONLY the deploy-order case degrades to []: any other failure (outage, 5xx)
+			// must reach the caller as a failure, exactly like every other method here.
+			const msg = err instanceof Error ? err.message : String(err);
+			if (!msg.includes('Unknown field "tags"')) throw err;
+			GraphQLBackend.tagsUnsupported = true;
+			return [];
+		}
+	}
+	browseFilterSupported(): boolean {
+		return !GraphQLBackend.unsupportedArgs.has('filter');
 	}
 	async series(id: Id): Promise<Series> {
 		const d = await this.gql<{ series: Series }>(ops.SERIES, { id });
