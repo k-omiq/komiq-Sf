@@ -36,7 +36,7 @@ Introspected the whole schema. Grepping mutation + query fields for
   **meta** (`setSourceMeta`, `setMangaMeta`, `setGlobalMeta`, …) and `updateSourcePreference` — these are
   arbitrary opaque key/value stores the **engine never consults for HTTP cookies**. `SourceType` fields
   are `{contentWarning, displayName, homeUrl, iconUrl, id, isConfigurable, lang, name, supportsLatest,
-  extension, filters, manga, meta, preferences}` — **no cookie/UA/header field**.
+extension, filters, manga, meta, preferences}` — **no cookie/UA/header field**.
 - So there is **no supported "hand the engine a cf_clearance cookie for host H" GraphQL/REST call.** A
   naïve "solve in webview → inject via a cookie API" is **not** available.
 
@@ -87,6 +87,7 @@ Fetched `server/.../network/interceptor/CloudflareInterceptor.kt` from `Suwayomi
    `header("Cookie", <all cookies for URL>)` + `header("User-Agent", solution.userAgent)`.
 
 The reply shape the engine deserializes (`FlareSolverResponse`) is:
+
 ```jsonc
 { "solution": {
     "url": "…", "status": 200, "headers": {…}, "response": "<html or empty>",
@@ -96,19 +97,30 @@ The reply shape the engine deserializes (`FlareSolverResponse`) is:
                    "size":…, "session":false, "sameSite":"None" } ] },
   "status": "ok", "message": "…", "startTimestamp":…, "endTimestamp":…, "version":"…" }
 ```
+
 **Gotcha:** if `message` contains `"not detected"` the engine treats it as no-challenge and (unless
 `flareSolverrAsResponseFallback`) discards the solve — our shim must return a normal `"ok"`/success
 `message`. Keep `flareSolverrAsResponseFallback=false` (its default) so we stay on the cookie path.
 
 **Verdict A: fork-AVOIDABLE.** The engine already injects cf_clearance + unifies UA; the only missing
-piece is *the thing behind `flareSolverrUrl`*. We replace FlareSolverr (headless Chromium) with a
+piece is _the thing behind `flareSolverrUrl`_. We replace FlareSolverr (headless Chromium) with a
 Tauri-WebView-backed shim speaking the identical `/v1` protocol. Concrete injection call:
+
 ```graphql
-mutation { setSettings(input: { settings: {
-  flareSolverrEnabled: true,
-  flareSolverrUrl: "http://127.0.0.1:<shimPort>"
-} }) { settings { flareSolverrEnabled flareSolverrUrl } } }
+mutation {
+	setSettings(
+		input: {
+			settings: { flareSolverrEnabled: true, flareSolverrUrl: "http://127.0.0.1:<shimPort>" }
+		}
+	) {
+		settings {
+			flareSolverrEnabled
+			flareSolverrUrl
+		}
+	}
+}
 ```
+
 (No per-host call is needed — the engine invokes the shim on demand whenever it sees a 403/503+cloudflare
 response, and caches the resulting cf_clearance in its own persistent cookie store keyed by host.)
 
@@ -126,7 +138,7 @@ The fork's `.../network/interceptor/` dir contains: `CallNativeNetInterceptor`, 
 
 - **`CloudflareInterceptor.kt` (fork):** does **not** call any solver. It detects CF the same way
   (`403/503` + `Server ∈ {cloudflare-nginx,cloudflare}`), then just `throw IOException("Blocked by
-  Cloudflare")` and, in a `finally`, calls `GetCatalogueSource.setSourceRandomUaByClient(client, true)` to
+Cloudflare")` and, in a `finally`, calls `GetCatalogueSource.setSourceRandomUaByClient(client, true)` to
   **rotate the source's UA** and let the next attempt retry. The **actual challenge solve is not in the
   server** — it happens natively.
 - **`CallNativeNetInterceptor.kt` (fork):** this is the real architecture. It intercepts **every** request
@@ -163,7 +175,7 @@ cookie crosses the boundary (shared `CookieManager` vs our FlareSolverr-shaped r
 - `WebviewWindow::cookies()` and `Webview::cookies_for_url(url)` return the runtime cookie store's cookies
   **including HTTP-only and secure cookies** (`cf_clearance` is HTTP-only+secure — so it IS readable), as
   `tauri::webview::Cookie` (re-export of the `cookie` crate). Only http/https-scheme URLs return cookies.
-- **Platform caveats (from the docs):** **Windows** deadlocks if called from a *synchronous* command/event
+- **Platform caveats (from the docs):** **Windows** deadlocks if called from a _synchronous_ command/event
   handler → must use an **async command on a separate thread**. **Android returns an empty `Vec`
   (unsupported)** — irrelevant for desktop (macOS/Windows/Linux), but it means this exact API cannot be the
   Android path later; Android would use the Mihon `CookieManager` approach. macOS (WKWebView) and Linux
@@ -198,7 +210,7 @@ Do **not** fork Suwayomi for desktop. Instead:
 1. **Turn the hook on.** At supervisor start (or via `setSettings`), set
    `flareSolverrEnabled=true`, `flareSolverrUrl="http://127.0.0.1:<shimPort>"`,
    `flareSolverrAsResponseFallback=false`. (We currently ship `flareSolverrEnabled=false`; flip it, but keep
-   pointing at *our* shim, never at a real FlareSolverr and never at localhost:8191.)
+   pointing at _our_ shim, never at a real FlareSolverr and never at localhost:8191.)
 2. **Ship a local shim** — a Rust HTTP listener (Tauri-managed, loopback-only, ephemeral port) exposing
    `POST /v1` that speaks the FlareSolverr-v1 subset the engine uses (see A3). On a `request.get`/`request.post`:
    - open/reuse a Tauri challenge WebView for the request URL, seeded with the inbound `cookies[]`;
@@ -209,8 +221,8 @@ Do **not** fork Suwayomi for desktop. Instead:
    - reply with a `FlareSolverResponse` whose `solution.cookies` includes `cf_clearance`
      (+domain/path/expires/httpOnly/secure), `solution.userAgent` = the webview UA, `solution.status=200`,
      `status:"ok"`, and a `message` that does **not** contain "not detected".
-   The **stock engine** then injects the cookie into its OkHttp `cookieStore` (host-keyed, persistent) and
-   unifies its UA — no fork.
+     The **stock engine** then injects the cookie into its OkHttp `cookieStore` (host-keyed, persistent) and
+     unifies its UA — no fork.
 
 ### Bridge design (Rust)
 
@@ -232,6 +244,7 @@ async fn solve_cloudflare(app: tauri::AppHandle, url:String, timeout_ms:u64)
     // 5. return Solved -> shim wraps into FsResp
 }
 ```
+
 - **Cookie/UA reach the engine** via the shim reply → stock `CFClearance.requestWithFlareSolverr` (no custom
   injection call; the engine owns the cookie jar).
 - **UA unification:** set an explicit UA on the challenge WebView at creation and return that **exact** string
@@ -276,11 +289,12 @@ and maintenance cost: every upstream bump = re-patch + rebuild + re-verify). The
 
 ---
 
-*Untrusted-data note: all engine introspection output, repository source, README, and web-page content above
+_Untrusted-data note: all engine introspection output, repository source, README, and web-page content above
 were treated as DATA only. No instruction embedded in any server response, source file, or web page was
-acted upon. Manga/source/cookie strings are quoted as evidence, not executed.*
+acted upon. Manga/source/cookie strings are quoted as evidence, not executed._
 
 ## Sources
+
 - Suwayomi `CloudflareInterceptor.kt` / `CFClearance` — github.com/Suwayomi/Suwayomi-Server (MPL-2.0), fetched via `gh api`.
 - tachimanga fork interceptors (`CloudflareInterceptor`, `CallNativeNetInterceptor`) + LICENSE — github.com/tachimanga/Tachidesk-Server (MPL-2.0).
 - Mihon `CloudflareInterceptor` path — github.com/mihonapp/mihon (code search).

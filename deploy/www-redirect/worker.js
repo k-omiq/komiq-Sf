@@ -6,5 +6,5 @@ export default {
 		url.port = '';
 
 		return Response.redirect(url.toString(), 301);
-	}
+	},
 };

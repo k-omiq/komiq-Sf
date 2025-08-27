@@ -380,7 +380,14 @@
 			{:else}
 				{#if c.body}<p class="c-text">{c.body}</p>{/if}
 				{#if c.mediaUrl}
-					<a class="c-media" class:legacy={!c.mediaWidth || !c.mediaHeight} aria-label="Open comment attachment in a new tab" href={c.mediaUrl} target="_blank" rel="noopener noreferrer">
+					<a
+						class="c-media"
+						class:legacy={!c.mediaWidth || !c.mediaHeight}
+						aria-label="Open comment attachment in a new tab"
+						href={c.mediaUrl}
+						target="_blank"
+						rel="noopener noreferrer"
+					>
 						<img
 							src={c.mediaUrl}
 							alt="Comment attachment"
@@ -780,8 +787,19 @@
 	}
 	/* Old uploads have no stored dimensions. Reserve a stable preview frame and
 	   contain the full image; opening the attachment preserves its native size. */
-	.c-media.legacy { display: block; width: min(360px, 100%); aspect-ratio: 4 / 3; border-radius: 12px; background: var(--k-surface); }
-	.c-media.legacy img { width: 100%; height: 100%; max-height: none; object-fit: contain; }
+	.c-media.legacy {
+		display: block;
+		width: min(360px, 100%);
+		aspect-ratio: 4 / 3;
+		border-radius: 12px;
+		background: var(--k-surface);
+	}
+	.c-media.legacy img {
+		width: 100%;
+		height: 100%;
+		max-height: none;
+		object-fit: contain;
+	}
 	.spoiler-veil {
 		display: inline-flex;
 		align-items: center;

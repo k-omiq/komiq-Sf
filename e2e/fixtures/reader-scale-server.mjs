@@ -17,7 +17,11 @@ const scan = {
 	lastScannedAt: at,
 	nextScanAt: at,
 };
-const series = Array.from({ length: 600 }, (_, i) => `Library ${String(i + 1).padStart(3, '0')}: ${i % 3 === 0 ? 'An Extremely Long Journey Through a World of Illustrated Stories' : 'Aster Crossing'}`).map((title, i) => ({
+const series = Array.from(
+	{ length: 600 },
+	(_, i) =>
+		`Library ${String(i + 1).padStart(3, '0')}: ${i % 3 === 0 ? 'An Extremely Long Journey Through a World of Illustrated Stories' : 'Aster Crossing'}`,
+).map((title, i) => ({
 	id: `w_fixture_${i}`,
 	workId: `w_fixture_${i}`,
 	title,
@@ -48,7 +52,26 @@ const series = Array.from({ length: 600 }, (_, i) => `Library ${String(i + 1).pa
 	credits: [],
 	covers: [],
 }));
-for (const item of series) item.metadata = { year: 2021, originalLanguage: 'ja', demographic: 'shounen', contentRating: 'safe', tags: [{id:'tag-genre',name:'Adventure',group:'genre'},{id:'tag-theme',name:'Coming of Age',group:'theme'},{id:null,name:'Long Strip',group:'format'}], trackers: [{provider:'mangadex',externalId:'436b9823-2d06-4477-af20-c526c1fd689b',url:'https://mangadex.org/title/436b9823-2d06-4477-af20-c526c1fd689b'},{provider:'al',externalId:'123',url:'https://anilist.co/manga/123'}] };
+for (const item of series)
+	item.metadata = {
+		year: 2021,
+		originalLanguage: 'ja',
+		demographic: 'shounen',
+		contentRating: 'safe',
+		tags: [
+			{ id: 'tag-genre', name: 'Adventure', group: 'genre' },
+			{ id: 'tag-theme', name: 'Coming of Age', group: 'theme' },
+			{ id: null, name: 'Long Strip', group: 'format' },
+		],
+		trackers: [
+			{
+				provider: 'mangadex',
+				externalId: '436b9823-2d06-4477-af20-c526c1fd689b',
+				url: 'https://mangadex.org/title/436b9823-2d06-4477-af20-c526c1fd689b',
+			},
+			{ provider: 'al', externalId: '123', url: 'https://anilist.co/manga/123' },
+		],
+	};
 const chapters = Array.from({ length: 12 }, (_, i) => ({
 	id: `fixture-chapter-${i}`,
 	seriesId: series[0].id,
@@ -192,7 +215,40 @@ export function fixtureData() {
 		myActivity: [],
 		myReview: null,
 		reviews: page([]),
-		comments: page([{id:'legacy-comment',targetType:'series',targetId:series[0].id,parentId:null,author:{id:'fixture-author',username:'Legacy Reader',avatarUrl:null},body:'Legacy attachment without dimensions.',hasSpoiler:false,mediaUrl:`${base}/legacy.svg`,mediaWidth:null,mediaHeight:null,createdAt:at,likes:0,dislikes:0,myVote:0},{id:'after-comment',targetType:'series',targetId:series[0].id,parentId:null,author:{id:'second-author',username:'Second Reader',avatarUrl:null},body:'This text must not shift when the attachment loads.',hasSpoiler:false,mediaUrl:null,mediaWidth:null,mediaHeight:null,createdAt:at,likes:0,dislikes:0,myVote:0}]),
+		comments: page([
+			{
+				id: 'legacy-comment',
+				targetType: 'series',
+				targetId: series[0].id,
+				parentId: null,
+				author: { id: 'fixture-author', username: 'Legacy Reader', avatarUrl: null },
+				body: 'Legacy attachment without dimensions.',
+				hasSpoiler: false,
+				mediaUrl: `${base}/legacy.svg`,
+				mediaWidth: null,
+				mediaHeight: null,
+				createdAt: at,
+				likes: 0,
+				dislikes: 0,
+				myVote: 0,
+			},
+			{
+				id: 'after-comment',
+				targetType: 'series',
+				targetId: series[0].id,
+				parentId: null,
+				author: { id: 'second-author', username: 'Second Reader', avatarUrl: null },
+				body: 'This text must not shift when the attachment loads.',
+				hasSpoiler: false,
+				mediaUrl: null,
+				mediaWidth: null,
+				mediaHeight: null,
+				createdAt: at,
+				likes: 0,
+				dislikes: 0,
+				myVote: 0,
+			},
+		]),
 		myPreferredSources: [],
 		sourceScanHealth: [],
 		workReview: null,
@@ -207,9 +263,11 @@ const server = createServer(async (req, res) => {
 		return;
 	}
 	if (req.url?.startsWith('/legacy.svg')) {
-		await new Promise(resolve => setTimeout(resolve, 2500));
+		await new Promise((resolve) => setTimeout(resolve, 2500));
 		res.setHeader('Content-Type', 'image/svg+xml');
-		res.end('<svg xmlns="http://www.w3.org/2000/svg" width="800" height="1200"><rect width="800" height="1200" fill="#395953"/><text x="40" y="90" fill="white" font-size="38">Legacy attachment</text></svg>');
+		res.end(
+			'<svg xmlns="http://www.w3.org/2000/svg" width="800" height="1200"><rect width="800" height="1200" fill="#395953"/><text x="40" y="90" fill="white" font-size="38">Legacy attachment</text></svg>',
+		);
 		return;
 	}
 	if (req.url?.startsWith('/cover.svg') || req.url?.startsWith('/page.svg')) {

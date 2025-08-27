@@ -58,12 +58,20 @@
 		e.preventDefault();
 		e.stopPropagation();
 		if (disabled) return;
-		if (open) { open = false; return; }
+		if (open) {
+			open = false;
+			return;
+		}
 		await openMenu();
 	}
 	async function openMenu(last = false): Promise<void> {
 		if (disabled) return;
-		activeIndex = last ? OPTIONS.length - 1 : Math.max(0, OPTIONS.findIndex((o) => o.key === status));
+		activeIndex = last
+			? OPTIONS.length - 1
+			: Math.max(
+					0,
+					OPTIONS.findIndex((o) => o.key === status),
+				);
 		open = true;
 		await tick();
 		itemElements[activeIndex]?.focus();
@@ -80,9 +88,16 @@
 		else if (event.key === 'ArrowUp') next = (activeIndex + OPTIONS.length - 1) % OPTIONS.length;
 		else if (event.key === 'Home') next = 0;
 		else if (event.key === 'End') next = OPTIONS.length - 1;
-		else if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); open = false; trigger?.focus(); return; }
-		else if (event.key === 'Tab') { open = false; return; }
-		else return;
+		else if (event.key === 'Escape') {
+			event.preventDefault();
+			event.stopPropagation();
+			open = false;
+			trigger?.focus();
+			return;
+		} else if (event.key === 'Tab') {
+			open = false;
+			return;
+		} else return;
 		event.preventDefault();
 		event.stopPropagation();
 		activeIndex = next;
@@ -102,7 +117,10 @@
 			if (root && !root.contains(e.target as Node)) open = false;
 		};
 		const onKey = (e: KeyboardEvent) => {
-			if (e.key === 'Escape') { open = false; trigger?.focus(); }
+			if (e.key === 'Escape') {
+				open = false;
+				trigger?.focus();
+			}
 		};
 		window.addEventListener('click', onDoc, true);
 		window.addEventListener('keydown', onKey);
