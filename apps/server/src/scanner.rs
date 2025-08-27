@@ -1733,16 +1733,29 @@ async fn mirror_feed_row_into_browse_catalogue(
         .map(|c| format!("browse_catalogue.{c} IS NOT excluded.{c}"))
         .collect::<Vec<_>>()
         .join(" OR ");
+    // Migration 0106's columns come from `work` / `work_stats` (the feed row carries none of
+    // them) through the SAME `catalog::BROWSE_*_SQL` expressions the rebuild's SELECT uses,
+    // and `content_rating` through the same `effective_content_rating_sql` over the feed row
+    // the rebuild copies for this work — so this row and the rebuilt one are byte-identical
+    // (the convergence test digests all of them).
+    use crate::catalog::{
+        effective_content_rating_sql, BROWSE_DEMOGRAPHIC_SQL, BROWSE_LANGUAGE_SQL, BROWSE_YEAR_SQL,
+    };
+    let rating = effective_content_rating_sql("f.content_rating", "f.is_nsfw");
     sqlx::query(&format!(
         "INSERT INTO browse_catalogue \
              (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, status, \
               content_rating, is_nsfw, en_chapter_count, latest_chapter, released_at, \
-              announced_at, created_at) \
+              announced_at, created_at, demographic, original_language, year, follows, \
+              rating) \
          SELECT f.work_id, f.reader_id, f.title, f.cover_url, f.suwayomi_thumbnail, \
-                f.comic_type, f.status, f.content_rating, f.is_nsfw, f.en_chapter_count, \
-                f.latest_chapter, f.released_at, f.announced_at, w.created_at \
+                f.comic_type, f.status, {rating}, f.is_nsfw, f.en_chapter_count, \
+                f.latest_chapter, f.released_at, f.announced_at, w.created_at, \
+                {BROWSE_DEMOGRAPHIC_SQL}, {BROWSE_LANGUAGE_SQL}, {BROWSE_YEAR_SQL}, \
+                st.follows, st.rating \
            FROM feed_series_updates f \
            JOIN work w ON w.id = f.work_id \
+           LEFT JOIN work_stats st ON st.work_id = f.work_id \
           WHERE f.work_id IN (SELECT work_id FROM source_series \
                               WHERE source_type = 'suwayomi' AND source_key = ?) \
          ON CONFLICT(work_id) DO UPDATE SET {set} WHERE {changed}"
@@ -5741,6 +5754,9 @@ mod tests {
                  || '|' || COALESCE(latest_chapter, '~') \
                  || '|' || COALESCE(released_at, -1) || '|' || typeof(released_at) \
                  || '|' || created_at \
+                 || '|' || COALESCE(demographic, '~') || '|' || COALESCE(original_language, '~') \
+                 || '|' || COALESCE(year, '~') || '|' || COALESCE(follows, '~') \
+                 || '|' || COALESCE(rating, '~') \
              FROM browse_catalogue WHERE work_id = 'w1'",
         )
         .fetch_optional(pool)
@@ -5767,6 +5783,20 @@ mod tests {
     async fn incremental_write_converges_with_the_periodic_rebuild() {
         let pool = migrated_pool().await;
         seed_feed_fixture(&pool, Some("1785071625000")).await;
+        // Migration 0106's columns, NON-NULL, so the browse digest below compares real values
+        // rather than two NULLs: a mixed-case demographic both writers must normalize the
+        // same way, a year, and a MangaDex statistics row both writers must copy.
+        sqlx::query("UPDATE work SET demographic = ' Seinen ', year = 2019 WHERE id = 'w1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO work_stats (work_id, follows, rating, rating_avg, fetched_at) \
+             VALUES ('w1', 4321, 8.25, 8.5, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let admin = ScanAdmin::default();
 
         record_scan(
@@ -5819,6 +5849,11 @@ mod tests {
         let incremental_browse = browse_digest(&pool)
             .await
             .expect("a detection must reach Browse's table too — it no longer reads the feed");
+        assert!(
+            incremental_browse.ends_with("|seinen|ko|2019|4321|8.25"),
+            "the incremental mirror must carry migration 0106's columns, normalized: \
+             {incremental_browse}"
+        );
         let (_, released_at, typ, .., chapter_count, _) = feed_row(&pool).await.unwrap();
         assert_eq!(
             chapter_count,

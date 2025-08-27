@@ -24,6 +24,7 @@ mod scanner;
 mod series_cache;
 mod suwayomi;
 mod sync;
+mod tags;
 mod task;
 mod views;
 
