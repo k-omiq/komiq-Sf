@@ -105,6 +105,189 @@ pub fn content_rating_nsfw_only(f: ContentRatingFilter) -> bool {
     matches!(f, ContentRatingFilter::NsfwOnly)
 }
 
+// ---- Browse v2 ("MangaDex advanced search") --------------------------------------------
+//
+// The shared contract with the reader (`browse-contract.md`): every name below is fixed by
+// it, which is why `Demographic::None` and friends read like the wire format rather than
+// like Rust. `search(filter: BrowseFilter)` is OPTIONAL and, when present, wins over every
+// v1 argument; see `graphql::search` and `browse::BrowseQuery`.
+
+/// How several tags combine (MangaDex's `includedTagsMode` / `excludedTagsMode`).
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum TagMode {
+    And,
+    Or,
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+/// Browse v2's orderings. Every one ends in a `work_id` tiebreak in the same direction, and
+/// sorts unknown (NULL) keys LAST in both directions.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum BrowseSortField {
+    /// Text-search ranking; without a query the server falls back to `LATEST_UPDATE`.
+    Relevance,
+    /// Newest chapter release.
+    LatestUpdate,
+    /// When the work entered Komika's catalogue.
+    RecentlyAdded,
+    /// Our own 24-hour view ranking (the v1 `TRENDING`).
+    MostViewed,
+    /// MangaDex follows.
+    MostFollows,
+    /// MangaDex's bayesian rating (0-10).
+    HighestRated,
+    /// English chapter count.
+    MostChapters,
+    /// A-Z; the one sort whose default direction is ASC.
+    Title,
+    /// Publication year.
+    Year,
+}
+
+/// MangaDex's publication demographic. `NONE` selects works with no demographic.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum Demographic {
+    Shounen,
+    Shoujo,
+    Seinen,
+    Josei,
+    None,
+}
+
+/// MangaDex's four content ratings — EXACT values, not cumulative tiers (contrast
+/// [`ContentRatingFilter`]). Narrows INSIDE the viewer's NSFW gate, never widens it.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ContentRating {
+    Safe,
+    Suggestive,
+    Erotica,
+    Pornographic,
+}
+
+/// MangaDex's four tag groups.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum TagGroup {
+    Genre,
+    Theme,
+    Format,
+    Content,
+}
+
+/// Browse v2's whole filter + sort. Every field is optional; an absent field is no
+/// constraint. Lists are bounded (`includedTags`/`excludedTags` 32, `originalLanguages` 16)
+/// and a longer list is an ERROR rather than truncated, because truncating an AND list
+/// silently widens the result.
+#[derive(InputObject, Clone, Debug, Default)]
+pub struct BrowseFilter {
+    /// Tag ids (`TagInfo.id`). Unknown ids are not an error — they simply match no work.
+    pub included_tags: Option<Vec<String>>,
+    /// Default AND.
+    pub included_tags_mode: Option<TagMode>,
+    pub excluded_tags: Option<Vec<String>>,
+    /// Default OR.
+    pub excluded_tags_mode: Option<TagMode>,
+    pub status: Option<Vec<SeriesStatus>>,
+    /// ALL selected formats apply (OR). WEBTOON folds into MANHWA and COMIC into MANGA.
+    pub types: Option<Vec<ComicType>>,
+    pub demographics: Option<Vec<Demographic>>,
+    /// Narrows INSIDE the viewer's NSFW gate, never widens it.
+    pub content_ratings: Option<Vec<ContentRating>>,
+    /// MangaDex `originalLanguage` codes: "ja", "ko", "zh", "zh-hk", "en", …
+    pub original_languages: Option<Vec<String>>,
+    /// Clamped to 1900..=2100; a reversed range is swapped.
+    pub year_from: Option<i32>,
+    pub year_to: Option<i32>,
+    /// `<= 0` is no filter.
+    pub min_chapters: Option<i32>,
+    /// MangaDex bayesian rating, 0-10. `<= 0` is no filter; excludes works with no rating.
+    pub min_rating: Option<f64>,
+    /// MangaDex follows. `<= 0` is no filter; excludes works with no statistics.
+    pub min_follows: Option<i32>,
+    /// `true` = only works with a known chapter; `false` = only works with none.
+    pub has_chapters: Option<bool>,
+    /// "mangadex", "suwayomi", or a Suwayomi source id.
+    pub source: Option<String>,
+    /// Default: RELEVANCE with a text query, LATEST_UPDATE without.
+    pub sort: Option<BrowseSortField>,
+    /// Default DESC (TITLE defaults ASC).
+    pub direction: Option<SortDirection>,
+}
+
+/// One entry of the `tags` query.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct TagInfo {
+    /// URL-safe slug of the canonical English name ("boys-love", "sci-fi", "4-koma").
+    pub id: String,
+    /// Display name ("Boys' Love").
+    pub name: String,
+    pub group: TagGroup,
+    /// Works carrying this tag that the VIEWER may see (NSFW-gated).
+    pub count: i32,
+}
+
+/// `TagGroup` from the stored `tag.tag_group` word. Anything unrecognized is filed under
+/// GENRE, matching `tags::rebuild_tag_table`'s default for free-text admin tags.
+pub fn tag_group_from_word(w: &str) -> TagGroup {
+    match w {
+        "theme" => TagGroup::Theme,
+        "format" => TagGroup::Format,
+        "content" => TagGroup::Content,
+        _ => TagGroup::Genre,
+    }
+}
+
+/// The stored word for a demographic filter value (`browse_catalogue.demographic`, or
+/// `"none"` for the IS NULL arm — see `browse::build_where`).
+pub fn demographic_word(d: Demographic) -> &'static str {
+    match d {
+        Demographic::Shounen => "shounen",
+        Demographic::Shoujo => "shoujo",
+        Demographic::Seinen => "seinen",
+        Demographic::Josei => "josei",
+        Demographic::None => "none",
+    }
+}
+
+/// The stored `content_rating` word for a v2 rating.
+pub fn content_rating_word(r: ContentRating) -> &'static str {
+    match r {
+        ContentRating::Safe => "safe",
+        ContentRating::Suggestive => "suggestive",
+        ContentRating::Erotica => "erotica",
+        ContentRating::Pornographic => "pornographic",
+    }
+}
+
+/// The internal sort for a v2 (field, direction). TITLE defaults ASC, everything else DESC.
+pub fn browse_sort(
+    field: BrowseSortField,
+    direction: Option<SortDirection>,
+) -> crate::browse::Sort {
+    use crate::browse::SortKey;
+    let key = match field {
+        BrowseSortField::Relevance => SortKey::Relevance,
+        BrowseSortField::LatestUpdate => SortKey::LatestUpdate,
+        BrowseSortField::RecentlyAdded => SortKey::RecentlyAdded,
+        BrowseSortField::MostViewed => SortKey::MostViewed,
+        BrowseSortField::MostFollows => SortKey::MostFollows,
+        BrowseSortField::HighestRated => SortKey::HighestRated,
+        BrowseSortField::MostChapters => SortKey::MostChapters,
+        BrowseSortField::Title => SortKey::Title,
+        BrowseSortField::Year => SortKey::Year,
+    };
+    let desc = match direction {
+        Some(SortDirection::Asc) => false,
+        Some(SortDirection::Desc) => true,
+        None => field != BrowseSortField::Title,
+    };
+    crate::browse::Sort { key, desc }
+}
+
 /// The COLLAPSED format word `feed_series_updates.comic_type` stores, per the reader's
 /// `toViewType`: `WEBTOON` folds into `MANHWA` and `COMIC` into `MANGA`.
 ///
