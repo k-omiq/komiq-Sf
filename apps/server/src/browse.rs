@@ -2929,4 +2929,915 @@ mod tests {
             ]
         );
     }
+
+    // ---- Browse v2 -----------------------------------------------------------------------
+
+    /// Migration 0106's columns on an already-seeded row, plus its tag KEYS.
+    #[allow(clippy::too_many_arguments)]
+    async fn v2(
+        pool: &SqlitePool,
+        work_id: &str,
+        demographic: Option<&str>,
+        lang: Option<&str>,
+        year: Option<i64>,
+        follows: Option<i64>,
+        rating: Option<f64>,
+        tags: &[&str],
+    ) {
+        sqlx::query(
+            "UPDATE browse_catalogue SET demographic = ?, original_language = ?, year = ?, \
+                    follows = ?, rating = ? WHERE work_id = ?",
+        )
+        .bind(demographic)
+        .bind(lang)
+        .bind(year)
+        .bind(follows)
+        .bind(rating)
+        .bind(work_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        for t in tags {
+            tag(pool, work_id, t, t, "mangadex").await;
+        }
+    }
+
+    /// One `work_tag` row with an explicit display name and key.
+    async fn tag(pool: &SqlitePool, work_id: &str, name: &str, key: &str, source: &str) {
+        sqlx::query(
+            "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) VALUES (?, ?, 0, ?, ?)",
+        )
+        .bind(work_id)
+        .bind(name)
+        .bind(source)
+        .bind(key)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// [`fixture`] plus every v2 dimension, all DISTINCT per work so each assertion below
+    /// proves which column it read:
+    ///
+    /// ```text
+    ///  id  rating(eff)   nsfw demo     lang year follows md-rating ch  tags
+    ///  A   safe          0    shounen  ja   2001 500     8.0       10  action comedy
+    ///  B   suggestive    0    seinen   ko   2015 100     9.0       40  action romance
+    ///  C   erotica       1    josei    zh   2010 900     7.0       20  romance comedy
+    ///  D   safe          0    (none)   ja   -    -       -         30  comedy
+    ///  E   pornographic  1    shoujo   ja   1995 50      6.0       50  action romance comedy
+    /// ```
+    async fn fixture_v2(pool: &SqlitePool) {
+        fixture(pool).await;
+        let rows: [(
+            &str,
+            Option<&str>,
+            &str,
+            Option<i64>,
+            Option<i64>,
+            Option<f64>,
+            &[&str],
+        ); 5] = [
+            (
+                "w_a",
+                Some("shounen"),
+                "ja",
+                Some(2001),
+                Some(500),
+                Some(8.0),
+                &["action", "comedy"],
+            ),
+            (
+                "w_b",
+                Some("seinen"),
+                "ko",
+                Some(2015),
+                Some(100),
+                Some(9.0),
+                &["action", "romance"],
+            ),
+            (
+                "w_c",
+                Some("josei"),
+                "zh",
+                Some(2010),
+                Some(900),
+                Some(7.0),
+                &["romance", "comedy"],
+            ),
+            ("w_d", None, "ja", None, None, None, &["comedy"]),
+            (
+                "w_e",
+                Some("shoujo"),
+                "ja",
+                Some(1995),
+                Some(50),
+                Some(6.0),
+                &["action", "romance", "comedy"],
+            ),
+        ];
+        for (w, demo, lang, year, follows, rating, tags) in rows {
+            v2(pool, w, demo, Some(lang), year, follows, rating, tags).await;
+        }
+    }
+
+    fn sorted(sort: SortKey, desc: bool) -> BrowseQuery<'static> {
+        BrowseQuery {
+            show_nsfw: true,
+            sort: Sort { key: sort, desc },
+            ..Default::default()
+        }
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Include/exclude × AND/OR, by tag KEY, with `total` describing the filtered set.
+    #[tokio::test]
+    async fn tag_filters_include_and_exclude_in_both_modes() {
+        let pool = pool().await;
+        fixture_v2(&pool).await;
+        let run = |inc: &[&str], im: TagMode, exc: &[&str], em: TagMode| {
+            let pool = pool.clone();
+            let (inc, exc) = (ids(inc), ids(exc));
+            async move {
+                let mut query = sorted(SortKey::LatestUpdate, true);
+                query.include_tags = canonical_tag_ids(&inc);
+                query.include_mode = im;
+                query.exclude_tags = canonical_tag_ids(&exc);
+                query.exclude_mode = em;
+                titles(&pool, &query).await
+            }
+        };
+        use TagMode::{And, Or};
+        let set = |v: &[&str]| (v.len() as i64, ids(v));
+        assert_eq!(
+            run(&["action", "romance"], And, &[], Or).await,
+            set(&["B", "E"])
+        );
+        assert_eq!(
+            run(&["action", "romance"], Or, &[], Or).await,
+            set(&["A", "B", "C", "E"])
+        );
+        assert_eq!(run(&["romance"], And, &[], Or).await, set(&["B", "C", "E"]));
+        // Exclude ANY: drop every work carrying romance.
+        assert_eq!(run(&[], And, &["romance"], Or).await, set(&["A", "D"]));
+        // Exclude ALL: drop only works carrying BOTH action and romance (B, E).
+        assert_eq!(
+            run(&[], And, &["action", "romance"], And).await,
+            set(&["A", "C", "D"])
+        );
+        assert_eq!(
+            run(&[], And, &["action", "romance"], Or).await,
+            set(&["D"]),
+            "exclude-OR of the same pair drops everything carrying either"
+        );
+        // Combined: action works that are not comedies.
+        assert_eq!(run(&["action"], Or, &["comedy"], Or).await, set(&["B"]));
+        // Unknown ids MATCH NOTHING: an include-AND containing one is empty, an include-OR
+        // is unaffected by it, an exclude of it excludes nothing — and an implausible id
+        // (the sentinel) behaves exactly the same.
+        assert_eq!(
+            run(&["action", "no-such-tag"], And, &[], Or).await,
+            set(&[])
+        );
+        assert_eq!(
+            run(&["action", "no-such-tag"], Or, &[], Or).await,
+            set(&["A", "B", "E"])
+        );
+        assert_eq!(
+            run(&["action", "DROP TABLE work;"], And, &[], Or).await,
+            set(&[])
+        );
+        assert_eq!(run(&[], And, &["no-such-tag"], Or).await.0, 5);
+        // Two display names that slug to ONE key on one work ("Sci fi" by an admin and
+        // "Sci-Fi" from MangaDex) are one tag: AND over {sci-fi, action} still matches A,
+        // which a COUNT(*) instead of COUNT(DISTINCT tag_key) would get wrong (3 rows, n=2).
+        tag(&pool, "w_a", "Sci fi", "sci-fi", "admin").await;
+        tag(&pool, "w_a", "Sci-Fi", "sci-fi", "mangadex").await;
+        assert_eq!(run(&["sci-fi", "action"], And, &[], Or).await, set(&["A"]));
+        assert_eq!(
+            run(&["sci-fi", "comedy", "action"], And, &[], Or).await,
+            set(&["A"])
+        );
+    }
+
+    /// THE BYPASS ATTEMPT: an opted-out viewer asking for EROTICA + PORNOGRAPHIC gets
+    /// nothing — not the adult works, and not "everything they may see" either. Same for
+    /// every other v2 dimension that could be used to reach an NSFW row (its tags, its
+    /// language, its demographic, a text query).
+    #[tokio::test]
+    async fn content_ratings_cannot_bypass_the_nsfw_gate() {
+        let pool = pool().await;
+        fixture_v2(&pool).await;
+        let adult: &[&str] = &["erotica", "pornographic"];
+        let mut query = sorted(SortKey::LatestUpdate, true);
+        query.show_nsfw = false;
+        query.ratings = Some(adult);
+        assert_eq!(titles(&pool, &query).await, (0, vec![]));
+        // Aimed squarely at the NSFW works' unique attributes, still nothing.
+        query.ratings = None;
+        query.languages = ids(&["zh"]);
+        query.demographics = vec!["josei"];
+        assert_eq!(titles(&pool, &query).await, (0, vec![]));
+        // The same request opted IN returns exactly the two adult works.
+        let mut opted_in = sorted(SortKey::LatestUpdate, true);
+        opted_in.ratings = Some(adult);
+        assert_eq!(titles(&pool, &opted_in).await, (2, ids(&["C", "E"])));
+
+        // The EFFECTIVE rating: a source-flagged NSFW work with no MangaDex rating was
+        // stored as 'safe'. Materialized through the real expression it reads as 'erotica', so
+        // SAFE never returns an adult work, even to an opted-in viewer.
+        sqlx::query("UPDATE browse_catalogue SET content_rating = 'safe', is_nsfw = 1 WHERE work_id = 'w_c'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let eff = crate::catalog::effective_content_rating_sql("content_rating", "is_nsfw");
+        sqlx::query(&format!(
+            "UPDATE browse_catalogue SET content_rating = {eff}"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let safe: &[&str] = &["safe"];
+        let mut q_safe = sorted(SortKey::LatestUpdate, true);
+        q_safe.ratings = Some(safe);
+        assert_eq!(titles(&pool, &q_safe).await, (2, ids(&["A", "D"])));
+        q_safe.ratings = Some(&["erotica"]);
+        assert_eq!(titles(&pool, &q_safe).await.1, ids(&["C"]));
+    }
+
+    /// Every other v2 filter dimension, alone, with `total` following.
+    #[tokio::test]
+    async fn v2_attribute_filters_narrow_and_total_follows() {
+        let pool = pool().await;
+        fixture_v2(&pool).await;
+        let run = |f: &dyn Fn(&mut BrowseQuery<'static>)| {
+            let mut query = sorted(SortKey::LatestUpdate, true);
+            f(&mut query);
+            let pool = pool.clone();
+            async move { titles(&pool, &query).await }
+        };
+        let set = |v: &[&str]| (v.len() as i64, ids(v));
+        // Several statuses / formats are ORed (v1 honoured only the first format).
+        assert_eq!(
+            run(&|q| q.statuses = vec!["COMPLETED", "ONGOING"]).await,
+            set(&["A", "B"])
+        );
+        assert_eq!(
+            run(&|q| q.types = vec!["MANHUA", "MANHWA"]).await,
+            set(&["B", "C"])
+        );
+        // Demographic, with NONE as the IS NULL arm, alone and mixed.
+        assert_eq!(run(&|q| q.demographics = vec!["seinen"]).await, set(&["B"]));
+        assert_eq!(run(&|q| q.demographics = vec!["none"]).await, set(&["D"]));
+        assert_eq!(
+            run(&|q| q.demographics = vec!["none", "shounen"]).await,
+            set(&["A", "D"])
+        );
+        assert_eq!(
+            run(&|q| q.languages = ids(&["ja"])).await,
+            set(&["A", "D", "E"])
+        );
+        assert_eq!(
+            run(&|q| q.languages = ids(&["ko", "zh"])).await,
+            set(&["B", "C"])
+        );
+        // Ranges exclude unknowns (D has no year/follows/rating).
+        assert_eq!(
+            run(&|q| (q.year_from, q.year_to) = (Some(2000), Some(2012))).await,
+            set(&["A", "C"])
+        );
+        assert_eq!(run(&|q| q.year_to = Some(2000)).await, set(&["E"]));
+        assert_eq!(
+            run(&|q| q.min_chapters = Some(30)).await,
+            set(&["B", "D", "E"])
+        );
+        assert_eq!(
+            run(&|q| q.min_follows = Some(100)).await,
+            set(&["A", "B", "C"])
+        );
+        assert_eq!(
+            run(&|q| q.min_md_rating = Some(7.5)).await,
+            set(&["A", "B"])
+        );
+        // Source.
+        sqlx::query(
+            "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
+             VALUES ('md1', 'w_a', 'mangadex', 'mangadex', 'u-a', '2026-01-01T00:00:00Z'), \
+                    ('sw1', 'w_b', 'suwayomi', '777', '1', '2026-01-01T00:00:00Z'), \
+                    ('sw2', 'w_d', 'suwayomi', '888', '2', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            run(&|q| q.source = parse_source(Some("MangaDex"))).await,
+            set(&["A"])
+        );
+        assert_eq!(
+            run(&|q| q.source = parse_source(Some("suwayomi"))).await,
+            set(&["B", "D"])
+        );
+        assert_eq!(
+            run(&|q| q.source = parse_source(Some("888"))).await,
+            set(&["D"])
+        );
+        assert_eq!(
+            run(&|q| q.source = parse_source(Some("x' OR 1=1 --"))).await,
+            set(&[]),
+            "an implausible source id matches nothing, it is never interpolated"
+        );
+        // Everything at once.
+        assert_eq!(
+            run(&|q| {
+                q.statuses = vec!["ONGOING", "COMPLETED", "UNKNOWN"];
+                q.languages = ids(&["ja", "ko"]);
+                q.min_follows = Some(60);
+                q.include_tags = ids(&["action"]);
+            })
+            .await,
+            set(&["A", "B"])
+        );
+    }
+
+    /// Every v2 sort, both directions: the key, then `work_id` in the same direction, and
+    /// unknown (NULL) keys LAST in BOTH directions.
+    #[tokio::test]
+    async fn every_sort_orders_by_its_key_in_both_directions_with_nulls_last() {
+        let pool = pool().await;
+        fixture_v2(&pool).await;
+        // An undated work for the chapter clock; created_at spread for RECENTLY_ADDED.
+        seed(&pool, "w_f", "F", "MANGA", "ONGOING", "safe", 0, 5, None).await;
+        for (w, at) in [
+            ("w_a", "2026-05-03T00:00:00Z"),
+            ("w_b", "2026-05-05T00:00:00Z"),
+            ("w_c", "2026-05-01T00:00:00Z"),
+            ("w_d", "2026-05-04T00:00:00Z"),
+            ("w_e", "2026-05-02T00:00:00Z"),
+            ("w_f", "2026-05-06T00:00:00Z"),
+        ] {
+            sqlx::query("UPDATE browse_catalogue SET created_at = ? WHERE work_id = ?")
+                .bind(at)
+                .bind(w)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        // Mixed-case titles so TITLE proves it is case-insensitive.
+        for (w, t) in [
+            ("w_a", "delta"),
+            ("w_b", "Alpha"),
+            ("w_c", "charlie"),
+            ("w_d", "Bravo"),
+            ("w_e", "echo"),
+            ("w_f", "Foxtrot"),
+        ] {
+            sqlx::query("UPDATE browse_catalogue SET title = ? WHERE work_id = ?")
+                .bind(t)
+                .bind(w)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let order = |key: SortKey, desc: bool| {
+            let pool = pool.clone();
+            async move {
+                let (total, rows) = browse_catalogue(&pool, &sorted(key, desc)).await.unwrap();
+                assert_eq!(total, 6, "{key:?} {desc}: a sort never changes the total");
+                rows.into_iter()
+                    .map(|r| r.work_id.trim_start_matches("w_").to_uppercase())
+                    .collect::<Vec<_>>()
+                    .join("")
+            }
+        };
+        use SortKey::*;
+        let cases: &[(SortKey, &str, &str)] = &[
+            // released_at: A 5000 … E 1000, F NULL.
+            (LatestUpdate, "ABCDEF", "EDCBAF"),
+            (RecentlyAdded, "FBDAEC", "CEADBF"),
+            // follows: C 900, A 500, B 100, E 50; D and F unknown (work_id order, DESC/ASC).
+            (MostFollows, "CABEFD", "EBACDF"),
+            (HighestRated, "BACEFD", "ECABDF"),
+            (Year, "BCAEFD", "EACBDF"),
+            // en_chapter_count: E 50, B 40, D 30, C 20, A 10, F 5.
+            (MostChapters, "EBDCAF", "FACDBE"),
+            // Case-insensitive: Alpha, Bravo, charlie, delta, echo, Foxtrot.
+            (Title, "FEACDB", "BDCAEF"),
+            // RELEVANCE without a query falls back to LATEST_UPDATE, keeping the direction.
+            (Relevance, "ABCDEF", "EDCBAF"),
+        ];
+        for (key, desc_order, asc_order) in cases {
+            assert_eq!(order(*key, true).await, *desc_order, "{key:?} DESC");
+            assert_eq!(order(*key, false).await, *asc_order, "{key:?} ASC");
+        }
+
+        // MOST_VIEWED: viewed works by views, the unviewed remainder newest-first, and ASC
+        // reverses only the viewed prefix — unviewed is still last.
+        let hour = chrono::Utc::now().timestamp() / 3600;
+        for (key, views) in [("w_c", 30i64), ("w_e", 20), ("w_b", 10)] {
+            sqlx::query(
+                "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES (?, ?, ?)",
+            )
+            .bind(key)
+            .bind(hour)
+            .bind(views)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(order(MostViewed, true).await, "CEBADF");
+        assert_eq!(order(MostViewed, false).await, "BECADF");
+    }
+
+    /// A nullable key sorted ASC is a two-phase walk; the pages must stitch across the
+    /// NULL boundary with no row repeated or skipped, and `total` must equal the walk.
+    #[tokio::test]
+    async fn nulls_last_ascending_pages_stitch_exactly_across_the_boundary() {
+        let pool = pool().await;
+        let n = BROWSE_PAGE_SIZE * 2 + 7;
+        for i in 0..n {
+            let id = format!("w_{i:04}");
+            seed(
+                &pool,
+                &id,
+                &id,
+                "MANGA",
+                "ONGOING",
+                "safe",
+                0,
+                1,
+                Some(1000 + i),
+            )
+            .await;
+            // Every third work has no follows; the rest descend with i so ASC reverses them.
+            let follows = (i % 3 != 0).then_some(10_000 - i);
+            sqlx::query("UPDATE browse_catalogue SET follows = ? WHERE work_id = ?")
+                .bind(follows)
+                .bind(&id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let mut seen: Vec<(Option<i64>, String)> = Vec::new();
+        let mut page = 1;
+        loop {
+            let mut query = sorted(SortKey::MostFollows, false);
+            query.page = page;
+            let (total, rows) = browse_catalogue(&pool, &query).await.unwrap();
+            assert_eq!(total, n);
+            if rows.is_empty() {
+                break;
+            }
+            for r in rows {
+                let f: Option<i64> =
+                    sqlx::query_scalar("SELECT follows FROM browse_catalogue WHERE work_id = ?")
+                        .bind(&r.work_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                seen.push((f, r.work_id));
+            }
+            page += 1;
+        }
+        assert_eq!(seen.len() as i64, n, "every row exactly once");
+        let unique: std::collections::HashSet<&String> = seen.iter().map(|(_, w)| w).collect();
+        assert_eq!(
+            unique.len() as i64,
+            n,
+            "no row repeated across a page boundary"
+        );
+        let first_null = seen.iter().position(|(f, _)| f.is_none()).unwrap();
+        assert!(
+            seen[first_null..].iter().all(|(f, _)| f.is_none()),
+            "NULLs strictly last"
+        );
+        assert!(
+            seen[..first_null].windows(2).all(|w| w[0].0 <= w[1].0),
+            "the known prefix ascends"
+        );
+        assert!(
+            seen[first_null..].windows(2).all(|w| w[0].1 < w[1].1),
+            "the NULL tail is in work_id ASC order"
+        );
+    }
+
+    async fn fts(pool: &SqlitePool, work_id: &str, title: &str, chapters: i64) {
+        sqlx::query(
+            "INSERT INTO work_fts (work_id, chapters, title, aliases) VALUES (?, ?, ?, '')",
+        )
+        .bind(work_id)
+        .bind(chapters)
+        .bind(title)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// TEXT QUERY + FILTERS. The filter narrows the match set (and `total` counts the
+    /// narrowed set), RELEVANCE ranking is preserved by default, any other sort re-orders the
+    /// filtered matches, and the NSFW gate holds on this path too.
+    #[tokio::test]
+    async fn text_search_applies_the_filters_and_keeps_relevance() {
+        let pool = pool().await;
+        //     id      title               nsfw demo     follows ch
+        for (id, title, nsfw, demo, follows, ch) in [
+            ("w_1", "Solo", 0, "seinen", 10, 5),
+            ("w_2", "Solo Leveling", 0, "seinen", 900, 200),
+            ("w_3", "Solo Camping", 0, "josei", 500, 80),
+            ("w_4", "Solo Nights", 1, "seinen", 999, 300),
+            ("w_5", "Unrelated", 0, "seinen", 1000, 400),
+        ] {
+            seed(
+                &pool,
+                id,
+                title,
+                "MANGA",
+                "ONGOING",
+                "safe",
+                nsfw,
+                ch,
+                Some(1000),
+            )
+            .await;
+            sqlx::query("UPDATE work SET is_nsfw = ? WHERE id = ?")
+                .bind(nsfw)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            v2(
+                &pool,
+                id,
+                Some(demo),
+                Some("ja"),
+                None,
+                Some(follows),
+                None,
+                &[],
+            )
+            .await;
+            fts(&pool, id, title, ch).await;
+        }
+        tag(&pool, "w_3", "Comedy", "comedy", "mangadex").await;
+        let search = |f: &dyn Fn(&mut BrowseQuery<'static>)| {
+            let mut query = BrowseQuery {
+                show_nsfw: true,
+                sort: Sort::desc(SortKey::Relevance),
+                ..Default::default()
+            };
+            f(&mut query);
+            let pool = pool.clone();
+            async move {
+                let (t, rows) = search_text(&pool, "solo", &query).await.unwrap();
+                (t, rows.into_iter().map(|r| r.title).collect::<Vec<_>>())
+            }
+        };
+        let set = |v: &[&str]| (v.len() as i64, ids(v));
+        // Relevance: the exact title first (tier 0), then prefix matches by chapters.
+        assert_eq!(
+            search(&|_| {}).await,
+            set(&["Solo", "Solo Nights", "Solo Leveling", "Solo Camping"])
+        );
+        // A filter NARROWS the matches and the total follows; order is still relevance.
+        assert_eq!(
+            search(&|q| q.demographics = vec!["seinen"]).await,
+            set(&["Solo", "Solo Nights", "Solo Leveling"])
+        );
+        assert_eq!(
+            search(&|q| q.include_tags = ids(&["comedy"])).await,
+            set(&["Solo Camping"])
+        );
+        // The gate: an opted-out viewer never sees the NSFW match, total included.
+        assert_eq!(
+            search(&|q| q.show_nsfw = false).await,
+            set(&["Solo", "Solo Leveling", "Solo Camping"])
+        );
+        // Another sort re-orders the FILTERED matches (never the non-matching w_5, despite
+        // its 1,000 follows).
+        assert_eq!(
+            search(&|q| q.sort = Sort::desc(SortKey::MostFollows)).await,
+            set(&["Solo Nights", "Solo Leveling", "Solo Camping", "Solo"])
+        );
+        assert_eq!(
+            search(&|q| {
+                q.sort = Sort {
+                    key: SortKey::MostFollows,
+                    desc: false,
+                };
+                q.min_follows = Some(100);
+            })
+            .await,
+            set(&["Solo Camping", "Solo Leveling", "Solo Nights"])
+        );
+        // A too-short query is no query: (0, []), exactly like `search_works_fts`.
+        let none = search_text(&pool, "so", &BrowseQuery::default())
+            .await
+            .unwrap();
+        assert_eq!((none.0, none.1.len()), (0, 0));
+        // Over-range page: honest total, no rows.
+        let (t, rows) = search_text(
+            &pool,
+            "solo",
+            &BrowseQuery {
+                show_nsfw: true,
+                sort: Sort::desc(SortKey::Relevance),
+                page: 99,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((t, rows.len()), (4, 0));
+    }
+
+    /// Client input is bounded and canonical before it reaches SQL or the memo key.
+    #[test]
+    fn v2_inputs_are_validated_bounded_and_canonical() {
+        // Tag ids: trimmed, lowercased, deduped, sorted; implausible -> one sentinel that no
+        // slug can equal (so it matches nothing instead of being dropped).
+        assert_eq!(
+            canonical_tag_ids(&ids(&[
+                " Romance ",
+                "action",
+                "ACTION",
+                "",
+                "x'; --",
+                "a b"
+            ])),
+            ids(&["!", "action", "romance"])
+        );
+        assert!(!crate::tags::is_plausible_tag_id(UNMATCHABLE));
+        assert_eq!(
+            canonical_tag_ids(&ids(&[&"a".repeat(65)])),
+            ids(&["!"]),
+            "over-long ids are implausible"
+        );
+        // Languages.
+        assert_eq!(
+            canonical_languages(&ids(&["JA", " zh-HK ", "ko", "ja", "english", "x"])),
+            ids(&["!", "ja", "ko", "zh-hk"])
+        );
+        // Years: clamped, reversed range swapped.
+        assert_eq!(year_range(Some(1500), Some(3000)), (Some(1900), Some(2100)));
+        assert_eq!(year_range(Some(2020), Some(2010)), (Some(2010), Some(2020)));
+        assert_eq!(year_range(None, Some(1)), (None, Some(1900)));
+        // Minimums: <= 0 is no filter (emitting `>= 0` would drop the unknowns), capped.
+        assert_eq!(min_chapters(Some(0)), None);
+        assert_eq!(min_chapters(Some(-5)), None);
+        assert_eq!(min_chapters(Some(i64::MAX)), Some(MIN_CHAPTERS_CAP));
+        assert_eq!(min_follows(Some(0)), None);
+        assert_eq!(min_follows(Some(42)), Some(42));
+        assert_eq!(min_md_rating(Some(f64::NAN)), None);
+        assert_eq!(min_md_rating(Some(f64::INFINITY)), None);
+        assert_eq!(min_md_rating(Some(0.0)), None);
+        assert_eq!(min_md_rating(Some(11.0)), Some(10.0));
+        assert_eq!(min_md_rating(Some(7.4567)), Some(7.46));
+        // Source.
+        assert_eq!(parse_source(None), None);
+        assert_eq!(parse_source(Some("   ")), None);
+        assert_eq!(parse_source(Some("MANGADEX")), Some(SourceFilter::MangaDex));
+        assert_eq!(parse_source(Some("suwayomi")), Some(SourceFilter::Suwayomi));
+        assert_eq!(
+            parse_source(Some("2499283573021220255")),
+            Some(SourceFilter::SuwayomiSource("2499283573021220255".into()))
+        );
+        assert_eq!(
+            parse_source(Some("bad id!")),
+            Some(SourceFilter::SuwayomiSource(UNMATCHABLE.into()))
+        );
+    }
+
+    /// The memo key must separate every v2 dimension too — same argument as the v1 test:
+    /// nothing end-to-end can catch a gap, because the TTL is zero under test.
+    #[test]
+    fn count_key_separates_every_v2_dimension() {
+        let base = count_key(&BrowseQuery::default());
+        let with = |f: &dyn Fn(&mut BrowseQuery<'static>)| {
+            let mut c = BrowseQuery::default();
+            f(&mut c);
+            count_key(&c)
+        };
+        let variants = vec![
+            with(&|c| c.types = vec!["MANGA", "MANHWA"]),
+            with(&|c| c.statuses = vec!["ONGOING", "COMPLETED"]),
+            with(&|c| c.demographics = vec!["none"]),
+            with(&|c| c.demographics = vec!["seinen"]),
+            with(&|c| c.ratings = Some(&["erotica"])),
+            with(&|c| c.ratings = Some(&[])),
+            with(&|c| c.languages = ids(&["ja"])),
+            with(&|c| c.year_from = Some(2000)),
+            with(&|c| c.year_to = Some(2000)),
+            with(&|c| c.min_chapters = Some(5)),
+            with(&|c| c.min_follows = Some(5)),
+            with(&|c| c.min_md_rating = Some(5.0)),
+            with(&|c| c.source = Some(SourceFilter::MangaDex)),
+            with(&|c| c.source = Some(SourceFilter::Suwayomi)),
+            with(&|c| c.source = Some(SourceFilter::SuwayomiSource("1".into()))),
+            with(&|c| c.include_tags = ids(&["action"])),
+            with(&|c| c.exclude_tags = ids(&["action"])),
+            with(&|c| c.include_mode = TagMode::Or),
+            with(&|c| c.exclude_mode = TagMode::And),
+            // The same strings in different lists must not collide.
+            with(&|c| {
+                c.include_tags = ids(&["a"]);
+                c.exclude_tags = ids(&["b"]);
+            }),
+            with(&|c| {
+                c.include_tags = ids(&["a", "b"]);
+            }),
+            with(&|c| {
+                c.languages = ids(&["a"]);
+                c.include_tags = ids(&["b"]);
+            }),
+        ];
+        let mut all = variants.clone();
+        all.push(base.clone());
+        let before = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(before, all.len(), "two distinct filter sets share a key");
+        // Direction is a ROW dimension, never a COUNT one.
+        let mut asc = BrowseQuery::default();
+        asc.sort.desc = false;
+        assert_eq!(base, count_key(&asc));
+        assert_ne!(row_key(&BrowseQuery::default()), row_key(&asc));
+    }
+
+    /// EXPLAIN QUERY PLAN over a fixture catalogue with realistic tag skew and statistics:
+    /// every tag shape must reach `work_tag` through one of migration 0106's indexes — a
+    /// covering SEEK on `tag_key` for the AND forms, a covering probe on `(work_id, tag_key)`
+    /// for the OR forms — and never by scanning it. The plans are printed so they can be
+    /// quoted.
+    #[tokio::test]
+    async fn tag_filters_use_the_tag_indexes() {
+        let pool = pool().await;
+        let mut tx = pool.begin().await.unwrap();
+        let vocab: Vec<String> = (0..60).map(|i| format!("tag-{i}")).collect();
+        for i in 0..3000 {
+            let id = format!("w_{i:05}");
+            sqlx::query(
+                "INSERT INTO work (id, primary_title, created_at, updated_at) \
+                 VALUES (?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            )
+            .bind(&id)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO browse_catalogue (work_id, reader_id, title, is_nsfw, \
+                     en_chapter_count, released_at, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z')",
+            )
+            .bind(&id)
+            .bind(&id)
+            .bind(&id)
+            .bind(i64::from(i % 10 == 0))
+            .bind((i % 50) as i64)
+            .bind(1000 + i as i64)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            // ~6 tags per work, skewed toward the low ids (tag-0 is on every other work).
+            for k in 0..6usize {
+                let t = &vocab[(i * (k + 1) * 7 + k * k) % (10 + k * 10)];
+                sqlx::query(
+                    "INSERT OR IGNORE INTO work_tag (work_id, tag, ord, source, tag_key) \
+                     VALUES (?, ?, 0, 'mangadex', ?)",
+                )
+                .bind(&id)
+                .bind(t)
+                .bind(t)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            }
+        }
+        tx.commit().await.unwrap();
+        sqlx::query("ANALYZE").execute(&pool).await.unwrap();
+
+        async fn plan(pool: &SqlitePool, sql: &str, binds: &[Bind]) -> Vec<String> {
+            use sqlx::Row;
+            let text = format!("EXPLAIN QUERY PLAN {sql}");
+            let mut qq = sqlx::query(&text);
+            for b in binds {
+                qq = match b {
+                    Bind::Text(s) => qq.bind(s.clone()),
+                    Bind::Real(v) => qq.bind(*v),
+                    Bind::Int(v) => qq.bind(*v),
+                };
+            }
+            qq.fetch_all(pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get::<String, _>("detail"))
+                .collect()
+        }
+        use TagMode::{And, Or};
+        let shapes: [(&str, Vec<&str>, TagMode, Vec<&str>, TagMode, &str); 5] = [
+            (
+                "include AND (2)",
+                vec!["tag-3", "tag-7"],
+                And,
+                vec![],
+                Or,
+                "idx_work_tag_key_work",
+            ),
+            (
+                "include AND (1)",
+                vec!["tag-3"],
+                And,
+                vec![],
+                Or,
+                "idx_work_tag_key_work",
+            ),
+            (
+                "include OR (2)",
+                vec!["tag-3", "tag-7"],
+                Or,
+                vec![],
+                Or,
+                "idx_work_tag_work_key",
+            ),
+            (
+                "exclude OR (2)",
+                vec![],
+                Or,
+                vec!["tag-3", "tag-7"],
+                Or,
+                "idx_work_tag_work_key",
+            ),
+            (
+                "exclude AND (2)",
+                vec![],
+                Or,
+                vec!["tag-3", "tag-7"],
+                And,
+                "idx_work_tag_key_work",
+            ),
+        ];
+        for (label, inc, im, exc, em, want_index) in shapes {
+            for show_nsfw in [false, true] {
+                let query = BrowseQuery {
+                    show_nsfw,
+                    include_tags: ids(&inc),
+                    include_mode: im,
+                    exclude_tags: ids(&exc),
+                    exclude_mode: em,
+                    ..Default::default()
+                };
+                let (where_sql, binds, _) = build_where(&query);
+                for (kind, sql) in [
+                    (
+                        "page",
+                        format!(
+                            "SELECT {BROWSE_COLS} FROM browse_catalogue f WHERE {where_sql} \
+                             ORDER BY {NEWEST_ORDER} LIMIT 30 OFFSET 0"
+                        ),
+                    ),
+                    (
+                        "count",
+                        format!("SELECT COUNT(*) FROM browse_catalogue f WHERE {where_sql}"),
+                    ),
+                ] {
+                    let lines = plan(&pool, &sql, &binds).await;
+                    eprintln!("--- {label} / {kind} / show_nsfw={show_nsfw}");
+                    for l in &lines {
+                        eprintln!("    {l}");
+                    }
+                    let tag_lines: Vec<&String> = lines
+                        .iter()
+                        .filter(|l| l.contains(" t ") || l.ends_with(" t"))
+                        .collect();
+                    assert!(
+                        !tag_lines.is_empty(),
+                        "{label}: no work_tag access in {lines:?}"
+                    );
+                    for l in &tag_lines {
+                        assert!(
+                            l.contains(want_index),
+                            "{label}/{kind}: work_tag must be read through {want_index}: {l}"
+                        );
+                        assert!(
+                            l.contains("COVERING INDEX"),
+                            "{label}/{kind}: the tag lookup must be index-only: {l}"
+                        );
+                        assert!(
+                            l.starts_with("SEARCH"),
+                            "{label}/{kind}: a seek, never a scan of work_tag: {l}"
+                        );
+                    }
+                    assert!(
+                        !lines
+                            .iter()
+                            .any(|l| l.starts_with("SCAN work ") || l == "SCAN work"),
+                        "{label}/{kind}: no scan of `work` per tag: {lines:?}"
+                    );
+                }
+            }
+        }
+    }
 }
