@@ -488,29 +488,40 @@ pub async fn sync_suwayomi_tags(pool: &SqlitePool) -> Result<SuwayomiTagSync> {
     Ok(out)
 }
 
-/// Give every `work_tag` row without a `tag_key` its [`slug`] (and, for a known MangaDex tag
-/// name, its group). Returns the rows updated.
+/// Give every `work_tag` row without a `tag_key` its [`slug`], and every row of a KNOWN
+/// MangaDex tag name without a `tag_group` its group. Returns the rows updated.
 ///
 /// The safety net under every writer: ingest, admin curation and the Suwayomi mapper all set
 /// the key themselves, but a row written by a path that predates migration 0106 (or one added
-/// later that forgets) must not be invisible to the tag filter. One UPDATE per DISTINCT name,
-/// through `idx_work_tag_tag(tag, work_id)`, so a no-op pass is one index probe on `tag_key IS
-/// NULL`-free data and a backfill is ~100 statements, not ~700k.
+/// later that forgets) must not be invisible to the tag filter. The group half matters because
+/// only the `/manga` ingest that carries `tag_details` writes groups; an admin's "Gore", or an
+/// ingest that arrived without details, would otherwise file a content tag under GENRE.
+///
+/// One UPDATE per DISTINCT name, through `idx_work_tag_tag(tag, work_id)`, so a backfill is
+/// ~100 statements rather than ~700k. A name whose only gap is a group we cannot know (admin
+/// free text) is skipped rather than rewritten every cycle, so a settled table costs one read.
 pub async fn fill_tag_keys(conn: &mut SqliteConnection) -> Result<u64> {
-    let names: Vec<String> =
-        sqlx::query_scalar("SELECT DISTINCT tag FROM work_tag WHERE tag_key IS NULL")
-            .fetch_all(&mut *conn)
-            .await?;
+    let names: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT tag, MAX(tag_key IS NULL) FROM work_tag \
+          WHERE tag_key IS NULL OR tag_group IS NULL GROUP BY tag",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
     let mut n = 0;
-    for name in names {
+    for (name, needs_key) in names {
         let group = known_tag(&name).map(|(_, g)| g);
+        if !needs_key && group.is_none() {
+            continue;
+        }
         n += sqlx::query(
-            "UPDATE work_tag SET tag_key = ?, tag_group = COALESCE(tag_group, ?) \
-              WHERE tag = ? AND tag_key IS NULL",
+            "UPDATE work_tag SET tag_key = COALESCE(tag_key, ?), \
+                                 tag_group = COALESCE(tag_group, ?) \
+              WHERE tag = ? AND (tag_key IS NULL OR (tag_group IS NULL AND ? IS NOT NULL))",
         )
         .bind(slug(&name))
         .bind(group)
         .bind(&name)
+        .bind(group)
         .execute(&mut *conn)
         .await?
         .rows_affected();

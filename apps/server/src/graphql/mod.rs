@@ -16748,6 +16748,220 @@ mod tests {
         assert_eq!(d["total"], serde_json::json!(1));
     }
 
+    /// Browse v2 over the wire: `search(filter:)` with and without a text query, the `tags`
+    /// query's NSFW-gated counts, the bypass attempt, the list bounds, and that a v1 call
+    /// beside it is unchanged. Everything goes through the REAL rebuild chain
+    /// (`refresh_feed_updates` -> `refresh_browse_catalogue` -> tag table), not hand-written
+    /// rows.
+    #[tokio::test]
+    async fn search_filter_v2_end_to_end() {
+        let (s, pool) = setup_full(100).await;
+        seed_browse_work(
+            &pool,
+            "md-v1",
+            "Solo Alpha",
+            "ja",
+            "ONGOING",
+            "safe",
+            false,
+            3,
+            &["Action", "Comedy"],
+        )
+        .await;
+        let beta = seed_browse_work(
+            &pool,
+            "md-v2",
+            "Solo Beta",
+            "ko",
+            "COMPLETED",
+            "suggestive",
+            false,
+            5,
+            &["Action", "Romance", "Gore"],
+        )
+        .await;
+        seed_browse_work(
+            &pool,
+            "md-v3",
+            "Solo Gamma",
+            "zh",
+            "ONGOING",
+            "erotica",
+            true,
+            2,
+            &["Action", "Romance"],
+        )
+        .await;
+        sqlx::query("UPDATE work SET demographic = 'seinen', year = 2015 WHERE id = ?")
+            .bind(&beta)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO work_stats (work_id, follows, rating, rating_avg, fetched_at) \
+             VALUES (?, 1234, 8.5, 8.7, '2026-01-01T00:00:00Z')",
+        )
+        .bind(&beta)
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+
+        let run = |q: String, tok: Option<&'static str>| {
+            let s = &s;
+            async move { exec(s, &q, tok, "1.1.1.1").await }
+        };
+        let titles = |r: &async_graphql::Response| -> (i64, Vec<String>) {
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            let d = r.data.clone().into_json().unwrap()["search"].clone();
+            (
+                d["total"].as_i64().unwrap(),
+                d["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i["title"].as_str().unwrap().to_string())
+                    .collect(),
+            )
+        };
+        let search = |query: &str, filter: &str| {
+            format!(
+                r#"{{ search(query: "{query}", filter: {{ {filter} }}) {{ total hasNextPage items {{ title }} }} }}"#
+            )
+        };
+
+        // tags: opted-out bob sees counts over the SFW works only, slug ids, MangaDex groups
+        // (Gore is CONTENT via the vocabulary even though the fixture wrote no group).
+        let r = run("{ tags { id name group count } }".into(), Some("bobtok")).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let tags = r.data.into_json().unwrap()["tags"].clone();
+        let find = |id: &str| {
+            tags.as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == id)
+                .cloned()
+        };
+        assert_eq!(find("action").unwrap()["count"], 2, "{tags}");
+        assert_eq!(find("action").unwrap()["name"], "Action");
+        assert_eq!(
+            find("romance").unwrap()["count"],
+            1,
+            "Gamma is NSFW: {tags}"
+        );
+        assert_eq!(find("gore").unwrap()["group"], "CONTENT");
+        assert_eq!(find("action").unwrap()["group"], "GENRE");
+
+        // Empty query + tags (AND default) + an exact content rating.
+        let r = run(
+            search(
+                "",
+                r#"includedTags: ["action", "romance"], contentRatings: [SUGGESTIVE]"#,
+            ),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r), (1, vec!["Solo Beta".to_string()]));
+        // OR mode + exclude.
+        let r = run(
+            search(
+                "",
+                r#"includedTags: ["comedy", "romance"], includedTagsMode: OR, excludedTags: ["gore"], hasChapters: true"#,
+            ),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r), (1, vec!["Solo Alpha".to_string()]));
+        // Demographic / follows / rating / language / year / status / type, all at once.
+        let r = run(
+            search(
+                "",
+                r#"demographics: [SEINEN], minFollows: 1000, minRating: 8.0, originalLanguages: ["KO"], yearFrom: 2010, yearTo: 2020, status: [COMPLETED, ONGOING], types: [WEBTOON]"#,
+            ),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r), (1, vec!["Solo Beta".to_string()]));
+
+        // THE BYPASS ATTEMPT, over the wire: opted-out bob asks for the adult ratings.
+        let r = run(
+            search("", "contentRatings: [EROTICA, PORNOGRAPHIC]"),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r), (0, vec![]));
+        let r = run(
+            search("Solo", "contentRatings: [EROTICA, PORNOGRAPHIC]"),
+            None,
+        )
+        .await;
+        assert_eq!(titles(&r), (0, vec![]), "anonymous, with a text query too");
+
+        // Text query + filters together: the filter narrows the matches, relevance orders.
+        let r = run(
+            search("Solo", r#"includedTags: ["action"]"#),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(
+            titles(&r),
+            (2, vec!["Solo Beta".to_string(), "Solo Alpha".to_string()]),
+            "prefix tier, then chapters DESC — Gamma gated out"
+        );
+        let r = run(
+            search("Solo", r#"includedTags: ["action"], sort: TITLE"#),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(
+            titles(&r),
+            (2, vec!["Solo Alpha".to_string(), "Solo Beta".to_string()]),
+            "TITLE defaults to ASC"
+        );
+        let r = run(
+            search("Solo", r#"sort: MOST_FOLLOWS, direction: DESC"#),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(
+            titles(&r).1.first().map(String::as_str),
+            Some("Solo Beta"),
+            "the only work with statistics leads; unknowns after"
+        );
+
+        // Bounds: an over-long list is an error, not a silently-widened query.
+        let many = (0..33)
+            .map(|i| format!("\"t{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let r = run(
+            search("", &format!("includedTags: [{many}]")),
+            Some("bobtok"),
+        )
+        .await;
+        assert!(
+            first_error(&r).contains("includedTags: at most 32"),
+            "{:?}",
+            r.errors
+        );
+
+        // v1 is untouched: the same request without `filter` still ignores filters on a
+        // text query (old clients keep identical behaviour)...
+        let r = run(
+            r#"{ search(query: "Solo", types: [MANHUA]) { total items { title } } }"#.into(),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r).0, 2);
+        // ...and `filter` WINS over the v1 arguments when both are sent.
+        let r = run(
+            r#"{ search(query: "", types: [MANGA], sort: NEWEST, filter: { types: [MANHWA] }) { total items { title } } }"#.into(),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r), (1, vec!["Solo Beta".to_string()]));
+    }
+
     /// Format / status / content-rating filters narrow the WHOLE catalogue, so `total`
     /// describes the filtered set rather than a slice of it — the thing the old
     /// `suwayomi_series` path could not do at all (it had no column for any of the three).
