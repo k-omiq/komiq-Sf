@@ -2987,17 +2987,20 @@ mod tests {
     ///  D   safe          0    (none)   ja   -    -       -         30  comedy
     ///  E   pornographic  1    shoujo   ja   1995 50      6.0       50  action romance comedy
     /// ```
+    /// `(work_id, demographic, language, year, follows, md-rating, tag keys)`.
+    type V2Row<'a> = (
+        &'a str,
+        Option<&'a str>,
+        &'a str,
+        Option<i64>,
+        Option<i64>,
+        Option<f64>,
+        &'a [&'a str],
+    );
+
     async fn fixture_v2(pool: &SqlitePool) {
         fixture(pool).await;
-        let rows: [(
-            &str,
-            Option<&str>,
-            &str,
-            Option<i64>,
-            Option<i64>,
-            Option<f64>,
-            &[&str],
-        ); 5] = [
+        let rows: [V2Row<'_>; 5] = [
             (
                 "w_a",
                 Some("shounen"),
@@ -3737,7 +3740,16 @@ mod tests {
                 .collect()
         }
         use TagMode::{And, Or};
-        let shapes: [(&str, Vec<&str>, TagMode, Vec<&str>, TagMode, &str); 5] = [
+        /// `(label, include, include mode, exclude, exclude mode, the index work_tag must use)`.
+        type Shape<'a> = (
+            &'a str,
+            Vec<&'a str>,
+            TagMode,
+            Vec<&'a str>,
+            TagMode,
+            &'a str,
+        );
+        let shapes: [Shape<'_>; 5] = [
             (
                 "include AND (2)",
                 vec!["tag-3", "tag-7"],
