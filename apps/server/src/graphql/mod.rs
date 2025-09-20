@@ -107,6 +107,13 @@ static DISCOVERY_CACHE: std::sync::LazyLock<FeedCache<Vec<DiscoveryFeed>>> =
 static GENRE_FACETS_CACHE: std::sync::LazyLock<FeedCache<Vec<(String, i64)>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Browse v2's tag list (`tags`).
+static TAGS_CACHE: std::sync::LazyLock<FeedCache<Vec<crate::tags::TagRow>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+/// Single-flight locks collapsing concurrent refills of [`TAGS_CACHE`].
+static TAGS_INFLIGHT: std::sync::LazyLock<KeyedLocks> =
+    std::sync::LazyLock::new(KeyedLocks::default);
+
 /// Single-flight locks collapsing concurrent refills of [`DISCOVERY_CACHE`] (S1
 /// pattern). Keyed 0/1 by NSFW posture — a separate keyspace from
 /// [`GENRE_FACETS_INFLIGHT`] and from the AppState locks, whose keys are series ids,
@@ -185,6 +192,9 @@ pub(crate) fn clear_feed_caches() {
         map.clear();
     }
     if let Ok(mut map) = GENRE_FACETS_CACHE.lock() {
+        map.clear();
+    }
+    if let Ok(mut map) = TAGS_CACHE.lock() {
         map.clear();
     }
     crate::browse::clear_count_cache();
@@ -1026,6 +1036,122 @@ async fn resolve_viewer_show_nsfw(ctx: &Context<'_>) -> bool {
 /// only for an admin. Anonymous and ordinary logged-in viewers are unaffected —
 /// the argument is ignored for them, so it grants nothing and cannot be used to bypass
 /// the gate.
+/// Translate a v2 [`BrowseFilter`] into a [`crate::browse::BrowseQuery`]: map every enum onto
+/// its stored word, validate and bound every client value, and pick the default sort.
+///
+/// Errors only for the over-long lists (see [`BrowseFilter`] for why they are not
+/// truncated); every other out-of-range value is CLAMPED or neutralized by the `browse`
+/// canonicalizers, so a sloppy client degrades to a sensible query instead of a failed page.
+///
+/// `ratings` is the canonical content-rating list ([`filter_content_ratings`]), owned by the
+/// caller because the query borrows it as a slice; empty means no rating clause.
+fn browse_query_from_filter<'a>(
+    f: &BrowseFilter,
+    show_nsfw: bool,
+    has_query: bool,
+    page: i32,
+    ratings: &'a [&'static str],
+) -> Result<crate::browse::BrowseQuery<'a>> {
+    use crate::browse::{self as b, TagMode as M};
+    let too_long = |name: &str, n: usize, max: usize| {
+        (n > max).then(|| Error::new(format!("{name}: at most {max} entries, got {n}")))
+    };
+    let inc = f.included_tags.as_deref().unwrap_or_default();
+    let exc = f.excluded_tags.as_deref().unwrap_or_default();
+    let langs = f.original_languages.as_deref().unwrap_or_default();
+    if let Some(e) = too_long("includedTags", inc.len(), b::MAX_TAG_FILTERS)
+        .or_else(|| too_long("excludedTags", exc.len(), b::MAX_TAG_FILTERS))
+        .or_else(|| too_long("originalLanguages", langs.len(), b::MAX_LANGUAGE_FILTERS))
+    {
+        return Err(e);
+    }
+    let mode = |m: Option<TagMode>, default: M| match m {
+        Some(TagMode::And) => M::And,
+        Some(TagMode::Or) => M::Or,
+        None => default,
+    };
+    let (year_from, year_to) = b::year_range(f.year_from.map(i64::from), f.year_to.map(i64::from));
+    let sort = types::browse_sort(
+        f.sort.unwrap_or(if has_query {
+            BrowseSortField::Relevance
+        } else {
+            BrowseSortField::LatestUpdate
+        }),
+        f.direction,
+    );
+    Ok(b::BrowseQuery {
+        show_nsfw,
+        types: filter_words(f.types.as_ref(), collapsed_comic_type_word),
+        statuses: filter_words(f.status.as_ref(), status_word),
+        // `None` when the client sent no ratings (or an empty list): no clause.
+        ratings: (!ratings.is_empty()).then_some(ratings),
+        nsfw_only: false,
+        genres: &[],
+        has_chapters: f.has_chapters,
+        min_rating: None,
+        max_rating: None,
+        demographics: filter_words(f.demographics.as_ref(), demographic_word),
+        languages: b::canonical_languages(langs),
+        year_from,
+        year_to,
+        min_chapters: b::min_chapters(f.min_chapters.map(i64::from)),
+        min_follows: b::min_follows(f.min_follows.map(i64::from)),
+        min_md_rating: b::min_md_rating(f.min_rating),
+        source: b::parse_source(f.source.as_deref()),
+        include_tags: b::canonical_tag_ids(inc),
+        include_mode: mode(f.included_tags_mode, M::And),
+        exclude_tags: b::canonical_tag_ids(exc),
+        exclude_mode: mode(f.excluded_tags_mode, M::Or),
+        sort,
+        page: i64::from(page.max(1)),
+    })
+}
+
+/// Dedupe and sort a fixed-vocabulary enum list into its stored words, so the memo key is
+/// order-insensitive. Bounded by the vocabulary once deduped (5 statuses, 3 collapsed
+/// formats, …), so a client repeating a value 10,000 times costs nothing.
+fn filter_words<T: Copy>(v: Option<&Vec<T>>, f: impl Fn(T) -> &'static str) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = v
+        .map(|v| v.iter().map(|x| f(*x)).collect())
+        .unwrap_or_default();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The v2 `contentRatings` as stored words, canonical (deduped, sorted).
+fn filter_content_ratings(f: &BrowseFilter) -> Vec<&'static str> {
+    filter_words(f.content_ratings.as_ref(), content_rating_word)
+}
+
+/// `search(filter:)` — Browse v2. One path for an empty query (`browse::browse_catalogue`)
+/// and a text query (`browse::search_text`), both over the SAME WHERE, both hydrated through
+/// `map_browse_rows` and re-gated by `filter_nsfw` exactly like the v1 branches.
+async fn search_v2(
+    st: &AppState,
+    trimmed: &str,
+    page: i32,
+    show_nsfw: bool,
+    filter: &BrowseFilter,
+) -> Result<SeriesPage> {
+    let ratings = filter_content_ratings(filter);
+    let bq = browse_query_from_filter(filter, show_nsfw, !trimmed.is_empty(), page, &ratings)?;
+    let (total, rows) = if trimmed.is_empty() {
+        crate::browse::browse_catalogue(&st.pool, &bq).await
+    } else {
+        crate::browse::search_text(&st.pool, trimmed, &bq).await
+    }
+    .map_err(gql_err)?;
+    let items = filter_nsfw(show_nsfw, map_browse_rows(st, rows).await);
+    let has_next = i64::from(page.max(1)) * BROWSE_PAGE_SIZE < total;
+    Ok(SeriesPage {
+        items,
+        page,
+        has_next_page: has_next,
+        total: Some(total.min(i64::from(i32::MAX)) as i32),
+    })
+}
+
 async fn viewer_show_nsfw_or_admin(ctx: &Context<'_>, include_nsfw: Option<bool>) -> bool {
     let Some(user) = current_user(ctx).await else {
         return false; // anonymous: never, regardless of the argument
@@ -3771,16 +3897,9 @@ async fn compute_discovery(st: &AppState, show_nsfw: bool) -> Result<Vec<Discove
     // two "Latest added" lists disagree entirely.
     let latest_added = crate::browse::BrowseQuery {
         show_nsfw,
-        type_word: None,
-        status_word: None,
-        ratings: None,
-        nsfw_only: false,
-        genres: &[],
-        has_chapters: None,
-        min_rating: None,
-        max_rating: None,
-        sort: BrowseSort::LatestAdded,
+        sort: BrowseSort::LatestAdded.into(),
         page: 1,
+        ..Default::default()
     };
     let (_, recent_rows) = crate::browse::browse_catalogue(&st.pool, &latest_added)
         .await
@@ -4977,7 +5096,15 @@ impl QueryRoot {
     /// read right now; absent, they are included and sorted last on the recency ordering.
     ///
     /// A TEXT query does full-text search over the canonical `work` catalogue instead (see
-    /// below); the structural filters do not apply on that path.
+    /// below); the v1 structural filters do not apply on that path.
+    ///
+    /// BROWSE V2: `filter: BrowseFilter` (migration 0106, `search_v2`). When present it WINS
+    /// over every v1 filter/sort argument, and its filters apply TOGETHER with a text query
+    /// (`browse::search_text` narrows the match set by the same WHERE Browse uses, keeping
+    /// relevance ranking by default) — the v1 behaviour above is kept for clients that do not
+    /// send it, with ONE deliberate change: the v1 content-rating tiers now read the EFFECTIVE
+    /// rating (`catalog::effective_content_rating_sql`), so an opted-in viewer's SAFE tier no
+    /// longer returns source-flagged adult works that merely lacked a MangaDex rating.
     ///
     /// `genres` matches ANY of the given genres and is capped at
     /// `browse::MAX_GENRE_FILTERS`. `minRating`/`maxRating` filter by the work's aggregate
@@ -5032,10 +5159,23 @@ impl QueryRoot {
                     non-MangaDex source."
         )]
         has_chapters: Option<bool>,
+        #[graphql(
+            desc = "Browse v2 (\"MangaDex advanced search\"): tags with AND/OR include and \
+                    exclude, several statuses/formats/demographics/content ratings/languages, \
+                    year range, minimum chapters/rating/follows, source, and sort + \
+                    direction. Applies TOGETHER with a text query (relevance-ranked by \
+                    default). When present it WINS over every v1 filter/sort argument above; \
+                    `includeNsfw` keeps its admin-only meaning. Content ratings narrow inside \
+                    the viewer's NSFW gate and can never widen it."
+        )]
+        filter: Option<BrowseFilter>,
     ) -> Result<SeriesPage> {
         let st = state(ctx);
         let trimmed = query.trim();
         let show_nsfw = viewer_show_nsfw_or_admin(ctx, include_nsfw).await;
+        if let Some(filter) = filter {
+            return search_v2(st, trimmed, page, show_nsfw, &filter).await;
+        }
         if trimmed.is_empty() {
             // Collapse to the three words `feed_series_updates.comic_type` stores. Asking
             // for WEBTOON returns the manhwa set rather than nothing, which is the useful
@@ -5045,19 +5185,21 @@ impl QueryRoot {
             // (the exact degradation migration 0064's header is about), and the argument is
             // a list only so the client does not need a schema change to gain multi-select
             // once a strategy for it exists.
-            let type_word = types
+            let type_word: Vec<&'static str> = types
                 .as_deref()
                 .and_then(|t| t.first().copied())
-                .map(collapsed_comic_type_word);
-            let status_word = status.map(status_word);
+                .map(collapsed_comic_type_word)
+                .into_iter()
+                .collect();
+            let status_word: Vec<&'static str> = status.map(status_word).into_iter().collect();
             let rating_filter = content_rating.unwrap_or(ContentRatingFilter::All);
             let tier = content_rating_tier(rating_filter);
             let nsfw_only = content_rating_nsfw_only(rating_filter);
             let genre_list = crate::browse::canonical_genres(&genres.unwrap_or_default());
             let bq = crate::browse::BrowseQuery {
                 show_nsfw,
-                type_word,
-                status_word,
+                types: type_word,
+                statuses: status_word,
                 ratings: tier,
                 nsfw_only,
                 genres: &genre_list,
@@ -5066,9 +5208,11 @@ impl QueryRoot {
                 has_chapters,
                 // TRENDING by default — the only ordering that reflects what people are
                 // reading. It degrades to NEWEST for everything unviewed, so a cold view
-                // table cannot render Browse empty.
-                sort: sort.unwrap_or(BrowseSort::Trending),
+                // table cannot render Browse empty. Mapped onto the internal sort with
+                // `desc = true`, which is exactly what each v1 sort did.
+                sort: sort.unwrap_or(BrowseSort::Trending).into(),
                 page: page.max(1) as i64,
+                ..Default::default()
             };
             let (total, rows) = crate::browse::browse_catalogue(&st.pool, &bq)
                 .await
@@ -5234,6 +5378,45 @@ impl QueryRoot {
             .map(|(genre, count)| GenreFacet {
                 genre,
                 count: count as i32,
+            })
+            .collect())
+    }
+
+    /// Browse v2's tag vocabulary (`TagInfo`), grouped genre/theme/format/content then by
+    /// name, read from the materialized `tag` table (migration 0106) and NSFW-gated exactly
+    /// like `genreFacets`: an opted-out viewer gets counts over the works they may see, and a
+    /// tag only NSFW works carry is not offered at all. Each `count` is the number the
+    /// single-tag include filter returns for that viewer — both count `browse_catalogue`,
+    /// rebuilt in one transaction.
+    ///
+    /// Cached like `genreFacets` (viewer-invariant given the NSFW posture, so the posture is
+    /// the whole key — see [`feed_cache_key`]), with the same single-flight refill.
+    async fn tags(&self, ctx: &Context<'_>) -> Result<Vec<TagInfo>> {
+        let st = state(ctx);
+        let show_nsfw = viewer_show_nsfw(ctx).await;
+        let key = feed_cache_key(show_nsfw);
+        let rows = if let Some(hit) = cached_feed(&TAGS_CACHE, key, FEED_TTL) {
+            (*hit).clone()
+        } else {
+            let lock = TAGS_INFLIGHT.lock_handle(i64::from(show_nsfw));
+            let _guard = lock.lock().await;
+            if let Some(hit) = cached_feed(&TAGS_CACHE, key, FEED_TTL) {
+                (*hit).clone()
+            } else {
+                let rows = crate::tags::list_tags(&st.pool, show_nsfw)
+                    .await
+                    .map_err(gql_err)?;
+                store_feed(&TAGS_CACHE, key, rows.clone());
+                rows
+            }
+        };
+        Ok(rows
+            .into_iter()
+            .map(|r| TagInfo {
+                group: tag_group_from_word(&r.tag_group),
+                id: r.id,
+                name: r.name,
+                count: r.count.min(i64::from(i32::MAX)) as i32,
             })
             .collect())
     }
@@ -8890,12 +9073,17 @@ impl MutationRoot {
                         if t.is_empty() {
                             continue;
                         }
+                        // `tag_key` (migration 0106) so the curated tag is filterable
+                        // immediately; `tags::fill_tag_keys` would otherwise only reach it
+                        // at the next Browse rebuild.
                         sqlx::query(
-                            "INSERT OR IGNORE INTO work_tag (work_id, tag, ord) VALUES (?, ?, ?)",
+                            "INSERT OR IGNORE INTO work_tag (work_id, tag, ord, tag_key) \
+                             VALUES (?, ?, ?, ?)",
                         )
                         .bind(&work_id)
                         .bind(t)
                         .bind(i as i64)
+                        .bind(crate::tags::slug(t))
                         .execute(&mut *tx)
                         .await
                         .map_err(gql_err)?;
@@ -16590,6 +16778,220 @@ mod tests {
             "the updates feed is unchanged by 0069"
         );
         assert_eq!(d["total"], serde_json::json!(1));
+    }
+
+    /// Browse v2 over the wire: `search(filter:)` with and without a text query, the `tags`
+    /// query's NSFW-gated counts, the bypass attempt, the list bounds, and that a v1 call
+    /// beside it is unchanged. Everything goes through the REAL rebuild chain
+    /// (`refresh_feed_updates` -> `refresh_browse_catalogue` -> tag table), not hand-written
+    /// rows.
+    #[tokio::test]
+    async fn search_filter_v2_end_to_end() {
+        let (s, pool) = setup_full(100).await;
+        seed_browse_work(
+            &pool,
+            "md-v1",
+            "Solo Alpha",
+            "ja",
+            "ONGOING",
+            "safe",
+            false,
+            3,
+            &["Action", "Comedy"],
+        )
+        .await;
+        let beta = seed_browse_work(
+            &pool,
+            "md-v2",
+            "Solo Beta",
+            "ko",
+            "COMPLETED",
+            "suggestive",
+            false,
+            5,
+            &["Action", "Romance", "Gore"],
+        )
+        .await;
+        seed_browse_work(
+            &pool,
+            "md-v3",
+            "Solo Gamma",
+            "zh",
+            "ONGOING",
+            "erotica",
+            true,
+            2,
+            &["Action", "Romance"],
+        )
+        .await;
+        sqlx::query("UPDATE work SET demographic = 'seinen', year = 2015 WHERE id = ?")
+            .bind(&beta)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO work_stats (work_id, follows, rating, rating_avg, fetched_at) \
+             VALUES (?, 1234, 8.5, 8.7, '2026-01-01T00:00:00Z')",
+        )
+        .bind(&beta)
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+
+        let run = |q: String, tok: Option<&'static str>| {
+            let s = &s;
+            async move { exec(s, &q, tok, "1.1.1.1").await }
+        };
+        let titles = |r: &async_graphql::Response| -> (i64, Vec<String>) {
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            let d = r.data.clone().into_json().unwrap()["search"].clone();
+            (
+                d["total"].as_i64().unwrap(),
+                d["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i["title"].as_str().unwrap().to_string())
+                    .collect(),
+            )
+        };
+        let search = |query: &str, filter: &str| {
+            format!(
+                r#"{{ search(query: "{query}", filter: {{ {filter} }}) {{ total hasNextPage items {{ title }} }} }}"#
+            )
+        };
+
+        // tags: opted-out bob sees counts over the SFW works only, slug ids, MangaDex groups
+        // (Gore is CONTENT via the vocabulary even though the fixture wrote no group).
+        let r = run("{ tags { id name group count } }".into(), Some("bobtok")).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let tags = r.data.into_json().unwrap()["tags"].clone();
+        let find = |id: &str| {
+            tags.as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == id)
+                .cloned()
+        };
+        assert_eq!(find("action").unwrap()["count"], 2, "{tags}");
+        assert_eq!(find("action").unwrap()["name"], "Action");
+        assert_eq!(
+            find("romance").unwrap()["count"],
+            1,
+            "Gamma is NSFW: {tags}"
+        );
+        assert_eq!(find("gore").unwrap()["group"], "CONTENT");
+        assert_eq!(find("action").unwrap()["group"], "GENRE");
+
+        // Empty query + tags (AND default) + an exact content rating.
+        let r = run(
+            search(
+                "",
+                r#"includedTags: ["action", "romance"], contentRatings: [SUGGESTIVE]"#,
+            ),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r), (1, vec!["Solo Beta".to_string()]));
+        // OR mode + exclude.
+        let r = run(
+            search(
+                "",
+                r#"includedTags: ["comedy", "romance"], includedTagsMode: OR, excludedTags: ["gore"], hasChapters: true"#,
+            ),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r), (1, vec!["Solo Alpha".to_string()]));
+        // Demographic / follows / rating / language / year / status / type, all at once.
+        let r = run(
+            search(
+                "",
+                r#"demographics: [SEINEN], minFollows: 1000, minRating: 8.0, originalLanguages: ["KO"], yearFrom: 2010, yearTo: 2020, status: [COMPLETED, ONGOING], types: [WEBTOON]"#,
+            ),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r), (1, vec!["Solo Beta".to_string()]));
+
+        // THE BYPASS ATTEMPT, over the wire: opted-out bob asks for the adult ratings.
+        let r = run(
+            search("", "contentRatings: [EROTICA, PORNOGRAPHIC]"),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r), (0, vec![]));
+        let r = run(
+            search("Solo", "contentRatings: [EROTICA, PORNOGRAPHIC]"),
+            None,
+        )
+        .await;
+        assert_eq!(titles(&r), (0, vec![]), "anonymous, with a text query too");
+
+        // Text query + filters together: the filter narrows the matches, relevance orders.
+        let r = run(
+            search("Solo", r#"includedTags: ["action"]"#),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(
+            titles(&r),
+            (2, vec!["Solo Beta".to_string(), "Solo Alpha".to_string()]),
+            "prefix tier, then chapters DESC — Gamma gated out"
+        );
+        let r = run(
+            search("Solo", r#"includedTags: ["action"], sort: TITLE"#),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(
+            titles(&r),
+            (2, vec!["Solo Alpha".to_string(), "Solo Beta".to_string()]),
+            "TITLE defaults to ASC"
+        );
+        let r = run(
+            search("Solo", r#"sort: MOST_FOLLOWS, direction: DESC"#),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(
+            titles(&r).1.first().map(String::as_str),
+            Some("Solo Beta"),
+            "the only work with statistics leads; unknowns after"
+        );
+
+        // Bounds: an over-long list is an error, not a silently-widened query.
+        let many = (0..33)
+            .map(|i| format!("\"t{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let r = run(
+            search("", &format!("includedTags: [{many}]")),
+            Some("bobtok"),
+        )
+        .await;
+        assert!(
+            first_error(&r).contains("includedTags: at most 32"),
+            "{:?}",
+            r.errors
+        );
+
+        // v1 is untouched: the same request without `filter` still ignores filters on a
+        // text query (old clients keep identical behaviour)...
+        let r = run(
+            r#"{ search(query: "Solo", types: [MANHUA]) { total items { title } } }"#.into(),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r).0, 2);
+        // ...and `filter` WINS over the v1 arguments when both are sent.
+        let r = run(
+            r#"{ search(query: "", types: [MANGA], sort: NEWEST, filter: { types: [MANHWA] }) { total items { title } } }"#.into(),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r), (1, vec!["Solo Beta".to_string()]));
     }
 
     /// Format / status / content-rating filters narrow the WHOLE catalogue, so `total`

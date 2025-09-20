@@ -36,9 +36,17 @@
 //!    all 115k rows through a temp B-tree. Migration 0064's header and `updates_feed` both
 //!    document this. `comic_type` is branched for the same reason — as an equality it
 //!    becomes an index prefix, so one index serves filter AND order.
-//! 3. **Every sort carries `f.work_id DESC` as a tiebreaker.** Not cosmetic: ~76,000 rows
-//!    share an `en_chapter_count` in the 0..5 range and 67,000 share `released_at IS NULL`,
-//!    and without a total order LIMIT/OFFSET repeats or skips rows at a page boundary.
+//! 3. **Every sort carries `f.work_id` as a tiebreaker, in the sort's own direction.** Not
+//!    cosmetic: ~76,000 rows share an `en_chapter_count` in the 0..5 range and 67,000 share
+//!    `released_at IS NULL`, and without a total order LIMIT/OFFSET repeats or skips rows at a
+//!    page boundary. (Same direction as the key, so a sort and its reverse walk one index.)
+//!
+//! BROWSE V2 ("MangaDex advanced search", migration 0106) keeps all three. It adds filters
+//! (tag include/exclude with AND/OR by `work_tag.tag_key`, several statuses/formats/
+//! demographics/content ratings/languages, year range, minimum chapters/follows/MangaDex
+//! rating, source), sorts with a direction and NULLs last in both, and [`search_text`] — the
+//! SAME WHERE applied to a full-text match set, so a text query no longer discards every
+//! filter. v1 requests map onto it unchanged (`From<BrowseSort> for Sort`).
 
 use anyhow::Result;
 use sqlx::SqlitePool;
@@ -68,6 +76,158 @@ pub const MAX_GENRE_FILTERS: usize = 12;
 /// "rank a bounded window, then stop" decision. Production holds 43 bucket rows / 17
 /// resolvable works today, so this is entirely headroom.
 const TRENDING_KEY_LIMIT: i64 = 500;
+
+/// Browse v2's limits on client-supplied lists (the GraphQL contract states them; the resolver
+/// rejects a longer list rather than truncating it, because truncating an include-AND list
+/// silently WIDENS the result). Bounded for the same two reasons as [`MAX_GENRE_FILTERS`]:
+/// the statement's bind count and the memo key space.
+pub const MAX_TAG_FILTERS: usize = 32;
+pub const MAX_LANGUAGE_FILTERS: usize = 16;
+
+/// The `yearFrom`/`yearTo` clamp. Wide enough for any real publication year; it exists so a
+/// client cannot mint unbounded distinct memo keys out of absurd integers.
+pub const YEAR_MIN: i64 = 1900;
+pub const YEAR_MAX: i64 = 2100;
+
+/// Ceilings for the numeric minimums, for the same memo-key reason. Both are far past any
+/// real value (the most-followed MangaDex title has ~400k follows; the longest run ~1,100
+/// chapters), so clamping never changes a result.
+const MIN_CHAPTERS_CAP: i64 = 100_000;
+const MIN_FOLLOWS_CAP: i64 = 100_000_000;
+
+/// What Browse orders by. A superset of the wire-level `BrowseSort` (v1) and
+/// `BrowseSortField` (v2): every v1 member maps onto one of these with `desc = true`
+/// (see `From<BrowseSort>`), which is what keeps an old client's ordering byte-identical.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortKey {
+    /// Text search's ranking (title tier, then chapters, then bm25). Without a query there is
+    /// nothing to rank, and it falls back to [`SortKey::LatestUpdate`] — the contract's rule.
+    Relevance,
+    /// `released_at` — the newest chapter release. NULL (no dated chapter) sorts last.
+    LatestUpdate,
+    /// `created_at` — when the work entered OUR catalogue (v1 `LATEST_ADDED`).
+    RecentlyAdded,
+    /// The 24-hour view ranking (v1 `TRENDING`), two-phase.
+    MostViewed,
+    /// `follows` — MangaDex statistics. NULL (not fetched / no MangaDex anchor) sorts last.
+    MostFollows,
+    /// `rating` — MangaDex's BAYESIAN rating. NULL sorts last.
+    HighestRated,
+    /// `en_chapter_count`.
+    MostChapters,
+    /// `title`, case-insensitively.
+    Title,
+    /// `year`. NULL sorts last.
+    Year,
+    /// OUR users' review average (v1 `RATING`), two-phase. Not on the v2 wire — v2's
+    /// HIGHEST_RATED is MangaDex's rating — but kept so a v1 client's RATING is unchanged.
+    CommunityRating,
+}
+
+/// A sort key plus its direction.
+///
+/// EVERY sort ends in `f.work_id` in the SAME direction as the key (invariant 3), so a sort
+/// and its reverse are exact mirror images and one index serves both. NULL keys sort LAST in
+/// BOTH directions — "unknown" is never the most- or least- anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sort {
+    pub key: SortKey,
+    pub desc: bool,
+}
+
+impl Sort {
+    pub const fn desc(key: SortKey) -> Self {
+        Sort { key, desc: true }
+    }
+
+    /// One fixed word per (key, direction), for [`row_key`]. A closed vocabulary (no client
+    /// text), so a bare `|` after it cannot be forged into looking like another key.
+    fn word(self) -> &'static str {
+        use SortKey::*;
+        match (self.key, self.desc) {
+            (Relevance, true) => "relevance",
+            (Relevance, false) => "relevance-asc",
+            // v1 words kept for the v1 sorts so their memo keys keep their old spelling.
+            (LatestUpdate, true) => "newest",
+            (LatestUpdate, false) => "newest-asc",
+            (RecentlyAdded, true) => "latest-added",
+            (RecentlyAdded, false) => "latest-added-asc",
+            (MostViewed, true) => "trending",
+            (MostViewed, false) => "trending-asc",
+            (MostFollows, true) => "follows",
+            (MostFollows, false) => "follows-asc",
+            (HighestRated, true) => "md-rating",
+            (HighestRated, false) => "md-rating-asc",
+            (MostChapters, true) => "chapters",
+            (MostChapters, false) => "chapters-asc",
+            (Title, true) => "title-desc",
+            (Title, false) => "title",
+            (Year, true) => "year",
+            (Year, false) => "year-asc",
+            (CommunityRating, true) => "rating",
+            (CommunityRating, false) => "rating-asc",
+        }
+    }
+
+    /// The sort Browse (no text query) actually runs: RELEVANCE has nothing to rank there and
+    /// becomes LATEST_UPDATE, keeping the requested direction.
+    fn for_browse(self) -> Self {
+        match self.key {
+            SortKey::Relevance => Sort {
+                key: SortKey::LatestUpdate,
+                desc: self.desc,
+            },
+            _ => self,
+        }
+    }
+}
+
+impl From<BrowseSort> for Sort {
+    /// The v1 enum, mapped so an old client's ordering is IDENTICAL: every v1 sort was
+    /// descending, and each maps onto the key that implemented it.
+    fn from(s: BrowseSort) -> Self {
+        Sort::desc(match s {
+            BrowseSort::Trending => SortKey::MostViewed,
+            BrowseSort::Newest => SortKey::LatestUpdate,
+            BrowseSort::LatestAdded => SortKey::RecentlyAdded,
+            BrowseSort::Rating => SortKey::CommunityRating,
+            BrowseSort::Chapters => SortKey::MostChapters,
+        })
+    }
+}
+
+/// The single-column sorts: `(column expression, nullable)`. `None` for the keys that are not
+/// a `browse_catalogue` column (the two-phase rankings and RELEVANCE).
+///
+/// Every column here has a `(is_nsfw, key DESC, work_id DESC)` + `(key DESC, work_id DESC)`
+/// index pair (0069/0102/0106), and `title` carries `COLLATE NOCASE` in both the index and
+/// this expression — they must match or the planner cannot use the index for the ORDER BY.
+fn sort_column(key: SortKey) -> Option<(&'static str, bool)> {
+    match key {
+        SortKey::LatestUpdate => Some(("f.released_at", true)),
+        SortKey::RecentlyAdded => Some(("f.created_at", false)),
+        SortKey::MostChapters => Some(("f.en_chapter_count", false)),
+        SortKey::MostFollows => Some(("f.follows", true)),
+        SortKey::HighestRated => Some(("f.rating", true)),
+        SortKey::Year => Some(("f.year", true)),
+        SortKey::Title => Some(("f.title COLLATE NOCASE", false)),
+        SortKey::Relevance | SortKey::MostViewed | SortKey::CommunityRating => None,
+    }
+}
+
+fn dir(desc: bool) -> &'static str {
+    if desc {
+        "DESC"
+    } else {
+        "ASC"
+    }
+}
+
+/// The two-phase sorts' remainder order (and TRENDING's cold fallback): newest release
+/// first. Fixed regardless of the requested direction — the remainder is the UNRANKED tail,
+/// which sorts last either way, and "newest first" is the only order in which a reader who
+/// scrolls that far finds anything.
+const NEWEST_ORDER: &str = "f.released_at DESC, f.work_id DESC";
 
 /// The per-work review aggregate, keyed by **work id**, for both the RATING sort and the
 /// `minRating`/`maxRating` bounds.
@@ -126,6 +286,14 @@ macro_rules! rated_votes_sql {
 }
 pub(crate) use rated_votes_sql;
 
+/// The `rated_per_work` CTE's DEFINITION, without the `WITH` — for a statement that has
+/// other CTEs of its own (text search) and must list them all after one `WITH`.
+const RATED_PER_WORK_DEF: &str = concat!(
+    "rated_per_work AS (SELECT wid, AVG(score) AS avg FROM (",
+    rated_votes_sql!(),
+    ") GROUP BY wid)"
+);
+
 const RATED_PER_WORK_CTE: &str = concat!(
     "WITH rated_per_work AS (SELECT wid, AVG(score) AS avg FROM (",
     rated_votes_sql!(),
@@ -177,26 +345,56 @@ pub struct BrowseRow {
     pub created_at: String,
 }
 
+/// How several tags combine — MangaDex's `includedTagsMode` / `excludedTagsMode`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TagMode {
+    /// Include: the work carries ALL of them. Exclude: drop only works carrying ALL of them.
+    #[default]
+    And,
+    /// Include: the work carries ANY of them. Exclude: drop works carrying ANY of them.
+    Or,
+}
+
+/// Browse v2's `source` filter, parsed (see [`parse_source`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceFilter {
+    /// Works with a MangaDex anchor.
+    MangaDex,
+    /// Works with ANY Suwayomi source.
+    Suwayomi,
+    /// Works with a Suwayomi source of this extension/source id (`source_series.source_id`).
+    SuwayomiSource(String),
+}
+
 /// One filtered, sorted Browse request.
 ///
 /// Every word-valued field is a fixed-vocabulary token the resolver has already mapped
 /// from a GraphQL enum (`'MANGA'`, `'ONGOING'`, `'safe'` …), never raw client text — that
-/// is what lets them be formatted into the SQL as branches rather than bound. `genres` is
-/// the one client-controlled field and it is always BOUND.
+/// is what lets them be formatted into the SQL as branches rather than bound. The
+/// client-controlled TEXT fields (`genres`, `languages`, the tag ids, a source id) are always
+/// BOUND, and canonicalized first ([`canonical_genres`], [`canonical_tag_ids`],
+/// [`canonical_languages`], [`parse_source`]) so the memo key does not depend on spelling or
+/// order.
 pub struct BrowseQuery<'a> {
     /// The viewer's NSFW posture. `false` pins `f.is_nsfw = 0`; `true` emits no predicate
     /// at all (not `is_nsfw IN (0,1)`) so the opted-in branch reads a different index.
     pub show_nsfw: bool,
-    /// Collapsed format word, or `None` for all formats.
-    pub type_word: Option<&'a str>,
-    /// Normalized status word, or `None` for any status.
-    pub status_word: Option<&'a str>,
-    /// The content-rating values this tier admits, or `None` for no rating clause.
+    /// Collapsed format words (`collapsed_comic_type_word`), deduped; empty = all formats.
+    /// v1 honoured only the FIRST format; v2 ORs them all (one is an index-prefix equality,
+    /// several an `IN`).
+    pub types: Vec<&'static str>,
+    /// Normalized status words, deduped; empty = any status.
+    pub statuses: Vec<&'static str>,
+    /// The content-rating values admitted, or `None` for no rating clause. v1's cumulative
+    /// tiers and v2's exact `contentRatings` set both land here — either way an allow-list
+    /// over the EFFECTIVE rating `browse_catalogue.content_rating` stores (migration 0106,
+    /// `catalog::effective_content_rating_sql`), and either way INSIDE the NSFW gate.
     pub ratings: Option<&'a [&'a str]>,
     /// Restrict to adult-rated works only (`ContentRatingFilter::NSFW_ONLY`). Constrains
     /// `is_nsfw`, not `content_rating`, so it is independent of `ratings` above.
     pub nsfw_only: bool,
-    /// Genre ANY-match. Canonicalized by [`canonical_genres`] before it gets here.
+    /// v1 genre ANY-match over `work_tag.tag` display names. Canonicalized by
+    /// [`canonical_genres`] before it gets here. (v2 filters by tag ID — `include_tags`.)
     pub genres: &'a [String],
     /// `Some(true)` keeps only works we know a chapter for (`en_chapter_count > 0`);
     /// `Some(false)` keeps only works we know none for. `None` — the default — emits NO
@@ -207,18 +405,71 @@ pub struct BrowseQuery<'a> {
     /// `number` — oneshots) and 1,505 works absent from it count more than 0. So this is "we
     /// know of a chapter", which is what a reader asking for something readable means.
     pub has_chapters: Option<bool>,
+    /// v1 bounds on OUR users' review average (see [`RATED_PER_WORK_CTE`]).
     pub min_rating: Option<f64>,
     pub max_rating: Option<f64>,
-    pub sort: BrowseSort,
+    /// Demographic words (`'shounen'`, …) plus `'none'` for "no demographic"; empty = any.
+    pub demographics: Vec<&'static str>,
+    /// Original-language codes, canonicalized by [`canonical_languages`]; empty = any.
+    pub languages: Vec<String>,
+    /// Inclusive publication-year bounds, already clamped and ordered ([`year_range`]).
+    pub year_from: Option<i64>,
+    pub year_to: Option<i64>,
+    /// `en_chapter_count >= n`; `None` for no clause (0 is normalized to `None`).
+    pub min_chapters: Option<i64>,
+    /// MangaDex follows `>= n` (`browse_catalogue.follows`); excludes works with no stats.
+    pub min_follows: Option<i64>,
+    /// MangaDex BAYESIAN rating `>= x` (`browse_catalogue.rating`); excludes works with no
+    /// stats. Not to be confused with v1's `min_rating`, which is our own reviews.
+    pub min_md_rating: Option<f64>,
+    pub source: Option<SourceFilter>,
+    /// Tag IDS (`work_tag.tag_key`), canonicalized by [`canonical_tag_ids`].
+    pub include_tags: Vec<String>,
+    pub include_mode: TagMode,
+    pub exclude_tags: Vec<String>,
+    pub exclude_mode: TagMode,
+    pub sort: Sort,
     pub page: i64,
+}
+
+impl Default for BrowseQuery<'_> {
+    /// No filter at all, NSFW gate CLOSED (the safe default), newest first, page 1.
+    fn default() -> Self {
+        BrowseQuery {
+            show_nsfw: false,
+            types: Vec::new(),
+            statuses: Vec::new(),
+            ratings: None,
+            nsfw_only: false,
+            genres: &[],
+            has_chapters: None,
+            min_rating: None,
+            max_rating: None,
+            demographics: Vec::new(),
+            languages: Vec::new(),
+            year_from: None,
+            year_to: None,
+            min_chapters: None,
+            min_follows: None,
+            min_md_rating: None,
+            source: None,
+            include_tags: Vec::new(),
+            include_mode: TagMode::And,
+            exclude_tags: Vec::new(),
+            exclude_mode: TagMode::Or,
+            sort: Sort::desc(SortKey::LatestUpdate),
+            page: 1,
+        }
+    }
 }
 
 /// A value bound into a dynamically-assembled statement. The SQL text is assembled from
 /// fixed vocabulary only; everything variable travels through here.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum Bind {
     Text(String),
     Real(f64),
+    Int(i64),
 }
 
 fn bind_rows<'q>(
@@ -229,6 +480,7 @@ fn bind_rows<'q>(
         q = match b {
             Bind::Text(s) => q.bind(s.clone()),
             Bind::Real(v) => q.bind(*v),
+            Bind::Int(v) => q.bind(*v),
         };
     }
     q
@@ -242,6 +494,7 @@ fn bind_count<'q>(
         q = match b {
             Bind::Text(s) => q.bind(s.clone()),
             Bind::Real(v) => q.bind(*v),
+            Bind::Int(v) => q.bind(*v),
         };
     }
     q
@@ -269,6 +522,118 @@ pub fn canonical_genres(genres: &[String]) -> Vec<String> {
     out.dedup();
     out.truncate(MAX_GENRE_FILTERS);
     out
+}
+
+/// A tag id no tag can have: [`crate::tags::slug`] only ever produces `[a-z0-9-]`. An
+/// implausible client id is REPLACED by this rather than dropped, so it keeps its meaning of
+/// "a tag nobody carries": dropped from an include-AND list it would silently WIDEN the
+/// result, while as this sentinel it correctly matches nothing (include) or excludes nothing
+/// (exclude). Every implausible id collapses onto it, which also bounds the memo key.
+const UNMATCHABLE: &str = "!";
+
+/// Canonicalize a client tag-id list: trim, lowercase, implausible ids -> [`UNMATCHABLE`],
+/// dedupe, sort. The caller enforces [`MAX_TAG_FILTERS`] BEFORE this (and errors on a longer
+/// list) — see that constant for why truncation is not an option here.
+///
+/// Sorted for the memo's sake, as with [`canonical_genres`]: AND and OR are both
+/// order-insensitive, so `[a, b]` and `[b, a]` must share one entry.
+pub fn canonical_tag_ids(ids: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = ids
+        .iter()
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            if crate::tags::is_plausible_tag_id(&t) {
+                t
+            } else {
+                UNMATCHABLE.to_string()
+            }
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Canonicalize original-language codes the way `catalog::BROWSE_LANGUAGE_SQL` stores them:
+/// trimmed and lowercased. A code that is not language-shaped (`[a-z]{2,3}` plus optional
+/// `-subtag`s of alphanumerics, at most 16 bytes) becomes [`UNMATCHABLE`] — a value no row
+/// stores, so it matches nothing rather than widening the filter. Deduped and sorted.
+pub fn canonical_languages(codes: &[String]) -> Vec<String> {
+    fn plausible(c: &str) -> bool {
+        let mut parts = c.split('-');
+        let head = parts.next().unwrap_or("");
+        c.len() <= 16
+            && (2..=3).contains(&head.len())
+            && head.bytes().all(|b| b.is_ascii_lowercase())
+            && parts.all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric()))
+    }
+    let mut out: Vec<String> = codes
+        .iter()
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty())
+        .map(|c| {
+            if plausible(&c) {
+                c
+            } else {
+                UNMATCHABLE.to_string()
+            }
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Clamp a `yearFrom`/`yearTo` pair into [`YEAR_MIN`]..=[`YEAR_MAX`] and put it in order. A
+/// reversed range (`2020..2010`) is read as the range the user meant rather than as an empty
+/// result — the same reading every year-range picker's two independent dropdowns invite.
+pub fn year_range(from: Option<i64>, to: Option<i64>) -> (Option<i64>, Option<i64>) {
+    let clamp = |y: i64| y.clamp(YEAR_MIN, YEAR_MAX);
+    match (from.map(clamp), to.map(clamp)) {
+        (Some(a), Some(b)) if a > b => (Some(b), Some(a)),
+        other => other,
+    }
+}
+
+/// `minChapters`: `<= 0` is no filter at all (every work has `>= 0`), and the ceiling only
+/// bounds the memo key space.
+pub fn min_chapters(n: Option<i64>) -> Option<i64> {
+    n.filter(|n| *n > 0).map(|n| n.min(MIN_CHAPTERS_CAP))
+}
+
+/// `minFollows`: as [`min_chapters`] — `<= 0` is no filter. (Emitting `follows >= 0` would NOT
+/// be a no-op: it would drop every work with no statistics yet.)
+pub fn min_follows(n: Option<i64>) -> Option<i64> {
+    n.filter(|n| *n > 0).map(|n| n.min(MIN_FOLLOWS_CAP))
+}
+
+/// `minRating` (MangaDex bayesian, 0-10): non-finite or `<= 0` is no filter (same "would drop
+/// the unrated" argument as [`min_follows`]); above 10 clamps to 10. Rounded to 2 decimals so
+/// the memo key space is finite — a 0.001 difference in a rating floor is not a different
+/// question.
+pub fn min_md_rating(x: Option<f64>) -> Option<f64> {
+    x.filter(|x| x.is_finite() && *x > 0.0)
+        .map(|x| (x.min(10.0) * 100.0).round() / 100.0)
+}
+
+/// Parse the `source` filter. `"mangadex"` and `"suwayomi"` (any case) are the two families;
+/// anything else is a Suwayomi extension/source id, which must be short and
+/// `[A-Za-z0-9_-]` (Suwayomi's are decimal longs) or it becomes [`UNMATCHABLE`] — a source no
+/// row has. Blank is no filter.
+pub fn parse_source(raw: Option<&str>) -> Option<SourceFilter> {
+    let s = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    Some(match s.to_ascii_lowercase().as_str() {
+        "mangadex" => SourceFilter::MangaDex,
+        "suwayomi" => SourceFilter::Suwayomi,
+        _ if s.len() <= 64
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
+        {
+            SourceFilter::SuwayomiSource(s.to_string())
+        }
+        _ => SourceFilter::SuwayomiSource(UNMATCHABLE.to_string()),
+    })
 }
 
 // ---- the COUNT memo -------------------------------------------------------------------
@@ -301,6 +666,11 @@ pub(crate) const COUNT_TTL: std::time::Duration = std::time::Duration::ZERO;
 /// a single genre chip is involved, versus 2. At ~80 bytes a key this is ~160 KiB worst
 /// case, which is nothing next to what it buys (the genre COUNT is 68.8 ms even index-only;
 /// on the tag-dense replica it measured 150 ms).
+///
+/// Browse v2 made the space effectively unbounded (tag sets, year ranges, text queries), so
+/// the cap is now a memory bound rather than a coverage claim: a v2 key with a few tags is
+/// ~150 bytes, i.e. ~300 KiB at the cap, and the hot heads (no filter / one tab / one tag)
+/// still fit many times over. Eviction is expired-first ([`store_count_with`]).
 const COUNT_CACHE_CAP: usize = 2048;
 
 /// The memo key for one filter combination.
@@ -310,44 +680,57 @@ const COUNT_CACHE_CAP: usize = 2048;
 /// key that omits a filter the COUNT depends on.
 ///
 /// It must cover every input to that COUNT — and NOTHING ELSE. In particular it must NOT
-/// include `sort` or `page`: all four sorts share one WHERE, so they share one total, and
-/// keying on sort would quarter the hit rate for no gain. (`page` obviously cannot change a
-/// total.) The two-phase sorts' `rated_count` / trending prefix length are separate,
-/// unmemoized counts; they are not this number.
+/// include the sort (key OR direction) or `page`: every sort shares one WHERE, so they share
+/// one total, and keying on sort would divide the hit rate for no gain. (`page` obviously
+/// cannot change a total.) The two-phase rankings' `rated_count` / trending prefix length are
+/// separate, unmemoized counts; a nullable ASC sort's non-NULL prefix is a separate count
+/// memoized under its own `nn:` key ([`key_for_nulls`]); text search's total under an `fts|`
+/// key carrying the MATCH expression ([`search_text`]). None of them is this number.
 ///
-/// `v3|` PREFIX. The memo is a process-wide static and the totals it holds are computed over
+/// `v4|` PREFIX. The memo is a process-wide static and the totals it holds are computed over
 /// whichever table this module read when they were stored. Each repointing has changed that
 /// table's SCALE — 13,847 (`suwayomi_series`) → 48,567 (`feed_series_updates`, `v2`) →
 /// 115,567 (`browse_catalogue`, `v3`) — and a stale entry under a colliding key would serve
 /// one scale's `total` for another, which the pager renders as a page count and
 /// `hasNextPage` as a promise of rows that do not exist. The prefix makes that impossible by
-/// construction rather than by arguing about format overlap.
+/// construction rather than by arguing about format overlap. `v4` is Browse v2: a wider
+/// filter set, and migration 0106's change to what `content_rating` means.
 ///
-/// GENRE ENCODING. `search_catalogue` could join genres with `\u{1}` and call the result
+/// FREE-TEXT ENCODING. `search_catalogue` could join genres with `\u{1}` and call the result
 /// unforgeable, because it keyed on the escaped LIKE PATTERNS (`%"Action"%`) and the
-/// escaping guaranteed no pattern contained a bare `%`. This keys on RAW tags, where no
-/// character is off-limits, so a separator-based join is forgeable: `["a","b"]` and
-/// `["a<sep>b"]` would collide for any `<sep>`. Length-prefixed instead — each tag becomes
-/// `{byte_len}:{tag}` and they are concatenated with no separator. That is injective
-/// because the decoder is deterministic: read digits to the `:`, then take exactly that
-/// many bytes. `["a","b"]` -> `1:a1:b`, while the single tag `a1:b` -> `4:a1:b`.
+/// escaping guaranteed no pattern contained a bare `%`. This keys on RAW client strings
+/// (genres, languages, tag ids, a source id), where no character is off-limits, so a
+/// separator-based join is forgeable: `["a","b"]` and `["a<sep>b"]` would collide for any
+/// `<sep>`. Length-prefixed instead — each string becomes `{byte_len}:{s}`, each list is
+/// prefixed with its count, and they are concatenated with no separator. That is injective
+/// because the decoder is deterministic: read digits to the `#`/`:`, then take exactly that
+/// many items/bytes. `["a","b"]` -> `2#1:a1:b`, while the single tag `a1:b` -> `1#4:a1:b`.
 fn count_key(q: &BrowseQuery<'_>) -> String {
-    let mut key = String::from("v3|");
+    // `v4|`: Browse v2 widened the filter set (and the effective `content_rating` changed
+    // meaning in migration 0106), so no v3 entry may ever be read as a v4 one.
+    let mut key = String::from("v4|");
     key.push(if q.show_nsfw { '1' } else { '0' });
     key.push('|');
     // Its own dimension: NSFW_ONLY emits no rating clause, so without this a cached
     // "adult only" total would be served for the unfiltered query and vice versa.
     key.push(if q.nsfw_only { '1' } else { '0' });
     key.push('|');
-    // Tiers are cumulative allow-lists; joining their members is injective over them
-    // because every member is a fixed lowercase word with no ','.
+    // Fixed-vocabulary lists: joining their members with ',' is injective because every
+    // member is a fixed word containing no ',' or '|'. `ratings` is NOT sorted here — v1 tiers
+    // are already canonical and v2's set is sorted by the resolver.
     if let Some(r) = q.ratings {
         key.push_str(&r.join(","));
+    } else {
+        // Distinct from `Some(&[])`, which no caller produces but which would be a different
+        // WHERE (`IN ()` matches nothing).
+        key.push('*');
     }
     key.push('|');
-    key.push_str(q.type_word.unwrap_or(""));
+    key.push_str(&q.types.join(","));
     key.push('|');
-    key.push_str(q.status_word.unwrap_or(""));
+    key.push_str(&q.statuses.join(","));
+    key.push('|');
+    key.push_str(&q.demographics.join(","));
     key.push('|');
     // Its own dimension, and MANDATORY: `hasChapters` is one WHERE clause, so without it the
     // total for "everything" (115,567) would be served to a viewer who asked for "only what I
@@ -358,19 +741,54 @@ fn count_key(q: &BrowseQuery<'_>) -> String {
         None => '-',
     });
     key.push('|');
-    if let Some(v) = q.min_rating {
-        key.push_str(&v.to_string());
-    }
+    // Numeric bounds, positionally: "min 3, no max" is not "no min, max 3".
+    let num = |key: &mut String, v: Option<String>| {
+        if let Some(v) = v {
+            key.push_str(&v);
+        }
+        key.push('|');
+    };
+    num(&mut key, q.min_rating.map(|v| v.to_string()));
+    num(&mut key, q.max_rating.map(|v| v.to_string()));
+    num(&mut key, q.year_from.map(|v| v.to_string()));
+    num(&mut key, q.year_to.map(|v| v.to_string()));
+    num(&mut key, q.min_chapters.map(|v| v.to_string()));
+    num(&mut key, q.min_follows.map(|v| v.to_string()));
+    num(&mut key, q.min_md_rating.map(|v| v.to_string()));
+    key.push(match q.include_mode {
+        TagMode::And => 'a',
+        TagMode::Or => 'o',
+    });
+    key.push(match q.exclude_mode {
+        TagMode::And => 'a',
+        TagMode::Or => 'o',
+    });
     key.push('|');
-    if let Some(v) = q.max_rating {
-        key.push_str(&v.to_string());
+    // THE FREE-TEXT TAIL, LAST, and self-delimiting. `search_catalogue` could join genres
+    // with `\u{1}` and call the result unforgeable, because it keyed on the escaped LIKE
+    // PATTERNS and the escaping guaranteed no pattern contained a bare `%`. These are RAW
+    // client strings, where no character is off-limits, so a separator-based join is
+    // forgeable: `["a","b"]` and `["a<sep>b"]` would collide for any `<sep>`. Every string is
+    // length-prefixed (`{byte_len}:{s}`) and every LIST count-prefixed (`{n}#`), and the source
+    // is tagged — so a decoder reads the tail deterministically, which is what makes it
+    // injective: `["a","b"]` -> `2#1:a1:b`, while the single tag `a1:b` -> `1#4:a1:b`, and no
+    // string can bleed from one list into the next.
+    fn list(key: &mut String, items: &[String]) {
+        key.push_str(&format!("{}#", items.len()));
+        for s in items {
+            key.push_str(&format!("{}:{}", s.len(), s));
+        }
     }
-    key.push('|');
-    // Last, and length-prefixed — see the doc comment. Nothing may be appended after this
-    // segment without its own delimiter, since a tag can contain '|'.
-    for g in q.genres {
-        key.push_str(&format!("{}:{}", g.len(), g));
+    match &q.source {
+        None => key.push('-'),
+        Some(SourceFilter::MangaDex) => key.push('m'),
+        Some(SourceFilter::Suwayomi) => key.push('s'),
+        Some(SourceFilter::SuwayomiSource(id)) => key.push_str(&format!("i{}:{}", id.len(), id)),
     }
+    list(&mut key, &q.languages);
+    list(&mut key, &q.include_tags);
+    list(&mut key, &q.exclude_tags);
+    list(&mut key, q.genres);
     key
 }
 
@@ -479,8 +897,8 @@ static ROW_CACHE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, (Vec<BrowseRow>, std::time::Instant)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// The memo key for one PAGE of rows: the sort and the (clamped) page, then the whole
-/// filter signature.
+/// The memo key for one PAGE of rows: the sort (key AND direction, [`Sort::word`]) and the
+/// (clamped) page, then the whole filter signature.
 ///
 /// Built ON [`count_key`] rather than beside it, so a filter dimension added there is
 /// covered here by construction — the count key's own test asserts its completeness, and
@@ -491,26 +909,14 @@ static ROW_CACHE: std::sync::LazyLock<
 /// PREPENDED, not appended: the count key's genre segment is last and self-terminating
 /// only to a decoder ("nothing may be appended after this segment without its own
 /// delimiter, since a tag can contain '|'"). Putting sort and page FIRST sidesteps that
-/// argument entirely — both are fixed vocabulary (`sort_word` is a closed set, the page a
+/// argument entirely — both are fixed vocabulary (`Sort::word` is a closed set, the page a
 /// decimal integer) so their `|` boundaries are unforgeable, and the count key keeps its
 /// "genre segment is last" invariant intact.
 ///
 /// The page is clamped with the same `max(1)` [`browse_catalogue`] applies, so page 0 and
 /// page -5 share page 1's entry rather than caching duplicate copies of it.
 fn row_key(q: &BrowseQuery<'_>) -> String {
-    format!("{}|{}|{}", sort_word(q.sort), q.page.max(1), count_key(q))
-}
-
-/// One fixed lowercase word per sort, for [`row_key`]. A closed vocabulary (no client
-/// text), so a bare `|` after it cannot be forged into looking like another key.
-fn sort_word(sort: BrowseSort) -> &'static str {
-    match sort {
-        BrowseSort::Trending => "trending",
-        BrowseSort::Newest => "newest",
-        BrowseSort::LatestAdded => "latest-added",
-        BrowseSort::Rating => "rating",
-        BrowseSort::Chapters => "chapters",
-    }
+    format!("{}|{}|{}", q.sort.word(), q.page.max(1), count_key(q))
 }
 
 fn cached_rows(key: &str) -> Option<Vec<BrowseRow>> {
@@ -552,6 +958,9 @@ fn store_rows_with(key: String, rows: Vec<BrowseRow>, ttl: std::time::Duration) 
 ///
 /// Returns `(where_sql, binds, uses_rated_cte)`. The caller must prepend
 /// [`RATED_PER_WORK_CTE`] to any statement whose flag is set.
+///
+/// Each clause pushes its SQL and its binds TOGETHER, so the bind order is the clause order
+/// by construction rather than by a second list that has to be kept in step.
 fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
     let mut parts: Vec<String> = Vec::new();
     let mut binds: Vec<Bind> = Vec::new();
@@ -560,6 +969,12 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
     // leaves the rest of the index in ORDER BY order (the hot, edge-cacheable path);
     // `true` emits nothing, which is what lets the planner pick the `is_nsfw`-less index
     // instead of sorting 48k rows. NEVER `(? = 1 OR f.is_nsfw = 0)`.
+    //
+    // NOTHING BELOW CAN WIDEN THIS. Every other clause is ANDed onto it, so the content-rating
+    // allow-list in particular can only narrow inside it — `contentRatings: [EROTICA,
+    // PORNOGRAPHIC]` from an opted-out viewer is `is_nsfw = 0 AND content_rating IN (…)`,
+    // which the effective rating (migration 0106) makes empty. Tested as an explicit bypass
+    // attempt.
     if !q.show_nsfw {
         parts.push("f.is_nsfw = 0".into());
     }
@@ -576,33 +991,63 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
     if q.nsfw_only {
         parts.push("f.is_nsfw = 1".into());
     }
-    // Format. "Branched" means the CLAUSE is present or absent, not that the VALUE is
-    // interpolated — it is bound like everything else. What the planner needs is a
-    // single-column equality it can use as a seek prefix, and a bound `?` gives it that
-    // (verified: every shape plans as `SEARCH … USING INDEX idx_fsu_* (is_nsfw=? AND
-    // comic_type=?)`). It is `(? = 1 OR …)` that defeats it, because there the column is not
-    // constrained at all.
-    if q.type_word.is_some() {
-        parts.push("f.comic_type = ?".into());
+    // An `= ?` for one value, `IN (…)` for several. "Branched" means the CLAUSE is present or
+    // absent, not that the VALUE is interpolated — it is bound like everything else. What the
+    // planner needs is a single-column equality it can use as a seek prefix, and a bound `?`
+    // gives it that (verified: every shape plans as `SEARCH … USING INDEX idx_fsu_* (is_nsfw=?
+    // AND comic_type=?)`). It is `(? = 1 OR …)` that defeats it, because there the column is
+    // not constrained at all.
+    fn any_of(parts: &mut Vec<String>, binds: &mut Vec<Bind>, col: &str, vals: &[String]) {
+        match vals.len() {
+            0 => {}
+            1 => parts.push(format!("{col} = ?")),
+            n => parts.push(format!("{col} IN ({})", placeholders(n))),
+        }
+        binds.extend(vals.iter().cloned().map(Bind::Text));
     }
-    // Status: one equality over the normalized five-word vocabulary migration 0068
-    // materializes. Un-normalized this could not be an equality at all — `komika_status`
-    // has no `ON_HIATUS` member, so those rows would be unreachable by every filter value.
-    if q.status_word.is_some() {
-        parts.push("f.status = ?".into());
-    }
-    // Content rating, CUMULATIVE tiers. This narrows WITHIN the NSFW gate and can never
-    // widen it: no `is_nsfw = 0` row carries `erotica` or `pornographic` in production, so
-    // for an opted-out viewer the EROTICA and PORNOGRAPHIC tiers return exactly the
-    // SUGGESTIVE set rather than revealing anything. ALL and PORNOGRAPHIC emit no clause
-    // (they admit every stored value), which is also why they are cheaper than SAFE.
+    let owned = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    // Format. Several formats are ORed (v2); one stays the index-prefix equality v1 had.
+    any_of(&mut parts, &mut binds, "f.comic_type", &owned(&q.types));
+    // Status over the normalized five-word vocabulary migration 0068 materializes.
+    // Un-normalized this could not be an equality at all — `komika_status` has no `ON_HIATUS`
+    // member, so those rows would be unreachable by every filter value.
+    any_of(&mut parts, &mut binds, "f.status", &owned(&q.statuses));
+    // Content rating: an allow-list over the EFFECTIVE rating (see the gate note above).
+    // v1's ALL and PORNOGRAPHIC tiers arrive as `None` and emit no clause (they admit every
+    // stored value), which is also why they are cheaper than SAFE.
     if let Some(r) = q.ratings {
-        if r.len() == 1 {
-            parts.push("f.content_rating = ?".into());
+        if r.is_empty() {
+            // Not produced by any caller, but an empty allow-list means "nothing", and the
+            // SQL `IN ()` it would otherwise format is a syntax error.
+            parts.push("0".into());
         } else {
-            parts.push(format!("f.content_rating IN ({})", placeholders(r.len())));
+            any_of(&mut parts, &mut binds, "f.content_rating", &owned(r));
         }
     }
+    // Demographic. `'none'` is MangaDex's "no demographic", materialized as NULL
+    // (`catalog::BROWSE_DEMOGRAPHIC_SQL`), so it is an `IS NULL` arm rather than a value.
+    {
+        let named: Vec<String> = q
+            .demographics
+            .iter()
+            .filter(|d| **d != "none")
+            .map(|d| d.to_string())
+            .collect();
+        let none = q.demographics.contains(&"none");
+        match (named.is_empty(), none) {
+            (true, false) => {}
+            (true, true) => parts.push("f.demographic IS NULL".into()),
+            (false, false) => any_of(&mut parts, &mut binds, "f.demographic", &named),
+            (false, true) => {
+                parts.push(format!(
+                    "(f.demographic IN ({}) OR f.demographic IS NULL)",
+                    placeholders(named.len())
+                ));
+                binds.extend(named.into_iter().map(Bind::Text));
+            }
+        }
+    }
+    any_of(&mut parts, &mut binds, "f.original_language", &q.languages);
     // The `hasChapters` gate. `en_chapter_count` is the leading sort key of the four CHAPTERS
     // indices and index PAYLOAD on the four `released_at` ones (migration 0069), so this stays
     // index-only on both orderings — measured 2.1-2.5 ms for the COUNT at 115,567 rows versus
@@ -617,17 +1062,105 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
         Some(false) => parts.push("f.en_chapter_count = 0".into()),
         None => {}
     }
-    // Binds, in the order the clauses above were pushed.
-    if let Some(t) = q.type_word {
-        binds.push(Bind::Text(t.to_string()));
+    // Range floors/ceilings. Each is a range bound on a column with its own index (0106), and
+    // each EXCLUDES a NULL — "at least 1,000 follows" cannot be claimed of a work whose follows
+    // we do not know, which is the honest reading and the one MangaDex's own filters use.
+    for (col, op, v) in [
+        ("f.year", ">=", q.year_from),
+        ("f.year", "<=", q.year_to),
+        ("f.en_chapter_count", ">=", q.min_chapters),
+        ("f.follows", ">=", q.min_follows),
+    ] {
+        if let Some(v) = v {
+            parts.push(format!("{col} {op} ?"));
+            binds.push(Bind::Int(v));
+        }
     }
-    if let Some(s) = q.status_word {
-        binds.push(Bind::Text(s.to_string()));
+    if let Some(v) = q.min_md_rating {
+        parts.push("f.rating >= ?".into());
+        binds.push(Bind::Real(v));
     }
-    for v in q.ratings.unwrap_or(&[]) {
-        binds.push(Bind::Text(v.to_string()));
+    // Source. `EXISTS` over `source_series` by `idx_source_series_work(work_id)` — one probe per
+    // candidate row; the family words are fixed vocabulary, a source id is bound.
+    match &q.source {
+        None => {}
+        Some(SourceFilter::MangaDex) => parts.push(
+            "EXISTS (SELECT 1 FROM source_series ss \
+              WHERE ss.work_id = f.work_id AND ss.source_type = 'mangadex')"
+                .into(),
+        ),
+        Some(SourceFilter::Suwayomi) => parts.push(
+            "EXISTS (SELECT 1 FROM source_series ss \
+              WHERE ss.work_id = f.work_id AND ss.source_type = 'suwayomi')"
+                .into(),
+        ),
+        Some(SourceFilter::SuwayomiSource(id)) => {
+            parts.push(
+                "EXISTS (SELECT 1 FROM source_series ss \
+                  WHERE ss.work_id = f.work_id AND ss.source_type = 'suwayomi' \
+                    AND ss.source_id = ?)"
+                    .into(),
+            );
+            binds.push(Bind::Text(id.clone()));
+        }
     }
-    // Genre ANY-match. Deliberately NO `t.source` predicate, unlike
+    // TAGS, by `work_tag.tag_key` (migration 0106), with NO `source` predicate for the reason
+    // the v1 genre clause below gives: a work matches every tag it carries, on every tier.
+    //
+    // INCLUDE-AND: "carries ALL n". One uncorrelated subquery, driven by
+    // `idx_work_tag_key_work(tag_key, work_id)` — a covering SEEK per tag — whose GROUP BY
+    // keeps the works that matched all n DISTINCT keys (DISTINCT because two display names can
+    // slug to one key on one work; see `tags::rebuild_tag_table`). SQLite materializes the
+    // work-id list once and probes it per candidate row, so the cost is proportional to the
+    // tags' postings, never a scan of `work_tag`. With one tag the GROUP BY is dropped.
+    //
+    // INCLUDE-OR: "carries ANY". A correlated `EXISTS` through
+    // `idx_work_tag_work_key(work_id, tag_key)` — one covering probe per candidate row, which
+    // is what an ANY-match over potentially huge tags ("Action": ~40% of the catalogue) wants;
+    // a materialized list of every Action work would be the larger structure.
+    //
+    // EXCLUDE-OR: drop works carrying ANY → `NOT EXISTS` over the same probe.
+    // EXCLUDE-AND: drop only works carrying ALL → `NOT IN` the include-AND list.
+    //
+    // An id no work carries (unknown, or the `UNMATCHABLE` sentinel) needs no special case:
+    // under include-AND nothing has it so nothing matches; under include-OR it adds nothing;
+    // excluded, it excludes nothing. `browse::tests::tag_filters_use_the_tag_indexes` pins all
+    // four plans.
+    fn all_of_list(n: usize) -> String {
+        if n == 1 {
+            "SELECT t.work_id FROM work_tag t WHERE t.tag_key = ?".to_string()
+        } else {
+            format!(
+                "SELECT t.work_id FROM work_tag t WHERE t.tag_key IN ({}) \
+                 GROUP BY t.work_id HAVING COUNT(DISTINCT t.tag_key) = {n}",
+                placeholders(n)
+            )
+        }
+    }
+    fn any_probe(n: usize) -> String {
+        format!(
+            "SELECT 1 FROM work_tag t WHERE t.work_id = f.work_id AND t.tag_key IN ({})",
+            placeholders(n)
+        )
+    }
+    if !q.include_tags.is_empty() {
+        let n = q.include_tags.len();
+        parts.push(match q.include_mode {
+            TagMode::And => format!("f.work_id IN ({})", all_of_list(n)),
+            TagMode::Or => format!("EXISTS ({})", any_probe(n)),
+        });
+        binds.extend(q.include_tags.iter().cloned().map(Bind::Text));
+    }
+    if !q.exclude_tags.is_empty() {
+        let n = q.exclude_tags.len();
+        parts.push(match q.exclude_mode {
+            TagMode::And if n > 1 => format!("f.work_id NOT IN ({})", all_of_list(n)),
+            // One tag: "all of {x}" and "any of {x}" are the same set; the probe is cheaper.
+            TagMode::And | TagMode::Or => format!("NOT EXISTS ({})", any_probe(n)),
+        });
+        binds.extend(q.exclude_tags.iter().cloned().map(Bind::Text));
+    }
+    // v1 genre ANY-match, by display NAME. Deliberately NO `t.source` predicate, unlike
     // `catalog::work_effective_genres`, which applies admin-over-upstream-over-source tier
     // PRECEDENCE because it is choosing what to DISPLAY. Filtering is a different question:
     // a work should match any tag it carries, on any tier, or a work whose admin curation
@@ -673,40 +1206,32 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
     (where_sql, binds, uses_rated)
 }
 
-/// The ORDER BY for a single-phase sort. Both keys are materialized columns with a
-/// dedicated index per (NSFW branch x format branch) shape, so neither sorts.
+/// The ORDER BY for a single-phase column sort: the key, then `f.work_id`, both in the
+/// requested direction (invariant 3) — so every shape walks one `(…, key DESC, work_id DESC)`
+/// index, forwards for DESC and backwards for ASC, and never sorts.
 ///
 /// `released_at DESC` puts the 67,000 works with a NULL `released_at` LAST, because SQLite
 /// treats NULL as smaller than every value — so no `NULLS LAST` clause (which SQLite only
 /// gained in 3.30 and which would defeat the index anyway) is needed. VERIFIED on a
 /// 115,567-row copy of production: the first row is dated, the last is NULL, the 30-row
 /// window straddling row 48,567 is 15 dated then 15 NULL, and the plan at that boundary is
-/// still `SEARCH … USING COVERING INDEX idx_bc_order` with no temp B-tree.
-fn order_by(sort: BrowseSort) -> &'static str {
-    match sort {
-        BrowseSort::Chapters => "f.en_chapter_count DESC, f.work_id DESC",
-        // The WORK clock, not the chapter clock. `announced_at` (0101's key) is
-        // `MAX(COALESCE(announce_at, first_seen_at))` over the work's release events, so
-        // every new chapter of an already-tracked series bumps it to ~now — the /updates
-        // order, which filled "Latest added" with actively-updating (and therefore
-        // trending) works while genuinely new intake sat pages deep. `created_at` is
-        // `work.created_at` verbatim: when the work entered OUR catalogue, the same field
-        // `Series.createdAt` and the reader's `addedAt` resolve from.
-        //
-        // TEXT ISO-8601 under BINARY collation, which is chronological here: every
-        // production writer stamps either chrono `to_rfc3339()` ("…+00:00") or the
-        // schema's strftime("…Z"), and the date-time digits decide every comparison
-        // before the suffix. The two suffix encodings can mis-order two rows that fall
-        // in the SAME second ('Z' sorts above both '+' and '.'), by at most that one
-        // second; every "Z" row shares 0005's single backfill instant, so in practice
-        // this touches nothing, and the ordering stays deterministic either way.
-        // NOT NULL on every row (0069), so there is no NULLS-last case. Index shapes:
-        // migration 0102.
-        BrowseSort::LatestAdded => "f.created_at DESC, f.work_id DESC",
-        // NEWEST, and the second phase of RATING/TRENDING, which page their unranked
-        // remainder on this same key.
-        _ => "f.released_at DESC, f.work_id DESC",
-    }
+/// still `SEARCH … USING COVERING INDEX idx_bc_order` with no temp B-tree. The same holds for
+/// every nullable key under DESC; under ASC the NULLs would come FIRST, which is why
+/// [`browse_catalogue`] runs a nullable ASC sort through [`nulls_last_page`] instead.
+///
+/// LATEST_ADDED (`created_at`) is the WORK clock, not the chapter clock. `announced_at`
+/// (0101's key) is `MAX(COALESCE(announce_at, first_seen_at))` over the work's release
+/// events, so every new chapter of an already-tracked series bumps it to ~now — the /updates
+/// order, which filled "Latest added" with actively-updating (and therefore trending) works
+/// while genuinely new intake sat pages deep. `created_at` is `work.created_at` verbatim:
+/// when the work entered OUR catalogue, the same field `Series.createdAt` and the reader's
+/// `addedAt` resolve from. TEXT ISO-8601 under BINARY collation, which is chronological
+/// here: every production writer stamps either chrono `to_rfc3339()` ("…+00:00") or the
+/// schema's strftime("…Z"), and the date-time digits decide every comparison before the
+/// suffix. NOT NULL on every row (0069). Index shapes: migration 0102.
+fn order_by(col: &str, desc: bool) -> String {
+    let d = dir(desc);
+    format!("{col} {d}, f.work_id {d}")
 }
 
 /// Run one page statement.
@@ -768,6 +1293,191 @@ pub async fn rows_by_work_ids(pool: &SqlitePool, ids: &[String]) -> Result<Vec<B
     Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
 }
 
+/// Browse v2's TEXT search: full-text matches, narrowed by the SAME WHERE Browse uses, ranked
+/// by RELEVANCE unless another sort was asked for. Returns `(total, page)`.
+///
+/// WHY THIS EXISTS. `search` used to send any non-empty query to
+/// `catalog::search_works_fts`, which knows nothing about filters, and dropped every filter
+/// on the floor — so "romance, completed, Korean" plus a title word returned every title
+/// match. Applying filters AFTER the fetch would have corrupted `total` and pagination (a
+/// 30-row page filtered down to 4, a pager promising pages that do not exist), which is why
+/// that path refused to filter at all. Here the filter is part of the candidate query, so
+/// `total` counts exactly what the pages walk.
+///
+/// THE SHAPE. `m` is the FTS match set with its bm25 rank; it is JOINed to `browse_catalogue f`
+/// by primary key, so [`build_where`]'s clauses — written against `f` — apply VERBATIM (one
+/// WHERE for Browse and search, invariant 1). The FTS index drives: a match set is small next
+/// to the catalogue, and each candidate costs one PK probe plus the filter's own probes.
+///
+/// RELEVANCE keeps `search_works_fts`' ranking exactly — the title tier
+/// (`catalog::fts_title_tier`, shared, not copied), then `chapters DESC`, then bm25, then
+/// `work_id` — over the same bounded window of the `RANK_WINDOW` bm25-best candidates, but
+/// the window is now taken AFTER the filter, so a narrow filter still fills its pages from
+/// deeper in the bm25 order. `total` is capped at the window, as before, so `hasNextPage`
+/// never promises a page past it. Direction is ignored for RELEVANCE (there is no "least
+/// relevant first").
+///
+/// ANY OTHER SORT re-orders the whole filtered match set — no window, because "the 500
+/// bm25-best, by follows" is not "by follows" — and `total` is the full filtered match count.
+/// That sorts the matches through a temp B-tree, which is bounded by the match set (the
+/// 3-character query floor keeps the worst case to tens of thousands of rows) rather than by
+/// the catalogue. NULL keys sort last in both directions, as in Browse.
+///
+/// NSFW: [`build_where`]'s gate on the materialized flag, PLUS the live
+/// `COALESCE(is_nsfw_override, is_nsfw)` on `work` that `search_works_fts` always applied — an
+/// override written since the last Browse rebuild is honoured here immediately, and the
+/// resolver's `filter_nsfw` backstop still runs after hydration.
+pub async fn search_text(
+    pool: &SqlitePool,
+    raw_query: &str,
+    q: &BrowseQuery<'_>,
+) -> Result<(i64, Vec<BrowseRow>)> {
+    let Some(match_expr) = crate::catalog::fts_match_query(raw_query) else {
+        return Ok((0, Vec::new()));
+    };
+    let (where_sql, where_binds, uses_rated) = build_where(q);
+    let page_size = BROWSE_PAGE_SIZE;
+    let page = q.page.max(1);
+    let offset = (page - 1) * page_size;
+    let window = crate::catalog::RANK_WINDOW;
+    let gate = if q.show_nsfw {
+        ""
+    } else {
+        " AND COALESCE(w.is_nsfw_override, w.is_nsfw) = 0"
+    };
+    let relevance = q.sort.key == SortKey::Relevance;
+    let community = q.sort.key == SortKey::CommunityRating;
+    let rated_def = if uses_rated || community {
+        format!("{RATED_PER_WORK_DEF}, ")
+    } else {
+        String::new()
+    };
+    const M_CTE: &str = "m AS (SELECT work_fts.work_id AS work_id, \
+                                 CAST(work_fts.chapters AS INTEGER) AS chapters, \
+                                 bm25(work_fts, 0.0, 0.0, 10.0, 1.0) AS rank \
+                            FROM work_fts WHERE work_fts MATCH ?)";
+    let from = "FROM m JOIN browse_catalogue f ON f.work_id = m.work_id \
+                JOIN work w ON w.id = f.work_id";
+    let mut head: Vec<Bind> = vec![Bind::Text(match_expr.clone())];
+    head.extend(where_binds.iter().cloned());
+
+    // total. The memo key carries the MATCH expression (length-prefixed — it is client text)
+    // and the window flag, on top of the filter signature.
+    let ckey = format!(
+        "fts|{}|{}:{}|{}",
+        u8::from(relevance),
+        match_expr.len(),
+        match_expr,
+        count_key(q)
+    );
+    let total = match cached_count(&ckey) {
+        Some(t) => t,
+        None => {
+            let (sql, binds) = if relevance {
+                let mut b = head.clone();
+                b.push(Bind::Int(window));
+                (
+                    format!(
+                        "WITH {rated_def}{M_CTE} SELECT COUNT(*) FROM \
+                         (SELECT 1 {from} WHERE {where_sql}{gate} LIMIT ?)"
+                    ),
+                    b,
+                )
+            } else {
+                (
+                    format!(
+                        "WITH {rated_def}{M_CTE} SELECT COUNT(*) {from} \
+                         WHERE {where_sql}{gate}"
+                    ),
+                    head.clone(),
+                )
+            };
+            let t = bind_count(sqlx::query_scalar::<_, i64>(&sql), &binds)
+                .fetch_one(pool)
+                .await?;
+            store_count(ckey, t);
+            t
+        }
+    };
+    if offset >= total {
+        return Ok((total, Vec::new()));
+    }
+
+    if relevance {
+        let (tier, tier_params) = crate::catalog::fts_title_tier(raw_query);
+        let sql = format!(
+            "WITH {rated_def}{M_CTE}, \
+             cand AS (SELECT m.work_id AS work_id, m.chapters AS chapters, m.rank AS rank \
+                        {from} WHERE {where_sql}{gate} ORDER BY m.rank LIMIT ?) \
+             SELECT {BROWSE_COLS} FROM cand c \
+               JOIN browse_catalogue f ON f.work_id = c.work_id \
+               JOIN work w ON w.id = c.work_id \
+              ORDER BY {tier}, c.chapters DESC, c.rank, c.work_id LIMIT ? OFFSET ?"
+        );
+        let mut binds = head;
+        binds.push(Bind::Int(window));
+        binds.extend(tier_params.into_iter().map(Bind::Text));
+        let rows = bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), &binds)
+            .bind(page_size.min(window))
+            .bind(offset)
+            .fetch_all(pool)
+            .await?;
+        return Ok((total, rows));
+    }
+
+    // Every other sort over the filtered match set.
+    let d = dir(q.sort.desc);
+    let mut extra_cte = String::new();
+    let mut extra_join = String::new();
+    let mut cte_binds: Vec<Bind> = Vec::new();
+    let order = match q.sort.key {
+        SortKey::MostViewed => {
+            // The view ranking as a VALUES table of (work_id, position) — positions are our
+            // own integers, formatted; the ids are bound. Unviewed works (no row) sort last
+            // in both directions, then newest-first like Browse's remainder.
+            let ranked = trending_work_ids(pool, TRENDING_KEY_LIMIT).await;
+            if ranked.is_empty() {
+                NEWEST_ORDER.to_string()
+            } else {
+                let values = (0..ranked.len())
+                    .map(|i| format!("(?, {i})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                extra_cte = format!(", tr(wid, pos) AS (VALUES {values})");
+                extra_join = " LEFT JOIN tr ON tr.wid = f.work_id".into();
+                cte_binds.extend(ranked.into_iter().map(Bind::Text));
+                // Most viewed = position 0 first, so DESC ranks ascending positions.
+                let pd = dir(!q.sort.desc);
+                format!("(tr.pos IS NULL), tr.pos {pd}, {NEWEST_ORDER}")
+            }
+        }
+        SortKey::CommunityRating => {
+            extra_join = " LEFT JOIN rated_per_work rp ON rp.wid = f.work_id".into();
+            format!("(rp.avg IS NULL), rp.avg {d}, {NEWEST_ORDER}")
+        }
+        key => match sort_column(key) {
+            Some((col, true)) => format!("({col} IS NULL), {}", order_by(col, q.sort.desc)),
+            Some((col, false)) => order_by(col, q.sort.desc),
+            None => NEWEST_ORDER.to_string(),
+        },
+    };
+    let sql = format!(
+        "WITH {rated_def}{M_CTE}{extra_cte} SELECT {BROWSE_COLS} {from}{extra_join} \
+         WHERE {where_sql}{gate} ORDER BY {order} LIMIT ? OFFSET ?"
+    );
+    // Bind order follows the text: the MATCH (in `m`), the VALUES ids (in `tr`), then the
+    // WHERE's binds.
+    let mut binds: Vec<Bind> = vec![Bind::Text(match_expr)];
+    binds.extend(cte_binds);
+    binds.extend(where_binds);
+    let rows = bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), &binds)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+    Ok((total, rows))
+}
+
 /// Catalogue-wide Browse. Returns `(total, page)` where `total` counts exactly the row set
 /// the page query walks.
 pub async fn browse_catalogue(
@@ -808,20 +1518,8 @@ pub async fn browse_catalogue(
         return Ok((total, rows));
     }
 
-    let rows = match q.sort {
-        BrowseSort::Newest | BrowseSort::LatestAdded | BrowseSort::Chapters => {
-            fetch_page(
-                pool,
-                uses_rated,
-                &where_sql,
-                "",
-                &binds,
-                order_by(q.sort),
-                page_size,
-                offset,
-            )
-            .await?
-        }
+    let sort = q.sort.for_browse();
+    let rows = match sort.key {
         // TWO-PHASE, both of them, for the same reason: the ranking key exists for a tiny
         // minority of works ("unrated last" / "never viewed last"), which makes the ranked
         // set a strict PREFIX of the result list. The naive form — `LEFT JOIN` the
@@ -829,13 +1527,135 @@ pub async fn browse_catalogue(
         // B-tree on every page, including the ~99.99% of pages that contain no ranked row
         // at all. Phase 1 pages the ranked prefix; phase 2 runs only when the page reaches
         // past it and pages the remainder on `released_at DESC` off an existing index.
-        BrowseSort::Rating => rating_page(pool, &where_sql, &binds, page_size, offset).await?,
-        BrowseSort::Trending => {
-            trending_page(pool, &where_sql, &binds, uses_rated, page_size, offset).await?
+        SortKey::CommunityRating => {
+            rating_page(pool, &where_sql, &binds, sort.desc, page_size, offset).await?
+        }
+        SortKey::MostViewed => {
+            trending_page(
+                pool, &where_sql, &binds, uses_rated, sort.desc, page_size, offset,
+            )
+            .await?
+        }
+        key => {
+            // `for_browse` has already turned RELEVANCE into LATEST_UPDATE; every other key
+            // left is a column.
+            let (col, nullable) = sort_column(key).unwrap_or(("f.released_at", true));
+            if nullable && !sort.desc {
+                // A nullable key ASCENDING would put its NULLs FIRST (SQLite collates NULL
+                // lowest) — "fewest follows" opening on 60k works nobody has counted. Split
+                // instead, exactly like the two-phase rankings: the non-NULL prefix in key
+                // order off the same index walked backwards, then the NULLs.
+                let ctx = PageCtx {
+                    pool,
+                    uses_rated,
+                    where_sql: &where_sql,
+                    binds: &binds,
+                    count_key: &key_for_nulls(col, q),
+                };
+                nulls_last_page(&ctx, col, page_size, offset).await?
+            } else {
+                fetch_page(
+                    pool,
+                    uses_rated,
+                    &where_sql,
+                    "",
+                    &binds,
+                    &order_by(col, sort.desc),
+                    page_size,
+                    offset,
+                )
+                .await?
+            }
         }
     };
     store_rows(rkey, rows.clone());
     Ok((total, rows))
+}
+
+/// The memo key for a nullable sort's non-NULL prefix length: the column, then the filter
+/// signature. A separate entry from the total (it is a different COUNT), memoized under the
+/// same TTL and cleared by the same [`clear_count_cache`], so a deep ASC page does not pay
+/// two COUNTs per request.
+fn key_for_nulls(col: &str, q: &BrowseQuery<'_>) -> String {
+    format!("nn:{col}|{}", count_key(q))
+}
+
+/// What a phase function needs to run statements over the shared WHERE.
+struct PageCtx<'a> {
+    pool: &'a SqlitePool,
+    uses_rated: bool,
+    where_sql: &'a str,
+    binds: &'a [Bind],
+    count_key: &'a str,
+}
+
+/// A nullable column sorted ASCENDING with its NULLs LAST: the non-NULL rows in `col ASC,
+/// work_id ASC` order, then the NULL rows in `work_id ASC` order.
+///
+/// Same shape and the same [`split_two_phase`] arithmetic as the rankings. Phase 1 is
+/// `col IS NOT NULL` — a range bound on the key's own index, walked backwards — and phase 2
+/// is its exact complement, `col IS NULL`, so no row can appear in both (the reader's grid
+/// keys on the id and a duplicate kills the page; see [`rating_page`]). The prefix COUNT is
+/// memoized like the total.
+async fn nulls_last_page(
+    ctx: &PageCtx<'_>,
+    col: &str,
+    page_size: i64,
+    offset: i64,
+) -> Result<Vec<BrowseRow>> {
+    let prefix_len = match cached_count(ctx.count_key) {
+        Some(n) => n,
+        None => {
+            let prelude = if ctx.uses_rated {
+                RATED_PER_WORK_CTE
+            } else {
+                ""
+            };
+            let sql = format!(
+                "{prelude}SELECT COUNT(*) FROM browse_catalogue f \
+                 WHERE {} AND {col} IS NOT NULL",
+                ctx.where_sql
+            );
+            let n = bind_count(sqlx::query_scalar::<_, i64>(&sql), ctx.binds)
+                .fetch_one(ctx.pool)
+                .await?;
+            store_count(ctx.count_key.to_string(), n);
+            n
+        }
+    };
+    let (take_prefix, take_rest, rest_offset) = split_two_phase(prefix_len, offset, page_size);
+    let mut rows = Vec::with_capacity(page_size as usize);
+    if take_prefix > 0 {
+        rows.extend(
+            fetch_page(
+                ctx.pool,
+                ctx.uses_rated,
+                ctx.where_sql,
+                &format!(" AND {col} IS NOT NULL"),
+                ctx.binds,
+                &order_by(col, false),
+                take_prefix,
+                offset,
+            )
+            .await?,
+        );
+    }
+    if take_rest > 0 {
+        rows.extend(
+            fetch_page(
+                ctx.pool,
+                ctx.uses_rated,
+                ctx.where_sql,
+                &format!(" AND {col} IS NULL"),
+                ctx.binds,
+                "f.work_id ASC",
+                take_rest,
+                rest_offset,
+            )
+            .await?,
+        );
+    }
+    Ok(rows)
 }
 
 /// How many rows a two-phase sort should take from its ranked prefix, and how many from
@@ -866,9 +1686,11 @@ async fn rating_page(
     pool: &SqlitePool,
     where_sql: &str,
     binds: &[Bind],
+    desc: bool,
     page_size: i64,
     offset: i64,
 ) -> Result<Vec<BrowseRow>> {
+    let d = dir(desc);
     let count_sql = format!(
         "{RATED_PER_WORK_CTE}SELECT COUNT(*) FROM browse_catalogue f \
          JOIN rated_per_work rp ON rp.wid = f.work_id WHERE {where_sql}"
@@ -883,7 +1705,7 @@ async fn rating_page(
         let sql = format!(
             "{RATED_PER_WORK_CTE}SELECT {BROWSE_COLS} FROM browse_catalogue f \
              JOIN rated_per_work rp ON rp.wid = f.work_id WHERE {where_sql} \
-             ORDER BY rp.avg DESC, f.work_id DESC LIMIT ? OFFSET ?"
+             ORDER BY rp.avg {d}, f.work_id {d} LIMIT ? OFFSET ?"
         );
         let q = bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), binds);
         rows.extend(q.bind(take_rated).bind(offset).fetch_all(pool).await?);
@@ -902,7 +1724,7 @@ async fn rating_page(
                 where_sql,
                 extra,
                 binds,
-                order_by(BrowseSort::Newest),
+                NEWEST_ORDER,
                 take_rest,
                 rest_offset,
             )
@@ -933,10 +1755,16 @@ async fn trending_page(
     where_sql: &str,
     binds: &[Bind],
     uses_rated: bool,
+    desc: bool,
     page_size: i64,
     offset: i64,
 ) -> Result<Vec<BrowseRow>> {
-    let ranked = trending_work_ids(pool, TRENDING_KEY_LIMIT).await;
+    let mut ranked = trending_work_ids(pool, TRENDING_KEY_LIMIT).await;
+    // ASCENDING = least-viewed of the VIEWED works first. The never-viewed remainder stays
+    // last either way: it has no view count, and an unknown sorts last in both directions.
+    if !desc {
+        ranked.reverse();
+    }
     if ranked.is_empty() {
         // No views recorded in the window: TRENDING degenerates to NEWEST over the whole
         // filtered set. Returning nothing would be the wrong reading of "sort by trending"
@@ -947,7 +1775,7 @@ async fn trending_page(
             where_sql,
             "",
             binds,
-            order_by(BrowseSort::Newest),
+            NEWEST_ORDER,
             page_size,
             offset,
         )
@@ -998,7 +1826,7 @@ async fn trending_page(
                 where_sql,
                 &extra,
                 &rest_binds,
-                order_by(BrowseSort::Newest),
+                NEWEST_ORDER,
                 take_rest,
                 rest_offset,
             )
@@ -1159,16 +1987,9 @@ mod tests {
     fn q<'a>(sort: BrowseSort, page: i64) -> BrowseQuery<'a> {
         BrowseQuery {
             show_nsfw: true,
-            type_word: None,
-            status_word: None,
-            ratings: None,
-            nsfw_only: false,
-            genres: &[],
-            min_rating: None,
-            max_rating: None,
-            has_chapters: None,
-            sort,
+            sort: sort.into(),
             page,
+            ..Default::default()
         }
     }
 
@@ -1488,15 +2309,15 @@ mod tests {
         let pool = pool().await;
         fixture(&pool).await;
         let mut query = q(BrowseSort::Newest, 1);
-        query.type_word = Some("MANGA");
+        query.types = vec!["MANGA"];
         assert_eq!(
             titles(&pool, &query).await,
             (3, vec!["A".into(), "D".into(), "E".into()])
         );
-        query.status_word = Some("ONGOING");
+        query.statuses = vec!["ONGOING"];
         assert_eq!(titles(&pool, &query).await, (1, vec!["A".into()]));
         // A status word no row carries is empty, not unfiltered.
-        query.status_word = Some("HIATUS");
+        query.statuses = vec!["HIATUS"];
         assert_eq!(titles(&pool, &query).await, (0, Vec::<String>::new()));
     }
 
@@ -1889,10 +2710,10 @@ mod tests {
             with(&|c| c.show_nsfw = false),
             with(&|c| c.ratings = Some(&["safe"])),
             with(&|c| c.ratings = Some(&["safe", "suggestive"])),
-            with(&|c| c.type_word = Some("MANGA")),
-            with(&|c| c.type_word = Some("MANHWA")),
-            with(&|c| c.status_word = Some("ONGOING")),
-            with(&|c| c.status_word = Some("COMPLETED")),
+            with(&|c| c.types = vec!["MANGA"]),
+            with(&|c| c.types = vec!["MANHWA"]),
+            with(&|c| c.statuses = vec!["ONGOING"]),
+            with(&|c| c.statuses = vec!["COMPLETED"]),
             with(&|c| c.min_rating = Some(3.0)),
             with(&|c| c.max_rating = Some(3.0)),
             // `hasChapters` is ONE WHERE clause, so it is the easiest dimension to forget —
@@ -2124,5 +2945,928 @@ mod tests {
                 ("Romance".into(), 3)
             ]
         );
+    }
+
+    // ---- Browse v2 -----------------------------------------------------------------------
+
+    /// Migration 0106's columns on an already-seeded row, plus its tag KEYS.
+    #[allow(clippy::too_many_arguments)]
+    async fn v2(
+        pool: &SqlitePool,
+        work_id: &str,
+        demographic: Option<&str>,
+        lang: Option<&str>,
+        year: Option<i64>,
+        follows: Option<i64>,
+        rating: Option<f64>,
+        tags: &[&str],
+    ) {
+        sqlx::query(
+            "UPDATE browse_catalogue SET demographic = ?, original_language = ?, year = ?, \
+                    follows = ?, rating = ? WHERE work_id = ?",
+        )
+        .bind(demographic)
+        .bind(lang)
+        .bind(year)
+        .bind(follows)
+        .bind(rating)
+        .bind(work_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        for t in tags {
+            tag(pool, work_id, t, t, "mangadex").await;
+        }
+    }
+
+    /// One `work_tag` row with an explicit display name and key.
+    async fn tag(pool: &SqlitePool, work_id: &str, name: &str, key: &str, source: &str) {
+        sqlx::query(
+            "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) VALUES (?, ?, 0, ?, ?)",
+        )
+        .bind(work_id)
+        .bind(name)
+        .bind(source)
+        .bind(key)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// [`fixture`] plus every v2 dimension, all DISTINCT per work so each assertion below
+    /// proves which column it read:
+    ///
+    /// ```text
+    ///  id  rating(eff)   nsfw demo     lang year follows md-rating ch  tags
+    ///  A   safe          0    shounen  ja   2001 500     8.0       10  action comedy
+    ///  B   suggestive    0    seinen   ko   2015 100     9.0       40  action romance
+    ///  C   erotica       1    josei    zh   2010 900     7.0       20  romance comedy
+    ///  D   safe          0    (none)   ja   -    -       -         30  comedy
+    ///  E   pornographic  1    shoujo   ja   1995 50      6.0       50  action romance comedy
+    /// ```
+    /// `(work_id, demographic, language, year, follows, md-rating, tag keys)`.
+    type V2Row<'a> = (
+        &'a str,
+        Option<&'a str>,
+        &'a str,
+        Option<i64>,
+        Option<i64>,
+        Option<f64>,
+        &'a [&'a str],
+    );
+
+    async fn fixture_v2(pool: &SqlitePool) {
+        fixture(pool).await;
+        let rows: [V2Row<'_>; 5] = [
+            (
+                "w_a",
+                Some("shounen"),
+                "ja",
+                Some(2001),
+                Some(500),
+                Some(8.0),
+                &["action", "comedy"],
+            ),
+            (
+                "w_b",
+                Some("seinen"),
+                "ko",
+                Some(2015),
+                Some(100),
+                Some(9.0),
+                &["action", "romance"],
+            ),
+            (
+                "w_c",
+                Some("josei"),
+                "zh",
+                Some(2010),
+                Some(900),
+                Some(7.0),
+                &["romance", "comedy"],
+            ),
+            ("w_d", None, "ja", None, None, None, &["comedy"]),
+            (
+                "w_e",
+                Some("shoujo"),
+                "ja",
+                Some(1995),
+                Some(50),
+                Some(6.0),
+                &["action", "romance", "comedy"],
+            ),
+        ];
+        for (w, demo, lang, year, follows, rating, tags) in rows {
+            v2(pool, w, demo, Some(lang), year, follows, rating, tags).await;
+        }
+    }
+
+    fn sorted(sort: SortKey, desc: bool) -> BrowseQuery<'static> {
+        BrowseQuery {
+            show_nsfw: true,
+            sort: Sort { key: sort, desc },
+            ..Default::default()
+        }
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Include/exclude × AND/OR, by tag KEY, with `total` describing the filtered set.
+    #[tokio::test]
+    async fn tag_filters_include_and_exclude_in_both_modes() {
+        let pool = pool().await;
+        fixture_v2(&pool).await;
+        let run = |inc: &[&str], im: TagMode, exc: &[&str], em: TagMode| {
+            let pool = pool.clone();
+            let (inc, exc) = (ids(inc), ids(exc));
+            async move {
+                let mut query = sorted(SortKey::LatestUpdate, true);
+                query.include_tags = canonical_tag_ids(&inc);
+                query.include_mode = im;
+                query.exclude_tags = canonical_tag_ids(&exc);
+                query.exclude_mode = em;
+                titles(&pool, &query).await
+            }
+        };
+        use TagMode::{And, Or};
+        let set = |v: &[&str]| (v.len() as i64, ids(v));
+        assert_eq!(
+            run(&["action", "romance"], And, &[], Or).await,
+            set(&["B", "E"])
+        );
+        assert_eq!(
+            run(&["action", "romance"], Or, &[], Or).await,
+            set(&["A", "B", "C", "E"])
+        );
+        assert_eq!(run(&["romance"], And, &[], Or).await, set(&["B", "C", "E"]));
+        // Exclude ANY: drop every work carrying romance.
+        assert_eq!(run(&[], And, &["romance"], Or).await, set(&["A", "D"]));
+        // Exclude ALL: drop only works carrying BOTH action and romance (B, E).
+        assert_eq!(
+            run(&[], And, &["action", "romance"], And).await,
+            set(&["A", "C", "D"])
+        );
+        assert_eq!(
+            run(&[], And, &["action", "romance"], Or).await,
+            set(&["D"]),
+            "exclude-OR of the same pair drops everything carrying either"
+        );
+        // Combined: action works that are not comedies.
+        assert_eq!(run(&["action"], Or, &["comedy"], Or).await, set(&["B"]));
+        // Unknown ids MATCH NOTHING: an include-AND containing one is empty, an include-OR
+        // is unaffected by it, an exclude of it excludes nothing — and an implausible id
+        // (the sentinel) behaves exactly the same.
+        assert_eq!(
+            run(&["action", "no-such-tag"], And, &[], Or).await,
+            set(&[])
+        );
+        assert_eq!(
+            run(&["action", "no-such-tag"], Or, &[], Or).await,
+            set(&["A", "B", "E"])
+        );
+        assert_eq!(
+            run(&["action", "DROP TABLE work;"], And, &[], Or).await,
+            set(&[])
+        );
+        assert_eq!(run(&[], And, &["no-such-tag"], Or).await.0, 5);
+        // Two display names that slug to ONE key on one work ("Sci fi" by an admin and
+        // "Sci-Fi" from MangaDex) are one tag: AND over {sci-fi, action} still matches A,
+        // which a COUNT(*) instead of COUNT(DISTINCT tag_key) would get wrong (3 rows, n=2).
+        tag(&pool, "w_a", "Sci fi", "sci-fi", "admin").await;
+        tag(&pool, "w_a", "Sci-Fi", "sci-fi", "mangadex").await;
+        assert_eq!(run(&["sci-fi", "action"], And, &[], Or).await, set(&["A"]));
+        assert_eq!(
+            run(&["sci-fi", "comedy", "action"], And, &[], Or).await,
+            set(&["A"])
+        );
+    }
+
+    /// THE BYPASS ATTEMPT: an opted-out viewer asking for EROTICA + PORNOGRAPHIC gets
+    /// nothing — not the adult works, and not "everything they may see" either. Same for
+    /// every other v2 dimension that could be used to reach an NSFW row (its tags, its
+    /// language, its demographic, a text query).
+    #[tokio::test]
+    async fn content_ratings_cannot_bypass_the_nsfw_gate() {
+        let pool = pool().await;
+        fixture_v2(&pool).await;
+        let adult: &[&str] = &["erotica", "pornographic"];
+        let mut query = sorted(SortKey::LatestUpdate, true);
+        query.show_nsfw = false;
+        query.ratings = Some(adult);
+        assert_eq!(titles(&pool, &query).await, (0, vec![]));
+        // Aimed squarely at the NSFW works' unique attributes, still nothing.
+        query.ratings = None;
+        query.languages = ids(&["zh"]);
+        query.demographics = vec!["josei"];
+        assert_eq!(titles(&pool, &query).await, (0, vec![]));
+        // The same request opted IN returns exactly the two adult works.
+        let mut opted_in = sorted(SortKey::LatestUpdate, true);
+        opted_in.ratings = Some(adult);
+        assert_eq!(titles(&pool, &opted_in).await, (2, ids(&["C", "E"])));
+
+        // The EFFECTIVE rating: a source-flagged NSFW work with no MangaDex rating was
+        // stored as 'safe'. Materialized through the real expression it reads as 'erotica', so
+        // SAFE never returns an adult work, even to an opted-in viewer.
+        sqlx::query("UPDATE browse_catalogue SET content_rating = 'safe', is_nsfw = 1 WHERE work_id = 'w_c'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let eff = crate::catalog::effective_content_rating_sql("content_rating", "is_nsfw");
+        sqlx::query(&format!(
+            "UPDATE browse_catalogue SET content_rating = {eff}"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let safe: &[&str] = &["safe"];
+        let mut q_safe = sorted(SortKey::LatestUpdate, true);
+        q_safe.ratings = Some(safe);
+        assert_eq!(titles(&pool, &q_safe).await, (2, ids(&["A", "D"])));
+        q_safe.ratings = Some(&["erotica"]);
+        assert_eq!(titles(&pool, &q_safe).await.1, ids(&["C"]));
+    }
+
+    /// Every other v2 filter dimension, alone, with `total` following.
+    #[tokio::test]
+    async fn v2_attribute_filters_narrow_and_total_follows() {
+        let pool = pool().await;
+        fixture_v2(&pool).await;
+        let run = |f: &dyn Fn(&mut BrowseQuery<'static>)| {
+            let mut query = sorted(SortKey::LatestUpdate, true);
+            f(&mut query);
+            let pool = pool.clone();
+            async move { titles(&pool, &query).await }
+        };
+        let set = |v: &[&str]| (v.len() as i64, ids(v));
+        // Several statuses / formats are ORed (v1 honoured only the first format).
+        assert_eq!(
+            run(&|q| q.statuses = vec!["COMPLETED", "ONGOING"]).await,
+            set(&["A", "B"])
+        );
+        assert_eq!(
+            run(&|q| q.types = vec!["MANHUA", "MANHWA"]).await,
+            set(&["B", "C"])
+        );
+        // Demographic, with NONE as the IS NULL arm, alone and mixed.
+        assert_eq!(run(&|q| q.demographics = vec!["seinen"]).await, set(&["B"]));
+        assert_eq!(run(&|q| q.demographics = vec!["none"]).await, set(&["D"]));
+        assert_eq!(
+            run(&|q| q.demographics = vec!["none", "shounen"]).await,
+            set(&["A", "D"])
+        );
+        assert_eq!(
+            run(&|q| q.languages = ids(&["ja"])).await,
+            set(&["A", "D", "E"])
+        );
+        assert_eq!(
+            run(&|q| q.languages = ids(&["ko", "zh"])).await,
+            set(&["B", "C"])
+        );
+        // Ranges exclude unknowns (D has no year/follows/rating).
+        assert_eq!(
+            run(&|q| (q.year_from, q.year_to) = (Some(2000), Some(2012))).await,
+            set(&["A", "C"])
+        );
+        assert_eq!(run(&|q| q.year_to = Some(2000)).await, set(&["E"]));
+        assert_eq!(
+            run(&|q| q.min_chapters = Some(30)).await,
+            set(&["B", "D", "E"])
+        );
+        assert_eq!(
+            run(&|q| q.min_follows = Some(100)).await,
+            set(&["A", "B", "C"])
+        );
+        assert_eq!(
+            run(&|q| q.min_md_rating = Some(7.5)).await,
+            set(&["A", "B"])
+        );
+        // Source.
+        sqlx::query(
+            "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
+             VALUES ('md1', 'w_a', 'mangadex', 'mangadex', 'u-a', '2026-01-01T00:00:00Z'), \
+                    ('sw1', 'w_b', 'suwayomi', '777', '1', '2026-01-01T00:00:00Z'), \
+                    ('sw2', 'w_d', 'suwayomi', '888', '2', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            run(&|q| q.source = parse_source(Some("MangaDex"))).await,
+            set(&["A"])
+        );
+        assert_eq!(
+            run(&|q| q.source = parse_source(Some("suwayomi"))).await,
+            set(&["B", "D"])
+        );
+        assert_eq!(
+            run(&|q| q.source = parse_source(Some("888"))).await,
+            set(&["D"])
+        );
+        assert_eq!(
+            run(&|q| q.source = parse_source(Some("x' OR 1=1 --"))).await,
+            set(&[]),
+            "an implausible source id matches nothing, it is never interpolated"
+        );
+        // Everything at once.
+        assert_eq!(
+            run(&|q| {
+                q.statuses = vec!["ONGOING", "COMPLETED", "UNKNOWN"];
+                q.languages = ids(&["ja", "ko"]);
+                q.min_follows = Some(60);
+                q.include_tags = ids(&["action"]);
+            })
+            .await,
+            set(&["A", "B"])
+        );
+    }
+
+    /// Every v2 sort, both directions: the key, then `work_id` in the same direction, and
+    /// unknown (NULL) keys LAST in BOTH directions.
+    #[tokio::test]
+    async fn every_sort_orders_by_its_key_in_both_directions_with_nulls_last() {
+        let pool = pool().await;
+        fixture_v2(&pool).await;
+        // An undated work for the chapter clock; created_at spread for RECENTLY_ADDED.
+        seed(&pool, "w_f", "F", "MANGA", "ONGOING", "safe", 0, 5, None).await;
+        for (w, at) in [
+            ("w_a", "2026-05-03T00:00:00Z"),
+            ("w_b", "2026-05-05T00:00:00Z"),
+            ("w_c", "2026-05-01T00:00:00Z"),
+            ("w_d", "2026-05-04T00:00:00Z"),
+            ("w_e", "2026-05-02T00:00:00Z"),
+            ("w_f", "2026-05-06T00:00:00Z"),
+        ] {
+            sqlx::query("UPDATE browse_catalogue SET created_at = ? WHERE work_id = ?")
+                .bind(at)
+                .bind(w)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        // Mixed-case titles so TITLE proves it is case-insensitive.
+        for (w, t) in [
+            ("w_a", "delta"),
+            ("w_b", "Alpha"),
+            ("w_c", "charlie"),
+            ("w_d", "Bravo"),
+            ("w_e", "echo"),
+            ("w_f", "Foxtrot"),
+        ] {
+            sqlx::query("UPDATE browse_catalogue SET title = ? WHERE work_id = ?")
+                .bind(t)
+                .bind(w)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let order = |key: SortKey, desc: bool| {
+            let pool = pool.clone();
+            async move {
+                let (total, rows) = browse_catalogue(&pool, &sorted(key, desc)).await.unwrap();
+                assert_eq!(total, 6, "{key:?} {desc}: a sort never changes the total");
+                rows.into_iter()
+                    .map(|r| r.work_id.trim_start_matches("w_").to_uppercase())
+                    .collect::<Vec<_>>()
+                    .join("")
+            }
+        };
+        use SortKey::*;
+        let cases: &[(SortKey, &str, &str)] = &[
+            // released_at: A 5000 … E 1000, F NULL.
+            (LatestUpdate, "ABCDEF", "EDCBAF"),
+            (RecentlyAdded, "FBDAEC", "CEADBF"),
+            // follows: C 900, A 500, B 100, E 50; D and F unknown (work_id order, DESC/ASC).
+            (MostFollows, "CABEFD", "EBACDF"),
+            (HighestRated, "BACEFD", "ECABDF"),
+            (Year, "BCAEFD", "EACBDF"),
+            // en_chapter_count: E 50, B 40, D 30, C 20, A 10, F 5.
+            (MostChapters, "EBDCAF", "FACDBE"),
+            // Case-insensitive: Alpha, Bravo, charlie, delta, echo, Foxtrot.
+            (Title, "FEACDB", "BDCAEF"),
+            // RELEVANCE without a query falls back to LATEST_UPDATE, keeping the direction.
+            (Relevance, "ABCDEF", "EDCBAF"),
+        ];
+        for (key, desc_order, asc_order) in cases {
+            assert_eq!(order(*key, true).await, *desc_order, "{key:?} DESC");
+            assert_eq!(order(*key, false).await, *asc_order, "{key:?} ASC");
+        }
+
+        // MOST_VIEWED: viewed works by views, the unviewed remainder newest-first, and ASC
+        // reverses only the viewed prefix — unviewed is still last.
+        let hour = chrono::Utc::now().timestamp() / 3600;
+        for (key, views) in [("w_c", 30i64), ("w_e", 20), ("w_b", 10)] {
+            sqlx::query(
+                "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES (?, ?, ?)",
+            )
+            .bind(key)
+            .bind(hour)
+            .bind(views)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(order(MostViewed, true).await, "CEBADF");
+        assert_eq!(order(MostViewed, false).await, "BECADF");
+    }
+
+    /// A nullable key sorted ASC is a two-phase walk; the pages must stitch across the
+    /// NULL boundary with no row repeated or skipped, and `total` must equal the walk.
+    #[tokio::test]
+    async fn nulls_last_ascending_pages_stitch_exactly_across_the_boundary() {
+        let pool = pool().await;
+        let n = BROWSE_PAGE_SIZE * 2 + 7;
+        for i in 0..n {
+            let id = format!("w_{i:04}");
+            seed(
+                &pool,
+                &id,
+                &id,
+                "MANGA",
+                "ONGOING",
+                "safe",
+                0,
+                1,
+                Some(1000 + i),
+            )
+            .await;
+            // Every third work has no follows; the rest descend with i so ASC reverses them.
+            let follows = (i % 3 != 0).then_some(10_000 - i);
+            sqlx::query("UPDATE browse_catalogue SET follows = ? WHERE work_id = ?")
+                .bind(follows)
+                .bind(&id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let mut seen: Vec<(Option<i64>, String)> = Vec::new();
+        let mut page = 1;
+        loop {
+            let mut query = sorted(SortKey::MostFollows, false);
+            query.page = page;
+            let (total, rows) = browse_catalogue(&pool, &query).await.unwrap();
+            assert_eq!(total, n);
+            if rows.is_empty() {
+                break;
+            }
+            for r in rows {
+                let f: Option<i64> =
+                    sqlx::query_scalar("SELECT follows FROM browse_catalogue WHERE work_id = ?")
+                        .bind(&r.work_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                seen.push((f, r.work_id));
+            }
+            page += 1;
+        }
+        assert_eq!(seen.len() as i64, n, "every row exactly once");
+        let unique: std::collections::HashSet<&String> = seen.iter().map(|(_, w)| w).collect();
+        assert_eq!(
+            unique.len() as i64,
+            n,
+            "no row repeated across a page boundary"
+        );
+        let first_null = seen.iter().position(|(f, _)| f.is_none()).unwrap();
+        assert!(
+            seen[first_null..].iter().all(|(f, _)| f.is_none()),
+            "NULLs strictly last"
+        );
+        assert!(
+            seen[..first_null].windows(2).all(|w| w[0].0 <= w[1].0),
+            "the known prefix ascends"
+        );
+        assert!(
+            seen[first_null..].windows(2).all(|w| w[0].1 < w[1].1),
+            "the NULL tail is in work_id ASC order"
+        );
+    }
+
+    async fn fts(pool: &SqlitePool, work_id: &str, title: &str, chapters: i64) {
+        sqlx::query(
+            "INSERT INTO work_fts (work_id, chapters, title, aliases) VALUES (?, ?, ?, '')",
+        )
+        .bind(work_id)
+        .bind(chapters)
+        .bind(title)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// TEXT QUERY + FILTERS. The filter narrows the match set (and `total` counts the
+    /// narrowed set), RELEVANCE ranking is preserved by default, any other sort re-orders the
+    /// filtered matches, and the NSFW gate holds on this path too.
+    #[tokio::test]
+    async fn text_search_applies_the_filters_and_keeps_relevance() {
+        let pool = pool().await;
+        //     id      title               nsfw demo     follows ch
+        for (id, title, nsfw, demo, follows, ch) in [
+            ("w_1", "Solo", 0, "seinen", 10, 5),
+            ("w_2", "Solo Leveling", 0, "seinen", 900, 200),
+            ("w_3", "Solo Camping", 0, "josei", 500, 80),
+            ("w_4", "Solo Nights", 1, "seinen", 999, 300),
+            ("w_5", "Unrelated", 0, "seinen", 1000, 400),
+        ] {
+            seed(
+                &pool,
+                id,
+                title,
+                "MANGA",
+                "ONGOING",
+                "safe",
+                nsfw,
+                ch,
+                Some(1000),
+            )
+            .await;
+            sqlx::query("UPDATE work SET is_nsfw = ? WHERE id = ?")
+                .bind(nsfw)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            v2(
+                &pool,
+                id,
+                Some(demo),
+                Some("ja"),
+                None,
+                Some(follows),
+                None,
+                &[],
+            )
+            .await;
+            fts(&pool, id, title, ch).await;
+        }
+        tag(&pool, "w_3", "Comedy", "comedy", "mangadex").await;
+        let search = |f: &dyn Fn(&mut BrowseQuery<'static>)| {
+            let mut query = BrowseQuery {
+                show_nsfw: true,
+                sort: Sort::desc(SortKey::Relevance),
+                ..Default::default()
+            };
+            f(&mut query);
+            let pool = pool.clone();
+            async move {
+                let (t, rows) = search_text(&pool, "solo", &query).await.unwrap();
+                (t, rows.into_iter().map(|r| r.title).collect::<Vec<_>>())
+            }
+        };
+        let set = |v: &[&str]| (v.len() as i64, ids(v));
+        // Relevance: the exact title first (tier 0), then prefix matches by chapters.
+        assert_eq!(
+            search(&|_| {}).await,
+            set(&["Solo", "Solo Nights", "Solo Leveling", "Solo Camping"])
+        );
+        // A filter NARROWS the matches and the total follows; order is still relevance.
+        assert_eq!(
+            search(&|q| q.demographics = vec!["seinen"]).await,
+            set(&["Solo", "Solo Nights", "Solo Leveling"])
+        );
+        assert_eq!(
+            search(&|q| q.include_tags = ids(&["comedy"])).await,
+            set(&["Solo Camping"])
+        );
+        // The gate: an opted-out viewer never sees the NSFW match, total included.
+        assert_eq!(
+            search(&|q| q.show_nsfw = false).await,
+            set(&["Solo", "Solo Leveling", "Solo Camping"])
+        );
+        // Another sort re-orders the FILTERED matches (never the non-matching w_5, despite
+        // its 1,000 follows).
+        assert_eq!(
+            search(&|q| q.sort = Sort::desc(SortKey::MostFollows)).await,
+            set(&["Solo Nights", "Solo Leveling", "Solo Camping", "Solo"])
+        );
+        assert_eq!(
+            search(&|q| {
+                q.sort = Sort {
+                    key: SortKey::MostFollows,
+                    desc: false,
+                };
+                q.min_follows = Some(100);
+            })
+            .await,
+            set(&["Solo Camping", "Solo Leveling", "Solo Nights"])
+        );
+        // A too-short query is no query: (0, []), exactly like `search_works_fts`.
+        let none = search_text(&pool, "so", &BrowseQuery::default())
+            .await
+            .unwrap();
+        assert_eq!((none.0, none.1.len()), (0, 0));
+        // Over-range page: honest total, no rows.
+        let (t, rows) = search_text(
+            &pool,
+            "solo",
+            &BrowseQuery {
+                show_nsfw: true,
+                sort: Sort::desc(SortKey::Relevance),
+                page: 99,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((t, rows.len()), (4, 0));
+    }
+
+    /// Client input is bounded and canonical before it reaches SQL or the memo key.
+    #[test]
+    fn v2_inputs_are_validated_bounded_and_canonical() {
+        // Tag ids: trimmed, lowercased, deduped, sorted; implausible -> one sentinel that no
+        // slug can equal (so it matches nothing instead of being dropped).
+        assert_eq!(
+            canonical_tag_ids(&ids(&[
+                " Romance ",
+                "action",
+                "ACTION",
+                "",
+                "x'; --",
+                "a b"
+            ])),
+            ids(&["!", "action", "romance"])
+        );
+        assert!(!crate::tags::is_plausible_tag_id(UNMATCHABLE));
+        assert_eq!(
+            canonical_tag_ids(&ids(&[&"a".repeat(65)])),
+            ids(&["!"]),
+            "over-long ids are implausible"
+        );
+        // Languages.
+        assert_eq!(
+            canonical_languages(&ids(&["JA", " zh-HK ", "ko", "ja", "english", "x"])),
+            ids(&["!", "ja", "ko", "zh-hk"])
+        );
+        // Years: clamped, reversed range swapped.
+        assert_eq!(year_range(Some(1500), Some(3000)), (Some(1900), Some(2100)));
+        assert_eq!(year_range(Some(2020), Some(2010)), (Some(2010), Some(2020)));
+        assert_eq!(year_range(None, Some(1)), (None, Some(1900)));
+        // Minimums: <= 0 is no filter (emitting `>= 0` would drop the unknowns), capped.
+        assert_eq!(min_chapters(Some(0)), None);
+        assert_eq!(min_chapters(Some(-5)), None);
+        assert_eq!(min_chapters(Some(i64::MAX)), Some(MIN_CHAPTERS_CAP));
+        assert_eq!(min_follows(Some(0)), None);
+        assert_eq!(min_follows(Some(42)), Some(42));
+        assert_eq!(min_md_rating(Some(f64::NAN)), None);
+        assert_eq!(min_md_rating(Some(f64::INFINITY)), None);
+        assert_eq!(min_md_rating(Some(0.0)), None);
+        assert_eq!(min_md_rating(Some(11.0)), Some(10.0));
+        assert_eq!(min_md_rating(Some(7.4567)), Some(7.46));
+        // Source.
+        assert_eq!(parse_source(None), None);
+        assert_eq!(parse_source(Some("   ")), None);
+        assert_eq!(parse_source(Some("MANGADEX")), Some(SourceFilter::MangaDex));
+        assert_eq!(parse_source(Some("suwayomi")), Some(SourceFilter::Suwayomi));
+        assert_eq!(
+            parse_source(Some("2499283573021220255")),
+            Some(SourceFilter::SuwayomiSource("2499283573021220255".into()))
+        );
+        assert_eq!(
+            parse_source(Some("bad id!")),
+            Some(SourceFilter::SuwayomiSource(UNMATCHABLE.into()))
+        );
+    }
+
+    /// The memo key must separate every v2 dimension too — same argument as the v1 test:
+    /// nothing end-to-end can catch a gap, because the TTL is zero under test.
+    #[test]
+    fn count_key_separates_every_v2_dimension() {
+        let base = count_key(&BrowseQuery::default());
+        let with = |f: &dyn Fn(&mut BrowseQuery<'static>)| {
+            let mut c = BrowseQuery::default();
+            f(&mut c);
+            count_key(&c)
+        };
+        let variants = vec![
+            with(&|c| c.types = vec!["MANGA", "MANHWA"]),
+            with(&|c| c.statuses = vec!["ONGOING", "COMPLETED"]),
+            with(&|c| c.demographics = vec!["none"]),
+            with(&|c| c.demographics = vec!["seinen"]),
+            with(&|c| c.ratings = Some(&["erotica"])),
+            with(&|c| c.ratings = Some(&[])),
+            with(&|c| c.languages = ids(&["ja"])),
+            with(&|c| c.year_from = Some(2000)),
+            with(&|c| c.year_to = Some(2000)),
+            with(&|c| c.min_chapters = Some(5)),
+            with(&|c| c.min_follows = Some(5)),
+            with(&|c| c.min_md_rating = Some(5.0)),
+            with(&|c| c.source = Some(SourceFilter::MangaDex)),
+            with(&|c| c.source = Some(SourceFilter::Suwayomi)),
+            with(&|c| c.source = Some(SourceFilter::SuwayomiSource("1".into()))),
+            with(&|c| c.include_tags = ids(&["action"])),
+            with(&|c| c.exclude_tags = ids(&["action"])),
+            with(&|c| c.include_mode = TagMode::Or),
+            with(&|c| c.exclude_mode = TagMode::And),
+            // The same strings in different lists must not collide.
+            with(&|c| {
+                c.include_tags = ids(&["a"]);
+                c.exclude_tags = ids(&["b"]);
+            }),
+            with(&|c| {
+                c.include_tags = ids(&["a", "b"]);
+            }),
+            with(&|c| {
+                c.languages = ids(&["a"]);
+                c.include_tags = ids(&["b"]);
+            }),
+        ];
+        let mut all = variants.clone();
+        all.push(base.clone());
+        let before = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(before, all.len(), "two distinct filter sets share a key");
+        // Direction is a ROW dimension, never a COUNT one.
+        let mut asc = BrowseQuery::default();
+        asc.sort.desc = false;
+        assert_eq!(base, count_key(&asc));
+        assert_ne!(row_key(&BrowseQuery::default()), row_key(&asc));
+    }
+
+    /// EXPLAIN QUERY PLAN over a fixture catalogue with realistic tag skew and statistics:
+    /// every tag shape must reach `work_tag` through one of migration 0106's indexes — a
+    /// covering SEEK on `tag_key` for the AND forms, a covering probe on `(work_id, tag_key)`
+    /// for the OR forms — and never by scanning it. The plans are printed so they can be
+    /// quoted.
+    #[tokio::test]
+    async fn tag_filters_use_the_tag_indexes() {
+        let pool = pool().await;
+        let mut tx = pool.begin().await.unwrap();
+        let vocab: Vec<String> = (0..60).map(|i| format!("tag-{i}")).collect();
+        for i in 0..3000 {
+            let id = format!("w_{i:05}");
+            sqlx::query(
+                "INSERT INTO work (id, primary_title, created_at, updated_at) \
+                 VALUES (?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            )
+            .bind(&id)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO browse_catalogue (work_id, reader_id, title, is_nsfw, \
+                     en_chapter_count, released_at, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z')",
+            )
+            .bind(&id)
+            .bind(&id)
+            .bind(&id)
+            .bind(i64::from(i % 10 == 0))
+            .bind((i % 50) as i64)
+            .bind(1000 + i as i64)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            // ~6 tags per work, skewed toward the low ids (tag-0 is on every other work).
+            for k in 0..6usize {
+                let t = &vocab[(i * (k + 1) * 7 + k * k) % (10 + k * 10)];
+                sqlx::query(
+                    "INSERT OR IGNORE INTO work_tag (work_id, tag, ord, source, tag_key) \
+                     VALUES (?, ?, 0, 'mangadex', ?)",
+                )
+                .bind(&id)
+                .bind(t)
+                .bind(t)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            }
+        }
+        tx.commit().await.unwrap();
+        sqlx::query("ANALYZE").execute(&pool).await.unwrap();
+
+        async fn plan(pool: &SqlitePool, sql: &str, binds: &[Bind]) -> Vec<String> {
+            use sqlx::Row;
+            let text = format!("EXPLAIN QUERY PLAN {sql}");
+            let mut qq = sqlx::query(&text);
+            for b in binds {
+                qq = match b {
+                    Bind::Text(s) => qq.bind(s.clone()),
+                    Bind::Real(v) => qq.bind(*v),
+                    Bind::Int(v) => qq.bind(*v),
+                };
+            }
+            qq.fetch_all(pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get::<String, _>("detail"))
+                .collect()
+        }
+        use TagMode::{And, Or};
+        /// `(label, include, include mode, exclude, exclude mode, the index work_tag must use)`.
+        type Shape<'a> = (
+            &'a str,
+            Vec<&'a str>,
+            TagMode,
+            Vec<&'a str>,
+            TagMode,
+            &'a str,
+        );
+        let shapes: [Shape<'_>; 5] = [
+            (
+                "include AND (2)",
+                vec!["tag-3", "tag-7"],
+                And,
+                vec![],
+                Or,
+                "idx_work_tag_key_work",
+            ),
+            (
+                "include AND (1)",
+                vec!["tag-3"],
+                And,
+                vec![],
+                Or,
+                "idx_work_tag_key_work",
+            ),
+            (
+                "include OR (2)",
+                vec!["tag-3", "tag-7"],
+                Or,
+                vec![],
+                Or,
+                "idx_work_tag_work_key",
+            ),
+            (
+                "exclude OR (2)",
+                vec![],
+                Or,
+                vec!["tag-3", "tag-7"],
+                Or,
+                "idx_work_tag_work_key",
+            ),
+            (
+                "exclude AND (2)",
+                vec![],
+                Or,
+                vec!["tag-3", "tag-7"],
+                And,
+                "idx_work_tag_key_work",
+            ),
+        ];
+        for (label, inc, im, exc, em, want_index) in shapes {
+            for show_nsfw in [false, true] {
+                let query = BrowseQuery {
+                    show_nsfw,
+                    include_tags: ids(&inc),
+                    include_mode: im,
+                    exclude_tags: ids(&exc),
+                    exclude_mode: em,
+                    ..Default::default()
+                };
+                let (where_sql, binds, _) = build_where(&query);
+                for (kind, sql) in [
+                    (
+                        "page",
+                        format!(
+                            "SELECT {BROWSE_COLS} FROM browse_catalogue f WHERE {where_sql} \
+                             ORDER BY {NEWEST_ORDER} LIMIT 30 OFFSET 0"
+                        ),
+                    ),
+                    (
+                        "count",
+                        format!("SELECT COUNT(*) FROM browse_catalogue f WHERE {where_sql}"),
+                    ),
+                ] {
+                    let lines = plan(&pool, &sql, &binds).await;
+                    eprintln!("--- {label} / {kind} / show_nsfw={show_nsfw}");
+                    for l in &lines {
+                        eprintln!("    {l}");
+                    }
+                    let tag_lines: Vec<&String> = lines
+                        .iter()
+                        .filter(|l| l.contains(" t ") || l.ends_with(" t"))
+                        .collect();
+                    assert!(
+                        !tag_lines.is_empty(),
+                        "{label}: no work_tag access in {lines:?}"
+                    );
+                    for l in &tag_lines {
+                        assert!(
+                            l.contains(want_index),
+                            "{label}/{kind}: work_tag must be read through {want_index}: {l}"
+                        );
+                        assert!(
+                            l.contains("COVERING INDEX"),
+                            "{label}/{kind}: the tag lookup must be index-only: {l}"
+                        );
+                        assert!(
+                            l.starts_with("SEARCH"),
+                            "{label}/{kind}: a seek, never a scan of work_tag: {l}"
+                        );
+                    }
+                    assert!(
+                        !lines
+                            .iter()
+                            .any(|l| l.starts_with("SCAN work ") || l == "SCAN work"),
+                        "{label}/{kind}: no scan of `work` per tag: {lines:?}"
+                    );
+                }
+            }
+        }
     }
 }

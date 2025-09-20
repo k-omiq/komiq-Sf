@@ -575,6 +575,44 @@ impl MangaDexClient {
         })
     }
 
+    /// `GET /statistics/manga?manga[]=…` — follows and rating for up to
+    /// [`crate::work_stats::STATS_IDS_LIMIT`] manga, keyed by MangaDex uuid. Feeds the
+    /// statistics drain (`work_stats::backfill_work_stats`, migration 0106).
+    ///
+    /// ONE REQUEST, NO CHUNKING, and more ids than the limit is an error — the same contract
+    /// as [`Self::get_chapters_by_ids`], for the same reason: the only caller is a paced drain,
+    /// and chunking in here would fire several requests inside one "batch". Parsing is the
+    /// pure `work_stats::parse_statistics`, so it is tested on fixture JSON, never the network.
+    pub async fn get_statistics(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, crate::work_stats::MdStats>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if ids.len() > crate::work_stats::STATS_IDS_LIMIT {
+            return Err(anyhow!(
+                "MangaDex /statistics/manga accepts at most {} ids, got {}",
+                crate::work_stats::STATS_IDS_LIMIT,
+                ids.len()
+            ));
+        }
+        let params: Vec<(String, String)> = ids
+            .iter()
+            .map(|id| ("manga[]".to_string(), id.clone()))
+            .collect();
+        let res = self
+            .get_with_retry(
+                &format!("{API_BASE}/statistics/manga"),
+                &params,
+                false,
+                "/statistics/manga",
+            )
+            .await?;
+        let body: Value = res.json().await?;
+        crate::work_stats::parse_statistics(&body)
+    }
+
     /// Download a work's cover thumbnail and compute its perceptual hash. Uses the
     /// 512px thumbnail (smaller download, always JPEG). Best-effort: returns `None`
     /// on any network/decode failure — a missing hash just means one fewer dedup
