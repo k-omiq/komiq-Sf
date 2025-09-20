@@ -36,9 +36,17 @@
 //!    all 115k rows through a temp B-tree. Migration 0064's header and `updates_feed` both
 //!    document this. `comic_type` is branched for the same reason — as an equality it
 //!    becomes an index prefix, so one index serves filter AND order.
-//! 3. **Every sort carries `f.work_id DESC` as a tiebreaker.** Not cosmetic: ~76,000 rows
-//!    share an `en_chapter_count` in the 0..5 range and 67,000 share `released_at IS NULL`,
-//!    and without a total order LIMIT/OFFSET repeats or skips rows at a page boundary.
+//! 3. **Every sort carries `f.work_id` as a tiebreaker, in the sort's own direction.** Not
+//!    cosmetic: ~76,000 rows share an `en_chapter_count` in the 0..5 range and 67,000 share
+//!    `released_at IS NULL`, and without a total order LIMIT/OFFSET repeats or skips rows at a
+//!    page boundary. (Same direction as the key, so a sort and its reverse walk one index.)
+//!
+//! BROWSE V2 ("MangaDex advanced search", migration 0106) keeps all three. It adds filters
+//! (tag include/exclude with AND/OR by `work_tag.tag_key`, several statuses/formats/
+//! demographics/content ratings/languages, year range, minimum chapters/follows/MangaDex
+//! rating, source), sorts with a direction and NULLs last in both, and [`search_text`] — the
+//! SAME WHERE applied to a full-text match set, so a text query no longer discards every
+//! filter. v1 requests map onto it unchanged (`From<BrowseSort> for Sort`).
 
 use anyhow::Result;
 use sqlx::SqlitePool;
@@ -658,6 +666,11 @@ pub(crate) const COUNT_TTL: std::time::Duration = std::time::Duration::ZERO;
 /// a single genre chip is involved, versus 2. At ~80 bytes a key this is ~160 KiB worst
 /// case, which is nothing next to what it buys (the genre COUNT is 68.8 ms even index-only;
 /// on the tag-dense replica it measured 150 ms).
+///
+/// Browse v2 made the space effectively unbounded (tag sets, year ranges, text queries), so
+/// the cap is now a memory bound rather than a coverage claim: a v2 key with a few tags is
+/// ~150 bytes, i.e. ~300 KiB at the cap, and the hot heads (no filter / one tab / one tag)
+/// still fit many times over. Eviction is expired-first ([`store_count_with`]).
 const COUNT_CACHE_CAP: usize = 2048;
 
 /// The memo key for one filter combination.
@@ -667,27 +680,31 @@ const COUNT_CACHE_CAP: usize = 2048;
 /// key that omits a filter the COUNT depends on.
 ///
 /// It must cover every input to that COUNT — and NOTHING ELSE. In particular it must NOT
-/// include `sort` or `page`: all four sorts share one WHERE, so they share one total, and
-/// keying on sort would quarter the hit rate for no gain. (`page` obviously cannot change a
-/// total.) The two-phase sorts' `rated_count` / trending prefix length are separate,
-/// unmemoized counts; they are not this number.
+/// include the sort (key OR direction) or `page`: every sort shares one WHERE, so they share
+/// one total, and keying on sort would divide the hit rate for no gain. (`page` obviously
+/// cannot change a total.) The two-phase rankings' `rated_count` / trending prefix length are
+/// separate, unmemoized counts; a nullable ASC sort's non-NULL prefix is a separate count
+/// memoized under its own `nn:` key ([`key_for_nulls`]); text search's total under an `fts|`
+/// key carrying the MATCH expression ([`search_text`]). None of them is this number.
 ///
-/// `v3|` PREFIX. The memo is a process-wide static and the totals it holds are computed over
+/// `v4|` PREFIX. The memo is a process-wide static and the totals it holds are computed over
 /// whichever table this module read when they were stored. Each repointing has changed that
 /// table's SCALE — 13,847 (`suwayomi_series`) → 48,567 (`feed_series_updates`, `v2`) →
 /// 115,567 (`browse_catalogue`, `v3`) — and a stale entry under a colliding key would serve
 /// one scale's `total` for another, which the pager renders as a page count and
 /// `hasNextPage` as a promise of rows that do not exist. The prefix makes that impossible by
-/// construction rather than by arguing about format overlap.
+/// construction rather than by arguing about format overlap. `v4` is Browse v2: a wider
+/// filter set, and migration 0106's change to what `content_rating` means.
 ///
-/// GENRE ENCODING. `search_catalogue` could join genres with `\u{1}` and call the result
+/// FREE-TEXT ENCODING. `search_catalogue` could join genres with `\u{1}` and call the result
 /// unforgeable, because it keyed on the escaped LIKE PATTERNS (`%"Action"%`) and the
-/// escaping guaranteed no pattern contained a bare `%`. This keys on RAW tags, where no
-/// character is off-limits, so a separator-based join is forgeable: `["a","b"]` and
-/// `["a<sep>b"]` would collide for any `<sep>`. Length-prefixed instead — each tag becomes
-/// `{byte_len}:{tag}` and they are concatenated with no separator. That is injective
-/// because the decoder is deterministic: read digits to the `:`, then take exactly that
-/// many bytes. `["a","b"]` -> `1:a1:b`, while the single tag `a1:b` -> `4:a1:b`.
+/// escaping guaranteed no pattern contained a bare `%`. This keys on RAW client strings
+/// (genres, languages, tag ids, a source id), where no character is off-limits, so a
+/// separator-based join is forgeable: `["a","b"]` and `["a<sep>b"]` would collide for any
+/// `<sep>`. Length-prefixed instead — each string becomes `{byte_len}:{s}`, each list is
+/// prefixed with its count, and they are concatenated with no separator. That is injective
+/// because the decoder is deterministic: read digits to the `#`/`:`, then take exactly that
+/// many items/bytes. `["a","b"]` -> `2#1:a1:b`, while the single tag `a1:b` -> `1#4:a1:b`.
 fn count_key(q: &BrowseQuery<'_>) -> String {
     // `v4|`: Browse v2 widened the filter set (and the effective `content_rating` changed
     // meaning in migration 0106), so no v3 entry may ever be read as a v4 one.
@@ -880,8 +897,8 @@ static ROW_CACHE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, (Vec<BrowseRow>, std::time::Instant)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// The memo key for one PAGE of rows: the sort and the (clamped) page, then the whole
-/// filter signature.
+/// The memo key for one PAGE of rows: the sort (key AND direction, [`Sort::word`]) and the
+/// (clamped) page, then the whole filter signature.
 ///
 /// Built ON [`count_key`] rather than beside it, so a filter dimension added there is
 /// covered here by construction — the count key's own test asserts its completeness, and
@@ -892,7 +909,7 @@ static ROW_CACHE: std::sync::LazyLock<
 /// PREPENDED, not appended: the count key's genre segment is last and self-terminating
 /// only to a decoder ("nothing may be appended after this segment without its own
 /// delimiter, since a tag can contain '|'"). Putting sort and page FIRST sidesteps that
-/// argument entirely — both are fixed vocabulary (`sort_word` is a closed set, the page a
+/// argument entirely — both are fixed vocabulary (`Sort::word` is a closed set, the page a
 /// decimal integer) so their `|` boundaries are unforgeable, and the count key keeps its
 /// "genre segment is last" invariant intact.
 ///

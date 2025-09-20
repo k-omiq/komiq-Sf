@@ -5072,7 +5072,15 @@ impl QueryRoot {
     /// read right now; absent, they are included and sorted last on the recency ordering.
     ///
     /// A TEXT query does full-text search over the canonical `work` catalogue instead (see
-    /// below); the structural filters do not apply on that path.
+    /// below); the v1 structural filters do not apply on that path.
+    ///
+    /// BROWSE V2: `filter: BrowseFilter` (migration 0106, `search_v2`). When present it WINS
+    /// over every v1 filter/sort argument, and its filters apply TOGETHER with a text query
+    /// (`browse::search_text` narrows the match set by the same WHERE Browse uses, keeping
+    /// relevance ranking by default) — the v1 behaviour above is kept for clients that do not
+    /// send it, with ONE deliberate change: the v1 content-rating tiers now read the EFFECTIVE
+    /// rating (`catalog::effective_content_rating_sql`), so an opted-in viewer's SAFE tier no
+    /// longer returns source-flagged adult works that merely lacked a MangaDex rating.
     ///
     /// `genres` matches ANY of the given genres and is capped at
     /// `browse::MAX_GENRE_FILTERS`. `minRating`/`maxRating` filter by the work's aggregate
