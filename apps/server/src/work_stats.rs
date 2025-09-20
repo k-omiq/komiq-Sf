@@ -130,6 +130,35 @@ pub struct PendingStats {
     pub mangadex_id: Option<String>,
 }
 
+/// The never-fetched half of the work-list. ORDER BY `created_at` ALONE, deliberately: it is
+/// exactly the index's second column, so the walk is the index order and LIMIT stops it.
+/// Adding a tiebreak (`ss.id`) would turn it into a partial sort per equal `created_at` —
+/// and the catalogue seed stamped ~100k anchors with near-identical times. A drain needs no
+/// deterministic order among ties, only a terminating one. Pinned by
+/// `the_stats_worklist_queries_are_index_walks`.
+///
+/// `INDEXED BY`, and that is measured, not decorative: `source_type = 'mangadex'` is ~90% of
+/// `source_series`, so with statistics the planner rates the predicate unselective and picks
+/// `SCAN ss` + `USE TEMP B-TREE FOR ORDER BY` — a sort of every anchor on every 2-second
+/// batch, to hand back 200 rows (`the_stats_worklist_queries_are_index_walks` caught exactly
+/// that plan on an ANALYZEd fixture). The hint pins the index walk that LIMIT can stop. It is
+/// a FULL index (migration 0058), so unlike the partial-index hint `graphql` once had to drop,
+/// it can answer any predicate.
+const NEVER_FETCHED_SQL: &str = "SELECT ss.work_id, ss.source_key \
+       FROM source_series ss INDEXED BY idx_source_series_type_created \
+      WHERE ss.source_type = 'mangadex' \
+        AND NOT EXISTS (SELECT 1 FROM work_stats s WHERE s.work_id = ss.work_id) \
+      ORDER BY ss.created_at LIMIT ?";
+
+/// The stale half: `idx_work_stats_fetched` walked from the oldest row; the anchor per work is
+/// a `source_series(work_id)` probe (oldest anchor, matching the never-fetched half).
+const STALE_SQL: &str = "SELECT s.work_id, \
+            (SELECT ss.source_key FROM source_series ss \
+              WHERE ss.work_id = s.work_id AND ss.source_type = 'mangadex' \
+              ORDER BY ss.created_at, ss.id LIMIT 1) \
+       FROM work_stats s WHERE s.fetched_at < ? \
+      ORDER BY s.fetched_at LIMIT ?";
+
 /// The next `limit` works to fetch: never-fetched first, then the stalest past `stale_before`.
 ///
 /// PLANS. The never-fetched half drives from `source_series` through
@@ -150,15 +179,10 @@ pub async fn works_needing_stats(
     let mut seen: HashSet<String> = HashSet::new();
     // Asked for 2x: a duplicate-anchored work costs one extra row, and the dedupe below must
     // still be able to fill the batch.
-    let never: Vec<(String, String)> = sqlx::query_as(
-        "SELECT ss.work_id, ss.source_key FROM source_series ss \
-          WHERE ss.source_type = 'mangadex' \
-            AND NOT EXISTS (SELECT 1 FROM work_stats s WHERE s.work_id = ss.work_id) \
-          ORDER BY ss.created_at, ss.id LIMIT ?",
-    )
-    .bind(limit * 2)
-    .fetch_all(pool)
-    .await?;
+    let never: Vec<(String, String)> = sqlx::query_as(NEVER_FETCHED_SQL)
+        .bind(limit * 2)
+        .fetch_all(pool)
+        .await?;
     for (work_id, key) in never {
         if out.len() as i64 >= limit {
             break;
@@ -171,18 +195,11 @@ pub async fn works_needing_stats(
         }
     }
     if (out.len() as i64) < limit {
-        let stale: Vec<(String, Option<String>)> = sqlx::query_as(
-            "SELECT s.work_id, \
-                    (SELECT ss.source_key FROM source_series ss \
-                      WHERE ss.work_id = s.work_id AND ss.source_type = 'mangadex' \
-                      ORDER BY ss.created_at, ss.id LIMIT 1) \
-               FROM work_stats s WHERE s.fetched_at < ? \
-              ORDER BY s.fetched_at, s.work_id LIMIT ?",
-        )
-        .bind(stale_before)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+        let stale: Vec<(String, Option<String>)> = sqlx::query_as(STALE_SQL)
+            .bind(stale_before)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?;
         for (work_id, key) in stale {
             if out.len() as i64 >= limit {
                 break;
@@ -704,6 +721,66 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(rebuilt, (Some(1000), Some(9.0)));
+    }
+
+    /// Both work-list halves must be LIMIT-bounded index walks — no temp B-tree over the
+    /// ~115k anchors, no scan of `work_stats` — or every 2-second batch would re-sort the
+    /// catalogue. The plans are printed so they can be quoted.
+    #[tokio::test]
+    async fn the_stats_worklist_queries_are_index_walks() {
+        use sqlx::Row;
+        let pool = pool().await;
+        for i in 0..300 {
+            let w = format!("w_{i:04}");
+            anchored(
+                &pool,
+                &w,
+                &format!("{i:08}-0000-0000-0000-000000000000"),
+                "2026-01-01T00:00:00Z",
+            )
+            .await;
+            if i % 2 == 0 {
+                stats_row(&pool, &w, "2026-01-01T00:00:00Z").await;
+            }
+        }
+        sqlx::query("ANALYZE").execute(&pool).await.unwrap();
+        for (label, sql, want) in [
+            ("never", NEVER_FETCHED_SQL, "idx_source_series_type_created"),
+            ("stale", STALE_SQL, "idx_work_stats_fetched"),
+        ] {
+            let text = format!("EXPLAIN QUERY PLAN {sql}");
+            let rows = if label == "never" {
+                sqlx::query(&text)
+                    .bind(200i64)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap()
+            } else {
+                sqlx::query(&text)
+                    .bind("2026-06-01T00:00:00Z")
+                    .bind(100i64)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap()
+            };
+            let lines: Vec<String> = rows.iter().map(|r| r.get::<String, _>("detail")).collect();
+            // A sort at the TOP level (parent 0) is the one that would re-sort the catalogue.
+            // The stale half's per-work anchor lookup sorts its own 1-2 rows ("oldest anchor"),
+            // which is a correlated subquery's business and costs nothing.
+            let top_sort = rows.iter().any(|r| {
+                r.get::<i64, _>("parent") == 0
+                    && r.get::<String, _>("detail").contains("TEMP B-TREE")
+            });
+            eprintln!("--- stats work-list / {label}");
+            for l in &lines {
+                eprintln!("    {l}");
+            }
+            assert!(
+                lines.iter().any(|l| l.contains(want)),
+                "{label}: must walk {want}: {lines:?}"
+            );
+            assert!(!top_sort, "{label}: no top-level sort: {lines:?}");
+        }
     }
 
     #[test]
