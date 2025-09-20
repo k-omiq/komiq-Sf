@@ -64,7 +64,14 @@ jobs:
           pnpm --filter @komika/reader check
           pnpm --filter @komika/reader build
 
+      # Admin reads its API endpoint from `$env/static/public` (build-time inlined; see
+      # apps/admin/src/lib/config.ts), and a STATIC public env var must exist at
+      # typecheck/build time or svelte-check fails with "has no exported member
+      # PUBLIC_KOMIKA_API". Production builds get it from `apps/admin/.env.production`,
+      # which is not committed, so CI supplies the code's own localhost default.
       - name: Typecheck + build admin
+        env:
+          PUBLIC_KOMIKA_API: http://localhost:8080/graphql
         run: |
           pnpm --filter @komika/admin check
           pnpm --filter @komika/admin build
