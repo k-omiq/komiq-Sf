@@ -182,6 +182,14 @@ export interface Backend {
 	 * API implements it; callers fall back to `chapterCount` (unread) when absent. */
 	libraryProgress?(): Promise<SeriesProgress[]>;
 	setProgress(chapterId: Id, lastPageRead: number, read: boolean): Promise<void>;
+	/**
+	 * Mark ONE chapter read or unread, exactly — the series list's toggle. Unlike
+	 * {@link setProgress} (which never un-reads and cascades every earlier chapter to read
+	 * on a finish), this sets just this chapter, and unread clears every copy of it.
+	 * Resolves `false` when the API predates it, so the caller can fall back or refuse.
+	 * Optional: only the unified Komika API implements it.
+	 */
+	setChapterRead?(chapterId: Id, read: boolean): Promise<boolean>;
 	/** Record one view (a chapter open) for a series — the popularity signal behind
 	 * Trending and the series-page view counts. No auth: anonymous reads count too.
 	 * Best-effort; callers ignore failures. Optional: only the unified Komika API

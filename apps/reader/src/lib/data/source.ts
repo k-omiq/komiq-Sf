@@ -2578,14 +2578,23 @@ export async function saveProgress(
  * reader's fire-and-forget page sync) this reports whether the write landed, because the
  * list paints the new state optimistically and must undo it on failure.
  *
- * `lastPageRead` is 0 either way: the list knows nothing about pages, and the reader's own
- * progress write supersedes it on the next open. The server routes on id shape (a
- * MangaDex uuid → `canonical_progress`, which read-state folds across a number's copies).
+ * Goes through `setChapterRead`, NOT `setProgress`: the server merges `setProgress`'s
+ * `read` as `MAX(old, new)` (reopening a finished chapter must not un-finish it), so an
+ * unread through it "succeeded" and the chapter came back read on reload; and its read
+ * cascades every earlier chapter to read, which a single tick in a list must not do.
+ *
+ * Against an API that predates `setChapterRead`: read falls back to `setProgress` (the
+ * old behaviour, cascade included); unread reports failure, so the list undoes the mark
+ * rather than claiming a state the server will not keep.
  */
 export async function setChapterRead(chapterId: string, read: boolean): Promise<boolean> {
 	if (!LIVE || !chapterId) return false;
 	try {
-		await backend.setProgress(chapterId, 0, read);
+		const done = (await backend.setChapterRead?.(chapterId, read)) ?? false;
+		if (!done) {
+			if (!read) return false;
+			await backend.setProgress(chapterId, 0, true);
+		}
 		await invalidate('komika:library');
 		return true;
 	} catch (err) {

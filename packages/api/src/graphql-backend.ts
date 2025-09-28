@@ -468,6 +468,24 @@ export class GraphQLBackend implements Backend {
 	async setProgress(chapterId: Id, lastPageRead: number, read: boolean): Promise<void> {
 		await this.gql<{ setProgress: boolean }>(ops.SET_PROGRESS, { chapterId, lastPageRead, read });
 	}
+	/** Process-wide, like {@link seriesPageUnsupported}: one `Unknown field` answer means
+	 *  every later call would get it too. */
+	private static setChapterReadUnsupported = false;
+	async setChapterRead(chapterId: Id, read: boolean): Promise<boolean> {
+		if (GraphQLBackend.setChapterReadUnsupported) return false;
+		try {
+			await this.gql<{ setChapterRead: boolean }>(ops.SET_CHAPTER_READ, { chapterId, read });
+			return true;
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			// The API predates the mutation — deploy-order drift, not a failure to report.
+			if (msg.includes('Unknown field "setChapterRead"')) {
+				GraphQLBackend.setChapterReadUnsupported = true;
+				return false;
+			}
+			throw e;
+		}
+	}
 
 	async recordView(seriesId: Id): Promise<void> {
 		await this.gql<{ recordView: boolean }>(ops.RECORD_VIEW, { seriesId });

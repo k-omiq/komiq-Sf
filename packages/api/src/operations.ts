@@ -501,6 +501,14 @@ export const SET_PROGRESS = /* GraphQL */ `
 	}
 `;
 
+// The series list's per-chapter toggle: sets exactly this chapter (no catch-up cascade),
+// and unread clears every copy of it — which `setProgress` cannot express.
+export const SET_CHAPTER_READ = /* GraphQL */ `
+	mutation SetChapterRead($chapterId: ID!, $read: Boolean!) {
+		setChapterRead(chapterId: $chapterId, read: $read)
+	}
+`;
+
 // Popularity signal: fire once per chapter open (see `views` module server-side). No
 // auth — anonymous reads count too — so it never carries user identity.
 export const RECORD_VIEW = /* GraphQL */ `

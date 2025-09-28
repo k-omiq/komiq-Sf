@@ -8112,6 +8112,147 @@ impl MutationRoot {
         Ok(true)
     }
 
+    /// Mark ONE chapter read or unread, exactly — the series list's per-chapter toggle.
+    ///
+    /// NOT `setProgress`, on purpose, for two reasons that are both features THERE:
+    ///  - `setProgress` merges `read = MAX(old, new)`, so a reader reopening a finished
+    ///    chapter at page 1 does not un-finish it. That makes it unable to express "unread"
+    ///    at all: the call succeeded and the chapter came back read on the next load.
+    ///  - `read: true` there cascades (`catch_up_*`) every earlier chapter to read, which is
+    ///    right when the viewer FINISHES chapter 178 and wrong when they tick one box in a
+    ///    list.
+    ///
+    /// Unread clears the chapter's read flag on EVERY copy this viewer has a row for — the
+    /// same `chapter_key` within the same work, across the MangaDex mirror and Suwayomi
+    /// sources — because the list's read state is the cross-source fold (`readAnywhere`,
+    /// `work_read_keys`); clearing only the clicked copy would leave the row read. Resume
+    /// positions (`last_page_read`) are left alone either way.
+    async fn set_chapter_read(
+        &self,
+        ctx: &Context<'_>,
+        chapter_id: ID,
+        read: bool,
+    ) -> Result<bool> {
+        let st = state(ctx);
+        let user = require_user(ctx).await?;
+        let id = chapter_id.0.trim();
+        if id.is_empty() || id.len() > 128 {
+            return Err(Error::new("Invalid chapter id"));
+        }
+        // Same id-shape routing as `set_progress` (CR6): numeric = Suwayomi, else MangaDex.
+        let numeric = id.bytes().all(|b| b.is_ascii_digit());
+        let now = Utc::now().to_rfc3339();
+        let mut tx = st.pool.begin().await.map_err(gql_err)?;
+        if read {
+            if numeric {
+                let series_id: String = sqlx::query_scalar::<_, i64>(
+                    "SELECT manga_id FROM suwayomi_chapter WHERE id = ? LIMIT 1",
+                )
+                .bind(id.parse::<i64>().map_err(gql_err)?)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(gql_err)?
+                .map(|m| m.to_string())
+                .unwrap_or_default();
+                sqlx::query(
+                    "INSERT INTO suwayomi_progress \
+                       (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
+                     VALUES (?, ?, ?, 0, 1, ?) \
+                     ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
+                       read = 1, updated_at = excluded.updated_at",
+                )
+                .bind(&user.id)
+                .bind(id)
+                .bind(&series_id)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .map_err(gql_err)?;
+            } else {
+                let work_id: String = sqlx::query_scalar::<_, String>(
+                    "SELECT ss.work_id FROM chapter c \
+                       JOIN source_series ss ON ss.id = c.source_series_id \
+                      WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
+                )
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(gql_err)?
+                .unwrap_or_default();
+                sqlx::query(
+                    "INSERT INTO canonical_progress \
+                       (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
+                     VALUES (?, ?, ?, 0, 1, ?) \
+                     ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
+                       read = 1, updated_at = excluded.updated_at",
+                )
+                .bind(&user.id)
+                .bind(id)
+                .bind(&work_id)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .map_err(gql_err)?;
+            }
+            tx.commit().await.map_err(gql_err)?;
+            return Ok(true);
+        }
+        // Unread. The clicked copy first, by id — this alone is the whole answer for a
+        // chapter the spine does not know (no key to fold on).
+        let own = if numeric {
+            "UPDATE suwayomi_progress SET read = 0, updated_at = ? \
+              WHERE user_id = ? AND chapter_id = ? AND read = 1"
+        } else {
+            "UPDATE canonical_progress SET read = 0, updated_at = ? \
+              WHERE user_id = ? AND chapter_id = ? AND read = 1"
+        };
+        sqlx::query(own)
+            .bind(&now)
+            .bind(&user.id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(gql_err)?;
+        // Then every sibling copy of the same chapter in the same work, on both stores.
+        let ident: Option<(String, String)> = sqlx::query_as(
+            "SELECT ss.work_id, c.chapter_key FROM chapter c \
+               JOIN source_series ss ON ss.id = c.source_series_id \
+              WHERE c.external_id = ? AND ss.source_type = ? AND c.chapter_key IS NOT NULL \
+              LIMIT 1",
+        )
+        .bind(id)
+        .bind(if numeric { "suwayomi" } else { "mangadex" })
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(gql_err)?;
+        if let Some((work_id, key)) = ident {
+            for (table, source_type) in [
+                ("canonical_progress", "mangadex"),
+                ("suwayomi_progress", "suwayomi"),
+            ] {
+                // `table`/`source_type` are compile-time literals from the array above,
+                // never input, so formatting them into the statement is safe.
+                sqlx::query(&format!(
+                    "UPDATE {table} SET read = 0, updated_at = ?1 \
+                      WHERE user_id = ?2 AND read = 1 AND chapter_id IN ( \
+                        SELECT c.external_id FROM chapter c \
+                          JOIN source_series ss ON ss.id = c.source_series_id \
+                         WHERE ss.work_id = ?3 AND ss.source_type = '{source_type}' \
+                           AND c.chapter_key = ?4)"
+                ))
+                .bind(&now)
+                .bind(&user.id)
+                .bind(&work_id)
+                .bind(&key)
+                .execute(&mut *tx)
+                .await
+                .map_err(gql_err)?;
+            }
+        }
+        tx.commit().await.map_err(gql_err)?;
+        Ok(true)
+    }
+
     async fn post_review(&self, ctx: &Context<'_>, input: PostReviewInput) -> Result<Review> {
         if !(1..=10).contains(&input.score) {
             return Err(Error::new("score must be between 1 and 10"));
@@ -17747,6 +17888,152 @@ mod tests {
     ///
     /// Asserted on BOTH arms, because they map through different functions: the canonical
     /// spine and the per-source Suwayomi lists.
+    /// `setChapterRead` is the series list's toggle, and it must do what it says where
+    /// `setProgress` cannot: UNREAD really clears (setProgress merges `read = MAX(old,new)`,
+    /// so its unread was a silent no-op), it clears EVERY copy of the chapter so the
+    /// cross-source fold reads unread too, it keeps resume positions, and READ marks one
+    /// chapter without cascading every earlier one.
+    #[tokio::test]
+    async fn set_chapter_read_sets_exactly_one_chapter_across_its_copies() {
+        let (s, pool) = setup_full(100).await;
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-toggle",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Toggle".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let md_ssid =
+            crate::catalog::find_source_series_id(&pool, "mangadex", "mangadex", "md-toggle")
+                .await
+                .unwrap()
+                .unwrap();
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-toggle'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let suw_ssid = crate::catalog::upsert_source_series(
+            &pool, &work_id, "suwayomi", "suwayomi", "779", None, false,
+        )
+        .await
+        .unwrap();
+        for (ssid, ext, num) in [
+            (&md_ssid, "tg-1", "1"),
+            (&md_ssid, "tg-2", "2"),
+            (&md_ssid, "tg-3", "3"),
+            (&suw_ssid, "9101", "1"),
+        ] {
+            crate::catalog::upsert_chapter(
+                &pool,
+                ssid,
+                &crate::catalog::ChapterInput {
+                    external_id: ext.into(),
+                    number: Some(num.into()),
+                    lang: Some("en".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // Ch. 1 read on BOTH copies, the MangaDex one stopped at page 7.
+        sqlx::query(
+            "INSERT INTO canonical_progress (user_id, work_id, chapter_id, last_page_read, read, updated_at) \
+             VALUES ('bob-id', ?, 'tg-1', 7, 1, '2026-01-01T00:00:00Z')",
+        )
+        .bind(&work_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO suwayomi_progress (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
+             VALUES ('bob-id', '9101', '779', 0, 1, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let read_of = |table: &'static str, id: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (i64, i64)>(&format!(
+                    "SELECT read, last_page_read FROM {table} WHERE user_id = 'bob-id' AND chapter_id = ?"
+                ))
+                .bind(id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+            }
+        };
+
+        // setProgress cannot unread — the bug the toggle had.
+        let r = exec(
+            &s,
+            r#"mutation { setProgress(chapterId: "tg-1", lastPageRead: 7, read: false) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(read_of("canonical_progress", "tg-1").await, Some((1, 7)));
+
+        // setChapterRead does, on every copy, keeping the resume position.
+        let r = exec(
+            &s,
+            r#"mutation { setChapterRead(chapterId: "tg-1", read: false) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(read_of("canonical_progress", "tg-1").await, Some((0, 7)));
+        assert_eq!(
+            read_of("suwayomi_progress", "9101").await,
+            Some((0, 0)),
+            "the sibling copy must clear too, or the fold still reads it as read"
+        );
+        assert!(work_read_keys(&pool, Some("bob-id"), &work_id)
+            .await
+            .is_empty());
+
+        // Read marks exactly one chapter: ch. 3 read, 1 and 2 untouched (no catch-up).
+        let r = exec(
+            &s,
+            r#"mutation { setChapterRead(chapterId: "tg-3", read: true) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(read_of("canonical_progress", "tg-3").await, Some((1, 0)));
+        assert_eq!(read_of("canonical_progress", "tg-2").await, None);
+        assert_eq!(read_of("canonical_progress", "tg-1").await, Some((0, 7)));
+
+        // A Suwayomi id routes to its own store.
+        let r = exec(
+            &s,
+            r#"mutation { setChapterRead(chapterId: "9101", read: true) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(read_of("suwayomi_progress", "9101").await, Some((1, 0)));
+
+        // Signed out: refused, never a silent success.
+        let r = exec(
+            &s,
+            r#"mutation { setChapterRead(chapterId: "tg-1", read: true) }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert!(!r.errors.is_empty());
+    }
+
     #[tokio::test]
     async fn series_page_carries_found_dates_and_cross_source_read_state() {
         let (s, pool) = setup_full(100).await;
