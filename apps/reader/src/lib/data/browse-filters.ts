@@ -412,14 +412,25 @@ export const BROWSE_PARAMS = [
  * `?genre=Boys' Love` links (and the genre-facet fallback) onto tag ids. Mirrors the
  * contract's examples: "Boys' Love" → `boys-love`, "Sci-Fi" → `sci-fi`, "4-Koma" →
  * `4-koma`.
+ *
+ * MUST be the server's `tags::slug` (apps/server/src/tags.rs) rule exactly, because the
+ * result is compared against `work_tag.tag_key`, which the server writes: every run of
+ * characters that is not an ASCII letter or digit is ONE separator — accented letters and
+ * inner apostrophes included ("Pokémon" → `pok-mon`, "Doesn't" → `doesn-t`). Folding
+ * diacritics or deleting apostrophes here would mint ids the server never stores, and a
+ * legacy link would filter the grid to nothing.
+ *
+ * The one case it cannot mirror is a name with NO ASCII alphanumerics ("恋愛"): the server
+ * keys those by a SHA-256 prefix, which needs async `crypto.subtle` here. Those return ''
+ * and the caller drops them — the filter widens rather than silently emptying the grid.
  */
 export function tagSlug(name: string): string {
+	// Separators BEFORE lowercasing: `toLowerCase` maps a few non-ASCII letters onto ASCII
+	// ("İ" → "i̇", the Kelvin sign → "k"), where Rust's `is_ascii_alphanumeric` sees them
+	// as separators.
 	return name
-		.normalize('NFKD')
-		.replace(/[̀-ͯ]/g, '')
+		.replace(/[^A-Za-z0-9]+/g, '-')
 		.toLowerCase()
-		.replace(/['’]/g, '')
-		.replace(/[^a-z0-9]+/g, '-')
 		.replace(/^-+|-+$/g, '')
 		.slice(0, TAG_ID_MAX);
 }

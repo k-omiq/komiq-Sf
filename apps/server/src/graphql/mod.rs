@@ -1134,6 +1134,9 @@ async fn search_v2(
     show_nsfw: bool,
     filter: &BrowseFilter,
 ) -> Result<SeriesPage> {
+    // Clamped ONCE, so the page echoed back is the page the rows came from — `page: 0`
+    // returns page-1 rows labelled page 1, as `updatesFeed` already does.
+    let page = page.max(1);
     let ratings = filter_content_ratings(filter);
     let bq = browse_query_from_filter(filter, show_nsfw, !trimmed.is_empty(), page, &ratings)?;
     let (total, rows) = if trimmed.is_empty() {
@@ -1143,7 +1146,7 @@ async fn search_v2(
     }
     .map_err(gql_err)?;
     let items = filter_nsfw(show_nsfw, map_browse_rows(st, rows).await);
-    let has_next = i64::from(page.max(1)) * BROWSE_PAGE_SIZE < total;
+    let has_next = i64::from(page) * BROWSE_PAGE_SIZE < total;
     Ok(SeriesPage {
         items,
         page,
@@ -16785,6 +16788,22 @@ mod tests {
     /// beside it is unchanged. Everything goes through the REAL rebuild chain
     /// (`refresh_feed_updates` -> `refresh_browse_catalogue` -> tag table), not hand-written
     /// rows.
+    /// `search(filter:)` echoes the page its rows came from: a page below 1 is served AND
+    /// labelled as page 1, so a pager never shows "page 0" over page-1 content.
+    #[tokio::test]
+    async fn search_filter_v2_clamps_the_echoed_page() {
+        let (s, _pool) = setup_full(100).await;
+        for page in [0, -3] {
+            let q = format!(
+                r#"{{ search(query: "", page: {page}, filter: {{}}) {{ page hasNextPage }} }}"#
+            );
+            let r = exec(&s, &q, None, "1.1.1.1").await;
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            let page_out = r.data.into_json().unwrap()["search"]["page"].clone();
+            assert_eq!(page_out, serde_json::json!(1), "page {page}");
+        }
+    }
+
     #[tokio::test]
     async fn search_filter_v2_end_to_end() {
         let (s, pool) = setup_full(100).await;

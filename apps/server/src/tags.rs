@@ -611,6 +611,22 @@ mod tests {
         assert_eq!(slug("   "), "");
     }
 
+    /// The reader's `tagSlug` (apps/reader/src/lib/data/browse-filters.ts) must produce
+    /// the SAME id for a name — it turns legacy `?genre=` links into `includedTags`, which
+    /// are matched against the keys this function writes. Same fixtures as the reader's
+    /// `tagSlug follows the server rule…` test; change both together.
+    #[test]
+    fn slug_matches_the_reader_on_shared_fixtures() {
+        assert_eq!(slug("Pokémon"), "pok-mon");
+        assert_eq!(slug("Doesn't Matter"), "doesn-t-matter");
+        assert_eq!(slug("Shōnen Ai"), "sh-nen-ai");
+        assert_eq!(slug("İdol"), "dol");
+        assert!(
+            slug("恋愛").starts_with("tag-"),
+            "hashed; the reader drops these"
+        );
+    }
+
     #[test]
     fn every_known_tag_has_a_unique_plausible_slug_and_a_mangadex_group() {
         let mut seen = HashSet::new();

@@ -254,7 +254,9 @@
 	// the SHARED `deriveShelf` — this page used to carry its own inline copy of the
 	// rule, which is how the same series could read "Completed" here and "Reading" on
 	// the library. Catching up on an ongoing series no longer derives to `completed`.
-	const readCount = $derived((view?.chapters ?? []).filter((c) => c.read).length);
+	// Through `isChapterRead`, not `c.read`: a chapter toggled from the list must move the
+	// shelf and the hero's Continue/Read state too, not only its own mark.
+	const readCount = $derived((view?.chapters ?? []).filter((c) => isChapterRead(c)).length);
 	const effectiveShelf = $derived<Shelf>(libStatus ?? deriveShelf(readCount, totalCh, ended));
 
 	// Library writes are optimistic, but a FAILED write now rolls back and says so.

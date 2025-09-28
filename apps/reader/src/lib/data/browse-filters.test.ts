@@ -244,6 +244,17 @@ test('tagSlug matches the contract examples', () => {
 	assert.equal(tagSlug('Isekai (異世界)'), 'isekai');
 });
 
+test('tagSlug follows the server rule for accents, inner apostrophes and non-ASCII', () => {
+	// The SAME fixtures as `tags::tests::slug_matches_the_reader_on_shared_fixtures`: the
+	// id is compared against `work_tag.tag_key`, which the server's `slug` writes.
+	assert.equal(tagSlug('Pokémon'), 'pok-mon');
+	assert.equal(tagSlug("Doesn't Matter"), 'doesn-t-matter');
+	assert.equal(tagSlug('Shōnen Ai'), 'sh-nen-ai');
+	assert.equal(tagSlug('İdol'), 'dol');
+	// No ASCII alphanumerics: the server hashes these; the reader drops them ('').
+	assert.equal(tagSlug('恋愛'), '');
+});
+
 // ---- sort -------------------------------------------------------------------------------
 
 test('default sort is Relevance with a query and Latest update without', () => {
