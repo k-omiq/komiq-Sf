@@ -251,8 +251,11 @@ test('tagSlug follows the server rule for accents, inner apostrophes and non-ASC
 	assert.equal(tagSlug("Doesn't Matter"), 'doesn-t-matter');
 	assert.equal(tagSlug('Shōnen Ai'), 'sh-nen-ai');
 	assert.equal(tagSlug('İdol'), 'dol');
-	// No ASCII alphanumerics: the server hashes these; the reader drops them ('').
-	assert.equal(tagSlug('恋愛'), '');
+	// No ASCII alphanumerics: the server's hash id, so a legacy link to such a tag keeps
+	// filtering on the id it is stored under. Value pinned on BOTH sides.
+	assert.equal(tagSlug('恋愛'), 'tag-08457119f4ed');
+	assert.equal(tagSlug('  恋愛 '), 'tag-08457119f4ed');
+	assert.equal(tagSlug('   '), '');
 });
 
 // ---- sort -------------------------------------------------------------------------------

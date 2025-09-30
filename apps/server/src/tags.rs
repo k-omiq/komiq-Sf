@@ -621,10 +621,9 @@ mod tests {
         assert_eq!(slug("Doesn't Matter"), "doesn-t-matter");
         assert_eq!(slug("Shōnen Ai"), "sh-nen-ai");
         assert_eq!(slug("İdol"), "dol");
-        assert!(
-            slug("恋愛").starts_with("tag-"),
-            "hashed; the reader drops these"
-        );
+        // Hash id, pinned: the reader computes the same SHA-256 prefix (`sha256.ts`).
+        assert_eq!(slug("恋愛"), "tag-08457119f4ed");
+        assert_eq!(slug("  恋愛 "), "tag-08457119f4ed");
     }
 
     #[test]

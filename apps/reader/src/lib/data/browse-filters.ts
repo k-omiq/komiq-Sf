@@ -22,6 +22,7 @@
  * Every mutator returns a NEW normalised state with the page reset to 1: a different
  * filter is a different result set, and page 7 of the old one is meaningless.
  */
+import { sha256Hex } from './sha256.ts';
 import type {
 	BrowseFilter,
 	BrowseSort,
@@ -420,19 +421,23 @@ export const BROWSE_PARAMS = [
  * diacritics or deleting apostrophes here would mint ids the server never stores, and a
  * legacy link would filter the grid to nothing.
  *
- * The one case it cannot mirror is a name with NO ASCII alphanumerics ("恋愛"): the server
- * keys those by a SHA-256 prefix, which needs async `crypto.subtle` here. Those return ''
- * and the caller drops them — the filter widens rather than silently emptying the grid.
+ * A name with NO ASCII alphanumerics ("恋愛") gets the server's hash id: `"tag-"` + the
+ * first 12 hex chars of SHA-256 of the trimmed name ({@link sha256Hex}, bit-exact with the
+ * server's `sha2`), so a legacy link to such a tag still filters on the id it was stored
+ * under.
  */
 export function tagSlug(name: string): string {
 	// Separators BEFORE lowercasing: `toLowerCase` maps a few non-ASCII letters onto ASCII
 	// ("İ" → "i̇", the Kelvin sign → "k"), where Rust's `is_ascii_alphanumeric` sees them
 	// as separators.
-	return name
+	const slug = name
 		.replace(/[^A-Za-z0-9]+/g, '-')
 		.toLowerCase()
 		.replace(/^-+|-+$/g, '')
 		.slice(0, TAG_ID_MAX);
+	const trimmed = name.trim();
+	if (slug || !trimmed) return slug;
+	return `tag-${sha256Hex(trimmed).slice(0, 12)}`;
 }
 
 /** Read a numeric param; '' / junk → null. */

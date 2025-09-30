@@ -185,16 +185,17 @@
 	async function toggleChapterRead(c: { id?: string; read: boolean }) {
 		const id = c.id;
 		if (!id || readPending[id]) return;
-		const next = !isChapterRead(c);
+		// The state BEFORE this click, overrides included: after one successful toggle
+		// `c.read` is the stale page-load value, so a failed second toggle must restore THIS,
+		// not fall back to it.
+		const previous = isChapterRead(c);
+		const next = !previous;
 		readOverride = { ...readOverride, [id]: next };
 		readPending = { ...readPending, [id]: true };
 		const ok = await setChapterRead(id, next);
 		const { [id]: _done, ...rest } = readPending;
 		readPending = rest;
-		if (!ok) {
-			const { [id]: _undo, ...kept } = readOverride;
-			readOverride = kept;
-		}
+		if (!ok) readOverride = { ...readOverride, [id]: previous };
 	}
 
 	// Heal the address bar when the id we asked for is not the id we got back.
