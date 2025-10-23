@@ -2583,18 +2583,16 @@ export async function saveProgress(
  * unread through it "succeeded" and the chapter came back read on reload; and its read
  * cascades every earlier chapter to read, which a single tick in a list must not do.
  *
- * Against an API that predates `setChapterRead`: read falls back to `setProgress` (the
- * old behaviour, cascade included); unread reports failure, so the list undoes the mark
- * rather than claiming a state the server will not keep.
+ * Against an API that predates `setChapterRead` it reports failure for BOTH directions,
+ * and the list undoes the mark. `setProgress` is no stand-in even for read: its catch-up
+ * would mark every earlier chapter read behind a click on one row, a change the list
+ * would not show until reload.
  */
 export async function setChapterRead(chapterId: string, read: boolean): Promise<boolean> {
 	if (!LIVE || !chapterId) return false;
 	try {
 		const done = (await backend.setChapterRead?.(chapterId, read)) ?? false;
-		if (!done) {
-			if (!read) return false;
-			await backend.setProgress(chapterId, 0, true);
-		}
+		if (!done) return false;
 		await invalidate('komika:library');
 		return true;
 	} catch (err) {

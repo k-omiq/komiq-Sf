@@ -38,18 +38,18 @@ test('uses the exact setChapterRead mutation, never setProgress, when the API ha
 	]);
 });
 
-test('an older API: read falls back to setProgress, unread refuses instead of faking it', async () => {
+test('an older API refuses BOTH directions instead of falling back to setProgress', async () => {
 	reset();
-	const progress: unknown[][] = [];
+	let progressCalls = 0;
 	testGlobals.backend.setChapterRead = async () => false; // "Unknown field" → false
-	testGlobals.backend.setProgress = async (...args: unknown[]) => {
-		progress.push(args);
+	testGlobals.backend.setProgress = async () => {
+		progressCalls++;
 	};
-	assert.equal(await setChapterRead('9005', true), true);
-	assert.deepEqual(progress, [['9005', 0, true]]);
-	// setProgress cannot un-read on the server, so the list must undo its mark.
+	// setProgress would cascade a read to every earlier chapter and can never un-read, so
+	// neither direction may use it: the list undoes its optimistic mark instead.
+	assert.equal(await setChapterRead('9005', true), false);
 	assert.equal(await setChapterRead('9005', false), false);
-	assert.equal(progress.length, 1, 'no setProgress for an unread');
+	assert.equal(progressCalls, 0);
 });
 
 test('a failed write reports failure so the list can undo its optimistic mark', async () => {

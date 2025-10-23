@@ -8127,6 +8127,12 @@ impl MutationRoot {
     /// sources — because the list's read state is the cross-source fold (`readAnywhere`,
     /// `work_read_keys`); clearing only the clicked copy would leave the row read. Resume
     /// positions (`last_page_read`) are left alone either way.
+    ///
+    /// A READ of a chapter the server does not know is refused ("No such chapter") rather
+    /// than stored with an empty owner the way `set_progress` does: this upsert never
+    /// rewrites the owner on conflict, so a row written with `''` would stay invisible to
+    /// the per-series progress maps even after the chapter is catalogued. The list only
+    /// offers chapters it loaded, so a refusal here means the id is stale or forged.
     async fn set_chapter_read(
         &self,
         ctx: &Context<'_>,
@@ -8145,15 +8151,24 @@ impl MutationRoot {
         let mut tx = st.pool.begin().await.map_err(gql_err)?;
         if read {
             if numeric {
-                let series_id: String = sqlx::query_scalar::<_, i64>(
-                    "SELECT manga_id FROM suwayomi_chapter WHERE id = ? LIMIT 1",
+                // The owning Suwayomi series: from the engine's chapter cache, or — when that
+                // cache never held the chapter (the engine is down, or the row came in through
+                // the spine drain) — from the spine mapping, whose `source_key` IS the series
+                // id `suwayomi_progress.series_id` stores.
+                let series_id: String = sqlx::query_scalar::<_, String>(
+                    "SELECT CAST(manga_id AS TEXT) FROM suwayomi_chapter WHERE id = ?1 \
+                     UNION ALL \
+                     SELECT ss.source_key FROM chapter c \
+                       JOIN source_series ss ON ss.id = c.source_series_id \
+                      WHERE c.external_id = ?2 AND ss.source_type = 'suwayomi' \
+                     LIMIT 1",
                 )
                 .bind(id.parse::<i64>().map_err(gql_err)?)
+                .bind(id)
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(gql_err)?
-                .map(|m| m.to_string())
-                .unwrap_or_default();
+                .ok_or_else(|| Error::new("No such chapter"))?;
                 sqlx::query(
                     "INSERT INTO suwayomi_progress \
                        (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
@@ -8178,7 +8193,7 @@ impl MutationRoot {
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(gql_err)?
-                .unwrap_or_default();
+                .ok_or_else(|| Error::new("No such chapter"))?;
                 sqlx::query(
                     "INSERT INTO canonical_progress \
                        (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
@@ -8226,27 +8241,30 @@ impl MutationRoot {
         .await
         .map_err(gql_err)?;
         if let Some((work_id, key)) = ident {
-            for (table, source_type) in [
-                ("canonical_progress", "mangadex"),
-                ("suwayomi_progress", "suwayomi"),
-            ] {
-                // `table`/`source_type` are compile-time literals from the array above,
-                // never input, so formatting them into the statement is safe.
-                sqlx::query(&format!(
-                    "UPDATE {table} SET read = 0, updated_at = ?1 \
-                      WHERE user_id = ?2 AND read = 1 AND chapter_id IN ( \
-                        SELECT c.external_id FROM chapter c \
-                          JOIN source_series ss ON ss.id = c.source_series_id \
-                         WHERE ss.work_id = ?3 AND ss.source_type = '{source_type}' \
-                           AND c.chapter_key = ?4)"
-                ))
-                .bind(&now)
-                .bind(&user.id)
-                .bind(&work_id)
-                .bind(&key)
-                .execute(&mut *tx)
-                .await
-                .map_err(gql_err)?;
+            // Two static statements rather than one formatted over the table name: identical
+            // but for the store, and kept literal so no SQL text is ever assembled at runtime.
+            const CLEAR_CANONICAL: &str =
+                "UPDATE canonical_progress SET read = 0, updated_at = ?1 \
+                  WHERE user_id = ?2 AND read = 1 AND chapter_id IN ( \
+                    SELECT c.external_id FROM chapter c \
+                      JOIN source_series ss ON ss.id = c.source_series_id \
+                     WHERE ss.work_id = ?3 AND ss.source_type = 'mangadex' \
+                       AND c.chapter_key = ?4)";
+            const CLEAR_SUWAYOMI: &str = "UPDATE suwayomi_progress SET read = 0, updated_at = ?1 \
+                  WHERE user_id = ?2 AND read = 1 AND chapter_id IN ( \
+                    SELECT c.external_id FROM chapter c \
+                      JOIN source_series ss ON ss.id = c.source_series_id \
+                     WHERE ss.work_id = ?3 AND ss.source_type = 'suwayomi' \
+                       AND c.chapter_key = ?4)";
+            for sql in [CLEAR_CANONICAL, CLEAR_SUWAYOMI] {
+                sqlx::query(sql)
+                    .bind(&now)
+                    .bind(&user.id)
+                    .bind(&work_id)
+                    .bind(&key)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(gql_err)?;
             }
         }
         tx.commit().await.map_err(gql_err)?;
@@ -18032,6 +18050,32 @@ mod tests {
         )
         .await;
         assert!(!r.errors.is_empty());
+
+        // An id the server does not know is refused, not stored with an empty owner.
+        for unknown in ["not-a-chapter", "999999"] {
+            let r = exec(
+                &s,
+                &format!(r#"mutation {{ setChapterRead(chapterId: "{unknown}", read: true) }}"#),
+                Some("bobtok"),
+                "1.1.1.1",
+            )
+            .await;
+            assert!(
+                r.errors
+                    .iter()
+                    .any(|e| e.message.contains("No such chapter")),
+                "{unknown}: {:?}",
+                r.errors
+            );
+        }
+        let stray: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM canonical_progress WHERE chapter_id = 'not-a-chapter') \
+                  + (SELECT COUNT(*) FROM suwayomi_progress WHERE chapter_id = '999999')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stray, 0);
     }
 
     #[tokio::test]

@@ -13,7 +13,8 @@
  * paths it can render without, and a response passes only when:
  *   - `data` is present (a non-null failure nulls `data` and is never partial), and
  *   - EVERY error carries a `path` at or under one of those prefixes. An error with no
- *     path (validation, a transport-level failure) or anywhere else still throws.
+ *     path (validation, a transport-level failure) or anywhere else still throws;
+ *   - the tolerated field's PARENT resolved — a null parent is not a partial result.
  *
  * Dependency-free so it is unit testable on its own; `graphql-backend.ts` owns the I/O.
  */
@@ -30,13 +31,31 @@ function startsWith(path: readonly PathSegment[], prefix: readonly PathSegment[]
 	return prefix.length <= path.length && prefix.every((seg, i) => path[i] === seg);
 }
 
+/**
+ * Whether the PARENT of a tolerated field resolved. A tolerated field's error can still
+ * null its parent — on a schema where the field is non-null but the parent nullable, null
+ * propagation stops at the parent — and reading past that would hand the caller a null
+ * object (a `seriesPage` of null reads as "not found") instead of reaching its retry.
+ */
+function parentResolved(data: unknown, prefix: readonly PathSegment[]): boolean {
+	let value: unknown = data;
+	for (const seg of prefix.slice(0, -1)) {
+		if (value == null || typeof value !== 'object') return false;
+		value = (value as Record<string | number, unknown>)[seg];
+	}
+	return value != null && typeof value === 'object';
+}
+
 export function tolerablePartialErrors(
 	data: unknown,
 	errors: readonly GraphQLErrorLike[] | undefined,
 	tolerate: readonly (readonly PathSegment[])[] | undefined,
 ): boolean {
 	if (data == null || !errors?.length || !tolerate?.length) return false;
-	return errors.every((e) => !!e.path?.length && tolerate.some((p) => startsWith(e.path!, p)));
+	return errors.every(
+		(e) =>
+			!!e.path?.length && tolerate.some((p) => startsWith(e.path!, p) && parentResolved(data, p)),
+	);
 }
 
 /**

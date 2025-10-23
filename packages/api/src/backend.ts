@@ -186,7 +186,8 @@ export interface Backend {
 	 * Mark ONE chapter read or unread, exactly — the series list's toggle. Unlike
 	 * {@link setProgress} (which never un-reads and cascades every earlier chapter to read
 	 * on a finish), this sets just this chapter, and unread clears every copy of it.
-	 * Resolves `false` when the API predates it, so the caller can fall back or refuse.
+	 * Resolves `false` when the API predates it, and the caller refuses (there is no safe
+	 * fallback: `setProgress` cascades).
 	 * Optional: only the unified Komika API implements it.
 	 */
 	setChapterRead?(chapterId: Id, read: boolean): Promise<boolean>;

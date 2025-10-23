@@ -53,6 +53,16 @@ test('a null `data` is never partial, and opting out (no paths) keeps the old th
 	assert.equal(tolerablePartialErrors(bundle, errors, []), false);
 });
 
+test('a tolerated error that nulled the PARENT is not partial (so the caller can retry)', () => {
+	// A schema with `seriesPage` nullable but `aggregated` non-null: the aggregation error
+	// stops null propagation at `seriesPage`, and `data.seriesPage` is null. Reading past
+	// that would hand the reader a null bundle ("not found") instead of its retry.
+	const errors = [{ message: 'boom', path: ['seriesPage', 'aggregated'] }];
+	assert.equal(tolerablePartialErrors({ seriesPage: null }, errors, [AGG]), false);
+	assert.equal(tolerablePartialErrors({}, errors, [AGG]), false);
+	assert.equal(tolerablePartialErrors({ seriesPage: { workId: 'w_1' } }, errors, [AGG]), true);
+});
+
 test('failedOnlyAt recognises a non-null field that nulled the whole response', () => {
 	// What a server that still types `aggregated` non-null answers: data null, but the
 	// error's path names the field — enough for the client to retry without it.
