@@ -32,7 +32,10 @@ jobs:
   # is not a cross-compiler — the runner arch/OS must match the slug), so the
   # matrix pins each slug to the runner whose native arch produces it:
   #   aarch64-macos -> macos-14 (Apple Silicon)
-  #   x86_64-macos  -> macos-13 (Intel)
+  #   x86_64-macos  -> macos-15-intel (Intel). NOT macos-13: GitHub retired that
+  #                    image, so a job pinned to it sits in "queued" forever and the
+  #                    Intel JRE is never built. macos-15-intel is the replacement
+  #                    Intel label (x86_64 host, so jlink still emits an x86_64 JRE).
   #   x86_64-linux  -> ubuntu-latest
   #   x86_64-windows-> windows-latest
   # fail-fast:false so one target's failure doesn't mask the others. The shell
@@ -51,7 +54,7 @@ jobs:
             runner: macos-14
             java_ext: ''
           - slug: x86_64-macos
-            runner: macos-13
+            runner: macos-15-intel
             java_ext: ''
           - slug: x86_64-linux
             runner: ubuntu-latest
