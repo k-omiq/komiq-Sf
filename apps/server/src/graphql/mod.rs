@@ -107,6 +107,13 @@ static DISCOVERY_CACHE: std::sync::LazyLock<FeedCache<Vec<DiscoveryFeed>>> =
 static GENRE_FACETS_CACHE: std::sync::LazyLock<FeedCache<Vec<(String, i64)>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Browse v2's tag list (`tags`).
+static TAGS_CACHE: std::sync::LazyLock<FeedCache<Vec<crate::tags::TagRow>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+/// Single-flight locks collapsing concurrent refills of [`TAGS_CACHE`].
+static TAGS_INFLIGHT: std::sync::LazyLock<KeyedLocks> =
+    std::sync::LazyLock::new(KeyedLocks::default);
+
 /// Single-flight locks collapsing concurrent refills of [`DISCOVERY_CACHE`] (S1
 /// pattern). Keyed 0/1 by NSFW posture — a separate keyspace from
 /// [`GENRE_FACETS_INFLIGHT`] and from the AppState locks, whose keys are series ids,
@@ -185,6 +192,9 @@ pub(crate) fn clear_feed_caches() {
         map.clear();
     }
     if let Ok(mut map) = GENRE_FACETS_CACHE.lock() {
+        map.clear();
+    }
+    if let Ok(mut map) = TAGS_CACHE.lock() {
         map.clear();
     }
     crate::browse::clear_count_cache();
@@ -1026,6 +1036,125 @@ async fn resolve_viewer_show_nsfw(ctx: &Context<'_>) -> bool {
 /// only for an admin. Anonymous and ordinary logged-in viewers are unaffected —
 /// the argument is ignored for them, so it grants nothing and cannot be used to bypass
 /// the gate.
+/// Translate a v2 [`BrowseFilter`] into a [`crate::browse::BrowseQuery`]: map every enum onto
+/// its stored word, validate and bound every client value, and pick the default sort.
+///
+/// Errors only for the over-long lists (see [`BrowseFilter`] for why they are not
+/// truncated); every other out-of-range value is CLAMPED or neutralized by the `browse`
+/// canonicalizers, so a sloppy client degrades to a sensible query instead of a failed page.
+///
+/// `ratings` is the canonical content-rating list ([`filter_content_ratings`]), owned by the
+/// caller because the query borrows it as a slice; empty means no rating clause.
+fn browse_query_from_filter<'a>(
+    f: &BrowseFilter,
+    show_nsfw: bool,
+    has_query: bool,
+    page: i32,
+    ratings: &'a [&'static str],
+) -> Result<crate::browse::BrowseQuery<'a>> {
+    use crate::browse::{self as b, TagMode as M};
+    let too_long = |name: &str, n: usize, max: usize| {
+        (n > max).then(|| Error::new(format!("{name}: at most {max} entries, got {n}")))
+    };
+    let inc = f.included_tags.as_deref().unwrap_or_default();
+    let exc = f.excluded_tags.as_deref().unwrap_or_default();
+    let langs = f.original_languages.as_deref().unwrap_or_default();
+    if let Some(e) = too_long("includedTags", inc.len(), b::MAX_TAG_FILTERS)
+        .or_else(|| too_long("excludedTags", exc.len(), b::MAX_TAG_FILTERS))
+        .or_else(|| too_long("originalLanguages", langs.len(), b::MAX_LANGUAGE_FILTERS))
+    {
+        return Err(e);
+    }
+    let mode = |m: Option<TagMode>, default: M| match m {
+        Some(TagMode::And) => M::And,
+        Some(TagMode::Or) => M::Or,
+        None => default,
+    };
+    let (year_from, year_to) = b::year_range(f.year_from.map(i64::from), f.year_to.map(i64::from));
+    let sort = types::browse_sort(
+        f.sort.unwrap_or(if has_query {
+            BrowseSortField::Relevance
+        } else {
+            BrowseSortField::LatestUpdate
+        }),
+        f.direction,
+    );
+    Ok(b::BrowseQuery {
+        show_nsfw,
+        types: filter_words(f.types.as_ref(), collapsed_comic_type_word),
+        statuses: filter_words(f.status.as_ref(), status_word),
+        // `None` when the client sent no ratings (or an empty list): no clause.
+        ratings: (!ratings.is_empty()).then_some(ratings),
+        nsfw_only: false,
+        genres: &[],
+        has_chapters: f.has_chapters,
+        min_rating: None,
+        max_rating: None,
+        demographics: filter_words(f.demographics.as_ref(), demographic_word),
+        languages: b::canonical_languages(langs),
+        year_from,
+        year_to,
+        min_chapters: b::min_chapters(f.min_chapters.map(i64::from)),
+        min_follows: b::min_follows(f.min_follows.map(i64::from)),
+        min_md_rating: b::min_md_rating(f.min_rating),
+        source: b::parse_source(f.source.as_deref()),
+        include_tags: b::canonical_tag_ids(inc),
+        include_mode: mode(f.included_tags_mode, M::And),
+        exclude_tags: b::canonical_tag_ids(exc),
+        exclude_mode: mode(f.excluded_tags_mode, M::Or),
+        sort,
+        page: i64::from(page.max(1)),
+    })
+}
+
+/// Dedupe and sort a fixed-vocabulary enum list into its stored words, so the memo key is
+/// order-insensitive. Bounded by the vocabulary once deduped (5 statuses, 3 collapsed
+/// formats, …), so a client repeating a value 10,000 times costs nothing.
+fn filter_words<T: Copy>(v: Option<&Vec<T>>, f: impl Fn(T) -> &'static str) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = v
+        .map(|v| v.iter().map(|x| f(*x)).collect())
+        .unwrap_or_default();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The v2 `contentRatings` as stored words, canonical (deduped, sorted).
+fn filter_content_ratings(f: &BrowseFilter) -> Vec<&'static str> {
+    filter_words(f.content_ratings.as_ref(), content_rating_word)
+}
+
+/// `search(filter:)` — Browse v2. One path for an empty query (`browse::browse_catalogue`)
+/// and a text query (`browse::search_text`), both over the SAME WHERE, both hydrated through
+/// `map_browse_rows` and re-gated by `filter_nsfw` exactly like the v1 branches.
+async fn search_v2(
+    st: &AppState,
+    trimmed: &str,
+    page: i32,
+    show_nsfw: bool,
+    filter: &BrowseFilter,
+) -> Result<SeriesPage> {
+    // Clamped ONCE, so the page echoed back is the page the rows came from — `page: 0`
+    // returns page-1 rows labelled page 1, as `updatesFeed` already does.
+    let page = page.max(1);
+    let ratings = filter_content_ratings(filter);
+    let bq = browse_query_from_filter(filter, show_nsfw, !trimmed.is_empty(), page, &ratings)?;
+    let (total, rows) = if trimmed.is_empty() {
+        crate::browse::browse_catalogue(&st.pool, &bq).await
+    } else {
+        crate::browse::search_text(&st.pool, trimmed, &bq).await
+    }
+    .map_err(gql_err)?;
+    let items = filter_nsfw(show_nsfw, map_browse_rows(st, rows).await);
+    let has_next = i64::from(page) * BROWSE_PAGE_SIZE < total;
+    Ok(SeriesPage {
+        items,
+        page,
+        has_next_page: has_next,
+        total: Some(total.min(i64::from(i32::MAX)) as i32),
+    })
+}
+
 async fn viewer_show_nsfw_or_admin(ctx: &Context<'_>, include_nsfw: Option<bool>) -> bool {
     let Some(user) = current_user(ctx).await else {
         return false; // anonymous: never, regardless of the argument
@@ -1827,6 +1956,11 @@ fn group_aggregated_chapters(rows: Vec<catalog::WorkChapterRow>) -> Vec<Aggregat
     // interleaving arbitrarily — and, crucially, keep one row each rather than all
     // collapsing onto 0 the way a numeric-only key forced them to (F2).
     let mut by_key: BTreeMap<(OrderedNumber, String), AggregatedChapter> = BTreeMap::new();
+    // Numbers whose `chapter_volume` came from a MangaDex copy, which no later copy may
+    // replace. The query yields the Suwayomi half FIRST, so first-seen alone would let a
+    // source's label beat the mirror's.
+    let mut volume_from_mirror: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for r in rows {
         let key = (OrderedNumber(r.number), r.key.clone());
         let entry = by_key.entry(key).or_insert_with(|| AggregatedChapter {
@@ -1838,6 +1972,7 @@ fn group_aggregated_chapters(rows: Vec<catalog::WorkChapterRow>) -> Vec<Aggregat
             key: r.key.clone(),
             title: r.title.clone(),
             first_released_at: None,
+            chapter_volume: None,
             // Filled by the resolver, which is where the viewer is known. Grouping stays
             // pure and viewer-independent.
             read_anywhere: false,
@@ -1858,6 +1993,15 @@ fn group_aggregated_chapters(rows: Vec<catalog::WorkChapterRow>) -> Vec<Aggregat
         if let Some(t) = r.released_at.as_deref() {
             if entry.first_released_at.as_deref().is_none_or(|cur| t < cur) {
                 entry.first_released_at = Some(t.to_string());
+            }
+        }
+        if let Some(v) = r.volume.as_deref().filter(|v| !v.is_empty()) {
+            let mirror = r.source_type == "mangadex";
+            if entry.chapter_volume.is_none() || (mirror && !volume_from_mirror.contains(&r.key)) {
+                entry.chapter_volume = Some(v.to_string());
+                if mirror {
+                    volume_from_mirror.insert(r.key.clone());
+                }
             }
         }
         entry.sources.push(ChapterSource {
@@ -3756,16 +3900,9 @@ async fn compute_discovery(st: &AppState, show_nsfw: bool) -> Result<Vec<Discove
     // two "Latest added" lists disagree entirely.
     let latest_added = crate::browse::BrowseQuery {
         show_nsfw,
-        type_word: None,
-        status_word: None,
-        ratings: None,
-        nsfw_only: false,
-        genres: &[],
-        has_chapters: None,
-        min_rating: None,
-        max_rating: None,
-        sort: BrowseSort::LatestAdded,
+        sort: BrowseSort::LatestAdded.into(),
         page: 1,
+        ..Default::default()
     };
     let (_, recent_rows) = crate::browse::browse_catalogue(&st.pool, &latest_added)
         .await
@@ -3892,7 +4029,16 @@ impl SeriesPageBundle {
     /// S2 cross-source aggregation (same rows as `aggregatedChapters`), resolved
     /// lazily so the reader route can skip it. No redirect re-follow and no NSFW
     /// re-gate: the bundle only exists for a work that already passed both.
-    async fn aggregated(&self, ctx: &Context<'_>) -> Result<Vec<AggregatedChapter>> {
+    ///
+    /// NULLABLE ON PURPOSE, although it is never `Ok(None)`. A resolver error on a
+    /// NON-null field propagates to the nearest nullable ancestor, and `seriesPage` is
+    /// non-null too — so one failing aggregation query used to null the whole `data` and
+    /// take the series, spine and every source list down with it, i.e. a blank reader for
+    /// what is an optional enrichment. Nullable, the failure stays on this field: the
+    /// response carries the bundle plus one error at `["seriesPage","aggregated"]`, which
+    /// the client tolerates and reads as an empty aggregation (single-copy behaviour).
+    /// Widening non-null to nullable is backward compatible for every existing document.
+    async fn aggregated(&self, ctx: &Context<'_>) -> Result<Option<Vec<AggregatedChapter>>> {
         let st = state(ctx);
         let rows = catalog::work_source_chapters(&st.pool, &self.work_id.0)
             .await
@@ -3907,7 +4053,7 @@ impl SeriesPageBundle {
                 }
             }
         }
-        Ok(chapters)
+        Ok(Some(chapters))
     }
 }
 
@@ -4953,7 +5099,15 @@ impl QueryRoot {
     /// read right now; absent, they are included and sorted last on the recency ordering.
     ///
     /// A TEXT query does full-text search over the canonical `work` catalogue instead (see
-    /// below); the structural filters do not apply on that path.
+    /// below); the v1 structural filters do not apply on that path.
+    ///
+    /// BROWSE V2: `filter: BrowseFilter` (migration 0106, `search_v2`). When present it WINS
+    /// over every v1 filter/sort argument, and its filters apply TOGETHER with a text query
+    /// (`browse::search_text` narrows the match set by the same WHERE Browse uses, keeping
+    /// relevance ranking by default) — the v1 behaviour above is kept for clients that do not
+    /// send it, with ONE deliberate change: the v1 content-rating tiers now read the EFFECTIVE
+    /// rating (`catalog::effective_content_rating_sql`), so an opted-in viewer's SAFE tier no
+    /// longer returns source-flagged adult works that merely lacked a MangaDex rating.
     ///
     /// `genres` matches ANY of the given genres and is capped at
     /// `browse::MAX_GENRE_FILTERS`. `minRating`/`maxRating` filter by the work's aggregate
@@ -5008,10 +5162,23 @@ impl QueryRoot {
                     non-MangaDex source."
         )]
         has_chapters: Option<bool>,
+        #[graphql(
+            desc = "Browse v2 (\"MangaDex advanced search\"): tags with AND/OR include and \
+                    exclude, several statuses/formats/demographics/content ratings/languages, \
+                    year range, minimum chapters/rating/follows, source, and sort + \
+                    direction. Applies TOGETHER with a text query (relevance-ranked by \
+                    default). When present it WINS over every v1 filter/sort argument above; \
+                    `includeNsfw` keeps its admin-only meaning. Content ratings narrow inside \
+                    the viewer's NSFW gate and can never widen it."
+        )]
+        filter: Option<BrowseFilter>,
     ) -> Result<SeriesPage> {
         let st = state(ctx);
         let trimmed = query.trim();
         let show_nsfw = viewer_show_nsfw_or_admin(ctx, include_nsfw).await;
+        if let Some(filter) = filter {
+            return search_v2(st, trimmed, page, show_nsfw, &filter).await;
+        }
         if trimmed.is_empty() {
             // Collapse to the three words `feed_series_updates.comic_type` stores. Asking
             // for WEBTOON returns the manhwa set rather than nothing, which is the useful
@@ -5021,19 +5188,21 @@ impl QueryRoot {
             // (the exact degradation migration 0064's header is about), and the argument is
             // a list only so the client does not need a schema change to gain multi-select
             // once a strategy for it exists.
-            let type_word = types
+            let type_word: Vec<&'static str> = types
                 .as_deref()
                 .and_then(|t| t.first().copied())
-                .map(collapsed_comic_type_word);
-            let status_word = status.map(status_word);
+                .map(collapsed_comic_type_word)
+                .into_iter()
+                .collect();
+            let status_word: Vec<&'static str> = status.map(status_word).into_iter().collect();
             let rating_filter = content_rating.unwrap_or(ContentRatingFilter::All);
             let tier = content_rating_tier(rating_filter);
             let nsfw_only = content_rating_nsfw_only(rating_filter);
             let genre_list = crate::browse::canonical_genres(&genres.unwrap_or_default());
             let bq = crate::browse::BrowseQuery {
                 show_nsfw,
-                type_word,
-                status_word,
+                types: type_word,
+                statuses: status_word,
                 ratings: tier,
                 nsfw_only,
                 genres: &genre_list,
@@ -5042,9 +5211,11 @@ impl QueryRoot {
                 has_chapters,
                 // TRENDING by default — the only ordering that reflects what people are
                 // reading. It degrades to NEWEST for everything unviewed, so a cold view
-                // table cannot render Browse empty.
-                sort: sort.unwrap_or(BrowseSort::Trending),
+                // table cannot render Browse empty. Mapped onto the internal sort with
+                // `desc = true`, which is exactly what each v1 sort did.
+                sort: sort.unwrap_or(BrowseSort::Trending).into(),
                 page: page.max(1) as i64,
+                ..Default::default()
             };
             let (total, rows) = crate::browse::browse_catalogue(&st.pool, &bq)
                 .await
@@ -5210,6 +5381,45 @@ impl QueryRoot {
             .map(|(genre, count)| GenreFacet {
                 genre,
                 count: count as i32,
+            })
+            .collect())
+    }
+
+    /// Browse v2's tag vocabulary (`TagInfo`), grouped genre/theme/format/content then by
+    /// name, read from the materialized `tag` table (migration 0106) and NSFW-gated exactly
+    /// like `genreFacets`: an opted-out viewer gets counts over the works they may see, and a
+    /// tag only NSFW works carry is not offered at all. Each `count` is the number the
+    /// single-tag include filter returns for that viewer — both count `browse_catalogue`,
+    /// rebuilt in one transaction.
+    ///
+    /// Cached like `genreFacets` (viewer-invariant given the NSFW posture, so the posture is
+    /// the whole key — see [`feed_cache_key`]), with the same single-flight refill.
+    async fn tags(&self, ctx: &Context<'_>) -> Result<Vec<TagInfo>> {
+        let st = state(ctx);
+        let show_nsfw = viewer_show_nsfw(ctx).await;
+        let key = feed_cache_key(show_nsfw);
+        let rows = if let Some(hit) = cached_feed(&TAGS_CACHE, key, FEED_TTL) {
+            (*hit).clone()
+        } else {
+            let lock = TAGS_INFLIGHT.lock_handle(i64::from(show_nsfw));
+            let _guard = lock.lock().await;
+            if let Some(hit) = cached_feed(&TAGS_CACHE, key, FEED_TTL) {
+                (*hit).clone()
+            } else {
+                let rows = crate::tags::list_tags(&st.pool, show_nsfw)
+                    .await
+                    .map_err(gql_err)?;
+                store_feed(&TAGS_CACHE, key, rows.clone());
+                rows
+            }
+        };
+        Ok(rows
+            .into_iter()
+            .map(|r| TagInfo {
+                group: tag_group_from_word(&r.tag_group),
+                id: r.id,
+                name: r.name,
+                count: r.count.min(i64::from(i32::MAX)) as i32,
             })
             .collect())
     }
@@ -7902,6 +8112,165 @@ impl MutationRoot {
         Ok(true)
     }
 
+    /// Mark ONE chapter read or unread, exactly — the series list's per-chapter toggle.
+    ///
+    /// NOT `setProgress`, on purpose, for two reasons that are both features THERE:
+    ///  - `setProgress` merges `read = MAX(old, new)`, so a reader reopening a finished
+    ///    chapter at page 1 does not un-finish it. That makes it unable to express "unread"
+    ///    at all: the call succeeded and the chapter came back read on the next load.
+    ///  - `read: true` there cascades (`catch_up_*`) every earlier chapter to read, which is
+    ///    right when the viewer FINISHES chapter 178 and wrong when they tick one box in a
+    ///    list.
+    ///
+    /// Unread clears the chapter's read flag on EVERY copy this viewer has a row for — the
+    /// same `chapter_key` within the same work, across the MangaDex mirror and Suwayomi
+    /// sources — because the list's read state is the cross-source fold (`readAnywhere`,
+    /// `work_read_keys`); clearing only the clicked copy would leave the row read. Resume
+    /// positions (`last_page_read`) are left alone either way.
+    ///
+    /// A READ of a chapter the server does not know is refused ("No such chapter") rather
+    /// than stored with an empty owner the way `set_progress` does: this upsert never
+    /// rewrites the owner on conflict, so a row written with `''` would stay invisible to
+    /// the per-series progress maps even after the chapter is catalogued. The list only
+    /// offers chapters it loaded, so a refusal here means the id is stale or forged.
+    async fn set_chapter_read(
+        &self,
+        ctx: &Context<'_>,
+        chapter_id: ID,
+        read: bool,
+    ) -> Result<bool> {
+        let st = state(ctx);
+        let user = require_user(ctx).await?;
+        let id = chapter_id.0.trim();
+        if id.is_empty() || id.len() > 128 {
+            return Err(Error::new("Invalid chapter id"));
+        }
+        // Same id-shape routing as `set_progress` (CR6): numeric = Suwayomi, else MangaDex.
+        let numeric = id.bytes().all(|b| b.is_ascii_digit());
+        let now = Utc::now().to_rfc3339();
+        let mut tx = st.pool.begin().await.map_err(gql_err)?;
+        if read {
+            if numeric {
+                // The owning Suwayomi series: from the engine's chapter cache, or — when that
+                // cache never held the chapter (the engine is down, or the row came in through
+                // the spine drain) — from the spine mapping, whose `source_key` IS the series
+                // id `suwayomi_progress.series_id` stores.
+                let series_id: String = sqlx::query_scalar::<_, String>(
+                    "SELECT CAST(manga_id AS TEXT) FROM suwayomi_chapter WHERE id = ?1 \
+                     UNION ALL \
+                     SELECT ss.source_key FROM chapter c \
+                       JOIN source_series ss ON ss.id = c.source_series_id \
+                      WHERE c.external_id = ?2 AND ss.source_type = 'suwayomi' \
+                     LIMIT 1",
+                )
+                .bind(id.parse::<i64>().map_err(gql_err)?)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(gql_err)?
+                .ok_or_else(|| Error::new("No such chapter"))?;
+                sqlx::query(
+                    "INSERT INTO suwayomi_progress \
+                       (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
+                     VALUES (?, ?, ?, 0, 1, ?) \
+                     ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
+                       read = 1, updated_at = excluded.updated_at",
+                )
+                .bind(&user.id)
+                .bind(id)
+                .bind(&series_id)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .map_err(gql_err)?;
+            } else {
+                let work_id: String = sqlx::query_scalar::<_, String>(
+                    "SELECT ss.work_id FROM chapter c \
+                       JOIN source_series ss ON ss.id = c.source_series_id \
+                      WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
+                )
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(gql_err)?
+                .ok_or_else(|| Error::new("No such chapter"))?;
+                sqlx::query(
+                    "INSERT INTO canonical_progress \
+                       (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
+                     VALUES (?, ?, ?, 0, 1, ?) \
+                     ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
+                       read = 1, updated_at = excluded.updated_at",
+                )
+                .bind(&user.id)
+                .bind(id)
+                .bind(&work_id)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .map_err(gql_err)?;
+            }
+            tx.commit().await.map_err(gql_err)?;
+            return Ok(true);
+        }
+        // Unread. The clicked copy first, by id — this alone is the whole answer for a
+        // chapter the spine does not know (no key to fold on).
+        let own = if numeric {
+            "UPDATE suwayomi_progress SET read = 0, updated_at = ? \
+              WHERE user_id = ? AND chapter_id = ? AND read = 1"
+        } else {
+            "UPDATE canonical_progress SET read = 0, updated_at = ? \
+              WHERE user_id = ? AND chapter_id = ? AND read = 1"
+        };
+        sqlx::query(own)
+            .bind(&now)
+            .bind(&user.id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(gql_err)?;
+        // Then every sibling copy of the same chapter in the same work, on both stores.
+        let ident: Option<(String, String)> = sqlx::query_as(
+            "SELECT ss.work_id, c.chapter_key FROM chapter c \
+               JOIN source_series ss ON ss.id = c.source_series_id \
+              WHERE c.external_id = ? AND ss.source_type = ? AND c.chapter_key IS NOT NULL \
+              LIMIT 1",
+        )
+        .bind(id)
+        .bind(if numeric { "suwayomi" } else { "mangadex" })
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(gql_err)?;
+        if let Some((work_id, key)) = ident {
+            // Two static statements rather than one formatted over the table name: identical
+            // but for the store, and kept literal so no SQL text is ever assembled at runtime.
+            const CLEAR_CANONICAL: &str =
+                "UPDATE canonical_progress SET read = 0, updated_at = ?1 \
+                  WHERE user_id = ?2 AND read = 1 AND chapter_id IN ( \
+                    SELECT c.external_id FROM chapter c \
+                      JOIN source_series ss ON ss.id = c.source_series_id \
+                     WHERE ss.work_id = ?3 AND ss.source_type = 'mangadex' \
+                       AND c.chapter_key = ?4)";
+            const CLEAR_SUWAYOMI: &str = "UPDATE suwayomi_progress SET read = 0, updated_at = ?1 \
+                  WHERE user_id = ?2 AND read = 1 AND chapter_id IN ( \
+                    SELECT c.external_id FROM chapter c \
+                      JOIN source_series ss ON ss.id = c.source_series_id \
+                     WHERE ss.work_id = ?3 AND ss.source_type = 'suwayomi' \
+                       AND c.chapter_key = ?4)";
+            for sql in [CLEAR_CANONICAL, CLEAR_SUWAYOMI] {
+                sqlx::query(sql)
+                    .bind(&now)
+                    .bind(&user.id)
+                    .bind(&work_id)
+                    .bind(&key)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(gql_err)?;
+            }
+        }
+        tx.commit().await.map_err(gql_err)?;
+        Ok(true)
+    }
+
     async fn post_review(&self, ctx: &Context<'_>, input: PostReviewInput) -> Result<Review> {
         if !(1..=10).contains(&input.score) {
             return Err(Error::new("score must be between 1 and 10"));
@@ -8866,12 +9235,17 @@ impl MutationRoot {
                         if t.is_empty() {
                             continue;
                         }
+                        // `tag_key` (migration 0106) so the curated tag is filterable
+                        // immediately; `tags::fill_tag_keys` would otherwise only reach it
+                        // at the next Browse rebuild.
                         sqlx::query(
-                            "INSERT OR IGNORE INTO work_tag (work_id, tag, ord) VALUES (?, ?, ?)",
+                            "INSERT OR IGNORE INTO work_tag (work_id, tag, ord, tag_key) \
+                             VALUES (?, ?, ?, ?)",
                         )
                         .bind(&work_id)
                         .bind(t)
                         .bind(i as i64)
+                        .bind(crate::tags::slug(t))
                         .execute(&mut *tx)
                         .await
                         .map_err(gql_err)?;
@@ -16568,6 +16942,236 @@ mod tests {
         assert_eq!(d["total"], serde_json::json!(1));
     }
 
+    /// Browse v2 over the wire: `search(filter:)` with and without a text query, the `tags`
+    /// query's NSFW-gated counts, the bypass attempt, the list bounds, and that a v1 call
+    /// beside it is unchanged. Everything goes through the REAL rebuild chain
+    /// (`refresh_feed_updates` -> `refresh_browse_catalogue` -> tag table), not hand-written
+    /// rows.
+    /// `search(filter:)` echoes the page its rows came from: a page below 1 is served AND
+    /// labelled as page 1, so a pager never shows "page 0" over page-1 content.
+    #[tokio::test]
+    async fn search_filter_v2_clamps_the_echoed_page() {
+        let (s, _pool) = setup_full(100).await;
+        for page in [0, -3] {
+            let q = format!(
+                r#"{{ search(query: "", page: {page}, filter: {{}}) {{ page hasNextPage }} }}"#
+            );
+            let r = exec(&s, &q, None, "1.1.1.1").await;
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            let page_out = r.data.into_json().unwrap()["search"]["page"].clone();
+            assert_eq!(page_out, serde_json::json!(1), "page {page}");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_filter_v2_end_to_end() {
+        let (s, pool) = setup_full(100).await;
+        seed_browse_work(
+            &pool,
+            "md-v1",
+            "Solo Alpha",
+            "ja",
+            "ONGOING",
+            "safe",
+            false,
+            3,
+            &["Action", "Comedy"],
+        )
+        .await;
+        let beta = seed_browse_work(
+            &pool,
+            "md-v2",
+            "Solo Beta",
+            "ko",
+            "COMPLETED",
+            "suggestive",
+            false,
+            5,
+            &["Action", "Romance", "Gore"],
+        )
+        .await;
+        seed_browse_work(
+            &pool,
+            "md-v3",
+            "Solo Gamma",
+            "zh",
+            "ONGOING",
+            "erotica",
+            true,
+            2,
+            &["Action", "Romance"],
+        )
+        .await;
+        sqlx::query("UPDATE work SET demographic = 'seinen', year = 2015 WHERE id = ?")
+            .bind(&beta)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO work_stats (work_id, follows, rating, rating_avg, fetched_at) \
+             VALUES (?, 1234, 8.5, 8.7, '2026-01-01T00:00:00Z')",
+        )
+        .bind(&beta)
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+
+        let run = |q: String, tok: Option<&'static str>| {
+            let s = &s;
+            async move { exec(s, &q, tok, "1.1.1.1").await }
+        };
+        let titles = |r: &async_graphql::Response| -> (i64, Vec<String>) {
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            let d = r.data.clone().into_json().unwrap()["search"].clone();
+            (
+                d["total"].as_i64().unwrap(),
+                d["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i["title"].as_str().unwrap().to_string())
+                    .collect(),
+            )
+        };
+        let search = |query: &str, filter: &str| {
+            format!(
+                r#"{{ search(query: "{query}", filter: {{ {filter} }}) {{ total hasNextPage items {{ title }} }} }}"#
+            )
+        };
+
+        // tags: opted-out bob sees counts over the SFW works only, slug ids, MangaDex groups
+        // (Gore is CONTENT via the vocabulary even though the fixture wrote no group).
+        let r = run("{ tags { id name group count } }".into(), Some("bobtok")).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let tags = r.data.into_json().unwrap()["tags"].clone();
+        let find = |id: &str| {
+            tags.as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == id)
+                .cloned()
+        };
+        assert_eq!(find("action").unwrap()["count"], 2, "{tags}");
+        assert_eq!(find("action").unwrap()["name"], "Action");
+        assert_eq!(
+            find("romance").unwrap()["count"],
+            1,
+            "Gamma is NSFW: {tags}"
+        );
+        assert_eq!(find("gore").unwrap()["group"], "CONTENT");
+        assert_eq!(find("action").unwrap()["group"], "GENRE");
+
+        // Empty query + tags (AND default) + an exact content rating.
+        let r = run(
+            search(
+                "",
+                r#"includedTags: ["action", "romance"], contentRatings: [SUGGESTIVE]"#,
+            ),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r), (1, vec!["Solo Beta".to_string()]));
+        // OR mode + exclude.
+        let r = run(
+            search(
+                "",
+                r#"includedTags: ["comedy", "romance"], includedTagsMode: OR, excludedTags: ["gore"], hasChapters: true"#,
+            ),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r), (1, vec!["Solo Alpha".to_string()]));
+        // Demographic / follows / rating / language / year / status / type, all at once.
+        let r = run(
+            search(
+                "",
+                r#"demographics: [SEINEN], minFollows: 1000, minRating: 8.0, originalLanguages: ["KO"], yearFrom: 2010, yearTo: 2020, status: [COMPLETED, ONGOING], types: [WEBTOON]"#,
+            ),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r), (1, vec!["Solo Beta".to_string()]));
+
+        // THE BYPASS ATTEMPT, over the wire: opted-out bob asks for the adult ratings.
+        let r = run(
+            search("", "contentRatings: [EROTICA, PORNOGRAPHIC]"),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r), (0, vec![]));
+        let r = run(
+            search("Solo", "contentRatings: [EROTICA, PORNOGRAPHIC]"),
+            None,
+        )
+        .await;
+        assert_eq!(titles(&r), (0, vec![]), "anonymous, with a text query too");
+
+        // Text query + filters together: the filter narrows the matches, relevance orders.
+        let r = run(
+            search("Solo", r#"includedTags: ["action"]"#),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(
+            titles(&r),
+            (2, vec!["Solo Beta".to_string(), "Solo Alpha".to_string()]),
+            "prefix tier, then chapters DESC — Gamma gated out"
+        );
+        let r = run(
+            search("Solo", r#"includedTags: ["action"], sort: TITLE"#),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(
+            titles(&r),
+            (2, vec!["Solo Alpha".to_string(), "Solo Beta".to_string()]),
+            "TITLE defaults to ASC"
+        );
+        let r = run(
+            search("Solo", r#"sort: MOST_FOLLOWS, direction: DESC"#),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(
+            titles(&r).1.first().map(String::as_str),
+            Some("Solo Beta"),
+            "the only work with statistics leads; unknowns after"
+        );
+
+        // Bounds: an over-long list is an error, not a silently-widened query.
+        let many = (0..33)
+            .map(|i| format!("\"t{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let r = run(
+            search("", &format!("includedTags: [{many}]")),
+            Some("bobtok"),
+        )
+        .await;
+        assert!(
+            first_error(&r).contains("includedTags: at most 32"),
+            "{:?}",
+            r.errors
+        );
+
+        // v1 is untouched: the same request without `filter` still ignores filters on a
+        // text query (old clients keep identical behaviour)...
+        let r = run(
+            r#"{ search(query: "Solo", types: [MANHUA]) { total items { title } } }"#.into(),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r).0, 2);
+        // ...and `filter` WINS over the v1 arguments when both are sent.
+        let r = run(
+            r#"{ search(query: "", types: [MANGA], sort: NEWEST, filter: { types: [MANHWA] }) { total items { title } } }"#.into(),
+            Some("bobtok"),
+        )
+        .await;
+        assert_eq!(titles(&r), (1, vec!["Solo Beta".to_string()]));
+    }
+
     /// Format / status / content-rating filters narrow the WHOLE catalogue, so `total`
     /// describes the filtered set rather than a slice of it — the thing the old
     /// `suwayomi_series` path could not do at all (it had no column for any of the three).
@@ -17265,6 +17869,29 @@ mod tests {
         assert_eq!(numbers, vec![1.0, 2.0], "{agg:?}");
     }
 
+    /// `SeriesPageBundle.aggregated` must stay NULLABLE. Under GraphQL's null propagation
+    /// a resolver error on a non-null field nulls the nearest nullable ancestor, and every
+    /// ancestor here (`seriesPage`, `data`) is non-null — so a failing aggregation query
+    /// blanked the series, spine and source lists with it, and the reader rendered
+    /// "Ch. 0". Nullable, the error stays on the field and the client degrades it to an
+    /// empty aggregation (`graphql-backend.ts`, `tolerablePartialErrors`).
+    #[tokio::test]
+    async fn series_page_aggregated_is_nullable_so_its_failure_cannot_blank_the_bundle() {
+        let (s, _pool) = setup_full(100).await;
+        let sdl = s.sdl();
+        let bundle = sdl
+            .split("type SeriesPageBundle {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("SeriesPageBundle in the SDL");
+        let field = bundle
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("aggregated:"))
+            .expect("aggregated field");
+        assert_eq!(field, "aggregated: [AggregatedChapter!]", "{bundle}");
+    }
+
     /// P2.1 REGRESSION GUARD: the bundle must carry the WORK-level enrichment, not only
     /// what the row mappers can produce on their own.
     ///
@@ -17279,6 +17906,178 @@ mod tests {
     ///
     /// Asserted on BOTH arms, because they map through different functions: the canonical
     /// spine and the per-source Suwayomi lists.
+    /// `setChapterRead` is the series list's toggle, and it must do what it says where
+    /// `setProgress` cannot: UNREAD really clears (setProgress merges `read = MAX(old,new)`,
+    /// so its unread was a silent no-op), it clears EVERY copy of the chapter so the
+    /// cross-source fold reads unread too, it keeps resume positions, and READ marks one
+    /// chapter without cascading every earlier one.
+    #[tokio::test]
+    async fn set_chapter_read_sets_exactly_one_chapter_across_its_copies() {
+        let (s, pool) = setup_full(100).await;
+        crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-toggle",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Toggle".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let md_ssid =
+            crate::catalog::find_source_series_id(&pool, "mangadex", "mangadex", "md-toggle")
+                .await
+                .unwrap()
+                .unwrap();
+        let work_id: String =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-toggle'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let suw_ssid = crate::catalog::upsert_source_series(
+            &pool, &work_id, "suwayomi", "suwayomi", "779", None, false,
+        )
+        .await
+        .unwrap();
+        for (ssid, ext, num) in [
+            (&md_ssid, "tg-1", "1"),
+            (&md_ssid, "tg-2", "2"),
+            (&md_ssid, "tg-3", "3"),
+            (&suw_ssid, "9101", "1"),
+        ] {
+            crate::catalog::upsert_chapter(
+                &pool,
+                ssid,
+                &crate::catalog::ChapterInput {
+                    external_id: ext.into(),
+                    number: Some(num.into()),
+                    lang: Some("en".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // Ch. 1 read on BOTH copies, the MangaDex one stopped at page 7.
+        sqlx::query(
+            "INSERT INTO canonical_progress (user_id, work_id, chapter_id, last_page_read, read, updated_at) \
+             VALUES ('bob-id', ?, 'tg-1', 7, 1, '2026-01-01T00:00:00Z')",
+        )
+        .bind(&work_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO suwayomi_progress (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
+             VALUES ('bob-id', '9101', '779', 0, 1, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let read_of = |table: &'static str, id: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (i64, i64)>(&format!(
+                    "SELECT read, last_page_read FROM {table} WHERE user_id = 'bob-id' AND chapter_id = ?"
+                ))
+                .bind(id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+            }
+        };
+
+        // setProgress cannot unread — the bug the toggle had.
+        let r = exec(
+            &s,
+            r#"mutation { setProgress(chapterId: "tg-1", lastPageRead: 7, read: false) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(read_of("canonical_progress", "tg-1").await, Some((1, 7)));
+
+        // setChapterRead does, on every copy, keeping the resume position.
+        let r = exec(
+            &s,
+            r#"mutation { setChapterRead(chapterId: "tg-1", read: false) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(read_of("canonical_progress", "tg-1").await, Some((0, 7)));
+        assert_eq!(
+            read_of("suwayomi_progress", "9101").await,
+            Some((0, 0)),
+            "the sibling copy must clear too, or the fold still reads it as read"
+        );
+        assert!(work_read_keys(&pool, Some("bob-id"), &work_id)
+            .await
+            .is_empty());
+
+        // Read marks exactly one chapter: ch. 3 read, 1 and 2 untouched (no catch-up).
+        let r = exec(
+            &s,
+            r#"mutation { setChapterRead(chapterId: "tg-3", read: true) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(read_of("canonical_progress", "tg-3").await, Some((1, 0)));
+        assert_eq!(read_of("canonical_progress", "tg-2").await, None);
+        assert_eq!(read_of("canonical_progress", "tg-1").await, Some((0, 7)));
+
+        // A Suwayomi id routes to its own store.
+        let r = exec(
+            &s,
+            r#"mutation { setChapterRead(chapterId: "9101", read: true) }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(read_of("suwayomi_progress", "9101").await, Some((1, 0)));
+
+        // Signed out: refused, never a silent success.
+        let r = exec(
+            &s,
+            r#"mutation { setChapterRead(chapterId: "tg-1", read: true) }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert!(!r.errors.is_empty());
+
+        // An id the server does not know is refused, not stored with an empty owner.
+        for unknown in ["not-a-chapter", "999999"] {
+            let r = exec(
+                &s,
+                &format!(r#"mutation {{ setChapterRead(chapterId: "{unknown}", read: true) }}"#),
+                Some("bobtok"),
+                "1.1.1.1",
+            )
+            .await;
+            assert!(
+                r.errors
+                    .iter()
+                    .any(|e| e.message.contains("No such chapter")),
+                "{unknown}: {:?}",
+                r.errors
+            );
+        }
+        let stray: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM canonical_progress WHERE chapter_id = 'not-a-chapter') \
+                  + (SELECT COUNT(*) FROM suwayomi_progress WHERE chapter_id = '999999')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stray, 0);
+    }
+
     #[tokio::test]
     async fn series_page_carries_found_dates_and_cross_source_read_state() {
         let (s, pool) = setup_full(100).await;
@@ -21232,7 +22031,31 @@ mod tests {
             scanlator: None,
             external_url: None,
             released_at: released.map(Into::into),
+            volume: None,
         }
+    }
+
+    /// The series page's volume headers read `chapterVolume`: the MangaDex copy's label
+    /// wins even though the query yields the Suwayomi half first, and a number whose copies
+    /// carry no volume reports none rather than borrowing a neighbour's.
+    #[test]
+    fn group_aggregated_chapters_takes_the_mirror_volume_per_number() {
+        let with_vol = |num: f64, st: &str, cid: &str, vol: Option<&str>| {
+            let mut r = agg_row(num, st, "s", (st == "suwayomi").then_some("777"), cid, None);
+            r.volume = vol.map(Into::into);
+            r
+        };
+        let out = group_aggregated_chapters(vec![
+            with_vol(1.0, "suwayomi", "9001", Some("9")),
+            with_vol(1.0, "mangadex", "md-1", Some("1")),
+            with_vol(1.0, "mangadex", "md-1b", Some("2")),
+            with_vol(2.0, "suwayomi", "9002", Some("4")),
+            with_vol(3.0, "mangadex", "md-3", None),
+        ]);
+        let vols: Vec<Option<&str>> = out.iter().map(|c| c.chapter_volume.as_deref()).collect();
+        // ch.1: the FIRST mirror copy's label, never the source's, never a later group's.
+        // ch.2: only a non-mirror label exists, so it stands. ch.3: unknown stays unknown.
+        assert_eq!(vols, vec![Some("1"), Some("4"), None]);
     }
 
     #[test]

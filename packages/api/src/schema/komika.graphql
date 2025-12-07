@@ -20,7 +20,8 @@ type Query {
 	# catalog
 	discovery: [DiscoveryFeed!]! # [komika] curated feeds over the [suwayomi] catalog
 	updates(page: Int = 1): SeriesPage! # [komika] library series the adaptive scanner found new chapters for, ordered by latestChapterAt (real upstream release time) DESC — the clock the cards display. Membership is the scanner's detection; only the ORDER is upstream's. Undated rows sort last.
-	search(query: String!, page: Int = 1, genres: [String!], minRating: Float, maxRating: Float, types: [ComicType!], status: SeriesStatus, sort: BrowseSort, contentRating: ContentRatingFilter, includeNsfw: Boolean, hasChapters: Boolean): SeriesPage! # [komika] S4: catalogue search + BROWSE. An EMPTY query browses the whole BROWSABLE canonical catalogue (115.6k works, from the materialized `browse_catalogue`) with every filter and sort applied in SQL, so `total`/`hasNextPage` describe the filtered set — it used to browse only the 13.8k-work Suwayomi library subset with one fixed order, then the 48.5k works that have a DATED chapter. A TEXT query runs full-text search over the canonical works instead; `types`/`status`/`sort`/`contentRating` apply to the BROWSE path only. Page size is 30 on both. `genres` matches ANY (capped at 12); `minRating`/`maxRating` filter by aggregate user rating 0–10 (minRating>0 drops unrated). `contentRating` can only NARROW within the viewer's NSFW posture, never widen past it (see ContentRatingFilter). `includeNsfw` is the ADMIN CONSOLE escape hatch: honoured only for an admin (silently ignored for anonymous + ordinary users), it ignores the admin's own show_nsfw so the console can find NSFW-flagged works — including the ~2.5k mainstream titles that are mis-flagged — and unflag them. `hasChapters` (BROWSE only) narrows to works we know a chapter for (`true`) or know none for (`false`); ABSENT means no clause, i.e. the ~67k works whose chapters MangaDex removed on licensing (Boku no Hero Academia, Nausicaä) or that will get them from a Suwayomi source are INCLUDED and sorted last on the recency ordering — hiding them hid exactly what people search for
+	search(query: String!, page: Int = 1, genres: [String!], minRating: Float, maxRating: Float, types: [ComicType!], status: SeriesStatus, sort: BrowseSort, contentRating: ContentRatingFilter, includeNsfw: Boolean, hasChapters: Boolean, filter: BrowseFilter): SeriesPage! # [komika] Browse v2: `filter` applies TOGETHER with a text query and wins over every legacy argument; optional so an older server can be stripped of it (OPTIONAL_ARGUMENTS). S4: catalogue search + BROWSE. An EMPTY query browses the whole BROWSABLE canonical catalogue (115.6k works, from the materialized `browse_catalogue`) with every filter and sort applied in SQL, so `total`/`hasNextPage` describe the filtered set — it used to browse only the 13.8k-work Suwayomi library subset with one fixed order, then the 48.5k works that have a DATED chapter. A TEXT query runs full-text search over the canonical works instead; `types`/`status`/`sort`/`contentRating` apply to the BROWSE path only. Page size is 30 on both. `genres` matches ANY (capped at 12); `minRating`/`maxRating` filter by aggregate user rating 0–10 (minRating>0 drops unrated). `contentRating` can only NARROW within the viewer's NSFW posture, never widen past it (see ContentRatingFilter). `includeNsfw` is the ADMIN CONSOLE escape hatch: honoured only for an admin (silently ignored for anonymous + ordinary users), it ignores the admin's own show_nsfw so the console can find NSFW-flagged works — including the ~2.5k mainstream titles that are mis-flagged — and unflag them. `hasChapters` (BROWSE only) narrows to works we know a chapter for (`true`) or know none for (`false`); ABSENT means no clause, i.e. the ~67k works whose chapters MangaDex removed on licensing (Boku no Hero Academia, Nausicaä) or that will get them from a Suwayomi source are INCLUDED and sorted last on the recency ordering — hiding them hid exactly what people search for
+	tags: [TagInfo!]! # [komika] Browse v2: the tag picker's vocabulary — stable slug ids, display names, MangaDex group, and a count of works carrying the tag that the viewer may see (NSFW-gated)
 	genreFacets: [GenreFacet!]! # [komika] S4: the genre chips for Browse's filter, most common first then alphabetical, gated by the viewer's NSFW posture. Each `count` is now EXACTLY the number of results the same genre filter returns — it previously came from JSON-parsing 13.8k Suwayomi `genre` blobs per request (301 entries, ungated, top entry literally "Japanese") while the filter ran against the canonical catalogue, so the chip's number and its results disagreed. Empty until MangaDex tags are ingested into `work_tag`
 	searchAllSources(query: String!, page: Int = 1): FederatedSearchPage! # [komika] federated multi-extension search — fans out to every installed source, dedupes to one canonical work per series with its per-source translators; NSFW-gated by the viewer's posture. REQUIRES LOGIN (persists mappings); per-user rate-limited (~20/min); errors "Not authenticated" for anonymous callers
 	series(id: ID!): Series! # [suwayomi] MangaType by id
@@ -176,6 +177,74 @@ enum ContentRatingFilter {
 	# follows admin overrides rather than contradicting them. For an opted-out viewer it
 	# returns an EMPTY page — the honest answer — rather than degrading to "everything".
 	NSFW_ONLY
+}
+
+# --- Browse v2 (`search(filter:)` + `tags`) ---------------------------------------
+enum TagMode {
+	AND
+	OR
+}
+enum SortDirection {
+	ASC
+	DESC
+}
+enum BrowseSortField {
+	RELEVANCE # text query only; without a query the server falls back to LATEST_UPDATE
+	LATEST_UPDATE # newest chapter release
+	RECENTLY_ADDED # work created_at
+	MOST_VIEWED # our own view counts
+	MOST_FOLLOWS # MangaDex follows
+	HIGHEST_RATED # MangaDex bayesian rating
+	MOST_CHAPTERS # en chapter count
+	TITLE # A-Z (ASC default for this one)
+	YEAR # publication year
+}
+enum Demographic {
+	SHOUNEN
+	SHOUJO
+	SEINEN
+	JOSEI
+	NONE
+}
+# A rating as a CATEGORY, not a ceiling (cf. ContentRatingFilter). Narrows INSIDE the
+# viewer's NSFW gate, never widens it.
+enum ContentRating {
+	SAFE
+	SUGGESTIVE
+	EROTICA
+	PORNOGRAPHIC
+}
+enum TagGroup {
+	GENRE
+	THEME
+	FORMAT
+	CONTENT
+}
+input BrowseFilter {
+	includedTags: [String!] # TagInfo.id, max 32
+	includedTagsMode: TagMode # default AND
+	excludedTags: [String!] # max 32
+	excludedTagsMode: TagMode # default OR
+	status: [SeriesStatus!]
+	types: [ComicType!] # OR; WEBTOON->MANHWA, COMIC->MANGA
+	demographics: [Demographic!]
+	contentRatings: [ContentRating!]
+	originalLanguages: [String!] # "ja","ko","zh","zh-hk","en",... max 16
+	yearFrom: Int # clamped 1900..=2100
+	yearTo: Int
+	minChapters: Int
+	minRating: Float # MangaDex bayesian 0..10
+	minFollows: Int
+	hasChapters: Boolean # true = only works with a readable chapter
+	source: String
+	sort: BrowseSortField # default RELEVANCE with a query, LATEST_UPDATE without
+	direction: SortDirection # default DESC (TITLE: ASC)
+}
+type TagInfo {
+	id: String! # URL-safe slug of the canonical English name: "action", "boys-love"
+	name: String!
+	group: TagGroup!
+	count: Int!
 }
 
 type Series {

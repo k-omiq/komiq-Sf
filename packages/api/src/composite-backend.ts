@@ -33,6 +33,7 @@ import type {
 	SourceInfo,
 	SourceScanHealth,
 	SplitSourcesResult,
+	TagInfo,
 	UpdateFeedRow,
 	WorkSource,
 	WorkSourceGroup,
@@ -230,6 +231,12 @@ export class CompositeBackend implements Backend {
 	}
 	genreFacets(): Promise<GenreFacet[]> {
 		return this.opts.hosted.genreFacets!();
+	}
+	tags(): Promise<TagInfo[]> {
+		return this.opts.hosted.tags?.() ?? Promise.resolve([]);
+	}
+	browseFilterSupported(): boolean {
+		return this.opts.hosted.browseFilterSupported?.() ?? false;
 	}
 	series(id: Id): Promise<Series> {
 		// Always hosted. Local serving for canonical works happens in the `canonical*`
@@ -638,6 +645,11 @@ export class CompositeBackend implements Backend {
 
 	// Popularity view counting is a hosted write; the embedded engine never counts.
 	// Best-effort (a hosted backend that doesn't track views simply no-ops).
+	setChapterRead(chapterId: Id, read: boolean): Promise<boolean> {
+		// Hosted only: read state lives on the API, and an explicit toggle is an online
+		// action the list undoes on failure, so it is not queued like `setProgress`.
+		return this.opts.hosted.setChapterRead?.(chapterId, read) ?? Promise.resolve(false);
+	}
 	recordView(seriesId: Id): Promise<void> {
 		return this.opts.hosted.recordView?.(seriesId) ?? Promise.resolve();
 	}

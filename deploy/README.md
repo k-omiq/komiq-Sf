@@ -26,7 +26,7 @@ admin login: <KOMIKA_ADMIN_USERS> / KOMIKA_ADMIN_PASSWORD
 ```
 
 **Both published ports bind to `127.0.0.1` only.** Docker's DNAT bypasses the host
-firewall's `filter/INPUT` chain entirely, so a `0.0.0.0` publish here is *not* covered
+firewall's `filter/INPUT` chain entirely, so a `0.0.0.0` publish here is _not_ covered
 by your host firewall rules — and it is reachable from containers in unrelated
 compose stacks on the same machine, via any bridge. Put a reverse proxy or a
 Cloudflare Tunnel in front (see `CLOUDFLARE-RUNBOOK.md`) rather than widening these.
@@ -43,7 +43,7 @@ would publish an unused world-bound port. To run it:
 > is served over plain HTTP (`nginx.conf` has no TLS listener) and calls the API with
 > an `http://` URL. Every session token (`Authorization: Bearer …`) then crosses the
 > network in cleartext — anyone on the path (LAN, public Wi-Fi) can capture a token and
-> replay it for 30 days. This path is meant for a *loopback or trusted-LAN evaluation*,
+> replay it for 30 days. This path is meant for a _loopback or trusted-LAN evaluation_,
 > not public exposure. On an untrusted network, put TLS in front (Caddy/nginx + LE, or
 > a Cloudflare Tunnel) and flip the API URL + CSP `connect-src` in `docker-compose.yml`
 > to `https://`. Production (Cloudflare Worker reader) already terminates TLS at the edge.
@@ -74,7 +74,7 @@ the next daemon restart, not at the next `docker compose up`.
 | **suwayomi**     | Runs the source extensions (MangaDex, …): catalog, chapters, **and page/cover images**.                                                                                                          |
 | **flaresolverr** | Headless-browser sidecar that solves Cloudflare "checking your browser" challenges. Internal-only; Suwayomi calls it at `http://flaresolverr:8191`.                                              |
 | **server**       | `komika-server` — federates Suwayomi + adds accounts/social/admin, and runs the **adaptive scan scheduler** (auto-updates the library on a cadence derived from each series' chapter frequency). |
-| **reader**       | Static SvelteKit SPA (nginx), pointed at the server. **Opt-in** — compose profile `selfhost`; in production the reader is a Cloudflare Worker instead.                                            |
+| **reader**       | Static SvelteKit SPA (nginx), pointed at the server. **Opt-in** — compose profile `selfhost`; in production the reader is a Cloudflare Worker instead.                                           |
 
 ## How it's wired (important gotcha)
 

@@ -193,7 +193,9 @@ export class LocalSuwayomiBackend implements ContentBackend {
 			await this.ensureProvisionedPkg(MANGADEX_PKG, KEIYOUSHI_REPO).catch(() => undefined);
 			const sourceId = await this.resolveMangaDexSourceId(ws.lang || 'en');
 			if (sourceId == null) return null;
-			const sourceKey = ws.sourceKey.startsWith('/manga/') ? ws.sourceKey : `/manga/${ws.sourceKey}`;
+			const sourceKey = ws.sourceKey.startsWith('/manga/')
+				? ws.sourceKey
+				: `/manga/${ws.sourceKey}`;
 			return { sourceId, sourceKey, pkgName: MANGADEX_PKG, repoUrl: KEIYOUSHI_REPO, title };
 		}
 		return null;

@@ -1490,8 +1490,7 @@ fn browse_catalogue_select_for(scope: &str) -> String {
             CASE WHEN f.work_id IS NOT NULL THEN f.suwayomi_thumbnail \
                  ELSE sw.thumbnail_url END, \
             CASE WHEN f.work_id IS NOT NULL THEN f.status ELSE {FSU_STATUS_SQL} END, \
-            CASE WHEN f.work_id IS NOT NULL THEN f.content_rating \
-                 ELSE COALESCE(w.content_rating, 'safe') END, \
+            {rating}, \
             CASE WHEN f.work_id IS NOT NULL THEN f.is_nsfw \
                  ELSE COALESCE(w.is_nsfw_override, w.is_nsfw) END, \
             -- The BEST-SOURCED count wins, not the MangaDex one. This was
@@ -1508,9 +1507,15 @@ fn browse_catalogue_select_for(scope: &str) -> String {
             f.latest_chapter, \
             f.released_at, \
             f.announced_at, \
-            w.created_at \
+            w.created_at, \
+            {BROWSE_DEMOGRAPHIC_SQL}, \
+            {BROWSE_LANGUAGE_SQL}, \
+            {BROWSE_YEAR_SQL}, \
+            st.follows, \
+            st.rating \
        FROM work w \
        LEFT JOIN feed_series_updates f ON f.work_id = w.id \
+       LEFT JOIN work_stats st ON st.work_id = w.id \
        LEFT JOIN (SELECT work_id FROM source_series \
                    WHERE source_type = 'mangadex' GROUP BY work_id) md ON md.work_id = w.id \
        LEFT JOIN (SELECT ss.work_id AS work_id, ss.source_key AS source_key, \
@@ -1530,7 +1535,71 @@ fn browse_catalogue_select_for(scope: &str) -> String {
                    WHERE ss.source_type = 'mangadex' AND c.lang = 'en' \
                    GROUP BY ss.work_id) en ON en.work_id = w.id \
       WHERE (md.work_id IS NOT NULL OR sw.work_id IS NOT NULL) \
-        AND COALESCE(f.title, w.title_override, w.primary_title, sw.title, '') <> ''{scope}"
+        AND COALESCE(f.title, w.title_override, w.primary_title, sw.title, '') <> ''{scope}",
+        rating = effective_content_rating_sql(
+            "CASE WHEN f.work_id IS NOT NULL THEN f.content_rating \
+                  ELSE COALESCE(w.content_rating, 'safe') END",
+            "CASE WHEN f.work_id IS NOT NULL THEN f.is_nsfw \
+                  ELSE COALESCE(w.is_nsfw_override, w.is_nsfw) END",
+        ),
+    )
+}
+
+/// `browse_catalogue.demographic` (migration 0106) over a `work` row aliased `w`: MangaDex's
+/// four words, lowercased, and NULL for everything else — `"none"` upstream, an unknown, or a
+/// stray casing/spacing variant from a non-MangaDex writer. Normalized at WRITE time so the
+/// filter is a plain `IN (…)` over a closed vocabulary, and `Demographic.NONE` is exactly
+/// `IS NULL`.
+///
+/// Shared by the rebuild's SELECT and `scanner::mirror_feed_row_into_browse_catalogue`, so the
+/// two writers of the table produce the same word (and migration 0106's backfill mirrors it by
+/// hand).
+pub(crate) const BROWSE_DEMOGRAPHIC_SQL: &str = "CASE lower(trim(w.demographic)) \
+        WHEN 'shounen' THEN 'shounen' WHEN 'shoujo' THEN 'shoujo' \
+        WHEN 'seinen' THEN 'seinen' WHEN 'josei' THEN 'josei' END";
+
+/// `browse_catalogue.original_language` (0106): MangaDex's `originalLanguage`, lowercased,
+/// blank folded to NULL. The filter's language codes are lowercased the same way
+/// (`browse::canonical_languages`), so "ZH-HK" and "zh-hk" are one value.
+pub(crate) const BROWSE_LANGUAGE_SQL: &str = "NULLIF(lower(trim(w.original_language)), '')";
+
+/// `browse_catalogue.year` (0106): the publication year, or NULL when it is missing or
+/// implausible. The bounds are wider than the filter's 1900..=2100 clamp on purpose — they
+/// only reject garbage (a 0 or a 5-digit typo would otherwise sort first under YEAR ASC), and
+/// a real 1890s work must still be sortable.
+pub(crate) const BROWSE_YEAR_SQL: &str = "CASE WHEN w.year BETWEEN 1800 AND 2200 THEN w.year END";
+
+/// The EFFECTIVE four-level content rating Browse materializes and filters on (migration
+/// 0106), from a stored rating expression and an effective-NSFW expression.
+///
+/// HOW `is_nsfw` IS DERIVED TODAY (verified, not assumed). A MangaDex work is `is_nsfw = 1`
+/// exactly when its rating is `erotica` or `pornographic` (`mangadex::to_work_input`) —
+/// SUGGESTIVE IS NOT NSFW, and stays visible to an opted-out viewer. On top of that, a source
+/// can ESCALATE a work (`mark_work_nsfw`: a Suwayomi source flagged NSFW, or an adult genre
+/// via `genre_is_nsfw`), except where MangaDex authoritatively rated it safe/suggestive; and an
+/// admin `is_nsfw_override` wins over everything. That gate is unchanged here.
+///
+/// WHY AN *EFFECTIVE* RATING RATHER THAN THE RAW COLUMN. The rating and the gate are two
+/// columns that can disagree: a Suwayomi-only work flagged NSFW by its source has NO MangaDex
+/// rating, so it was materialized as `safe` (the old `COALESCE(…, 'safe')`), and an admin can
+/// pin a MangaDex-`safe` work NSFW. With the raw column, an opted-in viewer asking for
+/// `contentRatings: [SAFE]` got adult works labelled safe. So a work the gate treats as NSFW is
+/// never materialized below `erotica` — the lowest adult level, and the honest reading of "we
+/// know it is adult but not how adult". The other direction (an `erotica` work an admin forced
+/// SFW) keeps its real rating: the label stays true, and the gate, which is the authority on
+/// VISIBILITY, already lets an opted-out viewer see it by the admin's decision.
+///
+/// The consequence that matters for the filter: `contentRatings` can only ever NARROW inside
+/// the gate. `SAFE`/`SUGGESTIVE` now select exactly the gate-visible works for every viewer,
+/// and `EROTICA`/`PORNOGRAPHIC` select nothing for an opted-out viewer because the gate's
+/// `is_nsfw = 0` and an adult effective rating are (admin overrides aside) mutually exclusive.
+///
+/// Both writers of `browse_catalogue` call this with their own column expressions; for a work
+/// with a feed row both pass the feed row's `content_rating`/`is_nsfw`, so they converge.
+pub(crate) fn effective_content_rating_sql(rating: &str, nsfw: &str) -> String {
+    format!(
+        "CASE WHEN ({nsfw}) = 1 AND ({rating}) IN ('safe', 'suggestive') \
+              THEN 'erotica' ELSE ({rating}) END"
     )
 }
 
@@ -1538,7 +1607,8 @@ fn browse_catalogue_select_for(scope: &str) -> String {
 /// `comic_type` is absent on purpose — see [`fill_comic_types`].
 const BROWSE_CATALOGUE_COLUMNS: &str = "work_id, reader_id, title, cover_url, \
      suwayomi_thumbnail, status, content_rating, is_nsfw, en_chapter_count, latest_chapter, \
-     released_at, announced_at, created_at";
+     released_at, announced_at, created_at, demographic, original_language, year, follows, \
+     rating";
 
 /// The columns the UPSERT re-assigns on conflict, i.e. everything except the primary key and
 /// `comic_type`.
@@ -1570,6 +1640,16 @@ pub(crate) const BROWSE_CATALOGUE_MUTABLE: &[&str] = &[
     // not disagree with the same work's Updates card.
     "announced_at",
     "created_at",
+    // Migration 0106 — Browse v2's filter/sort keys. All five are MUTABLE: MangaDex re-syncs
+    // can change demographic/language/year, and `follows`/`rating` move every time the stats
+    // drain re-fetches a work. The scanner's incremental mirror writes them from `work` /
+    // `work_stats` with the SAME expressions (`BROWSE_*_SQL`), which is what lets it share
+    // this list.
+    "demographic",
+    "original_language",
+    "year",
+    "follows",
+    "rating",
 ];
 
 /// Rebuild `browse_catalogue` (migration 0069) — the table Browse pages.
@@ -1603,6 +1683,23 @@ pub(crate) const BROWSE_CATALOGUE_MUTABLE: &[&str] = &[
 ///   title-went-empty case — where the upsert already does the safe thing by leaving the row
 ///   at its last known title rather than writing a NULL into a `NOT NULL` column.
 pub async fn refresh_browse_catalogue(pool: &SqlitePool) -> Result<u64> {
+    // Suwayomi-only works' tags (migration 0106): map their sources' free-text genres onto
+    // the MangaDex vocabulary BEFORE the rebuild, so the tag counts below — and the tag filter
+    // — see this cycle's result. Its own (short, diff-only) transaction, ahead of this one,
+    // to keep the write lock this function holds inside the pool's busy_timeout budget.
+    // Best-effort: a failure leaves last cycle's derived tags in place, which is stale but
+    // not wrong, and must not cost Browse its rebuild.
+    match crate::tags::sync_suwayomi_tags(pool).await {
+        Ok(s) if s != crate::tags::SuwayomiTagSync::default() => tracing::info!(
+            inserted = s.inserted,
+            deleted = s.deleted,
+            demographics = s.demographics,
+            "tags: synced Suwayomi-derived tags"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "tags: Suwayomi genre sync failed"),
+    }
+
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
     let set = BROWSE_CATALOGUE_MUTABLE
@@ -1639,6 +1736,13 @@ pub async fn refresh_browse_catalogue(pool: &SqlitePool) -> Result<u64> {
     // generation becomes visible fully typed or not at all, and a failure rolls back the
     // whole rebuild rather than publishing an untyped one.
     let typed = fill_comic_types(&mut tx, "browse_catalogue", None).await?;
+
+    // The tag vocabulary (migration 0106), in THIS transaction for the facet table's reason
+    // below: `tag.work_count` is the number on a tag chip, and it must count the generation
+    // the tag filter is about to query. Keys first (the safety net under every `work_tag`
+    // writer — see `tags::fill_tag_keys`), then the counts over them.
+    let keyed = crate::tags::fill_tag_keys(&mut tx).await?;
+    let tags = crate::tags::rebuild_tag_table(&mut tx).await?;
 
     // The genre facet list Browse renders as chips (migration 0068), MOVED here from the feed
     // rebuild, because the chips must count the table the chip's filter actually queries.
@@ -1692,6 +1796,8 @@ pub async fn refresh_browse_catalogue(pool: &SqlitePool) -> Result<u64> {
         pruned,
         typed,
         facets,
+        keyed,
+        tags,
         "browse_catalogue: rebuilt browse catalogue"
     );
     Ok(total as u64)
@@ -2010,7 +2116,7 @@ const MIN_FTS_QUERY_CHARS: usize = 3;
 /// a temp B-tree was the search hot path. Ranking a bounded window of the bm25-best
 /// candidates instead makes the tail cost flat, and `total` is capped to the same
 /// window so pagination never promises a page the window can't serve.
-const RANK_WINDOW: i64 = 500;
+pub(crate) const RANK_WINDOW: i64 = 500;
 
 /// Build an FTS5 MATCH expression from raw user input: split into unicode
 /// alphanumeric word tokens, quote each (so an FTS keyword like `and`/`or`/`near`
@@ -2022,7 +2128,7 @@ const RANK_WINDOW: i64 = 500;
 /// Only the last token is prefix-matched: while typing, the earlier tokens are
 /// complete words and starring them only widens the postings list scanned ("one
 /// piece" scanned every work containing a word starting with "one").
-fn fts_match_query(raw: &str) -> Option<String> {
+pub(crate) fn fts_match_query(raw: &str) -> Option<String> {
     let mut terms: Vec<String> = Vec::new();
     let mut cur = String::new();
     for ch in raw.chars() {
@@ -2057,6 +2163,76 @@ fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+/// The exact/prefix title TIER of [`search_works_fts`]' ranking — a SQL `CASE` over a `work`
+/// row aliased `w` — plus its bind values in order, chosen by script (see that function's doc
+/// comment for the tiers and why the case-folding is script-dependent).
+///
+/// Factored out so Browse v2's filtered text search (`browse::search_text`) ranks RELEVANCE
+/// with the IDENTICAL expression: "the filters narrowed my search" must never also mean "and
+/// the order changed", and two copies of a six-branch CASE is exactly how that would happen.
+pub(crate) fn fts_title_tier(query: &str) -> (&'static str, Vec<String>) {
+    if query.is_ascii() {
+        let qx = query.trim().to_lowercase();
+        let qp = format!("{}%", escape_like(&qx));
+        // Tiers 2/3 repeat the exact/prefix test over `normalized_title` — punctuation
+        // folded away, diacritics folded, noise tails stripped — BELOW the raw tiers,
+        // never merged into them. Without them the tier compared the user's RAW text
+        // against raw titles, so punctuation the user typed differently from the title
+        // dropped EVERY row into one bottom tier, leaving `chapters DESC` to decide and
+        // letting an unrelated spin-off outrank the work itself. Verified on production:
+        // `dr stone` put "Dr. STONE reboot: Byakuya" above "Dr.STONE", and `spy family`
+        // ranked "SPY×FAMILY" purely on chapter count; both are top-of-page correct with
+        // these tiers, and `dr. stone` / `spy x family` still resolve at tier 0.
+        //
+        // They must stay BELOW the raw tiers because `normalize_title` ALSO strips noise
+        // tails: "Naruto (Official Colored)" normalizes to plain "naruto", so promoting
+        // normalized-exact into tier 0 would tie the re-release with *Naruto* itself.
+        // Verified unchanged by this addition: naruto / one piece / bleach / dragon ball
+        // / chainsaw man all keep the canonical work at rank 1.
+        //
+        // RESIDUAL (tested, see `search_ranks_the_exact_title_first_despite_punctuation_
+        // differences`): because of that same tail-stripping, a punctuation-MISMATCHED
+        // query still cannot separate a work from its own re-release — both land in tier
+        // 2 and the re-release's larger chapter count wins. That is exactly what the
+        // single-tier version did too, so this is a strict improvement rather than a new
+        // regression; closing it needs a punctuation-folded but noise-PRESERVING key,
+        // which no column stores today.
+        (
+            "CASE \
+               WHEN lower(COALESCE(w.title_override, w.primary_title)) = ? \
+                 OR EXISTS (SELECT 1 FROM work_alias a \
+                            WHERE a.work_id = w.id AND lower(a.raw_title) = ?) THEN 0 \
+               WHEN lower(COALESCE(w.title_override, w.primary_title)) LIKE ? ESCAPE '\\' \
+                 OR EXISTS (SELECT 1 FROM work_alias a \
+                            WHERE a.work_id = w.id AND lower(a.raw_title) LIKE ? ESCAPE '\\') THEN 1 \
+               WHEN EXISTS (SELECT 1 FROM work_alias a \
+                            WHERE a.work_id = w.id AND a.normalized_title = ?) THEN 2 \
+               WHEN EXISTS (SELECT 1 FROM work_alias a \
+                            WHERE a.work_id = w.id \
+                              AND a.normalized_title LIKE ? ESCAPE '\\') THEN 3 \
+               ELSE 4 END",
+            {
+                let nq = normalize_title(query);
+                let np = format!("{}%", escape_like(&nq));
+                vec![qx.clone(), qx, qp.clone(), qp, nq, np]
+            },
+        )
+    } else {
+        let nq = normalize_title(query);
+        let np = format!("{}%", escape_like(&nq));
+        (
+            "CASE \
+               WHEN EXISTS (SELECT 1 FROM work_alias a \
+                            WHERE a.work_id = w.id AND a.normalized_title = ?) THEN 0 \
+               WHEN EXISTS (SELECT 1 FROM work_alias a \
+                            WHERE a.work_id = w.id \
+                              AND a.normalized_title LIKE ? ESCAPE '\\') THEN 1 \
+               ELSE 2 END",
+            vec![nq, np],
+        )
+    }
 }
 
 /// Full-text search over the canonical catalogue (AD-5). Returns `(total, page)`
@@ -2117,67 +2293,7 @@ pub async fn search_works_fts(
     if offset >= RANK_WINDOW {
         return Ok((total, Vec::new()));
     }
-    // The title tier + its bind values, chosen by script (see the doc comment).
-    let (tier, tier_params): (&str, Vec<String>) = if query.is_ascii() {
-        let qx = query.trim().to_lowercase();
-        let qp = format!("{}%", escape_like(&qx));
-        // Tiers 2/3 repeat the exact/prefix test over `normalized_title` — punctuation
-        // folded away, diacritics folded, noise tails stripped — BELOW the raw tiers,
-        // never merged into them. Without them the tier compared the user's RAW text
-        // against raw titles, so punctuation the user typed differently from the title
-        // dropped EVERY row into one bottom tier, leaving `chapters DESC` to decide and
-        // letting an unrelated spin-off outrank the work itself. Verified on production:
-        // `dr stone` put "Dr. STONE reboot: Byakuya" above "Dr.STONE", and `spy family`
-        // ranked "SPY×FAMILY" purely on chapter count; both are top-of-page correct with
-        // these tiers, and `dr. stone` / `spy x family` still resolve at tier 0.
-        //
-        // They must stay BELOW the raw tiers because `normalize_title` ALSO strips noise
-        // tails: "Naruto (Official Colored)" normalizes to plain "naruto", so promoting
-        // normalized-exact into tier 0 would tie the re-release with *Naruto* itself.
-        // Verified unchanged by this addition: naruto / one piece / bleach / dragon ball
-        // / chainsaw man all keep the canonical work at rank 1.
-        //
-        // RESIDUAL (tested, see `search_ranks_the_exact_title_first_despite_punctuation_
-        // differences`): because of that same tail-stripping, a punctuation-MISMATCHED
-        // query still cannot separate a work from its own re-release — both land in tier
-        // 2 and the re-release's larger chapter count wins. That is exactly what the
-        // single-tier version did too, so this is a strict improvement rather than a new
-        // regression; closing it needs a punctuation-folded but noise-PRESERVING key,
-        // which no column stores today.
-        (
-            "CASE \
-               WHEN lower(COALESCE(w.title_override, w.primary_title)) = ? \
-                 OR EXISTS (SELECT 1 FROM work_alias a \
-                            WHERE a.work_id = w.id AND lower(a.raw_title) = ?) THEN 0 \
-               WHEN lower(COALESCE(w.title_override, w.primary_title)) LIKE ? ESCAPE '\\' \
-                 OR EXISTS (SELECT 1 FROM work_alias a \
-                            WHERE a.work_id = w.id AND lower(a.raw_title) LIKE ? ESCAPE '\\') THEN 1 \
-               WHEN EXISTS (SELECT 1 FROM work_alias a \
-                            WHERE a.work_id = w.id AND a.normalized_title = ?) THEN 2 \
-               WHEN EXISTS (SELECT 1 FROM work_alias a \
-                            WHERE a.work_id = w.id \
-                              AND a.normalized_title LIKE ? ESCAPE '\\') THEN 3 \
-               ELSE 4 END",
-            {
-                let nq = normalize_title(query);
-                let np = format!("{}%", escape_like(&nq));
-                vec![qx.clone(), qx, qp.clone(), qp, nq, np]
-            },
-        )
-    } else {
-        let nq = normalize_title(query);
-        let np = format!("{}%", escape_like(&nq));
-        (
-            "CASE \
-               WHEN EXISTS (SELECT 1 FROM work_alias a \
-                            WHERE a.work_id = w.id AND a.normalized_title = ?) THEN 0 \
-               WHEN EXISTS (SELECT 1 FROM work_alias a \
-                            WHERE a.work_id = w.id \
-                              AND a.normalized_title LIKE ? ESCAPE '\\') THEN 1 \
-               ELSE 2 END",
-            vec![nq, np],
-        )
-    };
+    let (tier, tier_params) = fts_title_tier(query);
     let sql = format!(
         "WITH cand AS ( \
            SELECT work_fts.work_id AS work_id, \
@@ -2576,13 +2692,16 @@ async fn replace_source_tags(
         if tag.is_empty() {
             continue;
         }
+        // `tag_key` (migration 0106) at write time, so a freshly ingested tag is filterable
+        // without waiting for the rebuild's `tags::fill_tag_keys` safety net.
         sqlx::query(
-            "INSERT OR IGNORE INTO work_tag (work_id, tag, ord, source) \
-             VALUES (?, ?, ?, 'mangadex')",
+            "INSERT OR IGNORE INTO work_tag (work_id, tag, ord, source, tag_key) \
+             VALUES (?, ?, ?, 'mangadex', ?)",
         )
         .bind(work_id)
         .bind(tag)
         .bind(ord as i64)
+        .bind(crate::tags::slug(tag))
         .execute(&mut **tx)
         .await?;
     }
@@ -3220,9 +3339,9 @@ async fn merge_works_guarded(
     // tags — a blob no single work carries. Human curation is the only half worth
     // rescuing from a work that is about to stop existing.
     sqlx::query(
-        "INSERT OR IGNORE INTO work_tag (work_id, tag, ord, source) \
+        "INSERT OR IGNORE INTO work_tag (work_id, tag, ord, source, tag_key, tag_group) \
          SELECT ?, tag, ord + (SELECT COALESCE(MAX(ord), -1) + 1 FROM work_tag WHERE work_id = ?), \
-                'admin' \
+                'admin', tag_key, tag_group \
          FROM work_tag WHERE work_id = ? AND source = 'admin'",
     )
     .bind(target_work)
@@ -4091,6 +4210,11 @@ pub struct WorkChapterRow {
     /// Suwayomi). Per copy, not per number: one group's upload of a chapter can be a
     /// MangaPlus redirect while another group's is ordinary pages.
     pub external_url: Option<String>,
+    /// The volume THIS copy was published in ("3", "12.5"), as MangaDex labels it; `None`
+    /// when unknown. Suwayomi sources expose no volume, so their half is always `None`.
+    /// Blank is folded to `None` (SQL `NULLIF(TRIM(…), '')`) so no surface prints
+    /// "Volume ".
+    pub volume: Option<String>,
 }
 
 /// One reconciled Suwayomi mapping for a work (F1): the authoritative
@@ -4194,6 +4318,7 @@ async fn work_source_chapters_two_branch(
                 // helper `spine::drain_suwayomi_series` uses, which is exactly what the
                 // equivalence assertion is meant to check the drain got right.
                 released_at: suwayomi_upload_date_to_iso(upload_date.as_deref()),
+                volume: None,
             });
         }
     }
@@ -4212,10 +4337,12 @@ async fn work_source_chapters_two_branch(
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
         ),
     >(
         "SELECT c.number, c.title, ss.source_id, c.external_id, \
-                COALESCE(c.readable_at, c.published_at), c.scanlator, c.external_url \
+                COALESCE(c.readable_at, c.published_at), c.scanlator, c.external_url, \
+                c.volume \
          FROM source_series ss \
          JOIN chapter c ON c.source_series_id = ss.id \
          WHERE ss.work_id = ? AND ss.source_type = 'mangadex' AND c.lang = 'en'",
@@ -4223,7 +4350,8 @@ async fn work_source_chapters_two_branch(
     .bind(work_id)
     .fetch_all(pool)
     .await?;
-    for (number, title, source_id, external_id, released_at, scanlator, external_url) in md {
+    for (number, title, source_id, external_id, released_at, scanlator, external_url, volume) in md
+    {
         let label =
             crate::chapter_label::chapter_display(None, number.as_deref(), title.as_deref());
         rows.push(WorkChapterRow {
@@ -4240,6 +4368,9 @@ async fn work_source_chapters_two_branch(
             scanlator: scanlator.filter(|s| !s.is_empty()),
             external_url,
             released_at,
+            volume: volume
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
         });
     }
     Ok(rows)
@@ -4319,14 +4450,15 @@ pub async fn work_source_chapters(pool: &SqlitePool, work_id: &str) -> Result<Ve
          SELECT c.number, c.title, a.source_id, c.external_id, c.chapter_key, c.label, \
                 'suwayomi' AS source_type, a.source_key, NULLIF(c.scanlator, '') AS scanlator, \
                 COALESCE(c.readable_at, c.published_at) AS released_at, \
-                c.external_url \
+                c.external_url, NULLIF(TRIM(c.volume), '') AS volume \
            FROM authoritative a \
            JOIN chapter c ON c.source_series_id = a.ssid \
           WHERE a.rn = 1 \
          UNION ALL \
          SELECT c.number, c.title, ss.source_id, c.external_id, c.chapter_key, c.label, \
                 'mangadex' AS source_type, NULL, NULLIF(c.scanlator, ''), \
-                COALESCE(c.readable_at, c.published_at), c.external_url \
+                COALESCE(c.readable_at, c.published_at), c.external_url, \
+                NULLIF(TRIM(c.volume), '') \
            FROM source_series ss \
            JOIN chapter c ON c.source_series_id = ss.id \
           WHERE ss.work_id = ?1 AND ss.source_type = 'mangadex' AND c.lang = 'en' \
@@ -4366,6 +4498,7 @@ pub async fn work_source_chapters(pool: &SqlitePool, work_id: &str) -> Result<Ve
                 scanlator: r.scanlator,
                 external_url: r.external_url,
                 released_at: r.released_at,
+                volume: r.volume,
             }
         })
         .collect())
@@ -4386,6 +4519,7 @@ struct SpineChapterRow {
     scanlator: Option<String>,
     released_at: Option<String>,
     external_url: Option<String>,
+    volume: Option<String>,
 }
 
 /// The count of "main" chapters to display for a series: the number of DISTINCT
@@ -7062,7 +7196,7 @@ mod tests {
             .into_iter()
             .map(|r| {
                 format!(
-                    "{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                    "{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
                     r.source_type,
                     r.source_id,
                     r.chapter_id,
@@ -7077,6 +7211,8 @@ mod tests {
                     // Per-copy hand-off: a copy the reader opens from the series page must
                     // redirect off-site exactly when the spine says it is external.
                     r.external_url,
+                    // The series page's volume headers: same label, same blank fold.
+                    r.volume,
                 )
             })
             .collect();
@@ -7145,6 +7281,12 @@ mod tests {
                     published_at: Some("2026-01-01T00:00:00Z".into()),
                     scanlator: scanlator.map(Into::into),
                     external_url: external_url.map(Into::into),
+                    // A real volume label, and a blank one both versions must fold to None.
+                    volume: match ext {
+                        "u-1" => Some("3".into()),
+                        "u-15" => Some("  ".into()),
+                        _ => None,
+                    },
                     ..Default::default()
                 },
             )
@@ -7219,6 +7361,14 @@ mod tests {
             "the backfill's '' must read as unknown"
         );
         assert_eq!(group_of("u-null"), None);
+        let volume_of = |ext: &str| {
+            spine_rows
+                .iter()
+                .find(|r| r.chapter_id == ext)
+                .and_then(|r| r.volume.clone())
+        };
+        assert_eq!(volume_of("u-1").as_deref(), Some("3"));
+        assert_eq!(volume_of("u-15"), None, "a blank volume reads as unknown");
         assert_eq!(
             comparable(spine_rows),
             comparable(legacy),

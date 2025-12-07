@@ -49,6 +49,7 @@ extensions, and downloads land under the chosen dir and the OS default
 this at `app_data_dir()/suwayomi` and pre-write `server.conf` there before launch.
 
 Full launch line (proven):
+
 ```
 <jre>/bin/java -Djava.awt.headless=true -Xmx512m \
   -Dsuwayomi.tachidesk.config.server.rootDir=<app_data_dir>/suwayomi \

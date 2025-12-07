@@ -55,7 +55,26 @@ const series = [
 	credits: [],
 	covers: [],
 }));
-for (const item of series) item.metadata = { year: 2021, originalLanguage: 'ja', demographic: 'shounen', contentRating: 'safe', tags: [{id:'tag-genre',name:'Adventure',group:'genre'},{id:'tag-theme',name:'Coming of Age',group:'theme'},{id:null,name:'Long Strip',group:'format'}], trackers: [{provider:'mangadex',externalId:'436b9823-2d06-4477-af20-c526c1fd689b',url:'https://mangadex.org/title/436b9823-2d06-4477-af20-c526c1fd689b'},{provider:'al',externalId:'123',url:'https://anilist.co/manga/123'}] };
+for (const item of series)
+	item.metadata = {
+		year: 2021,
+		originalLanguage: 'ja',
+		demographic: 'shounen',
+		contentRating: 'safe',
+		tags: [
+			{ id: 'tag-genre', name: 'Adventure', group: 'genre' },
+			{ id: 'tag-theme', name: 'Coming of Age', group: 'theme' },
+			{ id: null, name: 'Long Strip', group: 'format' },
+		],
+		trackers: [
+			{
+				provider: 'mangadex',
+				externalId: '436b9823-2d06-4477-af20-c526c1fd689b',
+				url: 'https://mangadex.org/title/436b9823-2d06-4477-af20-c526c1fd689b',
+			},
+			{ provider: 'al', externalId: '123', url: 'https://anilist.co/manga/123' },
+		],
+	};
 const chapters = Array.from({ length: 12 }, (_, i) => ({
 	id: `fixture-chapter-${i}`,
 	seriesId: series[0].id,

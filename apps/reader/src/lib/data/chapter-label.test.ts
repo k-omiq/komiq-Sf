@@ -13,7 +13,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { chapterChip, externalChapterHost, externalChapterHref } from './chapter-label.ts';
+import {
+	chapterChip,
+	chapterSourceUrl,
+	externalChapterHost,
+	externalChapterHref,
+} from './chapter-label.ts';
 
 test('a numeric label gets the Ch. prefix', () => {
 	assert.equal(chapterChip('45'), 'Ch. 45');
@@ -90,4 +95,44 @@ test('the host names the destination, without the www. noise', () => {
 	);
 	assert.equal(externalChapterHost('javascript:alert(1)'), '');
 	assert.equal(externalChapterHost(null), '');
+});
+
+// --- "Read on <host>" (chapterSourceUrl) -------------------------------------------------
+
+const MD_UUID = 'E9FB431B-5A4D-4BF8-9C4A-0510C5ECA6D0';
+
+test('a MangaDex spine copy links to its mangadex.org chapter page', () => {
+	const href = chapterSourceUrl({ id: MD_UUID }, null);
+	assert.equal(href, 'https://mangadex.org/chapter/e9fb431b-5a4d-4bf8-9c4a-0510c5eca6d0');
+	assert.equal(externalChapterHost(href), 'mangadex.org');
+});
+
+test('an off-site copy links to its validated external URL, whatever its source', () => {
+	const ext = 'https://mangaplus.shueisha.co.jp/viewer/1000486';
+	assert.equal(chapterSourceUrl({ id: MD_UUID, externalUrl: ext }, null), ext);
+	assert.equal(chapterSourceUrl({ id: '9005', externalUrl: ext }, '777'), ext);
+	assert.equal(externalChapterHost(ext), 'mangaplus.shueisha.co.jp');
+});
+
+test('a Suwayomi copy has no known chapter URL, so the link hides', () => {
+	assert.equal(chapterSourceUrl({ id: '9005' }, '777'), null);
+	// Even a uuid-shaped id: `src` says it is not the MangaDex spine.
+	assert.equal(chapterSourceUrl({ id: MD_UUID }, '777'), null);
+});
+
+test('a non-uuid id without a source never becomes a dead MangaDex link', () => {
+	// A numeric Suwayomi-only series reads with `src === null` too.
+	assert.equal(chapterSourceUrl({ id: '9005' }, null), null);
+	assert.equal(chapterSourceUrl({ id: '../admin' }, null), null);
+	assert.equal(chapterSourceUrl({ id: `${MD_UUID}/../x` }, null), null);
+});
+
+test('a hostile external URL is rejected, and the MangaDex fallback is NOT used for it', () => {
+	assert.equal(chapterSourceUrl({ id: '9005', externalUrl: 'javascript:alert(1)' }, '777'), null);
+	assert.equal(chapterSourceUrl({ id: '9005', externalUrl: 'data:text/html,x' }, null), null);
+	// An invalid external URL on a MangaDex copy falls back to the copy's own MangaDex page.
+	assert.equal(
+		chapterSourceUrl({ id: MD_UUID, externalUrl: 'javascript:alert(1)' }, null),
+		'https://mangadex.org/chapter/e9fb431b-5a4d-4bf8-9c4a-0510c5eca6d0',
+	);
 });

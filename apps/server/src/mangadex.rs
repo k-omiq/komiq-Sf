@@ -575,6 +575,44 @@ impl MangaDexClient {
         })
     }
 
+    /// `GET /statistics/manga?manga[]=…` — follows and rating for up to
+    /// [`crate::work_stats::STATS_IDS_LIMIT`] manga, keyed by MangaDex uuid. Feeds the
+    /// statistics drain (`work_stats::backfill_work_stats`, migration 0106).
+    ///
+    /// ONE REQUEST, NO CHUNKING, and more ids than the limit is an error — the same contract
+    /// as [`Self::get_chapters_by_ids`], for the same reason: the only caller is a paced drain,
+    /// and chunking in here would fire several requests inside one "batch". Parsing is the
+    /// pure `work_stats::parse_statistics`, so it is tested on fixture JSON, never the network.
+    pub async fn get_statistics(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, crate::work_stats::MdStats>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if ids.len() > crate::work_stats::STATS_IDS_LIMIT {
+            return Err(anyhow!(
+                "MangaDex /statistics/manga accepts at most {} ids, got {}",
+                crate::work_stats::STATS_IDS_LIMIT,
+                ids.len()
+            ));
+        }
+        let params: Vec<(String, String)> = ids
+            .iter()
+            .map(|id| ("manga[]".to_string(), id.clone()))
+            .collect();
+        let res = self
+            .get_with_retry(
+                &format!("{API_BASE}/statistics/manga"),
+                &params,
+                false,
+                "/statistics/manga",
+            )
+            .await?;
+        let body: Value = res.json().await?;
+        crate::work_stats::parse_statistics(&body)
+    }
+
     /// Download a work's cover thumbnail and compute its perceptual hash. Uses the
     /// 512px thumbnail (smaller download, always JPEG). Best-effort: returns `None`
     /// on any network/decode failure — a missing hash just means one fewer dedup
@@ -3041,8 +3079,10 @@ pub fn spawn_readable_backfill(
 //   * Read-first priority. Before the plain index-order sweep, each batch first takes rows
 //     from works people actually use — anything in a library, anything with reading
 //     progress, and the most-viewed series — so the groups appear where they are looked at
-//     within the first minutes, not somewhere in a ~5-hour walk. That costs one indexed
-//     probe per hot work per batch and stops finding anything once they are done.
+//     within the first minutes, not somewhere in a ~5-hour walk. The hot set itself is
+//     computed once per drain run and refreshed every `GROUP_BACKFILL_HOT_REFRESH_EVERY`
+//     batches (see `group_backfill_hot_works` for why not per batch); each batch then costs
+//     one indexed probe per hot work, and a refresh drops the works that have drained.
 
 /// Rows per batch = ids per request, MangaDex's `ids[]` ceiling (see
 /// [`READABLE_BACKFILL_BATCH`] for why the two are deliberately one number).
@@ -3071,6 +3111,15 @@ const GROUP_BACKFILL_PROGRESS_EVERY: u64 = 500;
 /// point is "what people look at", and the head of `series_views` is that. Library and
 /// progress rows are uncapped — they are per-user and small.
 const GROUP_BACKFILL_HOT_VIEWED: i64 = 2_000;
+
+/// Batches between recomputations of the hot work set: 50 × the 2 s gap ≈ 100 s. Long
+/// enough that the scans behind it (`canonical_progress` is one row per user per chapter
+/// ever opened — small per user, but the one input that grows with every read — plus an
+/// ORDER BY over `series_views`) run ~90 times over a ~5-hour drain instead of ~8,780 times; short enough
+/// that a series someone starts reading mid-drain jumps the queue within two minutes. A
+/// stale set costs only ORDER, never correctness: every row is still reached by the plain
+/// sweep, and `filled == 0` is decided by the work-list, not by the hot set.
+const GROUP_BACKFILL_HOT_REFRESH_EVERY: u64 = 50;
 
 /// The work-list predicate, ONE string shared by the batch query, the priority query and
 /// the remaining-count, so they cannot disagree about what "still to do" means (the
@@ -3108,22 +3157,39 @@ pub struct GroupFill {
     pub unanswered: u64,
 }
 
-/// One batch of the work-list: priority rows first, topped up from the plain sweep.
+/// The read-first priority set: every work that is in a library, has reading progress, or
+/// is among the [`GROUP_BACKFILL_HOT_VIEWED`] most-viewed series — AND still has MangaDex
+/// chapters on the work-list. Distinct `w_` work ids, in no particular order.
 ///
-/// Both halves read migration 0105's partial index. The plain half is
-/// `SCAN c USING INDEX idx_chapter_needs_group` + one primary-key probe per row (verified
-/// with `EXPLAIN QUERY PLAN`), linear in the rows still to do. The priority half drives from
-/// the hot work set — `source_series(work_id)` then the same partial index keyed on
-/// `source_series_id` — so a drained hot work costs one empty index probe.
+/// COMPUTED ONCE PER DRAIN RUN, NOT PER BATCH. This used to be a CTE inside the batch query,
+/// which meant every 2 s batch re-read all of `user_library`, `canonical_library` and
+/// `canonical_progress` and re-sorted `series_views` to learn a set that changes on the
+/// scale of minutes. `spawn_group_backfill` now calls this at the start of a run and every
+/// [`GROUP_BACKFILL_HOT_REFRESH_EVERY`] batches, and hands the result to
+/// [`chapters_needing_group`] as a bound JSON array (`json_each`). A bound value rather than
+/// a TEMP table because a temp table belongs to ONE connection and the batch query runs on
+/// whichever pooled connection is free — it would be missing, or a stale copy, half the time.
 ///
-/// The hot set resolves numeric (Suwayomi) series ids to their work through
-/// `source_series`, because `user_library.series_id` and `series_views.series_key` hold
-/// either kind of id; an unmapped key simply matches nothing.
-async fn chapters_needing_group(
-    pool: &sqlx::SqlitePool,
-    limit: i64,
-) -> Result<Vec<PendingGroupChapter>> {
-    const HOT_SQL: &str = "WITH keys(k) AS ( \
+/// The `EXISTS` filter keeps the set to works with something left to do, so a refresh is
+/// also how drained hot works stop costing their per-batch probe; between refreshes they
+/// cost one empty partial-index probe each, as before.
+///
+/// Numeric (Suwayomi) series ids are resolved to their work through `source_series`,
+/// because `user_library.series_id` and `series_views.series_key` hold either kind of id;
+/// an unmapped key simply matches nothing.
+///
+/// THE HOT SET IS A SET OF WORKS, NOT OF KEYS. The `UNION` in `keys` de-dups KEYS, but two
+/// different keys routinely name one work: a reader who opened a series through its
+/// Suwayomi id ("4242" in `series_views` / `user_library`) and then read it (its `w_` id in
+/// `canonical_progress`) puts both in `keys`, and both resolve to the same `work_id`.
+/// Without the `DISTINCT`, that work joins to its chapters once per key and every chapter
+/// is offered twice — `ids[]` then repeats a uuid, MangaDex answers 400, a failed batch
+/// writes nothing, and the next pass re-offers EXACTLY the same batch: the drain stalls
+/// forever on the first doubly-hot work, which is precisely the work most likely to be
+/// looked at. [`chapters_needing_group`] and [`group_batch_ids`] each de-dup again, so no
+/// single layer is load-bearing for that property.
+async fn group_backfill_hot_works(pool: &sqlx::SqlitePool) -> Result<Vec<String>> {
+    const HOT_WORKS_SQL: &str = "WITH keys(k) AS ( \
              SELECT series_id FROM user_library \
              UNION SELECT work_id FROM canonical_library \
              UNION SELECT work_id FROM canonical_progress \
@@ -3131,22 +3197,63 @@ async fn chapters_needing_group(
                                    ORDER BY total DESC LIMIT ?) \
          ), \
          hot(work_id) AS ( \
-             SELECT COALESCE((SELECT s2.work_id FROM source_series s2 \
+             SELECT DISTINCT COALESCE((SELECT s2.work_id FROM source_series s2 \
                                WHERE s2.source_type = 'suwayomi' AND s2.source_key = keys.k \
                                LIMIT 1), keys.k) \
                FROM keys \
          ) \
-         SELECT c.id, c.external_id \
-           FROM hot \
-           JOIN source_series ss ON ss.work_id = hot.work_id AND ss.source_type = 'mangadex' \
+         SELECT hot.work_id FROM hot \
+          WHERE hot.work_id IS NOT NULL \
+            AND EXISTS (SELECT 1 FROM source_series ss \
+                          JOIN chapter c ON c.source_series_id = ss.id \
+                         WHERE ss.work_id = hot.work_id AND ss.source_type = 'mangadex' \
+                           AND c.scanlator IS NULL AND c.external_id GLOB '*-*')";
+    Ok(sqlx::query_scalar(HOT_WORKS_SQL)
+        .bind(GROUP_BACKFILL_HOT_VIEWED)
+        .fetch_all(pool)
+        .await?)
+}
+
+/// One batch of the work-list: priority rows first (from `hot`, the set
+/// [`group_backfill_hot_works`] computed), topped up from the plain sweep.
+///
+/// Both halves read migration 0105's partial index. The plain half is
+/// `SCAN c USING INDEX idx_chapter_needs_group` + one primary-key probe per row (verified
+/// with `EXPLAIN QUERY PLAN`), linear in the rows still to do. The priority half drives from
+/// the bound hot set — `SCAN hot VIRTUAL TABLE` (`json_each`), then `SEARCH ss USING INDEX
+/// idx_source_series_work (work_id=?)`, then `SEARCH c USING INDEX idx_chapter_needs_group
+/// (source_series_id=?)` (also verified with `EXPLAIN QUERY PLAN`) — so a drained hot work
+/// costs one empty index probe and an empty hot set skips the query outright.
+///
+/// The result is unique by `chapter.id` whatever either query returns: `SELECT DISTINCT` on
+/// the priority half (the hot set is distinct by construction, but a repeated id here is a
+/// stalled drain — see [`group_backfill_hot_works`] — so this does not rely on it), and both
+/// halves merge through one `seen` set.
+async fn chapters_needing_group(
+    pool: &sqlx::SqlitePool,
+    hot: &[String],
+    limit: i64,
+) -> Result<Vec<PendingGroupChapter>> {
+    const HOT_SQL: &str = "SELECT DISTINCT c.id, c.external_id \
+           FROM json_each(?) AS hot \
+           JOIN source_series ss ON ss.work_id = hot.value AND ss.source_type = 'mangadex' \
            JOIN chapter c ON c.source_series_id = ss.id \
           WHERE c.scanlator IS NULL AND c.external_id GLOB '*-*' \
           LIMIT ?";
-    let mut rows: Vec<(String, String)> = sqlx::query_as(HOT_SQL)
-        .bind(GROUP_BACKFILL_HOT_VIEWED)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+    let mut rows: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if !hot.is_empty() {
+        let prio: Vec<(String, String)> = sqlx::query_as(HOT_SQL)
+            .bind(serde_json::to_string(hot)?)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?;
+        for row in prio {
+            if seen.insert(row.0.clone()) {
+                rows.push(row);
+            }
+        }
+    }
     if (rows.len() as i64) < limit {
         let plain_sql = format!(
             "SELECT c.id, c.external_id FROM chapter c WHERE {GROUP_WORKLIST_WHERE} LIMIT ?"
@@ -3158,8 +3265,6 @@ async fn chapters_needing_group(
             .bind(limit)
             .fetch_all(pool)
             .await?;
-        let mut seen: std::collections::HashSet<String> =
-            rows.iter().map(|(id, _)| id.clone()).collect();
         for row in plain {
             if rows.len() as i64 >= limit {
                 break;
@@ -3173,6 +3278,22 @@ async fn chapters_needing_group(
         .into_iter()
         .map(|(id, external_id)| PendingGroupChapter { id, external_id })
         .collect())
+}
+
+/// The `ids[]` for one batch: each external id once, in work-list order. The work-list is
+/// already unique by `chapter.id`, but `ids[]` is keyed by the MangaDex uuid, and two
+/// chapter rows carrying one uuid (two mangadex `source_series` rows that both mirrored the
+/// same chapter) would still repeat it — and a repeated id is a 400 that fails the batch
+/// and so re-offers it forever (see [`chapters_needing_group`]). Nothing is lost by
+/// collapsing them: `write_group_backfill` looks each pending row up by uuid, so both rows
+/// receive the one answer.
+fn group_batch_ids(pending: &[PendingGroupChapter]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::with_capacity(pending.len());
+    pending
+        .iter()
+        .filter(|p| seen.insert(p.external_id.as_str()))
+        .map(|p| p.external_id.clone())
+        .collect()
 }
 
 /// Rows still to do, for the completion line. Same predicate as the work-list.
@@ -3228,15 +3349,19 @@ async fn write_group_backfill(
 
 /// One batch of the scanlation-group backfill. `filled == 0` means done. Resumable with no
 /// cursor and no completion marker, exactly like [`backfill_chapter_external_urls`].
+///
+/// `hot` is the caller's cached [`group_backfill_hot_works`]; it orders the batch and
+/// nothing else, so a stale or empty one cannot make `filled == 0` lie.
 pub async fn backfill_chapter_groups(
     pool: &sqlx::SqlitePool,
     client: &MangaDexClient,
+    hot: &[String],
 ) -> Result<GroupFill> {
-    let pending = chapters_needing_group(pool, GROUP_BACKFILL_BATCH).await?;
+    let pending = chapters_needing_group(pool, hot, GROUP_BACKFILL_BATCH).await?;
     if pending.is_empty() {
         return Ok(GroupFill::default());
     }
-    let ids: Vec<String> = pending.iter().map(|p| p.external_id.clone()).collect();
+    let ids = group_batch_ids(&pending);
     // A failed fetch fails the whole batch with nothing written: the rows stay in the
     // work-list and the next pass re-offers exactly them. Writing `GROUP_UNKNOWN` over a
     // transient 503 would be the unsafe direction — it is terminal.
@@ -3276,6 +3401,11 @@ pub fn spawn_group_backfill(
         let mut total = GroupFill::default();
         let mut batches = 0u64;
         let mut announced = false;
+        // The cached hot work set and the batches since it was computed. Starts "due" so the
+        // first batch of a run computes it; an idle or failed-batch nap re-arms it, since an
+        // hour-old set is worth nothing (see GROUP_BACKFILL_HOT_REFRESH_EVERY).
+        let mut hot: Vec<String> = Vec::new();
+        let mut since_hot = GROUP_BACKFILL_HOT_REFRESH_EVERY;
         loop {
             if *shutdown.borrow() {
                 tracing::info!(
@@ -3285,7 +3415,22 @@ pub fn spawn_group_backfill(
                 );
                 return;
             }
-            match backfill_chapter_groups(&pool, &client).await {
+            if since_hot >= GROUP_BACKFILL_HOT_REFRESH_EVERY {
+                // A failed refresh keeps the set it has (empty on the first) and waits a full
+                // interval before trying again. The hot set only ORDERS the drain, so it is no
+                // reason to stop it — and if the database is really unhappy the batch query
+                // below fails too and takes the back-off path.
+                match group_backfill_hot_works(&pool).await {
+                    Ok(h) => hot = h,
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "group backfill: hot-set refresh failed — keeping the previous one"
+                    ),
+                }
+                since_hot = 0;
+            }
+            since_hot += 1;
+            match backfill_chapter_groups(&pool, &client, &hot).await {
                 Ok(fill) if fill.filled == 0 => {
                     if !announced {
                         match group_backfill_remaining(&pool).await {
@@ -3313,6 +3458,7 @@ pub fn spawn_group_backfill(
                     if nap_or_shutdown(GROUP_BACKFILL_IDLE_RECHECK, &mut shutdown).await {
                         return;
                     }
+                    since_hot = GROUP_BACKFILL_HOT_REFRESH_EVERY;
                 }
                 Ok(fill) => {
                     total.filled += fill.filled;
@@ -3343,6 +3489,7 @@ pub fn spawn_group_backfill(
                     if nap_or_shutdown(GROUP_BACKFILL_IDLE_RECHECK, &mut shutdown).await {
                         return;
                     }
+                    since_hot = GROUP_BACKFILL_HOT_REFRESH_EVERY;
                 }
             }
         }
@@ -5099,9 +5246,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(group_backfill_remaining(&pool).await.unwrap(), 3);
+        // The drain computes the hot set once and reuses it across batches.
+        let hot = group_backfill_hot_works(&pool).await.unwrap();
+        assert_eq!(hot, vec![hot_work.clone()]);
 
         // --- Batch 1: the hot work's chapter comes first, whatever the index order. ----
-        let batch = chapters_needing_group(&pool, 1).await.unwrap();
+        let batch = chapters_needing_group(&pool, &hot, 1).await.unwrap();
         assert_eq!(
             batch
                 .iter()
@@ -5121,9 +5271,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((fill.filled, fill.named), (1, 1));
+        // A refresh now drops the drained hot work…
+        assert!(group_backfill_hot_works(&pool).await.unwrap().is_empty());
 
         // --- Batch 2: the cold sweep. One upstream says "no group", one unanswered. -----
-        let batch = chapters_needing_group(&pool, 100).await.unwrap();
+        // …but the drain may still be holding the STALE set until its next refresh, and a
+        // stale set must cost nothing but an empty probe: same rows, same termination.
+        let batch = chapters_needing_group(&pool, &hot, 100).await.unwrap();
         let mut got: Vec<&str> = batch.iter().map(|p| p.external_id.as_str()).collect();
         got.sort_unstable();
         assert_eq!(
@@ -5140,7 +5294,14 @@ mod tests {
         assert_eq!(fill.unanswered, 1);
 
         // THE TERMINATION PROPERTY: an id upstream did not answer for still left the list.
-        assert!(chapters_needing_group(&pool, 100).await.unwrap().is_empty());
+        assert!(chapters_needing_group(&pool, &hot, 100)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(chapters_needing_group(&pool, &[], 100)
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(group_backfill_remaining(&pool).await.unwrap(), 0);
 
         let group = |ext: &'static str| {
@@ -5179,6 +5340,222 @@ mod tests {
         }];
         write_group_backfill(&pool, &stale, &[]).await.unwrap();
         assert_eq!(group("md-c3").await.as_deref(), Some("Already Known"));
+    }
+
+    /// One work, hot under TWO keys: the Suwayomi series id a reader opened it by
+    /// (`series_views` / `user_library` hold numeric ids) and its `w_` canonical id
+    /// (`canonical_progress` holds those). Both resolve to the same work, and the work's
+    /// chapters must still be offered ONCE — a repeated id in `ids[]` is a MangaDex 400, a
+    /// failed batch writes nothing, and the next pass re-offers exactly the same batch.
+    #[tokio::test]
+    async fn the_group_backfill_offers_a_work_hot_under_two_keys_once() {
+        let pool = pool().await;
+        let work = catalog::upsert_work_from_mangadex(
+            &pool,
+            "twice-hot-uuid",
+            &catalog::WorkInput {
+                primary_title: Some("Twice Hot".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let md = catalog::find_source_series_id(&pool, "mangadex", "mangadex", "twice-hot-uuid")
+            .await
+            .unwrap()
+            .unwrap();
+        for (ext, n) in [("md-t1", "1"), ("md-t2", "2"), ("md-t3", "3")] {
+            catalog::upsert_chapter(
+                &pool,
+                &md,
+                &catalog::ChapterInput {
+                    external_id: ext.into(),
+                    number: Some(n.into()),
+                    lang: Some("en".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // The same work as a Suwayomi series, numeric key "4242".
+        catalog::upsert_source_series(&pool, &work, "suwayomi", "src-1", "4242", None, false)
+            .await
+            .unwrap();
+        // Viewed under BOTH keys, and read under the canonical one.
+        for key in ["4242", work.as_str()] {
+            sqlx::query(
+                "INSERT INTO series_views (series_key, total, updated_at) VALUES (?, 10, 'x')",
+            )
+            .bind(key)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, created_at) \
+             VALUES ('u1','u1','u1@x','h','now')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO canonical_progress (user_id, chapter_id, work_id, updated_at) \
+             VALUES ('u1', 'md-t1', ?, 'now')",
+        )
+        .bind(&work)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Three keys ("4242" viewed, the w_ id viewed, the w_ id read), ONE work.
+        let hot = group_backfill_hot_works(&pool).await.unwrap();
+        assert_eq!(hot, vec![work.clone()], "the hot set is a set of works");
+
+        // And the batch query does not lean on that: hand it the work twice, as the old
+        // per-batch CTE effectively did, and every chapter must still come back once.
+        let doubled = vec![work.clone(), work.clone()];
+        for hot in [&hot, &doubled] {
+            let batch = chapters_needing_group(&pool, hot, 100).await.unwrap();
+            let ids: Vec<&str> = batch.iter().map(|p| p.id.as_str()).collect();
+            let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
+            assert_eq!(
+                ids.len(),
+                unique.len(),
+                "a work hot under two keys offered its chapters twice: {ids:?}"
+            );
+            let mut got: Vec<&str> = batch.iter().map(|p| p.external_id.as_str()).collect();
+            got.sort_unstable();
+            assert_eq!(got, vec!["md-t1", "md-t2", "md-t3"]);
+            assert_eq!(group_batch_ids(&batch).len(), 3, "ids[] repeats nothing");
+            // A batch smaller than the work must not be eaten by the duplicate either: two
+            // DISTINCT chapters, not one chapter twice.
+            let batch = chapters_needing_group(&pool, hot, 2).await.unwrap();
+            assert_eq!(batch.len(), 2);
+            assert_ne!(batch[0].id, batch[1].id);
+        }
+    }
+
+    /// Every input of the hot set contributes, each through the id kind it actually stores,
+    /// and the set holds only works that still have something to drain.
+    #[tokio::test]
+    async fn group_backfill_hot_works_reads_every_source_and_skips_drained_works() {
+        let pool = pool().await;
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, created_at) \
+             VALUES ('u1','u1','u1@x','h','now')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A MangaDex work with one chapter; `pending` decides whether it is on the work-list.
+        let work = |uuid: &'static str, pending: bool| {
+            let pool = pool.clone();
+            async move {
+                let w = catalog::upsert_work_from_mangadex(
+                    &pool,
+                    uuid,
+                    &catalog::WorkInput {
+                        primary_title: Some(uuid.into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let ss = catalog::find_source_series_id(&pool, "mangadex", "mangadex", uuid)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                catalog::upsert_chapter(
+                    &pool,
+                    &ss,
+                    &catalog::ChapterInput {
+                        external_id: format!("{uuid}-ch1"),
+                        number: Some("1".into()),
+                        lang: Some("en".into()),
+                        scanlator: (!pending).then(|| "Done Scans".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                w
+            }
+        };
+        let in_library = work("lib-uuid", true).await;
+        let in_canon_library = work("canon-lib-uuid", true).await;
+        let in_progress = work("progress-uuid", true).await;
+        let most_viewed = work("viewed-uuid", true).await;
+        let drained = work("drained-uuid", false).await;
+        let _cold = work("cold-uuid", true).await;
+
+        // `user_library` by the Suwayomi id, the way a library add from a source page lands.
+        catalog::upsert_source_series(&pool, &in_library, "suwayomi", "src-1", "77", None, false)
+            .await
+            .unwrap();
+        let exec = |sql: &'static str, arg: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(sql).bind(arg).execute(&pool).await.unwrap();
+            }
+        };
+        exec(
+            "INSERT INTO user_library (user_id, series_id, created_at) VALUES ('u1', ?, 'now')",
+            "77".into(),
+        )
+        .await;
+        exec(
+            "INSERT INTO canonical_library (user_id, work_id, created_at) VALUES ('u1', ?, 'now')",
+            in_canon_library.clone(),
+        )
+        .await;
+        exec(
+            "INSERT INTO canonical_progress (user_id, chapter_id, work_id, updated_at) \
+             VALUES ('u1', 'x', ?, 'now')",
+            in_progress.clone(),
+        )
+        .await;
+        exec(
+            "INSERT INTO series_views (series_key, total, updated_at) VALUES (?, 9, 'x')",
+            most_viewed.clone(),
+        )
+        .await;
+        // Hot but fully drained: must not cost a probe per batch.
+        exec(
+            "INSERT INTO canonical_library (user_id, work_id, created_at) VALUES ('u1', ?, 'now')",
+            drained.clone(),
+        )
+        .await;
+        // A viewed key that maps to nothing (an unmirrored Suwayomi id) matches nothing.
+        exec(
+            "INSERT INTO series_views (series_key, total, updated_at) VALUES (?, 99, 'x')",
+            "9999".into(),
+        )
+        .await;
+
+        let mut got = group_backfill_hot_works(&pool).await.unwrap();
+        got.sort_unstable();
+        let mut want = vec![in_library, in_canon_library, in_progress, most_viewed];
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn group_batch_ids_never_repeat_an_id_and_keep_work_list_order() {
+        let p = |id: &str, ext: &str| PendingGroupChapter {
+            id: id.into(),
+            external_id: ext.into(),
+        };
+        // Two chapter rows carrying one uuid collapse to one `ids[]` entry, at the place
+        // the first one stood.
+        let pending = [
+            p("ch_1", "b"),
+            p("ch_2", "a"),
+            p("ch_3", "b"),
+            p("ch_4", "c"),
+        ];
+        assert_eq!(group_batch_ids(&pending), vec!["b", "a", "c"]);
+        assert!(group_batch_ids(&[]).is_empty());
     }
 
     #[test]

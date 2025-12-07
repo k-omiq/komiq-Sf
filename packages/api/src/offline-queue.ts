@@ -223,10 +223,7 @@ export class OfflineWriteQueue {
 	 * `currentUserId` is purged up front — a foreign op can never be replayed under
 	 * this session — before the oldest-first flush of the remaining owned ops.
 	 */
-	async drain(
-		flush: (op: WriteOp) => Promise<void>,
-		currentUserId: string | null,
-	): Promise<void> {
+	async drain(flush: (op: WriteOp) => Promise<void>, currentUserId: string | null): Promise<void> {
 		// Identity unknown (e.g. token restored but session not yet validated): defer.
 		// Never drop here — the owner may still sign in and reclaim these ops.
 		if (currentUserId == null) return;

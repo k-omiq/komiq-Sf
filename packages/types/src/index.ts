@@ -765,6 +765,24 @@ export interface GenreFacet {
 	count: number;
 }
 
+/** Which shelf of Browse's tag picker a tag sits on (MangaDex's own tag groups). */
+export type TagGroup = 'GENRE' | 'THEME' | 'FORMAT' | 'CONTENT';
+
+/**
+ * One filterable tag (Browse v2). Supersedes {@link GenreFacet} for the tag picker:
+ * a STABLE id to filter by rather than a display string, and a group to shelve it
+ * under. `count` is how many works carrying the tag the viewer may see (NSFW-gated).
+ */
+export interface TagInfo {
+	/** URL-safe slug of the canonical English name (`boys-love`, `4-koma`, `sci-fi`).
+	 *  This is what Browse puts in the URL and sends as `includedTags`/`excludedTags`. */
+	id: string;
+	/** Display name (`Boys' Love`). */
+	name: string;
+	group: TagGroup;
+	count: number;
+}
+
 /** Per-series read progress for the whole library (see `Backend.libraryProgress`).
  *  Series the viewer has never opened are omitted; callers treat those as unread. */
 export interface SeriesProgress {
@@ -843,6 +861,12 @@ export interface AggregatedChapter {
 	 * caller must fall back to the selected source's own `read`, never invert it.
 	 */
 	readAnywhere?: boolean;
+	/**
+	 * The volume this chapter belongs to ("3", "12.5") as MangaDex labels it, or null when
+	 * no copy says. OPTIONAL like {@link firstReleasedAt}: opportunistically selected, so an
+	 * older API drops it and the series page renders without volume headers.
+	 */
+	chapterVolume?: string | null;
 	/** Every COPY of this number — one entry per (source, scanlation group) upload. */
 	sources: ChapterSource[];
 }

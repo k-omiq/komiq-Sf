@@ -19,6 +19,7 @@ import type {
 	Series,
 	SeriesProgress,
 	SeriesStatus,
+	TagInfo,
 	Translator,
 	UpdateFeedRow,
 	WorkSource,
@@ -35,11 +36,17 @@ import { backend, images } from '$lib/context';
 import { invalidate } from '$app/navigation';
 import { api, type LoadFetch } from './load-fetch';
 import { homeLatestAdded } from './home-latest-added';
+import {
+	tagsFromGenreFacets,
+	toFilterInput,
+	toLegacyFilters,
+	type BrowseState,
+} from './browse-filters';
 import { findChapterOwner } from './chapter-owner';
 import type { ChapterCandidate } from './chapter-owner';
 import { adjacentChapters, copiesOf, normalizeGroup, sortChaptersAsc } from './chapter-versions';
 import { loadFirstReadable } from './reader-pages';
-import { chapterChip, externalChapterHref } from './chapter-label';
+import { chapterChip, chapterSourceUrl, externalChapterHref } from './chapter-label';
 import { chapterDateLabel, chapterFoundLabel } from './chapter-date';
 import {
 	isRedundantMangadexExt,
@@ -1156,6 +1163,75 @@ export function getGenreFacets(fetch?: LoadFetch): Promise<{ genre: string; coun
 	}, []);
 }
 
+// ---- Browse v2 -----------------------------------------------------------------
+
+/**
+ * Browse's tag vocabulary, and where it came from.
+ *
+ * `'tags'` is the v2 `tags` query (grouped, include/exclude-able). Against a server that
+ * predates it — or one whose tag table is still empty — this falls back to the legacy
+ * genre facets as a flat GENRE shelf (`'genres'`), which the page offers include-only:
+ * on such a server the only tag clause that can reach SQL is the legacy `genres`
+ * argument, and it matches ANY. Never rejects; an outage on both is an empty list.
+ */
+export async function getBrowseTags(
+	fetch?: LoadFetch,
+): Promise<{ tags: TagInfo[]; source: 'tags' | 'genres' }> {
+	const b = api(fetch);
+	const tags = await live(async () => (b.tags ? b.tags() : []), [] as TagInfo[]);
+	if (tags.length) return { tags, source: 'tags' };
+	const facets = await live(async () => (b.genreFacets ? b.genreFacets() : []), []);
+	return { tags: tagsFromGenreFacets(facets), source: 'genres' };
+}
+
+/** One Browse v2 result page. */
+export interface BrowseSearchResult {
+	items: FederatedResultView[];
+	/** A genuine backend failure — never an honest empty page, never mock mode. */
+	error: boolean;
+	hasNext: boolean;
+	total: number | null;
+	/**
+	 * False when the server predates `search(filter:)` and stripped it: the page then
+	 * reflects only the legacy arguments ({@link toLegacyFilters}), and the screen must
+	 * say which filters did not apply rather than show wider results under live chips.
+	 */
+	filterApplied: boolean;
+}
+
+/**
+ * Browse v2 search: text query + `BrowseFilter`, server-side, paged at 30.
+ *
+ * The legacy arguments ride along on every request (see {@link toLegacyFilters}): a
+ * current server ignores them because `filter` wins, and an older one — which strips
+ * `filter` — applies them, so a reader deployed first degrades to the subset the old
+ * API can express instead of to an unfiltered catalogue.
+ */
+export async function getBrowseSearch(
+	state: BrowseState,
+	tagName: (id: string) => string,
+): Promise<BrowseSearchResult> {
+	let hasNext = false;
+	let total: number | null = null;
+	let filterApplied = true;
+	const r = await liveResult(async () => {
+		const res = await backend.search(state.q, state.page, {
+			...toLegacyFilters(state, tagName),
+			filter: toFilterInput(state),
+		});
+		// Read AFTER the call: the first rejection is what flips it (strip + retry happen
+		// inside that same request).
+		filterApplied = backend.browseFilterSupported?.() ?? false;
+		hasNext = res.hasNextPage ?? false;
+		total = res.total ?? null;
+		return res.items.map((s, i) => ({
+			...toCatalogEntryFull(s, i),
+			translators: [] as TranslatorChip[],
+		}));
+	}, [] as FederatedResultView[]);
+	return { items: r.data, error: r.error, hasNext, total, filterApplied };
+}
+
 /** A federated search row for the Browse grid: a catalog entry + translator tags
  *  + the full genre list (for client-side ANY-genre filtering of federated rows). */
 export interface FederatedResultView extends CatalogEntry {
@@ -1645,6 +1721,8 @@ export interface SeriesChapterView {
 	external?: boolean;
 	/** Scanlation group of the default copy (`id`/`src`); null when unknown. */
 	group?: string | null;
+	/** Volume label ("3"), null when unknown; undefined on paths with no aggregation. */
+	volume?: string | null;
 }
 /** One source's copy of a chapter, for the series-page provenance cluster. */
 export interface ChapterSourceLink {
@@ -1680,6 +1758,9 @@ export interface ReaderChapterVersion {
 	group: string | null;
 	/** This is the copy currently open. */
 	current: boolean;
+	/** This copy on its original site (validated http/s), or null when unknown — see
+	 *  {@link chapterSourceUrl}. Optional so hand-built versions need not carry it. */
+	sourceUrl?: string | null;
 }
 
 export interface SeriesDetailView {
@@ -2118,6 +2199,7 @@ function buildAggregatedChapters(
 			// the number, else the chosen fallback copy's `copyExternalUrl` — never a guess.
 			external,
 			group,
+			volume: c.chapterVolume?.trim() || null,
 		};
 	});
 }
@@ -2492,6 +2574,34 @@ export async function saveProgress(
 }
 
 /**
+ * Mark ONE chapter read or unread from the series list. Unlike {@link saveProgress} (the
+ * reader's fire-and-forget page sync) this reports whether the write landed, because the
+ * list paints the new state optimistically and must undo it on failure.
+ *
+ * Goes through `setChapterRead`, NOT `setProgress`: the server merges `setProgress`'s
+ * `read` as `MAX(old, new)` (reopening a finished chapter must not un-finish it), so an
+ * unread through it "succeeded" and the chapter came back read on reload; and its read
+ * cascades every earlier chapter to read, which a single tick in a list must not do.
+ *
+ * Against an API that predates `setChapterRead` it reports failure for BOTH directions,
+ * and the list undoes the mark. `setProgress` is no stand-in even for read: its catch-up
+ * would mark every earlier chapter read behind a click on one row, a change the list
+ * would not show until reload.
+ */
+export async function setChapterRead(chapterId: string, read: boolean): Promise<boolean> {
+	if (!LIVE || !chapterId) return false;
+	try {
+		const done = (await backend.setChapterRead?.(chapterId, read)) ?? false;
+		if (!done) return false;
+		await invalidate('komika:library');
+		return true;
+	} catch (err) {
+		console.warn('[komika] setChapterRead failed:', err);
+		return false;
+	}
+}
+
+/**
  * Record one view (a chapter open) for a series — the popularity signal behind
  * Trending and the series-page view count. Fire-and-forget: no auth (anonymous reads
  * count too), and a failure never affects reading. `seriesId` is the reader's series
@@ -2560,6 +2670,9 @@ export interface ReaderView {
 	versions?: ReaderChapterVersion[];
 	/** Scanlation group of the open copy; null when unknown. */
 	group?: string | null;
+	/** The OPEN copy on its original site — the menu's "Read on <host>" link; null hides
+	 *  it. Validated http/s, see {@link chapterSourceUrl}. */
+	sourceUrl?: string | null;
 }
 
 /** Honest empty reader view — no chapter/pages available for this series. */
@@ -2696,6 +2809,7 @@ function buildReaderView(
 			iconUrl: ctx.iconUrl ?? null,
 			group: normalizeGroup(c.scanlator),
 			current: c.id === target.id,
+			sourceUrl: chapterSourceUrl(c, readingSrc),
 		}));
 	return {
 		seriesId,
@@ -2729,6 +2843,7 @@ function buildReaderView(
 		externalUrl: chapterExternalUrl(target),
 		versions,
 		group: group ?? versions.find((v) => v.current)?.group ?? null,
+		sourceUrl: chapterSourceUrl(target, readingSrc),
 	};
 }
 
@@ -2880,6 +2995,10 @@ function readerVersions(
 		iconUrl: cp.iconUrl,
 		group: cp.group,
 		current: cp.source.chapterId === target.id && cp.src === src,
+		sourceUrl: chapterSourceUrl(
+			{ id: cp.source.chapterId, externalUrl: cp.source.copyExternalUrl },
+			cp.src,
+		),
 	}));
 	if (!versions.some((v) => v.current)) {
 		versions.unshift({
@@ -2889,6 +3008,7 @@ function readerVersions(
 			iconUrl: activeCand?.iconUrl ?? null,
 			group: normalizeGroup(target.scanlator),
 			current: true,
+			sourceUrl: chapterSourceUrl(target, src),
 		});
 	}
 	return versions;
@@ -3020,16 +3140,30 @@ export function getReaderChapter(
 					// ID, never by number: this cannot open a different chapter than asked.
 					const hit = findAggregatedCopy(agg, chParam, srcParam ?? null);
 					const spineCand = resolved.candidates.find((c) => c.suwayomiMangaId === null);
-					// Genuinely unknown to every source — stay honest and render empty. (A
-					// Suwayomi copy missing from its own source's list means that list failed
-					// to load; there is nothing to read it from.)
-					if (!hit || hit.copy.suwayomiMangaId || !spineCand) {
+					// A Suwayomi copy missing from its own source's list means that list failed
+					// to load — the engine is down (the server answers a dead source with `[]`).
+					// There is nothing to read THAT copy from, but the aggregation entry it
+					// belongs to is the same chapter, so open the spine's copy of it instead of
+					// a blank reader. Every Suwayomi source rides the same engine, so the spine
+					// is the only candidate worth trying; `loadFirstReadable` below still walks
+					// the spine's other groups if this one fails too.
+					const spineCopy =
+						hit && hit.copy.suwayomiMangaId
+							? hit.agg.sources.find((s) => !s.suwayomiMangaId && !s.copyExternalUrl)
+							: hit?.copy;
+					// Genuinely unknown to every source — stay honest and render empty.
+					if (!hit || !spineCopy || !spineCand) {
 						const empty = emptyReader(effectiveId, tmeta);
 						return { ...empty, seriesTitle: resolved.meta?.title ?? '' };
 					}
-					const provisional = chapterFromCopy(effectiveId, hit.agg, hit.copy, undefined);
+					const provisional = chapterFromCopy(effectiveId, hit.agg, spineCopy, undefined);
 					const sibling = copiesOf(spineCand.chapters, provisional)[0];
-					target = chapterFromCopy(effectiveId, hit.agg, hit.copy, sibling);
+					// The spine's OWN row for the copy when it lists it (that row carries the
+					// real read state and page count); a synthesized one only for an upload
+					// the aggregation alone knows.
+					target =
+						spineCand.chapters.find((c) => c.id === spineCopy.chapterId) ??
+						chapterFromCopy(effectiveId, hit.agg, spineCopy, sibling);
 					activeChs = spineCand.chapters;
 					activeSrc = null;
 					activeSpine = true;
@@ -3082,24 +3216,28 @@ export function getReaderChapter(
 				spine: activeSpine,
 				key: null,
 			};
+			// Every OTHER copy of the chosen number, in `resolveWork`'s candidate order (spine
+			// first) — the ACTIVE source included: on the spine, the open group's upload and
+			// another group's readable upload of the same number are both "MangaDex", and
+			// skipping the active source here is exactly what left a taken-down spine copy
+			// with no fallback while a sibling upload read fine.
 			const fallbacks: PageAttempt[] = chapterExternalUrl(chosen)
 				? []
-				: resolved.candidates
-						.filter((cand) => cand.suwayomiMangaId !== activeSrc)
-						.flatMap((cand) =>
-							// The POOL, not the list: the spine's list keeps ONE copy per
-							// number, and that one is often the off-site upload while another
-							// group's readable upload exists only in the aggregation.
-							copiesOf(copyPool(effectiveId, agg, cand.chapters, cand.suwayomiMangaId), chosen)
-								.filter((c) => c.id !== chosen.id && !chapterExternalUrl(c))
-								.map((c) => ({
-									chapter: c,
-									chs: cand.chapters,
-									src: cand.suwayomiMangaId,
-									spine: cand.suwayomiMangaId === null,
-									key: cand.key,
-								})),
-						);
+				: resolved.candidates.flatMap((cand) => {
+						// The POOL, not the list: the spine's list keeps ONE copy per number, and
+						// that one is often the off-site upload while another group's readable
+						// upload exists only in the aggregation.
+						const pool = copyPool(effectiveId, agg, cand.chapters, cand.suwayomiMangaId);
+						return copiesOf(pool, chosen)
+							.filter((c) => c.id !== chosen.id && !chapterExternalUrl(c))
+							.map((c) => ({
+								chapter: c,
+								chs: cand.chapters,
+								src: cand.suwayomiMangaId,
+								spine: cand.suwayomiMangaId === null,
+								key: cand.key,
+							}));
+					});
 			const opened = await loadFirstReadable<PageAttempt, Page>(
 				[primary, ...fallbacks],
 				(a) =>

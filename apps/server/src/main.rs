@@ -24,8 +24,10 @@ mod scanner;
 mod series_cache;
 mod suwayomi;
 mod sync;
+mod tags;
 mod task;
 mod views;
+mod work_stats;
 
 use std::sync::Arc;
 
@@ -1709,6 +1711,12 @@ async fn main() -> anyhow::Result<()> {
         // work-list is `scanlator IS NULL` on a MangaDex row (migration 0105's partial
         // index), so it resumes itself and costs an hourly empty-index probe once drained.
         mangadex::spawn_group_backfill(pool.clone(), mangadex.clone(), shutdown_tx.subscribe());
+        // Same gate, same limiter, same shape: MangaDex follows + rating into `work_stats`
+        // (migration 0106) for Browse's MOST_FOLLOWS / HIGHEST_RATED sorts and its
+        // minFollows / minRating filters. 100 ids per request, 0.5 req/s; never-fetched works
+        // first, then anything older than a week, so it never finishes for good — it idles
+        // on an hourly probe between weekly refreshes.
+        work_stats::spawn_stats_backfill(pool.clone(), mangadex.clone(), shutdown_tx.subscribe());
     } else {
         tracing::info!("catalogue sync disabled (set CATALOGUE_SYNC=on to enable)");
     }

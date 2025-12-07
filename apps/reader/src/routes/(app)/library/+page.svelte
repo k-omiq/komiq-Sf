@@ -262,7 +262,9 @@
 						<Cover src={item.cover} alt={item.title} loading="lazy" sizing="card" />
 						<a class="cover-link" {href} aria-label={item.title}></a>
 						<span class="flag-svg"><FlagBadge type={item.type} /></span>
-						<span class="rating" aria-label={item.rating ? `Rating ${item.rating} out of 10` : 'Not rated yet'}
+						<span
+							class="rating"
+							aria-label={item.rating ? `Rating ${item.rating} out of 10` : 'Not rated yet'}
 							><Icon name="star" size={10} fill="var(--k-star)" />{item.rating}</span
 						>
 						<button
@@ -554,9 +556,16 @@
 	}
 	/* Covers have a definite aspect ratio, so skipping offscreen artwork never
 	   guesses card height. Open shelf menus opt out of paint containment. */
-	.grid.large .cover { content-visibility: auto; }
-	.grid.large .cover:has(:global(.sm.open)) { content-visibility: visible; }
-	.lib-card:has(:global(.sm.open)) { position: relative; z-index: 5; }
+	.grid.large .cover {
+		content-visibility: auto;
+	}
+	.grid.large .cover:has(:global(.sm.open)) {
+		content-visibility: visible;
+	}
+	.lib-card:has(:global(.sm.open)) {
+		position: relative;
+		z-index: 5;
+	}
 	.lib-card {
 		display: flex;
 		flex-direction: column;

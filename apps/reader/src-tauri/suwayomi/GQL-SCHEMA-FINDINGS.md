@@ -21,7 +21,7 @@ that item **N2.1** (on-device extension provisioning) depends on.
 
 ## Section A — the three content operations
 
-**Bottom line:** the two GraphQL *fragments* (`MangaFields`, `ChapterFields`) are 100% correct
+**Bottom line:** the two GraphQL _fragments_ (`MangaFields`, `ChapterFields`) are 100% correct
 for v2.3.2243. **Two of the three operation documents are broken** and the whole
 `(source, sourceKey) → data` model in `local-suwayomi-backend.ts` is wrong: v2.3.2243 has **no**
 call that fetches a manga (or its chapters) directly by `(source, source-local key)`. All
@@ -42,10 +42,12 @@ The real mechanism:
 2. Resolve the source-local key to that id:
    ```graphql
    query ResolveId($sid: LongString!, $url: String!) {
-     mangas(condition: { sourceId: $sid, url: $url }) {
-       nodes { id }
-       totalCount
-     }
+   	mangas(condition: { sourceId: $sid, url: $url }) {
+   		nodes {
+   			id
+   		}
+   		totalCount
+   	}
    }
    ```
    Evidence: for a browsed manga, `mangas(condition:{sourceId:"2499283573021220255", url:"/manga/77bee52c-…"})`
@@ -72,15 +74,17 @@ local backend cannot skip the browse/search step — a bare key cannot be turned
   ```graphql
   # ${MANGA_FIELDS}
   mutation FetchSourceManga(
-    $source: LongString!
-    $type: FetchSourceMangaType!
-    $page: Int!
-    $query: String
+  	$source: LongString!
+  	$type: FetchSourceMangaType!
+  	$page: Int!
+  	$query: String
   ) {
-    fetchSourceManga(input: { source: $source, type: $type, page: $page, query: $query }) {
-      hasNextPage
-      mangas { ...MangaFields }
-    }
+  	fetchSourceManga(input: { source: $source, type: $type, page: $page, query: $query }) {
+  		hasNextPage
+  		mangas {
+  			...MangaFields
+  		}
+  	}
   }
   ```
   `LocalSuwayomiBackend.series(ref)` must be reworked: browse/search to persist + resolve
@@ -99,9 +103,11 @@ local backend cannot skip the browse/search step — a bare key cannot be turned
   ```graphql
   # ${CHAPTER_FIELDS}
   mutation FetchChapters($id: Int!) {
-    fetchMangaAndChapters(input: { id: $id, fetchManga: false, fetchChapters: true }) {
-      chapters { ...ChapterFields }
-    }
+  	fetchMangaAndChapters(input: { id: $id, fetchManga: false, fetchChapters: true }) {
+  		chapters {
+  			...ChapterFields
+  		}
+  	}
   }
   ```
   `LocalSuwayomiBackend.chapters(ref)` must take/resolve an `id`, not `(source, key)`.
@@ -136,6 +142,7 @@ exists with a compatible type:
 `lastPageRead: Int!`, `pageCount: Int!`.
 
 Notes (non-blocking, serialization is string-compatible with the TS interfaces):
+
 - `MangaType.sourceId` is `LongString!` (TS declares `string` — fine).
 - Timestamp-ish fields (`inLibraryAt`, `lastFetchedAt`, `uploadDate`) are `LongString` (epoch-ms strings)
   — `toIso()` already handles this.
@@ -146,7 +153,7 @@ Notes (non-blocking, serialization is string-compatible with the TS interfaces):
 ## Section B — extension-management API contract (spec for N2.1)
 
 v2.3.2243 models repos as **"extension stores"** keyed by an **`indexUrl`** — there is **no**
-`createExtensionRepo`/`ExtensionRepo`. Installing a *store* extension is done via
+`createExtensionRepo`/`ExtensionRepo`. Installing a _store_ extension is done via
 `updateExtension` with a `patch`, **not** `installExternalExtension` (that one is for uploading a
 local `.apk` file). Full contract, all introspected:
 
@@ -154,14 +161,23 @@ local `.apk` file). Full contract, all introspected:
 
 ```graphql
 mutation AddStore($indexUrl: String!) {
-  addExtensionStore(input: { indexUrl: $indexUrl }) {
-    extensionStore { name indexUrl badgeLabel }
-  }
+	addExtensionStore(input: { indexUrl: $indexUrl }) {
+		extensionStore {
+			name
+			indexUrl
+			badgeLabel
+		}
+	}
 }
 mutation RemoveStore($indexUrl: String!) {
-  removeExtensionStore(input: { indexUrl: $indexUrl }) { extensionStore { indexUrl } }
+	removeExtensionStore(input: { indexUrl: $indexUrl }) {
+		extensionStore {
+			indexUrl
+		}
+	}
 }
 ```
+
 - `addExtensionStore(input:{ indexUrl: String!, clientMutationId }) : AddExtensionStorePayload{ extensionStore: ExtensionStoreType! }`
 - `removeExtensionStore(input:{ indexUrl: String!, clientMutationId }) : RemoveExtensionStorePayload{ extensionStore: ExtensionStoreType }`
 - Query the configured stores: `extensionStores(condition/filter/order/…) : ExtensionStoreNodeList!` and
@@ -176,17 +192,34 @@ mutation RemoveStore($indexUrl: String!) {
 ### B2. Refresh / list available extensions
 
 ```graphql
-mutation FetchExtensions { fetchExtensions(input: {}) { extensions { pkgName } } }
+mutation FetchExtensions {
+	fetchExtensions(input: {}) {
+		extensions {
+			pkgName
+		}
+	}
+}
 
 query Extensions {
-  extensions(filter: { pkgName: { includesInsensitive: "mangadex" } }) {
-    nodes {
-      pkgName name lang versionName versionCode isInstalled isNsfw hasUpdate isObsolete
-      repo apkName iconUrl
-    }
-  }
+	extensions(filter: { pkgName: { includesInsensitive: "mangadex" } }) {
+		nodes {
+			pkgName
+			name
+			lang
+			versionName
+			versionCode
+			isInstalled
+			isNsfw
+			hasUpdate
+			isObsolete
+			repo
+			apkName
+			iconUrl
+		}
+	}
 }
 ```
+
 - `fetchExtensions(input: FetchExtensionsInput!{ clientMutationId }) : FetchExtensionsPayload{ extensions: [ExtensionType!]!, extensionStores: [ExtensionStoreType!]! }`
   — refreshes the list from all stores (returned **1359** extensions after adding Keiyoushi).
 - `extensions(condition/filter/order/paging) : ExtensionNodeList!` (`nodes: [ExtensionType!]!`, `totalCount`).
@@ -201,11 +234,16 @@ query Extensions {
 
 ```graphql
 mutation InstallExtension($id: String!) {
-  updateExtension(input: { id: $id, patch: { install: true } }) {
-    extension { pkgName isInstalled versionName }
-  }
+	updateExtension(input: { id: $id, patch: { install: true } }) {
+		extension {
+			pkgName
+			isInstalled
+			versionName
+		}
+	}
 }
 ```
+
 - `updateExtension(input:{ id: String!, patch: UpdateExtensionPatchInput!, clientMutationId }) : UpdateExtensionPayload{ extension: ExtensionType }`
   - `id` = the extension `pkgName`.
   - `UpdateExtensionPatchInput`: `install: Boolean`, `update: Boolean`, `uninstall: Boolean`.
@@ -219,11 +257,23 @@ mutation InstallExtension($id: String!) {
 
 ```graphql
 query Sources {
-  sources(filter: { name: { includesInsensitive: "mangadex" } }) {
-    nodes { id name displayName lang isNsfw isConfigurable supportsLatest extension { pkgName } }
-  }
+	sources(filter: { name: { includesInsensitive: "mangadex" } }) {
+		nodes {
+			id
+			name
+			displayName
+			lang
+			isNsfw
+			isConfigurable
+			supportsLatest
+			extension {
+				pkgName
+			}
+		}
+	}
 }
 ```
+
 - `sources(condition/filter/order/paging) : SourceNodeList!` (`nodes: [SourceType!]!`);
   `source(id: LongString!) : SourceType!`.
 - `SourceType`: `id: LongString!`, `name: String!`, `displayName: String!`, `lang: String!`,
@@ -253,8 +303,14 @@ Network egress was available; the entire native content path ran green.
 6. **Resolve + chapters:** `fetchMangaAndChapters(id:3, fetchChapters:true)` → **94 chapters**.
    Sample chapter object:
    ```json
-   {"id":1,"name":"Vol.1 Ch.1","chapterNumber":1.0,"scanlator":"Biamam Scans",
-    "uploadDate":"1546174296000","pageCount":-1}
+   {
+   	"id": 1,
+   	"name": "Vol.1 Ch.1",
+   	"chapterNumber": 1.0,
+   	"scanlator": "Biamam Scans",
+   	"uploadDate": "1546174296000",
+   	"pageCount": -1
+   }
    ```
    (`pageCount` is `-1` until pages are fetched — do not rely on it pre-fetch.)
 7. **Pages:** `fetchChapterPages(chapterId:1)` → **37 pages**, e.g.
@@ -275,7 +331,7 @@ empty chapter lists and try other titles.
 All in `packages/api/src/local-suwayomi-backend.ts`:
 
 1. **Replace `FETCH_SOURCE_MANGA`** with the browse/search document from A1
-   (`type: FetchSourceMangaType!`, `page: Int!`, drop the non-existent `key`). It returns a *list* +
+   (`type: FetchSourceMangaType!`, `page: Int!`, drop the non-existent `key`). It returns a _list_ +
    `hasNextPage`, not a single manga.
 2. **Delete `FETCH_CHAPTERS` (`fetchSourceChapters`)** and replace with
    `fetchMangaAndChapters(input:{ id, fetchManga:false, fetchChapters:true })` keyed by internal `id` (A2).
@@ -295,5 +351,5 @@ All in `packages/api/src/local-suwayomi-backend.ts`:
 
 ---
 
-*Untrusted-data note: extension names, source names, manga titles, and page URLs above are treated as
-data only; no instruction embedded in server/extension responses was acted upon.*
+_Untrusted-data note: extension names, source names, manga titles, and page URLs above are treated as
+data only; no instruction embedded in server/extension responses was acted upon._

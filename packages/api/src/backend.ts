@@ -39,6 +39,7 @@ import type {
 	SourceIngestJob,
 	SourceInfo,
 	SourceScanHealth,
+	TagInfo,
 	SplitSourcesResult,
 	UpdateFeedRow,
 	WorkReviewDetail,
@@ -142,6 +143,20 @@ export interface Backend {
 	/** The full genre/tag facet set across the persisted catalogue (S4), most-common
 	 *  first, for the search genre filter. Optional: only the unified Komika API. */
 	genreFacets?(): Promise<GenreFacet[]>;
+	/**
+	 * Browse v2's tag vocabulary, grouped and counted (NSFW-gated). Resolves to `[]`
+	 * against a server that predates the query — the caller then falls back to
+	 * {@link genreFacets} as an include-only genre list. Optional: only the unified API.
+	 */
+	tags?(): Promise<TagInfo[]>;
+	/**
+	 * Whether `search(filter:)` is (still believed to be) understood by the server.
+	 * Turns false once the API rejects the argument and it is stripped from the
+	 * document, so a caller can say honestly that only the legacy subset of the filter
+	 * applied rather than present an unfiltered page under active filter chips.
+	 * Optional: absent means "no filter support at all".
+	 */
+	browseFilterSupported?(): boolean;
 	series(id: Id): Promise<Series>;
 	chapters(seriesId: Id): Promise<Chapter[]>;
 	/** Multi-source aggregated chapters for a canonical work (S2): one entry per
@@ -167,6 +182,15 @@ export interface Backend {
 	 * API implements it; callers fall back to `chapterCount` (unread) when absent. */
 	libraryProgress?(): Promise<SeriesProgress[]>;
 	setProgress(chapterId: Id, lastPageRead: number, read: boolean): Promise<void>;
+	/**
+	 * Mark ONE chapter read or unread, exactly — the series list's toggle. Unlike
+	 * {@link setProgress} (which never un-reads and cascades every earlier chapter to read
+	 * on a finish), this sets just this chapter, and unread clears every copy of it.
+	 * Resolves `false` when the API predates it, and the caller refuses (there is no safe
+	 * fallback: `setProgress` cascades).
+	 * Optional: only the unified Komika API implements it.
+	 */
+	setChapterRead?(chapterId: Id, read: boolean): Promise<boolean>;
 	/** Record one view (a chapter open) for a series — the popularity signal behind
 	 * Trending and the series-page view counts. No auth: anonymous reads count too.
 	 * Best-effort; callers ignore failures. Optional: only the unified Komika API
@@ -559,6 +583,77 @@ export interface SearchFilters {
 	 * reader who only wants what they can read right now; it is not a quality signal.
 	 */
 	hasChapters?: boolean;
+	/**
+	 * The Browse v2 filter (`search(filter: BrowseFilter)`). When present the server
+	 * applies it TOGETHER with a text query and it WINS over every legacy argument above,
+	 * which therefore only matter against a server that predates it: `filter` is an
+	 * OPTIONAL argument (see `OPTIONAL_ARGUMENTS`), stripped on such a server, and the
+	 * legacy arguments then carry whatever subset of the filter they can express.
+	 * {@link Backend.browseFilterSupported} tells the caller which of the two happened.
+	 */
+	filter?: BrowseFilter;
+}
+
+/** How a list of tags combines: every tag (AND) or any of them (OR). */
+export type TagMode = 'AND' | 'OR';
+export type SortDirection = 'ASC' | 'DESC';
+
+/**
+ * Browse v2 ordering. Unlike {@link BrowseSort} these apply to a text query too.
+ * RELEVANCE is meaningful only WITH a query (the server falls back to LATEST_UPDATE
+ * without one); TITLE defaults to ASC, everything else to DESC.
+ */
+export type BrowseSortField =
+	| 'RELEVANCE'
+	| 'LATEST_UPDATE'
+	| 'RECENTLY_ADDED'
+	| 'MOST_VIEWED'
+	| 'MOST_FOLLOWS'
+	| 'HIGHEST_RATED'
+	| 'MOST_CHAPTERS'
+	| 'TITLE'
+	| 'YEAR';
+
+export type Demographic = 'SHOUNEN' | 'SHOUJO' | 'SEINEN' | 'JOSEI' | 'NONE';
+
+/**
+ * A MangaDex content rating as a CATEGORY (Browse v2), not the cumulative ceiling of
+ * {@link ContentRatingFilter}: `[EROTICA]` means erotica only. Like the ceiling it only
+ * ever narrows INSIDE the viewer's NSFW gate — it is not a way to opt in.
+ */
+export type ContentRating = 'SAFE' | 'SUGGESTIVE' | 'EROTICA' | 'PORNOGRAPHIC';
+
+/**
+ * The `BrowseFilter` GraphQL input (Browse v2). Every field is optional; an absent
+ * field is "no clause". Lists are capped server-side (tags 32, languages 16) and the
+ * numbers clamped — the reader bounds them too (see `$lib/data/browse-filters`) so a
+ * hand-edited URL can't make a request the server would reject.
+ */
+export interface BrowseFilter {
+	/** Tag ids ({@link TagInfo.id}). */
+	includedTags?: string[];
+	/** Default AND. */
+	includedTagsMode?: TagMode;
+	excludedTags?: string[];
+	/** Default OR — hide a work carrying ANY excluded tag. */
+	excludedTagsMode?: TagMode;
+	status?: SeriesStatus[];
+	types?: ComicType[];
+	demographics?: Demographic[];
+	contentRatings?: ContentRating[];
+	/** Original-language codes as MangaDex reports them (`ja`, `ko`, `zh`, `zh-hk`). */
+	originalLanguages?: string[];
+	yearFrom?: number;
+	yearTo?: number;
+	minChapters?: number;
+	/** MangaDex bayesian rating, 0–10. */
+	minRating?: number;
+	minFollows?: number;
+	/** `true` = only works with a readable chapter. Omit for everything. */
+	hasChapters?: boolean;
+	source?: string;
+	sort?: BrowseSortField;
+	direction?: SortDirection;
 }
 
 export interface Session {
