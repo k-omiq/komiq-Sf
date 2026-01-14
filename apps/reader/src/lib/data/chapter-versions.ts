@@ -46,6 +46,12 @@ export function normalizeGroup(group: string | null | undefined): string | null 
 	return g === '' ? null : g;
 }
 
+/** Identify each upload by its hosting source and group (or uploader fallback). */
+export function chapterAttribution(source: string, group: string | null | undefined): string {
+	const credit = normalizeGroup(group);
+	return credit ? `${source} · ${credit}` : source;
+}
+
 /**
  * Whether a label names a NUMBERED chapter. The wire `number` cannot tell: a oneshot
  * arrives as `0`, indistinguishable from a real Chapter 0, and sorting by it floats every

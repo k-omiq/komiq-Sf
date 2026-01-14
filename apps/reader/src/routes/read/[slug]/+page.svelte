@@ -5,6 +5,7 @@
 	import { untrack, onDestroy, tick } from 'svelte';
 	import { saveProgress, recordView } from '$lib/data/source';
 	import { externalChapterHost, externalChapterHref } from '$lib/data/chapter-label';
+	import { chapterAttribution } from '$lib/data/chapter-versions';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
 	import Icon, { type IconName } from '$lib/components/Icon.svelte';
 	import CommentThread from '$lib/components/CommentThread.svelte';
@@ -879,7 +880,7 @@
 				<div class="tr-opts">
 					{#if versions.length}
 						{#each versions as v (`${v.src ?? 'spine'}:${v.id}`)}
-							{@const label = v.group || v.source}
+							{@const label = chapterAttribution(v.source, v.group)}
 							<button
 								class="tr-opt ver"
 								class:on={v.current}
@@ -892,7 +893,6 @@
 								{@render srcLogo(v.iconUrl, v.source)}
 								<span class="ver-text">
 									<span class="tr-name">{label}</span>
-									{#if v.group}<span class="ver-src">{v.source}</span>{/if}
 								</span>
 								{#if v.current}<Icon name="check" size={14} strokeWidth={2.6} />{/if}
 							</button>
@@ -904,8 +904,9 @@
 						<div class="tr-opt ver on static">
 							{@render srcLogo(activeTranslator?.iconUrl ?? null, srcName ?? openGroup ?? '?')}
 							<span class="ver-text">
-								<span class="tr-name">{openGroup || srcName || 'Unknown group'}</span>
-								{#if openGroup && srcName}<span class="ver-src">{srcName}</span>{/if}
+								<span class="tr-name"
+									>{chapterAttribution(srcName || 'Unknown source', openGroup)}</span
+								>
 							</span>
 							<Icon name="check" size={14} strokeWidth={2.6} />
 						</div>
@@ -1760,14 +1761,6 @@
 	}
 	.ver-text .tr-name {
 		flex: none;
-	}
-	.ver-src {
-		font-size: 11.5px;
-		font-weight: 600;
-		color: var(--k-text-faint);
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
 	}
 	.tr-opt.ver.on,
 	.tr-opt.static {

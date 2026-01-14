@@ -7,6 +7,7 @@ import { test } from 'node:test';
 
 import {
 	NO_GROUP,
+	chapterAttribution,
 	adjacentChapters,
 	copiesOf,
 	isNumberedLabel,
@@ -113,4 +114,11 @@ test('labels and groups normalise', () => {
 	assert.equal(normalizeGroup(''), null);
 	assert.equal(normalizeGroup('  '), null);
 	assert.equal(normalizeGroup(' Uwaki Scans '), 'Uwaki Scans');
+});
+
+test('upload labels retain the source alongside the group or uploader', () => {
+	assert.equal(chapterAttribution('MangaDex', 'Team'), 'MangaDex · Team');
+	assert.equal(chapterAttribution('MangaDex', ' solo-uploader '), 'MangaDex · solo-uploader');
+	assert.equal(chapterAttribution('MangaDex', null), 'MangaDex');
+	assert.equal(chapterAttribution('Other source', 'Team'), 'Other source · Team');
 });

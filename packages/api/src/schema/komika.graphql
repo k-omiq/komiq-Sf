@@ -1020,7 +1020,7 @@ type ChapterSource {
 	sourceId: String!
 	suwayomiMangaId: ID # for a Suwayomi source: pass to chapters(seriesId:) to read this source's copy; null for the MangaDex mirror
 	chapterId: ID! # the specific chapter to open (a Suwayomi chapter id, or a MangaDex chapter uuid)
-	scanlator: String # the scanlation group(s) of THIS copy: MangaDex group names joined with " & ", or "No Group" when MangaDex lists none; null = unknown (not backfilled yet / the source reports none)
+	scanlator: String # attribution for THIS copy: MangaDex group names joined with " & ", else the uploader username (or "No Group" if unavailable); null = unknown (not backfilled yet / the source reports none)
 	copyReleasedAt: String # when THIS copy was released (ISO-8601, readable_at else published_at); null when undated. Named copy… so the client's by-name stripper never touches UpdateFeedRow.releasedAt
 	copyExternalUrl: String # set when THIS copy is hosted off-site (MangaPlus, Comikey…) — open it as a hand-off, not as pages
 }

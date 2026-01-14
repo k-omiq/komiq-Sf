@@ -1178,8 +1178,8 @@ pub struct ChapterSource {
     pub source_id: String,
     pub suwayomi_manga_id: Option<ID>,
     pub chapter_id: ID,
-    /// Who translated THIS copy. For MangaDex: the group name(s) joined with `" & "`, or
-    /// `"No Group"` when MangaDex lists none. `null` means unknown — a MangaDex row the
+    /// Attribution for THIS copy. For MangaDex: group names joined with `" & "`, else
+    /// the uploader username (or `"No Group"` if unavailable). `null` means unknown — a row the
     /// group backfill has not reached yet, or a Suwayomi source that reports no scanlator.
     pub scanlator: Option<String>,
     /// When THIS copy was released (ISO-8601) — `COALESCE(readable_at, published_at)`, the
