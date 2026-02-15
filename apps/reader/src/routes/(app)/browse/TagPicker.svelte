@@ -1,6 +1,7 @@
 <script lang="ts">
-	import type { TagInfo } from '@komika/types';
+	import type { TagGroup, TagInfo } from '@komika/types';
 	import type { TagMode } from '@komika/api';
+	import { innerHeight } from 'svelte/reactivity/window';
 	import Icon from '$lib/components/Icon.svelte';
 	import {
 		cycleTag,
@@ -13,9 +14,9 @@
 	} from '$lib/data/browse-filters';
 
 	/**
-	 * The tag picker: every tag on its group's shelf, each a THREE-state toggle
-	 * (off → include → exclude → off), with type-to-search and the AND/OR mode of each
-	 * list.
+	 * A compact category preview with search, expansion, and a permanent selection
+	 * shelf. Each tag cycles off → include → exclude → off. Match options hold the
+	 * include/exclude list modes.
 	 *
 	 * Tri-state is not expressible with `aria-pressed` ("mixed" means partially pressed,
 	 * not "excluded"), so each tag carries its state in its accessible NAME instead —
@@ -43,7 +44,25 @@
 
 	const uid = $props.id();
 	let needle = $state('');
-	const shelves = $derived(shelveTags(tags, needle, draft));
+	let category = $state<TagGroup>('GENRE');
+	let showAll = $state(false);
+	// Shorter screens start with two rows; taller screens can show four.
+	const previewCount = $derived((innerHeight.current ?? 900) <= 850 ? 4 : 8);
+	const allShelves = $derived(shelveTags(tags, '', draft));
+	const activeCategory = $derived(
+		allShelves.some((shelf) => shelf.group === category) ? category : allShelves[0]?.group,
+	);
+	// Selected tags have a permanent shelf, so changing categories or searching never
+	// hides a draft selection. The category list only contains unselected tags.
+	const selectedTags = $derived(tags.filter((tag) => tagState(draft, tag.id) !== 'off'));
+	const shelves = $derived(
+		shelveTags(tags, needle, draft)
+			.map((shelf) => ({
+				...shelf,
+				tags: shelf.tags.filter((tag) => tagState(draft, tag.id) === 'off'),
+			}))
+			.filter((shelf) => shelf.tags.length && (needle.trim() || shelf.group === activeCategory)),
+	);
 	const triState = $derived(source === 'tags');
 
 	function tap(id: string) {
@@ -93,13 +112,30 @@
 	</div>
 {/snippet}
 
+{#snippet tagButton(tag: TagInfo)}
+	{@const state = tagState(draft, tag.id)}
+	<button
+		type="button"
+		class="tag {state}"
+		aria-label="{tag.name}, {STATE_TEXT[state]}"
+		aria-describedby="{uid}-hint"
+		title="{tag.count.toLocaleString()} series"
+		onclick={() => tap(tag.id)}
+	>
+		{#if state !== 'off'}<span class="mark" aria-hidden="true"
+				>{state === 'include' ? '+' : '-'}</span
+			>{/if}
+		<span class="tname">{tag.name}</span>
+	</button>
+{/snippet}
+
 <div class="picker">
 	<div class="tsearch">
 		<Icon name="search" size={15} />
 		<input
 			type="search"
 			bind:value={needle}
-			placeholder="Search tags…"
+			placeholder="Search tags"
 			aria-label="Search tags"
 			autocomplete="off"
 			aria-controls="{uid}-shelves"
@@ -109,60 +145,90 @@
 				type="button"
 				class="tclear"
 				aria-label="Clear tag search"
-				onclick={() => (needle = '')}><Icon name="x" size={14} /></button
+				onclick={() => (needle = '')}
 			>
+				<Icon name="x" size={14} />
+			</button>
 		{/if}
 	</div>
 
-	{#if triState}
-		<div class="modes">
-			{@render modeToggle('inclMode', 'Include', 'AND')}
-			{@render modeToggle('exclMode', 'Exclude', 'OR')}
+	{#if selectedTags.length}
+		<div class="tags selected" role="group" aria-label="Selected tags">
+			{#each selectedTags as tag (tag.id)}{@render tagButton(tag)}{/each}
 		</div>
-		<p class="thint" id="{uid}-hint">
-			Tap a tag once to include it, again to exclude it, and a third time to clear it.
-			<strong>Include · All</strong> needs every included tag; <strong>Exclude · Any</strong> hides a
-			series with any excluded tag.
-		</p>
-	{:else if !loading}
-		<p class="thint" id="{uid}-hint">
-			Shows series with <strong>any</strong> of the selected genres. Excluding tags needs a newer server.
-		</p>
+	{/if}
+
+	{#if allShelves.length > 1 && !needle.trim()}
+		<div class="categories" role="group" aria-label="Tag category">
+			{#each allShelves as shelf (shelf.group)}
+				<button
+					type="button"
+					aria-pressed={activeCategory === shelf.group}
+					onclick={() => {
+						category = shelf.group;
+						showAll = false;
+					}}>{shelf.label}</button
+				>
+			{/each}
+		</div>
 	{/if}
 
 	<div class="shelves" id="{uid}-shelves" aria-busy={loading}>
 		{#if loading}
-			<span class="tempty">Loading tags…</span>
+			<div class="tag-skeleton" aria-label="Loading tags">
+				{#each Array(6) as _}<span></span>{/each}
+			</div>
 		{:else if tags.length === 0}
-			<span class="tempty">Tags aren't available yet.</span>
+			<p class="tempty">Tags aren't available yet.</p>
 		{:else}
-			{#each shelves as sh (sh.group)}
-				<div class="shelf" role="group" aria-labelledby="{uid}-g-{sh.group}">
-					<span class="shelf-label" id="{uid}-g-{sh.group}">{sh.label}</span>
+			{#each shelves as shelf (shelf.group)}
+				<div class="shelf" role="group" aria-label={shelf.label}>
+					{#if needle.trim()}<span class="shelf-label">{shelf.label}</span>{/if}
 					<div class="tags">
-						{#each sh.tags as t (t.id)}
-							{@const st = tagState(draft, t.id)}
-							<button
-								type="button"
-								class="tag {st}"
-								aria-label="{t.name}, {STATE_TEXT[st]}"
-								aria-describedby="{uid}-hint"
-								onclick={() => tap(t.id)}
-							>
-								{#if st !== 'off'}<span class="mark" aria-hidden="true"
-										>{st === 'include' ? '+' : '−'}</span
-									>{/if}
-								<span class="tname">{t.name}</span>
-								<span class="tcount" aria-hidden="true">{t.count.toLocaleString()}</span>
-							</button>
+						{#each showAll || needle.trim() ? shelf.tags : shelf.tags.slice(0, previewCount) as tag (tag.id)}
+							{@render tagButton(tag)}
 						{/each}
 					</div>
 				</div>
 			{:else}
-				<span class="tempty">No tags match “{needle}”.</span>
+				<p class="tempty">
+					{needle.trim() ? 'No matching tags to add.' : 'All tags in this category are selected.'}
+				</p>
 			{/each}
 		{/if}
 	</div>
+
+	<div class="tag-tools">
+		{#if !needle.trim() && (shelves[0]?.tags.length ?? 0) > previewCount}
+			<button
+				type="button"
+				class="show-all"
+				aria-expanded={showAll}
+				onclick={() => (showAll = !showAll)}
+			>
+				{showAll ? 'Show fewer' : `Show all ${shelves[0].tags.length} tags`}
+				<Icon name="chevron-down" size={13} />
+			</button>
+		{/if}
+		{#if triState}
+			<details class="match-options">
+				<summary>Tag options<Icon name="chevron-down" size={13} /></summary>
+				<p class="thint" id="{uid}-hint">Click to cycle: include (+), exclude (-), clear.</p>
+				<div class="modes">
+					{@render modeToggle('inclMode', 'Include', 'AND')}
+					{@render modeToggle('exclMode', 'Exclude', 'OR')}
+				</div>
+				<p class="thint">
+					Include All requires every selected tag. Exclude Any hides series with any excluded tag.
+				</p>
+			</details>
+		{/if}
+	</div>
+	{#if !triState && !loading}
+		<p class="thint" id="{uid}-hint">
+			Matches any selected genre. Tag exclusions need a newer server.
+		</p>
+	{/if}
 </div>
 
 <style>
@@ -176,170 +242,233 @@
 		display: flex;
 		align-items: center;
 		gap: 8px;
-		height: 38px;
-		padding: 0 6px 0 12px;
-		border-radius: var(--k-radius-md);
+		min-height: 40px;
+		padding: 0 6px 0 10px;
+		border-radius: var(--k-radius);
 		background: var(--k-surface-2);
 		border: 1px solid var(--k-border-3);
-		color: var(--k-text-faint);
+		color: var(--k-text-dim);
 	}
 	.tsearch:focus-within {
 		border-color: var(--k-border-strong);
+		outline: 2px solid var(--k-accent);
+		outline-offset: 2px;
 	}
 	.tsearch input {
 		flex: 1;
 		min-width: 0;
+		padding: 9px 0;
 		background: transparent;
 		border: none;
 		outline: none;
 		color: var(--k-text);
-		font-size: 13.5px;
+		font-size: 13px;
+	}
+	.tsearch input::placeholder {
+		color: var(--k-text-dim);
+		opacity: 1;
 	}
 	.tclear {
-		width: 28px;
-		height: 28px;
+		width: 30px;
+		height: 30px;
 		border: none;
 		background: transparent;
-		color: var(--k-text-faint);
+		color: var(--k-text-dim);
 		cursor: pointer;
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
 	}
-	.modes {
+	.categories {
 		display: flex;
-		flex-wrap: wrap;
-		gap: 10px 16px;
+		border-bottom: 1px solid var(--k-border-1);
 	}
-	.mode {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-	}
-	.mode-label {
-		font-size: 12.5px;
-		font-weight: 600;
-		color: var(--k-text-dim);
-	}
-	.seg {
-		display: inline-flex;
-		padding: 2px;
-		border-radius: var(--k-radius-pill);
-		background: var(--k-surface-2);
-		border: 1px solid var(--k-border-3);
-	}
-	.seg button {
-		min-width: 44px;
-		height: 28px;
-		padding: 0 10px;
+	.categories button {
+		flex: 1;
+		min-width: 0;
+		min-height: 36px;
+		padding: 4px 3px 10px;
 		border: none;
-		border-radius: var(--k-radius-pill);
+		border-bottom: 2px solid transparent;
 		background: transparent;
 		color: var(--k-text-dim);
-		font-size: 12px;
-		font-weight: 700;
+		font-size: 11.5px;
 		cursor: pointer;
 	}
-	.seg button[aria-checked='true'] {
-		background: var(--k-primary);
-		color: var(--k-on-primary);
+	.categories button[aria-pressed='true'] {
+		border-bottom-color: var(--k-text);
+		color: var(--k-text);
+		font-weight: 650;
 	}
-	.thint {
-		margin: 0;
-		font-size: 12px;
-		line-height: 1.45;
-		color: var(--k-text-faint);
+	.categories button:hover {
+		color: var(--k-text);
 	}
-	.thint strong {
-		color: var(--k-text-dim);
-		font-weight: 700;
-	}
-	.shelves {
-		display: flex;
-		flex-direction: column;
-		gap: 14px;
-	}
+	.shelves,
 	.shelf {
 		display: flex;
 		flex-direction: column;
-		gap: 8px;
+		gap: 12px;
 	}
 	.shelf-label {
-		font-size: 11.5px;
-		font-weight: 700;
+		font-size: 12px;
+		font-weight: 600;
 		color: var(--k-text-dim);
 	}
-	.tags {
-		display: flex;
-		flex-wrap: wrap;
+	.tags,
+	.tag-skeleton {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
 		gap: 6px;
 	}
 	.tag {
-		display: inline-flex;
+		display: flex;
 		align-items: center;
-		gap: 5px;
-		max-width: 100%;
-		min-height: 30px;
-		padding: 4px 10px;
+		gap: 6px;
+		min-width: 0;
+		min-height: 36px;
+		padding: 6px 10px;
 		border-radius: var(--k-radius);
 		background: transparent;
-		border: 1px solid var(--k-border-3);
+		border: 1px solid var(--k-border-2);
 		color: var(--k-text-3);
-		font-size: 12.5px;
-		font-weight: 600;
+		font-size: 12px;
+		font-weight: 500;
 		cursor: pointer;
 		text-align: left;
 		transition:
-			color 0.12s,
 			background-color 0.12s,
 			border-color 0.12s;
 	}
 	.tag:hover {
+		background: var(--k-hover-fill);
 		border-color: var(--k-border-strong);
 	}
+	.tag:active {
+		transform: scale(0.98);
+	}
 	.mark {
-		width: 10px;
-		font-weight: 800;
-		text-align: center;
-		flex: 0 0 auto;
+		flex-shrink: 0;
+		font-size: 14px;
+		font-weight: 600;
 	}
 	.tname {
 		min-width: 0;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
+		overflow-wrap: anywhere;
 	}
-	.tcount {
-		font-size: 10.5px;
-		font-weight: 700;
-		color: var(--k-text-faint);
-		flex: 0 0 auto;
-	}
-	/* Include / exclude tints are mixed from the status tokens, so they follow the theme
-	   (the light ramp darkens them) without a hard-coded colour per theme. */
 	.tag.include {
-		background: color-mix(in srgb, var(--k-ongoing) 16%, transparent);
-		border-color: color-mix(in srgb, var(--k-ongoing) 60%, transparent);
-		color: var(--k-text-bright);
-	}
-	.tag.include .mark {
-		color: var(--k-ongoing);
+		background: var(--k-primary);
+		border-color: var(--k-primary);
+		color: var(--k-on-primary);
 	}
 	.tag.exclude {
-		background: color-mix(in srgb, var(--k-cancelled) 14%, transparent);
-		border-color: color-mix(in srgb, var(--k-cancelled) 60%, transparent);
-		color: var(--k-text-bright);
-	}
-	.tag.exclude .mark {
-		color: var(--k-cancelled);
+		border-color: var(--k-border-strong);
+		color: var(--k-text-dim);
 	}
 	.tag.exclude .tname {
 		text-decoration: line-through;
-		text-decoration-thickness: 1.5px;
 	}
+	.tag-tools {
+		position: relative;
+		min-height: 28px;
+	}
+	.tag-tools .show-all {
+		position: absolute;
+		top: 0;
+		left: 0;
+	}
+	.match-options summary {
+		margin-left: auto;
+		width: fit-content;
+	}
+	.match-options[open] > .thint:first-of-type {
+		margin-top: 8px;
+	}
+	.show-all,
+	.match-options summary {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		min-height: 28px;
+		padding: 0;
+		border: none;
+		background: transparent;
+		color: var(--k-text-dim);
+		font-size: 11.5px;
+		cursor: pointer;
+	}
+	.show-all:hover,
+	.match-options summary:hover {
+		color: var(--k-text);
+	}
+	.show-all[aria-expanded='true'] :global(svg),
+	.match-options[open] summary :global(svg) {
+		transform: rotate(180deg);
+	}
+	.match-options summary {
+		list-style: none;
+	}
+	.match-options summary::-webkit-details-marker {
+		display: none;
+	}
+	.match-options summary:focus-visible {
+		outline: 2px solid var(--k-accent);
+		outline-offset: 2px;
+	}
+	.modes {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 10px;
+		margin: 8px 0 10px;
+	}
+	.mode {
+		display: flex;
+		flex-direction: column;
+		gap: 5px;
+	}
+	.mode-label {
+		font-size: 11.5px;
+		color: var(--k-text-dim);
+	}
+	.seg {
+		display: inline-flex;
+		gap: 6px;
+	}
+	.seg button {
+		flex: 1;
+		min-height: 32px;
+		padding: 3px 8px;
+		border: 1px solid transparent;
+		border-radius: var(--k-radius);
+		background: transparent;
+		color: var(--k-text-dim);
+		font-size: 12px;
+		cursor: pointer;
+	}
+	.seg button[aria-checked='true'] {
+		background: var(--k-surface-4);
+		border-color: var(--k-border-2);
+		color: var(--k-text);
+	}
+	.thint,
 	.tempty {
-		font-size: 12.5px;
-		color: var(--k-text-faint);
-		padding: 4px 2px;
+		margin: 0;
+		font-size: 11px;
+		line-height: 1.55;
+		color: var(--k-text-dim);
+	}
+	.tag-skeleton span {
+		height: 36px;
+		border-radius: var(--k-radius);
+		background: var(--k-surface-4);
+	}
+	@media (max-width: 959px) {
+		.tag,
+		.categories button,
+		.seg button {
+			min-height: 40px;
+		}
+		.tsearch input {
+			font-size: 16px;
+		}
 	}
 </style>

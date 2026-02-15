@@ -680,19 +680,23 @@
 
 <style>
 	.head {
+		display: grid;
+		grid-template-columns: 300px minmax(0, 1fr);
+		align-items: center;
+		gap: 36px;
 		padding-top: 40px;
 	}
 	h1 {
 		font-size: 34px;
-		margin: 0 0 18px;
+		margin: 0;
 		color: var(--k-text-bright);
 	}
 	.searchbar {
 		display: flex;
 		align-items: center;
 		gap: 12px;
-		max-width: 960px;
-		height: 54px;
+		max-width: none;
+		height: 48px;
 		padding: 0 8px 0 20px;
 		background: var(--k-surface-2);
 		border: 1px solid var(--k-border-3);
@@ -941,6 +945,12 @@
 	/* Must match FilterPanel's SHEET_QUERY: below it the panel is a sheet, out of the
 	   grid flow, and the toolbar grows a Filters button to open it. */
 	@media (max-width: 959px) {
+		.head {
+			display: block;
+		}
+		h1 {
+			margin-bottom: 18px;
+		}
 		.body {
 			grid-template-columns: minmax(0, 1fr);
 			gap: 0;
