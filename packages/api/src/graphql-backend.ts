@@ -52,6 +52,7 @@ import type {
 	Backend,
 	ChapterOverrideInput,
 	CommentMediaUpload,
+	MyComment,
 	PostCommentInput,
 	PostReviewInput,
 	RegisterInput,
@@ -952,6 +953,12 @@ export class GraphQLBackend implements Backend {
 	async myActivity(limit = 20): Promise<Activity[]> {
 		const d = await this.gql<{ myActivity: Activity[] }>(ops.MY_ACTIVITY, { limit });
 		return d.myActivity;
+	}
+	async myComments(page = 1): Promise<Paginated<MyComment>> {
+		const d = await this.gql<{ myComments: Paginated<MyComment> }>(ops.MY_COMMENTS, {
+			page: pageArg(page),
+		});
+		return d.myComments;
 	}
 	/**
 	 * Avatar upload is a REST multipart POST (not GraphQL): the endpoint is the

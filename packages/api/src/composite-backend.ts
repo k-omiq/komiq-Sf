@@ -45,6 +45,7 @@ import type {
 	Backend,
 	ChapterOverrideInput,
 	CommentMediaUpload,
+	MyComment,
 	PostCommentInput,
 	PostReviewInput,
 	RegisterInput,
@@ -329,6 +330,12 @@ export class CompositeBackend implements Backend {
 	}
 	myActivity(limit?: number): Promise<Activity[]> {
 		return this.opts.hosted.myActivity!(limit);
+	}
+	myComments(page = 1): Promise<Paginated<MyComment>> {
+		return (
+			this.opts.hosted.myComments?.(page) ??
+			Promise.resolve({ items: [], page, hasNextPage: false, total: 0 })
+		);
 	}
 
 	// --- canonical catalogue (MangaDex mirror) ---

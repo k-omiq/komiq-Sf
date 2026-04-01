@@ -6508,6 +6508,107 @@ impl QueryRoot {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// The viewer's OWN comments, newest first — the profile's "My comments" list, so
+    /// a reader can find their way back to a thread. Replies are included alongside
+    /// top-level comments. Empty for anonymous viewers.
+    ///
+    /// Each row carries its like/dislike tallies, direct reply count, the owning series
+    /// (a chapter target resolves the same way `notifications` resolves it) plus that
+    /// series' title and the chapter number, so the list renders and deep-links without
+    /// a lookup per row.
+    async fn my_comments(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 1)] page: i32,
+    ) -> Result<MyCommentPage> {
+        let page = page.max(1);
+        let Some(user) = current_user(ctx).await else {
+            return Ok(MyCommentPage {
+                items: vec![],
+                page,
+                has_next_page: false,
+                total: Some(0),
+            });
+        };
+        let st = state(ctx);
+        let offset = (page as i64 - 1) * PAGE_SIZE;
+        // `mine` pages the viewer's comments first (idx_comments_user), so every
+        // correlated lookup below runs for at most PAGE_SIZE rows. A numeric chapter id
+        // is a Suwayomi chapter, a uuid a MangaDex one (the `NOT GLOB` guard keeps a uuid
+        // that starts with a digit out of the numeric branch). A `w_` series id is a
+        // canonical work — its title falls back to a Suwayomi mapping's title while the
+        // work is unenriched — and a numeric one is a Suwayomi series.
+        let rows: Vec<MyCommentRow> = sqlx::query_as(
+            "WITH mine AS ( \
+                 SELECT c.id, c.target_type, c.target_id, c.parent_id, c.body, \
+                        c.has_spoiler, c.created_at \
+                 FROM comments c WHERE c.user_id = ? \
+                 ORDER BY c.created_at DESC, c.id DESC LIMIT ? OFFSET ? \
+             ), \
+             resolved AS ( \
+                 SELECT m.*, \
+                    CASE WHEN m.target_type = 'series' THEN m.target_id ELSE COALESCE( \
+                        (SELECT CAST(sc.manga_id AS TEXT) FROM suwayomi_chapter sc \
+                         WHERE m.target_id <> '' AND m.target_id NOT GLOB '*[^0-9]*' \
+                           AND sc.id = CAST(m.target_id AS INTEGER)), \
+                        (SELECT ss.work_id FROM chapter ch \
+                         JOIN source_series ss ON ss.id = ch.source_series_id \
+                         WHERE ch.external_id = m.target_id AND ss.source_type = 'mangadex' \
+                         LIMIT 1) \
+                    ) END AS series_id, \
+                    CASE WHEN m.target_type = 'chapter' THEN COALESCE( \
+                        (SELECT CAST(sc.chapter_number AS TEXT) FROM suwayomi_chapter sc \
+                         WHERE m.target_id <> '' AND m.target_id NOT GLOB '*[^0-9]*' \
+                           AND sc.id = CAST(m.target_id AS INTEGER)), \
+                        (SELECT ch.number FROM chapter ch \
+                         JOIN source_series ss ON ss.id = ch.source_series_id \
+                         WHERE ch.external_id = m.target_id AND ss.source_type = 'mangadex' \
+                         LIMIT 1) \
+                    ) END AS chapter_number \
+                 FROM mine m \
+             ) \
+             SELECT r.id, r.target_type, r.target_id, r.parent_id, r.body, r.has_spoiler, \
+                    r.created_at, r.series_id, r.chapter_number, \
+                    CASE \
+                        WHEN substr(r.series_id, 1, 2) = 'w_' THEN COALESCE( \
+                            (SELECT COALESCE(w.title_override, w.primary_title) FROM work w \
+                             WHERE w.id = r.series_id), \
+                            (SELECT s.title FROM source_series ss \
+                             JOIN suwayomi_series s ON s.id = CAST(ss.source_key AS INTEGER) \
+                             WHERE ss.work_id = r.series_id AND ss.source_type = 'suwayomi' \
+                             ORDER BY ss.created_at ASC LIMIT 1)) \
+                        WHEN r.series_id <> '' AND r.series_id NOT GLOB '*[^0-9]*' THEN \
+                            (SELECT s.title FROM suwayomi_series s \
+                             WHERE s.id = CAST(r.series_id AS INTEGER)) \
+                    END AS series_title, \
+                    COALESCE((SELECT COUNT(*) FROM comment_votes v \
+                              WHERE v.comment_id = r.id AND v.value = 1), 0) AS likes, \
+                    COALESCE((SELECT COUNT(*) FROM comment_votes v \
+                              WHERE v.comment_id = r.id AND v.value = -1), 0) AS dislikes, \
+                    (SELECT COUNT(*) FROM comments k JOIN users u ON u.id = k.user_id \
+                     WHERE k.parent_id = r.id AND u.is_banned = 0) AS reply_count \
+             FROM resolved r \
+             ORDER BY r.created_at DESC, r.id DESC",
+        )
+        .bind(&user.id)
+        .bind(PAGE_SIZE)
+        .bind(offset)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM comments WHERE user_id = ?")
+            .bind(&user.id)
+            .fetch_one(&st.pool)
+            .await
+            .map_err(gql_err)?;
+        Ok(MyCommentPage {
+            items: rows.into_iter().map(MyComment::from).collect(),
+            page,
+            has_next_page: offset + PAGE_SIZE < total,
+            total: Some(total as i32),
+        })
+    }
+
     /// The viewer's inbound notifications, newest-first (the bell feed). Empty for
     /// anonymous viewers. Each carries the actor, a short excerpt of the viewer's own
     /// comment, and the thread target for deep-linking.
@@ -7577,6 +7678,54 @@ impl From<NotificationRow> for Notification {
             created_at: r.created_at,
             read: r.read_at.is_some(),
         }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct MyCommentRow {
+    id: String,
+    target_type: String,
+    target_id: String,
+    parent_id: Option<String>,
+    body: String,
+    has_spoiler: i64,
+    created_at: String,
+    series_id: Option<String>,
+    chapter_number: Option<String>,
+    series_title: Option<String>,
+    likes: i64,
+    dislikes: i64,
+    reply_count: i64,
+}
+
+impl From<MyCommentRow> for MyComment {
+    fn from(r: MyCommentRow) -> Self {
+        MyComment {
+            id: ID(r.id),
+            target_type: r.target_type,
+            target_id: ID(r.target_id),
+            parent_id: r.parent_id.map(ID),
+            body: r.body,
+            has_spoiler: r.has_spoiler != 0,
+            created_at: r.created_at,
+            likes: r.likes as i32,
+            dislikes: r.dislikes as i32,
+            reply_count: r.reply_count as i32,
+            series_id: r.series_id.filter(|s| !s.is_empty()).map(ID),
+            series_title: r.series_title.filter(|s| !s.trim().is_empty()),
+            chapter_number: r.chapter_number.map(|n| tidy_chapter_number(&n)),
+        }
+    }
+}
+
+/// `12.0` → `12`, `10.50` → `10.5`: a Suwayomi chapter number is a REAL, and SQLite's
+/// text cast of one always carries a fractional part. Non-numeric input is kept as is.
+fn tidy_chapter_number(raw: &str) -> String {
+    let t = raw.trim();
+    if t.contains('.') && t.parse::<f64>().is_ok() {
+        t.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        t.to_string()
     }
 }
 
@@ -14522,6 +14671,117 @@ mod tests {
         assert_eq!(n["targetType"], serde_json::json!("chapter"));
         assert_eq!(n["targetId"], serde_json::json!("9001"));
         assert_eq!(n["seriesId"], serde_json::json!("500"));
+    }
+
+    #[tokio::test]
+    async fn my_comments_lists_own_comments_with_tallies_and_targets() {
+        let (s, pool) = setup_full(100).await;
+        // Signed out → an empty page, never an error.
+        let r = exec(
+            &s,
+            r#"{ myComments { items { id } total } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let d = r.data.into_json().unwrap();
+        assert_eq!(d["myComments"]["total"], serde_json::json!(0));
+
+        // Chapter 9001 (ch. 12.5) of the cached Suwayomi series 42 ("Fixture 42").
+        sqlx::query(
+            "INSERT INTO suwayomi_chapter (id, manga_id, name, chapter_number, page_count, updated_at) \
+             VALUES (9001, 42, 'Ch 12.5', 12.5, 10, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // bob comments on series "42" (older) and on chapter 9001 (newer).
+        let mut ids = vec![];
+        for (tt, tid) in [("series", "42"), ("chapter", "9001")] {
+            let m = format!(
+                r#"mutation {{ postComment(input: {{ targetType: "{tt}", targetId: "{tid}", body: "on {tt}", hasSpoiler: false }}) {{ id }} }}"#
+            );
+            let r = exec(&s, &m, Some("bobtok"), "2.2.2.2").await;
+            assert!(r.errors.is_empty(), "postComment: {:?}", r.errors);
+            ids.push(
+                r.data.into_json().unwrap()["postComment"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        // Pin distinct timestamps so newest-first is deterministic.
+        for (id, at) in [
+            (&ids[0], "2026-01-01T00:00:00Z"),
+            (&ids[1], "2026-01-02T00:00:00Z"),
+        ] {
+            sqlx::query("UPDATE comments SET created_at = ? WHERE id = ?")
+                .bind(at)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        // admin likes + replies to bob's series comment, and comments on their own —
+        // which must NOT show up in bob's list.
+        let like = format!(
+            r#"mutation {{ voteComment(commentId: "{}", value: 1) {{ likes }} }}"#,
+            ids[0]
+        );
+        assert!(exec(&s, &like, Some("admintok"), "1.1.1.1")
+            .await
+            .errors
+            .is_empty());
+        let reply = format!(
+            r#"mutation {{ postComment(input: {{ targetType: "series", targetId: "42", parentId: "{}", body: "re", hasSpoiler: false }}) {{ id }} }}"#,
+            ids[0]
+        );
+        assert!(exec(&s, &reply, Some("admintok"), "1.1.1.1")
+            .await
+            .errors
+            .is_empty());
+
+        let r = exec(
+            &s,
+            r#"{ myComments { total hasNextPage items { id targetType targetId body likes dislikes replyCount seriesId seriesTitle chapterNumber } } }"#,
+            Some("bobtok"),
+            "2.2.2.2",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "myComments: {:?}", r.errors);
+        let d = r.data.into_json().unwrap()["myComments"].clone();
+        assert_eq!(d["total"], serde_json::json!(2));
+        assert_eq!(d["hasNextPage"], serde_json::json!(false));
+        let items = d["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+
+        // Newest first: the chapter comment, resolved to its owning series + number.
+        assert_eq!(items[0]["id"], serde_json::json!(ids[1]));
+        assert_eq!(items[0]["targetType"], serde_json::json!("chapter"));
+        assert_eq!(items[0]["seriesId"], serde_json::json!("42"));
+        assert_eq!(items[0]["seriesTitle"], serde_json::json!("Fixture 42"));
+        assert_eq!(items[0]["chapterNumber"], serde_json::json!("12.5"));
+        assert_eq!(items[0]["likes"], serde_json::json!(0));
+        assert_eq!(items[0]["replyCount"], serde_json::json!(0));
+
+        assert_eq!(items[1]["id"], serde_json::json!(ids[0]));
+        assert_eq!(items[1]["targetType"], serde_json::json!("series"));
+        assert_eq!(items[1]["seriesId"], serde_json::json!("42"));
+        assert_eq!(items[1]["seriesTitle"], serde_json::json!("Fixture 42"));
+        assert_eq!(items[1]["chapterNumber"], serde_json::Value::Null);
+        assert_eq!(items[1]["likes"], serde_json::json!(1));
+        assert_eq!(items[1]["replyCount"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn tidy_chapter_number_drops_a_real_cast_fraction() {
+        assert_eq!(tidy_chapter_number("12.0"), "12");
+        assert_eq!(tidy_chapter_number("10.50"), "10.5");
+        assert_eq!(tidy_chapter_number("7"), "7");
+        assert_eq!(tidy_chapter_number("100"), "100");
+        assert_eq!(tidy_chapter_number("Extra"), "Extra");
     }
 
     #[tokio::test]

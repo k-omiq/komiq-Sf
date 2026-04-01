@@ -3347,135 +3347,42 @@ export interface ProfileView {
 	/** Stored avatar path/URL, or null → render an initial. */
 	avatarUrl: string | null;
 	stats: { value: string; label: string }[];
-	reading: {
-		id?: string;
-		title: string;
-		cover: string;
-		genre: string;
-		ch: number;
-		total: number;
-	}[];
-	favGenres: { name: string; pct: number }[];
-	activity: { id: string; icon: string; iconBg: string; text: string; time: string }[];
-	shelves: {
-		id?: string;
-		title: string;
-		cover: string;
-		genre: string;
-		rating: string;
-		type: ComicType;
-		status: Status;
-		shelf: string;
-		favorite: boolean;
-		ch: number;
-		total: number;
-	}[];
 }
 
 /**
- * The signed-in user's profile, built from their session identity + real reading
- * state. Resolves to `null` when signed out (or backend off/error) — the profile
- * screen renders its sign-in state.
+ * The signed-in user's profile: session identity + headline reading stats.
+ * Resolves to `null` when signed out (or backend off/error) — the profile screen
+ * renders its sign-in state.
  *
- * NOTE: reading/library reflects the shared Suwayomi state this MVP federates,
- * and "activity" is derived from that progress — there is no per-user timestamped
- * event log yet, so a true activity stream would need a new server capability.
+ * Deliberately NO series lists: the Library screen owns shelves and reading
+ * progress, and the profile repeating them was a second library. The comment
+ * history is its own paged query ({@link getMyComments}).
  */
 export function getProfile(): Promise<ProfileView | null> {
 	return live<ProfileView | null>(async () => {
 		const session = await backend.session();
 		if (!session) return null;
 		const user = session.user;
-		// Everything below depends only on the SESSION existing, never on each other:
-		// the library, its batched read progress and the activity log are three
-		// independent queries, so they go out together. (Read progress is one batched
-		// query, not a chapters() fetch per series — the old N+1 that stalled this
-		// page for a signed-in user with a large library.)
-		const [lib, progress, rawActivity] = await Promise.all([
+		// The library and its batched read progress are independent queries, so they
+		// go out together. (Read progress is one batched query, not a chapters() fetch
+		// per series — the old N+1 that stalled this page for a large library.)
+		const [lib, progress] = await Promise.all([
 			backend.library().catch(() => [] as Series[]),
 			backend.libraryProgress
 				? backend.libraryProgress().catch(() => [] as SeriesProgress[])
 				: Promise.resolve([] as SeriesProgress[]),
-			backend.myActivity
-				? backend.myActivity(12).catch(() => [])
-				: Promise.resolve([] as Awaited<ReturnType<NonNullable<typeof backend.myActivity>>>),
 		]);
 		const byId = new Map(progress.map((p) => [p.id, p]));
-		const rows = lib.map((s) => {
+		let chaptersRead = 0;
+		let readingNow = 0;
+		for (const s of lib) {
 			const p = byId.get(s.id);
 			const total = p?.total || s.chapterCount;
 			const read = p?.read ?? 0;
-			return { s, p, total, read };
-		});
-		const chaptersRead = rows.reduce((n, r) => n + r.read, 0);
-		const readingNow = rows.filter((r) => r.read > 0 && r.read < r.total);
-		const completed = rows.filter((r) => r.total > 0 && r.read >= r.total);
+			chaptersRead += read;
+			if (read > 0 && read < total) readingNow++;
+		}
 		const libAvg = lib.length ? lib.reduce((n, s) => n + s.rating.average, 0) / lib.length : 0;
-
-		const freq = new Map<string, number>();
-		for (const { s } of rows) for (const g of s.genres) freq.set(g, (freq.get(g) ?? 0) + 1);
-		const totalG = [...freq.values()].reduce((a, b) => a + b, 0);
-		const favGenres = [...freq.entries()]
-			.sort((a, b) => b[1] - a[1])
-			.slice(0, 5)
-			.map(([name, c]) => ({ name, pct: totalG ? Math.round((c / totalG) * 100) : 0 }));
-
-		// Continue reading: the six series touched most recently, newest first.
-		//
-		// Ordered by `lastReadAt`, NOT by the array order. `library()` comes back in
-		// `user_library.created_at DESC` — when the series was ADDED — so slicing it
-		// directly showed the six most recently shelved, which is a different set from
-		// the six most recently read and, for anyone who adds in bulk, a mostly untouched
-		// one. Series with no timestamp (progress predating `lastReadAt`) sort last
-		// rather than jumping the queue on an empty string.
-		const reading = [...readingNow]
-			.sort((a, b) => (b.p?.lastReadAt ?? '').localeCompare(a.p?.lastReadAt ?? ''))
-			.slice(0, 6)
-			.map(({ s, read, total }) => ({
-				id: s.id,
-				title: s.title,
-				cover: s.coverUrl,
-				genre: s.genres[0] ?? '',
-				ch: read,
-				total,
-			}));
-
-		const shelves = rows.map(({ s, read, total }) => ({
-			id: s.id,
-			title: s.title,
-			cover: s.coverUrl,
-			genre: s.genres[0] ?? '',
-			rating: s.rating.average.toFixed(1),
-			// Format + publication status for the shared MangaCard's flag and status
-			// badges — the same two overlays Browse renders, so a shelf card is the
-			// same card everywhere.
-			type: toViewType(s.type),
-			status: toViewStatus(s.status),
-			// Explicit shelf wins; else derive. Shares {@link deriveShelf} with the library
-			// and the series page — this used to be its own near-copy with no `plan`
-			// branch and no ongoing-series gate, so an untouched series read "Reading"
-			// here and "Plan" there, and a caught-up ongoing one read "Completed" on both.
-			shelf: (s.libraryStatus as string | null) ?? deriveShelf(read, total, isEnded(s)),
-			favorite: s.isFavorite ?? false,
-			ch: read,
-			total,
-		}));
-
-		// Real, timestamped activity from the server's per-user event log, mapped to
-		// display text via the library title index (falls back to a generic label
-		// when the target isn't in the library, e.g. a chapter comment).
-		const titleById = new Map(lib.map((s) => [s.id, s.title]));
-		const activity = rawActivity.map((a) => {
-			const title = a.targetId ? titleById.get(a.targetId) : undefined;
-			const on = title ?? (a.targetType === 'chapter' ? 'a chapter' : 'a series');
-			const view =
-				a.kind === 'review'
-					? { icon: '★', iconBg: 'rgba(246,183,60,0.16)', text: `Reviewed ${on}` }
-					: a.kind === 'library_add'
-						? { icon: '＋', iconBg: 'rgba(95,191,126,0.16)', text: `Added ${on} to library` }
-						: { icon: '💬', iconBg: 'rgba(255,255,255,0.07)', text: `Commented on ${on}` };
-			return { id: a.id, ...view, time: relTimeAgo(a.createdAt) };
-		});
 
 		return {
 			id: user.id,
@@ -3492,15 +3399,77 @@ export function getProfile(): Promise<ProfileView | null> {
 			stats: [
 				{ value: String(lib.length), label: 'In library' },
 				{ value: String(chaptersRead), label: 'Chapters read' },
-				{ value: String(readingNow.length), label: 'Reading now' },
+				{ value: String(readingNow), label: 'Reading now' },
 				{ value: libAvg ? libAvg.toFixed(1) : '—', label: 'Library avg' },
 			],
-			reading,
-			favGenres,
-			activity,
-			shelves,
 		};
 	}, null);
+}
+
+/** One row of the profile's "My comments" list. */
+export interface MyCommentView {
+	id: string;
+	body: string;
+	hasSpoiler: boolean;
+	isReply: boolean;
+	likes: number;
+	replies: number;
+	/** Relative time ("3 days ago"); empty when the timestamp is unusable. */
+	time: string;
+	/** Absolute timestamp for the row's `title`/`datetime`. */
+	createdAt: string;
+	/** What the comment is on: "Berserk", "Berserk · Ch. 12", or a generic label. */
+	where: string;
+	/** Deep link back to the thread, or null when the server couldn't resolve it. */
+	href: string | null;
+}
+
+export interface MyCommentsPage {
+	items: MyCommentView[];
+	hasNextPage: boolean;
+	total: number;
+}
+
+/**
+ * One page of the signed-in user's OWN comments, newest first. Links mirror the
+ * notification bell's: a series discussion opens the series page, a chapter
+ * thread opens the reader at that chapter (the server resolves the owning series).
+ * Throws on a backend failure so the profile can offer a retry rather than claim
+ * "no comments yet".
+ */
+export async function getMyComments(page = 1): Promise<MyCommentsPage> {
+	if (!LIVE || !backend.myComments) return { items: [], hasNextPage: false, total: 0 };
+	const res = await backend.myComments(page);
+	const items = res.items.map((c): MyCommentView => {
+		const title = c.seriesTitle?.trim() || null;
+		const chapter = c.targetType === 'chapter';
+		const ch = c.chapterNumber ? `Ch. ${c.chapterNumber}` : 'a chapter';
+		const where = chapter
+			? title
+				? `${title} · ${ch}`
+				: c.chapterNumber
+					? ch
+					: 'A chapter'
+			: (title ?? 'A series discussion');
+		const href = chapter
+			? c.seriesId
+				? `/read/${encodeURIComponent(c.seriesId)}?ch=${encodeURIComponent(c.targetId)}`
+				: null
+			: `/series/${encodeURIComponent(c.targetId)}#discussion`;
+		return {
+			id: c.id,
+			body: c.body,
+			hasSpoiler: c.hasSpoiler,
+			isReply: !!c.parentId,
+			likes: c.likes,
+			replies: c.replyCount,
+			time: relTimeAgo(c.createdAt),
+			createdAt: c.createdAt,
+			where,
+			href,
+		};
+	});
+	return { items, hasNextPage: res.hasNextPage, total: res.total ?? items.length };
 }
 
 /**

@@ -1,13 +1,17 @@
 <script lang="ts">
+	import { tick } from 'svelte';
 	import { page } from '$app/state';
 	import { protectUnsaved } from '$lib/unsaved.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
-	import Cover from '$lib/components/Cover.svelte';
-	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
-	import MangaCard from '$lib/components/MangaCard.svelte';
-	import { slug, STATUS_META } from '$lib/data/types';
-	import { getProfile, updateProfile, uploadAvatar, type ProfileView } from '$lib/data/source';
+	import {
+		getMyComments,
+		getProfile,
+		updateProfile,
+		uploadAvatar,
+		type MyCommentView,
+		type ProfileView,
+	} from '$lib/data/source';
 	import { auth, revalidateSession } from '$lib/auth.svelte';
 	import { backend } from '$lib/context';
 
@@ -32,8 +36,7 @@
 	// The profile is fetched HERE, once, and only once auth is ready.
 	//
 	// There used to be a `+page.ts` that awaited `getProfile()` as well, so every
-	// visit pulled the entire payload (session + library + progress + activity)
-	// twice: the `load` copy raced ahead of `initAuth`, went out with no token and
+	// visit pulled the entire payload (session + library + progress) twice: the `load` copy raced ahead of `initAuth`, went out with no token and
 	// resolved to null for a signed-in user, and the effect below immediately
 	// refetched the real one. Deleting that load removes a full duplicate round trip
 	// per visit and costs nothing — its result was always discarded.
@@ -138,39 +141,70 @@
 		}
 	}
 
-	const tab = $derived<'reading' | 'completed' | 'favorites'>(
-		page.url.searchParams.get('shelf') === 'completed'
-			? 'completed'
-			: page.url.searchParams.get('shelf') === 'favorites'
-				? 'favorites'
-				: 'reading',
-	);
-	const shelfHref = (shelf: string) => {
-		const url = new URL(page.url);
-		url.searchParams.set('shelf', shelf);
-		return url.pathname + url.search + url.hash;
-	};
-
-	const counts = $derived({
-		reading: (profile?.shelves ?? []).filter((c) => c.shelf === 'reading').length,
-		completed: (profile?.shelves ?? []).filter((c) => c.shelf === 'completed').length,
-		favorites: (profile?.shelves ?? []).filter((c) => c.favorite).length,
+	// --- Settings ---------------------------------------------------------------
+	// The settings card sits right under the stats on a phone (above the comment
+	// list, which can be long) and in the sticky side column on desktop. The gear
+	// scrolls to it explicitly, and an incoming `/profile#profile-preferences` link
+	// (Browse's "Show NSFW content" hint) is honoured once the profile has rendered —
+	// the browser's own hash jump fires before the async fetch, when the card doesn't
+	// exist yet, which is why that link used to land at the top of the page.
+	let settingsEl = $state<HTMLElement | null>(null);
+	let settingsFlash = $state(false);
+	async function showSettings(): Promise<void> {
+		await tick();
+		if (!settingsEl) return;
+		const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+		settingsEl.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'start' });
+		settingsEl.focus({ preventScroll: true });
+		settingsFlash = false;
+		requestAnimationFrame(() => (settingsFlash = true));
+	}
+	$effect(() => {
+		if (profile && page.url.hash === '#profile-preferences') void showSettings();
 	});
 
-	const tabDefs = [
-		{ key: 'reading', label: 'Reading' },
-		{ key: 'completed', label: 'Completed' },
-		{ key: 'favorites', label: 'Favorites' },
-	] as const;
-
-	const shelfItems = $derived(
-		(profile?.shelves ?? [])
-			.filter((c) => (tab === 'favorites' ? c.favorite : c.shelf === tab))
-			.map((c) => ({
-				...c,
-				sub: c.shelf === 'reading' ? `Ch. ${c.ch} / ${c.total}` : `${c.genre} · ${c.total} ch`,
-			})),
-	);
+	// --- My comments ---------------------------------------------------------------
+	// Paged separately from the profile so a long comment history never holds up the
+	// header, and "Load more" appends rather than refetching.
+	let comments = $state<MyCommentView[]>([]);
+	let commentsTotal = $state(0);
+	let commentsPage = $state(0);
+	let commentsHasNext = $state(false);
+	let commentsLoading = $state(false);
+	let commentsError = $state(false);
+	let revealed = $state<Record<string, boolean>>({});
+	async function loadComments(next: number): Promise<void> {
+		if (commentsLoading) return;
+		commentsLoading = true;
+		commentsError = false;
+		try {
+			const res = await getMyComments(next);
+			// Page 1 replaces (first load / retry); later pages append, skipping any row a
+			// new comment pushed across the page boundary since the last fetch.
+			if (next === 1) comments = res.items;
+			else {
+				const seen = new Set(comments.map((c) => c.id));
+				comments = [...comments, ...res.items.filter((c) => !seen.has(c.id))];
+			}
+			commentsTotal = res.total;
+			commentsPage = next;
+			commentsHasNext = res.hasNextPage;
+		} catch (err) {
+			console.warn('[komika] my comments failed:', err);
+			commentsError = true;
+		} finally {
+			commentsLoading = false;
+		}
+	}
+	$effect(() => {
+		void auth.user?.id;
+		if (!profile?.id) return;
+		comments = [];
+		commentsPage = 0;
+		revealed = {};
+		void loadComments(1);
+	});
+	const countLabel = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 </script>
 
 <svelte:head>
@@ -180,12 +214,14 @@
 {#if loadingProfile}
 	<!-- Auth restoring or the profile fetch is in flight — show a skeleton, never
 	     the sign-in CTA (which would misrepresent a signed-in user as signed out). -->
-	<div class="head k-gutter">
-		<div class="identity">
+	<div class="profile k-gutter" aria-busy="true">
+		<div class="head">
 			<div class="k-skeleton sk-avatar"></div>
 			<div class="who">
 				<div class="k-skeleton sk-line sk-name"></div>
 				<div class="k-skeleton sk-line sk-handle"></div>
+			</div>
+			<div class="bio-wrap">
 				<div class="k-skeleton sk-line sk-bio"></div>
 			</div>
 		</div>
@@ -197,17 +233,12 @@
 				</div>
 			{/each}
 		</div>
-	</div>
-	<div class="body k-gutter">
-		<div class="left">
-			<div class="section">
+		<div class="body">
+			<div class="side"><div class="k-skeleton sk-card"></div></div>
+			<div class="main">
 				<div class="k-skeleton sk-line sk-section"></div>
-				<CardGridSkeleton count={8} min={158} />
+				{#each Array(3) as _, i (i)}<div class="k-skeleton sk-comment"></div>{/each}
 			</div>
-		</div>
-		<div class="right">
-			<div class="k-skeleton sk-card"></div>
-			<div class="k-skeleton sk-card"></div>
 		</div>
 	</div>
 {:else if signedOut}
@@ -215,18 +246,19 @@
 	<div class="signed-out k-gutter">
 		<div class="so-icon"><Icon name="bookmark" size={26} /></div>
 		<h1>Your profile</h1>
-		<p>Sign in to track your reading, shelves, and activity.</p>
+		<p>Sign in to see your reading stats, your comments, and your settings.</p>
 		<a class="so-btn" href="/login?redirect=%2Fprofile">Sign in</a>
 	</div>
 {:else if profile}
-	<div class="head k-gutter">
-		<div class="identity">
+	<div class="profile k-gutter">
+		<div class="head">
 			<div class="avatar-wrap">
+				<!-- Sized by CSS (smaller on a phone); `size` only seeds the initial's font. -->
 				<Avatar
 					url={profile.avatarUrl}
 					name={profile.name}
 					colorKey={profile.id || profile.name}
-					size={104}
+					size={96}
 				/>
 				{#if canEdit}
 					<button
@@ -257,15 +289,19 @@
 					<span class="pro">{profile.badge}</span>
 				</div>
 				<div class="handle">{profile.handle} · {profile.since}</div>
+			</div>
+			<div class="bio-wrap">
 				<p class="bio">{profile.bio}</p>
 				{#if avatarError}<p class="setting-error" role="alert">{avatarError}</p>{/if}
 			</div>
-			{#if canEdit}
+			{#if auth.user}
 				<div class="actions">
-					<button class="edit" onclick={openEditor}>Edit profile</button>
-					<a class="gear" href="#profile-preferences" aria-label="Profile preferences"
-						><Icon name="gear" size={18} /></a
-					>
+					{#if canEdit}
+						<button class="edit" onclick={openEditor} aria-expanded={editing}>Edit profile</button>
+					{/if}
+					<button class="gear" onclick={showSettings} aria-controls="profile-preferences">
+						<Icon name="gear" size={17} /><span>Settings</span>
+					</button>
 				</div>
 			{/if}
 		</div>
@@ -314,123 +350,148 @@
 				</div>
 			{/each}
 		</div>
-	</div>
 
-	<div class="body k-gutter">
-		<div class="left">
-			<div class="section">
-				<h2 class="section-label">Currently Reading</h2>
-				<div class="reading-list">
-					{#each profile.reading as r (r.id ?? r.title)}
-						<!-- Guard `total === 0`: a series whose chapter count hasn't resolved yet
-						     divided to NaN and rendered `style="width:NaN%"`, which the browser
-						     drops — leaving a bar stuck empty with no clue why. -->
-						{@const pct = r.total ? Math.round((r.ch / r.total) * 100) : 0}
-						<a class="reading-row" href={`/series/${r.id ?? slug(r.title)}`}>
-							<div class="mini-cover k-cover">
-								<Cover src={r.cover} alt={r.title} loading="lazy" sizing="card" />
-							</div>
-							<div class="reading-info">
-								<div class="reading-top">
-									<span class="reading-title">{r.title}</span>
-									<span class="reading-ch">{r.ch} / {r.total}</span>
-								</div>
-								<div class="reading-genre">{r.genre}</div>
-								<div class="reading-bar"><div class="fill" style="width:{pct}%"></div></div>
-							</div>
-						</a>
-					{/each}
-				</div>
-			</div>
-
-			<div class="section">
-				<div class="tabs">
-					{#each tabDefs as t (t.key)}
-						<a
-							class="tab"
-							class:on={tab === t.key}
-							href={shelfHref(t.key)}
-							aria-current={tab === t.key ? 'page' : undefined}
-						>
-							{t.label}<span class="count">{counts[t.key]}</span>
-						</a>
-					{/each}
-				</div>
-				<div class="shelf-grid">
-					{#each shelfItems as item (item.id ?? item.title + item.shelf)}
-						<MangaCard
-							title={item.title}
-							sub={item.sub}
-							rating={item.rating}
-							cover={item.cover}
-							id={item.id}
-							flagType={item.type}
-							status={STATUS_META[item.status]}
-						/>
-					{/each}
-				</div>
-			</div>
-		</div>
-
-		<div class="right">
+		<div class="body">
+			<!-- Settings come FIRST in source order: on a phone the single column puts them
+			     right under the stats instead of below the whole comment history. -->
 			{#if auth.user}
-				<div class="card">
-					<h2 class="card-title" id="profile-preferences">Content Settings</h2>
-					<div class="setting-row">
-						<div class="setting-text">
-							<span class="setting-label">Show NSFW content</span>
-							<span class="setting-desc">
-								Include adult-rated series in browse, search, and updates.
-							</span>
+				<aside class="side">
+					<section
+						class="card settings"
+						class:flash={settingsFlash}
+						id="profile-preferences"
+						aria-labelledby="settings-title"
+						tabindex="-1"
+						bind:this={settingsEl}
+						onanimationend={() => (settingsFlash = false)}
+					>
+						<h2 class="card-title" id="settings-title">Settings</h2>
+						<div class="setting-group">
+							<span class="group-label">Content</span>
+							<div class="setting-row">
+								<label class="setting-text" for="nsfw-switch">
+									<span class="setting-label">Show NSFW content</span>
+									<span class="setting-desc" id="nsfw-desc">
+										Include adult-rated series in browse, search, and updates.
+									</span>
+								</label>
+								<button
+									type="button"
+									id="nsfw-switch"
+									class="switch"
+									class:on={showNsfw}
+									role="switch"
+									aria-checked={showNsfw}
+									aria-label="Show NSFW content"
+									aria-describedby="nsfw-desc"
+									disabled={savingNsfw || !backend.setShowNsfw}
+									onclick={toggleNsfw}
+								>
+									<span class="knob"></span>
+								</button>
+							</div>
+							{#if nsfwError}<p class="setting-error" role="alert">{nsfwError}</p>{/if}
 						</div>
-						<button
-							type="button"
-							class="switch"
-							class:on={showNsfw}
-							role="switch"
-							aria-checked={showNsfw}
-							aria-label="Show NSFW content"
-							disabled={savingNsfw}
-							onclick={toggleNsfw}
-						>
-							<span class="knob"></span>
-						</button>
-					</div>
-					{#if nsfwError}<p class="setting-error" role="alert">{nsfwError}</p>{/if}
-				</div>
+						<div class="setting-group">
+							<span class="group-label">Profile</span>
+							<div class="setting-links">
+								{#if canEdit}
+									<button class="setting-link" onclick={openEditor}>
+										<span>Edit display name &amp; bio</span><Icon name="chevron-right" size={16} />
+									</button>
+									<button class="setting-link" onclick={() => fileInput?.click()}>
+										<span>Change profile photo</span><Icon name="chevron-right" size={16} />
+									</button>
+								{/if}
+								<a class="setting-link" href="/library">
+									<span>Your library &amp; shelves</span><Icon name="chevron-right" size={16} />
+								</a>
+							</div>
+						</div>
+					</section>
+				</aside>
 			{/if}
 
-			<div class="card">
-				<h3 class="card-title">Favorite Genres</h3>
-				<div class="genres">
-					{#each profile.favGenres as g (g.name)}
-						<div class="genre">
-							<div class="genre-top">
-								<span class="gname">{g.name}</span><span class="gpct">{g.pct}%</span>
-							</div>
-							<div class="genre-bar"><div class="fill" style="width:{g.pct}%"></div></div>
-						</div>
-					{/each}
+			<section class="main" aria-labelledby="comments-title">
+				<div class="section-head">
+					<h2 class="section-label" id="comments-title">Your comments</h2>
+					{#if commentsPage > 0 && commentsTotal > 0}
+						<span class="section-count">{commentsTotal}</span>
+					{/if}
 				</div>
-			</div>
 
-			<div class="section">
-				<h3 class="section-label">Recent Activity</h3>
-				<div class="activity">
-					{#each profile.activity as a (a.id)}
-						<div class="act-row">
-							<div class="act-icon" style="background:{a.iconBg}">{a.icon}</div>
-							<div class="act-body">
-								<div class="act-text">{a.text}</div>
-								<!-- Omitted when the event carries no usable timestamp: relTimeAgo()
-								     returns '' there rather than claiming "just now", and an empty
-								     line would leave a stray 3px gap under the text. -->
-								{#if a.time}<div class="act-time">{a.time}</div>{/if}
-							</div>
-						</div>
-					{/each}
-				</div>
-			</div>
+				{#if commentsPage === 0 && commentsLoading}
+					{#each Array(3) as _, i (i)}<div class="k-skeleton sk-comment"></div>{/each}
+				{:else if commentsError && comments.length === 0}
+					<div class="empty">
+						<p>Couldn't load your comments.</p>
+						<button class="ghost-btn" onclick={() => loadComments(1)}>Retry</button>
+					</div>
+				{:else if comments.length === 0}
+					<div class="empty">
+						<div class="empty-icon"><Icon name="comment" size={20} /></div>
+						<p>You haven't commented yet.</p>
+						<span>Join the discussion on a series or a chapter — it'll show up here.</span>
+					</div>
+				{:else}
+					<ul class="comment-list">
+						{#each comments as c (c.id)}
+							{@const hidden = c.hasSpoiler && !revealed[c.id]}
+							<li class="comment" class:linked={!!c.href}>
+								<div class="c-top">
+									{#if c.href}
+										<!-- Stretched over the whole row, so the row is the tap target. -->
+										<a class="c-where" href={c.href}>{c.where}</a>
+									{:else}
+										<span class="c-where">{c.where}</span>
+									{/if}
+									{#if c.time}<time class="c-time" datetime={c.createdAt} title={c.createdAt}
+											>{c.time}</time
+										>{/if}
+								</div>
+								{#if c.isReply}<span class="c-tag">Reply</span>{/if}
+								<p class="c-body" class:blurred={hidden}>{c.body}</p>
+								{#if hidden}
+									<button class="reveal" onclick={() => (revealed = { ...revealed, [c.id]: true })}
+										>Spoiler — tap to show</button
+									>
+								{/if}
+								<div class="c-meta">
+									<span
+										class="c-stat"
+										title={countLabel(c.likes, 'like', 'likes')}
+										aria-label={countLabel(c.likes, 'like', 'likes')}
+									>
+										<Icon name="thumbs-up" size={14} /><span aria-hidden="true">{c.likes}</span>
+									</span>
+									<span
+										class="c-stat"
+										title={countLabel(c.replies, 'reply', 'replies')}
+										aria-label={countLabel(c.replies, 'reply', 'replies')}
+									>
+										<Icon name="comment" size={14} /><span aria-hidden="true">{c.replies}</span>
+									</span>
+									{#if c.href}<span class="c-go" aria-hidden="true"
+											>View thread <Icon name="chevron-right" size={14} /></span
+										>{/if}
+								</div>
+							</li>
+						{/each}
+					</ul>
+					{#if commentsError}
+						<p class="setting-error" role="alert">Couldn't load more comments.</p>
+					{/if}
+					{#if commentsHasNext}
+						<button
+							class="ghost-btn more"
+							disabled={commentsLoading}
+							onclick={() => loadComments(commentsPage + 1)}
+						>
+							{commentsLoading ? 'Loading…' : 'Load more'}
+						</button>
+					{/if}
+				{/if}
+			</section>
 		</div>
 	</div>
 {:else if loadFailed}
@@ -445,11 +506,70 @@
 {/if}
 
 <style>
-	/* Loading skeleton (mirrors the profile header + body layout). */
+	/* ---- Layout ------------------------------------------------------------
+	   Desktop: header row, stats, then comments (wide) beside a sticky settings
+	   column. Phone (≤ 820px): one column, settings first — see the markup. */
+	.profile {
+		padding-top: 44px;
+		padding-bottom: 32px;
+	}
+	.head {
+		display: grid;
+		grid-template-columns: auto minmax(0, 1fr) auto;
+		grid-template-areas:
+			'avatar who actions'
+			'avatar bio bio';
+		column-gap: 24px;
+		row-gap: 10px;
+		align-items: center;
+	}
+	.avatar-wrap,
 	.sk-avatar {
-		flex: 0 0 auto;
-		width: 104px;
-		height: 104px;
+		grid-area: avatar;
+		align-self: start;
+	}
+	.who {
+		grid-area: who;
+		min-width: 0;
+		align-self: end;
+	}
+	.bio-wrap {
+		grid-area: bio;
+		min-width: 0;
+		align-self: start;
+	}
+	.actions {
+		grid-area: actions;
+		display: flex;
+		gap: 10px;
+		align-self: end;
+	}
+	.body {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) 340px;
+		grid-template-areas: 'main side';
+		gap: 40px;
+		margin-top: 40px;
+		align-items: start;
+	}
+	.main {
+		grid-area: main;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 14px;
+	}
+	.side {
+		grid-area: side;
+		min-width: 0;
+		position: sticky;
+		top: calc(var(--k-header-h) + 20px);
+	}
+
+	/* ---- Loading skeleton ---------------------------------------------------- */
+	.sk-avatar {
+		width: 96px;
+		height: 96px;
 		border-radius: 50%;
 	}
 	.sk-line {
@@ -457,36 +577,41 @@
 		border-radius: 5px;
 	}
 	.sk-name {
-		width: 220px;
-		height: 30px;
-		margin-bottom: 14px;
+		width: min(220px, 100%);
+		height: 28px;
+		margin-bottom: 10px;
 	}
 	.sk-handle {
-		width: 260px;
+		width: min(200px, 80%);
 		height: 13px;
-		margin-bottom: 18px;
 	}
 	.sk-bio {
 		width: min(460px, 90%);
 		height: 14px;
 	}
 	.sk-stat-value {
-		width: 60px;
+		width: 52px;
 		height: 24px;
 		margin-bottom: 8px;
 	}
 	.sk-stat-label {
-		width: 84px;
+		width: 76px;
 		height: 11px;
 	}
 	.sk-section {
-		width: 180px;
+		width: 160px;
 		height: 14px;
 	}
 	.sk-card {
-		height: 180px;
+		height: 200px;
 		border-radius: 12px;
 	}
+	.sk-comment {
+		height: 112px;
+		border-radius: 12px;
+	}
+
+	/* ---- Signed out / failed -------------------------------------------------- */
 	.signed-out {
 		display: flex;
 		flex-direction: column;
@@ -534,20 +659,19 @@
 		cursor: pointer;
 		font-family: inherit;
 	}
-	.head {
-		padding-top: 52px;
-	}
-	.identity {
-		display: flex;
-		gap: 28px;
-		align-items: flex-start;
-		flex-wrap: wrap;
-	}
+
+	/* ---- Header --------------------------------------------------------------- */
 	.avatar-wrap {
-		flex: 0 0 auto;
 		position: relative;
-		width: 104px;
-		height: 104px;
+		width: 96px;
+		height: 96px;
+	}
+	/* The Avatar sizes itself inline; let the wrapper drive it so the phone layout
+	   can shrink it. */
+	.avatar-wrap :global(.avatar-img),
+	.avatar-wrap :global(.avatar-fallback) {
+		width: 100% !important;
+		height: 100% !important;
 	}
 	.avatar-edit {
 		position: absolute;
@@ -601,6 +725,75 @@
 		white-space: nowrap;
 		border: 0;
 	}
+	.name-row {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		flex-wrap: wrap;
+	}
+	h1 {
+		font-size: 32px;
+		line-height: 1.15;
+		margin: 0;
+		color: var(--k-text-bright);
+		overflow-wrap: anywhere;
+	}
+	.pro {
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.04em;
+		color: var(--k-ongoing);
+		background: rgba(95, 191, 126, 0.14);
+		border: 1px solid rgba(95, 191, 126, 0.4);
+		border-radius: 6px;
+		padding: 3px 9px;
+	}
+	.handle {
+		font-size: 14px;
+		color: var(--k-text-dimmer);
+		margin-top: 4px;
+		overflow-wrap: anywhere;
+	}
+	.bio {
+		max-width: 620px;
+		font-size: 14.5px;
+		line-height: 1.6;
+		color: var(--k-text-muted);
+		margin: 0;
+		overflow-wrap: anywhere;
+		white-space: pre-line;
+	}
+	.edit,
+	.gear {
+		height: 42px;
+		padding: 0 18px;
+		border-radius: 8px;
+		font-weight: 700;
+		font-size: 13.5px;
+		font-family: inherit;
+		cursor: pointer;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 8px;
+		white-space: nowrap;
+	}
+	.edit {
+		background: var(--k-primary);
+		border: none;
+		color: var(--k-on-primary);
+	}
+	.gear {
+		background: transparent;
+		border: 1px solid var(--k-border-4);
+		color: var(--k-text-3);
+	}
+	.gear:hover {
+		border-color: rgba(255, 255, 255, 0.34);
+		color: var(--k-text);
+	}
+
+	/* ---- Editor --------------------------------------------------------------- */
 	.editor {
 		margin-top: 24px;
 		max-width: 560px;
@@ -631,7 +824,8 @@
 		border-radius: 8px;
 		color: var(--k-text);
 		font-family: var(--k-font-sans);
-		font-size: 14px;
+		/* 16px keeps iOS Safari from zooming the page on focus. */
+		font-size: 16px;
 		resize: vertical;
 	}
 	.field input:focus,
@@ -668,80 +862,13 @@
 		opacity: 0.6;
 		cursor: default;
 	}
-	.who {
-		flex: 1;
-		min-width: 260px;
-	}
-	.name-row {
-		display: flex;
-		align-items: center;
-		gap: 12px;
-		flex-wrap: wrap;
-	}
-	h1 {
-		font-size: 34px;
-		margin: 0;
-		color: var(--k-text-bright);
-	}
-	.pro {
-		font-size: 11px;
-		font-weight: 700;
-		letter-spacing: 0.04em;
-		color: var(--k-ongoing);
-		background: rgba(95, 191, 126, 0.14);
-		border: 1px solid rgba(95, 191, 126, 0.4);
-		border-radius: 6px;
-		padding: 3px 9px;
-	}
-	.handle {
-		font-size: 14px;
-		color: var(--k-text-dimmer);
-		margin-top: 6px;
-	}
-	.bio {
-		max-width: 560px;
-		font-size: 14.5px;
-		line-height: 1.6;
-		color: var(--k-text-muted);
-		margin: 14px 0 0;
-	}
-	.actions {
-		display: flex;
-		gap: 10px;
-		flex-shrink: 0;
-	}
-	.edit {
-		height: 42px;
-		padding: 0 20px;
-		border-radius: 8px;
-		background: var(--k-primary);
-		border: none;
-		color: var(--k-on-primary);
-		font-weight: 700;
-		font-size: 13.5px;
-		cursor: pointer;
-	}
-	.gear {
-		width: 42px;
-		height: 42px;
-		border-radius: 8px;
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-3);
-		cursor: pointer;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-	}
-	.gear:hover {
-		border-color: rgba(255, 255, 255, 0.34);
-		color: var(--k-text);
-	}
+
+	/* ---- Stats ---------------------------------------------------------------- */
 	.stats {
 		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+		grid-template-columns: repeat(4, minmax(0, 1fr));
 		gap: 1px;
-		margin-top: 36px;
+		margin-top: 32px;
 		background: var(--k-border-1);
 		border: 1px solid var(--k-border-1);
 		border-radius: 12px;
@@ -749,15 +876,16 @@
 	}
 	.stat {
 		background: var(--k-surface);
-		padding: 20px 22px;
+		padding: 18px 20px;
 		display: flex;
 		flex-direction: column;
 		gap: 4px;
+		min-width: 0;
 	}
 	.stat-value {
 		font-family: var(--k-font-display);
 		font-weight: 700;
-		font-size: 28px;
+		font-size: 26px;
 		color: var(--k-text-bright);
 		line-height: 1;
 	}
@@ -765,157 +893,58 @@
 		font-size: 12.5px;
 		color: var(--k-text-dimmer);
 	}
-	.body {
-		display: grid;
-		grid-template-columns: 1.6fr 1fr;
-		gap: 44px;
-		padding-top: 48px;
-		padding-bottom: 20px;
-		align-items: start;
-	}
-	.left,
-	.right {
-		display: flex;
-		flex-direction: column;
-		min-width: 0;
-	}
-	.left {
-		gap: 40px;
-	}
-	.right {
-		gap: 32px;
-	}
-	.section {
-		display: flex;
-		flex-direction: column;
-		gap: 16px;
-	}
-	.section-label {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 16px;
-		letter-spacing: 0.04em;
-		text-transform: uppercase;
-		margin: 0;
-		color: var(--k-text-dimmer);
-	}
-	.reading-list {
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-	}
-	.reading-row {
-		display: flex;
-		align-items: center;
-		gap: 16px;
-		padding: 12px;
-		border-radius: 10px;
-		text-decoration: none;
-		transition: background 0.12s;
-	}
-	.reading-row:hover {
-		background: rgba(255, 255, 255, 0.035);
-	}
-	.mini-cover {
-		position: relative;
-		flex: 0 0 auto;
-		width: 48px;
-		height: 68px;
-		border-radius: 6px;
-	}
-	.reading-info {
-		flex: 1;
-		min-width: 0;
-	}
-	.reading-top {
-		display: flex;
-		justify-content: space-between;
-		align-items: baseline;
-		gap: 12px;
-	}
-	.reading-title {
-		font-weight: 700;
-		font-size: 14.5px;
-		color: var(--k-text-1);
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.reading-ch {
-		flex: 0 0 auto;
-		font-size: 12px;
-		color: var(--k-text-faint);
-	}
-	.reading-genre {
-		font-size: 12px;
-		color: var(--k-text-fainter);
-		margin-top: 3px;
-	}
-	.reading-bar {
-		margin-top: 9px;
-		height: 4px;
-		border-radius: 3px;
-		background: rgba(255, 255, 255, 0.1);
-		overflow: hidden;
-	}
-	.reading-bar .fill,
-	.genre-bar .fill {
-		height: 100%;
-		background: var(--k-primary);
-		border-radius: 3px;
-	}
-	.tabs {
-		display: flex;
-		gap: 8px;
-		flex-wrap: wrap;
-	}
-	.tab {
-		display: inline-flex;
-		align-items: center;
-		gap: 7px;
-		font-size: 13.5px;
-		font-weight: 700;
-		padding: 8px 16px;
-		border-radius: var(--k-radius-pill);
-		cursor: pointer;
-		background: transparent;
-		color: var(--k-text-dimmer);
-		border: 1px solid var(--k-border-4);
-		transition:
-			color 0.15s,
-			background-color 0.15s,
-			border-color 0.15s,
-			opacity 0.15s;
-	}
-	.tab.on {
-		background: var(--k-primary);
-		color: var(--k-on-primary);
-		border-color: var(--k-primary);
-	}
-	.count {
-		opacity: 0.55;
-		font-weight: 600;
-	}
-	.shelf-grid {
-		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
-		gap: 30px 22px;
-	}
+
+	/* ---- Settings card -------------------------------------------------------- */
 	.card {
 		border: 1px solid var(--k-border-1);
 		border-radius: 12px;
-		padding: 22px 24px;
+		padding: 20px 22px;
 		background: var(--k-surface);
 		display: flex;
 		flex-direction: column;
-		gap: 16px;
+		gap: 18px;
+	}
+	.settings {
+		scroll-margin-top: calc(var(--k-header-h) + 16px);
+		outline: none;
+	}
+	.settings.flash {
+		animation: flash 1.2s ease-out;
+	}
+	@keyframes flash {
+		0%,
+		30% {
+			border-color: var(--k-primary);
+			box-shadow: 0 0 0 3px color-mix(in srgb, var(--k-primary) 30%, transparent);
+		}
+		100% {
+			border-color: var(--k-border-1);
+			box-shadow: 0 0 0 0 transparent;
+		}
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.settings.flash {
+			animation-duration: 0.01s;
+		}
 	}
 	.card-title {
 		font-family: var(--k-font-display);
 		font-weight: 700;
-		font-size: 15px;
+		font-size: 16px;
 		margin: 0;
 		color: var(--k-text);
+	}
+	.setting-group {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+	}
+	.group-label {
+		font-size: 11.5px;
+		font-weight: 700;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--k-text-faint);
 	}
 	.setting-row {
 		display: flex;
@@ -928,6 +957,7 @@
 		flex-direction: column;
 		gap: 3px;
 		min-width: 0;
+		cursor: pointer;
 	}
 	.setting-label {
 		font-weight: 600;
@@ -941,8 +971,8 @@
 	}
 	.switch {
 		flex: 0 0 auto;
-		width: 44px;
-		height: 26px;
+		width: 48px;
+		height: 28px;
 		border-radius: 999px;
 		border: 1px solid var(--k-border-4);
 		background: var(--k-border-1);
@@ -965,82 +995,331 @@
 		position: absolute;
 		top: 2px;
 		left: 2px;
-		width: 20px;
-		height: 20px;
+		width: 22px;
+		height: 22px;
 		border-radius: 50%;
 		background: var(--k-on-primary, #fff);
 		transition: transform 0.15s;
 	}
 	.switch.on .knob {
-		transform: translateX(18px);
+		transform: translateX(20px);
+	}
+	.setting-links {
+		display: flex;
+		flex-direction: column;
+		margin: 0 -10px;
+	}
+	.setting-link {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		min-height: 44px;
+		padding: 0 10px;
+		border-radius: 8px;
+		border: none;
+		background: transparent;
+		color: var(--k-text-2);
+		font-family: inherit;
+		font-size: 14px;
+		font-weight: 600;
+		text-align: left;
+		text-decoration: none;
+		cursor: pointer;
+	}
+	.setting-link:hover {
+		background: rgba(255, 255, 255, 0.04);
+		color: var(--k-text);
+	}
+	.setting-link :global(svg) {
+		color: var(--k-text-fainter);
+		flex: 0 0 auto;
 	}
 	.setting-error {
 		margin: 4px 0 0;
 		font-size: 12.5px;
 		color: var(--k-danger, #e08a8a);
 	}
-	.genres {
+
+	/* ---- Comments ------------------------------------------------------------- */
+	.section-head {
 		display: flex;
-		flex-direction: column;
-		gap: 13px;
+		align-items: baseline;
+		gap: 10px;
 	}
-	.genre {
-		display: flex;
-		flex-direction: column;
-		gap: 6px;
+	.section-label {
+		font-family: var(--k-font-display);
+		font-weight: 700;
+		font-size: 16px;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		margin: 0;
+		color: var(--k-text-dimmer);
 	}
-	.genre-top {
-		display: flex;
-		justify-content: space-between;
+	.section-count {
 		font-size: 13px;
-	}
-	.gname {
-		color: var(--k-text-2);
-		font-weight: 600;
-	}
-	.gpct {
+		font-weight: 700;
 		color: var(--k-text-faint);
 	}
-	.genre-bar {
-		height: 6px;
-		border-radius: 4px;
-		background: var(--k-border-1);
-		overflow: hidden;
-	}
-	.activity {
+	.comment-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
 		display: flex;
 		flex-direction: column;
+		gap: 10px;
 	}
-	.act-row {
+	.comment {
+		position: relative;
 		display: flex;
-		gap: 14px;
-		align-items: flex-start;
-		padding: 14px 0;
-		border-top: 1px solid var(--k-border);
+		flex-direction: column;
+		gap: 8px;
+		padding: 14px 16px;
+		border: 1px solid var(--k-border-1);
+		border-radius: 12px;
+		background: var(--k-surface);
+		transition:
+			border-color 0.15s,
+			background-color 0.15s;
 	}
-	.act-icon {
+	.comment.linked:hover {
+		border-color: var(--k-border-4);
+	}
+	.comment:focus-within {
+		border-color: var(--k-border-strong);
+	}
+	.c-top {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 12px;
+	}
+	.c-where {
+		min-width: 0;
+		font-weight: 700;
+		font-size: 14px;
+		color: var(--k-text-1);
+		text-decoration: none;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	a.c-where {
+		outline: none;
+	}
+	/* Stretched link: the whole card opens the thread. */
+	a.c-where::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		border-radius: inherit;
+	}
+	.c-time {
 		flex: 0 0 auto;
-		width: 30px;
-		height: 30px;
+		font-size: 12px;
+		color: var(--k-text-fainter);
+	}
+	.c-tag {
+		align-self: flex-start;
+		font-size: 10.5px;
+		font-weight: 700;
+		letter-spacing: 0.05em;
+		text-transform: uppercase;
+		color: var(--k-text-faint);
+		border: 1px solid var(--k-border-4);
+		border-radius: 5px;
+		padding: 1px 6px;
+	}
+	.c-body {
+		margin: 0;
+		font-size: 14px;
+		line-height: 1.5;
+		color: var(--k-text-2);
+		white-space: pre-line;
+		overflow-wrap: anywhere;
+		display: -webkit-box;
+		-webkit-line-clamp: 4;
+		line-clamp: 4;
+		-webkit-box-orient: vertical;
+		overflow: hidden;
+	}
+	.c-body.blurred {
+		filter: blur(6px);
+		user-select: none;
+	}
+	/* Above the stretched link so it reveals instead of navigating. */
+	.reveal {
+		position: relative;
+		z-index: 1;
+		align-self: flex-start;
+		margin-top: -4px;
+		min-height: 32px;
+		padding: 0 12px;
 		border-radius: 8px;
+		border: 1px solid var(--k-border-4);
+		background: var(--k-surface-2, var(--k-surface));
+		color: var(--k-text-2);
+		font-family: inherit;
+		font-size: 12.5px;
+		font-weight: 700;
+		cursor: pointer;
+	}
+	.c-meta {
+		display: flex;
+		align-items: center;
+		gap: 16px;
+		font-size: 12.5px;
+		color: var(--k-text-faint);
+	}
+	.c-stat {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		font-variant-numeric: tabular-nums;
+	}
+	.c-go {
+		margin-left: auto;
+		display: inline-flex;
+		align-items: center;
+		gap: 2px;
+		font-weight: 600;
+		color: var(--k-text-dimmer);
+	}
+	.comment.linked:hover .c-go {
+		color: var(--k-text);
+	}
+	.empty {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 8px;
+		padding: 36px 20px;
+		border: 1px dashed var(--k-border-4);
+		border-radius: 12px;
+		text-align: center;
+	}
+	.empty p {
+		margin: 0;
+		font-weight: 600;
+		font-size: 14.5px;
+		color: var(--k-text-2);
+	}
+	.empty span {
+		max-width: 320px;
+		font-size: 13px;
+		line-height: 1.45;
+		color: var(--k-text-faint);
+	}
+	.empty-icon {
+		width: 40px;
+		height: 40px;
+		border-radius: 50%;
 		display: flex;
 		align-items: center;
 		justify-content: center;
+		background: var(--k-surface-2);
+		color: var(--k-text-disabled);
 	}
-	.act-text {
-		font-size: 13.5px;
+	.ghost-btn {
+		height: 40px;
+		padding: 0 18px;
+		border-radius: 8px;
+		border: 1px solid var(--k-border-4);
+		background: transparent;
 		color: var(--k-text-2);
-		line-height: 1.45;
+		font-family: inherit;
+		font-weight: 700;
+		font-size: 13.5px;
+		cursor: pointer;
 	}
-	.act-time {
-		font-size: 11.5px;
-		color: var(--k-text-fainter);
-		margin-top: 3px;
+	.ghost-btn:disabled {
+		opacity: 0.6;
+		cursor: default;
 	}
+	.ghost-btn.more {
+		align-self: center;
+		margin-top: 4px;
+	}
+
+	/* ---- Tablet / phone --------------------------------------------------------- */
 	@media (max-width: 820px) {
 		.body {
-			grid-template-columns: 1fr;
-			gap: 32px;
+			grid-template-columns: minmax(0, 1fr);
+			grid-template-areas:
+				'side'
+				'main';
+			gap: 28px;
+			margin-top: 28px;
+		}
+		.side {
+			position: static;
+		}
+	}
+	@media (max-width: 640px) {
+		.profile {
+			padding-top: 24px;
+		}
+		.head {
+			grid-template-columns: auto minmax(0, 1fr);
+			grid-template-areas:
+				'avatar who'
+				'bio bio'
+				'actions actions';
+			column-gap: 16px;
+			row-gap: 14px;
+		}
+		.who {
+			align-self: center;
+		}
+		.avatar-wrap,
+		.sk-avatar {
+			width: 72px;
+			height: 72px;
+		}
+		.avatar-wrap :global(.avatar-fallback) {
+			font-size: 32px !important;
+		}
+		.avatar-edit {
+			width: 30px;
+			height: 30px;
+			font-size: 13px;
+		}
+		h1 {
+			font-size: 24px;
+		}
+		.handle {
+			font-size: 13px;
+		}
+		.bio {
+			font-size: 14px;
+		}
+		.actions {
+			display: grid;
+			grid-auto-flow: column;
+			grid-auto-columns: minmax(0, 1fr);
+		}
+		.stats {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+			margin-top: 22px;
+		}
+		.stat {
+			padding: 14px 16px;
+		}
+		.stat-value {
+			font-size: 22px;
+		}
+		.card {
+			padding: 18px;
+		}
+		.editor {
+			padding: 18px;
+			max-width: none;
+		}
+		.editor-actions > button {
+			flex: 1;
+		}
+		.comment {
+			padding: 14px;
 		}
 	}
 </style>

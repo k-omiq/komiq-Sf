@@ -808,6 +808,42 @@ pub struct CommentPage {
     pub total: Option<i32>,
 }
 
+/// One of the viewer's OWN comments, as listed on their profile (`myComments`). Carries
+/// what the list needs to render a row and deep-link back to the thread without a
+/// per-row lookup: the owning series (resolved for a chapter target, the same way
+/// notifications resolve it), that series' display title and the chapter number.
+#[derive(SimpleObject, Clone)]
+pub struct MyComment {
+    pub id: ID,
+    /// `"chapter"` | `"series"`.
+    pub target_type: String,
+    pub target_id: ID,
+    /// The comment this one replies to, or `null` for a top-level comment.
+    pub parent_id: Option<ID>,
+    pub body: String,
+    pub has_spoiler: bool,
+    pub created_at: String,
+    pub likes: i32,
+    pub dislikes: i32,
+    /// Direct replies to this comment (banned authors excluded, as in the thread).
+    pub reply_count: i32,
+    /// The series the thread hangs off: `targetId` for a series discussion, the
+    /// chapter's owning series for a chapter thread. Null when it can't be resolved.
+    pub series_id: Option<ID>,
+    /// That series' display title, when the catalogue knows it.
+    pub series_title: Option<String>,
+    /// Chapter number for a chapter thread (e.g. `"12"`, `"10.5"`), when known.
+    pub chapter_number: Option<String>,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct MyCommentPage {
+    pub items: Vec<MyComment>,
+    pub page: i32,
+    pub has_next_page: bool,
+    pub total: Option<i32>,
+}
+
 #[derive(InputObject)]
 pub struct PostReviewInput {
     pub series_id: ID,

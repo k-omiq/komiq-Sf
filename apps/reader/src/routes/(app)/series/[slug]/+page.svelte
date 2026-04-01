@@ -753,7 +753,15 @@
 	$effect(() => {
 		seriesId; // a different series starts fresh
 		untrack(() => {
-			tab = 'chapters';
+			// `#discussion` opens straight onto the thread — the profile's "My comments"
+			// links here — and brings the tab strip into view.
+			const toDiscussion = page.url.hash === '#discussion';
+			tab = toDiscussion ? 'discussion' : 'chapters';
+			if (toDiscussion) {
+				requestAnimationFrame(() =>
+					document.getElementById('chapters')?.scrollIntoView({ block: 'start' }),
+				);
+			}
 			aboutOpen = false;
 			rateOpen = false;
 			sortOpen = false;
