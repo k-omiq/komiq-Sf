@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { tick } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import { page } from '$app/state';
 	import { protectUnsaved } from '$lib/unsaved.svelte';
 	import Icon from '$lib/components/Icon.svelte';
@@ -159,8 +159,17 @@
 		settingsFlash = false;
 		requestAnimationFrame(() => (settingsFlash = true));
 	}
+	// Once per arrival — a later profile refetch (after saving the bio) mustn't yank
+	// the page back to the settings card.
+	let settingsHashHandled = false;
 	$effect(() => {
-		if (profile && page.url.hash === '#profile-preferences') void showSettings();
+		if (!profile || page.url.hash !== '#profile-preferences') {
+			settingsHashHandled = false;
+			return;
+		}
+		if (settingsHashHandled) return;
+		settingsHashHandled = true;
+		void showSettings();
 	});
 
 	// --- My comments ---------------------------------------------------------------
@@ -196,13 +205,19 @@
 			commentsLoading = false;
 		}
 	}
+	// Keyed on the id STRING, not the profile object: saving the bio or a new avatar
+	// refetches the profile, and that must not throw away the loaded comment pages.
+	const profileId = $derived(profile?.id ?? '');
 	$effect(() => {
-		void auth.user?.id;
-		if (!profile?.id) return;
-		comments = [];
-		commentsPage = 0;
-		revealed = {};
-		void loadComments(1);
+		if (!profileId) return;
+		// `loadComments` reads its own state before its first await; untracked so a
+		// load finishing can't re-run this effect and loop back to page 1.
+		untrack(() => {
+			comments = [];
+			commentsPage = 0;
+			revealed = {};
+			void loadComments(1);
+		});
 	});
 	const countLabel = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 </script>
