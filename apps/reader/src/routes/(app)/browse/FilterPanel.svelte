@@ -179,7 +179,7 @@
 		</div>
 	</header>
 
-	<div class="panel-body">
+	<div class="panel-body k-scrollbar-slim">
 		<section class="section" aria-labelledby="{uid}-tags">
 			<h3 class="glabel" id="{uid}-tags">Tags</h3>
 			<TagPicker {tags} source={tagSource} loading={tagsLoading} {draft} {onchange} />
@@ -330,19 +330,18 @@
 <style>
 	/* One open rail on desktop, one solid modal sheet on smaller screens. */
 	.panel {
+		position: relative;
 		display: flex;
 		flex-direction: column;
 		min-width: 0;
-		position: sticky;
-		top: calc(var(--k-header-h) + 20px);
-		/* Reserve the browse heading/search row and gutter so Apply is visible on
-		   the first screen as well as after this rail becomes sticky. */
-		max-height: calc(100dvh - var(--k-header-h) - 140px);
+		height: 100%;
+		min-height: 0;
 		padding-right: 24px;
 		border-right: 1px solid var(--k-border-1);
 		background: transparent;
 	}
 	.panel-head {
+		flex-shrink: 0;
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
@@ -392,10 +391,9 @@
 		min-height: 0;
 		overflow-y: auto;
 		overscroll-behavior: contain;
-		scrollbar-width: thin;
 		display: flex;
 		flex-direction: column;
-		padding: 0 3px 0 0;
+		padding: 0 8px 0 0;
 	}
 	.section {
 		min-width: 0;
@@ -582,6 +580,7 @@
 		/* Existing overlay layer scale: backdrop 59, dialog 60. */
 		.panel {
 			position: fixed;
+			height: auto;
 			top: max(12px, env(safe-area-inset-top, 0px));
 			left: 0;
 			right: 0;

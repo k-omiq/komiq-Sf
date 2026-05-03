@@ -58,8 +58,50 @@ async function openBrowse(page: Page, query = '') {
 	await browse.click();
 	await expect(page.getByRole('heading', { name: 'Browse', exact: true })).toBeVisible();
 	await expect(
-		page.locator('aside.panel').getByRole('button', { name: 'Action, not filtered', exact: true }),
+		page
+			.locator('aside.panel')
+			.getByRole('button', { name: 'Action, not filtered', exact: true, includeHidden: true }),
 	).toBeAttached();
+}
+
+async function pagedCatalogue(page: Page) {
+	await page.route(/\/graphql(?:\?|$)/, async (route) => {
+		const request = route.request();
+		const params = new URL(request.url()).searchParams;
+		const payload =
+			request.method() === 'POST'
+				? request.postDataJSON()
+				: {
+						query: params.get('query'),
+						variables: JSON.parse(params.get('variables') ?? '{}'),
+					};
+		if (!/query Search\b/.test(payload.query ?? '')) return route.fallback();
+		const current = payload.variables?.page ?? 1;
+		await route.fulfill({
+			headers: { 'access-control-allow-origin': '*' },
+			json: {
+				data: {
+					search: {
+						items: Array.from({ length: 30 }, (_, index) => ({
+							id: `catalogue-${current}-${index}`,
+							title: `Catalogue ${current}-${index}`,
+							genres: ['Action'],
+							chapterCount: 10,
+							latestChapter: '10',
+							rating: { average: 8, count: 2 },
+							status: 'ONGOING',
+							type: 'MANGA',
+							coverUrl: null,
+							isNsfw: false,
+						})),
+						page: current,
+						hasNextPage: current < 3,
+						total: 90,
+					},
+				},
+			},
+		});
+	});
 }
 
 test('tag categories, expansion and search retain draft selections and all three states', async ({
@@ -163,6 +205,73 @@ test('match options retain radio keyboard behavior', async ({ page }) => {
 });
 
 for (const theme of ['dark', 'light'] as const) {
+	test(`${theme}: desktop columns scroll independently, and paging/Back restore results`, async ({
+		page,
+	}) => {
+		await page.emulateMedia({ colorScheme: theme, reducedMotion: 'reduce' });
+		await page.setViewportSize({ width: 1280, height: 800 });
+		await pagedCatalogue(page);
+		await openBrowse(page);
+		const filters = page.locator('.panel-body');
+		const results = page.getByRole('region', { name: 'Browse results', exact: true });
+		await expect(results.locator('.grid > a')).toHaveCount(30);
+		await expect(results).toHaveAttribute('aria-busy', 'false');
+		const filterTop = await page
+			.locator('aside.panel')
+			.evaluate((el) => el.getBoundingClientRect().top);
+		const resultsTop = await results.evaluate((el) => el.getBoundingClientRect().top);
+		expect(await filters.evaluate((el) => getComputedStyle(el, '::-webkit-scrollbar').width)).toBe(
+			'3px',
+		);
+		expect(await results.evaluate((el) => getComputedStyle(el, '::-webkit-scrollbar').width)).toBe(
+			'3px',
+		);
+		await filters.hover();
+		await page.mouse.wheel(0, 400);
+		await expect.poll(() => filters.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
+		expect(await results.evaluate((el) => el.scrollTop)).toBe(0);
+		expect(await page.evaluate(() => window.scrollY)).toBe(0);
+		await filters.evaluate((el) => (el.scrollTop = el.scrollHeight));
+		const filterPosition = await filters.evaluate((el) => el.scrollTop);
+		await page.mouse.wheel(0, 800);
+		expect(await results.evaluate((el) => el.scrollTop)).toBe(0);
+		expect(await page.evaluate(() => window.scrollY)).toBe(0);
+		await results.focus();
+		await page.keyboard.press('PageDown');
+		await expect.poll(() => results.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
+		expect(await filters.evaluate((el) => el.scrollTop)).toBe(filterPosition);
+		expect(await page.evaluate(() => window.scrollY)).toBe(0);
+		await expect(
+			page.locator('aside.panel').getByRole('button', { name: 'Apply filters' }),
+		).toBeInViewport({ ratio: 1 });
+		const next = results.getByRole('link', { name: 'Next page, page 2', exact: true });
+		await next.scrollIntoViewIfNeeded();
+		const previousPosition = await results.evaluate((el) => el.scrollTop);
+		await next.click();
+		await expect(page).toHaveURL(/page=2/);
+		await expect(results).toHaveAttribute('aria-busy', 'false');
+		await expect.poll(() => results.evaluate((el) => el.scrollTop)).toBe(0);
+		expect(await filters.evaluate((el) => el.scrollTop)).toBe(filterPosition);
+		expect(await page.evaluate(() => window.scrollY)).toBe(0);
+		await page.goBack();
+		await expect(page).toHaveURL(/\/browse$/);
+		await expect.poll(() => results.evaluate((el) => el.scrollTop)).toBe(previousPosition);
+		expect(await page.locator('aside.panel').evaluate((el) => el.getBoundingClientRect().top)).toBe(
+			filterTop,
+		);
+		expect(await results.evaluate((el) => el.getBoundingClientRect().top)).toBe(resultsTop);
+		// A component remount (leaving Browse and returning) also restores its scroll.
+		await page.getByRole('link', { name: 'Home', exact: true }).first().click();
+		await expect(page).toHaveURL(new URL('/', page.url()).href);
+		await expect(results).toHaveCount(0);
+		await page.goBack();
+		await expect(page).toHaveURL(/\/browse$/);
+		await expect.poll(() => results.evaluate((el) => el.scrollTop)).toBe(previousPosition);
+		await results.evaluate((el) => (el.scrollTop = 0));
+		await filters.evaluate((el) => (el.scrollTop = 0));
+		await page.screenshot({ path: `test-results/browse-scroll-${theme}-desktop.png` });
+	});
+
 	test(`${theme}: flat surfaces, visible Apply at laptop size, and mobile dismissal/focus`, async ({
 		page,
 	}) => {
@@ -204,3 +313,26 @@ for (const theme of ['dark', 'light'] as const) {
 		await expect(apply).toBeInViewport({ ratio: 1 });
 	});
 }
+
+test('mobile keeps document scrolling and paging clears the fixed header', async ({ page }) => {
+	await page.setViewportSize({ width: 390, height: 844 });
+	await pagedCatalogue(page);
+	await openBrowse(page);
+	const results = page.getByRole('region', { name: 'Browse results', exact: true });
+	await expect(results.locator('.grid > a')).toHaveCount(30);
+	const next = results.getByRole('link', { name: 'Next page, page 2', exact: true });
+	await next.scrollIntoViewIfNeeded();
+	const before = await page.evaluate(() => window.scrollY);
+	expect(before).toBeGreaterThan(500);
+	expect(await results.evaluate((el) => el.scrollTop)).toBe(0);
+	await next.click();
+	await expect(page).toHaveURL(/page=2/);
+	await expect(results).toHaveAttribute('aria-busy', 'false');
+	await expect
+		.poll(() => results.evaluate((el) => el.getBoundingClientRect().top))
+		.toBeGreaterThanOrEqual(60);
+	await expect
+		.poll(() => results.evaluate((el) => el.getBoundingClientRect().top))
+		.toBeLessThanOrEqual(104);
+	expect(await page.evaluate(() => window.scrollY)).toBeLessThan(before);
+});
