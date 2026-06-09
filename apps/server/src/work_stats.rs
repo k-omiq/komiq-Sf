@@ -438,6 +438,44 @@ pub fn spawn_stats_backfill(
     });
 }
 
+/// The MangaDex rating to DISPLAY for a page of works, keyed by work id, in ONE `IN` query.
+///
+/// `rating_avg` (the plain mean — the column migration 0106 keeps "for display") first, the
+/// bayesian `rating` only where the average is missing. A work with no `work_stats` row (not
+/// MangaDex-anchored, or the drain has not reached it yet), or whose row carries no positive
+/// value (MangaDex reports an unrated title as `average: null, bayesian: 0`), is simply absent:
+/// absent means "MangaDex has no rating for it", never "rated zero".
+///
+/// Fails OPEN to "no rating" — a query error logs and yields an empty map — because this only
+/// ever decorates a card; it must not take a feed page down with it.
+pub async fn display_rating_batch(pool: &SqlitePool, work_ids: &[String]) -> HashMap<String, f64> {
+    if work_ids.is_empty() {
+        return HashMap::new();
+    }
+    let ph = std::iter::repeat_n("?", work_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT work_id, \
+                COALESCE(CASE WHEN rating_avg > 0 THEN rating_avg END, \
+                         CASE WHEN rating > 0 THEN rating END) \
+           FROM work_stats WHERE work_id IN ({ph})"
+    );
+    let mut q = sqlx::query_as::<_, (String, Option<f64>)>(&sql);
+    for id in work_ids {
+        q = q.bind(id);
+    }
+    q.fetch_all(pool)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "work_stats: display_rating_batch query failed");
+            Vec::new()
+        })
+        .into_iter()
+        .filter_map(|(wid, r)| r.filter(|x| x.is_finite()).map(|x| (wid, x)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

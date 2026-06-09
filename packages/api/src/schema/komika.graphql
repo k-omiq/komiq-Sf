@@ -721,7 +721,7 @@ type UpdateFeedRow {
 	# safe against a server that predates the field.
 	announcedAt: String
 	detectedAt: String # when OUR scanner noticed; per-SERIES, Suwayomi-only, never stamped on a baseline scan. Tooltip only, never a sort key. NOT a substitute for announcedAt
-	rating: Float # aggregate user rating 0-10; null when unrated
+	rating: Float # aggregate rating 0-10: our readers' review average where they have rated the work, else MangaDex's community rating (statistics cache, `work_stats`); null ONLY when neither has one — the sole case the card labels "Unrated"
 	isNsfw: Boolean!
 }
 

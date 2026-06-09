@@ -326,7 +326,9 @@ export interface UpdateFeedRow {
 	/** When OUR scanner noticed; null on mirror-only rows. Per-SERIES and Suwayomi-only —
 	 *  NOT a substitute for {@link announcedAt}. Tooltip only, never a sort key. */
 	detectedAt: string | null;
-	/** Aggregate user rating 0-10, or null when unrated. */
+	/** Aggregate rating 0-10: our readers' review average where they have rated the work,
+	 *  else MangaDex's community rating (the server's `work_stats` cache). Null ONLY when
+	 *  neither has one, which is the sole case a card should label "Unrated". */
 	rating: number | null;
 	isNsfw: boolean;
 }

@@ -3386,8 +3386,10 @@ pub struct UpdateFeedRow {
     pub announced_at: Option<String>,
     /// When our scanner noticed, ISO-8601; null on mirror-only rows. Tooltip only.
     pub detected_at: Option<String>,
-    /// Aggregate user rating 0-10, or null when unrated. Resolved per page (20 rows), not
-    /// materialized: review averages move independently of the feed.
+    /// Aggregate rating 0-10, or null only when the work has NO rating anywhere: our own
+    /// readers' review average where they have rated it, else MangaDex's community rating
+    /// from the statistics cache (`work_stats`, migration 0106). Resolved per page (20
+    /// rows, two batched queries), not materialized: both move independently of the feed.
     pub rating: Option<f64>,
     pub is_nsfw: bool,
 }
@@ -4435,16 +4437,33 @@ impl QueryRoot {
         }
         let total: i64 = cq.fetch_one(&st.pool).await.map_err(gql_err)?;
 
-        // Ratings are resolved for the <=20 ids of this page in ONE grouped query, asked
-        // with `reader_id` but resolved through the WORK: `reviews.series_id` holds
-        // whichever id the reader was addressing, so a work can carry reviews under BOTH
-        // its `w_…` id and the numeric id of any of its sources, and keying on the literal
-        // `reader_id` showed the feed card a different star than the series page. Not
-        // materialized: review averages move independently of the feed's refresh, and an
-        // unrated work must come back as null rather than the "0.0" star the old
-        // scanner-half card rendered from `RatingSummary::empty()`.
-        let reader_ids: Vec<String> = rows.iter().map(|r| r.reader_id.clone()).collect();
-        let ratings = rating_summary_for_series_ids(&st.pool, &reader_ids).await;
+        // The card's star: the work's aggregate rating, resolved for the <=20 rows of this
+        // page in TWO batched queries (never one per row), both keyed by the row's WORK id.
+        //
+        // (1) Our own readers' reviews, through `rating_summary_by_work_batch` — the SAME
+        //     reader Browse cards and the series page use, which resolves both shapes of the
+        //     polymorphic `reviews.series_id` (a `w_…` work id or the numeric id of any of its
+        //     Suwayomi sources) onto the work. Every feed row's `work_id` is a live `work.id`
+        //     (both halves of the refresh JOIN `work`), so it is asked with directly rather
+        //     than re-resolving `reader_id` back to the work it was derived from.
+        // (2) MangaDex's community rating from the statistics cache (`work_stats`, migration
+        //     0106), for every work our own readers have not rated.
+        //
+        // (2) is the fix for "Latest Updates says Unrated on everything": this resolver used
+        // to consult only (1), and the whole database holds a handful of reviews, so a feed
+        // of the most popular MangaDex titles printed "Unrated" on every card even though the
+        // statistics drain had a rating for nearly all of them. Local reviews still WIN where
+        // they exist, so a series' feed card agrees with the star its own page counts.
+        //
+        // Neither is materialized onto `feed_series_updates`: both move independently of the
+        // feed's refresh. A work with neither comes back null — never the "0.0" star the old
+        // scanner-half card rendered from `RatingSummary::empty()` — which is the only case
+        // the reader labels "Unrated".
+        let work_ids: Vec<String> = rows.iter().map(|r| r.work_id.clone()).collect();
+        let (ratings, md_ratings) = futures::join!(
+            rating_summary_by_work_batch(&st.pool, &work_ids),
+            crate::work_stats::display_rating_batch(&st.pool, &work_ids),
+        );
 
         let items = rows
             .into_iter()
@@ -4460,9 +4479,10 @@ impl QueryRoot {
                     }
                 };
                 let rating = ratings
-                    .get(&r.reader_id)
+                    .get(&r.work_id)
                     .filter(|s| s.count > 0)
-                    .map(|s| s.average);
+                    .map(|s| s.average)
+                    .or_else(|| md_ratings.get(&r.work_id).copied());
                 UpdateFeedRow {
                     id: ID(r.reader_id),
                     work_id: r.work_id,
@@ -15826,6 +15846,92 @@ mod tests {
             .unwrap();
         assert_eq!(rated["averageRating"], 7.0);
         assert_eq!(rated["ratingCount"], 2);
+    }
+
+    /// "Latest Updates says Unrated on everything": the feed used to read ONLY local reviews,
+    /// of which the whole database holds a handful, so every card printed "Unrated" even where
+    /// the MangaDex statistics cache (`work_stats`, 0106) had a rating. A work with no local
+    /// review must now carry MangaDex's rating; local reviews still win where they exist; and
+    /// null is reserved for a work with no rating ANYWHERE (no row, or MangaDex's own
+    /// "unrated" shape of `average: null, bayesian: 0`, which the drain stores as NULLs).
+    #[tokio::test]
+    async fn updates_feed_rating_falls_back_to_mangadex_statistics() {
+        let (s, pool) = setup_full(100).await;
+        for (md, title) in [
+            ("md-r-md-only", "MangaDex only"),
+            ("md-r-bayes-only", "Bayesian only"),
+            ("md-r-local-wins", "Local wins"),
+            ("md-r-md-unrated", "MangaDex unrated"),
+            ("md-r-no-stats", "No stats row"),
+        ] {
+            seed_canonical(&pool, md, title, false, "3").await;
+        }
+        for (md, avg, bayes) in [
+            ("md-r-md-only", Some(8.4), Some(8.2)),
+            ("md-r-bayes-only", None, Some(7.5)),
+            ("md-r-local-wins", Some(9.1), Some(9.0)),
+            ("md-r-md-unrated", None, None),
+        ] {
+            let wid = work_id_of(&pool, md).await;
+            sqlx::query(
+                "INSERT INTO work_stats (work_id, follows, rating, rating_avg, fetched_at) \
+                 VALUES (?, 10, ?, ?, '2026-10-01T00:00:00Z')",
+            )
+            .bind(&wid)
+            .bind(bayes)
+            .bind(avg)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let local = work_id_of(&pool, "md-r-local-wins").await;
+        sqlx::query("INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) VALUES ('r-local', ?, 'bob-id', 6, '', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+            .bind(&local)
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+
+        let response = exec(
+            &s,
+            "{ updatesFeed { items { title rating } } }",
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let data = response.data.into_json().unwrap();
+        let items = data["updatesFeed"]["items"].as_array().unwrap();
+        let rating = |t: &str| {
+            items
+                .iter()
+                .find(|r| r["title"] == t)
+                .unwrap_or_else(|| panic!("{t} missing from the feed"))["rating"]
+                .clone()
+        };
+        assert_eq!(
+            rating("MangaDex only"),
+            8.4,
+            "MangaDex average is the display value"
+        );
+        assert_eq!(
+            rating("Bayesian only"),
+            7.5,
+            "bayesian fills a missing average"
+        );
+        assert_eq!(
+            rating("Local wins"),
+            6.0,
+            "our own readers' reviews take precedence"
+        );
+        assert!(
+            rating("MangaDex unrated").is_null(),
+            "MangaDex 'unrated' is not 0.0"
+        );
+        assert!(
+            rating("No stats row").is_null(),
+            "no rating anywhere stays null"
+        );
     }
 
     #[tokio::test]
