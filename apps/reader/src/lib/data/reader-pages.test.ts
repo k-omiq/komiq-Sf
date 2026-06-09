@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { loadFirstReadable } from './reader-pages.ts';
+import { loadFirstReadable, settleWithin, TimeoutError, withTimeout } from './reader-pages.ts';
 
 interface Copy {
 	id: string;
@@ -77,7 +77,7 @@ test('an empty copy falls through, but an all-empty chapter is not reported as a
 // ---------------------------------------------------------------------------------------
 import { testGlobals } from './node-test-hooks.ts';
 
-const { getReaderChapter } = await import('./source.ts');
+const { getReaderChapter, clearReaderWorkCache, saveProgress } = await import('./source.ts');
 
 const WORK = 'w_fixture';
 const SUW = '777';
@@ -141,6 +141,8 @@ interface FakeOpts {
 	suwChapters?: ReturnType<typeof chapter>[];
 	/** The aggregation as the bundle carries it. */
 	aggregated?: unknown[];
+	/** The Suwayomi mapping's series URL (`WorkSource.sourceUrl`). */
+	suwSourceUrl?: string | null;
 }
 
 const DEAD_ENGINE = 'Internal error';
@@ -152,6 +154,8 @@ function fakeBackend(opts: FakeOpts = {}) {
 	const toPages = (urls: string[]) => urls.map((sourceUrl, index) => ({ index, sourceUrl }));
 	const b = testGlobals.backend;
 	for (const k of Object.keys(b)) delete b[k];
+	// Every case shares one work id; the reader memoizes its resolution per work.
+	clearReaderWorkCache();
 	Object.assign(b, {
 		seriesPage: async (workId: string) => ({
 			workId,
@@ -163,7 +167,7 @@ function fakeBackend(opts: FakeOpts = {}) {
 						sourceType: 'suwayomi',
 						sourceId: '1998944621602463790',
 						sourceKey: SUW,
-						sourceUrl: null,
+						sourceUrl: opts.suwSourceUrl ?? null,
 						isNsfw: false,
 						lang: 'en',
 						extension: { pkgName: 'eu.kanade.tachiyomi.extension.all.mangaplus' },
@@ -321,4 +325,145 @@ test('"Read on source": the view and each version carry their copy\'s original-s
 	const suw = await getReaderChapter(WORK, '9005', SUW);
 	assert.equal(suw.readingSrc, SUW);
 	assert.equal(suw.sourceUrl, null);
+});
+
+test('"Read on source" falls back to the reading source\'s SERIES page when the chapter URL is unknown', async () => {
+	fakeBackend({
+		mdPages: {},
+		aggregated: [],
+		suwSourceUrl: 'https://mangaplus.shueisha.co.jp/titles/100020',
+	});
+	const suw = await getReaderChapter(WORK, '9005', SUW);
+	assert.equal(suw.readingSrc, SUW);
+	assert.equal(suw.sourceUrl, null);
+	assert.equal(suw.seriesSourceUrl, 'https://mangaplus.shueisha.co.jp/titles/100020');
+
+	// Upstream text bound for an href: anything but absolute http(s) is dropped.
+	fakeBackend({ mdPages: {}, aggregated: [], suwSourceUrl: 'javascript:alert(1)' });
+	const hostile = await getReaderChapter(WORK, '9005', SUW);
+	assert.equal(hostile.seriesSourceUrl, null);
+});
+
+// ---------------------------------------------------------------------------------------
+// The production "page goes grey, chapter never changes" bug and its guards.
+// ---------------------------------------------------------------------------------------
+
+/** A promise that never settles — a request the server accepted and never answered. */
+const hang = <T>() => new Promise<T>(() => {});
+
+test('withTimeout rejects a stalled promise with a TimeoutError, and passes a fast one through', async () => {
+	await assert.rejects(withTimeout(hang(), 10, 'page list'), TimeoutError);
+	assert.equal(await withTimeout(Promise.resolve(7), 1000), 7);
+	await assert.rejects(withTimeout(Promise.reject(new Error('boom')), 1000), /boom/);
+});
+
+test('settleWithin answers the fallback for a stalled or failed promise', async () => {
+	assert.equal(await settleWithin(hang<string>(), 10, 'fallback'), 'fallback');
+	assert.equal(await settleWithin(Promise.reject(new Error('x')), 1000, 'fallback'), 'fallback');
+	assert.equal(await settleWithin(Promise.resolve('real'), 1000, 'fallback'), 'real');
+});
+
+test('a copy that never answers falls through to the next one instead of hanging the load', async () => {
+	const errors: unknown[] = [];
+	const got = await loadFirstReadable(
+		[MANGA_PLUS, MANGADEX],
+		(c) => (c.src ? hang<string[]>() : Promise.resolve(['p1'])),
+		(_c, err) => errors.push(err),
+		{ timeoutMs: 20 },
+	);
+	assert.equal(got.copy, MANGADEX);
+	assert.deepEqual(got.pages, ['p1']);
+	assert.ok(errors[0] instanceof TimeoutError);
+
+	// Every copy stalled: the load still RESOLVES (no pages, flagged failed) — it never hangs.
+	const allHung = await loadFirstReadable(
+		[MANGADEX, MANGA_PLUS],
+		() => hang<string[]>(),
+		undefined,
+		{
+			timeoutMs: 10,
+		},
+	);
+	assert.deepEqual(allHung.pages, []);
+	assert.equal(allHung.failed, true);
+});
+
+test('saving progress never calls invalidate() while a navigation is in flight', async () => {
+	// SvelteKit's `invalidate()` steals the router's navigation token, which ABORTS a
+	// navigation still waiting on its load and leaves `navigating` set forever: the reader
+	// dimmed the old chapter and the next one never appeared. `openChapter` saves progress
+	// right before `goto`, so the save always resolves mid-navigation.
+	fakeBackend();
+	testGlobals.backend.setProgress = async () => {};
+	testGlobals.invalidated.length = 0;
+	testGlobals.page.route.id = '/read/[slug]';
+	testGlobals.navigating.to = { url: new URL('https://komiq.cc/read/w_fixture?ch=md-5a') };
+	await saveProgress('md-4', 3, true);
+	assert.deepEqual(testGlobals.invalidated, []);
+
+	// Idle, but in the reader: nothing depends on the key here, so nothing to refresh.
+	testGlobals.navigating.to = null;
+	await saveProgress('md-4', 3, true);
+	assert.deepEqual(testGlobals.invalidated, []);
+
+	// The library is on screen and idle — the one case the refresh exists for.
+	testGlobals.page.route.id = '/(app)/library';
+	await saveProgress('md-4', 3, true);
+	assert.deepEqual(testGlobals.invalidated, ['komika:library']);
+
+	testGlobals.page.route.id = null;
+	testGlobals.invalidated.length = 0;
+});
+
+test('chapter-to-chapter loads share ONE series bundle; a bare open always re-resolves', async () => {
+	fakeBackend({ mdPages: { 'md-4': ['a.webp'], 'md-5a': ['b.webp'] } });
+	const seriesPage = testGlobals.backend.seriesPage as (id: string) => Promise<object>;
+	let bundles = 0;
+	testGlobals.backend.seriesPage = (id: string) => {
+		bundles++;
+		return seriesPage(id);
+	};
+	// The next-chapter prefetch and the click race each other: one request between them.
+	const [a, b] = await Promise.all([
+		getReaderChapter(WORK, 'md-5a', null),
+		getReaderChapter(WORK, 'md-4', null),
+	]);
+	assert.equal(bundles, 1);
+	assert.equal(a.chapterId, 'md-5a');
+	assert.equal(b.chapterId, 'md-4');
+	// A later chapter turn reuses it too — only the pages are fetched.
+	const c = await getReaderChapter(WORK, 'md-5a', null);
+	assert.equal(bundles, 1);
+	assert.deepEqual(
+		c.pages.map((p) => p.url),
+		['b.webp'],
+	);
+	// Opening the work bare picks "first unread", which needs fresh read state.
+	await getReaderChapter(WORK, null, null);
+	assert.equal(bundles, 2);
+});
+
+test('a chapter marked read is still read when reopened from the shared bundle', async () => {
+	fakeBackend({ mdPages: { 'md-4': ['a.webp'] } });
+	testGlobals.backend.setProgress = async () => {};
+	const before = await getReaderChapter(WORK, 'md-4', null);
+	assert.equal(before.chapterRead, false);
+	await saveProgress('md-4', 0, true);
+	const after = await getReaderChapter(WORK, 'md-4', null);
+	assert.equal(after.chapterRead, true);
+});
+
+test('a failed series bundle is not memoized: the next load asks again', async () => {
+	fakeBackend({ mdPages: { 'md-4': ['a.webp'] } });
+	const seriesPage = testGlobals.backend.seriesPage as (id: string) => Promise<object>;
+	let calls = 0;
+	testGlobals.backend.seriesPage = (id: string) => {
+		calls++;
+		return calls === 1 ? Promise.reject(new Error('Backend error 502')) : seriesPage(id);
+	};
+	const failed = await getReaderChapter(WORK, 'md-4', null);
+	assert.equal(failed.chapterId, undefined);
+	const ok = await getReaderChapter(WORK, 'md-4', null);
+	assert.equal(ok.chapterId, 'md-4');
+	assert.equal(calls, 2);
 });

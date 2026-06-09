@@ -34,6 +34,7 @@ import { isTauri } from '@komika/api';
 import type { Backend } from '@komika/api';
 import { backend, images } from '$lib/context';
 import { invalidate } from '$app/navigation';
+import { navigating, page } from '$app/state';
 import { api, type LoadFetch } from './load-fetch';
 import { homeLatestAdded } from './home-latest-added';
 import {
@@ -45,7 +46,7 @@ import {
 import { findChapterOwner } from './chapter-owner';
 import type { ChapterCandidate } from './chapter-owner';
 import { adjacentChapters, copiesOf, normalizeGroup, sortChaptersAsc } from './chapter-versions';
-import { loadFirstReadable } from './reader-pages';
+import { loadFirstReadable, settleWithin, withTimeout } from './reader-pages';
 import { chapterChip, chapterSourceUrl, externalChapterHref } from './chapter-label';
 import { chapterDateLabel, chapterFoundLabel } from './chapter-date';
 import {
@@ -737,6 +738,12 @@ interface ResolvedWork {
 		 * version switcher) drop them wherever the spine carries the same number.
 		 */
 		redundant: boolean;
+		/**
+		 * The SERIES page on this source's own site (the mapping's `sourceUrl`), validated
+		 * http(s), or null. The reader's "Read on source" falls back to it when the open
+		 * chapter's own URL is unknown (a Suwayomi copy: the server keeps no chapter URL).
+		 */
+		sourceUrl: string | null;
 	})[];
 	/**
 	 * Cross-source aggregation, when it rode along in the single-round-trip
@@ -1006,9 +1013,23 @@ async function resolveWork(
 			iconUrl: c.view.iconUrl,
 			chapters: c.chapters,
 			redundant: !!c.redundant,
+			sourceUrl: mappingSourceUrl(wsList, c.view.suwayomiMangaId),
 		})),
 		aggregated,
 	};
+}
+
+/**
+ * A source's series URL out of the work's mappings: the Suwayomi mapping whose manga id
+ * matches, or — for the spine (`null`) — the MangaDex mapping. Validated through
+ * {@link externalChapterHref} (http/s only), because it is upstream text bound for an href.
+ */
+function mappingSourceUrl(wsList: WorkSource[], suwayomiMangaId: string | null): string | null {
+	const ws =
+		suwayomiMangaId === null
+			? wsList.find((w) => w.sourceType === 'mangadex')
+			: wsList.find((w) => w.sourceType !== 'mangadex' && w.sourceKey === suwayomiMangaId);
+	return externalChapterHref(ws?.sourceUrl);
 }
 
 /**
@@ -2555,6 +2576,35 @@ export async function setSeriesNsfw(
 	}
 }
 
+/** The library route — the only `load` that `depends('komika:library')`. */
+const LIBRARY_ROUTE_ID = '/(app)/library';
+
+/**
+ * Re-run the library's `load` after a progress/read write — but ONLY when the library is
+ * the page on screen and no navigation is in flight.
+ *
+ * THIS IS THE READER'S "PAGE TURNS GREY BUT NOTHING HAPPENS" BUG. `invalidate()` is not a
+ * targeted refresh: SvelteKit's `_invalidate` unconditionally takes over the client
+ * router's navigation token (`token = {}`) and re-loads the CURRENT url, whatever depends
+ * on the key. Any navigation still awaiting its `load` then sees a foreign token and bails
+ * with "navigation aborted" — and on that path (kit 2.70, client.js `navigate`) it never
+ * clears `navigating` nor `is_navigating`. The reader saves progress on every chapter
+ * change (`openChapter` + `beforeNavigate`), the `setProgress` write lands in ~100 ms while
+ * the next chapter's `load` takes several round trips, so for every signed-in reader in
+ * production (`LIVE`, and `setProgress` only succeeds with a session) the invalidate
+ * killed the chapter navigation: the reader's `navigating`-driven overlay dimmed the old
+ * chapter forever and the new one never rendered. A stuck `is_navigating` also silenced
+ * every later `beforeNavigate`. Dev/mock never saw it: `saveProgress` is a no-op there.
+ *
+ * Skipping the refresh elsewhere loses nothing: a route's `load` always runs when it is
+ * navigated to, so the library is fresh the next time it is opened, and while it IS open
+ * it also refreshes itself on focus.
+ */
+async function refreshLibraryIfShown(): Promise<void> {
+	if (navigating.to || page.route.id !== LIBRARY_ROUTE_ID) return;
+	await invalidate('komika:library');
+}
+
 /** Persist reading progress for a chapter (best-effort; no-op offline/mock). */
 export async function saveProgress(
 	chapterId: string | undefined,
@@ -2567,7 +2617,8 @@ export async function saveProgress(
 	// non-empty guard above is the only shape check the client needs.
 	try {
 		await backend.setProgress(chapterId, lastPageRead, read);
-		await invalidate('komika:library');
+		if (read) markCachedChapterRead(chapterId);
+		await refreshLibraryIfShown();
 	} catch (err) {
 		console.warn('[komika] setProgress failed:', err);
 	}
@@ -2593,7 +2644,7 @@ export async function setChapterRead(chapterId: string, read: boolean): Promise<
 	try {
 		const done = (await backend.setChapterRead?.(chapterId, read)) ?? false;
 		if (!done) return false;
-		await invalidate('komika:library');
+		await refreshLibraryIfShown();
 		return true;
 	} catch (err) {
 		console.warn('[komika] setChapterRead failed:', err);
@@ -2673,6 +2724,10 @@ export interface ReaderView {
 	/** The OPEN copy on its original site — the menu's "Read on <host>" link; null hides
 	 *  it. Validated http/s, see {@link chapterSourceUrl}. */
 	sourceUrl?: string | null;
+	/** The reading source's SERIES page on its own site — where "Read on source" goes when
+	 *  the open chapter's own URL is unknown (Suwayomi copies). Validated http/s; null
+	 *  when the mapping carries no URL. */
+	seriesSourceUrl?: string | null;
 }
 
 /** Honest empty reader view — no chapter/pages available for this series. */
@@ -2760,6 +2815,8 @@ interface ReaderCopyContext {
 	/** Name/icon of the active source, for versions built from the list alone. */
 	sourceName?: string;
 	iconUrl?: string | null;
+	/** The active source's SERIES page on its own site — "Read on source"'s fallback. */
+	seriesSourceUrl?: string | null;
 }
 
 /**
@@ -2844,6 +2901,7 @@ function buildReaderView(
 		versions,
 		group: group ?? versions.find((v) => v.current)?.group ?? null,
 		sourceUrl: chapterSourceUrl(target, readingSrc),
+		seriesSourceUrl: externalChapterHref(ctx.seriesSourceUrl),
 	};
 }
 
@@ -3014,6 +3072,87 @@ function readerVersions(
 	return versions;
 }
 
+/**
+ * Deadlines for the reader's `load`. The shared GraphQL client has no request timeout, and
+ * a `load` that never settles holds the chapter navigation open forever — the old chapter
+ * sits dimmed under the loading overlay and nothing changes. With these, a stalled copy
+ * falls through to the next one (`loadFirstReadable`), a stalled series bundle degrades to
+ * the empty reader, and secondary data stops waiting and renders without it.
+ */
+const READER_PAGES_TIMEOUT_MS = 15_000;
+const READER_WORK_TIMEOUT_MS = 20_000;
+/** How long SECONDARY data (a numeric series' title, a legacy aggregation) may hold a
+ *  chapter whose pages are already in hand. */
+const READER_SECONDARY_GRACE_MS = 2_500;
+/** How long one resolved work is reused across chapter-to-chapter navigations. */
+const READER_WORK_TTL_MS = 60_000;
+
+interface ReaderWorkEntry {
+	/** When it was started, then when it settled. */
+	at: number;
+	settled: boolean;
+	promise: Promise<ResolvedWork | null>;
+	value?: ResolvedWork | null;
+}
+const readerWorkCache = new Map<string, ReaderWorkEntry>();
+
+/** Drop every cached work resolution (tests; a sign-in/out could change what resolves). */
+export function clearReaderWorkCache(): void {
+	readerWorkCache.clear();
+}
+
+/** Reflect a just-saved "read" in the memoized lists, so reopening that chapter within the
+ *  memo's lifetime still reports it read. */
+function markCachedChapterRead(chapterId: string): void {
+	for (const { value } of readerWorkCache.values()) {
+		for (const cand of value?.candidates ?? []) {
+			for (const c of cand.chapters) if (c.id === chapterId) c.read = true;
+		}
+	}
+}
+
+/**
+ * `resolveWork` for the reader, with a deadline and a short-lived memo.
+ *
+ * Every chapter of a work resolves the SAME bundle (translators, every source's list, the
+ * aggregation), so re-fetching it on each next/previous click put a full `seriesPage`
+ * round trip — the heaviest query the reader makes on a long work — on the critical path
+ * of every chapter turn, in front of pages that were often already prefetched. With
+ * `reuse` (the caller names an exact `?ch=`) a resolution younger than
+ * {@link READER_WORK_TTL_MS} is shared; concurrent loads (the next-chapter prefetch, a
+ * hover preload, the click) always share the one in flight. Without `reuse` — opening the
+ * work bare, where the chapter picked is "first unread" and depends on fresh read state —
+ * a settled entry is never served. Failures and `null` are never cached.
+ */
+function resolveReaderWork(
+	workId: string,
+	preferred: string | undefined,
+	reuse: boolean,
+): Promise<ResolvedWork | null> {
+	const key = `${workId}\u0000${preferred ?? ''}`;
+	const hit = readerWorkCache.get(key);
+	if (hit && (!hit.settled || (reuse && Date.now() - hit.at < READER_WORK_TTL_MS))) {
+		return hit.promise;
+	}
+	const promise = withTimeout(
+		resolveWork(workId, preferred, { withAggregated: true }),
+		READER_WORK_TIMEOUT_MS,
+		'series bundle',
+	);
+	const entry: ReaderWorkEntry = { at: Date.now(), settled: false, promise };
+	readerWorkCache.set(key, entry);
+	const drop = () => {
+		if (readerWorkCache.get(key) === entry) readerWorkCache.delete(key);
+	};
+	promise.then((r) => {
+		entry.settled = true;
+		entry.value = r;
+		entry.at = Date.now();
+		if (!r) drop();
+	}, drop);
+	return promise;
+}
+
 export function getReaderChapter(
 	seriesId: string,
 	chParam?: string | null,
@@ -3061,11 +3200,14 @@ export function getReaderChapter(
 				!backend.seriesPage && backend.aggregatedChapters
 					? backend.aggregatedChapters(seriesId).catch(() => [] as AggregatedChapter[])
 					: null;
-			const resolved = await resolveWork(seriesId, preferred, { withAggregated: true });
+			const resolved = await resolveReaderWork(seriesId, preferred, !!chParam);
 			if (!resolved) return emptyReader(seriesId);
 			// Absent on an API that predates the per-copy fields or the bundle: the reader
-			// then degrades to exactly its old single-copy behaviour.
-			const agg: AggregatedChapter[] = resolved.aggregated ?? (aggP ? await aggP : []);
+			// then degrades to exactly its old single-copy behaviour. Secondary (it feeds the
+			// version switcher), so it gets a grace period, not a veto over the chapter.
+			const agg: AggregatedChapter[] =
+				resolved.aggregated ??
+				(aggP ? await settleWithin(aggP, READER_SECONDARY_GRACE_MS, []) : []);
 			// Same `work_redirect` healing as getSeries: a reader URL bookmarked before
 			// a merge resolves to the SURVIVOR, so the back-to-series link and the
 			// translator switch (which does a real `goto(/read/<workId>)`) address the
@@ -3257,6 +3399,7 @@ export function getReaderChapter(
 						`[komika] pages failed for chapter ${a.chapter.id} (${a.src ?? 'mangadex'}):`,
 						err,
 					),
+				{ timeoutMs: READER_PAGES_TIMEOUT_MS },
 			);
 			target = opened.copy.chapter;
 			if (opened.copy !== primary) {
@@ -3292,13 +3435,23 @@ export function getReaderChapter(
 					versions: readerVersions(agg, resolved, target, readingSrc, activeCand),
 					sourceName: activeCand?.name,
 					iconUrl: activeCand?.iconUrl ?? null,
+					seriesSourceUrl: activeCand?.sourceUrl ?? null,
 				},
 			);
 		}
 		// Numeric Suwayomi series — single source, no translator picker. Its list holds
 		// every copy (one row per scanlator), so versions and group-preferring prev/next
 		// come from the list itself.
-		const chs = await backend.chapters(seriesId);
+		//
+		// The series row only supplies the title, so it starts NOW, alongside the list, and
+		// is awaited last with a grace period: it used to be fetched after the pages, adding
+		// a whole round trip to every chapter open for a header string.
+		const seriesP = backend.series(seriesId).catch(() => null);
+		const chs = await withTimeout(
+			backend.chapters(seriesId),
+			READER_WORK_TIMEOUT_MS,
+			'chapter list',
+		);
 		if (!chs.length) return emptyReader(seriesId);
 		const asc = sortChaptersAsc(chs);
 		let target = chParam ? chs.find((c) => c.id === chParam) : undefined;
@@ -3321,9 +3474,10 @@ export function getReaderChapter(
 						? speculatedPages
 						: backend.pages(c.id),
 			(c, err) => console.warn(`[komika] pages failed for chapter ${c.id}:`, err),
+			{ timeoutMs: READER_PAGES_TIMEOUT_MS },
 		);
 		const urls = pages.length ? await resolvePageUrls(pages) : [];
-		const series = await backend.series(seriesId).catch(() => null);
+		const series = await settleWithin(seriesP, READER_SECONDARY_GRACE_MS, null);
 		return buildReaderView(
 			seriesId,
 			chs,

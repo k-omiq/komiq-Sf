@@ -20,12 +20,20 @@ import { fileURLToPath } from 'node:url';
 export interface TestGlobals {
 	backend: Record<string, unknown>;
 	images: { resolvePage: (p: { sourceUrl?: string }) => Promise<string> };
+	/** Every key passed to the stubbed `invalidate`, in order. */
+	invalidated: string[];
+	/** Stand-ins for `$app/state`'s `page` / `navigating` (only the fields source.ts reads). */
+	page: { route: { id: string | null } };
+	navigating: { to: { url: URL } | null };
 }
 
 const g = globalThis as unknown as { __komikaTest?: TestGlobals };
 g.__komikaTest ??= {
 	backend: {},
 	images: { resolvePage: async (p) => p.sourceUrl ?? '' },
+	invalidated: [],
+	page: { route: { id: null } },
+	navigating: { to: null },
 };
 export const testGlobals: TestGlobals = g.__komikaTest;
 
@@ -34,7 +42,12 @@ const STUBS: Record<string, string> = {
 		'export const backend = globalThis.__komikaTest.backend;' +
 		'export const images = globalThis.__komikaTest.images;',
 	'$app/navigation':
-		'export const invalidate = async () => {}; export const goto = async () => {};',
+		'export const invalidate = async (k) => { globalThis.__komikaTest.invalidated.push(k); };' +
+		'export const goto = async () => {};',
+	// The router state, as plain mutable objects a test points at a route / navigation.
+	'$app/state':
+		'export const page = globalThis.__komikaTest.page;' +
+		'export const navigating = globalThis.__komikaTest.navigating;',
 	'$lib/config':
 		'export const config = { backendEnabled: true, nativeEngine: false };' +
 		'export const apiAssetSrc = (s) => s;',
