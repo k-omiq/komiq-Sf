@@ -722,6 +722,7 @@ fn chapter_list_params(
         // group is unknowable and a series with three uploads of "Ch. 3" shows three
         // anonymous rows. See `scanlation_group_label`.
         ("includes[]".into(), "scanlation_group".into()),
+        ("includes[]".into(), "user".into()),
         // English-only: Komika serves only English chapters, so filter the firehose
         // at the source (smaller pages, no non-English rows to mirror).
         ("translatedLanguage[]".into(), "en".into()),
@@ -763,6 +764,7 @@ fn chapter_ids_params(ids: &[String]) -> Vec<(String, String)> {
     let mut params: Vec<(String, String)> = vec![
         ("limit".into(), ids.len().to_string()),
         ("includes[]".into(), "scanlation_group".into()),
+        ("includes[]".into(), "user".into()),
         ("contentRating[]".into(), "safe".into()),
         ("contentRating[]".into(), "suggestive".into()),
         ("contentRating[]".into(), "erotica".into()),
@@ -960,6 +962,8 @@ pub struct MdRel {
 pub struct MdRelAttrs {
     pub file_name: Option<String>,
     pub name: Option<String>,
+    /// Public uploader name on an expanded chapter `user` relationship.
+    pub username: Option<String>,
     /// Cover locale (F2) — `cover_art` relationships carry `locale` + `volume`.
     pub locale: Option<String>,
     pub volume: Option<String>,
@@ -1497,8 +1501,8 @@ pub fn chapter_manga_id(c: &MdChapter) -> Option<String> {
         .map(|r| r.id.clone())
 }
 
-/// What `chapter.scanlator` holds for a MangaDex chapter whose upstream record lists NO
-/// scanlation group — the upload MangaDex itself labels "No Group".
+/// What `chapter.scanlator` holds when MangaDex lists no scanlation group and no public
+/// uploader username is available.
 ///
 /// A real, renderable value rather than NULL, because NULL already means something else on
 /// this column: "never asked". The group backfill's work-list is `scanlator IS NULL`, so if
@@ -1516,11 +1520,11 @@ pub const NO_GROUP: &str = "No Group";
 /// group" and "we could not find out" are different claims and only one is true.
 pub const GROUP_UNKNOWN: &str = "";
 
-/// The scanlation group label for one MangaDex chapter, from its `scanlation_group`
-/// relationships (which carry `attributes.name` only when the request asked for
-/// `includes[]=scanlation_group` — both chapter queries do).
+/// Attribution for one MangaDex chapter: expanded scanlation-group names, falling back
+/// to the expanded uploader username when no group is listed. Both chapter queries
+/// request `includes[]=scanlation_group` and `includes[]=user`.
 ///
-///   * no group relationship at all → [`NO_GROUP`] (upstream's own "No Group");
+///   * no group relationship → the uploader's public username, else [`NO_GROUP`];
 ///   * one or more NAMED groups     → the names, de-duplicated, joined with `" & "`;
 ///   * groups present but none named → [`GROUP_UNKNOWN`] (an include that did not expand).
 ///
@@ -1540,7 +1544,15 @@ pub fn scanlation_group_label(c: &MdChapter) -> String {
         .filter(|r| r.kind == "scanlation_group")
         .collect();
     if groups.is_empty() {
-        return NO_GROUP.to_string();
+        return c
+            .relationships
+            .iter()
+            .filter(|r| r.kind == "user")
+            .filter_map(|r| r.attributes.as_ref()?.username.as_deref())
+            .map(str::trim)
+            .find(|name| !name.is_empty())
+            .unwrap_or(NO_GROUP)
+            .to_string();
     }
     let mut names: Vec<String> = groups
         .iter()
@@ -4578,6 +4590,7 @@ mod tests {
         // relationship is a bare `{id, type}` with no name, and every upload of a number
         // reaches the reader anonymous.
         assert!(params.contains(&("includes[]".into(), "scanlation_group".into())));
+        assert!(params.contains(&("includes[]".into(), "user".into())));
         assert!(params.contains(&("order[createdAt]".into(), "asc".into())));
         assert!(
             !params.iter().any(|(k, _)| k.ends_with("Since")),
@@ -4771,6 +4784,7 @@ mod tests {
         // The group backfill rides this exact request, so it must expand the groups. An
         // include only adds attributes to returned records — it can never subtract an id.
         assert!(params.contains(&("includes[]".into(), "scanlation_group".into())));
+        assert!(params.contains(&("includes[]".into(), "user".into())));
         // All four ratings — `/chapter` applies its safe,suggestive,erotica default to an
         // `ids[]` query too, exactly as it does to the firehose.
         let ratings: Vec<&str> = params
@@ -5171,6 +5185,123 @@ mod tests {
             ]),
         );
         assert_eq!(scanlation_group_label(&bare), GROUP_UNKNOWN);
+    }
+
+    #[test]
+    fn chapter_attribution_uses_uploader_only_when_no_group_is_listed() {
+        let uploader = serde_json::json!({
+            "id": "u", "type": "user", "attributes": { "username": " solo-uploader " }
+        });
+        assert_eq!(
+            scanlation_group_label(&md_chapter("c", serde_json::json!([uploader.clone()]))),
+            "solo-uploader"
+        );
+        assert_eq!(
+            scanlation_group_label(&md_chapter(
+                "c",
+                serde_json::json!([
+                    uploader.clone(),
+                    { "id": "g", "type": "scanlation_group", "attributes": { "name": "Team" } }
+                ])
+            )),
+            "Team"
+        );
+        // A group which failed to expand is unknown, rather than a group-less upload.
+        assert_eq!(
+            scanlation_group_label(&md_chapter(
+                "c",
+                serde_json::json!([
+                    uploader,
+                    { "id": "g", "type": "scanlation_group" }
+                ])
+            )),
+            GROUP_UNKNOWN
+        );
+        assert_eq!(
+            scanlation_group_label(&md_chapter(
+                "c",
+                serde_json::json!([
+                    { "id": "u", "type": "user", "attributes": { "username": "  " } }
+                ])
+            )),
+            NO_GROUP
+        );
+    }
+
+    #[tokio::test]
+    async fn uploader_migration_reoffers_only_group_less_mangadex_rows() {
+        let pool = pool().await;
+        let m: MdManga = serde_json::from_value(manga_json()).unwrap();
+        let (key, input) = to_work_input(&m);
+        let work = catalog::upsert_work_from_mangadex(&pool, &key, &input)
+            .await
+            .unwrap();
+        let md = catalog::find_source_series_id(&pool, "mangadex", "mangadex", &key)
+            .await
+            .unwrap()
+            .unwrap();
+        let other =
+            catalog::upsert_source_series(&pool, &work, "suwayomi", "src-1", "4242", None, false)
+                .await
+                .unwrap();
+        for (source, external_id, credit) in [
+            (&md, "md-solo", NO_GROUP),
+            (&md, "md-team", "Team"),
+            (&md, "md-unknown", GROUP_UNKNOWN),
+            (&other, "991", NO_GROUP),
+        ] {
+            catalog::upsert_chapter(
+                &pool,
+                source,
+                &catalog::ChapterInput {
+                    external_id: external_id.into(),
+                    number: Some("1".into()),
+                    lang: Some("en".into()),
+                    scanlator: Some(credit.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        sqlx::raw_sql(include_str!(
+            "../migrations/0107_chapter_uploader_attribution.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let pending = chapters_needing_group(&pool, &[], 100).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].external_id, "md-solo");
+        for (external_id, expected) in [
+            ("md-team", "Team"),
+            ("md-unknown", GROUP_UNKNOWN),
+            ("991", NO_GROUP),
+        ] {
+            let actual: Option<String> =
+                sqlx::query_scalar("SELECT scanlator FROM chapter WHERE external_id = ?")
+                    .bind(external_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(actual.as_deref(), Some(expected));
+        }
+        let chapter = md_chapter(
+            "md-solo",
+            serde_json::json!([
+                { "id": "u", "type": "user", "attributes": { "username": "solo-uploader" } }
+            ]),
+        );
+        write_group_backfill(&pool, &pending, &[chapter])
+            .await
+            .unwrap();
+        assert_eq!(group_backfill_remaining(&pool).await.unwrap(), 0);
+        let actual: String =
+            sqlx::query_scalar("SELECT scanlator FROM chapter WHERE external_id = 'md-solo'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(actual, "solo-uploader");
     }
 
     #[tokio::test]

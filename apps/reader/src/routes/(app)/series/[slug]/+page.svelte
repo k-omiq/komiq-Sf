@@ -34,6 +34,7 @@
 
 	import type { SeriesResult } from '$lib/data/source';
 	import { volumeHeaders } from '$lib/data/chapter-volumes';
+	import { chapterAttribution } from '$lib/data/chapter-versions';
 
 	let { data } = $props();
 
@@ -1423,9 +1424,9 @@
 							     copies: each gets its own sub-row below instead. -->
 								{#if c.sources?.length === 1}
 									{@const s = c.sources[0]}
-									<span class="ch-by" title={s.group ? `${s.group} · ${s.name}` : s.name}>
+									<span class="ch-by" title={chapterAttribution(s.name, s.group)}>
 										{@render srcLogo(s.iconUrl, s.name)}
-										<span class="ch-src-name">{s.group || s.name}</span>
+										<span class="ch-src-name">{chapterAttribution(s.name, s.group)}</span>
 									</span>
 								{:else if !c.sources?.length && c.group}
 									<span class="ch-by"
@@ -1459,12 +1460,11 @@
 										<a
 											class="ch-copy"
 											href={chapterHref(s.id, s.src)}
-											aria-label={`Read Chapter ${c.n} by ${s.group || s.name} on ${s.name}`}
+											aria-label={`Read Chapter ${c.n} on ${chapterAttribution(s.name, s.group)}`}
 										>
 											{@render srcLogo(s.iconUrl, s.name)}
 											<span class="cp-text">
-												<span class="cp-group">{s.group || s.name}</span>
-												{#if s.group}<span class="cp-src">{s.name}</span>{/if}
+												<span class="cp-group">{chapterAttribution(s.name, s.group)}</span>
 											</span>
 											{#if s.date}<span class="cp-date">{s.date}</span>{/if}
 										</a>
@@ -2466,8 +2466,7 @@
 		gap: 8px;
 		white-space: nowrap;
 	}
-	.cp-group,
-	.cp-src {
+	.cp-group {
 		min-width: 0;
 		overflow: hidden;
 		text-overflow: ellipsis;
@@ -2476,13 +2475,6 @@
 		flex: 0 1 auto;
 		font-weight: 700;
 		color: var(--k-text-2);
-	}
-	/* The source name gives way before the group does. */
-	.cp-src {
-		flex: 0 100 auto;
-		font-size: 12px;
-		font-weight: 600;
-		color: var(--k-text-faint);
 	}
 	.ch-copy:hover .cp-group {
 		color: var(--k-text);

@@ -12,7 +12,6 @@
 	import type { TagInfo } from '@komika/types';
 	import Icon from '$lib/components/Icon.svelte';
 	import { mobileModalFocus } from '$lib/modal-focus';
-	import { FLAG, type ComicType } from '$lib/data/types';
 	import {
 		CONTENT_RATINGS,
 		CONTENT_RATING_LABEL,
@@ -89,7 +88,6 @@
 	const typeOpts = TYPES.map((v) => ({
 		value: v,
 		label: TYPE_LABEL[v],
-		prefix: FLAG[TYPE_LABEL[v] as ComicType],
 	}));
 	const demoOpts = DEMOGRAPHICS.map((v) => ({ value: v, label: DEMOGRAPHIC_LABEL[v] }));
 	const ratingOpts = $derived(
@@ -173,12 +171,15 @@
 >
 	<header class="panel-head">
 		<h2 class="panel-title" id="{uid}-title">Filters</h2>
-		<button type="button" class="close" aria-label="Close filters" onclick={onclose}>
-			<Icon name="x" size={20} />
-		</button>
+		<div class="head-actions">
+			<button type="button" class="reset" disabled={!canReset} onclick={onreset}>Reset</button>
+			<button type="button" class="close" aria-label="Close filters" onclick={onclose}>
+				<Icon name="x" size={20} />
+			</button>
+		</div>
 	</header>
 
-	<div class="panel-body">
+	<div class="panel-body k-scrollbar-slim">
 		<section class="section" aria-labelledby="{uid}-tags">
 			<h3 class="glabel" id="{uid}-tags">Tags</h3>
 			<TagPicker {tags} source={tagSource} loading={tagsLoading} {draft} {onchange} />
@@ -186,12 +187,15 @@
 
 		<ChipGroup
 			legend="Status"
+			initialOpen
 			options={statusOpts}
 			selected={draft.status}
 			ontoggle={(v) => onchange(toggleIn(draft, 'status', v))}
 		/>
 		<ChipGroup
 			legend="Format"
+			initialOpen
+			segmented
 			options={typeOpts}
 			selected={draft.types}
 			ontoggle={(v) => onchange(toggleIn(draft, 'types', v))}
@@ -232,47 +236,56 @@
 			ontoggle={(v) => onchange(toggleIn(draft, 'languages', v))}
 		/>
 
-		<fieldset class="section nums">
-			<legend class="glabel">Year</legend>
-			<div class="num-row">
-				{@render numberField('yearFrom', 'From', {
-					min: YEAR_MIN,
-					max: YEAR_MAX,
-					placeholder: String(YEAR_MIN),
-				})}
-				<span class="dash" aria-hidden="true">–</span>
-				{@render numberField('yearTo', 'To', {
-					min: YEAR_MIN,
-					max: YEAR_MAX,
-					placeholder: 'Now',
-				})}
-			</div>
-		</fieldset>
+		<details class="facet" open={draft.yearFrom != null || draft.yearTo != null}>
+			<summary>Year<Icon name="chevron-down" size={14} /></summary>
+			<fieldset class="section nums">
+				<legend class="sr-only">Year</legend>
+				<div class="num-row">
+					{@render numberField('yearFrom', 'From', {
+						min: YEAR_MIN,
+						max: YEAR_MAX,
+						placeholder: String(YEAR_MIN),
+					})}
+					<span class="dash" aria-hidden="true">-</span>
+					{@render numberField('yearTo', 'To', {
+						min: YEAR_MIN,
+						max: YEAR_MAX,
+						placeholder: 'Now',
+					})}
+				</div>
+			</fieldset>
+		</details>
 
-		<fieldset class="section nums">
-			<legend class="glabel">Minimums</legend>
-			<div class="num-grid">
-				{@render numberField('minChapters', 'Chapters', {
-					min: 0,
-					max: MAX_MIN_CHAPTERS,
-					placeholder: 'Any',
-				})}
-				{@render numberField('minRating', 'Rating (0–10)', {
-					min: 0,
-					max: 10,
-					step: 0.5,
-					placeholder: 'Any',
-					decimal: true,
-				})}
-				{@render numberField('minFollows', 'Follows', {
-					min: 0,
-					max: MAX_MIN_FOLLOWS,
-					step: 100,
-					placeholder: 'Any',
-				})}
-			</div>
-			<p class="ghint">Rating and follows are MangaDex's figures.</p>
-		</fieldset>
+		<details
+			class="facet"
+			open={draft.minChapters != null || draft.minRating != null || draft.minFollows != null}
+		>
+			<summary>Minimums<Icon name="chevron-down" size={14} /></summary>
+			<fieldset class="section nums">
+				<legend class="sr-only">Minimums</legend>
+				<div class="num-grid">
+					{@render numberField('minChapters', 'Chapters', {
+						min: 0,
+						max: MAX_MIN_CHAPTERS,
+						placeholder: 'Any',
+					})}
+					{@render numberField('minRating', 'Rating (0-10)', {
+						min: 0,
+						max: 10,
+						step: 0.5,
+						placeholder: 'Any',
+						decimal: true,
+					})}
+					{@render numberField('minFollows', 'Follows', {
+						min: 0,
+						max: MAX_MIN_FOLLOWS,
+						step: 100,
+						placeholder: 'Any',
+					})}
+				</div>
+				<p class="ghint">Rating and follows are MangaDex's figures.</p>
+			</fieldset>
+		</details>
 
 		<!-- A switch, not a two-state chip pair: the wire flag has three values and only
 		     two are worth offering. Off is the whole catalogue — including the many
@@ -282,7 +295,7 @@
 		<div class="section switch-row">
 			<span class="switch-text">
 				<span class="switch-label" id="{uid}-hc">Has readable chapters</span>
-				<span class="ghint" id="{uid}-hc-d">Only series you can start reading right now.</span>
+				<span class="sr-only" id="{uid}-hc-d">Only series you can start reading right now.</span>
 			</span>
 			<button
 				type="button"
@@ -299,55 +312,79 @@
 	</div>
 
 	<footer class="panel-foot">
-		<button type="button" class="reset" disabled={!canReset} onclick={onreset}>Reset</button>
-		<button type="button" class="apply" class:dirty={changes > 0} onclick={onapply}>
-			{changes > 0 ? `Apply ${changes} ${changes === 1 ? 'change' : 'changes'}` : 'Apply'}
-		</button>
+		{#if changes > 0}
+			<p class="pending" id="{uid}-pending" role="status">
+				{changes}
+				{changes === 1 ? 'change' : 'changes'} ready to apply
+			</p>
+		{/if}
+		<button
+			type="button"
+			class="apply"
+			aria-describedby={changes > 0 ? `${uid}-pending` : undefined}
+			onclick={onapply}>Apply filters</button
+		>
 	</footer>
 </aside>
 
 <style>
+	/* One open rail on desktop, one solid modal sheet on smaller screens. */
 	.panel {
+		position: relative;
 		display: flex;
 		flex-direction: column;
 		min-width: 0;
-		/* Desktop rail: sticky beside the grid, scrolling inside itself so the Apply bar
-		   stays reachable however long the tag list is. */
-		position: sticky;
-		top: calc(var(--k-header-h) + 16px);
-		max-height: calc(100vh - var(--k-header-h) - 32px);
-		max-height: calc(100dvh - var(--k-header-h) - 32px);
-		background: var(--k-surface-2);
-		border: 1px solid var(--k-border-1);
-		border-radius: var(--k-radius-xl);
+		height: 100%;
+		min-height: 0;
+		padding-right: 24px;
+		border-right: 1px solid var(--k-border-1);
+		background: transparent;
 	}
 	.panel-head {
+		flex-shrink: 0;
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
 		gap: 12px;
-		padding: 16px 18px 12px;
-		border-bottom: 1px solid var(--k-border);
+		padding: 0 0 20px;
 	}
 	.panel-title {
 		margin: 0;
 		font-family: var(--k-font-display);
-		font-size: 16px;
+		font-size: 18px;
 		font-weight: 700;
 		color: var(--k-text);
+	}
+	.head-actions {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+	}
+	.reset,
+	.close {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-height: 32px;
+		padding: 0;
+		border: none;
+		background: transparent;
+		color: var(--k-text-dim);
+		font-size: 12px;
+		cursor: pointer;
+	}
+	.reset:hover:not(:disabled),
+	.close:hover {
+		color: var(--k-text);
+	}
+	.reset:disabled {
+		color: var(--k-text-disabled);
+		cursor: default;
 	}
 	.close {
 		display: none;
 		width: 40px;
 		height: 40px;
-		margin: -8px -10px -8px 0;
-		border: none;
-		background: transparent;
-		color: var(--k-text-dim);
-		cursor: pointer;
-		align-items: center;
-		justify-content: center;
-		border-radius: var(--k-radius-pill);
 	}
 	.panel-body {
 		flex: 1;
@@ -356,238 +393,234 @@
 		overscroll-behavior: contain;
 		display: flex;
 		flex-direction: column;
-		gap: 26px;
-		padding: 16px 18px 20px;
+		padding: 0 8px 0 0;
 	}
 	.section {
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
 		min-width: 0;
 		margin: 0;
-		padding: 0;
+		padding: 0 0 20px;
 		border: none;
 	}
 	.glabel {
-		margin: 0 0 10px;
-		padding: 0;
-		font-size: 11px;
-		font-weight: 700;
-		letter-spacing: 0.09em;
-		text-transform: uppercase;
-		color: var(--k-text-faint);
+		margin: 0 0 12px;
+		font-size: 13px;
+		font-weight: 650;
+		letter-spacing: 0;
+		color: var(--k-text-1);
 	}
-	h3.glabel {
-		margin: 0;
+	.facet {
+		border-top: 1px solid var(--k-border-1);
 	}
-	/* Fieldsets lay out as blocks (see ChipGroup for the floated-legend rationale). */
-	.nums {
-		display: block;
+	.facet summary {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		min-height: 48px;
+		list-style: none;
+		font-size: 13px;
+		font-weight: 650;
+		color: var(--k-text-1);
+		cursor: pointer;
 	}
-	.nums .glabel {
-		float: left;
-		width: 100%;
+	.facet summary::-webkit-details-marker {
+		display: none;
 	}
-	.nums .num-row,
-	.nums .num-grid {
-		clear: both;
+	.facet summary :global(svg) {
+		color: var(--k-text-dim);
 	}
-	.nums .ghint {
-		margin-top: 8px;
+	.facet[open] summary :global(svg) {
+		transform: rotate(180deg);
+	}
+	.facet summary:focus-visible {
+		outline: 2px solid var(--k-accent);
+		outline-offset: 2px;
+		border-radius: var(--k-radius-sm);
 	}
 	.ghint {
-		margin: 0;
-		font-size: 12px;
-		line-height: 1.45;
-		color: var(--k-text-faint);
+		margin: 10px 0 0;
+		font-size: 11.5px;
+		line-height: 1.55;
+		color: var(--k-text-dim);
 	}
 	.num-row {
-		display: flex;
-		align-items: flex-end;
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+		align-items: end;
 		gap: 8px;
-	}
-	.num-row .num {
-		flex: 1;
 	}
 	.dash {
 		padding-bottom: 10px;
-		color: var(--k-text-faint);
+		color: var(--k-text-dim);
 	}
 	.num-grid {
 		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
-		gap: 10px;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 12px;
 	}
 	.num {
 		display: flex;
 		flex-direction: column;
-		gap: 5px;
+		gap: 6px;
 		min-width: 0;
 	}
 	.num-label {
 		font-size: 12px;
-		font-weight: 600;
 		color: var(--k-text-dim);
 	}
 	.num input {
 		width: 100%;
 		min-width: 0;
-		height: 38px;
+		height: 40px;
 		padding: 0 10px;
-		border-radius: var(--k-radius-md);
-		background: var(--k-surface);
+		border-radius: var(--k-radius);
+		background: var(--k-surface-2);
 		border: 1px solid var(--k-border-3);
 		color: var(--k-text);
-		font-size: 13.5px;
-		font-family: inherit;
+		font-size: 13px;
+	}
+	.num input::placeholder {
+		color: var(--k-text-dim);
+		opacity: 1;
 	}
 	.num input:focus {
-		outline: none;
+		outline: 2px solid var(--k-accent);
+		outline-offset: 2px;
 		border-color: var(--k-border-strong);
 	}
 	.switch-row {
-		flex-direction: row;
+		display: flex;
 		align-items: center;
 		justify-content: space-between;
-		gap: 14px;
-	}
-	.switch-text {
-		display: flex;
-		flex-direction: column;
-		gap: 3px;
-		min-width: 0;
+		gap: 12px;
+		min-height: 60px;
+		padding: 12px 0;
+		border-top: 1px solid var(--k-border-1);
 	}
 	.switch-label {
-		font-size: 13.5px;
-		font-weight: 700;
-		color: var(--k-text);
+		font-size: 12.5px;
+		font-weight: 600;
+		color: var(--k-text-2);
 	}
 	.switch {
 		position: relative;
-		flex: 0 0 auto;
-		width: 44px;
-		height: 26px;
-		border-radius: 13px;
+		flex-shrink: 0;
+		width: 36px;
+		height: 22px;
+		border-radius: 11px;
 		border: 1px solid var(--k-border-3);
 		background: var(--k-surface-5);
 		cursor: pointer;
 		transition: background-color 0.15s;
 	}
-	.switch .knob {
+	.knob {
 		position: absolute;
 		top: 2px;
 		left: 2px;
-		width: 20px;
-		height: 20px;
+		width: 16px;
+		height: 16px;
 		border-radius: 50%;
 		background: var(--k-text-dim);
-		transition:
-			transform 0.15s,
-			background-color 0.15s;
+		transition: transform 0.15s;
 	}
 	.switch[aria-checked='true'] {
 		background: var(--k-primary);
 		border-color: var(--k-primary);
 	}
 	.switch[aria-checked='true'] .knob {
-		transform: translateX(18px);
+		transform: translateX(14px);
 		background: var(--k-on-primary);
 	}
 	.panel-foot {
+		flex-shrink: 0;
 		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 10px;
-		padding: 12px 18px;
-		border-top: 1px solid var(--k-border);
+		flex-direction: column;
+		gap: 8px;
+		padding-top: 16px;
+		border-top: 1px solid var(--k-border-1);
 	}
-	.reset {
-		height: 40px;
-		padding: 0 14px;
-		border: none;
-		border-radius: var(--k-radius-pill);
-		background: transparent;
+	.pending {
+		margin: 0;
+		font-size: 11.5px;
 		color: var(--k-text-dim);
-		font-size: 13px;
-		font-weight: 700;
-		cursor: pointer;
-	}
-	.reset:hover:not(:disabled) {
-		color: var(--k-text);
-	}
-	.reset:disabled {
-		opacity: 0.45;
-		cursor: default;
 	}
 	.apply {
-		height: 40px;
-		padding: 0 20px;
-		border-radius: var(--k-radius-pill);
-		border: 1px solid var(--k-border-3);
-		background: var(--k-surface-4);
-		color: var(--k-text);
-		font-size: 13.5px;
-		font-weight: 700;
-		cursor: pointer;
-		transition:
-			background-color 0.15s,
-			color 0.15s;
-	}
-	.apply.dirty {
+		width: 100%;
+		min-height: 44px;
+		padding: 10px 16px;
+		border-radius: var(--k-radius);
+		border: none;
 		background: var(--k-primary);
-		border-color: var(--k-primary);
 		color: var(--k-on-primary);
+		font-size: 13px;
+		font-weight: 700;
+		white-space: nowrap;
+		cursor: pointer;
+	}
+	.apply:hover {
+		background: var(--k-primary-hover);
+	}
+	.apply:active {
+		transform: scale(0.98);
+	}
+	.sr-only {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
 	}
 	.scrim {
 		display: none;
 	}
-
 	@media (max-width: 959px) {
-		/* Sheet. Full height on phones (with room for the status bar), centred and capped
-		   on tablets. Hidden by transform + visibility rather than display so it can
-		   animate; `mobileModalFocus` also marks it inert while closed. */
+		/* Existing overlay layer scale: backdrop 59, dialog 60. */
 		.panel {
 			position: fixed;
-			top: max(16px, env(safe-area-inset-top, 0px));
+			height: auto;
+			top: max(12px, env(safe-area-inset-top, 0px));
 			left: 0;
 			right: 0;
 			bottom: 0;
 			z-index: 60;
-			max-width: 720px;
+			max-width: 640px;
 			max-height: none;
 			margin-inline: auto;
-			border-radius: 18px 18px 0 0;
+			padding: 0 20px;
+			border: 1px solid var(--k-border-2);
 			border-bottom: none;
-			background: var(--k-surface-3);
-			box-shadow: 0 -20px 60px rgba(0, 0, 0, 0.45);
+			border-radius: var(--k-radius-lg) var(--k-radius-lg) 0 0;
+			background: var(--k-surface-2);
 			transform: translateY(102%);
 			visibility: hidden;
 			transition:
-				transform 0.28s cubic-bezier(0.4, 0, 0.2, 1),
-				visibility 0s linear 0.28s;
+				transform 0.2s ease,
+				visibility 0s linear 0.2s;
 		}
 		.panel.open {
 			transform: translateY(0);
 			visibility: visible;
 			transition:
-				transform 0.28s cubic-bezier(0.4, 0, 0.2, 1),
+				transform 0.2s ease,
 				visibility 0s;
+		}
+		.panel-head {
+			padding: 16px 0 12px;
+		}
+		.reset {
+			min-height: 40px;
 		}
 		.close {
 			display: inline-flex;
 		}
-		.panel-head,
-		.panel-body,
 		.panel-foot {
-			padding-left: max(18px, env(safe-area-inset-left, 0px));
-			padding-right: max(18px, env(safe-area-inset-right, 0px));
+			padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
 		}
-		.panel-foot {
-			padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
-		}
-		.apply {
-			flex: 1;
-			max-width: 320px;
+		.num input {
+			font-size: 16px;
 		}
 		.scrim {
 			display: block;
@@ -596,7 +629,6 @@
 			z-index: 59;
 			border: none;
 			background: rgba(8, 8, 9, 0.55);
-			backdrop-filter: blur(2px);
 		}
 	}
 </style>

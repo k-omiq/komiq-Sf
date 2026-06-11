@@ -12,6 +12,7 @@
 		rowsAreFederated: boolean;
 		filterApplied: boolean;
 		scrollY: number;
+		resultsScrollTop: number;
 	};
 	// Back-nav restore (B1): keep the last few browse result sets in MODULE memory —
 	// it survives a component remount (series → back) but not a full reload — so
@@ -72,6 +73,7 @@
 	import SortMenu from './SortMenu.svelte';
 
 	let { data } = $props();
+	let resultsElement = $state<HTMLElement>();
 
 	// ---- tag vocabulary -----------------------------------------------------------
 	// `data.tags` never rejects (see +page.ts). Until it lands, the source is assumed to
@@ -292,7 +294,12 @@
 				lastSig = sig;
 				lastReloadKey = rk;
 				const y = cached.scrollY;
-				tick().then(() => requestAnimationFrame(() => window.scrollTo(0, y)));
+				tick().then(() =>
+					requestAnimationFrame(() => {
+						window.scrollTo(0, y);
+						resultsElement?.scrollTo(0, cached.resultsScrollTop);
+					}),
+				);
 				return;
 			}
 		}
@@ -306,6 +313,9 @@
 		}
 
 		rowsLoading = true;
+		// A new search/page starts at the top of the desktop results column. Its
+		// previous position was saved before navigation for a browser-Back restore.
+		untrack(() => resultsElement?.scrollTo(0, 0));
 		// The rate-limit branch KEEPS the previous rows on screen, so it must put the
 		// previous pager envelope back with them.
 		const prevPager = { hasNext, total: totalCount };
@@ -398,6 +408,7 @@
 				rowsAreFederated,
 				filterApplied,
 				scrollY: window.scrollY,
+				resultsScrollTop: resultsElement?.scrollTop ?? 0,
 			});
 		}
 		restoreOnPop = nav.type === 'popstate';
@@ -479,220 +490,235 @@
 	<title>{pageTitle}</title>
 </svelte:head>
 
-<div class="head k-gutter">
-	<h1>Browse</h1>
-	<form
-		class="searchbar"
-		role="search"
-		onsubmit={(e) => {
-			e.preventDefault();
-			writeQuery.flush();
-		}}
-	>
-		<Icon name="search" size={20} />
-		<input
-			type="search"
-			name="q"
-			autocomplete="off"
-			enterkeyhint="search"
-			aria-label="Search series, authors and alternative titles"
-			bind:value={qInput}
-			oninput={() => writeQuery(qInput)}
-			placeholder="Search series, authors…"
+<div class="browse">
+	<div class="head k-gutter">
+		<h1>Browse</h1>
+		<form
+			class="searchbar"
+			role="search"
+			onsubmit={(e) => {
+				e.preventDefault();
+				writeQuery.flush();
+			}}
+		>
+			<Icon name="search" size={20} />
+			<input
+				type="search"
+				name="q"
+				autocomplete="off"
+				enterkeyhint="search"
+				aria-label="Search series, authors and alternative titles"
+				bind:value={qInput}
+				oninput={() => writeQuery(qInput)}
+				placeholder="Search series, authors…"
+			/>
+			{#if qInput}
+				<button type="button" class="clear" aria-label="Clear search" onclick={clearSearch}
+					><Icon name="x" size={18} /></button
+				>
+			{/if}
+		</form>
+	</div>
+
+	<div class="body k-gutter">
+		<FilterPanel
+			open={filtersOpen}
+			{draft}
+			onchange={(next) => (draft = next)}
+			tags={tagData.tags}
+			tagSource={tagData.source}
+			{tagsLoading}
+			{nsfw}
+			signedIn={!!auth.user}
+			changes={pendingChanges}
+			{canReset}
+			onapply={applyFilters}
+			onreset={resetDraft}
+			onclose={closeSheet}
 		/>
-		{#if qInput}
-			<button type="button" class="clear" aria-label="Clear search" onclick={clearSearch}
-				><Icon name="x" size={18} /></button
-			>
-		{/if}
-	</form>
-</div>
 
-<div class="body k-gutter">
-	<FilterPanel
-		open={filtersOpen}
-		{draft}
-		onchange={(next) => (draft = next)}
-		tags={tagData.tags}
-		tagSource={tagData.source}
-		{tagsLoading}
-		{nsfw}
-		signedIn={!!auth.user}
-		changes={pendingChanges}
-		{canReset}
-		onapply={applyFilters}
-		onreset={resetDraft}
-		onclose={closeSheet}
-	/>
-
-	<div class="results" id="browse-results" aria-busy={rowsLoading}>
-		<div class="results-head">
-			<div class="results-title">
-				<h2 class="rt">{applied.q ? `“${applied.q}”` : 'All series'}</h2>
-				<span class="rc" aria-live="polite">{countLabel}</span>
-			</div>
-			<div class="controls">
-				<button
-					type="button"
-					class="filter-trigger"
-					aria-haspopup="dialog"
-					aria-expanded={filtersOpen}
-					onclick={() => (filtersOpen = true)}
-				>
-					<Icon name="sliders-h" size={16} />Filters{#if chips.length}<span
-							class="ft-badge"
-							aria-hidden="true">{chips.length}</span
-						><span class="sr-only">, {chips.length} active</span>{/if}
-				</button>
-				<SortMenu
-					options={sortOpts}
-					value={sortValue}
-					dir={dirValue}
-					onselect={sortBy}
-					ontoggledir={flipDir}
-				/>
-			</div>
-		</div>
-
-		<ActiveFilters {chips} onapply={go} onclear={() => go(clearFilters(applied))} />
-
-		{#if searchNotice}
-			<div class="notice" role="status">
-				<Icon name="alert" size={16} />
-				<span>{searchNotice}</span>
-			</div>
-		{/if}
-		{#if unapplied.length}
-			<div class="notice" role="status">
-				<Icon name="alert" size={16} />
-				<span
-					>This server doesn't support every filter yet, so these weren't applied: {unapplied.join(
-						', ',
-					)}.</span
-				>
-			</div>
-		{/if}
-		{#if federatedIgnores}
-			<p class="scope-note">
-				External-source results are matched live: only tags, format and status narrow them, and they
-				keep the sources' own order.
-			</p>
-		{/if}
-
-		{#if rowsLoading}
-			<CardGridSkeleton count={12} />
-		{:else if rowsError}
-			<div class="empty">
-				<div class="empty-icon error"><Icon name="alert" size={24} /></div>
-				<h3 class="empty-title">Couldn't load results</h3>
-				<p class="empty-desc">
-					Something went wrong reaching the server. Check your connection and try again.
-				</p>
-				<button type="button" class="empty-btn" onclick={retryRows}>Retry</button>
-			</div>
-		{:else if results.length}
-			<div class="grid">
-				{#each results as m (m.id ?? m.title)}
-					<MangaCard
-						title={m.title}
-						sub={cardSub(m)}
-						rating={m.rating.toFixed(1)}
-						cover={m.cover}
-						id={m.id}
-						flagType={m.type}
-						status={{ label: STATUS_META[m.status].label, color: STATUS_META[m.status].color }}
-						translators={m.translators ?? []}
-					/>
-				{/each}
-			</div>
-			{#if canSearchExternal}
-				<div class="ext-search">
-					<span class="ext-hint">Not finding it in the catalogue?</span>
-					<button type="button" class="ext-btn" onclick={requestFederated}>
-						<Icon name="search" size={15} />Search external sources
+		<!-- A focusable scroll region lets keyboard users scroll the desktop results. -->
+		<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+		<section
+			class="results k-scrollbar-slim"
+			id="browse-results"
+			aria-label="Browse results"
+			aria-busy={rowsLoading}
+			tabindex="0"
+			bind:this={resultsElement}
+		>
+			<div class="results-head" id="browse-results-top">
+				<div class="results-title">
+					<h2 class="rt">{applied.q ? `“${applied.q}”` : 'All series'}</h2>
+					<span class="rc" aria-live="polite">{countLabel}</span>
+				</div>
+				<div class="controls">
+					<button
+						type="button"
+						class="filter-trigger"
+						aria-haspopup="dialog"
+						aria-expanded={filtersOpen}
+						onclick={() => (filtersOpen = true)}
+					>
+						<Icon name="sliders-h" size={16} />Filters{#if chips.length}<span
+								class="ft-badge"
+								aria-hidden="true">{chips.length}</span
+							><span class="sr-only">, {chips.length} active</span>{/if}
 					</button>
+					<SortMenu
+						options={sortOpts}
+						value={sortValue}
+						dir={dirValue}
+						onselect={sortBy}
+						ontoggledir={flipDir}
+					/>
+				</div>
+			</div>
+
+			<ActiveFilters {chips} onapply={go} onclear={() => go(clearFilters(applied))} />
+
+			{#if searchNotice}
+				<div class="notice" role="status">
+					<Icon name="alert" size={16} />
+					<span>{searchNotice}</span>
 				</div>
 			{/if}
-		{:else if !searchNotice}
-			<!-- Honest empties: with every filter resolved server-side, an empty page means the
+			{#if unapplied.length}
+				<div class="notice" role="status">
+					<Icon name="alert" size={16} />
+					<span
+						>This server doesn't support every filter yet, so these weren't applied: {unapplied.join(
+							', ',
+						)}.</span
+					>
+				</div>
+			{/if}
+			{#if federatedIgnores}
+				<p class="scope-note">
+					External-source results are matched live: only tags, format and status narrow them, and
+					they keep the sources' own order.
+				</p>
+			{/if}
+
+			{#if rowsLoading}
+				<CardGridSkeleton count={12} />
+			{:else if rowsError}
+				<div class="empty">
+					<div class="empty-icon error"><Icon name="alert" size={24} /></div>
+					<h3 class="empty-title">Couldn't load results</h3>
+					<p class="empty-desc">
+						Something went wrong reaching the server. Check your connection and try again.
+					</p>
+					<button type="button" class="empty-btn" onclick={retryRows}>Retry</button>
+				</div>
+			{:else if results.length}
+				<div class="grid">
+					{#each results as m (m.id ?? m.title)}
+						<MangaCard
+							title={m.title}
+							sub={cardSub(m)}
+							rating={m.rating.toFixed(1)}
+							cover={m.cover}
+							id={m.id}
+							flagType={m.type}
+							status={{ label: STATUS_META[m.status].label, color: STATUS_META[m.status].color }}
+							translators={m.translators ?? []}
+						/>
+					{/each}
+				</div>
+				{#if canSearchExternal}
+					<div class="ext-search">
+						<span class="ext-hint">Not finding it in the catalogue?</span>
+						<button type="button" class="ext-btn" onclick={requestFederated}>
+							<Icon name="search" size={15} />Search external sources
+						</button>
+					</div>
+				{/if}
+			{:else if !searchNotice}
+				<!-- Honest empties: with every filter resolved server-side, an empty page means the
 			     filtered catalogue is genuinely empty — so say WHICH thing emptied it and offer
 			     the one action that widens it. -->
-			<div class="empty">
-				<div class="empty-icon"><Icon name="search" size={24} /></div>
-				{#if chips.length}
-					<h3 class="empty-title">No series match these filters</h3>
-					<p class="empty-desc">
-						{applied.q
-							? `Nothing matching “${applied.q}” passes every filter. Remove a filter or two, or clear them all.`
-							: 'Remove a filter or two, or clear them all.'}
-					</p>
-					<div class="empty-actions">
-						<button type="button" class="empty-btn" onclick={() => go(clearFilters(applied))}
-							>Clear filters</button
-						>
+				<div class="empty">
+					<div class="empty-icon"><Icon name="search" size={24} /></div>
+					{#if chips.length}
+						<h3 class="empty-title">No series match these filters</h3>
+						<p class="empty-desc">
+							{applied.q
+								? `Nothing matching “${applied.q}” passes every filter. Remove a filter or two, or clear them all.`
+								: 'Remove a filter or two, or clear them all.'}
+						</p>
+						<div class="empty-actions">
+							<button type="button" class="empty-btn" onclick={() => go(clearFilters(applied))}
+								>Clear filters</button
+							>
+							{#if canSearchExternal}
+								<button type="button" class="empty-btn secondary" onclick={requestFederated}
+									>Search external sources</button
+								>
+							{/if}
+						</div>
+					{:else if applied.q}
+						<h3 class="empty-title">No matches for “{applied.q}”</h3>
+						<p class="empty-desc">
+							{canSearchExternal
+								? 'Nothing in the catalogue matches. Try searching external sources.'
+								: 'Check the spelling, or try a shorter or alternative title.'}
+						</p>
 						{#if canSearchExternal}
-							<button type="button" class="empty-btn secondary" onclick={requestFederated}
+							<button type="button" class="empty-btn" onclick={requestFederated}
 								>Search external sources</button
 							>
+						{:else}
+							<button type="button" class="empty-btn" onclick={clearSearch}>Clear search</button>
 						{/if}
-					</div>
-				{:else if applied.q}
-					<h3 class="empty-title">No matches for “{applied.q}”</h3>
-					<p class="empty-desc">
-						{canSearchExternal
-							? 'Nothing in the catalogue matches. Try searching external sources.'
-							: 'Check the spelling, or try a shorter or alternative title.'}
-					</p>
-					{#if canSearchExternal}
-						<button type="button" class="empty-btn" onclick={requestFederated}
-							>Search external sources</button
-						>
 					{:else}
-						<button type="button" class="empty-btn" onclick={clearSearch}>Clear search</button>
+						<h3 class="empty-title">Nothing to browse yet</h3>
+						<p class="empty-desc">The catalogue is empty right now. Check back soon.</p>
 					{/if}
-				{:else}
-					<h3 class="empty-title">Nothing to browse yet</h3>
-					<p class="empty-desc">The catalogue is empty right now. Check back soon.</p>
-				{/if}
-			</div>
-		{/if}
+				</div>
+			{/if}
 
-		<!-- Native path only: the federated fan-out returns one deduped page with no server
+			<!-- Native path only: the federated fan-out returns one deduped page with no server
 		     pager. `Pager` hides itself on page 1 with no next page; past page 1 it stays
 		     through a load (inert links) so the landmark and live region survive the click
 		     that triggered it. `aria-controls` is deliberately not passed: the only candidate
 		     region is `.results`, which CONTAINS this pager. -->
-		{#if !rowsAreFederated}
-			<Pager
-				page={applied.page}
-				{hasNext}
-				total={totalCount}
-				pageSize={BROWSE_PAGE_SIZE}
-				count={results.length}
-				loading={rowsLoading}
-				href={(p) => withPage(page.url, p)}
-				label="Browse results pages"
-				scrollTarget="browse-results"
-			/>
-		{/if}
+			{#if !rowsAreFederated}
+				<Pager
+					page={applied.page}
+					{hasNext}
+					total={totalCount}
+					pageSize={BROWSE_PAGE_SIZE}
+					count={results.length}
+					loading={rowsLoading}
+					href={(p) => withPage(page.url, p)}
+					label="Browse results pages"
+					scrollTarget="browse-results-top"
+				/>
+			{/if}
+		</section>
 	</div>
 </div>
 
 <style>
 	.head {
+		display: grid;
+		grid-template-columns: 300px minmax(0, 1fr);
+		align-items: center;
+		gap: 36px;
 		padding-top: 40px;
 	}
 	h1 {
 		font-size: 34px;
-		margin: 0 0 18px;
+		margin: 0;
 		color: var(--k-text-bright);
 	}
 	.searchbar {
 		display: flex;
 		align-items: center;
 		gap: 12px;
-		max-width: 960px;
-		height: 54px;
+		max-width: none;
+		height: 48px;
 		padding: 0 8px 0 20px;
 		background: var(--k-surface-2);
 		border: 1px solid var(--k-border-3);
@@ -737,9 +763,7 @@
 		align-items: start;
 	}
 	.results {
-		/* Clears the sticky header when the pager aligns this column to the top of the
-		   viewport on a page step. */
-		scroll-margin-top: calc(var(--k-header-h) + 12px);
+		position: relative;
 		min-width: 0;
 		display: flex;
 		flex-direction: column;
@@ -938,9 +962,45 @@
 		color: var(--k-text);
 	}
 
+	@media (min-width: 960px) {
+		.browse {
+			display: flex;
+			flex-direction: column;
+			height: calc(100dvh - var(--k-header-h));
+			/* Clip instead of hidden: pager focus must not scroll these shared ancestors. */
+			overflow: clip;
+		}
+		.head {
+			width: 100%;
+			flex-shrink: 0;
+		}
+		.body {
+			width: 100%;
+			flex: 1;
+			min-height: 0;
+			grid-template-rows: minmax(0, 1fr);
+			align-items: stretch;
+			padding-bottom: 24px;
+			overflow: clip;
+		}
+		.results {
+			min-height: 0;
+			overflow-y: auto;
+			overscroll-behavior: contain;
+			padding-right: 12px;
+			padding-bottom: 24px;
+		}
+	}
+
 	/* Must match FilterPanel's SHEET_QUERY: below it the panel is a sheet, out of the
 	   grid flow, and the toolbar grows a Filters button to open it. */
 	@media (max-width: 959px) {
+		.head {
+			display: block;
+		}
+		h1 {
+			margin-bottom: 18px;
+		}
 		.body {
 			grid-template-columns: minmax(0, 1fr);
 			gap: 0;
