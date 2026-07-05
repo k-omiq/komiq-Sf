@@ -51,6 +51,7 @@ type Query {
 	# auth
 	session: Session # [komika] current session or null
 	myActivity(limit: Int = 20): [Activity!]! # [komika] the signed-in user's recent activity feed (empty when signed out)
+	myComments(page: Int = 1): MyCommentPage! # [komika] the signed-in user's OWN comments (top-level + replies), newest first, 20 per page, each with its tallies, direct reply count and resolved series/chapter (empty page when signed out)
 	notifications(page: Int = 1): [Notification!]! # [komika] the viewer's inbound bell feed, newest-first (empty when signed out)
 	unreadNotificationCount: Int! # [komika] unread count for the bell badge (0 when signed out)
 	# ops / admin (all require isAdmin)
@@ -453,6 +454,32 @@ type Comment {
 	myVote: Int! # [komika] the viewer's own vote: 1 like, -1 dislike, 0 none
 }
 
+# [komika] One of the viewer's own comments (the profile's "My comments" list). The owning
+# series is resolved server-side (a chapter thread's series, as on Notification) along with
+# its title and the chapter number, so a row renders and deep-links without a lookup.
+type MyComment {
+	id: ID!
+	targetType: String! # "chapter" | "series"
+	targetId: ID!
+	parentId: ID # reply parent; null = top-level comment
+	body: String!
+	hasSpoiler: Boolean!
+	createdAt: String!
+	likes: Int!
+	dislikes: Int!
+	replyCount: Int! # direct replies (banned authors excluded)
+	seriesId: ID # owning series; null when unresolvable
+	seriesTitle: String
+	chapterNumber: String # chapter threads only, e.g. "12" / "10.5"
+}
+
+type MyCommentPage {
+	items: [MyComment!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int
+}
+
 # [komika] Result of voteComment — a comment's fresh tallies + the viewer's vote.
 type CommentVote {
 	likes: Int!
@@ -694,7 +721,7 @@ type UpdateFeedRow {
 	# safe against a server that predates the field.
 	announcedAt: String
 	detectedAt: String # when OUR scanner noticed; per-SERIES, Suwayomi-only, never stamped on a baseline scan. Tooltip only, never a sort key. NOT a substitute for announcedAt
-	rating: Float # aggregate user rating 0-10; null when unrated
+	rating: Float # aggregate rating 0-10: our readers' review average where they have rated the work, else MangaDex's community rating (statistics cache, `work_stats`); null ONLY when neither has one — the sole case the card labels "Unrated"
 	isNsfw: Boolean!
 }
 

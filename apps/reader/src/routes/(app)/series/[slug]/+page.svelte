@@ -754,7 +754,15 @@
 	$effect(() => {
 		seriesId; // a different series starts fresh
 		untrack(() => {
-			tab = 'chapters';
+			// `#discussion` opens straight onto the thread — the profile's "My comments"
+			// links here — and brings the tab strip into view.
+			const toDiscussion = page.url.hash === '#discussion';
+			tab = toDiscussion ? 'discussion' : 'chapters';
+			if (toDiscussion) {
+				requestAnimationFrame(() =>
+					document.getElementById('chapters')?.scrollIntoView({ block: 'start' }),
+				);
+			}
 			aboutOpen = false;
 			rateOpen = false;
 			sortOpen = false;
@@ -999,7 +1007,7 @@
 						canComplete={ended}
 					/>
 				{/if}
-				<a class="read" href={readHref}
+				<a class="read-btn" href={readHref}
 					><Icon name="book-open" size={16} />{isRead
 						? `Continue Ch. ${continueCh}`
 						: 'Start reading'}</a
@@ -1694,7 +1702,7 @@
 		gap: 10px;
 	}
 	.lib,
-	.read {
+	.read-btn {
 		height: 46px;
 		padding: 0 22px;
 		border-radius: var(--k-radius-md);
@@ -1721,11 +1729,11 @@
 		box-shadow: inset 0 0 0 1px rgba(95, 191, 126, 0.5);
 		color: var(--k-ongoing);
 	}
-	.read {
+	.read-btn {
 		background: var(--k-primary);
 		color: var(--k-on-primary);
 	}
-	.read:hover {
+	.read-btn:hover {
 		background: var(--k-primary-hover);
 	}
 	.actions :global(.sm-btn),
@@ -2795,7 +2803,7 @@
 			gap: 8px;
 		}
 		.lib,
-		.read {
+		.read-btn {
 			flex: 1 1 140px;
 			justify-content: center;
 			padding: 0 14px;

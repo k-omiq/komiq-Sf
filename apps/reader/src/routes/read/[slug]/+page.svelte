@@ -34,12 +34,15 @@
 	// `externalChapterHref` in source.ts — never raw upstream text in an href.
 	const externalUrl = $derived(data.externalUrl ?? null);
 	const externalHost = $derived(externalChapterHost(data.externalUrl));
-	// The open copy on its original site ("Read on mangadex.org"). The data layer already
-	// validated it; re-checked here because this string becomes an `href` and the check is
-	// the whole XSS defence. Null (a Suwayomi copy, an unknown id shape) hides the link.
+	// "Read on source": the open copy on its original site ("This chapter on mangadex.org"),
+	// else — when the chapter's own URL is unknown, as for every Suwayomi copy — the reading
+	// source's series page. The data layer already validated both; re-checked here because
+	// the string becomes an `href` and the check is the whole XSS defence. Null when neither
+	// is known: the menu then explains instead of offering a dead link.
 	const readOnSource = $derived.by(() => {
-		const href = externalChapterHref(data.sourceUrl);
-		return href ? { href, host: externalChapterHost(href) } : null;
+		const chapterHref = externalChapterHref(data.sourceUrl);
+		const href = chapterHref ?? externalChapterHref(data.seriesSourceUrl);
+		return href ? { href, host: externalChapterHost(href), chapter: !!chapterHref } : null;
 	});
 
 	// Translators (sources) for this work — switchable from the reader menu. Picking
@@ -53,7 +56,7 @@
 	function switchTranslator(key: string): void {
 		if (!data.workId || key === data.selectedTranslatorKey) return;
 		setPreferredTranslator(data.workId, key);
-		void saveProgress(data.chapterId, currentPageIndex(), readMarked);
+		// Progress for the chapter being left is saved by `beforeNavigate`.
 		closeMenu();
 		// Drop any `?ch=` (chapter ids differ per source) and force the load to re-run
 		// even when we're already at the bare `/read/<workId>` URL — otherwise
@@ -77,7 +80,6 @@
 	}
 	async function openVersion(v: { id: string; src: string | null; current: boolean }) {
 		if (v.current) return;
-		void saveProgress(data.chapterId, currentPageIndex(), readMarked);
 		if (!docked) closeMenu();
 		await goto(versionHref(v));
 		resetWindowScroll();
@@ -190,7 +192,29 @@
 	// SvelteKit blocks a same-route navigation on its load, so without this the old
 	// chapter's pages stay fully painted and the reader looks frozen. Scoped to
 	// `/read/` targets so leaving for the series page or a comment link doesn't fade.
-	const chapterLoading = $derived(navigating.to?.url.pathname.startsWith('/read/') ?? false);
+	//
+	// Keyed on the navigation's own `complete` promise, NOT on `navigating.to` alone.
+	// SvelteKit does not clear `navigating` when a navigation is ABORTED (another
+	// navigation or an `invalidate()` takes its token — kit 2.70 `navigate()` returns
+	// without resetting it), so an overlay driven by `navigating.to` alone dimmed the old
+	// chapter, blocked its pointer events, and never lifted: the production "page turns
+	// grey but the change doesn't happen". `complete` settles on every outcome (fulfilled,
+	// aborted, cancelled), and a deadline lifts the overlay even if it somehow never does,
+	// so the reader can always try again.
+	const NAV_STUCK_MS = 15_000;
+	const pendingNav = $derived(
+		navigating.to?.url.pathname.startsWith('/read/') ? navigating.complete : null,
+	);
+	let settledNav = $state<Promise<void> | null>(null);
+	$effect(() => {
+		const nav = pendingNav;
+		if (!nav) return;
+		const settle = () => (settledNav = nav);
+		nav.then(settle, settle);
+		const timer = setTimeout(settle, NAV_STUCK_MS);
+		return () => clearTimeout(timer);
+	});
+	const chapterLoading = $derived(!!pendingNav && settledNav !== pendingNav);
 
 	// Popularity: count ONE view per chapter open — for every reader, signed-in or
 	// anonymous (the product decision is to count everyone). Keyed on the chapter so
@@ -336,16 +360,21 @@
 
 	function chapterHref(id: string) {
 		// Keep prev/next on the same source (S2) — chapter ids are per-source.
-		const src = data.readingSrc ? `&src=${data.readingSrc}` : '';
-		return `/read/${data.seriesId}?ch=${id}${src}`;
+		const src = data.readingSrc ? `&src=${encodeURIComponent(data.readingSrc)}` : '';
+		return `/read/${data.seriesId}?ch=${encodeURIComponent(id)}${src}`;
 	}
 
 	async function openChapter(id?: string) {
 		if (!docked) menuOpen = false;
 		if (!id) return;
-		// Persist how far we got in the chapter we're leaving.
-		void saveProgress(data.chapterId, currentPageIndex(), readMarked);
-		await goto(chapterHref(id));
+		const href = chapterHref(id);
+		// A second tap on the same control while its chapter is still loading is a no-op,
+		// not a restarted navigation.
+		const to = navigating.to?.url;
+		if (to && `${to.pathname}${to.search}` === href) return;
+		// Progress for the chapter being left is saved by `beforeNavigate` — NOT here as
+		// well: the duplicate write only doubled the requests racing the navigation.
+		await goto(href);
 		// Immediate jump so a same-chapter re-open (chapterId unchanged, the
 		// reset effect does not re-run) still lands on the first image. The
 		// chapter-change effect re-asserts after layout when the id DID change.
@@ -365,18 +394,35 @@
 	$effect(() => {
 		const id = data.nextChapterId;
 		const deepEnough = readPct >= PREFETCH_AT_PCT;
-		// Off-site next chapter (MangaPlus/Comikey/…): its load deliberately returns no
-		// pages, so prefetching it can only ever warm an empty result.
-		if (!id || !deepEnough || nextChapter?.externalUrl || prefetchedFor === id) return;
+		if (!id || !deepEnough || prefetchedFor === id) return;
 		// Set before awaiting so a burst of scroll frames can't launch it twice.
 		prefetchedFor = id;
+		warmChapter(id);
+	});
+
+	/**
+	 * Run the load a chapter navigation would run, ahead of the click, and warm its first
+	 * page images. Called by the 40% rule above and on INTENT — pointer over, focus or
+	 * touch on any previous/next control — so even a reader who jumps straight to "next"
+	 * from the top of a chapter usually clicks into a load that is already under way.
+	 *
+	 * SvelteKit keeps ONE preloaded result, and reuses it only for a navigation to the
+	 * identical URL; a hover on "previous" therefore replaces a warmed "next", which is
+	 * why intent re-warms instead of trusting an earlier preload. Same-URL calls share the
+	 * in-flight load, so repeated hovers cost nothing. Off-site chapters
+	 * (MangaPlus/Comikey/…) load no pages by design, so there is nothing to warm.
+	 */
+	function warmChapter(id: string | undefined): void {
+		if (!id || id === data.chapterId) return;
+		if (data.chapters.find((c) => c.id === id)?.externalUrl) return;
 		void preloadData(chapterHref(id))
 			.then((res) => {
 				// `redirect` results carry no data; only a `loaded` one has pages.
 				if (res?.type !== 'loaded') return;
 				const next = (res.data as { pages?: { url?: string }[] } | undefined)?.pages ?? [];
 				for (const pg of next.slice(0, PREFETCH_IMAGES)) {
-					if (!pg?.url) continue;
+					if (!pg?.url || warmedUrls.has(pg.url)) continue;
+					warmedUrls.add(pg.url);
 					const warm = new Image();
 					warm.decoding = 'async';
 					warm.src = pg.url;
@@ -385,7 +431,13 @@
 			// Best-effort only: a failed prefetch must never surface as an unhandled
 			// rejection, and the real navigation will fetch (and report) for itself.
 			.catch(() => {});
-	});
+	}
+
+	/** Intent handlers for a control that opens chapter `id` (pointer, keyboard, touch). */
+	function warmOn(id: string | undefined) {
+		const warm = () => warmChapter(id);
+		return { onpointerenter: warm, onfocus: warm, ontouchstart: warm };
+	}
 
 	// ---- strip position --------------------------------------------------------
 	let stripEl = $state<HTMLElement | null>(null);
@@ -803,6 +855,37 @@
 					>
 				</div>
 			{/if}
+			<!-- "Read on source": the open copy on its original site, for the source being read.
+			     New tab, no opener and no referrer: the destination is a third-party site and
+			     gets neither a handle on this window nor the reader URL. Always rendered, so a
+			     copy with no known link says so instead of the action silently vanishing. -->
+			{#if readOnSource}
+				<a
+					class="dr-source"
+					href={readOnSource.href}
+					target="_blank"
+					rel="noopener noreferrer"
+					title={readOnSource.href}
+				>
+					<Icon name="globe" size={16} />
+					<span class="dr-source-text">
+						<span class="dr-source-cap">Read on source</span>
+						<span class="dr-source-sub"
+							>{readOnSource.chapter ? 'This chapter on' : 'Series page on'}
+							{readOnSource.host}</span
+						>
+					</span>
+					<Icon name="arrow-right" size={14} />
+				</a>
+			{:else}
+				<div class="dr-source off" role="note">
+					<Icon name="globe" size={16} />
+					<span class="dr-source-text">
+						<span class="dr-source-cap">Read on source</span>
+						<span class="dr-source-sub">No link to this copy on its source site is known</span>
+					</span>
+				</div>
+			{/if}
 		{/if}
 
 		{#if hasPages}
@@ -843,6 +926,7 @@
 					class="step"
 					aria-label="Previous chapter"
 					disabled={!data.prevChapterId}
+					{...warmOn(data.prevChapterId)}
 					onclick={() => openChapter(data.prevChapterId)}
 					><Icon name="chevron-left" size={16} /></button
 				>
@@ -865,6 +949,7 @@
 					class="step"
 					aria-label="Next chapter"
 					disabled={!data.nextChapterId}
+					{...warmOn(data.nextChapterId)}
 					onclick={() => openChapter(data.nextChapterId)}
 					><Icon name="chevron-right" size={16} /></button
 				>
@@ -912,20 +997,6 @@
 						</div>
 					{/if}
 				</div>
-				{#if readOnSource}
-					<!-- New tab, no opener and no referrer: the destination is a third-party
-					     site and gets neither a handle on this window nor the reader URL. -->
-					<a
-						class="dr-source"
-						href={readOnSource.href}
-						target="_blank"
-						rel="noopener noreferrer"
-						title={readOnSource.href}
-					>
-						<Icon name="globe" size={14} />
-						<span>Read on {readOnSource.host}</span>
-					</a>
-				{/if}
 			</div>
 		{/if}
 
@@ -1037,12 +1108,16 @@
 	</div>
 {/snippet}
 
+<!-- Links in here preload on TAP, not hover (the app default): SvelteKit keeps a single
+     preloaded result, and a pointer drifting over a comment author or the series link on
+     the way to "Next chapter" would otherwise throw away the warmed chapter. -->
 <div
 	class="reader"
 	class:docked
 	class:gaps
 	class:header-off={headerMode === 'hidden'}
 	style="--w:{width}px"
+	data-sveltekit-preload-data="tap"
 >
 	<!-- top header -->
 	<header class="chrome" class:hidden={chromeHidden}>
@@ -1067,6 +1142,7 @@
 				aria-label="Previous chapter"
 				title="Previous chapter"
 				disabled={!data.prevChapterId}
+				{...warmOn(data.prevChapterId)}
 				onclick={() => openChapter(data.prevChapterId)}
 				><Icon name="chevrons-left" size={16} /></button
 			>
@@ -1075,6 +1151,7 @@
 				aria-label="Next chapter"
 				title="Next chapter"
 				disabled={!data.nextChapterId}
+				{...warmOn(data.nextChapterId)}
 				onclick={() => openChapter(data.nextChapterId)}
 				><Icon name="chevrons-right" size={16} /></button
 			>
@@ -1131,12 +1208,18 @@
 				</p>
 				<div class="no-pages-btns">
 					{#if data.prevChapterId}
-						<button class="prev-ch" onclick={() => openChapter(data.prevChapterId)}
+						<button
+							class="prev-ch"
+							{...warmOn(data.prevChapterId)}
+							onclick={() => openChapter(data.prevChapterId)}
 							><Icon name="chevron-left" size={16} strokeWidth={2.4} />Previous chapter</button
 						>
 					{/if}
 					{#if data.nextChapterId}
-						<button class="next-ch" onclick={() => openChapter(data.nextChapterId)}
+						<button
+							class="next-ch"
+							{...warmOn(data.nextChapterId)}
+							onclick={() => openChapter(data.nextChapterId)}
 							>Next chapter<Icon name="arrow-right" size={16} strokeWidth={2.4} /></button
 						>
 					{/if}
@@ -1227,12 +1310,18 @@
 				     chapters" becomes the primary action instead of a dead control. -->
 				<div class="eoc-btns">
 					{#if data.prevChapterId}
-						<button class="prev-ch" onclick={() => openChapter(data.prevChapterId)}
+						<button
+							class="prev-ch"
+							{...warmOn(data.prevChapterId)}
+							onclick={() => openChapter(data.prevChapterId)}
 							><Icon name="chevron-left" size={16} strokeWidth={2.4} />Previous chapter</button
 						>
 					{/if}
 					{#if data.nextChapterId}
-						<button class="next-ch" onclick={() => openChapter(data.nextChapterId)}
+						<button
+							class="next-ch"
+							{...warmOn(data.nextChapterId)}
+							onclick={() => openChapter(data.nextChapterId)}
 							>Next chapter<Icon name="arrow-right" size={16} strokeWidth={2.4} /></button
 						>
 					{/if}
@@ -1777,27 +1866,54 @@
 	.dr-source {
 		display: flex;
 		align-items: center;
-		gap: 8px;
+		gap: 10px;
 		min-width: 0;
-		margin-top: 8px;
-		padding: 9px 12px;
-		border-radius: 10px;
+		margin: 2px 0 4px;
+		padding: 10px 12px;
+		border-radius: 12px;
 		border: 1px solid var(--k-border-2);
-		font-size: 12.5px;
-		font-weight: 700;
+		background: var(--k-surface-4);
 		color: var(--k-text-2);
 		text-decoration: none;
 	}
-	.dr-source span {
+	.dr-source :global(svg) {
+		flex: 0 0 auto;
+	}
+	.dr-source-text {
+		flex: 1;
 		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		line-height: 1.3;
+	}
+	.dr-source-cap {
+		font-size: 13px;
+		font-weight: 700;
+		color: var(--k-text-bright);
+	}
+	.dr-source-sub {
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--k-text-dim);
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
 	}
-	.dr-source:hover,
-	.dr-source:focus-visible {
+	a.dr-source:hover,
+	a.dr-source:focus-visible {
 		border-color: var(--k-accent);
-		color: var(--k-text-bright);
+		color: var(--k-accent);
+	}
+	.dr-source.off {
+		background: transparent;
+		border-style: dashed;
+		color: var(--k-text-faint);
+	}
+	.dr-source.off .dr-source-cap {
+		color: var(--k-text-3);
+	}
+	.dr-source.off .dr-source-sub {
+		white-space: normal;
 	}
 	.dr-report {
 		display: inline-flex;
@@ -1865,7 +1981,9 @@
 	   bare `main.loading`. */
 	main.loading {
 		opacity: 0.32;
-		transition: opacity 0.12s ease-out;
+		/* Held back a beat: a preloaded chapter swaps in well under this, and dimming for
+		   one frame first reads as a flicker rather than as speed. */
+		transition: opacity 0.15s ease-out 0.15s;
 	}
 	main.loading :global(*) {
 		pointer-events: none;

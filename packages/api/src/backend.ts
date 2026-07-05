@@ -214,6 +214,10 @@ export interface Backend {
 	/** The signed-in user's recent activity feed (newest first; empty when signed
 	 * out). Optional: only the unified Komika API implements it. */
 	myActivity?(limit?: number): Promise<Activity[]>;
+	/** The signed-in user's OWN comments, newest first (empty page when signed out) —
+	 * the profile's "My comments" list. Optional: only the unified Komika API
+	 * implements it. */
+	myComments?(page?: number): Promise<Paginated<MyComment>>;
 
 	// --- canonical catalogue (MangaDex mirror) ---
 	/** Recently-updated mirrored MangaDex works + their latest stored chapter, newest
@@ -684,6 +688,29 @@ export interface Activity {
 	/** The series/chapter id acted on; the client resolves a display title. */
 	targetId: Id | null;
 	createdAt: string;
+}
+
+/** One of the viewer's own comments (see {@link Backend.myComments}). */
+export interface MyComment {
+	id: Id;
+	targetType: CommentTargetType;
+	targetId: Id;
+	/** The comment this one replies to; null for a top-level comment. */
+	parentId: Id | null;
+	body: string;
+	hasSpoiler: boolean;
+	createdAt: string;
+	likes: number;
+	dislikes: number;
+	/** Direct replies to this comment. */
+	replyCount: number;
+	/** The series the thread hangs off (a chapter thread's owning series); null when
+	 *  the server can't resolve it. */
+	seriesId: Id | null;
+	/** That series' display title, when known. */
+	seriesTitle: string | null;
+	/** Chapter number for a chapter thread (e.g. "12", "10.5"), when known. */
+	chapterNumber: string | null;
 }
 
 export interface RegisterInput {

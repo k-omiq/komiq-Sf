@@ -1181,6 +1181,31 @@ export const UPDATE_PROFILE = /* GraphQL */ `
 	}
 `;
 
+export const MY_COMMENTS = /* GraphQL */ `
+	query MyComments($page: Int) {
+		myComments(page: $page) {
+			items {
+				id
+				targetType
+				targetId
+				parentId
+				body
+				hasSpoiler
+				createdAt
+				likes
+				dislikes
+				replyCount
+				seriesId
+				seriesTitle
+				chapterNumber
+			}
+			page
+			hasNextPage
+			total
+		}
+	}
+`;
+
 export const MY_ACTIVITY = /* GraphQL */ `
 	query MyActivity($limit: Int) {
 		myActivity(limit: $limit) {

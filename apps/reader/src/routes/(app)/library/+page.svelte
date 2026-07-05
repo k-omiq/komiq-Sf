@@ -1,9 +1,11 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { invalidate } from '$app/navigation';
+	import { onMount, untrack } from 'svelte';
+	import { invalidate, replaceState } from '$app/navigation';
+	import { page } from '$app/state';
 	import Icon from '$lib/components/Icon.svelte';
 	import Cover from '$lib/components/Cover.svelte';
 	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
+	import Dropdown, { type DropdownOption } from '$lib/components/Dropdown.svelte';
 	import FlagBadge from '$lib/components/FlagBadge.svelte';
 	import StatusMenu from '$lib/components/StatusMenu.svelte';
 	import {
@@ -12,7 +14,7 @@
 		type ContinueRowView,
 		type LibraryRowView,
 	} from '$lib/data/source';
-	import { slug, type Shelf } from '$lib/data/types';
+	import { slug, type ComicType, type Shelf } from '$lib/data/types';
 
 	let { data } = $props();
 	// Refresh releases and progress when returning to a tab left open during a scan.
@@ -52,27 +54,95 @@
 		};
 	});
 
-	/**
-	 * Descending by an RFC-3339 field, with blanks pushed to the end.
-	 *
-	 * Parse RFC 3339 timestamps to compare instants across timezone offsets and
-	 * fractional-second precision. Ties break on title so the order is stable rather than
-	 * dependent on however the rows happened to arrive.
-	 */
-	function byDateDesc(key: 'latestChapterAt' | 'lastReadAt') {
-		return (a: LibraryRowView, b: LibraryRowView) => {
-			const x = a[key];
-			const y = b[key];
-			if (!x !== !y) return x ? -1 : 1;
-			return (Date.parse(y) || 0) - (Date.parse(x) || 0) || a.title.localeCompare(b.title);
-		};
-	}
+	type ShelfKey = 'all' | Shelf | 'favorites';
+	type SortKey = 'updated' | 'read' | 'added' | 'alpha' | 'unread';
+	type Dir = 'asc' | 'desc';
+	type FormatKey = 'all' | ComicType;
 
-	let shelf = $state<'all' | Shelf | 'favorites'>('all');
+	const shelfDefs: readonly { key: ShelfKey; label: string }[] = [
+		{ key: 'all', label: 'All' },
+		{ key: 'reading', label: 'Reading' },
+		{ key: 'completed', label: 'Completed' },
+		{ key: 'onhold', label: 'On Hold' },
+		{ key: 'plan', label: 'Plan to Read' },
+		{ key: 'favorites', label: 'Favorites' },
+	];
+	const sortOptions: readonly DropdownOption<SortKey>[] = [
+		{ value: 'updated', label: 'Latest update' },
+		{ value: 'read', label: 'Recently read' },
+		{ value: 'added', label: 'Recently added' },
+		{ value: 'alpha', label: 'Title' },
+		{ value: 'unread', label: 'Unread chapters' },
+	];
+	const FORMATS: readonly ComicType[] = ['Manga', 'Manhwa', 'Manhua'];
+	// Each sort has a "natural" direction — the one a reader expects on first pick —
+	// and the order toggle names both ends in that sort's own words.
+	const NATURAL_DIR: Record<SortKey, Dir> = {
+		updated: 'desc',
+		read: 'desc',
+		added: 'desc',
+		alpha: 'asc',
+		unread: 'desc',
+	};
+	const DIR_LABEL: Record<SortKey, Record<Dir, string>> = {
+		updated: { desc: 'Newest first', asc: 'Oldest first' },
+		read: { desc: 'Newest first', asc: 'Oldest first' },
+		added: { desc: 'Newest first', asc: 'Oldest first' },
+		alpha: { asc: 'A–Z', desc: 'Z–A' },
+		unread: { desc: 'Most first', asc: 'Fewest first' },
+	};
+
+	// Shelf, sort, order and format live in the query string so a refresh or a shared
+	// link keeps the view. Defaults are written as ABSENCE (a bare /library), and the
+	// title filter stays local — it changes on every keystroke.
+	function param<K extends string>(name: string, allowed: readonly K[], fallback: K): K {
+		const v = page.url.searchParams.get(name);
+		return v && (allowed as readonly string[]).includes(v) ? (v as K) : fallback;
+	}
+	let shelf = $state<ShelfKey>(
+		param(
+			'shelf',
+			shelfDefs.map((d) => d.key),
+			'all',
+		),
+	);
 	// Default is 'updated' — a library's most useful question is "what has new chapters?".
-	// The old default, 'recent', was a no-op chip that just left the backend's order
-	// (date ADDED) untouched while implying reading recency.
-	let sort = $state<'updated' | 'read' | 'added' | 'alpha'>('updated');
+	let sort = $state<SortKey>(
+		param(
+			'sort',
+			sortOptions.map((o) => o.value),
+			'updated',
+		),
+	);
+	let dir = $state<Dir>(param<Dir>('dir', ['asc', 'desc'], NATURAL_DIR[untrack(() => sort)]));
+	let format = $state<FormatKey>(param<FormatKey>('format', ['all', ...FORMATS], 'all'));
+	let query = $state('');
+
+	$effect(() => {
+		const url = new URL(location.href);
+		const sp = url.searchParams;
+		const put = (k: string, v: string | null) => (v === null ? sp.delete(k) : sp.set(k, v));
+		put('shelf', shelf === 'all' ? null : shelf);
+		put('sort', sort === 'updated' ? null : sort);
+		put('dir', dir === NATURAL_DIR[sort] ? null : dir);
+		put('format', format === 'all' ? null : format);
+		if (url.search === location.search) return;
+		// Shallow: `load` never reads the URL, so there is nothing to re-run. Only an
+		// invalid param can make this differ on the very first run, before the router
+		// may be ready — tidying that URL is cosmetic, so a throw there is ignored.
+		untrack(() => {
+			try {
+				replaceState(url, page.state);
+			} catch {
+				/* router not initialised yet */
+			}
+		});
+	});
+
+	function setSort(next: SortKey): void {
+		sort = next;
+		dir = NATURAL_DIR[next];
+	}
 
 	const counts = $derived({
 		all: rows.length,
@@ -83,26 +153,64 @@
 		favorites: rows.filter((c) => c.favorite).length,
 	});
 
+	const onShelf = $derived(
+		shelf === 'all'
+			? rows
+			: shelf === 'favorites'
+				? rows.filter((c) => c.favorite)
+				: rows.filter((c) => c.shelf === shelf),
+	);
+	const formatOptions = $derived<DropdownOption<FormatKey>[]>([
+		{ value: 'all', label: 'All formats', hint: onShelf.length },
+		...FORMATS.map((f) => ({
+			value: f,
+			label: f,
+			hint: onShelf.filter((c) => c.type === f).length,
+		})),
+	]);
+	const needle = $derived(query.trim().toLowerCase());
+	const filtersActive = $derived(format !== 'all' || needle !== '');
+
+	const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
+	const byTitle = (a: LibraryRowView, b: LibraryRowView) => collator.compare(a.title, b.title);
+	const unread = (c: LibraryRowView) => Math.max(0, c.total - c.read);
+
+	/**
+	 * Orders a shelf. Ties break on title so the order is stable rather than dependent
+	 * on however the rows happened to arrive.
+	 *
+	 * The two timestamp sorts parse RFC 3339 (so offsets and fractional seconds compare
+	 * as instants) and keep rows with NO timestamp last in either direction: a series
+	 * that has never had a chapter dated, or has never been opened, is neither the
+	 * newest nor the oldest thing on the shelf — it's unknown.
+	 *
+	 * 'added' is the order the backend already returns (`user_library.created_at DESC`),
+	 * so it sorts nothing; ascending just reverses it.
+	 */
+	function sortRows(list: LibraryRowView[], key: SortKey, d: Dir): LibraryRowView[] {
+		const sign = d === 'asc' ? 1 : -1;
+		if (key === 'added') return d === 'desc' ? list : [...list].reverse();
+		if (key === 'alpha') return [...list].sort((a, b) => sign * byTitle(a, b));
+		if (key === 'unread')
+			return [...list].sort((a, b) => sign * (unread(a) - unread(b)) || byTitle(a, b));
+		const field = key === 'updated' ? 'latestChapterAt' : 'lastReadAt';
+		return [...list].sort((a, b) => {
+			const x = a[field];
+			const y = b[field];
+			if (!x !== !y) return x ? -1 : 1;
+			return sign * ((Date.parse(x) || 0) - (Date.parse(y) || 0)) || byTitle(a, b);
+		});
+	}
+
 	const items = $derived.by(() => {
-		let list =
-			shelf === 'all'
-				? [...rows]
-				: shelf === 'favorites'
-					? rows.filter((c) => c.favorite)
-					: rows.filter((c) => c.shelf === shelf);
-		// 'added' is the order the backend already returns (`user_library.created_at DESC`),
-		// so it sorts nothing. The two timestamp sorts put rows with no timestamp LAST
-		// instead of letting an empty string win a plain descending compare — a series
-		// that has never had a chapter dated, or has never been opened, is the least
-		// recent thing in the shelf, not the most.
-		if (sort === 'alpha') list = [...list].sort((a, b) => a.title.localeCompare(b.title));
-		else if (sort === 'updated') list = [...list].sort(byDateDesc('latestChapterAt'));
-		else if (sort === 'read') list = [...list].sort(byDateDesc('lastReadAt'));
-		return list.map((c) => {
+		let list = onShelf;
+		if (format !== 'all') list = list.filter((c) => c.type === format);
+		if (needle) list = list.filter((c) => c.title.toLowerCase().includes(needle));
+		return sortRows(list, sort, dir).map((c) => {
 			const progress = c.total ? Math.round((c.read / c.total) * 100) : 0;
 			let sub: string;
 			if (c.shelf === 'completed') sub = `Completed · ${c.total} ch`;
-			else if (c.shelf === 'plan') sub = `${c.genre} · ${c.total} ch`;
+			else if (c.shelf === 'plan') sub = c.genre ? `${c.genre} · ${c.total} ch` : `${c.total} ch`;
 			// Read every chapter of a series that is STILL PUBLISHING. The shelf stays
 			// "Reading" (see `deriveShelf`) because the series isn't finished, so the
 			// sub-line names the state that actually holds rather than leaving a
@@ -118,21 +226,16 @@
 		});
 	});
 
-	const sortDefs = [
-		{ key: 'updated', label: 'Latest chapter' },
-		{ key: 'read', label: 'Recently read' },
-		{ key: 'added', label: 'Added' },
-		{ key: 'alpha', label: 'A–Z' },
-	] as const;
+	function clearFilters(): void {
+		format = 'all';
+		query = '';
+	}
 
-	const shelfDefs = [
-		{ key: 'all', label: 'All' },
-		{ key: 'reading', label: 'Reading' },
-		{ key: 'completed', label: 'Completed' },
-		{ key: 'onhold', label: 'On Hold' },
-		{ key: 'plan', label: 'Plan to Read' },
-		{ key: 'favorites', label: 'Favorites' },
-	] as const;
+	// Pick a shelf and keep its tab visible inside the horizontally scrolling strip.
+	function selectShelf(key: ShelfKey, el: HTMLElement): void {
+		shelf = key;
+		el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+	}
 
 	// Optimistically re-shelve / (un)favourite, persisting via the backend. A FAILED
 	// write now rolls the card back and says why — the data layer used to resolve to
@@ -183,11 +286,9 @@
 </svelte:head>
 
 <div class="head k-gutter">
-	<div>
-		<h1>Your Library</h1>
-		<div class="subtitle">
-			{#if loading}Loading your shelves…{:else}{counts.all} series · {counts.reading} in progress{/if}
-		</div>
+	<h1>Your Library</h1>
+	<div class="subtitle">
+		{#if loading}Loading your shelves…{:else}{counts.all} series · {counts.reading} in progress{/if}
 	</div>
 </div>
 
@@ -218,7 +319,7 @@
 						<span class="ctitle">{item.title}</span>
 						<span class="cch">{item.ch}</span>
 					</div>
-					<div class="csub">{item.progress}% · {item.genre}</div>
+					<div class="csub">{item.progress}%{item.genre ? ` · ${item.genre}` : ''}</div>
 				</a>
 			{/each}
 		</div>
@@ -226,25 +327,95 @@
 {/if}
 
 <div class="shelfbar k-gutter">
-	<div class="shelf-tabs">
-		{#each shelfDefs as d (d.key)}
-			<button
-				class="shelf-tab"
-				class:on={shelf === d.key}
-				onclick={() => (shelf = d.key as 'all' | Shelf)}
-			>
-				{d.label}<span class="count">{counts[d.key]}</span>
-			</button>
-		{/each}
+	<div class="shelf-scroll">
+		<div class="shelf-tabs" role="group" aria-label="Shelves">
+			{#each shelfDefs as d (d.key)}
+				<button
+					type="button"
+					class="shelf-tab"
+					class:on={shelf === d.key}
+					aria-pressed={shelf === d.key}
+					onclick={(e) => selectShelf(d.key, e.currentTarget)}
+				>
+					<span>{d.label}</span>
+					<span class="count">{loading ? '–' : counts[d.key]}</span>
+				</button>
+			{/each}
+		</div>
 	</div>
-	<div class="sort">
-		<span class="sort-label">Sort</span>
-		{#each sortDefs as d (d.key)}
-			<button class="sortchip" class:on={sort === d.key} onclick={() => (sort = d.key)}
-				>{d.label}</button
-			>
-		{/each}
+
+	<div class="toolbar">
+		<label class="search">
+			<span class="search-icon"><Icon name="search" size={16} /></span>
+			<input
+				type="search"
+				placeholder="Filter by title"
+				aria-label="Filter library by title"
+				autocomplete="off"
+				spellcheck="false"
+				bind:value={query}
+			/>
+		</label>
+		<div class="controls">
+			<Dropdown
+				class="format-dd"
+				label="Format"
+				options={formatOptions}
+				value={format}
+				onchange={(v) => (format = v)}
+			/>
+			<div class="sort-group">
+				<Dropdown
+					class="sort-dd"
+					label="Sort by"
+					prefix="Sort:"
+					align="right"
+					options={sortOptions}
+					value={sort}
+					onchange={setSort}
+				/>
+				<button
+					type="button"
+					class="dir-btn"
+					aria-label={`Order: ${DIR_LABEL[sort][dir]}`}
+					title={`Order: ${DIR_LABEL[sort][dir]} — switch to ${DIR_LABEL[sort][dir === 'asc' ? 'desc' : 'asc']}`}
+					onclick={() => (dir = dir === 'asc' ? 'desc' : 'asc')}
+				>
+					<svg
+						class="dir-icon"
+						class:asc={dir === 'asc'}
+						viewBox="0 0 24 24"
+						width="16"
+						height="16"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+						aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6" /></svg
+					>
+					<span class="dir-label">{DIR_LABEL[sort][dir]}</span>
+				</button>
+			</div>
+		</div>
 	</div>
+
+	{#if !loading && counts.all > 0}
+		<div class="resultline" aria-live="polite">
+			<span>
+				{#if filtersActive}
+					{items.length} of {onShelf.length} series
+				{:else}
+					{items.length} series
+				{/if}
+			</span>
+			{#if filtersActive}
+				<button type="button" class="clear-btn" onclick={clearFilters}>
+					<Icon name="x" size={13} strokeWidth={2.4} />Clear filters
+				</button>
+			{/if}
+		</div>
+	{/if}
 </div>
 
 <div class="grid-wrap k-gutter">
@@ -262,11 +433,11 @@
 						<Cover src={item.cover} alt={item.title} loading="lazy" sizing="card" />
 						<a class="cover-link" {href} aria-label={item.title}></a>
 						<span class="flag-svg"><FlagBadge type={item.type} /></span>
-						<span
-							class="rating"
-							aria-label={item.rating ? `Rating ${item.rating} out of 10` : 'Not rated yet'}
-							><Icon name="star" size={10} fill="var(--k-star)" />{item.rating}</span
-						>
+						{#if Number(item.rating) > 0}
+							<span class="rating" aria-label={`Rating ${item.rating} out of 10`}
+								><Icon name="star" size={10} fill="var(--k-star)" />{item.rating}</span
+							>
+						{/if}
 						<button
 							class="fav-chip"
 							class:on={item.favorite}
@@ -290,10 +461,23 @@
 							<div class="progressbar"><div class="fill" style="width:{item.progress}%"></div></div>
 						{/if}
 					</div>
-					<a class="lib-title" {href}>{item.title}</a>
-					<div class="lib-sub">{item.sub}</div>
+					<div class="lib-meta">
+						<a class="lib-title" {href} title={item.title}>{item.title}</a>
+						<div class="lib-sub">{item.sub}</div>
+					</div>
 				</div>
 			{/each}
+		</div>
+	{:else if filtersActive && onShelf.length}
+		<div class="empty">
+			<div class="empty-icon"><Icon name="search" size={22} /></div>
+			<div class="empty-title">No matches on this shelf</div>
+			<div class="empty-desc">
+				Nothing here matches{needle ? ` “${query.trim()}”` : ''}{format !== 'all'
+					? ` in ${format}`
+					: ''}. Try a different title or format.
+			</div>
+			<button type="button" class="empty-btn" onclick={clearFilters}>Clear filters</button>
 		</div>
 	{:else}
 		<div class="empty">
@@ -314,14 +498,10 @@
 <style>
 	.head {
 		padding-top: 52px;
-		display: flex;
-		align-items: flex-end;
-		justify-content: space-between;
-		gap: 24px;
-		flex-wrap: wrap;
 	}
 	h1 {
 		font-size: 40px;
+		line-height: 1.1;
 		margin: 0 0 6px;
 		color: var(--k-text-bright);
 	}
@@ -338,6 +518,8 @@
 		margin: 0;
 		color: var(--k-text-dimmer);
 	}
+
+	/* ---- continue reading ---- */
 	.continue {
 		display: flex;
 		flex-direction: column;
@@ -349,16 +531,19 @@
 		gap: 20px;
 		overflow-x: auto;
 		padding-bottom: 4px;
+		scroll-snap-type: x proximity;
+		scrollbar-width: thin;
 	}
 	.continue-card {
 		flex: 0 0 auto;
 		width: 300px;
 		text-decoration: none;
+		scroll-snap-align: start;
 	}
 	.landscape {
 		position: relative;
-		width: 300px;
-		height: 168px;
+		width: 100%;
+		aspect-ratio: 300 / 168;
 		border-radius: 10px;
 		transition: border-color 0.2s;
 	}
@@ -373,7 +558,7 @@
 		border-radius: 8px;
 	}
 	.continue-card:hover .landscape {
-		border-color: rgba(255, 255, 255, 0.2);
+		border-color: var(--k-border-strong);
 	}
 	.resume {
 		position: absolute;
@@ -387,7 +572,7 @@
 		border-radius: 6px;
 		font-size: 11px;
 		font-weight: 700;
-		color: var(--k-text);
+		color: #f2f1ee;
 	}
 	.bar {
 		position: absolute;
@@ -410,6 +595,7 @@
 		gap: 10px;
 	}
 	.ctitle {
+		min-width: 0;
 		font-weight: 600;
 		font-size: 14.5px;
 		color: var(--k-text-1);
@@ -427,28 +613,42 @@
 		color: var(--k-text-fainter);
 		margin-top: 3px;
 	}
+
+	/* ---- shelves + toolbar ---- */
 	.shelfbar {
-		padding-top: 36px;
+		padding-top: 32px;
 		margin-top: 48px;
 		border-top: 1px solid var(--k-border);
 		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 20px;
-		flex-wrap: wrap;
+		flex-direction: column;
+		gap: 16px;
+	}
+	/* The strip scrolls sideways instead of wrapping into a ragged second row. */
+	.shelf-scroll {
+		min-width: 0;
+		overflow-x: auto;
+		scrollbar-width: none;
+		overscroll-behavior-x: contain;
+	}
+	.shelf-scroll::-webkit-scrollbar {
+		display: none;
 	}
 	.shelf-tabs {
 		display: flex;
 		gap: 8px;
-		flex-wrap: wrap;
+		width: max-content;
 	}
 	.shelf-tab {
+		flex: 0 0 auto;
 		display: inline-flex;
 		align-items: center;
-		gap: 7px;
+		gap: 8px;
+		height: 40px;
+		padding: 0 8px 0 16px;
+		font: inherit;
 		font-size: 13.5px;
 		font-weight: 700;
-		padding: 8px 16px;
+		white-space: nowrap;
 		border-radius: var(--k-radius-pill);
 		cursor: pointer;
 		background: transparent;
@@ -457,8 +657,15 @@
 		transition:
 			color 0.15s,
 			background-color 0.15s,
-			border-color 0.15s,
-			opacity 0.15s;
+			border-color 0.15s;
+	}
+	.shelf-tab:hover:not(.on) {
+		color: var(--k-text);
+		border-color: var(--k-border-strong);
+	}
+	.shelf-tab:focus-visible {
+		outline: 2px solid var(--k-accent);
+		outline-offset: 2px;
 	}
 	.shelf-tab.on {
 		background: var(--k-primary);
@@ -466,47 +673,158 @@
 		border-color: var(--k-primary);
 	}
 	.count {
-		opacity: 0.55;
-		font-weight: 600;
+		min-width: 24px;
+		height: 24px;
+		padding: 0 7px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border-radius: var(--k-radius-pill);
+		background: var(--k-surface-4);
+		color: var(--k-text-faint);
+		font-size: 11.5px;
+		font-weight: 700;
+		font-variant-numeric: tabular-nums;
 	}
-	.sort {
+	.shelf-tab.on .count {
+		background: color-mix(in srgb, var(--k-on-primary) 12%, transparent);
+		color: var(--k-on-primary);
+	}
+
+	.toolbar {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+	}
+	.search {
+		position: relative;
+		flex: 0 1 320px;
+		min-width: 0;
+		display: flex;
+		align-items: center;
+	}
+	.search-icon {
+		position: absolute;
+		left: 14px;
+		display: inline-flex;
+		color: var(--k-text-faint);
+		pointer-events: none;
+	}
+	.search input {
+		width: 100%;
+		height: 40px;
+		padding: 0 14px 0 40px;
+		border-radius: var(--k-radius-pill);
+		background: var(--k-surface-2);
+		border: 1px solid var(--k-border-2);
+		color: var(--k-text);
+		font: inherit;
+		font-size: 13.5px;
+		font-weight: 600;
+		outline: none;
+		transition: border-color 0.15s;
+	}
+	.search input::placeholder {
+		color: var(--k-text-faint);
+		font-weight: 500;
+	}
+	.search input:hover {
+		border-color: var(--k-border-4);
+	}
+	.search input:focus-visible {
+		border-color: var(--k-border-strong);
+		outline: 2px solid var(--k-accent);
+		outline-offset: 2px;
+	}
+	.controls {
 		display: flex;
 		align-items: center;
 		gap: 8px;
+		min-width: 0;
 	}
-	.sort-label {
-		font-size: 13px;
-		color: var(--k-text-faint);
-		margin-right: 6px;
+	.sort-group {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		min-width: 0;
 	}
-	.sortchip {
+	.dir-btn {
+		flex: 0 0 auto;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 7px;
+		height: 40px;
+		min-width: 40px;
+		padding: 0 13px 0 11px;
+		border-radius: var(--k-radius-pill);
+		background: var(--k-surface-4);
+		border: 1px solid var(--k-border-2);
+		color: var(--k-text-2);
+		font: inherit;
 		font-size: 13px;
 		font-weight: 700;
-		padding: 7px 14px;
-		border-radius: var(--k-radius-pill);
+		white-space: nowrap;
 		cursor: pointer;
-		background: transparent;
-		color: var(--k-text-dimmer);
-		border: 1px solid var(--k-border-2);
 		transition:
-			color 0.15s,
-			background-color 0.15s,
 			border-color 0.15s,
-			opacity 0.15s;
+			color 0.15s;
 	}
-	.sortchip.on {
-		background: rgba(255, 255, 255, 0.1);
+	.dir-btn:hover {
+		border-color: var(--k-border-strong);
 		color: var(--k-text);
-		border-color: rgba(255, 255, 255, 0.2);
 	}
+	.dir-btn:focus-visible {
+		outline: 2px solid var(--k-accent);
+		outline-offset: 2px;
+	}
+	.dir-icon {
+		flex: 0 0 auto;
+		color: var(--k-text-faint);
+		transition: transform 0.18s;
+	}
+	.dir-icon.asc {
+		transform: rotate(180deg);
+	}
+	.resultline {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		min-height: 24px;
+		font-size: 12.5px;
+		font-weight: 600;
+		color: var(--k-text-faint);
+		font-variant-numeric: tabular-nums;
+	}
+	.clear-btn {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		padding: 4px 2px;
+		border: none;
+		background: none;
+		color: var(--k-text-2);
+		font: inherit;
+		font-weight: 700;
+		cursor: pointer;
+		text-decoration: underline;
+		text-decoration-color: var(--k-border-strong);
+		text-underline-offset: 3px;
+	}
+	.clear-btn:hover {
+		color: var(--k-text-bright);
+	}
+
+	/* ---- grid ---- */
 	.grid-wrap {
-		padding-top: 28px;
+		padding-top: 20px;
 		padding-bottom: 80px;
 	}
 	.grid {
 		display: grid;
 		grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-		gap: 26px 24px;
+		gap: 28px 24px;
 	}
 	.empty {
 		display: flex;
@@ -538,6 +856,7 @@
 		color: var(--k-text-dimmer);
 		max-width: 340px;
 		line-height: 1.5;
+		overflow-wrap: anywhere;
 	}
 	.empty-btn {
 		margin-top: 6px;
@@ -549,6 +868,7 @@
 		background: var(--k-primary);
 		border: none;
 		color: var(--k-on-primary);
+		font: inherit;
 		font-weight: 700;
 		font-size: 13.5px;
 		text-decoration: none;
@@ -570,6 +890,7 @@
 		display: flex;
 		flex-direction: column;
 		gap: 10px;
+		min-width: 0;
 	}
 	.cover {
 		position: relative;
@@ -615,6 +936,13 @@
 			background-color 0.12s,
 			border-color 0.12s;
 	}
+	/* Grow the touch target to 40px without growing the chip itself. */
+	.fav-chip::after,
+	.status-slot :global(.trigger.chip)::after {
+		content: '';
+		position: absolute;
+		inset: -6px;
+	}
 	.fav-chip:hover:not(:disabled) {
 		color: #e96e6e;
 		border-color: rgba(233, 110, 110, 0.5);
@@ -622,6 +950,11 @@
 	.fav-chip:disabled {
 		opacity: 0.55;
 		cursor: default;
+	}
+	.fav-chip.on {
+		color: #e96e6e;
+		background: rgba(233, 110, 110, 0.2);
+		border-color: rgba(233, 110, 110, 0.55);
 	}
 	.write-error {
 		display: flex;
@@ -636,19 +969,11 @@
 		font-size: 13px;
 		font-weight: 600;
 	}
-	.fav-chip.on {
-		color: #e96e6e;
-		background: rgba(233, 110, 110, 0.2);
-		border-color: rgba(233, 110, 110, 0.55);
-	}
 	.status-slot {
 		position: absolute;
 		z-index: 2;
 		right: 9px;
 		bottom: 9px;
-	}
-	.lib-title {
-		text-decoration: none;
 	}
 	.flag-svg {
 		position: absolute;
@@ -680,16 +1005,120 @@
 		bottom: 0;
 		height: 4px;
 		background: rgba(12, 12, 13, 0.55);
+		border-radius: 0 0 8px 8px;
+		overflow: hidden;
+	}
+	.lib-meta {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+		min-width: 0;
 	}
 	.lib-title {
+		display: -webkit-box;
+		-webkit-box-orient: vertical;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
+		overflow: hidden;
+		overflow-wrap: anywhere;
 		font-weight: 600;
 		font-size: 13.5px;
+		line-height: 1.3;
 		color: var(--k-text-1);
-		line-height: 1.25;
+		text-decoration: none;
+	}
+	.lib-title:hover {
+		color: var(--k-text-bright);
 	}
 	.lib-sub {
 		font-size: 12px;
 		color: var(--k-text-faint);
-		margin-top: 3px;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	/* ---- tablet ---- */
+	@media (max-width: 900px) {
+		.toolbar {
+			flex-wrap: wrap;
+		}
+		.search {
+			flex: 1 1 100%;
+		}
+		.controls {
+			flex: 1 1 100%;
+		}
+		.controls :global(.format-dd) {
+			flex: 1 1 0;
+		}
+		.sort-group {
+			flex: 1.6 1 0;
+		}
+		.sort-group :global(.sort-dd) {
+			flex: 1 1 auto;
+		}
+	}
+
+	/* ---- phone ---- */
+	@media (max-width: 640px) {
+		.head {
+			padding-top: 28px;
+		}
+		h1 {
+			font-size: 30px;
+		}
+		.continue {
+			padding-top: 28px;
+			gap: 14px;
+		}
+		.continue-row {
+			gap: 14px;
+			/* Bleed to the screen edge so cards scroll out of view, not into the gutter. */
+			margin-inline: calc(-1 * var(--k-gutter));
+			padding-inline: var(--k-gutter);
+			scroll-padding-inline: var(--k-gutter);
+			scrollbar-width: none;
+		}
+		.continue-card {
+			width: min(260px, 72vw);
+		}
+		.shelfbar {
+			margin-top: 32px;
+			padding-top: 24px;
+			gap: 12px;
+		}
+		.shelf-scroll {
+			margin-inline: calc(-1 * var(--k-gutter));
+			padding-inline: var(--k-gutter);
+			scroll-padding-inline: var(--k-gutter);
+		}
+		.shelf-tab {
+			font-size: 13px;
+			padding: 0 7px 0 14px;
+		}
+		.controls,
+		.sort-group {
+			gap: 6px;
+		}
+		/* Icon-only order toggle on phones; the label lives in aria-label/title. */
+		.dir-label {
+			display: none;
+		}
+		.dir-btn {
+			padding: 0;
+			width: 40px;
+		}
+		.grid-wrap {
+			padding-top: 16px;
+			padding-bottom: 40px;
+		}
+		.grid {
+			grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+			gap: 22px 14px;
+		}
+		.empty {
+			padding: 56px 0;
+		}
 	}
 </style>

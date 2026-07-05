@@ -30,16 +30,31 @@ export interface ReadableCopy<C, P> {
 	failed: boolean;
 }
 
+export interface LoadFirstReadableOptions {
+	/**
+	 * Give up on ONE copy after this long and fall through to the next, as if it had thrown.
+	 * The shared GraphQL client has no request timeout, so a source that accepts the
+	 * connection and never answers (a wedged Suwayomi engine, an upstream that stalls) used
+	 * to hold the reader's `load` — and with it the whole navigation — open forever: the
+	 * old chapter stayed dimmed under the loading overlay and nothing ever changed.
+	 */
+	timeoutMs?: number;
+}
+
 export async function loadFirstReadable<C, P>(
 	copies: readonly C[],
 	load: (copy: C) => Promise<P[]>,
 	onError: (copy: C, err: unknown) => void = () => {},
+	opts: LoadFirstReadableOptions = {},
 ): Promise<ReadableCopy<C, P>> {
 	if (!copies.length) throw new Error('loadFirstReadable: no copies to try');
 	let firstFailed = false;
 	for (let i = 0; i < copies.length; i++) {
 		try {
-			const pages = await load(copies[i]);
+			const attempt = load(copies[i]);
+			const pages = opts.timeoutMs
+				? await withTimeout(attempt, opts.timeoutMs, 'page list')
+				: await attempt;
 			if (pages.length) return { copy: copies[i], pages, failed: false };
 		} catch (err) {
 			onError(copies[i], err);
@@ -47,4 +62,40 @@ export async function loadFirstReadable<C, P>(
 		}
 	}
 	return { copy: copies[0], pages: [], failed: firstFailed };
+}
+
+/** The rejection {@link withTimeout} produces, so callers can tell a stall from an error. */
+export class TimeoutError extends Error {
+	constructor(label: string, ms: number) {
+		super(`${label} timed out after ${ms} ms`);
+		this.name = 'TimeoutError';
+	}
+}
+
+/**
+ * `promise`, or a {@link TimeoutError} once `ms` pass without it settling. The timer is
+ * always cleared, so a settled race leaves nothing behind. The original promise is marked
+ * handled: if it rejects AFTER the deadline nobody is listening any more, and that must not
+ * surface as an unhandled rejection.
+ */
+export function withTimeout<T>(promise: Promise<T>, ms: number, label = 'request'): Promise<T> {
+	promise.catch(() => {});
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const deadline = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new TimeoutError(label, ms)), ms);
+	});
+	return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * `promise`'s value, or `fallback` if it rejects or has not settled within `ms`. For the
+ * reader's SECONDARY data — a series title, the version list — which must never keep a
+ * chapter whose pages are already in hand off the screen.
+ */
+export async function settleWithin<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+	try {
+		return await withTimeout(promise, ms);
+	} catch {
+		return fallback;
+	}
 }
