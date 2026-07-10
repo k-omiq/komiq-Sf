@@ -1,6 +1,11 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
-	import { images } from '$lib/context';
+	import { backend, images } from '$lib/context';
+	import { retryCoverUrl, retryCoverSrcSet } from '$lib/data/cover-retry';
+	import { withTimeout } from '$lib/data/reader-pages';
+	import { apiOrigin, config } from '$lib/config';
+	import { fetchCoverSource } from '$lib/data/cover-source';
+	const cacheOrigins = [apiOrigin, config.imgWorkerBaseUrl].filter(Boolean);
 
 	let {
 		src = '',
@@ -9,6 +14,7 @@
 		fit = 'cover',
 		sizing = 'full',
 		priority = false,
+		seriesId = '',
 	}: {
 		src?: string;
 		alt?: string;
@@ -30,9 +36,12 @@
 		 * marking several is the same as marking none.
 		 */
 		priority?: boolean;
+		/** Enables manual recovery on series cards, including missing cover metadata. */
+		seriesId?: string;
 	} = $props();
 
 	// Web: the provider resolves covers synchronously (a pure URL rewrite), so resolve
+	// impeccable-disable-next-line broken-image: literal image element in explanatory prose.
 	// eagerly — including during SSR — so the <img src> is in the server HTML and the
 	// cover counts toward LCP instead of appearing only after a browser-only effect.
 	// Native (Tauri): resolveCoverSync is absent (covers are async blob URLs), so we
@@ -41,9 +50,24 @@
 		s && images.resolveCoverSync ? images.resolveCoverSync(s) : '';
 
 	// Empty whenever the source can't be resized (native, `direct` mode, a foreign CDN)
+	// impeccable-disable-next-line broken-image: literal image element in explanatory prose.
 	// or this isn't a card — in which case the <img> falls back to `src` alone.
+	let replacement = $state<{ original: string; seriesId: string; url: string } | null>(null);
+	let refreshToken = $state('');
+	let fetching = $state(false);
+	let fetchError = $state('');
+	let loaded = $state(false);
+	const requestedSrc = $derived(
+		replacement?.original === src && replacement.seriesId === seriesId ? replacement.url : src,
+	);
 	const srcSet = $derived(
-		sizing === 'card' && src && images.coverCardSrcSet ? images.coverCardSrcSet(src) : '',
+		retryCoverSrcSet(
+			sizing === 'card' && requestedSrc && images.coverCardSrcSet
+				? images.coverCardSrcSet(requestedSrc)
+				: '',
+			refreshToken,
+			cacheOrigins,
+		),
 	);
 
 	// Snapshot only the initial source; the effect below owns later source changes.
@@ -56,6 +80,7 @@
 	// changed, so one such blip left a grey placeholder in that slot for the rest of
 	// the page's life, even after the network recovered. Retry a bounded number of
 	// times with a backoff (the reader does the same for pages via `retryImage`);
+	// impeccable-disable-next-line broken-image: literal image element in explanatory prose.
 	// `attempt` is part of the <img> key so a retry remounts a fresh element rather
 	// than relying on the browser to re-request an identical src.
 	const MAX_RETRIES = 2;
@@ -99,6 +124,7 @@
 			return;
 		}
 		retries += 1;
+		loaded = false;
 		broken = true; // drop the failed element, then remount a fresh one
 		clearTimeout(retryTimer);
 		const delay = retries * RETRY_BASE_MS + Math.random() * RETRY_JITTER_MS;
@@ -115,16 +141,104 @@
 		retries = 0;
 		attempt = 0;
 		broken = false;
+		loaded = false;
 	}
+
+	async function fetchCover(event: MouseEvent): Promise<void> {
+		event.preventDefault();
+		event.stopPropagation();
+		if (fetching) return;
+		const originalSrc = src;
+		const originalId = seriesId;
+		const generation = fetchGeneration;
+		const current = () =>
+			generation === fetchGeneration && src === originalSrc && seriesId === originalId;
+		fetching = true;
+		fetchError = '';
+		try {
+			// Re-read metadata in case the source has repaired or replaced its cover.
+			const cover = await withTimeout(
+				fetchCoverSource(backend, originalId),
+				8000,
+				'cover metadata',
+			);
+			if (!current()) return;
+			const url = cover || requestedSrc;
+			if (!url) throw new Error('No cover is available from the source yet.');
+			replacement = { original: originalSrc, seriesId: originalId, url };
+			refreshToken = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		} catch (error) {
+			if (!current()) return;
+			// Existing URLs can still recover if metadata is temporarily unavailable.
+			if (requestedSrc) refreshToken = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+			else fetchError = error instanceof Error ? error.message : 'Cover fetch failed.';
+		} finally {
+			if (current()) fetching = false;
+		}
+	}
+
+	let fetchGeneration = 0;
+	$effect(() => {
+		// Cancel metadata results when a reused component switches series/source or unmounts.
+		src;
+		seriesId;
+		return () => {
+			fetchGeneration += 1;
+			fetching = false;
+			fetchError = '';
+		};
+	});
+
+	function onLoad(): void {
+		if (el && el.naturalWidth <= 1) {
+			onError();
+			return;
+		}
+		loaded = true;
+		broken = false;
+	}
+
+	// Start the stall watchdog only when lazy images enter the viewport.
+	$effect(() => {
+		const img = el;
+		if (!img || loaded || broken) return;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const start = () => {
+			if (!timeout) timeout = setTimeout(onError, 15000);
+		};
+		if (img.complete && img.naturalWidth > 0) {
+			onLoad();
+			return;
+		}
+		let observer: IntersectionObserver | undefined;
+		if (loading === 'eager' || typeof IntersectionObserver === 'undefined') start();
+		else {
+			observer = new IntersectionObserver(
+				(entries) => {
+					if (entries.some((entry) => entry.isIntersecting)) {
+						start();
+						observer?.disconnect();
+					}
+				},
+				{ rootMargin: '300px' },
+			);
+			observer.observe(img);
+		}
+		return () => {
+			clearTimeout(timeout);
+			observer?.disconnect();
+		};
+	});
 
 	$effect(() => () => clearTimeout(retryTimer));
 
 	$effect(() => {
-		const source = src;
+		const source = requestedSrc;
+		const token = refreshToken;
 		// Web sync path: just track `src` changes; no async round-trip, no blob URL to
 		// release. (This branch also re-runs the initial resolve on hydration.)
 		if (images.resolveCoverSync) {
-			resolved = syncResolve(source);
+			resolved = retryCoverUrl(syncResolve(source), token, cacheOrigins);
 			resetRetries();
 			return;
 		}
@@ -133,25 +247,33 @@
 		resetRetries();
 		if (!source) return;
 		let alive = true;
+		let timedOut = false;
+		const deadline = setTimeout(() => {
+			timedOut = true;
+			if (alive) broken = true;
+		}, 15000);
 		images
 			.resolveCover(source)
 			.then((u) => {
+				clearTimeout(deadline);
 				// The provider mints the object URL before this settles, so a fetch that
 				// lands after unmount (or after `src` changed) has already pinned the
 				// cover's bytes to the document — and the teardown below never saw it, so
 				// nothing would ever release it. Scroll-flinging a grid abandons dozens of
 				// these; on iOS that is tens of MB held in a jetsam-limited process.
-				if (!alive) {
+				if (!alive || timedOut) {
 					if (u && images.release) images.release(u);
 					return;
 				}
 				resolved = u;
 			})
 			.catch(() => {
+				clearTimeout(deadline);
 				if (alive) broken = true;
 			});
 		return () => {
 			alive = false;
+			clearTimeout(deadline);
 			if (resolved && images.release) images.release(resolved);
 		};
 	});
@@ -196,7 +318,7 @@
 </script>
 
 {#if resolved && !broken}
-	{#key attempt}
+	{#key `${refreshToken}:${attempt}`}
 		<img
 			bind:this={el}
 			class="cover-img"
@@ -211,6 +333,7 @@
 			referrerpolicy="no-referrer"
 			style="object-fit:{fit}"
 			onerror={onError}
+			onload={onLoad}
 		/>
 	{/key}
 {:else}
@@ -221,7 +344,53 @@
 	></div>
 {/if}
 
+{#if seriesId && (broken || !requestedSrc)}
+	<div class="cover-recovery">
+		<button
+			type="button"
+			onclick={fetchCover}
+			disabled={fetching}
+			aria-label={`Fetch cover for ${alt || 'series'}`}
+		>
+			{fetching ? 'Fetching…' : 'Fetch cover'}
+		</button>
+		{#if fetchError}<span role="status">{fetchError}</span>{/if}
+	</div>
+{/if}
+
 <style>
+	.cover-recovery {
+		position: absolute;
+		inset: 0;
+		z-index: 2;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 8px;
+		padding: 12px;
+		pointer-events: none;
+	}
+	.cover-recovery button {
+		pointer-events: auto;
+		border: 1px solid var(--k-border-3);
+		border-radius: 6px;
+		background: var(--k-surface);
+		color: var(--k-text-1);
+		padding: 8px 12px;
+		font-size: 12px;
+		cursor: pointer;
+	}
+	.cover-recovery button:disabled {
+		opacity: 0.6;
+		cursor: wait;
+	}
+	.cover-recovery span {
+		font-size: 11px;
+		color: var(--k-text-1);
+		text-align: center;
+	}
+
 	/* CONTRACT: the parent must establish a containing block — `position: relative` (or
 	   any non-static position) AND a size. Both boxes below are `position: absolute`, so
 	   against a STATIC parent they size to the nearest positioned ancestor instead, which

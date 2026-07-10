@@ -25,7 +25,6 @@
 	let heroIndex = $state(0);
 	// Once the reader picks a slide, stop auto-rotating so their choice sticks.
 	let heroPicked = $state(false);
-	let heroStopped = $state(false);
 	// …and hold the rotation while they are actually AT the hero (pointer over it, or
 	// keyboard focus inside it). Without this the banner swaps the slide out from under
 	// whatever they are doing: mid-synopsis it is merely rude, but with focus on the
@@ -35,7 +34,7 @@
 	// "pause, stop, hide" mechanism for a 5s auto-advancing region.)
 	let heroHeld = $state(false);
 	/** Auto-rotation is stopped — either pinned by a click or held by the reader. */
-	const heroPaused = $derived(heroPicked || heroHeld || heroStopped);
+	const heroPaused = $derived(heroPicked || heroHeld);
 
 	/** Step the carousel by ±1, wrapping, and pin it to the reader's choice. */
 	function stepHero(delta: number): void {
@@ -271,16 +270,6 @@
 						<span class="hero-author">{current.author}</span>
 					{/if}
 					<div class="hero-nav">
-						{#if featured.length > 1}
-							<button
-								class="hero-pause"
-								aria-pressed={heroStopped || heroPicked}
-								onclick={() => {
-									heroStopped = !(heroStopped || heroPicked);
-									heroPicked = false;
-								}}>{heroStopped || heroPicked ? 'Play' : 'Pause'}</button
-							>
-						{/if}
 						{#if chapterMeta}
 							<span class="hero-chapters">{chapterMeta}</span>
 						{/if}
@@ -437,21 +426,6 @@
 		text-transform: uppercase;
 		color: var(--k-accent);
 	}
-	.hero-pause {
-		padding: 0 8px;
-		min-height: 44px;
-		background: transparent;
-		border: 1px solid var(--k-border-2);
-		border-radius: var(--k-radius-sm);
-		color: var(--k-text-muted);
-		font-size: 12px;
-		cursor: pointer;
-	}
-	.hero-pause:hover {
-		background: var(--k-hover-fill);
-		color: var(--k-text);
-	}
-
 	/* SOLID, not the slide's cover blurred into a colour field. The wash was the only
 	   thing tinting the banner, but it was also what every piece of hero text had its
 	   contrast computed against — and the art behind it is arbitrary, so the dimmest

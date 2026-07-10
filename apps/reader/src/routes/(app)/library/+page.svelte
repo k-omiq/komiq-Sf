@@ -15,6 +15,7 @@
 		type LibraryRowView,
 	} from '$lib/data/source';
 	import { slug, type ComicType, type Shelf } from '$lib/data/types';
+	import { sortLibraryRows } from '$lib/data/library-order';
 
 	let { data } = $props();
 	// Refresh releases and progress when returning to a tab left open during a scan.
@@ -171,42 +172,11 @@
 	const needle = $derived(query.trim().toLowerCase());
 	const filtersActive = $derived(format !== 'all' || needle !== '');
 
-	const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
-	const byTitle = (a: LibraryRowView, b: LibraryRowView) => collator.compare(a.title, b.title);
-	const unread = (c: LibraryRowView) => Math.max(0, c.total - c.read);
-
-	/**
-	 * Orders a shelf. Ties break on title so the order is stable rather than dependent
-	 * on however the rows happened to arrive.
-	 *
-	 * The two timestamp sorts parse RFC 3339 (so offsets and fractional seconds compare
-	 * as instants) and keep rows with NO timestamp last in either direction: a series
-	 * that has never had a chapter dated, or has never been opened, is neither the
-	 * newest nor the oldest thing on the shelf — it's unknown.
-	 *
-	 * 'added' is the order the backend already returns (`user_library.created_at DESC`),
-	 * so it sorts nothing; ascending just reverses it.
-	 */
-	function sortRows(list: LibraryRowView[], key: SortKey, d: Dir): LibraryRowView[] {
-		const sign = d === 'asc' ? 1 : -1;
-		if (key === 'added') return d === 'desc' ? list : [...list].reverse();
-		if (key === 'alpha') return [...list].sort((a, b) => sign * byTitle(a, b));
-		if (key === 'unread')
-			return [...list].sort((a, b) => sign * (unread(a) - unread(b)) || byTitle(a, b));
-		const field = key === 'updated' ? 'latestChapterAt' : 'lastReadAt';
-		return [...list].sort((a, b) => {
-			const x = a[field];
-			const y = b[field];
-			if (!x !== !y) return x ? -1 : 1;
-			return sign * ((Date.parse(x) || 0) - (Date.parse(y) || 0)) || byTitle(a, b);
-		});
-	}
-
 	const items = $derived.by(() => {
 		let list = onShelf;
 		if (format !== 'all') list = list.filter((c) => c.type === format);
 		if (needle) list = list.filter((c) => c.title.toLowerCase().includes(needle));
-		return sortRows(list, sort, dir).map((c) => {
+		return sortLibraryRows(list, sort, dir).map((c) => {
 			const progress = c.total ? Math.round((c.read / c.total) * 100) : 0;
 			let sub: string;
 			if (c.shelf === 'completed') sub = `Completed · ${c.total} ch`;
@@ -311,7 +281,7 @@
 						<!-- Deliberately NOT sizing="card": `.landscape` is 300x168, twice the ~150px
 						     box the card derivative is cut for, so a 1x viewer would get a 192px
 						     image stretched to 300px. The master is the right source here. -->
-						<Cover src={item.cover} alt={item.title} loading="lazy" />
+						<Cover seriesId={item.id} src={item.cover} alt={item.title} loading="lazy" />
 						<span class="resume"><Icon name="play" size={9} fill="currentColor" />Resume</span>
 						<div class="bar"><div class="fill" style="width:{item.progress}%"></div></div>
 					</div>
@@ -430,7 +400,13 @@
 				{@const href = `/series/${item.id ?? slug(item.title)}`}
 				<div class="lib-card">
 					<div class="cover k-cover">
-						<Cover src={item.cover} alt={item.title} loading="lazy" sizing="card" />
+						<Cover
+							seriesId={item.id}
+							src={item.cover}
+							alt={item.title}
+							loading="lazy"
+							sizing="card"
+						/>
 						<a class="cover-link" {href} aria-label={item.title}></a>
 						<span class="flag-svg"><FlagBadge type={item.type} /></span>
 						{#if Number(item.rating) > 0}

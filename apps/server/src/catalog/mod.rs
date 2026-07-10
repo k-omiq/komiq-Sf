@@ -3423,11 +3423,26 @@ async fn merge_works_guarded(
         .execute(&mut *tx)
         .await?;
 
+    // A user can have both copies in their library. Preserve the favourite from
+    // either copy, retain the survivor's explicit shelf (falling back to the
+    // losing copy's shelf), and keep the original add date. UPDATE OR IGNORE
+    // followed by deleting the loser used to silently discard these preferences.
+    sqlx::query(
+        "INSERT INTO user_library (user_id, series_id, created_at, status, is_favorite) \
+         SELECT user_id, ?, created_at, status, is_favorite FROM user_library \
+         WHERE series_id = ? \
+         ON CONFLICT(user_id, series_id) DO UPDATE SET \
+           created_at = MIN(user_library.created_at, excluded.created_at), \
+           status = COALESCE(user_library.status, excluded.status), \
+           is_favorite = MAX(user_library.is_favorite, excluded.is_favorite)",
+    )
+    .bind(target_work)
+    .bind(source_work)
+    .execute(&mut *tx)
+    .await?;
+
     for (table, col) in [
         ("merge_candidate", "candidate_work_id"),
-        // Per-user library membership for canonical works lives in `user_library`
-        // (series_id = the `w_` work id); repoint it when folding works.
-        ("user_library", "series_id"),
         ("reviews", "series_id"),
         // `canonical_library` is the superseded canonical-only library table
         // (migration 0024 folded it into `user_library`, but the table and its rows
@@ -3443,11 +3458,9 @@ async fn merge_works_guarded(
         .execute(&mut *tx)
         .await?;
     }
-    // `reviews`/`user_library` have a unique key on (series_id, user_id) /
-    // (user_id, series_id), so a user with a row on BOTH merged works had their
-    // source row SKIPPED by the `UPDATE OR IGNORE` above (the target's row wins).
-    // Delete those losing leftovers so the imminent `work` delete can't orphan a
-    // row pointing at a nonexistent work (phantom library entry / stray review).
+    // Delete the folded library rows and any colliding reviews so the imminent
+    // work delete can't orphan a row pointing at a nonexistent work. Reviews keep
+    // the survivor's review when the same user reviewed both copies.
     // `canonical_library` (PK (user_id, work_id)) skips the same way.
     for (table, col) in [
         ("reviews", "series_id"),
@@ -7724,6 +7737,72 @@ mod tests {
         assert!(merge_works(&pool, &target, &target).await.is_err());
         // A missing work is rejected.
         assert!(merge_works(&pool, "w_nope", &target).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn merge_works_preserves_library_preferences_and_progress_on_both_copies() {
+        let pool = pool().await;
+        let source = create_work(&pool, &WorkInput::default()).await.unwrap();
+        let target = create_work(&pool, &WorkInput::default()).await.unwrap();
+        for user in ["both", "fallback", "source-only"] {
+            sqlx::query("INSERT INTO users (id, username, email, password_hash, created_at) VALUES (?, ?, ?, 'h', 'now')")
+                .bind(user).bind(user).bind(format!("{user}@x"))
+                .execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO user_library (user_id, series_id, created_at, status, is_favorite) VALUES (?, ?, '2026-01-01T00:00:00Z', 'reading', 1)")
+                .bind(user).bind(&source).execute(&pool).await.unwrap();
+        }
+        for (user, status) in [("both", Some("onhold")), ("fallback", None)] {
+            sqlx::query("INSERT INTO user_library (user_id, series_id, created_at, status, is_favorite) VALUES (?, ?, '2026-02-01T00:00:00Z', ?, 0)")
+                .bind(user).bind(&target).bind(status)
+                .execute(&pool).await.unwrap();
+        }
+        for (work, chapter, page, read) in [
+            (&source, "chapter-24", 7i64, 1i64),
+            (&target, "chapter-26", 3, 0),
+        ] {
+            sqlx::query("INSERT INTO canonical_progress (user_id, chapter_id, work_id, last_page_read, read, updated_at) VALUES ('both', ?, ?, ?, ?, 'now')")
+                .bind(chapter).bind(work).bind(page).bind(read)
+                .execute(&pool).await.unwrap();
+        }
+
+        merge_works(&pool, &source, &target).await.unwrap();
+
+        for (user, expected_status) in [
+            ("both", "onhold"),
+            ("fallback", "reading"),
+            ("source-only", "reading"),
+        ] {
+            let rows: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+                "SELECT series_id, created_at, status, is_favorite FROM user_library WHERE user_id = ?",
+            )
+            .bind(user)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(rows.len(), 1, "only the surviving library card remains");
+            assert_eq!(rows[0].0, target);
+            assert_eq!(rows[0].1, "2026-01-01T00:00:00Z");
+            assert_eq!(rows[0].2.as_deref(), Some(expected_status));
+            assert_eq!(rows[0].3, 1, "a favourite on either copy survives");
+        }
+        let progress: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT chapter_id, last_page_read, read FROM canonical_progress WHERE work_id = ? ORDER BY chapter_id",
+        )
+        .bind(&target)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            progress,
+            vec![("chapter-24".into(), 7, 1), ("chapter-26".into(), 3, 0)]
+        );
+        let orphan_progress: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM canonical_progress WHERE work_id = ?")
+                .bind(&source)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(orphan_progress, 0);
     }
 
     #[tokio::test]

@@ -104,7 +104,9 @@ export default {
 			{ method: 'GET' },
 		);
 		const edge = caches.default;
-		const cached = await edge.match(cacheKey);
+		// An explicit reader recovery bypasses a stale image, still subject to the
+		// normal miss rate limit and host validation. Refresh the shared cache on success.
+		const cached = url.searchParams.get('retry') === '1' ? undefined : await edge.match(cacheKey);
 		if (cached) return withMethod(cached, request.method);
 
 		// --- Rate limit (per client IP) — only reached on a cache MISS. ----------

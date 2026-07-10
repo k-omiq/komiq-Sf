@@ -6,6 +6,7 @@
 	import { saveProgress, recordView } from '$lib/data/source';
 	import { externalChapterHost, externalChapterHref } from '$lib/data/chapter-label';
 	import { chapterAttribution } from '$lib/data/chapter-versions';
+	import { stripProgress } from '$lib/data/reader-format';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
 	import Icon, { type IconName } from '$lib/components/Icon.svelte';
 	import CommentThread from '$lib/components/CommentThread.svelte';
@@ -122,11 +123,15 @@
 		{ value: 'hidden', label: 'Progress hidden', icon: 'x' },
 	];
 
-	let mode = $state<Mode>('strip');
+	// Keep manga preferences intact when a webtoon enforces continuous reading.
+	const longStrip = $derived(data.longStrip === true);
+	let preferredMode = $state<Mode>('strip');
+	const mode = $derived(longStrip ? 'strip' : preferredMode);
 	let fit = $state<Fit>('both');
 	let dir = $state<Dir>('ltr');
 	let headerMode = $state<HeaderMode>('auto');
-	let bar = $state<Bar>('segments');
+	let preferredBar = $state<Bar>('segments');
+	const bar = $derived(longStrip ? 'continuous' : preferredBar);
 	let width = $state(720);
 	let gaps = $state(false);
 	let pinned = $state(false);
@@ -146,7 +151,16 @@
 		try {
 			localStorage.setItem(
 				'komiq-reader',
-				JSON.stringify({ mode, fit, dir, header: headerMode, bar, width, gaps, pinned }),
+				JSON.stringify({
+					mode: preferredMode,
+					fit,
+					dir,
+					header: headerMode,
+					bar: preferredBar,
+					width,
+					gaps,
+					pinned,
+				}),
 			);
 		} catch {
 			/* ignore */
@@ -158,6 +172,7 @@
 	let chromeVisible = $state(true);
 	let menuOpen = $state(false);
 	let scrolledPage = $state(1);
+	let scrollFraction = $state(0);
 	let maxScrolledPage = $state(1);
 	const warmedUrls = new Set<string>();
 
@@ -261,6 +276,7 @@
 		untrack(() => {
 			pageIdx = 0;
 			scrolledPage = 1;
+			scrollFraction = 0;
 			maxScrolledPage = 1;
 			readMarked = data.chapterRead ?? false;
 			pageRatio = {};
@@ -326,7 +342,9 @@
 			? `${currentIdx + 1}–${currentEnd + 1} / ${total}`
 			: `${currentIdx + 1} / ${total}`,
 	);
-	const readPct = $derived(total ? ((currentEnd + 1) / total) * 100 : 0);
+	const readPct = $derived(
+		longStrip ? scrollFraction * 100 : total ? ((currentEnd + 1) / total) * 100 : 0,
+	);
 
 	// Mark the chapter read once the reader reaches the end (idempotent per chapter).
 	// Strip mode: the bottom of the final page is on screen — NOT a document %, since
@@ -441,6 +459,24 @@
 
 	// ---- strip position --------------------------------------------------------
 	let stripEl = $state<HTMLElement | null>(null);
+	function updateStripProgress() {
+		if (!longStrip || !stripEl) return;
+		const rect = stripEl.getBoundingClientRect();
+		scrollFraction = stripProgress(rect.top, rect.height, window.innerHeight);
+	}
+	$effect(() => {
+		const el = stripEl;
+		if (!longStrip || !el) return;
+		// Images refine their reserved height as they load; progress follows that geometry.
+		const observer = new ResizeObserver(updateStripProgress);
+		observer.observe(el);
+		window.addEventListener('resize', updateStripProgress);
+		untrack(updateStripProgress);
+		return () => {
+			observer.disconnect();
+			window.removeEventListener('resize', updateStripProgress);
+		};
+	});
 	// The reading line: a page is "current" once its top passes 40% of the viewport.
 	function stripPageAtLine(): number {
 		const cells = stripEl?.children;
@@ -470,11 +506,11 @@
 			restored = true;
 			try {
 				const saved = JSON.parse(localStorage.getItem('komiq-reader') || '{}') ?? {};
-				mode = pick(MODES, saved.mode, 'strip');
+				preferredMode = pick(MODES, saved.mode, 'strip');
 				fit = pick(FITS, saved.fit, 'both');
 				dir = pick(DIRS, saved.dir, 'ltr');
 				headerMode = pick(HEADERS, saved.header, 'auto');
-				bar = pick(BARS, saved.bar, 'segments');
+				preferredBar = pick(BARS, saved.bar, 'segments');
 				width = typeof saved.width === 'number' ? saved.width : 720;
 				gaps = saved.gaps === true;
 				pinned = saved.pinned === true;
@@ -495,6 +531,7 @@
 			if (mode === 'strip') {
 				scrolledPage = Math.min(total, stripPageAtLine());
 				if (scrolledPage > maxScrolledPage) maxScrolledPage = scrolledPage;
+				updateStripProgress();
 			}
 			maybeMarkRead();
 			const dy = y - lastY;
@@ -551,6 +588,7 @@
 		advanceQueue();
 	}
 
+	// impeccable-disable-next-line broken-image: literal image element in explanatory prose.
 	// Per-page load failures — a failed <img> otherwise leaves a permanent
 	// full-height gap with the browser's broken-image glyph and no way to retry.
 	let pageError = $state<Record<number, boolean>>({});
@@ -581,6 +619,7 @@
 		pageError = { ...pageError, [index]: true };
 		settlePage(index);
 	}
+	// impeccable-disable-next-line broken-image: literal image element in explanatory prose.
 	// Clearing the flag remounts a fresh <img> for that page, re-fetching the URL.
 	function retryImage(index: number): void {
 		const next = { ...pageError };
@@ -667,8 +706,9 @@
 	}
 
 	function setMode(m: Mode) {
+		if (longStrip) return;
 		const at = currentPageIndex();
-		mode = m;
+		preferredMode = m;
 		persist();
 		// Keep the reader on the same page across a mode switch.
 		void tick().then(() => {
@@ -690,6 +730,19 @@
 	}
 
 	// ---- page bar ---------------------------------------------------------------
+	function jumpToProgress(fraction: number) {
+		if (!stripEl) return;
+		const rect = stripEl.getBoundingClientRect();
+		const target = Math.max(0, Math.min(1, fraction));
+		window.scrollTo({
+			top: Math.max(
+				0,
+				rect.top + window.scrollY + target * Math.max(0, rect.height - window.innerHeight),
+			),
+			behavior: 'auto',
+		});
+		scrollFraction = target;
+	}
 	let barHover = $state<{ i: number; x: number } | null>(null);
 	function barIndexAt(e: PointerEvent | MouseEvent): number {
 		const el = e.currentTarget as HTMLElement;
@@ -1028,7 +1081,16 @@
 
 		<div class="dr-sec">
 			<span class="dr-label">Display</span>
-			{@render cycle(MODES, mode, setMode, 'Mode')}
+			{#if longStrip}
+				<div class="cycle">
+					<Icon name="list" size={16} />
+					<span class="cycle-text"
+						><span class="cycle-cap">Mode</span><span class="cycle-val">Long strip</span></span
+					>
+				</div>
+			{:else}
+				{@render cycle(MODES, mode, setMode, 'Mode')}
+			{/if}
 			{#if isStrip}
 				<div class="width-row">
 					<div class="width-head">
@@ -1090,15 +1152,17 @@
 				},
 				'Header',
 			)}
-			{@render cycle(
-				BARS,
-				bar,
-				(v) => {
-					bar = v;
-					persist();
-				},
-				'Progress',
-			)}
+			{#if !longStrip}
+				{@render cycle(
+					BARS,
+					preferredBar,
+					(v) => {
+						preferredBar = v;
+						persist();
+					},
+					'Progress',
+				)}
+			{/if}
 		</div>
 
 		<a class="dr-report" href={reportHref}><Icon name="flag" size={14} />Report a problem</a>
@@ -1134,7 +1198,9 @@
 				>{/if}
 		</div>
 		<div class="head-right">
-			{#if hasPages}<span class="pg-chip" aria-live="polite">Pg. {pageReadout}</span>{/if}
+			{#if hasPages}<span class="pg-chip" aria-live={longStrip ? 'off' : 'polite'}
+					>{longStrip ? `${Math.round(readPct)}%` : `Pg. ${pageReadout}`}</span
+				>{/if}
 			<!-- Prev/next chapter stay on phones (icon-only): going BACK a chapter must
 			     never depend on finding the chapter picker inside the menu. -->
 			<button
@@ -1348,10 +1414,26 @@
 		</section>
 	</main>
 
-	<!-- page progress: one segment per page, click or drag to jump -->
+	<!-- Long strips track scroll distance; manga retains the configured page bar. -->
 	{#if hasPages && bar !== 'hidden'}
 		<div class="pbar-wrap" class:thin={bar === 'thin'} class:rtl={dir === 'rtl' && !isStrip}>
-			{#if bar === 'thin'}
+			{#if bar === 'continuous'}
+				<div class="continuous-progress">
+					<div class="pthin">
+						<div class="pthin-fill" style="transform:scaleX({scrollFraction})"></div>
+					</div>
+					<input
+						type="range"
+						min="0"
+						max="100"
+						step="0.1"
+						value={readPct}
+						aria-label="Chapter progress"
+						aria-valuetext={`${Math.round(readPct)}% through chapter`}
+						oninput={(e) => jumpToProgress(Number(e.currentTarget.value) / 100)}
+					/>
+				</div>
+			{:else if bar === 'thin'}
 				<div class="pthin">
 					<div class="pthin-fill" style="transform:scaleX({readPct / 100})"></div>
 				</div>
@@ -2342,6 +2424,31 @@
 	.pthin {
 		height: 3px;
 		background: var(--k-border);
+	}
+	.continuous-progress {
+		position: relative;
+		height: 22px;
+		display: flex;
+		align-items: flex-end;
+		pointer-events: auto;
+	}
+	.continuous-progress .pthin {
+		width: 100%;
+		height: 5px;
+		border-radius: 3px;
+		overflow: hidden;
+	}
+	.continuous-progress input {
+		position: absolute;
+		inset: 0;
+		width: 100%;
+		margin: 0;
+		opacity: 0;
+		cursor: pointer;
+	}
+	.continuous-progress:focus-within {
+		outline: 2px solid var(--k-accent);
+		outline-offset: 3px;
 	}
 	/* Full-width fill scaled to the read fraction: a transform, so moving it never
 	   re-runs layout. */

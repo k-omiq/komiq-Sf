@@ -82,3 +82,49 @@ test('redirect targets are refused before a second fetch', async () => {
 		globalThis.caches = originalCaches;
 	}
 });
+
+test('manual cover recovery bypasses stale cache and still obeys the miss rate limit', async () => {
+	const originalFetch = globalThis.fetch;
+	const originalCaches = globalThis.caches;
+	let cacheReads = 0;
+	let upstreamCalls = 0;
+	let limits = 0;
+	globalThis.caches = {
+		default: {
+			match: async () => {
+				cacheReads += 1;
+				return new Response('stale', { headers: { 'Content-Type': 'image/jpeg' } });
+			},
+		},
+	};
+	globalThis.fetch = async () => {
+		upstreamCalls += 1;
+		throw new Error('unexpected upstream request');
+	};
+	const env = {
+		ALLOWED_SOURCE_HOSTS: 'cdn.example',
+		IMG_RATE_LIMITER: {
+			limit: async () => {
+				limits += 1;
+				return { success: false };
+			},
+		},
+	};
+	try {
+		const url = 'https://img.example/img?src=https%3A%2F%2Fcdn.example%2Fa.jpg';
+		const cached = await worker.default.fetch(new Request(url), env, {});
+		assert.equal(await cached.text(), 'stale');
+		const retried = await worker.default.fetch(
+			new Request(`${url}&retry=1&_coverRetry=next`),
+			env,
+			{},
+		);
+		assert.equal(retried.status, 429);
+		assert.equal(cacheReads, 1);
+		assert.equal(limits, 1);
+		assert.equal(upstreamCalls, 0);
+	} finally {
+		globalThis.fetch = originalFetch;
+		globalThis.caches = originalCaches;
+	}
+});

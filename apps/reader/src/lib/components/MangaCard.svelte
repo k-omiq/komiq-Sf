@@ -57,7 +57,7 @@
 
 <a {href} class="card" class:fixed style={fixed ? `width:${width}px` : ''}>
 	<div class="cover" class:fixed style={fixed ? `height:${Math.round((width * 212) / 150)}px` : ''}>
-		<Cover src={cover} alt={title} {loading} sizing="card" />
+		<Cover src={cover} alt={title} {loading} sizing="card" seriesId={id} />
 		{#if flagType}
 			<span class="flag-svg"><FlagBadge type={flagType} /></span>
 		{:else if flagEmoji}

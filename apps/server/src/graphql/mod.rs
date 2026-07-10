@@ -1,5 +1,8 @@
 pub mod types;
 
+#[cfg(test)]
+mod cache_refresh_tests;
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -206,9 +209,20 @@ pub(crate) fn clear_feed_caches() {
 /// losers re-check the cache (now populated) after acquiring it. The outer map is
 /// guarded by a std mutex held only for the O(1) lookup/insert — never across an
 /// `await` — and dead entries are pruned via `Weak` so the map can't grow unbounded.
-#[derive(Default)]
 pub struct KeyedLocks {
     map: Mutex<HashMap<i64, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    refresh_attempts: Mutex<HashMap<i64, std::time::Instant>>,
+    refresh_slots: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for KeyedLocks {
+    fn default() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+            refresh_attempts: Mutex::new(HashMap::new()),
+            refresh_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+        }
+    }
 }
 
 impl KeyedLocks {
@@ -225,6 +239,30 @@ impl KeyedLocks {
         // weak, so a long-lived process doesn't accumulate one entry per id ever seen.
         map.retain(|_, w| w.strong_count() > 0);
         arc
+    }
+
+    /// Refreshes already-cached data without queuing foreground readers. Retain a
+    /// short retry window after failures too, so a dead source cannot turn every
+    /// navigation into another request. The map has both a time and size bound.
+    fn try_background_refresh(
+        &self,
+        key: i64,
+    ) -> Option<(
+        tokio::sync::OwnedMutexGuard<()>,
+        tokio::sync::OwnedSemaphorePermit,
+    )> {
+        let slot = self.refresh_slots.clone().try_acquire_owned().ok()?;
+        let guard = self.lock_handle(key).try_lock_owned().ok()?;
+        let mut attempts = self
+            .refresh_attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        attempts.retain(|_, at| at.elapsed() < Duration::from_secs(60));
+        if attempts.contains_key(&key) || attempts.len() >= 1024 {
+            return None;
+        }
+        attempts.insert(key, std::time::Instant::now());
+        Some((guard, slot))
     }
 }
 
@@ -676,18 +714,28 @@ async fn fetch_library_row(
     user_id: &str,
     series_id: &str,
 ) -> Option<LibraryRow> {
-    sqlx::query_as::<_, (i64, Option<String>)>(
-        "SELECT is_favorite, status FROM user_library WHERE user_id = ? AND series_id = ?",
+    let rows = sqlx::query_as::<_, (i64, Option<String>)>(
+        "WITH target(work_id) AS ( \
+           SELECT COALESCE((SELECT work_id FROM source_series \
+             WHERE source_type = 'suwayomi' AND source_key = ?1 LIMIT 1), ?1) \
+         ) SELECT is_favorite, status FROM user_library \
+           WHERE user_id = ?2 AND series_id IN ( \
+             SELECT work_id FROM target UNION ALL \
+             SELECT source_key FROM source_series JOIN target USING(work_id) \
+              WHERE source_type = 'suwayomi' \
+           ) ORDER BY (series_id = (SELECT work_id FROM target)) DESC, created_at DESC",
     )
-    .bind(user_id)
     .bind(series_id)
-    .fetch_optional(pool)
+    .bind(user_id)
+    .fetch_all(pool)
     .await
-    .ok()
-    .flatten()
-    .map(|(fav, status)| LibraryRow {
-        is_favorite: fav != 0,
-        status,
+    .ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+    Some(LibraryRow {
+        is_favorite: rows.iter().any(|(fav, _)| *fav != 0),
+        status: rows.into_iter().find_map(|(_, status)| status),
     })
 }
 
@@ -2066,11 +2114,6 @@ impl PartialOrd for OrderedNumber {
     }
 }
 
-/// S1: resolve one Suwayomi series DB-first — return the cached row when it's still
-/// fresh; on a stale hit or a miss, revalidate upstream under a single-flight lock
-/// (so N concurrent readers of the same id trigger ONE fetch), and fall back to the
-/// stale cached row if the refetch fails (the reader never hard-fails on upstream
-/// trouble).
 /// The memo key for `updates`' `total`.
 ///
 /// THE VIEWER DIMENSION IS THE WHOLE POINT. That COUNT takes exactly one bind —
@@ -2341,13 +2384,26 @@ async fn reload_series_in_shape(
     }
 }
 
+/// Serve persisted metadata immediately, refreshing expired rows asynchronously.
+/// Only a genuinely uncached series waits for Suwayomi on the request path.
 async fn resolve_series_cached(st: &AppState, id: i64) -> anyhow::Result<SuwayomiManga> {
-    // Fast path: a fresh cache hit needs no lock and no upstream call.
-    let stale = match crate::series_cache::get_series_fresh(&st.pool, id).await? {
-        Some((m, true)) => return Ok(m),
-        Some((m, false)) => Some(m), // stale — refresh below, keep as fallback
-        None => None,                // miss
-    };
+    if let Some((m, fresh)) = crate::series_cache::get_series_fresh(&st.pool, id).await? {
+        if !fresh {
+            if let Some((guard, slot)) = st.series_inflight.try_background_refresh(id) {
+                let pool = st.pool.clone();
+                let client = st.suwayomi.clone();
+                tokio::spawn(async move {
+                    let (_guard, _slot) = (guard, slot);
+                    if let Ok(refreshed) = client.series(id).await {
+                        let _ = crate::series_cache::put_series(&pool, &refreshed).await;
+                    }
+                });
+            }
+        }
+        // Progress/library overlays are read separately for this request. Only
+        // source metadata is stale; a slow refresh never delays a cached card.
+        return Ok(m);
+    }
 
     // Single-flight: collapse concurrent misses/refreshes for this id.
     let lock = st.series_inflight.lock_handle(id);
@@ -2372,16 +2428,12 @@ async fn resolve_series_cached(st: &AppState, id: i64) -> anyhow::Result<Suwayom
             crate::series_cache::hydrate_latest_chapter_at(&st.pool, &mut m).await;
             Ok(m)
         }
-        // Refetch failed: serve the stale cached row rather than erroring the reader.
-        Err(e) => match stale {
-            Some(m) => Ok(m),
-            None => Err(e),
-        },
+        Err(e) => Err(e),
     }
 }
 
-/// S1: resolve one series' chapter list DB-first — cached rows when present AND
-/// fresh, else revalidate upstream under a single-flight lock and cache. An empty
+/// Resolve chapter lists DB-first, refreshing expired rows in the background.
+/// A true cache miss still fetches under a single-flight lock. An empty
 /// cache is a miss (a series with genuinely zero chapters re-checks the source until
 /// scanned). A refetch failure falls back to the stale cached rows. The returned
 /// rows carry GLOBAL chapter state; the per-viewer `suwayomi_progress` overlay is
@@ -2393,9 +2445,20 @@ async fn resolve_chapters_cached(
     let cached = crate::series_cache::get_chapters(&st.pool, manga_id).await?;
     if !cached.is_empty() {
         let last = crate::series_cache::chapters_last_fetched(&st.pool, manga_id).await?;
-        if crate::series_cache::is_fresh(last.as_deref(), crate::series_cache::CHAPTERS_TTL_SECS) {
-            return Ok(cached);
+        if !crate::series_cache::is_fresh(last.as_deref(), crate::series_cache::CHAPTERS_TTL_SECS) {
+            if let Some((guard, slot)) = st.chapters_inflight.try_background_refresh(manga_id) {
+                let pool = st.pool.clone();
+                let client = st.suwayomi.clone();
+                tokio::spawn(async move {
+                    let (_guard, _slot) = (guard, slot);
+                    if let Ok(refreshed) = client.chapters(manga_id).await {
+                        let _ =
+                            crate::series_cache::put_chapters(&pool, manga_id, &refreshed).await;
+                    }
+                });
+            }
         }
+        return Ok(cached);
     }
 
     // Single-flight: collapse concurrent misses/refreshes for this manga id.
@@ -5586,13 +5649,61 @@ impl QueryRoot {
         let Some(user) = current_user(ctx).await else {
             return Ok(Vec::new());
         };
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT series_id FROM user_library WHERE user_id = ? ORDER BY created_at DESC",
+        let stored_rows = sqlx::query_as::<_, (String, String, i64, Option<String>)>(
+            "SELECT COALESCE(ss.work_id, ul.series_id), ul.series_id, ul.is_favorite, ul.status \
+             FROM user_library ul LEFT JOIN source_series ss \
+               ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
+             WHERE ul.user_id = ? ORDER BY ul.created_at DESC, ul.series_id",
         )
         .bind(&user.id)
         .fetch_all(&st.pool)
         .await
         .map_err(gql_err)?;
+        let mut ids = Vec::new();
+        let mut flags: HashMap<String, LibraryRow> = HashMap::new();
+        let mut aliases: Vec<(String, String)> = Vec::new();
+        for (identity, stored_id, favorite, status) in stored_rows {
+            if !flags.contains_key(&identity) {
+                ids.push(identity.clone());
+            }
+            let row = flags.entry(identity.clone()).or_insert(LibraryRow {
+                is_favorite: false,
+                status: None,
+            });
+            row.is_favorite |= favorite != 0;
+            if status.is_some() && (stored_id == identity || row.status.is_none()) {
+                row.status = status;
+            }
+            aliases.push((stored_id, identity));
+        }
+        // The library query already has every viewer flag. Prime resolver cells for
+        // work/source IDs so selecting isMarked/status/favorite costs no per-card SQL.
+        if let Some(cache) = ctx.data_opt::<RequestLibraryCache>() {
+            let mut cells = cache.0.lock().unwrap();
+            for (id, row) in &flags {
+                let _ = cells.entry(id.clone()).or_default().set(Some(row.clone()));
+            }
+            for (alias, identity) in aliases {
+                let _ = cells
+                    .entry(alias)
+                    .or_default()
+                    .set(flags.get(&identity).cloned());
+            }
+        }
+        // Reuse the catalogue's materialized metadata and hydrate the whole library
+        // in grouped queries. Loading chapters + canonical metadata per card was
+        // hundreds of serial DB round trips on an ordinary library.
+        let mut cached_rows = crate::browse::rows_by_work_ids(&st.pool, &ids)
+            .await
+            .map_err(gql_err)?;
+        for row in &mut cached_rows {
+            row.reader_id.clone_from(&row.work_id);
+        }
+        let mut cached: HashMap<String, Series> = map_browse_rows(st, cached_rows)
+            .await
+            .into_iter()
+            .map(|series| (series.id.0.clone(), series))
+            .collect();
         // Build the library in the stored (newest-added-first) order. Canonical works
         // fill their slot immediately; numeric Suwayomi series reserve a slot and are
         // mapped together in ONE batched pass afterwards (O(1) grouped queries per
@@ -5600,6 +5711,10 @@ impl QueryRoot {
         let mut out: Vec<Option<Series>> = Vec::with_capacity(ids.len());
         let mut pending: Vec<(usize, SuwayomiManga)> = Vec::new();
         for sid in ids {
+            if let Some(series) = cached.remove(&sid) {
+                out.push(Some(series));
+                continue;
+            }
             if sid.starts_with("w_") {
                 // Canonical (MangaDex-mirrored) work.
                 if let Some(work) = catalog::load_canonical_work(&st.pool, &sid)
@@ -5640,24 +5755,25 @@ impl QueryRoot {
             out[idx] = Some(series);
         }
         let mut out: Vec<Series> = out.into_iter().flatten().collect();
-        // A numeric library entry represents the same work as its canonical entry.
-        // Use the work feed's newest release so updates from a sibling source move
-        // the library card as well, rather than leaving it on this source's stale clock.
-        let work_recency: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
-            "SELECT ul.series_id, MAX(f.released_at) FROM user_library ul \
-             LEFT JOIN source_series ss ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
-             JOIN feed_series_updates f ON f.work_id = COALESCE(ss.work_id, ul.series_id) \
-             WHERE ul.user_id = ? GROUP BY ul.series_id",
+        // Library updates follow the catalogue's announcement/found clock. Release
+        // dates stay separate so an old chapter discovered today still moves here.
+        let work_recency: HashMap<String, (i64, Option<i64>)> = sqlx::query_as::<_, (String, i64, Option<i64>)>(
+            "SELECT f.work_id, f.released_at, f.announced_at FROM feed_series_updates f \
+             WHERE f.work_id IN (SELECT COALESCE(ss.work_id, ul.series_id) FROM user_library ul \
+               LEFT JOIN source_series ss ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
+               WHERE ul.user_id = ?)",
         )
         .bind(&user.id)
         .fetch_all(&st.pool)
         .await
         .map_err(gql_err)?
         .into_iter()
+        .map(|(id, released, found)| (id, (released, found)))
         .collect();
         for series in &mut out {
-            if let Some(at) = work_recency.get(&series.id.0) {
-                series.latest_chapter_at = epoch_ms_to_iso(*at);
+            if let Some((released, found)) = work_recency.get(&series.id.0) {
+                series.latest_chapter_at = epoch_ms_to_iso(*released);
+                series.detected_at = found.map(epoch_ms_to_iso);
             }
         }
         // Hide NSFW series from the library too, unless the viewer opted in (N2).
@@ -5705,7 +5821,12 @@ impl QueryRoot {
         // scalar sub-select so a row that doesn't resolve (spine not drained for that
         // source yet) still contributes its timestamp — COUNT(DISTINCT) skips the NULL.
         let read_rows = sqlx::query_as::<_, (String, i64, Option<String>)>(
-            "WITH prog(lib_id, ckey, ts) AS ( \
+            "WITH library AS ( \
+               SELECT ul.user_id, COALESCE(ss.work_id, ul.series_id) AS series_id \
+               FROM user_library ul LEFT JOIN source_series ss \
+                 ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
+               WHERE ul.user_id = ?1 GROUP BY ul.user_id, COALESCE(ss.work_id, ul.series_id) \
+             ), prog(lib_id, ckey, ts) AS ( \
                SELECT ul.series_id, \
                       (SELECT c.chapter_key FROM chapter c \
                          JOIN source_series ss ON ss.id = c.source_series_id \
@@ -5713,7 +5834,7 @@ impl QueryRoot {
                         WHERE c.external_id = cp.chapter_id LIMIT 1), \
                       cp.updated_at \
                  FROM canonical_progress cp \
-                 JOIN user_library ul ON ul.user_id = cp.user_id AND ul.series_id = cp.work_id \
+                 JOIN library ul ON ul.user_id = cp.user_id AND ul.series_id = cp.work_id \
                 WHERE cp.user_id = ?1 AND cp.read = 1 \
                UNION ALL \
                SELECT ul.series_id, \
@@ -5723,7 +5844,7 @@ impl QueryRoot {
                         WHERE c.external_id = sp.chapter_id LIMIT 1), \
                       sp.updated_at \
                  FROM suwayomi_progress sp \
-                 JOIN user_library ul ON ul.user_id = sp.user_id AND ul.series_id = sp.series_id \
+                 JOIN library ul ON ul.user_id = sp.user_id AND ul.series_id = sp.series_id \
                 WHERE sp.user_id = ?1 AND sp.read = 1 \
                UNION ALL \
                SELECT ul.series_id, \
@@ -5734,7 +5855,7 @@ impl QueryRoot {
                  FROM suwayomi_progress sp \
                  JOIN source_series ss ON ss.source_type = 'suwayomi' \
                       AND ss.source_key = sp.series_id \
-                 JOIN user_library ul ON ul.user_id = sp.user_id AND ul.series_id = ss.work_id \
+                 JOIN library ul ON ul.user_id = sp.user_id AND ul.series_id = ss.work_id \
                 WHERE sp.user_id = ?1 AND sp.read = 1 \
              ) \
              SELECT lib_id, COUNT(DISTINCT ckey), MAX(ts) FROM prog GROUP BY lib_id",
@@ -5748,15 +5869,20 @@ impl QueryRoot {
         // second numeric Suwayomi rows (that one source); the two id shapes are disjoint,
         // and the outer GROUP BY would fold them anyway.
         let total_rows = sqlx::query_as::<_, (String, i64)>(
-            "SELECT lib_id, COUNT(DISTINCT ckey) FROM ( \
+            "WITH library AS ( \
+               SELECT ul.user_id, COALESCE(ss.work_id, ul.series_id) AS series_id \
+               FROM user_library ul LEFT JOIN source_series ss \
+                 ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
+               WHERE ul.user_id = ?1 GROUP BY ul.user_id, COALESCE(ss.work_id, ul.series_id) \
+             ) SELECT lib_id, COUNT(DISTINCT ckey) FROM ( \
                SELECT ul.series_id AS lib_id, c.chapter_key AS ckey \
-                 FROM user_library ul \
+                 FROM library ul \
                  JOIN source_series ss ON ss.work_id = ul.series_id \
                  JOIN chapter c ON c.source_series_id = ss.id \
                 WHERE ul.user_id = ?1 \
                UNION ALL \
                SELECT ul.series_id, c.chapter_key \
-                 FROM user_library ul \
+                 FROM library ul \
                  JOIN source_series ss ON ss.source_type = 'suwayomi' \
                       AND ss.source_key = ul.series_id \
                  JOIN chapter c ON c.source_series_id = ss.id \
@@ -5776,18 +5902,24 @@ impl QueryRoot {
         // when the spine has nothing for the row (below); on production data the two
         // agree exactly on every numeric library series.
         let fallback = sqlx::query_as::<_, (String, i64, i64)>(
-            "SELECT lib_id, \
+            "WITH library AS ( \
+               SELECT ul.user_id, COALESCE(ss.work_id, ul.series_id) AS series_id \
+               FROM user_library ul LEFT JOIN source_series ss \
+                 ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
+               WHERE ul.user_id = ?1 GROUP BY ul.user_id, COALESCE(ss.work_id, ul.series_id) \
+             ) SELECT lib_id, \
                     COUNT(DISTINCT CASE WHEN rd = 1 THEN k END), \
                     COUNT(DISTINCT k) \
                FROM ( \
                  SELECT ul.series_id AS lib_id, \
                         CAST(CAST(ROUND(sc.chapter_number * 100) AS INTEGER) AS TEXT) AS k, \
                         COALESCE(sp.read, 0) AS rd \
-                   FROM user_library ul \
-                   JOIN suwayomi_chapter sc ON sc.manga_id = CAST(ul.series_id AS INTEGER) \
+                   FROM library ul \
+                   LEFT JOIN source_series ss ON ss.source_type = 'suwayomi' AND ss.work_id = ul.series_id \
+                   JOIN suwayomi_chapter sc ON sc.manga_id = CAST(COALESCE(ss.source_key, ul.series_id) AS INTEGER) \
                    LEFT JOIN suwayomi_progress sp ON sp.user_id = ul.user_id \
                         AND sp.chapter_id = CAST(sc.id AS TEXT) \
-                  WHERE ul.user_id = ?1 AND ul.series_id GLOB '[0-9]*' \
+                  WHERE ul.user_id = ?1 \
                ) GROUP BY lib_id",
         )
         .bind(&user.id)
@@ -7749,6 +7881,63 @@ fn tidy_chapter_number(raw: &str) -> String {
     }
 }
 
+/// Store library membership once per work, folding historical source-scoped rows.
+/// Preserve favorites, the explicit shelf, and original addition date on consolidation.
+async fn consolidate_library_identity(
+    pool: &SqlitePool,
+    user_id: &str,
+    series_id: &str,
+) -> Result<String> {
+    let identity = resolve_work_id(pool, series_id)
+        .await
+        .unwrap_or_else(|| series_id.to_string());
+    if identity == series_id && !identity.starts_with("w_") {
+        return Ok(identity);
+    }
+    let mut tx = pool.begin().await.map_err(gql_err)?;
+    let rows = sqlx::query_as::<_, (String, String, i64, Option<String>)>(
+        "SELECT series_id, created_at, is_favorite, status FROM user_library \
+         WHERE user_id = ?1 AND (series_id = ?2 OR series_id IN ( \
+           SELECT source_key FROM source_series WHERE work_id = ?2 AND source_type = 'suwayomi' \
+         )) ORDER BY (series_id = ?2) DESC, created_at DESC",
+    )
+    .bind(user_id)
+    .bind(&identity)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(gql_err)?;
+    if !rows.is_empty() {
+        let created = rows.iter().map(|r| &r.1).min().unwrap();
+        let favorite = rows.iter().any(|r| r.2 != 0);
+        let status = rows.iter().find_map(|r| r.3.as_deref());
+        sqlx::query(
+            "INSERT INTO user_library (user_id, series_id, created_at, is_favorite, status) \
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, series_id) DO UPDATE SET \
+             created_at = excluded.created_at, is_favorite = excluded.is_favorite, status = excluded.status",
+        )
+        .bind(user_id)
+        .bind(&identity)
+        .bind(created)
+        .bind(favorite as i64)
+        .bind(status)
+        .execute(&mut *tx)
+        .await
+        .map_err(gql_err)?;
+        sqlx::query(
+            "DELETE FROM user_library WHERE user_id = ?1 AND series_id != ?2 AND series_id IN ( \
+               SELECT source_key FROM source_series WHERE work_id = ?2 AND source_type = 'suwayomi' \
+             )",
+        )
+        .bind(user_id)
+        .bind(&identity)
+        .execute(&mut *tx)
+        .await
+        .map_err(gql_err)?;
+    }
+    tx.commit().await.map_err(gql_err)?;
+    Ok(identity)
+}
+
 /// Reload a series (canonical `w_` work or numeric Suwayomi id) as a `Series`
 /// whose per-viewer fields (`isMarked` / `libraryStatus` / `isFavorite`) resolve
 /// against `user_id`. Shared by the library mutations to echo the updated state.
@@ -7802,6 +7991,7 @@ impl MutationRoot {
         if !series_id.0.starts_with("w_") && series_id.0.parse::<i64>().is_err() {
             return Err(Error::new("Invalid series id"));
         }
+        let library_id = consolidate_library_identity(&st.pool, &user.id, &series_id.0).await?;
         if marked {
             let now = Utc::now().to_rfc3339();
             sqlx::query(
@@ -7809,7 +7999,7 @@ impl MutationRoot {
                  ON CONFLICT(user_id, series_id) DO NOTHING",
             )
             .bind(&user.id)
-            .bind(&series_id.0)
+            .bind(&library_id)
             .bind(&now)
             .execute(&st.pool)
             .await
@@ -7825,33 +8015,12 @@ impl MutationRoot {
         } else {
             sqlx::query("DELETE FROM user_library WHERE user_id = ? AND series_id = ?")
                 .bind(&user.id)
-                .bind(&series_id.0)
+                .bind(&library_id)
                 .execute(&st.pool)
                 .await
                 .map_err(gql_err)?;
         }
-        // Return the series with the (now-updated) per-viewer `isMarked` resolved by
-        // the ComplexObject impl. Canonical `w_` works load from the mirror; numeric
-        // ids load the source series.
-        if series_id.0.starts_with("w_") {
-            let work = catalog::load_canonical_work(&st.pool, &series_id.0)
-                .await
-                .map_err(gql_err)?
-                .ok_or_else(|| Error::new("No such work"))?;
-            let chapters = catalog::load_canonical_chapters(&st.pool, &series_id.0)
-                .await
-                .map_err(gql_err)?;
-            return Ok(map_canonical_series(
-                &st.pool,
-                Some(user.id.as_str()),
-                work,
-                catalog::main_chapter_count_str(&chapters) as i32,
-            )
-            .await);
-        }
-        let n = series_id.0.parse::<i64>().map_err(gql_err)?;
-        let m = st.suwayomi.series(n).await.map_err(gql_err)?;
-        Ok(map_series(st, m).await)
+        reload_series(st, &user.id, &series_id.0).await
     }
 
     /// File a series under an explicit shelf for the viewer ('reading' |
@@ -7873,13 +8042,14 @@ impl MutationRoot {
                 ));
             }
         }
+        let library_id = consolidate_library_identity(&st.pool, &user.id, &series_id.0).await?;
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO user_library (user_id, series_id, created_at, status) VALUES (?, ?, ?, ?) \
              ON CONFLICT(user_id, series_id) DO UPDATE SET status = excluded.status",
         )
         .bind(&user.id)
-        .bind(&series_id.0)
+        .bind(&library_id)
         .bind(&now)
         .bind(&status)
         .execute(&st.pool)
@@ -7898,13 +8068,14 @@ impl MutationRoot {
     ) -> Result<Series> {
         let st = state(ctx);
         let user = require_user(ctx).await?;
+        let library_id = consolidate_library_identity(&st.pool, &user.id, &series_id.0).await?;
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO user_library (user_id, series_id, created_at, is_favorite) VALUES (?, ?, ?, ?) \
              ON CONFLICT(user_id, series_id) DO UPDATE SET is_favorite = excluded.is_favorite",
         )
         .bind(&user.id)
-        .bind(&series_id.0)
+        .bind(&library_id)
         .bind(&now)
         .bind(favorite as i64)
         .execute(&st.pool)
@@ -19410,6 +19581,165 @@ mod tests {
             r.errors
         );
         assert!(data_json(&r).contains("Anchored Work"));
+    }
+
+    #[tokio::test]
+    async fn library_identity_unifies_favorites_duplicate_cards_and_progress() {
+        let (schema, pool) = setup_full(100).await;
+        let work_id = catalog::create_work(
+            &pool,
+            &catalog::WorkInput {
+                primary_title: Some("A Painter Who Draws Dungeons".into()),
+                original_language: Some("ko".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for (series_id, numbers) in [(323, vec![1, 2]), (324, vec![1, 2, 3])] {
+            sqlx::query("INSERT INTO suwayomi_series (id, title, thumbnail_url, status, source_id, lang, chapter_count, updated_at) VALUES (?, 'A Painter Who Draws Dungeons', '/cover.png', 'ONGOING', 'src', 'en', ?, '2026-10-03T00:00:00Z')")
+                .bind(series_id).bind(numbers.len() as i64).execute(&pool).await.unwrap();
+            let ssid = catalog::upsert_source_series(
+                &pool,
+                &work_id,
+                "suwayomi",
+                "src",
+                &series_id.to_string(),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            for number in numbers {
+                catalog::upsert_chapter(
+                    &pool,
+                    &ssid,
+                    &catalog::ChapterInput {
+                        external_id: format!("{series_id}{number}"),
+                        number: Some(number.to_string()),
+                        lang: Some("en".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        }
+        // Historical source and canonical rows for the same work.
+        sqlx::query("INSERT INTO user_library (user_id, series_id, created_at, is_favorite, status) VALUES ('bob-id', '323', '2020-01-01T00:00:00Z', 1, 'reading'), ('bob-id', ?, '2026-10-01T00:00:00Z', 0, NULL)")
+            .bind(&work_id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO suwayomi_progress (user_id, chapter_id, series_id, read, updated_at) VALUES ('bob-id', '3231', '323', 1, '2026-10-02T00:00:00Z'), ('bob-id', '3242', '324', 1, '2026-10-03T00:00:00Z')")
+            .execute(&pool).await.unwrap();
+        catalog::refresh_feed_updates(&pool).await.unwrap();
+        let query = format!(
+            r#"{{ library {{ id isFavorite libraryStatus }} libraryProgress {{ id read total }} seriesPage(workId: "{work_id}") {{ series {{ id }} sources {{ series {{ id isFavorite libraryStatus }} }} }} }}"#
+        );
+        let response = exec(&schema, &query, Some("bobtok"), "1.1.1.1").await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let data = response.data.into_json().unwrap();
+        assert_eq!(data["library"].as_array().unwrap().len(), 1);
+        assert_eq!(data["library"][0]["id"], work_id);
+        assert_eq!(data["library"][0]["isFavorite"], true);
+        assert_eq!(data["library"][0]["libraryStatus"], "reading");
+        assert_eq!(data["libraryProgress"].as_array().unwrap().len(), 1);
+        assert_eq!(data["libraryProgress"][0]["id"], work_id);
+        assert_eq!(data["libraryProgress"][0]["read"], 2);
+        assert_eq!(data["libraryProgress"][0]["total"], 3);
+        assert!(data["seriesPage"]["series"].is_null());
+        for source in data["seriesPage"]["sources"].as_array().unwrap() {
+            assert_eq!(source["series"]["isFavorite"], true);
+        }
+        // Toggle through another source; both the echoed and reloaded flags agree.
+        let response = exec(&schema, r#"mutation { setFavorite(seriesId: "324", favorite: false) { id isFavorite libraryStatus } }"#, Some("bobtok"), "1.1.1.1").await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(
+            response.data.into_json().unwrap()["setFavorite"]["isFavorite"],
+            false
+        );
+        let rows: Vec<(String, i64, Option<String>, String)> = sqlx::query_as("SELECT series_id, is_favorite, status, created_at FROM user_library WHERE user_id = 'bob-id'").fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                work_id.clone(),
+                0,
+                Some("reading".into()),
+                "2020-01-01T00:00:00Z".into()
+            )]
+        );
+        let response = exec(&schema, &query, Some("bobtok"), "1.1.1.1").await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(
+            response.data.into_json().unwrap()["library"][0]["isFavorite"],
+            false
+        );
+        let response = exec(
+            &schema,
+            r#"mutation { mark(seriesId: "323", marked: false) { isMarked } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(
+            response.data.into_json().unwrap()["mark"]["isMarked"],
+            false
+        );
+        let mutation = format!(
+            r#"mutation {{ setFavorite(seriesId: "{work_id}", favorite: true) {{ isFavorite }} }}"#
+        );
+        let response = exec(&schema, &mutation, Some("bobtok"), "1.1.1.1").await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(
+            response.data.into_json().unwrap()["setFavorite"]["isFavorite"],
+            true
+        );
+        // A fresh request models reloading the federation page after favoriting it.
+        let response = exec(&schema, &query, Some("bobtok"), "1.1.1.1").await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let data = response.data.into_json().unwrap();
+        assert_eq!(data["library"][0]["isFavorite"], true);
+        for source in data["seriesPage"]["sources"].as_array().unwrap() {
+            assert_eq!(source["series"]["isFavorite"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn library_recency_exposes_found_clock_separately_from_release_clock() {
+        let (schema, pool) = setup_full(100).await;
+        seed_canonical(
+            &pool,
+            "md-library-found",
+            "Old release found today",
+            false,
+            "1",
+        )
+        .await;
+        let work_id: String = sqlx::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-library-found'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO user_library (user_id, series_id, created_at) VALUES ('bob-id', ?, '2026-10-03T00:00:00Z')").bind(&work_id).execute(&pool).await.unwrap();
+        catalog::refresh_feed_updates(&pool).await.unwrap();
+        sqlx::query("UPDATE feed_series_updates SET released_at = 1577836800000, announced_at = 1791028800000 WHERE work_id = ?").bind(&work_id).execute(&pool).await.unwrap();
+        let response = exec(
+            &schema,
+            "{ library { id latestChapterAt detectedAt } }",
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let data = response.data.into_json().unwrap();
+        assert_eq!(
+            data["library"][0]["latestChapterAt"],
+            epoch_ms_to_iso(1577836800000)
+        );
+        assert_eq!(
+            data["library"][0]["detectedAt"],
+            epoch_ms_to_iso(1791028800000)
+        );
     }
 
     #[tokio::test]

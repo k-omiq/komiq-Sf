@@ -76,6 +76,7 @@ test('an empty copy falls through, but an all-empty chapter is not reported as a
 // Suwayomi source ("MANGA Plus", manga 777) with its own copies of ch. 4 and 5.
 // ---------------------------------------------------------------------------------------
 import { testGlobals } from './node-test-hooks.ts';
+import type { ReaderFormatMetadata } from './reader-format.ts';
 
 const { getReaderChapter, clearReaderWorkCache, saveProgress } = await import('./source.ts');
 
@@ -135,6 +136,7 @@ const AGGREGATED = [
 ];
 
 interface FakeOpts {
+	publication?: ReaderFormatMetadata;
 	/** Pages per MangaDex chapter id; an id not listed REJECTS (taken down upstream). */
 	mdPages?: Record<string, string[]>;
 	/** The Suwayomi source's chapter list as the server reports it (`[]` = engine down). */
@@ -159,7 +161,7 @@ function fakeBackend(opts: FakeOpts = {}) {
 	Object.assign(b, {
 		seriesPage: async (workId: string) => ({
 			workId,
-			series: { id: WORK, title: 'Fixture Work' },
+			series: { id: WORK, title: 'Fixture Work', ...opts.publication },
 			spineChapters: SPINE,
 			sources: [
 				{
@@ -198,6 +200,40 @@ function fakeBackend(opts: FakeOpts = {}) {
 	});
 	return { asked };
 }
+
+test('reader classification carries canonical long-strip tags even with an English source', async () => {
+	fakeBackend({
+		mdPages: { 'md-5a': ['image'] },
+		publication: { type: 'MANGA', metadata: { tags: [{ name: 'Long Strip' }] } },
+	});
+	const got = await getReaderChapter(WORK, 'md-5a');
+	assert.equal(got.longStrip, true);
+	assert.equal(got.pages.length, 1);
+});
+
+test('reader classification preserves ordinary manga and respects original Korean language', async () => {
+	for (const [language, expected] of [
+		['ja', false],
+		['ko', true],
+	] as const) {
+		fakeBackend({
+			mdPages: { 'md-5a': ['image'] },
+			publication: { type: 'MANGA', metadata: { originalLanguage: language } },
+		});
+		const got = await getReaderChapter(WORK, 'md-5a');
+		assert.equal(got.longStrip, expected);
+	}
+});
+
+test('single-source readers also carry publication layout metadata', async () => {
+	fakeBackend();
+	testGlobals.backend.series = async () => ({ type: 'MANHUA', title: 'Single-source comic' });
+	testGlobals.backend.chapters = async () => [chapter('9005', 5, null)];
+	testGlobals.backend.pages = async () => [{ index: 0, sourceUrl: 'image' }];
+	const got = await getReaderChapter('777', '9005');
+	assert.equal(got.longStrip, true);
+	assert.equal(got.seriesTitle, 'Single-source comic');
+});
 
 // The reader logs every failed copy on purpose; keep the test output readable.
 console.warn = () => {};

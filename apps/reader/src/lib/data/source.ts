@@ -47,6 +47,7 @@ import { findChapterOwner } from './chapter-owner';
 import type { ChapterCandidate } from './chapter-owner';
 import { adjacentChapters, copiesOf, normalizeGroup, sortChaptersAsc } from './chapter-versions';
 import { loadFirstReadable, settleWithin, withTimeout } from './reader-pages';
+import { isLongStripSeries } from './reader-format';
 import { chapterChip, chapterSourceUrl, externalChapterHref } from './chapter-label';
 import { chapterDateLabel, chapterFoundLabel } from './chapter-date';
 import {
@@ -1584,8 +1585,8 @@ export interface LibraryRowView {
 	favorite: boolean;
 	read: number;
 	total: number;
-	/** Newest chapter's release time (RFC 3339), or '' — sorts "Latest chapter". */
-	latestChapterAt: string;
+	/** When Komiq found/announced the latest chapter (RFC 3339), or '' if unknown. */
+	latestFoundAt: string;
 	/**
 	 * When the viewer last made progress (RFC 3339), or '' if never — sorts "Recently read".
 	 *
@@ -1648,7 +1649,7 @@ export function getLibrary() {
 			favorite: s.isFavorite ?? false,
 			read,
 			total,
-			latestChapterAt: s.latestChapterAt ?? '',
+			latestFoundAt: s.detectedAt ?? '',
 			lastReadAt: p?.lastReadAt ?? '',
 		}));
 		// Continue-reading: series with progress underway.
@@ -2687,6 +2688,8 @@ export interface ReaderChapterRef {
 	externalUrl?: string | null;
 }
 export interface ReaderView {
+	/** Publication format/origin requires continuous vertical reading. */
+	longStrip?: boolean;
 	/** Completion survives reopening a chapter, including native backends. */
 	chapterRead?: boolean;
 	seriesId: string;
@@ -2803,6 +2806,7 @@ function chapterExternalUrl(c: Chapter): string | null {
  * its own list.
  */
 interface ReaderCopyContext {
+	longStrip?: boolean;
 	/**
 	 * Every copy the reader can open from the ACTIVE source, for prev/next. Defaults to the
 	 * list itself. On the MangaDex spine this is wider than the list: `canonicalChapters`
@@ -2871,6 +2875,7 @@ function buildReaderView(
 	return {
 		seriesId,
 		seriesTitle: seriesTitle || 'Reader',
+		longStrip: ctx.longStrip ?? false,
 		chapterId: target.id,
 		chapterRead: target.read,
 		chNum: target.number,
@@ -3431,6 +3436,7 @@ export function getReaderChapter(
 				tmeta,
 				readingSrc,
 				{
+					longStrip: isLongStripSeries(resolved.canonSeries) || isLongStripSeries(resolved.meta),
 					pool: copyPool(effectiveId, agg, activeChs, readingSrc),
 					versions: readerVersions(agg, resolved, target, readingSrc, activeCand),
 					sourceName: activeCand?.name,
@@ -3486,6 +3492,7 @@ export function getReaderChapter(
 			series?.title ?? 'Reader',
 			NO_TRANSLATORS,
 			null,
+			{ longStrip: isLongStripSeries(series) },
 		);
 	}, emptyReader(seriesId));
 }
