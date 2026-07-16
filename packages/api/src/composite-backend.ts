@@ -570,6 +570,9 @@ export class CompositeBackend implements Backend {
 	mergeWorks(sourceWorkId: Id, targetWorkId: Id): Promise<MergeWorksResult> {
 		return this.opts.hosted.mergeWorks!(sourceWorkId, targetWorkId);
 	}
+	retryCover(workId: Id): Promise<boolean> {
+		return this.opts.hosted.retryCover!(workId);
+	}
 	workSourceRows(workId: Id): Promise<WorkSourceRow[]> {
 		return this.opts.hosted.workSourceRows!(workId);
 	}

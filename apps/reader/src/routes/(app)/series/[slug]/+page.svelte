@@ -24,6 +24,8 @@
 		setChapterRead,
 	} from '$lib/data/source';
 	import { backend, images } from '$lib/context';
+	import { apiOrigin, config } from '$lib/config';
+	import { retryCoverUrl } from '$lib/data/cover-retry';
 	import { auth } from '$lib/auth.svelte';
 	import {
 		socialLive,
@@ -498,6 +500,50 @@
 	);
 	let splitOpen = $state(false);
 
+	// Available even when the current image loaded: admins can replace a damaged
+	// or outdated stored cover through the same repair action as the admin console.
+	const canFetchCover = $derived(auth.ready && !!auth.user?.isAdmin && !!backend.retryCover);
+	let coverBusy = $state(false);
+	let coverError = $state('');
+	let fetchedCover = $state('');
+	const heroCover = $derived(fetchedCover || detail?.cover || '');
+	let coverGeneration = 0;
+	$effect(() => {
+		data.slug;
+		workId;
+		coverBusy = false;
+		coverError = '';
+		fetchedCover = '';
+		return () => {
+			coverGeneration += 1;
+		};
+	});
+
+	async function fetchAdminCover(): Promise<void> {
+		if (!canFetchCover || !workId || coverBusy) return;
+		const id = workId;
+		const generation = coverGeneration;
+		coverBusy = true;
+		coverError = '';
+		try {
+			const stored = await backend.retryCover!(id);
+			if (generation !== coverGeneration) return;
+			if (!stored) throw new Error('Could not fetch a source cover. Try again later.');
+			// retryCover stores this work's processed image on the API origin. Use it
+			// directly, including for numeric source pages whose metadata has an old URL.
+			fetchedCover = retryCoverUrl(
+				`${apiOrigin}/covers/${encodeURIComponent(id)}.webp`,
+				`${Date.now()}-${Math.random().toString(36).slice(2)}`,
+				[apiOrigin, config.imgWorkerBaseUrl].filter(Boolean),
+			);
+		} catch (error) {
+			if (generation === coverGeneration)
+				coverError = error instanceof Error ? error.message : 'Could not fetch the cover.';
+		} finally {
+			if (generation === coverGeneration) coverBusy = false;
+		}
+	}
+
 	// Go to what was just created. Confirming the detached run landed where the admin
 	// meant it to is the whole point of the action, and the new work's page is the only
 	// place that shows it.
@@ -721,7 +767,7 @@
 		}
 		return raw.length > 200 ? `${raw.slice(0, 197).trimEnd()}…` : raw;
 	});
-	// The cover goes through the SAME resolver the <img> uses, so the preview image
+	// The cover goes through the same resolver as the poster, so the preview image
 	// is the proxied/cached absolute URL rather than an upstream host that blocks
 	// hotlinking. Falls back to the site card (what the layout would have emitted)
 	// when there's no cover to show — native has no sync resolver, and a not-found
@@ -961,7 +1007,7 @@
 {:else if detail && seriesDetail}
 	<!-- Blurred cover backdrop. Decorative, so hidden from assistive tech. -->
 	<div class="banner" aria-hidden="true">
-		<div class="banner-img"><Cover src={detail.cover} alt="" sizing="card" /></div>
+		<div class="banner-img"><Cover src={heroCover} alt="" sizing="card" /></div>
 	</div>
 
 	<!-- hero -->
@@ -973,7 +1019,7 @@
 				disabled={!covers.length}
 				aria-label={covers.length ? `View covers for ${title}` : title}
 			>
-				<Cover src={detail.cover} alt={title} priority />
+				<Cover src={heroCover} alt={title} priority />
 			</button>
 
 			<div class="head">
@@ -1079,6 +1125,15 @@
 						onclick={() => (splitOpen = true)}>Split</button
 					>
 				{/if}
+				{#if canFetchCover}
+					<button
+						class="merge"
+						disabled={!workId || coverBusy}
+						aria-busy={coverBusy}
+						title={workId ? 'Fetch and store a fresh source cover' : 'Resolving work…'}
+						onclick={fetchAdminCover}>{coverBusy ? 'Fetching…' : 'Fetch cover'}</button
+					>
+				{/if}
 				{#if canRate && nsfwOverride !== undefined}
 					<div class="rating" role="group" aria-label="Admin: content rating">
 						<span class="rating-tag">RATING</span>
@@ -1144,6 +1199,14 @@
 				</div>
 			</div>
 		</div>
+		{#if coverError}
+			<div class="write-error" role="alert">
+				<Icon name="alert" size={15} />
+				<span>{coverError}</span>
+			</div>
+		{:else if canFetchCover && fetchedCover && !coverBusy}
+			<p role="status">Cover fetched.</p>
+		{/if}
 		{#if nsfwError}
 			<div class="write-error" role="alert">
 				<Icon name="alert" size={15} />
