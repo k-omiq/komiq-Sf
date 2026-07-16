@@ -396,7 +396,7 @@ pub async fn put_work_cover(
     webp: &[u8],
 ) -> Result<()> {
     let now = Utc::now();
-    let version = now.timestamp();
+    let version = now.timestamp_millis();
     let ts = now.to_rfc3339();
     // 1) Blob first, into the un-replicated covers DB.
     sqlx::query(
@@ -415,12 +415,26 @@ pub async fn put_work_cover(
     // relying on the `?v=` bust: that only stops browsers and the edge from reusing the
     // old bytes, it does not touch what we would hand the next cold request.
     clear_cover_variants(covers, work_id).await;
-    // 2) Version pointer second, into the main (replicated) DB.
+    // 2) Publish the version and every materialized card URL atomically. Updating
+    // only work left library/browse cards pointing at immutable damaged thumbnails
+    // even after an admin had successfully fetched a replacement.
+    let mut tx = main.begin().await?;
     sqlx::query("UPDATE work SET cover_cached_version = ? WHERE id = ?")
         .bind(version)
         .bind(work_id)
-        .execute(main)
+        .execute(&mut *tx)
         .await?;
+    let url = cover_path(work_id, version);
+    for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
+        sqlx::query(&format!(
+            "UPDATE {table} SET cover_url = ? WHERE work_id = ?"
+        ))
+        .bind(&url)
+        .bind(work_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -2231,6 +2245,13 @@ mod tests {
                 .unwrap();
         assert!(ver0.is_none());
 
+        sqlx::query("INSERT INTO feed_updates (work_id, title, latest_at, cover_url) VALUES ('w_test', 'Cover fixture', '2026-01-01', '/old.webp')")
+            .execute(&main).await.unwrap();
+        sqlx::query("INSERT INTO feed_series_updates (work_id, reader_id, title, released_at, cover_url) VALUES ('w_test', '7', 'Cover fixture', 1, '/old.webp')")
+            .execute(&main).await.unwrap();
+        sqlx::query("INSERT INTO browse_catalogue (work_id, reader_id, title, created_at, cover_url) VALUES ('w_test', '7', 'Cover fixture', '2026-01-01', '/old.webp')")
+            .execute(&main).await.unwrap();
+
         let webp = process_cover(&noisy_png(400, 600)).unwrap();
         put_work_cover(&main, &covers, "w_test", &webp)
             .await
@@ -2259,6 +2280,39 @@ mod tests {
             cover_path("w_test", blob_ver),
             "resolver now prefers the cached VPS path"
         );
+        for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
+            let query = format!("SELECT cover_url FROM {table} WHERE work_id = 'w_test'");
+            let url: String = sqlx::query_scalar(&query).fetch_one(&main).await.unwrap();
+            assert_eq!(
+                url,
+                cover_path("w_test", blob_ver),
+                "{table} publishes the new thumbnail version"
+            );
+            sqlx::query(&format!(
+                "UPDATE {table} SET cover_url = '/old.webp' WHERE work_id = 'w_test'"
+            ))
+            .execute(&main)
+            .await
+            .unwrap();
+        }
+        // Existing repairs also need their stale materialized URLs corrected once.
+        sqlx::raw_sql(include_str!("../migrations/0109_cover_card_versions.sql"))
+            .execute(&main)
+            .await
+            .unwrap();
+        for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
+            let url: String = sqlx::query_scalar(&format!(
+                "SELECT cover_url FROM {table} WHERE work_id = 'w_test'"
+            ))
+            .fetch_one(&main)
+            .await
+            .unwrap();
+            assert_eq!(
+                url,
+                cover_path("w_test", blob_ver),
+                "migration repairs {table}"
+            );
+        }
 
         // pending_cover_count excludes the now-cached work.
         assert_eq!(pending_cover_count(&main).await.unwrap(), 0);

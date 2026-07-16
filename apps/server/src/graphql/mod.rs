@@ -1038,6 +1038,7 @@ async fn resync_feed_nsfw(pool: &SqlitePool, work_ids: &[String]) {
 #[derive(Clone, Default)]
 struct SuwayomiWorkOverrides {
     work_id: Option<String>,
+    cover_cached_version: Option<i64>,
     content_type_override: Option<String>,
     original_language: Option<String>,
     title_override: Option<String>,
@@ -1284,7 +1285,10 @@ fn assemble_series(
         .unwrap_or_else(|| paused_for_status(status));
 
     Series {
-        cover_url: st.suwayomi.abs(m.thumbnail_url.as_deref()),
+        cover_url: match (&ov_meta.work_id, ov_meta.cover_cached_version) {
+            (Some(work_id), Some(version)) => crate::cover::cover_path(work_id, version),
+            _ => st.suwayomi.abs(m.thumbnail_url.as_deref()),
+        },
         rating,
         detected_at: None,
         scan: ScanPolicy {
@@ -1901,6 +1905,7 @@ async fn canonical_overrides_batch(
     struct Row {
         source_key: String,
         work_id: String,
+        cover_cached_version: Option<i64>,
         content_type_override: Option<String>,
         original_language: Option<String>,
         title_override: Option<String>,
@@ -1908,7 +1913,7 @@ async fn canonical_overrides_batch(
     }
     let sql = format!(
         "SELECT ss.source_key, w.id AS work_id, w.content_type_override, w.original_language, \
-                w.title_override, w.description_override \
+                w.title_override, w.description_override, w.cover_cached_version \
          FROM source_series ss \
          JOIN work w ON w.id = ss.work_id \
          WHERE ss.source_type = 'suwayomi' AND ss.source_key IN ({}) \
@@ -1928,6 +1933,7 @@ async fn canonical_overrides_batch(
         let Row {
             source_key,
             work_id,
+            cover_cached_version,
             content_type_override,
             original_language,
             title_override,
@@ -1937,6 +1943,7 @@ async fn canonical_overrides_batch(
         map.entry(source_key)
             .or_insert_with(|| SuwayomiWorkOverrides {
                 work_id: Some(work_id),
+                cover_cached_version,
                 content_type_override,
                 original_language,
                 title_override,
@@ -10023,7 +10030,7 @@ impl MutationRoot {
     async fn retry_cover(&self, ctx: &Context<'_>, work_id: ID) -> Result<bool> {
         require_admin(ctx).await?;
         let st = state(ctx);
-        crate::cover::retry_one_cover(
+        let stored = crate::cover::retry_one_cover(
             &st.pool,
             &st.cover_pool,
             &st.mangadex,
@@ -10031,7 +10038,11 @@ impl MutationRoot {
             &work_id.0,
         )
         .await
-        .map_err(gql_err)
+        .map_err(gql_err)?;
+        if stored {
+            clear_feed_caches();
+        }
+        Ok(stored)
     }
 
     /// Admin series-detail editor: soft-hide (reversible) or rename one chapter of a
@@ -19581,6 +19592,48 @@ mod tests {
             r.errors
         );
         assert!(data_json(&r).contains("Anchored Work"));
+    }
+
+    #[tokio::test]
+    async fn source_metadata_prefers_a_repaired_work_cover_on_reload() {
+        let (schema, pool) = setup_full(100).await;
+        let work_id = catalog::create_work(
+            &pool,
+            &catalog::WorkInput {
+                primary_title: Some("Cover repair fixture".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO suwayomi_series (id, title, thumbnail_url, status, source_id, chapter_count, updated_at) VALUES (323, 'Cover repair fixture', '/api/v1/manga/323/thumbnail', 'ONGOING', 'src', 0, '2026-10-03T00:00:00Z')")
+            .execute(&pool).await.unwrap();
+        catalog::upsert_source_series(&pool, &work_id, "suwayomi", "src", "323", None, false)
+            .await
+            .unwrap();
+        let query = format!(
+            r#"{{ series(id: "323") {{ coverUrl }} seriesPage(workId: "{work_id}") {{ sources {{ series {{ coverUrl }} }} }} }}"#
+        );
+        let before = exec(&schema, &query, None, "1.1.1.1").await;
+        assert!(before.errors.is_empty(), "{:?}", before.errors);
+        assert!(before.data.into_json().unwrap()["series"]["coverUrl"]
+            .as_str()
+            .unwrap()
+            .contains("/api/v1/manga/323/thumbnail"));
+        sqlx::query("UPDATE work SET cover_cached_version = 1791051562000 WHERE id = ?")
+            .bind(&work_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let after = exec(&schema, &query, None, "1.1.1.1").await;
+        assert!(after.errors.is_empty(), "{:?}", after.errors);
+        let data = after.data.into_json().unwrap();
+        let expected = crate::cover::cover_path(&work_id, 1791051562000);
+        assert_eq!(data["series"]["coverUrl"], expected);
+        assert_eq!(
+            data["seriesPage"]["sources"][0]["series"]["coverUrl"],
+            expected
+        );
     }
 
     #[tokio::test]

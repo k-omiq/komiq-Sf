@@ -333,13 +333,21 @@ mod tests {
         crate::avatar::encode_lossless(&rgba).expect("lossless encodes")
     }
 
-    /// Main DB with just enough of `work` for `put_work_cover`'s version pointer.
+    /// Main DB with the version pointer and materialized URLs `put_work_cover` publishes.
     async fn main_db() -> SqlitePool {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::query("CREATE TABLE work (id TEXT PRIMARY KEY, cover_cached_version INTEGER)")
             .execute(&pool)
             .await
             .unwrap();
+        for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
+            sqlx::query(&format!(
+                "CREATE TABLE {table} (work_id TEXT PRIMARY KEY, cover_url TEXT)"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
         pool
     }
 

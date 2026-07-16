@@ -652,6 +652,7 @@ async fn upload_cover(
         return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Could not save cover");
     }
     cover::clear_cover_issue(&app.pool, &work_id).await;
+    graphql::clear_feed_caches();
 
     // Report the freshly-versioned URL so the admin UI can show the new cover
     // immediately (cache-busted by the stored version).
