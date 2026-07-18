@@ -871,11 +871,87 @@ pub async fn clear_source_cover_backoff(main: &SqlitePool, source_id: &str) {
     }
 }
 
-/// Attempt to materialize ONE work's cover on demand (admin "retry" action). Tries
-/// the MangaDex anchor first, then the Suwayomi thumbnail. Clears the issue on
-/// success; re-records it (refreshed reason) on a deterministic failure; leaves it
-/// untouched on a transient upstream-fetch failure. Returns Ok(true) when a cover
-/// was stored, Ok(false) when neither source yielded processable bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepairCoverSource {
+    MangaDex { manga_id: String, file_name: String },
+    Suwayomi { path: String },
+}
+
+async fn repair_cover_sources(main: &SqlitePool, work_id: &str) -> Result<Vec<RepairCoverSource>> {
+    let md = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT (SELECT ss.source_key FROM source_series ss \
+                 WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' \
+                 ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1), \
+                w.cover_file_name FROM work w WHERE w.id = ?",
+    )
+    .bind(work_id)
+    .fetch_optional(main)
+    .await?;
+    let mut sources = Vec::new();
+    if let Some((Some(manga_id), Some(file_name))) = md {
+        if !manga_id.is_empty() && !file_name.is_empty() {
+            sources.push(RepairCoverSource::MangaDex {
+                manga_id,
+                file_name,
+            });
+        }
+    }
+    // Every linked engine manga can supply a cover, even before its metadata is
+    // mirrored locally. Use the internal thumbnail endpoint rather than requiring
+    // a cached thumbnail_url or following a stale public/CDN URL.
+    let keys: Vec<String> = sqlx::query_scalar(
+        "SELECT source_key FROM source_series WHERE work_id = ? \
+         AND source_type = 'suwayomi' ORDER BY created_at ASC, id ASC",
+    )
+    .bind(work_id)
+    .fetch_all(main)
+    .await?;
+    for key in keys {
+        let Ok(id) = key.parse::<i64>() else { continue };
+        if id < 0 {
+            continue;
+        }
+        let candidate = RepairCoverSource::Suwayomi {
+            path: format!("/api/v1/manga/{id}/thumbnail"),
+        };
+        if !sources.contains(&candidate) {
+            sources.push(candidate);
+        }
+    }
+    Ok(sources)
+}
+
+async fn process_repair_sources<F, Fut>(
+    sources: Vec<RepairCoverSource>,
+    mut fetch: F,
+) -> Result<Option<Vec<u8>>>
+where
+    F: FnMut(RepairCoverSource) -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<u8>>>,
+{
+    let mut last_error = None;
+    for source in sources {
+        let Some(bytes) = fetch(source).await else {
+            continue;
+        };
+        // A download is only usable after it has decoded and processed. A corrupt
+        // MangaDex image must not prevent trying Suwayomi, nor may a bad first
+        // Suwayomi source prevent trying the remaining linked sources.
+        match tokio::task::spawn_blocking(move || process_cover(&bytes)).await? {
+            Ok(webp) => return Ok(Some(webp)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match last_error {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
+}
+
+/// Admin cover repair: try MangaDex and every linked Suwayomi source until one
+/// supplies a complete, processable image. Works without MangaDex use Suwayomi
+/// directly. Only store a successful replacement; leave the current cover intact
+/// if every source fails.
 pub async fn retry_one_cover(
     main: &SqlitePool,
     covers: &SqlitePool,
@@ -883,72 +959,41 @@ pub async fn retry_one_cover(
     suwayomi: &crate::suwayomi::SuwayomiClient,
     work_id: &str,
 ) -> Result<bool> {
-    // MangaDex anchor (oldest source_series) + cover file name, mirroring the crawl.
-    let md = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-        "SELECT (SELECT ss.source_key FROM source_series ss \
-                 WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' \
-                 ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1), \
-                w.cover_file_name \
-         FROM work w WHERE w.id = ?",
-    )
-    .bind(work_id)
-    .fetch_optional(main)
-    .await?;
-
-    // Collect candidate source byte-fetches in priority order.
-    let mut source_bytes: Option<Vec<u8>> = None;
-    if let Some((Some(mangadex_id), Some(file_name))) = &md {
-        if !mangadex_id.is_empty() {
-            source_bytes = mangadex.cover_thumb_bytes(mangadex_id, file_name).await;
+    let sources = repair_cover_sources(main, work_id).await?;
+    let processed = process_repair_sources(sources, |source| async move {
+        match source {
+            RepairCoverSource::MangaDex {
+                manga_id,
+                file_name,
+            } => mangadex.cover_thumb_bytes(&manga_id, &file_name).await,
+            RepairCoverSource::Suwayomi { path } => suwayomi.cover_bytes(Some(&path)).await,
         }
-    }
-    if source_bytes.is_none() {
-        // Fall back to the Suwayomi thumbnail anchor.
-        // The cast is on `ss.source_key` (TEXT, no usable index for this join), NOT on
-        // `s.id`. Casting the INDEXED side — `CAST(s.id AS TEXT)` — hides
-        // `suwayomi_series`' INTEGER PRIMARY KEY from the planner, which then has no
-        // choice but `SCAN s` across all 13,802 rows for every call. Same fix and same
-        // reasoning as `catalog::work_effective_genres`. Measured on a copy of
-        // production: 2.00 ms -> 0.01 ms, and 5.99 ms -> 0.01 ms once 0058 drops
-        // `idx_suwayomi_series_library` and the fallback scan target widens.
-        let thumb = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT s.thumbnail_url FROM source_series ss \
-             JOIN suwayomi_series s ON s.id = CAST(ss.source_key AS INTEGER) \
-             WHERE ss.work_id = ? AND ss.source_type = 'suwayomi' \
-             ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1",
-        )
-        .bind(work_id)
-        .fetch_optional(main)
-        .await?
-        .flatten();
-        if let Some(t) = thumb.filter(|t| !t.is_empty()) {
-            source_bytes = suwayomi.cover_bytes(Some(&t)).await;
-        }
-    }
-
-    let Some(bytes) = source_bytes else {
-        // Transient — couldn't fetch a source. Leave any existing issue as-is.
-        return Ok(false);
-    };
-
-    // `bytes` is moved into the blocking task; `work_id` (a &str) stays borrowable
-    // across the await for the DB writes below.
-    match tokio::task::spawn_blocking(move || process_cover(&bytes)).await {
-        Ok(Ok(webp)) => {
+    })
+    .await;
+    match processed {
+        Ok(Some(webp)) => {
             put_work_cover(main, covers, work_id, &webp).await?;
             clear_cover_issue(main, work_id).await;
             Ok(true)
         }
-        Ok(Err(e)) => {
-            // A truncated download is transient — don't freeze it into work_cover_issue.
-            if !is_transient_cover_error(&e) {
-                record_cover_issue(main, work_id, classify_cover_error(&e), &e.to_string()).await;
+        Ok(None) => Ok(false),
+        Err(error) => {
+            // Do not freeze truncated downloads or blocking-task failures into the
+            // issues table. A deterministic image failure is recorded only after
+            // all alternative sources have had a chance to repair it.
+            if !is_transient_cover_error(&error)
+                && error.downcast_ref::<tokio::task::JoinError>().is_none()
+            {
+                record_cover_issue(
+                    main,
+                    work_id,
+                    classify_cover_error(&error),
+                    &error.to_string(),
+                )
+                .await;
             }
-            Err(anyhow!("cover processing failed: {e}"))
+            Err(error.context("cover processing failed"))
         }
-        // A spawn_blocking JoinError (panic) is not necessarily deterministic — surface
-        // it as an error but do NOT record an issue, so a later attempt can retry.
-        Err(e) => Err(anyhow!("cover processing task failed: {e}")),
     }
 }
 
@@ -2359,6 +2404,105 @@ mod tests {
             pending_cover_count(&main).await.unwrap(),
             1,
             "a work the crawl will never select must not be counted as pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_falls_back_after_bad_mangadex_and_unavailable_first_suwayomi() {
+        let sources = vec![
+            RepairCoverSource::MangaDex {
+                manga_id: "md".into(),
+                file_name: "bad.jpg".into(),
+            },
+            RepairCoverSource::Suwayomi {
+                path: "/first".into(),
+            },
+            RepairCoverSource::Suwayomi {
+                path: "/second".into(),
+            },
+        ];
+        let good = noisy_png(300, 450);
+        let mut visited = Vec::new();
+        let webp = process_repair_sources(sources.clone(), |source| {
+            visited.push(source.clone());
+            std::future::ready(match source {
+                RepairCoverSource::MangaDex { .. } => Some(b"not an image".to_vec()),
+                RepairCoverSource::Suwayomi { path } if path == "/second" => Some(good.clone()),
+                _ => None,
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(visited, sources);
+        assert_eq!(
+            image::load_from_memory(&webp).unwrap().dimensions(),
+            (300, 450)
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_uses_suwayomi_without_mangadex_or_cached_metadata_and_keeps_old_cover_on_failure(
+    ) {
+        let (main, covers) = warm_test_pools().await;
+        sqlx::query("CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL)")
+            .execute(&covers).await.unwrap();
+        sqlx::query("INSERT INTO work (id, created_at, updated_at) VALUES ('w_repair', '2026-01-01', '2026-01-01')")
+            .execute(&main).await.unwrap();
+        sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_key, created_at) VALUES ('ss_repair', 'w_repair', 'suwayomi', '7', '2026-01-01')")
+            .execute(&main).await.unwrap();
+        assert_eq!(
+            repair_cover_sources(&main, "w_repair").await.unwrap(),
+            vec![RepairCoverSource::Suwayomi {
+                path: "/api/v1/manga/7/thumbnail".into()
+            }]
+        );
+        record_cover_issue(&main, "w_repair", "unsupported", "old failure").await;
+        let origin = crate::suwayomi::testsrv::spawn(
+            crate::suwayomi::testsrv::jpeg(300, 450),
+            Duration::ZERO,
+        )
+        .await;
+        let suwayomi = crate::suwayomi::SuwayomiClient::new(origin.base_url.clone(), None, None);
+        let mangadex = MangaDexClient::new("cover-repair-test", 5.0, 40.0);
+        assert!(
+            retry_one_cover(&main, &covers, &mangadex, &suwayomi, "w_repair")
+                .await
+                .unwrap()
+        );
+        let before: (Vec<u8>, i64) =
+            sqlx::query_as("SELECT webp, version FROM work_cover_blob WHERE work_id = 'w_repair'")
+                .fetch_one(&covers)
+                .await
+                .unwrap();
+        assert_eq!(
+            image::load_from_memory(&before.0).unwrap().dimensions(),
+            (300, 450)
+        );
+        let issues: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM work_cover_issue WHERE work_id = 'w_repair'")
+                .fetch_one(&main)
+                .await
+                .unwrap();
+        assert_eq!(issues, 0);
+        assert_eq!(origin.hits.load(Ordering::SeqCst), 1);
+        let bad_origin =
+            crate::suwayomi::testsrv::spawn(b"not an image".to_vec(), Duration::ZERO).await;
+        let bad_client =
+            crate::suwayomi::SuwayomiClient::new(bad_origin.base_url.clone(), None, None);
+        assert!(
+            retry_one_cover(&main, &covers, &mangadex, &bad_client, "w_repair")
+                .await
+                .is_err()
+        );
+        let after: (Vec<u8>, i64) =
+            sqlx::query_as("SELECT webp, version FROM work_cover_blob WHERE work_id = 'w_repair'")
+                .fetch_one(&covers)
+                .await
+                .unwrap();
+        assert_eq!(
+            after, before,
+            "failed sources must not replace the stored cover"
         );
     }
 
