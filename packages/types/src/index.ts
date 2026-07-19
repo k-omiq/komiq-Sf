@@ -471,6 +471,55 @@ export interface SourceScanHealth {
 	outageKind: string | null;
 	/** How far out this source's series are parked while the outage lasts. */
 	outageParkedUntil: string | null;
+	/** What every upstream request to this source did over the last 24h, one entry per
+	 * (surface, reason). Unlike the scan counts above it includes the requests READERS
+	 * make, and says why the failures failed. */
+	activity: SourceHealthStat[];
+}
+
+/** Which upstream request a {@link SourceHealthStat} counts: a chapter-list fetch, a
+ * reader opening a chapter, one page image, or a source listing. */
+export type SourceHealthSurface = 'chapters' | 'pages' | 'image' | 'browse';
+
+/** One (surface, reason) total for a source. */
+export interface SourceHealthStat {
+	surface: SourceHealthSurface | (string & {});
+	/** `ok`, or why it failed: `blocked`, `rate_limited`, `solver`, `not_found`, `timeout`,
+	 * `network`, `server_error`, `extension`, `engine`, `other`. */
+	reason: string;
+	count: number;
+	/** The newest error text for this reason; null for `ok`. */
+	lastMessage: string | null;
+	lastAt: string;
+}
+
+/** The extension updater's status: is it on, when did it last run, what did it change. */
+export interface ExtensionAutoUpdate {
+	enabled: boolean;
+	intervalSeconds: number;
+	/** A pass is in flight right now. */
+	running: boolean;
+	/** When the last pass finished; null if none has run since the server started. */
+	lastRunAt: string | null;
+	/** Why the last pass failed as a whole; null when it ran. */
+	lastError: string | null;
+	lastUpdated: number;
+	lastFailed: number;
+	/** Per-extension history, newest first. */
+	recent: ExtensionUpdateEvent[];
+}
+
+/** One extension an update pass touched. */
+export interface ExtensionUpdateEvent {
+	at: string;
+	pkgName: string;
+	fromVersion: string | null;
+	/** Null when the update failed. */
+	toVersion: string | null;
+	/** `auto` (the background pass) or `manual` (an admin asked for one). */
+	origin: string;
+	/** Null when the update succeeded. */
+	error: string | null;
 }
 
 /** Result of a bulk catalogue ingest: per-id entries plus a decision summary. */

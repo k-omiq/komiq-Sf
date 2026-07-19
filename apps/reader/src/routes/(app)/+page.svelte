@@ -22,21 +22,28 @@
 	// See +page.ts. `HomeData` is the resolved shape either way.
 	type HomeData = Awaited<typeof data.home>;
 
-	let heroIndex = $state(0);
-	// Once the reader picks a slide, stop auto-rotating so their choice sticks.
-	let heroPicked = $state(false);
-	// …and hold the rotation while they are actually AT the hero (pointer over it, or
-	// keyboard focus inside it). Without this the banner swaps the slide out from under
-	// whatever they are doing: mid-synopsis it is merely rude, but with focus on the
-	// title link it is a correctness bug — the link the reader tabbed to keeps its DOM
-	// node and its focus ring while its href is rewritten to a different series, so
-	// pressing Enter opens something they never chose. (It is also the WCAG 2.2.2
-	// "pause, stop, hide" mechanism for a 5s auto-advancing region.)
-	let heroHeld = $state(false);
-	/** Auto-rotation is stopped — either pinned by a click or held by the reader. */
-	const heroPaused = $derived(heroPicked || heroHeld);
+	/** How long a hero slide stays up before the carousel advances on its own. */
+	const HERO_ROTATE_MS = 10_000;
 
-	/** Step the carousel by ±1, wrapping, and pin it to the reader's choice. */
+	let heroIndex = $state(0);
+	// Hold the rotation while the reader is about to ACT on the slide: pointer over one
+	// of its links or arrows, or keyboard focus inside it. Without this the banner swaps
+	// the slide out from under them, which is a correctness bug — the link keeps its DOM
+	// node (and its focus ring) while its href is rewritten to a different series, so the
+	// click or Enter opens something they never chose. (It is also the WCAG 2.2.2
+	// "pause, stop, hide" mechanism for an auto-advancing region.)
+	//
+	// Deliberately NOT "pointer anywhere over the hero": the banner is the full-width top
+	// of the page, so a resting pointer is over it more often than not and the carousel
+	// then never advances at all. For the same reason an arrow click does not pin the
+	// slide for good, and a mouse click's leftover focus (not `:focus-visible`) does not
+	// count as the reader being there.
+	let heroHovered = $state(false);
+	let heroFocused = $state(false);
+	/** Auto-rotation is on hold while the reader is at one of the hero's controls. */
+	const heroPaused = $derived(heroHovered || heroFocused);
+
+	/** Step the carousel by ±1, wrapping. The rotation timer restarts from the new slide. */
 	function stepHero(delta: number): void {
 		const n = featured.length;
 		if (!n) return;
@@ -44,10 +51,8 @@
 		// feed shrank under a stationary `heroIndex` (see `slide`), and stepping from the
 		// raw value then moves relative to a slide nobody is looking at: `heroIndex` 7 in a
 		// 3-slide feed shows slide 2, and "next" would compute (7 + 1) % 3 = 2 — the same
-		// slide. The click would do nothing visible while still setting `heroPicked`, i.e.
-		// permanently stopping the rotation, so the hero would look frozen for good.
+		// slide, so the click would do nothing visible.
 		heroIndex = (slide + delta + n) % n;
-		heroPicked = true;
 	}
 
 	function seriesHref(f: FeaturedView): string {
@@ -82,23 +87,27 @@
 	// entirely there, it does not fall back to the skeleton.
 	const featured = $derived<FeaturedView[]>((settled ?? streamed)?.featured ?? []);
 
-	// Auto-rotate the hero, unless the reader stopped it or prefers reduced motion.
-	// Re-runs (and so re-arms a fresh interval) whenever `featured` or the paused flag
-	// changes; the teardown clears the old one, so there is exactly one timer at a time
-	// and none at all after unmount.
+	// Auto-rotate the hero, unless the reader is holding it or prefers reduced motion.
+	// A one-shot timer per slide, not an interval: the effect reads `slide`, so every
+	// change of slide — the timer's own or an arrow click — re-arms a full
+	// `HERO_ROTATE_MS`, and a slide the reader just stepped to is never cut short. The
+	// teardown clears the old timer, so there is exactly one at a time and none at all
+	// after unmount.
 	$effect(() => {
 		if (heroPaused) return;
-		if (featured.length < 2) return;
+		const n = featured.length;
+		if (n < 2) return;
 		const reduce =
 			typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
 		if (reduce) return;
-		const t = setInterval(() => {
-			// From `slide`, not `heroIndex` — same reason as `stepHero`. Advancing the raw
-			// index after the feed shrank would re-render the same slide and read as a
-			// carousel that skipped a beat.
-			heroIndex = (slide + 1) % featured.length;
-		}, 5000);
-		return () => clearInterval(t);
+		// From `slide`, not `heroIndex` — same reason as `stepHero`. Advancing the raw
+		// index after the feed shrank would re-render the same slide and read as a
+		// carousel that skipped a beat.
+		const next = (slide + 1) % n;
+		const t = setTimeout(() => {
+			heroIndex = next;
+		}, HERO_ROTATE_MS);
+		return () => clearTimeout(t);
 	});
 
 	/**
@@ -223,15 +232,16 @@
 			class="hero"
 			aria-roledescription="carousel"
 			aria-label="Featured series"
-			onmouseenter={() => (heroHeld = true)}
-			onmouseleave={() => (heroHeld = false)}
-			onfocusin={() => (heroHeld = true)}
-			onfocusout={() => (heroHeld = false)}
+			onpointerover={(e) => (heroHovered = (e.target as Element).closest('a, button') !== null)}
+			onpointerleave={() => (heroHovered = false)}
+			onfocusin={(e) => (heroFocused = (e.target as Element).matches(':focus-visible'))}
+			onfocusout={() => (heroFocused = false)}
 		>
 			<!-- `aria-live` is off while the carousel is advancing on its own (announcing a
-			     slide every 5s would make the page unusable) and polite once it is paused —
-			     which includes the moment an arrow is clicked, so a screen-reader user hears
-			     the slide they just asked for. This is the APG carousel pattern. -->
+			     slide every 10s would make the page unusable) and polite once it is paused —
+			     which includes the moment an arrow is clicked (the pointer or the keyboard
+			     focus is on that arrow), so a screen-reader user hears the slide they just
+			     asked for. This is the APG carousel pattern. -->
 			<div
 				class="hero-slide"
 				role="group"

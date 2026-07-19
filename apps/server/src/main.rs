@@ -22,6 +22,7 @@ mod phash;
 mod rate_limit;
 mod scanner;
 mod series_cache;
+mod source_health;
 mod suwayomi;
 mod sync;
 mod tags;
@@ -882,8 +883,23 @@ async fn serve_suwayomi_image(
     // the unbounded `fetch_image`, which shared the 30 s scan timeout and no concurrency
     // bound, so a burst of page requests (a chapter is tens of pages) could pile onto the
     // engine behind the scanner and each pay the full 30 s ceiling.
+    // The owning manga, for the per-source health buckets (`is_suwayomi_image_path`
+    // already proved the first segment numeric).
+    let manga_id = rest.split('/').next().and_then(|id| id.parse::<i64>().ok());
+    let health = |outcome: Result<(), &anyhow::Error>| {
+        if let Some(id) = manga_id {
+            source_health::observe(
+                source_health::Subject::Manga(id),
+                source_health::Surface::Image,
+                &outcome,
+            );
+        }
+    };
     match app.suwayomi.fetch_page_now(&path).await {
-        Ok((bytes, content_type)) => raw_image_response(content_type, bytes),
+        Ok((bytes, content_type)) => {
+            health(Ok(()));
+            raw_image_response(content_type, bytes)
+        }
         Err(crate::suwayomi::PageFetchError::Busy) => {
             // Saturated past the short wait — shed with a retryable 503 rather than queue.
             // `info`, not `warn`: a steady stream is the operator's signal that page demand
@@ -892,6 +908,7 @@ async fn serve_suwayomi_image(
             page_busy_response()
         }
         Err(crate::suwayomi::PageFetchError::Upstream(e)) => {
+            health(Err(&e));
             tracing::warn!(error = %e, path = %path, "suwayomi image proxy failed");
             StatusCode::BAD_GATEWAY.into_response()
         }
@@ -1645,6 +1662,8 @@ async fn main() -> anyhow::Result<()> {
     // the buffered views into one transaction every few seconds. The handle is awaited
     // after serve() returns so the final on-shutdown flush completes before exit.
     let views_flusher = views::spawn_flusher(pool.clone(), shutdown_tx.subscribe());
+    // Same idea for the per-source request health counters (`source_health`).
+    let health_flusher = source_health::spawn_flusher(pool.clone(), shutdown_tx.subscribe());
 
     // Keep `sqlite_stat1` current so the planner keeps choosing migration 0058's
     // indexes. Background, not boot-blocking. See `db::spawn_analyze` for why this is
@@ -1935,6 +1954,7 @@ async fn main() -> anyhow::Result<()> {
     // AFTER that flush (and if the flusher died in its supervisor backoff, its
     // shutdown flush never ran at all). This last call catches both.
     let _ = views_flusher.await;
+    let _ = health_flusher.await;
     if let Err(e) = views::flush(&pool).await {
         tracing::warn!(error = %e, "post-shutdown view flush failed; buffered views lost");
     }

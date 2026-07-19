@@ -1051,6 +1051,58 @@ pub struct SourceScanHealth {
     pub outage_last_alert_at: Option<String>,
     pub outage_kind: Option<String>,
     pub outage_parked_until: Option<String>,
+    /// What every upstream request to this source did over the requested window, one
+    /// entry per (surface, reason). Unlike the scan counts above this includes the
+    /// requests READERS make, and says why the failures failed.
+    pub activity: Vec<SourceHealthStat>,
+}
+
+/// One (surface, reason) total for a source over a window (migration 0110).
+#[derive(SimpleObject, Clone)]
+pub struct SourceHealthStat {
+    /// 'chapters' (chapter-list fetch), 'pages' (a reader opening a chapter), 'image'
+    /// (one page image), or 'browse' (a source listing).
+    pub surface: String,
+    /// 'ok', or why it failed: 'blocked', 'rate_limited', 'solver', 'not_found',
+    /// 'timeout', 'network', 'server_error', 'extension', 'engine', 'other'.
+    pub reason: String,
+    pub count: i32,
+    /// The newest error text for this reason; null for 'ok'.
+    pub last_message: Option<String>,
+    pub last_at: String,
+}
+
+/// The extension updater's status (`extensionAutoUpdate`).
+#[derive(SimpleObject, Clone)]
+pub struct ExtensionAutoUpdate {
+    /// False when `EXTENSION_AUTO_UPDATE_INTERVAL_SECONDS=0`.
+    pub enabled: bool,
+    pub interval_seconds: i32,
+    /// A pass is in flight right now.
+    pub running: bool,
+    /// When the last pass finished; null if none has run since the server started.
+    pub last_run_at: Option<String>,
+    /// Why the last pass failed as a whole; null when it ran.
+    pub last_error: Option<String>,
+    /// Extensions the last pass updated, and extensions it tried and could not.
+    pub last_updated: i32,
+    pub last_failed: i32,
+    /// Per-extension history, newest first.
+    pub recent: Vec<ExtensionUpdateEvent>,
+}
+
+/// One extension an update pass touched.
+#[derive(SimpleObject, Clone)]
+pub struct ExtensionUpdateEvent {
+    pub at: String,
+    pub pkg_name: String,
+    pub from_version: Option<String>,
+    /// Null when the update failed.
+    pub to_version: Option<String>,
+    /// 'auto' (the background pass) or 'manual' (an admin asked for one).
+    pub origin: String,
+    /// Null when the update succeeded.
+    pub error: Option<String>,
 }
 
 /// One installed Suwayomi source — the admin picker feeding `sourceBrowse(sourceId)`.

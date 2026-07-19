@@ -1,12 +1,148 @@
 //! Automatic pending-review merges and installed-extension updates.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, LazyLock, Mutex},
+    time::Duration,
+};
 
+use sqlx::SqlitePool;
 use tokio::sync::watch;
 
 use crate::{graphql::AppState, suwayomi::SuwayomiClient};
 
+/// Rows kept in `extension_update_log`. An update pass writes one row per extension it
+/// touched, and extensions update a few times a month, so this is months of history.
+const UPDATE_LOG_KEEP: i64 = 500;
+
+/// What the extension updater last did — the admin answer to "is auto-update running?".
+///
+/// In memory on purpose: the first pass runs 45s after boot, so a restart costs under a
+/// minute of "not run yet", and a pass that never ran since boot is exactly what the
+/// panel should say. The per-extension history is in `extension_update_log`.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateStatus {
+    /// Seconds between automatic passes; 0 means automatic updates are off.
+    pub interval_secs: u64,
+    /// A pass is in flight right now.
+    pub running: bool,
+    /// When the last pass FINISHED, whatever its outcome.
+    pub last_run_at: Option<String>,
+    /// Why the last pass failed as a whole (the store index could not be refreshed or
+    /// listed). `None` when it ran, even if single extensions failed.
+    pub last_error: Option<String>,
+    /// Extensions the last pass updated, and extensions it tried and could not.
+    pub last_updated: u64,
+    pub last_failed: u64,
+}
+
+static STATUS: LazyLock<Mutex<UpdateStatus>> = LazyLock::new(Default::default);
+/// One pass at a time: the automatic loop and an admin's "update now" must not both
+/// drive `updateExtension` for the same package.
+static PASS: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
+
+fn status() -> std::sync::MutexGuard<'static, UpdateStatus> {
+    STATUS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The updater's current status.
+pub fn update_status() -> UpdateStatus {
+    status().clone()
+}
+
+/// One row of `extension_update_log`, newest first.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UpdateLogEntry {
+    pub at: String,
+    pub pkg_name: String,
+    pub from_version: Option<String>,
+    pub to_version: Option<String>,
+    pub origin: String,
+    pub error: Option<String>,
+}
+
+pub async fn recent_updates(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<UpdateLogEntry>> {
+    Ok(sqlx::query_as::<_, UpdateLogEntry>(
+        "SELECT at, pkg_name, from_version, to_version, origin, error \
+           FROM extension_update_log ORDER BY id DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn log_attempts(
+    pool: &SqlitePool,
+    attempts: &[UpdateAttempt],
+    origin: &str,
+) -> anyhow::Result<()> {
+    if attempts.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    for a in attempts {
+        sqlx::query(
+            "INSERT INTO extension_update_log (at, pkg_name, from_version, to_version, origin, error) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&now)
+        .bind(&a.pkg_name)
+        .bind(&a.from_version)
+        .bind(&a.to_version)
+        .bind(origin)
+        .bind(&a.error)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query(
+        "DELETE FROM extension_update_log \
+          WHERE id <= (SELECT MAX(id) FROM extension_update_log) - ?",
+    )
+    .bind(UPDATE_LOG_KEEP)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Run one update pass and record what it did: the in-memory status, one log row per
+/// extension touched, and refreshed `source_extension` coordinates when anything changed.
+/// `origin` is 'auto' or 'manual'. Returns immediately if a pass is already in flight.
+pub async fn run_update_pass(state: &AppState, origin: &'static str) {
+    let Ok(_pass) = PASS.try_lock() else {
+        return;
+    };
+    status().running = true;
+    let result = update_extensions(&state.suwayomi).await;
+    let (updated, failed, error) = match &result {
+        Ok(attempts) => {
+            let failed = attempts.iter().filter(|a| a.error.is_some()).count() as u64;
+            (attempts.len() as u64 - failed, failed, None)
+        }
+        Err(e) => (0, 0, Some(e.to_string())),
+    };
+    match &result {
+        Ok(attempts) => {
+            tracing::info!(updated, failed, origin, "extension update pass complete");
+            if let Err(e) = log_attempts(&state.pool, attempts, origin).await {
+                tracing::warn!(error = %e, "extension update log write failed");
+            }
+            if updated > 0 {
+                crate::scanner::record_source_extensions(state).await;
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, origin, "extension update check failed; will retry"),
+    }
+    let mut s = status();
+    s.running = false;
+    s.last_run_at = Some(chrono::Utc::now().to_rfc3339());
+    s.last_error = error;
+    s.last_updated = updated;
+    s.last_failed = failed;
+}
+
 pub fn spawn(state: Arc<AppState>, update_interval_secs: u64, shutdown: watch::Receiver<bool>) {
+    status().interval_secs = update_interval_secs;
     let review_state = state.clone();
     let review_shutdown = shutdown.clone();
     tokio::spawn(async move {
@@ -36,31 +172,31 @@ pub fn spawn(state: Arc<AppState>, update_interval_secs: u64, shutdown: watch::R
         return;
     }
     tokio::spawn(async move {
-        crate::task::supervise("extension-auto-update", Duration::from_secs(30), shutdown.clone(), move || {
-            let state = state.clone();
-            let mut shutdown = shutdown.clone();
-            async move {
-                if !wait(Duration::from_secs(45), &mut shutdown).await { return; }
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = shutdown.changed() => return,
-                        result = update_extensions(&state.suwayomi) => {
-                            match result {
-                                Ok(updated) => {
-                                    tracing::info!(updated, "automatic extension update pass complete");
-                                    if updated > 0 {
-                                        crate::scanner::record_source_extensions(&state).await;
-                                    }
-                                }
-                                Err(e) => tracing::warn!(error = %e, "extension update check failed; will retry"),
-                            }
+        crate::task::supervise(
+            "extension-auto-update",
+            Duration::from_secs(30),
+            shutdown.clone(),
+            move || {
+                let state = state.clone();
+                let mut shutdown = shutdown.clone();
+                async move {
+                    if !wait(Duration::from_secs(45), &mut shutdown).await {
+                        return;
+                    }
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.changed() => return,
+                            _ = run_update_pass(&state, "auto") => {}
+                        }
+                        if !wait(Duration::from_secs(update_interval_secs), &mut shutdown).await {
+                            return;
                         }
                     }
-                    if !wait(Duration::from_secs(update_interval_secs), &mut shutdown).await { return; }
                 }
-            }
-        }).await;
+            },
+        )
+        .await;
     });
 }
 
@@ -75,31 +211,49 @@ async fn wait(duration: Duration, shutdown: &mut watch::Receiver<bool>) -> bool 
     }
 }
 
+/// One extension an update pass touched. `error` is `None` when it is now up to date.
+#[derive(Debug, Clone)]
+pub struct UpdateAttempt {
+    pub pkg_name: String,
+    pub from_version: String,
+    pub to_version: Option<String>,
+    pub error: Option<String>,
+}
+
 /// Refresh before checking hasUpdate. One failure must not block other packages.
-async fn update_extensions(client: &SuwayomiClient) -> anyhow::Result<u64> {
+/// Returns every extension that had an update, with how its update went.
+async fn update_extensions(client: &SuwayomiClient) -> anyhow::Result<Vec<UpdateAttempt>> {
     client.refresh_extensions().await?;
     let mut extensions = client.list_extensions().await?;
     extensions.sort_by(|a, b| a.pkg_name.cmp(&b.pkg_name));
-    let mut updated = 0;
+    let mut attempts = Vec::new();
     for ext in extensions
         .into_iter()
         .filter(|e| e.is_installed && e.has_update)
     {
-        match client.update_extension(&ext.pkg_name).await {
+        let (to_version, error) = match client.update_extension(&ext.pkg_name).await {
             Ok(current) if current.is_installed && !current.has_update => {
-                updated += 1;
                 tracing::info!(pkg_name = %ext.pkg_name, from = %ext.version_name,
-                    to = %current.version_name, "extension automatically updated");
+                    to = %current.version_name, "extension updated");
+                (Some(current.version_name), None)
             }
             Ok(_) => {
-                tracing::warn!(pkg_name = %ext.pkg_name, "extension still has an update; will retry")
+                tracing::warn!(pkg_name = %ext.pkg_name, "extension still has an update; will retry");
+                (None, Some("still has an update after updating".to_string()))
             }
             Err(e) => {
-                tracing::warn!(pkg_name = %ext.pkg_name, error = %e, "extension update failed; will retry")
+                tracing::warn!(pkg_name = %ext.pkg_name, error = %e, "extension update failed; will retry");
+                (None, Some(e.to_string()))
             }
-        }
+        };
+        attempts.push(UpdateAttempt {
+            pkg_name: ext.pkg_name,
+            from_version: ext.version_name,
+            to_version,
+            error,
+        });
     }
-    Ok(updated)
+    Ok(attempts)
 }
 
 #[cfg(test)]
@@ -149,7 +303,24 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let client = SuwayomiClient::new(url, None, None);
-        assert_eq!(update_extensions(&client).await.unwrap(), 1);
+        let attempts = update_extensions(&client).await.unwrap();
+        let outcome: Vec<_> = attempts
+            .iter()
+            .map(|a| {
+                (
+                    a.pkg_name.as_str(),
+                    a.to_version.as_deref(),
+                    a.error.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            outcome,
+            [
+                ("a-fails", None, Some("download failed")),
+                ("b-updates", Some("1.2"), None)
+            ]
+        );
         assert_eq!(
             *calls.lock().unwrap(),
             ["refresh", "list", "a-fails", "b-updates"]

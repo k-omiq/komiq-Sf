@@ -26,6 +26,7 @@ import type {
 	SourceIngestJob,
 	SourceInfo,
 	SourceScanHealth,
+	ExtensionAutoUpdate,
 	WorkReviewDetail,
 	WorkSource,
 } from '@komika/types';
@@ -421,6 +422,20 @@ export async function setSeriesPaused(seriesId: Id, paused: boolean): Promise<Se
 export async function loadSourceScanHealth(): Promise<SourceScanHealth[]> {
 	if (!backend.sourceScanHealth) throw new Error('Scan health is unavailable on this backend.');
 	return backend.sourceScanHealth();
+}
+
+/** The extension updater's status and per-extension history. */
+export async function loadExtensionAutoUpdate(): Promise<ExtensionAutoUpdate> {
+	if (!backend.extensionAutoUpdate)
+		throw new Error('Extension update status is unavailable on this backend.');
+	return backend.extensionAutoUpdate();
+}
+
+/** Start an extension update pass now; it runs server-side in the background. */
+export async function runExtensionUpdates(): Promise<ExtensionAutoUpdate> {
+	if (!backend.runExtensionUpdates)
+		throw new Error('Extension updates are unavailable on this backend.');
+	return backend.runExtensionUpdates();
 }
 
 /**

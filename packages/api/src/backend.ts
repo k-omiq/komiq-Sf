@@ -39,6 +39,7 @@ import type {
 	SourceIngestJob,
 	SourceInfo,
 	SourceScanHealth,
+	ExtensionAutoUpdate,
 	TagInfo,
 	SplitSourcesResult,
 	UpdateFeedRow,
@@ -490,6 +491,11 @@ export interface Backend {
 	 * many of those failed by being served Suwayomi's CACHE rather than the source — the
 	 * failure mode that used to record as a success. Worst source first. Optional. */
 	sourceScanHealth?(): Promise<SourceScanHealth[]>;
+	/** The extension updater's status and per-extension history. Optional. */
+	extensionAutoUpdate?(): Promise<ExtensionAutoUpdate>;
+	/** Start an extension update pass now (it runs server-side in the background);
+	 * returns the status with `running` set. Optional. */
+	runExtensionUpdates?(): Promise<ExtensionAutoUpdate>;
 
 	// --- admin background source-ingest jobs (requires an admin session; S1) ---
 	/** The "add all from this source" ingest jobs, newest first. Pass

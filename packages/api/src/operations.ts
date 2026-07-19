@@ -1578,6 +1578,51 @@ export const SOURCE_SCAN_HEALTH = /* GraphQL */ `
 			outageLastAlertAt
 			outageKind
 			outageParkedUntil
+			activity {
+				surface
+				reason
+				count
+				lastMessage
+				lastAt
+			}
+		}
+	}
+`;
+
+const EXTENSION_AUTO_UPDATE_FIELDS = /* GraphQL */ `
+	fragment ExtensionAutoUpdateFields on ExtensionAutoUpdate {
+		enabled
+		intervalSeconds
+		running
+		lastRunAt
+		lastError
+		lastUpdated
+		lastFailed
+		recent {
+			at
+			pkgName
+			fromVersion
+			toVersion
+			origin
+			error
+		}
+	}
+`;
+
+export const EXTENSION_AUTO_UPDATE = /* GraphQL */ `
+	${EXTENSION_AUTO_UPDATE_FIELDS}
+	query ExtensionAutoUpdate {
+		extensionAutoUpdate {
+			...ExtensionAutoUpdateFields
+		}
+	}
+`;
+
+export const RUN_EXTENSION_UPDATES = /* GraphQL */ `
+	${EXTENSION_AUTO_UPDATE_FIELDS}
+	mutation RunExtensionUpdates {
+		runExtensionUpdates {
+			...ExtensionAutoUpdateFields
 		}
 	}
 `;

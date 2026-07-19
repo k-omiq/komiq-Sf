@@ -456,6 +456,35 @@ fn state<'a>(ctx: &Context<'a>) -> &'a AppState {
     ctx.data_unchecked::<std::sync::Arc<AppState>>()
 }
 
+/// The extension updater's status and recent history (`extensionAutoUpdate`, and the
+/// answer `runExtensionUpdates` returns).
+async fn extension_auto_update_status(st: &AppState) -> Result<ExtensionAutoUpdate> {
+    let s = crate::maintenance::update_status();
+    let recent = crate::maintenance::recent_updates(&st.pool, 30)
+        .await
+        .map_err(gql_err)?
+        .into_iter()
+        .map(|e| ExtensionUpdateEvent {
+            at: e.at,
+            pkg_name: e.pkg_name,
+            from_version: e.from_version,
+            to_version: e.to_version,
+            origin: e.origin,
+            error: e.error,
+        })
+        .collect();
+    Ok(ExtensionAutoUpdate {
+        enabled: s.interval_secs > 0,
+        interval_seconds: s.interval_secs.min(i32::MAX as u64) as i32,
+        running: s.running,
+        last_run_at: s.last_run_at,
+        last_error: s.last_error,
+        last_updated: s.last_updated as i32,
+        last_failed: s.last_failed as i32,
+        recent,
+    })
+}
+
 /// Resolver fields on `Series` that read the S2 enrichment tables (H2). Opt-in
 /// per query — a feed that doesn't select them pays nothing. `self.id` is the
 /// work id for a canonical series (`w_…`); for a numeric Suwayomi series id there
@@ -5626,14 +5655,25 @@ impl QueryRoot {
         // chapters aren't mirrored locally — so resolve the manga id from the source and
         // gate the page images exactly like `series`/`chapters` (N2). An unknown chapter
         // is allowed through to the (cleanly-failing) page fetch, mirroring canonicalPages.
-        if let Some(manga_id) = st.suwayomi.chapter_manga_id(n).await.map_err(gql_err)? {
+        let manga_id = st.suwayomi.chapter_manga_id(n).await.map_err(gql_err)?;
+        if let Some(manga_id) = manga_id {
             if canonical_is_nsfw(&st.pool, &manga_id.to_string()).await
                 && !viewer_show_nsfw(ctx).await
             {
                 return Err(Error::new("No such chapter"));
             }
         }
-        let urls = st.suwayomi.pages(n).await.map_err(gql_err)?;
+        let urls = st.suwayomi.pages(n).await;
+        // A reader opening a chapter is the request that matters most, and the scanner
+        // never makes it — so it is counted here, against the owning source.
+        if let Some(manga_id) = manga_id {
+            crate::source_health::observe(
+                crate::source_health::Subject::Manga(manga_id),
+                crate::source_health::Surface::Pages,
+                &urls,
+            );
+        }
+        let urls = urls.map_err(gql_err)?;
         Ok(urls
             .into_iter()
             .enumerate()
@@ -6929,9 +6969,33 @@ impl QueryRoot {
     /// Three joins deep but all indexed, and no per-row lookups: the health aggregate, the
     /// exclusive-work counts, and the open outages are one query each, then zipped with the
     /// engine's installed-source list for names.
-    async fn source_scan_health(&self, ctx: &Context<'_>) -> Result<Vec<SourceScanHealth>> {
+    ///
+    /// `activity` is the other half (migration 0110): what every upstream request to the
+    /// source did over the last `hours`, sorted by WHY it failed — blocked, not found,
+    /// timed out — including the requests readers make, which the scanner never sees.
+    async fn source_scan_health(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 24)] hours: i32,
+    ) -> Result<Vec<SourceScanHealth>> {
         require_admin(ctx).await?;
         let st = state(ctx);
+        let mut activity: HashMap<String, Vec<SourceHealthStat>> = HashMap::new();
+        for s in crate::source_health::stats(&st.pool, hours as i64)
+            .await
+            .map_err(gql_err)?
+        {
+            activity
+                .entry(s.source_id)
+                .or_default()
+                .push(SourceHealthStat {
+                    surface: s.surface,
+                    reason: s.reason,
+                    count: s.count as i32,
+                    last_message: s.last_message,
+                    last_at: s.last_at,
+                });
+        }
         let health = catalog::source_scan_health(&st.pool)
             .await
             .map_err(gql_err)?;
@@ -6972,11 +7036,12 @@ impl QueryRoot {
                 Default::default()
             }
         };
-        Ok(health
+        let mut out: Vec<SourceScanHealth> = health
             .into_iter()
             .map(|h| {
                 let outage = outages.get(&h.source_id);
                 SourceScanHealth {
+                    activity: activity.remove(&h.source_id).unwrap_or_default(),
                     id: ID(h.source_id.clone()),
                     name: names.get(&h.source_id).cloned(),
                     installed: names.contains_key(&h.source_id),
@@ -7005,7 +7070,48 @@ impl QueryRoot {
                     pkg_name: h.pkg_name,
                 }
             })
-            .collect())
+            .collect();
+        // A source with requests but no tracked series (a subscribed extension whose walk
+        // fails before it ever enrols anything) has no scan-state row to hang off. It is
+        // the source most in need of a line here, so it gets one with empty scan counts.
+        let mut untracked: Vec<_> = activity.into_iter().collect();
+        untracked.sort_by(|a, b| a.0.cmp(&b.0));
+        for (source_id, activity) in untracked {
+            out.push(SourceScanHealth {
+                name: names.get(&source_id).cloned(),
+                installed: names.contains_key(&source_id),
+                pkg_name: None,
+                subscribed: false,
+                subscription_disabled_at: None,
+                series: 0,
+                failing: 0,
+                confirmed_failing: 0,
+                cached_fallback: 0,
+                fetch_error: 0,
+                zero_chapter_series: 0,
+                exclusive_works: 0,
+                worst_streak: 0,
+                last_failure_at: None,
+                last_scanned_at: None,
+                outage_detected_at: None,
+                outage_last_alert_at: None,
+                outage_kind: None,
+                outage_parked_until: None,
+                activity,
+                id: ID(source_id),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Admin: is the extension updater running, and what did it last do?
+    ///
+    /// A broken source is very often an extension one release behind, so "did the update
+    /// get installed?" is the first question after "why is it failing?". The updater only
+    /// ever wrote log lines; this is its status plus the per-extension history.
+    async fn extension_auto_update(&self, ctx: &Context<'_>) -> Result<ExtensionAutoUpdate> {
+        require_admin(ctx).await?;
+        extension_auto_update_status(state(ctx)).await
     }
 
     /// Admin: "add all from source" ingest jobs, newest first (S1). Pass
@@ -10612,6 +10718,24 @@ impl MutationRoot {
             .await
             .map_err(gql_err)?;
         Ok(map_extension_info(st, e))
+    }
+
+    /// Admin: run an extension update pass now, instead of waiting for the next automatic
+    /// one. Updates every installed extension that has an update, exactly as the
+    /// background pass does. The pass runs in the background (each extension is a
+    /// download, so it can outlast a request); the returned status says `running`, and
+    /// `extensionAutoUpdate` reports the result. A pass already in flight is left alone.
+    async fn run_extension_updates(&self, ctx: &Context<'_>) -> Result<ExtensionAutoUpdate> {
+        require_admin(ctx).await?;
+        let st = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
+        let bg = st.clone();
+        tokio::spawn(async move {
+            crate::maintenance::run_update_pass(&bg, "manual").await;
+        });
+        let mut status = extension_auto_update_status(&st).await?;
+        // The spawned pass may not have taken its lock yet; it is running either way.
+        status.running = true;
+        Ok(status)
     }
 
     /// Admin (S2/H1/F2): backfill MangaDex enrichment — all-language alt titles,
@@ -23096,6 +23220,16 @@ mod tests {
                 r#"mutation { setSeriesPaused(seriesId: "1", paused: false) { id } }"#,
                 Some("bobtok"),
             ),
+            (
+                r#"{ sourceScanHealth { id activity { reason } } }"#,
+                Some("bobtok"),
+            ),
+            (r#"{ extensionAutoUpdate { enabled } }"#, Some("bobtok")),
+            (r#"{ extensionAutoUpdate { enabled } }"#, None),
+            (
+                r#"mutation { runExtensionUpdates { running } }"#,
+                Some("bobtok"),
+            ),
         ] {
             let r = exec(&s, q, who, "1.1.1.1").await;
             let msg = first_error(&r);
@@ -23104,6 +23238,70 @@ mod tests {
                 "expected auth refusal for {q}, got: {msg}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn source_health_reports_request_failures_and_the_updater_history() {
+        let (s, pool) = setup_full(100).await;
+        let pool = &pool;
+        // A source with failing requests and NO tracked series still gets a line: that is
+        // the subscribed extension whose walk never enrols anything.
+        let hour = Utc::now().timestamp() / 3600;
+        sqlx::query(
+            "INSERT INTO source_health_bucket \
+               (source_id, surface, hour_ts, reason, count, last_message, last_at) \
+             VALUES ('src-x', 'pages', ?, 'blocked', 4, 'HTTP error 403', ?), \
+                    ('src-x', 'pages', ?, 'ok', 6, NULL, ?), \
+                    ('src-x', 'pages', ?, 'blocked', 9, 'too old to count', ?)",
+        )
+        .bind(hour)
+        .bind(Utc::now().to_rfc3339())
+        .bind(hour)
+        .bind(Utc::now().to_rfc3339())
+        .bind(hour - 48)
+        .bind((Utc::now() - chrono::Duration::hours(48)).to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO extension_update_log (at, pkg_name, from_version, to_version, origin, error) \
+             VALUES ('2026-10-01T00:00:00+00:00', 'pkg.a', '1.0', '1.1', 'auto', NULL)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let r = exec(
+            &s,
+            r#"{ sourceScanHealth { id series activity { surface reason count lastMessage } }
+                 extensionAutoUpdate { recent { pkgName fromVersion toVersion origin error } } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let d = r.data.into_json().unwrap();
+        let src = d["sourceScanHealth"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["id"] == "src-x")
+            .expect("untracked source is listed");
+        assert_eq!(src["series"], 0);
+        let mut activity: Vec<_> = src["activity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| (a["reason"].as_str().unwrap(), a["count"].as_i64().unwrap()))
+            .collect();
+        activity.sort();
+        // The 48h-old bucket is outside the default 24h window.
+        assert_eq!(activity, [("blocked", 4), ("ok", 6)]);
+        assert_eq!(
+            d["extensionAutoUpdate"]["recent"][0],
+            serde_json::json!({"pkgName": "pkg.a", "fromVersion": "1.0", "toVersion": "1.1",
+                "origin": "auto", "error": null})
+        );
     }
 
     #[tokio::test]

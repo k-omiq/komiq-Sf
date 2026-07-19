@@ -1,10 +1,12 @@
 <script lang="ts">
 	import type {
 		BulkAddResult,
+		ExtensionAutoUpdate,
 		ExtensionInfo,
 		SourceBrowseEntry,
 		SourceBrowseType,
 		SourceIngestJob,
+		SourceHealthStat,
 		SourceInfo,
 		SourceScanHealth,
 	} from '@komika/types';
@@ -20,12 +22,14 @@
 		cancelExtensionIngest,
 		cancelSourceIngest,
 		installExtension,
+		loadExtensionAutoUpdate,
 		loadExtensions,
 		loadSourceIngestJobs,
 		loadSourceScanHealth,
 		loadSources,
 		materializeCatalogueCovers,
 		persistCatalogue,
+		runExtensionUpdates,
 		setExtensionSubscription,
 		startExtensionIngest,
 		startSourceIngest,
@@ -441,6 +445,8 @@
 	async function refreshHealth(): Promise<void> {
 		healthLoading = true;
 		healthError = null;
+		// Independent of the health read: one failing must not blank the other.
+		void refreshAutoUpdate();
 		try {
 			health = await loadSourceScanHealth();
 			healthLoaded = true;
@@ -450,6 +456,168 @@
 			healthLoaded = true; // A failed attempt waits for explicit retry.
 			healthLoading = false;
 		}
+	}
+
+	// ---- Extension updater ----------------------------------------------------
+	// A broken source is very often an extension one release behind, so "did the update
+	// get installed?" sits next to "why is it failing?". The server updates installed
+	// extensions on a timer; this is its status and history, plus a way to run it now.
+	let autoUpdate = $state<ExtensionAutoUpdate | null>(null);
+	let autoUpdateError = $state<string | null>(null);
+	let autoUpdateStarting = $state(false);
+	/** Bumped by every poll loop so a newer one supersedes an older one. */
+	let autoUpdatePoll = 0;
+
+	async function refreshAutoUpdate(): Promise<void> {
+		try {
+			autoUpdate = await loadExtensionAutoUpdate();
+			autoUpdateError = null;
+		} catch (err) {
+			autoUpdateError = err instanceof Error ? err.message : 'Failed to load update status.';
+		}
+	}
+
+	/** Start a pass, then follow it until it finishes (it runs server-side, and each
+	 * extension is a download, so it outlasts the request that started it). */
+	async function runUpdatesNow(): Promise<void> {
+		autoUpdateStarting = true;
+		autoUpdateError = null;
+		try {
+			autoUpdate = await runExtensionUpdates();
+		} catch (err) {
+			autoUpdateError = err instanceof Error ? err.message : 'Failed to start the update.';
+			return;
+		} finally {
+			autoUpdateStarting = false;
+		}
+		const poll = ++autoUpdatePoll;
+		// ~5 minutes at most; a pass that long is stuck, and Refresh still works.
+		for (let i = 0; i < 75 && autoUpdate?.running && poll === autoUpdatePoll; i++) {
+			await new Promise((r) => setTimeout(r, 4000));
+			if (poll !== autoUpdatePoll) return;
+			await refreshAutoUpdate();
+		}
+	}
+
+	function everyLabel(seconds: number): string {
+		if (seconds % 3600 === 0) return `${seconds / 3600} h`;
+		if (seconds % 60 === 0) return `${seconds / 60} min`;
+		return `${seconds} s`;
+	}
+
+	// ---- Request health (why requests fail) -----------------------------------
+	// The scan columns say THAT a source is failing. `activity` says why, and it counts
+	// the requests readers make too — a chapter that will not open, a page image the
+	// site refuses — which the scanner never sees.
+	const SURFACE_LABEL: Record<string, string> = {
+		pages: 'Chapter opens',
+		image: 'Page images',
+		chapters: 'Chapter lists',
+		browse: 'Listings',
+	};
+	/** Reader-facing surfaces first: they are the ones a visitor notices. */
+	const SURFACE_ORDER = ['pages', 'image', 'chapters', 'browse'];
+	const REASON: Record<string, { label: string; hint: string }> = {
+		blocked: {
+			label: 'Blocked',
+			hint: 'The site refuses our requests (403 or a Cloudflare check).',
+		},
+		rate_limited: { label: 'Rate limited', hint: 'The site says we ask too often (429).' },
+		solver: {
+			label: 'Solver down',
+			hint: 'FlareSolverr failed. The site needs it to pass Cloudflare.',
+		},
+		not_found: {
+			label: 'Not found',
+			hint: 'The site answers 404. It moved, or the extension is out of date.',
+		},
+		timeout: { label: 'Timeout', hint: 'The site did not answer in time.' },
+		network: {
+			label: 'Unreachable',
+			hint: 'The site could not be reached (DNS, connection or TLS).',
+		},
+		server_error: { label: 'Site error', hint: 'The site answers with a 5xx error.' },
+		extension: {
+			label: 'Extension broken',
+			hint: 'The extension could not read the site. It needs an update.',
+		},
+		engine: { label: 'Engine', hint: 'Suwayomi itself failed, not the source.' },
+		other: { label: 'Other', hint: 'Not sorted. Read the message.' },
+	};
+
+	interface SurfaceSummary {
+		surface: string;
+		label: string;
+		total: number;
+		failed: number;
+		/** Failure reasons, most frequent first. */
+		reasons: SourceHealthStat[];
+	}
+
+	function summarize(activity: SourceHealthStat[]): SurfaceSummary[] {
+		const bySurface: Record<string, SurfaceSummary> = {};
+		for (const a of activity) {
+			const s = (bySurface[a.surface] ??= {
+				surface: a.surface,
+				label: SURFACE_LABEL[a.surface] ?? a.surface,
+				total: 0,
+				failed: 0,
+				reasons: [],
+			});
+			s.total += a.count;
+			if (a.reason !== 'ok') {
+				s.failed += a.count;
+				s.reasons.push(a);
+			}
+		}
+		const rank = (surface: string): number => {
+			const i = SURFACE_ORDER.indexOf(surface);
+			return i < 0 ? SURFACE_ORDER.length : i;
+		};
+		return Object.values(bySurface)
+			.map((s) => ({ ...s, reasons: s.reasons.sort((a, b) => b.count - a.count) }))
+			.sort((a, b) => rank(a.surface) - rank(b.surface));
+	}
+
+	/** Per source: its surfaces, and its totals across them. */
+	const requests = $derived(
+		new Map(
+			health.map((h) => {
+				const surfaces = summarize(h.activity);
+				return [
+					h.id,
+					{
+						surfaces,
+						failing: surfaces.filter((s) => s.failed > 0),
+						total: surfaces.reduce((n, s) => n + s.total, 0),
+						failed: surfaces.reduce((n, s) => n + s.failed, 0),
+					},
+				] as const;
+			}),
+		),
+	);
+	/**
+	 * The table order. The server sorts by scan failures, which puts a source whose scans
+	 * look fine but whose readers get refused near the bottom — so within "no confirmed
+	 * scan failure", the most failed requests come first. The sort is stable, so the
+	 * server's order still decides ties.
+	 */
+	const healthRows = $derived(
+		[...health].sort(
+			(a, b) =>
+				Number(b.confirmedFailing > 0) - Number(a.confirmedFailing > 0) ||
+				(requests.get(b.id)?.failed ?? 0) - (requests.get(a.id)?.failed ?? 0),
+		),
+	);
+	/** Sources with at least one failed request in the window. */
+	const sourcesFailing = $derived(
+		health.filter((h) => (requests.get(h.id)?.failed ?? 0) > 0).length,
+	);
+
+	function percent(part: number, whole: number): string {
+		if (whole <= 0) return '—';
+		const p = (part / whole) * 100;
+		return p > 0 && p < 1 ? '<1%' : `${Math.round(p)}%`;
 	}
 
 	/** Sources with an open whole-source outage — the loud ones, surfaced above the table. */
@@ -1146,7 +1314,7 @@
 				class:on={currentTab === 'health'}
 				onclick={() => setTab('health')}
 			>
-				Scan health{#if outages.length > 0}<span class="tab-alarm" aria-label="sources down"
+				Health{#if outages.length > 0}<span class="tab-alarm" aria-label="sources down"
 						>{outages.length}</span
 					>{/if}
 			</button>
@@ -1429,14 +1597,84 @@
 			{/if}
 		{/if}
 	{:else if currentTab === 'health'}
-		<!-- Sources → scan health (Phase E4.3) -->
+		<!-- Sources → health: the extension updater, then scan + request health per source -->
+		<section class="updater" aria-label="Extension updates">
+			<div class="updater-head">
+				<div class="updater-state">
+					<strong>Extension auto-update</strong>
+					{#if !autoUpdate}
+						<span class="pill">{autoUpdateError ? 'unknown' : 'loading…'}</span>
+					{:else if !autoUpdate.enabled}
+						<span class="pill bad">off</span>
+					{:else}
+						<span class="pill ok">on · every {everyLabel(autoUpdate.intervalSeconds)}</span>
+					{/if}
+					{#if autoUpdate?.running}<span class="pill warn">running…</span>{/if}
+				</div>
+				<button
+					class="act"
+					onclick={() => runUpdatesNow()}
+					disabled={autoUpdateStarting || !!autoUpdate?.running}
+				>
+					{autoUpdate?.running ? 'Updating…' : 'Update all now'}
+				</button>
+			</div>
+			{#if autoUpdateError}
+				<p class="updater-line bad" role="alert">{autoUpdateError}</p>
+			{/if}
+			{#if autoUpdate}
+				{#if !autoUpdate.enabled}
+					<p class="updater-line">
+						The server does not update extensions on its own (<code
+							>EXTENSION_AUTO_UPDATE_INTERVAL_SECONDS=0</code
+						>). Use “Update all now”.
+					</p>
+				{/if}
+				{#if autoUpdate.lastError}
+					<p class="updater-line bad" role="alert">
+						Last run {shortDate(autoUpdate.lastRunAt)} failed: {autoUpdate.lastError}
+					</p>
+				{:else if autoUpdate.lastRunAt}
+					<p class="updater-line">
+						Last run {shortDate(autoUpdate.lastRunAt)} ·
+						{autoUpdate.lastUpdated} updated{#if autoUpdate.lastFailed > 0}
+							· <span class="bad">{autoUpdate.lastFailed} failed</span
+							>{/if}{#if autoUpdate.lastUpdated === 0 && autoUpdate.lastFailed === 0}
+							· everything was up to date{/if}
+					</p>
+				{:else if !autoUpdate.running}
+					<p class="updater-line">No run yet since the server started.</p>
+				{/if}
+				{#if autoUpdate.recent.length > 0}
+					<details class="updater-log">
+						<summary>Update history ({autoUpdate.recent.length})</summary>
+						<ul>
+							{#each autoUpdate.recent as e (e.at + e.pkgName)}
+								<li class:bad={!!e.error}>
+									<span class="when">{shortDate(e.at)}</span>
+									<span class="mono">{e.pkgName}</span>
+									{#if e.error}
+										<span>failed: {e.error}</span>
+									{:else}
+										<span>{e.fromVersion ?? '?'} → {e.toVersion ?? '?'}</span>
+									{/if}
+									<span class="sub">{e.origin}</span>
+								</li>
+							{/each}
+						</ul>
+					</details>
+				{/if}
+			{/if}
+		</section>
 		{#if healthError && health.length === 0}
 			<div class="notice error" role="alert">{healthError}</div>
 			<button class="act" onclick={() => refreshHealth()} disabled={healthLoading}>Retry</button>
 		{:else if healthLoading && health.length === 0}
 			<div class="notice" role="status">Loading scan health…</div>
 		{:else if health.length === 0}
-			<div class="notice">No source has any tracked series yet, so there is nothing to report.</div>
+			<div class="notice">
+				No source has tracked series or recorded requests yet, so there is nothing to report.
+			</div>
 		{:else}
 			{#if healthError}
 				<div class="notice error" role="alert">{healthError}</div>
@@ -1473,7 +1711,12 @@
 			{/if}
 			<div class="toolbar">
 				<span class="scope-label">
-					{health.length} source{health.length === 1 ? '' : 's'} with tracked series · worst first
+					{health.length} source{health.length === 1 ? '' : 's'} · worst first ·
+					{#if sourcesFailing > 0}
+						<strong>{sourcesFailing}</strong> with failed requests in the last 24 h
+					{:else}
+						no failed requests in the last 24 h
+					{/if}
 				</span>
 				<button class="act" onclick={() => refreshHealth()} disabled={healthLoading}>
 					{healthLoading ? 'Refreshing…' : 'Refresh'}
@@ -1505,8 +1748,14 @@
 					<span role="columnheader" title="Works reachable through no other source">Only here</span>
 					<span role="columnheader">Last scan</span>
 				</div>
-				{#each health as h (h.id)}
-					<div class="hrow" role="row" class:down={!!h.outageDetectedAt}>
+				{#each healthRows as h (h.id)}
+					{@const req = requests.get(h.id)}
+					<div
+						class="hrow"
+						role="row"
+						class:down={!!h.outageDetectedAt}
+						class:has-act={!!req && req.failing.length > 0}
+					>
 						<span role="cell" class="src-cell">
 							<strong>{h.name ?? h.pkgName ?? h.id}</strong>
 							{#if h.outageDetectedAt}<span class="pill bad">down</span>{/if}
@@ -1526,8 +1775,40 @@
 						<span role="cell">{h.exclusiveWorks}</span>
 						<span role="cell" class="when">{shortDate(h.lastScannedAt)}</span>
 					</div>
+					{#if req && req.failing.length > 0}
+						<!-- Why this source's requests failed in the last 24 h. Only failing
+						     surfaces are listed; a source with none gets no second line. -->
+						<div class="hact" role="row" class:down={!!h.outageDetectedAt}>
+							<div role="cell">
+								{#each req.failing as s (s.surface)}
+									<div class="hact-surface">
+										<span class="hact-label">{s.label}</span>
+										<span class="bad"
+											>{s.failed}/{s.total} failed ({percent(s.failed, s.total)})</span
+										>
+										{#each s.reasons as r (r.reason)}
+											<span class="pill bad" title={REASON[r.reason]?.hint ?? r.reason}>
+												{REASON[r.reason]?.label ?? r.reason} · {r.count}
+											</span>
+										{/each}
+									</div>
+									<p class="hact-why">
+										{REASON[s.reasons[0].reason]?.hint ?? ''}
+										{#if s.reasons[0].lastMessage}
+											<span class="mono">{s.reasons[0].lastMessage}</span>
+										{/if}
+										<span class="when">{shortDate(s.reasons[0].lastAt)}</span>
+									</p>
+								{/each}
+							</div>
+						</div>
+					{/if}
 				{/each}
 			</div>
+			<p class="hint">
+				The line under a source shows its failed requests in the last 24 h and the reason. It counts
+				what readers request too (chapter opens and page images), not only the scanner.
+			</p>
 			<p class="hint">
 				<strong>Cached</strong> is the failure mode this panel exists for: on an upstream error the engine
 				answers from its own database, so the scan used to succeed with stale — or empty — data. A cached
@@ -2860,8 +3141,101 @@
 		text-transform: uppercase;
 		color: var(--k-text-faint);
 	}
-	.hrow.down {
+	.hrow.down,
+	.hact.down {
 		background: rgba(240, 128, 138, 0.06);
+	}
+	/* The request-health line belongs to the row above it: no rule between the two. */
+	.hrow.has-act {
+		border-bottom: none;
+		padding-bottom: 4px;
+	}
+	.hact {
+		padding: 0 14px 10px;
+		border-bottom: 1px solid var(--k-border);
+		font-size: 12.5px;
+	}
+	.hact:last-child {
+		border-bottom: none;
+	}
+	.hact-surface {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 6px;
+		margin-top: 6px;
+		font-variant-numeric: tabular-nums;
+	}
+	.hact-label {
+		font-weight: 600;
+		color: var(--k-text-1);
+	}
+	.hact .bad {
+		color: #f0808a;
+		font-weight: 600;
+	}
+	.hact-why {
+		margin: 3px 0 0;
+		color: var(--k-text-dim);
+		overflow-wrap: anywhere;
+	}
+	.mono {
+		font-family: var(--k-font-mono, ui-monospace, monospace);
+		font-size: 11.5px;
+		color: var(--k-text-2);
+	}
+
+	/* extension updater strip, above the health table */
+	.updater {
+		padding: 12px 14px;
+		border: 1px solid var(--k-border);
+		border-radius: var(--k-radius-md);
+		background: var(--k-surface-2);
+	}
+	.updater-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		flex-wrap: wrap;
+	}
+	.updater-state {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		flex-wrap: wrap;
+		font-size: 13.5px;
+	}
+	.updater-line {
+		margin: 8px 0 0;
+		font-size: 12.5px;
+		color: var(--k-text-dim);
+		overflow-wrap: anywhere;
+	}
+	.updater .bad {
+		color: #f0808a;
+	}
+	.updater-log {
+		margin-top: 8px;
+		font-size: 12.5px;
+	}
+	.updater-log summary {
+		cursor: pointer;
+		color: var(--k-text-2);
+	}
+	.updater-log ul {
+		margin: 8px 0 0;
+		padding: 0;
+		list-style: none;
+		display: grid;
+		gap: 4px;
+	}
+	.updater-log li {
+		display: flex;
+		align-items: baseline;
+		flex-wrap: wrap;
+		gap: 8px;
+		overflow-wrap: anywhere;
 	}
 	.src-cell {
 		display: flex;
@@ -2905,6 +3279,10 @@
 	.pill.warn {
 		background: rgba(224, 179, 84, 0.15);
 		color: var(--k-hiatus);
+	}
+	.pill.ok {
+		background: color-mix(in srgb, var(--k-ongoing) 15%, transparent);
+		color: var(--k-ongoing);
 	}
 
 	/* Dense grids (extensions, ingest results, scan health) become stacked rows

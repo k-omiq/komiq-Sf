@@ -11,6 +11,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
+use crate::source_health::{Subject, Surface};
+
 /// Max simultaneous upstream COVER fetches (Suwayomi -> source CDN) across the whole
 /// process. Covers are the only Suwayomi call a browser `<img>` blocks on, and the
 /// engine proxies each one to a third-party CDN, so an unbounded fan-out (a 30-card
@@ -613,7 +615,17 @@ impl SuwayomiClient {
         let url = format!("{}{}", self.base_url, path);
         let res = self.page_http.get(url).send().await?;
         if !res.status().is_success() {
-            return Err(anyhow!("Suwayomi page error {}", res.status()));
+            // Include a snippet of the body, as the cover fetcher does: Suwayomi answers
+            // its own 500 with the SOURCE's error ("HTTP error 403") in the body, and
+            // that is the only thing that says why the page failed.
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            let snippet: String = body.trim().chars().take(160).collect();
+            return Err(if snippet.is_empty() {
+                anyhow!("Suwayomi page error {status}")
+            } else {
+                anyhow!("Suwayomi page error {status}: {snippet}")
+            });
         }
         let content_type = res
             .headers()
@@ -745,12 +757,16 @@ impl SuwayomiClient {
             #[serde(rename = "fetchSourceManga")]
             fetch_source_manga: Payload,
         }
-        let data: Data = self
-            .gql(
+        let fetched = self
+            .gql::<Data>(
                 &doc,
                 json!({ "source": source_id, "type": ty.as_str(), "page": page, "query": query }),
             )
-            .await?;
+            .await;
+        // Every listing caller (discovery, source-sync, search, ingest) comes through
+        // here, so this one line is the whole of the `browse` health surface.
+        crate::source_health::observe(Subject::Source(source_id), Surface::Browse, &fetched);
+        let data = fetched?;
         Ok((
             data.fetch_source_manga.has_next_page,
             parse_records::<SuwayomiManga>(data.fetch_source_manga.mangas, "browse_manga"),
@@ -831,10 +847,13 @@ impl SuwayomiClient {
             .gql::<FetchData>(&fetch, json!({ "id": series_id }))
             .await
         {
-            Ok(d) => Ok((
-                parse_records::<SuwayomiChapter>(d.f.chapters.unwrap_or_default(), "chapters"),
-                Provenance::Upstream,
-            )),
+            Ok(d) => {
+                crate::source_health::ok(Subject::Manga(series_id), Surface::Chapters);
+                Ok((
+                    parse_records::<SuwayomiChapter>(d.f.chapters.unwrap_or_default(), "chapters"),
+                    Provenance::Upstream,
+                ))
+            }
             Err(e) => {
                 // "No chapters" is an upstream ANSWER, not an upstream failure: the
                 // mutation reached the source and it has nothing. Reported as
@@ -842,8 +861,14 @@ impl SuwayomiClient {
                 // source — the per-source health view counts zero-chapter series
                 // separately (see `catalog::source_scan_health`).
                 if e.to_string().contains("No chapters") {
+                    crate::source_health::ok(Subject::Manga(series_id), Surface::Chapters);
                     return Ok((vec![], Provenance::Upstream));
                 }
+                // The one place the upstream error text still exists: below this line it
+                // is replaced by Suwayomi's cache and never seen again (F11). Recorded
+                // here rather than by the callers so the scanner and the reader's
+                // cache-miss path are both covered.
+                crate::source_health::fail(Subject::Manga(series_id), Surface::Chapters, &e);
                 let doc = format!(
                     "{CHAPTER_FIELDS}\n\
                      query C($id: Int!) {{ chapters(condition: {{ mangaId: $id }}, order: {{ by: SOURCE_ORDER, byType: DESC }}) {{ nodes {{ ...ChapterFields }} }} }}"
@@ -909,13 +934,18 @@ impl SuwayomiClient {
             f: Payload,
         }
         match self.gql::<Data>(&doc, json!({ "id": id })).await {
-            Ok(d) => Ok((
-                d.f.manga,
-                parse_records::<SuwayomiChapter>(d.f.chapters.unwrap_or_default(), "chapters"),
-                Provenance::Upstream,
-            )),
+            Ok(d) => {
+                crate::source_health::ok(Subject::Manga(id), Surface::Chapters);
+                Ok((
+                    d.f.manga,
+                    parse_records::<SuwayomiChapter>(d.f.chapters.unwrap_or_default(), "chapters"),
+                    Provenance::Upstream,
+                ))
+            }
             Err(_) => {
-                // Fallback: two calls (each carries its own older-engine fallback).
+                // Fallback: two calls (each carries its own older-engine fallback). The
+                // failure is recorded by `chapters_with_provenance`, once, so a scan that
+                // fails here is not counted twice.
                 let (m, m_prov) = self.series_with_provenance(id).await?;
                 let (chapters, ch_prov) = self.chapters_with_provenance(id).await?;
                 Ok((m, chapters, m_prov.and(ch_prov)))

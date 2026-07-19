@@ -93,6 +93,12 @@ async fn sweep(pool: &SqlitePool) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "gc: view-bucket prune failed"),
     }
+    // Same for the per-source request health buckets (migration 0110).
+    match crate::source_health::prune_buckets(pool).await {
+        Ok(n) if n > 0 => tracing::info!(deleted = n, "gc: pruned old source health buckets"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "gc: source-health prune failed"),
+    }
 }
 
 // ---------------------------------------------------------------------------------

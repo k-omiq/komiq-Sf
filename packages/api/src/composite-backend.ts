@@ -32,6 +32,7 @@ import type {
 	SourceIngestJob,
 	SourceInfo,
 	SourceScanHealth,
+	ExtensionAutoUpdate,
 	SplitSourcesResult,
 	TagInfo,
 	UpdateFeedRow,
@@ -622,6 +623,12 @@ export class CompositeBackend implements Backend {
 
 	sourceScanHealth(): Promise<SourceScanHealth[]> {
 		return this.opts.hosted.sourceScanHealth!();
+	}
+	extensionAutoUpdate(): Promise<ExtensionAutoUpdate> {
+		return this.opts.hosted.extensionAutoUpdate!();
+	}
+	runExtensionUpdates(): Promise<ExtensionAutoUpdate> {
+		return this.opts.hosted.runExtensionUpdates!();
 	}
 
 	// --- admin background source-ingest jobs (S1) ---

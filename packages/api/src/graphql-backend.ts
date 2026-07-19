@@ -38,6 +38,7 @@ import type {
 	SourceIngestJob,
 	SourceInfo,
 	SourceScanHealth,
+	ExtensionAutoUpdate,
 	SplitSourcesResult,
 	TagInfo,
 	UpdateFeedRow,
@@ -879,6 +880,20 @@ export class GraphQLBackend implements Backend {
 	async sourceScanHealth(): Promise<SourceScanHealth[]> {
 		const d = await this.gql<{ sourceScanHealth: SourceScanHealth[] }>(ops.SOURCE_SCAN_HEALTH);
 		return d.sourceScanHealth;
+	}
+
+	async extensionAutoUpdate(): Promise<ExtensionAutoUpdate> {
+		const d = await this.gql<{ extensionAutoUpdate: ExtensionAutoUpdate }>(
+			ops.EXTENSION_AUTO_UPDATE,
+		);
+		return d.extensionAutoUpdate;
+	}
+
+	async runExtensionUpdates(): Promise<ExtensionAutoUpdate> {
+		const d = await this.gql<{ runExtensionUpdates: ExtensionAutoUpdate }>(
+			ops.RUN_EXTENSION_UPDATES,
+		);
+		return d.runExtensionUpdates;
 	}
 
 	async sourceIngestJobs(active = false): Promise<SourceIngestJob[]> {
