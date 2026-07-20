@@ -16,26 +16,121 @@ use std::hash::{Hash, Hasher};
 /// Minimum character similarity for author-corroborated exact-title merges.
 pub const AUTHOR_MATCH_THRESHOLD: f64 = 0.90;
 
-/// Unicode character edit similarity after folding case, punctuation and name order.
-/// Missing or blank names supply no evidence, even when both are missing.
-pub fn author_similarity(a: Option<&str>, b: Option<&str>) -> f64 {
-    fn key(name: &str) -> Vec<char> {
-        let lower = name.to_lowercase();
-        let mut tokens: Vec<&str> = lower
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| !t.is_empty())
-            .collect();
-        tokens.sort_unstable();
-        tokens.concat().chars().collect()
+/// One name's comparison key: case, punctuation and word order folded away.
+fn name_key(name: &str) -> Vec<char> {
+    let lower = name.to_lowercase();
+    let mut tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    tokens.sort_unstable();
+    tokens.concat().chars().collect()
+}
+
+/// Words that mark a parenthetical as an organisation or role rather than a second
+/// spelling of the person's name.
+const AUTHOR_LABEL_WORDS: &[&str] = &[
+    "circle",
+    "studio",
+    "studios",
+    "comics",
+    "team",
+    "group",
+    "works",
+    "committee",
+    "project",
+    "production",
+    "productions",
+    "entertainment",
+    "company",
+    "artist",
+    "author",
+    "story",
+    "art",
+    "original",
+];
+
+/// Every name a credit line can be recognised by. Sources credit the same person in
+/// different shapes, and comparing the whole line alone missed all of these:
+///
+///   * a transliteration in parentheses — "Dedart (디다트)" vs "Dedart";
+///   * a list of people — "Masashi Kishimoto, Mikio Ikemoto" vs "Kishimoto Masashi".
+///
+/// So besides the whole line, each listed person and each parenthesised transliteration
+/// is a variant. Two guards keep that from inventing matches:
+///
+///   * a parenthetical only counts when it is in a different script from the name it
+///     follows — that is what a transliteration looks like — and when it is not an
+///     organisation label (`AUTHOR_LABEL_WORDS`). "(Circle)" and "(REDICE STUDIO)" say
+///     what someone belongs to, not who they are: every doujin circle would otherwise
+///     match every other one, and so would two artists of one studio.
+///   * a single Latin word out of a list is skipped: "Kishimoto, Masashi" is one
+///     person written family-name-first, not two people called Kishimoto and Masashi.
+fn author_variants(line: &str) -> Vec<Vec<char>> {
+    let mut outside = String::new();
+    let mut inside: Vec<String> = Vec::new();
+    let mut depth = 0usize;
+    for c in line.chars() {
+        match c {
+            '(' | '（' => {
+                depth += 1;
+                if depth == 1 {
+                    inside.push(String::new());
+                }
+                outside.push(' ');
+            }
+            ')' | '）' => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {
+                if let Some(current) = inside.last_mut() {
+                    current.push(c);
+                }
+            }
+            _ => outside.push(c),
+        }
     }
-    let (Some(a), Some(b)) = (a, b) else {
-        return 0.0;
+    let foreign = |s: &str| s.chars().any(|c| c.is_alphabetic() && !c.is_ascii());
+    let words = |s: &str| {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .count()
     };
-    let (a, b) = (key(a), key(b));
-    let length = a.len().max(b.len());
+    let mut variants = vec![name_key(line)];
+    let people: Vec<&str> = outside
+        .split([',', ';', '/', '&', '、', '，'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    for person in &people {
+        if people.len() == 1 || words(person) >= 2 || foreign(person) {
+            variants.push(name_key(person));
+        }
+    }
+    for alias in &inside {
+        let label = alias
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| AUTHOR_LABEL_WORDS.contains(&word));
+        if !label && foreign(alias) != foreign(&outside) {
+            variants.push(name_key(alias));
+        }
+    }
+    // The whole line keeps whatever it is; a derived variant needs two characters to
+    // carry any identity.
+    let mut seen: Vec<Vec<char>> = Vec::new();
+    for (i, v) in variants.into_iter().enumerate() {
+        if ((i == 0 && !v.is_empty()) || v.len() >= 2) && !seen.contains(&v) {
+            seen.push(v);
+        }
+    }
+    seen
+}
+
+/// Unicode character edit similarity of two name keys (0.0..=1.0).
+fn edit_similarity(a: &[char], b: &[char]) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
+    let length = a.len().max(b.len());
     let mut row: Vec<usize> = (0..=b.len()).collect();
     for (i, ac) in a.iter().enumerate() {
         let mut diagonal = row[0];
@@ -49,6 +144,19 @@ pub fn author_similarity(a: Option<&str>, b: Option<&str>) -> f64 {
         }
     }
     1.0 - row[b.len()] as f64 / length as f64
+}
+
+/// Best character edit similarity between any name of one credit line and any name of
+/// the other (see [`author_variants`]), after folding case, punctuation and name order.
+/// Missing or blank names supply no evidence, even when both are missing.
+pub fn author_similarity(a: Option<&str>, b: Option<&str>) -> f64 {
+    let (Some(a), Some(b)) = (a, b) else {
+        return 0.0;
+    };
+    let (a, b) = (author_variants(a), author_variants(b));
+    a.iter()
+        .flat_map(|x| b.iter().map(move |y| edit_similarity(x, y)))
+        .fold(0.0_f64, f64::max)
 }
 
 pub fn authors_match(a: Option<&str>, b: Option<&str>) -> bool {
@@ -230,6 +338,53 @@ mod tests {
             Some("Masashi Kishimoto"),
             Some("Eiichiro Oda")
         ));
+    }
+
+    /// The shapes real sources credit one person in, taken from catalogue pairs the
+    /// whole-line comparison refused.
+    #[test]
+    fn author_lines_match_through_transliterations_and_lists() {
+        // A native-script transliteration in parentheses.
+        assert!(authors_match(Some("Dedart (디다트)"), Some("Dedart")));
+        assert!(authors_match(
+            Some("常盘勇者 (Chang Pan Yong Zhe)"),
+            Some("Chang Pan Yong Zhe")
+        ));
+        // One person out of a list, in either name order.
+        assert!(authors_match(
+            Some("Masashi Kishimoto, Mikio Ikemoto"),
+            Some("Kishimoto Masashi")
+        ));
+        assert!(authors_match(
+            Some("Team the J/ Han Yurim"),
+            Some("Han Yurim (한유림)")
+        ));
+        // A same-script parenthetical is a label, not a name: two circles do not match.
+        assert!(!authors_match(
+            Some("Moon Clock (Circle)"),
+            Some("Tsubame Gaeshi! (Circle)")
+        ));
+        assert!(!authors_match(
+            Some("TryTry (REDICE STUDIO)"),
+            Some("Someone Else (REDICE STUDIO)")
+        ));
+        // "Family, Given" is one person; a shared given name is not a match.
+        assert!(!authors_match(
+            Some("Kishimoto, Masashi"),
+            Some("Asada, Masashi")
+        ));
+        // …also when the name before the label is in another script, which makes the
+        // label look like a transliteration.
+        assert!(!authors_match(
+            Some("박성우 (REDICE STUDIO)"),
+            Some("장성락 (REDICE STUDIO)")
+        ));
+        assert!(!authors_match(
+            Some("José (Circle)"),
+            Some("André (Circle)")
+        ));
+        // Unbalanced parentheses must not panic.
+        assert!(!authors_match(Some(")(("), Some("Known Author")));
     }
 
     #[test]

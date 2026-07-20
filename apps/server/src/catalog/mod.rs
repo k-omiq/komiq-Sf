@@ -164,6 +164,23 @@ pub async fn find_works_by_alias(pool: &SqlitePool, normalized: &str) -> Result<
     Ok(ids)
 }
 
+/// Distinct work ids with an alias whose article-insensitive key
+/// (`normalize::match_key`) is `key`, so "The X" finds "X". Weaker than
+/// [`find_works_by_alias`]: callers treat a hit as a LOOSE title match and use it only
+/// when the exact lookup found nothing.
+pub async fn find_works_by_match_key(pool: &SqlitePool, key: &str) -> Result<Vec<String>> {
+    if key.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT work_id FROM work_alias WHERE match_key = ?",
+    )
+    .bind(key)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids)
+}
+
 /// Fuzzy blocking (step 3): distinct work ids whose alias index contains `token` as
 /// a whole word, capped at `limit`. `token` is a whole word of the candidate's
 /// normalized title (the fuzzy block keys on the top-N longest words), so the block
@@ -3127,6 +3144,16 @@ pub struct WorkIdentity {
     pub year: Option<i64>,
     pub author: Option<String>,
     pub cover_phash: Option<String>,
+    /// Whether the work carried a MangaDex source. The gate refuses a loose title match
+    /// between two anchored works, so a work gaining its anchor under the gate (another
+    /// merge landing first) must abort the merge.
+    pub mangadex_anchored: bool,
+    /// The duplicate key (`work_alias.match_key`) the gate found this work under, when
+    /// the decision rested on it. Re-checked so an alias removed under the gate
+    /// (`removeSeriesAltTitle`) cannot leave a merge standing on evidence that is gone.
+    /// Not a column: never read back, only verified.
+    #[sqlx(skip)]
+    pub match_key: Option<String>,
 }
 
 /// As [`merge_works_ex`], but with an optional OPTIMISTIC-CONCURRENCY precondition:
@@ -3208,12 +3235,27 @@ async fn merge_works_guarded(
     // change these columns, so a gate that still holds now holds for the whole merge.
     if let Some((exp_src, exp_tgt)) = expected {
         for (id, want) in [(source_work, exp_src), (target_work, exp_tgt)] {
-            let now: WorkIdentity = sqlx::query_as(
-                "SELECT primary_title, year, author, cover_phash FROM work WHERE id = ?",
+            let mut now: WorkIdentity = sqlx::query_as(
+                "SELECT w.primary_title, w.year, w.author, w.cover_phash, \
+                        EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id \
+                                AND ss.source_type = 'mangadex') AS mangadex_anchored \
+                 FROM work w WHERE w.id = ?",
             )
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
+            if let Some(key) = &want.match_key {
+                let still_named: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM work_alias WHERE work_id = ? AND match_key = ?)",
+                )
+                .bind(id)
+                .bind(key)
+                .fetch_one(&mut *tx)
+                .await?;
+                if still_named {
+                    now.match_key = Some(key.clone());
+                }
+            }
             if now != *want {
                 anyhow::bail!("merge precondition failed: work {id} changed under the gate");
             }
@@ -6397,6 +6439,7 @@ mod tests {
             year: Some(2015),
             author: None,
             cover_phash: None,
+            ..Default::default()
         };
         let expect_loser = snapshot.clone();
         let expect_survivor = snapshot;

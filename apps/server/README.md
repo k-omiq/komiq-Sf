@@ -80,10 +80,19 @@ Re-run the `discovery` scenario as the acceptance test for any caching work.
 
 ## Automatic maintenance
 
-Exact normalized series names with author names at least 90% similar auto-merge.
-Author comparison uses Unicode character edit distance, ignoring case, punctuation
-and word order. Missing authors remain in review. External-ID and corroborated-cover
-matching still apply. Waiting merge reviews are rechecked at startup (after 30 seconds),
+Series names are compared article-insensitively ("The X" matches "X"). A matching
+name with author names at least 90% similar auto-merges. Author comparison uses
+Unicode character edit distance, ignoring case, punctuation and word order, and
+matches through any listed person or parenthesised transliteration
+("Dedart (디다트)" matches "Dedart"). Missing authors remain in review. External-ID
+and corroborated-cover matching still apply.
+
+The duplicate sweep (admin Settings, and after catalogue ingestion) also merges on an
+alternative title or an article-only difference, but only with author or cover
+evidence, only when exactly one target qualifies, and never between two MangaDex
+entries. Two MangaDex entries merge only on the same title with author or cover
+evidence (a matching year is not enough), and never when one is a sequel
+("X" / "X Season 2"). A work with "novel" in its name never merges with one without. Waiting merge reviews are rechecked at startup (after 30 seconds),
 hourly and after catalogue ingestion. Confirmed/rejected reviews and admin splits
 are respected; accepted waiting reviews are merged and confirmed atomically.
 

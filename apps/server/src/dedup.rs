@@ -8,8 +8,10 @@
 //!   5. exact title + >=90% author characters -> auto-merge; fuzzy high
 //!      (cover-corroborated) -> auto-merge; mid -> manual review queue.
 //!
-//! Author names ignore case, punctuation and word order. Missing authors remain
-//! in review. External identities and admin split decisions retain precedence.
+//! Titles are compared article-insensitively ("The X" = "X"). Author names ignore
+//! case, punctuation and word order, and match through any listed person or
+//! parenthesised transliteration. Missing authors remain in review. A novel never
+//! matches a non-novel. External identities and admin split decisions retain precedence.
 
 use std::collections::HashSet;
 
@@ -18,7 +20,7 @@ use sqlx::SqlitePool;
 
 use crate::catalog::{
     self,
-    normalize::normalize_title,
+    normalize::{match_key, normalize_title, novel_mismatch},
     similarity::{
         description_shingles, description_similarity_pre, phash_similarity, title_shingles,
         title_similarity_pre, DescShingles, TitleShingles,
@@ -138,6 +140,20 @@ pub async fn resolve_ex(
     if let Some(ex) = exclude_work_id {
         candidate_ids.remove(ex);
     }
+    // 2b. No exact title: the same titles with articles ignored ("The X" = "X"), which
+    //     is how one series is named across sites. Only a fallback, so an exactly-named
+    //     work is never passed over for an article variant of it.
+    let cand_keys: Vec<String> = norm_titles.iter().map(|t| match_key(t)).collect();
+    let mut article_hit = false;
+    if candidate_ids.is_empty() {
+        for key in &cand_keys {
+            candidate_ids.extend(catalog::find_works_by_match_key(pool, key).await?);
+        }
+        if let Some(ex) = exclude_work_id {
+            candidate_ids.remove(ex);
+        }
+        article_hit = !candidate_ids.is_empty();
+    }
     let exact_hit = !candidate_ids.is_empty();
     let exact_ids = candidate_ids.clone();
 
@@ -179,6 +195,11 @@ pub async fn resolve_ex(
         let Some(md) = match_data.get(wid) else {
             continue;
         };
+        // A novel and its comic adaptation share a title, alt titles and an author, so
+        // they score as a perfect duplicate. They are not one: never offer the pair.
+        if novel_mismatch(Some(&cand.title), md.primary_title.as_deref()) {
+            continue;
+        }
         if exact_ids.contains(wid)
             && crate::catalog::similarity::authors_match(
                 cand.author.as_deref(),
@@ -187,7 +208,13 @@ pub async fn resolve_ex(
         {
             author_hits.push(wid.clone());
         }
-        let scored = score_candidate(cand, &cand_title_shingles, cand_desc_shingles.as_ref(), md);
+        let scored = score_candidate(
+            cand,
+            &cand_title_shingles,
+            &cand_keys,
+            cand_desc_shingles.as_ref(),
+            md,
+        );
         let replace = match best.as_ref() {
             None => true,
             Some((s, w)) => scored.score > s.score || (scored.score == s.score && wid < w),
@@ -202,7 +229,13 @@ pub async fn resolve_ex(
         let wid = catalog::pick_survivor(pool, &author_hits).await?;
         let md = &match_data[&wid];
         best = Some((
-            score_candidate(cand, &cand_title_shingles, cand_desc_shingles.as_ref(), md),
+            score_candidate(
+                cand,
+                &cand_title_shingles,
+                &cand_keys,
+                cand_desc_shingles.as_ref(),
+                md,
+            ),
             wid,
         ));
     }
@@ -243,7 +276,10 @@ pub async fn resolve_ex(
             .as_deref()
             .map(is_discriminative_phash)
             .unwrap_or(false);
-    let exact_auto_merge = exact_hit && !author_hits.is_empty();
+    // An article-only match that fits several same-author works has no single right
+    // target; that is a question for review, not for `pick_survivor`'s sort order.
+    let exact_auto_merge =
+        exact_hit && !author_hits.is_empty() && !(article_hit && author_hits.len() > 1);
     let decision = if exact_auto_merge || (score >= HIGH && cover_corroborated) {
         Decision::AutoMerge {
             work_id,
@@ -276,6 +312,7 @@ struct Scored {
 fn score_candidate(
     cand: &Candidate,
     cand_titles: &[TitleShingles],
+    cand_keys: &[String],
     cand_desc: Option<&DescShingles>,
     md: &WorkMatchData,
 ) -> Scored {
@@ -294,6 +331,18 @@ fn score_candidate(
                 .map(move |al| title_similarity_pre(nt, al))
         })
         .fold(0.0_f64, f64::max);
+    // Titles that differ only by an article are the same title. Shingle overlap scores
+    // "The Box" against "Box" at about 0.5, which would drop an uncorroborated article
+    // match below MID and mint a silent duplicate instead of asking for review.
+    let title_sim = if md
+        .aliases_norm
+        .iter()
+        .any(|al| cand_keys.contains(&match_key(al)))
+    {
+        1.0
+    } else {
+        title_sim
+    };
 
     let mut corrob = 0.0_f64;
     if let (Some(a), Some(b)) = (cand_desc, &md.description) {

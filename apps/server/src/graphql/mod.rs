@@ -9787,9 +9787,14 @@ impl MutationRoot {
                         );
                         continue;
                     }
-                    let pair: Vec<ConsolidateWork> = sqlx::query_as(
-                        "SELECT id, primary_title, year, author, cover_phash FROM work WHERE id IN (?, ?)")
-                        .bind(other).bind(&survivor).fetch_all(&st.pool).await.map_err(gql_err)?;
+                    let pair: Vec<ConsolidateWork> = sqlx::query_as(&format!(
+                        "SELECT {CONSOLIDATE_WORK_COLUMNS} FROM work w WHERE w.id IN (?, ?)"
+                    ))
+                    .bind(other)
+                    .bind(&survivor)
+                    .fetch_all(&st.pool)
+                    .await
+                    .map_err(gql_err)?;
                     let Some(source) = pair.iter().find(|w| &w.id == other) else {
                         continue;
                     };
@@ -9799,6 +9804,14 @@ impl MutationRoot {
                     if !crate::catalog::similarity::authors_match(
                         source.author.as_deref(),
                         target.author.as_deref(),
+                    ) {
+                        continue;
+                    }
+                    // A novel and its comic share alt titles and an author, so an alt
+                    // title typed on one would otherwise swallow the other.
+                    if crate::catalog::normalize::novel_mismatch(
+                        source.primary_title.as_deref(),
+                        target.primary_title.as_deref(),
                     ) {
                         continue;
                     }
@@ -9857,15 +9870,17 @@ impl MutationRoot {
         reload_series_in_shape(st, ctx, &id.0, &work_id).await
     }
 
-    /// Admin: consolidate the backlog of duplicate works — works that share an exact
-    /// normalized alias but were minted separately (pre-policy or by concurrent ingest).
+    /// Admin: consolidate the backlog of duplicate works — works that share a title or
+    /// an alt title (articles ignored) but were minted separately (pre-policy, concurrent
+    /// ingest, or two sites naming one series differently).
     ///
-    /// A shared alias alone is NOT enough to merge: `merge_works` physically deletes the
+    /// A shared title alone is NOT enough to merge: `merge_works` physically deletes the
     /// loser, and MangaDex alt-titles make unrelated series share aliases (every JoJo
-    /// part carries `ジョジョの奇妙な冒険`). Only a 2-work cluster whose shared alias is
-    /// the PRIMARY title of both sides, is long enough, and is corroborated by year /
-    /// author / cover-pHash is folded — see `consolidate_gate`. Everything else is routed
-    /// to the `merge_candidate` review queue.
+    /// part carries `ジョジョの奇妙な冒険`). The same primary title needs year / author /
+    /// cover-pHash corroboration; an alt-title or article-only match needs author or
+    /// cover evidence and is never applied between two MangaDex entries; a novel never
+    /// merges with a non-novel — see `consolidate_gate`. Everything else is routed to
+    /// the `merge_candidate` review queue.
     ///
     /// `limit` bounds the alias GROUPS examined per call, and every merged
     /// `(loser, survivor)` pair is logged for audit. Returns how many works were merged
@@ -11535,7 +11550,7 @@ async fn new_session(pool: &SqlitePool, user_id: &str, ttl_secs: i64) -> Result<
 static RECONCILE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Where the NEXT `consolidateExactDuplicates` call resumes its keyset walk of
-/// `work_alias` (exclusive `normalized_title` lower bound; `""` = from the start).
+/// `work_alias` (exclusive `match_key` lower bound; `""` = from the start).
 ///
 /// WHY THIS EXISTS. The sweep REFUSES far more clusters than it merges, and a refusal
 /// leaves the alias group exactly where it was — still in `work_alias`, still matching
@@ -11668,6 +11683,11 @@ struct ConsolidateWork {
     year: Option<i64>,
     author: Option<String>,
     cover_phash: Option<String>,
+    /// Does the work carry a MangaDex source? Two MangaDex-anchored works are two
+    /// distinct entries of the spine, so only an exact title may fold them
+    /// (`consolidate_gate`). Derived from `source_series`, not a `work` column; every
+    /// query that builds this struct selects it (`CONSOLIDATE_WORK_COLUMNS`).
+    mangadex_anchored: bool,
 }
 
 impl ConsolidateWork {
@@ -11681,9 +11701,25 @@ impl ConsolidateWork {
             year: self.year,
             author: self.author.clone(),
             cover_phash: self.cover_phash.clone(),
+            mangadex_anchored: self.mangadex_anchored,
+            match_key: None,
+        }
+    }
+
+    /// As `identity`, for a decision that rested on both works carrying the duplicate
+    /// key `key`: the merge also verifies the alias is still there.
+    fn identity_under(&self, key: &str) -> catalog::WorkIdentity {
+        catalog::WorkIdentity {
+            match_key: Some(key.to_string()),
+            ..self.identity()
         }
     }
 }
+
+/// The select list every `ConsolidateWork` query uses (the table must be aliased `w`).
+const CONSOLIDATE_WORK_COLUMNS: &str = "w.id, w.primary_title, w.year, w.author, w.cover_phash, \
+     EXISTS (SELECT 1 FROM source_series ss \
+             WHERE ss.work_id = w.id AND ss.source_type = 'mangadex') AS mangadex_anchored";
 
 /// Did this error come from `merge_works_checked`'s optimistic-concurrency precondition?
 /// A stale gate is an ordinary, expected outcome (skip the pair, retry next pass), not a
@@ -11692,41 +11728,83 @@ fn is_precondition_failure(e: &anyhow::Error) -> bool {
     e.to_string().starts_with("merge precondition failed")
 }
 
-/// The ambiguity gate for an exact-alias consolidation. `Ok(())` means the pair is
+/// How strongly two works in one duplicate group are tied together by their titles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitleMatch {
+    /// Both works carry the same primary title (after `normalize_title`).
+    Exact,
+    /// They only meet through an alternative title, or through primary titles that
+    /// differ by an article ("The X" / "X").
+    Loose,
+}
+
+/// The ambiguity gate for a duplicate-group consolidation. `Ok(kind)` means the pair is
 /// safe to fold irreversibly; `Err(reason)` is a short machine-friendly label used in
 /// the log line and to route the pair to the review queue instead.
 ///
-/// A shared normalized ALIAS is far too weak to justify `merge_works` (which physically
-/// DELETEs the loser): aliases include every MangaDex `altTitle`, so distinct series in
-/// one franchise routinely share one. Every condition below must hold:
+/// `key` is the group's article-insensitive key (`normalize::match_key`). Sharing it is
+/// far too weak on its own to justify `merge_works` (which physically DELETEs the
+/// loser): the alias index includes every MangaDex `altTitle`, so distinct series in one
+/// franchise routinely share one. The rules, in order:
 ///
-///  1. the shared alias is the PRIMARY title of both works (not merely an alt-title);
-///  2. short titles require >=90% author similarity;
-///  3. corroboration beyond the title: >=90% author similarity, equal-or-adjacent
-///     `year`, OR cover-pHash similarity >= `CONSOLIDATE_PHASH_CORROBORATION` between two
-///     DISCRIMINATIVE hashes (`consolidate_phash_is_discriminative` — the guard
-///     `dedup` applies alongside the same threshold).
+///  0. a novel never merges with a non-novel (`normalize::novel_mismatch`), whatever
+///     else agrees — a comic adaptation shares its novel's name, alt titles and author;
+///  1. short keys require >=90% author similarity;
+///  2. EXACT — the key is the primary title of both works and those titles normalize
+///     identically. Corroborated by >=90% author similarity, equal-or-adjacent `year`,
+///     OR cover-pHash similarity >= `CONSOLIDATE_PHASH_CORROBORATION` between two
+///     DISCRIMINATIVE hashes (`consolidate_phash_is_discriminative` — the guard `dedup`
+///     applies alongside the same threshold);
+///  3. LOOSE — the key is the primary title of at least one of them, and the other
+///     knows it as an alt title or differs by an article. This is how the same series
+///     looks across sites ("The Apothecary Diaries" on one, "Kusuriya no Hitorigoto"
+///     with that alt title on MangaDex), but it is also how MangaDex relates a series to
+///     its own colored edition, pre-serialization, prequel and anthology. So:
+///       * never when the key is only an alt title on BOTH sides (`alt_title_only`);
+///       * never between two MangaDex-anchored works — those are distinct spine entries
+///         by construction (`alt_title_only`, as before);
+///       * and only on author or cover evidence. A year alone proves nothing here.
 ///
-/// The cluster-size limit (`CONSOLIDATE_MAX_CLUSTER`) is enforced by the caller, which
-/// sees the whole cluster.
+/// Two MangaDex-anchored works are held to more even when EXACT: their titles must not
+/// differ by an instalment marker `normalize_title` strips ("X" / "X Season 2" is a
+/// sequel there — `sequel_mismatch`), and a year alone does not corroborate them (two
+/// adaptations of one title by different authors start in the same year).
+///
+/// The cluster-size limit (`CONSOLIDATE_MAX_CLUSTER`) and the choice between several
+/// possible targets are the caller's, which sees the whole group.
 fn consolidate_gate(
-    norm: &str,
+    key: &str,
     a: &ConsolidateWork,
     b: &ConsolidateWork,
-) -> std::result::Result<(), &'static str> {
+) -> std::result::Result<TitleMatch, &'static str> {
+    use crate::catalog::normalize::{match_key, normalize_title, novel_mismatch, sequel_mismatch};
+    if novel_mismatch(a.primary_title.as_deref(), b.primary_title.as_deref()) {
+        return Err("novel_mismatch");
+    }
     let author_ok =
         crate::catalog::similarity::authors_match(a.author.as_deref(), b.author.as_deref());
-    if norm.chars().count() < FEDERATED_MIN_TITLE_CHARS && !author_ok {
+    if key.chars().count() < FEDERATED_MIN_TITLE_CHARS && !author_ok {
         return Err("short_title");
     }
-    let is_primary = |w: &ConsolidateWork| {
-        w.primary_title
-            .as_deref()
-            .map(|t| crate::catalog::normalize::normalize_title(t) == norm)
-            .unwrap_or(false)
-    };
-    if !is_primary(a) || !is_primary(b) {
+    let primary = |w: &ConsolidateWork| w.primary_title.as_deref().map(normalize_title);
+    let (primary_a, primary_b) = (primary(a), primary(b));
+    let names_key =
+        |primary: &Option<String>| primary.as_deref().map(match_key).as_deref() == Some(key);
+    let exact = primary_a == primary_b && names_key(&primary_a);
+    // A loose match needs the key to be somebody's actual NAME. Two works that only
+    // share an alt title are a franchise ("Phantom Blood" and "Battle Tendency" both
+    // list `ジョジョの奇妙な冒険`), and its author is shared too.
+    if !(exact || names_key(&primary_a) || names_key(&primary_b)) {
         return Err("alt_title_only");
+    }
+    // Two MangaDex-anchored works are distinct spine entries by construction, so the
+    // bar is higher for them than for a site's copy of a series.
+    let both_mangadex = a.mangadex_anchored && b.mangadex_anchored;
+    if !exact && both_mangadex {
+        return Err("alt_title_only");
+    }
+    if both_mangadex && sequel_mismatch(a.primary_title.as_deref(), b.primary_title.as_deref()) {
+        return Err("sequel_mismatch");
     }
     let year_ok = matches!((a.year, b.year), (Some(x), Some(y)) if (x - y).abs() <= 1);
     // BOTH hashes must carry signal before their similarity means anything — see
@@ -11746,10 +11824,11 @@ fn consolidate_gate(
         )
         .map(|p| p >= CONSOLIDATE_PHASH_CORROBORATION)
         .unwrap_or(false);
-    if year_ok || author_ok || phash_ok {
-        Ok(())
-    } else {
-        Err("uncorroborated")
+    match (exact, author_ok || phash_ok) {
+        (true, true) => Ok(TitleMatch::Exact),
+        (true, false) if year_ok && !both_mangadex => Ok(TitleMatch::Exact),
+        (false, true) => Ok(TitleMatch::Loose),
+        _ => Err("uncorroborated"),
     }
 }
 
@@ -11774,19 +11853,29 @@ struct ConsolidateOutcome {
     cursor: String,
 }
 
-/// Consolidate up to `limit` clusters of works that share an exact normalized alias
-/// but were minted separately (pre-policy, concurrent ingest, or a UUID-keyed backfill
-/// that bypassed the dedup matcher).
+/// Consolidate up to `limit` groups of works that share a duplicate key
+/// (`work_alias.match_key`: a normalized title or alt title, articles ignored) but were
+/// minted separately (pre-policy, concurrent ingest, a UUID-keyed backfill that bypassed
+/// the dedup matcher, or two sites publishing one series under different names).
 ///
-/// SAFETY: a shared alias alone is NOT evidence of a duplicate — see `consolidate_gate`.
-/// Only a 2-work cluster that clears the gate is folded (MangaDex-anchored survivor
-/// first, then most sources, then lowest id). Everything else is routed to the
-/// `merge_candidate` review queue for a human, never merged and never dropped.
+/// SAFETY: a shared key alone is NOT evidence of a duplicate — see `consolidate_gate`.
+/// Within a group the best survivor comes first (MangaDex-anchored, then most sources,
+/// then lowest id) and each later work is folded into the survivor the gate approves:
 ///
-/// `limit` bounds the alias groups EXAMINED, so a pass that merges nothing is normal and
-/// does not mean the sweep is finished. Keyset-paginated from `cursor` (an exclusive
-/// `normalized_title` lower bound): a pass that REFUSES every cluster still advances,
-/// instead of re-examining the same first `limit` groups forever.
+///   * an EXACT title match wins over a LOOSE one;
+///   * a LOOSE match is taken only when exactly ONE survivor qualifies. A site's
+///     "Solo Leveling: Ragnarok" is an alt title of both the MangaDex series and its
+///     pre-serialization; picking either by sort order would be a coin toss;
+///   * in a group wider than `CONSOLIDATE_MAX_CLUSTER` every merge needs matching authors.
+///
+/// Everything else is routed to the `merge_candidate` review queue for a human, never
+/// merged and never dropped — except a novel/non-novel pair, which is a settled "no" and
+/// would only be noise in that queue.
+///
+/// `limit` bounds the groups EXAMINED, so a pass that merges nothing is normal and does
+/// not mean the sweep is finished. Keyset-paginated from `cursor` (an exclusive
+/// `match_key` lower bound): a pass that REFUSES every group still advances, instead of
+/// re-examining the same first `limit` groups forever.
 async fn consolidate_exact_duplicates_from(
     pool: &SqlitePool,
     covers: Option<&SqlitePool>,
@@ -11794,9 +11883,9 @@ async fn consolidate_exact_duplicates_from(
     cursor: &str,
 ) -> anyhow::Result<ConsolidateOutcome> {
     let groups: Vec<String> = sqlx::query_scalar(
-        "SELECT normalized_title FROM work_alias WHERE normalized_title > ? \
-         GROUP BY normalized_title HAVING COUNT(DISTINCT work_id) > 1 \
-         ORDER BY normalized_title ASC LIMIT ?",
+        "SELECT match_key FROM work_alias WHERE match_key > ? \
+         GROUP BY match_key HAVING COUNT(DISTINCT work_id) > 1 \
+         ORDER BY match_key ASC LIMIT ?",
     )
     .bind(cursor)
     .bind(limit.max(1))
@@ -11806,21 +11895,20 @@ async fn consolidate_exact_duplicates_from(
         cursor: cursor.to_string(),
         ..Default::default()
     };
-    for norm in groups {
+    for key in groups {
         out.groups_seen += 1;
-        out.cursor.clone_from(&norm);
+        out.cursor.clone_from(&key);
         // Re-query the group's works fresh (a prior group may already have folded
         // some), best survivor first.
-        let works: Vec<ConsolidateWork> = sqlx::query_as(
-            "SELECT w.id, w.primary_title, w.year, w.author, w.cover_phash FROM work w \
-             JOIN work_alias a ON a.work_id = w.id AND a.normalized_title = ? \
+        let works: Vec<ConsolidateWork> = sqlx::query_as(&format!(
+            "SELECT {CONSOLIDATE_WORK_COLUMNS} FROM work w \
+             JOIN work_alias a ON a.work_id = w.id AND a.match_key = ? \
              GROUP BY w.id \
-             ORDER BY (SELECT COUNT(*) FROM source_series ss \
-                       WHERE ss.work_id = w.id AND ss.source_type = 'mangadex') > 0 DESC, \
+             ORDER BY mangadex_anchored DESC, \
                       (SELECT COUNT(*) FROM source_series ss WHERE ss.work_id = w.id) DESC, \
-                      w.id ASC",
-        )
-        .bind(&norm)
+                      w.id ASC"
+        ))
+        .bind(&key)
         .fetch_all(pool)
         .await?;
         if works.len() < 2 {
@@ -11829,45 +11917,73 @@ async fn consolidate_exact_duplicates_from(
         let oversized = works.len() > CONSOLIDATE_MAX_CLUSTER;
         let mut survivors = vec![works[0].clone()];
         for other in &works[1..] {
-            // A common title can contain several authors' works. Compare against
-            // the richest surviving representative for this author, not only the
-            // first work in the whole alias group.
-            let survivor = survivors
-                .iter()
-                .find(|candidate| {
-                    crate::catalog::similarity::authors_match(
-                        candidate.author.as_deref(),
-                        other.author.as_deref(),
-                    ) && consolidate_gate(&norm, candidate, other).is_ok()
-                })
-                .unwrap_or(&survivors[0])
-                .clone();
+            // A common title can contain several authors' works, so every surviving
+            // representative is a possible target, not only the first work of the group.
+            let mut exact: Vec<&ConsolidateWork> = Vec::new();
+            let mut loose: Vec<&ConsolidateWork> = Vec::new();
+            // The refusal worth reporting, ranked: one against a same-author survivor is
+            // the likeliest real duplicate, and a novel mismatch (which is never queued)
+            // must not hide a refusal a human should see.
+            let mut refused: Option<(&ConsolidateWork, &'static str, u8)> = None;
+            for candidate in &survivors {
+                let same_author = crate::catalog::similarity::authors_match(
+                    candidate.author.as_deref(),
+                    other.author.as_deref(),
+                );
+                let verdict = match consolidate_gate(&key, candidate, other) {
+                    Err("novel_mismatch") => Err("novel_mismatch"),
+                    _ if oversized && !same_author => Err("cluster_too_large"),
+                    verdict => verdict,
+                };
+                match verdict {
+                    Ok(TitleMatch::Exact) => exact.push(candidate),
+                    Ok(TitleMatch::Loose) => loose.push(candidate),
+                    Err(reason) => {
+                        let rank = match (reason, same_author) {
+                            ("novel_mismatch", _) => 0,
+                            (_, false) => 1,
+                            (_, true) => 2,
+                        };
+                        if refused.is_none_or(|(_, _, best)| rank > best) {
+                            refused = Some((candidate, reason, rank));
+                        }
+                    }
+                }
+            }
+            // The work `other` is judged against: its merge target, or — when refused —
+            // the survivor the refusal is reported and queued against. Survivors are by
+            // construction works that did NOT fold into each other, so two qualifying
+            // targets (a credit line naming both authors of two namesakes, or both halves
+            // of an admin split) is an ambiguity, never a tie to break by sort order.
+            let (against, verdict) = match (exact.as_slice(), loose.as_slice()) {
+                ([target], _) | ([], [target]) => ((*target).clone(), Ok(())),
+                ([first, ..], _) | ([], [first, ..]) => ((*first).clone(), Err("ambiguous_target")),
+                ([], []) => match refused {
+                    Some((candidate, reason, _)) => (candidate.clone(), Err(reason)),
+                    None => (survivors[0].clone(), Err("uncorroborated")),
+                },
+            };
             // An admin already ruled on this pair by SPLITTING it apart (migration 0098).
             // Skip it outright — not queued for review either, because the review queue is
-            // a question and this pair has an answer. Checked BEFORE the gate for the
-            // reason the table exists: the two halves of a split share a normalized title
-            // by construction (that shared title is what caused the bad merge), and they
-            // routinely share an author too, so the gate would pass and `merge_works`
+            // a question and this pair has an answer. Checked BEFORE acting on the gate for
+            // the reason the table exists: the two halves of a split share a normalized
+            // title by construction (that shared title is what caused the bad merge), and
+            // they routinely share an author too, so the gate would pass and `merge_works`
             // would destroy one of them for good.
-            if catalog::is_split_pair(pool, &other.id, &survivor.id)
+            //
+            // The skipped half stays a survivor: a later work that fits both halves must
+            // see two targets and go to review, not fold into whichever half came first.
+            if catalog::is_split_pair(pool, &other.id, &against.id)
                 .await
                 .unwrap_or(false)
             {
                 tracing::debug!(
-                    a = %other.id, b = %survivor.id, alias = %norm,
+                    a = %other.id, b = %against.id, alias = %key,
                     "consolidate: skipped — an admin split this pair apart"
                 );
+                survivors.push(other.clone());
                 continue;
             }
-            let verdict = if oversized
-                && !crate::catalog::similarity::authors_match(
-                    survivor.author.as_deref(),
-                    other.author.as_deref(),
-                ) {
-                Err("cluster_too_large")
-            } else {
-                consolidate_gate(&norm, &survivor, other)
-            };
             match verdict {
                 Ok(()) => {
                     // The gate judged a snapshot read OUTSIDE any transaction, and
@@ -11878,28 +11994,28 @@ async fn consolidate_exact_duplicates_from(
                     // `year` that was the sole corroboration) in that window aborts the
                     // merge instead of silently destroying a work on stale grounds. The
                     // pair is simply re-examined next pass, against the new values.
-                    let expect_loser = other.identity();
-                    let expect_survivor = survivor.identity();
+                    let expect_loser = other.identity_under(&key);
+                    let expect_survivor = against.identity_under(&key);
                     match catalog::merge_works_checked(
                         pool,
                         covers,
                         &other.id,
-                        &survivor.id,
+                        &against.id,
                         Some((&expect_loser, &expect_survivor)),
                     )
                     .await
                     {
                         Ok(_) => {
                             tracing::info!(
-                                loser = %other.id, survivor = %survivor.id, alias = %norm,
+                                loser = %other.id, survivor = %against.id, alias = %key,
                                 "consolidate: merged"
                             );
-                            out.merged.push((other.id.clone(), survivor.id.clone()));
+                            out.merged.push((other.id.clone(), against.id.clone()));
                         }
                         Err(e) if is_precondition_failure(&e) => {
                             out.stale += 1;
                             tracing::info!(
-                                loser = %other.id, survivor = %survivor.id, alias = %norm,
+                                loser = %other.id, survivor = %against.id, alias = %key,
                                 "consolidate: skipped — identity changed under the gate"
                             );
                         }
@@ -11908,12 +12024,21 @@ async fn consolidate_exact_duplicates_from(
                 }
                 Err(reason) => {
                     survivors.push(other.clone());
-                    match queue_consolidate_review(pool, &other.id, &survivor.id).await? {
+                    // A novel next to its comic is not a question for a human: the answer
+                    // is always "different works". Keep it out of the review queue.
+                    if reason == "novel_mismatch" {
+                        tracing::debug!(
+                            a = %other.id, b = %against.id, alias = %key,
+                            "consolidate: skipped — a novel never merges with a non-novel"
+                        );
+                        continue;
+                    }
+                    match queue_consolidate_review(pool, &other.id, &against.id).await? {
                         true => out.queued += 1,
                         false => out.unqueueable += 1,
                     }
                     tracing::debug!(
-                        loser = %other.id, survivor = %survivor.id, alias = %norm, reason,
+                        loser = %other.id, survivor = %against.id, alias = %key, reason,
                         "consolidate: refused (routed to review)"
                     );
                 }
@@ -11981,9 +12106,9 @@ pub(crate) async fn auto_merge_pending_reviews(
             if source == target {
                 continue;
             }
-            let mut identities: Vec<ConsolidateWork> = sqlx::query_as(
-                "SELECT id, primary_title, year, author, cover_phash FROM work WHERE id IN (?, ?)",
-            )
+            let mut identities: Vec<ConsolidateWork> = sqlx::query_as(&format!(
+                "SELECT {CONSOLIDATE_WORK_COLUMNS} FROM work w WHERE w.id IN (?, ?)"
+            ))
             .bind(&source)
             .bind(&target)
             .fetch_all(pool)
@@ -13108,7 +13233,91 @@ mod tests {
             year,
             author: author.map(str::to_string),
             cover_phash: None,
+            mangadex_anchored: false,
         }
+    }
+
+    /// As `cw`, but MangaDex-anchored: a distinct entry of the spine.
+    fn md(id: &str, title: &str, year: Option<i64>, author: Option<&str>) -> ConsolidateWork {
+        ConsolidateWork {
+            mangadex_anchored: true,
+            ..cw(id, title, year, author)
+        }
+    }
+
+    /// Two MangaDex entries are separate works unless the evidence is strong: a sequel
+    /// marker or a merely matching year keeps them apart, where a site's copy of the
+    /// same series would still fold in.
+    #[test]
+    fn consolidate_gate_keeps_mangadex_sequels_and_namesakes_apart() {
+        let key = "rosario to vampire";
+        let author = Some("Ikeda Akihisa");
+        // A sequel is its own MangaDex entry, same author or not.
+        assert_eq!(
+            consolidate_gate(
+                key,
+                &md("a", "Rosario to Vampire", Some(2004), author),
+                &md("b", "Rosario to Vampire Season II", Some(2007), author),
+            ),
+            Err("sequel_mismatch")
+        );
+        // A site that lists the season separately still finds its series.
+        assert_eq!(
+            consolidate_gate(
+                key,
+                &md("a", "Rosario to Vampire", Some(2004), author),
+                &cw("b", "Rosario to Vampire Season II", None, author),
+            ),
+            Ok(TitleMatch::Exact)
+        );
+        // Two adaptations of one title in one year, by different authors.
+        let key = "pretty rhythm aurora dream";
+        assert_eq!(
+            consolidate_gate(
+                key,
+                &md(
+                    "a",
+                    "Pretty Rhythm - Aurora Dream",
+                    Some(2011),
+                    Some("Fujimi Rio")
+                ),
+                &md(
+                    "b",
+                    "Pretty Rhythm: Aurora Dream",
+                    Some(2011),
+                    Some("Tachibana Mami")
+                ),
+            ),
+            Err("uncorroborated")
+        );
+        // The same pair with one author is a true MangaDex duplicate.
+        assert_eq!(
+            consolidate_gate(
+                key,
+                &md(
+                    "a",
+                    "Pretty Rhythm - Aurora Dream",
+                    Some(2011),
+                    Some("Fujimi Rio")
+                ),
+                &md("b", "Pretty Rhythm: Aurora Dream", None, Some("Fujimi Rio")),
+            ),
+            Ok(TitleMatch::Exact)
+        );
+        // A colored edition carries no sequel marker.
+        assert_eq!(
+            consolidate_gate(
+                "jujutsu kaisen",
+                &md("a", "Jujutsu Kaisen", Some(2018), Some("Akutami Gege")),
+                &md(
+                    "b",
+                    "Jujutsu Kaisen (Official Colored)",
+                    Some(2020),
+                    Some("Akutami Gege")
+                ),
+            ),
+            Ok(TitleMatch::Exact)
+        );
     }
 
     /// P0-1: the ambiguity gate. A shared normalized ALIAS is not evidence of a
@@ -13130,7 +13339,7 @@ mod tests {
                 &cw("a", "Naruto", None, Some("Masashi Kishimoto")),
                 &cw("b", "Naruto", None, Some("Kishimoto, Masashi")),
             ),
-            Ok(())
+            Ok(TitleMatch::Exact)
         );
         // Title only, nothing else: refused.
         assert_eq!(
@@ -13150,15 +13359,25 @@ mod tests {
             ),
             Err("uncorroborated")
         );
-        // The alias is only an ALT title on one side (its primary is something else):
-        // this is the JoJo/`ジョジョの奇妙な冒険` shape — refused.
+        // The alias is only an ALT title on one side (its primary is something else).
+        // Between two MangaDex entries this is the JoJo/`ジョジョの奇妙な冒険` shape —
+        // refused outright, even with the same author and year.
+        assert_eq!(
+            consolidate_gate(
+                n,
+                &md("a", "Naruto", Some(1999), Some("Masashi Kishimoto")),
+                &md("b", "Boruto", Some(1999), Some("Masashi Kishimoto")),
+            ),
+            Err("alt_title_only")
+        );
+        // Off the spine a year is still no evidence for an alt-title match.
         assert_eq!(
             consolidate_gate(
                 n,
                 &cw("a", "Naruto", Some(1999), None),
                 &cw("b", "Boruto", Some(1999), None),
             ),
-            Err("alt_title_only")
+            Err("uncorroborated")
         );
         // Too short to be discriminating.
         assert_eq!(
@@ -13169,6 +13388,390 @@ mod tests {
             ),
             Err("short_title")
         );
+    }
+
+    /// A site publishes a series under the name MangaDex only lists as an alt title, or
+    /// drops the article. Those merge on author evidence — but never spine-to-spine.
+    #[test]
+    fn consolidate_gate_accepts_alt_and_article_matches_across_sources_only() {
+        let key = "apothecary diaries";
+        let spine = md(
+            "a",
+            "Kusuriya no Hitorigoto",
+            Some(2017),
+            Some("Hyuuga Natsu"),
+        );
+        // A source work named by the alt title, credited with a longer author list.
+        assert_eq!(
+            consolidate_gate(
+                key,
+                &spine,
+                &cw(
+                    "b",
+                    "The Apothecary Diaries",
+                    None,
+                    Some("Hyuuga Natsu, Nanao Itsuki")
+                ),
+            ),
+            Ok(TitleMatch::Loose)
+        );
+        // No author on the source side: nothing ties them together.
+        assert_eq!(
+            consolidate_gate(
+                key,
+                &spine,
+                &cw("b", "The Apothecary Diaries", Some(2017), None)
+            ),
+            Err("uncorroborated")
+        );
+        // Primary titles that differ only by an article are a LOOSE match…
+        let robot = "robot emperor";
+        assert_eq!(
+            consolidate_gate(
+                robot,
+                &md("a", "The Robot Emperor", Some(1958), Some("Fujita Shigeru")),
+                &cw("b", "Robot Emperor", None, Some("Fujita Shigeru")),
+            ),
+            Ok(TitleMatch::Loose)
+        );
+        // …so the year that would corroborate an exact title does not carry it…
+        assert_eq!(
+            consolidate_gate(
+                robot,
+                &cw("a", "The Robot Emperor", Some(1958), None),
+                &cw("b", "Robot Emperor", Some(1959), None),
+            ),
+            Err("uncorroborated")
+        );
+        // …and two MangaDex entries stay apart even with the same author.
+        assert_eq!(
+            consolidate_gate(
+                robot,
+                &md("a", "The Robot Emperor", Some(1958), Some("Fujita Shigeru")),
+                &md("b", "Robot Emperor", Some(1958), Some("Fujita Shigeru")),
+            ),
+            Err("alt_title_only")
+        );
+        // The same primary title on both sides is still EXACT, articles and all.
+        assert_eq!(
+            consolidate_gate(
+                "kill dragon",
+                &md(
+                    "a",
+                    "Kill the Dragon",
+                    Some(2022),
+                    Some("Baeksu Noble (백수귀족)")
+                ),
+                &cw("b", "Kill The Dragon", None, Some("Baeksu Noble")),
+            ),
+            Ok(TitleMatch::Exact)
+        );
+    }
+
+    /// Two parts of a franchise share its name as an alt title, and its author. Off the
+    /// spine that used to be enough for a loose match.
+    #[test]
+    fn consolidate_gate_refuses_a_key_that_is_only_an_alt_title_on_both_sides() {
+        assert_eq!(
+            consolidate_gate(
+                "jojo s bizarre adventure",
+                &md("a", "Phantom Blood", Some(1987), Some("Hirohiko Araki")),
+                &cw("b", "Battle Tendency", None, Some("Hirohiko Araki")),
+            ),
+            Err("alt_title_only")
+        );
+    }
+
+    /// A novel and its comic adaptation agree on everything the gate looks at. They are
+    /// still two works.
+    #[test]
+    fn consolidate_gate_never_merges_a_novel_with_a_non_novel() {
+        let author = Some("Chugong");
+        assert_eq!(
+            consolidate_gate(
+                "solo leveling",
+                &cw("a", "Solo Leveling", Some(2018), author),
+                &cw("b", "Solo Leveling (Novel)", Some(2018), author),
+            ),
+            Err("novel_mismatch")
+        );
+        // Two novels are judged like any other pair.
+        assert_eq!(
+            consolidate_gate(
+                "solo leveling novel",
+                &cw("a", "Solo Leveling (Novel)", None, author),
+                &cw("b", "Solo Leveling Novel", None, author),
+            ),
+            Ok(TitleMatch::Exact)
+        );
+    }
+
+    /// Create a work with the given titles (first = primary) and one source of
+    /// `source_type`, for the sweep tests.
+    async fn sweep_work(
+        pool: &SqlitePool,
+        source_type: &str,
+        titles: &[&str],
+        author: Option<&str>,
+    ) -> String {
+        let id = catalog::create_work(
+            pool,
+            &catalog::WorkInput {
+                primary_title: Some(titles[0].into()),
+                author: author.map(str::to_string),
+                aliases: titles
+                    .iter()
+                    .map(|t| catalog::Alias {
+                        raw: (*t).into(),
+                        lang: None,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        catalog::upsert_source_series(pool, &id, source_type, "src", &id, None, false)
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn work_exists(pool: &SqlitePool, id: &str) -> bool {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work WHERE id = ?)")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The SQL generated column that groups the sweep and the Rust key the gate trusts
+    /// must agree, or duplicates silently stop meeting (or stop being approved).
+    #[tokio::test]
+    async fn match_key_column_agrees_with_the_rust_definition() {
+        use crate::catalog::normalize::{match_key, normalize_title};
+        let pool = migrated_pool().await;
+        let titles = [
+            "The Beginning After the End",
+            "A Returner's Magic Should Be Special",
+            "An Unordinary Life",
+            "Heavy Object A",
+            "The The",
+            "The A Team",
+            "Theatre of the Absurd",
+            "Kill the Dragon",
+            "鬼滅の刃",
+            "A",
+        ];
+        let id = sweep_work(&pool, "suwayomi", &titles, None).await;
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT normalized_title, match_key FROM work_alias WHERE work_id = ?")
+                .bind(&id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), titles.len());
+        for (normalized, key) in rows {
+            assert_eq!(key, match_key(&normalized), "for {normalized:?}");
+        }
+        assert_eq!(
+            match_key(&normalize_title("The Beginning After the End")),
+            "beginning after end"
+        );
+    }
+
+    /// The button's job: a site's copy of a series folds into the MangaDex entry that
+    /// knows its name only as an alt title, and into one that differs by an article.
+    #[tokio::test]
+    async fn consolidate_merges_alt_title_and_article_variants_into_the_spine() {
+        let pool = migrated_pool().await;
+        let spine = sweep_work(
+            &pool,
+            "mangadex",
+            &["Kusuriya no Hitorigoto", "The Apothecary Diaries"],
+            Some("Hyuuga Natsu"),
+        )
+        .await;
+        let site = sweep_work(
+            &pool,
+            "suwayomi",
+            &["Apothecary Diaries"],
+            Some("Hyuuga Natsu, Nanao Itsuki"),
+        )
+        .await;
+        let article = sweep_work(
+            &pool,
+            "mangadex",
+            &["The Newbie Is Too Strong"],
+            Some("Dedart (디다트)"),
+        )
+        .await;
+        let no_article =
+            sweep_work(&pool, "suwayomi", &["Newbie Is Too Strong"], Some("Dedart")).await;
+
+        let out = consolidate_exact_duplicates_from(&pool, None, 100, "")
+            .await
+            .unwrap();
+        assert_eq!(out.merged.len(), 2, "{:?}", out.merged);
+        assert!(work_exists(&pool, &spine).await && work_exists(&pool, &article).await);
+        assert!(!work_exists(&pool, &site).await && !work_exists(&pool, &no_article).await);
+    }
+
+    /// A novel sharing its comic's title, alt title and author is skipped — and NOT sent
+    /// to the review queue, where it would only ever be rejected.
+    #[tokio::test]
+    async fn consolidate_leaves_a_novel_and_its_comic_apart() {
+        let pool = migrated_pool().await;
+        let comic = sweep_work(&pool, "mangadex", &["Solo Leveling"], Some("Chugong")).await;
+        let novel = sweep_work(
+            &pool,
+            "suwayomi",
+            &["Solo Leveling (Novel)", "Solo Leveling"],
+            Some("Chugong"),
+        )
+        .await;
+        let out = consolidate_exact_duplicates_from(&pool, None, 100, "")
+            .await
+            .unwrap();
+        assert!(out.merged.is_empty(), "{:?}", out.merged);
+        assert_eq!(out.queued, 0, "a novel/comic pair is not a review question");
+        assert!(work_exists(&pool, &comic).await && work_exists(&pool, &novel).await);
+    }
+
+    /// One site title that is an alt title of TWO spine entries (a series and its
+    /// pre-serialization) has no single right target: ask a human instead of guessing.
+    #[tokio::test]
+    async fn consolidate_refuses_an_alt_title_match_with_two_possible_targets() {
+        let pool = migrated_pool().await;
+        let author = Some("DAUL (다울)");
+        let series = sweep_work(
+            &pool,
+            "mangadex",
+            &["Na Honjaman Level Up: Ragnarok", "Solo Leveling: Ragnarok"],
+            author,
+        )
+        .await;
+        let pre = sweep_work(
+            &pool,
+            "mangadex",
+            &[
+                "Solo Leveling: Ragnarok (Pre-serialization)",
+                "Solo Leveling: Ragnarok",
+            ],
+            author,
+        )
+        .await;
+        let site = sweep_work(
+            &pool,
+            "suwayomi",
+            &["Solo Leveling: Ragnarok"],
+            Some("DAUL"),
+        )
+        .await;
+        let out = consolidate_exact_duplicates_from(&pool, None, 100, "")
+            .await
+            .unwrap();
+        assert!(out.merged.is_empty(), "{:?}", out.merged);
+        assert!(out.queued >= 1, "the ambiguous site copy goes to review");
+        for id in [&series, &pre, &site] {
+            assert!(work_exists(&pool, id).await);
+        }
+    }
+
+    /// A credit line naming both authors of two same-titled works matches BOTH exactly.
+    /// Sort order must not pick the winner.
+    #[tokio::test]
+    async fn consolidate_refuses_an_exact_match_with_two_possible_targets() {
+        let pool = migrated_pool().await;
+        let first = sweep_work(&pool, "mangadex", &["After School"], Some("Aki Tanaka")).await;
+        let second = sweep_work(&pool, "mangadex", &["After School"], Some("Yui Sato")).await;
+        let site = sweep_work(
+            &pool,
+            "suwayomi",
+            &["After School"],
+            Some("Aki Tanaka, Yui Sato"),
+        )
+        .await;
+        let out = consolidate_exact_duplicates_from(&pool, None, 100, "")
+            .await
+            .unwrap();
+        assert!(out.merged.is_empty(), "{:?}", out.merged);
+        for id in [&first, &second, &site] {
+            assert!(work_exists(&pool, id).await);
+        }
+    }
+
+    /// Both halves of an admin split stay possible targets, so a later copy that fits
+    /// both is not silently folded into whichever half sorts first.
+    #[tokio::test]
+    async fn consolidate_keeps_both_halves_of_a_split_as_targets() {
+        let pool = migrated_pool().await;
+        let author = Some("Aki Tanaka");
+        let a = sweep_work(&pool, "mangadex", &["Series Alpha", "Shared Name"], author).await;
+        let b = sweep_work(&pool, "mangadex", &["Series Beta", "Shared Name"], author).await;
+        let (lo, hi) = if a < b { (&a, &b) } else { (&b, &a) };
+        sqlx::query(
+            "INSERT INTO work_split (work_a, work_b, split_at) VALUES (?, ?, '2026-01-01')",
+        )
+        .bind(lo)
+        .bind(hi)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let site = sweep_work(&pool, "suwayomi", &["Shared Name"], author).await;
+        let out = consolidate_exact_duplicates_from(&pool, None, 100, "")
+            .await
+            .unwrap();
+        assert!(out.merged.is_empty(), "{:?}", out.merged);
+        for id in [&a, &b, &site] {
+            assert!(work_exists(&pool, id).await);
+        }
+    }
+
+    /// The alias a loose match rested on is part of the merge precondition: removing it
+    /// between the gate and the merge must abort, not delete a work on vanished evidence.
+    #[tokio::test]
+    async fn merge_aborts_when_the_shared_alias_was_removed_under_the_gate() {
+        let pool = migrated_pool().await;
+        let author = Some("Hyuuga Natsu");
+        let spine = sweep_work(
+            &pool,
+            "mangadex",
+            &["Kusuriya no Hitorigoto", "The Apothecary Diaries"],
+            author,
+        )
+        .await;
+        let site = sweep_work(&pool, "suwayomi", &["Apothecary Diaries"], author).await;
+        let pair: Vec<ConsolidateWork> = sqlx::query_as(&format!(
+            "SELECT {CONSOLIDATE_WORK_COLUMNS} FROM work w WHERE w.id IN (?, ?)"
+        ))
+        .bind(&spine)
+        .bind(&site)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let of = |id: &str| pair.iter().find(|w| w.id == id).unwrap();
+        let key = "apothecary diaries";
+        let (expect_site, expect_spine) = (
+            of(&site).identity_under(key),
+            of(&spine).identity_under(key),
+        );
+        assert!(expect_spine.mangadex_anchored && !expect_site.mangadex_anchored);
+
+        catalog::remove_work_alias(&pool, &spine, "The Apothecary Diaries")
+            .await
+            .unwrap();
+        let err = catalog::merge_works_checked(
+            &pool,
+            None,
+            &site,
+            &spine,
+            Some((&expect_site, &expect_spine)),
+        )
+        .await
+        .unwrap_err();
+        assert!(is_precondition_failure(&err), "{err}");
+        assert!(work_exists(&pool, &site).await);
     }
 
     #[tokio::test]
@@ -13226,8 +13829,9 @@ mod tests {
         assert_eq!(count, 2, "unrelated namesakes survive");
     }
 
-    /// P0-1 end-to-end: three works sharing one alias is a GENERIC-TITLE cluster, not a
-    /// duplicate cluster. Nothing may be merged; every pair goes to the review queue.
+    /// P0-1 end-to-end: three MangaDex entries sharing one alias is a FRANCHISE cluster,
+    /// not a duplicate cluster — even with one author and one year (every JoJo part).
+    /// Nothing may be merged; every pair goes to the review queue.
     #[tokio::test]
     async fn consolidate_refuses_oversized_alias_clusters() {
         let pool = migrated_pool().await;
@@ -13261,7 +13865,7 @@ mod tests {
             // Give each a source_series so a refusal is queueable rather than dropped.
             sqlx::query(
                 "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
-                 VALUES (?, ?, 'suwayomi', 'src', ?, '2020-01-01T00:00:00Z')",
+                 VALUES (?, ?, 'mangadex', 'mangadex', ?, '2020-01-01T00:00:00Z')",
             )
             .bind(format!("ss{i}"))
             .bind(&id)
@@ -13430,6 +14034,7 @@ mod tests {
             year: None,
             author: None,
             cover_phash: Some(hash.into()),
+            mangadex_anchored: false,
         };
         let n = "blank cover series";
 
@@ -13469,7 +14074,7 @@ mod tests {
                 &with_hash("a", "ff00ff00ff00ff00"),
                 &with_hash("b", "ff00ff00ff00ff01"),
             ),
-            Ok(()),
+            Ok(TitleMatch::Exact),
             "a real cover match must still corroborate"
         );
         // The popcount window is dedup's 12..=52 — one bit set is below it.

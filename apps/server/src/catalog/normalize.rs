@@ -110,6 +110,77 @@ pub fn normalize_title(raw: &str) -> String {
     tokens.join(" ")
 }
 
+/// The article-insensitive duplicate key for an already-normalized title: the tokens
+/// `the` / `a` / `an` dropped, except in last position. Sites disagree on articles
+/// ("The Newbie Is Too Strong" vs "Newbie Is Too Strong"), so duplicate lookups compare
+/// this key rather than `normalize_title`'s output.
+///
+/// The last token is always kept. A trailing "a" is a series marker ("Heavy Object A",
+/// "Ultraman A"), not an article, and it guarantees a non-empty key for non-empty input.
+///
+/// Mirrored in SQL by the `work_alias.match_key` generated column (migration 0111).
+pub fn match_key(normalized: &str) -> String {
+    let tokens: Vec<&str> = normalized.split(' ').collect();
+    let last = tokens.len().saturating_sub(1);
+    tokens
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| *i == last || !matches!(**t, "the" | "a" | "an"))
+        .map(|(_, t)| *t)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// True when two titles disagree on being a novel. A novel and its comic adaptation
+/// share a name, alt titles and an author, so every other merge signal says
+/// "duplicate" — but they are different works and must never be folded together.
+///
+/// Compares HOW OFTEN "novel" occurs, not merely whether it does: a comic called
+/// "The Novel's Extra" and its source "The Novel's Extra (Novel)" both contain the
+/// word, and only the count tells them apart. A missing title counts as zero.
+pub fn novel_mismatch(a: Option<&str>, b: Option<&str>) -> bool {
+    let novels = |t: Option<&str>| t.map_or(0, |t| t.to_lowercase().matches("novel").count());
+    novels(a) != novels(b)
+}
+
+/// Noise words that name an instalment rather than a format. "Overlord Season 2" and
+/// "Overlord" share a `normalize_title` key so a site's per-season listing finds its
+/// series, but the stripped marker still says they may be different works.
+const SEQUEL_TAIL: &[&str] = &["season", "part", "cour", "arc"];
+
+/// The instalment marker `normalize_title` strips from the end of `raw`: its sequel
+/// words and their numbers ("Rosario to Vampire Season II" -> `["season", "ii"]`),
+/// format words ("Official Colored") ignored. Empty for a title without one.
+fn sequel_marker(raw: &str) -> Vec<String> {
+    let folded = raw.replace(['&', '＆'], " and ").to_lowercase();
+    let tokens: Vec<String> = folded
+        .chars()
+        .map(fold_diacritic)
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    let kept = normalize_title(raw).split_whitespace().count();
+    tokens
+        .into_iter()
+        .skip(kept)
+        .filter(|t| {
+            SEQUEL_TAIL.contains(&t.as_str())
+                || t.chars().all(|c| c.is_ascii_digit())
+                || is_roman_numeral(t)
+        })
+        .collect()
+}
+
+/// True when two titles carry different instalment markers ("X" vs "X Season 2").
+/// MangaDex lists a sequel as its own entry, so between two MangaDex-anchored works a
+/// marker one side lacks means two works, not one. A missing title has no marker.
+pub fn sequel_mismatch(a: Option<&str>, b: Option<&str>) -> bool {
+    let marker = |t: Option<&str>| t.map(sequel_marker).unwrap_or_default();
+    marker(a) != marker(b)
+}
+
 /// True when `s` is a genuinely, canonically formed Roman numeral (e.g. "ii", "iv",
 /// "xiii"). The old implementation accepted any string over {i,v,x,l,c,d,m}, so
 /// ordinary words like "did" or "civic" were mistaken for numerals and stripped.
@@ -190,6 +261,29 @@ mod tests {
     }
 
     #[test]
+    fn sequel_mismatch_sees_the_marker_normalization_strips() {
+        assert!(sequel_mismatch(
+            Some("Rosario to Vampire"),
+            Some("Rosario to Vampire Season II")
+        ));
+        assert!(sequel_mismatch(Some("Kid Gang"), Some("Kid Gang Season 2")));
+        assert!(sequel_mismatch(Some("X Part 1"), Some("X Part 2")));
+        // Format words and punctuation are not instalments.
+        assert!(!sequel_mismatch(
+            Some("Jujutsu Kaisen"),
+            Some("Jujutsu Kaisen (Official Colored)")
+        ));
+        assert!(!sequel_mismatch(
+            Some("Pretty Rhythm - Aurora Dream"),
+            Some("Pretty Rhythm: Aurora Dream")
+        ));
+        assert!(!sequel_mismatch(Some("X Season 2"), Some("x: season 2")));
+        // A number that is part of the name is not stripped, so it is no marker.
+        assert!(!sequel_mismatch(Some("Area 51"), Some("Area 51")));
+        assert!(!sequel_mismatch(None, Some("Overlord")));
+    }
+
+    #[test]
     fn strips_season_and_part_markers() {
         assert_eq!(normalize_title("Overlord Season 2"), "overlord");
         assert_eq!(normalize_title("Berserk Part III"), "berserk");
@@ -252,6 +346,50 @@ mod tests {
             normalize_title("Kaiju No.8 and Friends")
         );
         assert_eq!(normalize_title("A & B"), "a and b");
+    }
+
+    #[test]
+    fn match_key_drops_articles_but_never_the_last_token() {
+        let key = |raw: &str| match_key(&normalize_title(raw));
+        assert_eq!(
+            key("The Beginning After the End"),
+            key("Beginning After End")
+        );
+        assert_eq!(key("A Returner's Magic"), key("Returner's Magic"));
+        assert_eq!(key("An Unordinary Life"), "unordinary life");
+        // A trailing "a" names a different series, not an article.
+        assert_eq!(key("Heavy Object A"), "heavy object a");
+        assert_ne!(key("Heavy Object A"), key("Heavy Object"));
+        // Only whole tokens: "theatre" and "anthem" are untouched.
+        assert_eq!(key("Theatre Anthem"), "theatre anthem");
+        // Never empty for a real title.
+        assert_eq!(key("The"), "the");
+        assert_eq!(key("A"), "a");
+        assert_eq!(match_key(""), "");
+    }
+
+    #[test]
+    fn novel_mismatch_only_when_one_side_is_a_novel() {
+        assert!(novel_mismatch(
+            Some("Solo Leveling (Novel)"),
+            Some("Solo Leveling")
+        ));
+        assert!(novel_mismatch(
+            Some("Overlord"),
+            Some("Overlord Light Novel")
+        ));
+        assert!(!novel_mismatch(
+            Some("The Novel's Extra"),
+            Some("Novel's Extra")
+        ));
+        assert!(!novel_mismatch(Some("Overlord"), Some("Overlord")));
+        // "novel" is part of the name itself: the format marker still tells them apart.
+        assert!(novel_mismatch(
+            Some("The Novel's Extra"),
+            Some("The Novel's Extra (Novel)")
+        ));
+        assert!(novel_mismatch(Some("Web Novel"), None));
+        assert!(!novel_mismatch(None, None));
     }
 
     #[test]

@@ -320,8 +320,9 @@ export interface Backend {
 	addSeriesAltTitle?(id: Id, title: string): Promise<Series>;
 	/** Remove an alternative title from a work. Returns the recomputed series. Optional. */
 	removeSeriesAltTitle?(id: Id, title: string): Promise<Series>;
-	/** Consolidate the backlog of duplicate works sharing an exact title, up to `limit`
-	 * clusters per call; returns how many works were merged away. Optional. */
+	/** Consolidate the backlog of duplicate works sharing a title or alt title (articles
+	 * ignored, author or cover corroborated), up to `limit` groups per call; returns how
+	 * many works were merged away. Optional. */
 	consolidateExactDuplicates?(limit?: number): Promise<number>;
 	/** Raw metadata-override state of a series' canonical work (pinned vs derived),
 	 * for the series-detail editor. Optional. */
