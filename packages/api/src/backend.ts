@@ -447,9 +447,9 @@ export interface Backend {
 	uploadCover?(workId: Id, file: Blob): Promise<string>;
 
 	// --- admin sources & extensions (requires an admin session; EXT-1/EXT-2) ---
-	/** Every Keiyoushi/Mihon extension known to the Suwayomi engine, installed or
-	 * not. First use seeds the curated Keiyoushi store; NSFW extensions are hidden
-	 * unless the admin opted in via show_nsfw. `refresh: true` re-fetches the
+	/** Every Mihon extension known to the Suwayomi engine, installed or not. No
+	 * store is seeded — the list is empty until a repo is added; NSFW extensions
+	 * are hidden unless the admin opted in via show_nsfw. `refresh: true` re-fetches the
 	 * store indexes first so hasUpdate/versions are fresh. Optional: only the
 	 * unified Komika API implements it. */
 	extensions?(refresh?: boolean): Promise<ExtensionInfo[]>;

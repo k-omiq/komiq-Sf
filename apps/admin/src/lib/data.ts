@@ -270,8 +270,8 @@ export async function loadCanonicalUpdates(page = 1): Promise<CanonicalUpdate[]>
 // ---- Sources & Extensions console (EXT-2) -----------------------------------
 
 /**
- * Every Keiyoushi/Mihon extension known to the Suwayomi engine (installed or
- * not). First use auto-seeds the curated Keiyoushi store; NSFW extensions are
+ * Every Mihon extension known to the Suwayomi engine (installed or not). No
+ * store is seeded — the list is empty until a repo is added; NSFW extensions are
  * hidden unless the admin opted in via show_nsfw (CATALOGUE.md §2).
  * `refresh: true` re-fetches the store indexes so hasUpdate/versions are fresh.
  */

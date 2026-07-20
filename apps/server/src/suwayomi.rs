@@ -1238,9 +1238,8 @@ impl SuwayomiClient {
 
     // ---- Extension management (EXT-1, GQL-SCHEMA-FINDINGS.md §B) ------------
 
-    /// Number of configured extension stores (repos). Used by the idempotent
-    /// Keiyoushi default-store seeding: Suwayomi canonicalizes the index URL on
-    /// add (min.json → index.pb), so presence can't be checked by URL equality.
+    /// Number of configured extension stores (repos). Zero on a fresh engine:
+    /// no store is seeded, the operator adds their own.
     pub async fn extension_store_count(&self) -> Result<i64> {
         let doc = "query { extensionStores { totalCount } }";
         #[derive(Deserialize)]

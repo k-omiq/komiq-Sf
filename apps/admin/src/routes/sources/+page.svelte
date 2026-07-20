@@ -132,11 +132,9 @@
 	/** Per-row action outcome (success note or error). */
 	let rowMsg = $state<Record<string, string>>({});
 
-	// One-time "add repo" affordance shown when nothing is seeded.
-	// `index.pb` is the URL Keiyoushi publishes; the older `index.min.json` on the
-	// same branch still resolves but now holds only two "update your app" stubs.
-	const KEIYOUSHI_URL = 'https://github.com/keiyoushi/extensions/raw/repo/index.pb';
-	let repoUrl = $state(KEIYOUSHI_URL);
+	// "Add repo" affordance shown while the engine knows no extensions. No repo is
+	// built in: the operator supplies the index URL.
+	let repoUrl = $state('');
 	let addingRepo = $state(false);
 	let repoMsg = $state<string | null>(null);
 
@@ -1291,8 +1289,7 @@
 		<div>
 			<h1>Sources</h1>
 			<p class="lede">
-				Manage Keiyoushi extensions on the engine and bulk-ingest source catalogues into the
-				canonical DB
+				Manage extensions on the engine and bulk-ingest source catalogues into the canonical DB
 			</p>
 		</div>
 		<div class="tabs" role="tablist" aria-label="Sources console">
@@ -1420,10 +1417,10 @@
 				>Retry</button
 			>
 		{:else if extsLoading && exts.length === 0}
-			<div class="notice">Loading extensions… (first load fetches the Keiyoushi index)</div>
+			<div class="notice">Loading extensions… (first load fetches the repo index)</div>
 		{:else if exts.length === 0}
 			<div class="notice">
-				<p>No extensions are known to the engine — the extension store may not be seeded yet.</p>
+				<p>No extensions are known to the engine. Add an extension repo to get started.</p>
 				<form class="repo-form" onsubmit={onAddRepo}>
 					<input
 						type="url"
@@ -1435,7 +1432,7 @@
 						required
 					/>
 					<button type="submit" disabled={addingRepo}>
-						{addingRepo ? 'Adding…' : 'Add Keiyoushi repo'}
+						{addingRepo ? 'Adding…' : 'Add repo'}
 					</button>
 				</form>
 				{#if repoMsg}<p class="repo-msg">{repoMsg}</p>{/if}

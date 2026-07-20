@@ -6872,9 +6872,10 @@ impl QueryRoot {
     }
 
     /// Admin "Sources & Extensions" console (EXT-1): every Keiyoushi/Mihon
-    /// extension known to the Suwayomi engine, installed or not. On first use it
-    /// seeds the curated Keiyoushi index as the default store (idempotent) and
-    /// refreshes the list when the engine has never fetched one. NSFW extensions
+    /// extension known to the Suwayomi engine, installed or not. No store is
+    /// seeded: the list stays empty until the operator adds one with
+    /// `addExtensionRepo`. Refreshes the list when the engine has never fetched
+    /// one. NSFW extensions
     /// are hidden unless the admin opted in via `show_nsfw` (CATALOGUE.md §2).
     async fn extensions(
         &self,
@@ -6893,13 +6894,15 @@ impl QueryRoot {
     ) -> Result<Vec<ExtensionInfo>> {
         require_admin(ctx).await?;
         let st = state(ctx);
-        ensure_default_extension_store(st).await?;
-        if refresh {
+        // With no store there is no index to fetch, so skip the refresh rather
+        // than surface an engine error on a fresh install.
+        let has_store = st.suwayomi.extension_store_count().await.map_err(gql_err)? > 0;
+        if refresh && has_store {
             st.suwayomi.refresh_extensions().await.map_err(gql_err)?;
         }
         let mut list = st.suwayomi.list_extensions().await.map_err(gql_err)?;
         // Fresh engine: the store may be registered but its index never fetched.
-        if list.is_empty() && !refresh {
+        if list.is_empty() && !refresh && has_store {
             st.suwayomi.refresh_extensions().await.map_err(gql_err)?;
             list = st.suwayomi.list_extensions().await.map_err(gql_err)?;
         }
@@ -7264,32 +7267,6 @@ impl QueryRoot {
             has_next_page: has_next,
         })
     }
-}
-
-/// The curated Keiyoushi extension index — the hardcoded default store
-/// (CATALOGUE.md §Tier-2: curated, not crawled; `keiyoushi.github.io` 404s, the
-/// raw `repo` branch is the working host). This is the `index.pb` URL Keiyoushi's
-/// README publishes: the older `index.min.json` on the same branch still
-/// resolves but was reduced to two "update your app" stub entries when they
-/// migrated, so seeding it would yield an empty catalogue.
-const KEIYOUSHI_INDEX_URL: &str = "https://github.com/keiyoushi/extensions/raw/repo/index.pb";
-
-/// Seed the Keiyoushi index as the default extension store when the engine has
-/// NONE configured. Presence can't be checked by URL equality (Suwayomi
-/// canonicalizes the index URL on add), so "any store exists"
-/// is the idempotency signal — an operator who removed the default on purpose
-/// and added another store is left alone.
-async fn ensure_default_extension_store(st: &AppState) -> Result<()> {
-    let count = st.suwayomi.extension_store_count().await.map_err(gql_err)?;
-    if count == 0 {
-        let name = st
-            .suwayomi
-            .add_extension_store(KEIYOUSHI_INDEX_URL)
-            .await
-            .map_err(gql_err)?;
-        tracing::info!(store = name, "seeded default Keiyoushi extension store");
-    }
-    Ok(())
 }
 
 /// The `repo` branch base every Keiyoushi index URL canonicalizes to, once
