@@ -19,6 +19,7 @@ import type {
 	MatchResult,
 	MergeCandidate,
 	MergeCandidateRow,
+	DuplicateSweepResult,
 	MergeWorksResult,
 	Page,
 	Paginated,
@@ -625,8 +626,8 @@ export class GraphQLBackend implements Backend {
 		return d.removeSeriesAltTitle;
 	}
 
-	async consolidateExactDuplicates(limit?: number): Promise<number> {
-		const d = await this.gql<{ consolidateExactDuplicates: number }>(
+	async consolidateExactDuplicates(limit?: number): Promise<DuplicateSweepResult> {
+		const d = await this.gql<{ consolidateExactDuplicates: DuplicateSweepResult }>(
 			ops.CONSOLIDATE_EXACT_DUPLICATES,
 			{ limit },
 		);

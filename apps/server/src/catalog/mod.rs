@@ -9,6 +9,7 @@
 
 pub mod ledger;
 pub mod normalize;
+pub mod pair;
 pub mod similarity;
 pub mod spine;
 
@@ -111,21 +112,78 @@ pub struct ChapterInput {
     pub scanlator: Option<String>,
 }
 
-/// The fields the matcher needs to corroborate a candidate work. A complete DTO —
-/// a few fields (id/title/language) are carried for callers/future signals even
-/// though the current scorer reads only description/author/year/cover/aliases.
-#[allow(dead_code)]
+/// The fields the matcher needs to corroborate a candidate work, and everything
+/// [`pair::assess`] reads to decide whether two works are one series.
 #[derive(Debug, Clone, Default)]
 pub struct WorkMatchData {
     pub work_id: String,
     pub primary_title: Option<String>,
     pub description: Option<String>,
     pub author: Option<String>,
+    pub artist: Option<String>,
     pub year: Option<i64>,
     pub original_language: Option<String>,
     pub cover_phash: Option<String>,
+    /// Does the work carry a MangaDex source? Two MangaDex-anchored works are two
+    /// distinct entries of the spine. Derived from `source_series`, not a `work` column.
+    pub mangadex_anchored: bool,
     /// Normalized alias keys for this work (includes the primary title).
     pub aliases_norm: Vec<String>,
+}
+
+impl WorkMatchData {
+    /// The snapshot a merge decision was made from, in the shape `merge_works_checked`
+    /// re-validates inside its transaction. `key` is the duplicate key the decision
+    /// rested on, when it rested on one.
+    pub fn identity(&self, key: Option<&str>) -> WorkIdentity {
+        WorkIdentity {
+            primary_title: self.primary_title.clone(),
+            year: self.year,
+            author: self.author.clone(),
+            artist: self.artist.clone(),
+            original_language: self.original_language.clone(),
+            description: self.description.clone(),
+            cover_phash: self.cover_phash.clone(),
+            mangadex_anchored: self.mangadex_anchored,
+            match_key: key.map(str::to_string),
+        }
+    }
+}
+
+/// The select list both match-data loaders use (the table must be aliased `w`).
+const MATCH_DATA_COLUMNS: &str = "w.id, w.primary_title, w.description, w.author, w.artist, \
+     w.year, w.original_language, w.cover_phash, \
+     EXISTS (SELECT 1 FROM source_series ss \
+             WHERE ss.work_id = w.id AND ss.source_type = 'mangadex') AS mangadex_anchored";
+
+#[derive(sqlx::FromRow)]
+struct MatchDataRow {
+    id: String,
+    primary_title: Option<String>,
+    description: Option<String>,
+    author: Option<String>,
+    artist: Option<String>,
+    year: Option<i64>,
+    original_language: Option<String>,
+    cover_phash: Option<String>,
+    mangadex_anchored: bool,
+}
+
+impl MatchDataRow {
+    fn into_match_data(self) -> WorkMatchData {
+        WorkMatchData {
+            work_id: self.id,
+            primary_title: self.primary_title,
+            description: self.description,
+            author: self.author,
+            artist: self.artist,
+            year: self.year,
+            original_language: self.original_language,
+            cover_phash: self.cover_phash,
+            mangadex_anchored: self.mangadex_anchored,
+            aliases_norm: Vec::new(),
+        }
+    }
 }
 
 fn new_id(prefix: &str) -> String {
@@ -240,39 +298,21 @@ async fn insert_alias_tokens(
 
 /// Load the corroboration fields + normalized aliases for one work.
 pub async fn load_match_data(pool: &SqlitePool, work_id: &str) -> Result<Option<WorkMatchData>> {
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        primary_title: Option<String>,
-        description: Option<String>,
-        author: Option<String>,
-        year: Option<i64>,
-        original_language: Option<String>,
-        cover_phash: Option<String>,
-    }
-    let row = sqlx::query_as::<_, Row>(
-        "SELECT primary_title, description, author, year, original_language, cover_phash \
-         FROM work WHERE id = ?",
-    )
+    let row = sqlx::query_as::<_, MatchDataRow>(&format!(
+        "SELECT {MATCH_DATA_COLUMNS} FROM work w WHERE w.id = ?"
+    ))
     .bind(work_id)
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else { return Ok(None) };
-    let aliases_norm = sqlx::query_scalar::<_, String>(
+    let mut data = row.into_match_data();
+    data.aliases_norm = sqlx::query_scalar::<_, String>(
         "SELECT normalized_title FROM work_alias WHERE work_id = ?",
     )
     .bind(work_id)
     .fetch_all(pool)
     .await?;
-    Ok(Some(WorkMatchData {
-        work_id: work_id.to_string(),
-        primary_title: row.primary_title,
-        description: row.description,
-        author: row.author,
-        year: row.year,
-        original_language: row.original_language,
-        cover_phash: row.cover_phash,
-        aliases_norm,
-    }))
+    Ok(Some(data))
 }
 
 /// Batch variant of [`load_match_data`]: loads the corroboration fields + normalized
@@ -302,38 +342,14 @@ pub async fn load_match_data_batch(
         .collect::<Vec<_>>()
         .join(",");
 
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        id: String,
-        primary_title: Option<String>,
-        description: Option<String>,
-        author: Option<String>,
-        year: Option<i64>,
-        original_language: Option<String>,
-        cover_phash: Option<String>,
-    }
-    let work_sql = format!(
-        "SELECT id, primary_title, description, author, year, original_language, cover_phash \
-         FROM work WHERE id IN ({placeholders})"
-    );
-    let mut q = sqlx::query_as::<_, Row>(&work_sql);
+    let work_sql =
+        format!("SELECT {MATCH_DATA_COLUMNS} FROM work w WHERE w.id IN ({placeholders})");
+    let mut q = sqlx::query_as::<_, MatchDataRow>(&work_sql);
     for id in &ids {
         q = q.bind(*id);
     }
     for row in q.fetch_all(pool).await? {
-        out.insert(
-            row.id.clone(),
-            WorkMatchData {
-                work_id: row.id,
-                primary_title: row.primary_title,
-                description: row.description,
-                author: row.author,
-                year: row.year,
-                original_language: row.original_language,
-                cover_phash: row.cover_phash,
-                aliases_norm: Vec::new(),
-            },
-        );
+        out.insert(row.id.clone(), row.into_match_data());
     }
 
     let alias_sql = format!(
@@ -2868,6 +2884,120 @@ pub async fn pick_survivor(pool: &SqlitePool, work_ids: &[String]) -> Result<Str
     Ok(q.fetch_one(pool).await?)
 }
 
+/// A source-owned `work` column an admin may set by hand (migration 0112). The value is
+/// written to the column itself and recorded in `work_field_pin`, whose triggers restore
+/// it whenever a sync path overwrites the column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinnedField {
+    Author,
+    Artist,
+    Year,
+    OriginalLanguage,
+    Status,
+    Demographic,
+    ContentRating,
+}
+
+impl PinnedField {
+    /// The `work` column, which is also the `work_field_pin.field` value.
+    pub fn column(self) -> &'static str {
+        match self {
+            PinnedField::Author => "author",
+            PinnedField::Artist => "artist",
+            PinnedField::Year => "year",
+            PinnedField::OriginalLanguage => "original_language",
+            PinnedField::Status => "status",
+            PinnedField::Demographic => "demographic",
+            PinnedField::ContentRating => "content_rating",
+        }
+    }
+
+    /// SQL for the bound pin value in the column's own type.
+    fn typed_value(self) -> &'static str {
+        match self {
+            PinnedField::Year => "CAST(? AS INTEGER)",
+            _ => "?",
+        }
+    }
+}
+
+/// Pin `field` of a work to `value` (`None` pins it empty): the column takes the value
+/// now and keeps it across later syncs. The source's own value is remembered so
+/// [`unpin_work_field`] can restore it.
+pub async fn pin_work_field(
+    conn: &mut sqlx::SqliteConnection,
+    work_id: &str,
+    field: PinnedField,
+    value: Option<&str>,
+) -> Result<()> {
+    let column = field.column();
+    let now = Utc::now().to_rfc3339();
+    // The pin first: with it in place the UPDATE below already agrees with it, so the
+    // restore trigger stays quiet. A re-pin keeps the remembered source value.
+    sqlx::query(&format!(
+        "INSERT INTO work_field_pin (work_id, field, value, source_value, pinned_at) \
+         VALUES (?1, ?2, ?3, (SELECT CAST({column} AS TEXT) FROM work WHERE id = ?1), ?4) \
+         ON CONFLICT(work_id, field) DO UPDATE SET \
+             value = excluded.value, pinned_at = excluded.pinned_at"
+    ))
+    .bind(work_id)
+    .bind(column)
+    .bind(value)
+    .bind(&now)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(&format!(
+        "UPDATE work SET {column} = {}, updated_at = ? WHERE id = ?",
+        field.typed_value()
+    ))
+    .bind(value)
+    .bind(&now)
+    .bind(work_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Remove a pin and give the column back to the source: it takes the last value a source
+/// wrote, and later syncs update it again. A no-op for a field that is not pinned.
+pub async fn unpin_work_field(
+    conn: &mut sqlx::SqliteConnection,
+    work_id: &str,
+    field: PinnedField,
+) -> Result<()> {
+    let column = field.column();
+    let pinned: Option<Option<String>> = sqlx::query_scalar(
+        "DELETE FROM work_field_pin WHERE work_id = ? AND field = ? RETURNING source_value",
+    )
+    .bind(work_id)
+    .bind(column)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(source_value) = pinned else {
+        return Ok(());
+    };
+    sqlx::query(&format!(
+        "UPDATE work SET {column} = {}, updated_at = ? WHERE id = ?",
+        field.typed_value()
+    ))
+    .bind(source_value)
+    .bind(Utc::now().to_rfc3339())
+    .bind(work_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// The `work` columns an admin has pinned on this work.
+pub async fn pinned_work_fields(pool: &SqlitePool, work_id: &str) -> Result<Vec<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT field FROM work_field_pin WHERE work_id = ? ORDER BY field")
+            .bind(work_id)
+            .fetch_all(pool)
+            .await?,
+    )
+}
+
 /// Admin: remove an alt-title from a work — matched by its normalized key OR its exact
 /// raw text — then rebuild the work's token index (tokens can be shared across
 /// aliases, so a per-token delete is unsafe; rebuild from what remains).
@@ -3143,6 +3273,9 @@ pub struct WorkIdentity {
     pub primary_title: Option<String>,
     pub year: Option<i64>,
     pub author: Option<String>,
+    pub artist: Option<String>,
+    pub original_language: Option<String>,
+    pub description: Option<String>,
     pub cover_phash: Option<String>,
     /// Whether the work carried a MangaDex source. The gate refuses a loose title match
     /// between two anchored works, so a work gaining its anchor under the gate (another
@@ -3161,8 +3294,8 @@ pub struct WorkIdentity {
 /// evaluated against, re-read inside this transaction and required to still match.
 ///
 /// WHY. `merge_works` physically DELETEs the losing work — it is irreversible. The
-/// automated consolidation gate (`graphql::consolidate_gate`) reads `primary_title` /
-/// `year` / `author` / `cover_phash` on a snapshot taken OUTSIDE any transaction, and
+/// automated consolidation gate (`pair::assess`) reads the work's titles, credits, year,
+/// language, description and cover hash on a snapshot taken OUTSIDE any transaction, and
 /// `RECONCILE_RUNNING` single-flights the sweep only against itself, never against admin
 /// mutations. An `updateSeriesMetadata` landing in that window (retitling a work, or
 /// setting the `year` that was the sole corroboration) makes the merge execute against
@@ -3236,7 +3369,8 @@ async fn merge_works_guarded(
     if let Some((exp_src, exp_tgt)) = expected {
         for (id, want) in [(source_work, exp_src), (target_work, exp_tgt)] {
             let mut now: WorkIdentity = sqlx::query_as(
-                "SELECT w.primary_title, w.year, w.author, w.cover_phash, \
+                "SELECT w.primary_title, w.year, w.author, w.artist, w.original_language, \
+                        w.description, w.cover_phash, \
                         EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id \
                                 AND ss.source_type = 'mangadex') AS mangadex_anchored \
                  FROM work w WHERE w.id = ?",
@@ -4944,8 +5078,8 @@ pub async fn replace_source_chapters(
 /// the human "no". Verified on live data (2026-07-26): 5 duplicate pairs, 4 of them
 /// `rejected` → re-proposed as `pending`; 12 distinct rejected pairs were still
 /// re-proposable, and the consolidation gate now routes ~10.4k refusals through this
-/// same queue. Suppression is on the PAIR, not the work: a work whose match against
-/// work A was rejected can still be proposed against work B.
+/// same queue. Suppression is on the PAIR of works, in either direction, not the work:
+/// a work whose match against work A was rejected can still be proposed against work B.
 ///
 /// Re-proposal is refused unconditionally, including "the evidence changed" (a new
 /// pHash, a newly-learned author). The score is advisory metadata — an admin rejects a
@@ -4967,13 +5101,20 @@ pub async fn insert_merge_candidate(
 ) -> Result<Option<String>> {
     let id = new_id("mc_");
     let now = Utc::now().to_rfc3339();
+    // The pair is the two WORKS, whichever one the row hangs off: the sweep proposes
+    // "A into B" or "B into A" depending on which currently sorts first, and both are
+    // the same question.
     let res = sqlx::query(
         "INSERT INTO merge_candidate \
            (id, source_series_id, candidate_work_id, score, method, status, created_at) \
-         SELECT ?, ?, ?, ?, ?, 'pending', ? \
+         SELECT ?1, ?2, ?3, ?4, ?5, 'pending', ?6 \
          WHERE NOT EXISTS ( \
-             SELECT 1 FROM merge_candidate \
-             WHERE source_series_id = ? AND candidate_work_id = ?)",
+             SELECT 1 FROM merge_candidate mc \
+             JOIN source_series ss ON ss.id = mc.source_series_id \
+             JOIN source_series mine ON mine.id = ?2 \
+             WHERE mc.source_series_id = ?2 AND mc.candidate_work_id = ?3 \
+                OR ss.work_id = mine.work_id AND mc.candidate_work_id = ?3 \
+                OR ss.work_id = ?3 AND mc.candidate_work_id = mine.work_id)",
     )
     .bind(&id)
     .bind(source_series_id)
@@ -4981,8 +5122,6 @@ pub async fn insert_merge_candidate(
     .bind(score)
     .bind(method)
     .bind(&now)
-    .bind(source_series_id)
-    .bind(candidate_work_id)
     .execute(pool)
     .await?;
     Ok((res.rows_affected() > 0).then_some(id))
@@ -6427,6 +6566,77 @@ mod tests {
     /// `updateSeriesMetadata` landing in that window — here, clearing the `year` that was
     /// the pair's sole corroboration — must abort the merge, not destroy a work on
     /// grounds that no longer exist.
+    /// An admin's edit to a source-owned column survives the next sync, and removing
+    /// the pin hands the column back with whatever the source last wrote.
+    #[tokio::test]
+    async fn a_pinned_field_survives_source_writes_until_it_is_unpinned() {
+        let pool = pool().await;
+        let id = upsert_work_from_mangadex(&pool, "md-slime", &slime_input())
+            .await
+            .unwrap();
+        let read = |column: &'static str| {
+            let (pool, id) = (pool.clone(), id.clone());
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(&format!(
+                    "SELECT CAST({column} AS TEXT) FROM work WHERE id = ?"
+                ))
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let mut conn = pool.acquire().await.unwrap();
+        pin_work_field(&mut conn, &id, PinnedField::Author, Some("Fuse"))
+            .await
+            .unwrap();
+        pin_work_field(&mut conn, &id, PinnedField::Year, Some("2014"))
+            .await
+            .unwrap();
+        pin_work_field(&mut conn, &id, PinnedField::OriginalLanguage, None)
+            .await
+            .unwrap();
+        drop(conn);
+        assert_eq!(read("author").await.as_deref(), Some("Fuse"));
+        assert_eq!(read("year").await.as_deref(), Some("2014"));
+
+        // The catalogue sync writes its own values again.
+        let mut synced = slime_input();
+        synced.author = Some("Source Author".into());
+        synced.year = Some(2016);
+        synced.original_language = Some("ja".into());
+        upsert_work_from_mangadex(&pool, "md-slime", &synced)
+            .await
+            .unwrap();
+        assert_eq!(read("author").await.as_deref(), Some("Fuse"));
+        assert_eq!(read("year").await.as_deref(), Some("2014"));
+        assert_eq!(read("original_language").await, None, "pinned empty");
+        assert_eq!(
+            pinned_work_fields(&pool, &id).await.unwrap(),
+            ["author", "original_language", "year"]
+        );
+
+        // Unpinning restores what the source last wrote, and syncs apply again.
+        let mut conn = pool.acquire().await.unwrap();
+        for field in [
+            PinnedField::Author,
+            PinnedField::Year,
+            PinnedField::OriginalLanguage,
+            PinnedField::Status,
+        ] {
+            unpin_work_field(&mut conn, &id, field).await.unwrap();
+        }
+        drop(conn);
+        assert_eq!(read("author").await.as_deref(), Some("Source Author"));
+        assert_eq!(read("year").await.as_deref(), Some("2016"));
+        assert_eq!(read("original_language").await.as_deref(), Some("ja"));
+        synced.year = Some(2017);
+        upsert_work_from_mangadex(&pool, "md-slime", &synced)
+            .await
+            .unwrap();
+        assert_eq!(read("year").await.as_deref(), Some("2017"));
+    }
+
     #[tokio::test]
     async fn merge_works_checked_aborts_when_the_snapshot_went_stale() {
         let pool = pool().await;
@@ -6437,8 +6647,7 @@ mod tests {
         let snapshot = WorkIdentity {
             primary_title: Some("That Time I Got Reincarnated as a Slime".into()),
             year: Some(2015),
-            author: None,
-            cover_phash: None,
+            description: Some("Mikami Satoru is reincarnated as a slime.".into()),
             ..Default::default()
         };
         let expect_loser = snapshot.clone();

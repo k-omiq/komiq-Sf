@@ -588,8 +588,16 @@ impl Series {
     /// The full author/artist credit list for this work (S2). The singular
     /// `author`/`artist` fields keep only the first of each; this returns all.
     async fn credits(&self, ctx: &Context<'_>) -> Result<Vec<Credit>> {
+        // An admin-pinned author or artist replaces the source's credits for that role,
+        // or the series page would keep listing the names the admin corrected.
         let rows = sqlx::query_as::<_, (String, String)>(
-            "SELECT role, name FROM work_credit WHERE work_id = ? ORDER BY role, name",
+            "SELECT role, name FROM work_credit c WHERE work_id = ?1 \
+               AND NOT EXISTS (SELECT 1 FROM work_field_pin p \
+                               WHERE p.work_id = c.work_id AND p.field = c.role) \
+             UNION ALL \
+             SELECT field, value FROM work_field_pin \
+             WHERE work_id = ?1 AND field IN ('author', 'artist') AND value IS NOT NULL \
+             ORDER BY 1, 2",
         )
         .bind(&self.id.0)
         .fetch_all(&state(ctx).pool)
@@ -597,7 +605,17 @@ impl Series {
         .map_err(gql_err)?;
         Ok(rows
             .into_iter()
-            .map(|(role, name)| Credit { role, name })
+            .flat_map(|(role, names)| {
+                names
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(|name| Credit {
+                        role: role.clone(),
+                        name: name.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+            })
             .collect())
     }
 
@@ -4928,6 +4946,14 @@ impl QueryRoot {
                 is_nsfw_override: None,
                 tags: Vec::new(),
                 has_curated_tags: false,
+                author: None,
+                artist: None,
+                year: None,
+                original_language: None,
+                status: None,
+                demographic: None,
+                content_rating: None,
+                pinned_fields: Vec::new(),
             });
         };
         #[derive(sqlx::FromRow)]
@@ -4936,9 +4962,17 @@ impl QueryRoot {
             description_override: Option<String>,
             content_type_override: Option<String>,
             is_nsfw_override: Option<i64>,
+            author: Option<String>,
+            artist: Option<String>,
+            year: Option<i64>,
+            original_language: Option<String>,
+            status: Option<String>,
+            demographic: Option<String>,
+            content_rating: Option<String>,
         }
         let row = sqlx::query_as::<_, Row>(
-            "SELECT title_override, description_override, content_type_override, is_nsfw_override \
+            "SELECT title_override, description_override, content_type_override, is_nsfw_override, \
+                    author, artist, year, original_language, status, demographic, content_rating \
              FROM work WHERE id = ?",
         )
         .bind(&work_id)
@@ -4957,6 +4991,17 @@ impl QueryRoot {
         } else {
             catalog::work_effective_genres(&st.pool, &work_id).await
         };
+        // Column names to the field names of `SeriesAdminMeta`.
+        let pinned_fields = catalog::pinned_work_fields(&st.pool, &work_id)
+            .await
+            .map_err(gql_err)?
+            .into_iter()
+            .map(|column| match column.as_str() {
+                "original_language" => "originalLanguage".to_string(),
+                "content_rating" => "contentRating".to_string(),
+                _ => column,
+            })
+            .collect();
         Ok(SeriesAdminMeta {
             work_id: Some(ID(work_id)),
             title_override: row.title_override,
@@ -4968,6 +5013,21 @@ impl QueryRoot {
             is_nsfw_override: row.is_nsfw_override.map(|v| v != 0),
             tags,
             has_curated_tags,
+            author: row.author,
+            artist: row.artist,
+            year: row.year.and_then(|y| i32::try_from(y).ok()),
+            original_language: row.original_language,
+            // `status_from` also reads the upstream spellings a source row can carry.
+            status: row
+                .status
+                .as_deref()
+                .map(|s| komika_status(s).unwrap_or_else(|| status_from(s))),
+            demographic: row.demographic.as_deref().and_then(demographic_from_word),
+            content_rating: row
+                .content_rating
+                .as_deref()
+                .and_then(content_rating_from_word),
+            pinned_fields,
         })
     }
 
@@ -9553,12 +9613,15 @@ impl MutationRoot {
         Ok(map_series(st, m).await)
     }
 
-    /// Admin series-detail editor: edit a canonical work's user-facing metadata as an
-    /// override layer — the source-derived fields stay immutable and these overrides
-    /// win at read time (like `series_admin` for scan/status). Each field is
-    /// three-valued: OMITTED => leave unchanged; null => clear the override; a value =>
-    /// set it. `tags` is a whole-list replace of the curated set. Returns the
-    /// recomputed series (in the same id shape the caller passed).
+    /// Admin series-detail editor: edit a canonical work's metadata. Each field is
+    /// three-valued: OMITTED => leave unchanged; null => clear the admin's value and
+    /// fall back to the source; a value => set it.
+    ///
+    /// Title, description, type and the 18+ flag are an override layer that wins at read
+    /// time. `tags` is a whole-list replace of the curated set. Author, artist, year,
+    /// original language, status, demographic and content rating are PINNED: the value
+    /// is written to the work itself and survives later syncs (migration 0112). Returns
+    /// the recomputed series (in the same id shape the caller passed).
     async fn update_series_metadata(
         &self,
         ctx: &Context<'_>,
@@ -9683,6 +9746,83 @@ impl MutationRoot {
                 }
             }
         }
+        // Source-owned fields. A value pins the column; null hands it back to the source.
+        use catalog::PinnedField;
+        let text = |v: &str, max: usize| -> Option<String> {
+            let v: String = v.trim().chars().take(max).collect();
+            (!v.is_empty()).then_some(v)
+        };
+        let mut pins: Vec<(PinnedField, Option<Option<String>>)> = Vec::new();
+        let mut pin = |field, value: Option<Option<String>>| pins.push((field, value));
+        match &input.author {
+            Undefined => {}
+            Null => pin(PinnedField::Author, None),
+            Value(v) => pin(PinnedField::Author, Some(text(v, 300))),
+        }
+        match &input.artist {
+            Undefined => {}
+            Null => pin(PinnedField::Artist, None),
+            Value(v) => pin(PinnedField::Artist, Some(text(v, 300))),
+        }
+        match input.year {
+            Undefined => {}
+            Null => pin(PinnedField::Year, None),
+            Value(y) if (1800..=2100).contains(&y) => {
+                pin(PinnedField::Year, Some(Some(y.to_string())))
+            }
+            Value(_) => return Err(Error::new("Year must be between 1800 and 2100.")),
+        }
+        match &input.original_language {
+            Undefined => {}
+            Null => pin(PinnedField::OriginalLanguage, None),
+            Value(v) => {
+                let code = v.trim().to_lowercase();
+                let valid = code.is_empty()
+                    || (code.len() <= 8
+                        && code.split('-').all(|part| {
+                            (2..=4).contains(&part.len())
+                                && part.chars().all(|c| c.is_ascii_alphanumeric())
+                        }));
+                if !valid {
+                    return Err(Error::new(
+                        "Original language must be a language code such as ja, ko, zh or zh-hk.",
+                    ));
+                }
+                pin(PinnedField::OriginalLanguage, Some(text(&code, 8)))
+            }
+        }
+        match input.status {
+            Undefined => {}
+            Null => pin(PinnedField::Status, None),
+            Value(st) => pin(PinnedField::Status, Some(Some(status_word(st).to_string()))),
+        }
+        match input.demographic {
+            Undefined => {}
+            Null => pin(PinnedField::Demographic, None),
+            // "No demographic" is stored as NULL.
+            Value(Demographic::None) => pin(PinnedField::Demographic, Some(None)),
+            Value(d) => pin(
+                PinnedField::Demographic,
+                Some(Some(demographic_word(d).to_string())),
+            ),
+        }
+        match input.content_rating {
+            Undefined => {}
+            Null => pin(PinnedField::ContentRating, None),
+            Value(r) => pin(
+                PinnedField::ContentRating,
+                Some(Some(content_rating_word(r).to_string())),
+            ),
+        }
+        for (field, value) in pins {
+            match value {
+                Some(value) => {
+                    catalog::pin_work_field(&mut tx, &work_id, field, value.as_deref()).await
+                }
+                None => catalog::unpin_work_field(&mut tx, &work_id, field).await,
+            }
+            .map_err(gql_err)?;
+        }
         tx.commit().await.map_err(gql_err)?;
         // `is_nsfw` above may have just changed the effective flag; push it into the two
         // feed tables that store a COPY of it, or `updatesFeed` keeps serving this work to
@@ -9787,18 +9927,9 @@ impl MutationRoot {
                         );
                         continue;
                     }
-                    let pair: Vec<ConsolidateWork> = sqlx::query_as(&format!(
-                        "SELECT {CONSOLIDATE_WORK_COLUMNS} FROM work w WHERE w.id IN (?, ?)"
-                    ))
-                    .bind(other)
-                    .bind(&survivor)
-                    .fetch_all(&st.pool)
-                    .await
-                    .map_err(gql_err)?;
-                    let Some(source) = pair.iter().find(|w| &w.id == other) else {
-                        continue;
-                    };
-                    let Some(target) = pair.iter().find(|w| w.id == survivor) else {
+                    let (Some(source), Some(target)) =
+                        (match_data.get(other), match_data.get(&survivor))
+                    else {
                         continue;
                     };
                     if !crate::catalog::similarity::authors_match(
@@ -9820,7 +9951,7 @@ impl MutationRoot {
                         Some(&st.cover_pool),
                         other,
                         &survivor,
-                        Some((&source.identity(), &target.identity())),
+                        Some((&source.identity(None), &target.identity(None))),
                     )
                     .await
                     {
@@ -9870,34 +10001,30 @@ impl MutationRoot {
         reload_series_in_shape(st, ctx, &id.0, &work_id).await
     }
 
-    /// Admin: consolidate the backlog of duplicate works — works that share a title or
-    /// an alt title (articles ignored) but were minted separately (pre-policy, concurrent
-    /// ingest, or two sites naming one series differently).
+    /// Admin: sort the duplicate backlog. One full run walks the pending review queue,
+    /// then every group of works that share a title or an alt title (articles ignored).
+    /// Each pair is judged by `catalog::pair::assess`:
     ///
-    /// A shared title alone is NOT enough to merge: `merge_works` physically deletes the
-    /// loser, and MangaDex alt-titles make unrelated series share aliases (every JoJo
-    /// part carries `ジョジョの奇妙な冒険`). The same primary title needs year / author /
-    /// cover-pHash corroboration; an alt-title or article-only match needs author or
-    /// cover evidence and is never applied between two MangaDex entries; a novel never
-    /// merges with a non-novel — see `consolidate_gate`. Everything else is routed to
-    /// the `merge_candidate` review queue.
+    ///   * one series — merged (`merge_works` physically deletes the loser), when it has
+    ///     exactly one possible target;
+    ///   * two different works — closed without a merge and never queued;
+    ///   * a real question — left in the `merge_candidate` review queue, scored so the
+    ///     likeliest duplicates are listed first.
     ///
-    /// `limit` bounds the alias GROUPS examined per call, and every merged
-    /// `(loser, survivor)` pair is logged for audit. Returns how many works were merged
-    /// away. Single-flighted against `reconcileCatalogue` and the post-ingest sweep — it
-    /// will not run concurrently with another merge loop.
+    /// `limit` bounds the reviews and the groups examined per call, and every merged
+    /// `(loser, survivor)` pair is logged for audit. Single-flighted against
+    /// `reconcileCatalogue` and the post-ingest sweep — it will not run concurrently
+    /// with another merge loop.
     ///
-    /// Successive calls RESUME where the last one stopped (`CONSOLIDATE_CURSOR`) and wrap
-    /// to the start when the walk runs off the end. Restarting each time made the button
-    /// go permanently dead after two clicks: a refused cluster stays in `work_alias`, so
-    /// the head of the ordering silts up with refusals and the same `limit` groups get
-    /// re-examined forever. A pass that merges nothing is still normal — it means those
-    /// `limit` groups were all refused, and the next call moves past them.
+    /// Successive calls RESUME where the last one stopped (`CONSOLIDATE_CURSOR`);
+    /// `done` is true on the call that reaches the end of the run, after which the next
+    /// call starts a new one. A call that merges nothing is normal — it means the pairs
+    /// it examined were all left alone, and the next call moves past them.
     async fn consolidate_exact_duplicates(
         &self,
         ctx: &Context<'_>,
         #[graphql(default = 100)] limit: i32,
-    ) -> Result<i32> {
+    ) -> Result<DuplicateSweepResult> {
         require_admin(ctx).await?;
         let st = state(ctx);
         if RECONCILE_RUNNING
@@ -9914,38 +10041,18 @@ impl MutationRoot {
             ));
         }
         let limit = limit.max(1) as i64;
-        // RESUME, don't restart. See `CONSOLIDATE_CURSOR`.
-        let start = {
-            let g = CONSOLIDATE_CURSOR.lock().unwrap_or_else(|e| e.into_inner());
-            g.clone()
-        };
-        let res =
-            consolidate_exact_duplicates_from(&st.pool, Some(&st.cover_pool), limit, &start).await;
-        if let Ok(out) = &res {
-            // Fewer groups than asked for means the keyset walk ran off the end of
-            // `work_alias`; wrap so the next call re-examines from the start (and picks
-            // up duplicates minted since). Otherwise advance to where this pass stopped.
-            let next = if out.groups_seen < limit {
-                String::new()
-            } else {
-                out.cursor.clone()
-            };
-            *CONSOLIDATE_CURSOR.lock().unwrap_or_else(|e| e.into_inner()) = next;
-        }
+        let res = sweep_duplicates_once(&st.pool, Some(&st.cover_pool), limit).await;
         RECONCILE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
         let out = res.map_err(gql_err)?;
-        for (loser, survivor) in &out.merged {
-            tracing::info!(%loser, %survivor, "consolidateExactDuplicates: merged work");
-        }
         tracing::info!(
-            merged = out.merged.len(),
+            merged = out.merged,
+            dismissed = out.dismissed,
             queued = out.queued,
-            unqueueable = out.unqueueable,
-            stale = out.stale,
-            groups_seen = out.groups_seen,
+            pending = out.pending,
+            done = out.done,
             "consolidateExactDuplicates done"
         );
-        Ok(out.merged.len() as i32)
+        Ok(out)
     }
 
     /// Admin: force `is_nsfw_override` on EVERY catalogued work that has a Suwayomi
@@ -11549,18 +11656,14 @@ async fn new_session(pool: &SqlitePool, user_id: &str, ttl_secs: i64) -> Result<
 /// Single-flight guard for the catalogue reconcile (process-global; single replica).
 static RECONCILE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Where the NEXT `consolidateExactDuplicates` call resumes its keyset walk of
-/// `work_alias` (exclusive `match_key` lower bound; `""` = from the start).
+/// Where the NEXT `consolidateExactDuplicates` call resumes. One full run is two
+/// keyset walks, in order: the pending review queue (`reviews_after`, a `merge_candidate`
+/// id), then every duplicate-key group of `work_alias` (`groups_after`, a `match_key`).
 ///
-/// WHY THIS EXISTS. The sweep REFUSES far more clusters than it merges, and a refusal
-/// leaves the alias group exactly where it was — still in `work_alias`, still matching
-/// `HAVING COUNT(DISTINCT work_id) > 1`. A mutation that always restarted at `""`
-/// therefore re-walked the same refusals on every call. Measured against production
-/// (9,464 alias groups, 1,154 of them mergeable under `consolidate_gate`): the first
-/// 100 groups in `normalized_title ASC` order contain 12 mergeable clusters and 88
-/// refusals, so the default-`limit` call merges 12, and every subsequent call re-walks
-/// those 88 plus ~12 fresh ones — the merge rate collapses within two or three clicks
-/// and the mutation is a permanent no-op long before it reaches the other ~1,140.
+/// WHY THIS EXISTS. Most pairs are not merged, and a pair that is left alone stays
+/// exactly where it was — still pending, still sharing a key. A mutation that restarted
+/// at the beginning on every call re-walked the same pairs forever and never reached
+/// the rest of the catalogue.
 ///
 /// Process-global (not an `AppState` field) for the same reason as `VIEW_LIMITER`: the
 /// construction of `AppState` lives in `main.rs`. Losing the cursor on restart is
@@ -11570,7 +11673,19 @@ static RECONCILE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// The post-ingest sweep (`run_post_ingest_dedup_ex`) deliberately does NOT share this:
 /// it runs right after a bulk ingest to clean up what THAT ingest just minted, which
 /// can be anywhere in the alias space, so it must start from the beginning.
-static CONSOLIDATE_CURSOR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+#[derive(Clone, Debug, Default, PartialEq)]
+struct SweepCursor {
+    /// The review queue has been walked to its end in this run.
+    reviews_done: bool,
+    reviews_after: String,
+    groups_after: String,
+}
+
+static CONSOLIDATE_CURSOR: std::sync::Mutex<SweepCursor> = std::sync::Mutex::new(SweepCursor {
+    reviews_done: false,
+    reviews_after: String::new(),
+    groups_after: String::new(),
+});
 
 /// SQL predicate for a work that still needs reconciling: it has a Suwayomi source,
 /// no MangaDex source, and no pending merge_candidate yet.
@@ -11640,196 +11755,11 @@ pub(crate) async fn reconcile_provisional_works(
     Ok((merged, queued, skipped))
 }
 
-/// Minimum cover-pHash similarity that counts as corroboration for an alias-cluster
-/// consolidation. Deliberately the same 0.90 as `dedup::PHASH_CORROBORATION` (which is
-/// private to that module) — at most ~6 differing bits on the 64-bit dHash. Cover
-/// hashes are OPTIONAL corroboration only: `COVER_PHASH` is off in production and only
-/// ~10% of works carry a hash, so this can never be the sole gate.
-const CONSOLIDATE_PHASH_CORROBORATION: f64 = 0.90;
-
-/// The OTHER half of `dedup`'s cover rule, which the threshold constant alone does not
-/// carry: a near-uniform dHash (almost-all-0 / almost-all-1 bits) has no signal in it.
-/// Flat, letterboxed, all-dark and placeholder covers all collapse to such a hash, so
-/// two entirely UNRELATED works score 1.00 similarity against each other.
-///
-/// `dedup::is_discriminative_phash` (private there) guards its 0.90 comparison with
-/// exactly this test; copying only the threshold reproduced the number but not the
-/// rule, which is the drift this restores. Without it, `year`/`author` both being NULL
-/// — the common shape for a Suwayomi-only provisional work — leaves a blank cover as
-/// the SOLE corroboration for an irreversible `merge_works`.
-///
-/// Kept byte-identical to the original: 8 bytes (64-bit dHash), popcount in `12..=52`.
-fn consolidate_phash_is_discriminative(hex: &str) -> bool {
-    let Ok(bytes) = hex::decode(hex) else {
-        return false;
-    };
-    if bytes.len() != 8 {
-        return false;
-    }
-    let ones: u32 = bytes.iter().map(|b| b.count_ones()).sum();
-    (12..=52).contains(&ones)
-}
-
-/// Alias groups wider than a pair need matching authors as well as matching primary
-/// titles. A shared franchise alias alone never permits consolidation.
-const CONSOLIDATE_MAX_CLUSTER: usize = 2;
-
-/// One work's identity metadata inside an exact-alias cluster — everything the
-/// ambiguity gate needs, fetched in the same query as the cluster membership.
-#[derive(Clone, sqlx::FromRow)]
-struct ConsolidateWork {
-    id: String,
-    primary_title: Option<String>,
-    year: Option<i64>,
-    author: Option<String>,
-    cover_phash: Option<String>,
-    /// Does the work carry a MangaDex source? Two MangaDex-anchored works are two
-    /// distinct entries of the spine, so only an exact title may fold them
-    /// (`consolidate_gate`). Derived from `source_series`, not a `work` column; every
-    /// query that builds this struct selects it (`CONSOLIDATE_WORK_COLUMNS`).
-    mangadex_anchored: bool,
-}
-
-impl ConsolidateWork {
-    /// The snapshot the gate was evaluated against, in the shape `merge_works_checked`
-    /// re-validates inside its transaction. Every column the gate reads is here — adding
-    /// an input to `consolidate_gate` without adding it to `catalog::WorkIdentity` would
-    /// silently re-open the TOCTOU window for that column.
-    fn identity(&self) -> catalog::WorkIdentity {
-        catalog::WorkIdentity {
-            primary_title: self.primary_title.clone(),
-            year: self.year,
-            author: self.author.clone(),
-            cover_phash: self.cover_phash.clone(),
-            mangadex_anchored: self.mangadex_anchored,
-            match_key: None,
-        }
-    }
-
-    /// As `identity`, for a decision that rested on both works carrying the duplicate
-    /// key `key`: the merge also verifies the alias is still there.
-    fn identity_under(&self, key: &str) -> catalog::WorkIdentity {
-        catalog::WorkIdentity {
-            match_key: Some(key.to_string()),
-            ..self.identity()
-        }
-    }
-}
-
-/// The select list every `ConsolidateWork` query uses (the table must be aliased `w`).
-const CONSOLIDATE_WORK_COLUMNS: &str = "w.id, w.primary_title, w.year, w.author, w.cover_phash, \
-     EXISTS (SELECT 1 FROM source_series ss \
-             WHERE ss.work_id = w.id AND ss.source_type = 'mangadex') AS mangadex_anchored";
-
 /// Did this error come from `merge_works_checked`'s optimistic-concurrency precondition?
 /// A stale gate is an ordinary, expected outcome (skip the pair, retry next pass), not a
 /// sweep-aborting failure — every other error still propagates.
 fn is_precondition_failure(e: &anyhow::Error) -> bool {
     e.to_string().starts_with("merge precondition failed")
-}
-
-/// How strongly two works in one duplicate group are tied together by their titles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TitleMatch {
-    /// Both works carry the same primary title (after `normalize_title`).
-    Exact,
-    /// They only meet through an alternative title, or through primary titles that
-    /// differ by an article ("The X" / "X").
-    Loose,
-}
-
-/// The ambiguity gate for a duplicate-group consolidation. `Ok(kind)` means the pair is
-/// safe to fold irreversibly; `Err(reason)` is a short machine-friendly label used in
-/// the log line and to route the pair to the review queue instead.
-///
-/// `key` is the group's article-insensitive key (`normalize::match_key`). Sharing it is
-/// far too weak on its own to justify `merge_works` (which physically DELETEs the
-/// loser): the alias index includes every MangaDex `altTitle`, so distinct series in one
-/// franchise routinely share one. The rules, in order:
-///
-///  0. a novel never merges with a non-novel (`normalize::novel_mismatch`), whatever
-///     else agrees — a comic adaptation shares its novel's name, alt titles and author;
-///  1. short keys require >=90% author similarity;
-///  2. EXACT — the key is the primary title of both works and those titles normalize
-///     identically. Corroborated by >=90% author similarity, equal-or-adjacent `year`,
-///     OR cover-pHash similarity >= `CONSOLIDATE_PHASH_CORROBORATION` between two
-///     DISCRIMINATIVE hashes (`consolidate_phash_is_discriminative` — the guard `dedup`
-///     applies alongside the same threshold);
-///  3. LOOSE — the key is the primary title of at least one of them, and the other
-///     knows it as an alt title or differs by an article. This is how the same series
-///     looks across sites ("The Apothecary Diaries" on one, "Kusuriya no Hitorigoto"
-///     with that alt title on MangaDex), but it is also how MangaDex relates a series to
-///     its own colored edition, pre-serialization, prequel and anthology. So:
-///       * never when the key is only an alt title on BOTH sides (`alt_title_only`);
-///       * never between two MangaDex-anchored works — those are distinct spine entries
-///         by construction (`alt_title_only`, as before);
-///       * and only on author or cover evidence. A year alone proves nothing here.
-///
-/// Two MangaDex-anchored works are held to more even when EXACT: their titles must not
-/// differ by an instalment marker `normalize_title` strips ("X" / "X Season 2" is a
-/// sequel there — `sequel_mismatch`), and a year alone does not corroborate them (two
-/// adaptations of one title by different authors start in the same year).
-///
-/// The cluster-size limit (`CONSOLIDATE_MAX_CLUSTER`) and the choice between several
-/// possible targets are the caller's, which sees the whole group.
-fn consolidate_gate(
-    key: &str,
-    a: &ConsolidateWork,
-    b: &ConsolidateWork,
-) -> std::result::Result<TitleMatch, &'static str> {
-    use crate::catalog::normalize::{match_key, normalize_title, novel_mismatch, sequel_mismatch};
-    if novel_mismatch(a.primary_title.as_deref(), b.primary_title.as_deref()) {
-        return Err("novel_mismatch");
-    }
-    let author_ok =
-        crate::catalog::similarity::authors_match(a.author.as_deref(), b.author.as_deref());
-    if key.chars().count() < FEDERATED_MIN_TITLE_CHARS && !author_ok {
-        return Err("short_title");
-    }
-    let primary = |w: &ConsolidateWork| w.primary_title.as_deref().map(normalize_title);
-    let (primary_a, primary_b) = (primary(a), primary(b));
-    let names_key =
-        |primary: &Option<String>| primary.as_deref().map(match_key).as_deref() == Some(key);
-    let exact = primary_a == primary_b && names_key(&primary_a);
-    // A loose match needs the key to be somebody's actual NAME. Two works that only
-    // share an alt title are a franchise ("Phantom Blood" and "Battle Tendency" both
-    // list `ジョジョの奇妙な冒険`), and its author is shared too.
-    if !(exact || names_key(&primary_a) || names_key(&primary_b)) {
-        return Err("alt_title_only");
-    }
-    // Two MangaDex-anchored works are distinct spine entries by construction, so the
-    // bar is higher for them than for a site's copy of a series.
-    let both_mangadex = a.mangadex_anchored && b.mangadex_anchored;
-    if !exact && both_mangadex {
-        return Err("alt_title_only");
-    }
-    if both_mangadex && sequel_mismatch(a.primary_title.as_deref(), b.primary_title.as_deref()) {
-        return Err("sequel_mismatch");
-    }
-    let year_ok = matches!((a.year, b.year), (Some(x), Some(y)) if (x - y).abs() <= 1);
-    // BOTH hashes must carry signal before their similarity means anything — see
-    // `consolidate_phash_is_discriminative`. Checked before the comparison so a pair of
-    // blank covers is not even scored.
-    let phash_discriminative = a
-        .cover_phash
-        .as_deref()
-        .is_some_and(consolidate_phash_is_discriminative)
-        && b.cover_phash
-            .as_deref()
-            .is_some_and(consolidate_phash_is_discriminative);
-    let phash_ok = phash_discriminative
-        && crate::catalog::similarity::phash_similarity(
-            a.cover_phash.as_deref(),
-            b.cover_phash.as_deref(),
-        )
-        .map(|p| p >= CONSOLIDATE_PHASH_CORROBORATION)
-        .unwrap_or(false);
-    match (exact, author_ok || phash_ok) {
-        (true, true) => Ok(TitleMatch::Exact),
-        (true, false) if year_ok && !both_mangadex => Ok(TitleMatch::Exact),
-        (false, true) => Ok(TitleMatch::Loose),
-        _ => Err("uncorroborated"),
-    }
 }
 
 /// What one consolidation pass did. `merged` carries the audit trail — every
@@ -11839,7 +11769,7 @@ struct ConsolidateOutcome {
     merged: Vec<(String, String)>,
     /// Pairs routed to `merge_candidate` for human review instead of merging.
     queued: i64,
-    /// Pairs that failed the gate AND could not be queued (the loser has no
+    /// Pairs that needed a review but could not be queued (the loser has no
     /// `source_series` row to hang a candidate off). Never merged, never dropped
     /// silently — counted and logged.
     unqueueable: i64,
@@ -11849,7 +11779,7 @@ struct ConsolidateOutcome {
     stale: i64,
     /// Alias groups examined in this pass; 0 means the cursor reached the end.
     groups_seen: i64,
-    /// Keyset cursor (last `normalized_title` examined) for the next pass.
+    /// Keyset cursor (last `match_key` examined) for the next pass.
     cursor: String,
 }
 
@@ -11858,23 +11788,25 @@ struct ConsolidateOutcome {
 /// minted separately (pre-policy, concurrent ingest, a UUID-keyed backfill that bypassed
 /// the dedup matcher, or two sites publishing one series under different names).
 ///
-/// SAFETY: a shared key alone is NOT evidence of a duplicate — see `consolidate_gate`.
-/// Within a group the best survivor comes first (MangaDex-anchored, then most sources,
-/// then lowest id) and each later work is folded into the survivor the gate approves:
+/// SAFETY: a shared key alone is NOT evidence of a duplicate — `catalog::pair::assess`
+/// judges every pair. Within a group the best survivor comes first (MangaDex-anchored,
+/// then most sources, then lowest id) and each later work is folded into the survivor
+/// the rules approve:
 ///
-///   * an EXACT title match wins over a LOOSE one;
-///   * a LOOSE match is taken only when exactly ONE survivor qualifies. A site's
+///   * an EXACT title match wins over a looser one;
+///   * a merge is taken only when exactly ONE survivor qualifies. A site's
 ///     "Solo Leveling: Ragnarok" is an alt title of both the MangaDex series and its
 ///     pre-serialization; picking either by sort order would be a coin toss;
-///   * in a group wider than `CONSOLIDATE_MAX_CLUSTER` every merge needs matching authors.
+///   * a year alone carries a merge only in a group of two.
 ///
-/// Everything else is routed to the `merge_candidate` review queue for a human, never
-/// merged and never dropped — except a novel/non-novel pair, which is a settled "no" and
-/// would only be noise in that queue.
+/// A pair the rules call a real question goes to the `merge_candidate` review queue
+/// with its score. A pair they call two different works (two MangaDex entries sharing
+/// an alt title, a novel and its comic, namesakes) is left alone and NOT queued: the
+/// queue is for questions, and those pairs have an answer.
 ///
 /// `limit` bounds the groups EXAMINED, so a pass that merges nothing is normal and does
 /// not mean the sweep is finished. Keyset-paginated from `cursor` (an exclusive
-/// `match_key` lower bound): a pass that REFUSES every group still advances, instead of
+/// `match_key` lower bound): a pass that merges nothing still advances, instead of
 /// re-examining the same first `limit` groups forever.
 async fn consolidate_exact_duplicates_from(
     pool: &SqlitePool,
@@ -11882,6 +11814,7 @@ async fn consolidate_exact_duplicates_from(
     limit: i64,
     cursor: &str,
 ) -> anyhow::Result<ConsolidateOutcome> {
+    use catalog::pair::{assess, Assessment, Link, Verdict};
     let groups: Vec<String> = sqlx::query_scalar(
         "SELECT match_key FROM work_alias WHERE match_key > ? \
          GROUP BY match_key HAVING COUNT(DISTINCT work_id) > 1 \
@@ -11900,157 +11833,164 @@ async fn consolidate_exact_duplicates_from(
         out.cursor.clone_from(&key);
         // Re-query the group's works fresh (a prior group may already have folded
         // some), best survivor first.
-        let works: Vec<ConsolidateWork> = sqlx::query_as(&format!(
-            "SELECT {CONSOLIDATE_WORK_COLUMNS} FROM work w \
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT w.id FROM work w \
              JOIN work_alias a ON a.work_id = w.id AND a.match_key = ? \
              GROUP BY w.id \
-             ORDER BY mangadex_anchored DESC, \
+             ORDER BY EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id \
+                              AND ss.source_type = 'mangadex') DESC, \
                       (SELECT COUNT(*) FROM source_series ss WHERE ss.work_id = w.id) DESC, \
-                      w.id ASC"
-        ))
+                      w.id ASC",
+        )
         .bind(&key)
         .fetch_all(pool)
         .await?;
-        if works.len() < 2 {
+        if ids.len() < 2 {
             continue;
         }
-        let oversized = works.len() > CONSOLIDATE_MAX_CLUSTER;
-        let mut survivors = vec![works[0].clone()];
+        let mut data = catalog::load_match_data_batch(pool, &ids).await?;
+        let works: Vec<catalog::WorkMatchData> =
+            ids.iter().filter_map(|id| data.remove(id)).collect();
+        let Some(first) = works.first() else { continue };
+        // A year is the weakest corroboration there is: it settles a pair, not a crowd.
+        let pair_only = works.len() == 2;
+        let mut survivors = vec![first.clone()];
         for other in &works[1..] {
             // A common title can contain several authors' works, so every surviving
             // representative is a possible target, not only the first work of the group.
-            let mut exact: Vec<&ConsolidateWork> = Vec::new();
-            let mut loose: Vec<&ConsolidateWork> = Vec::new();
-            // The refusal worth reporting, ranked: one against a same-author survivor is
-            // the likeliest real duplicate, and a novel mismatch (which is never queued)
-            // must not hide a refusal a human should see.
-            let mut refused: Option<(&ConsolidateWork, &'static str, u8)> = None;
+            let mut exact: Vec<(&catalog::WorkMatchData, Assessment)> = Vec::new();
+            let mut loose: Vec<(&catalog::WorkMatchData, Assessment)> = Vec::new();
+            // The likeliest duplicate among the survivors this work did NOT merge into.
+            let mut question: Option<(&catalog::WorkMatchData, Assessment)> = None;
             for candidate in &survivors {
-                let same_author = crate::catalog::similarity::authors_match(
-                    candidate.author.as_deref(),
-                    other.author.as_deref(),
-                );
-                let verdict = match consolidate_gate(&key, candidate, other) {
-                    Err("novel_mismatch") => Err("novel_mismatch"),
-                    _ if oversized && !same_author => Err("cluster_too_large"),
-                    verdict => verdict,
-                };
-                match verdict {
-                    Ok(TitleMatch::Exact) => exact.push(candidate),
-                    Ok(TitleMatch::Loose) => loose.push(candidate),
-                    Err(reason) => {
-                        let rank = match (reason, same_author) {
-                            ("novel_mismatch", _) => 0,
-                            (_, false) => 1,
-                            (_, true) => 2,
-                        };
-                        if refused.is_none_or(|(_, _, best)| rank > best) {
-                            refused = Some((candidate, reason, rank));
+                let mut verdict = assess(candidate, other);
+                if verdict.reason == "same_title_and_year" && !pair_only {
+                    verdict.verdict = Verdict::Review;
+                    verdict.reason = "cluster_too_large";
+                }
+                match verdict.verdict {
+                    Verdict::Merge if verdict.link == Link::Exact => {
+                        exact.push((candidate, verdict))
+                    }
+                    Verdict::Merge => loose.push((candidate, verdict)),
+                    Verdict::Review => {
+                        if question
+                            .as_ref()
+                            .is_none_or(|(_, best)| verdict.score > best.score)
+                        {
+                            question = Some((candidate, verdict));
                         }
                     }
+                    Verdict::Distinct => {}
                 }
             }
-            // The work `other` is judged against: its merge target, or — when refused —
-            // the survivor the refusal is reported and queued against. Survivors are by
-            // construction works that did NOT fold into each other, so two qualifying
-            // targets (a credit line naming both authors of two namesakes, or both halves
-            // of an admin split) is an ambiguity, never a tie to break by sort order.
-            let (against, verdict) = match (exact.as_slice(), loose.as_slice()) {
-                ([target], _) | ([], [target]) => ((*target).clone(), Ok(())),
-                ([first, ..], _) | ([], [first, ..]) => ((*first).clone(), Err("ambiguous_target")),
-                ([], []) => match refused {
-                    Some((candidate, reason, _)) => (candidate.clone(), Err(reason)),
-                    None => (survivors[0].clone(), Err("uncorroborated")),
-                },
+            // The work `other` is judged against: its merge target, or the survivor the
+            // question is queued against. Survivors are by construction works that did
+            // NOT fold into each other, so two qualifying targets (a credit line naming
+            // both authors of two namesakes, or both halves of an admin split) is an
+            // ambiguity, never a tie to break by sort order.
+            let (against, merge) = match (exact.as_slice(), loose.as_slice()) {
+                ([(target, verdict)], _) | ([], [(target, verdict)]) => {
+                    (Some(((*target).clone(), verdict.clone())), true)
+                }
+                ([(first, verdict), ..], _) | ([], [(first, verdict), ..]) => {
+                    let mut verdict = verdict.clone();
+                    verdict.reason = "ambiguous_target";
+                    (Some(((*first).clone(), verdict)), false)
+                }
+                ([], []) => (
+                    question.map(|(candidate, verdict)| (candidate.clone(), verdict)),
+                    false,
+                ),
+            };
+            let Some((against, verdict)) = against else {
+                // Every survivor is a different work. Nothing to merge, nothing to ask.
+                survivors.push(other.clone());
+                continue;
             };
             // An admin already ruled on this pair by SPLITTING it apart (migration 0098).
             // Skip it outright — not queued for review either, because the review queue is
-            // a question and this pair has an answer. Checked BEFORE acting on the gate for
-            // the reason the table exists: the two halves of a split share a normalized
-            // title by construction (that shared title is what caused the bad merge), and
-            // they routinely share an author too, so the gate would pass and `merge_works`
-            // would destroy one of them for good.
+            // a question and this pair has an answer. Checked BEFORE acting on the verdict
+            // for the reason the table exists: the two halves of a split share a
+            // normalized title by construction (that shared title is what caused the bad
+            // merge), and they routinely share an author too, so the rules would pass and
+            // `merge_works` would destroy one of them for good.
             //
             // The skipped half stays a survivor: a later work that fits both halves must
             // see two targets and go to review, not fold into whichever half came first.
-            if catalog::is_split_pair(pool, &other.id, &against.id)
+            if catalog::is_split_pair(pool, &other.work_id, &against.work_id)
                 .await
                 .unwrap_or(false)
             {
                 tracing::debug!(
-                    a = %other.id, b = %against.id, alias = %key,
+                    a = %other.work_id, b = %against.work_id, alias = %key,
                     "consolidate: skipped — an admin split this pair apart"
                 );
                 survivors.push(other.clone());
                 continue;
             }
-            match verdict {
-                Ok(()) => {
-                    // The gate judged a snapshot read OUTSIDE any transaction, and
-                    // `RECONCILE_RUNNING` single-flights this sweep only against itself
-                    // — never against `updateSeriesMetadata`. Hand the exact values the
-                    // gate approved to the merge as a precondition it re-checks under its
-                    // own write lock, so an admin retitling a work (or clearing the
-                    // `year` that was the sole corroboration) in that window aborts the
-                    // merge instead of silently destroying a work on stale grounds. The
-                    // pair is simply re-examined next pass, against the new values.
-                    let expect_loser = other.identity_under(&key);
-                    let expect_survivor = against.identity_under(&key);
-                    match catalog::merge_works_checked(
-                        pool,
-                        covers,
-                        &other.id,
-                        &against.id,
-                        Some((&expect_loser, &expect_survivor)),
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            tracing::info!(
-                                loser = %other.id, survivor = %against.id, alias = %key,
-                                "consolidate: merged"
-                            );
-                            out.merged.push((other.id.clone(), against.id.clone()));
-                        }
-                        Err(e) if is_precondition_failure(&e) => {
-                            out.stale += 1;
-                            tracing::info!(
-                                loser = %other.id, survivor = %against.id, alias = %key,
-                                "consolidate: skipped — identity changed under the gate"
-                            );
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                Err(reason) => {
-                    survivors.push(other.clone());
-                    // A novel next to its comic is not a question for a human: the answer
-                    // is always "different works". Keep it out of the review queue.
-                    if reason == "novel_mismatch" {
-                        tracing::debug!(
-                            a = %other.id, b = %against.id, alias = %key,
-                            "consolidate: skipped — a novel never merges with a non-novel"
+            if merge {
+                // The rules judged a snapshot read OUTSIDE any transaction, and
+                // `RECONCILE_RUNNING` single-flights this sweep only against itself
+                // — never against `updateSeriesMetadata`. Hand the exact values they
+                // approved to the merge as a precondition it re-checks under its own
+                // write lock, so an admin retitling a work (or clearing the `year` that
+                // was the sole corroboration) in that window aborts the merge instead of
+                // silently destroying a work on stale grounds. The pair is simply
+                // re-examined next pass, against the new values.
+                let link_key = verdict.key.as_deref();
+                match catalog::merge_works_checked(
+                    pool,
+                    covers,
+                    &other.work_id,
+                    &against.work_id,
+                    Some((&other.identity(link_key), &against.identity(link_key))),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        tracing::info!(
+                            loser = %other.work_id, survivor = %against.work_id, alias = %key,
+                            reason = verdict.reason, "consolidate: merged"
                         );
-                        continue;
+                        out.merged
+                            .push((other.work_id.clone(), against.work_id.clone()));
                     }
-                    match queue_consolidate_review(pool, &other.id, &against.id).await? {
-                        true => out.queued += 1,
-                        false => out.unqueueable += 1,
+                    Err(e) if is_precondition_failure(&e) => {
+                        out.stale += 1;
+                        tracing::info!(
+                            loser = %other.work_id, survivor = %against.work_id, alias = %key,
+                            "consolidate: skipped — identity changed under the gate"
+                        );
                     }
-                    tracing::debug!(
-                        loser = %other.id, survivor = %against.id, alias = %key, reason,
-                        "consolidate: refused (routed to review)"
-                    );
+                    Err(e) => return Err(e),
                 }
+            } else {
+                survivors.push(other.clone());
+                match queue_consolidate_review(
+                    pool,
+                    &other.work_id,
+                    &against.work_id,
+                    verdict.score,
+                )
+                .await?
+                {
+                    true => out.queued += 1,
+                    false => out.unqueueable += 1,
+                }
+                tracing::debug!(
+                    loser = %other.work_id, survivor = %against.work_id, alias = %key,
+                    reason = verdict.reason, "consolidate: routed to review"
+                );
             }
         }
     }
     Ok(out)
 }
 
-/// Enqueue a refused alias pair for human review. Returns `Ok(true)` when a candidate
-/// row now exists (freshly inserted or already there), `Ok(false)` when `loser` has no
-/// `source_series` row to hang a candidate off.
+/// Enqueue a pair for human review with its confidence `score`. Returns `Ok(true)` when
+/// a candidate row now exists (freshly inserted or already there), `Ok(false)` when
+/// `loser` has no `source_series` row to hang a candidate off.
 ///
 /// Idempotence and the never-resurrect-a-decision rule are NOT implemented here: they
 /// live in `catalog::insert_merge_candidate`, which suppresses any pair that already has
@@ -12063,6 +12003,7 @@ async fn queue_consolidate_review(
     pool: &SqlitePool,
     loser: &str,
     survivor: &str,
+    score: f64,
 ) -> anyhow::Result<bool> {
     let ssid: Option<String> = sqlx::query_scalar(
         "SELECT id FROM source_series WHERE work_id = ? ORDER BY created_at ASC, id ASC LIMIT 1",
@@ -12073,95 +12014,286 @@ async fn queue_consolidate_review(
     let Some(ssid) = ssid else {
         return Ok(false);
     };
-    // A bare exact-alias hit scores exactly `dedup::MID` (title only, no corroboration)
-    // — the same score the reconcile path records for this band. A `None` return means
-    // the pair is already in the queue or already resolved; either way a row exists.
-    catalog::insert_merge_candidate(pool, &ssid, survivor, crate::dedup::MID, "title_exact")
-        .await?;
+    // A `None` return means the pair is already in the queue or already resolved; either
+    // way a row exists.
+    catalog::insert_merge_candidate(pool, &ssid, survivor, score, "title_exact").await?;
     Ok(true)
 }
 
-/// Revisit every waiting review using current primary titles and the author rule.
-/// Keyset pagination avoids starving later jobs when earlier rows remain in review.
+/// What one pass over the review queue did.
+#[derive(Default)]
+struct ReviewOutcome {
+    /// `(loser_id, survivor_id)` pairs folded.
+    merged: Vec<(String, String)>,
+    /// Pairs the rules call two different works; closed without a merge.
+    dismissed: i64,
+    /// Pending rows examined in this pass; fewer than the limit means the end.
+    seen: i64,
+    /// Keyset cursor (last `merge_candidate.id` examined) for the next pass.
+    cursor: String,
+}
+
+/// True when `loser` could equally be folded into a work other than `survivor`: another
+/// work that carries either title, that the rules would also merge `loser` into, and
+/// that is not itself a duplicate of `survivor`. Such a pair has no single right target.
+async fn has_rival_target(
+    pool: &SqlitePool,
+    loser: &catalog::WorkMatchData,
+    survivor: &catalog::WorkMatchData,
+) -> anyhow::Result<bool> {
+    use crate::catalog::normalize::{match_key, normalize_title};
+    use catalog::pair::{assess, Verdict};
+    let mut rivals: Vec<String> = Vec::new();
+    for work in [loser, survivor] {
+        let Some(title) = work.primary_title.as_deref() else {
+            continue;
+        };
+        rivals.extend(
+            catalog::find_works_by_match_key(pool, &match_key(&normalize_title(title))).await?,
+        );
+    }
+    rivals.retain(|id| *id != loser.work_id && *id != survivor.work_id);
+    rivals.sort();
+    rivals.dedup();
+    // A title shared by this many works is a common word, and no place to guess.
+    const MAX_RIVALS: usize = 40;
+    if rivals.len() > MAX_RIVALS {
+        return Ok(true);
+    }
+    let data = catalog::load_match_data_batch(pool, &rivals).await?;
+    Ok(data.values().any(|rival| {
+        assess(loser, rival).verdict == Verdict::Merge
+            && assess(survivor, rival).verdict != Verdict::Merge
+    }))
+}
+
+/// Sort up to `limit` waiting reviews, in id order after `after`, with the same rules
+/// the sweep uses (`catalog::pair::assess`):
+///
+///   * one series — merged, when it has exactly one possible target;
+///   * two different works — closed as `dismissed`, so the pair is never proposed again
+///     (as is a pair an admin split apart, and a second row asking about the same pair);
+///   * a real question — left pending, with its score refreshed so the queue lists the
+///     likeliest duplicates first.
+///
+/// `dismissed` is the rules' answer, not a person's: unlike `rejected` it does not bar
+/// a later automatic merge, should the works' metadata change.
+async fn sort_pending_reviews(
+    pool: &SqlitePool,
+    covers: Option<&SqlitePool>,
+    after: &str,
+    limit: i64,
+) -> anyhow::Result<ReviewOutcome> {
+    use catalog::pair::{assess, Verdict};
+    let rows: Vec<(String, String, String, f64)> = sqlx::query_as(
+        "SELECT mc.id, ss.work_id, mc.candidate_work_id, mc.score FROM merge_candidate mc \
+         JOIN source_series ss ON ss.id = mc.source_series_id \
+         WHERE mc.status = 'pending' AND mc.id > ? ORDER BY mc.id LIMIT ?",
+    )
+    .bind(after)
+    .bind(limit.max(1))
+    .fetch_all(pool)
+    .await?;
+    let mut out = ReviewOutcome {
+        cursor: after.to_string(),
+        ..Default::default()
+    };
+    for (id, source, target, old_score) in rows {
+        out.seen += 1;
+        out.cursor.clone_from(&id);
+        if source == target {
+            continue;
+        }
+        let data = catalog::load_match_data_batch(pool, &[source.clone(), target.clone()]).await?;
+        let (Some(a), Some(b)) = (data.get(&source), data.get(&target)) else {
+            continue;
+        };
+        let verdict = assess(a, b);
+        let split = catalog::is_split_pair(pool, &source, &target)
+            .await
+            .unwrap_or(false);
+        // The same two works, asked about or refused in an earlier row (the sweep used
+        // to queue a pair once per direction): one question is enough.
+        let repeated: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM merge_candidate mc \
+             JOIN source_series ss ON ss.id = mc.source_series_id \
+             WHERE mc.id < ?1 AND mc.status IN ('pending', 'rejected') \
+               AND (ss.work_id = ?2 AND mc.candidate_work_id = ?3 \
+                 OR ss.work_id = ?3 AND mc.candidate_work_id = ?2))",
+        )
+        .bind(&id)
+        .bind(&source)
+        .bind(&target)
+        .fetch_one(pool)
+        .await?;
+        if verdict.verdict == Verdict::Distinct || split || repeated {
+            let closed = sqlx::query(
+                "UPDATE merge_candidate SET status = 'dismissed', score = ?, resolved_at = ? \
+                 WHERE id = ? AND status = 'pending'",
+            )
+            .bind(verdict.score)
+            .bind(Utc::now().to_rfc3339())
+            .bind(&id)
+            .execute(pool)
+            .await?;
+            if closed.rows_affected() == 1 {
+                out.dismissed += 1;
+                tracing::debug!(
+                    candidate_id = %id, a = %source, b = %target, reason = verdict.reason,
+                    split, repeated, "review sorted: closed without a merge"
+                );
+            }
+            continue;
+        }
+        // Fold a site's copy into the MangaDex entry, whichever way the row points.
+        let flipped = a.mangadex_anchored && !b.mangadex_anchored;
+        let (loser, survivor) = if flipped { (b, a) } else { (a, b) };
+        if verdict.verdict == Verdict::Merge && !has_rival_target(pool, loser, survivor).await? {
+            let key = verdict.key.as_deref();
+            let expected = (&loser.identity(key), &survivor.identity(key));
+            let result = if flipped {
+                catalog::merge_works_checked(
+                    pool,
+                    covers,
+                    &loser.work_id,
+                    &survivor.work_id,
+                    Some(expected),
+                )
+                .await
+            } else {
+                catalog::merge_pending_candidate_checked(
+                    pool,
+                    covers,
+                    &loser.work_id,
+                    &survivor.work_id,
+                    expected,
+                    &id,
+                )
+                .await
+            };
+            match result {
+                Ok(_) => {
+                    tracing::info!(
+                        candidate_id = %id, loser = %loser.work_id, survivor = %survivor.work_id,
+                        reason = verdict.reason, "review sorted: merged"
+                    );
+                    out.merged
+                        .push((loser.work_id.clone(), survivor.work_id.clone()));
+                    continue;
+                }
+                Err(e) if is_precondition_failure(&e) => {}
+                Err(e) => {
+                    tracing::warn!(candidate_id = %id, error = %e, "review merge failed; will retry")
+                }
+            }
+        }
+        if (verdict.score - old_score).abs() > f64::EPSILON {
+            sqlx::query("UPDATE merge_candidate SET score = ? WHERE id = ? AND status = 'pending'")
+                .bind(verdict.score)
+                .bind(&id)
+                .execute(pool)
+                .await?;
+        }
+    }
+    if !out.merged.is_empty() {
+        clear_feed_caches();
+    }
+    Ok(out)
+}
+
+/// Sort the whole review queue (see `sort_pending_reviews`), yielding between batches so
+/// the live sync and the cover drainer keep getting the single SQLite writer.
 pub(crate) async fn auto_merge_pending_reviews(
     pool: &SqlitePool,
     covers: Option<&SqlitePool>,
 ) -> anyhow::Result<u64> {
+    const BATCH: i64 = 200;
     let mut cursor = String::new();
-    let mut merged = 0;
+    let (mut merged, mut dismissed) = (0u64, 0i64);
     loop {
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT mc.id, ss.work_id, mc.candidate_work_id FROM merge_candidate mc \
-             JOIN source_series ss ON ss.id = mc.source_series_id \
-             WHERE mc.status = 'pending' AND mc.id > ? ORDER BY mc.id LIMIT 200",
-        )
-        .bind(&cursor)
-        .fetch_all(pool)
-        .await?;
-        if rows.is_empty() {
+        let out = sort_pending_reviews(pool, covers, &cursor, BATCH).await?;
+        merged += out.merged.len() as u64;
+        dismissed += out.dismissed;
+        if out.seen < BATCH {
             break;
         }
-        for (id, source, target) in rows {
-            cursor = id.clone();
-            if source == target {
-                continue;
-            }
-            let mut identities: Vec<ConsolidateWork> = sqlx::query_as(&format!(
-                "SELECT {CONSOLIDATE_WORK_COLUMNS} FROM work w WHERE w.id IN (?, ?)"
-            ))
-            .bind(&source)
-            .bind(&target)
-            .fetch_all(pool)
-            .await?;
-            if identities.len() != 2 {
-                continue;
-            }
-            identities.sort_by_key(|w| w.id != source);
-            let (a, b) = (&identities[0], &identities[1]);
-            let norm = a
-                .primary_title
-                .as_deref()
-                .map(crate::catalog::normalize::normalize_title)
-                .unwrap_or_default();
-            if norm.is_empty()
-                || b.primary_title
-                    .as_deref()
-                    .map(crate::catalog::normalize::normalize_title)
-                    .as_deref()
-                    != Some(norm.as_str())
-                || !crate::catalog::similarity::authors_match(
-                    a.author.as_deref(),
-                    b.author.as_deref(),
-                )
-            {
-                continue;
-            }
-            match catalog::merge_pending_candidate_checked(
-                pool,
-                covers,
-                &source,
-                &target,
-                (&a.identity(), &b.identity()),
-                &id,
-            )
-            .await
-            {
-                Ok(_) => {
-                    merged += 1;
-                    tracing::info!(candidate_id = %id, loser = %source, survivor = %target, "auto-merged waiting review");
-                }
-                Err(e) if is_precondition_failure(&e) => {}
-                Err(e) => {
-                    tracing::warn!(candidate_id = %id, error = %e, "waiting review merge failed; will retry")
-                }
-            }
-        }
+        cursor = out.cursor;
         tokio::task::yield_now().await;
     }
-    if merged > 0 {
+    tracing::info!(merged, dismissed, "review queue sorted");
+    Ok(merged)
+}
+
+/// What one `consolidateExactDuplicates` call did.
+#[derive(SimpleObject, Debug, Default)]
+pub struct DuplicateSweepResult {
+    /// Works merged away by this call.
+    pub merged: i32,
+    /// Waiting reviews closed as "two different works" by this call.
+    pub dismissed: i32,
+    /// Pairs this call sent to the review queue.
+    pub queued: i32,
+    /// Reviews still waiting for a person, after this call.
+    pub pending: i32,
+    /// True when this call reached the end of the run.
+    pub done: bool,
+}
+
+/// One resumable step of the admin duplicate sweep: sort up to `limit` waiting reviews
+/// and, once the queue is exhausted, examine up to `limit` duplicate-key groups. Reads
+/// and advances `CONSOLIDATE_CURSOR`; the caller holds `RECONCILE_RUNNING`.
+async fn sweep_duplicates_once(
+    pool: &SqlitePool,
+    covers: Option<&SqlitePool>,
+    limit: i64,
+) -> anyhow::Result<DuplicateSweepResult> {
+    let mut cursor = CONSOLIDATE_CURSOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let mut result = DuplicateSweepResult::default();
+    if !cursor.reviews_done {
+        let out = sort_pending_reviews(pool, covers, &cursor.reviews_after, limit).await?;
+        for (loser, survivor) in &out.merged {
+            tracing::info!(%loser, %survivor, "consolidateExactDuplicates: merged work");
+        }
+        result.merged += out.merged.len() as i32;
+        result.dismissed += out.dismissed as i32;
+        cursor.reviews_after = out.cursor;
+        // Fewer rows than asked for means the queue is exhausted.
+        cursor.reviews_done = out.seen < limit;
+    }
+    if cursor.reviews_done {
+        let out =
+            consolidate_exact_duplicates_from(pool, covers, limit, &cursor.groups_after).await?;
+        for (loser, survivor) in &out.merged {
+            tracing::info!(%loser, %survivor, "consolidateExactDuplicates: merged work");
+        }
+        result.merged += out.merged.len() as i32;
+        result.queued += out.queued as i32;
+        // Fewer groups than asked for means the walk ran off the end of `work_alias`:
+        // the run is complete, and the next call starts a new one from the beginning
+        // (picking up duplicates minted since).
+        result.done = out.groups_seen < limit;
+        cursor = if result.done {
+            SweepCursor::default()
+        } else {
+            SweepCursor {
+                groups_after: out.cursor,
+                ..cursor
+            }
+        };
+    }
+    *CONSOLIDATE_CURSOR.lock().unwrap_or_else(|e| e.into_inner()) = cursor;
+    result.pending = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM merge_candidate mc          JOIN source_series ss ON ss.id = mc.source_series_id          WHERE mc.status = 'pending' AND mc.candidate_work_id <> ss.work_id",
+    )
+    .fetch_one(pool)
+    .await? as i32;
+    if result.merged > 0 {
         clear_feed_caches();
     }
-    Ok(merged)
+    Ok(result)
 }
 
 /// Post-ingest dedup sweep: fold Suwayomi-only provisionals into the MangaDex spine
@@ -12190,19 +12322,20 @@ pub(crate) async fn run_post_ingest_dedup_ex(pool: &SqlitePool, covers: Option<&
         return;
     }
     tracing::info!("post-ingest dedup: starting");
-    if let Err(e) = auto_merge_pending_reviews(pool, covers).await {
-        tracing::warn!(error = %e, "post-ingest dedup: pending review sweep failed");
-    }
     match reconcile_provisional_works(pool, covers).await {
         Ok((merged, queued, skipped)) => {
             tracing::info!(merged, queued, skipped, "post-ingest dedup: reconcile done")
         }
         Err(e) => tracing::error!(error = %e, "post-ingest dedup: reconcile failed"),
     }
+    // After the reconcile, so the reviews it just queued are sorted in this same run.
+    if let Err(e) = auto_merge_pending_reviews(pool, covers).await {
+        tracing::warn!(error = %e, "post-ingest dedup: pending review sweep failed");
+    }
     // BOUNDED. This used to be `loop { … }` until nothing merged, which — with the old
     // merge-on-any-shared-alias rule — would have folded 11,580 works across 9,464
     // clusters into each other on a single restart, irreversibly. The gate in
-    // `consolidate_gate` is the real fix; this cap is the belt-and-braces one: even a
+    // `catalog::pair::assess` is the real fix; this cap is the belt-and-braces one: even a
     // future gate regression can only touch CONSOLIDATE_MAX_BATCHES × 200 alias groups
     // per run, and stopping early is logged loudly.
     const CONSOLIDATE_MAX_BATCHES: usize = 10;
@@ -13225,287 +13358,6 @@ mod tests {
         assert_eq!(count, 2);
     }
 
-    /// Build a `ConsolidateWork` for the gate unit tests.
-    fn cw(id: &str, title: &str, year: Option<i64>, author: Option<&str>) -> ConsolidateWork {
-        ConsolidateWork {
-            id: id.into(),
-            primary_title: Some(title.into()),
-            year,
-            author: author.map(str::to_string),
-            cover_phash: None,
-            mangadex_anchored: false,
-        }
-    }
-
-    /// As `cw`, but MangaDex-anchored: a distinct entry of the spine.
-    fn md(id: &str, title: &str, year: Option<i64>, author: Option<&str>) -> ConsolidateWork {
-        ConsolidateWork {
-            mangadex_anchored: true,
-            ..cw(id, title, year, author)
-        }
-    }
-
-    /// Two MangaDex entries are separate works unless the evidence is strong: a sequel
-    /// marker or a merely matching year keeps them apart, where a site's copy of the
-    /// same series would still fold in.
-    #[test]
-    fn consolidate_gate_keeps_mangadex_sequels_and_namesakes_apart() {
-        let key = "rosario to vampire";
-        let author = Some("Ikeda Akihisa");
-        // A sequel is its own MangaDex entry, same author or not.
-        assert_eq!(
-            consolidate_gate(
-                key,
-                &md("a", "Rosario to Vampire", Some(2004), author),
-                &md("b", "Rosario to Vampire Season II", Some(2007), author),
-            ),
-            Err("sequel_mismatch")
-        );
-        // A site that lists the season separately still finds its series.
-        assert_eq!(
-            consolidate_gate(
-                key,
-                &md("a", "Rosario to Vampire", Some(2004), author),
-                &cw("b", "Rosario to Vampire Season II", None, author),
-            ),
-            Ok(TitleMatch::Exact)
-        );
-        // Two adaptations of one title in one year, by different authors.
-        let key = "pretty rhythm aurora dream";
-        assert_eq!(
-            consolidate_gate(
-                key,
-                &md(
-                    "a",
-                    "Pretty Rhythm - Aurora Dream",
-                    Some(2011),
-                    Some("Fujimi Rio")
-                ),
-                &md(
-                    "b",
-                    "Pretty Rhythm: Aurora Dream",
-                    Some(2011),
-                    Some("Tachibana Mami")
-                ),
-            ),
-            Err("uncorroborated")
-        );
-        // The same pair with one author is a true MangaDex duplicate.
-        assert_eq!(
-            consolidate_gate(
-                key,
-                &md(
-                    "a",
-                    "Pretty Rhythm - Aurora Dream",
-                    Some(2011),
-                    Some("Fujimi Rio")
-                ),
-                &md("b", "Pretty Rhythm: Aurora Dream", None, Some("Fujimi Rio")),
-            ),
-            Ok(TitleMatch::Exact)
-        );
-        // A colored edition carries no sequel marker.
-        assert_eq!(
-            consolidate_gate(
-                "jujutsu kaisen",
-                &md("a", "Jujutsu Kaisen", Some(2018), Some("Akutami Gege")),
-                &md(
-                    "b",
-                    "Jujutsu Kaisen (Official Colored)",
-                    Some(2020),
-                    Some("Akutami Gege")
-                ),
-            ),
-            Ok(TitleMatch::Exact)
-        );
-    }
-
-    /// P0-1: the ambiguity gate. A shared normalized ALIAS is not evidence of a
-    /// duplicate — `merge_works` deletes the loser, so every condition must hold.
-    #[test]
-    fn consolidate_gate_requires_primary_title_length_and_corroboration() {
-        let n = "naruto";
-        // Corroborated by year: merges.
-        assert!(consolidate_gate(
-            n,
-            &cw("a", "Naruto", Some(1999), None),
-            &cw("b", "Naruto", Some(2000), None)
-        )
-        .is_ok());
-        // Corroborated by author (order-insensitive key): merges.
-        assert_eq!(
-            consolidate_gate(
-                n,
-                &cw("a", "Naruto", None, Some("Masashi Kishimoto")),
-                &cw("b", "Naruto", None, Some("Kishimoto, Masashi")),
-            ),
-            Ok(TitleMatch::Exact)
-        );
-        // Title only, nothing else: refused.
-        assert_eq!(
-            consolidate_gate(
-                n,
-                &cw("a", "Naruto", None, None),
-                &cw("b", "Naruto", None, None)
-            ),
-            Err("uncorroborated")
-        );
-        // Different authors + far-apart years: refused.
-        assert_eq!(
-            consolidate_gate(
-                n,
-                &cw("a", "Naruto", Some(1999), Some("A B")),
-                &cw("b", "Naruto", Some(2015), Some("C D")),
-            ),
-            Err("uncorroborated")
-        );
-        // The alias is only an ALT title on one side (its primary is something else).
-        // Between two MangaDex entries this is the JoJo/`ジョジョの奇妙な冒険` shape —
-        // refused outright, even with the same author and year.
-        assert_eq!(
-            consolidate_gate(
-                n,
-                &md("a", "Naruto", Some(1999), Some("Masashi Kishimoto")),
-                &md("b", "Boruto", Some(1999), Some("Masashi Kishimoto")),
-            ),
-            Err("alt_title_only")
-        );
-        // Off the spine a year is still no evidence for an alt-title match.
-        assert_eq!(
-            consolidate_gate(
-                n,
-                &cw("a", "Naruto", Some(1999), None),
-                &cw("b", "Boruto", Some(1999), None),
-            ),
-            Err("uncorroborated")
-        );
-        // Too short to be discriminating.
-        assert_eq!(
-            consolidate_gate(
-                "ao",
-                &cw("a", "Ao", Some(1999), None),
-                &cw("b", "Ao", Some(1999), None)
-            ),
-            Err("short_title")
-        );
-    }
-
-    /// A site publishes a series under the name MangaDex only lists as an alt title, or
-    /// drops the article. Those merge on author evidence — but never spine-to-spine.
-    #[test]
-    fn consolidate_gate_accepts_alt_and_article_matches_across_sources_only() {
-        let key = "apothecary diaries";
-        let spine = md(
-            "a",
-            "Kusuriya no Hitorigoto",
-            Some(2017),
-            Some("Hyuuga Natsu"),
-        );
-        // A source work named by the alt title, credited with a longer author list.
-        assert_eq!(
-            consolidate_gate(
-                key,
-                &spine,
-                &cw(
-                    "b",
-                    "The Apothecary Diaries",
-                    None,
-                    Some("Hyuuga Natsu, Nanao Itsuki")
-                ),
-            ),
-            Ok(TitleMatch::Loose)
-        );
-        // No author on the source side: nothing ties them together.
-        assert_eq!(
-            consolidate_gate(
-                key,
-                &spine,
-                &cw("b", "The Apothecary Diaries", Some(2017), None)
-            ),
-            Err("uncorroborated")
-        );
-        // Primary titles that differ only by an article are a LOOSE match…
-        let robot = "robot emperor";
-        assert_eq!(
-            consolidate_gate(
-                robot,
-                &md("a", "The Robot Emperor", Some(1958), Some("Fujita Shigeru")),
-                &cw("b", "Robot Emperor", None, Some("Fujita Shigeru")),
-            ),
-            Ok(TitleMatch::Loose)
-        );
-        // …so the year that would corroborate an exact title does not carry it…
-        assert_eq!(
-            consolidate_gate(
-                robot,
-                &cw("a", "The Robot Emperor", Some(1958), None),
-                &cw("b", "Robot Emperor", Some(1959), None),
-            ),
-            Err("uncorroborated")
-        );
-        // …and two MangaDex entries stay apart even with the same author.
-        assert_eq!(
-            consolidate_gate(
-                robot,
-                &md("a", "The Robot Emperor", Some(1958), Some("Fujita Shigeru")),
-                &md("b", "Robot Emperor", Some(1958), Some("Fujita Shigeru")),
-            ),
-            Err("alt_title_only")
-        );
-        // The same primary title on both sides is still EXACT, articles and all.
-        assert_eq!(
-            consolidate_gate(
-                "kill dragon",
-                &md(
-                    "a",
-                    "Kill the Dragon",
-                    Some(2022),
-                    Some("Baeksu Noble (백수귀족)")
-                ),
-                &cw("b", "Kill The Dragon", None, Some("Baeksu Noble")),
-            ),
-            Ok(TitleMatch::Exact)
-        );
-    }
-
-    /// Two parts of a franchise share its name as an alt title, and its author. Off the
-    /// spine that used to be enough for a loose match.
-    #[test]
-    fn consolidate_gate_refuses_a_key_that_is_only_an_alt_title_on_both_sides() {
-        assert_eq!(
-            consolidate_gate(
-                "jojo s bizarre adventure",
-                &md("a", "Phantom Blood", Some(1987), Some("Hirohiko Araki")),
-                &cw("b", "Battle Tendency", None, Some("Hirohiko Araki")),
-            ),
-            Err("alt_title_only")
-        );
-    }
-
-    /// A novel and its comic adaptation agree on everything the gate looks at. They are
-    /// still two works.
-    #[test]
-    fn consolidate_gate_never_merges_a_novel_with_a_non_novel() {
-        let author = Some("Chugong");
-        assert_eq!(
-            consolidate_gate(
-                "solo leveling",
-                &cw("a", "Solo Leveling", Some(2018), author),
-                &cw("b", "Solo Leveling (Novel)", Some(2018), author),
-            ),
-            Err("novel_mismatch")
-        );
-        // Two novels are judged like any other pair.
-        assert_eq!(
-            consolidate_gate(
-                "solo leveling novel",
-                &cw("a", "Solo Leveling (Novel)", None, author),
-                &cw("b", "Solo Leveling Novel", None, author),
-            ),
-            Ok(TitleMatch::Exact)
-        );
-    }
-
     /// Create a work with the given titles (first = primary) and one source of
     /// `source_type`, for the sweep tests.
     async fn sweep_work(
@@ -13638,10 +13490,10 @@ mod tests {
         assert!(work_exists(&pool, &comic).await && work_exists(&pool, &novel).await);
     }
 
-    /// One site title that is an alt title of TWO spine entries (a series and its
-    /// pre-serialization) has no single right target: ask a human instead of guessing.
+    /// One site title that is an alt title of TWO spine entries, a series and its
+    /// pre-serialization. The site's copy is the series, never the other edition.
     #[tokio::test]
-    async fn consolidate_refuses_an_alt_title_match_with_two_possible_targets() {
+    async fn consolidate_folds_a_site_copy_into_the_series_not_its_pre_serialization() {
         let pool = migrated_pool().await;
         let author = Some("DAUL (다울)");
         let series = sweep_work(
@@ -13671,11 +13523,9 @@ mod tests {
         let out = consolidate_exact_duplicates_from(&pool, None, 100, "")
             .await
             .unwrap();
-        assert!(out.merged.is_empty(), "{:?}", out.merged);
-        assert!(out.queued >= 1, "the ambiguous site copy goes to review");
-        for id in [&series, &pre, &site] {
-            assert!(work_exists(&pool, id).await);
-        }
+        assert_eq!(out.merged, vec![(site.clone(), series.clone())]);
+        assert!(work_exists(&pool, &series).await && work_exists(&pool, &pre).await);
+        assert!(!work_exists(&pool, &site).await);
     }
 
     /// A credit line naming both authors of two same-titled works matches BOTH exactly.
@@ -13742,19 +13592,13 @@ mod tests {
         )
         .await;
         let site = sweep_work(&pool, "suwayomi", &["Apothecary Diaries"], author).await;
-        let pair: Vec<ConsolidateWork> = sqlx::query_as(&format!(
-            "SELECT {CONSOLIDATE_WORK_COLUMNS} FROM work w WHERE w.id IN (?, ?)"
-        ))
-        .bind(&spine)
-        .bind(&site)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        let of = |id: &str| pair.iter().find(|w| w.id == id).unwrap();
+        let pair = catalog::load_match_data_batch(&pool, &[spine.clone(), site.clone()])
+            .await
+            .unwrap();
         let key = "apothecary diaries";
         let (expect_site, expect_spine) = (
-            of(&site).identity_under(key),
-            of(&spine).identity_under(key),
+            pair[&site].identity(Some(key)),
+            pair[&spine].identity(Some(key)),
         );
         assert!(expect_spine.mangadex_anchored && !expect_site.mangadex_anchored);
 
@@ -13831,7 +13675,7 @@ mod tests {
 
     /// P0-1 end-to-end: three MangaDex entries sharing one alias is a FRANCHISE cluster,
     /// not a duplicate cluster — even with one author and one year (every JoJo part).
-    /// Nothing may be merged; every pair goes to the review queue.
+    /// Nothing may be merged, and nothing is a question for the review queue either.
     #[tokio::test]
     async fn consolidate_refuses_oversized_alias_clusters() {
         let pool = migrated_pool().await;
@@ -13884,9 +13728,9 @@ mod tests {
             "a 3-way alias cluster must never merge: {:?}",
             out.merged
         );
-        assert!(
-            out.queued > 0,
-            "refused pairs must land in the review queue"
+        assert_eq!(
+            out.queued, 0,
+            "separate MangaDex entries are not a review question"
         );
         let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
@@ -13965,7 +13809,7 @@ mod tests {
 
         // No `source_series` for the loser → unqueueable, and NOTHING is written.
         assert!(
-            !queue_consolidate_review(&pool, &loser, &survivor)
+            !queue_consolidate_review(&pool, &loser, &survivor, 0.6)
                 .await
                 .unwrap(),
             "a loser with no source_series is reported unqueueable, not queued"
@@ -13991,7 +13835,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert!(queue_consolidate_review(&pool, &loser, &survivor)
+        assert!(queue_consolidate_review(&pool, &loser, &survivor, 0.6)
             .await
             .unwrap());
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
@@ -14006,7 +13850,7 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..3 {
-            assert!(queue_consolidate_review(&pool, &loser, &survivor)
+            assert!(queue_consolidate_review(&pool, &loser, &survivor, 0.6)
                 .await
                 .unwrap());
         }
@@ -14022,90 +13866,26 @@ mod tests {
         );
     }
 
-    /// REGRESSION: the cover-pHash rung copied `dedup`'s 0.90 threshold but not its
-    /// `is_discriminative_phash` guard, so a pair of blank/flat covers (dHash
-    /// `0000000000000000`) scored 1.00 against each other and became the SOLE
-    /// corroboration for an irreversible `merge_works` between two unrelated works.
-    #[test]
-    fn consolidate_gate_ignores_a_non_discriminative_cover_phash() {
-        let with_hash = |id: &str, hash: &str| ConsolidateWork {
-            id: id.into(),
-            primary_title: Some("Blank Cover Series".into()),
-            year: None,
-            author: None,
-            cover_phash: Some(hash.into()),
-            mangadex_anchored: false,
-        };
-        let n = "blank cover series";
-
-        // An all-zero (and an all-one) 64-bit dHash carries no signal: two of them are
-        // a perfect 1.00 "match" and must NOT corroborate anything.
-        assert_eq!(
-            consolidate_gate(
-                n,
-                &with_hash("a", "0000000000000000"),
-                &with_hash("b", "0000000000000000"),
-            ),
-            Err("uncorroborated"),
-            "a flat cover hash must not corroborate a merge"
-        );
-        assert_eq!(
-            consolidate_gate(
-                n,
-                &with_hash("a", "ffffffffffffffff"),
-                &with_hash("b", "ffffffffffffffff"),
-            ),
-            Err("uncorroborated")
-        );
-        // One discriminative side is not enough — dedup requires signal in the hash it
-        // is corroborating WITH, so both are tested.
-        assert_eq!(
-            consolidate_gate(
-                n,
-                &with_hash("a", "ff00ff00ff00ff00"),
-                &with_hash("b", "0000000000000000"),
-            ),
-            Err("uncorroborated")
-        );
-        // Two genuinely discriminative, near-identical hashes still corroborate.
-        assert_eq!(
-            consolidate_gate(
-                n,
-                &with_hash("a", "ff00ff00ff00ff00"),
-                &with_hash("b", "ff00ff00ff00ff01"),
-            ),
-            Ok(TitleMatch::Exact),
-            "a real cover match must still corroborate"
-        );
-        // The popcount window is dedup's 12..=52 — one bit set is below it.
-        assert!(!consolidate_phash_is_discriminative("0000000000000001"));
-        assert!(consolidate_phash_is_discriminative("ff00ff00ff00ff00"));
-        // Wrong length / non-hex are rejected rather than panicking.
-        assert!(!consolidate_phash_is_discriminative("ff00"));
-        assert!(!consolidate_phash_is_discriminative("zzzzzzzzzzzzzzzz"));
-    }
-
     /// REGRESSION: `consolidateExactDuplicates` used to restart its keyset walk at the
-    /// beginning on every call. A REFUSED cluster stays in `work_alias`, so the head of
-    /// the ordering silts up with refusals and the mutation goes permanently no-op —
-    /// measured on production, the first 100 alias groups hold 12 mergeable clusters and
-    /// 88 refusals, out of 1,154 mergeable clusters overall. Successive calls must
-    /// RESUME past what they already refused.
+    /// beginning on every call. A pair that is left alone stays in `work_alias`, so the
+    /// head of the ordering silts up with them and the mutation goes permanently no-op.
+    /// Successive calls must RESUME past what they already examined, and say when the
+    /// run is complete.
     #[tokio::test]
     async fn consolidate_mutation_resumes_past_refused_alias_groups() {
         let (s, pool) = setup_full(100).await;
         // Process-global cursor: start from a known point (other tests never touch it,
         // but do not rely on that).
-        *CONSOLIDATE_CURSOR.lock().unwrap_or_else(|e| e.into_inner()) = String::new();
+        *CONSOLIDATE_CURSOR.lock().unwrap_or_else(|e| e.into_inner()) = SweepCursor::default();
 
-        // Group 1 (sorts first): uncorroborated — no year, no author → always refused.
+        // Group 1 (sorts first): a short name and nothing else → always left alone.
         for _ in 0..2 {
             catalog::create_work(
                 &pool,
                 &catalog::WorkInput {
-                    primary_title: Some("Alpha Refused Title".into()),
+                    primary_title: Some("Alpha Dog".into()),
                     aliases: vec![catalog::Alias {
-                        raw: "Alpha Refused Title".into(),
+                        raw: "Alpha Dog".into(),
                         lang: None,
                     }],
                     ..Default::default()
@@ -14119,10 +13899,10 @@ mod tests {
             catalog::create_work(
                 &pool,
                 &catalog::WorkInput {
-                    primary_title: Some("Beta Mergeable Title".into()),
+                    primary_title: Some("Beta Cat".into()),
                     year: Some(2013),
                     aliases: vec![catalog::Alias {
-                        raw: "Beta Mergeable Title".into(),
+                        raw: "Beta Cat".into(),
                         lang: None,
                     }],
                     ..Default::default()
@@ -14132,49 +13912,201 @@ mod tests {
             .unwrap();
         }
 
-        let call = r#"mutation { consolidateExactDuplicates(limit: 1) }"#;
-        let r = exec(&s, call, Some("admintok"), "1.1.1.1").await;
-        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let call = r#"mutation { consolidateExactDuplicates(limit: 1) { merged done } }"#;
+        let run = |r: async_graphql::Response| {
+            assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+            r.data.into_json().unwrap()["consolidateExactDuplicates"].clone()
+        };
+        let first = run(exec(&s, call, Some("admintok"), "1.1.1.1").await);
         assert_eq!(
-            r.data.into_json().unwrap()["consolidateExactDuplicates"],
-            serde_json::json!(0),
-            "the first group is refused, so nothing merges yet"
+            first,
+            serde_json::json!({ "merged": 0, "done": false }),
+            "the first group is left alone, so nothing merges yet"
         );
 
         // Second call: must move ON to the next alias group instead of re-walking the
-        // refusal. Before the fix this returned 0 forever.
-        let r = exec(&s, call, Some("admintok"), "1.1.1.1").await;
-        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        // first. Before the fix this returned 0 forever.
+        let second = run(exec(&s, call, Some("admintok"), "1.1.1.1").await);
         assert_eq!(
-            r.data.into_json().unwrap()["consolidateExactDuplicates"],
+            second["merged"],
             serde_json::json!(1),
             "the second call must reach the group beyond the refused one"
         );
-        let alpha: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM work WHERE primary_title = 'Alpha Refused Title'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let beta: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM work WHERE primary_title = 'Beta Mergeable Title'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(alpha, 2, "the refused pair is never merged");
-        assert_eq!(beta, 1, "the corroborated pair folds");
+        let count = |title: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM work WHERE primary_title = ?")
+                    .bind(title)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(count("Alpha Dog").await, 2, "the weak pair is never merged");
+        assert_eq!(count("Beta Cat").await, 1, "the corroborated pair folds");
 
-        // Running off the end wraps back to the start, so newly-minted duplicates are
-        // still reachable without a restart.
+        // Running off the end reports `done` and wraps back to the start, so
+        // newly-minted duplicates are still reachable without a restart.
+        let mut done = false;
         for _ in 0..3 {
-            let _ = exec(&s, call, Some("admintok"), "1.1.1.1").await;
+            done |= run(exec(&s, call, Some("admintok"), "1.1.1.1").await)["done"] == true;
         }
+        assert!(done, "the run must report that it reached the end");
+    }
+
+    /// THE BUG THIS FIXES: the sweep sent every pair it did not merge to the review
+    /// queue — including two MangaDex entries that only share an alt title, which are
+    /// separate works by construction. On production each batch merged ~10 works and
+    /// queued ~250 such pairs, so pressing "Merge duplicates" grew the Duplicates page.
+    #[tokio::test]
+    async fn consolidate_does_not_queue_pairs_that_are_two_different_works() {
+        let pool = migrated_pool().await;
+        // A franchise: two spine entries sharing its name as an alt title.
+        let araki = Some("Hirohiko Araki");
+        let franchise = "JoJo's Bizarre Adventure";
+        sweep_work(&pool, "mangadex", &["Phantom Blood", franchise], araki).await;
+        sweep_work(&pool, "mangadex", &["Battle Tendency", franchise], araki).await;
+        // Namesakes by different people.
+        sweep_work(
+            &pool,
+            "mangadex",
+            &["Black Diamond"],
+            Some("Fujisawa Tohru"),
+        )
+        .await;
+        sweep_work(&pool, "mangadex", &["Black Diamond"], Some("Fuwa Shinri")).await;
+        // A real question: one name, no evidence either way.
+        sweep_work(&pool, "suwayomi", &["The Mad Dog"], None).await;
+        sweep_work(&pool, "suwayomi", &["Mad Dog"], None).await;
+
+        let out = consolidate_exact_duplicates_from(&pool, None, 100, "")
+            .await
+            .unwrap();
+        assert!(out.merged.is_empty(), "{:?}", out.merged);
+        assert_eq!(out.queued, 1, "only the real question is queued");
+        let queued: Vec<(String, f64)> = sqlx::query_as(
+            "SELECT w.primary_title, mc.score FROM merge_candidate mc              JOIN work w ON w.id = mc.candidate_work_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].0.contains("Mad Dog"));
+        assert!(queued[0].1 > 0.5, "queued with its real score: {queued:?}");
+    }
+
+    /// The other half of the fix: reviews already waiting are sorted by the same rules.
+    /// Two different works are closed, one series is merged, a question stays.
+    #[tokio::test]
+    async fn pending_reviews_are_merged_dismissed_or_kept() {
+        let pool = migrated_pool().await;
+        let queue = |loser: String, survivor: String| {
+            let pool = pool.clone();
+            async move {
+                assert!(queue_consolidate_review(&pool, &loser, &survivor, 0.6)
+                    .await
+                    .unwrap());
+            }
+        };
+        // Two MangaDex entries sharing an alt title → dismissed.
+        let grave = sweep_work(&pool, "mangadex", &["Grave"], Some("Tsurita Kuniko")).await;
+        let haka = sweep_work(&pool, "mangadex", &["Haka", "Grave"], Some("Kashimiharu")).await;
+        queue(grave.clone(), haka.clone()).await;
+        // A site's copy named by the alt title, same author → merged into the spine,
+        // even though the review row points from the spine to the site.
+        let spine = sweep_work(
+            &pool,
+            "mangadex",
+            &["Kusuriya no Hitorigoto", "The Apothecary Diaries"],
+            Some("Hyuuga Natsu"),
+        )
+        .await;
+        let site = sweep_work(
+            &pool,
+            "suwayomi",
+            &["The Apothecary Diaries"],
+            Some("Hyuuga Natsu"),
+        )
+        .await;
+        queue(spine.clone(), site.clone()).await;
+        // A short shared name and nothing else → still a question.
+        let one = sweep_work(&pool, "suwayomi", &["The Mad Dog"], None).await;
+        let two = sweep_work(&pool, "suwayomi", &["Mad Dog"], None).await;
+        queue(one.clone(), two.clone()).await;
+
+        let out = sort_pending_reviews(&pool, None, "", 100).await.unwrap();
+        assert_eq!(out.seen, 3);
+        assert_eq!(out.dismissed, 1);
+        assert_eq!(out.merged, vec![(site.clone(), spine.clone())]);
+        assert!(work_exists(&pool, &spine).await && !work_exists(&pool, &site).await);
+        for id in [&grave, &haka, &one, &two] {
+            assert!(work_exists(&pool, id).await, "only the site copy is folded");
+        }
+        let statuses: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, COUNT(*) FROM merge_candidate GROUP BY status ORDER BY status",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(
-            *CONSOLIDATE_CURSOR.lock().unwrap_or_else(|e| e.into_inner()),
-            "",
-            "the cursor wraps once the walk runs off the end"
+            statuses,
+            vec![("dismissed".to_string(), 1), ("pending".to_string(), 1)],
+            "the merged pair's review is gone, the question remains"
         );
+        // A second pass changes nothing, and the sweep does not re-queue the dismissal.
+        let again = sort_pending_reviews(&pool, None, "", 100).await.unwrap();
+        assert!(again.merged.is_empty() && again.dismissed == 0);
+        consolidate_exact_duplicates_from(&pool, None, 100, "")
+            .await
+            .unwrap();
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate WHERE status = 'pending'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pending, 1);
+    }
+
+    /// A person's "no" outranks the rules: a rejected pair is never merged, and three
+    /// copies of one series are not an ambiguity just because each could fold into
+    /// either of the others.
+    #[tokio::test]
+    async fn pending_review_merges_respect_rejections_and_sibling_copies() {
+        let pool = migrated_pool().await;
+        let title = "The Return of the Unrivaled Genius Ranker";
+        let a = sweep_work(&pool, "suwayomi", &[title], None).await;
+        let b = sweep_work(&pool, "suwayomi", &[title], None).await;
+        let c = sweep_work(&pool, "suwayomi", &[title], None).await;
+        assert!(queue_consolidate_review(&pool, &b, &a, 0.6).await.unwrap());
+        assert!(queue_consolidate_review(&pool, &c, &a, 0.6).await.unwrap());
+        let out = sort_pending_reviews(&pool, None, "", 100).await.unwrap();
+        assert_eq!(out.merged.len(), 2, "{:?}", out.merged);
+        assert!(work_exists(&pool, &a).await);
+
+        // Two namesake targets that are NOT duplicates of each other: no single answer.
+        let first = sweep_work(
+            &pool,
+            "mangadex",
+            &["After School Detective Club"],
+            Some("Aki Tanaka"),
+        )
+        .await;
+        let second = sweep_work(
+            &pool,
+            "mangadex",
+            &["After School Detective Club"],
+            Some("Yui Sato"),
+        )
+        .await;
+        let copy = sweep_work(&pool, "suwayomi", &["After School Detective Club"], None).await;
+        assert!(queue_consolidate_review(&pool, &copy, &first, 0.6)
+            .await
+            .unwrap());
+        let out = sort_pending_reviews(&pool, None, "", 100).await.unwrap();
+        assert!(out.merged.is_empty(), "{:?}", out.merged);
+        for id in [&first, &second, &copy] {
+            assert!(work_exists(&pool, id).await);
+        }
     }
 
     #[tokio::test]
@@ -17571,6 +17503,110 @@ mod tests {
              `total` must agree with the empty page"
         );
         assert!(d["items"].as_array().unwrap().is_empty());
+    }
+
+    /// Every source-owned field of a work can be set by an admin, reads back through the
+    /// reader's own queries, and returns to the source's value when the edit is cleared.
+    #[tokio::test]
+    async fn an_admin_can_pin_and_release_every_source_owned_field() {
+        let (s, pool) = setup_full(100).await;
+        seed_canonical(&pool, "md-edit", "Editable Work", false, "1").await;
+        let wid = work_id_of(&pool, "md-edit").await;
+        sqlx::query("UPDATE work SET author = 'Source Author', year = 2001 WHERE id = ?")
+            .bind(&wid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO work_credit (work_id, role, name) VALUES (?, 'author', 'Source Author')",
+        )
+        .bind(&wid)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run = |query: String, token: Option<&'static str>| {
+            let s = &s;
+            async move { exec(s, &query, token, "1.1.1.1").await }
+        };
+        let edit = format!(
+            r#"mutation {{ updateSeriesMetadata(input: {{ seriesId: "{wid}",
+                author: "Right Author, Second Author", artist: "Right Artist", year: 2019,
+                originalLanguage: "KO", status: HIATUS, demographic: SEINEN,
+                contentRating: SUGGESTIVE }}) {{ id author artist status type
+                credits {{ role name }}
+                metadata {{ year originalLanguage demographic contentRating }} }} }}"#
+        );
+        // Not for readers.
+        assert!(!run(edit.clone(), Some("bobtok")).await.errors.is_empty());
+        let r = run(edit, Some("admintok")).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let series = r.data.into_json().unwrap()["updateSeriesMetadata"].clone();
+        assert_eq!(series["author"], "Right Author, Second Author");
+        assert_eq!(series["artist"], "Right Artist");
+        assert_eq!(series["status"], "HIATUS");
+        assert_eq!(
+            series["type"], "MANHWA",
+            "the type follows the origin language"
+        );
+        assert_eq!(
+            series["metadata"],
+            serde_json::json!({ "year": 2019, "originalLanguage": "ko",
+                "demographic": "seinen", "contentRating": "suggestive" })
+        );
+        assert_eq!(
+            series["credits"],
+            serde_json::json!([
+                { "role": "artist", "name": "Right Artist" },
+                { "role": "author", "name": "Right Author" },
+                { "role": "author", "name": "Second Author" },
+            ]),
+            "the pinned names replace the source's credits"
+        );
+
+        let meta = format!(
+            r#"{{ seriesAdminMeta(seriesId: "{wid}") {{ author year originalLanguage status
+                demographic contentRating pinnedFields }} }}"#
+        );
+        let r = run(meta.clone(), Some("admintok")).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(
+            r.data.into_json().unwrap()["seriesAdminMeta"],
+            serde_json::json!({ "author": "Right Author, Second Author", "year": 2019,
+                "originalLanguage": "ko", "status": "HIATUS", "demographic": "SEINEN",
+                "contentRating": "SUGGESTIVE",
+                "pinnedFields": ["artist", "author", "contentRating", "demographic",
+                    "originalLanguage", "status", "year"] })
+        );
+
+        // Bad values are refused, and refuse the whole edit.
+        for bad in [r#"year: 12"#, r#"originalLanguage: "not a code""#] {
+            let m = format!(
+                r#"mutation {{ updateSeriesMetadata(input: {{ seriesId: "{wid}", artist: "Lost", {bad} }}) {{ id }} }}"#
+            );
+            assert!(!run(m, Some("admintok")).await.errors.is_empty(), "{bad}");
+        }
+
+        // Clearing hands the fields back to the source.
+        let release = format!(
+            r#"mutation {{ updateSeriesMetadata(input: {{ seriesId: "{wid}", author: null,
+                year: null }}) {{ author artist credits {{ role name }} metadata {{ year }} }} }}"#
+        );
+        let r = run(release, Some("admintok")).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let series = r.data.into_json().unwrap()["updateSeriesMetadata"].clone();
+        assert_eq!(series["author"], "Source Author");
+        assert_eq!(
+            series["artist"], "Right Artist",
+            "a refused edit changed nothing"
+        );
+        assert_eq!(series["metadata"]["year"], 2001);
+        assert_eq!(
+            series["credits"],
+            serde_json::json!([
+                { "role": "artist", "name": "Right Artist" },
+                { "role": "author", "name": "Source Author" },
+            ])
+        );
     }
 
     // ---- Browse / search(query: "") over the canonical catalogue (migration 0068) -----

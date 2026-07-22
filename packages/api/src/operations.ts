@@ -1699,6 +1699,14 @@ export const SERIES_ADMIN_META = /* GraphQL */ `
 			isNsfwOverride
 			tags
 			hasCuratedTags
+			author
+			artist
+			year
+			originalLanguage
+			status
+			demographic
+			contentRating
+			pinnedFields
 		}
 	}
 `;
@@ -1732,7 +1740,13 @@ export const REMOVE_SERIES_ALT_TITLE = /* GraphQL */ `
 
 export const CONSOLIDATE_EXACT_DUPLICATES = /* GraphQL */ `
 	mutation ConsolidateExactDuplicates($limit: Int) {
-		consolidateExactDuplicates(limit: $limit)
+		consolidateExactDuplicates(limit: $limit) {
+			merged
+			dismissed
+			queued
+			pending
+			done
+		}
 	}
 `;
 

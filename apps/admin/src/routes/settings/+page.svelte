@@ -239,30 +239,28 @@
 	}
 
 	// ---- Maintenance: bulk consolidation (destructive) ------------------------
-	// One batch of clusters per server call. The run is BOUNDED (never "loop until
-	// the server says zero"): a confirm gates the first batch, MAX_BATCHES caps a
-	// single run, and Stop halts it between batches. Matching is by title or
-	// alternative title with articles ignored, and the server only merges on author
-	// or cover evidence (never a novel into a non-novel). It is still irreversible,
-	// so it stays attended by design.
+	// One batch per server call: waiting reviews first, then groups of works that share
+	// a title. The run is BOUNDED: a confirm gates the first batch, MAX_BATCHES caps a
+	// single run, and Stop halts it between batches. The server merges a pair only on
+	// evidence, closes pairs that are two different works, and leaves real questions in
+	// Duplicates. A merge is irreversible, so the run stays attended by design.
 	const BATCH_SIZE = 200;
-	const MAX_BATCHES = 5;
+	const MAX_BATCHES = 80;
 
 	let consolidating = $state(false);
 	let stopRequested = $state(false);
 	let consolidateMsg = $state<string | null>(null);
 	let batchesDone = $state(0);
-	let mergedTotal = $state(0);
 
 	async function consolidate(): Promise<void> {
 		if (consolidating) return;
 		const ok = await confirm({
 			title: 'Merge duplicate works?',
 			message:
-				`This merges works that share a title or an alternative title. Articles (the, a, an) are ignored, so "The X" matches "X".\n\n` +
-				`A merge needs proof: the same author or a matching cover. A novel is never merged with a non-novel. Two MangaDex entries merge only on the exact same title, and a sequel such as "Season 2" stays separate. Unclear pairs go to Duplicates for review.\n\n` +
-				`Each merge permanently deletes the merged work. There is no undo.\n\n` +
-				`One run handles at most ${MAX_BATCHES} batches of ${BATCH_SIZE} groups. You can stop it between batches.`,
+				`This sorts every pair of works that share a title or an alternative title. Articles (the, a, an) are ignored, so "The X" matches "X".\n\n` +
+				`A pair is merged when the author, description, cover or original-language title also matches, or when the shared title is long enough to mean one series. Two MangaDex entries merge only on the same title and the same author. A novel, a sequel, a promo or a work in another language stays separate.\n\n` +
+				`Pairs that are clearly two different works are closed. Unclear pairs stay in Duplicates, likeliest first.\n\n` +
+				`Each merge permanently deletes the merged work. There is no undo. You can stop the run between batches.`,
 			confirmLabel: 'Merge duplicates',
 			danger: true,
 		});
@@ -270,10 +268,16 @@
 		consolidating = true;
 		stopRequested = false;
 		batchesDone = 0;
-		mergedTotal = 0;
 		consolidateMsg = 'Starting…';
+		let merged = 0;
+		let dismissed = 0;
+		let pending: number | null = null;
 		let stopped = false;
-		let exhausted = false;
+		let finished = false;
+		const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
+		const summary = () =>
+			`Merged ${count(merged, 'work')}. Closed ${count(dismissed, 'pair')} as different works.` +
+			(pending === null ? '' : ` ${count(pending, 'pair')} left to review.`);
 		try {
 			for (let i = 0; i < MAX_BATCHES; i++) {
 				// `left`: each batch deletes works for good, so a run nobody can see or stop
@@ -282,26 +286,25 @@
 					stopped = true;
 					break;
 				}
-				const n = await consolidateDuplicates(BATCH_SIZE);
+				const batch = await consolidateDuplicates(BATCH_SIZE);
 				batchesDone += 1;
-				mergedTotal += n;
-				consolidateMsg = `Batch ${batchesDone} of ${MAX_BATCHES} done. Merged ${mergedTotal} work${mergedTotal === 1 ? '' : 's'} so far.`;
-				if (n === 0) {
-					exhausted = true;
+				merged += batch.merged;
+				dismissed += batch.dismissed;
+				pending = batch.pending;
+				consolidateMsg = `Batch ${batchesDone} done. ${summary()}`;
+				if (batch.done) {
+					finished = true;
 					break;
 				}
 			}
-			const merged = `merged ${mergedTotal} work${mergedTotal === 1 ? '' : 's'} in ${batchesDone} batch${batchesDone === 1 ? '' : 'es'}`;
 			consolidateMsg = stopped
-				? `Stopped: ${merged}.`
-				: exhausted
-					? mergedTotal === 0
-						? 'No duplicate groups left to merge.'
-						: `Done: ${merged}. Nothing left to merge.`
-					: `Batch limit reached: ${merged}. Run again to continue.`;
+				? `Stopped. ${summary()}`
+				: finished
+					? `Done. ${summary()}`
+					: `Batch limit reached. ${summary()} Run again to continue.`;
 		} catch (err) {
 			const why = err instanceof Error ? err.message : 'Merging failed.';
-			consolidateMsg = `${why} (Merged ${mergedTotal} work${mergedTotal === 1 ? '' : 's'} before failing.)`;
+			consolidateMsg = `${why} Before the failure: ${summary()}`;
 		} finally {
 			consolidating = false;
 			stopRequested = false;
@@ -575,11 +578,11 @@
 						<div class="setting-text">
 							<p class="setting-name">Merge duplicate works</p>
 							<p class="k-hint">
-								Merge works that share a title or an alternative title when the author or cover also
-								matches. Articles (the, a, an) are ignored. A novel is never merged with a
-								non-novel. Each merge deletes the merged work and cannot be undone. Unclear pairs go
-								to
-								<a class="k-link" href="/review">Duplicates</a>.
+								Sort works that share a title or an alternative title. Articles (the, a, an) are
+								ignored. A pair with matching evidence is merged. A pair that is two different
+								works is closed. Each merge deletes the merged work and cannot be undone. Unclear
+								pairs stay in
+								<a class="k-link" href="/review">Duplicates</a>, likeliest first.
 							</p>
 							{#if consolidateMsg}
 								<p class="result" role="status">{consolidateMsg}</p>
@@ -592,9 +595,7 @@
 								</Button>
 							{/if}
 							<Button variant="danger" icon="merge" busy={consolidating} onclick={consolidate}>
-								{consolidating
-									? `Merging, batch ${batchesDone + 1} of ${MAX_BATCHES}`
-									: 'Merge duplicates'}
+								{consolidating ? `Merging, batch ${batchesDone + 1}` : 'Merge duplicates'}
 							</Button>
 						</div>
 					</div>

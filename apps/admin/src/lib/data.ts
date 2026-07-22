@@ -12,6 +12,7 @@ import type {
 	Id,
 	MatchResult,
 	MergeCandidate,
+	DuplicateSweepResult,
 	MergeWorksResult,
 	Paginated,
 	Report,
@@ -565,15 +566,14 @@ export async function removeSeriesAltTitle(id: string, title: string): Promise<S
 }
 
 /**
- * Merge one batch of the duplicate-work backlog — up to `limit` clusters per call.
- * Returns how many works were merged away (0 when the backlog is clear).
+ * Sort one batch of the duplicate backlog — up to `limit` waiting reviews, then up to
+ * `limit` groups of works that share a title. Each pair is merged, closed as two
+ * different works, or left in the review queue. `done` marks the end of a run.
  *
- * DESTRUCTIVE: each cluster folds via `merge_works`, which physically DELETEs the
- * losing work. Clusters are grouped by NORMALIZED ALIAS (alternative titles included),
- * so this is broader than "same exact title" — callers must confirm it and bound the
- * number of batches rather than looping until the server returns zero.
+ * DESTRUCTIVE: a merge folds via `merge_works`, which physically DELETEs the losing
+ * work. Callers must confirm it and bound the number of batches.
  */
-export async function consolidateDuplicates(limit?: number): Promise<number> {
+export async function consolidateDuplicates(limit?: number): Promise<DuplicateSweepResult> {
 	if (!backend.consolidateExactDuplicates)
 		throw new Error('Duplicate consolidation is unavailable on this backend.');
 	return withTimeout(

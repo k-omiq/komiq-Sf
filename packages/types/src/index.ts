@@ -156,6 +156,20 @@ export interface MatchResult {
 	sourceSeriesId: string;
 }
 
+/** What one batch of the admin duplicate sweep (`consolidateExactDuplicates`) did. */
+export interface DuplicateSweepResult {
+	/** Works merged away by this batch. */
+	merged: number;
+	/** Waiting reviews closed as "two different works" by this batch. */
+	dismissed: number;
+	/** Pairs this batch sent to the review queue. */
+	queued: number;
+	/** Reviews still waiting for a person, after this batch. */
+	pending: number;
+	/** True when this batch reached the end of the run. */
+	done: boolean;
+}
+
 /**
  * The result of folding one canonical work into another (admin `mergeWorks`):
  * the source work's mappings + user data re-point to the target and the source

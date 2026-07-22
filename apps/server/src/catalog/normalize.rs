@@ -146,7 +146,15 @@ pub fn novel_mismatch(a: Option<&str>, b: Option<&str>) -> bool {
 /// Noise words that name an instalment rather than a format. "Overlord Season 2" and
 /// "Overlord" share a `normalize_title` key so a site's per-season listing finds its
 /// series, but the stripped marker still says they may be different works.
-const SEQUEL_TAIL: &[&str] = &["season", "part", "cour", "arc"];
+const SEQUEL_TAIL: &[&str] = &[
+    "season",
+    "part",
+    "cour",
+    "arc",
+    "remake",
+    "remaster",
+    "remastered",
+];
 
 /// The instalment marker `normalize_title` strips from the end of `raw`: its sequel
 /// words and their numbers ("Rosario to Vampire Season II" -> `["season", "ii"]`),
@@ -179,6 +187,70 @@ fn sequel_marker(raw: &str) -> Vec<String> {
 pub fn sequel_mismatch(a: Option<&str>, b: Option<&str>) -> bool {
     let marker = |t: Option<&str>| t.map(sequel_marker).unwrap_or_default();
     marker(a) != marker(b)
+}
+
+/// Words that name a different edition of a series rather than the series itself: a
+/// promo, a pre-serialization, a doujinshi, an anthology, a one-shot, a side story.
+const EDITION_WORDS: &[&str] = &[
+    "promo",
+    "serialization",
+    "serialisation",
+    "preserialization",
+    "doujinshi",
+    "anthology",
+    "oneshot",
+    "shot",
+    "gaiden",
+    "spinoff",
+    "side",
+    "extras",
+    "fan",
+];
+
+/// Lowercased alphanumeric tokens of a raw title, diacritics folded.
+fn raw_tokens(raw: &str) -> Vec<String> {
+    raw.to_lowercase()
+        .chars()
+        .map(fold_diacritic)
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// True when one title names an edition the other does not ("X" vs "X (Promo)",
+/// "X - Side Stories", "X (Fan Colored)"). Such a pair is related, but it is not one
+/// work, so it never merges automatically. A missing title names no edition.
+pub fn edition_mismatch(a: Option<&str>, b: Option<&str>) -> bool {
+    let editions = |t: Option<&str>| {
+        let mut found: Vec<String> = t
+            .map(raw_tokens)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|w| EDITION_WORDS.contains(&w.as_str()))
+            .collect();
+        found.sort();
+        found.dedup();
+        found
+    };
+    editions(a) != editions(b)
+}
+
+/// True when two titles carry different numbers ("X" vs "X 2", "Anz" vs "Anz 2025").
+/// A number one title lacks usually marks a sequel or another year's edition.
+pub fn number_mismatch(a: Option<&str>, b: Option<&str>) -> bool {
+    let numbers = |t: Option<&str>| {
+        let mut found: Vec<String> = t
+            .map(raw_tokens)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|w| w.chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        found.sort();
+        found
+    };
+    numbers(a) != numbers(b)
 }
 
 /// True when `s` is a genuinely, canonically formed Roman numeral (e.g. "ii", "iv",
@@ -253,6 +325,37 @@ mod tests {
             normalize_title("Re:ZERO -Starting Life-"),
             "re zero starting life"
         );
+    }
+
+    #[test]
+    fn edition_and_number_markers_keep_related_works_apart() {
+        assert!(edition_mismatch(
+            Some("Solo Leveling: Ragnarok"),
+            Some("Solo Leveling: Ragnarok (Pre-serialization)")
+        ));
+        assert!(edition_mismatch(Some("Estio"), Some("Estio (Promo)")));
+        assert!(edition_mismatch(
+            Some("Leviathan"),
+            Some("Leviathan - Side Stories")
+        ));
+        assert!(!edition_mismatch(
+            Some("Yuri Ecchi Anthology"),
+            Some("Yuri Erotic Anthology")
+        ));
+        assert!(!edition_mismatch(Some("Naruto"), None));
+        assert!(number_mismatch(
+            Some("My Stepmom Made Me Her Toy"),
+            Some("My Stepmom Made Me Her Toy 2")
+        ));
+        assert!(!number_mismatch(
+            Some("Starting With 13 Hidden Traits"),
+            Some("Hidden Teukseong 13-gae Deulgo Sijakhanda")
+        ));
+        // A remake is its own MangaDex entry, like a sequel.
+        assert!(sequel_mismatch(
+            Some("Lord of the Mysteries"),
+            Some("Lord of the Mysteries (Remake)")
+        ));
     }
 
     #[test]

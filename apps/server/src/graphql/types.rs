@@ -253,6 +253,29 @@ pub fn demographic_word(d: Demographic) -> &'static str {
     }
 }
 
+/// The demographic a stored word names (the inverse of [`demographic_word`]). A work
+/// with no demographic stores NULL, not `"none"`.
+pub fn demographic_from_word(word: &str) -> Option<Demographic> {
+    match word.trim().to_lowercase().as_str() {
+        "shounen" => Some(Demographic::Shounen),
+        "shoujo" => Some(Demographic::Shoujo),
+        "seinen" => Some(Demographic::Seinen),
+        "josei" => Some(Demographic::Josei),
+        _ => None,
+    }
+}
+
+/// The rating a stored `content_rating` word names.
+pub fn content_rating_from_word(word: &str) -> Option<ContentRating> {
+    match word.trim().to_lowercase().as_str() {
+        "safe" => Some(ContentRating::Safe),
+        "suggestive" => Some(ContentRating::Suggestive),
+        "erotica" => Some(ContentRating::Erotica),
+        "pornographic" => Some(ContentRating::Pornographic),
+        _ => None,
+    }
+}
+
 /// The stored `content_rating` word for a v2 rating.
 pub fn content_rating_word(r: ContentRating) -> &'static str {
     match r {
@@ -903,6 +926,20 @@ pub struct SeriesMetadataInput {
     /// The full curated tag/genre set (a whole-list replace). NULL clears the
     /// curated set so genres derive from the source again.
     pub tags: MaybeUndefined<Vec<String>>,
+    /// The fields below are owned by the source. A VALUE pins the field, so later
+    /// syncs keep it; NULL removes the pin and restores the source's value. An empty
+    /// `author` / `artist` / `originalLanguage` pins the field empty.
+    pub author: MaybeUndefined<String>,
+    pub artist: MaybeUndefined<String>,
+    /// First publication year.
+    pub year: MaybeUndefined<i32>,
+    /// Origin language code, e.g. `ja`, `ko`, `zh`, `zh-hk`, `en`.
+    pub original_language: MaybeUndefined<String>,
+    /// Publication status.
+    pub status: MaybeUndefined<SeriesStatus>,
+    /// `NONE` pins "no demographic".
+    pub demographic: MaybeUndefined<Demographic>,
+    pub content_rating: MaybeUndefined<ContentRating>,
 }
 
 /// The raw override state of a work, for the series-detail editor to show what is
@@ -920,6 +957,17 @@ pub struct SeriesAdminMeta {
     pub tags: Vec<String>,
     /// Whether `tags` is an admin-curated set (true) or derived from the source (false).
     pub has_curated_tags: bool,
+    /// The work's current source-owned fields, pinned or not.
+    pub author: Option<String>,
+    pub artist: Option<String>,
+    pub year: Option<i32>,
+    pub original_language: Option<String>,
+    pub status: Option<SeriesStatus>,
+    pub demographic: Option<Demographic>,
+    pub content_rating: Option<ContentRating>,
+    /// Which of those fields an admin has pinned, by their name in this type
+    /// (`author`, `originalLanguage`, …).
+    pub pinned_fields: Vec<String>,
 }
 
 /// One chapter of a canonical work in the admin editor: its aggregate identity plus

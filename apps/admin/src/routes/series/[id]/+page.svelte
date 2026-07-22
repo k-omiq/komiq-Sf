@@ -1,12 +1,18 @@
 <script lang="ts">
 	import type { Series, WorkSource } from '@komika/types';
-	import type { AdminChapter, SeriesAdminMeta, SeriesMetadataInput } from '@komika/api';
+	import type {
+		AdminChapter,
+		PinnableField,
+		SeriesAdminMeta,
+		SeriesMetadataInput,
+	} from '@komika/api';
 	import { page } from '$app/state';
 	import { afterNavigate, beforeNavigate } from '$app/navigation';
 	import { assetSrc } from '$lib/config';
 	import { confirm } from '$lib/confirm.svelte';
 	import {
 		COMIC_TYPE_OPTIONS,
+		STATUS_OPTIONS,
 		addSeriesAltTitle,
 		loadSeriesAdminMeta,
 		loadSeriesDetail,
@@ -99,7 +105,22 @@
 		}
 	}
 
+	const LANGUAGE_OPTIONS = ['ja', 'ko', 'zh', 'zh-hk', 'en', 'fr', 'es', 'id', 'vi', 'th'];
+	const DEMOGRAPHIC_OPTIONS = ['NONE', 'SHOUNEN', 'SHOUJO', 'SEINEN', 'JOSEI'] as const;
+	const RATING_OPTIONS = ['SAFE', 'SUGGESTIVE', 'EROTICA', 'PORNOGRAPHIC'] as const;
+
 	let meta = $state<SeriesAdminMeta | null>(null);
+	/** The label of the "follow the source" choice: it names the value in use when the
+	 * field is not pinned. */
+	function autoLabel(field: PinnableField, current: string | null): string {
+		if (meta?.pinnedFields.includes(field)) return 'Auto (use the source value)';
+		return current ? `Auto (now ${current})` : 'Auto (the source has no value)';
+	}
+	/** The hint inside an empty text field: the source value it falls back to. */
+	function autoHint(field: PinnableField, current: string | null): string {
+		if (meta?.pinnedFields.includes(field)) return 'Leave empty to use the source value';
+		return current ?? 'The source has no value';
+	}
 	let sources = $state<WorkSource[]>([]);
 	let chapters = $state<AdminChapter[]>([]);
 	let loading = $state(true);
@@ -111,6 +132,18 @@
 	let fType = $state(''); // '' => Auto (clear override), else a ComicType word
 	let fNsfw = $state<'auto' | 'sfw' | 'nsfw'>('auto');
 	let fTags = $state<string[]>([]);
+	// Fields the source owns. '' => follow the source; anything else pins that value,
+	// so a later sync keeps it.
+	let fAuthor = $state('');
+	let fArtist = $state('');
+	let fYear = $state('');
+	let fLanguage = $state('');
+	let fStatus = $state('');
+	let fDemographic = $state('');
+	let fRating = $state('');
+	// What the pinned fields held when the form was seeded. Only a field that moved
+	// away from this is sent on save.
+	let pinSeed = { author: '', artist: '', year: '', language: '', status: '', demographic: '', rating: '' };
 	// Whether the admin has touched the tag chips this session. Tags are seeded from
 	// the EFFECTIVE genres (which may be merely source-derived), so we only send them
 	// on save when actually edited — otherwise saving would silently PIN source genres
@@ -126,7 +159,21 @@
 	let loadSeq = 0;
 
 	let formBaseline = $state('');
-	const formSnapshot = () => JSON.stringify([fTitle, fDescription, fType, fNsfw, fTags]);
+	const formSnapshot = () =>
+		JSON.stringify([
+			fTitle,
+			fDescription,
+			fType,
+			fNsfw,
+			fTags,
+			fAuthor,
+			fArtist,
+			fYear,
+			fLanguage,
+			fStatus,
+			fDemographic,
+			fRating,
+		]);
 	const metadataDirty = $derived(!!meta && formBaseline !== formSnapshot());
 	beforeNavigate(({ cancel }) => {
 		// Must answer synchronously, so this one stays a native prompt.
@@ -145,6 +192,24 @@
 		fNsfw = m.isNsfwOverride === null ? 'auto' : m.isNsfwOverride ? 'nsfw' : 'sfw';
 		fTags = [...m.tags];
 		tagsDirty = false;
+		const pinned = (field: PinnableField) => m.pinnedFields.includes(field);
+		pinSeed = {
+			author: pinned('author') ? (m.author ?? '') : '',
+			artist: pinned('artist') ? (m.artist ?? '') : '',
+			year: pinned('year') && m.year !== null ? String(m.year) : '',
+			language: pinned('originalLanguage') ? (m.originalLanguage ?? '') : '',
+			status: pinned('status') ? (m.status ?? '') : '',
+			// A pinned empty demographic is the admin saying "none".
+			demographic: pinned('demographic') ? (m.demographic ?? 'NONE') : '',
+			rating: pinned('contentRating') ? (m.contentRating ?? '') : '',
+		};
+		fAuthor = pinSeed.author;
+		fArtist = pinSeed.artist;
+		fYear = pinSeed.year;
+		fLanguage = pinSeed.language;
+		fStatus = pinSeed.status;
+		fDemographic = pinSeed.demographic;
+		fRating = pinSeed.rating;
 		formBaseline = formSnapshot();
 	}
 
@@ -293,6 +358,27 @@
 		};
 		// Only touch tags when edited (omit key => server leaves them unchanged).
 		if (tagsDirty) input.tags = fTags;
+		// A pinned field is sent only when it changed. Empty hands it back to the source.
+		const author = fAuthor.trim();
+		if (author !== pinSeed.author) input.author = author || null;
+		const artist = fArtist.trim();
+		if (artist !== pinSeed.artist) input.artist = artist || null;
+		const year = fYear.trim();
+		if (year !== pinSeed.year) {
+			const n = Number(year);
+			if (year !== '' && (!/^\d{4}$/.test(year) || n < 1800 || n > 2100)) {
+				toast.error('The year must be between 1800 and 2100.');
+				return;
+			}
+			input.year = year === '' ? null : n;
+		}
+		if (fLanguage !== pinSeed.language) input.originalLanguage = fLanguage || null;
+		if (fStatus !== pinSeed.status)
+			input.status = (fStatus || null) as SeriesMetadataInput['status'];
+		if (fDemographic !== pinSeed.demographic)
+			input.demographic = (fDemographic || null) as SeriesMetadataInput['demographic'];
+		if (fRating !== pinSeed.rating)
+			input.contentRating = (fRating || null) as SeriesMetadataInput['contentRating'];
 		await persistMeta(input, 'Metadata saved.');
 	}
 
@@ -481,10 +567,10 @@
 						<section class="group" aria-labelledby="source-details-title">
 							<div class="group-head">
 								<div>
-									<h2 id="source-details-title" class="group-title">Details from the source</h2>
+									<h2 id="source-details-title" class="group-title">Details</h2>
 									<p class="group-desc">
-										Read only. This is what the source sent. Anything you set under Metadata is used
-										instead.
+										Read only. These are the values in use now. To change one, set it under
+										Metadata.
 									</p>
 								</div>
 							</div>
@@ -615,6 +701,143 @@
 										<option value="nsfw">NSFW</option>
 									</select>
 								</div>
+
+								{#if meta}
+									<div class="pair">
+										<label class="k-field">
+											<span class="k-label">Author</span>
+											<input
+												class="k-input"
+												autocomplete="off"
+												name="fAuthor"
+												type="text"
+												maxlength="300"
+												bind:value={fAuthor}
+												placeholder={autoHint('author', meta.author)}
+											/>
+										</label>
+										<label class="k-field">
+											<span class="k-label">Artist</span>
+											<input
+												class="k-input"
+												autocomplete="off"
+												name="fArtist"
+												type="text"
+												maxlength="300"
+												bind:value={fArtist}
+												placeholder={autoHint('artist', meta.artist)}
+											/>
+										</label>
+									</div>
+									<div class="setting">
+										<div class="setting-text">
+											<label class="setting-name" for="f-year">Publication year</label>
+											<p class="k-hint">Leave empty to use the year from the source.</p>
+										</div>
+										<input
+											id="f-year"
+											class="k-input k-num"
+											autocomplete="off"
+											name="fYear"
+											type="text"
+											inputmode="numeric"
+											maxlength="4"
+											bind:value={fYear}
+											placeholder={autoHint('year', meta.year === null ? null : String(meta.year))}
+										/>
+									</div>
+									<div class="setting">
+										<div class="setting-text">
+											<label class="setting-name" for="f-language">Original language</label>
+											<p class="k-hint">The language the series was first published in.</p>
+										</div>
+										<select
+											id="f-language"
+											class="k-select"
+											autocomplete="off"
+											name="fLanguage"
+											bind:value={fLanguage}
+										>
+											<option value=""
+												>{autoLabel(
+													'originalLanguage',
+													meta.originalLanguage && languageName(meta.originalLanguage),
+												)}</option
+											>
+											{#each LANGUAGE_OPTIONS.includes(fLanguage) || !fLanguage ? LANGUAGE_OPTIONS : [fLanguage, ...LANGUAGE_OPTIONS] as code (code)}
+												<option value={code}>{languageName(code)}</option>
+											{/each}
+										</select>
+									</div>
+									<div class="setting">
+										<div class="setting-text">
+											<label class="setting-name" for="f-status">Status</label>
+											<p class="k-hint">Whether the series is still coming out.</p>
+										</div>
+										<select
+											id="f-status"
+											class="k-select"
+											autocomplete="off"
+											name="fStatus"
+											bind:value={fStatus}
+										>
+											<option value=""
+												>{autoLabel('status', meta.status && enumLabel(meta.status))}</option
+											>
+											{#each STATUS_OPTIONS as s (s)}
+												<option value={s}>{enumLabel(s)}</option>
+											{/each}
+										</select>
+									</div>
+									<div class="setting">
+										<div class="setting-text">
+											<label class="setting-name" for="f-demographic">Demographic</label>
+											<p class="k-hint">The audience the series was published for.</p>
+										</div>
+										<select
+											id="f-demographic"
+											class="k-select"
+											autocomplete="off"
+											name="fDemographic"
+											bind:value={fDemographic}
+										>
+											<option value=""
+												>{autoLabel(
+													'demographic',
+													meta.demographic && enumLabel(meta.demographic),
+												)}</option
+											>
+											{#each DEMOGRAPHIC_OPTIONS as d (d)}
+												<option value={d}>{enumLabel(d)}</option>
+											{/each}
+										</select>
+									</div>
+									<div class="setting">
+										<div class="setting-text">
+											<label class="setting-name" for="f-rating">Content rating</label>
+											<p class="k-hint">
+												This is a label only. The NSFW setting above decides who can see the series.
+											</p>
+										</div>
+										<select
+											id="f-rating"
+											class="k-select"
+											autocomplete="off"
+											name="fRating"
+											bind:value={fRating}
+										>
+											<option value=""
+												>{autoLabel(
+													'contentRating',
+													meta.contentRating && enumLabel(meta.contentRating),
+												)}</option
+											>
+											{#each RATING_OPTIONS as r (r)}
+												<option value={r}>{enumLabel(r)}</option>
+											{/each}
+										</select>
+									</div>
+								{/if}
 
 								<div class="block" role="group" aria-labelledby="tags-title">
 									<h3 id="tags-title" class="block-title">Tags</h3>
@@ -1024,9 +1247,16 @@
 		color: var(--k-text-1);
 		font-weight: 700;
 	}
-	.setting .k-select {
+	.setting .k-select,
+	.setting .k-input {
 		flex: 0 1 240px;
 		width: auto;
+	}
+	.pair {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+		gap: var(--k-space-5);
+		min-width: 0;
 	}
 	.block {
 		display: grid;
@@ -1183,6 +1413,7 @@
 			grid-template-columns: 124px minmax(0, 1fr);
 		}
 		.setting .k-select,
+		.setting .k-input,
 		.add-line .k-field {
 			flex-basis: 100%;
 		}

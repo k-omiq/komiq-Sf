@@ -66,6 +66,11 @@ const AUTHOR_LABEL_WORDS: &[&str] = &[
 ///     match every other one, and so would two artists of one studio.
 ///   * a single Latin word out of a list is skipped: "Kishimoto, Masashi" is one
 ///     person written family-name-first, not two people called Kishimoto and Masashi.
+///
+/// Sites also disagree on where a romanised name breaks ("Hong Junghoon" / "Hong Jung
+/// Hoon", "Seo Taerang" / "Seo Tae rang"). Sorting the words — which is what folds name
+/// order away — scrambles those differently, so each name is also compared by its
+/// letters alone, in the order written.
 fn author_variants(line: &str) -> Vec<Vec<char>> {
     let mut outside = String::new();
     let mut inside: Vec<String> = Vec::new();
@@ -94,15 +99,22 @@ fn author_variants(line: &str) -> Vec<Vec<char>> {
             .filter(|t| !t.is_empty())
             .count()
     };
+    let letters = |s: &str| -> Vec<char> {
+        s.to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect()
+    };
     let mut variants = vec![name_key(line)];
     let people: Vec<&str> = outside
-        .split([',', ';', '/', '&', '、', '，'])
+        .split([',', ';', '/', '&', '×', '、', '，'])
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .collect();
     for person in &people {
         if people.len() == 1 || words(person) >= 2 || foreign(person) {
             variants.push(name_key(person));
+            variants.push(letters(person));
         }
     }
     for alias in &inside {
@@ -161,6 +173,13 @@ pub fn author_similarity(a: Option<&str>, b: Option<&str>) -> f64 {
 
 pub fn authors_match(a: Option<&str>, b: Option<&str>) -> bool {
     author_similarity(a, b) >= AUTHOR_MATCH_THRESHOLD
+}
+
+/// True when any credit of one work names a person the other work credits. `a` and `b`
+/// are each work's credit lines (author, artist). One source lists the writer where
+/// another lists the illustrator, so the two fields are compared crosswise.
+pub fn credits_match(a: [Option<&str>; 2], b: [Option<&str>; 2]) -> bool {
+    a.iter().any(|x| b.iter().any(|y| authors_match(*x, *y)))
 }
 
 /// Precomputed shingle set for one description — so a candidate whose description is
@@ -385,6 +404,23 @@ mod tests {
         ));
         // Unbalanced parentheses must not panic.
         assert!(!authors_match(Some(")(("), Some("Known Author")));
+        // The same romanised name, broken into words differently.
+        assert!(authors_match(
+            Some("Hong Junghoon"),
+            Some("Hong Jung Hoon (홍정훈)")
+        ));
+        assert!(authors_match(
+            Some("Seo Taerang"),
+            Some("Seo Tae rang (서태랑)")
+        ));
+        assert!(authors_match(Some("BOM Ga'eul"), Some("Bomgaeul (봄가을)")));
+        assert!(!authors_match(Some("Kim Hyun-woo"), Some("Kim Yeon Woo")));
+        // A writer credited on one side and an illustrator on the other.
+        assert!(credits_match(
+            [Some("Fried-Mandu"), Some("Park Jong Suk")],
+            [Some("Park Jong Suk"), None]
+        ));
+        assert!(!credits_match([Some("A Writer"), None], [None, None]));
     }
 
     #[test]

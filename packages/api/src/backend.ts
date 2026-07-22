@@ -18,6 +18,7 @@ import type {
 	MatchResult,
 	MergeCandidate,
 	MergeCandidateRow,
+	DuplicateSweepResult,
 	MergeWorksResult,
 	Notification,
 	Page,
@@ -320,10 +321,11 @@ export interface Backend {
 	addSeriesAltTitle?(id: Id, title: string): Promise<Series>;
 	/** Remove an alternative title from a work. Returns the recomputed series. Optional. */
 	removeSeriesAltTitle?(id: Id, title: string): Promise<Series>;
-	/** Consolidate the backlog of duplicate works sharing a title or alt title (articles
-	 * ignored, author or cover corroborated), up to `limit` groups per call; returns how
-	 * many works were merged away. Optional. */
-	consolidateExactDuplicates?(limit?: number): Promise<number>;
+	/** Sort one batch of the duplicate backlog: waiting reviews first, then groups of
+	 * works that share a title or alt title (articles ignored). Each pair is merged,
+	 * closed as two different works, or left for review. Successive calls resume;
+	 * `done` marks the end of a run. Optional. */
+	consolidateExactDuplicates?(limit?: number): Promise<DuplicateSweepResult>;
 	/** Raw metadata-override state of a series' canonical work (pinned vs derived),
 	 * for the series-detail editor. Optional. */
 	seriesAdminMeta?(seriesId: Id): Promise<SeriesAdminMeta>;
@@ -781,7 +783,29 @@ export interface SeriesMetadataInput {
 	type?: ComicType | null;
 	isNsfw?: boolean | null;
 	tags?: string[] | null;
+	/** The fields below are owned by the source. A value PINS the field so later syncs
+	 * keep it; `null` removes the pin and restores the source's value. An empty string
+	 * pins the field empty. */
+	author?: string | null;
+	artist?: string | null;
+	year?: number | null;
+	/** Language code: `ja`, `ko`, `zh`, `zh-hk`, `en`, … */
+	originalLanguage?: string | null;
+	status?: SeriesStatus | null;
+	/** `NONE` pins "no demographic". */
+	demographic?: Demographic | null;
+	contentRating?: ContentRating | null;
 }
+
+/** A source-owned field of {@link SeriesAdminMeta} an admin can pin. */
+export type PinnableField =
+	| 'author'
+	| 'artist'
+	| 'year'
+	| 'originalLanguage'
+	| 'status'
+	| 'demographic'
+	| 'contentRating';
 
 /** Raw metadata-override state of a work (pinned vs derived) for the editor. */
 export interface SeriesAdminMeta {
@@ -794,6 +818,16 @@ export interface SeriesAdminMeta {
 	/** Effective genres: the curated set if any, else source-derived. */
 	tags: string[];
 	hasCuratedTags: boolean;
+	/** The work's current source-owned fields, pinned or not. */
+	author: string | null;
+	artist: string | null;
+	year: number | null;
+	originalLanguage: string | null;
+	status: SeriesStatus | null;
+	demographic: Demographic | null;
+	contentRating: ContentRating | null;
+	/** Which of those fields an admin has pinned. */
+	pinnedFields: PinnableField[];
 }
 
 /** One chapter of a work in the admin editor, with its override state. */

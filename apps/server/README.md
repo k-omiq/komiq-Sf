@@ -87,14 +87,35 @@ matches through any listed person or parenthesised transliteration
 ("Dedart (디다트)" matches "Dedart"). Missing authors remain in review. External-ID
 and corroborated-cover matching still apply.
 
-The duplicate sweep (admin Settings, and after catalogue ingestion) also merges on an
-alternative title or an article-only difference, but only with author or cover
-evidence, only when exactly one target qualifies, and never between two MangaDex
-entries. Two MangaDex entries merge only on the same title with author or cover
-evidence (a matching year is not enough), and never when one is a sequel
-("X" / "X Season 2"). A work with "novel" in its name never merges with one without. Waiting merge reviews are rechecked at startup (after 30 seconds),
-hourly and after catalogue ingestion. Confirmed/rejected reviews and admin splits
-are respected; accepted waiting reviews are merged and confirmed atomically.
+One rule set (`catalog::pair::assess`) judges every pair of works. It gives one of
+three answers: merge, different works, or review. The duplicate sweep (admin
+Settings, and after catalogue ingestion) and the recheck of waiting reviews both
+use it.
+
+- Evidence is a matching author or artist, a matching cover, a similar
+  description, or a shared title in Japanese, Korean or Chinese script.
+- A site copy merges into a work on the same title or alternative title with one
+  piece of evidence, or on a long specific title alone. An article-only difference
+  ("The X" / "X") counts as the same title.
+- Two MangaDex entries merge only on the same title with author or cover evidence,
+  and never when one is a sequel ("X" / "X Season 2").
+- A merge needs exactly one target. A work with "novel" in its name never merges
+  with one without. Edition words (colored, pre-serialization, anthology, side
+  story) and a different number in the title send the pair to review.
+- A pair judged as different works is not queued. A waiting review judged that way
+  is closed as `dismissed`. A dismissal is the machine's answer, so it does not
+  stop a later merge when new evidence arrives; a `rejected` review is the admin's
+  answer and does.
+- The review queue holds only pairs the rules cannot decide, ordered by score.
+
+Waiting reviews are rechecked at startup (after 30 seconds), hourly and after
+catalogue ingestion. Confirmed/rejected reviews and admin splits are respected;
+accepted waiting reviews are merged and confirmed atomically.
+
+An admin can set the author, artist, year, original language, status, demographic
+and content rating of a work. The value is written to the `work` row and recorded
+in `work_field_pin`; triggers put it back when a sync overwrites it, and keep the
+source's latest value so removing the pin restores it.
 
 Installed Suwayomi extensions update automatically at startup (after 45 seconds)
 and every six hours. The updater refreshes configured stores first, processes updates

@@ -114,7 +114,7 @@ type Mutation {
 	setChapterOverride(input: ChapterOverrideInput!): Boolean! # [komika] admin series-detail editor — soft-hide (reversible) or rename one chapter of a work by aggregate number; non-destructive (requires isAdmin)
 	addSeriesAltTitle(id: ID!, title: String!): Series! # [komika] admin series-detail editor — add an alternative title to a work's alias index. May trigger an auto-merge of works sharing the normalized alias and at least 90% similar author names (≤8 of them) into the richest survivor, so the returned Series can be a DIFFERENT work than the one edited (requires isAdmin)
 	removeSeriesAltTitle(id: ID!, title: String!): Series! # [komika] admin series-detail editor — drop one alternative title from a work's alias index (requires isAdmin)
-	consolidateExactDuplicates(limit: Int = 100): Int! # [komika] admin dedup sweep — fold canonical works that share an exact normalized alias, gated on corroborating signals; oversized clusters are routed to mergeQueue instead of merged. `limit` bounds the alias GROUPS examined; returns works merged away. Single-flighted against reconcileCatalogue (requires isAdmin)
+	consolidateExactDuplicates(limit: Int = 100): DuplicateSweepResult! # [komika] admin duplicate sweep, one resumable batch: sorts up to `limit` waiting reviews, then up to `limit` groups of works sharing a title or alt title (articles ignored). Each pair is merged on evidence, closed as two different works, or left in mergeQueue with a score. `done` marks the end of a run. Single-flighted against reconcileCatalogue (requires isAdmin)
 	reconcileCatalogue: Int! # [komika] admin — background pass matching every provisional (Suwayomi-only) work against the MangaDex spine; merges confident matches, queues mid-confidence ones for review. Returns the pending count at kickoff, not the result. Single-flighted (requires isAdmin)
 	resyncCatalogue: Boolean! # [komika] admin — force a full catalogue re-seed: clears the catalogue/chapters sync cursors so the next cycle walks the whole createdAt history, and kicks one cycle in the background. Refused while any sync cycle is running (requires isAdmin)
 	markSourceNsfw(sourceId: String!, isNsfw: Boolean!): Int! # [komika] admin — flag/unflag a whole Suwayomi source as adult and re-derive the NSFW flag of every work ingested from it; returns works changed (requires isAdmin)
@@ -598,6 +598,15 @@ input SeriesMetadataInput {
 	type: ComicType
 	isNsfw: Boolean
 	tags: [String!] # full curated tag set (whole-list replace); null clears it
+	# Source-owned fields. A value PINS the field so later syncs keep it; null removes
+	# the pin and restores the source's value. An empty string pins the field empty.
+	author: String
+	artist: String
+	year: Int # first publication year, 1800-2100
+	originalLanguage: String # language code: ja, ko, zh, zh-hk, en, ...
+	status: SeriesStatus
+	demographic: Demographic # NONE pins "no demographic"
+	contentRating: ContentRating
 }
 
 # [komika] Raw override state of a work for the series-detail editor (parallels how
@@ -610,6 +619,15 @@ type SeriesAdminMeta {
 	isNsfwOverride: Boolean
 	tags: [String!]! # effective genres (curated set if any, else source-derived)
 	hasCuratedTags: Boolean! # true => `tags` is an admin-curated set
+	# The work's current source-owned fields, pinned or not.
+	author: String
+	artist: String
+	year: Int
+	originalLanguage: String
+	status: SeriesStatus
+	demographic: Demographic
+	contentRating: ContentRating
+	pinnedFields: [String!]! # which of those an admin has pinned, by field name here
 }
 
 # [komika] One chapter of a work in the admin editor: aggregate identity + override
@@ -1001,6 +1019,15 @@ type ReportPage {
 	hasNextPage: Boolean!
 	total: Int # the FILTERED count (what the pager needs)
 	openCount: Int! # the GLOBAL open backlog (what the nav badge needs)
+}
+
+# [komika] What one consolidateExactDuplicates batch did.
+type DuplicateSweepResult {
+	merged: Int! # works merged away
+	dismissed: Int! # waiting reviews closed as two different works
+	queued: Int! # pairs sent to the review queue
+	pending: Int! # reviews still waiting for a person
+	done: Boolean! # this batch reached the end of the run
 }
 
 type MergeWorksResult {
