@@ -12203,15 +12203,31 @@ async fn sort_pending_reviews(
 
 /// Sort the whole review queue (see `sort_pending_reviews`), yielding between batches so
 /// the live sync and the cover drainer keep getting the single SQLite writer.
+///
+/// A batch that loses the writer to another job (see `db::is_locked_error`) is run again
+/// from the same cursor: a row it already settled is no longer waiting, so the repeat
+/// only does the rest.
 pub(crate) async fn auto_merge_pending_reviews(
     pool: &SqlitePool,
     covers: Option<&SqlitePool>,
 ) -> anyhow::Result<u64> {
     const BATCH: i64 = 200;
+    const LOCK_RETRIES: u32 = 8;
     let mut cursor = String::new();
     let (mut merged, mut dismissed) = (0u64, 0i64);
+    let mut lock_retry = 0u32;
     loop {
-        let out = sort_pending_reviews(pool, covers, &cursor, BATCH).await?;
+        let out = match sort_pending_reviews(pool, covers, &cursor, BATCH).await {
+            Ok(out) => out,
+            Err(e) if crate::db::is_locked_error(&e) && lock_retry < LOCK_RETRIES => {
+                lock_retry += 1;
+                tracing::debug!(lock_retry, "review batch lost the writer; running it again");
+                tokio::time::sleep(std::time::Duration::from_secs(5 * u64::from(lock_retry))).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        lock_retry = 0;
         merged += out.merged.len() as u64;
         dismissed += out.dismissed;
         if out.seen < BATCH {

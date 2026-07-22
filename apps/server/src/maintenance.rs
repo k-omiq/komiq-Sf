@@ -152,17 +152,25 @@ pub fn spawn(state: Arc<AppState>, update_interval_secs: u64, shutdown: watch::R
             async move {
                 if !wait(Duration::from_secs(30), &mut shutdown).await { return; }
                 loop {
-                    tokio::select! {
+                    // A failed pass (the database stayed busy) is tried again soon, not an
+                    // hour later: the queue it left behind is what admins see.
+                    let pause = tokio::select! {
                         biased;
                         _ = shutdown.changed() => return,
                         result = crate::graphql::auto_merge_pending_reviews(&state.pool, Some(&state.cover_pool)) => {
                             match result {
-                                Ok(merged) => tracing::info!(merged, "waiting merge reviews rechecked"),
-                                Err(e) => tracing::warn!(error = %e, "waiting merge reviews failed; will retry"),
+                                Ok(merged) => {
+                                    tracing::info!(merged, "waiting merge reviews rechecked");
+                                    3600
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "waiting merge reviews failed; will retry");
+                                    300
+                                }
                             }
                         }
-                    }
-                    if !wait(Duration::from_secs(3600), &mut shutdown).await { return; }
+                    };
+                    if !wait(Duration::from_secs(pause), &mut shutdown).await { return; }
                 }
             }
         }).await;
