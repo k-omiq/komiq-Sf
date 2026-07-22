@@ -3,7 +3,13 @@
 	import { queuePage, queueNavigate } from '$lib/url-state';
 	import type { AdminUser } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
+	import { confirm } from '$lib/confirm.svelte';
 	import { loadUsers, setUserBanned, setUserAdmin } from '$lib/data';
+	import { toast } from '$lib/toast.svelte';
+	import Button from '$lib/components/Button.svelte';
+	import LoadState from '$lib/components/LoadState.svelte';
+	import PageHeader from '$lib/components/PageHeader.svelte';
+	import Pager from '$lib/components/Pager.svelte';
 
 	let users = $state<AdminUser[]>([]);
 	const page = $derived(queuePage(pageState.url));
@@ -11,7 +17,6 @@
 	let total = $state<number | null>(null);
 	let loading = $state(false);
 	let loadError = $state<string | null>(null);
-	let actionError = $state<string | null>(null);
 	let busy = $state<string | null>(null); // id currently being mutated
 
 	// Auth redirect is centralized in +layout.svelte.
@@ -20,14 +25,6 @@
 		if (!auth.user) return;
 		void refresh(page);
 	});
-
-	// The load effect is the single fetch driver: pager buttons update the URL,
-	// and refresh never changes pagination state.
-	function go(delta: number): void {
-		const next = Math.max(1, page + delta);
-		if (next === page) return;
-		void queueNavigate(pageState.url, { page: next });
-	}
 
 	let loadSeq = 0;
 	async function refresh(p: number): Promise<void> {
@@ -51,20 +48,29 @@
 
 	function fmtDate(iso: string): string {
 		const t = Date.parse(iso);
-		return Number.isNaN(t) ? '—' : new Date(t).toLocaleDateString();
+		return Number.isNaN(t) ? 'Unknown' : new Date(t).toLocaleDateString();
 	}
 
 	async function toggleBan(u: AdminUser): Promise<void> {
 		if (busy) return;
 		const next = !u.isBanned;
-		if (next && !confirm(`Ban ${u.username}? They won't be able to sign in.`)) return;
+		if (
+			next &&
+			!(await confirm({
+				title: `Ban ${u.username}?`,
+				message: 'They will not be able to sign in until you unban them.',
+				confirmLabel: 'Ban user',
+				danger: true,
+			}))
+		)
+			return;
 		busy = u.id;
-		actionError = null;
 		try {
 			await setUserBanned(u.id, next);
 			users = users.map((x) => (x.id === u.id ? { ...x, isBanned: next } : x));
+			toast.success(next ? `${u.username} is banned.` : `${u.username} is unbanned.`);
 		} catch (err) {
-			actionError = err instanceof Error ? err.message : 'Action failed.';
+			toast.fromError(err, 'Action failed.');
 		} finally {
 			busy = null;
 		}
@@ -73,288 +79,129 @@
 	async function toggleAdmin(u: AdminUser): Promise<void> {
 		if (busy) return;
 		const next = !u.isAdmin;
+		const ok = await confirm(
+			next
+				? {
+						title: `Make ${u.username} an admin?`,
+						message: 'They will get full access to this console and every admin action.',
+						confirmLabel: 'Make admin',
+					}
+				: {
+						title: `Remove admin access from ${u.username}?`,
+						message: 'They will be signed out of this console and keep a normal account.',
+						confirmLabel: 'Remove admin',
+						danger: true,
+					},
+		);
+		if (!ok) return;
 		busy = u.id;
-		actionError = null;
 		try {
 			const updated = await setUserAdmin(u.id, next);
 			users = users.map((x) => (x.id === u.id ? updated : x));
+			toast.success(
+				next ? `${u.username} is now an admin.` : `${u.username} is no longer an admin.`,
+			);
 		} catch (err) {
-			actionError = err instanceof Error ? err.message : 'Action failed.';
+			toast.fromError(err, 'Action failed.');
 		} finally {
 			busy = null;
 		}
 	}
+
+	const count = $derived(total ?? users.length);
 </script>
 
-<div class="page">
-	<div class="page-head">
-		<div>
-			<h1>Users</h1>
-			<p class="lede">
-				{total ?? users.length} account{(total ?? users.length) === 1 ? '' : 's'} · manage admin access
-				and suspensions
-			</p>
-		</div>
-	</div>
+<div class="k-page">
+	<PageHeader
+		title="Users"
+		description="{count} account{count === 1
+			? ''
+			: 's'}. Give or remove admin access, and ban accounts."
+	/>
 
-	{#if loadError}
-		<div class="notice error" role="alert">{loadError}</div>
-	{:else if loading && users.length === 0}
-		<div class="notice" role="status">Loading…</div>
-	{:else}
-		{#if actionError}<div class="notice error" role="alert">{actionError}</div>{/if}
-		<div class="table" role="table" aria-label="Users">
-			<div class="row head" role="row">
+	<LoadState
+		loading={loading && users.length === 0}
+		error={loadError}
+		empty={users.length === 0}
+		emptyTitle="No users on this page"
+		emptyIcon="users"
+		onretry={() => refresh(page)}
+	>
+		{#snippet emptyActions()}
+			<!-- An empty page past the first (a stale link, or the list shrank) has no table
+			     and so no pager: give the way back here. -->
+			{#if page > 1}
+				<Button size="sm" onclick={() => queueNavigate(pageState.url, { page: null })}>
+					Go to the first page
+				</Button>
+			{/if}
+		{/snippet}
+		<div class="k-table" class:is-dim={loading} role="table" aria-label="Users">
+			<div class="k-tr k-tr--head" role="row">
 				<span role="columnheader">User</span>
 				<span role="columnheader">Joined</span>
 				<span role="columnheader">Role</span>
 				<span role="columnheader">Status</span>
-				<span role="columnheader" class="actions-col">Actions</span>
+				<span role="columnheader" class="k-td--end">Actions</span>
 			</div>
 			{#each users as u (u.id)}
-				<div class="row" role="row" class:banned={u.isBanned}>
+				<div class="k-tr" role="row">
 					<span class="user" role="cell">
-						<span class="uname">{u.username}</span>
-						<span class="email">{u.email}</span>
+						<span class="uname k-truncate" class:banned={u.isBanned}>{u.username}</span>
+						<span class="k-muted k-truncate">{u.email}</span>
 					</span>
-					<span class="muted" role="cell">{fmtDate(u.createdAt)}</span>
-					<span role="cell">
-						{#if u.isAdmin}<span class="badge admin">Admin</span>{:else}<span class="badge"
-								>Member</span
+					<span class="k-muted k-num" role="cell" data-label="Joined">{fmtDate(u.createdAt)}</span>
+					<span role="cell" data-label="Role">
+						{#if u.isAdmin}<span class="k-badge" data-tone="accent">Admin</span>{:else}<span
+								class="k-badge">Member</span
 							>{/if}
 					</span>
-					<span role="cell">
-						{#if u.isBanned}<span class="badge danger">Banned</span>{:else}<span class="badge ok"
-								>Active</span
+					<span role="cell" data-label="Status">
+						{#if u.isBanned}<span class="k-badge" data-tone="danger">Banned</span>{:else}<span
+								class="k-badge"
+								data-tone="success">Active</span
 							>{/if}
 					</span>
-					<span class="actions" role="cell">
-						<button class="act" disabled={busy === u.id} onclick={() => toggleAdmin(u)}>
+					<span class="k-td--end" role="cell">
+						<Button size="sm" disabled={busy === u.id} onclick={() => toggleAdmin(u)}>
 							{u.isAdmin ? 'Revoke admin' : 'Make admin'}
-						</button>
-						<button
-							class="act"
-							class:danger={!u.isBanned}
+						</Button>
+						<Button
+							size="sm"
+							variant={u.isBanned ? 'secondary' : 'danger'}
 							disabled={busy === u.id}
 							onclick={() => toggleBan(u)}
 						>
 							{u.isBanned ? 'Unban' : 'Ban'}
-						</button>
+						</Button>
 					</span>
 				</div>
 			{/each}
 		</div>
 
-		<div class="pager">
-			<button class="pg" disabled={page <= 1 || loading} onclick={() => go(-1)}>← Prev</button>
-			<span class="pg-num">Page {page}</span>
-			<button class="pg" disabled={!hasNext || loading} onclick={() => go(1)}>Next →</button>
-		</div>
-	{/if}
+		<Pager
+			{page}
+			{hasNext}
+			busy={loading}
+			onpage={(n) => queueNavigate(pageState.url, { page: n })}
+		/>
+	</LoadState>
 </div>
 
 <style>
-	.page {
-		display: flex;
-		flex-direction: column;
-		gap: var(--k-space-6);
-	}
-	.page-head {
-		display: flex;
-		align-items: flex-end;
-		justify-content: space-between;
-	}
-	h1 {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 30px;
-		letter-spacing: -0.02em;
-		color: var(--k-text-bright);
-	}
-	.lede {
-		margin-top: 6px;
-		font-size: 13.5px;
-		color: var(--k-text-dim);
-	}
-	.notice {
-		padding: 14px 16px;
-		border-radius: var(--k-radius-md);
-		background: var(--k-surface-2);
-		border: 1px solid var(--k-border);
-		color: var(--k-text-dim);
-		font-size: 13.5px;
-	}
-	.notice.error {
-		color: #f0808a;
-		border-color: rgba(240, 128, 138, 0.4);
-	}
-	.table {
-		border: 1px solid var(--k-border);
-		border-radius: var(--k-radius-lg);
-		overflow: hidden;
-	}
-	.row {
-		display: grid;
-		grid-template-columns: 2fr 1fr 1fr 1fr auto;
-		align-items: center;
-		gap: var(--k-space-4);
-		padding: 12px 16px;
-		border-bottom: 1px solid var(--k-border);
-	}
-	.row:last-child {
-		border-bottom: none;
-	}
-	.row.head {
-		background: var(--k-surface-2);
-		font-size: 11px;
-		font-weight: 700;
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-		color: var(--k-text-faint);
-	}
-	.row.banned {
-		background: rgba(240, 128, 138, 0.05);
+	.k-table {
+		--cols: minmax(0, 2.2fr) minmax(0, 1fr) minmax(0, 0.8fr) minmax(0, 0.8fr) minmax(0, 1.6fr);
 	}
 	.user {
-		display: flex;
-		flex-direction: column;
+		display: grid;
 		gap: 2px;
-		min-width: 0;
 	}
 	.uname {
-		font-size: 14px;
-		font-weight: 600;
-		color: var(--k-text-1);
-	}
-	.email {
-		font-size: 12px;
-		color: var(--k-text-faint);
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.muted {
-		font-size: 13px;
-		color: var(--k-text-dim);
-	}
-	.badge {
-		display: inline-block;
-		font-size: 11px;
+		color: var(--k-text-bright);
 		font-weight: 700;
-		padding: 3px 8px;
-		border-radius: var(--k-radius-sm);
-		background: var(--k-surface-4);
-		color: var(--k-text-2);
 	}
-	.badge.admin {
-		background: rgba(95, 200, 207, 0.15);
-		color: var(--k-accent-teal);
-	}
-	.badge.ok {
-		background: rgba(127, 211, 154, 0.15);
-		color: var(--k-ongoing);
-	}
-	.badge.danger {
-		background: rgba(240, 128, 138, 0.15);
-		color: #f0808a;
-	}
-	.actions-col {
-		text-align: right;
-	}
-	.actions {
-		display: flex;
-		gap: 8px;
-		justify-content: flex-end;
-	}
-	.act {
-		height: 32px;
-		padding: 0 12px;
-		border-radius: var(--k-radius-md);
-		background: var(--k-surface);
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-2);
-		font-family: var(--k-font-sans);
-		font-size: 12.5px;
-		font-weight: 600;
-		cursor: pointer;
-		white-space: nowrap;
-		transition:
-			color 0.15s,
-			background-color 0.15s,
-			border-color 0.15s;
-	}
-	.act:hover:not(:disabled) {
-		border-color: var(--k-border-strong);
-		color: var(--k-text);
-	}
-	.act.danger:hover:not(:disabled) {
-		border-color: rgba(240, 128, 138, 0.5);
-		color: #f0808a;
-	}
-	.act:disabled {
-		opacity: 0.5;
-		cursor: default;
-	}
-	.pager {
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		gap: 16px;
-	}
-	.pg {
-		height: 36px;
-		padding: 0 16px;
-		border-radius: var(--k-radius-md);
-		background: var(--k-surface);
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-2);
-		font-family: var(--k-font-sans);
-		font-size: 13px;
-		font-weight: 600;
-		cursor: pointer;
-	}
-	.pg:disabled {
-		opacity: 0.4;
-		cursor: default;
-	}
-	.pg-num {
-		font-size: 13px;
+	.uname.banned {
 		color: var(--k-text-dim);
-	}
-	@media (max-width: 720px) {
-		.row {
-			grid-template-columns: 1fr;
-			gap: 6px;
-		}
-		.row.head {
-			display: none;
-		}
-		.row > [role='cell']:nth-child(2)::before,
-		.row > [role='cell']:nth-child(3)::before,
-		.row > [role='cell']:nth-child(4)::before {
-			font-weight: 700;
-			color: var(--k-text-faint);
-		}
-		.row > [role='cell']:nth-child(2)::before {
-			content: 'Joined · ';
-		}
-		.row > [role='cell']:nth-child(3)::before {
-			content: 'Role · ';
-		}
-		.row > [role='cell']:nth-child(4)::before {
-			content: 'Status · ';
-		}
-		.actions {
-			justify-content: flex-start;
-			flex-wrap: wrap;
-		}
-		.act {
-			height: 40px;
-		}
-		.pg {
-			height: 40px;
-		}
-		.pager {
-			flex-wrap: wrap;
-		}
+		text-decoration: line-through;
 	}
 </style>

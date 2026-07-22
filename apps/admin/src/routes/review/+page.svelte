@@ -1,12 +1,18 @@
 <script lang="ts">
 	import { page as pageState } from '$app/state';
 	import { queuePage, queueNavigate } from '$lib/url-state';
-	import { modal } from '$lib/modal';
 	import type { MergeCandidate, WorkReviewDetail } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
 	import { assetSrc } from '$lib/config';
+	import { confirm } from '$lib/confirm.svelte';
+	import { toast } from '$lib/toast.svelte';
+	import Button from '$lib/components/Button.svelte';
+	import Cover from '$lib/components/Cover.svelte';
+	import Dialog from '$lib/components/Dialog.svelte';
+	import LoadState from '$lib/components/LoadState.svelte';
+	import PageHeader from '$lib/components/PageHeader.svelte';
+	import Pager from '$lib/components/Pager.svelte';
 	import {
-		consolidateDuplicates,
 		loadMergeQueue,
 		loadWorkReviewDetail,
 		MERGE_QUEUE_PAGE_SIZE,
@@ -22,8 +28,8 @@
 	let total = $state<number | null>(null);
 	let loading = $state(false);
 	let loadError = $state<string | null>(null);
-	let actionError = $state<string | null>(null);
 	let busy = $state<string | null>(null); // candidate id currently being resolved
+	let busyAccept = $state(false); // which of that row's two buttons is in flight
 	/**
 	 * Rows resolved since this page was fetched — the OFFSET DRIFT.
 	 *
@@ -40,78 +46,6 @@
 	 * {@link settleAfterResolve} already re-reads the same page number for it.
 	 */
 	let resolvedOnPage = $state(0);
-
-	// ---- bulk consolidation (destructive: merge_works DELETEs the folded work) ----
-	// One batch of clusters per server call. The run is BOUNDED (never "loop until the
-	// server says zero"): an explicit confirm gates the first batch, MAX_BATCHES caps a
-	// single run, and Stop halts it between batches. Matching is by normalized alias —
-	// which includes alternative titles, not just the primary one — so a run can fold
-	// genuinely distinct entries; it stays attended by design.
-	const BATCH_SIZE = 200;
-	const MAX_BATCHES = 5;
-
-	let consolidating = $state(false);
-	let stopRequested = $state(false);
-	let consolidateMsg = $state<string | null>(null);
-	let batchesDone = $state(0);
-	let mergedTotal = $state(0);
-
-	function consolidateConfirmText(): string {
-		return (
-			`Consolidate duplicate works?\n\n` +
-			`This merges works whose NORMALIZED TITLE OR ALTERNATIVE TITLE collides — not ` +
-			`only exact primary-title matches. Each merge PERMANENTLY DELETES the folded ` +
-			`work; there is no undo.\n\n` +
-			`This run processes at most ${MAX_BATCHES} batches of ${BATCH_SIZE} clusters ` +
-			`(stop it any time). Review the result before running it again.`
-		);
-	}
-
-	async function consolidate(): Promise<void> {
-		if (consolidating) return;
-		if (!confirm(consolidateConfirmText())) return;
-		consolidating = true;
-		stopRequested = false;
-		batchesDone = 0;
-		mergedTotal = 0;
-		consolidateMsg = 'Starting…';
-		let stopped = false;
-		let exhausted = false;
-		try {
-			for (let i = 0; i < MAX_BATCHES; i++) {
-				if (stopRequested) {
-					stopped = true;
-					break;
-				}
-				const n = await consolidateDuplicates(BATCH_SIZE);
-				batchesDone += 1;
-				mergedTotal += n;
-				consolidateMsg = `Batch ${batchesDone}/${MAX_BATCHES} · merged ${mergedTotal} work${mergedTotal === 1 ? '' : 's'}…`;
-				if (n === 0) {
-					exhausted = true;
-					break;
-				}
-			}
-			const merged = `merged ${mergedTotal} work${mergedTotal === 1 ? '' : 's'} in ${batchesDone} batch${batchesDone === 1 ? '' : 'es'}`;
-			consolidateMsg = stopped
-				? `Stopped — ${merged}.`
-				: exhausted
-					? mergedTotal === 0
-						? 'No duplicate clusters left to merge.'
-						: `Done — ${merged}; nothing left to merge.`
-					: `Batch limit reached — ${merged}. Run again to continue.`;
-		} catch (err) {
-			const why = err instanceof Error ? err.message : 'Consolidation failed.';
-			consolidateMsg = `${why} (merged ${mergedTotal} work${mergedTotal === 1 ? '' : 's'} before failing.)`;
-		} finally {
-			consolidating = false;
-			stopRequested = false;
-		}
-		// Consolidation may have folded works referenced by pending review rows —
-		// pull the authoritative queue so stale/merged candidates drop out. Back to
-		// page 1: rows leaving anywhere in the backlog shift every page after them.
-		if (batchesDone > 0) await refresh(1);
-	}
 
 	// Auth redirect is centralized in +layout.svelte.
 
@@ -239,7 +173,13 @@
 
 	function fmtDate(iso: string): string {
 		const t = Date.parse(iso);
-		return Number.isNaN(t) ? '—' : new Date(t).toLocaleDateString();
+		return Number.isNaN(t) ? 'Unknown' : new Date(t).toLocaleDateString();
+	}
+
+	/** `title_corroborated` reads as "Title corroborated"; the raw value stays in a tooltip. */
+	function methodLabel(method: string): string {
+		const words = method.replace(/_/g, ' ').trim();
+		return words ? words.charAt(0).toUpperCase() + words.slice(1) : 'Unknown';
 	}
 
 	function pct(score: number): string {
@@ -248,16 +188,24 @@
 
 	async function resolve(c: MergeCandidate, accept: boolean): Promise<void> {
 		if (busy) return;
+		const source = c.sourceTitle ?? 'Untitled';
+		const candidate = c.candidateTitle ?? 'Untitled';
 		if (
 			accept &&
-			!confirm(
-				`Merge “${c.sourceTitle ?? 'this series'}” into “${c.candidateTitle ?? 'the candidate'}”? ` +
-					`They'll become one canonical entry.`,
-			)
+			!(await confirm({
+				title: 'Merge these two entries?',
+				message:
+					`“${source}” will be merged into “${candidate}” and deleted as a separate entry. ` +
+					`This cannot be undone.`,
+				confirmLabel: 'Merge',
+				danger: true,
+			}))
 		)
 			return;
+		// The confirm is async now: another row may have started resolving meanwhile.
+		if (busy) return;
 		busy = c.id;
-		actionError = null;
+		busyAccept = accept;
 		try {
 			// The resolver has no "already resolved" SUCCESS value — every exit path is
 			// either an error or a true. So a concurrent resolve arrives as a throw, and
@@ -266,6 +214,9 @@
 			queue = queue.filter((x) => x.id !== c.id);
 			resolvedOnPage += 1;
 			if (total != null && total > 0) total -= 1;
+			toast.success(
+				accept ? `Merged “${source}” into “${candidate}”.` : `Kept “${source}” separate.`,
+			);
 			await settleAfterResolve();
 		} catch (err) {
 			const why = err instanceof Error ? err.message : 'Action failed.';
@@ -273,7 +224,7 @@
 			// admin (or a consolidation run) already closed. Drop it and re-pull the
 			// authoritative queue instead of leaving it there to be clicked again.
 			const stale = /already resolved|no such merge candidate|not found/i.test(why);
-			actionError = stale ? `${why} Refreshing the queue…` : why;
+			toast.error(stale ? `${why} Reloading the list.` : why);
 			if (stale) {
 				await refresh();
 				await settleAfterResolve();
@@ -282,591 +233,308 @@
 			busy = null;
 		}
 	}
+
+	const count = $derived(total ?? queue.length);
+	const lead = $derived(
+		loading && total == null && queue.length === 0
+			? 'Pairs'
+			: `${total == null && hasNext ? `More than ${count}` : count} pair${count === 1 ? '' : 's'}`,
+	);
 </script>
 
-<div class="page">
-	<div class="page-head">
-		<div>
-			<h1>Dedup review</h1>
-			<p class="lede">
-				{total ?? queue.length}{total == null && hasNext ? '+' : ''} pending match{(total ??
-					queue.length) === 1
-					? ''
-					: 'es'} · confirm a merge into the canonical work, or keep the series as a distinct entry
-			</p>
-		</div>
-		<div class="head-actions">
-			{#if consolidateMsg}<span class="cmsg">{consolidateMsg}</span>{/if}
-			{#if consolidating}
-				<button class="pg stop" disabled={stopRequested} onclick={() => (stopRequested = true)}>
-					{stopRequested ? 'Stopping after this batch…' : 'Stop'}
-				</button>
-			{/if}
-			<button
-				class="pg"
-				disabled={consolidating}
-				onclick={() => consolidate()}
-				title="Merge works whose normalized title OR alternative title collides — destructive, deletes the folded work. Runs at most {MAX_BATCHES} batches of {BATCH_SIZE} clusters."
-			>
-				{consolidating
-					? `Consolidating… (batch ${batchesDone + 1}/${MAX_BATCHES})`
-					: 'Consolidate duplicates…'}
-			</button>
-			<button class="pg" disabled={loading || consolidating} onclick={() => refresh()}
-				>Refresh</button
-			>
-		</div>
-	</div>
+<div class="k-page">
+	<PageHeader
+		title="Duplicates"
+		description="{lead} the matcher was not sure about. Merge a pair if both are the same series, or keep them separate."
+	>
+		{#snippet actions()}
+			<Button icon="refresh" busy={loading} onclick={() => refresh()}>Refresh</Button>
+		{/snippet}
+		<a class="k-link bulk" href="/settings#maintenance">Merge many duplicates at once in Settings</a
+		>
+	</PageHeader>
 
-	{#if loadError}
-		<div class="notice error" role="alert">{loadError}</div>
-	{:else if loading && queue.length === 0}
-		<div class="notice" role="status">Loading…</div>
-	{:else if queue.length === 0}
-		<div class="notice">No matches awaiting review — the queue is clear.</div>
-	{:else}
-		{#if actionError}<div class="notice error" role="alert">{actionError}</div>{/if}
-		<div class="table" role="table" aria-label="Dedup review queue">
-			<div class="row head" role="row">
+	<LoadState
+		loading={loading && queue.length === 0}
+		error={loadError}
+		empty={queue.length === 0}
+		emptyTitle="No duplicates to review"
+		emptyHint="A pair shows up here when the matcher finds two series that might be the same and cannot decide. Nothing is waiting right now."
+		emptyIcon="layers"
+		onretry={() => refresh()}
+	>
+		<div class="k-table" class:is-dim={loading} role="table" aria-label="Dedup review queue">
+			<div class="k-tr k-tr--head" role="row">
 				<span role="columnheader">Source series</span>
 				<span role="columnheader">Candidate work</span>
 				<span role="columnheader">Confidence</span>
-				<span role="columnheader">Signal</span>
+				<span role="columnheader">Matched by</span>
 				<span role="columnheader">Queued</span>
-				<span role="columnheader" class="actions-col">Decision</span>
+				<span role="columnheader" class="k-td--end">Decision</span>
 			</div>
 			{#each queue as c (c.id)}
-				<div class="row" role="row">
-					<span class="work-cell" role="cell">
+				<div class="k-tr" role="row">
+					<span class="work-cell" role="cell" data-caption="Source series">
 						<button
+							type="button"
 							class="work"
-							title="Source series {c.sourceSeriesId} — click for details"
-							onclick={() => openDetail(c.sourceWorkId, c.sourceTitle ?? '(untitled)', 'source')}
+							title="Source series {c.sourceSeriesId}. Open details."
+							onclick={() => openDetail(c.sourceWorkId, c.sourceTitle ?? 'Untitled', 'source')}
 						>
-							{#if c.sourceCoverUrl}
-								<img
-									width="80"
-									height="112"
-									class="thumb"
-									src={assetSrc(c.sourceCoverUrl)}
-									alt=""
-									loading="lazy"
-									referrerpolicy="no-referrer"
-								/>
-							{:else}
-								<span class="thumb none" aria-hidden="true"></span>
-							{/if}
+							<Cover src={c.sourceCoverUrl ? assetSrc(c.sourceCoverUrl) : null} />
 							<span class="wtext">
-								<span class="wtitle">{c.sourceTitle ?? '(untitled)'}</span>
-								<span class="wid">{c.sourceWorkId}</span>
+								<span class="wtitle k-truncate">{c.sourceTitle ?? 'Untitled'}</span>
+								<span class="k-mono k-muted k-truncate">{c.sourceWorkId}</span>
 							</span>
 						</button>
 					</span>
-					<span class="work-cell" role="cell">
+					<span class="work-cell" role="cell" data-caption="Candidate work">
 						<button
+							type="button"
 							class="work"
-							title="Candidate work {c.candidateWorkId} — click for details"
+							title="Candidate work {c.candidateWorkId}. Open details."
 							onclick={() =>
-								openDetail(c.candidateWorkId, c.candidateTitle ?? '(untitled)', 'candidate')}
+								openDetail(c.candidateWorkId, c.candidateTitle ?? 'Untitled', 'candidate')}
 						>
-							{#if c.candidateCoverUrl}
-								<img
-									width="80"
-									height="112"
-									class="thumb"
-									src={assetSrc(c.candidateCoverUrl)}
-									alt=""
-									loading="lazy"
-									referrerpolicy="no-referrer"
-								/>
-							{:else}
-								<span class="thumb none" aria-hidden="true"></span>
-							{/if}
+							<Cover src={c.candidateCoverUrl ? assetSrc(c.candidateCoverUrl) : null} />
 							<span class="wtext">
-								<span class="wtitle">{c.candidateTitle ?? '(untitled)'}</span>
-								<span class="wid">{c.candidateWorkId}</span>
+								<span class="wtitle k-truncate">{c.candidateTitle ?? 'Untitled'}</span>
+								<span class="k-mono k-muted k-truncate">{c.candidateWorkId}</span>
 							</span>
 						</button>
 					</span>
-					<span role="cell">
-						<span class="badge" class:strong={c.score >= 0.75}>{pct(c.score)}</span>
+					<span role="cell" data-label="Confidence">
+						<span class="k-badge k-num" data-tone={c.score >= 0.75 ? 'info' : undefined}
+							>{pct(c.score)}</span
+						>
 					</span>
-					<span class="muted" role="cell">{c.method}</span>
-					<span class="muted" role="cell">{fmtDate(c.createdAt)}</span>
-					<span class="actions" role="cell">
-						<button class="act merge" disabled={busy === c.id} onclick={() => resolve(c, true)}>
+					<span class="k-muted" role="cell" data-label="Matched by" title={c.method}
+						>{methodLabel(c.method)}</span
+					>
+					<span class="k-muted k-num" role="cell" data-label="Queued">{fmtDate(c.createdAt)}</span>
+					<span class="k-td--end" role="cell">
+						<Button
+							size="sm"
+							icon="merge"
+							busy={busy === c.id && busyAccept}
+							disabled={busy === c.id}
+							onclick={() => resolve(c, true)}
+						>
 							Merge
-						</button>
-						<button class="act" disabled={busy === c.id} onclick={() => resolve(c, false)}>
+						</Button>
+						<Button
+							size="sm"
+							busy={busy === c.id && !busyAccept}
+							disabled={busy === c.id}
+							onclick={() => resolve(c, false)}
+						>
 							Keep separate
-						</button>
+						</Button>
 					</span>
 				</div>
 			{/each}
 		</div>
+
 		{#if page > 1 || hasNext}
-			<div class="pager">
-				<button
-					class="pg"
-					disabled={page <= 1 || loading}
-					onclick={() => queueNavigate(pageState.url, { page: Math.max(1, page - 1) })}
-				>
-					Prev
-				</button>
-				<span class="page-num">
-					Page {page} · showing {rangeStart}–{rangeEnd}{total != null ? ` of ${total}` : ''}
-					{#if resolvedOnPage > 0}
-						· <span
-							class="drift"
-							title="Resolving a row removes it from the server's ordered backlog, so the rows behind it shift into this page's slot. Next re-reads this page instead of advancing, otherwise those candidates would be skipped."
-							>{resolvedOnPage} resolved here — Next re-reads this page</span
-						>
-					{/if}
-				</span>
-				<button class="pg" disabled={!hasNext || loading} onclick={nextPage}> Next </button>
+			<div class="paging">
+				<Pager
+					{page}
+					{hasNext}
+					busy={loading}
+					detail="({rangeStart} to {rangeEnd}{total != null ? ` of ${total}` : ''})"
+					onpage={(n) => {
+						if (n > page) nextPage();
+						else void queueNavigate(pageState.url, { page: Math.max(1, n) });
+					}}
+				/>
+				{#if resolvedOnPage > 0}
+					<p class="drift">
+						You decided {resolvedOnPage} pair{resolvedOnPage === 1 ? '' : 's'} on this page, so the pairs
+						behind {resolvedOnPage === 1 ? 'it' : 'them'} moved up. Next reloads this page so none are
+						skipped.
+					</p>
+				{/if}
 			</div>
 		{/if}
-	{/if}
+	</LoadState>
 </div>
 
-<!-- Top level: `<svelte:window>` cannot live inside a block. -->
-<svelte:window
-	onkeydown={(e) => {
-		if (e.key === 'Escape' && detailFor) closeDetail();
-	}}
-/>
-
 {#if detailFor}
-	<button
-		data-modal-backdrop
-		tabindex="-1"
-		class="scrim"
-		aria-label="Close details"
-		onclick={closeDetail}
-	></button>
-	<div
-		class="modal"
-		role="dialog"
-		aria-modal="true"
-		aria-label="Work details"
-		use:modal={closeDetail}
+	{@const target = detailFor}
+	<Dialog
+		size="lg"
+		title={detail?.title ?? target.label}
+		description={target.side === 'source' ? 'Source series' : 'Candidate work'}
+		onclose={closeDetail}
 	>
-		<div class="modal-head">
-			<div class="modal-kicker">
-				{detailFor.side === 'source' ? 'SOURCE SERIES' : 'CANDIDATE WORK'}
-			</div>
-			<h2>{detail?.title ?? detailFor.label}</h2>
-			<button class="act close" onclick={closeDetail}>Close</button>
-		</div>
-
-		{#if detailError}
-			<div class="notice error" role="alert">{detailError}</div>
-		{:else if detailLoading || !detail}
-			<div class="notice" role="status">Loading…</div>
-		{:else}
-			<div class="detail">
-				{#if detail.coverUrl}
-					<img
-						width="80"
-						height="112"
-						class="cover"
-						src={assetSrc(detail.coverUrl)}
-						alt="Cover of {detail.title ?? 'this work'}"
-						referrerpolicy="no-referrer"
-					/>
-				{:else}
-					<div class="cover none">no cover</div>
-				{/if}
-				<div class="facts">
-					<div class="chips">
-						<span class="chip mono">{detail.workId}</span>
-						{#if detail.isNsfw}<span class="chip nsfw">NSFW</span>{/if}
-						{#if detail.status}<span class="chip">{detail.status}</span>{/if}
-						{#if detail.year}<span class="chip">{detail.year}</span>{/if}
-						{#if detail.contentRating}<span class="chip">{detail.contentRating}</span>{/if}
-						{#if detail.originalLanguage}<span class="chip">{detail.originalLanguage}</span>{/if}
-						<span class="chip">{detail.chapterCount} ch</span>
-					</div>
-					{#if detail.author || detail.artist}
-						<p class="by">
-							{detail.author ?? '—'}{detail.artist && detail.artist !== detail.author
-								? ` · art by ${detail.artist}`
-								: ''}
-						</p>
-					{/if}
-					{#if detail.description}
-						<p class="desc">{detail.description}</p>
-					{/if}
-					{#if detail.altTitles.length > 0}
-						<div class="facet">
-							<span class="facet-label">Also known as</span>
-							<div class="chips">
-								{#each detail.altTitles as t (t)}
-									<span class="chip alt">{t}</span>
-								{/each}
-							</div>
+		<LoadState
+			loading={detailLoading || (!detail && !detailError)}
+			error={detailError}
+			loadingLabel="Loading details…"
+			skeletonRows={3}
+			onretry={() => openDetail(target.workId, target.label, target.side)}
+		>
+			{#if detail}
+				<div class="detail">
+					<Cover src={detail.coverUrl ? assetSrc(detail.coverUrl) : null} width={132} />
+					<div class="facts">
+						<span class="k-mono k-muted workid">{detail.workId}</span>
+						<div class="chips">
+							{#if detail.isNsfw}<span class="k-badge" data-tone="danger">NSFW</span>{/if}
+							{#if detail.status}<span class="k-badge">{detail.status}</span>{/if}
+							{#if detail.year}<span class="k-badge k-num">{detail.year}</span>{/if}
+							{#if detail.contentRating}<span class="k-badge">{detail.contentRating}</span>{/if}
+							{#if detail.originalLanguage}<span class="k-badge">{detail.originalLanguage}</span
+								>{/if}
+							<span class="k-badge k-num"
+								>{detail.chapterCount} chapter{detail.chapterCount === 1 ? '' : 's'}</span
+							>
 						</div>
-					{/if}
-					<div class="facet">
-						<span class="facet-label">Sources ({detail.sources.length})</span>
-						{#if detail.sources.length === 0}
-							<span class="muted">No catalogued source mappings.</span>
-						{:else}
-							<div class="chips">
-								{#each detail.sources as s (`${s.sourceType}:${s.sourceId}:${s.sourceKey}`)}
-									<span class="chip mono" title="{s.sourceType} · {s.sourceKey}">
-										{s.extension?.pkgName?.split('.').pop() ?? s.sourceType}{s.lang
-											? ` (${s.lang})`
-											: ''}
-									</span>
-								{/each}
+						{#if detail.author || detail.artist}
+							<p class="by">
+								{detail.author ?? 'Unknown author'}{detail.artist && detail.artist !== detail.author
+									? `, art by ${detail.artist}`
+									: ''}
+							</p>
+						{/if}
+						{#if detail.description}
+							<p class="desc">{detail.description}</p>
+						{/if}
+						{#if detail.altTitles.length > 0}
+							<div class="facet">
+								<span class="k-label">Also known as</span>
+								<div class="chips wrap">
+									{#each detail.altTitles as t (t)}
+										<span class="k-badge">{t}</span>
+									{/each}
+								</div>
 							</div>
 						{/if}
+						<div class="facet">
+							<span class="k-label">Sources ({detail.sources.length})</span>
+							{#if detail.sources.length === 0}
+								<span class="k-muted note">No sources are linked to this work.</span>
+							{:else}
+								<div class="chips wrap">
+									{#each detail.sources as s (`${s.sourceType}:${s.sourceId}:${s.sourceKey}`)}
+										<span class="k-badge" title="{s.sourceType}: {s.sourceKey}">
+											{s.extension?.pkgName?.split('.').pop() ?? s.sourceType}{s.lang
+												? ` (${s.lang})`
+												: ''}
+										</span>
+									{/each}
+								</div>
+							{/if}
+						</div>
+						{#if editorHref}
+							<div>
+								<Button
+									size="sm"
+									icon="external"
+									href={editorHref}
+									target="_blank"
+									rel="noreferrer"
+								>
+									Open in the catalogue editor
+								</Button>
+							</div>
+						{:else}
+							<span class="k-muted note">
+								This work has no MangaDex mapping, so the catalogue editor cannot open it.
+							</span>
+						{/if}
 					</div>
-					{#if editorHref}
-						<a class="editor-link" href={editorHref} target="_blank" rel="noreferrer">
-							Open in the catalogue editor ↗
-						</a>
-					{:else}
-						<span class="muted small">
-							No MangaDex mapping — the catalogue editor can't open this work.
-						</span>
-					{/if}
 				</div>
-			</div>
-		{/if}
-	</div>
+			{/if}
+		</LoadState>
+	</Dialog>
 {/if}
 
 <style>
-	.page {
-		display: flex;
-		flex-direction: column;
-		gap: var(--k-space-6);
+	.k-table {
+		--cols: minmax(0, 2fr) minmax(0, 2fr) minmax(0, 0.7fr) minmax(0, 1.1fr) minmax(0, 0.7fr) 216px;
 	}
-	.page-head {
-		display: flex;
-		align-items: flex-end;
-		justify-content: space-between;
-	}
-	h1 {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 30px;
-		letter-spacing: -0.02em;
-		color: var(--k-text-bright);
-	}
-	.lede {
-		margin-top: 6px;
-		font-size: 13.5px;
-		color: var(--k-text-dim);
-		max-width: 60ch;
-	}
-	.notice {
-		padding: 14px 16px;
-		border-radius: var(--k-radius-md);
-		background: var(--k-surface-2);
-		border: 1px solid var(--k-border);
-		color: var(--k-text-dim);
-		font-size: 13.5px;
-	}
-	.notice.error {
-		color: #f0808a;
-		border-color: rgba(240, 128, 138, 0.4);
-	}
-	.table {
-		border: 1px solid var(--k-border);
-		border-radius: var(--k-radius-lg);
-		overflow: hidden;
-	}
-	.row {
-		display: grid;
-		grid-template-columns: 2fr 2fr 1fr 1.2fr 1fr auto;
-		align-items: center;
-		gap: var(--k-space-4);
-		padding: 12px 16px;
-		border-bottom: 1px solid var(--k-border);
-	}
-	.row:last-child {
-		border-bottom: none;
-	}
-	.row.head {
-		background: var(--k-surface-2);
-		font-size: 11px;
-		font-weight: 700;
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-		color: var(--k-text-faint);
-	}
-	/* The grid item, not the button, is what a `2fr` track sizes — without this it
-	   defaults to min-width:auto and a long title widens the column instead of
-	   ellipsising inside it. */
-	.work-cell {
-		min-width: 0;
+	.bulk {
+		font-size: var(--k-text-sm);
 	}
 	.work {
 		display: flex;
 		align-items: center;
-		gap: 10px;
+		gap: var(--k-space-3);
 		width: 100%;
 		min-width: 0;
 		padding: 0;
 		background: none;
 		border: none;
+		border-radius: var(--k-radius-sm);
 		text-align: left;
-		font-family: inherit;
 		cursor: pointer;
-		border-radius: var(--k-radius-sm);
-	}
-	.work:hover .wtitle,
-	.work:focus-visible .wtitle {
-		color: var(--k-accent-teal);
-		text-decoration: underline;
-	}
-	.thumb {
-		flex: none;
-		width: 38px;
-		height: 54px;
-		object-fit: cover;
-		border-radius: var(--k-radius-sm);
-		background: var(--k-surface-4);
-		border: 1px solid var(--k-border);
-	}
-	.thumb.none {
-		display: block;
 	}
 	.wtext {
-		display: flex;
-		flex-direction: column;
+		display: grid;
 		gap: 2px;
 		min-width: 0;
 	}
 	.wtitle {
-		font-size: 14px;
-		font-weight: 600;
-		color: var(--k-text-1);
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-	.wid {
-		font-size: 11px;
-		color: var(--k-text-faint);
-		font-family: var(--k-font-mono, monospace);
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.muted {
-		font-size: 13px;
-		color: var(--k-text-dim);
-	}
-	.badge {
-		display: inline-block;
-		font-size: 11px;
+		color: var(--k-text-bright);
 		font-weight: 700;
-		padding: 3px 8px;
-		border-radius: var(--k-radius-sm);
-		background: var(--k-surface-4);
-		color: var(--k-text-2);
 	}
-	.badge.strong {
-		background: rgba(95, 200, 207, 0.15);
-		color: var(--k-accent-teal);
+	.work:hover .wtitle,
+	.work:focus-visible .wtitle {
+		text-decoration: underline;
+		text-underline-offset: 3px;
 	}
-	.actions-col {
-		text-align: right;
-	}
-	.actions {
-		display: flex;
-		gap: 8px;
-		justify-content: flex-end;
-	}
-	.act {
-		height: 32px;
-		padding: 0 12px;
-		border-radius: var(--k-radius-md);
-		background: var(--k-surface);
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-2);
-		font-family: var(--k-font-sans);
-		font-size: 12.5px;
-		font-weight: 600;
-		cursor: pointer;
-		white-space: nowrap;
-		transition:
-			color 0.15s,
-			background-color 0.15s,
-			border-color 0.15s;
-	}
-	.act:hover:not(:disabled) {
-		border-color: var(--k-border-strong);
-		color: var(--k-text);
-	}
-	.act.merge:hover:not(:disabled) {
-		border-color: rgba(95, 200, 207, 0.5);
-		color: var(--k-accent-teal);
-	}
-	.act:disabled {
-		opacity: 0.5;
-		cursor: default;
-	}
-	.head-actions {
-		display: flex;
-		align-items: center;
-		gap: 10px;
-		flex-wrap: wrap;
-	}
-	.cmsg {
-		font-size: 12.5px;
-		color: var(--k-text-dim);
-	}
-	.pg {
-		height: 36px;
-		padding: 0 16px;
-		border-radius: var(--k-radius-md);
-		background: var(--k-surface);
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-2);
-		font-family: var(--k-font-sans);
-		font-size: 13px;
-		font-weight: 600;
-		cursor: pointer;
-	}
-	.pg:disabled {
-		opacity: 0.4;
-		cursor: default;
-	}
-	.pg.stop {
-		border-color: rgba(224, 131, 105, 0.5);
-		color: var(--k-accent);
-	}
-	.pager {
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		gap: 16px;
-	}
-	.page-num {
-		font-size: 13px;
-		color: var(--k-text-dim);
+	.paging {
+		display: grid;
+		gap: var(--k-space-2);
+		justify-items: center;
 	}
 	.drift {
-		color: var(--k-hiatus);
-		border-bottom: 1px dotted var(--k-border-4);
-		cursor: help;
+		max-width: 72ch;
+		color: var(--k-warning);
+		font-size: var(--k-text-xs);
+		line-height: 1.55;
+		text-align: center;
 	}
 
-	/* ---- detail overlay ---- */
-	.scrim {
-		position: fixed;
-		inset: 0;
-		z-index: 40;
-		border: none;
-		background: rgba(6, 6, 7, 0.6);
-		cursor: default;
-	}
-	.modal {
-		position: fixed;
-		top: 50%;
-		left: 50%;
-		transform: translate(-50%, -50%);
-		z-index: 41;
-		width: 720px;
-		max-width: 94vw;
-		max-height: 90vh;
-		overflow-y: auto;
-		background: var(--k-surface-2);
-		border: 1px solid var(--k-border-2);
-		border-radius: var(--k-radius-lg);
-		box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
-		padding: var(--k-space-6);
-		display: flex;
-		flex-direction: column;
-		gap: var(--k-space-4);
-	}
-	.modal-head {
-		display: grid;
-		grid-template-columns: 1fr auto;
-		align-items: center;
-		gap: 12px;
-	}
-	.modal-kicker {
-		grid-column: 1 / -1;
-		font-size: 11px;
-		font-weight: 800;
-		letter-spacing: 0.08em;
-		color: var(--k-accent);
-	}
-	.modal-head h2 {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 22px;
-		color: var(--k-text-bright);
-		min-width: 0;
-	}
-	.act.close {
-		height: 30px;
-	}
+	/* ---- detail dialog ---- */
 	.detail {
 		display: grid;
-		grid-template-columns: 150px 1fr;
+		grid-template-columns: auto minmax(0, 1fr);
 		gap: var(--k-space-5);
 		align-items: start;
 	}
-	.cover {
-		width: 150px;
-		aspect-ratio: 2 / 3;
-		object-fit: cover;
-		border-radius: var(--k-radius-md);
-		border: 1px solid var(--k-border);
-		background: var(--k-surface-4);
-	}
-	.cover.none {
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		font-size: 12px;
-		color: var(--k-text-faint);
-	}
 	.facts {
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
+		display: grid;
+		gap: var(--k-space-3);
 		min-width: 0;
+	}
+	.workid {
+		overflow-wrap: anywhere;
 	}
 	.chips {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 6px;
 	}
-	.chip {
-		font-size: 11px;
+	/* Alternative titles and source names can be long: let them wrap inside the
+	   dialog instead of forcing it to scroll sideways. */
+	.chips.wrap .k-badge {
+		height: auto;
+		min-height: 22px;
+		padding: 4px 8px;
+		line-height: 1.35;
 		font-weight: 600;
-		padding: 3px 8px;
-		border-radius: var(--k-radius-sm);
-		background: var(--k-surface-4);
-		color: var(--k-text-2);
-		border: 1px solid var(--k-border);
-	}
-	.chip.mono {
-		font-family: var(--k-font-mono, monospace);
-		font-weight: 500;
-	}
-	.chip.nsfw {
-		border-color: rgba(240, 128, 138, 0.45);
-		color: #f0808a;
-	}
-	.chip.alt {
-		font-weight: 500;
-		color: var(--k-text-dim);
+		white-space: normal;
+		overflow-wrap: anywhere;
 	}
 	.by {
-		font-size: 13px;
+		font-size: var(--k-text-sm);
 		color: var(--k-text-1);
 	}
 	.desc {
-		font-size: 13px;
-		line-height: 1.55;
+		font-size: var(--k-text-sm);
+		line-height: 1.6;
 		color: var(--k-text-dim);
 		/* A synopsis is context, not the point — cap it so the sources and alt titles
 		   below stay visible without scrolling past a wall of text. */
@@ -875,76 +543,29 @@
 		white-space: pre-wrap;
 	}
 	.facet {
-		display: flex;
-		flex-direction: column;
+		display: grid;
 		gap: 6px;
 	}
-	.facet-label {
-		font-size: 11px;
-		font-weight: 700;
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-		color: var(--k-text-faint);
-	}
-	.muted.small {
-		font-size: 12px;
-	}
-	.editor-link {
-		align-self: flex-start;
-		font-size: 12.5px;
-		font-weight: 600;
-		color: var(--k-accent-teal);
-		text-decoration: none;
-	}
-	.editor-link:hover {
-		text-decoration: underline;
+	.note {
+		font-size: var(--k-text-xs);
+		line-height: 1.55;
 	}
 
 	@media (max-width: 720px) {
-		.page-head {
-			flex-wrap: wrap;
-		}
-		.row {
-			grid-template-columns: 1fr;
-			gap: 8px;
-		}
-		.row.head {
-			display: none;
-		}
-		/* Confidence / Signal / Queued get their head-row labels back inline. */
-		.row > [role='cell']:nth-child(3)::before,
-		.row > [role='cell']:nth-child(4)::before,
-		.row > [role='cell']:nth-child(5)::before {
+		/* Both works get their column name back as a caption above the title, so the
+		   pair still reads as "source" and "candidate" once the row stacks. */
+		.work-cell::before {
+			content: attr(data-caption);
+			display: block;
+			margin-bottom: 6px;
+			color: var(--k-text-dim);
+			font-size: 11px;
 			font-weight: 700;
-			color: var(--k-text-faint);
-		}
-		.row > [role='cell']:nth-child(3)::before {
-			content: 'Confidence · ';
-		}
-		.row > [role='cell']:nth-child(4)::before {
-			content: 'Signal · ';
-		}
-		.row > [role='cell']:nth-child(5)::before {
-			content: 'Queued · ';
-		}
-		.actions {
-			justify-content: flex-start;
-			flex-wrap: wrap;
-		}
-		.head-actions .pg,
-		.act,
-		.pager .pg {
-			height: 40px;
+			letter-spacing: 0.05em;
+			text-transform: uppercase;
 		}
 		.detail {
-			grid-template-columns: 1fr;
-		}
-		.cover {
-			width: 110px;
-		}
-		.pager {
-			flex-wrap: wrap;
-			justify-content: flex-start;
+			grid-template-columns: minmax(0, 1fr);
 		}
 	}
 </style>

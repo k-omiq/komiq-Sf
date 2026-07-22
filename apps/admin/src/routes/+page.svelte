@@ -8,10 +8,19 @@
 	} from '@komika/types';
 	import { untrack } from 'svelte';
 	import { goto, beforeNavigate } from '$app/navigation';
-	import { modal } from '$lib/modal';
 	import { page as pageState } from '$app/state';
 	import { auth } from '$lib/auth.svelte';
 	import { assetSrc } from '$lib/config';
+	import { confirm } from '$lib/confirm.svelte';
+	import { toast } from '$lib/toast.svelte';
+	import Button from '$lib/components/Button.svelte';
+	import Cover from '$lib/components/Cover.svelte';
+	import Dialog from '$lib/components/Dialog.svelte';
+	import Icon from '$lib/components/Icon.svelte';
+	import LoadState from '$lib/components/LoadState.svelte';
+	import PageHeader from '$lib/components/PageHeader.svelte';
+	import Pager from '$lib/components/Pager.svelte';
+	import Segmented from '$lib/components/Segmented.svelte';
 	import {
 		loadCatalog,
 		loadSeriesSources,
@@ -88,10 +97,29 @@
 	);
 	const rangeStart = $derived(series.length === 0 ? 0 : (page - 1) * pageSize + 1);
 	const rangeEnd = $derived(series.length === 0 ? 0 : (page - 1) * pageSize + series.length);
+	const pagerDetail = $derived(
+		totalPages != null
+			? `of ${totalPages}, showing ${rangeStart} to ${rangeEnd}${total != null ? ` of ${total}` : ''}`
+			: `showing ${rangeStart} to ${rangeEnd}`,
+	);
+	// The count shown next to the search. A text search reports no total, so say
+	// "at least" while more pages follow rather than pretend the page is everything.
+	const countNumber = $derived(total ?? series.length);
+	const countText = $derived(
+		total != null
+			? String(total)
+			: hasNextPage
+				? `At least ${series.length}`
+				: String(series.length),
+	);
+	/** A page is on screen (not the first load, not a failed one), so a count means something. */
+	const listed = $derived(!loadError && !(loading && series.length === 0));
 
 	// ---- source/extension provenance (seriesSourcesBatch) ----
 	let provenance = $state<Record<string, SeriesSourceGroup>>({});
 	let provenanceError = $state<string | null>(null);
+	/** A provenance fetch is in flight: rows without an answer yet say "Checking". */
+	let provenancePending = $state(false);
 
 	/** Monotonic token: a slow provenance fetch must not overwrite a newer page's. */
 	let provSeq = 0;
@@ -112,8 +140,10 @@
 		const ids = list.filter((s) => !isCanonical(s)).map((s) => s.id);
 		if (ids.length === 0) {
 			provenance = {};
+			provenancePending = false;
 			return;
 		}
+		provenancePending = true;
 		try {
 			const groups = await loadSeriesSources(ids);
 			if (seq !== provSeq) return; // a newer page superseded this fetch
@@ -128,7 +158,9 @@
 			provenance = map;
 		} catch (err) {
 			if (seq !== provSeq) return;
-			provenanceError = err instanceof Error ? err.message : 'Failed to load source provenance.';
+			provenanceError = err instanceof Error ? err.message : 'The request failed.';
+		} finally {
+			if (seq === provSeq) provenancePending = false;
 		}
 	}
 
@@ -140,21 +172,32 @@
 	}
 
 	// ---- targeted pause toggle ----
-	let unpausing = $state<string | null>(null);
-	let pauseMsg = $state<Record<string, string>>({});
+	let pausing = $state<string | null>(null);
 
-	async function unpause(s: Series): Promise<void> {
-		if (unpausing) return;
-		unpausing = s.id;
-		const { [s.id]: _drop, ...rest } = pauseMsg;
-		pauseMsg = rest;
+	/**
+	 * Pause or unpause one row. `setSeriesPaused` writes the same forced override the
+	 * drawer's scanner mode does (true is "Paused", false is "Keep scanning") and
+	 * leaves the other overrides alone, so the two controls cannot disagree: the
+	 * returned series replaces the row, and the drawer decodes its mode from that.
+	 * Unpausing also re-scans on the server before it answers.
+	 */
+	async function setPaused(s: Series, paused: boolean): Promise<void> {
+		// Like the row editor: the server keys pause overrides by numeric source series
+		// id and rejects a `w_` one, so the buttons are not rendered for catalogue works.
+		if (pausing || isCanonical(s)) return;
+		pausing = s.id;
 		try {
-			const updated = await setSeriesPaused(s.id, false);
+			const updated = await setSeriesPaused(s.id, paused);
 			series = series.map((x) => (x.id === updated.id ? updated : x));
+			toast.success(
+				paused
+					? `Scanning is paused for ${s.title}.`
+					: `Scanning resumed for ${s.title}. It was scanned just now.`,
+			);
 		} catch (err) {
-			pauseMsg = { ...pauseMsg, [s.id]: err instanceof Error ? err.message : 'Unpause failed.' };
+			toast.fromError(err, paused ? 'Could not pause scanning.' : 'Could not resume scanning.');
 		} finally {
-			unpausing = null;
+			pausing = null;
 		}
 	}
 
@@ -165,8 +208,9 @@
 	/** The surviving target; when set, the confirmation dialog is shown. */
 	let mergeTarget = $state<MergeSide | null>(null);
 	let merging = $state(false);
+	// A failed merge stays inline in the confirm dialog: the dialog is still open and
+	// makes everything behind it (the toaster included) inert.
 	let mergeError = $state<string | null>(null);
-	let mergeResult = $state<{ targetTitle: string; movedSourceSeries: number } | null>(null);
 
 	/** The canonical work id for a row, or null when not catalogued. A text-search row
 	 * IS a canonical work, so its own id is the work id — no provenance lookup needed. */
@@ -209,7 +253,6 @@
 		mergeSource = side;
 		mergeTarget = null;
 		mergeError = null;
-		mergeResult = null;
 	}
 
 	async function pickTarget(s: Series): Promise<void> {
@@ -226,13 +269,21 @@
 		mergeError = null;
 	}
 
+	/** Step back from the confirm dialog to target picking (not while a merge runs). */
+	function backToTargets(): void {
+		if (!merging) mergeTarget = null;
+	}
+
 	async function confirmMerge(): Promise<void> {
 		if (!mergeSource || !mergeTarget || merging) return;
 		merging = true;
 		mergeError = null;
 		try {
 			const res = await mergeWorks(mergeSource.workId, mergeTarget.workId);
-			mergeResult = { targetTitle: mergeTarget.title, movedSourceSeries: res.movedSourceSeries };
+			const moved = res.movedSourceSeries;
+			toast.success(
+				`Merged into ${mergeTarget.title}. ${moved} source ${moved === 1 ? 'link' : 'links'} moved and the duplicate work was deleted.`,
+			);
 			mergeSource = null;
 			mergeTarget = null;
 			// Re-fetch the current server page so the deleted work's phantom row is gone.
@@ -297,7 +348,12 @@
 			// Learn the server's page size from any full page (a page with more to
 			// follow is full); keep the last known size otherwise.
 			if (res.hasNextPage && res.items.length > 0) pageSize = res.items.length;
-			else if (pageSize === 0) pageSize = res.items.length;
+			else if (pageSize === 0) {
+				// Opened directly on the last page. Its own length is not the page size
+				// (35 results, page 2 holds 5), but every page before it was full.
+				const before = (res.total ?? res.items.length) - res.items.length;
+				pageSize = toPage > 1 && before > 0 ? Math.ceil(before / (toPage - 1)) : res.items.length;
+			}
 			// Provenance for the new page is fetched by the series effect.
 		} catch (err) {
 			if (seq !== loadSeq) return;
@@ -344,22 +400,48 @@
 	}
 
 	// ---- add to canonical catalogue (Tier-2 dedup add flow) ----
-	let addMsg = $state<Record<string, string>>({});
+	/** Per-row result of a successful Add (the marker in the Source column); stays
+	 * until the page changes. */
+	let addMsg = $state<Record<string, MatchResult>>({});
 	let addingId = $state<string | null>(null);
 
 	function decisionLabel(r: MatchResult): string {
 		switch (r.decision) {
 			case 'auto_merge':
-				return `auto-merged into ${r.workId}`;
+				return 'Merged';
 			case 'review':
-				return 'queued for review';
+				return 'In review';
 			case 'new':
-				return 'added as new';
+				return 'Added';
 			case 'existing':
-				return 'already added';
+				return 'Already added';
 			default:
 				return r.decision;
 		}
+	}
+
+	function decisionToast(title: string, r: MatchResult): string {
+		switch (r.decision) {
+			case 'auto_merge':
+				return `${title} matched a work already in the catalogue and was merged into it (${r.workId}).`;
+			case 'review':
+				return `${title} looks like a work already in the catalogue. It is queued for review.`;
+			case 'new':
+				return `${title} was added to the catalogue as a new work.`;
+			case 'existing':
+				return `${title} is already in the catalogue.`;
+			default:
+				return `${title}: ${r.decision}.`;
+		}
+	}
+
+	/**
+	 * Hide Add once the row is known to be catalogued: its sources resolve to a work,
+	 * or an Add on this page just linked it. While that is still unknown (sources not
+	 * loaded, or the lookup failed) the button stays, as before.
+	 */
+	function canAdd(s: Series): boolean {
+		return !isCanonical(s) && !workIdOf(s) && !addMsg[s.id];
 	}
 
 	async function onAdd(s: Series): Promise<void> {
@@ -370,9 +452,11 @@
 		addingId = s.id;
 		try {
 			const r = await addSourceSeries(s.id);
-			addMsg = { ...addMsg, [s.id]: decisionLabel(r) };
+			addMsg = { ...addMsg, [s.id]: r };
+			if (r.decision === 'existing') toast.info(decisionToast(s.title, r));
+			else toast.success(decisionToast(s.title, r));
 		} catch (err) {
-			addMsg = { ...addMsg, [s.id]: err instanceof Error ? err.message : 'Add failed.' };
+			toast.fromError(err, 'Could not add this series to the catalogue.');
 		} finally {
 			addingId = null;
 		}
@@ -386,9 +470,13 @@
 	let fPoll = $state('');
 	let fScanner = $state<Scanner>('auto');
 	let saving = $state(false);
+	// Save and scan failures stay inline in the drawer: it is still open and makes
+	// everything behind it (the toaster included) inert.
 	let saveError = $state<string | null>(null);
+	let intervalError = $state<string | null>(null);
+	let pollError = $state<string | null>(null);
 	let scanning = $state(false);
-	let scanMsg = $state<string | null>(null);
+	let scanError = $state<string | null>(null);
 
 	/**
 	 * The row editor writes SCAN/STATUS overrides, which are keyed by Suwayomi series
@@ -402,7 +490,9 @@
 		if (isCanonical(s)) return;
 		editing = s;
 		saveError = null;
-		scanMsg = null;
+		intervalError = null;
+		pollError = null;
+		scanError = null;
 		// Decode straight from the raw admin overrides so an explicit choice is
 		// never mistaken for the status default (even when they coincide).
 		fStatus = s.scan.statusOverride ?? 'source';
@@ -431,30 +521,47 @@
 							: 'running')),
 	);
 	beforeNavigate(({ cancel }) => {
+		// Navigation guards must answer synchronously, so this one stays native.
 		if (
 			(editorDirty || saving) &&
-			!confirm(
-				'Leave this page? Unsaved changes will be lost; a save already in progress may still complete.',
+			!window.confirm(
+				'Leave this page? Unsaved changes will be lost. A save already in progress may still complete.',
 			)
 		)
 			cancel();
 	});
-	function closeEditor(): void {
-		if (saving || (editorDirty && !confirm('Discard your unsaved scan settings?'))) return;
+	async function closeEditor(): Promise<void> {
+		if (saving) return;
+		if (
+			editorDirty &&
+			!(await confirm({
+				title: 'Discard your changes?',
+				message: 'The scan settings you changed for this series have not been saved.',
+				confirmLabel: 'Discard changes',
+				cancelLabel: 'Keep editing',
+				danger: true,
+			}))
+		)
+			return;
 		editing = null;
 	}
 
 	async function save(): Promise<void> {
 		if (!editing || saving) return;
-		saving = true;
 		saveError = null;
+		const interval = fInterval.trim() === '' ? null : Number(fInterval);
+		const poll = fPoll.trim() === '' ? null : Number(fPoll);
+		intervalError =
+			interval != null && (!Number.isFinite(interval) || interval <= 0)
+				? 'Enter a number of hours greater than zero, or leave this blank.'
+				: null;
+		pollError =
+			poll != null && (!Number.isInteger(poll) || poll <= 0)
+				? 'Enter a whole number of minutes greater than zero, or leave this blank.'
+				: null;
+		if (intervalError || pollError) return;
+		saving = true;
 		try {
-			const interval = fInterval.trim() === '' ? null : Number(fInterval);
-			const poll = fPoll.trim() === '' ? null : Number(fPoll);
-			if (interval != null && (!Number.isFinite(interval) || interval <= 0))
-				throw new Error('Override interval must be a positive number of hours.');
-			if (poll != null && (!Number.isInteger(poll) || poll <= 0))
-				throw new Error('Poll cadence must be a whole number of minutes greater than zero.');
 			const updated = await saveSeriesAdmin({
 				seriesId: editing.id,
 				overrideIntervalHours: interval,
@@ -463,9 +570,11 @@
 				status: fStatus === 'source' ? null : fStatus,
 			});
 			series = series.map((s) => (s.id === updated.id ? updated : s));
+			toast.success(`Scan settings saved for ${updated.title}.`);
 			editing = null;
 		} catch (err) {
-			saveError = err instanceof Error ? err.message : 'Failed to save.';
+			saveError =
+				err instanceof Error ? err.message : 'The settings could not be saved. Try again.';
 		} finally {
 			saving = false;
 		}
@@ -474,1241 +583,625 @@
 	async function scanNow(): Promise<void> {
 		if (!editing || scanning) return;
 		scanning = true;
-		scanMsg = null;
+		scanError = null;
 		try {
 			const updated = await triggerScan(editing.id);
 			series = series.map((s) => (s.id === updated.id ? updated : s));
-			editing = updated;
+			// Only if the drawer still shows that series. Closed and reopened on another
+			// one, it would otherwise switch target under the form being edited.
+			if (editing?.id === updated.id) editing = updated;
 			const at = updated.scan.lastScannedAt;
-			scanMsg = at ? `Scanned just now (${new Date(at).toLocaleTimeString()}).` : 'Scan complete.';
+			toast.success(
+				at
+					? `${updated.title} was scanned at ${new Date(at).toLocaleTimeString()}.`
+					: `${updated.title} was scanned.`,
+			);
 		} catch (err) {
-			scanMsg = err instanceof Error ? err.message : 'Scan failed.';
+			scanError = err instanceof Error ? err.message : 'The scan failed. Try again.';
 		} finally {
 			scanning = false;
 		}
 	}
 
 	function cadence(s: Series): string {
-		if (s.scan.overrideIntervalHours != null) return `${s.scan.overrideIntervalHours}h · override`;
-		if (s.scan.avgIntervalHours > 0) return `${s.scan.avgIntervalHours}h · avg`;
-		return 'auto';
+		if (s.scan.overrideIntervalHours != null)
+			return `Every ${s.scan.overrideIntervalHours}h (set here)`;
+		if (s.scan.avgIntervalHours > 0) return `Every ${s.scan.avgIntervalHours}h (average)`;
+		return 'Automatic timing';
 	}
 
-	const STATUS_CLASS: Record<SeriesStatus, string> = {
-		ONGOING: 'ongoing',
-		COMPLETED: 'completed',
-		HIATUS: 'hiatus',
-		CANCELLED: 'cancelled',
-		UNKNOWN: 'unknown',
+	/** Badge tone per status; UNKNOWN keeps the neutral badge. */
+	const STATUS_TONE: Record<SeriesStatus, string | undefined> = {
+		ONGOING: 'success',
+		COMPLETED: 'info',
+		HIATUS: 'warning',
+		CANCELLED: 'danger',
+		UNKNOWN: undefined,
 	};
+
+	/** "ONGOING" reads as "Ongoing": enum words from the API, shown as words. */
+	function sentence(word: string): string {
+		return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase().replaceAll('_', ' ');
+	}
+
+	const SCANNER_OPTIONS: { value: Scanner; label: string }[] = [
+		{ value: 'auto', label: 'Auto' },
+		{ value: 'running', label: 'Keep scanning' },
+		{ value: 'paused', label: 'Paused' },
+	];
 </script>
 
-<div class="page">
-	<div class="page-head">
-		<div>
-			<h1>Catalog</h1>
-			<p class="lede">
-				{appliedQuery ? 'Search results' : 'Library'} · {total != null
-					? `${total} series`
-					: `${series.length}${hasNextPage ? '+' : ''} series`} · {appliedQuery
-					? 'canonical works from the catalogue index'
-					: 'source series'} · manage scan cadence and status ·
-				<span
-					class="nsfw-note"
-					title="This console always requests NSFW-inclusive results (an admin-only per-request override), independent of the NSFW on/off preference in the header. The reader still honours each viewer's own preference — so the console deliberately lists more than the reader does, including the mis-flagged mainstream titles it exists to correct."
-					>incl. NSFW-flagged</span
-				>
-			</p>
+{#snippet mergeSide(side: MergeSide, kept: boolean)}
+	<div class="side">
+		<span class="k-badge" data-tone={kept ? 'success' : 'danger'}>
+			{kept ? 'Will be kept' : 'Will be deleted'}
+		</span>
+		<p class="side-title">{side.title}</p>
+		<p class="k-mono k-muted side-id">{side.workId}</p>
+		<div class="chips">
+			{#if side.group.sources.length > 0}
+				{#each side.group.sources as src (`${src.sourceType}:${src.sourceId}:${src.sourceKey}`)}
+					<span class="k-badge" title={src.extension?.pkgName ?? src.sourceType}
+						>{extLabel(src)}</span
+					>
+				{/each}
+			{:else}
+				<span class="detail">No sources linked</span>
+			{/if}
 		</div>
-		<form class="search" onsubmit={onSearch}>
-			<input
-				type="search"
-				name="q"
-				aria-label="Search the catalog"
-				autocomplete="off"
-				placeholder="Search the catalog…"
-				bind:value={searchDraft}
-			/>
-			<button type="submit">Search</button>
+	</div>
+{/snippet}
+
+<div class="k-page">
+	<PageHeader
+		title="Catalog"
+		description="Find a series, set how often it is scanned, add it to the catalogue, or merge duplicates."
+	/>
+
+	<div class="find">
+		<form class="k-toolbar" onsubmit={onSearch}>
+			<div class="k-search k-grow">
+				<Icon name="search" />
+				<input
+					class="k-input"
+					type="search"
+					name="q"
+					aria-label="Search the catalog"
+					autocomplete="off"
+					placeholder="Search by title"
+					bind:value={searchDraft}
+				/>
+			</div>
+			<Button type="submit" variant="primary">Search</Button>
 			{#if searchDraft.trim() || appliedQuery}
-				<button type="button" class="clear" onclick={clearSearch}>Clear</button>
+				<Button variant="ghost" onclick={clearSearch}>Clear</Button>
 			{/if}
 		</form>
+		<!-- The console reads the catalogue NSFW-inclusive regardless of the header's NSFW
+		     preference; say so, so the console/reader difference isn't a mystery. -->
+		<p class="k-muted mode">
+			{#if appliedQuery}
+				{#if listed}
+					<span class="k-num">{countText}</span>
+					catalogue {countNumber === 1 ? 'work matches' : 'works match'} “{appliedQuery}”.
+				{:else}
+					Searching catalogue works for “{appliedQuery}”.
+				{/if}
+				Clear the search to list series as the source engine has them.
+			{:else}
+				{#if listed}
+					<span class="k-num">{countText}</span> series, listed as the source engine has them.
+				{:else}
+					Series are listed as the source engine has them.
+				{/if}
+				Search by title to list catalogue works instead.
+			{/if}
+			Series flagged NSFW always appear here, whatever your NSFW setting.
+		</p>
 	</div>
 
-	{#if loadError}
-		<div class="notice error" role="alert">{loadError}</div>
-	{/if}
 	{#if provenanceError}
-		<div class="notice error" role="alert">Source provenance unavailable: {provenanceError}</div>
-	{/if}
-
-	{#if mergeResult}
-		<div class="notice success" role="status">
-			Merged into <strong>{mergeResult.targetTitle}</strong> · {mergeResult.movedSourceSeries} source
-			mapping{mergeResult.movedSourceSeries === 1 ? '' : 's'} moved. The duplicate work was deleted.
-			<button class="link-btn" onclick={() => (mergeResult = null)}>Dismiss</button>
+		<div class="k-notice" data-tone="warning" role="alert">
+			<Icon name="alert" />
+			<div class="k-notice__body">
+				Could not check which catalogue work each series belongs to, so the Source column and the
+				Merge action are incomplete. {provenanceError}
+			</div>
+			<Button size="sm" onclick={() => loadProvenance(series)}>Retry</Button>
 		</div>
 	{/if}
 
 	{#if mergeSource}
-		<div class="notice merge-banner">
-			<span>
+		<div class="k-notice" data-tone="info">
+			<Icon name="merge" />
+			<div class="k-notice__body">
 				Merging <strong>{mergeSource.title}</strong>
-				<span class="mono">({mergeSource.workId})</span> — pick the <strong>target</strong> row to
-				keep. The source work will be <strong>deleted</strong> and its mappings + reading data moved to
-				the target.
-			</span>
-			<button class="link-btn" onclick={cancelMerge}>Cancel merge</button>
+				<span class="k-mono">({mergeSource.workId})</span>. Choose the row to keep. The work you are
+				merging will be deleted, and its sources and reading data move to the one you keep.
+			</div>
+			<Button size="sm" onclick={cancelMerge}>Cancel merge</Button>
 		</div>
 	{/if}
 
-	<div class="table" role="table" aria-label="Catalog" aria-busy={loading} class:dim={loading}>
-		<div class="thead" role="row">
-			<span role="columnheader" class="col-series">Series</span>
-			<span role="columnheader" class="col-type">Type</span>
-			<span role="columnheader" class="col-status">Status</span>
-			<span role="columnheader" class="col-ch">Chapters</span>
-			<span role="columnheader" class="col-src">Source</span>
-			<span role="columnheader" class="col-scan">Scan</span>
-			<span role="columnheader" class="col-actions">Actions</span>
-		</div>
-		{#if loading && series.length === 0}
-			<div class="empty">Loading…</div>
-		{:else if series.length === 0}
-			<div class="empty">No series. Add some to the library in the reader, or search above.</div>
-		{:else}
+	<LoadState
+		loading={loading && series.length === 0}
+		error={loadError}
+		empty={series.length === 0}
+		skeletonRows={8}
+		emptyIcon="book"
+		emptyTitle={page > 1
+			? 'Nothing on this page'
+			: appliedQuery
+				? 'No catalogue works match this search'
+				: 'No series yet'}
+		emptyHint={page > 1
+			? 'Go back to the previous page.'
+			: appliedQuery
+				? 'Check the spelling or try a shorter title. Clear the search to list series from the source engine.'
+				: 'Series show up here once the source engine has them. Add one to a library in the reader, then come back.'}
+		onretry={() => refresh(appliedQuery, page)}
+	>
+		<div
+			class="k-table"
+			class:is-dim={loading}
+			role="table"
+			aria-label="Catalog"
+			aria-busy={loading}
+		>
+			<div class="k-tr k-tr--head" role="row">
+				<span role="columnheader">Series</span>
+				<span role="columnheader">Type</span>
+				<span role="columnheader">Status</span>
+				<span role="columnheader">Chapters</span>
+				<span role="columnheader">Source</span>
+				<span role="columnheader">Scan</span>
+				<span role="columnheader" class="k-td--end">Actions</span>
+			</div>
 			{#each series as s (s.id)}
-				<div class="row" role="row">
-					<div role="cell" class="col-series cell-series">
-						{#if s.coverUrl}
-							<img
-								width="80"
-								height="112"
-								class="cover"
-								src={assetSrc(s.coverUrl)}
-								alt=""
-								loading="lazy"
-								referrerpolicy="no-referrer"
-							/>
-						{:else}
-							<div class="cover placeholder"></div>
-						{/if}
+				<div class="k-tr" role="row">
+					<div role="cell" class="series">
+						<Cover src={s.coverUrl ? assetSrc(s.coverUrl) : null} />
 						<div class="titles">
 							<a class="title" href="/series/{s.id}">{s.title}</a>
-							<span class="meta">#{s.id}{s.author ? ` · ${s.author}` : ''}</span>
+							<span class="detail k-truncate">
+								<span class="k-mono">#{s.id}</span>{s.author ? ` · ${s.author}` : ''}
+							</span>
 						</div>
 					</div>
-					<span role="cell" class="col-type">{s.type}</span>
-					<span role="cell" class="col-status">
-						<span class="badge {STATUS_CLASS[s.status]}">{s.status}</span>
+					<span role="cell" data-label="Type">{sentence(s.type)}</span>
+					<span role="cell" data-label="Status">
+						<span class="k-badge" data-tone={STATUS_TONE[s.status]}>{sentence(s.status)}</span>
 					</span>
-					<span role="cell" class="col-ch">{s.chapterCount}</span>
-					<span role="cell" class="col-src">
-						{#if isCanonical(s)}
-							<span
-								class="src-entry"
-								title="Canonical work — text search returns works, not source series"
-							>
-								<span class="src-name">canonical work</span>
-								<span class="src-id">{s.id}</span>
-							</span>
-						{:else if provenance[s.id]}
-							{#if provenance[s.id].workId && provenance[s.id].sources.length > 0}
-								{#each provenance[s.id].sources as src (`${src.sourceType}:${src.sourceId}:${src.sourceKey}`)}
-									<span
-										class="src-entry"
-										title="{src.extension?.pkgName ?? src.sourceType} · source {src.sourceId}"
-									>
-										<span class="src-name">{extLabel(src)}</span>
-										<span class="src-id">{src.sourceId}</span>
-									</span>
-								{/each}
-							{:else}
-								<span class="src-none">not catalogued</span>
+					<span role="cell" class="k-num" data-label="Chapters">{s.chapterCount}</span>
+					<div role="cell" data-label="Source">
+						<div class="stack">
+							{#if isCanonical(s)}
+								<span
+									class="src"
+									title="A search lists catalogue works, not the series of one source."
+								>
+									<span class="src-name k-truncate">Catalogue work</span>
+									<span class="k-mono k-muted k-truncate">{s.id}</span>
+								</span>
+							{:else if provenance[s.id]}
+								{#if provenance[s.id].workId && provenance[s.id].sources.length > 0}
+									{#each provenance[s.id].sources as src (`${src.sourceType}:${src.sourceId}:${src.sourceKey}`)}
+										<span
+											class="src"
+											title="{src.extension?.pkgName ?? src.sourceType}, source {src.sourceId}"
+										>
+											<span class="src-name k-truncate">{extLabel(src)}</span>
+											<span class="k-mono k-muted k-truncate">{src.sourceId}</span>
+										</span>
+									{/each}
+								{:else if !addMsg[s.id]}
+									<span class="detail">Not in the catalogue</span>
+								{/if}
+							{:else if !addMsg[s.id]}
+								<span class="detail">{provenancePending ? 'Checking' : 'Unknown'}</span>
 							{/if}
-						{:else}
-							<span class="src-none">—</span>
-						{/if}
-					</span>
-					<span role="cell" class="col-scan">
-						<span class="cadence">{cadence(s)}</span>
-						{#if s.scan.paused}
-							<span class="paused-badge">Paused</span>
-							<button class="unpause" onclick={() => unpause(s)} disabled={unpausing === s.id}>
-								{unpausing === s.id ? 'Unpausing…' : 'Unpause'}
-							</button>
-						{:else}
-							<span class="scan-state active">every {s.scan.pollEveryMinutes}m</span>
-						{/if}
-						{#if pauseMsg[s.id]}<span class="pause-err">{pauseMsg[s.id]}</span>{/if}
-					</span>
-					<span role="cell" class="col-actions">
+							{#if addMsg[s.id]}
+								<span class="src">
+									<span class="k-badge" data-tone="success">{decisionLabel(addMsg[s.id])}</span>
+									<span class="k-mono k-muted k-truncate">{addMsg[s.id].workId}</span>
+								</span>
+							{/if}
+						</div>
+					</div>
+					<div role="cell" data-label="Scan">
+						<div class="stack">
+							{#if s.scan.paused}
+								<span class="k-badge" data-tone="warning">Paused</span>
+							{:else}
+								<span class="k-badge" data-tone="success">Scanning</span>
+							{/if}
+							<span class="detail k-num">{cadence(s)}</span>
+							{#if !s.scan.paused}
+								<span class="detail k-num">Every {s.scan.pollEveryMinutes}m when overdue</span>
+							{/if}
+						</div>
+					</div>
+					<div role="cell" class="k-td--end">
 						{#if mergeSource}
 							{#if mergeSource.seriesId === s.id}
-								<span class="merge-source-badge">Source · will delete</span>
+								<span class="k-badge" data-tone="danger">Will be deleted</span>
 							{:else if canBeTarget(s)}
-								<button class="merge-target" onclick={() => pickTarget(s)}>Set as target</button>
+								<Button size="sm" variant="primary" onclick={() => pickTarget(s)}
+									>Keep this one</Button
+								>
 							{:else if workIdOf(s) === mergeSource.workId}
-								<span class="add-msg">same work</span>
+								<span class="detail">Same work</span>
 							{/if}
 						{:else}
 							{#if !isCanonical(s)}
-								<button class="edit" onclick={() => openEditor(s)}>Edit</button>
+								<Button size="sm" title="Edit scan settings" onclick={() => openEditor(s)}
+									>Edit</Button
+								>
 							{:else}
-								<a
-									class="edit"
+								<Button
+									size="sm"
 									href="/series/{s.id}"
-									title="Scan cadence and status are Suwayomi-source settings — a canonical work has none. Edit its metadata on the series page."
-									>Edit metadata</a
+									title="Scan timing and status are set per source series, and a catalogue work has none. Edit its details on the series page."
+									>Edit metadata</Button
 								>
 							{/if}
 							{#if !isCanonical(s)}
-								<button class="add" onclick={() => onAdd(s)} disabled={addingId === s.id}>
-									{addingId === s.id ? 'Adding…' : 'Add'}
-								</button>
+								{#if s.scan.paused}
+									<Button size="sm" busy={pausing === s.id} onclick={() => setPaused(s, false)}
+										>Unpause</Button
+									>
+								{:else}
+									<Button size="sm" busy={pausing === s.id} onclick={() => setPaused(s, true)}
+										>Pause</Button
+									>
+								{/if}
+							{/if}
+							{#if canAdd(s)}
+								<Button size="sm" busy={addingId === s.id} onclick={() => onAdd(s)}>Add</Button>
 							{/if}
 							{#if workIdOf(s)}
-								<button
-									class="merge-btn"
+								<Button
+									size="sm"
 									onclick={() => startMerge(s)}
-									title="Merge this work into another (delete this duplicate)">Merge…</button
+									title="Merge this work into another one. This one is deleted.">Merge…</Button
 								>
 							{/if}
-							{#if addMsg[s.id]}<span class="add-msg">{addMsg[s.id]}</span>{/if}
 						{/if}
-					</span>
+					</div>
 				</div>
 			{/each}
-		{/if}
-	</div>
+		</div>
+	</LoadState>
 
 	{#if page > 1 || hasNextPage}
-		<div class="pager">
-			<button class="pg" disabled={loading || page <= 1} onclick={() => goPage(-1)}>Prev</button>
-			<span class="page-num">
-				{#if totalPages != null}
-					Page {page} of {totalPages} · showing {rangeStart}–{rangeEnd}{total != null
-						? ` of ${total}`
-						: ''}
-				{:else}
-					Page {page} · showing {rangeStart}–{rangeEnd}
-				{/if}
-			</span>
-			<button class="pg" disabled={loading || !hasNextPage} onclick={() => goPage(1)}>Next</button>
-		</div>
+		<Pager
+			{page}
+			hasNext={hasNextPage}
+			busy={loading}
+			detail={pagerDetail}
+			onpage={(n) => goPage(n - page)}
+		/>
 	{/if}
 </div>
 
 {#if editing}
-	<button
-		data-modal-backdrop
-		tabindex="-1"
-		class="scrim"
-		aria-label="Close editor"
-		onclick={closeEditor}
-	></button>
-	<div
-		class="drawer"
-		role="dialog"
-		aria-modal="true"
-		aria-label="Edit scan settings"
-		use:modal={closeEditor}
+	<Dialog
+		variant="drawer"
+		title="Scan settings"
+		description="{editing.title} (#{editing.id})"
+		onclose={closeEditor}
 	>
-		<div class="drawer-head">
-			<div>
-				<div class="drawer-kicker">EDIT · #{editing.id}</div>
-				<h2>{editing.title}</h2>
-			</div>
-			<button class="x" aria-label="Close" onclick={closeEditor}>✕</button>
-		</div>
-
-		<div class="field">
-			<label class="label" for="scan-status">Status flag</label>
-			<select autocomplete="off" id="scan-status" name="status" bind:value={fStatus}>
-				<option value="source">Source default</option>
-				{#each STATUS_OPTIONS as opt (opt)}
-					<option value={opt}>{opt}</option>
-				{/each}
-			</select>
-			<span class="help">Overrides the status reported by the source.</span>
-		</div>
-
-		<div class="field">
-			<span class="label">Scanner</span>
-			<div class="segmented">
-				<button class:on={fScanner === 'auto'} onclick={() => (fScanner = 'auto')}>Auto</button>
-				<button class:on={fScanner === 'running'} onclick={() => (fScanner = 'running')}
-					>Force run</button
+		<div class="k-stack">
+			<label class="k-field">
+				<span class="k-label">Status</span>
+				<select
+					class="k-select"
+					autocomplete="off"
+					id="scan-status"
+					name="status"
+					bind:value={fStatus}
 				>
-				<button class:on={fScanner === 'paused'} onclick={() => (fScanner = 'paused')}
-					>Force pause</button
-				>
+					<option value="source">Use the status from the source</option>
+					{#each STATUS_OPTIONS as opt (opt)}
+						<option value={opt}>{sentence(opt)}</option>
+					{/each}
+				</select>
+				<span class="k-hint">Replaces the status the source reports for this series.</span>
+			</label>
+
+			<div class="k-field">
+				<span class="k-label">Scanning</span>
+				<div class="seg">
+					<Segmented
+						label="Scanner"
+						value={fScanner}
+						options={SCANNER_OPTIONS}
+						onchange={(v) => (fScanner = v)}
+					/>
+				</div>
+				<span class="k-hint">
+					Auto stops scanning a series that is completed, on hiatus or cancelled. The other two
+					apply whatever the status is.
+				</span>
 			</div>
-			<span class="help">Auto pauses for completed / hiatus / cancelled series.</span>
-		</div>
 
-		<div class="field">
-			<label class="label" for="scan-interval">Scan interval override (hours)</label>
-			<input
-				id="scan-interval"
-				name="interval"
-				autocomplete="off"
-				type="text"
-				inputmode="decimal"
-				placeholder="auto (from avg)"
-				bind:value={fInterval}
-			/>
-			<span class="help">Blank = derive cadence from average time between chapters.</span>
-		</div>
+			<label class="k-field">
+				<span class="k-label">Hours between scans</span>
+				<input
+					class="k-input"
+					id="scan-interval"
+					name="interval"
+					autocomplete="off"
+					type="text"
+					inputmode="decimal"
+					placeholder="Automatic"
+					aria-invalid={intervalError ? 'true' : undefined}
+					aria-describedby="scan-interval-note"
+					bind:value={fInterval}
+				/>
+				{#if intervalError}
+					<span class="field-error" id="scan-interval-note">{intervalError}</span>
+				{:else}
+					<span class="k-hint" id="scan-interval-note">
+						Leave blank to use the average time between chapters.
+					</span>
+				{/if}
+			</label>
 
-		<div class="field">
-			<label class="label" for="scan-poll">Poll cadence when overdue (minutes)</label>
-			<input
-				id="scan-poll"
-				name="poll"
-				autocomplete="off"
-				type="text"
-				inputmode="numeric"
-				placeholder="30"
-				bind:value={fPoll}
-			/>
-		</div>
+			<label class="k-field">
+				<span class="k-label">Minutes between checks when a chapter is overdue</span>
+				<input
+					class="k-input"
+					id="scan-poll"
+					name="poll"
+					autocomplete="off"
+					type="text"
+					inputmode="numeric"
+					placeholder="30"
+					aria-invalid={pollError ? 'true' : undefined}
+					aria-describedby="scan-poll-note"
+					bind:value={fPoll}
+				/>
+				{#if pollError}
+					<span class="field-error" id="scan-poll-note">{pollError}</span>
+				{:else}
+					<span class="k-hint" id="scan-poll-note">Leave blank to use the default.</span>
+				{/if}
+			</label>
 
-		<div class="field">
-			<span class="label">Manual scan</span>
-			<button class="scan-now" onclick={scanNow} disabled={scanning}>
-				{scanning ? 'Scanning…' : 'Scan now'}
-			</button>
-			<span class="help">
-				Force an immediate re-scan, ignoring cadence and pause. Last scanned:
+			<p class="k-hint">
 				{editing.scan.lastScannedAt
-					? new Date(editing.scan.lastScannedAt).toLocaleString()
-					: 'never'}.
-			</span>
-			{#if scanMsg}<span class="help scan-msg">{scanMsg}</span>{/if}
-		</div>
+					? `Last scanned ${new Date(editing.scan.lastScannedAt).toLocaleString()}.`
+					: 'Never scanned.'}
+				Scan now checks the source straight away, even when scanning is paused or not yet due.
+			</p>
 
-		{#if saveError}<div class="notice error" role="alert">{saveError}</div>{/if}
-
-		<div class="drawer-actions">
-			<button class="cancel" onclick={closeEditor}>Cancel</button>
-			<button class="save" onclick={save} disabled={saving}
-				>{saving ? 'Saving…' : 'Save settings'}</button
-			>
+			{#if saveError}
+				<div class="k-notice" data-tone="danger" role="alert">
+					<Icon name="alert" />
+					<div class="k-notice__body">{saveError}</div>
+				</div>
+			{/if}
+			{#if scanError}
+				<div class="k-notice" data-tone="danger" role="alert">
+					<Icon name="alert" />
+					<div class="k-notice__body">Scan failed. {scanError}</div>
+				</div>
+			{/if}
 		</div>
-	</div>
+		{#snippet footer()}
+			<Button icon="refresh" busy={scanning} onclick={scanNow}>Scan now</Button>
+			<span class="k-spacer"></span>
+			<Button variant="primary" busy={saving} onclick={save}>Save settings</Button>
+		{/snippet}
+	</Dialog>
 {/if}
 
 {#if mergeSource && mergeTarget}
-	<button
-		data-modal-backdrop
-		tabindex="-1"
-		class="scrim"
-		disabled={merging}
-		aria-label="Cancel merge"
-		onclick={() => (mergeTarget = null)}
-	></button>
-	<div
-		class="modal"
-		role="dialog"
-		aria-modal="true"
-		aria-label="Confirm work merge"
-		use:modal={() => {
-			if (!merging) mergeTarget = null;
-		}}
-	>
-		<div class="modal-head">
-			<div class="modal-kicker">DESTRUCTIVE · IRREVERSIBLE</div>
-			<h2>Merge duplicate works?</h2>
-		</div>
-		<p class="modal-lede">
-			The <strong>source</strong> work below will be <strong>permanently deleted</strong>. Its
-			source mappings and all user data (library, reading progress, reviews, comments) move to the
-			<strong>target</strong>, which survives as the canonical entry. Confirm both are the same
-			series.
-		</p>
-
-		<div class="merge-cards">
-			<div class="merge-card danger">
-				<div class="merge-card-tag delete">Source · deleted</div>
-				<div class="merge-card-title">{mergeSource.title}</div>
-				<div class="merge-card-id">{mergeSource.workId}</div>
-				<div class="merge-chips">
-					{#if mergeSource.group.sources.length > 0}
-						{#each mergeSource.group.sources as src (`${src.sourceType}:${src.sourceId}:${src.sourceKey}`)}
-							<span class="chip" title={src.extension?.pkgName ?? src.sourceType}
-								>{extLabel(src)}</span
-							>
-						{/each}
-					{:else}
-						<span class="src-none">no source mappings</span>
-					{/if}
-				</div>
+	<Dialog size="lg" title="Merge these works?" onclose={backToTargets}>
+		<div class="k-stack">
+			<p class="merge-lede">
+				<strong>{mergeSource.title}</strong> will be deleted. Its sources and everything readers
+				saved on it (library entries, reading progress, reviews and comments) move to
+				<strong>{mergeTarget.title}</strong>. Check that both are the same series. This cannot be
+				undone.
+			</p>
+			<div class="sides">
+				{@render mergeSide(mergeSource, false)}
+				<span class="sides-arrow"><Icon name="chevron-right" size={20} /></span>
+				{@render mergeSide(mergeTarget, true)}
 			</div>
-			<div class="merge-arrow" aria-hidden="true">→</div>
-			<div class="merge-card survive">
-				<div class="merge-card-tag keep">Target · survives</div>
-				<div class="merge-card-title">{mergeTarget.title}</div>
-				<div class="merge-card-id">{mergeTarget.workId}</div>
-				<div class="merge-chips">
-					{#if mergeTarget.group.sources.length > 0}
-						{#each mergeTarget.group.sources as src (`${src.sourceType}:${src.sourceId}:${src.sourceKey}`)}
-							<span class="chip" title={src.extension?.pkgName ?? src.sourceType}
-								>{extLabel(src)}</span
-							>
-						{/each}
-					{:else}
-						<span class="src-none">no source mappings</span>
-					{/if}
+			{#if mergeError}
+				<div class="k-notice" data-tone="danger" role="alert">
+					<Icon name="alert" />
+					<div class="k-notice__body">The merge failed and nothing was changed. {mergeError}</div>
 				</div>
-			</div>
+			{/if}
 		</div>
-
-		{#if mergeError}<div class="notice error" role="alert">{mergeError}</div>{/if}
-
-		<div class="modal-actions">
-			<button class="cancel" onclick={() => (mergeTarget = null)} disabled={merging}>Back</button>
-			<button class="danger-btn" onclick={confirmMerge} disabled={merging}>
-				{merging ? 'Merging…' : 'Merge & delete source'}
-			</button>
-		</div>
-	</div>
+		{#snippet footer()}
+			<Button variant="ghost" disabled={merging} onclick={backToTargets}>Back</Button>
+			<Button variant="danger-solid" busy={merging} onclick={confirmMerge}
+				>Merge and delete source</Button
+			>
+		{/snippet}
+	</Dialog>
 {/if}
 
 <style>
-	.page {
-		display: flex;
-		flex-direction: column;
-		gap: var(--k-space-6);
+	.k-table {
+		--cols: minmax(0, 2.4fr) 68px 100px 80px minmax(0, 1.2fr) 150px 204px;
 	}
-	.page-head {
-		display: flex;
-		align-items: flex-end;
-		justify-content: space-between;
-		gap: var(--k-space-6);
-		flex-wrap: wrap;
-	}
-	h1 {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 30px;
-		letter-spacing: -0.02em;
-		color: var(--k-text-bright);
-	}
-	.lede {
-		margin-top: 6px;
-		font-size: 13.5px;
-		color: var(--k-text-dim);
-	}
-	/* The console reads the catalogue NSFW-inclusive regardless of the header's NSFW
-	   preference pill; say so, so the console/reader difference isn't a mystery. */
-	.nsfw-note {
-		font-size: 11px;
-		font-weight: 700;
-		letter-spacing: 0.04em;
-		text-transform: uppercase;
-		color: var(--k-text-faint);
-		border-bottom: 1px dotted var(--k-border-4);
-		cursor: help;
-	}
-	.search {
-		display: flex;
-		gap: 8px;
-		flex-wrap: wrap;
-	}
-	.search input {
-		width: 280px;
-		max-width: 100%;
-		height: 40px;
-		padding: 0 14px;
-		background: var(--k-surface-2);
-		border: 1px solid var(--k-border-2);
-		border-radius: var(--k-radius-md);
-		color: var(--k-text);
-		font-family: var(--k-font-sans);
-		font-size: 14px;
-	}
-	.search input:focus {
-		outline: 2px solid var(--k-accent);
-		outline-offset: 2px;
-		border-color: var(--k-border-strong);
-	}
-	.search button {
-		height: 40px;
-		padding: 0 18px;
-		border: none;
-		border-radius: var(--k-radius-md);
-		background: var(--k-primary);
-		color: var(--k-on-primary);
-		font-family: var(--k-font-sans);
-		font-weight: 700;
-		font-size: 13px;
-		cursor: pointer;
-	}
-	.search .clear {
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-2);
-	}
-	.notice {
-		padding: 12px 16px;
-		border-radius: var(--k-radius);
-		font-size: 13px;
-	}
-	.notice.error {
-		background: rgba(224, 131, 105, 0.1);
-		border: 1px solid rgba(224, 131, 105, 0.3);
-		color: var(--k-accent);
-	}
-	.table {
-		border: 1px solid var(--k-border);
-		border-radius: var(--k-radius-lg);
-		overflow: hidden;
-		transition: opacity 0.15s;
-	}
-	.table.dim {
-		opacity: 0.6;
-	}
-	.thead,
-	.row {
+	.find {
 		display: grid;
-		grid-template-columns: minmax(220px, 2.5fr) 70px 100px 70px minmax(110px, 1fr) 110px 210px;
-		align-items: center;
-		gap: 16px;
-		padding: 12px 20px;
-	}
-	.thead {
-		background: var(--k-surface);
-		border-bottom: 1px solid var(--k-border);
-		font-size: 11px;
-		font-weight: 700;
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-		color: var(--k-text-faint);
-	}
-	.row {
-		border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-		font-size: 14px;
-		color: var(--k-text-2);
-	}
-	.row:last-child {
-		border-bottom: none;
-	}
-	.row:hover {
-		background: var(--k-hover-fill);
-	}
-	.cell-series {
-		display: flex;
-		align-items: center;
-		gap: 14px;
+		gap: var(--k-space-3);
 		min-width: 0;
 	}
-	.cover {
-		flex: 0 0 auto;
-		width: 38px;
-		height: 54px;
-		object-fit: cover;
-		border-radius: 5px;
-		background: var(--k-cover);
-		border: 1px solid var(--k-border-1);
+	.k-search {
+		max-width: 440px;
 	}
-	.cover.placeholder {
-		background-image: var(--k-hatch);
+	.mode {
+		max-width: 86ch;
+		font-size: var(--k-text-sm);
+		line-height: 1.6;
+	}
+	.k-notice strong {
+		color: var(--k-text-bright);
+	}
+
+	/* ---- rows ---- */
+	.series {
+		display: flex;
+		align-items: center;
+		gap: var(--k-space-3);
 	}
 	.titles {
-		display: flex;
-		flex-direction: column;
-		gap: 3px;
+		display: grid;
+		gap: 2px;
 		min-width: 0;
 	}
 	.title {
-		font-weight: 600;
-		color: var(--k-text-1);
-		white-space: nowrap;
+		display: -webkit-box;
+		-webkit-box-orient: vertical;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
 		overflow: hidden;
-		text-overflow: ellipsis;
-		text-decoration: none;
-		display: block;
+		overflow-wrap: anywhere;
+		color: var(--k-text-bright);
+		font-weight: 700;
+		line-height: 1.35;
 	}
 	.title:hover {
 		text-decoration: underline;
+		text-underline-offset: 3px;
 	}
-	.meta {
-		font-size: 12px;
-		color: var(--k-text-fainter);
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
+	.detail {
+		color: var(--k-text-dim);
+		font-size: var(--k-text-xs);
 	}
-	.badge {
-		display: inline-block;
-		font-size: 11px;
-		font-weight: 700;
-		letter-spacing: 0.04em;
-		padding: 3px 9px;
-		border-radius: var(--k-radius-pill);
-		border: 1px solid transparent;
-	}
-	.badge.ongoing {
-		color: var(--k-ongoing);
-		background: rgba(127, 211, 154, 0.12);
-		border-color: rgba(127, 211, 154, 0.35);
-	}
-	.badge.completed {
-		color: var(--k-completed);
-		background: rgba(143, 184, 255, 0.12);
-		border-color: rgba(143, 184, 255, 0.35);
-	}
-	.badge.hiatus {
-		color: var(--k-hiatus);
-		background: rgba(224, 179, 84, 0.12);
-		border-color: rgba(224, 179, 84, 0.35);
-	}
-	.badge.cancelled {
-		color: var(--k-accent);
-		background: rgba(224, 131, 105, 0.12);
-		border-color: rgba(224, 131, 105, 0.35);
-	}
-	.badge.unknown {
-		color: var(--k-text-faint);
-		background: var(--k-hover-fill);
-		border-color: var(--k-border-3);
-	}
-	.col-src {
-		display: flex;
-		flex-direction: column;
+	.stack {
+		display: grid;
+		justify-items: start;
 		gap: 4px;
 		min-width: 0;
 	}
-	.src-entry {
-		display: flex;
-		flex-direction: column;
-		gap: 1px;
+	.src {
+		display: grid;
+		gap: 2px;
 		min-width: 0;
+		max-width: 100%;
+	}
+	/* A badge keeps its own width; the text lines beside it fill the cell and truncate. */
+	.src > .k-badge {
+		justify-self: start;
 	}
 	.src-name {
-		font-size: 12.5px;
-		font-weight: 600;
 		color: var(--k-text-1);
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.src-id {
-		font-size: 10.5px;
-		color: var(--k-text-fainter);
-		font-family: var(--k-font-mono, monospace);
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.src-none {
-		font-size: 12px;
-		color: var(--k-text-faint);
-	}
-	.col-scan {
-		display: flex;
-		flex-direction: column;
-		align-items: flex-start;
-		gap: 3px;
-	}
-	.cadence {
-		font-size: 13px;
-		color: var(--k-text-2);
-	}
-	.scan-state {
-		font-size: 11.5px;
 		font-weight: 600;
 	}
-	.scan-state.active {
-		color: var(--k-text-faint);
-	}
-	.paused-badge {
-		display: inline-block;
-		font-size: 10px;
-		font-weight: 800;
-		letter-spacing: 0.05em;
-		text-transform: uppercase;
-		color: var(--k-hiatus);
-		background: rgba(224, 179, 84, 0.12);
-		border: 1px solid rgba(224, 179, 84, 0.35);
-		border-radius: var(--k-radius-sm);
-		padding: 2px 6px;
-	}
-	.unpause {
-		height: 24px;
-		padding: 0 10px;
-		border-radius: var(--k-radius);
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-1);
-		font-family: var(--k-font-sans);
-		font-weight: 600;
-		font-size: 11.5px;
-		cursor: pointer;
-		transition:
-			color 0.15s,
-			background-color 0.15s,
-			border-color 0.15s;
-	}
-	.unpause:hover:not(:disabled) {
-		border-color: var(--k-border-strong);
-	}
-	.unpause:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-	.pause-err {
-		font-size: 11px;
-		color: #f0808a;
-	}
-	.col-actions {
-		text-align: right;
-		display: flex;
+	.k-td--end {
 		align-items: center;
-		justify-content: flex-end;
-		gap: 8px;
-		flex-wrap: wrap;
-	}
-	.edit,
-	.add {
-		height: 32px;
-		padding: 0 14px;
-		border-radius: var(--k-radius);
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-1);
-		font-family: var(--k-font-sans);
-		font-weight: 600;
-		font-size: 12.5px;
-		cursor: pointer;
-		transition:
-			color 0.15s,
-			background-color 0.15s,
-			border-color 0.15s;
-	}
-	.edit:hover,
-	.add:hover {
-		border-color: var(--k-border-strong);
-	}
-	/* The canonical-work variant is a link, not a button: an inline <a> ignores the
-	   shared `height`, so give it the same box explicitly. */
-	a.edit {
-		display: inline-flex;
-		align-items: center;
-		text-decoration: none;
-	}
-	.add:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-	.add-msg {
-		font-size: 12px;
-		color: var(--k-text-faint);
-	}
-	.empty {
-		padding: 40px 20px;
-		text-align: center;
-		color: var(--k-text-faint);
-		font-size: 14px;
-	}
-	.pager {
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		gap: 16px;
-	}
-	.pager .pg {
-		height: 36px;
-		padding: 0 16px;
-		border-radius: var(--k-radius-md);
-		background: var(--k-surface);
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-2);
-		font-family: var(--k-font-sans);
-		font-size: 13px;
-		font-weight: 600;
-		cursor: pointer;
-	}
-	.pager .pg:disabled {
-		opacity: 0.4;
-		cursor: default;
-	}
-	.page-num {
-		font-size: 13px;
-		color: var(--k-text-dim);
 	}
 
-	/* drawer */
-	.scrim {
-		position: fixed;
-		inset: 0;
-		z-index: 40;
-		border: none;
-		background: rgba(6, 6, 7, 0.6);
-		cursor: default;
-	}
-	.drawer {
-		position: fixed;
-		top: 0;
-		right: 0;
-		bottom: 0;
-		z-index: 41;
-		width: 400px;
-		max-width: 92vw;
-		background: var(--k-surface-2);
-		border-left: 1px solid var(--k-border-2);
-		box-shadow: -24px 0 60px rgba(0, 0, 0, 0.5);
-		padding: var(--k-space-6);
+	/* ---- scan settings drawer ---- */
+	.seg {
 		display: flex;
-		flex-direction: column;
-		gap: var(--k-space-5);
-		overflow-y: auto;
-	}
-	.drawer-head {
-		display: flex;
-		align-items: flex-start;
-		justify-content: space-between;
-		gap: 12px;
-	}
-	.drawer-kicker {
-		font-size: 11px;
-		font-weight: 700;
-		letter-spacing: 0.08em;
-		color: var(--k-text-faint);
-		margin-bottom: 6px;
-	}
-	.drawer-head h2 {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 20px;
-		letter-spacing: -0.01em;
-		color: var(--k-text-bright);
-		line-height: 1.2;
-	}
-	.x {
-		flex: 0 0 auto;
-		width: 32px;
-		height: 32px;
-		border-radius: 50%;
-		background: transparent;
-		border: 1px solid var(--k-border-3);
-		color: var(--k-text-2);
-		cursor: pointer;
-		font-size: 13px;
-	}
-	.x:hover {
-		border-color: var(--k-border-strong);
-		color: var(--k-text);
-	}
-	.field {
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-	}
-	.label {
-		font-size: 12px;
-		font-weight: 700;
-		letter-spacing: 0.02em;
-		color: var(--k-text-2);
-	}
-	.help {
-		font-size: 12px;
-		color: var(--k-text-fainter);
-		line-height: 1.4;
-	}
-	select,
-	.field input {
-		height: 42px;
-		padding: 0 12px;
-		background: var(--k-surface);
-		border: 1px solid var(--k-border-2);
-		border-radius: var(--k-radius-md);
-		color: var(--k-text);
-		font-family: var(--k-font-sans);
-		font-size: 14px;
-	}
-	select:focus,
-	.field input:focus {
-		outline: 2px solid var(--k-accent);
-		outline-offset: 2px;
-		border-color: var(--k-border-strong);
-	}
-	.scan-now {
-		height: 42px;
-		padding: 0 18px;
-		border-radius: var(--k-radius-md);
-		background: var(--k-surface);
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text);
-		font-family: var(--k-font-sans);
-		font-weight: 600;
-		font-size: 13.5px;
-		cursor: pointer;
-		align-self: flex-start;
-	}
-	.scan-now:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-	.scan-msg {
-		color: var(--k-text-dim);
-	}
-	.segmented {
-		display: grid;
-		grid-template-columns: repeat(3, 1fr);
-		gap: 4px;
-		padding: 4px;
-		background: var(--k-surface);
-		border: 1px solid var(--k-border);
-		border-radius: var(--k-radius-md);
-	}
-	.segmented button {
-		height: 34px;
-		border: none;
-		border-radius: var(--k-radius);
-		background: transparent;
-		color: var(--k-text-dim);
-		font-family: var(--k-font-sans);
-		font-size: 12.5px;
-		font-weight: 600;
-		cursor: pointer;
-	}
-	.segmented button.on {
-		background: var(--k-primary);
-		color: var(--k-on-primary);
-	}
-	.drawer-actions {
-		margin-top: auto;
-		display: flex;
-		gap: 10px;
-		justify-content: flex-end;
-		padding-top: var(--k-space-4);
-	}
-	.cancel {
-		height: 42px;
-		padding: 0 18px;
-		border-radius: var(--k-radius-md);
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-2);
-		font-family: var(--k-font-sans);
-		font-weight: 600;
-		font-size: 13.5px;
-		cursor: pointer;
-	}
-	.save {
-		height: 42px;
-		padding: 0 24px;
-		border: none;
-		border-radius: var(--k-radius-md);
-		background: var(--k-primary);
-		color: var(--k-on-primary);
-		font-family: var(--k-font-sans);
-		font-weight: 700;
-		font-size: 13.5px;
-		cursor: pointer;
-	}
-	.save:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-
-	/* ---- merge duplicate works ---- */
-	.notice.success {
-		display: flex;
-		align-items: center;
-		gap: 10px;
-		flex-wrap: wrap;
-		background: rgba(127, 211, 154, 0.1);
-		border: 1px solid rgba(127, 211, 154, 0.35);
-		color: var(--k-ongoing);
-	}
-	.notice.merge-banner {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 12px;
-		flex-wrap: wrap;
-		background: rgba(95, 200, 207, 0.08);
-		border: 1px solid rgba(95, 200, 207, 0.35);
-		color: var(--k-text-2);
-	}
-	.notice.merge-banner strong {
-		color: var(--k-text-bright);
-	}
-	.mono {
-		font-family: var(--k-font-mono, monospace);
-		font-size: 12px;
-		color: var(--k-text-faint);
-	}
-	.link-btn {
-		background: none;
-		border: none;
-		color: var(--k-accent-teal);
-		font-family: var(--k-font-sans);
-		font-size: 12.5px;
-		font-weight: 600;
-		cursor: pointer;
-		padding: 0;
-		white-space: nowrap;
-	}
-	.merge-btn {
-		height: 32px;
-		padding: 0 12px;
-		border-radius: var(--k-radius);
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-1);
-		font-family: var(--k-font-sans);
-		font-weight: 600;
-		font-size: 12.5px;
-		cursor: pointer;
-		transition:
-			color 0.15s,
-			background-color 0.15s,
-			border-color 0.15s;
-	}
-	.merge-btn:hover {
-		border-color: rgba(95, 200, 207, 0.5);
-		color: var(--k-accent-teal);
-	}
-	.merge-target {
-		height: 32px;
-		padding: 0 12px;
-		border-radius: var(--k-radius);
-		background: rgba(95, 200, 207, 0.12);
-		border: 1px solid rgba(95, 200, 207, 0.45);
-		color: var(--k-accent-teal);
-		font-family: var(--k-font-sans);
-		font-weight: 700;
-		font-size: 12.5px;
-		cursor: pointer;
-	}
-	.merge-source-badge {
-		font-size: 11px;
-		font-weight: 700;
-		color: var(--k-accent);
-		border: 1px solid rgba(224, 131, 105, 0.4);
-		background: rgba(224, 131, 105, 0.1);
-		border-radius: var(--k-radius-sm);
-		padding: 3px 8px;
-		white-space: nowrap;
-	}
-
-	/* confirm modal */
-	.modal {
-		position: fixed;
-		top: 50%;
-		left: 50%;
-		transform: translate(-50%, -50%);
-		z-index: 41;
-		width: 680px;
-		max-width: 94vw;
-		max-height: 90vh;
-		overflow-y: auto;
-		background: var(--k-surface-2);
-		border: 1px solid var(--k-border-2);
-		border-radius: var(--k-radius-lg);
-		box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
-		padding: var(--k-space-6);
-		display: flex;
-		flex-direction: column;
-		gap: var(--k-space-4);
-	}
-	.modal-kicker {
-		font-size: 11px;
-		font-weight: 800;
-		letter-spacing: 0.08em;
-		color: var(--k-accent);
-		margin-bottom: 6px;
-	}
-	.modal-head h2 {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 22px;
-		color: var(--k-text-bright);
-	}
-	.modal-lede {
-		font-size: 13.5px;
-		line-height: 1.5;
-		color: var(--k-text-dim);
-	}
-	.modal-lede strong {
-		color: var(--k-text-1);
-	}
-	.merge-cards {
-		display: grid;
-		grid-template-columns: 1fr auto 1fr;
-		align-items: stretch;
-		gap: 14px;
-	}
-	.merge-card {
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-		padding: 14px;
-		border-radius: var(--k-radius-md);
-		border: 1px solid var(--k-border);
-		background: var(--k-surface);
 		min-width: 0;
 	}
-	.merge-card.danger {
-		border-color: rgba(224, 131, 105, 0.45);
+	.field-error {
+		color: var(--k-danger);
+		font-size: var(--k-text-xs);
+		line-height: 1.55;
 	}
-	.merge-card.survive {
-		border-color: rgba(127, 211, 154, 0.45);
+
+	/* ---- merge confirm ---- */
+	.merge-lede {
+		color: var(--k-text-2);
+		font-size: var(--k-text-md);
+		line-height: 1.65;
 	}
-	.merge-card-tag {
-		font-size: 10px;
-		font-weight: 800;
-		letter-spacing: 0.05em;
-		text-transform: uppercase;
-		padding: 2px 7px;
-		border-radius: var(--k-radius-sm);
-		align-self: flex-start;
-	}
-	.merge-card-tag.delete {
-		color: var(--k-accent);
-		background: rgba(224, 131, 105, 0.12);
-	}
-	.merge-card-tag.keep {
-		color: var(--k-ongoing);
-		background: rgba(127, 211, 154, 0.12);
-	}
-	.merge-card-title {
-		font-weight: 700;
-		font-size: 15px;
+	.merge-lede strong {
 		color: var(--k-text-bright);
-		line-height: 1.25;
 	}
-	.merge-card-id {
-		font-family: var(--k-font-mono, monospace);
-		font-size: 11.5px;
-		color: var(--k-text-faint);
-		word-break: break-all;
+	.sides {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+		align-items: stretch;
+		gap: var(--k-space-3);
 	}
-	.merge-chips {
+	.side {
+		display: grid;
+		align-content: start;
+		justify-items: start;
+		gap: var(--k-space-2);
+		min-width: 0;
+		padding: var(--k-space-4);
+		border: 1px solid var(--k-border-2);
+		border-radius: var(--k-radius);
+		background: var(--k-surface);
+	}
+	.side-title {
+		color: var(--k-text-bright);
+		font-size: var(--k-text-lg);
+		font-weight: 700;
+		line-height: 1.3;
+		overflow-wrap: anywhere;
+	}
+	.side-id {
+		overflow-wrap: anywhere;
+	}
+	.chips {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 6px;
-		margin-top: 2px;
 	}
-	.chip {
-		font-size: 11px;
-		font-weight: 600;
-		padding: 3px 8px;
-		border-radius: var(--k-radius-pill);
-		background: var(--k-surface-4);
-		color: var(--k-text-2);
-	}
-	.src-none {
-		font-size: 12px;
-		color: var(--k-text-faint);
-	}
-	.merge-arrow {
+	.sides-arrow {
 		display: grid;
 		place-items: center;
-		font-size: 22px;
-		color: var(--k-text-faint);
-	}
-	.modal-actions {
-		display: flex;
-		justify-content: flex-end;
-		gap: 10px;
-		margin-top: var(--k-space-2);
-	}
-	.danger-btn {
-		height: 42px;
-		padding: 0 22px;
-		border: none;
-		border-radius: var(--k-radius-md);
-		background: var(--k-accent);
-		color: #1a0d08;
-		font-family: var(--k-font-sans);
-		font-weight: 700;
-		font-size: 13.5px;
-		cursor: pointer;
-	}
-	.danger-btn:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-	@media (max-width: 640px) {
-		.merge-cards {
-			grid-template-columns: 1fr;
-		}
-		.merge-arrow {
-			transform: rotate(90deg);
-		}
+		color: var(--k-text-dim);
 	}
 
-	/* The 7-column grid table becomes stacked rows; each cell keeps its column
-	   context via an inline label (the .thead is hidden). */
-	@media (max-width: 1100px) {
-		.thead {
+	/* Between the phone layout and a full-width desktop the seven columns do not fit:
+	   each row becomes a three-column block with captioned cells. */
+	@media (min-width: 721px) and (max-width: 1360px) {
+		.k-table {
+			--cols: repeat(3, minmax(0, 1fr));
+		}
+		.k-tr--head {
 			display: none;
 		}
-		.row {
-			grid-template-columns: 1fr;
-			gap: 8px;
-			padding: 14px 16px;
+		.k-tr {
+			align-items: start;
 		}
-		.row:hover {
-			background: none;
-		}
-		.col-type::before,
-		.col-ch::before,
-		.col-src::before,
-		.col-scan::before {
-			font-weight: 700;
-			color: var(--k-text-faint);
-			font-size: 11px;
-			letter-spacing: 0.06em;
-			text-transform: uppercase;
-		}
-		.col-type::before {
-			content: 'Type · ';
-		}
-		.col-ch::before {
-			content: 'Chapters · ';
-		}
-		.col-src::before {
-			content: 'Source';
-			display: block;
-			margin-bottom: 2px;
-		}
-		.col-scan::before {
-			content: 'Scan';
-			display: block;
-		}
-		.col-actions {
-			justify-content: flex-start;
-		}
-		.edit,
-		.add,
-		.merge-btn,
-		.merge-target,
-		.unpause,
-		.pager .pg {
-			height: 40px;
-		}
-		.pager {
-			flex-wrap: wrap;
-		}
-	}
-	@media (min-width: 601px) and (max-width: 1100px) {
-		.row {
-			grid-template-columns: repeat(3, minmax(0, 1fr));
-			gap: 16px;
-		}
-		.col-series,
-		.col-actions {
+		.series,
+		.k-td--end {
 			grid-column: 1 / -1;
 		}
-		.col-src {
-			grid-column: span 2;
+		.k-td--end {
+			justify-content: flex-start;
+		}
+		.k-tr > [data-label]::before {
+			content: attr(data-label);
+			display: block;
+			margin-bottom: 4px;
+			color: var(--k-text-dim);
+			font-size: 11px;
+			font-weight: 700;
+			letter-spacing: 0.05em;
+			text-transform: uppercase;
+		}
+	}
+	@media (max-width: 720px) {
+		.stack {
+			justify-items: end;
+		}
+		.src > .k-badge {
+			justify-self: end;
+		}
+		.sides {
+			grid-template-columns: minmax(0, 1fr);
+		}
+		.sides-arrow {
+			transform: rotate(90deg);
 		}
 	}
 </style>

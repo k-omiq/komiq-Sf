@@ -1,49 +1,33 @@
 <script lang="ts">
+	import '@fontsource-variable/bricolage-grotesque';
+	import '@fontsource-variable/manrope';
 	import '@komika/ui/reset.css';
 	import '@komika/ui/tokens.css';
 	import '$lib/admin.css';
-	import mark from '$lib/assets/mark.png';
-	import { goto } from '$app/navigation';
+	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { auth, initAuth, logout, toggleNsfwVisibility } from '$lib/auth.svelte';
+	import { auth, initAuth, logout } from '$lib/auth.svelte';
+	import { settleConfirm } from '$lib/confirm.svelte';
 	import { theme, cycleTheme, initTheme } from '$lib/theme.svelte';
-
-	// ---- NSFW visibility (the admin's own show_nsfw flag) ---------------------
-	// Not a viewing preference here: with it off the server refuses source browsing,
-	// extension install and source ingest. Surfaced in the header so the state is
-	// never invisible.
-	//
-	// It no longer decides what the console LISTS: catalogue search and canonical
-	// updates are read with a per-request `includeNsfw: true` override (see
-	// ADMIN_INCLUDE_NSFW in $lib/data), which the server honours for admins only. The
-	// two are deliberately distinct — this pill is the ACCOUNT PREFERENCE (what the
-	// reader shows you, and what the write-side source APIs gate on), whereas the
-	// override is scoped to this console's read paths so the ~2.5k mis-flagged
-	// mainstream works stay reachable for correction either way. Folding the override
-	// into the pill would have made "NSFW off" silently mean two different things.
-	let nsfwBusy = $state(false);
-	let nsfwError = $state<string | null>(null);
+	import { refreshSourcesDown, sourceHealth } from '$lib/source-health.svelte';
+	import Brand from '$lib/components/Brand.svelte';
+	import Button from '$lib/components/Button.svelte';
+	import CommandPalette from '$lib/components/CommandPalette.svelte';
+	import ConfirmHost from '$lib/components/ConfirmHost.svelte';
+	import Icon, { type IconName } from '$lib/components/Icon.svelte';
+	import Toaster from '$lib/components/Toaster.svelte';
 
 	// The route guard bounces the signed-out admin to /login immediately, so this
-	// warning is rendered OUTSIDE the header if-block to survive that redirect.
+	// warning is rendered OUTSIDE the shell if-block to survive that redirect.
 	let signoutWarning = $state(false);
+	// It describes the sign-out that just happened; signing in again answers it.
+	$effect(() => {
+		if (auth.user) signoutWarning = false;
+	});
 
 	async function onSignOut(): Promise<void> {
 		const r = await logout();
 		if (!r.revoked) signoutWarning = true;
-	}
-
-	async function onToggleNsfw(): Promise<void> {
-		if (!auth.user || nsfwBusy) return;
-		nsfwBusy = true;
-		nsfwError = null;
-		try {
-			await toggleNsfwVisibility(!auth.user.showNsfw);
-		} catch (err) {
-			nsfwError = err instanceof Error ? err.message : 'Failed to change NSFW visibility.';
-		} finally {
-			nsfwBusy = false;
-		}
 	}
 
 	let { children } = $props();
@@ -63,24 +47,127 @@
 	$effect(() => {
 		if (auth.ready && !auth.user && !onLogin) goto('/login');
 	});
+
 	const themeLabel = $derived(
 		theme.pref === 'dark' ? 'Dark' : theme.pref === 'light' ? 'Light' : 'System',
 	);
-	const nav = [
-		{ href: '/', label: 'Catalog' },
-		{ href: '/sources', label: 'Sources' },
-		{ href: '/review', label: 'Review' },
-		{ href: '/updates', label: 'Updates' },
-		{ href: '/users', label: 'Users' },
-		{ href: '/bugs', label: 'Bugs' },
-		// Reader-filed reports. Distinct from Bugs (our cover pipeline's own failures) and
-		// from Review (the matcher's own uncertainty) — this is the queue a human filled in.
-		{ href: '/reports', label: 'Reports' },
-	];
+	const themeIcon = $derived<IconName>(
+		theme.pref === 'dark' ? 'moon' : theme.pref === 'light' ? 'sun' : 'monitor',
+	);
+
+	interface NavItem {
+		href: string;
+		label: string;
+		icon: IconName;
+		/** Extra path prefixes that belong to this item (detail pages). */
+		also?: string[];
+		/** A count that needs attention, shown as a badge. */
+		alarm?: number;
+		alarmLabel?: string;
+	}
+	// Labels match each page's heading. Grouped by what the admin is looking after:
+	// the catalogue itself, where it comes from, and the people using it.
+	const groups = $derived<{ label: string; items: NavItem[] }[]>([
+		{
+			label: 'Library',
+			items: [
+				{ href: '/', label: 'Catalog', icon: 'book', also: ['/series'] },
+				{ href: '/updates', label: 'Latest updates', icon: 'clock' },
+				// The matcher's own uncertainty: pairs it could not decide on.
+				{ href: '/review', label: 'Duplicates', icon: 'layers' },
+				// Our cover pipeline's own failures.
+				{ href: '/bugs', label: 'Cover issues', icon: 'image' },
+			],
+		},
+		{
+			label: 'Sources',
+			items: [
+				{ href: '/sources/extensions', label: 'Extensions', icon: 'package' },
+				{ href: '/sources/browse', label: 'Browse & add', icon: 'compass' },
+				{
+					href: '/sources/health',
+					label: 'Health',
+					icon: 'activity',
+					alarm: sourceHealth.down,
+					alarmLabel: 'sources down',
+				},
+			],
+		},
+		{
+			label: 'Community',
+			items: [
+				{ href: '/users', label: 'Users', icon: 'users' },
+				// Reader-filed reports: the queue a human filled in.
+				{ href: '/reports', label: 'Reports', icon: 'flag' },
+			],
+		},
+	]);
+	const settingsItem: NavItem = { href: '/settings', label: 'Settings', icon: 'gear' };
+
+	function isActive(item: NavItem, pathname: string): boolean {
+		if (item.href === '/') {
+			return pathname === '/' || (item.also ?? []).some((p) => pathname.startsWith(p));
+		}
+		return pathname === item.href || pathname.startsWith(item.href + '/');
+	}
+
+	// Off-canvas sidebar on narrow screens; always closed again after a navigation.
+	let menuOpen = $state(false);
+	afterNavigate((navigation) => {
+		menuOpen = false;
+		// A confirmation belongs to the page that asked. Left open across a page change it
+		// would sit over the new page and, if accepted, act for a page that is gone.
+		// (`from.url` is null for the entry that follows a reload.)
+		const from = navigation.from?.url?.pathname;
+		if (from !== undefined && from !== navigation.to?.url?.pathname) settleConfirm(false);
+	});
+
+	// The sidebar alarm: checked at sign-in and then every few minutes.
+	$effect(() => {
+		if (!auth.user) return;
+		void refreshSourcesDown();
+		const timer = setInterval(() => void refreshSourcesDown(), 5 * 60_000);
+		return () => clearInterval(timer);
+	});
+
+	// ---- quick search (Ctrl/Cmd+K) --------------------------------------------
+	let paletteOpen = $state(false);
+	const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
+	const palettePages = $derived([
+		...groups.flatMap((g) => g.items.map((i) => ({ href: i.href, label: i.label, icon: i.icon }))),
+		{ href: settingsItem.href, label: settingsItem.label, icon: settingsItem.icon },
+		...(
+			[
+				['appearance', 'Theme'],
+				['content', 'NSFW content'],
+				['repos', 'Extension repos'],
+				['updates', 'Extension updates'],
+				['maintenance', 'Maintenance jobs'],
+			] as const
+		).map(([id, label]) => ({
+			href: `/settings#${id}`,
+			label,
+			icon: 'gear' as IconName,
+			hint: 'Settings',
+		})),
+	]);
+
+	function onWindowKeydown(e: KeyboardEvent): void {
+		if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'k') {
+			if (!auth.user || onLogin) return;
+			e.preventDefault();
+			// Never over another dialog: jumping away from an open confirmation or an
+			// unsaved drawer would skip the question it is asking.
+			if (!paletteOpen && document.querySelector('[aria-modal="true"]')) return;
+			paletteOpen = !paletteOpen;
+		} else if (e.key === 'Escape' && menuOpen) {
+			menuOpen = false;
+		}
+	}
 </script>
 
 <svelte:head>
-	<title>Komiq · manga DB</title>
+	<title>Komiq admin</title>
 	<link rel="icon" href="/favicon.ico" sizes="any" />
 	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
 	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
@@ -89,294 +176,393 @@
 	<meta name="theme-color" content="#0c0c0d" />
 </svelte:head>
 
+<svelte:window onkeydown={onWindowKeydown} />
+
+{#snippet navLink(item: NavItem)}
+	<!-- Closes the phone drawer itself: a link to the page already open does not navigate,
+	     so `afterNavigate` never runs for it. -->
+	<a
+		href={item.href}
+		class="nav-link"
+		aria-current={isActive(item, page.url.pathname) ? 'page' : undefined}
+		onclick={() => (menuOpen = false)}
+	>
+		<Icon name={item.icon} size={17} />
+		<span>{item.label}</span>
+		{#if item.alarm}
+			<span class="alarm k-num" aria-label="{item.alarm} {item.alarmLabel}">{item.alarm}</span>
+		{/if}
+	</a>
+{/snippet}
+
 {#if !auth.ready}
 	<div class="boot" role="status">Loading admin console…</div>
 {:else}
 	<a class="skip-link" href="#main-content">Skip to main content</a>
-	{#if auth.user && !onLogin}
-		<header class="admin-header">
-			<div class="brand">
-				<img class="brand-mark" src={mark} alt="" width="24" height="18" />
-				<a href="/" class="mark" translate="no" aria-label="Komiq admin home">KOMIQ</a>
-				<span class="sub">Admin console</span>
-			</div>
-			<div class="who">
-				<button
-					class="nsfw-toggle"
-					class:off={!auth.user.showNsfw}
-					disabled={nsfwBusy}
-					aria-pressed={auth.user.showNsfw}
-					onclick={onToggleNsfw}
-					title={auth.user.showNsfw
-						? 'Your ACCOUNT preference — NSFW visible: source browsing, extension install and source ingest are unblocked. Click to opt out. (Catalog and Updates list NSFW-flagged works in this console either way.)'
-						: 'Your ACCOUNT preference — NSFW hidden: the server refuses source browsing, extension install and source ingest. Click to opt in. (Catalog and Updates still list NSFW-flagged works in this console, so mis-flagged titles stay fixable.)'}
-					>NSFW {nsfwBusy ? '…' : auth.user.showNsfw ? 'on' : 'off'}</button
-				>
-				<button
-					class="theme-toggle"
-					onclick={cycleTheme}
-					title="Theme: {themeLabel} (click to change)"
-					aria-label="Theme: {themeLabel}">{themeLabel}</button
-				>
-				<span class="username">{auth.user.username}</span>
-				<span class="admin-badge">Admin</span>
-				<button class="signout" onclick={onSignOut}>Sign out</button>
-			</div>
-			<nav class="nav" aria-label="Admin navigation">
-				{#each nav as item (item.href)}
-					<a
-						href={item.href}
-						class="nav-link"
-						aria-current={page.url.pathname === item.href ? 'page' : undefined}>{item.label}</a
-					>
-				{/each}
-			</nav>
-		</header>
-		{#if nsfwError}
-			<p class="nsfw-error" role="alert">{nsfwError}</p>
-		{/if}
-	{/if}
 	{#if signoutWarning}
 		<p class="signout-warning" role="status">
-			Signed out on this device, but the server could not be reached to revoke the session — it may
-			still be valid there.
+			You are signed out on this device. The server could not be reached, so the session may still
+			be valid there.
 		</p>
 	{/if}
-	<main id="main-content" class="admin-main" tabindex="-1" class:full={!auth.user || onLogin}>
-		{@render children()}
-	</main>
+	{#if auth.user && !onLogin}
+		<div class="shell">
+			<header class="topbar">
+				<Button
+					variant="ghost"
+					icon="menu"
+					iconOnly
+					aria-label="Open menu"
+					aria-expanded={menuOpen}
+					aria-controls="admin-sidebar"
+					onclick={() => (menuOpen = true)}
+				/>
+				<a href="/" class="brand" aria-label="Komiq admin home">
+					<Brand />
+				</a>
+			</header>
+
+			{#if menuOpen}
+				<div class="scrim" aria-hidden="true" onclick={() => (menuOpen = false)}></div>
+			{/if}
+
+			<aside id="admin-sidebar" class="sidebar" class:open={menuOpen}>
+				<a href="/" class="brand" aria-label="Komiq admin home">
+					<Brand />
+					<span class="brand-tag">Admin</span>
+				</a>
+
+				<button type="button" class="search" onclick={() => (paletteOpen = true)}>
+					<Icon name="search" size={15} />
+					<span>Search</span>
+					<span class="k-kbd">{isMac ? 'Cmd' : 'Ctrl'} K</span>
+				</button>
+
+				<nav class="nav" aria-label="Admin navigation">
+					{#each groups as group (group.label)}
+						<div class="group">
+							<p class="group-label">{group.label}</p>
+							{#each group.items as item (item.href)}
+								{@render navLink(item)}
+							{/each}
+						</div>
+					{/each}
+					<div class="group bottom">
+						{@render navLink(settingsItem)}
+					</div>
+				</nav>
+
+				{#if !auth.user.showNsfw}
+					<a class="nsfw-flag" href="/settings#content" onclick={() => (menuOpen = false)}>
+						<Icon name="eye-off" size={14} />
+						<span>NSFW off: source tools are blocked</span>
+					</a>
+				{/if}
+
+				<div class="account">
+					<span class="avatar" aria-hidden="true">{auth.user.username.slice(0, 1)}</span>
+					<div class="who">
+						<span class="username k-truncate">{auth.user.username}</span>
+						<span class="role">Admin</span>
+					</div>
+					<Button
+						variant="ghost"
+						size="sm"
+						icon={themeIcon}
+						iconOnly
+						title="Theme: {themeLabel}"
+						aria-label="Theme: {themeLabel}. Change theme"
+						onclick={cycleTheme}
+					/>
+					<Button
+						variant="ghost"
+						size="sm"
+						icon="logout"
+						iconOnly
+						title="Sign out"
+						aria-label="Sign out"
+						onclick={onSignOut}
+					/>
+				</div>
+			</aside>
+
+			<main id="main-content" class="admin-main" tabindex="-1">
+				{@render children()}
+			</main>
+		</div>
+	{:else if onLogin}
+		<main id="main-content" class="admin-main full" tabindex="-1">
+			{@render children()}
+		</main>
+	{:else}
+		<!-- Signed out on a protected route: the guard above is redirecting. Render
+		     nothing of the page, so it neither flashes nor fires its queries. -->
+		<div class="boot" role="status">Redirecting to sign in…</div>
+	{/if}
+	{#if paletteOpen}
+		<CommandPalette pages={palettePages} onclose={() => (paletteOpen = false)} />
+	{/if}
+	<ConfirmHost />
+	<Toaster />
 {/if}
 
 <style>
 	.boot {
-		min-height: 100dvh;
 		display: grid;
 		place-items: center;
+		min-height: 100dvh;
 		color: var(--k-text-dim);
-		font-family: var(--k-font-sans);
+		font-size: var(--k-text-sm);
 	}
-	.admin-header {
-		position: sticky;
-		top: 0;
-		z-index: 20;
-		display: grid;
-		grid-template-columns: minmax(0, 1fr) auto;
-		gap: 14px 24px;
-		padding: 18px max(var(--k-space-6), calc((100% - 1440px) / 2)) 0;
-		background: var(--k-bg);
-		border-bottom: 1px solid var(--k-border);
+	.signout-warning {
+		margin: var(--k-space-3) var(--k-space-4) 0;
+		padding: 10px 14px;
+		border: 1px solid var(--k-warning-border);
+		border-radius: var(--k-radius);
+		background: var(--k-warning-soft);
+		color: var(--k-warning);
+		font-size: var(--k-text-sm);
 	}
 
+	.shell {
+		--sidebar-w: 244px;
+		display: grid;
+		grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+		min-height: 100dvh;
+	}
+	.topbar {
+		display: none;
+	}
+
+	/* ---- sidebar ---- */
+	.sidebar {
+		position: sticky;
+		top: 0;
+		display: flex;
+		flex-direction: column;
+		gap: var(--k-space-4);
+		height: 100dvh;
+		padding: var(--k-space-5) var(--k-space-3) var(--k-space-3);
+		background: var(--k-surface);
+		border-right: 1px solid var(--k-border-1);
+		overflow-y: auto;
+		overscroll-behavior: contain;
+	}
 	.brand {
 		display: flex;
 		align-items: center;
-		gap: 16px;
+		gap: 10px;
+		padding: 0 var(--k-space-3);
 	}
-	.brand-mark {
-		display: block;
-		width: auto;
-		height: 18px;
+	.brand-tag {
+		padding: 2px 7px;
+		border: 1px solid var(--k-accent-border);
+		border-radius: var(--k-radius-pill);
+		background: var(--k-accent-soft);
+		color: var(--k-accent);
+		font-family: var(--k-font-sans);
+		font-size: 10.5px;
+		font-weight: 700;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+	}
+	.search {
+		display: flex;
+		align-items: center;
+		gap: var(--k-space-2);
+		height: var(--k-control);
+		padding: 0 var(--k-space-2) 0 var(--k-space-3);
+		border: 1px solid var(--k-border-2);
+		border-radius: var(--k-radius);
+		background: var(--k-surface-2);
+		color: var(--k-text-dim);
+		font-size: var(--k-text-sm);
+		cursor: pointer;
+		transition:
+			border-color var(--k-dur) var(--k-ease),
+			color var(--k-dur) var(--k-ease);
+	}
+	.search:hover {
+		border-color: var(--k-border-strong);
+		color: var(--k-text-1);
+	}
+	.search span:first-of-type {
+		flex: 1 1 auto;
+		text-align: left;
+	}
+	.alarm {
+		margin-left: auto;
+		min-width: 20px;
+		padding: 1px 6px;
+		border-radius: var(--k-radius-pill);
+		background: var(--k-danger-soft);
+		border: 1px solid var(--k-danger-border);
+		color: var(--k-danger);
+		font-size: 11px;
+		font-weight: 700;
+		text-align: center;
 	}
 	.nav {
-		grid-column: 1 / -1;
-		min-width: 0;
-		overflow-x: auto;
-		padding-bottom: 10px;
+		flex: 1 1 auto;
 		display: flex;
-		align-items: center;
-		gap: 4px;
+		flex-direction: column;
+		gap: var(--k-space-5);
+	}
+	.group {
+		display: grid;
+		gap: 2px;
+	}
+	.group.bottom {
+		margin-top: auto;
+	}
+	.group-label {
+		padding: 0 var(--k-space-3) 6px;
+		color: var(--k-text-dim);
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.07em;
+		text-transform: uppercase;
 	}
 	.nav-link {
-		padding: 9px 15px;
-		border-radius: var(--k-radius-md);
-		font-size: 13px;
-		font-weight: 600;
-		color: var(--k-text-dim);
-		text-decoration: none;
-		transition:
-			color 0.15s,
-			background-color 0.15s,
-			border-color 0.15s;
-	}
-	.nav-link:hover {
-		color: var(--k-text);
-		background: var(--k-hover-fill);
-	}
-	.nav-link[aria-current='page'] {
-		color: var(--k-text-bright);
-		background: var(--k-surface-4);
-	}
-	.theme-toggle {
-		height: 36px;
-		padding: 0 14px;
-		border-radius: var(--k-radius-md);
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-2);
-		font-family: var(--k-font-sans);
-		font-size: 12.5px;
-		font-weight: 600;
-		cursor: pointer;
-		transition:
-			color 0.15s,
-			background-color 0.15s,
-			border-color 0.15s;
-	}
-	.theme-toggle:hover {
-		border-color: var(--k-border-strong);
-		color: var(--k-text);
-	}
-	.nsfw-toggle {
-		height: 36px;
-		padding: 0 14px;
-		border-radius: var(--k-radius-md);
-		background: transparent;
-		border: 1px solid rgba(95, 200, 207, 0.4);
-		color: var(--k-accent-teal);
-		font-family: var(--k-font-sans);
-		font-size: 12.5px;
-		font-weight: 600;
-		cursor: pointer;
-		transition:
-			color 0.15s,
-			background-color 0.15s,
-			border-color 0.15s;
-	}
-	.nsfw-toggle.off {
-		border-color: rgba(224, 179, 84, 0.45);
-		color: var(--k-hiatus);
-	}
-	.nsfw-toggle:hover:not(:disabled) {
-		border-color: var(--k-border-strong);
-	}
-	.nsfw-toggle:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-	.nsfw-error {
-		margin: 0 auto;
-		padding: 10px var(--k-space-6) 0;
-		max-width: var(--k-max-content);
-		font-family: var(--k-font-sans);
-		font-size: 13px;
-		color: #f0808a;
-	}
-	.signout-warning {
-		margin: 0 auto;
-		padding: 10px var(--k-space-6) 0;
-		max-width: var(--k-max-content);
-		font-family: var(--k-font-sans);
-		font-size: 13px;
-		color: var(--k-hiatus);
-	}
-	.mark {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 18px;
-		letter-spacing: 0.02em;
-		color: var(--k-text-bright);
-	}
-	.sub {
-		font-size: 12px;
-		font-weight: 600;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--k-text-faint);
-	}
-	.who {
 		display: flex;
 		align-items: center;
-		gap: 12px;
+		gap: 11px;
+		min-height: 36px;
+		padding: 0 var(--k-space-3);
+		border-radius: var(--k-radius);
+		color: var(--k-text-muted);
+		font-size: var(--k-text-md);
+		font-weight: 600;
+		transition:
+			background var(--k-dur) var(--k-ease),
+			color var(--k-dur) var(--k-ease);
+	}
+	.nav-link:hover {
+		background: var(--k-hover-fill);
+		color: var(--k-text-bright);
+	}
+	.nav-link[aria-current='page'] {
+		background: var(--k-surface-5);
+		color: var(--k-text-bright);
+	}
+	.nav-link[aria-current='page'] :global(svg) {
+		color: var(--k-accent);
+	}
+	.nsfw-flag {
+		display: flex;
+		align-items: center;
+		gap: var(--k-space-2);
+		padding: 9px var(--k-space-3);
+		border: 1px solid var(--k-warning-border);
+		border-radius: var(--k-radius);
+		background: var(--k-warning-soft);
+		color: var(--k-warning);
+		font-size: var(--k-text-xs);
+		font-weight: 600;
+		line-height: 1.4;
+	}
+	.account {
+		display: flex;
+		align-items: center;
+		gap: var(--k-space-2);
+		padding: var(--k-space-3) var(--k-space-2) 0 var(--k-space-3);
+		border-top: 1px solid var(--k-border);
+	}
+	.avatar {
+		flex: none;
+		display: grid;
+		place-items: center;
+		width: 30px;
+		height: 30px;
+		border-radius: 50%;
+		background: var(--k-surface-5);
+		color: var(--k-text-1);
+		font-size: var(--k-text-sm);
+		font-weight: 700;
+		text-transform: uppercase;
+	}
+	.who {
+		flex: 1 1 auto;
+		display: grid;
+		min-width: 0;
+		line-height: 1.25;
 	}
 	.username {
-		font-size: 13px;
-		font-weight: 600;
-		color: var(--k-text-2);
+		color: var(--k-text-1);
+		font-size: var(--k-text-sm);
+		font-weight: 700;
 	}
-	.admin-badge {
-		font-size: 10px;
-		font-weight: 800;
-		letter-spacing: 0.05em;
-		text-transform: uppercase;
-		color: var(--k-accent-teal);
-		border: 1px solid rgba(95, 200, 207, 0.4);
-		border-radius: var(--k-radius-sm);
-		padding: 2px 6px;
+	.role {
+		color: var(--k-text-dim);
+		font-size: 11.5px;
 	}
-	.signout {
-		height: 36px;
-		padding: 0 14px;
-		border-radius: var(--k-radius-md);
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-2);
-		font-family: var(--k-font-sans);
-		font-size: 12.5px;
-		font-weight: 600;
-		cursor: pointer;
-		transition:
-			color 0.15s,
-			background-color 0.15s,
-			border-color 0.15s;
-	}
-	.signout:hover {
-		border-color: var(--k-border-strong);
-		color: var(--k-text);
-	}
-	main {
-		max-width: 1440px;
+
+	/* ---- main ---- */
+	.admin-main {
+		min-width: 0;
+		width: 100%;
+		max-width: 1360px;
 		margin: 0 auto;
-		padding: 40px var(--k-space-6) 64px;
+		padding: var(--k-space-8) var(--k-space-10) 72px;
+		scroll-margin-top: 16px;
 	}
-	main.full {
+	.admin-main:focus {
+		outline: none;
+	}
+	.admin-main.full {
 		max-width: none;
 		padding: 0;
 	}
 
-	/* Below ~720px the single-row header (brand + nav + account controls) would
-	   overflow the viewport: let it wrap into stacked, unhidden rows and enlarge
-	   touch targets. Every destination stays reachable; active state kept. */
+	/* ---- narrow: sidebar becomes an off-canvas drawer ---- */
 	@media (max-width: 900px) {
-		.admin-header {
-			position: static;
+		.shell {
+			grid-template-columns: minmax(0, 1fr);
+			grid-template-rows: auto 1fr;
+		}
+		.topbar {
+			position: sticky;
+			top: 0;
+			z-index: 50;
 			display: flex;
-			height: auto;
-			flex-wrap: wrap;
-			row-gap: 10px;
-			padding: 8px var(--k-space-4) 12px;
+			align-items: center;
+			gap: var(--k-space-2);
+			height: 56px;
+			padding: 0 var(--k-space-3);
+			background: var(--k-glass-strong);
+			backdrop-filter: blur(12px);
+			border-bottom: 1px solid var(--k-border-1);
 		}
-		.brand {
-			flex: 1 1 100%;
-			gap: 10px;
-			flex-wrap: wrap;
-			min-width: 0;
+		.topbar .brand {
+			padding: 0;
 		}
-		.nav {
-			order: 3;
-			flex: 1 1 100%;
-			gap: 2px;
-			flex-wrap: nowrap;
-			min-width: 0;
+		.sidebar {
+			position: fixed;
+			inset: 0 auto 0 0;
+			z-index: 120;
+			width: min(86vw, 290px);
+			box-shadow: var(--k-shadow-3);
+			transform: translateX(-100%);
+			visibility: hidden;
+			transition:
+				transform 220ms var(--k-ease),
+				visibility 220ms;
+		}
+		.sidebar.open {
+			transform: none;
+			visibility: visible;
+		}
+		.scrim {
+			position: fixed;
+			inset: 0;
+			z-index: 110;
+			background: var(--k-scrim);
+		}
+		.admin-main {
+			padding: var(--k-space-5) var(--k-space-4) 56px;
 		}
 		.nav-link {
-			display: inline-flex;
-			align-items: center;
 			min-height: 44px;
-			white-space: nowrap;
-			padding: 8px 12px;
-		}
-		.who {
-			flex: 1 1 100%;
-			gap: 8px;
-			flex-wrap: wrap;
-		}
-		.theme-toggle,
-		.nsfw-toggle,
-		.signout {
-			height: 40px;
-		}
-		main {
-			padding: var(--k-space-6) var(--k-space-4);
 		}
 	}
 </style>

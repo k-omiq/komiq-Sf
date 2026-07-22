@@ -65,6 +65,50 @@
 	--k-primary-hover: #ffffff;
 	--k-on-primary: #0c0c0d;
 
+	/* semantic feedback — each tone has a text colour, a soft fill and a border */
+	--k-danger: #f0808a;
+	--k-success: #7fd39a;
+	--k-warning: #e0b354;
+	--k-info: #8fb8ff;
+	--k-danger-soft: color-mix(in srgb, var(--k-danger) 12%, transparent);
+	--k-success-soft: color-mix(in srgb, var(--k-success) 12%, transparent);
+	--k-warning-soft: color-mix(in srgb, var(--k-warning) 12%, transparent);
+	--k-info-soft: color-mix(in srgb, var(--k-info) 12%, transparent);
+	--k-accent-soft: color-mix(in srgb, var(--k-accent) 14%, transparent);
+	--k-danger-border: color-mix(in srgb, var(--k-danger) 34%, transparent);
+	--k-success-border: color-mix(in srgb, var(--k-success) 34%, transparent);
+	--k-warning-border: color-mix(in srgb, var(--k-warning) 34%, transparent);
+	--k-info-border: color-mix(in srgb, var(--k-info) 34%, transparent);
+	--k-accent-border: color-mix(in srgb, var(--k-accent) 40%, transparent);
+	/* solid danger button */
+	--k-danger-solid: #d9505c;
+	--k-on-danger: #fffdfb;
+	--k-on-accent: #fffdfb;
+
+	/* motion: one exponential ease-out for every state change */
+	--k-ease: cubic-bezier(0.16, 1, 0.3, 1);
+	--k-dur: 160ms;
+
+	/* focus + overlays */
+	--k-focus-ring: var(--k-accent);
+	--k-scrim: rgba(6, 6, 7, 0.62);
+	--k-shadow-1: 0 1px 2px rgba(0, 0, 0, 0.32);
+	--k-shadow-2: 0 12px 32px rgba(0, 0, 0, 0.42);
+	--k-shadow-3: 0 24px 64px rgba(0, 0, 0, 0.55);
+
+	/* type scale */
+	--k-text-xs: 12px;
+	--k-text-sm: 13px;
+	--k-text-md: 14px;
+	--k-text-lg: 16px;
+	--k-text-xl: 20px;
+	--k-text-2xl: 26px;
+
+	/* control heights */
+	--k-control-sm: 30px;
+	--k-control: 36px;
+	--k-control-lg: 42px;
+
 	/* radius */
 	--k-radius-sm: 5px;
 	--k-radius: 8px;
@@ -150,6 +194,16 @@
 	--k-primary: #1a1a1b;
 	--k-primary-hover: #000000;
 	--k-on-primary: #f7f6f3;
+
+	--k-danger: #c0364a;
+	--k-success: #2f9e5b;
+	--k-warning: #a8761c;
+	--k-info: #3f6fd6;
+	--k-danger-solid: #c0364a;
+	--k-scrim: rgba(26, 26, 27, 0.4);
+	--k-shadow-1: 0 1px 2px rgba(0, 0, 0, 0.08);
+	--k-shadow-2: 0 12px 32px rgba(0, 0, 0, 0.12);
+	--k-shadow-3: 0 24px 64px rgba(0, 0, 0, 0.18);
 
 	/* status ramp darkened for contrast on a light background */
 	--k-ongoing: #2f9e5b;

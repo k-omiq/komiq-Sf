@@ -2,6 +2,9 @@
 	import { onMount } from 'svelte';
 	import { modal } from '$lib/modal';
 	import { loadSourceReader, type SourceReaderView } from '$lib/data';
+	import Button from './Button.svelte';
+	import Icon from './Icon.svelte';
+	import Segmented from './Segmented.svelte';
 
 	let { seriesId, title, onclose } = $props<{
 		seriesId: string;
@@ -17,6 +20,11 @@
 	let width = $state(720);
 	let retryNonce = $state(0);
 	let requestGeneration = 0;
+
+	const MODES: { value: 'strip' | 'page'; label: string }[] = [
+		{ value: 'strip', label: 'Long strip' },
+		{ value: 'page', label: 'Single page' },
+	];
 
 	const chapters = $derived(view?.chapters ?? []);
 	const chapter = $derived(view?.chapter ?? null);
@@ -115,27 +123,34 @@
 		tabindex="-1"
 		use:modal={onclose}
 	>
-		<header class="reader-toolbar">
-			<div class="reader-title">
-				<span class="eyebrow">SOURCE PREVIEW</span>
-				<strong>{title}</strong>
+		<header class="bar">
+			<div class="heading">
+				<h2 class="k-truncate">{title}</h2>
+				<p class="k-truncate">Source preview. Nothing is added to the catalogue.</p>
 			</div>
-			<div class="reader-controls">
+			<div class="controls">
 				{#if chapters.length > 0 && chapter}
-					<select value={String(chapter.id)} onchange={selectChapter} aria-label="Choose chapter">
+					<select
+						class="k-select chapter-select"
+						value={String(chapter.id)}
+						onchange={selectChapter}
+						aria-label="Choose chapter"
+					>
 						{#each chapters as option (option.id)}
 							<option value={String(option.id)}>
-								Ch. {option.label || option.number}{option.title ? ` · ${option.title}` : ''}
+								Ch. {option.label || option.number}{option.title ? `: ${option.title}` : ''}
 							</option>
 						{/each}
 					</select>
 				{/if}
-				<div class="mode-switch" aria-label="Reading mode">
-					<button class:on={mode === 'strip'} onclick={() => (mode = 'strip')}>Long strip</button>
-					<button class:on={mode === 'page'} onclick={() => (mode = 'page')}>Single page</button>
-				</div>
+				<Segmented
+					value={mode}
+					options={MODES}
+					label="Reading mode"
+					onchange={(next) => (mode = next)}
+				/>
 				<label class="width-control">
-					<span>Width {width}px</span>
+					<span class="k-label">Width <span class="k-num">{width}</span> px</span>
 					<input
 						autocomplete="off"
 						name="width"
@@ -146,42 +161,53 @@
 						bind:value={width}
 					/>
 				</label>
-				<button class="close" onclick={onclose} aria-label="Close reader">×</button>
 			</div>
+			<Button
+				class="close"
+				variant="ghost"
+				icon="x"
+				iconOnly
+				aria-label="Close reader"
+				onclick={onclose}
+			/>
 		</header>
 
-		<div class="reader-stage" style={`--reader-width: ${width}px`}>
+		<div class="stage" style={`--reader-width: ${width}px`}>
 			{#if loading}
-				<div class="reader-state">
-					<span class="spinner"></span>
+				<div class="state" role="status">
+					<span class="k-spin"><Icon name="refresh" size={22} /></span>
 					<p>Loading chapter…</p>
 				</div>
 			{:else if error}
-				<div class="reader-state error">
-					<strong>Couldn’t open this comic</strong>
+				<div class="state" role="alert">
+					<strong>Could not open this comic</strong>
 					<p>{error}</p>
-					<button onclick={() => load(chapter ? String(chapter.id) : null)}>Retry</button>
+					<Button icon="refresh" onclick={() => load(chapter ? String(chapter.id) : null)}
+						>Retry</Button
+					>
 				</div>
 			{:else if !chapter}
-				<div class="reader-state">
+				<div class="state">
 					<strong>No chapters available</strong>
 					<p>This source has not returned a readable chapter for this comic.</p>
 				</div>
 			{:else if view?.externalUrl}
-				<div class="reader-state">
+				<div class="state">
 					<strong>This chapter is hosted off-site</strong>
 					<p>The publisher serves this chapter on its own site.</p>
-					<a href={view.externalUrl} target="_blank" rel="noopener noreferrer">Open chapter ↗</a>
+					<Button href={view.externalUrl} target="_blank" rel="noopener noreferrer" icon="external">
+						Open chapter
+					</Button>
 				</div>
 			{:else if pages.length === 0}
-				<div class="reader-state">
+				<div class="state">
 					<strong>No pages available</strong>
-					<p>Try another chapter or retry after the source recovers.</p>
+					<p>Try another chapter, or retry after the source recovers.</p>
 				</div>
 			{:else if mode === 'strip'}
 				<div class="chapter-heading">
-					<span>CHAPTER {chapter.label || chapter.number}</span>
-					<h2>{chapter.title || title}</h2>
+					<h3>Chapter {chapter.label || chapter.number}</h3>
+					<p>{chapter.title || title}</p>
 				</div>
 				{#key `${chapter.id}:${retryNonce}`}
 					<div class="strip">
@@ -197,37 +223,49 @@
 					</div>
 				{/key}
 				<div class="chapter-end">
-					<span>END OF CHAPTER {chapter.label || chapter.number}</span>
+					<span class="end-note">End of chapter {chapter.label || chapter.number}</span>
 					{#if nextChapter}
-						<button onclick={() => load(String(nextChapter.id))}>Next chapter →</button>
+						<Button onclick={() => load(String(nextChapter.id))}>
+							Next chapter <Icon name="chevron-right" />
+						</Button>
 					{:else}
-						<strong>You’re at the latest chapter.</strong>
+						<span class="end-note">You are at the latest chapter.</span>
 					{/if}
-					<button class="quiet" onclick={() => (retryNonce += 1)}>Reload images</button>
+					<Button class="reload" icon="refresh" onclick={() => (retryNonce += 1)}>
+						Reload images
+					</Button>
 				</div>
 			{:else}
 				<div class="paged">
 					<div class="chapter-heading compact">
-						<span>CHAPTER {chapter.label || chapter.number}</span>
-						<h2>{chapter.title || title}</h2>
+						<h3>Chapter {chapter.label || chapter.number}</h3>
+						<p>{chapter.title || title}</p>
 					</div>
 					{#key `${chapter.id}:${currentPage?.index}:${retryNonce}`}
-						<div class="page-frame">
+						<div class="leaf-frame">
 							{#if currentPage}
 								<img src={currentPage.url} alt={`Page ${currentPage.index + 1}`} decoding="async" />
 							{/if}
-							<button class="turn left" onclick={previousPage} aria-label="Previous page"></button>
-							<button class="turn right" onclick={nextPage} aria-label="Next page"></button>
+							<button
+								type="button"
+								class="turn left"
+								onclick={previousPage}
+								aria-label="Previous page"
+							></button>
+							<button type="button" class="turn right" onclick={nextPage} aria-label="Next page"
+							></button>
 						</div>
 					{/key}
-					<div class="page-nav">
-						<button onclick={previousPage} disabled={!previousChapter && pageIndex === 0}
-							>← Prev</button
+					<div class="leaf-nav">
+						<Button
+							icon="chevron-left"
+							onclick={previousPage}
+							disabled={!previousChapter && pageIndex === 0}>Prev</Button
 						>
-						<span>{pageIndex + 1} / {pages.length}</span>
-						<button onclick={nextPage} disabled={!nextChapter && pageIndex === pages.length - 1}
-							>Next →</button
-						>
+						<span class="k-num">Page {pageIndex + 1} of {pages.length}</span>
+						<Button onclick={nextPage} disabled={!nextChapter && pageIndex === pages.length - 1}>
+							Next <Icon name="chevron-right" />
+						</Button>
 					</div>
 				</div>
 			{/if}
@@ -239,12 +277,11 @@
 	.reader-backdrop {
 		position: fixed;
 		inset: 0;
-		z-index: 100;
+		z-index: 200;
 		display: grid;
 		place-items: center;
-		padding: 18px;
-		background: rgba(0, 0, 0, 0.78);
-		backdrop-filter: blur(8px);
+		padding: var(--k-space-4);
+		background: var(--k-scrim);
 	}
 	.reader-scrim {
 		position: absolute;
@@ -259,216 +296,165 @@
 	.reader-shell {
 		position: relative;
 		width: min(1180px, 100%);
-		height: min(920px, calc(100vh - 36px));
+		height: min(920px, calc(100dvh - 2 * var(--k-space-4)));
 		display: flex;
 		flex-direction: column;
 		overflow: hidden;
-		background: #0c0c0d;
-		color: #f2f1ee;
-		border: 1px solid rgba(255, 255, 255, 0.14);
-		border-radius: 16px;
-		box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55);
+		overscroll-behavior: contain;
+		background: var(--k-surface-2);
+		color: var(--k-text);
+		border: 1px solid var(--k-border-2);
+		border-radius: var(--k-radius-xl);
+		box-shadow: var(--k-shadow-3);
 	}
-	.reader-toolbar {
+	.reader-shell:focus {
+		outline: none;
+	}
+
+	/* ---- toolbar: follows the theme ---- */
+	.bar {
 		position: relative;
 		z-index: 2;
 		display: flex;
 		align-items: center;
-		justify-content: space-between;
-		gap: 18px;
-		min-height: 70px;
-		padding: 12px 16px 12px 20px;
-		background: rgba(12, 12, 13, 0.94);
-		border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+		gap: var(--k-space-4);
+		padding: var(--k-space-3) var(--k-space-3) var(--k-space-3) var(--k-space-5);
+		background: var(--k-surface-2);
+		border-bottom: 1px solid var(--k-border-1);
 	}
-	.reader-title {
-		display: flex;
-		flex-direction: column;
-		min-width: 150px;
-		max-width: 320px;
+	.heading {
+		flex: 1 1 160px;
+		min-width: 0;
 	}
-	.reader-title strong {
-		overflow: hidden;
-		white-space: nowrap;
-		text-overflow: ellipsis;
-		font-size: 14px;
+	.heading h2 {
+		font-size: var(--k-text-md);
+		font-weight: 700;
 	}
-	.eyebrow,
-	.chapter-heading span,
-	.chapter-end > span {
-		font-size: 10px;
-		font-weight: 800;
-		letter-spacing: 0.12em;
-		color: #87857f;
+	.heading p {
+		color: var(--k-text-dim);
+		font-size: var(--k-text-xs);
 	}
-	.reader-controls {
+	.controls {
 		display: flex;
 		align-items: center;
 		justify-content: flex-end;
-		gap: 10px;
+		flex-wrap: wrap;
+		gap: var(--k-space-3);
 		min-width: 0;
 	}
-	.reader-controls select,
-	.mode-switch,
-	.close,
-	.page-nav button,
-	.chapter-end button,
-	.reader-state button,
-	.reader-state a {
-		border: 1px solid rgba(255, 255, 255, 0.14);
-		background: #1a1a1b;
-		color: #e7e5e0;
-		border-radius: 8px;
-	}
-	.reader-controls select {
+	.chapter-select {
 		width: min(260px, 25vw);
-		height: 36px;
-		padding: 0 10px;
-		font-size: 12px;
-	}
-	.mode-switch {
-		display: flex;
-		overflow: hidden;
-	}
-	.mode-switch button {
-		height: 34px;
-		padding: 0 10px;
-		border: 0;
-		background: transparent;
-		color: #87857f;
-		font-size: 11px;
-		font-weight: 700;
-		cursor: pointer;
-	}
-	.mode-switch button.on {
-		background: #f2f1ee;
-		color: #0c0c0d;
 	}
 	.width-control {
-		display: flex;
-		flex-direction: column;
+		display: grid;
 		gap: 2px;
-		width: 120px;
-		font-size: 9px;
-		font-weight: 700;
-		color: #87857f;
+		width: 132px;
 	}
 	.width-control input {
 		width: 100%;
+		accent-color: var(--k-accent);
 	}
-	.close {
-		width: 36px;
-		height: 36px;
-		padding: 0;
-		font-size: 24px;
-		line-height: 1;
-		cursor: pointer;
-	}
-	.reader-stage {
+
+	/* ---- reading canvas: dark in both themes, like any image viewer ----
+	 * The two tokens swap roles in the light theme, so the canvas stays dark
+	 * without a hard-coded colour. */
+	.stage {
+		--canvas: var(--k-bg);
+		--ink: var(--k-text-bright);
+		--ink-dim: color-mix(in srgb, var(--ink) 62%, var(--canvas));
 		flex: 1;
 		overflow: auto;
 		overscroll-behavior: contain;
-		background: #080809;
+		background: var(--canvas);
+		color: var(--ink);
+	}
+	:global(:root[data-theme='light']) .stage {
+		--canvas: var(--k-text-bright);
+		--ink: var(--k-bg);
 	}
 	.chapter-heading {
 		width: min(var(--reader-width), calc(100% - 32px));
-		margin: 34px auto 20px;
+		margin: var(--k-space-8) auto var(--k-space-5);
 	}
-	.chapter-heading h2 {
-		margin-top: 4px;
-		font-size: 20px;
-		color: #f7f6f3;
+	.chapter-heading h3 {
+		color: var(--ink);
+		font-size: var(--k-text-xl);
+		font-weight: 700;
+	}
+	.chapter-heading p {
+		margin-top: 2px;
+		color: var(--ink-dim);
+		font-size: var(--k-text-sm);
+		overflow-wrap: anywhere;
 	}
 	.chapter-heading.compact {
-		margin-top: 22px;
-		margin-bottom: 12px;
+		margin-top: var(--k-space-5);
+		margin-bottom: var(--k-space-3);
 	}
 	.strip {
 		width: min(var(--reader-width), 100%);
 		margin: 0 auto;
-		background: #111;
 	}
 	.strip img {
+		display: block;
 		width: 100%;
 		height: auto;
 		min-height: 180px;
 		object-fit: contain;
-		background: #141415;
+		background: color-mix(in srgb, var(--ink) 6%, var(--canvas));
 	}
 	.chapter-end {
 		width: min(var(--reader-width), calc(100% - 32px));
 		margin: 0 auto;
-		padding: 26px 0 36px;
+		padding: var(--k-space-6) 0 var(--k-space-10);
 		display: flex;
 		align-items: center;
-		gap: 12px;
+		flex-wrap: wrap;
+		gap: var(--k-space-3);
 	}
-	.chapter-end strong {
-		font-size: 12px;
-		color: #9c9a94;
+	.end-note {
+		color: var(--ink-dim);
+		font-size: var(--k-text-sm);
+		font-weight: 600;
 	}
-	.chapter-end button,
-	.reader-state button,
-	.reader-state a,
-	.page-nav button {
-		padding: 8px 13px;
-		font-size: 12px;
-		font-weight: 700;
-		cursor: pointer;
-	}
-	.chapter-end .quiet {
+	.chapter-end :global(.reload) {
 		margin-left: auto;
-		background: transparent;
-		color: #9c9a94;
 	}
-	.reader-state {
+	.state {
 		min-height: 440px;
 		display: grid;
 		place-content: center;
 		justify-items: center;
-		gap: 10px;
-		padding: 32px;
+		gap: var(--k-space-3);
+		padding: var(--k-space-8);
 		text-align: center;
-		color: #9c9a94;
+		color: var(--ink-dim);
 	}
-	.reader-state strong {
-		font-size: 18px;
-		color: #f2f1ee;
+	.state strong {
+		color: var(--ink);
+		font-family: var(--k-font-display);
+		font-size: var(--k-text-xl);
 	}
-	.reader-state p {
+	.state p {
 		max-width: 480px;
-		font-size: 13px;
-	}
-	.reader-state.error p {
-		color: #f0808a;
-	}
-	.spinner {
-		width: 24px;
-		height: 24px;
-		border: 2px solid rgba(255, 255, 255, 0.15);
-		border-top-color: #f2f1ee;
-		border-radius: 50%;
-		animation: spin 0.7s linear infinite;
-	}
-	@keyframes spin {
-		to {
-			transform: rotate(360deg);
-		}
+		font-size: var(--k-text-sm);
+		line-height: 1.6;
+		overflow-wrap: anywhere;
 	}
 	.paged {
 		min-height: 100%;
-		padding-bottom: 24px;
+		padding-bottom: var(--k-space-6);
 	}
-	.page-frame {
+	.leaf-frame {
 		position: relative;
 		width: min(var(--reader-width), calc(100% - 32px));
-		height: calc(100vh - 250px);
+		height: calc(100dvh - 250px);
 		min-height: 420px;
 		margin: 0 auto;
 		display: grid;
 		place-items: center;
 	}
-	.page-frame img {
+	.leaf-frame img {
 		width: 100%;
 		height: 100%;
 		object-fit: contain;
@@ -488,45 +474,47 @@
 	.turn.right {
 		right: 0;
 	}
-	.page-nav {
+	.leaf-nav {
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		gap: 16px;
-		margin-top: 14px;
-		font-size: 12px;
-		color: #9c9a94;
-	}
-	.page-nav button:disabled {
-		opacity: 0.35;
-		cursor: default;
+		flex-wrap: wrap;
+		gap: var(--k-space-4);
+		margin-top: var(--k-space-4);
+		color: var(--ink-dim);
+		font-size: var(--k-text-sm);
+		font-weight: 600;
 	}
 	@media (max-width: 800px) {
 		.reader-backdrop {
 			padding: 0;
 		}
 		.reader-shell {
-			height: 100vh;
+			height: 100dvh;
 			border: 0;
 			border-radius: 0;
 		}
-		.reader-toolbar {
-			align-items: flex-start;
-			padding: 10px;
+		/* Title and close on the first line, the controls on a line of their own. */
+		.bar {
+			display: grid;
+			grid-template-columns: minmax(0, 1fr) auto;
+			gap: var(--k-space-2) var(--k-space-3);
+			padding: var(--k-space-2) var(--k-space-2) var(--k-space-3) var(--k-space-4);
 		}
-		.reader-title,
+		.controls {
+			grid-column: 1 / -1;
+			grid-row: 2;
+			justify-content: flex-start;
+			padding-right: var(--k-space-2);
+		}
 		.width-control {
 			display: none;
 		}
-		.reader-controls {
-			width: 100%;
-		}
-		.reader-controls select {
-			flex: 1;
+		.chapter-select {
+			flex: 1 1 120px;
 			width: auto;
-		}
-		.mode-switch button {
-			padding: 0 7px;
+			/* Otherwise the longest chapter title sets the width and pushes the mode switch down. */
+			min-width: 0;
 		}
 	}
 </style>

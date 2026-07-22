@@ -271,8 +271,9 @@ export async function loadCanonicalUpdates(page = 1): Promise<CanonicalUpdate[]>
 
 /**
  * Every Mihon extension known to the Suwayomi engine (installed or not). No
- * store is seeded — the list is empty until a repo is added; NSFW extensions are
- * hidden unless the admin opted in via show_nsfw (CATALOGUE.md §2).
+ * store is seeded — the list is empty until a repo is added. NSFW extensions are
+ * always listed here, whatever the admin's own show_nsfw preference: an admin has
+ * to see an extension to manage it.
  * `refresh: true` re-fetches the store indexes so hasUpdate/versions are fresh.
  */
 export async function loadExtensions(refresh = false): Promise<ExtensionInfo[]> {

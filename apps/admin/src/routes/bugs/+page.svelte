@@ -5,6 +5,12 @@
 	import { auth } from '$lib/auth.svelte';
 	import { assetSrc } from '$lib/config';
 	import { loadCoverIssues, retryCover, uploadCover } from '$lib/data';
+	import { toast } from '$lib/toast.svelte';
+	import Button from '$lib/components/Button.svelte';
+	import Cover from '$lib/components/Cover.svelte';
+	import LoadState from '$lib/components/LoadState.svelte';
+	import PageHeader from '$lib/components/PageHeader.svelte';
+	import Pager from '$lib/components/Pager.svelte';
 
 	let issues = $state<CoverIssue[]>([]);
 	const page = $derived(queuePage(pageState.url));
@@ -12,17 +18,18 @@
 	let total = $state<number | null>(null);
 	let loading = $state(false);
 	let loadError = $state<string | null>(null);
-	let actionError = $state<string | null>(null);
 	let busy = $state<string | null>(null); // workId currently acting
+	// Which of the row's two actions is in flight, so only that button spins.
+	let busyAction = $state<'retry' | 'upload' | null>(null);
 	// Hidden file inputs keyed by workId, so each row's "Upload" button opens its own.
 	let fileInputs = $state<Record<string, HTMLInputElement>>({});
 
 	const REASON_LABEL: Record<string, string> = {
-		too_large: 'Source too large',
-		unsupported: 'Unsupported / corrupt',
-		empty: 'Empty source',
-		encode: 'Encode failed',
-		store: 'Store failed',
+		too_large: 'Image too large',
+		unsupported: 'Unsupported or damaged file',
+		empty: 'Image is empty',
+		encode: 'Could not convert',
+		store: 'Could not save',
 	};
 
 	// Auth redirect is centralized in +layout.svelte.
@@ -61,12 +68,16 @@
 
 	function fmtDate(iso: string): string {
 		const t = Date.parse(iso);
-		return Number.isNaN(t) ? '—' : new Date(t).toLocaleString();
+		return Number.isNaN(t) ? 'Unknown' : new Date(t).toLocaleString();
+	}
+
+	function nameOf(w: CoverIssue): string {
+		return w.title ?? w.workId;
 	}
 
 	// After an optimistic removal empties the current page while issues still exist
-	// elsewhere, reload so we don't show the "all clean 🎉" message (and hide the pager)
-	// on a page that only looks empty. Stay on the page if more are queued ahead
+	// elsewhere, reload so we don't show the "No cover issues" empty state (and hide the
+	// pager) on a page that only looks empty. Stay on the page if more are queued ahead
 	// (server backfills from the next page), else step back a page.
 	async function settleAfterFix(): Promise<void> {
 		if (issues.length === 0 && total != null && total > 0) {
@@ -79,24 +90,28 @@
 	async function retry(w: CoverIssue): Promise<void> {
 		if (busy) return;
 		busy = w.workId;
-		actionError = null;
+		busyAction = 'retry';
 		try {
 			const stored = await retryCover(w.workId);
 			if (stored) {
 				// Fixed — drop it from the list.
 				issues = issues.filter((x) => x.workId !== w.workId);
 				if (total != null) total -= 1;
+				toast.success(`Cover fixed for ${nameOf(w)}.`);
 				await settleAfterFix();
 			} else {
-				actionError = `Couldn't fetch a source image for “${w.title ?? w.workId}” — try again later or upload one.`;
+				toast.error(
+					`No source image could be fetched for ${nameOf(w)}. Try again later or upload one.`,
+				);
 			}
 		} catch (err) {
 			// A deterministic re-failure refreshes the reason server-side; reload so the
 			// row shows the latest attempt count / reason.
-			actionError = err instanceof Error ? err.message : 'Retry failed.';
+			toast.fromError(err, 'Retry failed. Try again or upload a cover.');
 			await refresh();
 		} finally {
 			busy = null;
+			busyAction = null;
 		}
 	}
 
@@ -106,87 +121,105 @@
 		input.value = ''; // allow re-picking the same file later
 		if (!file || busy) return;
 		busy = w.workId;
-		actionError = null;
+		busyAction = 'upload';
 		try {
 			await uploadCover(w.workId, file);
 			issues = issues.filter((x) => x.workId !== w.workId);
 			if (total != null) total -= 1;
+			toast.success(`Cover uploaded for ${nameOf(w)}.`);
 			await settleAfterFix();
 		} catch (err) {
-			actionError = err instanceof Error ? err.message : 'Upload failed.';
+			toast.fromError(err, 'Upload failed. Check the file is an image and try again.');
 		} finally {
 			busy = null;
+			busyAction = null;
 		}
 	}
+
+	const count = $derived(total ?? issues.length);
 </script>
 
-<div class="page">
-	<div class="page-head">
-		<div>
-			<h1>Cover issues</h1>
-			<p class="lede">
-				{total ?? issues.length} cover{(total ?? issues.length) === 1 ? '' : 's'} the crawl couldn't process.
-				Retry (re-fetch + re-encode) or upload a replacement.
-			</p>
-		</div>
-		<button class="pg" disabled={loading} onclick={() => refresh()}>Refresh</button>
-	</div>
+<div class="k-page">
+	<PageHeader
+		title="Cover issues"
+		description="{count} cover{count === 1
+			? ''
+			: 's'} could not be processed. Retry fetches and converts the image again. Upload replaces it with a file from your device."
+	>
+		{#snippet actions()}
+			<Button icon="refresh" busy={loading} onclick={() => refresh()}>Refresh</Button>
+		{/snippet}
+	</PageHeader>
 
-	{#if loadError}
-		<div class="notice error" role="alert">{loadError}</div>
-	{:else if loading && issues.length === 0}
-		<div class="notice" role="status">Loading…</div>
-	{:else if issues.length === 0}
-		<div class="notice">No cover issues — every cover processed cleanly. 🎉</div>
-	{:else}
-		{#if actionError}<div class="notice error" role="alert">{actionError}</div>{/if}
-		<div class="table" role="table" aria-label="Cover issues">
-			<div class="row head" role="row">
+	<LoadState
+		loading={loading && issues.length === 0}
+		error={loadError}
+		empty={issues.length === 0}
+		emptyTitle={page > 1 ? 'No cover issues on this page' : 'No cover issues'}
+		emptyHint={page > 1
+			? 'This page is past the end of the list.'
+			: 'Every cover was processed without a problem. Covers that fail to download or convert are listed here.'}
+		emptyIcon="check"
+		onretry={() => refresh()}
+	>
+		{#snippet emptyActions()}
+			<!-- An empty page past the first (a stale link, or the list shrank) has no table
+			     and so no pager: give the way back here. -->
+			{#if page > 1}
+				<Button size="sm" onclick={() => queueNavigate(pageState.url, { page: null })}>
+					Go to the first page
+				</Button>
+			{/if}
+		{/snippet}
+		<div class="k-table" class:is-dim={loading} role="table" aria-label="Cover issues">
+			<div class="k-tr k-tr--head" role="row">
 				<span role="columnheader">Cover</span>
 				<span role="columnheader">Work</span>
 				<span role="columnheader">Reason</span>
 				<span role="columnheader">Tries</span>
 				<span role="columnheader">Last attempt</span>
-				<span role="columnheader" class="actions-col">Fix</span>
+				<span role="columnheader" class="k-td--end">Fix</span>
 			</div>
 			{#each issues as w (w.workId)}
-				<div class="row" role="row">
-					<span role="cell">
-						{#if assetSrc(w.coverUrl)}
-							<img
-								width="80"
-								height="112"
-								class="cover"
-								src={assetSrc(w.coverUrl)}
-								alt=""
-								loading="lazy"
-							/>
-						{:else}
-							<span class="cover placeholder" aria-hidden="true">?</span>
-						{/if}
+				<div class="k-tr" role="row">
+					<span class="thumb" role="cell">
+						<Cover src={assetSrc(w.coverUrl)} width={40} />
 					</span>
 					<span class="work" role="cell">
-						<span class="wtitle">{w.title ?? '(untitled)'}</span>
-						<span class="wid">{w.workId}</span>
+						<span class="title k-truncate">{w.title ?? 'Untitled'}</span>
+						<span class="k-mono k-muted k-truncate">{w.workId}</span>
 					</span>
-					<span role="cell">
-						<span class="badge" title={w.detail ?? ''}>{REASON_LABEL[w.reason] ?? w.reason}</span>
+					<span role="cell" data-label="Reason">
+						<span class="reason">
+							<span class="k-badge" data-tone="danger">{REASON_LABEL[w.reason] ?? w.reason}</span>
+							{#if w.detail}<span class="detail k-muted" title={w.detail}>{w.detail}</span>{/if}
+						</span>
 					</span>
-					<span class="muted" role="cell">{w.attempts}</span>
-					<span class="muted" role="cell">{fmtDate(w.lastSeen)}</span>
-					<span class="actions" role="cell">
-						<button class="act" disabled={busy === w.workId} onclick={() => retry(w)}>
-							{busy === w.workId ? '…' : 'Retry'}
-						</button>
-						<button
-							class="act upload"
+					<span class="k-muted k-num" role="cell" data-label="Tries">{w.attempts}</span>
+					<span class="k-muted k-num" role="cell" data-label="Last attempt"
+						>{fmtDate(w.lastSeen)}</span
+					>
+					<span class="k-td--end" role="cell">
+						<Button
+							size="sm"
+							icon="refresh"
+							busy={busy === w.workId && busyAction === 'retry'}
+							disabled={busy === w.workId}
+							onclick={() => retry(w)}
+						>
+							Retry
+						</Button>
+						<Button
+							size="sm"
+							icon="upload"
+							busy={busy === w.workId && busyAction === 'upload'}
 							disabled={busy === w.workId}
 							onclick={() => fileInputs[w.workId]?.click()}
 						>
 							Upload
-						</button>
+						</Button>
 						<input
-							class="hidden-file"
+							class="file"
 							aria-label={`Upload cover for ${w.title ?? w.workId}`}
 							type="file"
 							accept="image/*"
@@ -198,230 +231,72 @@
 			{/each}
 		</div>
 
-		<div class="pager">
-			<button
-				class="pg"
-				disabled={page <= 1 || loading}
-				onclick={() => queueNavigate(pageState.url, { page: Math.max(1, page - 1) })}
-			>
-				← Prev
-			</button>
-			<span class="muted">Page {page}</span>
-			<button
-				class="pg"
-				disabled={!hasNext || loading}
-				onclick={() => queueNavigate(pageState.url, { page: page + 1 })}
-			>
-				Next →
-			</button>
-		</div>
-	{/if}
+		<Pager
+			{page}
+			{hasNext}
+			busy={loading}
+			onpage={(n) => queueNavigate(pageState.url, { page: Math.max(1, n) })}
+		/>
+	</LoadState>
 </div>
 
 <style>
-	.page {
+	.k-table {
+		/* The last track is fixed, not auto: each row is its own grid, so an auto track
+		   would size differently in the head row and the columns would not line up. */
+		--cols: 40px minmax(0, 2fr) minmax(0, 1.8fr) minmax(0, 0.5fr) minmax(0, 1.2fr) 176px;
+	}
+	.thumb {
 		display: flex;
-		flex-direction: column;
-		gap: var(--k-space-6);
-	}
-	.page-head {
-		display: flex;
-		align-items: flex-end;
-		justify-content: space-between;
-	}
-	h1 {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 30px;
-		letter-spacing: -0.02em;
-		color: var(--k-text-bright);
-	}
-	.lede {
-		margin-top: 6px;
-		font-size: 13.5px;
-		color: var(--k-text-dim);
-		max-width: 60ch;
-	}
-	.notice {
-		padding: 14px 16px;
-		border-radius: var(--k-radius-md);
-		background: var(--k-surface-2);
-		border: 1px solid var(--k-border);
-		color: var(--k-text-dim);
-		font-size: 13.5px;
-	}
-	.notice.error {
-		color: #f0808a;
-		border-color: rgba(240, 128, 138, 0.4);
-	}
-	.table {
-		border: 1px solid var(--k-border);
-		border-radius: var(--k-radius-lg);
-		overflow: hidden;
-	}
-	.row {
-		display: grid;
-		grid-template-columns: 56px 2.4fr 1.4fr 0.6fr 1.4fr auto;
-		align-items: center;
-		gap: var(--k-space-4);
-		padding: 12px 16px;
-		border-bottom: 1px solid var(--k-border);
-	}
-	.row:last-child {
-		border-bottom: none;
-	}
-	.row.head {
-		background: var(--k-surface-2);
-		font-size: 11px;
-		font-weight: 700;
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-		color: var(--k-text-faint);
-	}
-	.cover {
-		width: 40px;
-		height: 56px;
-		object-fit: cover;
-		border-radius: var(--k-radius-sm);
-		background: var(--k-surface-4);
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-	}
-	.cover.placeholder {
-		color: var(--k-text-faint);
-		font-size: 18px;
-		font-weight: 700;
 	}
 	.work {
-		display: flex;
-		flex-direction: column;
+		display: grid;
 		gap: 2px;
+	}
+	.title {
+		color: var(--k-text-bright);
+		font-weight: 700;
+	}
+	.reason {
+		display: grid;
+		justify-items: start;
+		gap: 4px;
 		min-width: 0;
 	}
-	.wtitle {
-		font-size: 14px;
-		font-weight: 600;
-		color: var(--k-text-1);
+	/* The server's own failure text: useful, but it can be a long unbroken string. */
+	.detail {
+		display: -webkit-box;
+		-webkit-box-orient: vertical;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
 		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
+		overflow-wrap: anywhere;
+		font-size: var(--k-text-xs);
+		line-height: 1.45;
 	}
-	.wid {
-		font-size: 11px;
-		color: var(--k-text-faint);
-		font-family: var(--k-font-mono, monospace);
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.muted {
-		font-size: 13px;
-		color: var(--k-text-dim);
-	}
-	.badge {
-		display: inline-block;
-		font-size: 11px;
-		font-weight: 700;
-		padding: 3px 8px;
-		border-radius: var(--k-radius-sm);
-		background: rgba(240, 128, 138, 0.14);
-		color: #f0808a;
-		cursor: help;
-	}
-	.actions-col {
-		text-align: right;
-	}
-	.actions {
-		display: flex;
-		gap: 8px;
-		justify-content: flex-end;
-	}
-	.act {
-		height: 32px;
-		padding: 0 12px;
-		border-radius: var(--k-radius-md);
-		background: var(--k-surface);
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-2);
-		font-family: var(--k-font-sans);
-		font-size: 12.5px;
-		font-weight: 600;
-		cursor: pointer;
-		white-space: nowrap;
-		transition:
-			color 0.15s,
-			background-color 0.15s,
-			border-color 0.15s;
-	}
-	.act:hover:not(:disabled) {
-		border-color: var(--k-border-strong);
-		color: var(--k-text);
-	}
-	.act.upload:hover:not(:disabled) {
-		border-color: rgba(95, 200, 207, 0.5);
-		color: var(--k-accent-teal);
-	}
-	.act:disabled {
-		opacity: 0.5;
-		cursor: default;
-	}
-	.hidden-file {
+	.file {
 		display: none;
 	}
-	.pager {
-		display: flex;
-		align-items: center;
-		gap: var(--k-space-4);
-		justify-content: flex-end;
-	}
-	.pg {
-		height: 36px;
-		padding: 0 16px;
-		border-radius: var(--k-radius-md);
-		background: var(--k-surface);
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-2);
-		font-family: var(--k-font-sans);
-		font-size: 13px;
-		font-weight: 600;
-		cursor: pointer;
-	}
-	.pg:disabled {
-		opacity: 0.4;
-		cursor: default;
-	}
 	@media (max-width: 720px) {
-		.page-head {
+		/* Keep the thumbnail beside the title; every other cell takes the full row. */
+		.k-tr {
+			grid-template-columns: 40px minmax(0, 1fr);
+			column-gap: var(--k-space-3);
+		}
+		.k-tr > :not(.thumb, .work) {
+			grid-column: 1 / -1;
+		}
+		/* Badge sits opposite the caption; the failure text takes its own full line. */
+		.k-tr > [data-label='Reason'] {
 			flex-wrap: wrap;
+			row-gap: 6px;
 		}
-		.row {
-			grid-template-columns: 1fr;
-			gap: 6px;
+		.reason {
+			display: contents;
 		}
-		.row.head {
-			display: none;
-		}
-		.row > [role='cell']:nth-child(4)::before,
-		.row > [role='cell']:nth-child(5)::before {
-			font-weight: 700;
-			color: var(--k-text-faint);
-		}
-		.row > [role='cell']:nth-child(4)::before {
-			content: 'Tries · ';
-		}
-		.row > [role='cell']:nth-child(5)::before {
-			content: 'Last attempt · ';
-		}
-		.actions {
-			justify-content: flex-start;
-			flex-wrap: wrap;
-		}
-		.act,
-		.pg {
-			height: 40px;
-		}
-		.pager {
-			justify-content: flex-start;
+		.detail {
+			flex: 1 1 100%;
+			text-align: left;
 		}
 	}
 </style>

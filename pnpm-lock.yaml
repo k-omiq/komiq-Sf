@@ -20,6 +20,12 @@ importers:
 
   apps/admin:
     dependencies:
+      '@fontsource-variable/bricolage-grotesque':
+        specifier: ^5.2.10
+        version: 5.2.10
+      '@fontsource-variable/manrope':
+        specifier: ^5.2.8
+        version: 5.2.8
       '@komika/api':
         specifier: workspace:*
         version: link:../../packages/api

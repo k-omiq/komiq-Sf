@@ -38,10 +38,10 @@ test('report URL filters and same-route note drafts', async ({ page }) => {
 	await expect(page).toHaveURL(/\/reports/);
 	await expect(page.getByLabel('Add a note (readers never see it)')).toHaveValue('Retained draft');
 });
-test('source extension filters persist and unrelated context survives tab changes', async ({
+test('source extension filters persist and old tab links keep unrelated context', async ({
 	page,
 }) => {
-	await page.goto('/sources?context=keep');
+	await page.goto('/sources/extensions?context=keep');
 	await page.getByRole('button', { name: /Installed \(/ }).click();
 	await page.getByLabel('Filter by language').selectOption('en');
 	await page.getByLabel('Filter extensions by name').fill('Fixture');
@@ -49,17 +49,15 @@ test('source extension filters persist and unrelated context survives tab change
 	await page.reload();
 	await expect(page.getByLabel('Filter by language')).toHaveValue('en');
 	await expect(page.getByLabel('Filter extensions by name')).toHaveValue('Fixture');
-	await page.getByRole('tab', { name: /Scan health/ }).click();
-	await expect(page).toHaveURL(/context=keep/);
+	// The three Sources tools are separate routes now; a bookmarked `?tab=` link
+	// must land on the right one and keep whatever else was in the URL.
+	await page.goto('/sources?tab=health&context=keep');
+	await expect(page).toHaveURL(/\/sources\/health\?context=keep/);
 	await expect(page.getByRole('table', { name: 'Per-source scan health' })).toBeVisible();
 });
 test('long report health and ingest states fit mobile', async ({ page }) => {
 	await page.setViewportSize({ width: 390, height: 844 });
-	for (const path of [
-		'/reports',
-		'/sources?tab=health',
-		'/sources?tab=catalogue&source=fixture-0',
-	]) {
+	for (const path of ['/reports', '/sources/health', '/sources/browse?source=fixture-0']) {
 		await page.goto(path);
 		if (path.includes('health'))
 			await expect(page.getByRole('table', { name: 'Per-source scan health' })).toBeVisible();
@@ -74,7 +72,7 @@ test('long report health and ingest states fit mobile', async ({ page }) => {
 test('health loading failure and retry are available', async ({ page }) => {
 	const state = { delayField: 'sourceScanHealth', errorField: 'sourceScanHealth' };
 	await installAdminQueueFixtures(page, state);
-	await page.goto('/sources?tab=health');
+	await page.goto('/sources/health');
 	await expect(page.getByRole('status')).toContainText('Loading scan health');
 	await expect(page.getByRole('alert')).toContainText('Fixture queue unavailable');
 	state.errorField = '';
@@ -83,8 +81,8 @@ test('health loading failure and retry are available', async ({ page }) => {
 	await expect(page.getByRole('table', { name: 'Per-source scan health' })).toBeVisible();
 });
 for (const [field, path] of [
-	['extensions', '/sources'],
-	['sources', '/sources?tab=catalogue&source=fixture-0&context=keep'],
+	['extensions', '/sources/extensions'],
+	['sources', '/sources/browse?source=fixture-0&context=keep'],
 ] as const) {
 	test(`${field} initial failure remains visible with explicit retry`, async ({ page }) => {
 		const state = { errorField: field };
@@ -102,7 +100,7 @@ for (const [field, path] of [
 test('ingestion poll failures retain progress and provide retry', async ({ page }) => {
 	const state = { errorField: '' };
 	await installAdminQueueFixtures(page, state);
-	await page.goto('/sources?tab=catalogue&source=fixture-0');
+	await page.goto('/sources/browse?source=fixture-0');
 	await expect(page.getByText('Add all from source fixture-0')).toBeVisible();
 	state.errorField = 'sourceIngestJobs';
 	await expect(page.getByText(/progress updates paused after repeated failures/)).toBeVisible({

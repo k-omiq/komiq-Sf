@@ -4,6 +4,9 @@
 	import type { CanonicalUpdate } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
 	import { loadCanonicalUpdates } from '$lib/data';
+	import LoadState from '$lib/components/LoadState.svelte';
+	import PageHeader from '$lib/components/PageHeader.svelte';
+	import Pager from '$lib/components/Pager.svelte';
 
 	// Mirrors the server's PAGE_SIZE (apps/server/src/graphql/mod.rs) — the pager's
 	// fullness threshold: a short page means there are no further pages.
@@ -39,249 +42,122 @@
 		}
 	}
 
-	function go(delta: number): void {
-		const next = Math.max(1, page + delta);
-		if (next === page) return;
-		void queueNavigate(pageState.url, { page: next });
+	function goTo(next: number): void {
+		const target = Math.max(1, next);
+		if (target === page) return;
+		void queueNavigate(pageState.url, { page: target });
 	}
 
 	function fmtDate(iso: string | null): string {
-		if (!iso) return '—';
+		if (!iso) return 'Unknown';
 		const t = Date.parse(iso);
-		return Number.isNaN(t) ? '—' : new Date(t).toLocaleString();
+		return Number.isNaN(t) ? 'Unknown' : new Date(t).toLocaleString();
 	}
+
+	// An empty page past the first is the end of the feed, not an empty feed.
+	const pastEnd = $derived(page > 1);
 </script>
 
-<div class="page">
-	<div class="page-head">
-		<div>
-			<h1>Catalogue updates</h1>
-			<p class="lede">
-				Latest chapter releases, newest first. Open a title to review its metadata. ·
-				<span
-					class="nsfw-note"
-					title="This console always requests NSFW-inclusive results (an admin-only per-request override), independent of the NSFW on/off preference in the header. The reader still honours each viewer's own preference."
-					>incl. NSFW-flagged</span
-				>
-			</p>
-		</div>
-		<div class="pager">
-			<button class="pg" disabled={loading || page === 1} onclick={() => go(-1)}>Prev</button>
-			<span class="page-num">Page {page}</span>
-			<button class="pg" disabled={loading || updates.length < PAGE_SIZE} onclick={() => go(1)}
-				>Next</button
-			>
-		</div>
-	</div>
+<div class="k-page">
+	<!-- The console reads this feed NSFW-inclusive regardless of the admin's own NSFW
+	     preference; say so, so the console/reader difference isn't a mystery. -->
+	<PageHeader
+		title="Latest updates"
+		description="Newest chapter releases first. Open a title to review it. NSFW titles are always included here, whatever your own NSFW setting is."
+	/>
 
-	{#if loadError}
-		<div class="notice error" role="alert">{loadError}</div>
-	{:else if loading && updates.length === 0}
-		<div class="notice" role="status">Loading…</div>
-	{:else if updates.length === 0}
-		<div class="notice">
-			No catalogue updates yet — the MangaDex mirror is empty (enable <code>CATALOGUE_SYNC</code>).
-		</div>
-	{:else}
-		<div class="table" role="table" aria-label="Catalogue updates">
-			<div class="row head" role="row">
+	<LoadState
+		loading={loading && updates.length === 0}
+		error={loadError}
+		empty={updates.length === 0}
+		emptyTitle={pastEnd ? 'No more updates' : 'No updates yet'}
+		emptyHint={pastEnd
+			? 'This page is past the end of the feed. Go back a page.'
+			: 'New chapter releases from MangaDex show up here. The feed stays empty while catalogue sync is off on the server.'}
+		emptyIcon="clock"
+		onretry={() => refresh(page)}
+	>
+		{#snippet emptyActions()}
+			{#if !pastEnd}
+				<p class="env">
+					To turn it on, set <span class="k-mono">CATALOGUE_SYNC=on</span> in the server environment.
+				</p>
+			{/if}
+		{/snippet}
+
+		<div class="k-table" class:is-dim={loading} role="table" aria-label="Catalogue updates">
+			<div class="k-tr k-tr--head" role="row">
 				<span role="columnheader">Work</span>
 				<span role="columnheader">Latest chapter</span>
 				<span role="columnheader">Updated</span>
 			</div>
 			{#each updates as u (u.workId)}
-				<div class="row" role="row">
+				<div class="k-tr" role="row">
 					<span class="work" role="cell">
-						<a class="wtitle" href="/series/{u.workId}">
-							{u.title ?? '(untitled)'}
-							{#if u.isNsfw}<span class="badge nsfw">NSFW</span>{/if}
-						</a>
-						<span class="wid">md:{u.mangadexId}</span>
+						<span class="title-line">
+							<a class="title k-truncate" href="/series/{u.workId}">{u.title ?? 'Untitled'}</a>
+							{#if u.isNsfw}<span class="k-badge" data-tone="warning">NSFW</span>{/if}
+						</span>
+						<span class="k-mono k-muted k-truncate">MangaDex {u.mangadexId}</span>
 					</span>
-					<span role="cell">
-						<span class="ch">Ch. {u.latestChapter ?? '—'}</span>
-						{#if u.latestChapterTitle}<span class="chtitle">{u.latestChapterTitle}</span>{/if}
+					<span role="cell" data-label="Latest chapter">
+						<span class="chapter">
+							<span class="k-num">
+								{u.latestChapter != null ? `Chapter ${u.latestChapter}` : 'Unknown'}
+							</span>
+							{#if u.latestChapterTitle}
+								<span class="k-muted chapter-title">{u.latestChapterTitle}</span>
+							{/if}
+						</span>
 					</span>
-					<span class="muted" role="cell">{fmtDate(u.latestAt)}</span>
+					<span class="k-muted k-num" role="cell" data-label="Updated">{fmtDate(u.latestAt)}</span>
 				</div>
 			{/each}
 		</div>
+	</LoadState>
+
+	<!-- Outside LoadState so "Prev" stays reachable from an empty page past the end. -->
+	{#if !loadError && (updates.length > 0 || page > 1)}
+		<Pager {page} hasNext={updates.length >= PAGE_SIZE} busy={loading} onpage={goTo} />
 	{/if}
 </div>
 
 <style>
-	.page {
-		display: flex;
-		flex-direction: column;
-		gap: var(--k-space-6);
-	}
-	.page-head {
-		display: flex;
-		align-items: flex-end;
-		justify-content: space-between;
-		gap: var(--k-space-4);
-		flex-wrap: wrap;
-	}
-	h1 {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 24px;
-		margin: 0 0 6px;
-		color: var(--k-text-bright);
-	}
-	.lede {
-		margin: 0;
-		max-width: 60ch;
-		font-size: 13.5px;
-		color: var(--k-text-dimmer);
-	}
-	/* The console reads this feed NSFW-inclusive regardless of the header's NSFW
-	   preference pill; say so, so the console/reader difference isn't a mystery. */
-	.nsfw-note {
-		font-size: 11px;
-		font-weight: 700;
-		letter-spacing: 0.04em;
-		text-transform: uppercase;
-		color: var(--k-text-faint);
-		border-bottom: 1px dotted var(--k-border-4);
-		cursor: help;
-	}
-	.pager {
-		display: flex;
-		align-items: center;
-		gap: 10px;
-	}
-	.page-num {
-		font-size: 13px;
-		color: var(--k-text-dimmer);
-	}
-	.pg {
-		height: 34px;
-		padding: 0 14px;
-		border-radius: 8px;
-		background: transparent;
-		border: 1px solid var(--k-border-4);
-		color: var(--k-text-2);
-		font-weight: 600;
-		font-size: 13px;
-		cursor: pointer;
-	}
-	.pg:disabled {
-		opacity: 0.45;
-		cursor: default;
-	}
-	.notice {
-		padding: 16px 18px;
-		border-radius: 10px;
-		border: 1px solid var(--k-border-1);
-		background: var(--k-surface);
-		color: var(--k-text-dimmer);
-		font-size: 13.5px;
-	}
-	.notice.error {
-		border-color: rgba(214, 92, 92, 0.4);
-		color: #e08a8a;
-	}
-	.notice code {
-		font-family: var(--k-font-mono, monospace);
-		font-size: 12.5px;
-		color: var(--k-text-2);
-	}
-	.table {
-		display: flex;
-		flex-direction: column;
-		border: 1px solid var(--k-border-1);
-		border-radius: 12px;
-		overflow: hidden;
-	}
-	.row {
-		display: grid;
-		grid-template-columns: 2.4fr 2fr 1.2fr;
-		gap: 16px;
-		align-items: center;
-		padding: 14px 18px;
-		border-top: 1px solid var(--k-border-1);
-	}
-	.row.head {
-		border-top: none;
-		background: var(--k-surface);
-		font-size: 11.5px;
-		font-weight: 700;
-		letter-spacing: 0.04em;
-		text-transform: uppercase;
-		color: var(--k-text-dimmer);
+	.k-table {
+		--cols: minmax(0, 2.4fr) minmax(0, 2fr) minmax(0, 1.2fr);
 	}
 	.work {
-		display: flex;
-		flex-direction: column;
-		gap: 3px;
-		min-width: 0;
+		display: grid;
+		gap: 2px;
 	}
-	.wtitle {
+	.title-line {
 		display: flex;
 		align-items: center;
-		gap: 8px;
-		font-weight: 600;
-		font-size: 14px;
-		color: var(--k-text-1);
+		gap: var(--k-space-2);
+		min-width: 0;
 	}
-	.wid {
-		font-family: var(--k-font-mono, monospace);
-		font-size: 11.5px;
-		color: var(--k-text-faint);
-	}
-	.ch {
-		font-weight: 600;
-		font-size: 13.5px;
-		color: var(--k-text-2);
-	}
-	.chtitle {
-		display: block;
-		font-size: 12px;
-		color: var(--k-text-faint);
-		margin-top: 2px;
-	}
-	.muted {
-		font-size: 12.5px;
-		color: var(--k-text-faint);
-	}
-	.badge {
-		font-size: 10.5px;
+	.title {
+		color: var(--k-text-bright);
 		font-weight: 700;
-		letter-spacing: 0.03em;
-		padding: 2px 7px;
-		border-radius: 5px;
 	}
-	.badge.nsfw {
-		color: #e08a8a;
-		background: rgba(214, 92, 92, 0.14);
-		border: 1px solid rgba(214, 92, 92, 0.4);
+	.title:hover {
+		text-decoration: underline;
+		text-underline-offset: 3px;
 	}
-	@media (max-width: 720px) {
-		.row {
-			grid-template-columns: 1fr;
-			gap: 6px;
-		}
-		.row.head {
-			display: none;
-		}
-		.row > [role='cell']:nth-child(2)::before,
-		.row > [role='cell']:nth-child(3)::before {
-			font-weight: 700;
-			color: var(--k-text-faint);
-		}
-		.row > [role='cell']:nth-child(2)::before {
-			content: 'Latest chapter · ';
-		}
-		.row > [role='cell']:nth-child(3)::before {
-			content: 'Updated · ';
-		}
-		.pager {
-			flex-wrap: wrap;
-			justify-content: flex-start;
-		}
-		.pg {
-			height: 42px;
-		}
+	.chapter {
+		display: grid;
+		gap: 2px;
+		min-width: 0;
+	}
+	.chapter-title {
+		font-size: var(--k-text-xs);
+		overflow-wrap: anywhere;
+	}
+	.env {
+		max-width: 52ch;
+		font-size: var(--k-text-sm);
+	}
+	.env .k-mono {
+		color: var(--k-text-1);
 	}
 </style>

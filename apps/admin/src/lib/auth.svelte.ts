@@ -77,11 +77,11 @@ export async function login(username: string, password: string): Promise<void> {
 /**
  * Flip the signed-in admin's NSFW visibility and mirror it into `auth.user`.
  *
- * The console is gated by this flag server-side (source browsing, extension install
- * and source ingest all refuse an opted-out admin; catalogue search + canonical
- * updates hide NSFW-flagged works from them), and there is no other way to change it
- * from here — without this the admin has to sign into the reader with the same
- * account to unblock their own console.
+ * The console is gated by this flag server-side: source browsing, extension install
+ * and source ingest all refuse an opted-out admin. (The console's own lists, Catalog
+ * and Latest updates, are read NSFW-inclusive either way; see ADMIN_INCLUDE_NSFW.)
+ * There is no other way to change it from here — without this the admin has to sign
+ * into the reader with the same account to unblock their own console.
  */
 export async function toggleNsfwVisibility(value: boolean): Promise<void> {
 	const next = await setShowNsfw(value);
