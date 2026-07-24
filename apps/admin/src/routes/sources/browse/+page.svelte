@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { href } from '$lib/paths';
 	import type {
 		BulkAddResult,
 		ExtensionInfo,
@@ -130,7 +131,7 @@
 			sp.set('page', String(opts.page));
 		}
 		const qs = sp.toString();
-		return qs ? `/sources/browse?${qs}` : '/sources/browse';
+		return href(qs ? `/sources/browse?${qs}` : '/sources/browse');
 	}
 
 	function onSourceChange(ev: Event): void {
@@ -992,7 +993,7 @@
 		onretry={() => refreshSources()}
 	>
 		{#snippet emptyActions()}
-			<Button href="/sources/extensions" icon="package">Open Extensions</Button>
+			<Button href={href('/sources/extensions')} icon="package">Open Extensions</Button>
 		{/snippet}
 
 		{#if extScope}
@@ -1007,7 +1008,7 @@
 							or browse another source.
 						{:else if extKnown}
 							{extKnown.name} is not installed, so it has no sources to browse. Install it on the
-							<a class="k-link" href="/sources/extensions">Extensions</a> page first.
+							<a class="k-link" href={href('/sources/extensions')}>Extensions</a> page first.
 						{:else}
 							No installed source belongs to an extension called
 							<span class="k-mono">{extScope.pkgName}</span>. Check the link you followed, or browse
@@ -1292,7 +1293,7 @@
 				{#if bulkResult.queuedForReview > 0}
 					<p class="k-hint">
 						Some series look like works already in the catalogue. Decide on them on the
-						<a class="k-link" href="/review">Duplicates</a> page.
+						<a class="k-link" href={href('/review')}>Duplicates</a> page.
 					</p>
 				{/if}
 			</section>

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { href } from '$lib/paths';
 	import type { ExtensionAutoUpdate, ExtensionInfo } from '@komika/types';
 	import { auth, toggleNsfwVisibility } from '$lib/auth.svelte';
 	import { config } from '$lib/config';
@@ -430,7 +431,7 @@
 					{/if}
 				</div>
 				<div class="group-foot">
-					<a class="k-link" href="/sources">Manage installed extensions</a>
+					<a class="k-link" href={href('/sources')}>Manage installed extensions</a>
 				</div>
 			</section>
 
@@ -579,10 +580,10 @@
 							<p class="setting-name">Merge duplicate works</p>
 							<p class="k-hint">
 								Sort works that share a title or an alternative title. Articles (the, a, an) are
-								ignored. A pair with matching evidence is merged. A pair that is two different
-								works is closed. Each merge deletes the merged work and cannot be undone. Unclear
-								pairs stay in
-								<a class="k-link" href="/review">Duplicates</a>, likeliest first.
+								ignored. A pair with matching evidence is merged. A pair that is two different works
+								is closed. Each merge deletes the merged work and cannot be undone. Unclear pairs
+								stay in
+								<a class="k-link" href={href('/review')}>Duplicates</a>, likeliest first.
 							</p>
 							{#if consolidateMsg}
 								<p class="result" role="status">{consolidateMsg}</p>

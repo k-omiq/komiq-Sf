@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { href } from '$lib/paths';
 	import { page as pageState } from '$app/state';
 	import { queuePage, queueNavigate } from '$lib/url-state';
 	import type { MergeCandidate, WorkReviewDetail } from '@komika/types';
@@ -168,7 +169,9 @@
 	 * reviewer to a "No such work" page.
 	 */
 	const editorHref = $derived(
-		detail?.sources.some((s) => s.sourceType === 'mangadex') ? `/series/${detail.workId}` : null,
+		detail?.sources.some((s) => s.sourceType === 'mangadex')
+			? href(`/series/${detail.workId}`)
+			: null,
 	);
 
 	function fmtDate(iso: string): string {
@@ -250,7 +253,8 @@
 		{#snippet actions()}
 			<Button icon="refresh" busy={loading} onclick={() => refresh()}>Refresh</Button>
 		{/snippet}
-		<a class="k-link bulk" href="/settings#maintenance">Merge many duplicates at once in Settings</a
+		<a class="k-link bulk" href={href('/settings#maintenance')}
+			>Merge many duplicates at once in Settings</a
 		>
 	</PageHeader>
 

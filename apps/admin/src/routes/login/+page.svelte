@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { href } from '$lib/paths';
 	import { goto } from '$app/navigation';
 	import { auth, login } from '$lib/auth.svelte';
 	import Brand from '$lib/components/Brand.svelte';
@@ -10,7 +11,7 @@
 	let busy = $state(false);
 
 	$effect(() => {
-		if (auth.user) goto('/', { replaceState: true });
+		if (auth.user) goto(href('/'), { replaceState: true });
 	});
 
 	async function submit(e: SubmitEvent): Promise<void> {
@@ -20,7 +21,7 @@
 		busy = true;
 		try {
 			await login(username.trim(), password);
-			await goto('/', { replaceState: true });
+			await goto(href('/'), { replaceState: true });
 		} catch (err) {
 			error = err instanceof Error ? err.message : 'Sign in failed.';
 		} finally {

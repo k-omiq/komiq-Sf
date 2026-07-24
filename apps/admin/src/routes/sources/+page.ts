@@ -1,3 +1,4 @@
+import { href } from '$lib/paths';
 import { redirect } from '@sveltejs/kit';
 import type { PageLoad } from './$types';
 
@@ -15,5 +16,5 @@ export const load: PageLoad = ({ url }) => {
 	const target = TAB_ROUTES[params.get('tab') ?? ''] ?? '/sources/extensions';
 	params.delete('tab');
 	const query = params.toString();
-	redirect(307, target + (query ? `?${query}` : ''));
+	redirect(307, href(target + (query ? `?${query}` : '')));
 };

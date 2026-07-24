@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { href } from '$lib/paths';
 	import { auth } from '$lib/auth.svelte';
 	import Button from '$lib/components/Button.svelte';
 	import Icon from '$lib/components/Icon.svelte';
@@ -16,7 +17,7 @@
 			Source tools are blocked for your account while NSFW content is off. Browsing a source,
 			installing an extension and adding series will fail until you turn it on.
 		</div>
-		<Button size="sm" href="/settings#content">Open Settings</Button>
+		<Button size="sm" href={href('/settings#content')}>Open Settings</Button>
 	</div>
 {/if}
 

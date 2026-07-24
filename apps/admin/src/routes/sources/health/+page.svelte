@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { href } from '$lib/paths';
 	import type { SourceHealthStat, SourceScanHealth } from '@komika/types';
 	import { auth } from '$lib/auth.svelte';
 	import { loadSourceScanHealth } from '$lib/data';
@@ -212,7 +213,7 @@
 			<Button icon="refresh" busy={healthLoading} onclick={() => refreshHealth()}>Refresh</Button>
 		{/snippet}
 		A failing source is often one extension release behind.
-		<a class="k-link" href="/settings#updates">Check extension updates in Settings</a>
+		<a class="k-link" href={href('/settings#updates')}>Check extension updates in Settings</a>
 	</PageHeader>
 
 	<LoadState

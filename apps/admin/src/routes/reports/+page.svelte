@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { href } from '$lib/paths';
 	import { page as pageState } from '$app/state';
 	import { queuePage, queueNavigate } from '$lib/url-state';
 	import type { Report, ReportKind, ReportStatus } from '@komika/types';
@@ -262,7 +263,7 @@
 		// /series/ — it can never introduce a scheme. (The only other reader-controlled URL
 		// on this page is `sourceUrl`; see `safeHref`. There are no `src`/`style`/`{@html}`
 		// sinks here at all.)
-		return `/series/${encodeURIComponent(id)}`;
+		return href(`/series/${encodeURIComponent(id)}`);
 	}
 
 	/**
@@ -300,9 +301,9 @@
 	<PageHeader title="Reports">
 		Reports that readers file from the reader's Support page.
 		<span class="k-num">{openCount}</span> open{total != null ? `, ${total} in this view` : ''}.
-		Merge two entries from <a class="k-link" href="/">Catalog</a>, because
-		<a class="k-link" href="/review">Duplicates</a> only lists pairs Komiq flagged itself. Ban
-		accounts in <a class="k-link" href="/users">Users</a>.
+		Merge two entries from <a class="k-link" href={href('/')}>Catalog</a>, because
+		<a class="k-link" href={href('/review')}>Duplicates</a> only lists pairs Komiq flagged itself.
+		Ban accounts in <a class="k-link" href={href('/users')}>Users</a>.
 		{#snippet actions()}
 			<Button icon="refresh" busy={loading} onclick={() => refresh(status, kind, page)}>
 				Refresh

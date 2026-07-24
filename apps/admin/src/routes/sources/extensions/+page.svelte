@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { href } from '$lib/paths';
 	import type { ExtensionInfo } from '@komika/types';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
@@ -175,7 +176,7 @@
 
 	/** The browse route resolves the extension's sources itself. */
 	function browseExtension(e: ExtensionInfo): void {
-		void goto('/sources/browse?extension=' + encodeURIComponent(e.pkgName));
+		void goto(href('/sources/browse?extension=' + encodeURIComponent(e.pkgName)));
 	}
 
 	function clearFilters(): void {
@@ -213,7 +214,7 @@
 		onretry={() => refreshExtensions(true)}
 	>
 		{#snippet emptyActions()}
-			<Button variant="primary" href="/settings#repos">Add a repo in Settings</Button>
+			<Button variant="primary" href={href('/settings#repos')}>Add a repo in Settings</Button>
 		{/snippet}
 
 		<div class="k-toolbar filters">

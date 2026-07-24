@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { href } from '$lib/paths';
 	import { page as pageState } from '$app/state';
 	import { queuePage, queueNavigate } from '$lib/url-state';
 	import type { CanonicalUpdate } from '@komika/types';
@@ -95,7 +96,9 @@
 				<div class="k-tr" role="row">
 					<span class="work" role="cell">
 						<span class="title-line">
-							<a class="title k-truncate" href="/series/{u.workId}">{u.title ?? 'Untitled'}</a>
+							<a class="title k-truncate" href={href(`/series/${u.workId}`)}
+								>{u.title ?? 'Untitled'}</a
+							>
 							{#if u.isNsfw}<span class="k-badge" data-tone="warning">NSFW</span>{/if}
 						</span>
 						<span class="k-mono k-muted k-truncate">MangaDex {u.mangadexId}</span>

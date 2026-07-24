@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { href } from '$lib/paths';
 	import type {
 		MatchResult,
 		Series,
@@ -762,7 +763,7 @@
 					<div role="cell" class="series">
 						<Cover src={s.coverUrl ? assetSrc(s.coverUrl) : null} />
 						<div class="titles">
-							<a class="title" href="/series/{s.id}">{s.title}</a>
+							<a class="title" href={href(`/series/${s.id}`)}>{s.title}</a>
 							<span class="detail k-truncate">
 								<span class="k-mono">#{s.id}</span>{s.author ? ` · ${s.author}` : ''}
 							</span>
@@ -840,7 +841,7 @@
 							{:else}
 								<Button
 									size="sm"
-									href="/series/{s.id}"
+									href={href(`/series/${s.id}`)}
 									title="Scan timing and status are set per source series, and a catalogue work has none. Edit its details on the series page."
 									>Edit metadata</Button
 								>

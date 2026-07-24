@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { href } from '$lib/paths';
 	import type { Snippet } from 'svelte';
 	import IngestCounts, { type CountItem } from './IngestCounts.svelte';
 
@@ -64,7 +65,7 @@
 	{#if review}
 		<p class="k-hint">
 			Some series look like works already in the catalogue. Decide on them on the
-			<a class="k-link" href="/review">Duplicates</a> page.
+			<a class="k-link" href={href('/review')}>Duplicates</a> page.
 		</p>
 	{/if}
 </section>

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { href, routePath } from '$lib/paths';
 	import '@fontsource-variable/bricolage-grotesque';
 	import '@fontsource-variable/manrope';
 	import '@komika/ui/reset.css';
@@ -7,6 +8,8 @@
 	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { auth, initAuth, logout } from '$lib/auth.svelte';
+	import { needsServer, target } from '$lib/config';
+	import { instance, loadInstance } from '$lib/instance.svelte';
 	import { settleConfirm } from '$lib/confirm.svelte';
 	import { theme, cycleTheme, initTheme } from '$lib/theme.svelte';
 	import { refreshSourcesDown, sourceHealth } from '$lib/source-health.svelte';
@@ -39,13 +42,35 @@
 		initTheme();
 	});
 
-	const onLogin = $derived(page.url.pathname === '/login');
+	const path = $derived(routePath(page.url.pathname));
+	const onLogin = $derived(path === '/login');
+	// First-run screens: full page, no sidebar, reachable signed out.
+	const onSetup = $derived(path === '/setup' || path === '/start');
+
+	// Self-host builds ask the server whether it still needs its owner. The hosted
+	// console never does (its server always has admins), except on /setup itself,
+	// which must know to send a visitor away.
+	const checksSetup = target !== 'hosted';
+	$effect(() => {
+		if ((checksSetup || onSetup) && !needsServer && !instance.ready) void loadInstance();
+	});
+	const setupKnown = $derived(!checksSetup || needsServer || instance.ready);
 
 	// Centralized route guard: once auth has settled, bounce signed-out visitors to
 	// /login from any protected route (but never off /login itself). Individual pages
 	// no longer duplicate this, which also removes the per-page empty-content flash.
+	// Before that, the desktop app picks a server and a fresh server runs setup.
 	$effect(() => {
-		if (auth.ready && !auth.user && !onLogin) goto('/login');
+		if (!auth.ready || !setupKnown) return;
+		if (needsServer) {
+			if (path !== '/start') goto(href('/start'), { replaceState: true });
+			return;
+		}
+		if (checksSetup && instance.info?.setupRequired && !onSetup) {
+			goto(href('/setup'), { replaceState: true });
+			return;
+		}
+		if (!auth.user && !onLogin && !onSetup) goto(href('/login'));
 	});
 
 	const themeLabel = $derived(
@@ -168,11 +193,11 @@
 
 <svelte:head>
 	<title>Komiq admin</title>
-	<link rel="icon" href="/favicon.ico" sizes="any" />
-	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
-	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
-	<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-	<link rel="manifest" href="/manifest.webmanifest" />
+	<link rel="icon" href={href('/favicon.ico')} sizes="any" />
+	<link rel="icon" type="image/png" sizes="32x32" href={href('/favicon-32.png')} />
+	<link rel="icon" type="image/png" sizes="16x16" href={href('/favicon-16.png')} />
+	<link rel="apple-touch-icon" href={href('/apple-touch-icon.png')} />
+	<link rel="manifest" href={href('/manifest.webmanifest')} />
 	<meta name="theme-color" content="#0c0c0d" />
 </svelte:head>
 
@@ -182,9 +207,9 @@
 	<!-- Closes the phone drawer itself: a link to the page already open does not navigate,
 	     so `afterNavigate` never runs for it. -->
 	<a
-		href={item.href}
+		href={href(item.href)}
 		class="nav-link"
-		aria-current={isActive(item, page.url.pathname) ? 'page' : undefined}
+		aria-current={isActive(item, routePath(page.url.pathname)) ? 'page' : undefined}
 		onclick={() => (menuOpen = false)}
 	>
 		<Icon name={item.icon} size={17} />
@@ -195,7 +220,7 @@
 	</a>
 {/snippet}
 
-{#if !auth.ready}
+{#if !auth.ready || !setupKnown}
 	<div class="boot" role="status">Loading admin console…</div>
 {:else}
 	<a class="skip-link" href="#main-content">Skip to main content</a>
@@ -205,7 +230,11 @@
 			be valid there.
 		</p>
 	{/if}
-	{#if auth.user && !onLogin}
+	{#if onSetup}
+		<main id="main-content" class="admin-main full" tabindex="-1">
+			{@render children()}
+		</main>
+	{:else if auth.user && !onLogin}
 		<div class="shell">
 			<header class="topbar">
 				<Button
@@ -217,7 +246,7 @@
 					aria-controls="admin-sidebar"
 					onclick={() => (menuOpen = true)}
 				/>
-				<a href="/" class="brand" aria-label="Komiq admin home">
+				<a href={href('/')} class="brand" aria-label="Komiq admin home">
 					<Brand />
 				</a>
 			</header>
@@ -227,7 +256,7 @@
 			{/if}
 
 			<aside id="admin-sidebar" class="sidebar" class:open={menuOpen}>
-				<a href="/" class="brand" aria-label="Komiq admin home">
+				<a href={href('/')} class="brand" aria-label="Komiq admin home">
 					<Brand />
 					<span class="brand-tag">Admin</span>
 				</a>
@@ -253,7 +282,7 @@
 				</nav>
 
 				{#if !auth.user.showNsfw}
-					<a class="nsfw-flag" href="/settings#content" onclick={() => (menuOpen = false)}>
+					<a class="nsfw-flag" href={href('/settings#content')} onclick={() => (menuOpen = false)}>
 						<Icon name="eye-off" size={14} />
 						<span>NSFW off: source tools are blocked</span>
 					</a>

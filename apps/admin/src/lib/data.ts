@@ -34,6 +34,9 @@ import type {
 import type {
 	AdminChapter,
 	ChapterOverrideInput,
+	CreateOwnerInput,
+	CreateUserInput,
+	Session,
 	SeriesAdminInput,
 	SeriesAdminMeta,
 	SeriesMetadataInput,
@@ -618,3 +621,27 @@ export const STATUS_OPTIONS: SeriesStatus[] = [
 	'CANCELLED',
 	'UNKNOWN',
 ];
+
+// ---- first-run setup ---------------------------------------------------------
+
+function setupUnavailable(): never {
+	throw new Error('This server does not support setup. Update the server and try again.');
+}
+
+/** Create the owner (first admin) with the setup code from the server log. */
+export async function createOwner(input: CreateOwnerInput): Promise<Session> {
+	if (!backend.createOwner) setupUnavailable();
+	return backend.createOwner(input);
+}
+
+/** Open or close public sign-up; resolves to the new effective value. */
+export async function setRegistrationOpen(open: boolean): Promise<boolean> {
+	if (!backend.setRegistrationOpen) setupUnavailable();
+	return backend.setRegistrationOpen(open);
+}
+
+/** Create an account directly; the user picks their own password at first sign-in. */
+export async function createUser(input: CreateUserInput): Promise<AdminUser> {
+	if (!backend.createUser) setupUnavailable();
+	return backend.createUser(input);
+}

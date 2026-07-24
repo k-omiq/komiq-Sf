@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { href as appHref } from '$lib/paths';
 	import type { Series } from '@komika/types';
 	import { goto } from '$app/navigation';
 	import { assetSrc } from '$lib/config';
@@ -70,7 +71,7 @@
 
 	function open(href: string): void {
 		onclose();
-		void goto(href);
+		void goto(appHref(href));
 	}
 
 	function onkeydown(e: KeyboardEvent): void {
@@ -122,7 +123,7 @@
 					class="hit"
 					role="option"
 					aria-selected={active === i}
-					href={p.href}
+					href={appHref(p.href)}
 					onmousemove={() => (active = i)}
 					onclick={(e) => {
 						e.preventDefault();
@@ -145,7 +146,7 @@
 					class="hit"
 					role="option"
 					aria-selected={active === i}
-					href="/series/{s.id}"
+					href={appHref(`/series/${s.id}`)}
 					onmousemove={() => (active = i)}
 					onclick={(e) => {
 						e.preventDefault();

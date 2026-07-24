@@ -57,6 +57,12 @@ export async function initAuth(): Promise<void> {
 	auth.ready = true;
 }
 
+/** Sign in with a session the server just issued (the setup wizard's owner account). */
+export function adoptSession(session: Session): void {
+	persist(session.token);
+	auth.user = session.user;
+}
+
 export async function login(username: string, password: string): Promise<void> {
 	const session = await backend.login(username, password);
 	if (!session.user.isAdmin) {

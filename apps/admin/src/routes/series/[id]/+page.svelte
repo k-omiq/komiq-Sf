@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { href, routePath } from '$lib/paths';
 	import type { Series, WorkSource } from '@komika/types';
 	import type {
 		AdminChapter,
@@ -37,12 +38,12 @@
 	// Where the admin came from (usually the Catalog with its search and page), so the
 	// breadcrumb returns there instead of resetting the list. A full page load has no
 	// `from`, and moving between two series keeps the earlier answer.
-	let backHref = $state('/');
+	let backHref = $state(href('/'));
 	afterNavigate(({ from }) => {
 		if (!from?.route.id || from.route.id === page.route.id) return;
 		backHref = from.url.pathname + from.url.search;
 	});
-	const backIsCatalog = $derived(backHref.split('?')[0] === '/');
+	const backIsCatalog = $derived(routePath(backHref.split('?')[0]) === '/');
 
 	const trackerProviders: Record<string, { label: string; hosts: string[] }> = {
 		mangadex: { label: 'MangaDex', hosts: ['mangadex.org'] },
@@ -143,7 +144,15 @@
 	let fRating = $state('');
 	// What the pinned fields held when the form was seeded. Only a field that moved
 	// away from this is sent on save.
-	let pinSeed = { author: '', artist: '', year: '', language: '', status: '', demographic: '', rating: '' };
+	let pinSeed = {
+		author: '',
+		artist: '',
+		year: '',
+		language: '',
+		status: '',
+		demographic: '',
+		rating: '',
+	};
 	// Whether the admin has touched the tag chips this session. Tags are seeded from
 	// the EFFECTIVE genres (which may be merely source-derived), so we only send them
 	// on save when actually edited — otherwise saving would silently PIN source genres
@@ -622,7 +631,7 @@
 								<Icon name="info" />
 								<div class="k-notice__body">
 									This series is not in the catalogue yet, so its metadata cannot be edited. Add it
-									to the catalogue from the <a class="k-link" href="/">Catalog</a> page first.
+									to the catalogue from the <a class="k-link" href={href('/')}>Catalog</a> page first.
 								</div>
 							</div>
 						</section>

@@ -40,3 +40,23 @@ npm run build
 You can preview the production build with `npm run preview`.
 
 > To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+
+## Build targets
+
+`ADMIN_TARGET` picks where the build runs (default `hosted`):
+
+| Target     | API                                                  | First run                                     |
+| ---------- | ---------------------------------------------------- | --------------------------------------------- |
+| `hosted`   | `PUBLIC_KOMIKA_API` (admin.komiq.cc, unchanged)      | none                                          |
+| `embedded` | same origin `/graphql`, served from `KOMIKA_WEB_DIR` | a server with no owner opens `/setup`         |
+| `desktop`  | the server chosen on `/start`, saved on the device   | `/start` (run here or connect), then `/setup` |
+
+`ADMIN_BASE_PATH=/admin` builds the console for a sub-path; the server serves the
+`embedded` build there:
+
+```sh
+ADMIN_TARGET=embedded ADMIN_BASE_PATH=/admin pnpm -C apps/admin build
+```
+
+Internal links go through `href()` in `src/lib/paths.ts` so they carry the base path.
+The desktop bridge the Tauri shell implements is described in `src/lib/desktop.ts`.
