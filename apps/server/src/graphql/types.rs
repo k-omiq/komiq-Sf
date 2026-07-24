@@ -736,6 +736,9 @@ pub struct SessionUser {
     pub show_nsfw: bool,
     /// Account creation timestamp (ISO 8601) — the profile "joined" date.
     pub joined_at: String,
+    /// Set when an admin created the account or reset its password; the client
+    /// should ask for a new password (`changePassword`) before anything else.
+    pub must_change_password: bool,
 }
 
 /// One entry in a user's activity feed (a review posted, a comment posted, a
@@ -895,6 +898,36 @@ pub struct RegisterInput {
     pub username: String,
     pub email: String,
     pub password: String,
+}
+
+/// Admin-created account (`createUser`).
+#[derive(InputObject)]
+pub struct CreateUserInput {
+    pub username: String,
+    pub email: String,
+    /// Initial password, chosen by the admin.
+    pub password: String,
+    /// Grant admin on creation. Default false.
+    pub is_admin: Option<bool>,
+    /// Ask the user to pick their own password at first sign-in. Default true:
+    /// the admin knows the initial one.
+    pub must_change_password: Option<bool>,
+}
+
+/// Public facts about this server, readable without signing in. Drives the
+/// first-run setup screen and the sign-up form.
+#[derive(SimpleObject, Clone)]
+pub struct Instance {
+    /// True while no admin account exists; the owner account is then created
+    /// with `createOwner` and the setup code from the server log.
+    pub setup_required: bool,
+    pub name: String,
+    /// Server version (the `komika-server` crate version).
+    pub version: String,
+    /// Whether `register` accepts new accounts.
+    pub registration_open: bool,
+    /// Whether the direct-MangaDex catalogue sync is on.
+    pub mangadex_enabled: bool,
 }
 
 /// Admin "manga DB" overrides. Every field is the desired whole state for the

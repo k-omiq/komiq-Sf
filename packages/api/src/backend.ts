@@ -66,6 +66,16 @@ export interface Backend {
 	login(username: string, password: string): Promise<Session>;
 	register(input: RegisterInput): Promise<Session>;
 	logout(): Promise<void>;
+	/** Public server facts (setup state, sign-up switch) — no sign-in needed.
+	 * Optional: only the unified Komika API implements it. */
+	instance?(): Promise<InstanceInfo>;
+	/** First-run setup: create the owner (first admin) account with the setup
+	 * code from the server log, and sign in. Works only while
+	 * {@link InstanceInfo.setupRequired}. Optional. */
+	createOwner?(input: CreateOwnerInput): Promise<Session>;
+	/** Change the signed-in user's own password; signs out their other sessions
+	 * and clears `mustChangePassword`. Optional. */
+	changePassword?(currentPassword: string, newPassword: string): Promise<Session['user']>;
 	/**
 	 * Set (or clear) the bearer token used for authenticated requests. Optional:
 	 * only backends with real auth (the unified Komika API) implement it; the
@@ -354,6 +364,15 @@ export interface Backend {
 	/** Grant or revoke a user's admin flag. Optional: only the unified Komika API
 	 * implements it. */
 	setUserAdmin?(userId: Id, isAdmin: boolean): Promise<AdminUser>;
+	/** Create an account directly (works with sign-up closed). Optional: only the
+	 * unified Komika API implements it. */
+	createUser?(input: CreateUserInput): Promise<AdminUser>;
+	/** Set a new password for another account; signs it out everywhere and asks
+	 * for a change at next sign-in. Optional. */
+	resetUserPassword?(userId: Id, password: string): Promise<boolean>;
+	/** Open or close public sign-up; returns the new effective value. Refused when
+	 * the server pins it by env. Optional. */
+	setRegistrationOpen?(open: boolean): Promise<boolean>;
 
 	// --- admin dedup review (requires an admin session) ---
 	/** Pending mid-confidence dedup matches awaiting manual review
@@ -684,7 +703,38 @@ export interface Session {
 		showNsfw: boolean;
 		/** Account creation timestamp (ISO 8601) — the profile "joined" date. */
 		joinedAt: string;
+		/** Set when an admin created the account or reset its password. Only
+		 * selected by the setup/password operations so far, so absent elsewhere. */
+		mustChangePassword?: boolean;
 	};
+}
+
+/** Public facts about a Komika server (see {@link Backend.instance}). */
+export interface InstanceInfo {
+	/** True while no admin account exists — show the first-run setup screen. */
+	setupRequired: boolean;
+	name: string;
+	version: string;
+	registrationOpen: boolean;
+	mangadexEnabled: boolean;
+}
+
+export interface CreateOwnerInput {
+	/** The one-time code the server printed to its log at boot. */
+	setupCode: string;
+	username: string;
+	email: string;
+	password: string;
+}
+
+export interface CreateUserInput {
+	username: string;
+	email: string;
+	password: string;
+	/** Default false. */
+	isAdmin?: boolean;
+	/** Default true: the admin chose the initial password. */
+	mustChangePassword?: boolean;
 }
 
 /** One entry in a user's activity feed (see {@link Backend.myActivity}). */

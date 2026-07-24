@@ -50,6 +50,7 @@ type Query {
 	comments(targetType: String!, targetId: ID!, page: Int = 1): CommentPage! # [komika] chapter thread or series discussion
 	# auth
 	session: Session # [komika] current session or null
+	instance: Instance! # [komika] public server facts (setup state, sign-up switch); no auth
 	myActivity(limit: Int = 20): [Activity!]! # [komika] the signed-in user's recent activity feed (empty when signed out)
 	myComments(page: Int = 1): MyCommentPage! # [komika] the signed-in user's OWN comments (top-level + replies), newest first, 20 per page, each with its tallies, direct reply count and resolved series/chapter (empty page when signed out)
 	notifications(page: Int = 1): [Notification!]! # [komika] the viewer's inbound bell feed, newest-first (empty when signed out)
@@ -84,6 +85,8 @@ type Mutation {
 	login(username: String!, password: String!): Session! # [komika]
 	register(input: RegisterInput!): Session! # [komika]
 	logout: Boolean! # [komika]
+	createOwner(setupCode: String!, username: String!, email: String!, password: String!): Session! # [komika] first-run setup — create the first admin with the setup code from the server log; only while no admin exists; rate-limited per IP like login
+	changePassword(currentPassword: String!, newPassword: String!): SessionUser! # [komika] change the viewer's own password; clears mustChangePassword and signs out their other sessions (requires auth)
 	setShowNsfw(value: Boolean!): Boolean! # [komika] set the viewer's NSFW visibility preference (CATALOGUE.md §2)
 	updateProfile(input: UpdateProfileInput!): SessionUser! # [komika] update the viewer's display name + bio (avatar upload is REST: POST /avatar)
 	updateSeriesAdmin(input: SeriesAdminInput!): Series! # [komika] admin "manga DB" overrides (requires isAdmin)
@@ -91,6 +94,9 @@ type Mutation {
 	banUser(userId: ID!, banned: Boolean!): AdminUser! # [komika] admin moderation — suspend/restore an account (requires isAdmin)
 	deleteComment(commentId: ID!): Boolean! # [komika] admin moderation — remove a chapter comment (requires isAdmin)
 	setUserAdmin(userId: ID!, isAdmin: Boolean!): AdminUser! # [komika] admin — grant/revoke admin (requires isAdmin)
+	createUser(input: CreateUserInput!): AdminUser! # [komika] admin — create an account directly, works with sign-up closed (requires isAdmin)
+	resetUserPassword(userId: ID!, password: String!): Boolean! # [komika] admin — set another account's password; revokes its sessions and sets mustChangePassword (requires isAdmin)
+	setRegistrationOpen(open: Boolean!): Boolean! # [komika] admin — open/close sign-up; refused when KOMIKA_REGISTRATION_OPEN pins it (requires isAdmin)
 	addSourceSeries(suwayomiMangaId: ID!): MatchResult! # [komika] Tier-2 add flow — run the dedup matcher, wire into the canonical model (requires isAdmin)
 	resolveMergeCandidate(id: ID!, accept: Boolean!): Boolean! # [komika] resolve a dedup review — accept merges, reject keeps distinct (requires isAdmin)
 	mergeWorks(sourceWorkId: ID!, targetWorkId: ID!): MergeWorksResult! # [komika] D1: fold one existing canonical work into another (dedup cleanup) — source's mappings + user data re-point to target, source deleted; pick target as the enriched/MangaDex-anchored one (requires isAdmin)
@@ -517,6 +523,16 @@ type SessionUser {
 	isAdmin: Boolean!
 	showNsfw: Boolean! # [komika] viewer's NSFW visibility preference (CATALOGUE.md §2)
 	joinedAt: String! # [komika] account creation timestamp (profile "joined" date)
+	mustChangePassword: Boolean! # [komika] set by createUser/resetUserPassword; cleared by changePassword
+}
+
+# Public server facts (`instance` query). Settings resolve env → admin setting → default.
+type Instance {
+	setupRequired: Boolean! # true while no admin account exists
+	name: String!
+	version: String!
+	registrationOpen: Boolean!
+	mangadexEnabled: Boolean!
 }
 
 # One entry in a user's activity feed, written by the corresponding mutation.
@@ -563,6 +579,14 @@ input PostCommentInput {
 	body: String!
 	hasSpoiler: Boolean!
 	mediaId: ID # [komika] a previously-uploaded comment-media id to attach (owned + unlinked)
+}
+
+input CreateUserInput {
+	username: String!
+	email: String!
+	password: String!
+	isAdmin: Boolean # default false
+	mustChangePassword: Boolean # default true
 }
 
 input RegisterInput {

@@ -612,6 +612,7 @@ mod tests {
             cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
+            setup_code: crate::instance::SetupCode::default(),
         }
     }
 

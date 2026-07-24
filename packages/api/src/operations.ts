@@ -744,6 +744,49 @@ export const LOGOUT = /* GraphQL */ `
 	}
 `;
 
+// ---- self-host setup + passwords ---------------------------------------------
+// `mustChangePassword` is selected only here, not in SessionUserFields, so the
+// shared session operations keep working against servers that predate it.
+
+export const INSTANCE = /* GraphQL */ `
+	query Instance {
+		instance {
+			setupRequired
+			name
+			version
+			registrationOpen
+			mangadexEnabled
+		}
+	}
+`;
+
+export const CREATE_OWNER = /* GraphQL */ `
+	${SESSION_FIELDS}
+	mutation CreateOwner(
+		$setupCode: String!
+		$username: String!
+		$email: String!
+		$password: String!
+	) {
+		createOwner(setupCode: $setupCode, username: $username, email: $email, password: $password) {
+			...SessionFields
+			user {
+				mustChangePassword
+			}
+		}
+	}
+`;
+
+export const CHANGE_PASSWORD = /* GraphQL */ `
+	${SESSION_USER_FIELDS}
+	mutation ChangePassword($currentPassword: String!, $newPassword: String!) {
+		changePassword(currentPassword: $currentPassword, newPassword: $newPassword) {
+			...SessionUserFields
+			mustChangePassword
+		}
+	}
+`;
+
 // ---- admin -----------------------------------------------------------------
 
 export const UPDATE_SERIES_ADMIN = /* GraphQL */ `
@@ -822,6 +865,27 @@ export const SET_USER_ADMIN = /* GraphQL */ `
 		setUserAdmin(userId: $userId, isAdmin: $isAdmin) {
 			...AdminUserFields
 		}
+	}
+`;
+
+export const CREATE_USER = /* GraphQL */ `
+	${ADMIN_USER_FIELDS}
+	mutation CreateUser($input: CreateUserInput!) {
+		createUser(input: $input) {
+			...AdminUserFields
+		}
+	}
+`;
+
+export const RESET_USER_PASSWORD = /* GraphQL */ `
+	mutation ResetUserPassword($userId: ID!, $password: String!) {
+		resetUserPassword(userId: $userId, password: $password)
+	}
+`;
+
+export const SET_REGISTRATION_OPEN = /* GraphQL */ `
+	mutation SetRegistrationOpen($open: Boolean!) {
+		setRegistrationOpen(open: $open)
 	}
 `;
 

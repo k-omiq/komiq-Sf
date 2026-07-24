@@ -15,7 +15,8 @@ axum = { version = "0.8", features = ["multipart"] }
 async-graphql = "7"
 async-graphql-axum = "7"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace", "set-header", "catch-panic", "request-id", "compression-gzip"] }
+# `fs` serves the optional self-host web folder (`KOMIKA_WEB_DIR`, see `web_dir.rs`).
+tower-http = { version = "0.6", features = ["cors", "trace", "set-header", "catch-panic", "request-id", "compression-gzip", "fs"] }
 async-trait = "0.1"
 # Stream combinators (buffer_unordered) for bounded-concurrency background crawls
 # (cover.rs). Only the façade over futures-util, already vendored transitively.

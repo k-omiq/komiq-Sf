@@ -138,6 +138,10 @@ pub fn parse_scan_source_rate_limits(raw: &str) -> Vec<SourceRateLimit> {
 /// Runtime configuration, sourced from env vars (see `.env.example`).
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Address the public listener binds (`BIND_ADDR`, default `0.0.0.0`). An IPv4
+    /// or IPv6 literal; `main` refuses to start on anything else rather than
+    /// silently widening a loopback-only intent to every interface.
+    pub bind_addr: String,
     pub port: u16,
     /// Port for the `/metrics` scrape endpoint, served on its own listener
     /// bound to 127.0.0.1 (never the public router). Default 9090, the de-facto
@@ -155,6 +159,10 @@ pub struct Config {
     /// `deploy/server.Dockerfile`. Override with `EXT_ICONS_DIR`; a missing
     /// directory is not fatal — the route falls back to its lazy Keiyoushi fetch.
     pub ext_icons_dir: String,
+    /// Optional folder holding the built web apps (`KOMIKA_WEB_DIR`): `reader/` is
+    /// served at `/` and `admin/` at `/admin`, each with an `index.html` SPA
+    /// fallback. Unset (the default) serves no static files at all.
+    pub web_dir: Option<String>,
     pub suwayomi_url: String,
     /// Publicly reachable base for Suwayomi image URLs (covers + pages). GraphQL
     /// federation uses the internal `suwayomi_url`, but image URLs are handed to
@@ -264,6 +272,11 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
+        let bind_addr = env::var("BIND_ADDR")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "0.0.0.0".to_string());
         let port = env::var("PORT")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -282,6 +295,9 @@ impl Config {
             env::var("COVERS_DATABASE_URL").unwrap_or_else(|_| derive_covers_url(&database_url));
         let ext_icons_dir =
             env::var("EXT_ICONS_DIR").unwrap_or_else(|_| "/srv/ext-icons".to_string());
+        let web_dir = env::var("KOMIKA_WEB_DIR")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         let suwayomi_url =
             env::var("SUWAYOMI_URL").unwrap_or_else(|_| "http://localhost:4567".to_string());
         let suwayomi_public_url = env::var("SUWAYOMI_PUBLIC_URL")
@@ -496,6 +512,7 @@ impl Config {
             .filter(|&v: &i64| v > 0)
             .unwrap_or(200);
         Self {
+            bind_addr,
             port,
             metrics_port,
             database_url,
@@ -537,6 +554,7 @@ impl Config {
             cover_recompress_batch,
             covers_database_url,
             ext_icons_dir,
+            web_dir,
         }
     }
 }

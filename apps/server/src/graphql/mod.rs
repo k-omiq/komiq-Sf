@@ -306,6 +306,9 @@ pub struct AppState {
     /// Directory of vendored extension icons served by `serve_ext_icon`
     /// (`Config::ext_icons_dir`).
     pub ext_icons_dir: std::path::PathBuf,
+    /// One-time first-run code (see `instance::SetupCode`); live only while no
+    /// admin exists. Never returned by the API.
+    pub setup_code: crate::instance::SetupCode,
 }
 
 /// Per-request auth: the bearer token from the `Authorization` header, if any.
@@ -3344,14 +3347,14 @@ impl From<AdminUserRow> for AdminUser {
 }
 
 /// Load the editable profile fields not carried on the auth `User` row loader
-/// (`display_name`, `bio`, `created_at`). Falls back to empties on any lookup
-/// failure so building a session never fails on a cold profile.
+/// (`display_name`, `bio`, `created_at`, `must_change_password`). Falls back to
+/// empties on any lookup failure so building a session never fails on a cold profile.
 async fn user_profile_fields(
     pool: &SqlitePool,
     user_id: &str,
-) -> (Option<String>, Option<String>, String) {
-    sqlx::query_as::<_, (Option<String>, Option<String>, String)>(
-        "SELECT display_name, bio, created_at FROM users WHERE id = ?",
+) -> (Option<String>, Option<String>, String, bool) {
+    sqlx::query_as::<_, (Option<String>, Option<String>, String, bool)>(
+        "SELECT display_name, bio, created_at, must_change_password FROM users WHERE id = ?",
     )
     .bind(user_id)
     .fetch_optional(pool)
@@ -3360,14 +3363,15 @@ async fn user_profile_fields(
     .inspect_err(|e| tracing::warn!(error = %e, user_id, "user_profile_fields query failed"))
     .ok()
     .flatten()
-    .unwrap_or((None, None, String::new()))
+    .unwrap_or((None, None, String::new(), false))
 }
 
 /// Build the client-facing `SessionUser` for a resolved auth `User`, loading its
 /// profile fields. Every session-returning path funnels through this so the
 /// shape stays consistent.
 async fn build_session_user(pool: &SqlitePool, u: &User, show_nsfw: bool) -> SessionUser {
-    let (display_name, bio, joined_at) = user_profile_fields(pool, &u.id).await;
+    let (display_name, bio, joined_at, must_change_password) =
+        user_profile_fields(pool, &u.id).await;
     SessionUser {
         id: ID(u.id.clone()),
         username: u.username.clone(),
@@ -3377,6 +3381,7 @@ async fn build_session_user(pool: &SqlitePool, u: &User, show_nsfw: bool) -> Ses
         is_admin: u.is_admin != 0,
         show_nsfw,
         joined_at,
+        must_change_password,
     }
 }
 
@@ -6727,6 +6732,21 @@ impl QueryRoot {
         })
     }
 
+    /// Public server facts for the setup screen and sign-up form. No auth needed.
+    async fn instance(&self, ctx: &Context<'_>) -> Result<Instance> {
+        use crate::instance as inst;
+        let pool = &state(ctx).pool;
+        Ok(Instance {
+            setup_required: !inst::admin_exists(pool).await.map_err(gql_err)?,
+            name: inst::resolve(pool, &inst::INSTANCE_NAME).await.value,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            registration_open: inst::resolve(pool, &inst::REGISTRATION_OPEN)
+                .await
+                .as_bool(),
+            mangadex_enabled: inst::resolve(pool, &inst::MANGADEX_ENABLED).await.as_bool(),
+        })
+    }
+
     async fn session(&self, ctx: &Context<'_>) -> Result<Option<Session>> {
         let Some(tok) = token(ctx) else {
             return Ok(None);
@@ -9295,38 +9315,17 @@ impl MutationRoot {
                 "Too many registration attempts — try again in {retry}s"
             )));
         }
+        // Sign-up switch (`registration_open`): env, then the admin setting, then
+        // open. Checked after the rate limit so probing it costs budget too.
+        if !crate::instance::resolve(&st.pool, &crate::instance::REGISTRATION_OPEN)
+            .await
+            .as_bool()
+        {
+            return Err(Error::new("Sign-up is closed on this server."));
+        }
         let username = input.username.trim();
         let email = input.email.trim();
-        // Count glyphs, not bytes, so a multibyte username can't slip under the
-        // minimum; also cap the maximum and restrict the charset (letters, digits,
-        // and `_ - .`) to keep control chars / whitespace / homoglyph tricks out.
-        let uname_len = username.chars().count();
-        if uname_len < 3 {
-            return Err(Error::new("username must be at least 3 characters"));
-        }
-        if uname_len > 32 {
-            return Err(Error::new("username must be at most 32 characters"));
-        }
-        if !username
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-        {
-            return Err(Error::new(
-                "username may only contain letters, digits, and _ - .",
-            ));
-        }
-        if email.chars().count() > 254 {
-            return Err(Error::new("a valid email is required"));
-        }
-        if !email.contains('@') {
-            return Err(Error::new("a valid email is required"));
-        }
-        if input.password.len() < 8 {
-            return Err(Error::new("password must be at least 8 characters"));
-        }
-        if input.password.len() > MAX_PASSWORD_LEN {
-            return Err(Error::new("password must be at most 1024 characters"));
-        }
+        validate_new_account(username, email, &input.password)?;
         // Admin usernames are reserved: open registration must never grant admin
         // (A5). Admin accounts are provisioned/promoted at startup from
         // KOMIKA_ADMIN_USERS + KOMIKA_ADMIN_PASSWORD (see provision_admins), so a
@@ -9338,34 +9337,8 @@ impl MutationRoot {
         {
             return Err(Error::new("This username is reserved."));
         }
-        // Friendly case-insensitive pre-check. The database triggers installed
-        // by migration 0103 enforce this atomically for simultaneous writers,
-        // while preserving legacy identities that already have case collisions.
-        let taken: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM users WHERE username = ? COLLATE NOCASE")
-                .bind(username)
-                .fetch_optional(&st.pool)
-                .await
-                .map_err(gql_err)?;
-        if taken.is_some() {
-            return Err(Error::new("username or email already taken"));
-        }
-        // Argon2 hashing is CPU-bound (~10-50ms): keep it off the async runtime.
-        let hash = {
-            let permit = st
-                .password_work
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| Error::new("Sign-in is busy — please try again shortly"))?;
-            let pw = input.password.clone();
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                auth::hash_password(&pw)
-            })
-            .await
-            .map_err(gql_err)?
-            .map_err(gql_err)?
-        };
+        ensure_username_free(&st.pool, username).await?;
+        let hash = hash_password_bounded(st, &input.password).await?;
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let is_admin = false;
@@ -9400,6 +9373,7 @@ impl MutationRoot {
                 is_admin,
                 show_nsfw: false, // fresh accounts default to hiding NSFW
                 joined_at: now,
+                must_change_password: false,
             },
         })
     }
@@ -9415,6 +9389,134 @@ impl MutationRoot {
                 .map_err(gql_err)?;
         }
         Ok(true)
+    }
+
+    /// First-run setup: create the owner (first admin) account and sign in. Works
+    /// only while no admin exists and only with the setup code the server printed
+    /// to its log at boot. Rate-limited per client IP like `login`.
+    async fn create_owner(
+        &self,
+        ctx: &Context<'_>,
+        setup_code: String,
+        username: String,
+        email: String,
+        password: String,
+    ) -> Result<Session> {
+        let st = state(ctx);
+        if let Err(retry) = st.auth_limiter.check(&format!("setup:{}", client_ip(ctx))) {
+            return Err(Error::new(format!(
+                "Too many setup attempts — try again in {retry}s"
+            )));
+        }
+        if crate::instance::admin_exists(&st.pool)
+            .await
+            .map_err(gql_err)?
+        {
+            return Err(Error::new("This server is already set up."));
+        }
+        // Before any Argon2 work, so a wrong code costs nothing but budget.
+        if !st.setup_code.verify(&setup_code) {
+            return Err(Error::new("Invalid setup code"));
+        }
+        let username = username.trim();
+        let email = email.trim();
+        validate_new_account(username, email, &password)?;
+        ensure_username_free(&st.pool, username).await?;
+        let hash = hash_password_bounded(st, &password).await?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        // One statement, so two racing setups cannot both create an admin.
+        let inserted = sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, avatar_url, is_admin, created_at) \
+             SELECT ?, ?, ?, ?, NULL, 1, ? \
+             WHERE NOT EXISTS (SELECT 1 FROM users WHERE is_admin = 1)",
+        )
+        .bind(&id)
+        .bind(username)
+        .bind(email)
+        .bind(&hash)
+        .bind(&now)
+        .execute(&st.pool)
+        .await
+        .map_err(user_insert_err)?;
+        if inserted.rows_affected() == 0 {
+            return Err(Error::new("This server is already set up."));
+        }
+        st.setup_code.clear();
+        tracing::info!(username, "owner account created; setup complete");
+        let tok = new_session(&st.pool, &id, st.session_ttl_secs).await?;
+        Ok(Session {
+            token: tok,
+            user: SessionUser {
+                id: ID(id),
+                username: username.to_string(),
+                display_name: None,
+                bio: None,
+                avatar_url: None,
+                is_admin: true,
+                show_nsfw: false,
+                joined_at: now,
+                must_change_password: false,
+            },
+        })
+    }
+
+    /// Change the signed-in user's own password. Needs the current one, clears
+    /// `mustChangePassword`, and signs out every OTHER session. Shares the auth
+    /// rate limiter, keyed per account.
+    async fn change_password(
+        &self,
+        ctx: &Context<'_>,
+        current_password: String,
+        new_password: String,
+    ) -> Result<SessionUser> {
+        let user = require_user(ctx).await?;
+        let st = state(ctx);
+        if let Err(retry) = st
+            .auth_limiter
+            .check(&format!("change-password:{}", user.id))
+        {
+            return Err(Error::new(format!(
+                "Too many password attempts — try again in {retry}s"
+            )));
+        }
+        if current_password.len() > MAX_PASSWORD_LEN
+            || !verify_password_bounded(st, &current_password, &user.password_hash).await?
+        {
+            return Err(Error::new("Current password is incorrect"));
+        }
+        validate_new_password(&new_password)?;
+        if new_password == current_password {
+            return Err(Error::new(
+                "New password must be different from the current one",
+            ));
+        }
+        let hash = hash_password_bounded(st, &new_password).await?;
+        let mut tx = st.pool.begin().await.map_err(gql_err)?;
+        // Guarded on the hash we verified against, so a concurrent reset wins.
+        let updated = sqlx::query(
+            "UPDATE users SET password_hash = ?, must_change_password = 0 \
+             WHERE id = ? AND password_hash = ?",
+        )
+        .bind(&hash)
+        .bind(&user.id)
+        .bind(&user.password_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(gql_err)?;
+        if updated.rows_affected() == 0 {
+            return Err(Error::new("Password changed elsewhere — sign in again"));
+        }
+        let keep = token(ctx).map(|t| auth::hash_token(&t)).unwrap_or_default();
+        sqlx::query("DELETE FROM sessions WHERE user_id = ? AND token != ?")
+            .bind(&user.id)
+            .bind(&keep)
+            .execute(&mut *tx)
+            .await
+            .map_err(gql_err)?;
+        tx.commit().await.map_err(gql_err)?;
+        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
+        Ok(build_session_user(&st.pool, &user, show_nsfw).await)
     }
 
     /// "Sign out other devices": revoke EVERY session of the signed-in user
@@ -10454,6 +10556,116 @@ impl MutationRoot {
         .await
         .map_err(gql_err)?;
         Ok(row.into())
+    }
+
+    /// Admin: open or close public sign-up (`registration_open`). Refused when the
+    /// server pins it with `KOMIKA_REGISTRATION_OPEN`, since env always wins.
+    /// Returns the new effective value.
+    async fn set_registration_open(&self, ctx: &Context<'_>, open: bool) -> Result<bool> {
+        require_admin(ctx).await?;
+        use crate::instance as inst;
+        let pool = &state(ctx).pool;
+        if inst::resolve(pool, &inst::REGISTRATION_OPEN).await.source == inst::Source::Env {
+            return Err(Error::new(
+                "Sign-up is set by KOMIKA_REGISTRATION_OPEN on this server and cannot be changed here.",
+            ));
+        }
+        inst::store(
+            pool,
+            &inst::REGISTRATION_OPEN,
+            if open { "true" } else { "false" },
+        )
+        .await
+        .map_err(gql_err)?;
+        Ok(inst::resolve(pool, &inst::REGISTRATION_OPEN)
+            .await
+            .as_bool())
+    }
+
+    /// Admin: create an account directly (works with sign-up closed). The user is
+    /// asked to pick their own password at first sign-in unless
+    /// `mustChangePassword: false`. Reserved admin usernames stay reserved.
+    async fn create_user(&self, ctx: &Context<'_>, input: CreateUserInput) -> Result<AdminUser> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let username = input.username.trim();
+        let email = input.email.trim();
+        validate_new_account(username, email, &input.password)?;
+        if st
+            .admin_users
+            .iter()
+            .any(|u| u.eq_ignore_ascii_case(username))
+        {
+            return Err(Error::new("This username is reserved."));
+        }
+        ensure_username_free(&st.pool, username).await?;
+        let hash = hash_password_bounded(st, &input.password).await?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO users \
+               (id, username, email, password_hash, avatar_url, is_admin, must_change_password, created_at) \
+             VALUES (?, ?, ?, ?, NULL, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(username)
+        .bind(email)
+        .bind(&hash)
+        .bind(input.is_admin.unwrap_or(false) as i64)
+        .bind(input.must_change_password.unwrap_or(true) as i64)
+        .bind(&now)
+        .execute(&st.pool)
+        .await
+        .map_err(user_insert_err)?;
+        let row: AdminUserRow = sqlx::query_as(
+            "SELECT id, username, email, avatar_url, is_admin, is_banned, created_at \
+             FROM users WHERE id = ?",
+        )
+        .bind(&id)
+        .fetch_one(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        Ok(row.into())
+    }
+
+    /// Admin: set a new password for another account. Signs that user out
+    /// everywhere and asks them to pick their own at next sign-in. Your own
+    /// password goes through `changePassword`.
+    async fn reset_user_password(
+        &self,
+        ctx: &Context<'_>,
+        user_id: ID,
+        password: String,
+    ) -> Result<bool> {
+        let admin = require_admin(ctx).await?;
+        let st = state(ctx);
+        if user_id.0 == admin.id {
+            return Err(Error::new(
+                "Use changePassword to change your own password.",
+            ));
+        }
+        validate_new_password(&password)?;
+        let hash = hash_password_bounded(st, &password).await?;
+        let mut tx = st.pool.begin().await.map_err(gql_err)?;
+        let updated = sqlx::query(
+            "UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?",
+        )
+        .bind(&hash)
+        .bind(&user_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(gql_err)?;
+        if updated.rows_affected() == 0 {
+            return Err(Error::new("No such user."));
+        }
+        sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+            .bind(&user_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(gql_err)?;
+        tx.commit().await.map_err(gql_err)?;
+        tracing::info!(user_id = %user_id.0, "admin reset a user password; sessions revoked");
+        Ok(true)
     }
 
     /// Tier-2 add flow (CATALOGUE.md §6): pull a source series' detail from Suwayomi,
@@ -11609,6 +11821,107 @@ async fn federated_ingest(st: &AppState, raw_id: &str) -> anyhow::Result<MatchRe
         None => None,
     };
     add_source_series_core_ex(&st.pool, &m, cover_phash, true).await
+}
+
+/// Account-field checks shared by `register`, `createOwner` and `createUser`.
+/// `username` and `email` are expected trimmed.
+fn validate_new_account(username: &str, email: &str, password: &str) -> Result<()> {
+    // Count glyphs, not bytes, so a multibyte username can't slip under the
+    // minimum; also cap the maximum and restrict the charset (letters, digits,
+    // and `_ - .`) to keep control chars / whitespace / homoglyph tricks out.
+    let uname_len = username.chars().count();
+    if uname_len < 3 {
+        return Err(Error::new("username must be at least 3 characters"));
+    }
+    if uname_len > 32 {
+        return Err(Error::new("username must be at most 32 characters"));
+    }
+    if !username
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(Error::new(
+            "username may only contain letters, digits, and _ - .",
+        ));
+    }
+    if email.chars().count() > 254 {
+        return Err(Error::new("a valid email is required"));
+    }
+    if !email.contains('@') {
+        return Err(Error::new("a valid email is required"));
+    }
+    validate_new_password(password)
+}
+
+/// Length rules for any password a user or admin sets.
+fn validate_new_password(password: &str) -> Result<()> {
+    if password.len() < 8 {
+        return Err(Error::new("password must be at least 8 characters"));
+    }
+    if password.len() > MAX_PASSWORD_LEN {
+        return Err(Error::new("password must be at most 1024 characters"));
+    }
+    Ok(())
+}
+
+/// Friendly case-insensitive "username taken" pre-check. The database triggers
+/// installed by migration 0103 enforce this atomically for simultaneous writers,
+/// while preserving legacy identities that already have case collisions.
+async fn ensure_username_free(pool: &SqlitePool, username: &str) -> Result<()> {
+    let taken: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM users WHERE username = ? COLLATE NOCASE")
+            .bind(username)
+            .fetch_optional(pool)
+            .await
+            .map_err(gql_err)?;
+    if taken.is_some() {
+        return Err(Error::new("username or email already taken"));
+    }
+    Ok(())
+}
+
+/// Map an INSERT into `users` failing on a unique key to the user-facing message.
+fn user_insert_err(e: sqlx::Error) -> Error {
+    if e.to_string().contains("UNIQUE") {
+        Error::new("username or email already taken")
+    } else {
+        gql_err(e)
+    }
+}
+
+/// Argon2id-hash a password under the shared password-work semaphore. Hashing is
+/// CPU-bound (~10-50ms) and 64 MiB each, so it runs off the async runtime and
+/// fails fast when every slot is busy.
+async fn hash_password_bounded(st: &AppState, password: &str) -> Result<String> {
+    let permit = st
+        .password_work
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error::new("Sign-in is busy — please try again shortly"))?;
+    let pw = password.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        auth::hash_password(&pw)
+    })
+    .await
+    .map_err(gql_err)?
+    .map_err(gql_err)
+}
+
+/// Verify a password against a stored hash under the same semaphore.
+async fn verify_password_bounded(st: &AppState, password: &str, phc: &str) -> Result<bool> {
+    let permit = st
+        .password_work
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error::new("Sign-in is busy — please try again shortly"))?;
+    let (pw, phc) = (password.to_string(), phc.to_string());
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        auth::verify_password(&pw, &phc)
+    })
+    .await
+    .map_err(gql_err)
 }
 
 /// Create a session row and return its opaque token.
@@ -14472,6 +14785,7 @@ mod tests {
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
+            setup_code: crate::instance::SetupCode::default(),
         });
         (build_schema(state.clone(), false), pool, state)
     }
@@ -15962,6 +16276,7 @@ mod tests {
                 cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 catalogue_cover_phash: false,
                 ext_icons_dir: std::path::PathBuf::new(),
+                setup_code: crate::instance::SetupCode::default(),
             })
         };
         const Q: &str = "{ __schema { queryType { name } } }";
@@ -16162,6 +16477,7 @@ mod tests {
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
+            setup_code: crate::instance::SetupCode::default(),
         });
         let s = build_schema(state, false);
         // A configured admin name is reserved (case-insensitive) — open
@@ -21620,6 +21936,367 @@ mod tests {
         assert_ne!(first_error(&r), "No such series");
     }
 
+    // ---- self-host setup + account management (phase 1) ----
+
+    fn data(resp: async_graphql::Response) -> serde_json::Value {
+        assert!(resp.errors.is_empty(), "unexpected: {:?}", resp.errors);
+        resp.data.into_json().unwrap()
+    }
+
+    /// A fresh server: the shared fixture with nobody holding admin.
+    async fn setup_without_admin() -> (ApiSchema, SqlitePool, std::sync::Arc<AppState>) {
+        let (s, pool, st) = setup_with_state(100).await;
+        sqlx::query("UPDATE users SET is_admin = 0")
+            .execute(&pool)
+            .await
+            .unwrap();
+        (s, pool, st)
+    }
+
+    fn create_owner_q(code: &str, username: &str) -> String {
+        format!(
+            r#"mutation {{ createOwner(setupCode:"{code}", username:"{username}", email:"{username}@e.com", password:"owner-pass-1") {{ token user {{ isAdmin mustChangePassword }} }} }}"#
+        )
+    }
+
+    const INSTANCE_Q: &str =
+        "{ instance { setupRequired name version registrationOpen mangadexEnabled } }";
+
+    #[tokio::test]
+    async fn instance_reports_setup_state_and_defaults() {
+        let (s, _, _) = setup_without_admin().await;
+        let d = data(exec(&s, INSTANCE_Q, None, "1.1.1.1").await);
+        assert_eq!(d["instance"]["setupRequired"], true);
+        assert_eq!(d["instance"]["version"], env!("CARGO_PKG_VERSION"));
+        assert!(d["instance"]["name"]
+            .as_str()
+            .is_some_and(|n| !n.is_empty()));
+
+        // The shared fixture has an admin: never "setup required".
+        let s = setup().await;
+        let d = data(exec(&s, INSTANCE_Q, None, "1.1.1.1").await);
+        assert_eq!(d["instance"]["setupRequired"], false);
+    }
+
+    #[tokio::test]
+    async fn create_owner_works_once_with_the_logged_code() {
+        let (s, pool, st) = setup_without_admin().await;
+        let code = st.setup_code.issue();
+
+        // Wrong code: refused, nothing created.
+        let r = exec(
+            &s,
+            &create_owner_q("AAAA-AAAA-AAAA", "owner"),
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "Invalid setup code");
+        assert!(!crate::instance::admin_exists(&pool).await.unwrap());
+
+        // Right code: an admin owner, signed in.
+        let d = data(exec(&s, &create_owner_q(&code, "owner"), None, "1.1.1.1").await);
+        assert_eq!(d["createOwner"]["user"]["isAdmin"], true);
+        assert_eq!(d["createOwner"]["user"]["mustChangePassword"], false);
+        let tok = d["createOwner"]["token"].as_str().unwrap().to_string();
+        let me = data(
+            exec(
+                &s,
+                "{ session { user { username isAdmin } } }",
+                Some(&tok),
+                "1.1.1.1",
+            )
+            .await,
+        );
+        assert_eq!(me["session"]["user"]["username"], "owner");
+        assert!(!st.setup_code.is_live(), "the code is retired");
+
+        let d = data(exec(&s, INSTANCE_Q, None, "1.1.1.1").await);
+        assert_eq!(d["instance"]["setupRequired"], false);
+
+        // Same code again: the server is set up now.
+        let r = exec(&s, &create_owner_q(&code, "second"), None, "1.1.1.1").await;
+        assert_eq!(first_error(&r), "This server is already set up.");
+
+        // And the owner can sign in normally.
+        let r = exec(
+            &s,
+            r#"mutation { login(username:"owner", password:"owner-pass-1") { token } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+    }
+
+    #[tokio::test]
+    async fn create_owner_is_refused_when_an_admin_exists() {
+        let (s, _, st) = setup_with_state(100).await;
+        // Even with a live code (it never is at boot here, but be strict).
+        let code = st.setup_code.issue();
+        let r = exec(&s, &create_owner_q(&code, "owner"), None, "1.1.1.1").await;
+        assert_eq!(first_error(&r), "This server is already set up.");
+    }
+
+    #[tokio::test]
+    async fn create_owner_is_rate_limited_per_ip() {
+        let (s, _, st) = setup_with_state(2).await;
+        sqlx::query("UPDATE users SET is_admin = 0")
+            .execute(&st.pool)
+            .await
+            .unwrap();
+        let code = st.setup_code.issue();
+        for _ in 0..2 {
+            let r = exec(&s, &create_owner_q("WRONG", "owner"), None, "6.6.6.6").await;
+            assert_eq!(first_error(&r), "Invalid setup code");
+        }
+        let r = exec(&s, &create_owner_q(&code, "owner"), None, "6.6.6.6").await;
+        assert!(first_error(&r).contains("Too many setup attempts"), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn register_respects_the_sign_up_switch() {
+        let s = setup().await;
+        let reg = |name: &str| {
+            format!(
+                r#"mutation {{ register(input:{{username:"{name}", email:"{name}@e.com", password:"password123"}}) {{ token user {{ mustChangePassword }} }} }}"#
+            )
+        };
+        // Non-admins cannot flip it.
+        let r = exec(
+            &s,
+            "mutation { setRegistrationOpen(open:false) }",
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "Admin access required");
+
+        let d = data(
+            exec(
+                &s,
+                "mutation { setRegistrationOpen(open:false) }",
+                Some("admintok"),
+                "1.1.1.1",
+            )
+            .await,
+        );
+        assert_eq!(d["setRegistrationOpen"], false);
+        let d = data(exec(&s, INSTANCE_Q, None, "1.1.1.1").await);
+        assert_eq!(d["instance"]["registrationOpen"], false);
+        let r = exec(&s, &reg("closedout"), None, "1.1.1.1").await;
+        assert_eq!(first_error(&r), "Sign-up is closed on this server.");
+
+        let d = data(
+            exec(
+                &s,
+                "mutation { setRegistrationOpen(open:true) }",
+                Some("admintok"),
+                "1.1.1.1",
+            )
+            .await,
+        );
+        assert_eq!(d["setRegistrationOpen"], true);
+        let d = data(exec(&s, &reg("openagain"), None, "1.1.1.1").await);
+        assert_eq!(d["register"]["user"]["mustChangePassword"], false);
+    }
+
+    #[tokio::test]
+    async fn admin_create_user_flags_a_password_change() {
+        let (s, pool, _) = setup_with_state(100).await;
+        let q = r#"mutation { createUser(input:{username:"dave", email:"dave@e.com", password:"initial-pass"}) { id username isAdmin isBanned } }"#;
+        let r = exec(&s, q, Some("bobtok"), "1.1.1.1").await;
+        assert_eq!(first_error(&r), "Admin access required");
+
+        let d = data(exec(&s, q, Some("admintok"), "1.1.1.1").await);
+        assert_eq!(d["createUser"]["username"], "dave");
+        assert_eq!(d["createUser"]["isAdmin"], false);
+        let must: i64 =
+            sqlx::query_scalar("SELECT must_change_password FROM users WHERE username = 'dave'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(must, 1, "defaults to asking for a new password");
+
+        // Works even with sign-up closed, and the user can sign in.
+        data(
+            exec(
+                &s,
+                "mutation { setRegistrationOpen(open:false) }",
+                Some("admintok"),
+                "1.1.1.1",
+            )
+            .await,
+        );
+        let d = data(exec(
+            &s,
+            r#"mutation { login(username:"dave", password:"initial-pass") { user { mustChangePassword } } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await);
+        assert_eq!(d["login"]["user"]["mustChangePassword"], true);
+
+        // Duplicate names are refused; the admin flag and opt-out are honoured.
+        let r = exec(&s, q, Some("admintok"), "1.1.1.1").await;
+        assert_eq!(first_error(&r), "username or email already taken");
+        let d = data(exec(
+            &s,
+            r#"mutation { createUser(input:{username:"erin", email:"erin@e.com", password:"initial-pass", isAdmin:true, mustChangePassword:false}) { isAdmin } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await);
+        assert_eq!(d["createUser"]["isAdmin"], true);
+        let must: i64 =
+            sqlx::query_scalar("SELECT must_change_password FROM users WHERE username = 'erin'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(must, 0);
+    }
+
+    #[tokio::test]
+    async fn admin_reset_password_revokes_sessions_and_flags_a_change() {
+        let (s, pool, _) = setup_with_state(100).await;
+        let q = r#"mutation { resetUserPassword(userId:"bob-id", password:"reset-pass-1") }"#;
+        let r = exec(&s, q, Some("bobtok"), "1.1.1.1").await;
+        assert_eq!(first_error(&r), "Admin access required");
+        let r = exec(
+            &s,
+            r#"mutation { resetUserPassword(userId:"admin-id", password:"reset-pass-1") }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(first_error(&r).contains("changePassword"), "{r:?}");
+        let r = exec(
+            &s,
+            r#"mutation { resetUserPassword(userId:"nobody", password:"reset-pass-1") }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "No such user.");
+
+        let d = data(exec(&s, q, Some("admintok"), "1.1.1.1").await);
+        assert_eq!(d["resetUserPassword"], true);
+        // Old session gone, old password refused, new one works and asks for a change.
+        let d = data(exec(&s, "{ session { token } }", Some("bobtok"), "1.1.1.1").await);
+        assert!(d["session"].is_null());
+        let r = exec(
+            &s,
+            r#"mutation { login(username:"bob", password:"password123") { token } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "Invalid username or password");
+        let d = data(exec(
+            &s,
+            r#"mutation { login(username:"bob", password:"reset-pass-1") { user { mustChangePassword } } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await);
+        assert_eq!(d["login"]["user"]["mustChangePassword"], true);
+        let sessions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = 'bob-id'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(sessions, 1, "only the new sign-in");
+    }
+
+    #[tokio::test]
+    async fn change_password_checks_current_and_clears_the_flag() {
+        let (s, pool, _) = setup_with_state(100).await;
+        sqlx::query("UPDATE users SET must_change_password = 1 WHERE id = 'bob-id'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A second session for bob, which the change must sign out.
+        sqlx::query(
+            "INSERT INTO sessions (token, user_id, created_at, expires_at) \
+             VALUES (?, 'bob-id', '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
+        )
+        .bind(auth::hash_token("bobtok2"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let change = |cur: &str, new: &str| {
+            format!(
+                r#"mutation {{ changePassword(currentPassword:"{cur}", newPassword:"{new}") {{ username mustChangePassword }} }}"#
+            )
+        };
+
+        let r = exec(&s, &change("password123", "new-pass-123"), None, "1.1.1.1").await;
+        assert_eq!(first_error(&r), "Not authenticated");
+        let r = exec(
+            &s,
+            &change("wrong-pass", "new-pass-123"),
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "Current password is incorrect");
+        let r = exec(
+            &s,
+            &change("password123", "short"),
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), "password must be at least 8 characters");
+        let r = exec(
+            &s,
+            &change("password123", "password123"),
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(
+            first_error(&r),
+            "New password must be different from the current one"
+        );
+
+        let d = data(
+            exec(
+                &s,
+                &change("password123", "new-pass-123"),
+                Some("bobtok"),
+                "1.1.1.1",
+            )
+            .await,
+        );
+        assert_eq!(d["changePassword"]["username"], "bob");
+        assert_eq!(d["changePassword"]["mustChangePassword"], false);
+        let d = data(
+            exec(
+                &s,
+                "{ session { user { mustChangePassword } } }",
+                Some("bobtok"),
+                "1.1.1.1",
+            )
+            .await,
+        );
+        assert_eq!(
+            d["session"]["user"]["mustChangePassword"], false,
+            "this session stays"
+        );
+        let d = data(exec(&s, "{ session { token } }", Some("bobtok2"), "1.1.1.1").await);
+        assert!(d["session"].is_null(), "other sessions are signed out");
+
+        let r = exec(
+            &s,
+            r#"mutation { login(username:"bob", password:"new-pass-123") { token } }"#,
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+    }
+
     #[tokio::test]
     async fn login_succeeds_with_correct_password() {
         let s = setup().await;
@@ -22402,6 +23079,7 @@ mod tests {
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
+            setup_code: crate::instance::SetupCode::default(),
         });
         let s = build_schema(state, false);
         let r = exec(
@@ -22917,6 +23595,7 @@ mod tests {
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
+            setup_code: crate::instance::SetupCode::default(),
         })
     }
 

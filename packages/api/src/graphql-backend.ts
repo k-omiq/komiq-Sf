@@ -54,6 +54,9 @@ import type {
 	Backend,
 	ChapterOverrideInput,
 	CommentMediaUpload,
+	CreateOwnerInput,
+	CreateUserInput,
+	InstanceInfo,
 	MyComment,
 	PostCommentInput,
 	PostReviewInput,
@@ -349,6 +352,21 @@ export class GraphQLBackend implements Backend {
 	}
 	async logout(): Promise<void> {
 		await this.gql<{ logout: boolean }>(ops.LOGOUT);
+	}
+	async instance(): Promise<InstanceInfo> {
+		const d = await this.gql<{ instance: InstanceInfo }>(ops.INSTANCE);
+		return d.instance;
+	}
+	async createOwner(input: CreateOwnerInput): Promise<Session> {
+		const d = await this.gql<{ createOwner: Session }>(ops.CREATE_OWNER, { ...input });
+		return d.createOwner;
+	}
+	async changePassword(currentPassword: string, newPassword: string): Promise<Session['user']> {
+		const d = await this.gql<{ changePassword: Session['user'] }>(ops.CHANGE_PASSWORD, {
+			currentPassword,
+			newPassword,
+		});
+		return d.changePassword;
 	}
 
 	// --- catalog ---
@@ -671,6 +689,24 @@ export class GraphQLBackend implements Backend {
 	async setUserAdmin(userId: Id, isAdmin: boolean): Promise<AdminUser> {
 		const d = await this.gql<{ setUserAdmin: AdminUser }>(ops.SET_USER_ADMIN, { userId, isAdmin });
 		return d.setUserAdmin;
+	}
+
+	async createUser(input: CreateUserInput): Promise<AdminUser> {
+		const d = await this.gql<{ createUser: AdminUser }>(ops.CREATE_USER, { input });
+		return d.createUser;
+	}
+
+	async resetUserPassword(userId: Id, password: string): Promise<boolean> {
+		const d = await this.gql<{ resetUserPassword: boolean }>(ops.RESET_USER_PASSWORD, {
+			userId,
+			password,
+		});
+		return d.resetUserPassword;
+	}
+
+	async setRegistrationOpen(open: boolean): Promise<boolean> {
+		const d = await this.gql<{ setRegistrationOpen: boolean }>(ops.SET_REGISTRATION_OPEN, { open });
+		return d.setRegistrationOpen;
 	}
 
 	// --- admin dedup review ---

@@ -13,6 +13,7 @@ mod ext_icon;
 mod gc;
 mod graphql;
 mod ingest;
+mod instance;
 mod maintenance;
 mod mangadex;
 mod media;
@@ -28,6 +29,7 @@ mod sync;
 mod tags;
 mod task;
 mod views;
+mod web_dir;
 mod work_stats;
 
 use std::sync::Arc;
@@ -1580,7 +1582,12 @@ async fn main() -> anyhow::Result<()> {
         cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         catalogue_cover_phash: cfg.catalogue_cover_phash,
         ext_icons_dir: std::path::PathBuf::from(&cfg.ext_icons_dir),
+        setup_code: instance::SetupCode::default(),
     });
+
+    // First-run setup: with no admin (none in the DB and none seeded from env just
+    // above), issue the one-time code the setup screen trades for the owner account.
+    instance::issue_setup_code_if_needed(&pool, &state.setup_code).await?;
 
     // Startup recovery: an ingest job still `running` was interrupted by the
     // previous shutdown — its task is gone, so mark it failed (otherwise the
@@ -1858,7 +1865,17 @@ async fn main() -> anyhow::Result<()> {
             post(upload_comment_media)
                 .layer(DefaultBodyLimit::max(media::MAX_UPLOAD_BYTES + 1024 * 1024)),
         )
-        .route("/comment-media/{file}", get(serve_comment_media))
+        .route("/comment-media/{file}", get(serve_comment_media));
+    // Self-host: the built reader at `/` and admin at `/admin`, below every API
+    // route above. Unset (the default, and the hosted deployment) serves nothing.
+    let app = match &cfg.web_dir {
+        Some(dir) => {
+            tracing::info!(dir, "serving web apps from KOMIKA_WEB_DIR");
+            web_dir::mount(app, std::path::Path::new(dir))
+        }
+        None => app,
+    };
+    let app = app
         // Compress compressible responses (JSON payloads — the home feed alone drops
         // 64 KB → ~22 KB). Innermost of the middleware so the request-id/trace span
         // and every outer layer observe the final (encoded) body. The default
@@ -1939,8 +1956,14 @@ async fn main() -> anyhow::Result<()> {
         let _ = axum::serve(metrics_listener, metrics_app).await;
     });
 
-    let addr = format!("0.0.0.0:{}", cfg.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let bind_ip: IpAddr = cfg.bind_addr.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "BIND_ADDR must be an IP address (e.g. 0.0.0.0 or 127.0.0.1), got {:?}",
+            cfg.bind_addr
+        )
+    })?;
+    let addr = SocketAddr::new(bind_ip, cfg.port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on http://{addr}/graphql");
     axum::serve(
         listener,

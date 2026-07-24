@@ -29,6 +29,22 @@ to use the console), `KOMIKA_ADMIN_USERS` (comma-separated reserved admin userna
 provisioned at startup, never through registration). Needs the Suwayomi container running
 (`docker start suwayomi`) for the federated half.
 
+Self-host settings: `BIND_ADDR` (listener address, default `0.0.0.0`), `KOMIKA_WEB_DIR`
+(optional; serves `reader/` at `/` and `admin/` at `/admin` with an `index.html` SPA
+fallback, below every API route), `KOMIKA_INSTANCE_NAME` and `KOMIKA_REGISTRATION_OPEN`.
+Instance settings read the env variable first, then the `instance_setting` table (changed
+from the admin console), then a default, so a value pinned in env cannot be changed at
+runtime. `registration_open` defaults to open.
+
+### First-run setup
+
+An instance is set up once any admin account exists. With no admin at boot (none in the
+database and none provisioned from `KOMIKA_ADMIN_USERS`), the server prints a one-time
+setup code to the log. The public `instance { setupRequired }` query reports the state,
+and `createOwner(setupCode, username, email, password)` creates the first admin with that
+code. The code lives in memory only, is never returned by the API, and is retired once the
+owner exists; a restart before then prints a new one.
+
 The admin "manga DB" console (`apps/admin`) uses the admin-gated `updateSeriesAdmin`
 mutation to upsert per-series overrides (`series_admin` table): scan-interval override,
 poll cadence, forced pause, and status flag. These fold into every `Series.scan`/`status`.
