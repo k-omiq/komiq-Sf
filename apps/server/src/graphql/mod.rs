@@ -6733,6 +6733,9 @@ impl QueryRoot {
     }
 
     /// Public server facts for the setup screen and sign-up form. No auth needed.
+    /// `no_cache`: setup state and the sign-up switch change at runtime, so the
+    /// anonymous GET path must not hand this to an edge or browser cache.
+    #[graphql(cache_control(no_cache))]
     async fn instance(&self, ctx: &Context<'_>) -> Result<Instance> {
         use crate::instance as inst;
         let pool = &state(ctx).pool;
@@ -21965,7 +21968,9 @@ mod tests {
     #[tokio::test]
     async fn instance_reports_setup_state_and_defaults() {
         let (s, _, _) = setup_without_admin().await;
-        let d = data(exec(&s, INSTANCE_Q, None, "1.1.1.1").await);
+        let r = exec(&s, INSTANCE_Q, None, "1.1.1.1").await;
+        assert_eq!(r.cache_control.max_age, -1, "instance is never cacheable");
+        let d = data(r);
         assert_eq!(d["instance"]["setupRequired"], true);
         assert_eq!(d["instance"]["version"], env!("CARGO_PKG_VERSION"));
         assert!(d["instance"]["name"]

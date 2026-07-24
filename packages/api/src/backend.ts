@@ -849,13 +849,7 @@ export interface SeriesMetadataInput {
 
 /** A source-owned field of {@link SeriesAdminMeta} an admin can pin. */
 export type PinnableField =
-	| 'author'
-	| 'artist'
-	| 'year'
-	| 'originalLanguage'
-	| 'status'
-	| 'demographic'
-	| 'contentRating';
+	'author' | 'artist' | 'year' | 'originalLanguage' | 'status' | 'demographic' | 'contentRating';
 
 /** Raw metadata-override state of a work (pinned vs derived) for the editor. */
 export interface SeriesAdminMeta {

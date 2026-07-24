@@ -46,6 +46,9 @@ import type {
 	Backend,
 	ChapterOverrideInput,
 	CommentMediaUpload,
+	CreateOwnerInput,
+	CreateUserInput,
+	InstanceInfo,
 	MyComment,
 	PostCommentInput,
 	PostReviewInput,
@@ -189,6 +192,15 @@ export class CompositeBackend implements Backend {
 	}
 	logout(): Promise<void> {
 		return this.opts.hosted.logout();
+	}
+	instance(): Promise<InstanceInfo> {
+		return this.opts.hosted.instance!();
+	}
+	createOwner(input: CreateOwnerInput): Promise<Session> {
+		return this.opts.hosted.createOwner!(input);
+	}
+	changePassword(currentPassword: string, newPassword: string): Promise<Session['user']> {
+		return this.opts.hosted.changePassword!(currentPassword, newPassword);
 	}
 	/** Forward the bearer token to the hosted backend only — the local engine is
 	 * content-only and never receives a token. */
@@ -556,6 +568,15 @@ export class CompositeBackend implements Backend {
 	}
 	setUserAdmin(userId: Id, isAdmin: boolean): Promise<AdminUser> {
 		return this.opts.hosted.setUserAdmin!(userId, isAdmin);
+	}
+	createUser(input: CreateUserInput): Promise<AdminUser> {
+		return this.opts.hosted.createUser!(input);
+	}
+	resetUserPassword(userId: Id, password: string): Promise<boolean> {
+		return this.opts.hosted.resetUserPassword!(userId, password);
+	}
+	setRegistrationOpen(open: boolean): Promise<boolean> {
+		return this.opts.hosted.setRegistrationOpen!(open);
 	}
 
 	// --- admin dedup review ---

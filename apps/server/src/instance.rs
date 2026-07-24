@@ -31,7 +31,7 @@ pub struct Setting {
 pub const INSTANCE_NAME: Setting = Setting {
     key: "instance_name",
     env: "KOMIKA_INSTANCE_NAME",
-    default: "Komika",
+    default: "komiq",
 };
 
 /// Whether `register` accepts new accounts. Defaults open: that is how every

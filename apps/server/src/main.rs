@@ -379,7 +379,7 @@ async fn graphql_get_response(
     // at this layer; the alternative — surfacing those failures as GraphQL errors —
     // would break the clients' tolerant-degradation contracts. Bounded (s-maxage)
     // and self-healing, and no worse than the in-process feed memos already allow.
-    let cacheable = anonymous && resp.is_ok();
+    let cacheable = get_response_cacheable(anonymous, &resp);
     let body = match serde_json::to_vec(&resp) {
         Ok(b) => b,
         Err(e) => {
@@ -422,6 +422,13 @@ async fn graphql_get_response(
         body,
     )
         .into_response()
+}
+
+/// May a GET /graphql response be served with public `Cache-Control`? Only a
+/// clean anonymous answer, and never one that selected a `no_cache` field
+/// (`instance`: setup state and the sign-up switch change at runtime).
+fn get_response_cacheable(anonymous: bool, resp: &async_graphql::Response) -> bool {
+    anonymous && resp.is_ok() && resp.cache_control.max_age != -1
 }
 
 /// Does a GET /graphql document contain ONLY query operations? An unparseable
@@ -2113,6 +2120,19 @@ mod tests {
 
     /// GET /graphql accepts only query operations — mutations must never be
     /// reachable through the cacheable/replayable endpoint.
+    #[test]
+    fn no_cache_responses_are_never_edge_cacheable() {
+        let ok = async_graphql::Response::new(async_graphql::Value::Null);
+        assert!(get_response_cacheable(true, &ok));
+        assert!(
+            !get_response_cacheable(false, &ok),
+            "signed-in reads stay private"
+        );
+        let mut no_cache = async_graphql::Response::new(async_graphql::Value::Null);
+        no_cache.cache_control.max_age = -1;
+        assert!(!get_response_cacheable(true, &no_cache));
+    }
+
     #[test]
     fn get_graphql_rejects_non_query_operations() {
         assert!(get_document_is_query_only("query Q { health }"));
