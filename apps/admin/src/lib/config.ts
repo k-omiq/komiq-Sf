@@ -39,13 +39,13 @@ export function forgetServer(): void {
 export const needsServer = target === 'desktop' && !savedServer();
 
 function endpoint(): string {
+	// Served by the API server itself: always same origin, whatever the build env says.
+	if (target === 'embedded') return '/graphql';
 	if (target === 'desktop') {
 		const saved = savedServer();
 		if (saved) return `${saved}/graphql`;
 	}
-	if (PUBLIC_KOMIKA_API) return PUBLIC_KOMIKA_API;
-	// Served by the API server itself: same origin.
-	return target === 'embedded' ? '/graphql' : 'http://localhost:8080/graphql';
+	return PUBLIC_KOMIKA_API || 'http://localhost:8080/graphql';
 }
 
 /**

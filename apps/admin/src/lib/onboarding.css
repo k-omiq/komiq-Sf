@@ -1,0 +1,141 @@
+/* Shared building blocks for the first-run screens (/start, /setup steps). Flat
+   surfaces, no outlines on choices or rows, one filled action per screen. Loaded by
+   Onboarding.svelte so every step can use these classes without its own styles. */
+
+.ob-form,
+.ob-stack {
+	display: grid;
+	gap: var(--k-space-4);
+}
+.ob-pair {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	align-items: start;
+	gap: var(--k-space-3);
+}
+.ob-input {
+	height: var(--k-control-lg);
+	font-size: var(--k-text-md);
+}
+.ob-mono {
+	font-family: var(--k-font-mono, ui-monospace, monospace);
+	letter-spacing: 0.06em;
+}
+.ob-hint-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin: 0;
+}
+.ob-choices {
+	display: grid;
+	gap: var(--k-space-2);
+}
+.ob-points {
+	display: grid;
+	gap: var(--k-space-3);
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+.ob-points li {
+	display: grid;
+	grid-template-columns: auto 1fr;
+	gap: var(--k-space-3);
+	align-items: start;
+	font-size: var(--k-text-md);
+	line-height: 1.55;
+	color: var(--k-text-2);
+}
+.ob-points svg {
+	margin-top: 3px;
+	color: var(--k-text-dim);
+}
+.ob-section {
+	display: grid;
+	gap: var(--k-space-3);
+	margin-top: var(--k-space-2);
+}
+.ob-section-title {
+	margin: 0;
+	font-size: var(--k-text-sm);
+	font-weight: 600;
+	color: var(--k-text-1);
+}
+.ob-section-title span {
+	margin-left: 6px;
+	font-weight: 400;
+	color: var(--k-text-dim);
+}
+.ob-inline {
+	display: grid;
+	grid-template-columns: 1fr 1fr auto;
+	gap: var(--k-space-2);
+}
+/* Flat rows: a list of people, steps, records. */
+.ob-rows {
+	display: grid;
+	gap: 2px;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+.ob-rows > li,
+.ob-rows > div {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--k-space-3);
+	min-height: 44px;
+	padding: 6px 14px;
+	border-radius: var(--k-radius);
+	background: var(--k-surface-2);
+	font-size: var(--k-text-sm);
+	color: var(--k-text-1);
+}
+.ob-rows dt,
+.ob-rows .ob-key {
+	color: var(--k-text-dim);
+}
+.ob-rows dd {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	min-width: 0;
+	margin: 0;
+}
+/* Icon buttons sit flush with the row's text edge. */
+.ob-rows .k-btn--icon {
+	margin-right: -8px;
+}
+.ob-truncate {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.ob-code {
+	font-size: var(--k-text-sm);
+	color: var(--k-text-2);
+	letter-spacing: 0.04em;
+	user-select: all;
+}
+.ob-link {
+	padding: 4px 6px;
+	border: 0;
+	background: none;
+	color: var(--k-text-dim);
+	font-size: var(--k-text-xs);
+	cursor: pointer;
+	text-decoration: underline;
+	text-underline-offset: 3px;
+}
+.ob-link:hover {
+	color: var(--k-text-1);
+}
+@media (max-width: 420px) {
+	.ob-pair,
+	.ob-inline {
+		grid-template-columns: 1fr;
+	}
+}

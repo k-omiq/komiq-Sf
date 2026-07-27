@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
 	import Brand from './Brand.svelte';
+	import '../onboarding.css';
 
 	// The frame every first-run screen shares: brand, an optional step bar, a title,
 	// one line of context, the step's body, and a footer row for its actions. Flat
