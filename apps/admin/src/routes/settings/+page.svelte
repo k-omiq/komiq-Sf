@@ -2,7 +2,7 @@
 	import { href } from '$lib/paths';
 	import type { ExtensionAutoUpdate, ExtensionInfo } from '@komika/types';
 	import { auth, toggleNsfwVisibility } from '$lib/auth.svelte';
-	import { config } from '$lib/config';
+	import { config, serverAddress, target } from '$lib/config';
 	import { confirm } from '$lib/confirm.svelte';
 	import {
 		addExtensionRepo,
@@ -12,7 +12,9 @@
 		materializeCatalogueCovers,
 		persistCatalogue,
 		runExtensionUpdates,
+		setRegistrationOpen,
 	} from '$lib/data';
+	import { instance, loadInstance } from '$lib/instance.svelte';
 	import { setTheme, theme, type ThemePref } from '$lib/theme.svelte';
 	import { toast } from '$lib/toast.svelte';
 	import Button from '$lib/components/Button.svelte';
@@ -21,14 +23,16 @@
 	import Segmented from '$lib/components/Segmented.svelte';
 	import Switch from '$lib/components/Switch.svelte';
 
-	const sections = [
+	const sections = $derived([
 		{ id: 'appearance', label: 'Appearance' },
 		{ id: 'content', label: 'Content' },
+		// Only on a server that reports its settings (`instance`).
+		...(instance.info ? [{ id: 'accounts', label: 'Accounts' }] : []),
 		{ id: 'repos', label: 'Extension repos' },
 		{ id: 'updates', label: 'Extension updates' },
 		{ id: 'maintenance', label: 'Maintenance' },
 		{ id: 'about', label: 'About' },
-	];
+	]);
 
 	function shortDate(iso: string | null): string {
 		if (!iso) return 'Never';
@@ -53,6 +57,32 @@
 			toast.fromError(err, 'Failed to change NSFW visibility.');
 		} finally {
 			nsfwBusy = false;
+		}
+	}
+
+	// ---- Accounts: the sign-up switch -------------------------------------------
+	// Read from the public `instance` facts (self-host builds already loaded them at
+	// boot; the hosted console asks here). A server that predates them hides the
+	// section. The server refuses the change when its environment pins the value.
+	$effect(() => {
+		if (!instance.ready) void loadInstance();
+	});
+	let signupBusy = $state(false);
+	let signupPinned = $state<string | null>(null);
+
+	async function onToggleSignup(next: boolean): Promise<void> {
+		if (!instance.info || signupBusy) return;
+		signupBusy = true;
+		try {
+			const open = await setRegistrationOpen(next);
+			instance.info = { ...instance.info, registrationOpen: open };
+			toast.success(open ? 'Anyone can sign up now.' : 'Sign-up is closed.');
+		} catch (err) {
+			const message = err instanceof Error ? err.message : '';
+			if (message.includes('KOMIKA_REGISTRATION_OPEN')) signupPinned = message;
+			else toast.fromError(err, 'The setting could not be saved.');
+		} finally {
+			signupBusy = false;
 		}
 	}
 
@@ -381,6 +411,40 @@
 				</div>
 			</section>
 
+			{#if instance.info}
+				<section id="accounts" class="group" aria-labelledby="accounts-h">
+					<div class="group-head">
+						<div>
+							<h2 id="accounts-h" class="group-title">Accounts</h2>
+							<p class="group-desc">Who can get an account on this server.</p>
+						</div>
+					</div>
+					<div class="group-body">
+						<div class="setting">
+							<div class="setting-text">
+								<p class="setting-name">Anyone can sign up</p>
+								{#if signupPinned}
+									<p class="k-hint">{signupPinned}</p>
+								{:else}
+									<p class="k-hint">
+										When this is off, the reader hides sign-up and only people you add on the <a
+											class="k-link"
+											href={href('/users')}>Users</a
+										> page can sign in.
+									</p>
+								{/if}
+							</div>
+							<Switch
+								label="Anyone can sign up"
+								checked={instance.info.registrationOpen}
+								disabled={signupBusy || !!signupPinned}
+								onchange={onToggleSignup}
+							/>
+						</div>
+					</div>
+				</section>
+			{/if}
+
 			<section id="repos" class="group" aria-labelledby="repos-h">
 				<div class="group-head">
 					<div>
@@ -610,7 +674,12 @@
 				<div class="group-body">
 					<dl class="facts">
 						<dt>Server</dt>
-						<dd class="k-mono">{config.apiEndpoint}</dd>
+						<!-- The embedded console talks to its own origin's /graphql: show that origin. -->
+						<dd class="k-mono">{target === 'embedded' ? serverAddress() : config.apiEndpoint}</dd>
+						{#if instance.info?.version}
+							<dt>Version</dt>
+							<dd class="k-mono">{instance.info.version}</dd>
+						{/if}
 						<dt>Signed in as</dt>
 						<dd>{auth.user?.username ?? 'Unknown'}</dd>
 					</dl>

@@ -628,6 +628,10 @@ function setupUnavailable(): never {
 	throw new Error('This server does not support setup. Update the server and try again.');
 }
 
+function accountsUnavailable(): never {
+	throw new Error('This server cannot manage accounts. Update the server and try again.');
+}
+
 /** Create the owner (first admin) with the setup code from the server log. */
 export async function createOwner(input: CreateOwnerInput): Promise<Session> {
 	if (!backend.createOwner) setupUnavailable();
@@ -636,12 +640,21 @@ export async function createOwner(input: CreateOwnerInput): Promise<Session> {
 
 /** Open or close public sign-up; resolves to the new effective value. */
 export async function setRegistrationOpen(open: boolean): Promise<boolean> {
-	if (!backend.setRegistrationOpen) setupUnavailable();
+	if (!backend.setRegistrationOpen) accountsUnavailable();
 	return backend.setRegistrationOpen(open);
 }
 
 /** Create an account directly; the user picks their own password at first sign-in. */
 export async function createUser(input: CreateUserInput): Promise<AdminUser> {
-	if (!backend.createUser) setupUnavailable();
+	if (!backend.createUser) accountsUnavailable();
 	return backend.createUser(input);
+}
+
+/**
+ * Give another account a new temporary password. Signs them out everywhere; they
+ * pick their own at next sign-in.
+ */
+export async function resetUserPassword(userId: Id, password: string): Promise<void> {
+	if (!backend.resetUserPassword) accountsUnavailable();
+	await backend.resetUserPassword(userId, password);
 }

@@ -105,11 +105,4 @@ export function finishSetup(path: string): void {
 	void goto(href(path), { replaceState: true });
 }
 
-export async function copyText(text: string): Promise<boolean> {
-	try {
-		await navigator.clipboard.writeText(text);
-		return true;
-	} catch {
-		return false;
-	}
-}
+export { copyText } from '$lib/passwords';
