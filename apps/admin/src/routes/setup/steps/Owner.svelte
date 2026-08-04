@@ -3,6 +3,7 @@
 	import { forgetServer, target } from '$lib/config';
 	import { createOwner } from '$lib/data';
 	import { takeSetupCode } from '$lib/desktop';
+	import { instance } from '$lib/instance.svelte';
 	import { href } from '$lib/paths';
 	import Button from '$lib/components/Button.svelte';
 	import Icon from '$lib/components/Icon.svelte';
@@ -52,6 +53,9 @@
 				password,
 			});
 			adoptSession(session);
+			// The server has its owner now. The layout's route guard reads this cached
+			// answer, so without it leaving the wizard would bounce straight back here.
+			if (instance.info) instance.info = { ...instance.info, setupRequired: false };
 			password = '';
 			confirm = '';
 			code = '';
