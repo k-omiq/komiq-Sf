@@ -16,7 +16,14 @@ const host = process.env.TAURI_DEV_HOST;
 // Tauri sets TAURI_ENV_PLATFORM during its build; a plain `pnpm build` targets
 // the web (Cloudflare). Set KOMIKA_TARGET=tauri to force the static SPA build
 // (e.g. building the web bundle for a static host without Tauri's env present).
-const isTauriBuild = !!process.env.TAURI_ENV_PLATFORM || process.env.KOMIKA_TARGET === 'tauri';
+//   • KOMIKA_TARGET=embedded → the same static SPA, built to be served BY the API
+//     server itself (`KOMIKA_WEB_DIR`, reader at `/`): it talks to `/graphql` on its
+//     own origin and loads images from there, whatever PUBLIC_* the build env holds
+//     (see $lib/config). One build works on any address the server is reached at.
+const isEmbeddedBuild = process.env.KOMIKA_TARGET === 'embedded';
+const isTauriBuild =
+	!!process.env.TAURI_ENV_PLATFORM || process.env.KOMIKA_TARGET === 'tauri' || isEmbeddedBuild;
+const target = isEmbeddedBuild ? 'embedded' : isTauriBuild ? 'tauri' : 'web';
 // `__KOMIKA_SSR__` gates the per-route `ssr` flags (see $lib/ssr): public pages
 // SSR on the web build, but stay client-only in the Tauri/static SPA build.
 const ssrEnabled = !isTauriBuild;
@@ -29,6 +36,7 @@ export default defineConfig(({ command, mode, isPreview }) => {
 	return {
 		define: {
 			__KOMIKA_SSR__: JSON.stringify(ssrEnabled),
+			__KOMIKA_TARGET__: JSON.stringify(target),
 		},
 		plugins: [
 			sveltekit({
