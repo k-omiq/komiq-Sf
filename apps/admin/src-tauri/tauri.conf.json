@@ -1,0 +1,45 @@
+{
+	"$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+	"productName": "Komiq Server",
+	"version": "0.1.0",
+	"identifier": "app.komika.desktop",
+	"build": {
+		"frontendDist": "../build",
+		"devUrl": "http://localhost:5273",
+		"beforeDevCommand": "pnpm dev",
+		"beforeBuildCommand": "bash src-tauri/scripts/prepare-bundle.sh && pnpm build"
+	},
+	"app": {
+		"windows": [
+			{
+				"title": "komiq",
+				"width": 1200,
+				"height": 820,
+				"minWidth": 360,
+				"minHeight": 560,
+				"resizable": true,
+				"fullscreen": false
+			}
+		],
+		"security": {
+			"csp": null
+		}
+	},
+	"bundle": {
+		"active": true,
+		"targets": "all",
+		"externalBin": ["binaries/komika-server"],
+		"resources": {
+			"web/": "web/",
+			"../../reader/src-tauri/suwayomi/": "suwayomi/",
+			"../../reader/src-tauri/jre/": "jre/"
+		},
+		"icon": [
+			"../../reader/src-tauri/icons/32x32.png",
+			"../../reader/src-tauri/icons/128x128.png",
+			"../../reader/src-tauri/icons/128x128@2x.png",
+			"../../reader/src-tauri/icons/icon.icns",
+			"../../reader/src-tauri/icons/icon.ico"
+		]
+	}
+}
