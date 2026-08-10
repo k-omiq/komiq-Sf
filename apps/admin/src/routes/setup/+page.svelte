@@ -4,8 +4,10 @@
 	import { href } from '$lib/paths';
 	import { auth } from '$lib/auth.svelte';
 	import { instance } from '$lib/instance.svelte';
+	import { runsLocalServer, target } from '$lib/config';
 	import Accounts from './steps/Accounts.svelte';
 	import Done from './steps/Done.svelte';
+	import Lan from './steps/Lan.svelte';
 	import Owner from './steps/Owner.svelte';
 	import Welcome from './steps/Welcome.svelte';
 	import { persist, stepNumber, wizard } from './wizard.svelte';
@@ -16,6 +18,13 @@
 	const STEPS: { id: string; label: string; component: Component; show?: () => boolean }[] = [
 		{ id: 'welcome', label: 'Welcome', component: Welcome },
 		{ id: 'owner', label: 'Owner account', component: Owner },
+		{
+			id: 'lan',
+			label: 'Home network',
+			component: Lan,
+			// Only the desktop app's own server can be opened to the home network.
+			show: () => target === 'desktop' && runsLocalServer && wizard.extra.access !== 'internet',
+		},
 		{ id: 'accounts', label: 'Accounts', component: Accounts },
 		{ id: 'done', label: 'Done', component: Done },
 	];
