@@ -68,10 +68,9 @@ echo "ok: binaries/komika-server-${TARGET_TRIPLE}${EXE}"
 WEB="${SRC_TAURI}/web"
 rm -rf "${WEB}/reader" "${WEB}/admin"
 
-# Reader: a static SPA calling the API on its own origin. (Phase 2 of the self-host plan
-# gives the reader its own `embedded` target; switch these variables to it when it lands.)
+# Reader: its `embedded` build, a static SPA calling the API on its own origin.
 echo "building the reader (served at /)"
-KOMIKA_TARGET=tauri PUBLIC_KOMIKA_API=/graphql pnpm -C "${REPO}/apps/reader" build
+KOMIKA_TARGET=embedded pnpm -C "${REPO}/apps/reader" build
 cp -R "${REPO}/apps/reader/build" "${WEB}/reader"
 
 # Console: the `embedded` build under /admin, for browsers on the home network. The
