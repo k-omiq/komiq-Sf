@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { createUser, setRegistrationOpen } from '$lib/data';
+	import { instance } from '$lib/instance.svelte';
+	import { tempPassword } from '$lib/passwords';
 	import Button from '$lib/components/Button.svelte';
 	import Choice from '$lib/components/Choice.svelte';
 	import Onboarding from '$lib/components/Onboarding.svelte';
@@ -12,14 +14,6 @@
 	let saveBusy = $state(false);
 	let saveError = $state<string | null>(null);
 	let copied = $state<string | null>(null);
-
-	/** A readable temporary password: 12 symbols, no look-alikes. */
-	function tempPassword(): string {
-		const alphabet = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789';
-		const bytes = crypto.getRandomValues(new Uint8Array(12));
-		const raw = Array.from(bytes, (b) => alphabet[b % alphabet.length]).join('');
-		return `${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8)}`;
-	}
 
 	async function addUser(e: SubmitEvent): Promise<void> {
 		e.preventDefault();
@@ -60,7 +54,8 @@
 		saveBusy = true;
 		saveError = null;
 		try {
-			await setRegistrationOpen(wizard.signup === 'open');
+			const open = await setRegistrationOpen(wizard.signup === 'open');
+			if (instance.info) instance.info = { ...instance.info, registrationOpen: open };
 			next();
 		} catch (err) {
 			const message = err instanceof Error ? err.message : '';

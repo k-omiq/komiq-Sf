@@ -2,9 +2,20 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { auth, login, register } from '$lib/auth.svelte';
+	import { loadInstance, registrationOpen } from '$lib/instance.svelte';
 
 	type Mode = 'login' | 'register';
 	let mode = $state<Mode>('login');
+
+	// The server can close sign-up (self-host). Until it says so the page looks as it
+	// always has; a server that cannot tell us keeps sign-up visible.
+	$effect(() => {
+		void loadInstance();
+	});
+	const canRegister = $derived(registrationOpen());
+	$effect(() => {
+		if (!canRegister && mode === 'register') mode = 'login';
+	});
 
 	let username = $state('');
 	let email = $state('');
@@ -59,18 +70,20 @@
 			</p>
 		</div>
 
-		<div class="tabs" role="group" aria-label="Account access">
-			<button
-				aria-pressed={mode === 'login'}
-				class:active={mode === 'login'}
-				onclick={() => switchMode('login')}>Sign in</button
-			>
-			<button
-				aria-pressed={mode === 'register'}
-				class:active={mode === 'register'}
-				onclick={() => switchMode('register')}>Create account</button
-			>
-		</div>
+		{#if canRegister}
+			<div class="tabs" role="group" aria-label="Account access">
+				<button
+					aria-pressed={mode === 'login'}
+					class:active={mode === 'login'}
+					onclick={() => switchMode('login')}>Sign in</button
+				>
+				<button
+					aria-pressed={mode === 'register'}
+					class:active={mode === 'register'}
+					onclick={() => switchMode('register')}>Create account</button
+				>
+			</div>
+		{/if}
 
 		<form onsubmit={submit}>
 			<label>
@@ -129,7 +142,9 @@
 		</form>
 
 		<p class="foot">
-			{#if mode === 'login'}
+			{#if !canRegister}
+				New here? Ask the owner for an account.
+			{:else if mode === 'login'}
 				New to komiq?
 				<button class="link" onclick={() => switchMode('register')}>Create an account</button>
 			{:else}

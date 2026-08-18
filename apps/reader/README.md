@@ -40,3 +40,24 @@ npm run build
 You can preview the production build with `npm run preview`.
 
 > To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+
+## Build targets
+
+`KOMIKA_TARGET` picks the build (default: the hosted web build):
+
+| Target      | Adapter              | API and images                                             |
+| ----------- | -------------------- | ---------------------------------------------------------- |
+| unset (web) | Cloudflare, edge SSR | `PUBLIC_*` from `.env.production` (komiq.cc, unchanged)    |
+| `tauri`     | static SPA           | `PUBLIC_*` (native apps, the Docker image)                 |
+| `embedded`  | static SPA           | same origin: `/graphql`, images direct; `PUBLIC_*` ignored |
+
+The `embedded` build is the one the API server serves at `/` from `KOMIKA_WEB_DIR`
+(next to the embedded admin at `/admin`):
+
+```sh
+KOMIKA_TARGET=embedded pnpm -C apps/reader build   # output: apps/reader/build
+```
+
+Static builds ask the server's `instance` facts: a server without an owner shows a
+"not set up" page that links to `/admin/setup`. The sign-in page hides sign-up when
+the server has closed it (every build).
