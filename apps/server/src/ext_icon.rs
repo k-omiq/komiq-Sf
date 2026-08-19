@@ -14,10 +14,21 @@
 //! authoritative and answers essentially every request without touching the
 //! network or the DB.
 //!
-//! The lazy fetch below exists only for the gap the snapshot can't cover:
-//! extensions Keiyoushi publishes AFTER a given snapshot was taken. Those are
-//! fetched once, cached in `extension_icon_blob`, and served from there
-//! afterwards — so a newly-listed source gets its icon without a redeploy.
+//! The lazy fetch below covers everything the snapshot can't: extensions
+//! published AFTER a given snapshot was taken, and — on a self-hosted server,
+//! where the operator adds whatever repos they like — every extension from any
+//! other repo. Each is fetched once, cached in `extension_icon_blob`, and served
+//! from there afterwards, so a newly-listed source gets its icon without a
+//! redeploy.
+//!
+//! WHERE THE ICON COMES FROM. The extension's OWN repo ([`icon_candidates`]): a
+//! Mihon-format repo keeps `icon/{pkgName}.png` next to its index, so the URL is
+//! derived from the repo the engine reports for the extension. Keiyoushi is the one
+//! repo known not to (its `icon/` directory is the one that was emptied), so for a
+//! Keiyoushi extension the source-tree layout is tried after it — the same fetch
+//! the snapshot was originally built from. The snapshot itself stays the first
+//! tier, because it is local disk and answers the hosted instance's ~1,300
+//! Keiyoushi icons without a single outbound request.
 
 use sqlx::SqlitePool;
 use std::time::Duration;
@@ -46,6 +57,58 @@ pub fn is_valid_pkg(pkg: &str) -> bool {
         && pkg
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
+/// The `repo` branch base every Keiyoushi index URL canonicalizes to, once
+/// `github.com/…/raw/…` is rewritten to the direct raw host ([`repo_base`]). The
+/// one repo whose `icon/` directory is known to be empty, and the origin of the
+/// vendored snapshot.
+pub const KEIYOUSHI_REPO_BASE: &str = "https://raw.githubusercontent.com/keiyoushi/extensions/repo";
+
+/// The directory an extension repo's index lives in, as a fetchable base URL.
+///
+/// The engine reports an extension's repo as its store's index URL (for Keiyoushi,
+/// canonicalized to `https://github.com/keiyoushi/extensions/raw/repo/index.pb`).
+/// A GitHub `/raw/` path is rewritten to `raw.githubusercontent.com`, skipping the
+/// redirect. `None` when the URL does not end in an `index.*` file: an unknown
+/// layout, where guessing an icon path would only produce 404s.
+pub fn repo_base(repo: &str) -> Option<String> {
+    let (base, index) = repo.trim().rsplit_once('/')?;
+    if !index.starts_with("index.")
+        || !(base.starts_with("https://") || base.starts_with("http://"))
+    {
+        return None;
+    }
+    Some(match base.strip_prefix("https://github.com/") {
+        Some(rest) if rest.contains("/raw/") => format!(
+            "https://raw.githubusercontent.com/{}",
+            rest.replacen("/raw/", "/", 1)
+        ),
+        _ => base.to_string(),
+    })
+}
+
+/// Where to look for `pkg`'s icon, best first, given the repo the engine reports
+/// for it (`None` = the extension is not known to the engine).
+///
+/// 1. The extension's own repo: `{base}/icon/{pkg}.png`, the Mihon repo layout.
+/// 2. For a Keiyoushi extension (its repo is Keiyoushi's, or unknown and the
+///    package is Keiyoushi-shaped): Keiyoushi's source tree, since their `icon/`
+///    directory no longer holds the icons.
+pub fn icon_candidates(repo: Option<&str>, pkg: &str) -> Vec<String> {
+    let base = repo.and_then(repo_base);
+    let mut out = Vec::new();
+    if let Some(base) = &base {
+        out.push(format!("{base}/icon/{pkg}.png"));
+    }
+    let keiyoushi_repo = match &base {
+        Some(b) => b == KEIYOUSHI_REPO_BASE,
+        None => repo.is_none(),
+    };
+    if keiyoushi_repo {
+        out.extend(keiyoushi_source_url(pkg));
+    }
+    out
 }
 
 /// Keiyoushi's source-repo icon URL for a package.
@@ -110,31 +173,79 @@ fn http() -> &'static reqwest::Client {
     })
 }
 
+/// Extension icons are small (launcher PNGs are a few KB); anything near this is not
+/// an icon, and the repo URL is operator-supplied, so the read is bounded.
+const MAX_ICON_BYTES: usize = 1024 * 1024;
+
 /// GET a PNG, or `None` for any failure — transport error, non-success status,
-/// or a body that isn't actually a PNG.
+/// a body over [`MAX_ICON_BYTES`], or a body that isn't actually a PNG.
 async fn fetch_png(url: &str) -> Option<Vec<u8>> {
-    let res = http().get(url).timeout(FETCH_TIMEOUT).send().await.ok()?;
-    if !res.status().is_success() {
+    let mut res = http().get(url).timeout(FETCH_TIMEOUT).send().await.ok()?;
+    if !res.status().is_success()
+        || res
+            .content_length()
+            .is_some_and(|n| n > MAX_ICON_BYTES as u64)
+    {
         return None;
     }
-    let bytes = res.bytes().await.ok()?.to_vec();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = res.chunk().await.ok()? {
+        if bytes.len() + chunk.len() > MAX_ICON_BYTES {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     is_png(&bytes).then_some(bytes)
 }
 
-/// Fetch a package's icon from Keiyoushi and record the outcome — the bytes on
-/// success, an empty-BLOB tombstone on failure. Returns the bytes to serve.
+/// What the engine knows about an extension's repo, for [`fetch_and_cache`].
+#[derive(Debug, Clone, Copy)]
+pub enum RepoLookup<'a> {
+    /// The extension's repo (its store's index URL).
+    Repo(&'a str),
+    /// The engine answered and does not know the extension (or it has no repo).
+    Unknown,
+    /// The engine could not be asked. A miss is then not recorded: the icon may
+    /// well exist in a repo we simply could not name this time.
+    Unavailable,
+}
+
+/// Fetch a package's icon from its own repo (then the Keiyoushi fallback, see
+/// [`icon_candidates`]) and record the outcome — the bytes on success, an
+/// empty-BLOB tombstone on a definite miss. Returns the bytes to serve.
 ///
 /// Cache writes are best-effort: a failed write costs a repeat fetch next time,
 /// which is not worth failing an image request over.
-pub async fn fetch_and_cache(pool: &SqlitePool, pkg: &str) -> Option<Vec<u8>> {
-    let bytes = match keiyoushi_source_url(pkg) {
-        // NB: every failure here must FALL THROUGH to the tombstone write below,
-        // not return early. An upstream 404 is precisely the case the tombstone
-        // exists for — returning from here on a non-success status would leave
-        // the ~41 iconless extensions re-fetching on every single request.
-        Some(url) => fetch_png(&url).await,
-        None => None,
-    };
+pub async fn fetch_and_cache(
+    pool: &SqlitePool,
+    pkg: &str,
+    repo: RepoLookup<'_>,
+) -> Option<Vec<u8>> {
+    let candidates = icon_candidates(
+        match repo {
+            RepoLookup::Repo(r) => Some(r),
+            RepoLookup::Unknown | RepoLookup::Unavailable => None,
+        },
+        pkg,
+    );
+    // NB: every failure here must FALL THROUGH to the tombstone write below, not
+    // return early. An upstream 404 is precisely the case the tombstone exists for —
+    // returning from here on a non-success status would leave the ~41 iconless
+    // extensions re-fetching on every single request.
+    let mut bytes = None;
+    for url in &candidates {
+        if let Some(b) = fetch_png(url).await {
+            bytes = Some(b);
+            break;
+        }
+    }
+    if bytes.is_none() && matches!(repo, RepoLookup::Unavailable) {
+        tracing::debug!(
+            pkg,
+            "extension icon: engine unavailable; not recording a miss"
+        );
+        return None;
+    }
     let store: &[u8] = bytes.as_deref().unwrap_or(&[]);
     if let Err(e) = sqlx::query(
         "INSERT INTO extension_icon_blob (pkg_name, png, updated_at) \
@@ -149,7 +260,11 @@ pub async fn fetch_and_cache(pool: &SqlitePool, pkg: &str) -> Option<Vec<u8>> {
         tracing::warn!(error = %e, pkg, "extension icon cache write failed");
     }
     if bytes.is_none() {
-        tracing::debug!(pkg, "no Keiyoushi-hosted icon; recorded miss");
+        tracing::debug!(
+            pkg,
+            tried = candidates.len(),
+            "no repo-hosted icon; recorded miss"
+        );
     }
     bytes
 }
@@ -260,7 +375,10 @@ mod tests {
         let pool = cache_pool().await;
         // No derivable URL → no outbound request, but the miss is still recorded
         // so the next request short-circuits instead of retrying the derivation.
-        assert_eq!(fetch_and_cache(&pool, "com.example.custom").await, None);
+        assert_eq!(
+            fetch_and_cache(&pool, "com.example.custom", RepoLookup::Unknown).await,
+            None
+        );
         assert_eq!(cached(&pool, "com.example.custom").await.unwrap(), None);
     }
 
@@ -275,8 +393,12 @@ mod tests {
         // A derivable-but-unroutable URL exercises the same fall-through the
         // upstream-404 path takes, without depending on the network.
         let pkg = "eu.kanade.tachiyomi.extension.zz.definitely-not-a-real-extension";
-        assert!(keiyoushi_source_url(pkg).is_some());
-        assert_eq!(fetch_and_cache(&pool, pkg).await, None);
+        // Port 1 on loopback: a refused connection, never the network.
+        let repo = "http://127.0.0.1:1/repo/index.min.json";
+        assert_eq!(
+            fetch_and_cache(&pool, pkg, RepoLookup::Repo(repo)).await,
+            None
+        );
         let tombstoned: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM extension_icon_blob WHERE pkg_name = ?")
                 .bind(pkg)
@@ -285,6 +407,116 @@ mod tests {
                 .unwrap();
         assert_eq!(tombstoned, 1, "a failed fetch must record a miss");
         assert_eq!(cached(&pool, pkg).await.unwrap(), None);
+    }
+
+    #[test]
+    fn icons_come_from_the_extensions_own_repo() {
+        let pkg = "eu.kanade.tachiyomi.extension.en.foo";
+        // A Mihon-format repo: its own `icon/` directory, nothing else (no Keiyoushi
+        // guess for an extension that is not Keiyoushi's, even when shaped like one).
+        assert_eq!(
+            icon_candidates(Some("https://example.org/ext/index.min.json"), pkg),
+            vec![format!("https://example.org/ext/icon/{pkg}.png")]
+        );
+        // GitHub `/raw/` index URLs go straight to the raw host.
+        assert_eq!(
+            icon_candidates(
+                Some("https://github.com/someone/repo/raw/main/index.min.json"),
+                pkg
+            ),
+            vec![format!(
+                "https://raw.githubusercontent.com/someone/repo/main/icon/{pkg}.png"
+            )]
+        );
+        // Keiyoushi: its own repo first, then the source tree (its `icon/` is empty).
+        assert_eq!(
+            icon_candidates(
+                Some("https://github.com/keiyoushi/extensions/raw/repo/index.pb"),
+                pkg
+            ),
+            vec![
+                format!("{KEIYOUSHI_REPO_BASE}/icon/{pkg}.png"),
+                keiyoushi_source_url(pkg).unwrap(),
+            ]
+        );
+        // Unknown to the engine: only the legacy Keiyoushi derivation, if any.
+        assert_eq!(
+            icon_candidates(None, pkg),
+            vec![keiyoushi_source_url(pkg).unwrap()]
+        );
+        assert!(icon_candidates(None, "com.example.custom").is_empty());
+        // A repo URL with no index file: no guess at all.
+        assert!(icon_candidates(Some("https://example.org/store"), "com.example.x").is_empty());
+        assert_eq!(repo_base("ftp://example.org/index.json"), None);
+    }
+
+    /// A local "repo" serving one icon at the Mihon path, counting requests.
+    async fn icon_repo() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::{http::header, routing::get, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = Router::new().route(
+            "/repo/icon/{file}",
+            get(
+                move |axum::extract::Path(file): axum::extract::Path<String>| {
+                    let h = h.clone();
+                    async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        if file == "pkg.has.icon.png" {
+                            (
+                                axum::http::StatusCode::OK,
+                                [(header::CONTENT_TYPE, "image/png")],
+                                b"\x89PNG\r\n\x1a\nicon".to_vec(),
+                            )
+                        } else {
+                            (
+                                axum::http::StatusCode::NOT_FOUND,
+                                [(header::CONTENT_TYPE, "text/html")],
+                                b"<html>404</html>".to_vec(),
+                            )
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/repo/index.min.json"), hits)
+    }
+
+    #[tokio::test]
+    async fn fetches_from_the_repo_then_serves_from_cache() {
+        use std::sync::atomic::Ordering;
+        let pool = cache_pool().await;
+        let (repo, hits) = icon_repo().await;
+
+        let got = fetch_and_cache(&pool, "pkg.has.icon", RepoLookup::Repo(&repo)).await;
+        assert_eq!(got.as_deref(), Some(&b"\x89PNG\r\n\x1a\nicon"[..]));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // Cached now: the route's tier 2 answers without the repo.
+        assert_eq!(
+            cached(&pool, "pkg.has.icon").await.unwrap().as_deref(),
+            Some(&b"\x89PNG\r\n\x1a\nicon"[..])
+        );
+
+        // The repo has no icon for this one: a definite miss, recorded.
+        assert_eq!(
+            fetch_and_cache(&pool, "pkg.no.icon", RepoLookup::Repo(&repo)).await,
+            None
+        );
+        assert_eq!(cached(&pool, "pkg.no.icon").await.unwrap(), None);
+
+        // The engine could not be asked: nothing to try for a non-Keiyoushi package,
+        // and NO tombstone — the icon may exist in a repo we could not name this time.
+        assert_eq!(
+            fetch_and_cache(&pool, "pkg.engine.down", RepoLookup::Unavailable).await,
+            None
+        );
+        assert!(cached(&pool, "pkg.engine.down").await.is_err());
     }
 
     #[test]

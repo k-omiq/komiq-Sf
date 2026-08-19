@@ -42,8 +42,24 @@ pub const REGISTRATION_OPEN: Setting = Setting {
     default: "true",
 };
 
-/// Whether the direct-MangaDex catalogue sync runs. Shares `CATALOGUE_SYNC` with
-/// `Config::catalogue_sync_enabled`, so the env meaning is unchanged.
+/// The one MangaDex switch: whether this server may talk to MangaDex at all.
+///
+/// Env `CATALOGUE_SYNC` keeps its old meaning and still wins (`on` pins everything on,
+/// exactly as before this setting existed; `off` pins it off). Unset, the admin's
+/// stored choice applies, and a new install defaults OFF (plan open point 3).
+///
+/// What it governs: every request the MangaDex client sends (the client refuses while
+/// off — `mangadex::MangadexOff`), so the catalogue/chapter sync and its drains, the
+/// MangaDex pass of the cover drainer, the lazy `/covers/` fetch, `canonicalPages` and
+/// the admin MangaDex mutations all follow it. The older flags stay as ADDITIONAL
+/// env knobs on top of it, never as a way around it:
+///
+/// - `METADATA_BACKFILL=on` — opt-in for the enrichment loop; runs only while this is on.
+/// - `COVER_PHASH=on` — opt-in pHash during a sync pass; a pass only runs while this is on.
+/// - `COVER_CACHE=off` — opt-out of the whole cover drainer, Suwayomi covers included.
+///   With it on and this off, the drainer still caches Suwayomi covers.
+///
+/// Applied at boot and by `setMangadexEnabled`; the loops read the live value each pass.
 pub const MANGADEX_ENABLED: Setting = Setting {
     key: "mangadex_enabled",
     env: "CATALOGUE_SYNC",

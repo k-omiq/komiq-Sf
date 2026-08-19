@@ -12,6 +12,7 @@ mod discovery;
 mod ext_icon;
 mod gc;
 mod graphql;
+mod img_proxy;
 mod ingest;
 mod instance;
 mod maintenance;
@@ -687,9 +688,11 @@ async fn upload_cover(
 /// Three tiers, cheapest first (see `ext_icon` for why we host these at all):
 ///   1. the vendored snapshot baked into the image (`assets/ext-icons/`) — this
 ///      answers essentially every request, with no DB or network work;
-///   2. `extension_icon_blob`, holding icons for extensions Keiyoushi added
-///      since that snapshot, plus tombstones for the ~41 that have no icon;
-///   3. a one-time fetch from Keiyoushi, cached into (2) for next time.
+///   2. `extension_icon_blob`, holding icons fetched since that snapshot (new
+///      Keiyoushi extensions, and every extension from any other repo), plus
+///      tombstones for the ones that have no icon;
+///   3. a one-time fetch from the extension's OWN repo (`ext_icon::icon_candidates`),
+///      cached into (2) for next time.
 ///
 /// The package name is validated before it is joined onto a path or a URL
 /// (`ext_icon::is_valid_pkg` rejects `/`, `\` and `..`), so a bad shape 404s
@@ -715,8 +718,29 @@ async fn serve_ext_icon(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(()) => {}
     }
-    // Tier 3: ask Keiyoushi once, then serve from tier 2 forever after.
-    match ext_icon::fetch_and_cache(&pool, pkg).await {
+    // Tier 3: ask the extension's own repo once, then serve from tier 2 forever
+    // after. The repo is the one the engine reports for the package — first from the
+    // catalogue's record of installed extensions, then the engine's store listing.
+    let recorded: Option<String> =
+        sqlx::query_scalar("SELECT repo_url FROM source_extension WHERE pkg_name = ? LIMIT 1")
+            .bind(pkg)
+            .fetch_optional(&app.pool)
+            .await
+            .ok()
+            .flatten();
+    let engine = match recorded {
+        Some(_) => None,
+        None => Some(app.suwayomi.get_extension(pkg).await),
+    };
+    let repo = match (&recorded, &engine) {
+        (Some(r), _) => ext_icon::RepoLookup::Repo(r),
+        (None, Some(Ok(e))) => match e.repo.as_deref() {
+            Some(r) => ext_icon::RepoLookup::Repo(r),
+            None => ext_icon::RepoLookup::Unknown,
+        },
+        (None, _) => ext_icon::RepoLookup::Unavailable,
+    };
+    match ext_icon::fetch_and_cache(&pool, pkg, repo).await {
         Some(bytes) => png_icon_response(bytes),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -778,7 +802,7 @@ async fn serve_avatar(
 /// WebP, store it (so it's on our origin from now on), and serve it — "save covers as
 /// we fetch". If the lazy fetch/resize fails (or the work has a version but a missing
 /// blob), 302-redirect to the MangaDex CDN so the cover still renders; a genuinely
-/// coverless work 404s.
+/// coverless work 404s, and so does every miss while MangaDex is switched off.
 async fn serve_cover(
     State(app): State<Arc<graphql::AppState>>,
     State(CoverDb(pool)): State<CoverDb>,
@@ -811,6 +835,13 @@ async fn serve_cover(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // MangaDex switched off: no lazy fetch and, just as important, no redirect to the
+    // MangaDex CDN (that would only move the MangaDex request into the browser). A
+    // plain miss the reader renders as a placeholder; `no-store` so the real cover
+    // shows once the drainer (Suwayomi pass, or MangaDex when it is back on) fills it.
+    if !app.mangadex.is_enabled() {
+        return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response();
+    }
     let cdn_fallback = crate::mangadex::cover_thumb_url(&mangadex_id, &file_name);
     let Some(bytes) = app
         .mangadex
@@ -1570,6 +1601,21 @@ async fn main() -> anyhow::Result<()> {
         cfg.mangadex_rate_per_sec,
         cfg.mangadex_athome_per_min,
     ));
+    // The MangaDex switch (`mangadex` module doc): env `CATALOGUE_SYNC`, then the
+    // admin's stored choice, then off. Read once here to set the client; from then on
+    // `setMangadexEnabled` flips the live client and the table together, and every
+    // loop reads the live value each pass. `pinned_off` is the one case nothing can
+    // change at runtime (env says off), so the MangaDex loops are not even spawned —
+    // which is exactly the old `CATALOGUE_SYNC` off behaviour.
+    let mangadex_setting = instance::resolve(&pool, &instance::MANGADEX_ENABLED).await;
+    let mangadex_on = mangadex_setting.as_bool();
+    let mangadex_pinned_off = mangadex_setting.source == instance::Source::Env && !mangadex_on;
+    mangadex.set_enabled(mangadex_on);
+    tracing::info!(
+        enabled = mangadex_on,
+        source = ?mangadex_setting.source,
+        "mangadex switch"
+    );
     let state = Arc::new(AppState {
         pool: pool.clone(),
         cover_pool: cover_pool.clone(),
@@ -1700,7 +1746,12 @@ async fn main() -> anyhow::Result<()> {
     // in-process, so it only bounds THIS process. Enable CATALOGUE_SYNC on exactly
     // one replica — N replicas syncing = N× the shared-IP budget → 429/ban. Moving
     // to a shared (DB/Redis) limiter is the prerequisite for multi-replica sync.
-    if cfg.catalogue_sync_enabled {
+    //
+    // Self-host: the loops are spawned whenever the switch CAN be on (env on, or not
+    // pinned), and each one parks on `MangaDexClient::wait_enabled` until it is. A
+    // parked loop is one idle task, so spawning them on a MangaDex-off server costs
+    // nothing and lets the admin's switch start them without a restart.
+    if !mangadex_pinned_off {
         mangadex::spawn_recurring(
             pool.clone(),
             mangadex.clone(),
@@ -1751,13 +1802,19 @@ async fn main() -> anyhow::Result<()> {
         // first, then anything older than a week, so it never finishes for good — it idles
         // on an hourly probe between weekly refreshes.
         work_stats::spawn_stats_backfill(pool.clone(), mangadex.clone(), shutdown_tx.subscribe());
+        if !mangadex_on {
+            tracing::info!(
+                "catalogue sync waiting: MangaDex is off (turn it on in the admin console)"
+            );
+        }
     } else {
-        tracing::info!("catalogue sync disabled (set CATALOGUE_SYNC=on to enable)");
+        tracing::info!("catalogue sync disabled (CATALOGUE_SYNC=off pins MangaDex off)");
     }
 
     // Recurring auto-enrichment drainer (X1) — opt-in. Keeps newly-ingested
     // MangaDex-anchored works self-enriching (S2 metadata + F2 covers) in small
-    // polite batches; shares the MangaDex rate limiter.
+    // polite batches; shares the MangaDex rate limiter. `METADATA_BACKFILL=on` is an
+    // ADDITIONAL opt-in on top of the MangaDex switch: each tick still checks it.
     if cfg.metadata_backfill_enabled {
         graphql::spawn_metadata_backfill(
             state.clone(),
@@ -1772,6 +1829,8 @@ async fn main() -> anyhow::Result<()> {
     // Automatic cover-cache drainer — populates the DB cover cache (`/covers/…`,
     // off the CF image Worker) with NO manual trigger. Defaults ON; hits MangaDex
     // under the shared limiter, so keep it to one replica (COVER_CACHE=off elsewhere).
+    // With MangaDex off it keeps running for Suwayomi covers and skips only its
+    // MangaDex pass (see `cover::spawn`).
     if cfg.cover_cache_enabled {
         cover::spawn(
             pool.clone(),
@@ -1847,7 +1906,7 @@ async fn main() -> anyhow::Result<()> {
         // (admin `materializeCatalogueCovers`).
         .route("/covers/{file}", get(serve_cover))
         // Public serve of extension icons from the vendored snapshot baked into
-        // this image, with a lazy Keiyoushi backfill for extensions added since.
+        // this image, with a lazy fetch from each extension's own repo for the rest.
         // Hosted here because Keiyoushi's own icon directory was emptied in their
         // `index.pb` migration (see the `ext_icon` module).
         .route("/ext-icons/{file}", get(serve_ext_icon))
@@ -1873,6 +1932,19 @@ async fn main() -> anyhow::Result<()> {
                 .layer(DefaultBodyLimit::max(media::MAX_UPLOAD_BYTES + 1024 * 1024)),
         )
         .route("/comment-media/{file}", get(serve_comment_media));
+    // Self-host: the server's own image proxy (`img_proxy`), the stand-in for the
+    // `img.komiq.cc` Worker. Mounted only where it is wanted — a server that serves
+    // the web apps (`KOMIKA_WEB_DIR`) or one told to (`KOMIKA_IMG_PROXY=on`) — so the
+    // hosted API, which has the Worker, exposes no new route.
+    let app = if cfg.img_proxy_enabled {
+        tracing::info!("image proxy enabled at /img");
+        app.route(
+            "/img",
+            get(img_proxy::serve).with_state(Arc::new(img_proxy::ImgProxy::new(mangadex.clone()))),
+        )
+    } else {
+        app
+    };
     // Self-host: the built reader at `/` and admin at `/admin`, below every API
     // route above. Unset (the default, and the hosted deployment) serves nothing.
     let app = match &cfg.web_dir {
@@ -2031,6 +2103,90 @@ async fn shutdown_signal(shutdown_tx: tokio::sync::watch::Sender<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lazy `/covers/` fetch follows the MangaDex switch: off, a miss is a plain
+    /// uncacheable 404 — no fetch, and no redirect that would move the MangaDex request
+    /// into the browser; on, the cover is fetched, stored and served.
+    #[tokio::test]
+    async fn lazy_cover_fetch_follows_the_mangadex_switch() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        use std::sync::atomic::Ordering;
+        let main = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&main).await.unwrap();
+        let covers = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        for ddl in [
+            "CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL)",
+            "CREATE TABLE cover_variant (asset_key TEXT NOT NULL, width INTEGER NOT NULL, webp BLOB NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (asset_key, width))",
+        ] {
+            sqlx::query(ddl).execute(&covers).await.unwrap();
+        }
+        sqlx::query("INSERT INTO work (id, cover_file_name, created_at, updated_at) VALUES ('w1', 'c.jpg', 't', 't')")
+            .execute(&main).await.unwrap();
+        sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_key, created_at) VALUES ('ss1', 'w1', 'mangadex', 'md-1', 't')")
+            .execute(&main).await.unwrap();
+        // Stands in for the MangaDex cover CDN.
+        let cdn = crate::suwayomi::testsrv::spawn(
+            crate::suwayomi::testsrv::jpeg(300, 450),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let mangadex = Arc::new(
+            mangadex::MangaDexClient::new("lazy-cover-test", 50.0, 600.0)
+                .with_bases(&cdn.base_url, &cdn.base_url),
+        );
+        let app = Arc::new(AppState {
+            pool: main.clone(),
+            cover_pool: covers.clone(),
+            suwayomi: SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
+            mangadex: mangadex.clone(),
+            admin_users: vec![],
+            scan_health: std::sync::Mutex::new(ScanHealth::default()),
+            auth_limiter: RateLimiter::new(100, 60),
+            password_work: Arc::new(tokio::sync::Semaphore::new(4)),
+            federated_limiter: RateLimiter::new(100, 60),
+            session_ttl_secs: 3600,
+            series_inflight: KeyedLocks::default(),
+            chapters_inflight: KeyedLocks::default(),
+            cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            catalogue_cover_phash: false,
+            ext_icons_dir: std::path::PathBuf::new(),
+            setup_code: instance::SetupCode::default(),
+        });
+        let get = || {
+            serve_cover(
+                State(app.clone()),
+                State(CoverDb(covers.clone())),
+                UrlPath("w1.webp".to_string()),
+                RawQuery(None),
+            )
+        };
+
+        let res = get().await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            cdn.hits.load(Ordering::SeqCst),
+            0,
+            "no MangaDex fetch while off"
+        );
+
+        mangadex.set_enabled(true);
+        let res = get().await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(cdn.hits.load(Ordering::SeqCst), 1);
+        // Stored: served from our origin from now on, whatever the switch says.
+        mangadex.set_enabled(false);
+        assert_eq!(get().await.status(), StatusCode::OK);
+        assert_eq!(cdn.hits.load(Ordering::SeqCst), 1);
+    }
 
     fn hdrs(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();

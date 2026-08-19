@@ -2,6 +2,8 @@ pub mod types;
 
 #[cfg(test)]
 mod cache_refresh_tests;
+#[cfg(test)]
+mod sources_tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -835,6 +837,26 @@ async fn require_admin(ctx: &Context<'_>) -> Result<User> {
 fn gql_err(e: impl std::fmt::Display) -> Error {
     tracing::error!(error = %e, "internal error");
     Error::new("Internal error")
+}
+
+/// What the admin console shows when the source engine cannot be reached.
+pub(crate) const ENGINE_UNREACHABLE: &str = "The source engine is not reachable.";
+
+/// Map a failed engine call for the extension/repo admin surface. An engine that is
+/// down or still starting (a fresh self-host before Suwayomi is up) is a normal state
+/// there, not a server fault, so it gets a plain sentence the console can show
+/// calmly instead of the generic "Internal error". Anything else stays internal.
+fn engine_err(e: anyhow::Error) -> Error {
+    let unreachable = e.chain().any(|c| {
+        c.downcast_ref::<reqwest::Error>()
+            .is_some_and(|r| r.is_connect() || r.is_timeout())
+    }) || e.to_string().starts_with("Suwayomi error 5");
+    if unreachable {
+        tracing::warn!(error = %e, "source engine unreachable");
+        Error::new(ENGINE_UNREACHABLE)
+    } else {
+        gql_err(e)
+    }
 }
 
 /// Parse a `chapter.number` for ordering. `None` when the label isn't a number.
@@ -5074,8 +5096,12 @@ impl QueryRoot {
     /// (CATALOGUE.md §5). `chapterId` is the MangaDex chapter uuid. The URLs are
     /// `*.mangadex.network` hosts the client resolves through the Worker proxy (never
     /// hotlinked). NSFW-gated by the owning work when the chapter is in the mirror.
+    ///
+    /// Refused with a clear message while MangaDex is switched off: these URLs ARE
+    /// MangaDex traffic (the reader loads every page from `*.mangadex.network`).
     async fn canonical_pages(&self, ctx: &Context<'_>, chapter_id: ID) -> Result<Vec<Page>> {
         let st = state(ctx);
+        require_mangadex(st)?;
         // Gate on the owning work's NSFW flag when we know the chapter; an unknown
         // chapter (not in the mirror) is allowed through to the at-home fetch, which
         // fails cleanly if the id is bogus.
@@ -6750,6 +6776,20 @@ impl QueryRoot {
         })
     }
 
+    /// Admin: the MangaDex switch and whether the server's environment pins it.
+    async fn mangadex_setting(&self, ctx: &Context<'_>) -> Result<MangadexSetting> {
+        require_admin(ctx).await?;
+        use crate::instance as inst;
+        let st = state(ctx);
+        let r = inst::resolve(&st.pool, &inst::MANGADEX_ENABLED).await;
+        Ok(MangadexSetting {
+            // The client's switch is what every request obeys; it is set from this same
+            // setting at boot and by `setMangadexEnabled`, so the two agree.
+            enabled: st.mangadex.is_enabled(),
+            pinned: r.source == inst::Source::Env,
+        })
+    }
+
     async fn session(&self, ctx: &Context<'_>) -> Result<Option<Session>> {
         let Some(tok) = token(ctx) else {
             return Ok(None);
@@ -6954,6 +6994,19 @@ impl QueryRoot {
         Ok(n as i32)
     }
 
+    /// Admin: the extension repos configured on the engine. The engine is the only
+    /// place repos live (we keep no copy), so this asks it every time.
+    async fn extension_repos(&self, ctx: &Context<'_>) -> Result<Vec<ExtensionRepo>> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let stores = st
+            .suwayomi
+            .list_extension_stores()
+            .await
+            .map_err(engine_err)?;
+        Ok(stores.into_iter().map(ExtensionRepo::from).collect())
+    }
+
     /// Admin "Sources & Extensions" console (EXT-1): every Keiyoushi/Mihon
     /// extension known to the Suwayomi engine, installed or not. No store is
     /// seeded: the list stays empty until the operator adds one with
@@ -6979,15 +7032,20 @@ impl QueryRoot {
         let st = state(ctx);
         // With no store there is no index to fetch, so skip the refresh rather
         // than surface an engine error on a fresh install.
-        let has_store = st.suwayomi.extension_store_count().await.map_err(gql_err)? > 0;
+        let has_store = st
+            .suwayomi
+            .extension_store_count()
+            .await
+            .map_err(engine_err)?
+            > 0;
         if refresh && has_store {
-            st.suwayomi.refresh_extensions().await.map_err(gql_err)?;
+            st.suwayomi.refresh_extensions().await.map_err(engine_err)?;
         }
-        let mut list = st.suwayomi.list_extensions().await.map_err(gql_err)?;
+        let mut list = st.suwayomi.list_extensions().await.map_err(engine_err)?;
         // Fresh engine: the store may be registered but its index never fetched.
         if list.is_empty() && !refresh && has_store {
-            st.suwayomi.refresh_extensions().await.map_err(gql_err)?;
-            list = st.suwayomi.list_extensions().await.map_err(gql_err)?;
+            st.suwayomi.refresh_extensions().await.map_err(engine_err)?;
+            list = st.suwayomi.list_extensions().await.map_err(engine_err)?;
         }
         // Admin management view: an admin curating the extension store must always be
         // able to SEE NSFW extensions (incl. MangaDex) to manage them, independent of
@@ -7352,55 +7410,25 @@ impl QueryRoot {
     }
 }
 
-/// The `repo` branch base every Keiyoushi index URL canonicalizes to, once
-/// `github.com/…/raw/…` is rewritten to the direct raw host.
-const KEIYOUSHI_REPO_BASE: &str = "https://raw.githubusercontent.com/keiyoushi/extensions/repo";
-
-/// Our own icon URL for a Keiyoushi extension: `/ext-icons/{pkgName}.png`,
-/// served by `serve_ext_icon` from the snapshot vendored in `assets/ext-icons/`.
+/// Our own icon URL for an extension from a known repo: `/ext-icons/{pkgName}.png`,
+/// served by `serve_ext_icon` — from the vendored snapshot when it has the icon, else
+/// fetched once from the extension's OWN repo and cached (`ext_icon`).
 ///
-/// We host these rather than link Keiyoushi's because Keiyoushi emptied the
-/// `icon/` directory on their `repo` branch during the `index.pb` migration —
-/// only two stub entries remain, so the `repo/icon/{pkgName}.png` URL this used
-/// to emit now 404s for every real extension. Pointing at their replacement
-/// layout would work today but leaves the product one upstream reshuffle away
-/// from losing every icon again.
+/// Every repo goes through our origin, not just Keiyoushi: the browser then never
+/// depends on a third-party host being reachable, CSP-allowed or still laid out the
+/// way it was (Keiyoushi emptying its `icon/` directory is how the product once lost
+/// every icon at once), and an edge cache in front of the server holds them.
 ///
 /// Relative on purpose: the caller absolutizes it against the public image base
 /// (`SUWAYOMI_PUBLIC_URL`), which is the browser-reachable origin this server is
 /// behind — the same treatment Suwayomi cover/page URLs get.
 ///
-/// `None` for a package that isn't a Keiyoushi one (e.g. a locally-built apk):
-/// the snapshot won't contain it, so the caller falls back to the engine icon
-/// endpoint, which CAN serve it by unpacking the installed apk.
-fn keiyoushi_icon_url(pkg_name: &str) -> Option<String> {
-    crate::ext_icon::keiyoushi_source_url(pkg_name)?;
-    Some(format!("/ext-icons/{pkg_name}.png"))
-}
-
-/// Derive a browser-reachable, store-hosted icon URL for an extension from its
-/// repo index URL. GitHub `/raw/` paths are rewritten to the direct
-/// `raw.githubusercontent.com` host to skip the 302 redirect. Keiyoushi — the
-/// default store — is served from our own origin (see `keiyoushi_icon_url`);
-/// other Mihon-format repos keep hosting icons next to their index at
-/// `icon/{pkgName}.png`. `None` when the repo URL doesn't end in an index file
-/// (unknown layout — caller falls back to the engine icon endpoint).
+/// `None` when the repo URL is not a recognisable index (`ext_icon::repo_base`) or the
+/// package name could not be served: the caller then falls back to the engine icon
+/// endpoint, which CAN serve an installed apk's icon by unpacking it.
 fn store_icon_url(repo: &str, pkg_name: &str) -> Option<String> {
-    let (base, index) = repo.rsplit_once('/')?;
-    if !index.starts_with("index.") {
-        return None;
-    }
-    let base = match base.strip_prefix("https://github.com/") {
-        Some(rest) if rest.contains("/raw/") => format!(
-            "https://raw.githubusercontent.com/{}",
-            rest.replacen("/raw/", "/", 1)
-        ),
-        _ => base.to_string(),
-    };
-    if base == KEIYOUSHI_REPO_BASE {
-        return keiyoushi_icon_url(pkg_name);
-    }
-    Some(format!("{base}/icon/{pkg_name}.png"))
+    crate::ext_icon::repo_base(repo)?;
+    crate::ext_icon::is_valid_pkg(pkg_name).then(|| format!("/ext-icons/{pkg_name}.png"))
 }
 
 /// Map a Suwayomi extension row onto the GraphQL `ExtensionInfo`. The icon URL
@@ -10585,6 +10613,43 @@ impl MutationRoot {
             .as_bool())
     }
 
+    /// Admin: turn MangaDex on or off (`mangadex_enabled`). Refused when the server
+    /// pins it with `CATALOGUE_SYNC`, since env always wins. The change is stored AND
+    /// applied to the live client, so the background loops start or park within a
+    /// moment, without a restart. Returns the new effective value.
+    async fn set_mangadex_enabled(&self, ctx: &Context<'_>, enabled: bool) -> Result<bool> {
+        let admin = require_admin(ctx).await?;
+        use crate::instance as inst;
+        let st = state(ctx);
+        if inst::resolve(&st.pool, &inst::MANGADEX_ENABLED)
+            .await
+            .source
+            == inst::Source::Env
+        {
+            return Err(Error::new(
+                "MangaDex is set by CATALOGUE_SYNC on this server and cannot be changed here.",
+            ));
+        }
+        inst::store(
+            &st.pool,
+            &inst::MANGADEX_ENABLED,
+            if enabled { "true" } else { "false" },
+        )
+        .await
+        .map_err(gql_err)?;
+        // Store first, then flip: a failed write leaves the live switch where it was,
+        // so memory never claims a value the next boot would not restore.
+        if st.mangadex.set_enabled(enabled) {
+            tracing::info!(
+                enabled,
+                by = %admin.username,
+                "mangadex: switched {} by an admin",
+                if enabled { "on" } else { "off" }
+            );
+        }
+        Ok(st.mangadex.is_enabled())
+    }
+
     /// Admin: create an account directly (works with sign-up closed). The user is
     /// asked to pick their own password at first sign-in unless
     /// `mustChangePassword: false`. Reserved admin usernames stay reserved.
@@ -10951,9 +11016,33 @@ impl MutationRoot {
         st.suwayomi
             .add_extension_store(url)
             .await
-            .map_err(gql_err)?;
-        let count = st.suwayomi.refresh_extensions().await.map_err(gql_err)?;
+            .map_err(engine_err)?;
+        let count = st.suwayomi.refresh_extensions().await.map_err(engine_err)?;
         Ok(count as i32)
+    }
+
+    /// Admin: remove an extension repo from the engine (`removeExtensionStore`).
+    /// `indexUrl` must be one `extensionRepos` lists — the engine canonicalizes URLs on
+    /// add, so the console always sends the listed form back. Refused with "No such
+    /// repo." otherwise, rather than passing a guess through to the engine.
+    async fn remove_extension_repo(&self, ctx: &Context<'_>, index_url: String) -> Result<bool> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let url = index_url.trim();
+        let known = st
+            .suwayomi
+            .list_extension_stores()
+            .await
+            .map_err(engine_err)?;
+        if !known.iter().any(|s| s.index_url == url) {
+            return Err(Error::new("No such repo."));
+        }
+        st.suwayomi
+            .remove_extension_store(url)
+            .await
+            .map_err(engine_err)?;
+        tracing::info!(index_url = url, "extension repo removed");
+        Ok(true)
     }
 
     /// Admin: install a store extension onto the Suwayomi engine. An NSFW
@@ -11067,6 +11156,7 @@ impl MutationRoot {
     ) -> Result<i32> {
         require_admin(ctx).await?;
         let st = state(ctx);
+        require_mangadex(st)?;
         let limit = limit.clamp(1, 500) as i64;
         let ids = works_needing_enrichment(&st.pool, limit).await?;
         enrich_works(st, &ids).await
@@ -11232,6 +11322,7 @@ impl MutationRoot {
     async fn resync_catalogue(&self, ctx: &Context<'_>) -> Result<bool> {
         require_admin(ctx).await?;
         let st = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
+        require_mangadex(&st)?;
         if !crate::mangadex::spawn_resync(
             st.pool.clone(),
             st.mangadex.clone(),
@@ -11693,6 +11784,13 @@ async fn metadata_backfill_loop(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                // The MangaDex switch, read every tick: `METADATA_BACKFILL=on` only says this
+                // loop may run; the switch says whether MangaDex may be asked at all. A tick
+                // is minutes apart, so a polled check is as good as a parked wait here.
+                if !state.mangadex.is_enabled() {
+                    tracing::debug!("enrich tick: MangaDex is off; skipping");
+                    continue;
+                }
                 let ids = match works_needing_enrichment(&state.pool, batch).await {
                     Ok(ids) => ids,
                     Err(e) => { tracing::warn!(error = %e.message, "enrich tick: selection failed"); continue; }
@@ -11713,6 +11811,18 @@ async fn metadata_backfill_loop(
                 }
             }
         }
+    }
+}
+
+/// Refuse a MangaDex-only operation while the switch is off, with the one sentence the
+/// console shows for it. The client would refuse the requests anyway (its gate is the
+/// backstop); checking first turns "a background job that silently did nothing" or a
+/// raw client error into an answer the admin can act on.
+fn require_mangadex(st: &AppState) -> Result<()> {
+    if st.mangadex.is_enabled() {
+        Ok(())
+    } else {
+        Err(Error::new(crate::mangadex::MANGADEX_OFF_MESSAGE))
     }
 }
 
@@ -24384,10 +24494,9 @@ mod tests {
     }
 
     #[test]
-    fn store_icon_url_derives_store_hosted_icons() {
-        // Keiyoushi's canonicalized repo URL → OUR origin-relative icon path
-        // (their `repo/icon/` dir is now empty; we serve the vendored snapshot).
-        // The caller absolutizes against the public image base.
+    fn store_icon_url_serves_every_repo_from_our_origin() {
+        // Keiyoushi's canonicalized repo URL → OUR origin-relative icon path (served
+        // from the vendored snapshot). The caller absolutizes against the public base.
         assert_eq!(
             store_icon_url(
                 "https://github.com/keiyoushi/extensions/raw/repo/index.pb",
@@ -24396,7 +24505,7 @@ mod tests {
             .as_deref(),
             Some("/ext-icons/eu.kanade.tachiyomi.extension.en.foo.png")
         );
-        // The pre-canonicalization min.json form resolves to the same base.
+        // The pre-canonicalization min.json form resolves the same way.
         assert_eq!(
             store_icon_url(
                 "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json",
@@ -24405,28 +24514,20 @@ mod tests {
             .as_deref(),
             Some("/ext-icons/eu.kanade.tachiyomi.extension.all.mangadex.png")
         );
-        // A Keiyoushi package that doesn't split into `{lang}.{dir}` → None, so the
-        // caller falls back to the engine icon rather than emitting a bogus path.
-        assert_eq!(
-            store_icon_url(
-                "https://github.com/keiyoushi/extensions/raw/repo/index.pb",
-                "com.example.custom"
-            ),
-            None
-        );
-        assert_eq!(keiyoushi_icon_url("eu.kanade.tachiyomi.extension.en"), None);
-        assert_eq!(
-            keiyoushi_icon_url("eu.kanade.tachiyomi.extension.en.foo.bar"),
-            None
-        );
-        // A non-Keiyoushi Mihon-format repo keeps the icons-next-to-index layout.
+        // Any other Mihon-format repo: also our origin now — `serve_ext_icon` fetches
+        // the icon from that repo's own `icon/` directory and caches it.
         assert_eq!(
             store_icon_url("https://example.com/repo/index.min.json", "pkg.x").as_deref(),
-            Some("https://example.com/repo/icon/pkg.x.png")
+            Some("/ext-icons/pkg.x.png")
         );
         // A repo URL that doesn't end in an index file → None (fall back to engine).
         assert_eq!(store_icon_url("https://example.com/store", "pkg.x"), None);
         assert_eq!(store_icon_url("", "pkg.x"), None);
+        // A package name that could never be served → None, never a bogus path.
+        assert_eq!(
+            store_icon_url("https://example.com/repo/index.min.json", "../x"),
+            None
+        );
     }
 
     #[tokio::test]

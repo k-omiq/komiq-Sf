@@ -254,6 +254,19 @@ pub struct SuwayomiManga {
     pub chapters: Option<ChapterCount>,
 }
 
+/// One configured extension store (repo), as `extensionStores` reports it.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionStore {
+    /// The store's canonical index URL — its identity in the engine, and the value an
+    /// extension's `repo` carries.
+    pub index_url: String,
+    pub name: String,
+    /// Short label the engine derives for the store (Keiyoushi's is `KEI`).
+    #[serde(default)]
+    pub badge_label: String,
+}
+
 /// One installed extension as reported by Suwayomi, flattened to the coordinates a
 /// native device needs to install it (§2.1). One extension can back several sources
 /// (e.g. an "all" extension), so `source_ids` carries every source it provides.
@@ -1254,6 +1267,35 @@ impl SuwayomiClient {
         }
         let d: Data = self.gql(doc, json!({})).await?;
         Ok(d.extension_stores.total_count)
+    }
+
+    /// Every configured extension store (repo), in the engine's order. The engine
+    /// keeps the list itself (`extensionStores`, keyed by `indexUrl`); we hold no copy,
+    /// so this is the one source of truth for the admin's repo list.
+    pub async fn list_extension_stores(&self) -> Result<Vec<ExtensionStore>> {
+        let doc = "query { extensionStores { nodes { indexUrl name badgeLabel } } }";
+        #[derive(Deserialize)]
+        struct Nodes {
+            nodes: Vec<ExtensionStore>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Data {
+            extension_stores: Nodes,
+        }
+        let d: Data = self.gql(doc, json!({})).await?;
+        Ok(d.extension_stores.nodes)
+    }
+
+    /// Remove an extension store by its index URL (`removeExtensionStore`, GQL-SCHEMA-
+    /// FINDINGS §B1). The URL must be the store's own `indexUrl` as `extensionStores`
+    /// reports it: the engine canonicalizes on add (Keiyoushi's `index.min.json`
+    /// becomes `…/raw/repo/index.pb`), so the typed-in form may not match.
+    pub async fn remove_extension_store(&self, index_url: &str) -> Result<()> {
+        let doc = "mutation R($url: String!) { \
+            removeExtensionStore(input: { indexUrl: $url }) { extensionStore { indexUrl } } }";
+        let _: Value = self.gql(doc, json!({ "url": index_url })).await?;
+        Ok(())
     }
 
     /// Register an extension store (repo) by its index URL. Idempotent upstream:
