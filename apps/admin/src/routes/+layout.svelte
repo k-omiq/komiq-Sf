@@ -15,6 +15,7 @@
 	import { refreshSourcesDown, sourceHealth } from '$lib/source-health.svelte';
 	import Brand from '$lib/components/Brand.svelte';
 	import Button from '$lib/components/Button.svelte';
+	import ChoosePassword from '$lib/components/ChoosePassword.svelte';
 	import CommandPalette from '$lib/components/CommandPalette.svelte';
 	import ConfirmHost from '$lib/components/ConfirmHost.svelte';
 	import Icon, { type IconName } from '$lib/components/Icon.svelte';
@@ -43,6 +44,9 @@
 	});
 
 	const path = $derived(routePath(page.url.pathname));
+	// An account with a password someone else chose (new or reset) picks its own
+	// before anything else in the console opens.
+	const mustChangePassword = $derived(!!auth.user?.mustChangePassword);
 	const onLogin = $derived(path === '/login');
 	// First-run screens: full page, no sidebar, reachable signed out.
 	const onSetup = $derived(path === '/setup' || path === '/start');
@@ -149,7 +153,7 @@
 
 	// The sidebar alarm: checked at sign-in and then every few minutes.
 	$effect(() => {
-		if (!auth.user) return;
+		if (!auth.user || mustChangePassword) return;
 		void refreshSourcesDown();
 		const timer = setInterval(() => void refreshSourcesDown(), 5 * 60_000);
 		return () => clearInterval(timer);
@@ -179,7 +183,7 @@
 
 	function onWindowKeydown(e: KeyboardEvent): void {
 		if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'k') {
-			if (!auth.user || onLogin) return;
+			if (!auth.user || onLogin || mustChangePassword) return;
 			e.preventDefault();
 			// Never over another dialog: jumping away from an open confirmation or an
 			// unsaved drawer would skip the question it is asking.
@@ -233,6 +237,10 @@
 	{#if onSetup}
 		<main id="main-content" class="admin-main full" tabindex="-1">
 			{@render children()}
+		</main>
+	{:else if auth.user && mustChangePassword}
+		<main id="main-content" class="admin-main full" tabindex="-1">
+			<ChoosePassword />
 		</main>
 	{:else if auth.user && !onLogin}
 		<div class="shell">

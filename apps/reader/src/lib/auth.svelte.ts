@@ -23,6 +23,18 @@ export const auth = $state<{ user: User | null; ready: boolean }>({
 	ready: false,
 });
 
+/**
+ * The temporary password this tab just signed in with, kept in memory only (never
+ * saved) while the server asks for a new one, so the "Choose a new password" screen
+ * does not ask for it a second time. Gone on reload; the screen then asks.
+ */
+let temporaryPassword: string | null = null;
+
+/** Whether the forced password screen still needs the current password typed. */
+export function needsCurrentPassword(): boolean {
+	return temporaryPassword === null;
+}
+
 function readToken(): string | null {
 	try {
 		return localStorage.getItem(TOKEN_KEY);
@@ -98,9 +110,24 @@ export async function revalidateSession(): Promise<User | null> {
 export async function login(username: string, password: string): Promise<void> {
 	const session = await backend.login(username, password);
 	persist(session.token);
+	temporaryPassword = session.user.mustChangePassword ? password : null;
 	auth.user = session.user;
 	// Bind the offline write-queue to this identity (C1) before any write can enqueue.
 	backend.setCurrentUser?.(session.user.id);
+}
+
+/**
+ * Replace the signed-in user's password (the forced change after an admin created
+ * or reset the account). `current` may be omitted right after sign-in: the password
+ * just typed is used. Clears `mustChangePassword` on success.
+ */
+export async function changeOwnPassword(newPassword: string, current?: string): Promise<void> {
+	if (!backend.changePassword) throw new Error('This server cannot change passwords.');
+	const currentPassword = current ?? temporaryPassword;
+	if (currentPassword === null) throw new Error('Enter your current password.');
+	const user = await backend.changePassword(currentPassword, newPassword);
+	temporaryPassword = null;
+	if (auth.user) auth.user = { ...auth.user, ...user, mustChangePassword: false };
 }
 
 export async function register(input: RegisterInput): Promise<void> {
@@ -124,6 +151,7 @@ export async function logout(): Promise<{ revoked: boolean }> {
 	// dropped (C1), so a queued write can never replay under the next account.
 	backend.setCurrentUser?.(null);
 	persist(null);
+	temporaryPassword = null;
 	auth.user = null;
 	return { revoked };
 }

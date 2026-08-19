@@ -83,6 +83,11 @@ export const OPTIONAL_SERIES_FIELDS = [
 	// load-bearing elsewhere (`UpdateFeedRow.releasedAt`, `Chapter.externalUrl`).
 	'copyReleasedAt',
 	'copyExternalUrl',
+	// `SessionUser.mustChangePassword` (self-host accounts): set on an account an admin
+	// created or reset, so the apps can ask for a new password at first sign-in. Optional
+	// so the shared session fragment keeps working against a server that predates it;
+	// stripped, the flag reads as absent and nobody is asked, which is the old behaviour.
+	'mustChangePassword',
 ] as const;
 
 /**
@@ -698,6 +703,7 @@ const SESSION_USER_FIELDS = /* GraphQL */ `
 		isAdmin
 		showNsfw
 		joinedAt
+		mustChangePassword
 	}
 `;
 
@@ -745,8 +751,6 @@ export const LOGOUT = /* GraphQL */ `
 `;
 
 // ---- self-host setup + passwords ---------------------------------------------
-// `mustChangePassword` is selected only here, not in SessionUserFields, so the
-// shared session operations keep working against servers that predate it.
 
 export const INSTANCE = /* GraphQL */ `
 	query Instance {
@@ -770,9 +774,6 @@ export const CREATE_OWNER = /* GraphQL */ `
 	) {
 		createOwner(setupCode: $setupCode, username: $username, email: $email, password: $password) {
 			...SessionFields
-			user {
-				mustChangePassword
-			}
 		}
 	}
 `;
@@ -782,7 +783,6 @@ export const CHANGE_PASSWORD = /* GraphQL */ `
 	mutation ChangePassword($currentPassword: String!, $newPassword: String!) {
 		changePassword(currentPassword: $currentPassword, newPassword: $newPassword) {
 			...SessionUserFields
-			mustChangePassword
 		}
 	}
 `;

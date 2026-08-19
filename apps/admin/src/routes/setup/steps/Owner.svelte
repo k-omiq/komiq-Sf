@@ -3,6 +3,7 @@
 	import { forgetServer, target } from '$lib/config';
 	import { createOwner } from '$lib/data';
 	import { takeSetupCode } from '$lib/desktop';
+	import { instance } from '$lib/instance.svelte';
 	import { href } from '$lib/paths';
 	import Button from '$lib/components/Button.svelte';
 	import Icon from '$lib/components/Icon.svelte';
@@ -52,6 +53,9 @@
 				password,
 			});
 			adoptSession(session);
+			// The server has its owner now. The layout's route guard reads this cached
+			// answer, so without it leaving the wizard would bounce straight back here.
+			if (instance.info) instance.info = { ...instance.info, setupRequired: false };
 			password = '';
 			confirm = '';
 			code = '';
@@ -83,9 +87,11 @@
 	{aside}
 >
 	<form id="owner" class="ob-form" onsubmit={submit} novalidate aria-busy={busy}>
-		<label class="k-field">
-			<span class="k-label">Username</span>
+		<div class="k-field">
+			<label class="k-label" for="owner-username">Username</label>
 			<input
+				id="owner-username"
+				aria-describedby="owner-username-msg"
 				class="k-input ob-input"
 				type="text"
 				autocomplete="username"
@@ -94,51 +100,62 @@
 				bind:value={username}
 				aria-invalid={errors.username ? true : undefined}
 			/>
-			{#if errors.username}<span class="k-error">{errors.username}</span>{/if}
-		</label>
-		<label class="k-field">
-			<span class="k-label">Email</span>
+			{#if errors.username}<span id="owner-username-msg" class="k-error">{errors.username}</span
+				>{/if}
+		</div>
+		<div class="k-field">
+			<label class="k-label" for="owner-email">Email</label>
 			<input
+				id="owner-email"
+				aria-describedby="owner-email-msg"
 				class="k-input ob-input"
 				type="email"
 				autocomplete="email"
 				bind:value={email}
 				aria-invalid={errors.email ? true : undefined}
 			/>
-			{#if errors.email}<span class="k-error">{errors.email}</span>{/if}
-		</label>
+			{#if errors.email}<span id="owner-email-msg" class="k-error">{errors.email}</span>{/if}
+		</div>
 		<div class="ob-pair">
-			<label class="k-field">
-				<span class="k-label">Password</span>
+			<div class="k-field">
+				<label class="k-label" for="owner-password">Password</label>
 				<input
+					id="owner-password"
+					aria-describedby="owner-password-msg"
 					class="k-input ob-input"
 					type="password"
 					autocomplete="new-password"
 					bind:value={password}
 					aria-invalid={errors.password ? true : undefined}
 				/>
-				{#if errors.password}<span class="k-error">{errors.password}</span>{/if}
-			</label>
-			<label class="k-field">
-				<span class="k-label">Confirm</span>
+				{#if errors.password}<span id="owner-password-msg" class="k-error">{errors.password}</span
+					>{/if}
+			</div>
+			<div class="k-field">
+				<label class="k-label" for="owner-confirm">Confirm</label>
 				<input
+					id="owner-confirm"
+					aria-describedby="owner-confirm-msg"
 					class="k-input ob-input"
 					type="password"
 					autocomplete="new-password"
 					bind:value={confirm}
 					aria-invalid={errors.confirm ? true : undefined}
 				/>
-				{#if errors.confirm}<span class="k-error">{errors.confirm}</span>{/if}
-			</label>
+				{#if errors.confirm}<span id="owner-confirm-msg" class="k-error">{errors.confirm}</span
+					>{/if}
+			</div>
 		</div>
 		{#if codeFromApp && !errors.code}
 			<p class="k-hint ob-hint-row">
 				<Icon name="check" size={14} />Setup code filled in by the app.
 			</p>
 		{:else}
-			<label class="k-field">
-				<span class="k-label">Setup code</span>
+			<div class="k-field">
+				<label class="k-label" for="owner-code">Setup code</label>
 				<input
+					id="owner-code"
+					aria-describedby="owner-code-msg"
 					class="k-input ob-input ob-mono"
 					type="text"
 					autocomplete="one-time-code"
@@ -149,13 +166,13 @@
 					aria-invalid={errors.code ? true : undefined}
 				/>
 				{#if errors.code}
-					<span class="k-error">{errors.code}</span>
+					<span id="owner-code-msg" class="k-error">{errors.code}</span>
 				{:else}
-					<span class="k-hint"
+					<span id="owner-code-msg" class="k-hint"
 						>Printed in the server log when it started. It proves you run this server.</span
 					>
 				{/if}
-			</label>
+			</div>
 		{/if}
 		{#if formError}<p class="k-error" role="alert">{formError}</p>{/if}
 	</form>
