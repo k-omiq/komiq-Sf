@@ -17,16 +17,22 @@ function adminBasePath(): '' | `/${string}` {
  * (`/start`).
  */
 function adminTarget(): 'hosted' | 'embedded' | 'desktop' {
-	const raw = (process.env.ADMIN_TARGET ?? 'hosted').trim();
+	// The Tauri CLI sets TAURI_ENV_PLATFORM for the desktop shell's dev/build hooks
+	// (src-tauri/tauri.conf.json), so those build `desktop` without a shell-specific
+	// env syntax. Every other build keeps the `hosted` default.
+	const fallback = process.env.TAURI_ENV_PLATFORM ? 'desktop' : 'hosted';
+	const raw = (process.env.ADMIN_TARGET || fallback).trim();
 	if (raw !== 'hosted' && raw !== 'embedded' && raw !== 'desktop') {
 		throw new Error(`ADMIN_TARGET must be hosted, embedded or desktop: ${raw}`);
 	}
 	return raw;
 }
 
+const target = adminTarget();
+
 export default defineConfig({
 	define: {
-		__ADMIN_TARGET__: JSON.stringify(adminTarget()),
+		__ADMIN_TARGET__: JSON.stringify(target),
 	},
 	plugins: [
 		sveltekit({
@@ -49,7 +55,11 @@ export default defineConfig({
 					'script-src': ['self'],
 					'style-src': ['self', 'unsafe-inline'],
 					'img-src': ['self', 'https:', 'http:', 'data:'],
-					'connect-src': ['self', 'https:', 'http:'],
+					// The desktop app also talks to its native side over Tauri's IPC.
+					'connect-src':
+						target === 'desktop'
+							? ['self', 'https:', 'http:', 'ipc:', 'http://ipc.localhost']
+							: ['self', 'https:', 'http:'],
 					'font-src': ['self', 'data:'],
 					'object-src': ['none'],
 					'base-uri': ['none'],

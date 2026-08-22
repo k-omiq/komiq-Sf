@@ -2,24 +2,26 @@
 	import { onDestroy } from 'svelte';
 	import { href } from '$lib/paths';
 	import { goto } from '$app/navigation';
-	import { saveServer, target } from '$lib/config';
-	import { desktop, handOffSetupCode, type LocalStage } from '$lib/desktop';
+	import { runsLocalServer, saveLocalServer, saveServer, target } from '$lib/config';
+	import { bridgeError, desktop, handOffSetupCode, type LocalStage } from '$lib/desktop';
 	import Button from '$lib/components/Button.svelte';
 	import Choice from '$lib/components/Choice.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import Onboarding from '$lib/components/Onboarding.svelte';
 
 	// Desktop first run: run the server here, or point the app at one that already
-	// runs. Either way the chosen address is saved and the app reloads into setup
-	// (a fresh server) or sign-in.
+	// runs. Either way the choice is saved and the app reloads into setup (a fresh
+	// server) or sign-in. An app that runs its own server comes back here on every
+	// launch and starts it straight away.
 	// Only the desktop app chooses its server; other builds talk to a fixed one.
 	if (target !== 'desktop') void goto(href('/'), { replaceState: true });
 
 	type View = 'choose' | 'local' | 'connect';
 	let view = $state<View>('choose');
 
-	function finish(origin: string, setupCode?: string | null): void {
-		saveServer(origin);
+	function finish(origin: string, local: boolean, setupCode?: string | null): void {
+		if (local) saveLocalServer(origin);
+		else saveServer(origin);
 		handOffSetupCode(setupCode);
 		// The backend is built once per load; reload so it targets the new server.
 		location.assign(href('/'));
@@ -55,9 +57,11 @@
 			await desktop.start();
 			void tick();
 		} catch (err) {
-			localError = err instanceof Error ? err.message : 'Could not start.';
+			localError = bridgeError(err, 'Could not start.');
 		}
 	}
+
+	if (desktop.available && runsLocalServer) void startLocal();
 
 	async function tick(): Promise<void> {
 		try {
@@ -68,11 +72,11 @@
 				return;
 			}
 			if (status.stage === 'ready' && status.address) {
-				finish(status.address, status.setupCode);
+				finish(status.address, true, status.setupCode);
 				return;
 			}
 		} catch (err) {
-			localError = err instanceof Error ? err.message : 'Lost contact with the server process.';
+			localError = bridgeError(err, 'Lost contact with the server process.');
 			return;
 		}
 		poll = setTimeout(tick, 700);
@@ -269,7 +273,9 @@
 		{#snippet footer()}
 			<Button variant="ghost" icon="arrow-left" onclick={() => (view = 'choose')}>Back</Button>
 			{#if found}
-				<Button variant="primary" onclick={() => found && finish(found.origin)}>Continue</Button>
+				<Button variant="primary" onclick={() => found && finish(found.origin, false)}
+					>Continue</Button
+				>
 			{:else}
 				<Button variant="primary" type="submit" form="connect" busy={checking}>
 					{checking ? 'Checking…' : 'Check'}
