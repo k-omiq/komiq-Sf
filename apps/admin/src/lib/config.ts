@@ -3,39 +3,74 @@ import { PUBLIC_KOMIKA_API } from '$env/static/public';
 /** Where this build runs: see `ADMIN_TARGET` in vite.config.ts. */
 export const target = __ADMIN_TARGET__;
 
-/** The server the desktop app chose on `/start` (an origin, no path). */
+/**
+ * The server the desktop app chose on `/start`: a remote origin (no path), or
+ * `local` for the server the app runs on this computer.
+ */
 const SERVER_KEY = 'komiq-server';
+const LOCAL = 'local';
+/**
+ * Where the app's own server answers in THIS run of the app. Session-only on purpose:
+ * every launch starts that server again through `/start`, which records it here.
+ */
+const LOCAL_ADDRESS_KEY = 'komiq-local-address';
 
-function savedServer(): string | null {
+function read(storage: () => Storage, key: string): string | null {
 	try {
-		return localStorage.getItem(SERVER_KEY);
+		return storage().getItem(key);
 	} catch {
 		return null;
 	}
 }
 
-/**
- * Remember the desktop app's server. The backend is built once at load, so the
- * caller reloads the app after saving.
- */
-export function saveServer(origin: string): void {
+function write(storage: () => Storage, key: string, value: string | null): void {
 	try {
-		localStorage.setItem(SERVER_KEY, origin);
+		if (value === null) storage().removeItem(key);
+		else storage().setItem(key, value);
 	} catch {
 		/* private mode: the choice lasts until reload only */
 	}
 }
 
-/** Forget the desktop app's server (back to `/start`). */
-export function forgetServer(): void {
-	try {
-		localStorage.removeItem(SERVER_KEY);
-	} catch {
-		/* ignore */
-	}
+const local = () => localStorage;
+const session = () => sessionStorage;
+
+function savedServer(): string | null {
+	const saved = read(local, SERVER_KEY);
+	return saved === LOCAL ? read(session, LOCAL_ADDRESS_KEY) : saved;
 }
 
-/** True when the desktop app has not picked a server yet. */
+/**
+ * Remember a remote server for the desktop app. The backend is built once at load, so
+ * the caller reloads the app after saving.
+ */
+export function saveServer(origin: string): void {
+	write(local, SERVER_KEY, origin);
+	write(session, LOCAL_ADDRESS_KEY, null);
+}
+
+/**
+ * Remember "run komiq on this computer", with the address the app's server answers
+ * on now. Later launches start that server by themselves (`/start`). Reload after.
+ */
+export function saveLocalServer(address: string): void {
+	write(local, SERVER_KEY, LOCAL);
+	write(session, LOCAL_ADDRESS_KEY, address);
+}
+
+/** Forget the desktop app's server (back to `/start`). */
+export function forgetServer(): void {
+	write(local, SERVER_KEY, null);
+	write(session, LOCAL_ADDRESS_KEY, null);
+}
+
+/** The desktop app runs its server on this computer (chosen on `/start` before). */
+export const runsLocalServer = target === 'desktop' && read(local, SERVER_KEY) === LOCAL;
+
+/**
+ * True when the desktop app has no server to talk to yet: none chosen, or its own
+ * server is not started in this run.
+ */
 export const needsServer = target === 'desktop' && !savedServer();
 
 function endpoint(): string {

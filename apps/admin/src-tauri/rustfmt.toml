@@ -1,0 +1,2 @@
+# Same layout as the reader's Tauri crate (apps/reader/src-tauri).
+tab_spaces = 2
