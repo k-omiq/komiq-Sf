@@ -375,7 +375,17 @@ pub type ApiSchema = Schema<QueryRoot, MutationRoot, EmptySubscription>;
 /// scheduler so resolvers and the background task see one set of state. When
 /// `disable_introspection` is set (production default), schema introspection is
 /// turned off so the API surface isn't publicly enumerable.
+#[cfg(test)]
 pub fn build_schema(state: std::sync::Arc<AppState>, disable_introspection: bool) -> ApiSchema {
+    schema_builder(state, disable_introspection).finish()
+}
+
+/// [`build_schema`] before `finish`, so `main` can attach optional services (the
+/// Cloudflare setup manager) as schema data without widening `AppState`.
+pub fn schema_builder(
+    state: std::sync::Arc<AppState>,
+    disable_introspection: bool,
+) -> async_graphql::SchemaBuilder<QueryRoot, MutationRoot, EmptySubscription> {
     let mut builder = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
         .extension(ErrorLogger)
         // Bound query cost on this public endpoint (H7): cap nesting depth and the
@@ -387,7 +397,7 @@ pub fn build_schema(state: std::sync::Arc<AppState>, disable_introspection: bool
     if disable_introspection {
         builder = builder.disable_introspection();
     }
-    builder.finish()
+    builder
 }
 
 /// async-graphql extension that logs every resolver error server-side. GraphQL
@@ -457,6 +467,12 @@ fn ensure_utc_offset(s: &str) -> String {
 
 fn state<'a>(ctx: &Context<'a>) -> &'a AppState {
     ctx.data_unchecked::<std::sync::Arc<AppState>>()
+}
+
+/// The Cloudflare setup manager, attached by `main` as schema data.
+fn cloudflare<'a>(ctx: &Context<'a>) -> Result<&'a std::sync::Arc<crate::cloudflare::Manager>> {
+    ctx.data_opt::<std::sync::Arc<crate::cloudflare::Manager>>()
+        .ok_or_else(|| Error::new("Cloudflare setup is not available on this server."))
 }
 
 /// The extension updater's status and recent history (`extensionAutoUpdate`, and the
@@ -6750,6 +6766,14 @@ impl QueryRoot {
         })
     }
 
+    /// Admin: Settings › Access — the access choice, the public address, what
+    /// Cloudflare setup created, the connector, and the current setup/remove run.
+    #[graphql(cache_control(no_cache))]
+    async fn access_status(&self, ctx: &Context<'_>) -> Result<crate::cloudflare::AccessStatus> {
+        require_admin(ctx).await?;
+        Ok(cloudflare(ctx)?.status().await)
+    }
+
     async fn session(&self, ctx: &Context<'_>) -> Result<Option<Session>> {
         let Some(tok) = token(ctx) else {
             return Ok(None);
@@ -10583,6 +10607,74 @@ impl MutationRoot {
         Ok(inst::resolve(pool, &inst::REGISTRATION_OPEN)
             .await
             .as_bool())
+    }
+
+    /// Admin: record the setup wizard's access choice (`local` or `internet`), and
+    /// the domain when the owner set Cloudflare up by hand.
+    async fn set_access_mode(
+        &self,
+        ctx: &Context<'_>,
+        mode: String,
+        domain: Option<String>,
+    ) -> Result<crate::cloudflare::AccessStatus> {
+        require_admin(ctx).await?;
+        let cf = cloudflare(ctx)?;
+        crate::cloudflare::set_access(&state(ctx).pool, mode.trim(), domain.as_deref())
+            .await
+            .map_err(Error::new)?;
+        Ok(cf.status().await)
+    }
+
+    /// Admin: verify a Cloudflare API token and find the zone for `domain`. Changes
+    /// nothing; the token is not kept.
+    async fn check_cloudflare_token(
+        &self,
+        ctx: &Context<'_>,
+        token: String,
+        domain: String,
+    ) -> Result<crate::cloudflare::CloudflareTokenCheck> {
+        require_admin(ctx).await?;
+        cloudflare(ctx)?
+            .check_token(&token, &domain)
+            .await
+            .map_err(Error::new)
+    }
+
+    /// Admin: start Cloudflare setup in the background; poll `accessStatus.job`.
+    /// The token is used for this run only and never stored.
+    async fn start_cloudflare_setup(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::cloudflare::CloudflareSetupInput,
+    ) -> Result<crate::cloudflare::AccessStatus> {
+        require_admin(ctx).await?;
+        let cf = cloudflare(ctx)?;
+        cf.start_setup(input).await.map_err(Error::new)?;
+        Ok(cf.status().await)
+    }
+
+    /// Admin: run the stored setup again from where it failed (or to repair it).
+    async fn retry_cloudflare_setup(
+        &self,
+        ctx: &Context<'_>,
+        token: String,
+    ) -> Result<crate::cloudflare::AccessStatus> {
+        require_admin(ctx).await?;
+        let cf = cloudflare(ctx)?;
+        cf.retry_setup(&token).await.map_err(Error::new)?;
+        Ok(cf.status().await)
+    }
+
+    /// Admin: delete exactly what Cloudflare setup created and stop the connector.
+    async fn remove_cloudflare_setup(
+        &self,
+        ctx: &Context<'_>,
+        token: String,
+    ) -> Result<crate::cloudflare::AccessStatus> {
+        require_admin(ctx).await?;
+        let cf = cloudflare(ctx)?;
+        cf.start_remove(&token).await.map_err(Error::new)?;
+        Ok(cf.status().await)
     }
 
     /// Admin: create an account directly (works with sign-up closed). The user is
