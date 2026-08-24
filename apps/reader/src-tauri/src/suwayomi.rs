@@ -53,7 +53,9 @@ const LOCK_STALE_AFTER: Duration = Duration::from_secs(60);
 /// How often a refused engine lock is retried before the engine can start.
 const LOCK_RETRY: Duration = Duration::from_secs(5);
 /// Basic-auth username for the embedded engine; the password is the per-run secret.
-const ENGINE_AUTH_USER: &str = "komika";
+/// `pub(crate)` (with [`engine_password`]) because the admin desktop shell includes this
+/// module (`apps/admin/src-tauri`) and hands the credential to the server it runs.
+pub(crate) const ENGINE_AUTH_USER: &str = "komika";
 
 /// Lifecycle state, surfaced to JS as a lowercase string via `suwayomi_status`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -135,7 +137,7 @@ impl Drop for LockGuard {
 /// The engine's Basic-auth password, generated once per app run. The conf is rewritten
 /// with it before every (re)launch and the supervisor's client sends it on every request,
 /// so an in-run engine restart keeps working while a credential never outlives the process.
-fn engine_password() -> &'static str {
+pub(crate) fn engine_password() -> &'static str {
   static PASSWORD: OnceLock<String> = OnceLock::new();
   PASSWORD.get_or_init(random_token)
 }
@@ -537,8 +539,9 @@ async fn request_graceful_exit(_child: &tokio::process::Child) -> bool {
 
 /// Terminate a live child: request a graceful exit first so the JVM's shutdown hooks run,
 /// then fall back to a kill (spike-proven to leave no orphan), confirming within a grace
-/// window and forcing again if it somehow lingers.
-async fn stop_child(child: &mut tokio::process::Child) {
+/// window and forcing again if it somehow lingers. `pub(crate)` so the admin desktop shell,
+/// which includes this module, stops its server child the same way.
+pub(crate) async fn stop_child(child: &mut tokio::process::Child) {
   if request_graceful_exit(child).await
     && tokio::time::timeout(GRACE, child.wait()).await.is_ok()
   {

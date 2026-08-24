@@ -5,10 +5,13 @@
 	import '@komika/ui/tokens.css';
 	import '$lib/app.css';
 	import { page } from '$app/state';
-	import { initAuth } from '$lib/auth.svelte';
+	import { auth, initAuth } from '$lib/auth.svelte';
 	import { initTheme } from '$lib/theme.svelte';
 	import { markHydrated } from '$lib/stream';
-	import { config } from '$lib/config';
+	import { config, target } from '$lib/config';
+	import { instance, loadInstance } from '$lib/instance.svelte';
+	import ChoosePassword from '$lib/components/ChoosePassword.svelte';
+	import NotSetUp from '$lib/components/NotSetUp.svelte';
 
 	let { children } = $props();
 
@@ -35,6 +38,20 @@
 	$effect(() => {
 		initTheme();
 	});
+
+	// Self-host builds ask the server whether it still needs its owner and show a
+	// "not set up" page instead of an empty app. The hosted web build never does (its
+	// server always has an owner), and neither does a backend without `instance`.
+	const checksSetup = target !== 'web' && config.backendEnabled && config.backendKind === 'komika';
+	$effect(() => {
+		if (checksSetup) void loadInstance();
+	});
+	const notSetUp = $derived(checksSetup && instance.info?.setupRequired === true);
+	// The embedded build is served by that same server, so it waits for the answer
+	// (bounded, see loadInstance) rather than flash an empty home first.
+	const waiting = $derived(checksSetup && target === 'embedded' && !instance.ready);
+	// An account the owner created or reset picks its own password before anything else.
+	const mustChangePassword = $derived(!!auth.user?.mustChangePassword);
 </script>
 
 <svelte:head>
@@ -74,4 +91,10 @@
 	{/if}
 </svelte:head>
 
-{@render children()}
+{#if notSetUp}
+	<NotSetUp />
+{:else if mustChangePassword}
+	<ChoosePassword />
+{:else if !waiting}
+	{@render children()}
+{/if}

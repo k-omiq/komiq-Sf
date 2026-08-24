@@ -5,6 +5,7 @@
 	import Icon from '$lib/components/Icon.svelte';
 	import Cover from '$lib/components/Cover.svelte';
 	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
+	import EmptyCatalog from '$lib/components/EmptyCatalog.svelte';
 	import Dropdown, { type DropdownOption } from '$lib/components/Dropdown.svelte';
 	import FlagBadge from '$lib/components/FlagBadge.svelte';
 	import StatusMenu from '$lib/components/StatusMenu.svelte';
@@ -16,6 +17,7 @@
 	} from '$lib/data/source';
 	import { slug, type ComicType, type Shelf } from '$lib/data/types';
 	import { sortLibraryRows } from '$lib/data/library-order';
+	import { catalogIsEmpty, checksCatalogEmpty } from '$lib/data/catalog-empty';
 
 	let { data } = $props();
 	// Refresh releases and progress when returning to a tab left open during a scan.
@@ -144,6 +146,21 @@
 		sort = next;
 		dir = NATURAL_DIR[next];
 	}
+
+	// An empty library on a server that has no series at all (a new self-hosted
+	// install) says so, instead of sending the reader to an empty Browse.
+	// `null` = still asking (self-host builds only; see $lib/data/catalog-empty).
+	let catalogEmpty = $state<boolean | null>(checksCatalogEmpty ? null : false);
+	$effect(() => {
+		if (loading || rows.length) return;
+		let cancelled = false;
+		void catalogIsEmpty().then((empty) => {
+			if (!cancelled) catalogEmpty = empty;
+		});
+		return () => {
+			cancelled = true;
+		};
+	});
 
 	const counts = $derived({
 		all: rows.length,
@@ -455,6 +472,8 @@
 			</div>
 			<button type="button" class="empty-btn" onclick={clearFilters}>Clear filters</button>
 		</div>
+	{:else if counts.all === 0 && catalogEmpty !== false}
+		{#if catalogEmpty}<EmptyCatalog heading="h2" />{/if}
 	{:else}
 		<div class="empty">
 			<div class="empty-icon"><Icon name="bookmark" size={24} /></div>

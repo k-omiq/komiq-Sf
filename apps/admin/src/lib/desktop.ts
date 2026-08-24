@@ -8,6 +8,14 @@
  *   immediately; progress is read with the next command.
  * - `local_server_status` → `LocalServerStatus`.
  * - `local_server_log` → the last lines of the engine and server logs (string).
+ *   Kept in memory only; the setup code and the engine's credential are masked.
+ * - `local_network` → `LocalNetwork`: whether "Allow other devices" is on and the
+ *   reader addresses other devices can open.
+ * - `set_local_network { enabled }` → `LocalNetwork`. Saves the choice and restarts
+ *   the server on all interfaces (on) or loopback only (off), on the same port when
+ *   it is free. Resolves once the server answers again; rejects with the reason.
+ *
+ * The shell is `apps/admin/src-tauri` (README: "Desktop app").
  */
 
 export type LocalStage = 'engine' | 'server' | 'ready';
@@ -21,6 +29,15 @@ export interface LocalServerStatus {
 	address?: string | null;
 	/** One-time setup code read from the server's own output, when it printed one. */
 	setupCode?: string | null;
+}
+
+export interface LocalNetwork {
+	/** "Allow other devices" is on: the server listens on every interface. */
+	enabled: boolean;
+	/** The server's port while it runs. */
+	port: number | null;
+	/** Reader addresses for other devices, e.g. `http://192.168.1.20:7580`. Empty when off. */
+	addresses: string[];
 }
 
 type Invoke = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -45,7 +62,19 @@ export const desktop = {
 	log(): Promise<string> {
 		return invoke!<string>('local_server_log');
 	},
+	network(): Promise<LocalNetwork> {
+		return invoke!<LocalNetwork>('local_network');
+	},
+	setNetwork(enabled: boolean): Promise<LocalNetwork> {
+		return invoke!<LocalNetwork>('set_local_network', { enabled });
+	},
 };
+
+/** A rejected command's reason: Tauri rejects with the command's error string. */
+export function bridgeError(err: unknown, fallback: string): string {
+	if (typeof err === 'string' && err) return err;
+	return err instanceof Error && err.message ? err.message : fallback;
+}
 
 /** The setup code handed from `/start` to the wizard. Session-only, never persisted. */
 const CODE_KEY = 'komiq-setup-code';

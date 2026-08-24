@@ -2,6 +2,7 @@
 	import MangaCard from '$lib/components/MangaCard.svelte';
 	import Cover from '$lib/components/Cover.svelte';
 	import CardRowSkeleton from '$lib/components/CardRowSkeleton.svelte';
+	import EmptyCatalog from '$lib/components/EmptyCatalog.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import {
 		slug,
@@ -11,6 +12,7 @@
 		STATUS_META,
 	} from '$lib/data/types';
 	import type { FeaturedView } from '$lib/data/source';
+	import { catalogIsEmpty, checksCatalogEmpty } from '$lib/data/catalog-empty';
 
 	let { data } = $props();
 
@@ -86,6 +88,27 @@
 	// backend-down / nothing-live case rather than a loading state — the hero is dropped
 	// entirely there, it does not fall back to the skeleton.
 	const featured = $derived<FeaturedView[]>((settled ?? streamed)?.featured ?? []);
+
+	function isEmptyHome(h: HomeData): boolean {
+		return (
+			!h.featured.length && !h.latestUpdates.length && !h.trending.length && !h.latestAdded.length
+		);
+	}
+	// Every feed empty means "failed" OR "this server has no series yet" (a new
+	// self-hosted install). Self-host builds ask which before saying anything; see
+	// $lib/data/catalog-empty. `null` = still asking.
+	let catalogEmpty = $state<boolean | null>(checksCatalogEmpty ? null : false);
+	$effect(() => {
+		const h = settled ?? streamed;
+		if (!checksCatalogEmpty || !h || !isEmptyHome(h)) return;
+		let cancelled = false;
+		void catalogIsEmpty().then((empty) => {
+			if (!cancelled) catalogEmpty = empty;
+		});
+		return () => {
+			cancelled = true;
+		};
+	});
 
 	// Auto-rotate the hero, unless the reader is holding it or prefers reduced motion.
 	// A one-shot timer per slide, not an interval: the effect reads `slide`, so every
@@ -211,7 +234,9 @@
 {/snippet}
 
 {#snippet content(home: HomeData)}
-	{#if !home.featured.length && !home.latestUpdates.length && !home.trending.length && !home.latestAdded.length}
+	{#if isEmptyHome(home) && catalogEmpty}
+		<EmptyCatalog />
+	{:else if isEmptyHome(home) && catalogEmpty === false}
 		<section class="empty-home k-gutter">
 			<span class="eyebrow">Your Next Read</span>
 			<h1>The Catalogue Is Unavailable</h1>
