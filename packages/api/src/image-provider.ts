@@ -76,6 +76,15 @@ export interface WebImageProviderConfig {
 	 */
 	direct?: boolean;
 	/**
+	 * Proxy through the Komika SERVER's own `/img` route instead of the Worker: only
+	 * absolute URLs on hosts that need a proxy (MangaDex) are rewritten to
+	 * `${workerBaseUrl}/img?src=…`; everything else — the server's own covers, avatars
+	 * and Suwayomi pages, relative or absolute — loads directly. Used by the embedded
+	 * build (`workerBaseUrl` = the page's origin) and `PUBLIC_KOMIKA_IMG_MODE=server`
+	 * (`workerBaseUrl` = the API origin). Off by default, so hosted builds are unchanged.
+	 */
+	serverProxy?: boolean;
+	/**
 	 * Origin of the Komika API (the GraphQL endpoint minus `/graphql`). Covers
 	 * cached in the DB are served from this origin under `/covers/...` (and
 	 * avatars under `/avatars/...`); those are same-origin / CORS-safe, so they are
@@ -99,6 +108,20 @@ const MANGADEX_HOSTS = [/(^|\.)mangadex\.org$/i, /(^|\.)mangadex\.network$/i];
 /** Hosts that must go through the Worker proxy (CORS + hotlink); `direct` breaks them. */
 const PROXY_REQUIRED_HOSTS = MANGADEX_HOSTS;
 
+/** True for an absolute http(s) URL on a host that must be proxied (MangaDex). */
+function needsProxy(sourceUrl: string): boolean {
+	let url: URL;
+	try {
+		url = new URL(sourceUrl);
+	} catch {
+		return false; // relative: the serving origin's own path
+	}
+	return (
+		(url.protocol === 'https:' || url.protocol === 'http:') &&
+		PROXY_REQUIRED_HOSTS.some((re) => re.test(url.hostname))
+	);
+}
+
 /** Web provider: rewrite source URLs to Worker-proxied URLs (or pass through in direct mode). */
 export class WebImageProvider implements ImageProvider {
 	constructor(private readonly config: WebImageProviderConfig) {}
@@ -108,6 +131,11 @@ export class WebImageProvider implements ImageProvider {
 
 	private resolve(sourceUrl: string): string {
 		if (!sourceUrl) return '';
+		if (this.config.serverProxy) {
+			if (!needsProxy(sourceUrl)) return sourceUrl;
+			const base = this.config.workerBaseUrl.replace(/\/$/, '');
+			return `${base}/img?src=${encodeURIComponent(sourceUrl)}`;
+		}
 		if (this.config.direct) {
 			this.warnIfProxyRequired(sourceUrl);
 			return sourceUrl;

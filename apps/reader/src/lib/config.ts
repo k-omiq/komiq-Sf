@@ -60,9 +60,13 @@ export const config = {
 	suwayomiUrl: PUBLIC_SUWAYOMI_URL,
 	/**
 	 * Image mode: 'direct' returns source URLs unchanged (for already-CORS-safe
-	 * hosts like Suwayomi); 'proxy' routes through the Cloudflare image Worker.
+	 * hosts like Suwayomi); 'proxy' routes through the Cloudflare image Worker;
+	 * 'server' routes only MangaDex images through the Komika server's own `/img`
+	 * route on the API origin (self-host without a Worker). The embedded build always
+	 * uses the server proxy on its own origin.
 	 */
-	imgDirect: embedded || PUBLIC_KOMIKA_IMG_MODE === 'direct',
+	imgDirect: !embedded && PUBLIC_KOMIKA_IMG_MODE === 'direct',
+	imgServerProxy: embedded || PUBLIC_KOMIKA_IMG_MODE === 'server',
 	/**
 	 * Native content engine (embedded Suwayomi). Off by default. When on AND running
 	 * inside Tauri, the reader fetches chapter lists/pages on-device via a
