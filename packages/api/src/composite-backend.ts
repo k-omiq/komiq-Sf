@@ -49,6 +49,8 @@ import type {
 	CreateOwnerInput,
 	CreateUserInput,
 	InstanceInfo,
+	ExtensionRepo,
+	MangadexSetting,
 	MyComment,
 	PostCommentInput,
 	PostReviewInput,
@@ -575,6 +577,12 @@ export class CompositeBackend implements Backend {
 	resetUserPassword(userId: Id, password: string): Promise<boolean> {
 		return this.opts.hosted.resetUserPassword!(userId, password);
 	}
+	mangadexSetting(): Promise<MangadexSetting> {
+		return this.opts.hosted.mangadexSetting!();
+	}
+	setMangadexEnabled(enabled: boolean): Promise<boolean> {
+		return this.opts.hosted.setMangadexEnabled!(enabled);
+	}
 	setRegistrationOpen(open: boolean): Promise<boolean> {
 		return this.opts.hosted.setRegistrationOpen!(open);
 	}
@@ -619,6 +627,12 @@ export class CompositeBackend implements Backend {
 		query?: string,
 	): Promise<SourceBrowsePage> {
 		return this.opts.hosted.sourceBrowse!(sourceId, type, page, query);
+	}
+	extensionRepos(): Promise<ExtensionRepo[]> {
+		return this.opts.hosted.extensionRepos!();
+	}
+	removeExtensionRepo(indexUrl: string): Promise<boolean> {
+		return this.opts.hosted.removeExtensionRepo!(indexUrl);
 	}
 	addExtensionRepo(indexUrl: string): Promise<number> {
 		return this.opts.hosted.addExtensionRepo!(indexUrl);

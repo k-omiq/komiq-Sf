@@ -45,6 +45,15 @@
 			<dt>Sign-up</dt>
 			<dd>{wizard.signup === 'open' ? 'Anyone can sign up' : 'Only people you add'}</dd>
 		</div>
+		{#if wizard.extra.mangadex !== undefined || wizard.extra.extensions}
+			<div>
+				<dt>Sources</dt>
+				<dd>
+					MangaDex {wizard.extra.mangadex ? 'on' : 'off'} · {Number(wizard.extra.extensions ?? 0)}
+					{Number(wizard.extra.extensions ?? 0) === 1 ? 'extension' : 'extensions'}
+				</dd>
+			</div>
+		{/if}
 		<div>
 			<dt>People added</dt>
 			<dd class="k-num">{wizard.added.length}</dd>
