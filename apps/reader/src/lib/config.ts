@@ -7,6 +7,7 @@ import {
 	PUBLIC_KOMIKA_IMG_MODE,
 	PUBLIC_KOMIKA_NATIVE_ENGINE,
 } from '$env/static/public';
+import { isTauri } from '@komika/api';
 
 /**
  * App configuration, resolved from PUBLIC_* env vars at BUILD time.
@@ -40,21 +41,66 @@ export const target = __KOMIKA_TARGET__;
  */
 const embedded = target === 'embedded';
 
+/**
+ * The native reader app (Tauri, desktop and mobile) can be pointed at any komiq
+ * server from its "Connect to a server" screen. Only there: the hosted web build
+ * and the embedded build talk to a fixed server, and so does the static SPA when a
+ * browser opens it (the Docker reader image), which `isTauri` tells apart at runtime.
+ */
+export const canChooseServer = target === 'tauri' && isTauri();
+
+/** The server picked on the connect screen (an origin, no path). Same key the
+ * desktop admin uses. */
+const SERVER_KEY = 'komiq-server';
+
+function savedServer(): string | null {
+	if (!canChooseServer) return null;
+	try {
+		const origin = localStorage.getItem(SERVER_KEY);
+		return origin && /^https?:\/\/[^/?#]+$/i.test(origin) ? origin : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Remember the server on this device. Every client is built once at load, so the
+ * caller reloads the app afterwards.
+ */
+export function saveServer(origin: string): void {
+	try {
+		localStorage.setItem(SERVER_KEY, origin);
+	} catch {
+		/* private mode: the choice lasts until reload only */
+	}
+}
+
+/** Server chosen on this device, or null for the one the app was built against. */
+export const chosenServer = savedServer();
+
+/**
+ * True when this native build has no server to talk to yet: nothing chosen and no
+ * address baked in at build time. The app then opens on the connect screen.
+ */
+export const needsServer = canChooseServer && !chosenServer && !PUBLIC_KOMIKA_API;
+
 export const config = {
-	apiEndpoint: embedded ? '/graphql' : PUBLIC_KOMIKA_API,
-	imgWorkerBaseUrl: embedded ? '' : PUBLIC_KOMIKA_IMG_WORKER,
+	apiEndpoint: embedded ? '/graphql' : chosenServer ? `${chosenServer}/graphql` : PUBLIC_KOMIKA_API,
+	// A chosen server serves its own images (and proxies source images), so there is
+	// no image Worker to route through.
+	imgWorkerBaseUrl: embedded || chosenServer ? '' : PUBLIC_KOMIKA_IMG_WORKER,
 	/**
 	 * Whether screens pull from the live backend. `PUBLIC_KOMIKA_BACKEND=on` enables
 	 * it; anything else runs standalone against `mock.ts`. The repository still falls
 	 * back to empty/mock on error.
 	 */
-	backendEnabled: embedded || PUBLIC_KOMIKA_BACKEND === 'on',
+	backendEnabled: embedded || !!chosenServer || PUBLIC_KOMIKA_BACKEND === 'on',
 	/**
 	 * Which backend implementation to use:
 	 *  - 'komika'   → the unified Komika GraphQL API (default, to-spec).
 	 *  - 'suwayomi' → a direct Suwayomi/Tachidesk adapter (real catalog now, no social).
 	 */
-	backendKind: (embedded ? 'komika' : PUBLIC_KOMIKA_BACKEND_KIND || 'komika') as
+	backendKind: (embedded || chosenServer ? 'komika' : PUBLIC_KOMIKA_BACKEND_KIND || 'komika') as
 		'komika' | 'suwayomi',
 	/** Suwayomi base URL when backendKind === 'suwayomi'. */
 	suwayomiUrl: PUBLIC_SUWAYOMI_URL,
@@ -69,7 +115,7 @@ export const config = {
 	 * CompositeBackend; otherwise it uses the hosted backend unchanged. The engine
 	 * transport itself lands later — this flag only selects the composite wrapper.
 	 */
-	nativeEngine: !embedded && PUBLIC_KOMIKA_NATIVE_ENGINE === 'on',
+	nativeEngine: !embedded && !chosenServer && PUBLIC_KOMIKA_NATIVE_ENGINE === 'on',
 };
 
 /**

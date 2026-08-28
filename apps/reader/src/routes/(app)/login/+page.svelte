@@ -3,6 +3,8 @@
 	import { page } from '$app/state';
 	import { auth, login, register } from '$lib/auth.svelte';
 	import { loadInstance, registrationOpen } from '$lib/instance.svelte';
+	import { apiOrigin, canChooseServer } from '$lib/config';
+	import { connectScreen } from '$lib/server-connect.svelte';
 
 	type Mode = 'login' | 'register';
 	let mode = $state<Mode>('login');
@@ -22,6 +24,9 @@
 	let password = $state('');
 	let error = $state<string | null>(null);
 	let busy = $state(false);
+
+	// Native app: which server this signs in to, with a way to pick another.
+	const serverHost = apiOrigin.replace(/^https?:\/\//, '');
 
 	const redirectTo = $derived(page.url.searchParams.get('redirect') || '/');
 
@@ -152,6 +157,15 @@
 				<button class="link" onclick={() => switchMode('login')}>Sign in</button>
 			{/if}
 		</p>
+
+		{#if canChooseServer}
+			<p class="server">
+				<span class="server-host" title={serverHost}>{serverHost}</span>
+				<button class="link" type="button" onclick={() => (connectScreen.open = true)}
+					>Change server</button
+				>
+			</p>
+		{/if}
 	</div>
 </div>
 
@@ -290,6 +304,26 @@
 		text-align: center;
 		font-size: 13px;
 		color: var(--k-text-dim);
+	}
+	.server {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--k-space-3);
+		margin-top: var(--k-space-5);
+		padding-top: var(--k-space-4);
+		border-top: 1px solid var(--k-border-1);
+		font-size: 13px;
+		color: var(--k-text-dim);
+	}
+	.server-host {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.server .link {
+		flex: none;
 	}
 	.link {
 		background: none;

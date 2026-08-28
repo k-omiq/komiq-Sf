@@ -22,8 +22,8 @@
 			}
 		],
 		"security": {
-			"csp": "default-src 'self'; img-src 'self' blob: data: https://api.komiq.cc; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://api.komiq.cc; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
-			"devCsp": "default-src 'self'; img-src 'self' blob: data: https://api.komiq.cc http://localhost:8080; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://api.komiq.cc http://localhost:8080 ws://localhost:5173; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+			"csp": "default-src 'self'; img-src 'self' blob: data: http: https:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost http: https:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+			"devCsp": "default-src 'self'; img-src 'self' blob: data: http: https:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost http: https: ws://localhost:5173; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
 		}
 	},
 	"bundle": {
