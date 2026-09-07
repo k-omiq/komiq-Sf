@@ -8,7 +8,8 @@
 	import { auth, initAuth } from '$lib/auth.svelte';
 	import { initTheme } from '$lib/theme.svelte';
 	import { markHydrated } from '$lib/stream';
-	import { config, target } from '$lib/config';
+	import { config, needsServer, target } from '$lib/config';
+	import { connectScreen } from '$lib/server-connect.svelte';
 	import { instance, loadInstance } from '$lib/instance.svelte';
 	import ChoosePassword from '$lib/components/ChoosePassword.svelte';
 	import NotSetUp from '$lib/components/NotSetUp.svelte';
@@ -52,6 +53,9 @@
 	const waiting = $derived(checksSetup && target === 'embedded' && !instance.ready);
 	// An account the owner created or reset picks its own password before anything else.
 	const mustChangePassword = $derived(!!auth.user?.mustChangePassword);
+	// Native app: choose the server first (nothing chosen or built in), or again from
+	// the sign-in page. Loaded on demand, so no other build carries the screen.
+	const connecting = $derived(needsServer || connectScreen.open);
 </script>
 
 <svelte:head>
@@ -91,7 +95,11 @@
 	{/if}
 </svelte:head>
 
-{#if notSetUp}
+{#if connecting}
+	{#await import('$lib/components/ConnectServer.svelte') then { default: ConnectServer }}
+		<ConnectServer />
+	{/await}
+{:else if notSetUp}
 	<NotSetUp />
 {:else if mustChangePassword}
 	<ChoosePassword />
