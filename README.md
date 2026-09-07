@@ -50,6 +50,11 @@ These policies describe services operated by the Komiq project, including the WI
 demo. A person who redistributes or self-hosts the software must provide policies and
 processes appropriate to their own deployment.
 
+## Self-host
+
+Run your own komiq server with Docker: [`docs/self-host.md`](./docs/self-host.md).
+A fresh install opens the setup screens in the browser.
+
 ## Prerequisites
 
 - Node ≥ 20, **pnpm** (`corepack enable`)
