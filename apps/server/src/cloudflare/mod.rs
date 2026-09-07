@@ -805,7 +805,12 @@ impl Manager {
                     .map_err(|_| "The server could not save the trusted proxies.".to_string())?;
                 self.trusted.replace(&list);
                 s.trusted_proxies_set = true;
-                Ok(Some(format!("Trusting {} address ranges.", list.len())))
+                Ok(Some(match s.connection {
+                    Some(Connection::PublicIp) => {
+                        format!("Trusting Cloudflare's {} address ranges.", list.len())
+                    }
+                    _ => "The connector on this machine passes visitor addresses on.".into(),
+                }))
             }
             Step::CacheRules => self.step_cache_rules(api, s).await,
             Step::CacheHeaders => {
