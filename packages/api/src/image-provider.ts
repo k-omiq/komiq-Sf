@@ -83,6 +83,14 @@ export interface WebImageProviderConfig {
 	 * paths are resolved against it.
 	 */
 	apiOrigin?: string;
+	/**
+	 * Native only: the komiq server the person chose on the reader's connect screen.
+	 * Its images (relative `/api/…`, `/covers/…`, `/avatars/…` paths and absolute URLs
+	 * on its origin) load straight from it in the WebView instead of through the Rust
+	 * fetch, whose address guard rightly refuses a LAN host it was not built for. Unset
+	 * keeps the built-in routing below (relative `/api/…` = the embedded engine).
+	 */
+	serverOrigin?: string | null;
 }
 
 /** API-origin asset paths the reader serves itself (never Worker-proxied). */
@@ -236,6 +244,8 @@ export class WebImageProvider implements ImageProvider {
  * for the web target.
  *
  * Resolution is source-aware, checked in order:
+ *  0. With `serverOrigin` set (a server chosen on the connect screen), anything on
+ *     that server loads directly from it.
  *  1. Relative engine path (`/api/…`) → `suwayomi_image`, which streams the
  *     bytes from the embedded loopback Suwayomi engine (the extension's
  *     per-source request context is applied inside the engine). This is the
@@ -308,8 +318,19 @@ export class NativeImageProvider implements ImageProvider {
 	 * `suwayomi_image`; absolute MangaDex host → `fetch_image`; everything else →
 	 * local proxy. Empty input → empty string (reader renders a placeholder).
 	 */
+	/** `sourceUrl` as a loadable URL on the chosen server, or null when it is not one. */
+	private onChosenServer(sourceUrl: string): string | null {
+		const origin = this.config.serverOrigin?.replace(/\/$/, '');
+		if (!origin) return null;
+		if (sourceUrl.startsWith('/') && !sourceUrl.startsWith('//')) return origin + sourceUrl;
+		// Origin boundary, not a bare prefix (see WebImageProvider.isOwnAsset).
+		return sourceUrl === origin || sourceUrl.startsWith(`${origin}/`) ? sourceUrl : null;
+	}
+
 	private async resolve(sourceUrl: string): Promise<string> {
 		if (!sourceUrl) return '';
+		const direct = this.onChosenServer(sourceUrl);
+		if (direct) return direct;
 		if (this.isEnginePath(sourceUrl)) return this.engineToBlobUrl(sourceUrl);
 		// Covers/avatars cached on the hosted API origin: fetch the absolute URL
 		// (relative `/covers/…` resolved against apiOrigin) via the generic path.

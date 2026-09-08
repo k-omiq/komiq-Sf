@@ -1582,6 +1582,31 @@ mod tests {
         SuwayomiClient::new(base.to_string(), None, Some("1".into()))
     }
 
+    /// The self-host image sets `SUWAYOMI_PUBLIC_URL=/` so cover and page URLs stay
+    /// relative to whatever address the browser used (localhost, a LAN IP, a domain),
+    /// and the server's own `/api/v1/manga/...` proxy serves them.
+    #[test]
+    fn root_public_url_keeps_image_urls_relative() {
+        let c = SuwayomiClient::new("http://suwayomi:4567".into(), Some("/".into()), None);
+        assert_eq!(
+            c.abs(Some("/api/v1/manga/7/thumbnail")),
+            "/api/v1/manga/7/thumbnail"
+        );
+        assert_eq!(
+            c.abs(Some("https://cdn.example/x.jpg")),
+            "https://cdn.example/x.jpg"
+        );
+        let hosted = SuwayomiClient::new(
+            "http://suwayomi:4567".into(),
+            Some("https://api.komiq.cc".into()),
+            None,
+        );
+        assert_eq!(
+            hosted.abs(Some("/api/v1/manga/7/thumbnail")),
+            "https://api.komiq.cc/api/v1/manga/7/thumbnail"
+        );
+    }
+
     /// The bounded pool is the fix for the 22 s p90: a burst larger than
     /// `COVER_FETCH_CONCURRENCY` must be REFUSED at the (COVER_FETCH_CONCURRENCY+1)-th
     /// request rather than queued behind the in-flight ones.

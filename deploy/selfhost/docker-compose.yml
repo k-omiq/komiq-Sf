@@ -1,0 +1,101 @@
+# komiq, self-hosted. Install guide: docs/self-host.md
+#
+#   cd deploy/selfhost
+#   docker compose up -d
+#   docker compose logs server | grep "setup code"
+#
+# Then open http://<this machine>:8080/admin/setup and follow the steps.
+# Reader at `/`, admin console at `/admin`, API and images on the same address.
+#
+# Services:
+#   server       komiq: API, reader, admin, image proxy. The only published port.
+#   suwayomi     The source engine. It runs the extensions you install in the
+#                admin console. Not published: its API has no authentication,
+#                so only the server talks to it, over the internal network.
+#   flaresolverr Optional. Solves "checking your browser" pages for sources
+#                behind Cloudflare. Off unless you enable it in .env.
+#
+# Nothing here is set up for you: no extension repo, no MangaDex, no admin
+# account. A fresh install opens the setup screens.
+
+name: komiq
+
+services:
+  server:
+    build:
+      context: ../..
+      dockerfile: deploy/selfhost/Dockerfile
+    image: komiq-selfhost:local
+    restart: unless-stopped
+    # Reaps child processes (cloudflared, when a tunnel is set up) and forwards
+    # stop signals.
+    init: true
+    environment:
+      TZ: ${TZ:-UTC}
+    ports:
+      # KOMIQ_BIND=0.0.0.0 (default): phones and other computers on your network
+      # can open komiq. KOMIQ_BIND=127.0.0.1: this machine only, which is what you
+      # want on a VPS that is reached through a Cloudflare Tunnel.
+      - '${KOMIQ_BIND:-0.0.0.0}:${KOMIQ_PORT:-8080}:8080'
+      # Public-IP mode of the Cloudflare setup serves HTTPS on port 443 inside the
+      # container. Uncomment when you choose that mode (see docs/self-host.md).
+      # - '443:443'
+    volumes:
+      - server-data:/data
+    depends_on:
+      # Started, not healthy: the setup screens work while the engine is still
+      # booting, and the server retries the engine on its own.
+      suwayomi:
+        condition: service_started
+    logging:
+      driver: json-file
+      options: { max-size: 20m, max-file: '5' }
+
+  suwayomi:
+    # Pinned by digest: the same Suwayomi release komiq.cc runs (v2.3.2243). An
+    # update is a deliberate edit here, never whatever `pull` happens to fetch.
+    image: ghcr.io/suwayomi/tachidesk@sha256:e59f212ccf91b26de8676a063a2db90256c148c6261535c7c477d47a43d9751b
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-UTC}
+      BIND_IP: 0.0.0.0
+      BIND_PORT: '4567'
+      # komiq is the interface; the engine's own web UI is not used (and would be
+      # downloaded from GitHub at every start).
+      WEB_UI_ENABLED: 'false'
+      FLARESOLVERR_ENABLED: ${FLARESOLVERR_ENABLED:-false}
+      FLARESOLVERR_URL: http://flaresolverr:8191
+    volumes:
+      - engine-data:/home/suwayomi/.local/share/Tachidesk
+    healthcheck:
+      test:
+        ['CMD-SHELL', 'curl -fsS http://localhost:4567/api/v1/settings/about >/dev/null || exit 1']
+      interval: 20s
+      timeout: 5s
+      retries: 8
+      start_period: 60s
+    logging:
+      driver: json-file
+      options: { max-size: 20m, max-file: '5' }
+
+  flaresolverr:
+    # Enabled by COMPOSE_PROFILES=flaresolverr together with
+    # FLARESOLVERR_ENABLED=true (see .env.example). Same pin as komiq.cc.
+    profiles: [flaresolverr]
+    image: ghcr.io/flaresolverr/flaresolverr@sha256:139dfee1c6f89249c8d665d1333a42e8ec74ec0a86bc6bb1c8461e10d3a66a47
+    restart: unless-stopped
+    # A headless browser: bound its memory so a runaway page cannot starve the
+    # rest of the machine.
+    mem_limit: 2g
+    environment:
+      TZ: ${TZ:-UTC}
+      LOG_LEVEL: info
+    logging:
+      driver: json-file
+      options: { max-size: 20m, max-file: '5' }
+
+volumes:
+  # Database, cover cache, uploaded avatars, Cloudflare connector files.
+  server-data:
+  # Installed extensions and the engine's own database.
+  engine-data:

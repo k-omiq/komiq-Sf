@@ -13,7 +13,8 @@
 import type { RegisterInput, Session } from '@komika/api';
 import { backend } from './context';
 
-const TOKEN_KEY = 'komika-token';
+/** Where the session token is kept on this device. */
+export const TOKEN_KEY = 'komika-token';
 
 type User = Session['user'];
 
