@@ -32,8 +32,12 @@ import type {
 	WorkSource,
 } from '@komika/types';
 import type {
+	AccessMode,
+	AccessStatus,
 	AdminChapter,
 	ChapterOverrideInput,
+	CloudflareSetupInput,
+	CloudflareTokenCheck,
 	CreateOwnerInput,
 	CreateUserInput,
 	Session,
@@ -657,4 +661,49 @@ export async function createUser(input: CreateUserInput): Promise<AdminUser> {
 export async function resetUserPassword(userId: Id, password: string): Promise<void> {
 	if (!backend.resetUserPassword) accountsUnavailable();
 	await backend.resetUserPassword(userId, password);
+}
+
+// ---- access + Cloudflare setup ----------------------------------------------
+// The API token passes through these calls only. Nothing here stores it.
+
+function accessUnavailable(): never {
+	throw new Error('This server cannot set up access yet. Update the server and try again.');
+}
+
+/** Settings › Access, and the live state of a Cloudflare setup or remove run. */
+export async function loadAccessStatus(): Promise<AccessStatus> {
+	if (!backend.accessStatus) accessUnavailable();
+	return backend.accessStatus();
+}
+
+/** Record the wizard's access choice (and a domain the owner set up by hand). */
+export async function setAccessMode(
+	mode: AccessMode,
+	domain?: string | null,
+): Promise<AccessStatus> {
+	if (!backend.setAccessMode) accessUnavailable();
+	return backend.setAccessMode(mode, domain);
+}
+
+export async function checkCloudflareToken(
+	token: string,
+	domain: string,
+): Promise<CloudflareTokenCheck> {
+	if (!backend.checkCloudflareToken) accessUnavailable();
+	return backend.checkCloudflareToken(token, domain);
+}
+
+export async function startCloudflareSetup(input: CloudflareSetupInput): Promise<AccessStatus> {
+	if (!backend.startCloudflareSetup) accessUnavailable();
+	return backend.startCloudflareSetup(input);
+}
+
+export async function retryCloudflareSetup(token: string): Promise<AccessStatus> {
+	if (!backend.retryCloudflareSetup) accessUnavailable();
+	return backend.retryCloudflareSetup(token);
+}
+
+export async function removeCloudflareSetup(token: string): Promise<AccessStatus> {
+	if (!backend.removeCloudflareSetup) accessUnavailable();
+	return backend.removeCloudflareSetup(token);
 }

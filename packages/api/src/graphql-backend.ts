@@ -67,6 +67,10 @@ import type {
 	SeriesMetadataInput,
 	Session,
 	UpdateProfileInput,
+	AccessMode,
+	AccessStatus,
+	CloudflareSetupInput,
+	CloudflareTokenCheck,
 } from './backend.js';
 import * as ops from './operations.js';
 import { failedOnlyAt, GraphQLRequestError, tolerablePartialErrors } from './partial-errors.js';
@@ -707,6 +711,49 @@ export class GraphQLBackend implements Backend {
 	async setRegistrationOpen(open: boolean): Promise<boolean> {
 		const d = await this.gql<{ setRegistrationOpen: boolean }>(ops.SET_REGISTRATION_OPEN, { open });
 		return d.setRegistrationOpen;
+	}
+
+	// --- admin access + Cloudflare setup ---
+	async accessStatus(): Promise<AccessStatus> {
+		const d = await this.gql<{ accessStatus: AccessStatus }>(ops.ACCESS_STATUS);
+		return d.accessStatus;
+	}
+
+	async setAccessMode(mode: AccessMode, domain?: string | null): Promise<AccessStatus> {
+		const d = await this.gql<{ setAccessMode: AccessStatus }>(ops.SET_ACCESS_MODE, {
+			mode,
+			domain: domain ?? null,
+		});
+		return d.setAccessMode;
+	}
+
+	async checkCloudflareToken(token: string, domain: string): Promise<CloudflareTokenCheck> {
+		const d = await this.gql<{ checkCloudflareToken: CloudflareTokenCheck }>(
+			ops.CHECK_CLOUDFLARE_TOKEN,
+			{ token, domain },
+		);
+		return d.checkCloudflareToken;
+	}
+
+	async startCloudflareSetup(input: CloudflareSetupInput): Promise<AccessStatus> {
+		const d = await this.gql<{ startCloudflareSetup: AccessStatus }>(ops.START_CLOUDFLARE_SETUP, {
+			input: { ...input, publicIp: input.publicIp ?? null },
+		});
+		return d.startCloudflareSetup;
+	}
+
+	async retryCloudflareSetup(token: string): Promise<AccessStatus> {
+		const d = await this.gql<{ retryCloudflareSetup: AccessStatus }>(ops.RETRY_CLOUDFLARE_SETUP, {
+			token,
+		});
+		return d.retryCloudflareSetup;
+	}
+
+	async removeCloudflareSetup(token: string): Promise<AccessStatus> {
+		const d = await this.gql<{ removeCloudflareSetup: AccessStatus }>(ops.REMOVE_CLOUDFLARE_SETUP, {
+			token,
+		});
+		return d.removeCloudflareSetup;
 	}
 
 	// --- admin dedup review ---

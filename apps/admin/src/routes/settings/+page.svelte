@@ -22,12 +22,18 @@
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import Segmented from '$lib/components/Segmented.svelte';
 	import Switch from '$lib/components/Switch.svelte';
+	import AccessSettings from './AccessSettings.svelte';
 
 	const sections = $derived([
 		{ id: 'appearance', label: 'Appearance' },
 		{ id: 'content', label: 'Content' },
 		// Only on a server that reports its settings (`instance`).
-		...(instance.info ? [{ id: 'accounts', label: 'Accounts' }] : []),
+		...(instance.info
+			? [
+					{ id: 'access', label: 'Access' },
+					{ id: 'accounts', label: 'Accounts' },
+				]
+			: []),
 		{ id: 'repos', label: 'Extension repos' },
 		{ id: 'updates', label: 'Extension updates' },
 		{ id: 'maintenance', label: 'Maintenance' },
@@ -412,6 +418,20 @@
 			</section>
 
 			{#if instance.info}
+				<section id="access" class="group" aria-labelledby="access-h">
+					<div class="group-head">
+						<div>
+							<h2 id="access-h" class="group-title">Access</h2>
+							<p class="group-desc">
+								How readers reach this server, and the Cloudflare setup in front of it.
+							</p>
+						</div>
+					</div>
+					<div class="group-body">
+						<AccessSettings />
+					</div>
+				</section>
+
 				<section id="accounts" class="group" aria-labelledby="accounts-h">
 					<div class="group-head">
 						<div>

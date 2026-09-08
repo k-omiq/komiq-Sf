@@ -374,6 +374,23 @@ export interface Backend {
 	 * the server pins it by env. Optional. */
 	setRegistrationOpen?(open: boolean): Promise<boolean>;
 
+	// --- admin access + Cloudflare setup (requires an admin session) ---
+	/** Settings › Access: access choice, public address, Cloudflare setup and the
+	 * current setup/remove run. Optional. */
+	accessStatus?(): Promise<AccessStatus>;
+	/** Record the setup wizard's access choice (and a domain set up by hand). Optional. */
+	setAccessMode?(mode: AccessMode, domain?: string | null): Promise<AccessStatus>;
+	/** Verify a Cloudflare API token and find the zone for `domain`. Nothing is
+	 * changed and the token is not kept. Optional. */
+	checkCloudflareToken?(token: string, domain: string): Promise<CloudflareTokenCheck>;
+	/** Start the Cloudflare checklist in the background; poll {@link accessStatus}.
+	 * The token is used for this run only. Optional. */
+	startCloudflareSetup?(input: CloudflareSetupInput): Promise<AccessStatus>;
+	/** Run the stored setup again from where it failed. Optional. */
+	retryCloudflareSetup?(token: string): Promise<AccessStatus>;
+	/** Delete exactly what Cloudflare setup created. Optional. */
+	removeCloudflareSetup?(token: string): Promise<AccessStatus>;
+
 	// --- admin dedup review (requires an admin session) ---
 	/** Pending mid-confidence dedup matches awaiting manual review
 	 * (CATALOGUE.md §4), highest score first, PAGINATED — the backlog runs to ~10k
@@ -717,6 +734,64 @@ export interface InstanceInfo {
 	version: string;
 	registrationOpen: boolean;
 	mangadexEnabled: boolean;
+}
+
+export type AccessMode = 'local' | 'internet';
+export type CloudflareConnection = 'TUNNEL' | 'PUBLIC_IP';
+
+/** One line of the Cloudflare checklist. */
+export interface CloudflareStep {
+	id: string;
+	label: string;
+	state: 'waiting' | 'running' | 'done' | 'failed';
+	message: string | null;
+}
+
+/** The current or last Cloudflare setup / remove run. */
+export interface CloudflareJob {
+	kind: 'setup' | 'remove';
+	running: boolean;
+	failed: boolean;
+	steps: CloudflareStep[];
+}
+
+/** What Cloudflare setup created on this server (no secrets). */
+export interface CloudflareSetup {
+	domain: string;
+	connection: CloudflareConnection | null;
+	zoneName: string | null;
+	complete: boolean;
+	/** Anything left for "Remove". */
+	removable: boolean;
+}
+
+/** Settings › Access (see {@link Backend.accessStatus}). */
+export interface AccessStatus {
+	/** `local`, `internet`, or empty while nobody chose. */
+	mode: AccessMode | '';
+	domain: string | null;
+	address: string | null;
+	cloudflare: CloudflareSetup | null;
+	connector: 'off' | 'starting' | 'running' | 'failed' | 'missing';
+	connectorMessage: string | null;
+	https: boolean;
+	trustedProxies: string[];
+	trustedProxiesPinned: boolean;
+	job: CloudflareJob | null;
+}
+
+export interface CloudflareTokenCheck {
+	zoneName: string;
+	zoneStatus: string;
+	accountName: string;
+}
+
+export interface CloudflareSetupInput {
+	token: string;
+	domain: string;
+	connection: CloudflareConnection;
+	/** Public IP only; empty detects the server's address. */
+	publicIp?: string | null;
 }
 
 export interface CreateOwnerInput {
