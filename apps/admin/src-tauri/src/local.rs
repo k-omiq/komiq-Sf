@@ -623,12 +623,14 @@ pub async fn boot_server(
     // CREATE_NO_WINDOW: the app is a GUI program; no console window for its server.
     cmd.creation_flags(0x0800_0000);
   }
+  crate::child::before_spawn(&mut cmd);
   let mut child = cmd.spawn().map_err(|e| {
     BootError::Failed(format!(
       "Could not run the server ({}): {e}",
       launch.bin.display()
     ))
   })?;
+  crate::child::after_spawn(&child);
 
   let mut pumps = Vec::new();
   if let Some(out) = child.stdout.take() {

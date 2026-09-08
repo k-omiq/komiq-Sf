@@ -375,6 +375,26 @@ fn prepare_data_dir(data_dir: &Path, port: u16) -> Result<(), String> {
   Ok(())
 }
 
+/// Process hooks a host crate may install for the engine child before the engine first
+/// starts. The reader installs none, so its launch is exactly as before. The admin
+/// desktop shell, which compiles this module in, uses them to tie the JVM's life to its
+/// own (apps/admin/src-tauri/src/child.rs): the JVM must not outlive a force-killed app.
+#[allow(dead_code)] // constructed only by the admin desktop shell
+pub(crate) struct ChildHooks {
+  /// Runs on the command before `spawn`.
+  pub before_spawn: fn(&mut tokio::process::Command),
+  /// Runs on the new child right after `spawn`.
+  pub after_spawn: fn(&tokio::process::Child),
+}
+
+static CHILD_HOOKS: OnceLock<ChildHooks> = OnceLock::new();
+
+/// Install [`ChildHooks`]. Only the first call counts.
+#[allow(dead_code)] // called only by the admin desktop shell
+pub(crate) fn set_child_hooks(hooks: ChildHooks) {
+  let _ = CHILD_HOOKS.set(hooks);
+}
+
 /// Spawn the JVM per the proven launch line, piping stdout/stderr into the `suwayomi`
 /// log target. Port is delivered via `server.conf`, not argv.
 fn spawn_engine(cfg: &EngineConfig) -> Result<tokio::process::Child, String> {
@@ -393,10 +413,20 @@ fn spawn_engine(cfg: &EngineConfig) -> Result<tokio::process::Child, String> {
     // Backstop: if this Child is ever dropped (task cancelled / runtime torn down),
     // the OS kills the JVM so we never orphan it.
     .kill_on_drop(true);
+  // CREATE_NO_WINDOW: `java.exe` is a console program, and a GUI app spawning it would
+  // otherwise flash a console window for the engine's whole life.
+  #[cfg(windows)]
+  cmd.creation_flags(0x0800_0000);
+  if let Some(hooks) = CHILD_HOOKS.get() {
+    (hooks.before_spawn)(&mut cmd);
+  }
 
   let mut child = cmd
     .spawn()
     .map_err(|e| format!("spawn java ({}) failed: {e}", cfg.java.display()))?;
+  if let Some(hooks) = CHILD_HOOKS.get() {
+    (hooks.after_spawn)(&child);
+  }
 
   if let Some(out) = child.stdout.take() {
     tokio::spawn(async move {

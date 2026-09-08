@@ -15,16 +15,23 @@ mod network;
 // The engine supervisor is the reader's own (apps/reader/src-tauri/src/suwayomi.rs),
 // compiled into this crate rather than copied: same jar pin, JRE layout, server.conf,
 // Basic-auth credential, lockfile and restart policy in both apps. It reaches two items
-// of its host crate by path, `crate::cloudflare` (a stub here, see cloudflare_stub.rs)
-// and `crate::image_fetch_semaphore` (below). Its Tauri commands are not registered
-// here, hence `dead_code`; it keeps the reader's formatting, hence `rustfmt::skip`.
+// of its host crate by path, `crate::cloudflare` (the reader's on-device Cloudflare shim,
+// also shared, below) and `crate::image_fetch_semaphore` (below). Its Tauri commands are
+// not registered here, hence `dead_code`; it keeps the reader's formatting, hence
+// `rustfmt::skip`.
 #[path = "../../../reader/src-tauri/src/suwayomi.rs"]
 #[allow(dead_code)]
 #[rustfmt::skip]
 mod suwayomi;
 
-#[path = "cloudflare_stub.rs"]
+// The reader's loopback FlareSolverr-v1 shim and WebView solver: the supervisor starts it
+// with the engine and points the engine at it, so Cloudflare-protected sources solve
+// their challenge in a hidden window of this app, exactly as in the reader.
+#[path = "../../../reader/src-tauri/src/cloudflare.rs"]
+#[rustfmt::skip]
 mod cloudflare;
+
+mod child;
 
 /// Required by the shared supervisor's `suwayomi_image` command, which this app does not
 /// register (the console never reads engine images directly).
@@ -154,6 +161,12 @@ pub fn run() {
   let app = tauri::Builder::default()
     .setup(move |app| {
       let data_dir = app.path().app_data_dir()?;
+      // Children die with the app, even a force-killed one (see child.rs).
+      child::init(&data_dir);
+      suwayomi::set_child_hooks(suwayomi::ChildHooks {
+        before_spawn: child::before_spawn,
+        after_spawn: child::after_spawn,
+      });
       let supervisor = Arc::new(suwayomi::SuwayomiSupervisor::new());
       let started = Arc::new(AtomicBool::new(false));
       app.manage(supervisor.clone());
@@ -188,7 +201,7 @@ pub fn run() {
 
   // Quit: stop the server first (it holds the database), then the engine. block_on is
   // safe here, the run callback is on the main thread. kill_on_drop on both children is
-  // the backstop.
+  // the backstop; child.rs covers a force-kill, which never gets here.
   app.run(|handle, event| {
     if let tauri::RunEvent::Exit = event {
       let server = handle
@@ -208,6 +221,7 @@ pub fn run() {
         if let Some(engine) = engine {
           engine.stop_and_wait().await;
         }
+        child::forget_all();
       });
     }
   });

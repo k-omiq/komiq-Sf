@@ -79,7 +79,15 @@ What the app bundles, and from where:
 
 `src-tauri/scripts/prepare-bundle.sh` builds all of it; `tauri build` runs it first
 (`beforeBuildCommand`), then the window's own build. The engine supervisor is the
-reader's `src/suwayomi.rs`, compiled into this crate by path, not copied.
+reader's `src/suwayomi.rs`, compiled into this crate by path, not copied; so is its
+on-device Cloudflare shim (`src/cloudflare.rs`), which solves Cloudflare challenges for
+the engine in a hidden window of the app.
+
+The server and the engine end with the app, even when it is force-killed
+(`src-tauri/src/child.rs`): `PR_SET_PDEATHSIG` on Linux, a Job Object with
+`KILL_ON_JOB_CLOSE` on Windows. macOS has no such kernel feature, so there the app
+records its children's pids and the next launch stops any that were left running
+before it starts new ones.
 
 Prerequisites: Rust (1.78+), Node 22 and pnpm, JDK 21 with `jlink` for the engine's
 runtime (`JAVA_HOME`), and the [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/)

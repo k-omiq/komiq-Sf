@@ -474,3 +474,46 @@ async fn real_server_first_run_then_restart() {
   assert!(!needs_setup(port).await);
   s.stop().await;
 }
+
+/// The server is tied to the app (src/child.rs): when what spawned it goes away without
+/// stopping it (a force-killed app), it ends too and its port is free again.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_server_ends_when_the_app_is_killed() {
+  let launch = fixture("ready");
+  let port = free_port();
+  std::thread::spawn({
+    let launch = launch.clone();
+    move || {
+      let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+      rt.block_on(async {
+        let child = boot_server(
+          &launch,
+          &attempt(port),
+          &LogBuf::new(),
+          &Arc::new(Mutex::new(None)),
+          Duration::from_secs(20),
+        )
+        .await
+        .expect("fake server boots");
+        // No stop, no kill_on_drop: only the kernel can end it now.
+        std::mem::forget(child);
+      })
+    }
+  })
+  .join()
+  .unwrap();
+  let deadline = Instant::now() + Duration::from_secs(10);
+  while std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok()
+    && Instant::now() < deadline
+  {
+    std::thread::sleep(Duration::from_millis(100));
+  }
+  assert!(
+    std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err(),
+    "the server stopped with the app"
+  );
+}

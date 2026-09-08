@@ -28,6 +28,19 @@ tauri = { version = "2.11.3", features = [] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # Child processes (engine, server), their output pumps, timers.
 tokio = { version = "1", features = ["net", "process", "time", "sync", "rt", "macros", "io-util"] }
+# The reader's on-device Cloudflare shim (src/lib.rs `mod cloudflare`) listens with it;
+# same version as the reader.
+tiny_http = "0.12"
+
+# src/child.rs: `prctl(PR_SET_PDEATHSIG)` so the server and engine end with the app.
+# Already in the tree (tokio, gtk-rs, …); this names the same 0.2 line directly.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# src/child.rs: a Job Object that ends the server and engine with the app. The same
+# 0.61 line tokio uses on Windows, plus the three API groups the job calls need.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "process", "time", "sync", "rt", "macros", "io-util", "rt-multi-thread"] }
