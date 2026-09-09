@@ -6772,21 +6772,23 @@ impl QueryRoot {
             registration_open: inst::resolve(pool, &inst::REGISTRATION_OPEN)
                 .await
                 .as_bool(),
-            mangadex_enabled: inst::resolve(pool, &inst::MANGADEX_ENABLED).await.as_bool(),
+            // The live usage switch: set from `resolve_mangadex` at boot and by
+            // `setMangadexEnabled`, and what every MangaDex request obeys.
+            mangadex_enabled: state(ctx).mangadex.is_enabled(),
         })
     }
 
-    /// Admin: the MangaDex switch and whether the server's environment pins it.
+    /// Admin: the MangaDex usage switch and whether the server's environment pins it.
     async fn mangadex_setting(&self, ctx: &Context<'_>) -> Result<MangadexSetting> {
         require_admin(ctx).await?;
-        use crate::instance as inst;
         let st = state(ctx);
-        let r = inst::resolve(&st.pool, &inst::MANGADEX_ENABLED).await;
+        let usage = crate::instance::resolve_mangadex(&st.pool).await;
         Ok(MangadexSetting {
             // The client's switch is what every request obeys; it is set from this same
-            // setting at boot and by `setMangadexEnabled`, so the two agree.
+            // resolution at boot and by `setMangadexEnabled`, so the two agree.
             enabled: st.mangadex.is_enabled(),
-            pinned: r.source == inst::Source::Env,
+            pinned: usage.pinned_by.is_some(),
+            pinned_by: usage.pinned_by.map(str::to_string),
         })
     }
 
@@ -10613,22 +10615,18 @@ impl MutationRoot {
             .as_bool())
     }
 
-    /// Admin: turn MangaDex on or off (`mangadex_enabled`). Refused when the server
-    /// pins it with `CATALOGUE_SYNC`, since env always wins. The change is stored AND
-    /// applied to the live client, so the background loops start or park within a
-    /// moment, without a restart. Returns the new effective value.
+    /// Admin: turn MangaDex on or off (`mangadex_enabled`). Refused when the server's
+    /// environment pins it (`KOMIKA_MANGADEX`, or `CATALOGUE_SYNC=on`), since env always
+    /// wins. The change is stored AND applied to the live client, so the background
+    /// loops start or park within a moment, without a restart. Returns the new value.
     async fn set_mangadex_enabled(&self, ctx: &Context<'_>, enabled: bool) -> Result<bool> {
         let admin = require_admin(ctx).await?;
         use crate::instance as inst;
         let st = state(ctx);
-        if inst::resolve(&st.pool, &inst::MANGADEX_ENABLED)
-            .await
-            .source
-            == inst::Source::Env
-        {
-            return Err(Error::new(
-                "MangaDex is set by CATALOGUE_SYNC on this server and cannot be changed here.",
-            ));
+        if let Some(var) = inst::resolve_mangadex(&st.pool).await.pinned_by {
+            return Err(Error::new(format!(
+                "MangaDex is set by {var} on this server and cannot be changed here."
+            )));
         }
         inst::store(
             &st.pool,

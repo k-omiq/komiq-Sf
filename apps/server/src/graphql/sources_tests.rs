@@ -133,18 +133,24 @@ fn err(resp: &async_graphql::Response) -> String {
         .unwrap_or_default()
 }
 
-const SETTING_Q: &str = "{ mangadexSetting { enabled pinned } instance { mangadexEnabled } }";
+const SETTING_Q: &str =
+    "{ mangadexSetting { enabled pinned pinnedBy } instance { mangadexEnabled } }";
 
-/// One test for everything that reads `CATALOGUE_SYNC`, so the env override cannot
-/// race another test's read of the same variable.
+/// One test for everything that reads `KOMIKA_MANGADEX` / `CATALOGUE_SYNC`, so the env
+/// overrides cannot race another test's read of the same variables. (The full
+/// deployment matrix is `instance::tests::mangadex_usage_and_crawl_across_deployments`,
+/// with an injected environment.)
 #[tokio::test]
 async fn the_mangadex_switch_is_admin_only_toggles_live_and_env_pins_it() {
     let (engine, _) = mock_engine().await;
     let (s, st) = fixture(&engine).await;
-    let saved = std::env::var("CATALOGUE_SYNC").ok();
-    std::env::remove_var("CATALOGUE_SYNC");
+    const VARS: [&str; 2] = ["CATALOGUE_SYNC", "KOMIKA_MANGADEX"];
+    let saved: Vec<Option<String>> = VARS.iter().map(|v| std::env::var(v).ok()).collect();
+    for v in VARS {
+        std::env::remove_var(v);
+    }
 
-    // Fresh install: off, not pinned.
+    // A server that booted with MangaDex off (a self-host): off, not pinned.
     let d = ok(run(&s, SETTING_Q, Some("admintok")).await);
     assert_eq!(d["mangadexSetting"]["enabled"], false);
     assert_eq!(d["mangadexSetting"]["pinned"], false);
@@ -191,32 +197,49 @@ async fn the_mangadex_switch_is_admin_only_toggles_live_and_env_pins_it() {
     assert_eq!(d["setMangadexEnabled"], false);
     assert!(!st.mangadex.is_enabled());
 
-    // Env wins: with CATALOGUE_SYNC set the console shows it pinned and cannot change
-    // it, and nothing is written.
-    std::env::set_var("CATALOGUE_SYNC", "on");
+    // Env wins: a pinned value is shown read-only, naming the variable, and the
+    // mutation is refused without writing anything.
+    for (var, value) in [("CATALOGUE_SYNC", "on"), ("KOMIKA_MANGADEX", "off")] {
+        std::env::set_var(var, value);
+        let d = ok(run(&s, SETTING_Q, Some("admintok")).await);
+        assert_eq!(d["mangadexSetting"]["pinned"], true, "{var}");
+        assert_eq!(d["mangadexSetting"]["pinnedBy"], var);
+        let r = run(
+            &s,
+            "mutation { setMangadexEnabled(enabled: true) }",
+            Some("admintok"),
+        )
+        .await;
+        assert_eq!(
+            err(&r),
+            format!("MangaDex is set by {var} on this server and cannot be changed here.")
+        );
+        let stored: String =
+            sqlx::query_scalar("SELECT value FROM instance_setting WHERE key = 'mangadex_enabled'")
+                .fetch_one(&st.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, "false", "a refused change writes nothing");
+        std::env::remove_var(var);
+    }
+
+    // CATALOGUE_SYNC=off only stops the crawl on this replica: usage stays the admin's.
+    std::env::set_var("CATALOGUE_SYNC", "off");
     let d = ok(run(&s, SETTING_Q, Some("admintok")).await);
-    assert_eq!(d["mangadexSetting"]["pinned"], true);
-    assert_eq!(d["instance"]["mangadexEnabled"], true);
-    let r = run(
+    assert_eq!(d["mangadexSetting"]["pinned"], false);
+    let d = ok(run(
         &s,
-        "mutation { setMangadexEnabled(enabled: false) }",
+        "mutation { setMangadexEnabled(enabled: true) }",
         Some("admintok"),
     )
-    .await;
-    assert_eq!(
-        err(&r),
-        "MangaDex is set by CATALOGUE_SYNC on this server and cannot be changed here."
-    );
-    let stored: String =
-        sqlx::query_scalar("SELECT value FROM instance_setting WHERE key = 'mangadex_enabled'")
-            .fetch_one(&st.pool)
-            .await
-            .unwrap();
-    assert_eq!(stored, "false", "a refused change writes nothing");
+    .await);
+    assert_eq!(d["setMangadexEnabled"], true);
 
-    match saved {
-        Some(v) => std::env::set_var("CATALOGUE_SYNC", v),
-        None => std::env::remove_var("CATALOGUE_SYNC"),
+    for (var, value) in VARS.iter().zip(saved) {
+        match value {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
     }
 }
 

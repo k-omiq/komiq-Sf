@@ -926,7 +926,8 @@ pub struct Instance {
     pub version: String,
     /// Whether `register` accepts new accounts.
     pub registration_open: bool,
-    /// Whether the direct-MangaDex catalogue sync is on.
+    /// Whether this server uses MangaDex (the usage switch; the catalogue crawl is a
+    /// separate per-replica setting).
     pub mangadex_enabled: bool,
 }
 
@@ -935,9 +936,11 @@ pub struct Instance {
 pub struct MangadexSetting {
     /// Whether the server may talk to MangaDex right now.
     pub enabled: bool,
-    /// True when `CATALOGUE_SYNC` in the server environment fixes the value, so the
-    /// console shows it read-only (`setMangadexEnabled` is refused).
+    /// True when the server environment fixes the value, so the console shows it
+    /// read-only (`setMangadexEnabled` is refused).
     pub pinned: bool,
+    /// The env variable that pins it: `KOMIKA_MANGADEX` or `CATALOGUE_SYNC`.
+    pub pinned_by: Option<String>,
 }
 
 /// Admin "manga DB" overrides. Every field is the desired whole state for the

@@ -118,7 +118,9 @@ export async function installAdminSetupFixtures(page, initial = {}) {
 				}
 				case 'MangadexSetting':
 					return route.fulfill(
-						ok({ mangadexSetting: { enabled: state.mangadexEnabled, pinned: false } }),
+						ok({
+							mangadexSetting: { enabled: state.mangadexEnabled, pinned: false, pinnedBy: null },
+						}),
 					);
 				case 'SetMangadexEnabled':
 					state.mangadexEnabled = v.enabled;

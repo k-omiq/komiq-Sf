@@ -93,8 +93,8 @@
 	}
 
 	// ---- Sources: the MangaDex switch ------------------------------------------
-	// Off on a new install. The server refuses the change when its environment pins
-	// it (`CATALOGUE_SYNC`), and says so in `pinned`; the switch is then read-only.
+	// Off on a new self-hosted install. The server refuses the change when its
+	// environment pins it (`pinnedBy`); the switch is then read-only.
 	let mangadex = $state<MangadexSetting | null>(null);
 	let mangadexBusy = $state(false);
 
@@ -529,7 +529,8 @@
 								</p>
 								{#if mangadex.pinned}
 									<p class="k-hint">
-										Set by <code>CATALOGUE_SYNC</code> in the server environment.
+										Set by <code>{mangadex.pinnedBy ?? 'the server configuration'}</code> in the server
+										environment.
 									</p>
 								{/if}
 							</div>

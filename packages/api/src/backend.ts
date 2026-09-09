@@ -376,7 +376,7 @@ export interface Backend {
 	/** The MangaDex switch and whether the server's env pins it. Optional. */
 	mangadexSetting?(): Promise<MangadexSetting>;
 	/** Turn MangaDex on or off; returns the new effective value. Refused when the
-	 * server pins it by env (`CATALOGUE_SYNC`). Optional. */
+	 * server pins it by env (`KOMIKA_MANGADEX`, `CATALOGUE_SYNC=on`). Optional. */
 	setMangadexEnabled?(enabled: boolean): Promise<boolean>;
 
 	// --- admin dedup review (requires an admin session) ---
@@ -731,8 +731,10 @@ export interface InstanceInfo {
 /** The MangaDex switch as the admin sees it. */
 export interface MangadexSetting {
 	enabled: boolean;
-	/** Fixed by the server's environment (`CATALOGUE_SYNC`); read-only here. */
+	/** Fixed by the server's environment; read-only here. */
 	pinned: boolean;
+	/** The env variable that fixes it (`KOMIKA_MANGADEX` or `CATALOGUE_SYNC`). */
+	pinnedBy: string | null;
 }
 
 /** One extension repo configured on the engine. */

@@ -8,9 +8,10 @@
 //! by default; nothing here runs unless explicitly enabled.
 //!
 //! **The switch.** Every request this client sends passes one gate,
-//! [`MangaDexClient::is_enabled`], fed by the `mangadex_enabled` instance setting
-//! (`CATALOGUE_SYNC` env, then the admin's choice, then off — see
-//! `instance::MANGADEX_ENABLED`). With it off a request fails at once with
+//! [`MangaDexClient::is_enabled`], fed by the `mangadex_enabled` usage setting
+//! (`KOMIKA_MANGADEX`, then `CATALOGUE_SYNC=on`, then the admin's choice, then on —
+//! off on a self-host; see `instance::resolve_mangadex`). Whether this replica also
+//! CRAWLS the catalogue is a separate decision (`instance::catalogue_crawl`). With it off a request fails at once with
 //! [`MangadexOff`] and never reaches the network, so a path nobody remembered to
 //! gate still cannot talk to MangaDex. The background loops wait on the same switch
 //! between passes ([`MangaDexClient::wait_enabled`]), so turning it on from the admin

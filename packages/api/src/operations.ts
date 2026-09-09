@@ -1177,6 +1177,7 @@ export const MANGADEX_SETTING = /* GraphQL */ `
 		mangadexSetting {
 			enabled
 			pinned
+			pinnedBy
 		}
 	}
 `;

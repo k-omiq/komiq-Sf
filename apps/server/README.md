@@ -36,6 +36,16 @@ Instance settings read the env variable first, then the `instance_setting` table
 from the admin console), then a default, so a value pinned in env cannot be changed at
 runtime. `registration_open` defaults to open.
 
+MangaDex has two separate settings. **Usage** (`mangadex_enabled`: may this server talk
+to MangaDex at all — reading, covers, metadata, `/img`) resolves `KOMIKA_MANGADEX`
+(on/off, pins it), then `CATALOGUE_SYNC=on` (pins it on), then the admin's switch, then
+the default: off on a self-hosted install (`KOMIKA_WEB_DIR` set), on everywhere else.
+The **catalogue crawl** runs where `CATALOGUE_SYNC=on` (one replica only — see
+`deploy/.env.example`), never where it is `off`, and, when it is unset, only on a
+self-hosted install while usage is on. `METADATA_BACKFILL`/`COVER_PHASH` act only while
+usage is on; `COVER_CACHE=off` still stops the whole cover drainer. `/img` (the image
+proxy) is mounted when `KOMIKA_WEB_DIR` is set or `KOMIKA_IMG_PROXY=on`.
+
 ### First-run setup
 
 An instance is set up once any admin account exists. With no admin at boot (none in the

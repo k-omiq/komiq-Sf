@@ -229,8 +229,8 @@ pub struct Config {
     pub mangadex_user_agent: String,
     /// Compute a cover perceptual-hash per work during the catalogue sync
     /// (CATALOGUE.md §4). Off by default — it adds one cover download per work, so
-    /// it's opt-in on top of the MangaDex switch via `COVER_PHASH=on` (it only ever
-    /// runs inside a sync pass, which only runs with MangaDex on).
+    /// it's opt-in on top of the catalogue sync via `COVER_PHASH=on` (it only ever
+    /// runs inside a sync pass, which only runs with MangaDex usage on).
     pub catalogue_cover_phash: bool,
     /// Interval between recurring incremental catalogue/chapter refresh cycles
     /// (`updatedAtSince`). The first cycle seeds on startup; default 6h.
@@ -405,9 +405,9 @@ impl Config {
                 v == "on" || v == "1" || v == "true"
             })
             .unwrap_or(false);
-        // `CATALOGUE_SYNC` is not read here any more: it is the env override of the
-        // `mangadex_enabled` instance setting (`instance::MANGADEX_ENABLED`), resolved in
-        // `main` against the admin's stored choice, with the same on/off spelling.
+        // `CATALOGUE_SYNC` is not read here any more: `instance::catalogue_crawl` decides
+        // the crawl from it (same on/off spelling), and `instance::resolve_mangadex` lets
+        // `CATALOGUE_SYNC=on` force MangaDex usage on. Both are resolved in `main`.
         let mangadex_rate_per_sec = env::var("MANGADEX_RATE_PER_SEC")
             .ok()
             .and_then(|v| v.parse().ok())

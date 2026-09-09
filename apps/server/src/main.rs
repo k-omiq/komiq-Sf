@@ -1601,19 +1601,20 @@ async fn main() -> anyhow::Result<()> {
         cfg.mangadex_rate_per_sec,
         cfg.mangadex_athome_per_min,
     ));
-    // The MangaDex switch (`mangadex` module doc): env `CATALOGUE_SYNC`, then the
-    // admin's stored choice, then off. Read once here to set the client; from then on
-    // `setMangadexEnabled` flips the live client and the table together, and every
-    // loop reads the live value each pass. `pinned_off` is the one case nothing can
-    // change at runtime (env says off), so the MangaDex loops are not even spawned —
-    // which is exactly the old `CATALOGUE_SYNC` off behaviour.
-    let mangadex_setting = instance::resolve(&pool, &instance::MANGADEX_ENABLED).await;
-    let mangadex_on = mangadex_setting.as_bool();
-    let mangadex_pinned_off = mangadex_setting.source == instance::Source::Env && !mangadex_on;
-    mangadex.set_enabled(mangadex_on);
+    // The MangaDex USAGE switch (`instance::resolve_mangadex`): `KOMIKA_MANGADEX`, then
+    // `CATALOGUE_SYNC=on`, then the admin's stored choice, then on (off on a self-host).
+    // Read once here to set the client; from then on `setMangadexEnabled` flips the live
+    // client and the table together, and every loop reads the live value each pass.
+    let mangadex_usage = instance::resolve_mangadex(&pool).await;
+    mangadex.set_enabled(mangadex_usage.enabled);
+    // The CRAWL is a separate, per-replica decision (`instance::catalogue_crawl`):
+    // `CATALOGUE_SYNC` still means "run the catalogue sync on this replica".
+    let crawl = instance::catalogue_crawl(|name| std::env::var(name).ok());
     tracing::info!(
-        enabled = mangadex_on,
-        source = ?mangadex_setting.source,
+        enabled = mangadex_usage.enabled,
+        source = ?mangadex_usage.source,
+        pinned_by = mangadex_usage.pinned_by.unwrap_or("-"),
+        crawl = ?crawl,
         "mangadex switch"
     );
     let state = Arc::new(AppState {
@@ -1747,11 +1748,12 @@ async fn main() -> anyhow::Result<()> {
     // one replica — N replicas syncing = N× the shared-IP budget → 429/ban. Moving
     // to a shared (DB/Redis) limiter is the prerequisite for multi-replica sync.
     //
-    // Self-host: the loops are spawned whenever the switch CAN be on (env on, or not
-    // pinned), and each one parks on `MangaDexClient::wait_enabled` until it is. A
-    // parked loop is one idle task, so spawning them on a MangaDex-off server costs
-    // nothing and lets the admin's switch start them without a restart.
-    if !mangadex_pinned_off {
+    // Spawned for `CATALOGUE_SYNC=on` (as always) and, on a self-host with it unset,
+    // to follow the admin's switch. Either way each loop parks on
+    // `MangaDexClient::wait_enabled` while usage is off: a parked loop is one idle task,
+    // and the switch starts it without a restart. `CATALOGUE_SYNC=off`, and unset on a
+    // hosted server, never spawn it — exactly the old behaviour.
+    if crawl != instance::CatalogueCrawl::Never {
         mangadex::spawn_recurring(
             pool.clone(),
             mangadex.clone(),
@@ -1802,13 +1804,17 @@ async fn main() -> anyhow::Result<()> {
         // first, then anything older than a week, so it never finishes for good — it idles
         // on an hourly probe between weekly refreshes.
         work_stats::spawn_stats_backfill(pool.clone(), mangadex.clone(), shutdown_tx.subscribe());
-        if !mangadex_on {
-            tracing::info!(
+        match (mangadex_usage.enabled, mangadex_usage.pinned_by) {
+            (true, _) => {}
+            (false, Some(var)) => {
+                tracing::info!(var, "catalogue sync waiting: MangaDex usage is pinned off")
+            }
+            (false, None) => tracing::info!(
                 "catalogue sync waiting: MangaDex is off (turn it on in the admin console)"
-            );
+            ),
         }
     } else {
-        tracing::info!("catalogue sync disabled (CATALOGUE_SYNC=off pins MangaDex off)");
+        tracing::info!("catalogue sync disabled (set CATALOGUE_SYNC=on to enable)");
     }
 
     // Recurring auto-enrichment drainer (X1) — opt-in. Keeps newly-ingested
