@@ -48,9 +48,35 @@ test('a fresh server opens setup, refuses a wrong code, creates the owner and cl
 
 	await page.getByRole('button', { name: 'Continue' }).click();
 
-	// Done: the choice reached the server and the console opens.
+	// Sources: MangaDex on, one repo, one extension installed from the picker.
+	await expect(page.getByRole('heading', { name: 'Sources' })).toBeVisible();
+	await expect(page.getByRole('switch', { name: 'Use MangaDex' })).toHaveAttribute(
+		'aria-checked',
+		'false',
+	);
+	await page.getByRole('switch', { name: 'Use MangaDex' }).click();
+	await page.getByLabel('Repo index address').fill('https://repo.example.invalid/index.min.json');
+	await page.getByRole('button', { name: 'Add', exact: true }).click();
+	await expect(page.getByRole('listitem').filter({ hasText: 'Test Repo' })).toBeVisible();
+	await page.getByLabel('Language').selectOption('all');
+	await page.getByLabel('Search extensions').fill('beta');
+	await expect(page.getByRole('listitem').filter({ hasText: 'Alpha Scans' })).toHaveCount(0);
+	await page
+		.getByRole('listitem')
+		.filter({ hasText: 'Beta Comics' })
+		.getByRole('button', { name: 'Install' })
+		.click();
+	await expect(page.getByRole('listitem').filter({ hasText: 'Beta Comics' })).toContainText(
+		'Installed',
+	);
+	expect(state.mangadexEnabled).toBe(false); // applied on Continue, not on toggle
+	await page.getByRole('button', { name: 'Continue' }).click();
+
+	// Done: the choices reached the server and the console opens.
 	await expect(page.getByRole('heading', { name: 'You are all set' })).toBeVisible();
 	expect(state.registrationOpen).toBe(false);
+	expect(state.mangadexEnabled).toBe(true);
+	await expect(page.getByText('MangaDex on · 1 extension')).toBeVisible();
 	await page.getByRole('button', { name: 'Open the catalog' }).click();
 	await expect(page).toHaveURL(/\/admin\/$/);
 	await expect(page.getByRole('navigation', { name: 'Admin navigation' })).toBeVisible();

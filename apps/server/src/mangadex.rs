@@ -5,7 +5,17 @@
 //! `altTitles`. Writes the canonical spine through `crate::catalog`. A global token
 //! bucket keeps the crawl under MangaDex's ~5 req/s per-IP ceiling (the egress IP is
 //! shared fleet-wide, so this is a fleet budget). The whole subsystem is gated off
-//! by default (`CATALOGUE_SYNC`); nothing here runs unless explicitly enabled.
+//! by default; nothing here runs unless explicitly enabled.
+//!
+//! **The switch.** Every request this client sends passes one gate,
+//! [`MangaDexClient::is_enabled`], fed by the `mangadex_enabled` usage setting
+//! (`KOMIKA_MANGADEX`, then `CATALOGUE_SYNC=on`, then the admin's choice, then on —
+//! off on a self-host; see `instance::resolve_mangadex`). Whether this replica also
+//! CRAWLS the catalogue is a separate decision (`instance::catalogue_crawl`). With it off a request fails at once with
+//! [`MangadexOff`] and never reaches the network, so a path nobody remembered to
+//! gate still cannot talk to MangaDex. The background loops wait on the same switch
+//! between passes ([`MangaDexClient::wait_enabled`]), so turning it on from the admin
+//! console starts them without a restart and turning it off parks them.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -249,8 +259,43 @@ impl<V: Clone> TtlMemo<V> {
     }
 }
 
+/// The error every gated request returns while the MangaDex switch is off. A type
+/// (not just a message) so the background drains can tell "switched off" from
+/// "upstream unhappy" and wait for the switch instead of backing off for an hour.
+#[derive(Debug, Clone, Copy)]
+pub struct MangadexOff;
+
+/// The user-facing wording, shared by the GraphQL refusals so the admin console and
+/// the reader see one sentence.
+pub const MANGADEX_OFF_MESSAGE: &str = "MangaDex is turned off on this server.";
+
+impl std::fmt::Display for MangadexOff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(MANGADEX_OFF_MESSAGE)
+    }
+}
+
+impl std::error::Error for MangadexOff {}
+
+/// Whether `e` is (or wraps) the switched-off refusal.
+pub fn is_off(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<MangadexOff>().is_some()
+}
+
 pub struct MangaDexClient {
     http: reqwest::Client,
+    /// The runtime on/off switch (see the module doc). A `watch` rather than an
+    /// `AtomicBool` so a parked loop can `await` the flip instead of polling for it.
+    /// Starts OFF: a client nobody switched on (every test fixture, and a server
+    /// whose setting resolves to off) cannot send a single request.
+    enabled: tokio::sync::watch::Sender<bool>,
+    /// `https://api.mangadex.org` in production; a local mock in tests, so no test
+    /// can reach the real API even when it switches the client on.
+    api_base: String,
+    /// `https://uploads.mangadex.org/covers` in production (see `api_base`). Only the
+    /// server-side cover download uses it; the URLs handed to clients keep
+    /// [`COVERS_BASE`] (`cover_url`).
+    covers_base: String,
     /// `/at-home` answers by chapter id, so N readers opening the same chapter inside
     /// the base URL's lifetime cost ONE request from the 40/min budget, and a reader
     /// whose next-chapter prefetch already ran opens it without a MangaDex round-trip.
@@ -277,9 +322,84 @@ impl MangaDexClient {
             .expect("reqwest client builds");
         Self {
             http,
+            enabled: tokio::sync::watch::Sender::new(false),
+            api_base: API_BASE.to_string(),
+            covers_base: COVERS_BASE.to_string(),
             athome_memo: TtlMemo::new(ATHOME_MEMO_TTL, ATHOME_MEMO_CAP),
             limiter: TokenBucket::new(rate_per_sec),
             athome_limiter: TokenBucket::new(athome_per_min / 60.0),
+        }
+    }
+
+    /// Point the client at a local mock instead of MangaDex (tests only).
+    #[cfg(test)]
+    pub fn with_bases(mut self, api_base: &str, covers_base: &str) -> Self {
+        self.api_base = api_base.trim_end_matches('/').to_string();
+        self.covers_base = covers_base.trim_end_matches('/').to_string();
+        self
+    }
+
+    /// Is MangaDex switched on right now?
+    pub fn is_enabled(&self) -> bool {
+        *self.enabled.borrow()
+    }
+
+    /// Flip the switch. Returns whether the value changed; only a change wakes the
+    /// loops parked in [`Self::wait_enabled`].
+    pub fn set_enabled(&self, on: bool) -> bool {
+        self.enabled.send_if_modified(|v| {
+            let changed = *v != on;
+            *v = on;
+            changed
+        })
+    }
+
+    /// A receiver that observes every flip (the recurring sync uses it to stop
+    /// between ticks when the switch goes off).
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.enabled.subscribe()
+    }
+
+    /// Park until the switch is on. Returns `true` when `shutdown` fired first (the
+    /// caller stops), `false` once MangaDex is on (immediately, when it already is).
+    ///
+    /// This is how a loop started while MangaDex was off begins working the moment an
+    /// admin turns it on: it awaits the flip itself, so there is no polling interval
+    /// to wait out and nothing to restart. A dropped shutdown sender counts as
+    /// shutdown, for the reason the drains' `nap` helpers document.
+    ///
+    /// `task` names the loop in the two log lines a park produces (parked, resumed),
+    /// which is how an operator sees the switch take effect.
+    pub async fn wait_enabled(
+        &self,
+        task: &'static str,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> bool {
+        let mut rx = self.enabled.subscribe();
+        let mut parked = false;
+        loop {
+            if *rx.borrow_and_update() {
+                if parked {
+                    tracing::info!(task, "mangadex: switched on — resuming");
+                }
+                return false;
+            }
+            if *shutdown.borrow() {
+                return true;
+            }
+            if !parked {
+                parked = true;
+                tracing::info!(task, "mangadex: off — waiting for the switch");
+            }
+            tokio::select! {
+                // The sender lives as long as this client, which outlives the borrow.
+                _ = rx.changed() => {}
+                r = shutdown.changed() => {
+                    if r.is_err() || *shutdown.borrow() {
+                        return true;
+                    }
+                }
+            }
         }
     }
 
@@ -301,6 +421,12 @@ impl MangaDexClient {
         let mut attempt: u32 = 0;
         let mut transport_attempt: u32 = 0;
         loop {
+            // THE gate (module doc). Checked on every attempt, not once per call, so a
+            // request sleeping in a retry backoff when the switch goes off stops there
+            // rather than firing its remaining attempts.
+            if !self.is_enabled() {
+                return Err(anyhow::Error::new(MangadexOff));
+            }
             if athome {
                 self.athome_limiter.acquire().await;
             }
@@ -383,7 +509,12 @@ impl MangaDexClient {
             params.push((window.since_param().into(), since.to_string()));
         }
         let res = self
-            .get_with_retry(&format!("{API_BASE}/manga"), &params, false, "/manga")
+            .get_with_retry(
+                &format!("{}/manga", self.api_base),
+                &params,
+                false,
+                "/manga",
+            )
             .await?;
         let body: RawList = res.json().await?;
         let raw_len = body.data.len();
@@ -422,7 +553,12 @@ impl MangaDexClient {
                 params.push(("ids[]".into(), id.clone()));
             }
             let res = self
-                .get_with_retry(&format!("{API_BASE}/manga"), &params, false, "/manga?ids")
+                .get_with_retry(
+                    &format!("{}/manga", self.api_base),
+                    &params,
+                    false,
+                    "/manga?ids",
+                )
                 .await?;
             let body: RawList = res.json().await?;
             // Same parse path (and the same loud, attributable drop log) as the sweep:
@@ -463,7 +599,12 @@ impl MangaDexClient {
             ("order[volume]".into(), "asc".into()),
         ];
         let res = self
-            .get_with_retry(&format!("{API_BASE}/cover"), &params, false, "/cover")
+            .get_with_retry(
+                &format!("{}/cover", self.api_base),
+                &params,
+                false,
+                "/cover",
+            )
             .await?;
         let body: RawList = res.json().await?;
         let mut out = Vec::with_capacity(body.data.len());
@@ -507,7 +648,12 @@ impl MangaDexClient {
     ) -> Result<ChapterPage> {
         let params = chapter_list_params(window, since, offset);
         let res = self
-            .get_with_retry(&format!("{API_BASE}/chapter"), &params, false, "/chapter")
+            .get_with_retry(
+                &format!("{}/chapter", self.api_base),
+                &params,
+                false,
+                "/chapter",
+            )
             .await?;
         let body: RawChapterList = res.json().await?;
         let raw_len = body.data.len();
@@ -557,7 +703,7 @@ impl MangaDexClient {
         let params = chapter_ids_params(ids);
         let res = self
             .get_with_retry(
-                &format!("{API_BASE}/chapter"),
+                &format!("{}/chapter", self.api_base),
                 &params,
                 false,
                 "/chapter?ids",
@@ -603,7 +749,7 @@ impl MangaDexClient {
             .collect();
         let res = self
             .get_with_retry(
-                &format!("{API_BASE}/statistics/manga"),
+                &format!("{}/statistics/manga", self.api_base),
                 &params,
                 false,
                 "/statistics/manga",
@@ -629,7 +775,7 @@ impl MangaDexClient {
     /// into a permanent miss. The body is read with a hard length cap. `None` on any
     /// failure: a missing cover is one fewer dedup signal, never a failed sync.
     async fn fetch_cover_thumb(&self, manga_id: &str, file_name: &str) -> Option<Vec<u8>> {
-        let url = format!("{}.512.jpg", cover_url(manga_id, file_name));
+        let url = format!("{}/{manga_id}/{file_name}.512.jpg", self.covers_base);
         let res = match self.get_with_retry(&url, &[], false, "cover").await {
             Ok(res) => res,
             Err(e) => {
@@ -661,6 +807,11 @@ impl MangaDexClient {
     /// the one step of the reader's open-chapter waterfall that waits on MangaDex, and
     /// the endpoint's budget is the tightest we have.
     pub async fn at_home(&self, chapter_id: &str) -> Result<Vec<String>> {
+        // Gated here too: a memo hit sends no request, but it still hands the reader
+        // `*.mangadex.network` URLs to load, which is MangaDex traffic all the same.
+        if !self.is_enabled() {
+            return Err(anyhow::Error::new(MangadexOff));
+        }
         self.athome_memo
             .get_or_try_init(chapter_id, || self.fetch_at_home(chapter_id))
             .await
@@ -669,7 +820,7 @@ impl MangaDexClient {
     async fn fetch_at_home(&self, chapter_id: &str) -> Result<Vec<String>> {
         let res = self
             .get_with_retry(
-                &format!("{API_BASE}/at-home/server/{chapter_id}"),
+                &format!("{}/at-home/server/{chapter_id}", self.api_base),
                 &[],
                 true,
                 "/at-home",
@@ -2605,6 +2756,15 @@ pub fn spawn_backfill_if_needed(
                 tracing::info!(pass, "backfill: shutting down before the next pass");
                 return;
             }
+            // Parked while MangaDex is off (module doc). A pass cut short by the switch
+            // going off ends like any failed pass; this wait keeps the next one from
+            // starting until it is back on.
+            if client
+                .wait_enabled("catalogue backfill", &mut shutdown)
+                .await
+            {
+                return;
+            }
             match run_backfill_pass(&pool, &covers, &client, cover_phash).await {
                 PassResult::Stop => return,
                 PassResult::Retry { scanned, last } => {
@@ -2986,6 +3146,13 @@ pub fn spawn_readable_backfill(
                 );
                 return;
             }
+            // Parked while MangaDex is off (module doc); resumes on the flip.
+            if client
+                .wait_enabled("readable backfill", &mut shutdown)
+                .await
+            {
+                return;
+            }
             match backfill_chapter_external_urls(&pool, &client).await {
                 Ok(fill) if fill.filled == 0 => {
                     if !announced {
@@ -3044,6 +3211,9 @@ pub fn spawn_readable_backfill(
                         return;
                     }
                 }
+                // Switched off mid-drain: nothing was asked of MangaDex, so there is no
+                // upstream to back off from. Go straight back to waiting on the switch.
+                Err(e) if is_off(&e) => continue,
                 Err(e) => {
                     // Nothing was written (the fetch is the only thing that can fail before
                     // the transaction), so the batch is simply re-offered. Back off to the
@@ -3442,6 +3612,10 @@ pub fn spawn_group_backfill(
                 since_hot = 0;
             }
             since_hot += 1;
+            // Parked while MangaDex is off (module doc); resumes on the flip.
+            if client.wait_enabled("group backfill", &mut shutdown).await {
+                return;
+            }
             match backfill_chapter_groups(&pool, &client, &hot).await {
                 Ok(fill) if fill.filled == 0 => {
                     if !announced {
@@ -3493,6 +3667,9 @@ pub fn spawn_group_backfill(
                         return;
                     }
                 }
+                // Switched off mid-drain: no upstream to back off from (see the
+                // readable backfill).
+                Err(e) if is_off(&e) => continue,
                 Err(e) => {
                     // Nothing was written; the batch is simply re-offered. Back off to the
                     // idle interval — retrying an unhappy upstream every 2 s is how a
@@ -4171,65 +4348,87 @@ async fn run_recurring(
     // Staggered starts so the boot burst is spread rather than landing in one instant, and
     // `Delay` on all three so a long pass postpones the next tick instead of queueing a
     // backlog. They share `CATALOGUE_SYNC_RUNNING`, so two sweeps can never interleave.
-    let mut catalogue = tokio::time::interval_at(
-        tokio::time::Instant::now() + std::time::Duration::from_secs(60),
-        std::time::Duration::from_secs(interval_secs),
-    );
-    catalogue.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut chapters = tokio::time::interval_at(
-        tokio::time::Instant::now() + std::time::Duration::from_secs(150),
-        std::time::Duration::from_secs(chapter_interval_secs),
-    );
-    chapters.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut reconcile = tokio::time::interval_at(
-        tokio::time::Instant::now() + std::time::Duration::from_secs(300),
-        std::time::Duration::from_secs(reconcile_interval_secs),
-    );
-    reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    tracing::info!(
-        interval_secs,
-        chapter_interval_secs,
-        reconcile_interval_secs,
-        cover_phash,
-        "mangadex: recurring sync started"
-    );
-    loop {
-        tokio::select! {
-            _ = catalogue.tick() => {
-                sync_cycle(&pool, &client, cover_phash).await;
-            }
-            _ = chapters.tick() => {
-                // The freshness path. What reaches /updates from here is the Phase C2
-                // incremental writer inside `sync_chapters` — one feed upsert per touched
-                // series, per page — NOT the wholesale chain, which is what makes a
-                // 15-minute cadence affordable at all.
-                chapter_cycle(&pool, &client).await;
-            }
-            _ = reconcile.tick() => {
-                // Phase C3: rebuild everything and report what the incremental writers
-                // missed. `drifted == 0` is the healthy answer, and it is the evidence that
-                // the incremental path is actually correct rather than merely present.
-                match crate::catalog::ledger::reconcile_feed(&pool).await {
-                    Ok(r) if r.drifted == 0 => tracing::info!(
-                        rows = r.rows_after,
-                        duration_ms = r.duration_ms,
-                        "feed reconciler: no drift — incremental writers are keeping up"
-                    ),
-                    Ok(r) => tracing::warn!(
-                        rows_before = r.rows_before,
-                        rows_after = r.rows_after,
-                        drifted = r.drifted,
-                        duration_ms = r.duration_ms,
-                        sample = %r.sample.join(" | "),
-                        "feed reconciler: DRIFT — the incremental writers missed rows"
-                    ),
-                    Err(e) => tracing::warn!(error = %e, "feed reconciler: failed"),
+    //
+    // THE SWITCH (module doc). The outer loop parks until MangaDex is on, then runs the
+    // three tickers until it goes off again, and parks again. The tickers are rebuilt on
+    // every resume with the same staggered first ticks, so an admin turning MangaDex on
+    // at runtime gets a catalogue pass a minute later, exactly as a boot with it on
+    // does. A pass in flight when the switch goes off is not cancelled: its next
+    // request fails at the client gate, the cycle ends with its cursor unchanged (the
+    // ordinary failed-cycle path), and the loop then sees the flip and parks. With the
+    // switch pinned on by `CATALOGUE_SYNC=on` this is the old loop, unchanged.
+    let mut switch = client.subscribe();
+    'resume: loop {
+        if client.wait_enabled("catalogue sync", &mut shutdown).await {
+            return;
+        }
+        switch.borrow_and_update();
+        let mut catalogue = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(interval_secs),
+        );
+        catalogue.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut chapters = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(150),
+            std::time::Duration::from_secs(chapter_interval_secs),
+        );
+        chapters.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut reconcile = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(reconcile_interval_secs),
+        );
+        reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tracing::info!(
+            interval_secs,
+            chapter_interval_secs,
+            reconcile_interval_secs,
+            cover_phash,
+            "mangadex: recurring sync started"
+        );
+        loop {
+            tokio::select! {
+                _ = catalogue.tick() => {
+                    sync_cycle(&pool, &client, cover_phash).await;
                 }
-            }
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    tracing::info!("mangadex: recurring sync stopping");
-                    break;
+                _ = chapters.tick() => {
+                    // The freshness path. What reaches /updates from here is the Phase C2
+                    // incremental writer inside `sync_chapters` — one feed upsert per touched
+                    // series, per page — NOT the wholesale chain, which is what makes a
+                    // 15-minute cadence affordable at all.
+                    chapter_cycle(&pool, &client).await;
+                }
+                _ = reconcile.tick() => {
+                    // Phase C3: rebuild everything and report what the incremental writers
+                    // missed. `drifted == 0` is the healthy answer, and it is the evidence that
+                    // the incremental path is actually correct rather than merely present.
+                    match crate::catalog::ledger::reconcile_feed(&pool).await {
+                        Ok(r) if r.drifted == 0 => tracing::info!(
+                            rows = r.rows_after,
+                            duration_ms = r.duration_ms,
+                            "feed reconciler: no drift — incremental writers are keeping up"
+                        ),
+                        Ok(r) => tracing::warn!(
+                            rows_before = r.rows_before,
+                            rows_after = r.rows_after,
+                            drifted = r.drifted,
+                            duration_ms = r.duration_ms,
+                            sample = %r.sample.join(" | "),
+                            "feed reconciler: DRIFT — the incremental writers missed rows"
+                        ),
+                        Err(e) => tracing::warn!(error = %e, "feed reconciler: failed"),
+                    }
+                }
+                r = switch.changed() => {
+                    if r.is_ok() && !*switch.borrow_and_update() {
+                        tracing::info!("mangadex: switched off — recurring sync paused");
+                        continue 'resume;
+                    }
+                }
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        tracing::info!("mangadex: recurring sync stopping");
+                        return;
+                    }
                 }
             }
         }
@@ -4861,6 +5060,135 @@ mod tests {
             .unwrap();
         let keys: Vec<String> = memo.slots.lock().unwrap().keys().cloned().collect();
         assert_eq!(keys, ["third"]);
+    }
+
+    /// A stand-in for MangaDex: `/statistics/manga`, `/at-home/server/{id}` and a cover,
+    /// each counted, so a test can show a refused request never left the process.
+    async fn mock_mangadex() -> (String, Arc<AtomicU64>) {
+        use axum::{routing::get, Json, Router};
+        let hits = Arc::new(AtomicU64::new(0));
+        let (a, b, c) = (hits.clone(), hits.clone(), hits.clone());
+        let app = Router::new()
+            .route(
+                "/statistics/manga",
+                get(move || {
+                    a.fetch_add(1, Ordering::SeqCst);
+                    async { Json(serde_json::json!({"result": "ok", "statistics": {}})) }
+                }),
+            )
+            .route(
+                "/at-home/server/{id}",
+                get(move || {
+                    b.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Json(serde_json::json!({
+                            "baseUrl": "https://x.mangadex.network",
+                            "chapter": {"hash": "h", "data": ["1.png"]}
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/covers/{manga}/{file}",
+                get(move || {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    async { vec![0xFFu8, 0xD8, 0xFF] }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    #[tokio::test]
+    async fn the_switch_gates_every_request_before_the_network() {
+        let (base, hits) = mock_mangadex().await;
+        let client = MangaDexClient::new("switch-test", 50.0, 600.0)
+            .with_bases(&base, &format!("{base}/covers"));
+        // A new client is OFF: nothing can reach MangaDex until something turns it on.
+        assert!(!client.is_enabled());
+        let ids = vec!["a".to_string()];
+        let err = client.get_statistics(&ids).await.unwrap_err();
+        assert!(is_off(&err), "{err}");
+        assert_eq!(err.to_string(), MANGADEX_OFF_MESSAGE);
+        assert!(is_off(&client.at_home("ch").await.unwrap_err()));
+        assert_eq!(client.cover_thumb_bytes("m", "f.jpg").await, None);
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "a refused request was sent");
+
+        // On: the same calls go through.
+        assert!(client.set_enabled(true));
+        assert!(!client.set_enabled(true), "no change, no wake-up");
+        client.get_statistics(&ids).await.unwrap();
+        assert_eq!(client.at_home("ch").await.unwrap().len(), 1);
+        assert!(client.cover_thumb_bytes("m", "f.jpg").await.is_some());
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        // Off again at runtime: refused again — including the at-home MEMO, which
+        // holds this chapter's URLs but must not hand MangaDex URLs out while off.
+        assert!(client.set_enabled(false));
+        assert!(is_off(&client.at_home("ch").await.unwrap_err()));
+        assert!(is_off(&client.get_statistics(&ids).await.unwrap_err()));
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_loop_parked_while_off_starts_when_switched_on() {
+        let (base, hits) = mock_mangadex().await;
+        let client = Arc::new(
+            MangaDexClient::new("switch-test", 50.0, 600.0)
+                .with_bases(&base, &format!("{base}/covers")),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // The shape of every MangaDex loop: wait on the switch, then do a pass.
+        let pass = |client: Arc<MangaDexClient>,
+                    mut shutdown: tokio::sync::watch::Receiver<bool>| async move {
+            let mut passes = 0;
+            loop {
+                if client.wait_enabled("test loop", &mut shutdown).await {
+                    return passes;
+                }
+                match client.get_statistics(&["a".to_string()]).await {
+                    Ok(_) => passes += 1,
+                    Err(e) if is_off(&e) => continue,
+                    Err(e) => panic!("{e}"),
+                }
+                if passes == 2 {
+                    return passes;
+                }
+            }
+        };
+        let task = tokio::spawn(pass(client.clone(), shutdown_rx.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "a loop must park while MangaDex is off"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        // Turned on at runtime: the parked loop wakes by itself and works.
+        client.set_enabled(true);
+        let passes = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop resumed")
+            .unwrap();
+        assert_eq!(passes, 2);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        // Parked again after a flip off, and shutdown still ends it promptly.
+        client.set_enabled(false);
+        let parked = tokio::spawn(pass(client.clone(), shutdown_rx));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!parked.is_finished());
+        shutdown_tx.send(true).unwrap();
+        let passes = tokio::time::timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("shutdown ends a parked loop")
+            .unwrap();
+        assert_eq!(passes, 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

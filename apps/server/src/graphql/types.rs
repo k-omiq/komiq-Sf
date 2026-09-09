@@ -926,8 +926,21 @@ pub struct Instance {
     pub version: String,
     /// Whether `register` accepts new accounts.
     pub registration_open: bool,
-    /// Whether the direct-MangaDex catalogue sync is on.
+    /// Whether this server uses MangaDex (the usage switch; the catalogue crawl is a
+    /// separate per-replica setting).
     pub mangadex_enabled: bool,
+}
+
+/// The MangaDex switch as the admin console sees it (`mangadexSetting`).
+#[derive(SimpleObject, Clone)]
+pub struct MangadexSetting {
+    /// Whether the server may talk to MangaDex right now.
+    pub enabled: bool,
+    /// True when the server environment fixes the value, so the console shows it
+    /// read-only (`setMangadexEnabled` is refused).
+    pub pinned: bool,
+    /// The env variable that pins it: `KOMIKA_MANGADEX` or `CATALOGUE_SYNC`.
+    pub pinned_by: Option<String>,
 }
 
 /// Admin "manga DB" overrides. Every field is the desired whole state for the
@@ -1082,6 +1095,28 @@ impl From<crate::suwayomi::ExtensionListEntry> for ExtensionInfo {
             icon_url: e.icon_url,
             repo: e.repo,
             subscribed: false,
+        }
+    }
+}
+
+/// One configured extension repo (an engine "extension store"). Mirrors
+/// `suwayomi::ExtensionStore`.
+#[derive(SimpleObject, Clone)]
+pub struct ExtensionRepo {
+    /// The repo's canonical index URL: its identity, what `removeExtensionRepo` takes,
+    /// and what each of its extensions reports as `repo`.
+    pub index_url: String,
+    pub name: String,
+    /// Short label (e.g. `KEI`).
+    pub badge_label: String,
+}
+
+impl From<crate::suwayomi::ExtensionStore> for ExtensionRepo {
+    fn from(s: crate::suwayomi::ExtensionStore) -> Self {
+        ExtensionRepo {
+            index_url: s.index_url,
+            name: s.name,
+            badge_label: s.badge_label,
         }
     }
 }

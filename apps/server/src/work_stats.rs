@@ -353,8 +353,8 @@ async fn nap(d: Duration, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> 
 
 /// Run the statistics drain in the background forever: a full pass, then idle re-checks
 /// that pick up new works and weekly-stale rows. Structured exactly like
-/// `mangadex::spawn_group_backfill`. Spawned only under `CATALOGUE_SYNC` (it shares the
-/// in-process MangaDex limiter, so the one-replica rule applies to it verbatim).
+/// `mangadex::spawn_group_backfill`. Waits on the MangaDex switch between batches (it
+/// shares the in-process MangaDex limiter, so the one-replica rule applies to it verbatim).
 pub fn spawn_stats_backfill(
     pool: SqlitePool,
     client: Arc<MangaDexClient>,
@@ -374,6 +374,10 @@ pub fn spawn_stats_backfill(
                     fetched = total.fetched,
                     "stats backfill: shutting down mid-drain — the work-list resumes it"
                 );
+                return;
+            }
+            // Parked while MangaDex is off (`mangadex` module doc); resumes on the flip.
+            if client.wait_enabled("stats backfill", &mut shutdown).await {
                 return;
             }
             match backfill_work_stats(&pool, &client).await {
@@ -424,6 +428,9 @@ pub fn spawn_stats_backfill(
                         return;
                     }
                 }
+                // Switched off mid-drain: nothing reached MangaDex, so wait on the
+                // switch rather than back off for an hour.
+                Err(e) if crate::mangadex::is_off(&e) => continue,
                 Err(e) => {
                     // Nothing was written; the batch is simply re-offered. Back off to the
                     // idle interval — retrying an unhappy upstream every 2 s is how a

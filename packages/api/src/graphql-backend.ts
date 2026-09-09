@@ -57,6 +57,8 @@ import type {
 	CreateOwnerInput,
 	CreateUserInput,
 	InstanceInfo,
+	ExtensionRepo,
+	MangadexSetting,
 	MyComment,
 	PostCommentInput,
 	PostReviewInput,
@@ -704,6 +706,18 @@ export class GraphQLBackend implements Backend {
 		return d.resetUserPassword;
 	}
 
+	async mangadexSetting(): Promise<MangadexSetting> {
+		const d = await this.gql<{ mangadexSetting: MangadexSetting }>(ops.MANGADEX_SETTING);
+		return d.mangadexSetting;
+	}
+
+	async setMangadexEnabled(enabled: boolean): Promise<boolean> {
+		const d = await this.gql<{ setMangadexEnabled: boolean }>(ops.SET_MANGADEX_ENABLED, {
+			enabled,
+		});
+		return d.setMangadexEnabled;
+	}
+
 	async setRegistrationOpen(open: boolean): Promise<boolean> {
 		const d = await this.gql<{ setRegistrationOpen: boolean }>(ops.SET_REGISTRATION_OPEN, { open });
 		return d.setRegistrationOpen;
@@ -863,6 +877,18 @@ export class GraphQLBackend implements Backend {
 			query: query ?? null,
 		});
 		return d.sourceBrowse;
+	}
+
+	async extensionRepos(): Promise<ExtensionRepo[]> {
+		const d = await this.gql<{ extensionRepos: ExtensionRepo[] }>(ops.EXTENSION_REPOS);
+		return d.extensionRepos;
+	}
+
+	async removeExtensionRepo(indexUrl: string): Promise<boolean> {
+		const d = await this.gql<{ removeExtensionRepo: boolean }>(ops.REMOVE_EXTENSION_REPO, {
+			indexUrl,
+		});
+		return d.removeExtensionRepo;
 	}
 
 	async addExtensionRepo(indexUrl: string): Promise<number> {

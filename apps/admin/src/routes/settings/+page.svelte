@@ -1,11 +1,17 @@
 <script lang="ts">
 	import { href } from '$lib/paths';
 	import type { ExtensionAutoUpdate, ExtensionInfo } from '@komika/types';
+	import type { ExtensionRepo, MangadexSetting } from '@komika/api';
 	import { auth, toggleNsfwVisibility } from '$lib/auth.svelte';
 	import { config, serverAddress, target } from '$lib/config';
 	import { confirm } from '$lib/confirm.svelte';
 	import {
 		addExtensionRepo,
+		isEngineUnreachable,
+		loadExtensionRepos,
+		loadMangadexSetting,
+		removeExtensionRepo,
+		setMangadexEnabled,
 		consolidateDuplicates,
 		loadExtensionAutoUpdate,
 		loadExtensions,
@@ -28,7 +34,7 @@
 		{ id: 'content', label: 'Content' },
 		// Only on a server that reports its settings (`instance`).
 		...(instance.info ? [{ id: 'accounts', label: 'Accounts' }] : []),
-		{ id: 'repos', label: 'Extension repos' },
+		{ id: 'sources', label: 'Sources' },
 		{ id: 'updates', label: 'Extension updates' },
 		{ id: 'maintenance', label: 'Maintenance' },
 		{ id: 'about', label: 'About' },
@@ -86,30 +92,62 @@
 		}
 	}
 
-	// ---- Extension repos ------------------------------------------------------
-	// The engine has no "list repos" query, so the known repos are read off the
-	// extensions it already lists.
+	// ---- Sources: the MangaDex switch ------------------------------------------
+	// Off on a new self-hosted install. The server refuses the change when its
+	// environment pins it (`pinnedBy`); the switch is then read-only.
+	let mangadex = $state<MangadexSetting | null>(null);
+	let mangadexBusy = $state(false);
+
+	async function refreshMangadex(): Promise<void> {
+		try {
+			mangadex = await loadMangadexSetting();
+		} catch {
+			mangadex = null; // An older server: the row is hidden.
+		}
+	}
+
+	async function onToggleMangadex(next: boolean): Promise<void> {
+		if (!mangadex || mangadexBusy) return;
+		mangadexBusy = true;
+		try {
+			const enabled = await setMangadexEnabled(next);
+			mangadex = { ...mangadex, enabled };
+			if (instance.info) instance.info = { ...instance.info, mangadexEnabled: enabled };
+			toast.success(enabled ? 'MangaDex is on.' : 'MangaDex is off.');
+		} catch (err) {
+			toast.fromError(err, 'The setting could not be saved.');
+			await refreshMangadex();
+		} finally {
+			mangadexBusy = false;
+		}
+	}
+
+	// ---- Sources: extension repos ---------------------------------------------
+	// The engine keeps the repo list; extension counts are read off its extension list.
+	let repoList = $state<ExtensionRepo[]>([]);
 	let exts = $state<ExtensionInfo[]>([]);
 	let extsLoading = $state(false);
 	let extsError = $state<string | null>(null);
+	/** The engine is down or still starting: a calm note, not an error wall. */
+	let engineDown = $state(false);
 	let repoUrl = $state('');
 	let addingRepo = $state(false);
+	let removingRepo = $state<string | null>(null);
 
-	const repos = $derived.by(() => {
-		const counts = new Map<string, number>();
-		for (const e of exts) {
-			if (e.repo) counts.set(e.repo, (counts.get(e.repo) ?? 0) + 1);
-		}
-		return [...counts].map(([url, count]) => ({ url, count })).sort((a, b) => b.count - a.count);
-	});
+	const repos = $derived(
+		repoList.map((r) => ({ ...r, count: exts.filter((e) => e.repo === r.indexUrl).length })),
+	);
 
 	async function refreshRepos(): Promise<void> {
 		extsLoading = true;
 		extsError = null;
 		try {
-			exts = await loadExtensions(false);
+			repoList = await loadExtensionRepos();
+			exts = repoList.length ? await loadExtensions(false) : [];
+			engineDown = false;
 		} catch (err) {
-			extsError = err instanceof Error ? err.message : 'Failed to load extension repos.';
+			if (isEngineUnreachable(err)) engineDown = true;
+			else extsError = err instanceof Error ? err.message : 'Failed to load extension repos.';
 		} finally {
 			extsLoading = false;
 		}
@@ -125,9 +163,33 @@
 			repoUrl = '';
 			await refreshRepos();
 		} catch (err) {
-			toast.fromError(err, 'Failed to add the repo.');
+			if (isEngineUnreachable(err)) engineDown = true;
+			else toast.fromError(err, 'Failed to add the repo.');
 		} finally {
 			addingRepo = false;
+		}
+	}
+
+	async function onRemoveRepo(r: ExtensionRepo): Promise<void> {
+		if (removingRepo) return;
+		const ok = await confirm({
+			title: `Remove ${r.name}?`,
+			message:
+				'Its extensions are no longer offered for install or updates. Series you already added stay in the catalog.',
+			confirmLabel: 'Remove repo',
+			danger: true,
+		});
+		if (!ok) return;
+		removingRepo = r.indexUrl;
+		try {
+			await removeExtensionRepo(r.indexUrl);
+			toast.success(`Removed ${r.name}.`);
+			await refreshRepos();
+		} catch (err) {
+			if (isEngineUnreachable(err)) engineDown = true;
+			else toast.fromError(err, 'Failed to remove the repo.');
+		} finally {
+			removingRepo = null;
 		}
 	}
 
@@ -191,6 +253,7 @@
 	$effect(() => {
 		if (!auth.user) return;
 		void refreshRepos();
+		void refreshMangadex();
 		void refreshAutoUpdate().then(followUpdates);
 	});
 	// Stop following a running update pass, and stop a merge run between batches, when
@@ -445,54 +508,118 @@
 				</section>
 			{/if}
 
-			<section id="repos" class="group" aria-labelledby="repos-h">
+			<section id="sources" class="group" aria-labelledby="sources-h">
 				<div class="group-head">
 					<div>
-						<h2 id="repos-h" class="group-title">Extension repos</h2>
+						<h2 id="sources-h" class="group-title">Sources</h2>
 						<p class="group-desc">
-							A repo is a list of extensions the engine can install. No repo is built in. Add the
-							index URL of each repo you want to use.
+							Where the library comes from. No source is built in: turn on MangaDex, add extension
+							repos, or both.
 						</p>
 					</div>
 				</div>
-				<div class="group-body k-stack">
-					<form class="repo-form" onsubmit={onAddRepo}>
-						<label class="k-field">
-							<span class="k-label">Repo index URL</span>
-							<input
-								class="k-input"
-								type="url"
-								name="repository"
-								autocomplete="off"
-								bind:value={repoUrl}
-								placeholder="https://example.org/extensions/index.min.json"
-								required
+				<div class="group-body jobs">
+					{#if mangadex}
+						<div class="setting">
+							<div class="setting-text">
+								<p class="setting-name">MangaDex</p>
+								<p class="k-hint">
+									When on, the server fetches the MangaDex catalogue, covers and chapter pages. When
+									off, it never contacts MangaDex.
+								</p>
+								{#if mangadex.pinned}
+									<p class="k-hint">
+										Set by <code>{mangadex.pinnedBy ?? 'the server configuration'}</code> in the server
+										environment.
+									</p>
+								{/if}
+							</div>
+							<Switch
+								label="MangaDex"
+								checked={mangadex.enabled}
+								disabled={mangadexBusy || mangadex.pinned}
+								onchange={onToggleMangadex}
 							/>
-						</label>
-						<Button type="submit" variant="primary" icon="plus" busy={addingRepo}>Add repo</Button>
-					</form>
-
-					{#if extsError}
-						<div class="k-notice" data-tone="danger" role="alert">
-							<Icon name="alert" />
-							<div class="k-notice__body">{extsError}</div>
-							<Button size="sm" onclick={refreshRepos}>Retry</Button>
 						</div>
-					{:else if repos.length > 0}
-						<ul class="repo-list" aria-label="Known repos">
-							{#each repos as r (r.url)}
-								<li>
-									<Icon name="package" />
-									<span class="k-mono k-truncate" title={r.url}>{r.url}</span>
-									<span class="k-badge k-num">{r.count} extension{r.count === 1 ? '' : 's'}</span>
-								</li>
-							{/each}
-						</ul>
-					{:else if extsLoading}
-						<p class="k-hint">Loading repos…</p>
-					{:else}
-						<p class="k-hint">No repo added yet. Extensions appear after you add one.</p>
 					{/if}
+
+					<div id="repos" class="setting repos">
+						<div class="setting-text">
+							<p class="setting-name">Extension repos</p>
+							<p class="k-hint">
+								A repo is a list of extensions the engine can install. Add the index address each
+								repo publishes.
+							</p>
+						</div>
+						{#if engineDown}
+							<p class="k-hint calm" role="status">
+								<Icon name="info" />
+								<span
+									>The source engine is not reachable yet. It may still be starting.
+									<button class="k-link retry" type="button" onclick={refreshRepos}
+										>Try again</button
+									></span
+								>
+							</p>
+						{:else}
+							<form class="repo-form" onsubmit={onAddRepo}>
+								<input
+									class="k-input"
+									type="url"
+									name="repository"
+									autocomplete="off"
+									aria-label="Repo index address"
+									bind:value={repoUrl}
+									placeholder="https://example.org/extensions/index.min.json"
+									required
+								/>
+								<Button type="submit" variant="primary" icon="plus" busy={addingRepo}
+									>Add repo</Button
+								>
+							</form>
+
+							{#if extsError}
+								<p class="k-error" role="alert">
+									{extsError}
+									<button class="k-link retry" type="button" onclick={refreshRepos}
+										>Try again</button
+									>
+								</p>
+							{:else if repos.length > 0}
+								<ul class="repo-list" aria-label="Extension repos">
+									{#each repos as r (r.indexUrl)}
+										<li>
+											<span class="repo-text">
+												<span class="repo-name">{r.name}</span>
+												<span class="k-mono k-truncate k-muted" title={r.indexUrl}
+													>{r.indexUrl}</span
+												>
+											</span>
+											{#if r.count}
+												<span class="k-hint k-num"
+													>{r.count} extension{r.count === 1 ? '' : 's'}</span
+												>
+											{/if}
+											<Button
+												variant="ghost"
+												size="sm"
+												icon="trash"
+												iconOnly
+												aria-label="Remove {r.name}"
+												busy={removingRepo === r.indexUrl}
+												disabled={!!removingRepo && removingRepo !== r.indexUrl}
+												onclick={() => onRemoveRepo(r)}
+											/>
+										</li>
+									{/each}
+								</ul>
+							{:else if extsLoading}
+								<p class="k-hint">Loading repos…</p>
+							{:else}
+								<p class="k-hint">No repo added yet. Extensions appear after you add one.</p>
+							{/if}
+						{/if}
+					</div>
 				</div>
 				<div class="group-foot">
 					<a class="k-link" href={href('/sources')}>Manage installed extensions</a>
@@ -799,30 +926,67 @@
 		overflow-wrap: anywhere;
 	}
 
+	.repos {
+		display: grid;
+		justify-content: stretch;
+		gap: var(--k-space-4);
+	}
 	.repo-form {
 		display: flex;
-		align-items: flex-end;
 		flex-wrap: wrap;
-		gap: var(--k-space-3);
+		gap: var(--k-space-2);
 	}
-	.repo-form .k-field {
-		flex: 1 1 320px;
+	.repo-form .k-input {
+		flex: 1 1 280px;
+		min-width: 0;
 	}
+	/* Flat rows, no rules: the list reads as one quiet block. */
 	.repo-list {
+		display: grid;
+		gap: 2px;
 		padding: 0;
 		list-style: none;
-		border-top: 1px solid var(--k-border);
 	}
 	.repo-list li {
 		display: flex;
 		align-items: center;
 		gap: var(--k-space-3);
-		padding: var(--k-space-3) 0;
-		border-bottom: 1px solid var(--k-border);
+		min-height: 52px;
+		padding: 6px 6px 6px 14px;
+		border-radius: var(--k-radius);
+		background: var(--k-surface-2);
 		color: var(--k-text-2);
 	}
-	.repo-list li > .k-truncate {
+	.repo-text {
+		display: grid;
+		gap: 2px;
 		flex: 1 1 auto;
+		min-width: 0;
+		font-size: var(--k-text-sm);
+	}
+	.repo-name {
+		color: var(--k-text-1);
+		font-weight: 600;
+	}
+	.repo-text .k-mono {
+		font-size: var(--k-text-xs);
+	}
+	.calm {
+		display: flex;
+		align-items: flex-start;
+		gap: 8px;
+		line-height: 1.55;
+	}
+	.calm :global(svg) {
+		flex: none;
+		margin-top: 3px;
+	}
+	.retry {
+		padding: 0;
+		border: 0;
+		background: none;
+		font: inherit;
+		cursor: pointer;
 	}
 
 	.history summary {

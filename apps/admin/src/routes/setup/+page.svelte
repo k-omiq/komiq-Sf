@@ -9,6 +9,7 @@
 	import Done from './steps/Done.svelte';
 	import Lan from './steps/Lan.svelte';
 	import Owner from './steps/Owner.svelte';
+	import Sources from './steps/Sources.svelte';
 	import Welcome from './steps/Welcome.svelte';
 	import { persist, stepNumber, wizard } from './wizard.svelte';
 
@@ -26,6 +27,7 @@
 			show: () => target === 'desktop' && runsLocalServer && wizard.extra.access !== 'internet',
 		},
 		{ id: 'accounts', label: 'Accounts', component: Accounts },
+		{ id: 'sources', label: 'Sources', component: Sources },
 		{ id: 'done', label: 'Done', component: Done },
 	];
 

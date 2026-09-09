@@ -373,6 +373,11 @@ export interface Backend {
 	/** Open or close public sign-up; returns the new effective value. Refused when
 	 * the server pins it by env. Optional. */
 	setRegistrationOpen?(open: boolean): Promise<boolean>;
+	/** The MangaDex switch and whether the server's env pins it. Optional. */
+	mangadexSetting?(): Promise<MangadexSetting>;
+	/** Turn MangaDex on or off; returns the new effective value. Refused when the
+	 * server pins it by env (`KOMIKA_MANGADEX`, `CATALOGUE_SYNC=on`). Optional. */
+	setMangadexEnabled?(enabled: boolean): Promise<boolean>;
 
 	// --- admin dedup review (requires an admin session) ---
 	/** Pending mid-confidence dedup matches awaiting manual review
@@ -489,6 +494,10 @@ export interface Backend {
 	/** Register an extension repo (store) by its index URL and refresh the list;
 	 * returns how many extensions are now known. Optional. */
 	addExtensionRepo?(indexUrl: string): Promise<number>;
+	/** The extension repos configured on the engine. Optional. */
+	extensionRepos?(): Promise<ExtensionRepo[]>;
+	/** Remove an extension repo by the `indexUrl` `extensionRepos` lists. Optional. */
+	removeExtensionRepo?(indexUrl: string): Promise<boolean>;
 	/** Install a store extension onto the Suwayomi engine (NSFW-gated). Optional. */
 	installExtension?(pkgName: string): Promise<ExtensionInfo>;
 	/** Uninstall an extension from the Suwayomi engine. Optional. */
@@ -717,6 +726,23 @@ export interface InstanceInfo {
 	version: string;
 	registrationOpen: boolean;
 	mangadexEnabled: boolean;
+}
+
+/** The MangaDex switch as the admin sees it. */
+export interface MangadexSetting {
+	enabled: boolean;
+	/** Fixed by the server's environment; read-only here. */
+	pinned: boolean;
+	/** The env variable that fixes it (`KOMIKA_MANGADEX` or `CATALOGUE_SYNC`). */
+	pinnedBy: string | null;
+}
+
+/** One extension repo configured on the engine. */
+export interface ExtensionRepo {
+	/** Canonical index URL: the repo's identity, and each extension's `repo`. */
+	indexUrl: string;
+	name: string;
+	badgeLabel: string;
 }
 
 export interface CreateOwnerInput {

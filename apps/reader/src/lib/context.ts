@@ -36,8 +36,10 @@ export const backend =
 				})
 			: komikaHosted;
 export const images = createImageProvider({
-	workerBaseUrl: config.imgWorkerBaseUrl,
+	// The server proxy lives on the API origin (the page's own origin when embedded).
+	workerBaseUrl: config.imgServerProxy ? apiOrigin : config.imgWorkerBaseUrl,
 	direct: config.imgDirect,
+	serverProxy: config.imgServerProxy,
 	// Cached covers are served from the API origin under `/covers/...`; the provider
 	// passes those through directly instead of routing them via the Worker.
 	apiOrigin,

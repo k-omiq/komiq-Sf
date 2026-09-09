@@ -42,13 +42,118 @@ pub const REGISTRATION_OPEN: Setting = Setting {
     default: "true",
 };
 
-/// Whether the direct-MangaDex catalogue sync runs. Shares `CATALOGUE_SYNC` with
-/// `Config::catalogue_sync_enabled`, so the env meaning is unchanged.
+/// The MangaDex USAGE switch: whether this server may talk to MangaDex at all
+/// (reading, covers, metadata, the admin MangaDex jobs, `/img` for MangaDex hosts).
+/// Resolved by [`resolve_mangadex`], not the generic [`resolve`], because two env
+/// variables and the install kind take part. `KOMIKA_MANGADEX` is its own env
+/// override; the `instance_setting` row is `mangadex_enabled`.
+///
+/// The catalogue CRAWL is a separate decision ([`catalogue_crawl`]): `CATALOGUE_SYNC`
+/// keeps meaning "run the crawl on this replica", which the hosted fleet runs on
+/// exactly one replica while every replica still reads from MangaDex.
 pub const MANGADEX_ENABLED: Setting = Setting {
     key: "mangadex_enabled",
-    env: "CATALOGUE_SYNC",
-    default: "false",
+    env: "KOMIKA_MANGADEX",
+    default: "true",
 };
+
+/// The resolved usage switch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MangadexUsage {
+    pub enabled: bool,
+    pub source: Source,
+    /// The env variable that fixes the value (`KOMIKA_MANGADEX` or `CATALOGUE_SYNC`);
+    /// the admin console cannot change it then.
+    pub pinned_by: Option<&'static str>,
+}
+
+/// A self-hosted install: the server serves the web apps itself. The self-host
+/// Docker image and the desktop app set `KOMIKA_WEB_DIR`; the hosted API does not.
+/// The same signal mounts `/img`.
+pub fn is_self_host(env: &impl Fn(&str) -> Option<String>) -> bool {
+    env("KOMIKA_WEB_DIR").is_some_and(|v| !v.trim().is_empty())
+}
+
+fn env_value(env: &impl Fn(&str) -> Option<String>, name: &str) -> Option<String> {
+    env(name).filter(|v| !v.trim().is_empty())
+}
+
+/// Resolve the usage switch, first match wins:
+///
+/// 1. `KOMIKA_MANGADEX` (on/off) — explicit, pins it either way.
+/// 2. `CATALOGUE_SYNC=on` — pins it ON: a replica told to crawl cannot crawl without
+///    MangaDex. `CATALOGUE_SYNC=off` says nothing about usage (the hosted replicas
+///    that do not crawl still read from MangaDex).
+/// 3. The admin's stored choice (`setMangadexEnabled`).
+/// 4. The default: OFF on a self-hosted install (plan open point 3), ON everywhere
+///    else, so every deployment that predates the switch keeps using MangaDex
+///    exactly as it did.
+///
+/// What else rides on it, as additional env knobs, never a way around it:
+/// `METADATA_BACKFILL=on` and `COVER_PHASH=on` act only while usage is on;
+/// `COVER_CACHE=off` still stops the whole cover drainer, Suwayomi covers included
+/// (with it on and usage off, the drainer still caches Suwayomi covers).
+pub async fn resolve_mangadex_with(
+    pool: &SqlitePool,
+    env: impl Fn(&str) -> Option<String>,
+) -> MangadexUsage {
+    if let Some(v) = env_value(&env, "KOMIKA_MANGADEX") {
+        return MangadexUsage {
+            enabled: parse_bool(&v),
+            source: Source::Env,
+            pinned_by: Some("KOMIKA_MANGADEX"),
+        };
+    }
+    if env_value(&env, "CATALOGUE_SYNC").is_some_and(|v| parse_bool(&v)) {
+        return MangadexUsage {
+            enabled: true,
+            source: Source::Env,
+            pinned_by: Some("CATALOGUE_SYNC"),
+        };
+    }
+    // The table and the install-kind default; no env variable is consulted here (the
+    // generic resolver's env step is the `KOMIKA_MANGADEX` case already handled).
+    let r = resolve_with(pool, &MANGADEX_ENABLED, |_| None).await;
+    let enabled = match r.source {
+        Source::Table => r.as_bool(),
+        _ => !is_self_host(&env),
+    };
+    MangadexUsage {
+        enabled,
+        source: r.source,
+        pinned_by: None,
+    }
+}
+
+/// [`resolve_mangadex_with`] against the process environment.
+pub async fn resolve_mangadex(pool: &SqlitePool) -> MangadexUsage {
+    resolve_mangadex_with(pool, |name| std::env::var(name).ok()).await
+}
+
+/// Whether this process runs the MangaDex catalogue crawl (the catalogue/chapter
+/// sync and its backfill drains).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogueCrawl {
+    /// `CATALOGUE_SYNC=on`: spawned, exactly as before.
+    Run,
+    /// Self-host with `CATALOGUE_SYNC` unset: spawned, and runs whenever the usage
+    /// switch is on — the admin's MangaDex switch is the whole story there.
+    FollowSwitch,
+    /// `CATALOGUE_SYNC=off`, or unset on a non-self-host server: never spawned, as
+    /// before this switch existed.
+    Never,
+}
+
+/// Decide [`CatalogueCrawl`]. Whatever this says, a spawned loop still waits on the
+/// usage switch between passes, so `KOMIKA_MANGADEX=off` stops even a `Run` crawl.
+pub fn catalogue_crawl(env: impl Fn(&str) -> Option<String>) -> CatalogueCrawl {
+    match env_value(&env, "CATALOGUE_SYNC") {
+        Some(v) if parse_bool(&v) => CatalogueCrawl::Run,
+        Some(_) => CatalogueCrawl::Never,
+        None if is_self_host(&env) => CatalogueCrawl::FollowSwitch,
+        None => CatalogueCrawl::Never,
+    }
+}
 
 /// Where a resolved value came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,6 +364,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    /// The deployment matrix: what each kind of server uses and crawls.
+    #[tokio::test]
+    async fn mangadex_usage_and_crawl_across_deployments() {
+        let pool = pool().await;
+        fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+            move |name| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        }
+        const WEB: (&str, &str) = ("KOMIKA_WEB_DIR", "/srv/web");
+
+        // (a) Hosted primary: crawls, so it must use MangaDex; pinned.
+        let e = env(&[("CATALOGUE_SYNC", "on")]);
+        let u = resolve_mangadex_with(&pool, &e).await;
+        assert!(u.enabled);
+        assert_eq!(u.pinned_by, Some("CATALOGUE_SYNC"));
+        assert_eq!(catalogue_crawl(&e), CatalogueCrawl::Run);
+
+        // (b) Hosted replica: no crawl here, but reading/covers still use MangaDex.
+        let e = env(&[("CATALOGUE_SYNC", "off")]);
+        let u = resolve_mangadex_with(&pool, &e).await;
+        assert!(u.enabled);
+        assert_eq!(u.pinned_by, None);
+        assert_eq!(catalogue_crawl(&e), CatalogueCrawl::Never);
+
+        // (c) Nothing set, not self-host: uses MangaDex, does not crawl — as before.
+        let e = env(&[]);
+        let u = resolve_mangadex_with(&pool, &e).await;
+        assert_eq!(
+            (u.enabled, u.source, u.pinned_by),
+            (true, Source::Default, None)
+        );
+        assert_eq!(catalogue_crawl(&e), CatalogueCrawl::Never);
+
+        // (d) Self-host, nothing else: off by default; the admin's choice applies, and
+        // the crawl follows it.
+        let e = env(&[WEB]);
+        let u = resolve_mangadex_with(&pool, &e).await;
+        assert_eq!(
+            (u.enabled, u.source, u.pinned_by),
+            (false, Source::Default, None)
+        );
+        assert_eq!(catalogue_crawl(&e), CatalogueCrawl::FollowSwitch);
+        store(&pool, &MANGADEX_ENABLED, "true").await.unwrap();
+        let u = resolve_mangadex_with(&pool, &e).await;
+        assert_eq!((u.enabled, u.source), (true, Source::Table));
+        // A stored "off" holds on a hosted server too (the admin turned it off).
+        store(&pool, &MANGADEX_ENABLED, "false").await.unwrap();
+        assert!(!resolve_mangadex_with(&pool, env(&[])).await.enabled);
+        store(&pool, &MANGADEX_ENABLED, "true").await.unwrap();
+
+        // (e) KOMIKA_MANGADEX=off pins it off everywhere — over a stored "on", and
+        // over CATALOGUE_SYNC=on (whose crawl then stays parked on the switch).
+        for e in [
+            env(&[("KOMIKA_MANGADEX", "off")]),
+            env(&[("KOMIKA_MANGADEX", "off"), WEB]),
+            env(&[("KOMIKA_MANGADEX", "off"), ("CATALOGUE_SYNC", "on")]),
+        ] {
+            let u = resolve_mangadex_with(&pool, &e).await;
+            assert!(!u.enabled);
+            assert_eq!(u.pinned_by, Some("KOMIKA_MANGADEX"));
+        }
+        // And =on pins it on, even on a self-host.
+        let u = resolve_mangadex_with(&pool, env(&[("KOMIKA_MANGADEX", "on"), WEB])).await;
+        assert!(u.enabled);
+        assert_eq!(u.pinned_by, Some("KOMIKA_MANGADEX"));
+        // CATALOGUE_SYNC=off on a self-host: never crawls, usage still the admin's.
+        assert_eq!(
+            catalogue_crawl(env(&[("CATALOGUE_SYNC", "off"), WEB])),
+            CatalogueCrawl::Never
+        );
+        // Blank values count as unset.
+        assert_eq!(
+            catalogue_crawl(env(&[("CATALOGUE_SYNC", " "), ("KOMIKA_WEB_DIR", "")])),
+            CatalogueCrawl::Never
+        );
     }
 
     #[test]

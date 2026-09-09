@@ -1156,6 +1156,38 @@ export const ADD_EXTENSION_REPO = /* GraphQL */ `
 	}
 `;
 
+export const EXTENSION_REPOS = /* GraphQL */ `
+	query ExtensionRepos {
+		extensionRepos {
+			indexUrl
+			name
+			badgeLabel
+		}
+	}
+`;
+
+export const REMOVE_EXTENSION_REPO = /* GraphQL */ `
+	mutation RemoveExtensionRepo($indexUrl: String!) {
+		removeExtensionRepo(indexUrl: $indexUrl)
+	}
+`;
+
+export const MANGADEX_SETTING = /* GraphQL */ `
+	query MangadexSetting {
+		mangadexSetting {
+			enabled
+			pinned
+			pinnedBy
+		}
+	}
+`;
+
+export const SET_MANGADEX_ENABLED = /* GraphQL */ `
+	mutation SetMangadexEnabled($enabled: Boolean!) {
+		setMangadexEnabled(enabled: $enabled)
+	}
+`;
+
 export const INSTALL_EXTENSION = /* GraphQL */ `
 	${EXTENSION_FIELDS}
 	mutation InstallExtension($pkgName: String!) {

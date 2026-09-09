@@ -71,7 +71,7 @@
 	<!-- Page images and covers come from the image Worker on its own host, so the
 	     first image fetch otherwise pays DNS + TCP + TLS before a byte moves. Open
 	     that connection while the document is still parsing. -->
-	{#if !config.imgDirect && config.imgWorkerBaseUrl}
+	{#if !config.imgDirect && !config.imgServerProxy && config.imgWorkerBaseUrl}
 		<link rel="preconnect" href={config.imgWorkerBaseUrl} />
 	{/if}
 	<link rel="icon" href="/favicon.ico" sizes="any" />

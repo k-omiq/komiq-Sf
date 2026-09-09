@@ -959,7 +959,12 @@ pub async fn retry_one_cover(
     suwayomi: &crate::suwayomi::SuwayomiClient,
     work_id: &str,
 ) -> Result<bool> {
-    let sources = repair_cover_sources(main, work_id).await?;
+    let mut sources = repair_cover_sources(main, work_id).await?;
+    // With MangaDex switched off the repair simply uses the linked Suwayomi sources;
+    // offering the MangaDex one would only collect the client's refusal.
+    if !mangadex.is_enabled() {
+        sources.retain(|s| !matches!(s, RepairCoverSource::MangaDex { .. }));
+    }
     let processed = process_repair_sources(sources, |source| async move {
         match source {
             RepairCoverSource::MangaDex {
@@ -1051,6 +1056,19 @@ pub async fn crawl_uncached_covers(
         }
     };
 
+    // THE SPLIT. This first pass is the only MangaDex part of the cover pipeline; the
+    // Suwayomi pass below and the warmer in `run_loop` never touch MangaDex. With the
+    // switch off the pass is skipped outright — not attempted — because every fetch
+    // would come back refused and be recorded as a failed cover with a backoff,
+    // burying the works the moment MangaDex is turned back on.
+    let pending = if mangadex.is_enabled() {
+        pending
+    } else {
+        if !pending.is_empty() {
+            tracing::debug!("cover crawl: MangaDex is off; skipping the MangaDex pass");
+        }
+        Vec::new()
+    };
     let jobs: Vec<PendingCover> = pending
         .into_iter()
         .filter_map(|(work_id, mid, fname)| match (mid, fname) {
@@ -1669,6 +1687,11 @@ async fn update_source_backoffs(
 ///
 /// FLEET CONSTRAINT: like the catalogue sync / metadata backfill, this hits
 /// MangaDex under the in-process rate limiter, so run it on exactly ONE replica.
+///
+/// MangaDex OFF: only the MangaDex pass of `crawl_uncached_covers` stops (it reads the
+/// switch every tick). Suwayomi covers keep flowing into `work_cover_blob` and the
+/// Suwayomi warmer keeps filling `suwayomi_cover_blob`, so a MangaDex-free server still
+/// serves every cover from its own origin. `COVER_CACHE=off` still stops the whole loop.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     main: SqlitePool,
@@ -2504,6 +2527,92 @@ mod tests {
             after, before,
             "failed sources must not replace the stored cover"
         );
+    }
+
+    #[tokio::test]
+    async fn with_mangadex_off_a_cover_repair_uses_the_suwayomi_sources() {
+        let (main, covers) = warm_test_pools().await;
+        sqlx::query("CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL)")
+            .execute(&covers).await.unwrap();
+        sqlx::query("INSERT INTO work (id, cover_file_name, created_at, updated_at) VALUES ('w_both', 'c.jpg', 't', 't')")
+            .execute(&main).await.unwrap();
+        sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_key, created_at) VALUES ('a', 'w_both', 'mangadex', 'md-uuid', '2026-01-01'), ('b', 'w_both', 'suwayomi', '9', '2026-01-02')")
+            .execute(&main).await.unwrap();
+        // Two counting origins: the MangaDex one (tried FIRST when it is on) must see
+        // nothing while it is off; the Suwayomi one supplies the cover.
+        let suw_origin = crate::suwayomi::testsrv::spawn(
+            crate::suwayomi::testsrv::jpeg(300, 450),
+            Duration::ZERO,
+        )
+        .await;
+        let md_origin = crate::suwayomi::testsrv::spawn(
+            crate::suwayomi::testsrv::jpeg(300, 450),
+            Duration::ZERO,
+        )
+        .await;
+        let suwayomi =
+            crate::suwayomi::SuwayomiClient::new(suw_origin.base_url.clone(), None, None);
+        let mangadex = MangaDexClient::new("cover-repair-off", 5.0, 40.0)
+            .with_bases(&md_origin.base_url, &md_origin.base_url);
+        assert!(
+            retry_one_cover(&main, &covers, &mangadex, &suwayomi, "w_both")
+                .await
+                .unwrap()
+        );
+        assert_eq!(md_origin.hits.load(Ordering::SeqCst), 0);
+        assert_eq!(suw_origin.hits.load(Ordering::SeqCst), 1);
+        // On, MangaDex is the preferred source again.
+        mangadex.set_enabled(true);
+        assert!(
+            retry_one_cover(&main, &covers, &mangadex, &suwayomi, "w_both")
+                .await
+                .unwrap()
+        );
+        assert_eq!(md_origin.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(suw_origin.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn with_mangadex_off_the_crawl_skips_only_its_mangadex_pass() {
+        let (main, covers) = warm_test_pools().await;
+        sqlx::query("CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL)")
+            .execute(&covers).await.unwrap();
+        // One MangaDex-anchored work and one Suwayomi-anchored work, both uncached.
+        sqlx::query("INSERT INTO work (id, cover_file_name, created_at, updated_at) VALUES ('w_md', 'c.jpg', '2026-01-01', '2026-01-01'), ('w_suw', NULL, '2026-01-01', '2026-01-01')")
+            .execute(&main).await.unwrap();
+        sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_key, created_at) VALUES ('ss_md', 'w_md', 'mangadex', 'md-uuid', '2026-01-01'), ('ss_suw', 'w_suw', 'suwayomi', '7', '2026-01-01')")
+            .execute(&main).await.unwrap();
+        insert_series(&main, 7, Some(&thumb_path(7))).await;
+        let origin = crate::suwayomi::testsrv::spawn(
+            crate::suwayomi::testsrv::jpeg(300, 450),
+            Duration::ZERO,
+        )
+        .await;
+        let suwayomi = crate::suwayomi::SuwayomiClient::new(origin.base_url.clone(), None, None);
+        // Off (the default), and pointed at a dead port should the gate ever leak.
+        let mangadex = MangaDexClient::new("cover-split-test", 5.0, 40.0)
+            .with_bases("http://127.0.0.1:1", "http://127.0.0.1:1");
+        assert_eq!(pending_cover_count(&main).await.unwrap(), 2);
+
+        crawl_uncached_covers(&main, &covers, &mangadex, &suwayomi, Some(10)).await;
+
+        let cached: Vec<String> = sqlx::query_scalar("SELECT work_id FROM work_cover_blob")
+            .fetch_all(&covers)
+            .await
+            .unwrap();
+        assert_eq!(
+            cached,
+            ["w_suw"],
+            "Suwayomi covers keep flowing with MangaDex off"
+        );
+        // The MangaDex work was not attempted: no failure marker that would bury it
+        // behind a backoff once MangaDex is turned back on.
+        let issues: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_issue")
+            .fetch_one(&main)
+            .await
+            .unwrap();
+        assert_eq!(issues, 0);
+        assert_eq!(pending_cover_count(&main).await.unwrap(), 1);
     }
 
     #[test]

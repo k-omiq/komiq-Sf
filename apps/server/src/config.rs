@@ -163,6 +163,10 @@ pub struct Config {
     /// served at `/` and `admin/` at `/admin`, each with an `index.html` SPA
     /// fallback. Unset (the default) serves no static files at all.
     pub web_dir: Option<String>,
+    /// Serve the image proxy at `/img` (`img_proxy`). `KOMIKA_IMG_PROXY=on|off`; when
+    /// unset it follows `web_dir` — on for a server that serves the reader itself, off
+    /// for the hosted API, which has the image Worker instead.
+    pub img_proxy_enabled: bool,
     pub suwayomi_url: String,
     /// Publicly reachable base for Suwayomi image URLs (covers + pages). GraphQL
     /// federation uses the internal `suwayomi_url`, but image URLs are handed to
@@ -215,9 +219,6 @@ pub struct Config {
     /// Serve the GraphiQL IDE on `GET /graphql` and allow schema introspection.
     /// Off by default so a public deployment exposes neither; enable only in dev.
     pub graphiql_enabled: bool,
-    /// Enable the direct-MangaDex catalogue sync (CATALOGUE.md §5). Off by default —
-    /// nothing hits MangaDex unless `CATALOGUE_SYNC=on`.
-    pub catalogue_sync_enabled: bool,
     /// Global request budget for the MangaDex crawl (fleet-wide; shared egress IP).
     /// MangaDex's per-IP ceiling is ~5 req/s.
     pub mangadex_rate_per_sec: f64,
@@ -228,7 +229,8 @@ pub struct Config {
     pub mangadex_user_agent: String,
     /// Compute a cover perceptual-hash per work during the catalogue sync
     /// (CATALOGUE.md §4). Off by default — it adds one cover download per work, so
-    /// it's opt-in on top of `CATALOGUE_SYNC` via `COVER_PHASH=on`.
+    /// it's opt-in on top of the catalogue sync via `COVER_PHASH=on` (it only ever
+    /// runs inside a sync pass, which only runs with MangaDex usage on).
     pub catalogue_cover_phash: bool,
     /// Interval between recurring incremental catalogue/chapter refresh cycles
     /// (`updatedAtSince`). The first cycle seeds on startup; default 6h.
@@ -241,7 +243,8 @@ pub struct Config {
     /// source and enqueues the series that moved up / entered. Default 15 min.
     pub discovery_interval_secs: u64,
     /// Recurring auto-enrichment drainer (X1). Off by default — it hits MangaDex
-    /// (`/manga?ids[]` + one `/cover` per work), so it's opt-in via `METADATA_BACKFILL=on`.
+    /// (`/manga?ids[]` + one `/cover` per work), so it's opt-in via `METADATA_BACKFILL=on`,
+    /// and then still only runs while the MangaDex switch is on (checked every tick).
     pub metadata_backfill_enabled: bool,
     /// Interval between auto-enrichment ticks (seconds). Default 5 min.
     pub metadata_backfill_interval_secs: u64,
@@ -250,7 +253,9 @@ pub struct Config {
     pub metadata_backfill_batch: i64,
     /// Automatic cover-cache drainer: fetch each catalogued work's cover once and
     /// store it as a WebP BLOB so the web reader serves covers off the CF Worker.
-    /// Defaults ON (no manual trigger needed); `COVER_CACHE=off` disables it.
+    /// Defaults ON (no manual trigger needed); `COVER_CACHE=off` disables it whole.
+    /// Its MangaDex pass additionally follows the MangaDex switch; its Suwayomi
+    /// passes do not touch MangaDex and run either way.
     pub cover_cache_enabled: bool,
     /// Interval between cover-drainer ticks (seconds). First tick fires on startup.
     /// Default 5 min.
@@ -298,6 +303,14 @@ impl Config {
         let web_dir = env::var("KOMIKA_WEB_DIR")
             .ok()
             .filter(|s| !s.trim().is_empty());
+        let img_proxy_enabled = match env::var("KOMIKA_IMG_PROXY")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+        {
+            Some(v) => v == "on" || v == "1" || v == "true",
+            None => web_dir.is_some(),
+        };
         let suwayomi_url =
             env::var("SUWAYOMI_URL").unwrap_or_else(|_| "http://localhost:4567".to_string());
         let suwayomi_public_url = env::var("SUWAYOMI_PUBLIC_URL")
@@ -392,12 +405,9 @@ impl Config {
                 v == "on" || v == "1" || v == "true"
             })
             .unwrap_or(false);
-        let catalogue_sync_enabled = env::var("CATALOGUE_SYNC")
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                v == "on" || v == "1" || v == "true"
-            })
-            .unwrap_or(false);
+        // `CATALOGUE_SYNC` is not read here any more: `instance::catalogue_crawl` decides
+        // the crawl from it (same on/off spelling), and `instance::resolve_mangadex` lets
+        // `CATALOGUE_SYNC=on` force MangaDex usage on. Both are resolved in `main`.
         let mangadex_rate_per_sec = env::var("MANGADEX_RATE_PER_SEC")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -534,7 +544,6 @@ impl Config {
             federated_rate_limit_window_secs,
             session_ttl_secs,
             graphiql_enabled,
-            catalogue_sync_enabled,
             mangadex_rate_per_sec,
             mangadex_athome_per_min,
             mangadex_user_agent,
@@ -555,6 +564,7 @@ impl Config {
             covers_database_url,
             ext_icons_dir,
             web_dir,
+            img_proxy_enabled,
         }
     }
 }

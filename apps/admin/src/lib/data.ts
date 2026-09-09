@@ -36,6 +36,8 @@ import type {
 	ChapterOverrideInput,
 	CreateOwnerInput,
 	CreateUserInput,
+	ExtensionRepo,
+	MangadexSetting,
 	Session,
 	SeriesAdminInput,
 	SeriesAdminMeta,
@@ -290,6 +292,41 @@ export async function addExtensionRepo(indexUrl: string): Promise<number> {
 	if (!backend.addExtensionRepo)
 		throw new Error('Extension management is unavailable on this backend.');
 	return backend.addExtensionRepo(indexUrl);
+}
+
+/** The extension repos configured on the engine. */
+export async function loadExtensionRepos(): Promise<ExtensionRepo[]> {
+	if (!backend.extensionRepos)
+		throw new Error('Extension management is unavailable on this backend.');
+	return backend.extensionRepos();
+}
+
+/** Remove an extension repo by the index URL `loadExtensionRepos` reported. */
+export async function removeExtensionRepo(indexUrl: string): Promise<boolean> {
+	if (!backend.removeExtensionRepo)
+		throw new Error('Extension management is unavailable on this backend.');
+	return backend.removeExtensionRepo(indexUrl);
+}
+
+/** The MangaDex switch and whether the server's environment fixes it. */
+export async function loadMangadexSetting(): Promise<MangadexSetting> {
+	if (!backend.mangadexSetting) setupUnavailable();
+	return backend.mangadexSetting();
+}
+
+/** Turn MangaDex on or off; returns the new effective value. */
+export async function setMangadexEnabled(enabled: boolean): Promise<boolean> {
+	if (!backend.setMangadexEnabled) setupUnavailable();
+	return backend.setMangadexEnabled(enabled);
+}
+
+/** The message the server uses when the source engine is down or still starting. */
+export const ENGINE_UNREACHABLE = 'The source engine is not reachable.';
+
+/** True when `err` is the server's "engine not reachable" answer — a state to show
+ * calmly (the engine may still be starting), not an error wall. */
+export function isEngineUnreachable(err: unknown): boolean {
+	return err instanceof Error && err.message.includes(ENGINE_UNREACHABLE);
 }
 
 /** Install a store extension onto the Suwayomi engine (NSFW-gated server-side). */

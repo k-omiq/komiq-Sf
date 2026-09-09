@@ -14,8 +14,30 @@ export async function installAdminSetupFixtures(page, initial = {}) {
 		registrationOpen: true,
 		users: [],
 		calls: [],
+		mangadexEnabled: false,
+		repos: [],
+		extensions: [],
 		...initial,
 	};
+	// What a made-up repo lists once added (B5 Sources step).
+	const repoExtensions = (indexUrl) =>
+		[
+			['Alpha Scans', 'en', false],
+			['Beta Comics', 'en', false],
+			['Gamma Manga', 'es', false],
+			['Delta Toons', 'fr', true],
+		].map(([name, lang, isNsfw], i) => ({
+			pkgName: `test.extension.${lang}.${name.split(' ')[0].toLowerCase()}`,
+			name,
+			lang,
+			versionName: `1.4.${i}`,
+			isInstalled: false,
+			hasUpdate: false,
+			isNsfw,
+			iconUrl: null,
+			repo: indexUrl,
+			subscribed: false,
+		}));
 	const sessionUser = (u) => ({
 		id: u.id,
 		username: u.username,
@@ -93,6 +115,28 @@ export async function installAdminSetupFixtures(page, initial = {}) {
 					};
 					state.users.push(u);
 					return route.fulfill(ok({ createUser: u }));
+				}
+				case 'MangadexSetting':
+					return route.fulfill(
+						ok({
+							mangadexSetting: { enabled: state.mangadexEnabled, pinned: false, pinnedBy: null },
+						}),
+					);
+				case 'SetMangadexEnabled':
+					state.mangadexEnabled = v.enabled;
+					return route.fulfill(ok({ setMangadexEnabled: v.enabled }));
+				case 'ExtensionRepos':
+					return route.fulfill(ok({ extensionRepos: state.repos }));
+				case 'AddExtensionRepo':
+					state.repos.push({ indexUrl: v.indexUrl, name: 'Test Repo', badgeLabel: 'TST' });
+					state.extensions.push(...repoExtensions(v.indexUrl));
+					return route.fulfill(ok({ addExtensionRepo: state.extensions.length }));
+				case 'Extensions':
+					return route.fulfill(ok({ extensions: state.extensions }));
+				case 'InstallExtension': {
+					const ext = state.extensions.find((e) => e.pkgName === v.pkgName);
+					ext.isInstalled = true;
+					return route.fulfill(ok({ installExtension: ext }));
 				}
 				default: {
 					// Whatever the console opens after setup: an empty catalogue.

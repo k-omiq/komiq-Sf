@@ -45,11 +45,11 @@ You can preview the production build with `npm run preview`.
 
 `KOMIKA_TARGET` picks the build (default: the hosted web build):
 
-| Target      | Adapter              | API and images                                             |
-| ----------- | -------------------- | ---------------------------------------------------------- |
-| unset (web) | Cloudflare, edge SSR | `PUBLIC_*` from `.env.production` (komiq.cc, unchanged)    |
-| `tauri`     | static SPA           | `PUBLIC_*` (native apps, the Docker image)                 |
-| `embedded`  | static SPA           | same origin: `/graphql`, images direct; `PUBLIC_*` ignored |
+| Target      | Adapter              | API and images                                                                      |
+| ----------- | -------------------- | ----------------------------------------------------------------------------------- |
+| unset (web) | Cloudflare, edge SSR | `PUBLIC_*` from `.env.production` (komiq.cc, unchanged)                             |
+| `tauri`     | static SPA           | `PUBLIC_*` (native apps, the Docker image)                                          |
+| `embedded`  | static SPA           | same origin: `/graphql`, own images direct, MangaDex via `/img`; `PUBLIC_*` ignored |
 
 The `embedded` build is the one the API server serves at `/` from `KOMIKA_WEB_DIR`
 (next to the embedded admin at `/admin`):
@@ -57,6 +57,12 @@ The `embedded` build is the one the API server serves at `/` from `KOMIKA_WEB_DI
 ```sh
 KOMIKA_TARGET=embedded pnpm -C apps/reader build   # output: apps/reader/build
 ```
+
+Images: `PUBLIC_KOMIKA_IMG_MODE` is `proxy` (the `img.komiq.cc` Worker, hosted),
+`direct`, or `server` — MangaDex images through the Komika server's own `/img` route
+on the API origin, everything else direct. The `embedded` build always behaves like
+`server` on its own origin. The server mounts `/img` when it serves the web apps
+(`KOMIKA_WEB_DIR`) or when `KOMIKA_IMG_PROXY=on`.
 
 Static builds ask the server's `instance` facts: a server without an owner shows a
 "not set up" page that links to `/admin/setup`. The sign-in page hides sign-up when
