@@ -5,8 +5,10 @@
 	import { auth } from '$lib/auth.svelte';
 	import { instance } from '$lib/instance.svelte';
 	import { runsLocalServer, target } from '$lib/config';
+	import Access from './steps/Access.svelte';
 	import Accounts from './steps/Accounts.svelte';
 	import Done from './steps/Done.svelte';
+	import Internet from './steps/Internet.svelte';
 	import Lan from './steps/Lan.svelte';
 	import Owner from './steps/Owner.svelte';
 	import Sources from './steps/Sources.svelte';
@@ -19,6 +21,7 @@
 	const STEPS: { id: string; label: string; component: Component; show?: () => boolean }[] = [
 		{ id: 'welcome', label: 'Welcome', component: Welcome },
 		{ id: 'owner', label: 'Owner account', component: Owner },
+		{ id: 'access', label: 'Access', component: Access },
 		{
 			id: 'lan',
 			label: 'Home network',
@@ -26,14 +29,26 @@
 			// Only the desktop app's own server can be opened to the home network.
 			show: () => target === 'desktop' && runsLocalServer && wizard.extra.access !== 'internet',
 		},
+		{
+			id: 'internet',
+			label: 'Internet',
+			component: Internet,
+			show: () => wizard.extra.access === 'internet',
+		},
 		{ id: 'accounts', label: 'Accounts', component: Accounts },
 		{ id: 'sources', label: 'Sources', component: Sources },
 		{ id: 'done', label: 'Done', component: Done },
 	];
 
-	const visible = STEPS.filter((s) => !s.show || s.show());
-	wizard.order = visible.map(({ id, label }) => ({ id, label }));
-	if (!visible.some((s) => s.id === wizard.current)) wizard.current = 'welcome';
+	// Reactive: a choice on one step (e.g. access) adds or removes later steps, and the
+	// step bar and Next/Back follow at once.
+	const visibleSteps = () => STEPS.filter((s) => !s.show || s.show());
+	const visible = $derived(visibleSteps());
+	wizard.order = visibleSteps().map(({ id, label }) => ({ id, label }));
+	$effect.pre(() => {
+		wizard.order = visible.map(({ id, label }) => ({ id, label }));
+	});
+	if (!visibleSteps().some((s) => s.id === wizard.current)) wizard.current = 'welcome';
 	const Current = $derived(visible.find((s) => s.id === wizard.current)?.component ?? Welcome);
 
 	// Save progress (never a password) so a closed app resumes here.

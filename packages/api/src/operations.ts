@@ -889,6 +889,94 @@ export const SET_REGISTRATION_OPEN = /* GraphQL */ `
 	}
 `;
 
+// ---- admin: access + Cloudflare setup -----------------------------------------
+
+const ACCESS_STATUS_FIELDS = /* GraphQL */ `
+	fragment AccessStatusFields on AccessStatus {
+		mode
+		domain
+		address
+		cloudflare {
+			domain
+			connection
+			zoneName
+			complete
+			removable
+		}
+		connector
+		connectorMessage
+		https
+		trustedProxies
+		trustedProxiesPinned
+		job {
+			kind
+			running
+			failed
+			steps {
+				id
+				label
+				state
+				message
+			}
+		}
+	}
+`;
+
+export const ACCESS_STATUS = /* GraphQL */ `
+	${ACCESS_STATUS_FIELDS}
+	query AccessStatus {
+		accessStatus {
+			...AccessStatusFields
+		}
+	}
+`;
+
+export const SET_ACCESS_MODE = /* GraphQL */ `
+	${ACCESS_STATUS_FIELDS}
+	mutation SetAccessMode($mode: String!, $domain: String) {
+		setAccessMode(mode: $mode, domain: $domain) {
+			...AccessStatusFields
+		}
+	}
+`;
+
+export const CHECK_CLOUDFLARE_TOKEN = /* GraphQL */ `
+	mutation CheckCloudflareToken($token: String!, $domain: String!) {
+		checkCloudflareToken(token: $token, domain: $domain) {
+			zoneName
+			zoneStatus
+			accountName
+		}
+	}
+`;
+
+export const START_CLOUDFLARE_SETUP = /* GraphQL */ `
+	${ACCESS_STATUS_FIELDS}
+	mutation StartCloudflareSetup($input: CloudflareSetupInput!) {
+		startCloudflareSetup(input: $input) {
+			...AccessStatusFields
+		}
+	}
+`;
+
+export const RETRY_CLOUDFLARE_SETUP = /* GraphQL */ `
+	${ACCESS_STATUS_FIELDS}
+	mutation RetryCloudflareSetup($token: String!) {
+		retryCloudflareSetup(token: $token) {
+			...AccessStatusFields
+		}
+	}
+`;
+
+export const REMOVE_CLOUDFLARE_SETUP = /* GraphQL */ `
+	${ACCESS_STATUS_FIELDS}
+	mutation RemoveCloudflareSetup($token: String!) {
+		removeCloudflareSetup(token: $token) {
+			...AccessStatusFields
+		}
+	}
+`;
+
 export const MERGE_QUEUE = /* GraphQL */ `
 	query MergeQueue($page: Int, $limit: Int) {
 		mergeQueue(page: $page, limit: $limit) {

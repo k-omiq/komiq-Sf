@@ -6,7 +6,9 @@
 	import { copyText, finishSetup, labels, stepNumber, wizard } from '../wizard.svelte';
 
 	let copied = $state(false);
-	const address = serverAddress();
+	// Internet mode: readers use the public domain, not the address this console uses.
+	const domain = wizard.extra.access === 'internet' ? (wizard.extra.domain as string) : '';
+	const address = domain ? `https://${domain}` : serverAddress();
 
 	async function copy(): Promise<void> {
 		if (await copyText(address)) {

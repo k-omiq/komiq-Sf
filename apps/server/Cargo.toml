@@ -10,7 +10,9 @@ name = "komika-server"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+# `process` + `io-util`: the self-host Cloudflare connector runs `cloudflared` as a
+# supervised child and reads its log lines (cloudflare/connector.rs).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "io-util"] }
 axum = { version = "0.8", features = ["multipart"] }
 async-graphql = "7"
 async-graphql-axum = "7"
@@ -47,6 +49,14 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 dotenvy = "0.15"
+# Self-host Cloudflare "public IP" mode (cloudflare/origin_tls.rs): the server serves HTTPS
+# with a Cloudflare Origin CA certificate. All three crates are already in the tree through
+# reqwest's rustls stack (same versions, ring backend), so nothing new is built: `ring`
+# makes the P-256 key and signs the certificate request, `tokio-rustls` terminates TLS,
+# `base64` writes the request as PEM. Nothing here runs unless an admin sets it up.
+ring = "0.17"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3

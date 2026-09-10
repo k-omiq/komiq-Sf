@@ -61,6 +61,10 @@ import type {
 	SeriesMetadataInput,
 	Session,
 	UpdateProfileInput,
+	AccessMode,
+	AccessStatus,
+	CloudflareSetupInput,
+	CloudflareTokenCheck,
 } from './backend.js';
 import type { ContentBackend, SourceRef } from './content-backend.js';
 import type { WorkSourceLike } from './local-suwayomi-backend.js';
@@ -585,6 +589,26 @@ export class CompositeBackend implements Backend {
 	}
 	setRegistrationOpen(open: boolean): Promise<boolean> {
 		return this.opts.hosted.setRegistrationOpen!(open);
+	}
+
+	// --- admin access + Cloudflare setup (hosted server only) ---
+	accessStatus(): Promise<AccessStatus> {
+		return this.opts.hosted.accessStatus!();
+	}
+	setAccessMode(mode: AccessMode, domain?: string | null): Promise<AccessStatus> {
+		return this.opts.hosted.setAccessMode!(mode, domain);
+	}
+	checkCloudflareToken(token: string, domain: string): Promise<CloudflareTokenCheck> {
+		return this.opts.hosted.checkCloudflareToken!(token, domain);
+	}
+	startCloudflareSetup(input: CloudflareSetupInput): Promise<AccessStatus> {
+		return this.opts.hosted.startCloudflareSetup!(input);
+	}
+	retryCloudflareSetup(token: string): Promise<AccessStatus> {
+		return this.opts.hosted.retryCloudflareSetup!(token);
+	}
+	removeCloudflareSetup(token: string): Promise<AccessStatus> {
+		return this.opts.hosted.removeCloudflareSetup!(token);
 	}
 
 	// --- admin dedup review ---

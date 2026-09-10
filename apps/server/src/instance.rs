@@ -21,7 +21,8 @@ use sqlx::SqlitePool;
 pub struct Setting {
     /// Primary key in `instance_setting`.
     pub key: &'static str,
-    /// Env variable that overrides the stored value.
+    /// Env variable that overrides the stored value. Empty: no env override (state
+    /// that only the server itself writes, e.g. what Cloudflare setup created).
     pub env: &'static str,
     /// Value used when neither env nor table has one.
     pub default: &'static str,
@@ -155,6 +156,42 @@ pub fn catalogue_crawl(env: impl Fn(&str) -> Option<String>) -> CatalogueCrawl {
     }
 }
 
+/// Proxies whose `X-Forwarded-For` / `CF-Connecting-IP` the server believes, as
+/// comma-separated CIDRs. A deployment that sets `TRUSTED_PROXY_CIDRS` (the hosted
+/// instance) keeps exactly its list; otherwise Cloudflare setup fills the stored value
+/// (loopback for a tunnel, Cloudflare's ranges for a public IP). Empty: always key on
+/// the socket peer.
+pub const TRUSTED_PROXY_CIDRS: Setting = Setting {
+    key: "trusted_proxy_cidrs",
+    env: "TRUSTED_PROXY_CIDRS",
+    default: "",
+};
+
+/// The wizard's access choice: `local` (only my devices) or `internet`. Display only:
+/// it decides what Settings › Access shows, not what the server listens on. Empty
+/// until someone chooses.
+pub const ACCESS_MODE: Setting = Setting {
+    key: "access_mode",
+    env: "",
+    default: "",
+};
+
+/// The public domain readers use in internet mode (`https://<domain>`), set by
+/// Cloudflare setup or by an owner who did it by hand. Display only.
+pub const PUBLIC_DOMAIN: Setting = Setting {
+    key: "public_domain",
+    env: "",
+    default: "",
+};
+
+/// JSON record of what Cloudflare setup created (ids for "Remove"); see
+/// `cloudflare::Stored`. Never holds a token.
+pub const CLOUDFLARE_STATE: Setting = Setting {
+    key: "cloudflare_state",
+    env: "",
+    default: "",
+};
+
 /// Where a resolved value came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -195,7 +232,11 @@ pub async fn resolve_with(
     s: &Setting,
     env: impl Fn(&str) -> Option<String>,
 ) -> Resolved {
-    if let Some(v) = env(s.env).filter(|v| !v.trim().is_empty()) {
+    if let Some(v) = Some(s.env)
+        .filter(|name| !name.is_empty())
+        .and_then(&env)
+        .filter(|v| !v.trim().is_empty())
+    {
         return Resolved {
             value: v,
             source: Source::Env,

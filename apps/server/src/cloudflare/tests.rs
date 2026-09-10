@@ -1,0 +1,1243 @@
+//! Cloudflare setup against a local mock of the v4 API. Nothing here reaches
+//! Cloudflare: every client is pointed at the mock below, and the connector is a
+//! shell script standing in for `cloudflared`.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
+use axum::Router;
+use ring::rand::SystemRandom;
+use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+use serde_json::{json, Value};
+use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::SqlitePool;
+
+use super::origin_tls::{der_bit_string, der_ecdsa_sha256, der_name, der_san_extension, pem};
+use super::*;
+
+const TOKEN: &str = "test-api-token-0123456789";
+const RUN_TOKEN: &str = "test-tunnel-run-token-abcdef";
+
+// ---- the mock ----------------------------------------------------------------
+
+#[derive(Default)]
+struct Mock {
+    tunnels: HashMap<String, Value>,
+    deleted_tunnels: Vec<String>,
+    dns: HashMap<String, Value>,
+    certs: HashMap<String, String>,
+    revoked: Vec<String>,
+    settings: HashMap<String, Value>,
+    ruleset: Option<(String, Vec<Value>)>,
+    ruleset_deleted: bool,
+    /// Operation name → how many more calls fail.
+    fail: HashMap<String, u32>,
+    /// Operation name → calls let through before `fail` applies.
+    fail_skip: HashMap<String, u32>,
+    calls: Vec<String>,
+    next_id: u32,
+    ca: Option<Arc<TestCa>>,
+}
+
+impl Mock {
+    fn id(&mut self, prefix: &str) -> String {
+        self.next_id += 1;
+        format!("{prefix}{:04}", self.next_id)
+    }
+}
+
+type Shared = Arc<Mutex<Mock>>;
+
+fn ok(result: Value) -> Response {
+    (
+        StatusCode::OK,
+        axum::Json(json!({ "success": true, "errors": [], "messages": [], "result": result })),
+    )
+        .into_response()
+}
+
+fn err(status: StatusCode, code: i64, message: &str) -> Response {
+    (
+        status,
+        axum::Json(json!({ "success": false, "errors": [{ "code": code, "message": message }], "messages": [], "result": null })),
+    )
+        .into_response()
+}
+
+async fn handle(
+    State(m): State<Shared>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let path = uri.path().to_string();
+    let query = uri.query().unwrap_or("").to_string();
+    let seg: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let op = match (&method, seg.as_slice()) {
+        (&Method::GET, ["health"]) => "health",
+        (&Method::GET, ["cdn-cgi", "trace"]) => "trace",
+        (&Method::GET, ["user", "tokens", "verify"]) => "verify",
+        (&Method::GET, ["zones"]) => "zones",
+        (&Method::GET, ["ips"]) => "ips",
+        (&Method::POST, ["accounts", _, "cfd_tunnel"]) => "create_tunnel",
+        (&Method::PUT, ["accounts", _, "cfd_tunnel", _, "configurations"]) => "tunnel_config",
+        (&Method::GET, ["accounts", _, "cfd_tunnel", _, "token"]) => "tunnel_token",
+        (&Method::DELETE, ["accounts", _, "cfd_tunnel", _, "connections"]) => "tunnel_connections",
+        (&Method::DELETE, ["accounts", _, "cfd_tunnel", _]) => "delete_tunnel",
+        (&Method::GET, ["zones", _, "dns_records"]) => "dns_list",
+        (&Method::POST, ["zones", _, "dns_records"]) => "dns_create",
+        (&Method::DELETE, ["zones", _, "dns_records", _]) => "dns_delete",
+        (&Method::POST, ["certificates"]) => "cert_create",
+        (&Method::DELETE, ["certificates", _]) => "cert_revoke",
+        (&Method::GET, ["zones", _, "settings", _]) => "settings_get",
+        (&Method::PATCH, ["zones", _, "settings", _]) => "settings_patch",
+        (&Method::GET, ["zones", _, "rulesets", "phases", _, "entrypoint"]) => "ruleset_entry",
+        (&Method::POST, ["zones", _, "rulesets"]) => "ruleset_create",
+        (&Method::POST, ["zones", _, "rulesets", _, "rules"]) => "rule_add",
+        (&Method::GET, ["zones", _, "rulesets", _]) => "ruleset_get",
+        (&Method::DELETE, ["zones", _, "rulesets", _, "rules", _]) => "rule_delete",
+        (&Method::DELETE, ["zones", _, "rulesets", _]) => "ruleset_delete",
+        _ => return err(StatusCode::NOT_FOUND, 7003, "No route for that URI"),
+    };
+    let mut m = m.lock().unwrap();
+    m.calls.push(op.to_string());
+    let skip = m.fail_skip.get_mut(op).filter(|n| **n > 0).map(|n| {
+        *n -= 1;
+    });
+    if let Some(n) = m.fail.get_mut(op).filter(|n| **n > 0 && skip.is_none()) {
+        *n -= 1;
+        if op == "health" {
+            return (StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
+        }
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            10000,
+            &format!("injected {op} failure"),
+        );
+    }
+    match op {
+        "health" => return (StatusCode::OK, "ok").into_response(),
+        "trace" => return (StatusCode::OK, "fl=1\nip=203.0.113.7\nts=1\n").into_response(),
+        _ => {}
+    }
+    let authed = headers.get("authorization").and_then(|v| v.to_str().ok())
+        == Some(&format!("Bearer {TOKEN}"));
+    if !authed {
+        return err(StatusCode::UNAUTHORIZED, 1000, "Invalid API Token");
+    }
+    match op {
+        "verify" => ok(json!({ "id": "tok", "status": "active" })),
+        "zones" => {
+            let name = query.strip_prefix("name=").unwrap_or_default();
+            if name == "example.com" {
+                ok(
+                    json!([{ "id": "zone1", "name": "example.com", "status": "active",
+                    "account": { "id": "acc1", "name": "Test account" } }]),
+                )
+            } else {
+                ok(json!([]))
+            }
+        }
+        "ips" => ok(
+            json!({ "ipv4_cidrs": ["173.245.48.0/20", "103.21.244.0/22"],
+            "ipv6_cidrs": ["2400:cb00::/32"], "etag": "x" }),
+        ),
+        "create_tunnel" => {
+            assert_eq!(body["config_src"], "cloudflare");
+            let id = m.id("tun-");
+            m.tunnels
+                .insert(id.clone(), json!({ "name": body["name"], "config": null }));
+            ok(json!({ "id": id, "name": body["name"] }))
+        }
+        "tunnel_config" => {
+            let id = seg[3].to_string();
+            let Some(t) = m.tunnels.get_mut(&id) else {
+                return err(StatusCode::NOT_FOUND, 1003, "tunnel not found");
+            };
+            t["config"] = body["config"].clone();
+            ok(json!({ "tunnel_id": id }))
+        }
+        "tunnel_token" => {
+            if !m.tunnels.contains_key(seg[3]) {
+                return err(StatusCode::NOT_FOUND, 1003, "tunnel not found");
+            }
+            ok(json!(RUN_TOKEN))
+        }
+        "tunnel_connections" => {
+            if !m.tunnels.contains_key(seg[3]) {
+                return err(StatusCode::NOT_FOUND, 1003, "tunnel not found");
+            }
+            ok(json!({}))
+        }
+        "delete_tunnel" => match m.tunnels.remove(seg[3]) {
+            Some(_) => {
+                m.deleted_tunnels.push(seg[3].to_string());
+                ok(json!({ "id": seg[3] }))
+            }
+            None => err(StatusCode::NOT_FOUND, 1003, "tunnel not found"),
+        },
+        "dns_list" => {
+            let name = query.strip_prefix("name.exact=").unwrap_or_default();
+            let list: Vec<Value> = m
+                .dns
+                .iter()
+                .filter(|(_, r)| r["name"] == name)
+                .map(|(id, r)| {
+                    let mut r = r.clone();
+                    r["id"] = json!(id);
+                    r
+                })
+                .collect();
+            ok(json!(list))
+        }
+        "dns_create" => {
+            assert_eq!(body["proxied"], true, "records must be proxied");
+            let id = m.id("dns-");
+            m.dns.insert(id.clone(), body.clone());
+            let mut r = body;
+            r["id"] = json!(id);
+            ok(r)
+        }
+        "dns_delete" => match m.dns.remove(seg[3]) {
+            Some(_) => ok(json!({ "id": seg[3] })),
+            None => err(StatusCode::NOT_FOUND, 81044, "Record does not exist."),
+        },
+        "cert_create" => {
+            assert_eq!(body["request_type"], "origin-ecc");
+            let ca = m.ca.clone().expect("mock CA");
+            let host = body["hostnames"][0].as_str().unwrap().to_string();
+            let cert = ca.sign_csr(body["csr"].as_str().unwrap(), &host);
+            let id = m.id("cert-");
+            m.certs.insert(id.clone(), cert.clone());
+            ok(json!({ "id": id, "certificate": cert, "hostnames": [host] }))
+        }
+        "cert_revoke" => match m.certs.remove(seg[1]) {
+            Some(_) => {
+                m.revoked.push(seg[1].to_string());
+                ok(json!({ "id": seg[1] }))
+            }
+            None => err(StatusCode::NOT_FOUND, 1001, "certificate not found"),
+        },
+        "settings_get" => {
+            let v = m.settings.get(seg[3]).cloned().unwrap_or(Value::Null);
+            ok(json!({ "id": seg[3], "value": v }))
+        }
+        "settings_patch" => {
+            m.settings.insert(seg[3].to_string(), body["value"].clone());
+            ok(json!({ "id": seg[3], "value": body["value"] }))
+        }
+        "ruleset_entry" => match &m.ruleset {
+            Some((id, rules)) => ok(json!({ "id": id, "rules": rules })),
+            None => err(
+                StatusCode::NOT_FOUND,
+                10003,
+                "could not find entrypoint ruleset",
+            ),
+        },
+        "ruleset_create" => {
+            assert_eq!(body["phase"], "http_request_cache_settings");
+            let id = m.id("rs-");
+            let mut rules = vec![];
+            for r in body["rules"].as_array().unwrap() {
+                let mut r = r.clone();
+                r["id"] = json!(m.id("rule-"));
+                rules.push(r);
+            }
+            m.ruleset = Some((id.clone(), rules.clone()));
+            ok(json!({ "id": id, "rules": rules }))
+        }
+        "rule_add" => {
+            let rid = m.id("rule-");
+            let Some((id, rules)) = m.ruleset.as_mut() else {
+                return err(StatusCode::NOT_FOUND, 10003, "no ruleset");
+            };
+            let mut r = body.clone();
+            r["id"] = json!(rid);
+            rules.push(r);
+            ok(json!({ "id": id, "rules": rules }))
+        }
+        "ruleset_get" => match &m.ruleset {
+            Some((id, rules)) if id == seg[3] => ok(json!({ "id": id, "rules": rules })),
+            _ => err(StatusCode::NOT_FOUND, 10003, "no ruleset"),
+        },
+        "rule_delete" => {
+            let Some((id, rules)) = m.ruleset.as_mut() else {
+                return err(StatusCode::NOT_FOUND, 10003, "no ruleset");
+            };
+            let before = rules.len();
+            rules.retain(|r| r["id"] != seg[5]);
+            if rules.len() == before {
+                return err(StatusCode::NOT_FOUND, 10003, "no rule");
+            }
+            let out = json!({ "id": id, "rules": rules });
+            ok(out)
+        }
+        "ruleset_delete" => {
+            m.ruleset = None;
+            m.ruleset_deleted = true;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        _ => unreachable!(),
+    }
+}
+
+async fn start_mock(mock: Mock) -> (String, Shared) {
+    let shared: Shared = Arc::new(Mutex::new(mock));
+    let app = Router::new().fallback(handle).with_state(shared.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), shared)
+}
+
+fn base_mock() -> Mock {
+    let mut m = Mock::default();
+    m.settings.insert("ssl".into(), json!("flexible"));
+    m.settings.insert("browser_cache_ttl".into(), json!(14400));
+    // Someone else's record and cache rule on the same zone: setup and remove must
+    // leave both alone.
+    m.dns.insert(
+        "dns-other".into(),
+        json!({ "type": "A", "name": "blog.example.com", "content": "198.51.100.1", "proxied": true }),
+    );
+    m.ruleset = Some((
+        "rs-existing".into(),
+        vec![json!({ "id": "rule-theirs", "ref": "their_rule", "expression": "true" })],
+    ));
+    m
+}
+
+// ---- a tiny CA so the mock can answer `POST /certificates` --------------------
+
+struct TestCa {
+    key: EcdsaKeyPair,
+    cert_der: Vec<u8>,
+}
+
+fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let len = content.len();
+    if len < 0x80 {
+        out.push(len as u8);
+    } else if len < 0x100 {
+        out.extend([0x81, len as u8]);
+    } else {
+        out.extend([0x82, (len >> 8) as u8, len as u8]);
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+fn seq(parts: &[&[u8]]) -> Vec<u8> {
+    tlv(0x30, &parts.concat())
+}
+
+/// (content, rest) of the TLV at the start of `b`.
+fn read(b: &[u8]) -> (&[u8], &[u8]) {
+    let (len, hdr) = if b[1] < 0x80 {
+        (b[1] as usize, 2)
+    } else {
+        let n = (b[1] & 0x7F) as usize;
+        (
+            b[2..2 + n]
+                .iter()
+                .fold(0usize, |a, x| (a << 8) | *x as usize),
+            2 + n,
+        )
+    };
+    (&b[hdr..hdr + len], &b[hdr + len..])
+}
+
+/// (whole TLV, rest).
+fn read_raw(b: &[u8]) -> (&[u8], &[u8]) {
+    let (_, rest) = read(b);
+    b.split_at(b.len() - rest.len())
+}
+
+impl TestCa {
+    fn new() -> Self {
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let spki = super::origin_tls::der_spki(key.public_key().as_ref());
+        // basicConstraints: critical, CA true.
+        let bc = seq(&[
+            &tlv(0x06, &[0x55, 0x1D, 0x13]),
+            &[0x01, 0x01, 0xFF],
+            &tlv(0x04, &seq(&[&[0x01, 0x01, 0xFF]])),
+        ]);
+        let name = der_name("komiq test CA");
+        let cert_der = Self::sign(&key, &[0x01], &name, &name, &spki, &bc);
+        Self { key, cert_der }
+    }
+
+    fn sign(
+        key: &EcdsaKeyPair,
+        serial: &[u8],
+        issuer: &[u8],
+        subject: &[u8],
+        spki: &[u8],
+        extension: &[u8],
+    ) -> Vec<u8> {
+        let validity = seq(&[&tlv(0x17, b"200101000000Z"), &tlv(0x17, b"491231235959Z")]);
+        let tbs = seq(&[
+            &tlv(0xA0, &tlv(0x02, &[0x02])),
+            &tlv(0x02, serial),
+            &der_ecdsa_sha256(),
+            issuer,
+            &validity,
+            subject,
+            spki,
+            &tlv(0xA3, &seq(&[extension])),
+        ]);
+        let sig = key.sign(&SystemRandom::new(), &tbs).unwrap();
+        seq(&[&tbs, &der_ecdsa_sha256(), &der_bit_string(sig.as_ref())])
+    }
+
+    /// Issue a leaf for the public key inside `csr_pem` (what Origin CA does).
+    fn sign_csr(&self, csr_pem: &str, host: &str) -> String {
+        use base64::Engine;
+        let b64: String = csr_pem
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        let (outer, _) = read(&der);
+        let (info, _) = read(outer);
+        let (_version, rest) = read_raw(info);
+        let (_subject, rest) = read_raw(rest);
+        let (spki, _) = read_raw(rest);
+        let (ca_subject_seq, _) = read(&self.cert_der);
+        let _ = ca_subject_seq;
+        let leaf = Self::sign(
+            &self.key,
+            &[0x02],
+            &der_name("komiq test CA"),
+            &der_name(host),
+            spki,
+            &der_san_extension(host),
+        );
+        pem("CERTIFICATE", &leaf)
+    }
+
+    fn pem(&self) -> String {
+        pem("CERTIFICATE", &self.cert_der)
+    }
+}
+
+// ---- harness -----------------------------------------------------------------
+
+async fn pool() -> SqlitePool {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    pool
+}
+
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        "komika-cf-{name}-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// A stand-in for `cloudflared`: records what it was given, reports a connection,
+/// and idles until killed.
+fn fake_cloudflared(dir: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join("cloudflared");
+    std::fs::write(
+        &p,
+        "#!/bin/sh\n\
+         d=$(dirname \"$0\")\n\
+         printf '%s' \"$TUNNEL_TOKEN\" > \"$d/seen-token\"\n\
+         printf '%s' \"$*\" > \"$d/seen-args\"\n\
+         echo 'INF Starting tunnel' >&2\n\
+         echo 'INF Registered tunnel connection connIndex=0' >&2\n\
+         exec sleep 600\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p.to_string_lossy().into_owned()
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn options(api: &str, dir: &std::path::Path, bin: Option<String>) -> Options {
+    Options {
+        api_base: api.to_string(),
+        trace_url: format!("{api}/cdn-cgi/trace"),
+        health_base: Some(api.to_string()),
+        cloudflared_bin: bin,
+        data_dir: dir.join("data"),
+        origin_service: "http://127.0.0.1:18080".into(),
+        https_addr: SocketAddr::from(([127, 0, 0, 1], free_port())),
+        health_attempts: 2,
+        health_delay: Duration::from_millis(10),
+        connector_timeout: Duration::from_secs(5),
+    }
+}
+
+fn manager(pool: &SqlitePool, opts: Options, trusted: Arc<crate::TrustedProxies>) -> Arc<Manager> {
+    let m = Arc::new(Manager::new(pool.clone(), opts, trusted));
+    m.set_router(Router::new().route("/health", axum::routing::get(|| async { "ok" })));
+    m
+}
+
+fn input(domain: &str, connection: Connection) -> CloudflareSetupInput {
+    CloudflareSetupInput {
+        token: TOKEN.into(),
+        domain: domain.into(),
+        connection,
+        public_ip: None,
+    }
+}
+
+async fn wait_job(m: &Manager) -> CloudflareJob {
+    for _ in 0..400 {
+        if let Some(j) = m.status().await.job {
+            if !j.running {
+                return j;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("job did not finish");
+}
+
+fn states(j: &CloudflareJob) -> Vec<(String, String)> {
+    j.steps
+        .iter()
+        .map(|s| (s.id.clone(), s.state.clone()))
+        .collect()
+}
+
+fn all_done(j: &CloudflareJob) {
+    assert!(
+        !j.failed && j.steps.iter().all(|s| s.state == "done"),
+        "not all done: {:?}",
+        j.steps
+            .iter()
+            .map(|s| (s.id.as_str(), s.state.as_str(), s.message.as_deref()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Nothing setup made is left in the mock; what was there before is intact.
+fn assert_clean(m: &Mock, ruleset_existed: bool) {
+    assert!(m.tunnels.is_empty(), "tunnels left: {:?}", m.tunnels);
+    assert_eq!(m.dns.keys().collect::<Vec<_>>(), vec!["dns-other"]);
+    assert!(m.certs.is_empty(), "certificates left");
+    if ruleset_existed {
+        let (id, rules) = m.ruleset.as_ref().expect("their ruleset kept");
+        assert_eq!(id, "rs-existing");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["ref"], "their_rule");
+    } else {
+        assert!(m.ruleset.is_none());
+    }
+    assert_eq!(m.settings["ssl"], json!("flexible"));
+    assert_eq!(m.settings["browser_cache_ttl"], json!(14400));
+}
+
+fn mode(p: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+}
+
+// ---- tests -------------------------------------------------------------------
+
+#[tokio::test]
+async fn tunnel_setup_then_remove_deletes_exactly_what_it_created() {
+    let (api, mock) = start_mock(base_mock()).await;
+    let dir = temp_dir("tunnel");
+    let pool = pool().await;
+    let trusted = Arc::new(crate::TrustedProxies::for_tests(vec![], false));
+    let mgr = manager(
+        &pool,
+        options(&api, &dir, Some(fake_cloudflared(&dir))),
+        trusted.clone(),
+    );
+
+    let check = mgr
+        .check_token(TOKEN, "https://Read.Example.com/")
+        .await
+        .unwrap();
+    assert_eq!(check.zone_name, "example.com");
+    assert_eq!(check.account_name, "Test account");
+
+    mgr.start_setup(input("read.example.com", Connection::Tunnel))
+        .await
+        .unwrap();
+    let job = wait_job(&mgr).await;
+    all_done(&job);
+    assert_eq!(
+        job.steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        [
+            "token",
+            "zone",
+            "tunnel",
+            "connector",
+            "client_ip",
+            "tunnel_dns",
+            "cache_rules",
+            "cache_headers",
+            "health"
+        ]
+    );
+
+    let stored = load_stored(&pool).await.unwrap();
+    let tunnel = stored.tunnel_id.clone().unwrap();
+    {
+        let m = mock.lock().unwrap();
+        let t = &m.tunnels[&tunnel];
+        assert_eq!(
+            t["config"]["ingress"],
+            json!([
+                { "hostname": "read.example.com", "service": "http://127.0.0.1:18080", "originRequest": {} },
+                { "service": "http_status:404" }
+            ])
+        );
+        let ours: Vec<_> = m.dns.iter().filter(|(id, _)| *id != "dns-other").collect();
+        assert_eq!(ours.len(), 1);
+        assert_eq!(ours[0].1["type"], "CNAME");
+        assert_eq!(ours[0].1["name"], "read.example.com");
+        assert_eq!(ours[0].1["content"], format!("{tunnel}.cfargotunnel.com"));
+        let (rs, rules) = m.ruleset.as_ref().unwrap();
+        assert_eq!(rs, "rs-existing");
+        assert_eq!(rules.len(), 5);
+        for r in &rules[1..] {
+            assert!(r["ref"].as_str().unwrap().starts_with("komiq_"));
+            assert!(r["expression"]
+                .as_str()
+                .unwrap()
+                .contains("http.host eq \"read.example.com\""));
+            assert_eq!(r["action"], "set_cache_settings");
+            assert_eq!(r["action_parameters"]["edge_ttl"]["mode"], "respect_origin");
+        }
+        assert_eq!(m.settings["browser_cache_ttl"], json!(0));
+        assert_eq!(
+            m.settings["ssl"],
+            json!("flexible"),
+            "a tunnel leaves SSL mode alone"
+        );
+        assert!(m.certs.is_empty());
+    }
+    assert_eq!(stored.rule_ids.len(), 4);
+    assert!(!stored.ruleset_created);
+
+    // Visitor addresses: loopback (the connector), stored and live.
+    assert_eq!(trusted.raw(), vec!["127.0.0.1/32", "::1/128"]);
+    let r = instance::resolve(&pool, &instance::TRUSTED_PROXY_CIDRS).await;
+    assert_eq!(r.value, "127.0.0.1/32,::1/128");
+
+    // The connector runs with the run token in its environment, not its arguments,
+    // and the token file is private.
+    let st = mgr.status().await;
+    assert_eq!(st.connector, "running");
+    assert_eq!(st.mode, "internet");
+    assert_eq!(st.address.as_deref(), Some("https://read.example.com"));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("seen-token")).unwrap(),
+        RUN_TOKEN
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("seen-args")).unwrap(),
+        "tunnel --no-autoupdate run"
+    );
+    assert_eq!(mode(&dir.join("data").join(TUNNEL_TOKEN_FILE)), 0o600);
+
+    // No credential is kept in the database or shown in the checklist.
+    let raw = instance::resolve(&pool, &instance::CLOUDFLARE_STATE)
+        .await
+        .value;
+    assert!(!raw.contains(TOKEN) && !raw.contains(RUN_TOKEN));
+    for s in &job.steps {
+        let m = s.message.clone().unwrap_or_default();
+        assert!(!m.contains(TOKEN) && !m.contains(RUN_TOKEN));
+    }
+
+    // Remove.
+    mgr.start_remove(TOKEN).await.unwrap();
+    let job = wait_job(&mgr).await;
+    all_done(&job);
+    {
+        let m = mock.lock().unwrap();
+        assert_clean(&m, true);
+        assert_eq!(m.deleted_tunnels, vec![tunnel]);
+        assert!(!m.ruleset_deleted, "the ruleset was there before setup");
+    }
+    assert!(trusted.raw().is_empty());
+    assert_eq!(
+        instance::resolve(&pool, &instance::TRUSTED_PROXY_CIDRS)
+            .await
+            .value,
+        ""
+    );
+    assert!(!dir.join("data").join(TUNNEL_TOKEN_FILE).exists());
+    let st = mgr.status().await;
+    assert_eq!(st.connector, "off");
+    assert_eq!(st.mode, "local");
+    assert!(st.cloudflare.is_none());
+    assert!(load_stored(&pool).await.is_none());
+}
+
+#[tokio::test]
+async fn public_ip_setup_serves_https_and_remove_restores_the_zone() {
+    let mut m = base_mock();
+    m.ruleset = None;
+    m.ca = Some(Arc::new(TestCa::new()));
+    let ca_pem = m.ca.as_ref().unwrap().pem();
+    let (api, mock) = start_mock(m).await;
+    let dir = temp_dir("public");
+    let pool = pool().await;
+    let trusted = Arc::new(crate::TrustedProxies::for_tests(vec![], false));
+    let opts = options(&api, &dir, None);
+    let https = opts.https_addr;
+    let mgr = manager(&pool, opts, trusted.clone());
+
+    mgr.start_setup(input("read.example.com", Connection::PublicIp))
+        .await
+        .unwrap();
+    let job = wait_job(&mgr).await;
+    all_done(&job);
+    assert_eq!(
+        job.steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        [
+            "token",
+            "zone",
+            "certificate",
+            "ssl",
+            "client_ip",
+            "dns",
+            "cache_rules",
+            "cache_headers",
+            "health"
+        ]
+    );
+    let stored = load_stored(&pool).await.unwrap();
+    assert_eq!(stored.public_ip.as_deref(), Some("203.0.113.7"), "detected");
+    assert!(stored.ruleset_created);
+    {
+        let m = mock.lock().unwrap();
+        let ours: Vec<_> = m.dns.iter().filter(|(id, _)| *id != "dns-other").collect();
+        assert_eq!(ours.len(), 1);
+        assert_eq!(ours[0].1["type"], "A");
+        assert_eq!(ours[0].1["content"], "203.0.113.7");
+        assert_eq!(m.settings["ssl"], json!("strict"));
+        assert_eq!(m.certs.len(), 1);
+        assert_eq!(m.ruleset.as_ref().unwrap().1.len(), 4);
+    }
+    assert_eq!(
+        trusted.raw(),
+        vec!["173.245.48.0/20", "103.21.244.0/22", "2400:cb00::/32"]
+    );
+    assert_eq!(mode(&dir.join("data").join(ORIGIN_KEY_FILE)), 0o600);
+
+    // The origin answers HTTPS with the Origin CA certificate for the domain.
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .resolve("read.example.com", https)
+        // The sandbox may route outbound HTTPS through a proxy; this is local.
+        .no_proxy()
+        .build()
+        .unwrap();
+    let url = format!("https://read.example.com:{}/health", https.port());
+    let body = client.get(&url).send().await.unwrap().text().await.unwrap();
+    assert_eq!(body, "ok");
+    assert!(mgr.status().await.https);
+
+    mgr.start_remove(TOKEN).await.unwrap();
+    let job = wait_job(&mgr).await;
+    all_done(&job);
+    {
+        let m = mock.lock().unwrap();
+        assert_clean(&m, false);
+        assert!(
+            m.ruleset_deleted,
+            "setup created the ruleset, so remove deletes it"
+        );
+        assert_eq!(m.revoked.len(), 1);
+    }
+    assert!(trusted.raw().is_empty());
+    assert!(!dir.join("data").join(ORIGIN_KEY_FILE).exists());
+    assert!(!dir.join("data").join(ORIGIN_CERT_FILE).exists());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!mgr.status().await.https);
+    assert!(
+        tokio::net::TcpStream::connect(https).await.is_err(),
+        "the HTTPS port is released"
+    );
+}
+
+#[tokio::test]
+async fn a_failure_at_any_step_is_retried_and_remove_leaves_nothing() {
+    let cases: &[(Connection, &str, u32, &str)] = &[
+        (Connection::Tunnel, "verify", 1, "token"),
+        (Connection::Tunnel, "zones", 1, "zone"),
+        (Connection::Tunnel, "create_tunnel", 1, "tunnel"),
+        (Connection::Tunnel, "tunnel_config", 1, "tunnel"),
+        (Connection::Tunnel, "tunnel_token", 1, "tunnel"),
+        (Connection::Tunnel, "dns_list", 1, "tunnel_dns"),
+        (Connection::Tunnel, "dns_create", 1, "tunnel_dns"),
+        (Connection::Tunnel, "ruleset_entry", 1, "cache_rules"),
+        (Connection::Tunnel, "rule_add", 1, "cache_rules"),
+        (Connection::Tunnel, "settings_get", 1, "cache_headers"),
+        (Connection::Tunnel, "settings_patch", 1, "cache_headers"),
+        (Connection::Tunnel, "health", 2, "health"),
+        (Connection::PublicIp, "cert_create", 1, "certificate"),
+        (Connection::PublicIp, "settings_patch", 1, "ssl"),
+        (Connection::PublicIp, "ips", 1, "client_ip"),
+        (Connection::PublicIp, "trace", 1, "dns"),
+        (Connection::PublicIp, "ruleset_create", 1, "cache_rules"),
+    ];
+    for (conn, op, times, step) in cases {
+        let mut m = base_mock();
+        m.ca = Some(Arc::new(TestCa::new()));
+        // "rule_add" fails on the second rule: the first is recorded, then retry
+        // must add the rest without duplicating it.
+        if *op == "rule_add" {
+            m.fail_skip.insert("rule_add".into(), 1);
+        }
+        m.fail.insert(op.to_string(), *times);
+        let had_ruleset = *op != "ruleset_create";
+        if !had_ruleset {
+            m.ruleset = None;
+        }
+        let (api, mock) = start_mock(m).await;
+        let dir = temp_dir("retry");
+        let pool = pool().await;
+        let trusted = Arc::new(crate::TrustedProxies::for_tests(vec![], false));
+        let mgr = manager(
+            &pool,
+            options(&api, &dir, Some(fake_cloudflared(&dir))),
+            trusted,
+        );
+        mgr.start_setup(input("read.example.com", *conn))
+            .await
+            .unwrap();
+        let job = wait_job(&mgr).await;
+        assert!(job.failed, "{op}: expected a failure");
+        let failed: Vec<_> = job.steps.iter().filter(|s| s.state == "failed").collect();
+        assert_eq!(failed.len(), 1, "{op}");
+        assert_eq!(failed[0].id, *step, "{op}: {:?}", states(&job));
+        assert!(failed[0].message.as_deref().is_some_and(|m| !m.is_empty()));
+        let at = job.steps.iter().position(|s| s.state == "failed").unwrap();
+        assert!(job.steps[..at].iter().all(|s| s.state == "done"), "{op}");
+        assert!(
+            job.steps[at + 1..].iter().all(|s| s.state == "waiting"),
+            "{op}"
+        );
+
+        mgr.retry_setup(TOKEN).await.unwrap();
+        let job = wait_job(&mgr).await;
+        all_done(&job);
+        {
+            let m = mock.lock().unwrap();
+            if *conn == Connection::Tunnel {
+                assert_eq!(m.tunnels.len(), 1, "{op}: one tunnel, never two");
+            }
+            assert_eq!(m.dns.len(), 2, "{op}: one record of ours");
+            let rules = &m.ruleset.as_ref().unwrap().1;
+            let theirs = usize::from(had_ruleset);
+            assert_eq!(
+                rules.len(),
+                4 + theirs,
+                "{op}: four rules of ours, no duplicates"
+            );
+        }
+
+        mgr.start_remove(TOKEN).await.unwrap();
+        all_done(&wait_job(&mgr).await);
+        assert_clean(&mock.lock().unwrap(), had_ruleset);
+        assert!(load_stored(&pool).await.is_none(), "{op}");
+    }
+}
+
+#[tokio::test]
+async fn a_failed_remove_keeps_what_is_left_and_retries() {
+    for op in [
+        "dns_delete",
+        "delete_tunnel",
+        "rule_delete",
+        "settings_patch",
+    ] {
+        let (api, mock) = start_mock(base_mock()).await;
+        let dir = temp_dir("remove");
+        let pool = pool().await;
+        let trusted = Arc::new(crate::TrustedProxies::for_tests(vec![], false));
+        let mgr = manager(
+            &pool,
+            options(&api, &dir, Some(fake_cloudflared(&dir))),
+            trusted,
+        );
+        mgr.start_setup(input("read.example.com", Connection::Tunnel))
+            .await
+            .unwrap();
+        all_done(&wait_job(&mgr).await);
+
+        mock.lock().unwrap().fail.insert(op.into(), 1);
+        mgr.start_remove(TOKEN).await.unwrap();
+        let job = wait_job(&mgr).await;
+        assert!(job.failed, "{op}");
+        let s = load_stored(&pool).await.expect("still stored");
+        assert!(s.has_resources(), "{op}: what is left is still recorded");
+        let st = mgr.status().await;
+        assert!(st.cloudflare.as_ref().unwrap().removable);
+
+        mgr.start_remove(TOKEN).await.unwrap();
+        all_done(&wait_job(&mgr).await);
+        assert_clean(&mock.lock().unwrap(), true);
+        assert!(load_stored(&pool).await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn bad_tokens_and_domains_are_refused_without_echoing_the_token() {
+    let (api, _mock) = start_mock(base_mock()).await;
+    let dir = temp_dir("bad");
+    let pool = pool().await;
+    let trusted = Arc::new(crate::TrustedProxies::for_tests(vec![], false));
+    let mgr = manager(&pool, options(&api, &dir, None), trusted);
+
+    let e = mgr
+        .check_token("wrong-token-secret-value", "read.example.com")
+        .await
+        .unwrap_err();
+    assert!(e.contains("did not accept"), "{e}");
+    assert!(!e.contains("wrong-token-secret-value"));
+    let e = mgr.check_token(TOKEN, "read.other.org").await.unwrap_err();
+    assert!(e.contains("cannot see a zone"), "{e}");
+    let e = mgr.check_token(TOKEN, "not a domain").await.unwrap_err();
+    assert!(e.contains("domain name"), "{e}");
+    let e = mgr.check_token("  ", "read.example.com").await.unwrap_err();
+    assert!(e.contains("token"), "{e}");
+    assert!(mgr
+        .start_setup(CloudflareSetupInput {
+            public_ip: Some("192.168.1.10".into()),
+            ..input("read.example.com", Connection::PublicIp)
+        })
+        .await
+        .unwrap_err()
+        .contains("not a public address"));
+    assert!(
+        load_stored(&pool).await.is_none(),
+        "nothing stored on refusal"
+    );
+    assert!(mgr.retry_setup(TOKEN).await.is_err());
+    assert!(mgr.start_remove(TOKEN).await.is_err());
+}
+
+#[tokio::test]
+async fn pinned_proxies_are_left_alone_and_a_second_domain_is_refused() {
+    let (api, _mock) = start_mock(base_mock()).await;
+    let dir = temp_dir("pinned");
+    let pool = pool().await;
+    let trusted = Arc::new(crate::TrustedProxies::for_tests(
+        vec!["10.0.0.0/8".into()],
+        true,
+    ));
+    let mgr = manager(
+        &pool,
+        options(&api, &dir, Some(fake_cloudflared(&dir))),
+        trusted.clone(),
+    );
+    mgr.start_setup(input("read.example.com", Connection::Tunnel))
+        .await
+        .unwrap();
+    let job = wait_job(&mgr).await;
+    all_done(&job);
+    let line = job.steps.iter().find(|s| s.id == "client_ip").unwrap();
+    assert!(line
+        .message
+        .as_deref()
+        .unwrap()
+        .contains("TRUSTED_PROXY_CIDRS"));
+    assert_eq!(trusted.raw(), vec!["10.0.0.0/8"]);
+    assert_eq!(
+        instance::resolve(&pool, &instance::TRUSTED_PROXY_CIDRS)
+            .await
+            .source,
+        instance::Source::Default,
+        "nothing written"
+    );
+    let e = mgr
+        .start_setup(input("other.example.com", Connection::Tunnel))
+        .await
+        .unwrap_err();
+    assert!(e.contains("already set up for read.example.com"), "{e}");
+    mgr.start_remove(TOKEN).await.unwrap();
+    all_done(&wait_job(&mgr).await);
+    assert_eq!(trusted.raw(), vec!["10.0.0.0/8"], "still pinned");
+}
+
+#[tokio::test]
+async fn a_missing_connector_fails_clearly_and_a_restart_resumes() {
+    let (api, mock) = start_mock(base_mock()).await;
+    let dir = temp_dir("missing");
+    let pool = pool().await;
+    let trusted = Arc::new(crate::TrustedProxies::for_tests(vec![], false));
+    let mut opts = options(&api, &dir, Some("/nonexistent/cloudflared".into()));
+    let mgr = manager(&pool, opts.clone(), trusted.clone());
+    mgr.start_setup(input("read.example.com", Connection::Tunnel))
+        .await
+        .unwrap();
+    let job = wait_job(&mgr).await;
+    let failed = job.steps.iter().find(|s| s.state == "failed").unwrap();
+    assert_eq!(failed.id, "connector");
+    assert!(failed
+        .message
+        .as_deref()
+        .unwrap()
+        .contains("CLOUDFLARED_BIN"));
+    assert_eq!(mgr.status().await.connector, "missing");
+
+    // The operator installs cloudflared and restarts; retry reuses the tunnel.
+    opts.cloudflared_bin = Some(fake_cloudflared(&dir));
+    let mgr2 = manager(&pool, opts.clone(), trusted.clone());
+    mgr2.retry_setup(TOKEN).await.unwrap();
+    all_done(&wait_job(&mgr2).await);
+    assert_eq!(mock.lock().unwrap().tunnels.len(), 1);
+    mgr2.connector.stop().await;
+
+    // Another restart: the stored setup brings the connector back by itself.
+    let mgr3 = manager(&pool, opts, trusted);
+    mgr3.resume().await;
+    mgr3.connector
+        .wait_running(Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(mgr3.status().await.connector, "running");
+    mgr3.connector.stop().await;
+}
+
+#[tokio::test]
+async fn nothing_runs_at_boot_without_a_stored_setup() {
+    let pool = pool().await;
+    let dir = temp_dir("boot");
+    let trusted = Arc::new(crate::TrustedProxies::for_tests(vec![], false));
+    let mgr = manager(&pool, options("http://127.0.0.1:1", &dir, None), trusted);
+    mgr.resume().await;
+    let st = mgr.status().await;
+    assert_eq!(st.connector, "off");
+    assert!(!st.https);
+    assert!(st.cloudflare.is_none() && st.job.is_none());
+    assert_eq!(st.mode, "");
+}
+
+#[test]
+fn domains_are_normalized_and_checked() {
+    assert_eq!(
+        normalize_domain(" HTTPS://Read.Example.com/admin ").unwrap(),
+        "read.example.com"
+    );
+    assert_eq!(normalize_domain("example.com.").unwrap(), "example.com");
+    for bad in [
+        "",
+        "localhost",
+        "-a.example.com",
+        "a..b",
+        "exa mple.com",
+        "a_b.example.com",
+    ] {
+        assert!(normalize_domain(bad).is_err(), "{bad}");
+    }
+    assert!(check_public_ip("203.0.113.7").is_ok());
+    assert!(check_public_ip("2001:db8::1").is_ok());
+    for bad in [
+        "10.0.0.1",
+        "127.0.0.1",
+        "192.168.0.2",
+        "::1",
+        "fd00::1",
+        "nope",
+    ] {
+        assert!(check_public_ip(bad).is_err(), "{bad}");
+    }
+    assert_eq!(
+        data_dir_for("sqlite:///data/komika.sqlite3?mode=rwc"),
+        std::path::PathBuf::from("/data/cloudflare")
+    );
+    assert_eq!(
+        data_dir_for("sqlite:komika.sqlite3"),
+        std::path::PathBuf::from("./cloudflare")
+    );
+}
+
+#[test]
+fn cache_rules_cover_images_and_static_files_on_this_host_only() {
+    let rules = cache_rules("read.example.com");
+    let refs: Vec<_> = rules.iter().map(|r| r["ref"].as_str().unwrap()).collect();
+    assert_eq!(
+        refs,
+        ["komiq_covers", "komiq_pages", "komiq_img", "komiq_static"]
+    );
+    let all: String = rules
+        .iter()
+        .map(|r| r["expression"].as_str().unwrap())
+        .collect();
+    for path in [
+        "/covers/",
+        "/api/v1/manga/",
+        "\"/img\"",
+        "/_app/immutable/",
+        "/admin/_app/immutable/",
+    ] {
+        assert!(all.contains(path), "{path}");
+    }
+    assert!(rules.iter().all(|r| r["expression"]
+        .as_str()
+        .unwrap()
+        .starts_with("(http.host eq \"read.example.com\" and (")));
+}
+
+#[tokio::test]
+async fn graphql_is_admin_only_and_drives_a_setup() {
+    use crate::graphql::{AppState, KeyedLocks, RateLimiter, RequestAuth, ScanHealth};
+    let (api, mock) = start_mock(base_mock()).await;
+    let dir = temp_dir("graphql");
+    let pool = pool().await;
+    for (id, name, admin) in [("a", "owner", 1), ("b", "reader", 0)] {
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, is_admin, created_at) \
+             VALUES (?, ?, ?, 'h', ?, '2020-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(format!("{name}@e"))
+        .bind(admin)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (token, user_id, created_at, expires_at) \
+             VALUES (?, ?, '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
+        )
+        .bind(crate::auth::hash_token(&format!("{name}-session")))
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let state = Arc::new(AppState {
+        pool: pool.clone(),
+        cover_pool: pool.clone(),
+        suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
+        mangadex: Arc::new(crate::mangadex::MangaDexClient::new("test-ua", 5.0, 40.0)),
+        admin_users: vec![],
+        scan_health: Mutex::new(ScanHealth::default()),
+        auth_limiter: RateLimiter::new(100, 60),
+        password_work: Arc::new(tokio::sync::Semaphore::new(4)),
+        federated_limiter: RateLimiter::new(100, 60),
+        session_ttl_secs: 3600,
+        series_inflight: KeyedLocks::default(),
+        chapters_inflight: KeyedLocks::default(),
+        cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        catalogue_cover_phash: false,
+        ext_icons_dir: std::path::PathBuf::new(),
+        setup_code: crate::instance::SetupCode::default(),
+    });
+    let trusted = Arc::new(crate::TrustedProxies::for_tests(vec![], false));
+    let mgr = manager(
+        &pool,
+        options(&api, &dir, Some(fake_cloudflared(&dir))),
+        trusted,
+    );
+    let schema = crate::graphql::schema_builder(state, false)
+        .data(mgr.clone())
+        .finish();
+    let exec = |q: String, who: &str| {
+        let req = async_graphql::Request::new(q)
+            .data(RequestAuth(Some(format!("{who}-session"))))
+            .data(crate::graphql::ClientIp(Some("127.0.0.1".into())));
+        let schema = schema.clone();
+        async move { schema.execute(req).await }
+    };
+
+    let ops = [
+        "{ accessStatus { mode } }".to_string(),
+        format!("mutation {{ checkCloudflareToken(token:\"{TOKEN}\", domain:\"read.example.com\") {{ zoneName }} }}"),
+        format!("mutation {{ startCloudflareSetup(input:{{token:\"{TOKEN}\", domain:\"read.example.com\", connection:TUNNEL}}) {{ mode }} }}"),
+        format!("mutation {{ retryCloudflareSetup(token:\"{TOKEN}\") {{ mode }} }}"),
+        format!("mutation {{ removeCloudflareSetup(token:\"{TOKEN}\") {{ mode }} }}"),
+        "mutation { setAccessMode(mode:\"local\") { mode } }".to_string(),
+    ];
+    for op in &ops {
+        let r = exec(op.clone(), "reader").await;
+        assert_eq!(r.errors.len(), 1, "{op}");
+        assert_eq!(r.errors[0].message, "Admin access required", "{op}");
+    }
+    assert!(
+        mock.lock().unwrap().calls.is_empty(),
+        "nothing reached Cloudflare"
+    );
+
+    let r = exec(ops[1].clone(), "owner").await;
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(
+        r.data.into_json().unwrap()["checkCloudflareToken"]["zoneName"],
+        "example.com"
+    );
+    let r = exec(ops[2].clone(), "owner").await;
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    all_done(&wait_job(&mgr).await);
+    let r = exec(
+        "{ accessStatus { mode address connector cloudflare { domain connection complete removable } job { kind running failed steps { id state } } } }".into(),
+        "owner",
+    )
+    .await;
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let d = r.data.into_json().unwrap();
+    let s = &d["accessStatus"];
+    assert_eq!(s["mode"], "internet");
+    assert_eq!(s["address"], "https://read.example.com");
+    assert_eq!(s["connector"], "running");
+    assert_eq!(s["cloudflare"]["connection"], "TUNNEL");
+    assert_eq!(s["cloudflare"]["complete"], true);
+    assert_eq!(s["job"]["steps"].as_array().unwrap().len(), 9);
+    assert!(!d.to_string().contains(TOKEN));
+
+    let r = exec(ops[4].clone(), "owner").await;
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    all_done(&wait_job(&mgr).await);
+    assert_clean(&mock.lock().unwrap(), true);
+
+    let r = exec(
+        "mutation { setAccessMode(mode:\"internet\", domain:\"Manual.Example.com\") { mode domain address } }".into(),
+        "owner",
+    )
+    .await;
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let d = r.data.into_json().unwrap();
+    assert_eq!(d["setAccessMode"]["address"], "https://manual.example.com");
+    let r = exec(
+        "mutation { setAccessMode(mode:\"public\") { mode } }".into(),
+        "owner",
+    )
+    .await;
+    assert_eq!(r.errors.len(), 1);
+}

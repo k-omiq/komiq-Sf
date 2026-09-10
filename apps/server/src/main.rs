@@ -3,6 +3,7 @@ mod avatar;
 mod browse;
 mod catalog;
 mod chapter_label;
+mod cloudflare;
 mod config;
 mod cover;
 mod cover_recompress;
@@ -63,8 +64,8 @@ use tracing::Level;
 
 use config::Config;
 use graphql::{
-    build_schema, ApiSchema, AppState, ClientIp, KeyedLocks, RateLimiter, RequestAuth,
-    RequestLibraryCache, RequestNsfwPref, RequestUserCache, ScanHealth,
+    ApiSchema, AppState, ClientIp, KeyedLocks, RateLimiter, RequestAuth, RequestLibraryCache,
+    RequestNsfwPref, RequestUserCache, ScanHealth,
 };
 use suwayomi::SuwayomiClient;
 
@@ -140,6 +141,71 @@ fn parse_trusted_proxies(raw: &[String]) -> Vec<Cidr> {
         .collect()
 }
 
+/// The trusted-proxy list, readable per request and replaceable at runtime: Cloudflare
+/// setup sets it (loopback for a tunnel, Cloudflare's ranges for a public IP) and
+/// "Remove" clears it. When `TRUSTED_PROXY_CIDRS` is set it is **pinned**: env wins, as
+/// for every instance setting, so the hosted deployment keeps exactly its list.
+pub(crate) struct TrustedProxies {
+    pinned: bool,
+    list: std::sync::RwLock<(Vec<String>, Arc<Vec<Cidr>>)>,
+}
+
+impl TrustedProxies {
+    fn new(raw: Vec<String>, pinned: bool) -> Self {
+        let parsed = Arc::new(parse_trusted_proxies(&raw));
+        Self {
+            pinned,
+            list: std::sync::RwLock::new((raw, parsed)),
+        }
+    }
+
+    /// Env first, then the stored setting (`instance::TRUSTED_PROXY_CIDRS`).
+    async fn load(pool: &sqlx::SqlitePool) -> Self {
+        let r = instance::resolve(pool, &instance::TRUSTED_PROXY_CIDRS).await;
+        let raw = r
+            .value
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        Self::new(raw, r.source == instance::Source::Env)
+    }
+
+    fn current(&self) -> Arc<Vec<Cidr>> {
+        self.list
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .1
+            .clone()
+    }
+
+    pub(crate) fn raw(&self) -> Vec<String> {
+        self.list
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .0
+            .clone()
+    }
+
+    pub(crate) fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// Replace the list; a no-op while env pins it.
+    pub(crate) fn replace(&self, raw: &[String]) {
+        if self.pinned {
+            return;
+        }
+        let parsed = Arc::new(parse_trusted_proxies(raw));
+        *self.list.write().unwrap_or_else(|p| p.into_inner()) = (raw.to_vec(), parsed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(raw: Vec<String>, pinned: bool) -> Self {
+        Self::new(raw, pinned)
+    }
+}
+
 /// Resolve the client IP for rate-limiting. Forwarding headers are honored ONLY
 /// when the direct socket peer is a configured trusted proxy
 /// (`TRUSTED_PROXY_CIDRS`); otherwise they are trivially spoofable, so we key on
@@ -192,7 +258,7 @@ struct RouterState {
     /// Un-replicated cover-cache DB (`work_cover_blob`); served by `serve_cover`.
     /// A newtype (`CoverDb`) distinguishes it from the main `pool` in `FromRef`.
     cover_pool: sqlx::SqlitePool,
-    trusted_proxies: Arc<Vec<Cidr>>,
+    trusted_proxies: Arc<TrustedProxies>,
     /// Per-user sliding-window limiter for the CPU-bound upload routes
     /// (`/avatar`, `/comment-media`), so a single account can't flood the
     /// decode/resize/encode blocking pool.
@@ -220,7 +286,7 @@ impl FromRef<RouterState> for CoverDb {
         CoverDb(s.cover_pool.clone())
     }
 }
-impl FromRef<RouterState> for Arc<Vec<Cidr>> {
+impl FromRef<RouterState> for Arc<TrustedProxies> {
     fn from_ref(s: &RouterState) -> Self {
         s.trusted_proxies.clone()
     }
@@ -238,13 +304,13 @@ impl FromRef<RouterState> for Arc<graphql::AppState> {
 
 async fn graphql_handler(
     State(schema): State<ApiSchema>,
-    State(trusted): State<Arc<Vec<Cidr>>>,
+    State(trusted): State<Arc<TrustedProxies>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     req: GraphQLRequest,
 ) -> GraphQLResponse {
     let auth = RequestAuth(bearer(&headers));
-    let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted)));
+    let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted.current())));
     // Fresh per-request caches so `current_user` does at most one session lookup, the
     // viewer's NSFW preference at most one `users` read, and each series' `user_library`
     // row is read at most once — even when many resolvers ask (one per feed item).
@@ -287,7 +353,7 @@ const GRAPHQL_GET_S_MAXAGE_SECS: u32 = 60;
 ///   `isMarked`/progress fields to the next requester of the same URL.
 async fn graphql_get_handler(
     State(schema): State<ApiSchema>,
-    State(trusted): State<Arc<Vec<Cidr>>>,
+    State(trusted): State<Arc<TrustedProxies>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     req: GraphQLRequest,
@@ -337,7 +403,7 @@ fn allow_any_origin(headers: &mut HeaderMap) {
 /// wrapper can post-process every one of its exit paths in one place.
 async fn graphql_get_response(
     schema: ApiSchema,
-    trusted: Arc<Vec<Cidr>>,
+    trusted: Arc<TrustedProxies>,
     peer: SocketAddr,
     headers: HeaderMap,
     req: GraphQLRequest,
@@ -356,7 +422,7 @@ async fn graphql_get_response(
     }
     let anonymous = bearer(&headers).is_none();
     let auth = RequestAuth(bearer(&headers));
-    let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted)));
+    let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted.current())));
     let user_cache = RequestUserCache::default();
     let nsfw_cache = RequestNsfwPref::default();
     let library_cache = RequestLibraryCache::default();
@@ -1868,7 +1934,18 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("cover recompress pass disabled (COVER_RECOMPRESS=off)");
     }
 
-    let schema = build_schema(state.clone(), !cfg.graphiql_enabled);
+    // Trusted proxies (env, else what Cloudflare setup stored) and the Cloudflare
+    // setup manager. The manager does nothing at boot unless a setup is stored.
+    let trusted_proxies = Arc::new(TrustedProxies::load(&pool).await);
+    let cloudflare = Arc::new(cloudflare::Manager::new(
+        pool.clone(),
+        cloudflare::Options::from_env(&cfg),
+        trusted_proxies.clone(),
+    ));
+
+    let schema = graphql::schema_builder(state.clone(), !cfg.graphiql_enabled)
+        .data(cloudflare.clone())
+        .finish();
 
     let origins: Vec<_> = cfg
         .cors_origins
@@ -2019,7 +2096,7 @@ async fn main() -> anyhow::Result<()> {
             // the post-shutdown view flush below.
             pool: pool.clone(),
             cover_pool,
-            trusted_proxies: Arc::new(parse_trusted_proxies(&cfg.trusted_proxy_cidrs)),
+            trusted_proxies: trusted_proxies.clone(),
             // ~20 uploads/min per user across the avatar + comment-media routes.
             upload_limiter: Arc::new(RateLimiter::new(20, 60)),
             app_state: state,
@@ -2031,6 +2108,11 @@ async fn main() -> anyhow::Result<()> {
     // pool is all it needs. No graceful shutdown of its own — a detached task lets
     // the process exit when `axum::serve` on the public port returns (an in-flight
     // metrics scrape dying at shutdown is immaterial).
+    // Public-IP mode serves this same router over HTTPS; a stored setup also brings
+    // its tunnel connector back. Both are no-ops on a server never set up that way.
+    cloudflare.set_router(app.clone());
+    cloudflare.resume().await;
+
     let metrics_app = Router::new()
         .route("/metrics", get(metrics))
         .with_state(pool.clone());

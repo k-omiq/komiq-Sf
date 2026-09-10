@@ -1350,6 +1350,7 @@ dependencies = [
  "async-graphql-axum",
  "async-trait",
  "axum",
+ "base64",
  "chrono",
  "dotenvy",
  "futures",
@@ -1357,11 +1358,13 @@ dependencies = [
  "image",
  "rand_core 0.6.4",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
  "sqlx",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tower-http",
  "tracing",
@@ -2118,6 +2121,7 @@ version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",

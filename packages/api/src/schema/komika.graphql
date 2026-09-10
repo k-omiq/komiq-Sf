@@ -51,6 +51,7 @@ type Query {
 	# auth
 	session: Session # [komika] current session or null
 	instance: Instance! # [komika] public server facts (setup state, sign-up switch); no auth
+	accessStatus: AccessStatus! # [komika] admin — Settings › Access: access choice, address, Cloudflare setup + current run (requires isAdmin)
 	myActivity(limit: Int = 20): [Activity!]! # [komika] the signed-in user's recent activity feed (empty when signed out)
 	myComments(page: Int = 1): MyCommentPage! # [komika] the signed-in user's OWN comments (top-level + replies), newest first, 20 per page, each with its tallies, direct reply count and resolved series/chapter (empty page when signed out)
 	notifications(page: Int = 1): [Notification!]! # [komika] the viewer's inbound bell feed, newest-first (empty when signed out)
@@ -97,6 +98,11 @@ type Mutation {
 	createUser(input: CreateUserInput!): AdminUser! # [komika] admin — create an account directly, works with sign-up closed (requires isAdmin)
 	resetUserPassword(userId: ID!, password: String!): Boolean! # [komika] admin — set another account's password; revokes its sessions and sets mustChangePassword (requires isAdmin)
 	setRegistrationOpen(open: Boolean!): Boolean! # [komika] admin — open/close sign-up; refused when KOMIKA_REGISTRATION_OPEN pins it (requires isAdmin)
+	setAccessMode(mode: String!, domain: String): AccessStatus! # [komika] admin — record the wizard's access choice ("local" | "internet") and a domain set up by hand
+	checkCloudflareToken(token: String!, domain: String!): CloudflareTokenCheck! # [komika] admin — verify a Cloudflare API token, find the zone; changes nothing, keeps no token
+	startCloudflareSetup(input: CloudflareSetupInput!): AccessStatus! # [komika] admin — run the Cloudflare checklist in the background; token used for this run only
+	retryCloudflareSetup(token: String!): AccessStatus! # [komika] admin — rerun the stored setup from where it failed
+	removeCloudflareSetup(token: String!): AccessStatus! # [komika] admin — delete exactly what setup created, stop the connector
 	addSourceSeries(suwayomiMangaId: ID!): MatchResult! # [komika] Tier-2 add flow — run the dedup matcher, wire into the canonical model (requires isAdmin)
 	resolveMergeCandidate(id: ID!, accept: Boolean!): Boolean! # [komika] resolve a dedup review — accept merges, reject keeps distinct (requires isAdmin)
 	mergeWorks(sourceWorkId: ID!, targetWorkId: ID!): MergeWorksResult! # [komika] D1: fold one existing canonical work into another (dedup cleanup) — source's mappings + user data re-point to target, source deleted; pick target as the enriched/MangaDex-anchored one (requires isAdmin)
@@ -533,6 +539,60 @@ type Instance {
 	version: String!
 	registrationOpen: Boolean!
 	mangadexEnabled: Boolean!
+}
+
+# Self-host access (admin). The Cloudflare API token is never stored or returned.
+enum CloudflareConnection {
+	TUNNEL
+	PUBLIC_IP
+}
+
+input CloudflareSetupInput {
+	token: String!
+	domain: String!
+	connection: CloudflareConnection!
+	publicIp: String # public IP only; empty detects the server's address
+}
+
+type CloudflareTokenCheck {
+	zoneName: String!
+	zoneStatus: String!
+	accountName: String!
+}
+
+type CloudflareStep {
+	id: String!
+	label: String!
+	state: String! # "waiting" | "running" | "done" | "failed"
+	message: String
+}
+
+type CloudflareJob {
+	kind: String! # "setup" | "remove"
+	running: Boolean!
+	failed: Boolean!
+	steps: [CloudflareStep!]!
+}
+
+type CloudflareSetup {
+	domain: String!
+	connection: CloudflareConnection
+	zoneName: String
+	complete: Boolean!
+	removable: Boolean! # anything left for removeCloudflareSetup
+}
+
+type AccessStatus {
+	mode: String! # "local" | "internet" | "" (not chosen)
+	domain: String
+	address: String # https://<domain> in internet mode
+	cloudflare: CloudflareSetup
+	connector: String! # "off" | "starting" | "running" | "failed" | "missing"
+	connectorMessage: String
+	https: Boolean! # public-IP origin HTTPS listener up
+	trustedProxies: [String!]!
+	trustedProxiesPinned: Boolean! # TRUSTED_PROXY_CIDRS set on the server
+	job: CloudflareJob
 }
 
 # One entry in a user's activity feed, written by the corresponding mutation.
