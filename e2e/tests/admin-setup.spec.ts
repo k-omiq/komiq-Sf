@@ -30,6 +30,12 @@ test('a fresh server opens setup, refuses a wrong code, creates the owner and cl
 	await page.getByLabel(/^Setup code/).fill(GOOD_SETUP_CODE);
 	await page.getByRole('button', { name: 'Create account' }).click();
 
+	// Access: only my devices (the internet path needs Cloudflare, covered elsewhere).
+	await expect(page.getByRole('heading', { name: 'Who should reach this server?' })).toBeVisible();
+	await page.getByRole('radio', { name: /Only my devices/ }).click();
+	await page.getByRole('button', { name: 'Continue' }).click();
+	await expect.poll(() => state.accessMode).toBe('local');
+
 	// Accounts: keep sign-up closed and add one person with a temporary password.
 	await expect(page.getByRole('heading', { name: 'Who can sign in?' })).toBeVisible();
 	expect(state.owner).toMatchObject({ username: 'owner' });

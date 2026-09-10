@@ -15,6 +15,7 @@ export async function installAdminSetupFixtures(page, initial = {}) {
 		users: [],
 		calls: [],
 		mangadexEnabled: false,
+		accessMode: null,
 		repos: [],
 		extensions: [],
 		...initial,
@@ -98,6 +99,24 @@ export async function installAdminSetupFixtures(page, initial = {}) {
 					return route.fulfill(
 						ok({
 							createOwner: { token: 'fixture-owner-token', user: sessionUser(state.owner) },
+						}),
+					);
+				case 'SetAccessMode':
+					state.accessMode = v.mode;
+					return route.fulfill(
+						ok({
+							setAccessMode: {
+								mode: v.mode,
+								domain: v.domain ?? null,
+								address: null,
+								cloudflare: null,
+								connector: 'off',
+								connectorMessage: null,
+								https: false,
+								trustedProxies: [],
+								trustedProxiesPinned: false,
+								job: null,
+							},
 						}),
 					);
 				case 'SetRegistrationOpen':

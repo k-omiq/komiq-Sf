@@ -5,7 +5,7 @@
 	import Button from '$lib/components/Button.svelte';
 	import Choice from '$lib/components/Choice.svelte';
 	import Onboarding from '$lib/components/Onboarding.svelte';
-	import { copyText, labels, next, stepNumber, wizard } from '../wizard.svelte';
+	import { back, copyText, labels, next, stepNumber, wizard } from '../wizard.svelte';
 
 	let newName = $state('');
 	let newEmail = $state('');
@@ -48,6 +48,10 @@
 			setTimeout(() => (copied = copied === text ? null : copied), 1600);
 		}
 	}
+
+	// Back never returns to the owner form: that account exists now.
+	const previous = $derived(wizard.order[stepNumber('accounts') - 2]?.id);
+	const canGoBack = $derived(!!previous && previous !== 'owner');
 
 	async function save(): Promise<void> {
 		if (saveBusy) return;
@@ -150,7 +154,11 @@
 	</div>
 	{#if saveError}<p class="k-error" role="alert">{saveError}</p>{/if}
 	{#snippet footer()}
-		<span></span>
+		{#if canGoBack}
+			<Button variant="ghost" icon="arrow-left" onclick={back}>Back</Button>
+		{:else}
+			<span></span>
+		{/if}
 		<Button variant="primary" busy={saveBusy} onclick={save}>Continue</Button>
 	{/snippet}
 </Onboarding>

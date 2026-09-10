@@ -1,5 +1,8 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { auth } from '$lib/auth.svelte';
+	import { desktop } from '$lib/desktop';
+	import Qr from '$lib/components/Qr.svelte';
 	import { serverAddress } from '$lib/config';
 	import Button from '$lib/components/Button.svelte';
 	import Onboarding from '$lib/components/Onboarding.svelte';
@@ -8,7 +11,18 @@
 	let copied = $state(false);
 	// Internet mode: readers use the public domain, not the address this console uses.
 	const domain = wizard.extra.access === 'internet' ? (wizard.extra.domain as string) : '';
-	const address = domain ? `https://${domain}` : serverAddress();
+	// Home network on (desktop app): phones and tablets use the LAN address.
+	let lanAddress = $state<string | null>(null);
+	onMount(async () => {
+		if (domain || !wizard.extra.lan || !desktop.available) return;
+		try {
+			const net = await desktop.network();
+			if (net.enabled && net.addresses.length) lanAddress = net.addresses[0];
+		} catch {
+			/* keep the console's own address */
+		}
+	});
+	const address = $derived(domain ? `https://${domain}` : (lanAddress ?? serverAddress()));
 
 	async function copy(): Promise<void> {
 		if (await copyText(address)) {
@@ -61,6 +75,12 @@
 			<dd class="k-num">{wizard.added.length}</dd>
 		</div>
 	</dl>
+	{#if lanAddress}
+		<div class="ob-hint-row lan-qr">
+			<Qr value={lanAddress} size={120} label="QR code for {lanAddress}" />
+			<p class="k-hint">Scan with a phone on the same Wi-Fi to open the reader.</p>
+		</div>
+	{/if}
 	{#each wizard.notices as notice (notice)}<p class="k-hint">{notice}</p>{/each}
 	{#snippet footer()}
 		<Button variant="ghost" onclick={() => finishSetup('/')}>Open the catalog</Button>
@@ -69,3 +89,9 @@
 		</Button>
 	{/snippet}
 </Onboarding>
+
+<style>
+	.lan-qr {
+		gap: var(--k-space-4);
+	}
+</style>
