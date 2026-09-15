@@ -73,28 +73,65 @@ export function saveLocalServer(address: string): void {
  * answering from the internet. Reloads the app when it follows. The console a server
  * serves itself cannot follow (another origin): see `HttpsMove.svelte`.
  *
+ * Resolves false when the app asked there and got no answer: it stays on the address
+ * that works, and the owner must be told (`moveTo` in `server-move.svelte.ts`).
+ * `beforeReload` runs when the app is about to follow: the last moment to save where
+ * the owner is. `wanted` is asked once the server answered: false when a later move
+ * took over, and then the app does not follow this one.
+ *
  * `typed` is the address the owner entered. The app follows to that host only: the
  * answer that names `address` came over plain HTTP, where someone on the network path
  * could have changed it to send the app, and its session, to another server.
  */
-export async function followServer(address: string, typed: string): Promise<void> {
-	if (target !== 'desktop' || runsLocalServer) return;
-	if (!address.startsWith('https://') || address === serverAddress()) return;
+export async function followServer(
+	address: string,
+	typed: string,
+	beforeReload?: () => void,
+	wanted: () => boolean = () => true,
+): Promise<boolean> {
+	if (target !== 'desktop' || runsLocalServer) return true;
+	if (!address.startsWith('https://') || address === serverAddress()) return true;
 	try {
-		const entered = typed.trim();
-		const wanted = new URL(entered.includes('://') ? entered : `http://${entered}`).hostname;
-		if (new URL(address).hostname !== wanted) return;
+		if (new URL(address).hostname !== typedHostname(typed)) return true;
 	} catch {
-		return;
+		return true;
 	}
-	try {
-		const health = await fetch(`${address}/health`, { signal: AbortSignal.timeout(6000) });
-		if (!health.ok) return;
-	} catch {
-		return; // port 443 is not open yet: stay on the address that works
-	}
+	if (!(await answers(address))) return false;
+	if (!wanted()) return true;
 	saveServer(address, true);
+	beforeReload?.();
 	location.reload();
+	return true;
+}
+
+/** The host of an address as its owner typed it: `203.0.113.5:8080`, `2001:db8::1`. */
+function typedHostname(typed: string): string {
+	const entered = typed.trim();
+	if (entered.includes('://')) return new URL(entered).hostname;
+	try {
+		return new URL(`http://${entered}`).hostname;
+	} catch {
+		// A bare IPv6 address: a URL wants it in brackets.
+		return new URL(`http://[${entered}]`).hostname;
+	}
+}
+
+/**
+ * Whether the server answers at `address`. The HTTPS port and a firewall rule can need
+ * a few seconds, so it asks four times, 1, 2 and 4 seconds apart. Each try waits 5
+ * seconds at most: 27 seconds when nothing ever answers.
+ */
+async function answers(address: string): Promise<boolean> {
+	for (const wait of [0, 1000, 2000, 4000]) {
+		if (wait) await new Promise((r) => setTimeout(r, wait));
+		try {
+			const health = await fetch(`${address}/health`, { signal: AbortSignal.timeout(5000) });
+			if (health.ok) return true;
+		} catch {
+			/* port 443 is not open yet */
+		}
+	}
+	return false;
 }
 
 /** Forget the desktop app's server (back to `/start`). */

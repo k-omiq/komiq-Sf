@@ -171,6 +171,7 @@
 			[
 				['appearance', 'Theme'],
 				['content', 'NSFW content'],
+				['blocked', 'Blocked content'],
 				['repos', 'Extension repos'],
 				['updates', 'Extension updates'],
 				['maintenance', 'Maintenance jobs'],

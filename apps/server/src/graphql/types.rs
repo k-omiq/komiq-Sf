@@ -321,6 +321,65 @@ pub struct ScanlatorPage {
     pub total: i32,
 }
 
+/// One tagged source (`sourceAiTags`): a site that translates its own series, so its
+/// chapters credit no group and the source is the scanlator.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct SourceAiTag {
+    /// A Suwayomi source id. Match it to `ChapterSource.sourceId`, or to the `sourceId`
+    /// of the series a `Chapter` belongs to. A copy takes the stronger of this tag and
+    /// the tag on its `scanlator` credit (AI over PARTIAL).
+    pub source_id: String,
+    pub ai: ScanlatorAi,
+}
+
+/// One row of the admin site list (`scanlatorSites`): a source, as a scanlator.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct ScanlatorSite {
+    pub source_id: String,
+    /// Display name; the extension package name, then the id, when the engine did not
+    /// answer.
+    pub name: String,
+    pub lang: Option<String>,
+    /// Series in the catalogue that have this source. 0 for a tagged source that has
+    /// none left.
+    pub series_count: i32,
+    /// The tag stored for the source; null when it has none.
+    pub ai: Option<ScanlatorAi>,
+}
+
+/// One content block rule (`siteBlockRules`, `myBlockRules`). It matches a series that
+/// carries ALL of `tags` and, when `ratings` is not empty, has ONE of them. A series is
+/// blocked when any rule matches it.
+#[derive(SimpleObject, Clone, Debug, PartialEq, Eq)]
+pub struct BlockRule {
+    /// Tag ids (`TagInfo.id`), sorted.
+    pub tags: Vec<String>,
+    /// Mildest first. Empty: any rating. Compared with the EFFECTIVE rating, the one
+    /// `BrowseFilter.contentRatings` filters on.
+    pub ratings: Vec<ContentRating>,
+}
+
+impl From<&crate::block::BlockRule> for BlockRule {
+    fn from(rule: &crate::block::BlockRule) -> Self {
+        BlockRule {
+            tags: rule.tags().to_vec(),
+            ratings: rule
+                .ratings()
+                .iter()
+                .filter_map(|word| content_rating_from_word(word))
+                .collect(),
+        }
+    }
+}
+
+/// One rule to store. A rule needs a tag or a rating.
+#[derive(InputObject, Clone, Debug)]
+pub struct BlockRuleInput {
+    /// At most 8.
+    pub tags: Option<Vec<String>>,
+    pub ratings: Option<Vec<ContentRating>>,
+}
+
 /// `TagGroup` from the stored `tag.tag_group` word. Anything unrecognized is filed under
 /// GENRE, matching `tags::rebuild_tag_table`'s default for free-text admin tags.
 pub fn tag_group_from_word(w: &str) -> TagGroup {
@@ -556,7 +615,12 @@ pub struct Series {
     /// NSFW per the canonical model (CATALOGUE.md §2); false until the series is
     /// catalogued. Drives `show_nsfw` filtering of discovery/search/updates feeds.
     pub is_nsfw: bool,
+    /// Our own readers' rating of the work. Never MangaDex's: see `mangadex_rating`.
     pub rating: RatingSummary,
+    /// MangaDex's community rating of the work, 0-10 (statistics cache, `work_stats`).
+    /// Null when MangaDex has none, when the work has no MangaDex statistics, or when
+    /// the admin turned MangaDex ratings off (`show_mangadex_ratings`).
+    pub mangadex_rating: Option<f64>,
     pub scan: ScanPolicy,
     pub created_at: String,
     /// Last metadata touch. Do NOT use as "recently updated" — it moves on every poll
@@ -1046,6 +1110,9 @@ pub struct Instance {
     /// Whether this server uses MangaDex (the usage switch; the catalogue crawl is a
     /// separate per-replica setting).
     pub mangadex_enabled: bool,
+    /// Whether the API carries MangaDex's community rating next to our own readers'
+    /// rating. Off: the reader shows our own rating only and hides its own switch.
+    pub show_mangadex_ratings: bool,
     /// True when reader apps must fetch chapter pages from the sources themselves
     /// (`KOMIKA_APPS_FETCH_THEMSELVES`): an app with its own engine then does not offer
     /// fetching through this server.

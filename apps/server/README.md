@@ -52,7 +52,10 @@ the default: off on a self-hosted install (`KOMIKA_WEB_DIR` set), on everywhere 
 The **catalogue crawl** runs where `CATALOGUE_SYNC=on` (one replica only — see
 `deploy/.env.example`), never where it is `off`, and, when it is unset, only on a
 self-hosted install while usage is on. `METADATA_BACKFILL`/`COVER_PHASH` act only while
-usage is on; `COVER_CACHE=off` still stops the whole cover drainer. `/img` (the image
+usage is on; `COVER_CACHE=off` still stops the whole cover drainer. A third, unrelated
+switch decides what readers are SHOWN: `show_mangadex_ratings` (`KOMIKA_MANGADEX_RATINGS`
+pins it, default on). Off, no response carries `mangadexRating` and every surface shows
+our own readers' rating only. `/img` (the image
 proxy) is mounted when `KOMIKA_WEB_DIR` is set or `KOMIKA_IMG_PROXY=on`.
 
 ### First-run setup
@@ -90,9 +93,12 @@ the checklist line "Get the connector (cloudflared)" downloads the release pinne
 
 The access choice (`setAccessMode`, shown by `accessStatus`) is `local`, `internet` (a
 domain with Cloudflare in front) or `direct` (public at the server's own address, no
-domain and no Cloudflare; `domain` then carries that address). `local`, `internet` and
-plain `direct` are display only: they do not change what the server listens on.
-`direct` with `encrypt: true` does: the server gets a Let's Encrypt certificate for the
+domain and no Cloudflare; `domain` then carries that address). `internet` and plain
+`direct` are display only: they do not change what the server listens on. With `local`
+the plain HTTP port refuses clients on the internet (`plain_http_guard` in
+`src/cloudflare/direct.rs`); the home network, a VPN, this computer and trusted proxies
+are let through. `direct` with `encrypt: true` changes what the server listens on: the
+server gets a Let's Encrypt certificate for the
 address (`src/cloudflare/acme.rs`, http-01 on port 80), serves HTTPS on
 `KOMIKA_HTTPS_PORT` and renews the certificate by itself (`src/cloudflare/direct.rs`).
 `cloudflare::plain_http_guard`, a layer of the public router, then stops handling plain

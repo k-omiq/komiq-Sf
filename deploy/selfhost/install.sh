@@ -389,6 +389,7 @@ lan_address=${lan_address:-<this-machine-address>}
 case "$lan_address" in *:*) lan_address="[$lan_address]" ;; esac
 printf '\nReader: http://%s:%s/\nConsole: http://%s:%s/admin\n' "$lan_address" "$port" "$lan_address" "$port"
 case "$access:$encrypt" in
+    local:*) printf '%s\n' 'Internet: closed when the server is set to "Only my devices". It then refuses plain HTTP from the internet.' ;;
     tunnel:*|public-ip:*) printf '%s\n' 'Internet: use the HTTPS domain chosen in setup, and /admin for the console.' ;;
     direct:yes) printf '%s\n' 'Internet: use https://<public-IP>/ and https://<public-IP>/admin after setup.' ;;
     direct:no) printf 'Internet: use http://<public-IP>:%s/ and http://<public-IP>:%s/admin. This connection is not encrypted.\n' "$port" "$port" ;;

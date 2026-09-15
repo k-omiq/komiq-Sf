@@ -1,9 +1,11 @@
 <script lang="ts">
 	import type { AccessMode } from '@komika/api';
-	import { runsLocalServer } from '$lib/config';
+	import { runsLocalServer, serverAddress } from '$lib/config';
 	import { setAccessMode } from '$lib/data';
+	import { typedFromInternet } from '$lib/preflight';
 	import Button from '$lib/components/Button.svelte';
 	import Choice from '$lib/components/Choice.svelte';
+	import Icon from '$lib/components/Icon.svelte';
 	import Onboarding from '$lib/components/Onboarding.svelte';
 	import { labels, next, stepNumber, wizard } from '../wizard.svelte';
 
@@ -15,6 +17,10 @@
 	let error = $state<string | null>(null);
 
 	const access = $derived(wizard.extra.access as AccessMode | undefined);
+	// With "Only my devices" the server refuses plain HTTP from the internet: a console
+	// that is open that way stops working with the choice.
+	const here = serverAddress();
+	const lockedOut = here.startsWith('http://') && typedFromInternet(here);
 
 	function choose(value: AccessMode): void {
 		wizard.extra = { ...wizard.extra, access: value };
@@ -73,6 +79,15 @@
 			/>
 		{/if}
 	</div>
+	{#if access === 'local' && lockedOut}
+		<div class="k-notice" data-tone="warning" role="note">
+			<Icon name="alert" />
+			<div class="k-notice__body">
+				This console is open at a public address. With "Only my devices", the server stops answering
+				here. Choose a public mode, or do the setup on your home network.
+			</div>
+		</div>
+	{/if}
 	{#if error}<p class="k-error" role="alert">{error}</p>{/if}
 	{#snippet footer()}
 		<span></span>

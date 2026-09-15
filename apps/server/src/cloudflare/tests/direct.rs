@@ -10,7 +10,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
 use super::super::direct::{direct_host, DIRECT_CERT_FILE, DIRECT_KEY_FILE};
-use super::super::origin_tls::{acme_csr_der, der_san_ip_extension, validity};
+use super::super::origin_tls::{acme_csr_der, der_san_ip_extension, names, validity};
 use super::*;
 
 struct AcmeMock {
@@ -63,12 +63,6 @@ fn thumbprint(jwk: &Value) -> String {
         &ring::digest::SHA256,
         canonical.as_bytes(),
     ))
-}
-
-fn utc_time(days_from_now: i64) -> String {
-    (chrono::Utc::now() + chrono::Duration::days(days_from_now))
-        .format("%y%m%d%H%M%SZ")
-        .to_string()
 }
 
 async fn acme_handle(
@@ -753,8 +747,12 @@ async fn plain_http_closes_to_the_internet_once_https_was_used() {
         .unwrap();
     assert_ne!(text(r).await, "handled");
 
-    // Leaving the mode opens the plain port again, and a later return starts over.
-    mgr.set_access("local", None, false).await.unwrap();
+    // Public without HTTPS opens the plain port again, and a later return starts over.
+    // ("Only my devices" keeps it closed to the internet: see
+    // `only_my_devices_refuses_plain_http_from_the_internet`.)
+    mgr.set_access("direct", Some("203.0.113.5:8080"), false)
+        .await
+        .unwrap();
     let r = plain(&router, Method::POST, "/graphql", STRANGER, None)
         .await
         .unwrap();
@@ -967,4 +965,390 @@ async fn direct_https_can_take_over_a_paused_origin_listener() {
     again.start_remove(TOKEN).await.unwrap();
     all_done(&wait_job(&again).await);
     assert_clean(&mock.lock().unwrap(), true);
+}
+
+/// The mock's certificate for the key on disk, but for another address: what a crash
+/// in the middle of an address change leaves next to settings that name the old one.
+fn write_certificate_for_another_address(r: &Rig) {
+    let key = std::fs::read(r.data.join(DIRECT_KEY_FILE)).unwrap();
+    let acme = r.acme.lock().unwrap();
+    let other = der_san_ip_extension("203.0.113.9".parse().unwrap());
+    let chain = format!(
+        "{}{}",
+        acme.ca.sign_for_key(&key, &other, (-1, 6)),
+        acme.ca.pem()
+    );
+    std::fs::write(r.data.join(DIRECT_CERT_FILE), chain).unwrap();
+}
+
+fn names_on_disk(r: &Rig) -> Vec<String> {
+    names(&std::fs::read_to_string(r.data.join(DIRECT_CERT_FILE)).unwrap())
+}
+
+async fn wait_for_orders(r: &Rig, orders: u32) {
+    for _ in 0..200 {
+        if r.acme.lock().unwrap().orders >= orders {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(r.acme.lock().unwrap().orders, orders);
+}
+
+#[test]
+fn a_certificate_says_what_it_is_for() {
+    let ca = TestCa::new();
+    let key = super::super::origin_tls::generate_key().unwrap();
+    for (host, san) in [
+        (
+            "203.0.113.5",
+            der_san_ip_extension("203.0.113.5".parse().unwrap()),
+        ),
+        (
+            "2001:db8::1",
+            der_san_ip_extension("2001:db8::1".parse().unwrap()),
+        ),
+        ("read.example.com", der_san_extension("Read.Example.com")),
+    ] {
+        let cert = ca.sign_for_key(&key, &san, (-1, 6));
+        assert_eq!(names(&cert), [host]);
+        assert!(super::super::origin_tls::is_for(&cert, host));
+        assert!(!super::super::origin_tls::is_for(&cert, "203.0.113.9"));
+    }
+    // Other extensions come first, and the names can be marked critical.
+    let basic = seq(&[&tlv(0x06, &[0x55, 0x1D, 0x13]), &tlv(0x04, &seq(&[]))]);
+    let critical = seq(&[
+        &tlv(0x06, &[0x55, 0x1D, 0x11]),
+        &[0x01, 0x01, 0xFF],
+        &tlv(0x04, &seq(&[&tlv(0x87, &[203, 0, 113, 5])])),
+    ]);
+    let cert = ca.sign_for_key(&key, &[basic, critical].concat(), (-1, 6));
+    assert_eq!(names(&cert), ["203.0.113.5"]);
+    // No names, or no certificate: for nothing.
+    let none = ca.sign_for_key(
+        &key,
+        &seq(&[&tlv(0x06, &[0x55, 0x1D, 0x13]), &tlv(0x04, &seq(&[]))]),
+        (-1, 6),
+    );
+    assert!(names(&none).is_empty());
+    assert!(names("not a certificate").is_empty());
+}
+
+#[tokio::test]
+async fn a_certificate_for_another_address_is_replaced() {
+    let r = rig("other-address").await;
+    // Only the first look of the renewal loop runs here: a change is seen by the code
+    // under test, not by a later look.
+    let mut opts = r.opts.clone();
+    opts.renew_check = Duration::from_secs(3600);
+    let trusted = || Arc::new(crate::TrustedProxies::for_tests(vec![], false));
+    let mgr = manager(&r.pool, opts.clone(), trusted());
+    mgr.set_access("direct", Some("127.0.0.1"), true)
+        .await
+        .unwrap();
+    assert_eq!(r.acme.lock().unwrap().orders, 1);
+    assert_eq!(names_on_disk(&r), ["127.0.0.1"]);
+
+    // Its key fits and its dates are fine, so only its name tells it is the wrong one.
+    // Saving the same address does not keep it.
+    write_certificate_for_another_address(&r);
+    mgr.set_access("direct", Some("127.0.0.1"), true)
+        .await
+        .unwrap();
+    assert_eq!(r.acme.lock().unwrap().orders, 2, "a new one was requested");
+    assert_eq!(names_on_disk(&r), ["127.0.0.1"]);
+
+    // A restart finds it: the server gets one for the address in its settings, and
+    // serves that.
+    mgr.stop_direct_tasks().await;
+    mgr.stop_https().await;
+    write_certificate_for_another_address(&r);
+    let again = manager(&r.pool, opts, trusted());
+    // It is never served, not even until the new one is there.
+    let refused = again.serve_direct("127.0.0.1").await.unwrap_err();
+    assert!(refused.contains("is not for 127.0.0.1"), "{refused}");
+    assert!(!again.https_up());
+    again.resume().await;
+    wait_for_orders(&r, 3).await;
+    assert!(https_answers(&r).await, "HTTPS serves one for 127.0.0.1");
+    assert_eq!(names_on_disk(&r), ["127.0.0.1"]);
+    let st = again.status().await;
+    assert!(st.https && st.https_error.is_none() && st.certificate_error.is_none());
+}
+
+#[tokio::test]
+async fn the_address_names_the_https_port_of_this_run() {
+    let r = rig("port-change").await;
+    r.mgr
+        .set_access("direct", Some("127.0.0.1"), true)
+        .await
+        .unwrap();
+    let st = r.mgr.status().await;
+    assert_eq!(
+        st.address,
+        Some(format!("https://127.0.0.1:{}", r.opts.https_addr.port()))
+    );
+    r.mgr.stop_direct_tasks().await;
+    r.mgr.stop_https().await;
+
+    // A restart with another KOMIKA_HTTPS_PORT: readers are sent to the new port.
+    let mut opts = r.opts.clone();
+    opts.https_addr.set_port(free_port());
+    let moved = format!("https://127.0.0.1:{}", opts.https_addr.port());
+    let trusted = Arc::new(crate::TrustedProxies::for_tests(vec![], false));
+    let again = manager(&r.pool, opts.clone(), trusted);
+    again.resume().await;
+    assert_eq!(again.status().await.address, Some(moved.clone()));
+    let http = client(&r.acme);
+    http.get(format!("{moved}/health"))
+        .send()
+        .await
+        .expect("HTTPS answers on the new port");
+    let sent = http
+        .get(format!(
+            "http://127.0.0.1:{}/library",
+            opts.acme_addr.port()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sent.headers()["location"], format!("{moved}/library"));
+}
+
+#[tokio::test]
+async fn direct_https_comes_back_after_a_busy_port_at_boot() {
+    let r = rig("busy-direct").await;
+    // The renewal loop also restarts a listener that is down, once an hour. Not here:
+    // what brings HTTPS back is the retry.
+    let mut opts = r.opts.clone();
+    opts.renew_check = Duration::from_secs(3600);
+    let trusted = || Arc::new(crate::TrustedProxies::for_tests(vec![], false));
+    let mgr = manager(&r.pool, opts.clone(), trusted());
+    mgr.set_access("direct", Some("127.0.0.1"), true)
+        .await
+        .unwrap();
+    // This also lets the renewal loop finish its first look. Stopped in the middle of
+    // a query, it would take the test's one in-memory database connection with it.
+    assert!(mgr.status().await.https);
+    mgr.stop_direct_tasks().await;
+    mgr.stop_https().await;
+
+    let other_program = std::net::TcpListener::bind(opts.https_addr).unwrap();
+    let again = manager(&r.pool, opts.clone(), trusted());
+    again.resume().await;
+    let st = again.status().await;
+    assert!(!st.https);
+    let why = st.https_error.expect("the console can show why");
+    assert!(
+        why.contains(&format!("port {}", opts.https_addr.port())),
+        "{why}"
+    );
+    assert!(st.certificate_error.is_none(), "the certificate is fine");
+
+    drop(other_program);
+    assert!(https_answers(&r).await, "HTTPS is back by itself");
+    let st = again.status().await;
+    assert!(st.https && st.https_error.is_none() && st.certificate_error.is_none());
+    assert_eq!(
+        r.acme.lock().unwrap().orders,
+        1,
+        "with the same certificate"
+    );
+}
+
+#[tokio::test]
+async fn only_my_devices_refuses_plain_http_from_the_internet() {
+    use tower::ServiceExt;
+
+    const STRANGER: &str = "198.51.100.7";
+    const DOCKER: &str = "172.17.0.1";
+    let dir = temp_dir("local-only");
+    let opts = options("http://127.0.0.1:9", &dir, None);
+    let pool = pool().await;
+    // One proxy of the owner's is trusted: what it passes on is its business.
+    let trusted = || {
+        Arc::new(crate::TrustedProxies::for_tests(
+            vec!["203.0.113.80/32".into()],
+            true,
+        ))
+    };
+    let mgr = Arc::new(Manager::new(pool.clone(), opts.clone(), trusted()));
+    let router = guarded(&mgr);
+    mgr.set_router(router.clone());
+    // (method, path, peer, extra headers) as the plain listener hands it to the router.
+    let send =
+        |router: &Router, method: Method, path: &str, peer: &str, headers: &[(&str, &str)]| {
+            let mut request = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("x-test-peer", peer);
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            router
+                .clone()
+                .oneshot(request.body(axum::body::Body::empty()).unwrap())
+        };
+    let status = |router: &Router, peer: &str, headers: &[(&str, &str)]| {
+        let sent = send(router, Method::GET, "/health", peer, headers);
+        async { sent.await.unwrap().status().as_u16() }
+    };
+
+    // Nobody chose yet: the first-run screens must open from anywhere.
+    assert_eq!(status(&router, STRANGER, &[]).await, 200);
+    // The public modes without HTTPS of the server's own are left alone too.
+    mgr.set_access("direct", Some("203.0.113.5:8080"), false)
+        .await
+        .unwrap();
+    assert_eq!(status(&router, STRANGER, &[]).await, 200);
+
+    mgr.set_access("local", None, false).await.unwrap();
+    // A public peer is the internet, whatever it says about itself.
+    for headers in [
+        &[][..],
+        &[("host", "192.168.1.20:8080")],
+        &[("x-forwarded-proto", "https")],
+    ] {
+        assert_eq!(status(&router, STRANGER, headers).await, 403, "{headers:?}");
+    }
+    let r = send(&router, Method::GET, "/library", STRANGER, &[])
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        body.contains("Only my devices") && body.contains("komika-server setup"),
+        "{body}"
+    );
+    // Sign-in and every other GraphQL call: an error the apps show, not the handler.
+    let r = send(&router, Method::POST, "/graphql", STRANGER, &[])
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert!(body["errors"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Only my devices"));
+
+    // This computer, the home network and a VPN are the owner's devices.
+    for peer in [
+        "127.0.0.1",
+        "192.168.1.9",
+        "10.0.0.4",
+        "100.101.102.103",
+        "fd00::9",
+    ] {
+        assert_eq!(
+            status(&router, peer, &[("host", "192.168.1.20:8080")]).await,
+            200,
+            "{peer}"
+        );
+    }
+    // Behind Docker Desktop every peer is Docker's: the address the client typed says
+    // where it is. A public one is the internet, unless HTTPS ended in front.
+    for (headers, answer) in [
+        (&[("host", "komiq.lan:8080")][..], 200),
+        (&[("host", "192.168.1.20:8080")], 200),
+        (&[("host", "203.0.113.5:8080")], 403),
+        (
+            &[("host", "203.0.113.5"), ("x-forwarded-proto", "https")],
+            200,
+        ),
+        // A name that leads nowhere counts as public; `localhost` is this computer.
+        (&[("host", "no-such-host.invalid:8080")], 403),
+    ] {
+        assert_eq!(
+            status(&router, DOCKER, headers).await,
+            answer,
+            "{headers:?}"
+        );
+    }
+    // The owner's own proxy.
+    assert_eq!(status(&router, "203.0.113.80", &[]).await, 200);
+
+    // A restart keeps the choice.
+    let again = Arc::new(Manager::new(pool.clone(), opts.clone(), trusted()));
+    let router = guarded(&again);
+    again.set_router(router.clone());
+    again.resume().await;
+    assert_eq!(status(&router, STRANGER, &[]).await, 403);
+    assert_eq!(status(&router, "192.168.1.9", &[]).await, 200);
+    // And a public mode opens the port again.
+    again
+        .set_access("direct", Some("203.0.113.5:8080"), false)
+        .await
+        .unwrap();
+    assert_eq!(status(&router, STRANGER, &[]).await, 200);
+}
+
+#[tokio::test]
+async fn a_renewal_that_waited_for_a_change_of_address_follows_it() {
+    let r = rig("renew-after-change").await;
+    r.mgr
+        .set_access("direct", Some("127.0.0.1"), true)
+        .await
+        .unwrap();
+    assert!(r.mgr.status().await.https);
+
+    // A change of address holds the lock, as `set_access` does, and the renewal loop
+    // comes for its look meanwhile (every 50 ms here).
+    let change = r.mgr.issuing.lock().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // What the change leaves: another address in the settings, with its certificate.
+    write_certificate_for_another_address(&r);
+    instance::store(&r.pool, &instance::DIRECT_TLS_HOST, "203.0.113.9")
+        .await
+        .unwrap();
+    drop(change);
+
+    // Several looks later, the certificate is still the one for that address.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        r.acme.lock().unwrap().orders,
+        1,
+        "none for the address that was left"
+    );
+    assert_eq!(names_on_disk(&r), ["203.0.113.9"]);
+}
+
+#[tokio::test]
+async fn a_restart_finishes_a_change_of_mode_that_a_crash_cut_short() {
+    use tower::ServiceExt;
+
+    let r = rig("crash-to-local").await;
+    let mut opts = r.opts.clone();
+    opts.renew_check = Duration::from_secs(3600);
+    let trusted = || Arc::new(crate::TrustedProxies::for_tests(vec![], false));
+    let mgr = manager(&r.pool, opts.clone(), trusted());
+    mgr.set_access("direct", Some("127.0.0.1"), true)
+        .await
+        .unwrap();
+    // (Why this line: see `direct_https_comes_back_after_a_busy_port_at_boot`.)
+    assert!(mgr.status().await.https);
+    mgr.stop_direct_tasks().await;
+    mgr.stop_https().await;
+    // The owner chose "Only my devices". The server stopped after it stored the choice
+    // and before it turned HTTPS off.
+    instance::store(&r.pool, &instance::ACCESS_MODE, "local")
+        .await
+        .unwrap();
+
+    let again = Arc::new(Manager::new(r.pool.clone(), opts.clone(), trusted()));
+    let router = guarded(&again);
+    again.set_router(router.clone());
+    again.resume().await;
+    let st = again.status().await;
+    assert_eq!(st.mode, "local");
+    assert!(!st.https && st.https_error.is_none());
+    assert!(again.direct_tls_host().await.is_none());
+    assert!(port_is_free(opts.https_addr) && port_is_free(opts.acme_addr));
+    // The stored choice acts: plain HTTP refuses the internet.
+    let stranger = axum::http::Request::builder()
+        .uri("/health")
+        .header("x-test-peer", "198.51.100.7")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(router.oneshot(stranger).await.unwrap().status(), 403);
 }

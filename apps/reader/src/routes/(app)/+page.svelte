@@ -5,6 +5,7 @@
 	import CardRowSkeleton from '$lib/components/CardRowSkeleton.svelte';
 	import EmptyCatalog from '$lib/components/EmptyCatalog.svelte';
 	import Icon from '$lib/components/Icon.svelte';
+	import Ratings from '$lib/components/Ratings.svelte';
 	import {
 		slug,
 		cardSub,
@@ -56,15 +57,6 @@
 		// 3-slide feed shows slide 2, and "next" would compute (7 + 1) % 3 = 2 — the same
 		// slide, so the click would do nothing visible.
 		heroIndex = (slide + delta + n) % n;
-	}
-
-	/**
-	 * Whether a row has a score worth printing. The feeds format an unrated series as
-	 * `''` or as `'0.0'` depending on which one it came through; a compact row prints
-	 * neither, because "★ 0.0" reads as a terrible score rather than as no score.
-	 */
-	function rated(rating: string): boolean {
-		return Number(rating) > 0;
 	}
 
 	/** A series' page — by id, or by title slug when the row carries none. The same
@@ -392,11 +384,7 @@
 										</span>
 										<span class="upd-foot">
 											{#if item.type}<FlagBadge type={item.type} width={18} height={12} />{/if}
-											{#if rated(item.rating)}
-												<span class="upd-rating" aria-label={`Rating ${item.rating} out of 10`}
-													><Icon name="star" size={11} fill="var(--k-star)" />{item.rating}</span
-												>
-											{/if}
+											<Ratings own={item.rating} md={item.mdRating} starSize={11} />
 											{#if item.status}
 												<span class="upd-status" style="color:{STATUS_META[item.status].color}"
 													>{STATUS_META[item.status].label}</span
@@ -431,11 +419,7 @@
 												>
 											{/if}
 										</span>
-										{#if rated(item.rating)}
-											<span class="rank-rating" aria-label={`Rating ${item.rating} out of 10`}
-												><Icon name="star" size={11} fill="var(--k-star)" />{item.rating}</span
-											>
-										{/if}
+										<Ratings own={item.rating} md={item.mdRating} stack starSize={11} />
 									</a>
 								</li>
 							{/each}
@@ -455,6 +439,7 @@
 							title={item.title}
 							sub={cardSub(item, 'Added ')}
 							rating={item.rating}
+							mdRating={item.mdRating}
 							cover={item.cover}
 							id={item.id}
 							flagType={item.type ?? null}
@@ -886,12 +871,10 @@
 		border-radius: 2px;
 		flex: 0 0 auto;
 	}
-	.upd-rating,
-	.rank-rating {
-		display: inline-flex;
-		align-items: center;
-		gap: 3px;
-		font-variant-numeric: tabular-nums;
+	/* The ratings are the row's own flex child, with no wrapper: a row with nothing to
+	   show (see Ratings) then leaves no empty box behind to take a gap. */
+	.upd-foot :global(.ratings),
+	.rank-row :global(.ratings) {
 		color: var(--k-text-3);
 	}
 	.upd-sk {
@@ -955,10 +938,9 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
-	.rank-rating {
+	.rank-row :global(.ratings) {
 		flex: 0 0 auto;
 		font-size: 12px;
-		font-weight: 700;
 	}
 	.rank-sk {
 		height: 79px;

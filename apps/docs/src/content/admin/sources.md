@@ -105,15 +105,29 @@ Troubled sources show diagnostic details below their rows:
 
 ## Scanlators
 
-The Scanlators page lists every scanlation group that a chapter on your server credits, with the most chapters first. Use it to tell readers which groups translate with AI.
+The Scanlators page lists who translates the chapters on your server. Use it to tell readers which scanlators translate with AI. The `List` control at the top switches between two lists:
 
-- `Name`: Search field for part of a group name.
-- `Tag`: Segmented control showing `All`, `Tagged`, `AI`, `Partial AI`, or `Not tagged` groups.
-- `Source`: Dropdown menu showing only groups with chapters on one source. The chapter and series counts then cover that source only.
+- `Groups`: The scanlation groups that chapters credit, with the most chapters first. MangaDex chapters name their group.
+- `Sites`: The sources that translate their own series. Their chapters credit no group, so you tag the whole source.
+
+Both lists share these controls:
+
+- `Name`: Search field for part of a name.
+- `Tag`: Segmented control showing `All`, `Tagged`, `AI`, `Partial AI`, or `Not tagged` rows.
 - `AI tag`: Sets each row to `None`, `Partial AI`, or `AI`. Use `AI` for machine translation and `Partial AI` when AI is part of the work, such as a machine translation that a person edits.
+
+### Groups
+
+The `Source` dropdown menu shows only groups with chapters on one source. The chapter and series counts then cover that source only.
 
 A tag is kept by group name. It applies to every chapter credited to that group, on every source, including chapters added later. A joint credit such as "A & B" takes the strongest tag of its members unless you give it its own tag. The row then shows where its tag comes from.
 
-Readers see an AI or Partial AI badge next to the group name in the chapter list and in the reader menu.
+Your server counts the group list at most once every ten minutes. The first load can take a few seconds, and a new group can take ten minutes to appear.
 
-Your server counts the list at most once every ten minutes. The first load can take a few seconds, and a new group can take ten minutes to appear. Tags save at once.
+### Sites
+
+The list shows every source with a series in your catalogue, except MangaDex, with the most series first. Each row shows the source name, its language and its series count.
+
+A tag on a site applies to every chapter read from that source, including chapters added later. A chapter that also credits a tagged group takes the stronger of the two tags. A tagged source stays in the list when its last series is gone, so you can remove the tag.
+
+Tags save at once in both lists. Readers see an AI or Partial AI badge next to the group or source name in the chapter list and in the reader menu.

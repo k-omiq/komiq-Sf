@@ -481,11 +481,15 @@ async fn access(api: &Api, preset: Option<&str>, encrypt: Option<bool>) -> Resul
         }
         match set_access_mode(api, "local", None).await {
             Err(e) => println!("  The choice was not saved: {e}"),
-            Ok(_) if mode == "internet" => {
-                println!("Cloudflare is turned off on this server. What setup made at Cloudflare");
-                println!("stays there: remove it in the console, Settings › Access.");
+            Ok(_) => {
+                println!("From the internet, the server now refuses plain HTTP.");
+                if mode == "internet" {
+                    println!(
+                        "Cloudflare is turned off on this server. What setup made at Cloudflare"
+                    );
+                    println!("stays there: remove it in the console, Settings › Access.");
+                }
             }
-            Ok(_) => {}
         }
         return Ok(None);
     }

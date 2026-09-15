@@ -840,6 +840,55 @@ test('Settings: "Only my devices" is the step between direct HTTPS and a Cloudfl
 	await expect(fact('HTTPS')).toBeVisible();
 });
 
+test('Settings: a Cloudflare public IP shows why HTTPS is down and when its certificate ends', async ({
+	page,
+}) => {
+	const { state, access, fact } = await openAccessSettings(page, {
+		accessMode: 'internet',
+		accessDomain: 'read.example.invalid',
+		cloudflare: { ...CLOUDFLARE_SETUP, connection: 'PUBLIC_IP' },
+		certificate: {
+			certificateExpires: '2041-03-12T00:00:00+00:00',
+			httpsError: 'Could not listen on port 443 (address in use).',
+		},
+	});
+	// Another program held the port when the server started.
+	await expect(fact('HTTPS')).toContainText('Not running');
+	await expect(fact('HTTPS')).toContainText(
+		'Could not listen on port 443 (address in use). The server tries again by itself.',
+	);
+	await expect(fact('HTTPS')).toContainText(/Cloudflare origin certificate, valid until .*2041/);
+	await expect(fact('HTTPS')).toContainText(
+		'Nothing renews it by itself: "Run setup again" gets a new one in its last 30 days.',
+	);
+
+	// Close to its end: the server's sentence takes the place of the date.
+	const due =
+		'The origin certificate ends on 2041-03-12. Choose "Run setup again" to get a new one.';
+	state.certificate = { certificateExpires: '2041-03-12T00:00:00+00:00', certificateError: due };
+	await page.reload();
+	await expect(fact('HTTPS')).toContainText(due);
+	await expect(fact('HTTPS')).not.toContainText('valid until');
+	await expect(fact('HTTPS')).not.toContainText('tries again');
+	await expect(access.getByRole('button', { name: 'Run setup again' })).toBeVisible();
+});
+
+test('Settings: "Only my devices" closes the HTTP port of a server without a domain', async ({
+	page,
+}) => {
+	const { access } = await openAccessSettings(page, {
+		accessMode: 'direct',
+		accessAddress: 'http://203.0.113.5:8080',
+	});
+	await access.getByRole('button', { name: 'Only my devices' }).click();
+	const dialog = page.getByRole('dialog', { name: 'Switch to "Only my devices"?' });
+	await expect(dialog).toContainText(
+		'komiq stops showing http://203.0.113.5:8080 as the reader address. The HTTP port stops answering clients on the internet.',
+	);
+	// This console is open on this computer: it keeps its way in.
+	await expect(dialog).not.toContainText('This console is open at a public address');
+});
+
 test('Settings: Cloudflare set up by hand is saved, with the domain as the server stores it', async ({
 	page,
 }) => {

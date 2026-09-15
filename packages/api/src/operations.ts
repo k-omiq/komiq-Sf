@@ -96,6 +96,16 @@ export const OPTIONAL_SERIES_FIELDS = [
 	// so the shared session fragment keeps working against a server that predates it;
 	// stripped, the flag reads as absent and nobody is asked, which is the old behaviour.
 	'mustChangePassword',
+	// The two-rating split. `Series.mangadexRating` / `UpdateFeedRow.mangadexRating` is
+	// MangaDex's community rating beside our own readers' rating, and
+	// `UpdateFeedRow.readerRating` is our own half of the feed's merged `rating`. Optional
+	// for the usual deploy-ordering reason. Stripped, a card shows one rating as it did
+	// before: `Series.rating` on a series, the merged `rating` on a feed row.
+	'mangadexRating',
+	'readerRating',
+	// `Instance.showMangadexRatings`: the admin's switch for the above. Stripped, it reads
+	// as absent, which the reader treats as "shown" (an older server has no switch).
+	'showMangadexRatings',
 ] as const;
 
 /**
@@ -157,6 +167,7 @@ const SERIES_FIELDS = /* GraphQL */ `
 			count
 			distribution
 		}
+		mangadexRating
 		scan {
 			avgIntervalHours
 			overrideIntervalHours
@@ -342,6 +353,18 @@ export const SCANLATOR_TAGS = /* GraphQL */ `
 	query ScanlatorTags {
 		scanlatorTags {
 			name
+			ai
+		}
+	}
+`;
+
+// Every source an admin tagged as using AI. A root-only query like `SCANLATOR_TAGS`, and
+// deliberately its own document: a server that predates it must not cost the reader the
+// group tags too.
+export const SOURCE_AI_TAGS = /* GraphQL */ `
+	query SourceAiTags {
+		sourceAiTags {
+			sourceId
 			ai
 		}
 	}
@@ -796,6 +819,7 @@ export const instanceQuery = (fetchPolicy: boolean) => /* GraphQL */ `
 			version
 			registrationOpen
 			mangadexEnabled
+			showMangadexRatings
 			${fetchPolicy ? 'appsFetchThemselves' : ''}
 		}
 	}
@@ -926,6 +950,12 @@ export const SET_REGISTRATION_OPEN = /* GraphQL */ `
 	}
 `;
 
+export const SET_SHOW_MANGADEX_RATINGS = /* GraphQL */ `
+	mutation SetShowMangadexRatings($shown: Boolean!) {
+		setShowMangadexRatings(shown: $shown)
+	}
+`;
+
 // ---- admin: access + Cloudflare setup -----------------------------------------
 
 const ACCESS_STATUS_FIELDS = /* GraphQL */ `
@@ -996,6 +1026,7 @@ export const CERTIFICATE_STATUS = /* GraphQL */ `
 		accessStatus {
 			certificateExpires
 			certificateError
+			httpsError
 			plainHttpClosed
 		}
 	}
@@ -1455,6 +1486,42 @@ export const SET_SCANLATOR_AI = /* GraphQL */ `
 	}
 `;
 
+export const SCANLATOR_SITES = /* GraphQL */ `
+	query ScanlatorSites {
+		scanlatorSites {
+			sourceId
+			name
+			lang
+			seriesCount
+			ai
+		}
+	}
+`;
+
+export const SET_SOURCE_AI = /* GraphQL */ `
+	mutation SetSourceAi($sourceId: String!, $ai: ScanlatorAi) {
+		setSourceAi(sourceId: $sourceId, ai: $ai)
+	}
+`;
+
+export const SITE_BLOCK_RULES = /* GraphQL */ `
+	query SiteBlockRules {
+		siteBlockRules {
+			tags
+			ratings
+		}
+	}
+`;
+
+export const SET_SITE_BLOCK_RULES = /* GraphQL */ `
+	mutation SetSiteBlockRules($rules: [BlockRuleInput!]!) {
+		setSiteBlockRules(rules: $rules) {
+			tags
+			ratings
+		}
+	}
+`;
+
 export const INSTALL_EXTENSION = /* GraphQL */ `
 	${EXTENSION_FIELDS}
 	mutation InstallExtension($pkgName: String!) {
@@ -1511,6 +1578,24 @@ export const BULK_ADD_SOURCE_SERIES = /* GraphQL */ `
 export const SET_SHOW_NSFW = /* GraphQL */ `
 	mutation SetShowNsfw($value: Boolean!) {
 		setShowNsfw(value: $value)
+	}
+`;
+
+export const MY_BLOCK_RULES = /* GraphQL */ `
+	query MyBlockRules {
+		myBlockRules {
+			tags
+			ratings
+		}
+	}
+`;
+
+export const SET_MY_BLOCK_RULES = /* GraphQL */ `
+	mutation SetMyBlockRules($rules: [BlockRuleInput!]!) {
+		setMyBlockRules(rules: $rules) {
+			tags
+			ratings
+		}
 	}
 `;
 
@@ -1623,6 +1708,8 @@ export const UPDATES_FEED = /* GraphQL */ `
 				announcedAt
 				detectedAt
 				rating
+				readerRating
+				mangadexRating
 				isNsfw
 			}
 			page

@@ -1,15 +1,19 @@
 <script lang="ts">
-	import { AI_LABEL, AI_TITLE, aiLevel } from '$lib/data/scanlator-ai';
+	import { AI_LABEL, AI_TITLE, copyAi } from '$lib/data/scanlator-ai';
 	import { loadScanlatorAi, scanlatorAi } from '$lib/scanlator-ai.svelte';
 
-	// The scanlation group of one chapter copy. Renders nothing unless an admin tagged it.
-	let { group }: { group: string | null | undefined } = $props();
+	// One chapter copy: its scanlation group and the source it is read from. Renders
+	// nothing unless an admin tagged one of the two.
+	let {
+		group,
+		sourceId,
+	}: { group: string | null | undefined; sourceId: string | null | undefined } = $props();
 
 	void loadScanlatorAi();
-	const level = $derived(aiLevel(group, scanlatorAi.index));
+	const mark = $derived(copyAi(group, sourceId, scanlatorAi.index));
 </script>
 
-{#if level}<span class="ai" title={AI_TITLE[level]}>{AI_LABEL[level]}</span>{/if}
+{#if mark}<span class="ai" title={AI_TITLE[mark.by][mark.level]}>{AI_LABEL[mark.level]}</span>{/if}
 
 <style>
 	.ai {

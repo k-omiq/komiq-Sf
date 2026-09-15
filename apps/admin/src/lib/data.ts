@@ -28,6 +28,7 @@ import type {
 	SourceInfo,
 	SourceScanHealth,
 	ExtensionAutoUpdate,
+	TagInfo,
 	WorkReviewDetail,
 	WorkSource,
 } from '@komika/types';
@@ -35,6 +36,7 @@ import type {
 	AccessMode,
 	AccessPreflight,
 	AccessStatus,
+	BlockRule,
 	BrowseSource,
 	CertificateStatus,
 	AdminChapter,
@@ -49,6 +51,7 @@ import type {
 	ScanlatorAi,
 	ScanlatorPage,
 	ScanlatorQuery,
+	ScanlatorSite,
 	Session,
 	SourceRateLimit,
 	SeriesAdminInput,
@@ -330,6 +333,12 @@ export async function loadMangadexSetting(): Promise<MangadexSetting> {
 export async function setMangadexEnabled(enabled: boolean): Promise<boolean> {
 	if (!backend.setMangadexEnabled) setupUnavailable();
 	return backend.setMangadexEnabled(enabled);
+}
+
+/** Show or hide MangaDex's rating for every reader; returns the new effective value. */
+export async function setShowMangadexRatings(shown: boolean): Promise<boolean> {
+	if (!backend.setShowMangadexRatings) setupUnavailable();
+	return backend.setShowMangadexRatings(shown);
 }
 
 /** Every per-source scan rate limit in force, the server's own sources first. */
@@ -712,6 +721,21 @@ export async function setScanlatorAi(name: string, ai: ScanlatorAi | null): Prom
 }
 
 /**
+ * The sources as scanlators of their own, biggest first, each with its AI tag. A source
+ * is listed once a series has it. The list is not paged.
+ */
+export async function loadScanlatorSites(): Promise<ScanlatorSite[]> {
+	if (!backend.scanlatorSites) throw new Error('Scanlator tags are unavailable on this backend.');
+	return backend.scanlatorSites();
+}
+
+/** Tag a whole source as using AI; `null` removes the tag. False when nothing changed. */
+export async function setSourceAi(sourceId: string, ai: ScanlatorAi | null): Promise<boolean> {
+	if (!backend.setSourceAi) throw new Error('Scanlator tags are unavailable on this backend.');
+	return backend.setSourceAi(sourceId, ai);
+}
+
+/**
  * The sources the scanlator list can be filtered by, biggest first.
  *
  * Always NSFW-inclusive — see {@link ADMIN_INCLUDE_NSFW}.
@@ -719,6 +743,32 @@ export async function setScanlatorAi(name: string, ai: ScanlatorAi | null): Prom
 export async function loadBrowseSources(): Promise<BrowseSource[]> {
 	if (!backend.browseSources) throw new Error('Source filters are unavailable on this backend.');
 	return backend.browseSources(ADMIN_INCLUDE_NSFW);
+}
+
+// ---- blocked content ----------------------------------------------------------
+
+/** The site-wide content block rules, in saved order. */
+export async function loadSiteBlockRules(): Promise<BlockRule[]> {
+	if (!backend.siteBlockRules) throw new Error('Block rules are unavailable on this backend.');
+	return backend.siteBlockRules();
+}
+
+/** Replace the whole list of site-wide block rules; returns the list the server stored. */
+export async function setSiteBlockRules(rules: BlockRule[]): Promise<BlockRule[]> {
+	if (!backend.setSiteBlockRules) throw new Error('Block rules are unavailable on this backend.');
+	return backend.setSiteBlockRules(rules);
+}
+
+/**
+ * The tags a block rule can name.
+ *
+ * NOT NSFW-inclusive, unlike the lists above: the query takes no override, so it follows
+ * the admin's own "Show NSFW content" setting. A tag only adult series carry is left
+ * out while that setting is off.
+ */
+export async function loadTags(): Promise<TagInfo[]> {
+	if (!backend.tags) throw new Error('Tags are unavailable on this backend.');
+	return backend.tags();
 }
 
 // ---- first-run setup ---------------------------------------------------------

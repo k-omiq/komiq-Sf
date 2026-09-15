@@ -6,6 +6,7 @@
 	import AiBadge from '$lib/components/AiBadge.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import Stars from '$lib/components/Stars.svelte';
+	import Ratings from '$lib/components/Ratings.svelte';
 	import MangaCard from '$lib/components/MangaCard.svelte';
 	import SeriesMetadata from '$lib/components/SeriesMetadata.svelte';
 	import Cover from '$lib/components/Cover.svelte';
@@ -39,8 +40,13 @@
 	import { volumeHeaders } from '$lib/data/chapter-volumes';
 	import { chapterAttribution } from '$lib/data/chapter-versions';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
+	import { aiSpoken, hasAiBadge, loadScanlatorAi } from '$lib/scanlator-ai.svelte';
 
 	let { data } = $props();
+
+	// The AI tags, asked for here and not only by a badge: a chapter row with no group
+	// has no badge to ask, and it needs the answer to know whether to show one.
+	void loadScanlatorAi();
 
 	// `data.series` is a RESOLVED result on the server and on hydration, and a
 	// pending Promise on client-side navigations — see +page.ts. It never rejects:
@@ -1207,6 +1213,7 @@
 							>({seriesDetail.votes})</span
 						></span
 					>
+					<Ratings md={seriesDetail.mdRating} />
 					<span class="stat"><Icon name="list" size={15} />{totalCh} ch</span>
 					{#if viewsTotal > 0}
 						<span class="stat"><Icon name="eye" size={15} />{viewsLabel}</span>
@@ -1480,8 +1487,8 @@
 					     and names it; the other copies sit in a dropdown, each a sibling link. -->
 					{@const multi = (c.sources?.length ?? 0) > 1}
 					{@const isRead = isChapterRead(c)}
-					{@const rowCopy =
-						c.sources?.find((s) => s.id === c.id && s.src === (c.src ?? null)) ?? c.sources?.[0]}
+					{@const rowMatch = c.sources?.find((s) => s.id === c.id && s.src === (c.src ?? null))}
+					{@const rowCopy = rowMatch ?? c.sources?.[0]}
 					{@const rowKey = c.id ?? String(c.n)}
 					{@const copiesOpen = multi && !!openCopies[rowKey]}
 					<li class="ch-card" class:read={isRead} class:multi>
@@ -1531,12 +1538,22 @@
 										<span class="ch-src-name"
 											>{chapterAttribution(rowCopy.name, rowCopy.group)}</span
 										>
-										<AiBadge group={rowCopy.group} />
+										<!-- The badge is for the copy the row OPENS. `rowCopy` can be
+										     another copy's entry: the aggregation does not always list the
+										     selected source's own copy. The row's own group and source are
+										     read then. -->
+										<AiBadge
+											group={rowMatch ? rowMatch.group : c.group}
+											sourceId={rowMatch ? rowMatch.sourceId : c.sourceId}
+										/>
 									</span>
-								{:else if c.group}
+								{:else if c.group || hasAiBadge(c.group, c.sourceId)}
+									<!-- A single source: its chapters often credit no group, and then
+									     the row has this column only for a tagged source's badge. -->
 									<span class="ch-by"
-										><Icon name="users" size={14} /><span class="ch-src-name">{c.group}</span
-										><AiBadge group={c.group} /></span
+										>{#if c.group}<Icon name="users" size={14} /><span class="ch-src-name"
+												>{c.group}</span
+											>{/if}<AiBadge group={c.group} sourceId={c.sourceId} /></span
 									>
 								{/if}
 								<!-- TWO CLOCKS, NAMED: a source that holds chapters behind early
@@ -1590,12 +1607,12 @@
 											class="ch-copy"
 											class:on={s === rowCopy}
 											href={chapterHref(s.id, s.src)}
-											aria-label={`Read Chapter ${c.n} on ${chapterAttribution(s.name, s.group)}`}
+											aria-label={`Read Chapter ${c.n} on ${chapterAttribution(s.name, s.group)}${aiSpoken(s.group, s.sourceId)}`}
 										>
 											{@render srcLogo(s.iconUrl, s.name)}
 											<span class="cp-text">
 												<span class="cp-group">{chapterAttribution(s.name, s.group)}</span>
-												<AiBadge group={s.group} />
+												<AiBadge group={s.group} sourceId={s.sourceId} />
 											</span>
 											{#if s.date}<span class="cp-date">{s.date}</span>{/if}
 										</a>
@@ -1656,6 +1673,7 @@
 						title={item.title}
 						sub={`${item.genre} · ${item.ch} ch`}
 						rating={item.rating}
+						mdRating={item.mdRating}
 						cover={item.cover}
 						id={item.id}
 					/>
@@ -2101,6 +2119,12 @@
 	.votes {
 		font-weight: 600;
 		color: var(--k-text-faint);
+	}
+	/* MangaDex's rating, next to ours. The row's own flex child with no wrapper, so
+	   there is no empty stat left in the row when there is nothing to show. */
+	.stats :global(.ratings) {
+		font-size: 13.5px;
+		color: var(--k-text-2);
 	}
 	.write-error {
 		display: flex;

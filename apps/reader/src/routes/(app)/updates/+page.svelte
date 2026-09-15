@@ -161,6 +161,7 @@
 							sub={cardSub(item)}
 							subTitle={timeTooltip(item)}
 							rating={item.rating}
+							mdRating={item.mdRating}
 							cover={item.cover}
 							id={item.id}
 							flagType={item.type ?? null}
@@ -242,6 +243,7 @@
 					sub={cardSub(item)}
 					subTitle={timeTooltip(item)}
 					rating={item.rating}
+					mdRating={item.mdRating}
 					cover={item.cover}
 					id={item.id}
 					flagType={item.type ?? null}

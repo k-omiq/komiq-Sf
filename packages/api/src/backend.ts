@@ -175,6 +175,12 @@ export interface Backend {
 	 */
 	scanlatorTags?(): Promise<ScanlatorTag[]>;
 	/**
+	 * Every source an admin tagged as using AI: a site that translates its own series
+	 * and credits no group. Public. Resolves to `[]` against a server that predates the
+	 * query. Optional: only the unified API.
+	 */
+	sourceAiTags?(): Promise<SourceAiTag[]>;
+	/**
 	 * Whether `search(filter:)` is (still believed to be) understood by the server.
 	 * Turns false once the API rejects the argument and it is stripped from the
 	 * document, so a caller can say honestly that only the legacy subset of the filter
@@ -226,6 +232,11 @@ export interface Backend {
 	/** Set the signed-in user's NSFW visibility preference (CATALOGUE.md §2), returning
 	 * the new value. Optional: only the unified Komika API implements it. */
 	setShowNsfw?(value: boolean): Promise<boolean>;
+	/** The signed-in user's own content block rules. Optional: only the unified API. */
+	myBlockRules?(): Promise<BlockRule[]>;
+	/** Replace the signed-in user's content block rules; returns the stored list.
+	 * Optional: only the unified API. */
+	setMyBlockRules?(rules: BlockRule[]): Promise<BlockRule[]>;
 
 	// --- profile ---
 	/** Update the viewer's editable profile (display name + bio); a blank field
@@ -392,6 +403,10 @@ export interface Backend {
 	/** Open or close public sign-up; returns the new effective value. Refused when
 	 * the server pins it by env. Optional. */
 	setRegistrationOpen?(open: boolean): Promise<boolean>;
+	/** Show or hide MangaDex's community rating for everyone on this server; returns
+	 * the new effective value. Refused when the server pins it by env
+	 * (`KOMIKA_MANGADEX_RATINGS`). Optional. */
+	setShowMangadexRatings?(shown: boolean): Promise<boolean>;
 	/** The MangaDex switch and whether the server's env pins it. Optional. */
 	mangadexSetting?(): Promise<MangadexSetting>;
 	/** Turn MangaDex on or off; returns the new effective value. Refused when the
@@ -411,6 +426,16 @@ export interface Backend {
 	/** Tag a scanlator as using AI, or with `null` remove its tag. `false` when nothing
 	 * changed. Optional. */
 	setScanlatorAi?(name: string, ai: ScanlatorAi | null): Promise<boolean>;
+	/** The admin site list: every source with a series in the catalogue, biggest first,
+	 * with its AI tag. Optional. */
+	scanlatorSites?(): Promise<ScanlatorSite[]>;
+	/** Tag a whole source as using AI, or with `null` remove its tag. `false` when
+	 * nothing changed. Optional. */
+	setSourceAi?(sourceId: string, ai: ScanlatorAi | null): Promise<boolean>;
+	/** The site-wide content block rules. Optional. */
+	siteBlockRules?(): Promise<BlockRule[]>;
+	/** Replace the site-wide content block rules; returns the stored list. Optional. */
+	setSiteBlockRules?(rules: BlockRule[]): Promise<BlockRule[]>;
 
 	// --- admin access + Cloudflare setup (requires an admin session) ---
 	/** Settings › Access: access choice, public address, Cloudflare setup and the
@@ -810,6 +835,12 @@ export interface InstanceInfo {
 	registrationOpen: boolean;
 	mangadexEnabled: boolean;
 	/**
+	 * False when the server's admin turned MangaDex ratings off: no response carries one,
+	 * so the reader hides its own switch. Absent on a server that predates the field,
+	 * which reads as true.
+	 */
+	showMangadexRatings?: boolean;
+	/**
 	 * True when the server tells reader apps to fetch chapter pages from the sources
 	 * themselves: an app with its own engine then does not offer fetching through the
 	 * server. Absent on a server that predates the field, which reads as false.
@@ -892,6 +923,35 @@ export interface ScanlatorPage {
 	total: number;
 }
 
+/** One tagged source. Match `sourceId` to a chapter copy's `sourceId`. A copy takes the
+ *  stronger of this tag and the tag on its `scanlator` credit (`AI` over `PARTIAL`). */
+export interface SourceAiTag {
+	sourceId: string;
+	ai: ScanlatorAi;
+}
+
+/** One row of the admin site list: a source, as a scanlator of its own. */
+export interface ScanlatorSite {
+	/** The source id ({@link BrowseSource.id}); never `mangadex`. */
+	sourceId: string;
+	/** Display name; the extension package name or the id when the engine did not answer. */
+	name: string;
+	lang: string | null;
+	/** Series in the catalogue that have this source. */
+	seriesCount: number;
+	ai: ScanlatorAi | null;
+}
+
+/**
+ * One content block rule. It matches a series that carries ALL of `tags` (tag ids, see
+ * `TagInfo.id`) and, when `ratings` is not empty, has ONE of them. A rule needs a tag or
+ * a rating. A series is blocked when any rule matches it.
+ */
+export interface BlockRule {
+	tags: string[];
+	ratings: ContentRating[];
+}
+
 /** One extension repo configured on the engine. */
 export interface ExtensionRepo {
 	/** Canonical index URL: the repo's identity, and each extension's `repo`. */
@@ -947,13 +1007,20 @@ export interface AccessStatus {
 	job: CloudflareJob | null;
 }
 
-/** The certificate of direct mode with HTTPS. Both null when that is off. */
+/** The certificate the server's own HTTPS listener serves: the Let's Encrypt one of
+ * direct mode, or the Origin CA one of Cloudflare's Public IP connection. All null
+ * when neither is on. */
 export interface CertificateStatus {
-	/** When the current certificate stops being valid (RFC 3339). The server renews
-	 * it long before. */
+	/** When the current certificate stops being valid (RFC 3339). Direct mode: the
+	 * server renews it long before. Public IP: nothing renews it; "Run setup again"
+	 * gets a new one. */
 	certificateExpires: string | null;
-	/** Why the last renewal failed, until one succeeds. */
+	/** Direct mode: why the last renewal failed, until one succeeds. Public IP: why the
+	 * certificate needs a new one in its place (it ends soon, or is not for the domain). */
 	certificateError: string | null;
+	/** Why the HTTPS listener is down while the access mode needs it (its port was busy
+	 * when the server started, for one). The server keeps trying. */
+	httpsError: string | null;
 	/** The plain HTTP port refuses clients on the internet. It starts to after the
 	 * first visit from the internet over HTTPS. */
 	plainHttpClosed: boolean;
@@ -981,7 +1048,8 @@ export interface AccessPreflight {
 	cloudflared: 'found' | 'download' | 'unsupported';
 	/** A sentence about the connector, e.g. why it is unsupported. */
 	cloudflaredDetail: string | null;
-	/** The plain HTTP port the server listens on. */
+	/** The plain HTTP port as other machines see it: the one a container's host
+	 * publishes, else the one the server listens on. */
 	httpPort: number;
 	/** The port HTTPS is served on (Cloudflare public IP, and direct mode). */
 	httpsPort: number;

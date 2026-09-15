@@ -10,6 +10,7 @@
 	import { stripProgress } from '$lib/data/reader-format';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
 	import AiBadge from '$lib/components/AiBadge.svelte';
+	import { aiSpoken } from '$lib/scanlator-ai.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import {
 		BARS,
@@ -95,6 +96,8 @@
 	const currentVersion = $derived(versions.find((v) => v.current) ?? null);
 	// The open copy's group: the view's own field first, else the current version row.
 	const openGroup = $derived(data.group ?? currentVersion?.group ?? null);
+	// Its source id, the same way. A source can carry an AI tag of its own.
+	const openSourceId = $derived(data.sourceId ?? currentVersion?.sourceId ?? null);
 	// "No Group" is a real MangaDex value but says nothing in a one-line header.
 	const headerGroup = $derived(openGroup && openGroup !== 'No Group' ? openGroup : null);
 	function versionHref(v: { id: string; src: string | null }): string {
@@ -1065,20 +1068,21 @@
 					{#if versions.length}
 						{#each versions as v (`${v.src ?? 'spine'}:${v.id}`)}
 							{@const label = chapterAttribution(v.source, v.group)}
+							{@const ai = aiSpoken(v.group, v.sourceId)}
 							<button
 								class="tr-opt ver"
 								class:on={v.current}
 								aria-pressed={v.current}
 								aria-label={v.current
-									? `${label} on ${v.source} (reading now)`
-									: `Read this chapter from ${label} on ${v.source}`}
+									? `${label} on ${v.source}${ai} (reading now)`
+									: `Read this chapter from ${label} on ${v.source}${ai}`}
 								onclick={() => openVersion(v)}
 							>
 								{@render srcLogo(v.iconUrl, v.source)}
 								<span class="ver-text">
 									<span class="tr-name">{label}</span>
 								</span>
-								<AiBadge group={v.group} />
+								<AiBadge group={v.group} sourceId={v.sourceId} />
 								{#if v.current}<Icon name="check" size={14} strokeWidth={2.6} />{/if}
 							</button>
 						{/each}
@@ -1093,7 +1097,7 @@
 									>{chapterAttribution(srcName || 'Unknown source', openGroup)}</span
 								>
 							</span>
-							<AiBadge group={openGroup} />
+							<AiBadge group={openGroup} sourceId={openSourceId} />
 							<Icon name="check" size={14} strokeWidth={2.6} />
 						</div>
 					{/if}

@@ -56,9 +56,11 @@ External results are deduplicated and displayed together. Because live queries c
 
 ## Browse page and results
 
-The browse page at `/browse` displays up to 30 catalogue series cards per page. External search results appear in one list without pagination. Each card shows the cover image, title, chapter information, rating score, comic format flag, and status badge. Scanlation translator credits appear when reported by sources.
+The browse page at `/browse` displays up to 30 catalogue series cards per page. External search results appear in one list without pagination. Each card shows the cover image, title, chapter information, ratings, comic format flag, and status badge. Read [Ratings, comments, reports](/guide/community#two-ratings) for the two ratings a card can show. Scanlation translator credits appear when reported by sources.
 
 Below the grid, a pagination bar navigates between pages.
+
+Series that the administrator of the server blocked do not appear. Series that your own block rules hide do not appear either. Read [Accounts and profile](/guide/accounts#blocked-content) to set rules.
 
 ### Shareable filter URLs
 

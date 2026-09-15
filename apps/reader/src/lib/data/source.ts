@@ -287,6 +287,7 @@ function toCard(s: Series): Card {
 		// distinguishable ("released 7d · we found it 1h ago").
 		detected: relTime(s.detectedAt),
 		rating: s.rating.average.toFixed(1),
+		mdRating: s.mangadexRating ?? null,
 		cover: s.coverUrl,
 		id: s.id,
 		type: toViewType(s.type),
@@ -340,6 +341,12 @@ function toCanonicalCard(u: CanonicalUpdate): Card {
  *  `rating` is '' when unrated rather than "0.0": the old scanner-half card ran
  *  `RatingSummary::empty().average.toFixed(1)` and printed a 0.0 star on every unrated
  *  series, which is the vast majority (the whole database holds a handful of reviews). */
+/** Our own readers' rating of a feed row, or the server's merged number when the server
+ *  cannot tell the two apart (it predates `readerRating`). */
+function feedRating(u: UpdateFeedRow): number | null {
+	return u.readerRating !== undefined ? u.readerRating : u.rating;
+}
+
 function toFeedCard(u: UpdateFeedRow): Card {
 	return {
 		title: u.title,
@@ -365,7 +372,11 @@ function toFeedCard(u: UpdateFeedRow): Card {
 		released: u.announcedAt && u.announcedAt !== u.releasedAt ? relTime(u.releasedAt) : undefined,
 		// Our detection time, hover-only, and null on mirror-only rows.
 		detected: relTime(u.detectedAt),
-		rating: u.rating != null ? u.rating.toFixed(1) : '',
+		// OUR readers' half. `readerRating` is undefined (not null) only against a server
+		// that predates the two-rating split; its merged `rating` is then all there is, and
+		// the card shows it the way it always did.
+		rating: feedRating(u)?.toFixed(1) ?? '',
+		mdRating: u.mangadexRating ?? null,
 		cover: u.coverUrl ?? '',
 		// `|| undefined`, not `u.id`. The grid keys its `{#each}` on `item.id ?? item.title`,
 		// and `''` is not nullish — so an id-less row would key on the empty string, and a
@@ -413,6 +424,7 @@ function toCatalogEntry(s: Series, i: number): CatalogEntry {
 		// strips it), and "older API" must degrade to "no number", not to a wrong one.
 		latestCh: chapterChip(s.latestChapter),
 		rating: s.rating.average,
+		mdRating: s.mangadexRating ?? null,
 		status: toViewStatus(s.status),
 		added: i,
 		addedAt: Number.isFinite(addedAt) ? addedAt : 0,
@@ -722,6 +734,9 @@ interface ResolvedWork {
 		 * chapter's own URL is unknown (a Suwayomi copy: the server keeps no chapter URL).
 		 */
 		sourceUrl: string | null;
+		/** The mapping's source id, for the AI badge of a copy read from this source; null
+		 *  when the work has no mapping for it. */
+		sourceId: string | null;
 	})[];
 	/**
 	 * Cross-source aggregation, when it rode along in the single-round-trip
@@ -992,22 +1007,26 @@ async function resolveWork(
 			chapters: c.chapters,
 			redundant: !!c.redundant,
 			sourceUrl: mappingSourceUrl(wsList, c.view.suwayomiMangaId),
+			sourceId: mappingOf(wsList, c.view.suwayomiMangaId)?.sourceId ?? null,
 		})),
 		aggregated,
 	};
 }
 
+/** A source's mapping out of the work's: the Suwayomi mapping whose manga id matches, or
+ *  the MangaDex mapping for the spine (`null`). */
+function mappingOf(wsList: WorkSource[], suwayomiMangaId: string | null): WorkSource | undefined {
+	return suwayomiMangaId === null
+		? wsList.find((w) => w.sourceType === 'mangadex')
+		: wsList.find((w) => w.sourceType !== 'mangadex' && w.sourceKey === suwayomiMangaId);
+}
+
 /**
- * A source's series URL out of the work's mappings: the Suwayomi mapping whose manga id
- * matches, or — for the spine (`null`) — the MangaDex mapping. Validated through
+ * A source's series URL out of the work's mappings ({@link mappingOf}). Validated through
  * {@link externalChapterHref} (http/s only), because it is upstream text bound for an href.
  */
 function mappingSourceUrl(wsList: WorkSource[], suwayomiMangaId: string | null): string | null {
-	const ws =
-		suwayomiMangaId === null
-			? wsList.find((w) => w.sourceType === 'mangadex')
-			: wsList.find((w) => w.sourceType !== 'mangadex' && w.sourceKey === suwayomiMangaId);
-	return externalChapterHref(ws?.sourceUrl);
+	return externalChapterHref(mappingOf(wsList, suwayomiMangaId)?.sourceUrl);
 }
 
 /**
@@ -1575,6 +1594,8 @@ export interface LibraryRowView {
 	type: ComicType;
 	genre: string;
 	rating: string;
+	/** MangaDex's rating; null when it has none or the server does not show them. */
+	mdRating: number | null;
 	shelf: Shelf;
 	/**
 	 * Whether the SERIES has finished publishing (completed/cancelled) — not whether
@@ -1642,6 +1663,7 @@ export function getLibrary() {
 			type: toViewType(s.type),
 			genre: s.genres[0] ?? '',
 			rating: s.rating.average.toFixed(1),
+			mdRating: s.mangadexRating ?? null,
 			// An explicit shelf the viewer filed wins; otherwise derive from progress —
 			// and only an ENDED series can derive to `completed`, so catching up on an
 			// ongoing one leaves the card on "Reading". See {@link deriveShelf}.
@@ -1744,6 +1766,8 @@ export interface SeriesChapterView {
 	external?: boolean;
 	/** Scanlation group of the default copy (`id`/`src`); null when unknown. */
 	group?: string | null;
+	/** Source id of the default copy, for its AI badge (`sourceAiTags`); null when unknown. */
+	sourceId?: string | null;
 	/** Volume label ("3"), null when unknown; undefined on paths with no aggregation. */
 	volume?: string | null;
 }
@@ -1764,6 +1788,8 @@ export interface ChapterSourceLink {
 	 * (not backfilled yet, or a source that does not report one).
 	 */
 	group?: string | null;
+	/** Source id of THIS copy, for its AI badge; null when unknown. */
+	sourceId?: string | null;
 	/** Release date of THIS copy, formatted like {@link SeriesChapterView.date}; '' when unknown. */
 	date?: string;
 }
@@ -1779,6 +1805,9 @@ export interface ReaderChapterVersion {
 	iconUrl: string | null;
 	/** Scanlation group label; null when unknown. */
 	group: string | null;
+	/** Source id of this copy, for its AI badge; null when unknown. Optional like
+	 *  {@link sourceUrl}. */
+	sourceId?: string | null;
 	/** This is the copy currently open. */
 	current: boolean;
 	/** This copy on its original site (validated http/s), or null when unknown — see
@@ -1798,6 +1827,8 @@ export interface SeriesDetailView {
 	flag: string;
 	rating: string;
 	votes: string;
+	/** MangaDex's rating; null when it has none or the server does not show them. */
+	mdRating: number | null;
 	totalCh: number;
 	/** All-time view count (chapter opens) — the popularity stat shown on the page.
 	 *  0 until reads accrue or when the backend doesn't track views. */
@@ -1863,6 +1894,7 @@ export interface RelatedView {
 	genre: string;
 	ch: number;
 	rating: string;
+	mdRating: number | null;
 	cover?: string;
 	id?: string;
 }
@@ -1893,6 +1925,7 @@ function toRelated(p: Series): RelatedView {
 		genre: p.genres[0] ?? '',
 		ch: p.chapterCount,
 		rating: p.rating.average.toFixed(1),
+		mdRating: p.mangadexRating ?? null,
 		cover: p.coverUrl,
 		id: p.id,
 	};
@@ -1979,6 +2012,7 @@ function mapSeriesView(
 			flag: FLAG[type],
 			rating: s.rating.average.toFixed(1),
 			votes: String(s.rating.count),
+			mdRating: s.mangadexRating ?? null,
 			totalCh: s.chapterCount || chs.length,
 			viewsTotal: s.views?.total ?? 0,
 			// Same clock as the cards (chapter release, not our poll) so the header and
@@ -2029,6 +2063,8 @@ function mapSeriesView(
 			external: !!chapterExternalUrl(c),
 			// One row per chapter ROW on this path, so the row's own group is the copy's.
 			group: normalizeGroup(c.scanlator),
+			// One source on this path, the series' own. A chapter names none.
+			sourceId: s.sourceId,
 		})),
 		related: relatedFor(s, pool),
 		translators: tmeta.translators,
@@ -2118,6 +2154,8 @@ function buildAggregatedChapters(
 	resolved: ResolvedWork,
 ): SeriesChapterView[] {
 	const selectedSuw = resolved.selected.suwayomiMangaId ?? null;
+	const selectedSourceId =
+		resolved.candidates.find((cand) => cand.suwayomiMangaId === selectedSuw)?.sourceId ?? null;
 	// The selected translator's OWN chapters are guaranteed readable (they came from
 	// `chapters(selectedSuw)` / the mirror). Index them by number so an aggregated
 	// chapter the translator also carries is read from IT (its real id + date +
@@ -2145,6 +2183,7 @@ function buildAggregatedChapters(
 		let id: string | undefined;
 		let src: string | null;
 		let group: string | null = null;
+		let sourceId: string | null = null;
 		let external = false;
 		// Cross-source read state FIRST, so it survives a translator switch: the selected
 		// source's own row only knows what was read from THAT source, and the ids differ
@@ -2170,6 +2209,7 @@ function buildAggregatedChapters(
 			read = read || own.read;
 			date = chapterDateLabel(c.firstReleasedAt ?? own.uploadedAt);
 			group = normalizeGroup(own.scanlator);
+			sourceId = selectedSourceId;
 			external = !!chapterExternalUrl(own);
 		} else {
 			// A chapter the selected translator doesn't carry — read from whichever source
@@ -2185,6 +2225,7 @@ function buildAggregatedChapters(
 			src = chosen?.suwayomiMangaId ?? null;
 			date = chapterDateLabel(c.firstReleasedAt);
 			group = normalizeGroup(chosen?.scanlator);
+			sourceId = chosen?.sourceId ?? null;
 			// Per-copy now (`copyExternalUrl`), so a chapter this translator does not carry
 			// keeps its off-site badge. Absent on an older API → `false`, i.e. "not known to
 			// be off-site", the pre-field behaviour.
@@ -2204,6 +2245,7 @@ function buildAggregatedChapters(
 			name: cp.name,
 			iconUrl: cp.iconUrl,
 			group: cp.group,
+			sourceId: cp.source.sourceId,
 			date: chapterDateLabel(cp.source.copyReleasedAt ?? cp.chapter?.uploadedAt),
 		}));
 		return {
@@ -2222,6 +2264,7 @@ function buildAggregatedChapters(
 			// the number, else the chosen fallback copy's `copyExternalUrl` — never a guess.
 			external,
 			group,
+			sourceId,
 			volume: c.chapterVolume?.trim() || null,
 		};
 	});
@@ -2730,6 +2773,8 @@ export interface ReaderView {
 	versions?: ReaderChapterVersion[];
 	/** Scanlation group of the open copy; null when unknown. */
 	group?: string | null;
+	/** Source id of the open copy, for its AI badge; null when unknown. */
+	sourceId?: string | null;
 	/** The OPEN copy on its original site — the menu's "Read on <host>" link; null hides
 	 *  it. Validated http/s, see {@link chapterSourceUrl}. */
 	sourceUrl?: string | null;
@@ -2857,9 +2902,10 @@ interface ReaderCopyContext {
 	copyMeta?: Map<string, PoolCopyMeta>;
 	/** Every copy of the OPEN number across sources and groups (the version switcher). */
 	versions?: ReaderChapterVersion[];
-	/** Name/icon of the active source, for versions built from the list alone. */
+	/** Name/icon/id of the active source, for versions built from the list alone. */
 	sourceName?: string;
 	iconUrl?: string | null;
+	sourceId?: string | null;
 	/** The active source's SERIES page on its own site — "Read on source"'s fallback. */
 	seriesSourceUrl?: string | null;
 }
@@ -2908,9 +2954,11 @@ function buildReaderView(
 			source: ctx.sourceName ?? 'Source',
 			iconUrl: ctx.iconUrl ?? null,
 			group: normalizeGroup(c.scanlator),
+			sourceId: ctx.sourceId ?? null,
 			current: c.id === target.id,
 			sourceUrl: chapterSourceUrl(c, readingSrc),
 		}));
+	const open = versions.find((v) => v.current);
 	return {
 		seriesId,
 		seriesTitle: seriesTitle || 'Reader',
@@ -2944,7 +2992,8 @@ function buildReaderView(
 		readingSrc,
 		externalUrl: chapterExternalUrl(target),
 		versions,
-		group: group ?? versions.find((v) => v.current)?.group ?? null,
+		group: group ?? open?.group ?? null,
+		sourceId: open?.sourceId ?? ctx.sourceId ?? null,
 		sourceUrl: chapterSourceUrl(target, readingSrc),
 		seriesSourceUrl: externalChapterHref(ctx.seriesSourceUrl),
 	};
@@ -3146,7 +3195,7 @@ function readerVersions(
 	resolved: ResolvedWork,
 	target: Chapter,
 	src: string | null,
-	activeCand: { name: string; iconUrl: string | null } | undefined,
+	activeCand: { name: string; iconUrl: string | null; sourceId: string | null } | undefined,
 ): ReaderChapterVersion[] | undefined {
 	const entry = agg.find((a) => a.sources.some((s) => s.chapterId === target.id));
 	if (!entry) return undefined;
@@ -3156,6 +3205,7 @@ function readerVersions(
 		source: cp.name,
 		iconUrl: cp.iconUrl,
 		group: cp.group,
+		sourceId: cp.source.sourceId,
 		current: cp.source.chapterId === target.id && cp.src === src,
 		sourceUrl: chapterSourceUrl(
 			{ id: cp.source.chapterId, externalUrl: cp.source.copyExternalUrl },
@@ -3169,6 +3219,7 @@ function readerVersions(
 			source: activeCand?.name ?? 'Source',
 			iconUrl: activeCand?.iconUrl ?? null,
 			group: normalizeGroup(target.scanlator),
+			sourceId: activeCand?.sourceId ?? null,
 			current: true,
 			sourceUrl: chapterSourceUrl(target, src),
 		});
@@ -3520,6 +3571,7 @@ export function getReaderChapter(
 					versions: readerVersions(agg, resolved, target, readingSrc, activeCand),
 					sourceName: activeCand?.name,
 					iconUrl: activeCand?.iconUrl ?? null,
+					sourceId: activeCand?.sourceId ?? null,
 					seriesSourceUrl: activeCand?.sourceUrl ?? null,
 				},
 			);
@@ -3571,7 +3623,9 @@ export function getReaderChapter(
 			series?.title ?? 'Reader',
 			NO_TRANSLATORS,
 			null,
-			{ longStrip: isLongStripSeries(series) },
+			// The source id comes with the series row, so a row that missed its grace
+			// period opens the chapter without the source's AI badge.
+			{ longStrip: isLongStripSeries(series), sourceId: series?.sourceId ?? null },
 		);
 	}, emptyReader(seriesId));
 }

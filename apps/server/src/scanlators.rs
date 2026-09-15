@@ -1,7 +1,15 @@
-//! Scanlators (translation groups) and the admin's AI tags on them (migration 0116).
+//! Scanlators and the admin's AI tags on them (migrations 0116 and 0117).
 //!
-//! A scanlator is not a row anywhere: it is the free-text `chapter.scanlator` credit of one
-//! chapter copy. This module owns the three things built on that text:
+//! A scanlator is one of two things, and neither is a row anywhere:
+//!
+//! * a GROUP: the free-text `chapter.scanlator` credit of one chapter copy. MangaDex
+//!   credits every chapter; most other sources credit none.
+//! * a SITE: a source that translates its own series. Its chapters carry no credit, so
+//!   the source itself is the scanlator ([`list_source_tags`] / [`set_source_tag`]).
+//!
+//! A chapter copy takes the stronger of the tag on its credit and the tag on its source.
+//!
+//! For groups this module owns the three things built on the credit text:
 //!
 //! 1. [`name_key`] / [`effective_level`] — the identity of a credit and the tag that
 //!    applies to it. A joint credit ("A & B") with no tag of its own takes the strongest
@@ -146,6 +154,62 @@ pub async fn set_tag(pool: &SqlitePool, name: &str, level: Option<AiLevel>) -> R
         None => {
             sqlx::query("DELETE FROM scanlator_tag WHERE name_key = ?")
                 .bind(&key)
+                .execute(pool)
+                .await?
+        }
+    };
+    Ok(res.rows_affected() > 0)
+}
+
+/// Longest source id a tag can name. Engine source ids are 64-bit numbers as text.
+pub const MAX_SOURCE_ID_LEN: usize = 32;
+
+/// Whether `id` can carry a source tag: a Suwayomi source id (`source_series.source_id`).
+/// Not [`MANGADEX_SOURCE`]: MangaDex credits its groups, so its groups are what is tagged.
+pub fn is_taggable_source(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_SOURCE_ID_LEN
+        && id != MANGADEX_SOURCE
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// Every tagged source: source id to level. Small and read on every request, like
+/// [`list_tags`].
+pub async fn list_source_tags(pool: &SqlitePool) -> Result<HashMap<String, AiLevel>> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT source_id, ai_level FROM source_ai_tag")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, word)| AiLevel::from_word(&word).map(|level| (id, level)))
+        .collect())
+}
+
+/// Set, change or (with `None`) remove the tag on a source. `false` when nothing changed.
+/// The caller validates `source_id` ([`is_taggable_source`]).
+pub async fn set_source_tag(
+    pool: &SqlitePool,
+    source_id: &str,
+    level: Option<AiLevel>,
+) -> Result<bool> {
+    let res = match level {
+        Some(level) => {
+            sqlx::query(
+                "INSERT INTO source_ai_tag (source_id, ai_level, updated_at) VALUES (?, ?, ?) \
+                 ON CONFLICT(source_id) DO UPDATE SET ai_level = excluded.ai_level, \
+                     updated_at = excluded.updated_at \
+                 WHERE source_ai_tag.ai_level != excluded.ai_level",
+            )
+            .bind(source_id)
+            .bind(level.word())
+            .bind(Utc::now().to_rfc3339())
+            .execute(pool)
+            .await?
+        }
+        None => {
+            sqlx::query("DELETE FROM source_ai_tag WHERE source_id = ?")
+                .bind(source_id)
                 .execute(pool)
                 .await?
         }
@@ -448,6 +512,42 @@ mod tests {
         assert!(set_tag(&pool, "robo scans", None).await.unwrap());
         assert!(!set_tag(&pool, "robo scans", None).await.unwrap());
         assert!(list_tags(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_source_tag_is_set_changed_and_removed_by_source_id() {
+        let pool = pool().await;
+        assert!(set_source_tag(&pool, "77", Some(AiLevel::Ai))
+            .await
+            .unwrap());
+        // Same level again: nothing changed.
+        assert!(!set_source_tag(&pool, "77", Some(AiLevel::Ai))
+            .await
+            .unwrap());
+        assert!(set_source_tag(&pool, "77", Some(AiLevel::Partial))
+            .await
+            .unwrap());
+        assert!(set_source_tag(&pool, "88", Some(AiLevel::Ai))
+            .await
+            .unwrap());
+        let tags = list_source_tags(&pool).await.unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags["77"], AiLevel::Partial);
+        assert_eq!(tags["88"], AiLevel::Ai);
+        assert!(set_source_tag(&pool, "77", None).await.unwrap());
+        assert!(!set_source_tag(&pool, "77", None).await.unwrap());
+        assert_eq!(list_source_tags(&pool).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn only_an_engine_source_can_carry_a_source_tag() {
+        assert!(is_taggable_source("6247824327199706550"));
+        assert!(is_taggable_source("-42"));
+        // MangaDex credits its groups; they are what is tagged.
+        assert!(!is_taggable_source(MANGADEX_SOURCE));
+        assert!(!is_taggable_source(""));
+        assert!(!is_taggable_source("a b"));
+        assert!(!is_taggable_source(&"9".repeat(MAX_SOURCE_ID_LEN + 1)));
     }
 
     /// Two works: `w1` on MangaDex and on Suwayomi source 77, `w2` on MangaDex only.

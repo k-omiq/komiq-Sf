@@ -152,7 +152,7 @@ pub(crate) fn pem(label: &str, der: &[u8]) -> String {
     out
 }
 
-// ---- reading a certificate's dates -------------------------------------------------
+// ---- reading a certificate's dates and names ---------------------------------------
 
 /// (tag, content, rest) of the DER element at the start of `b`.
 fn der_read(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
@@ -192,14 +192,16 @@ fn der_time(tag: u8, content: &[u8]) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|t| t.and_utc())
 }
 
-/// When the first certificate in `cert_pem` starts and stops being valid.
-pub fn validity(
-    cert_pem: &str,
-) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
-    let cert = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+/// The first certificate in `cert_pem`.
+fn first_certificate(cert_pem: &str) -> Option<CertificateDer<'static>> {
+    CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .next()?
-        .ok()?;
-    let (_, certificate, _) = der_read(cert.as_ref())?;
+        .ok()
+}
+
+/// (the two dates, the fields after them) of a DER certificate.
+fn der_dates(cert: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (_, certificate, _) = der_read(cert)?;
     let (_, mut tbs, _) = der_read(certificate)?;
     // version (optional, tagged [0]), then serial, signature algorithm and issuer.
     if tbs.first() == Some(&0xA0) {
@@ -208,11 +210,72 @@ pub fn validity(
     for _ in 0..3 {
         tbs = der_read(tbs)?.2;
     }
-    let (_, dates, _) = der_read(tbs)?;
+    let (_, dates, rest) = der_read(tbs)?;
+    Some((dates, rest))
+}
+
+/// When the first certificate in `cert_pem` starts and stops being valid.
+pub fn validity(
+    cert_pem: &str,
+) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    let cert = first_certificate(cert_pem)?;
+    let (dates, _) = der_dates(cert.as_ref())?;
     let (tag, from, rest) = der_read(dates)?;
     let from = der_time(tag, from)?;
     let (tag, until, _) = der_read(rest)?;
     Some((from, der_time(tag, until)?))
+}
+
+/// What the first certificate in `cert_pem` is for: the DNS names (lower case) and IP
+/// addresses of its subject alternative name. Empty when it cannot be read.
+pub fn names(cert_pem: &str) -> Vec<String> {
+    let read = || {
+        let cert = first_certificate(cert_pem)?;
+        let (_, mut rest) = der_dates(cert.as_ref())?;
+        // Subject, public key and the optional unique ids, up to the extensions ([3]).
+        let mut extensions = loop {
+            let (tag, content, after) = der_read(rest)?;
+            if tag == 0xA3 {
+                break der_read(content)?.1;
+            }
+            rest = after;
+        };
+        while let Some((_, extension, after)) = der_read(extensions) {
+            extensions = after;
+            let (_, oid, value) = der_read(extension)?;
+            if oid != OID_SUBJECT_ALT_NAME {
+                continue;
+            }
+            // An optional `critical` flag sits before the value.
+            let (tag, mut value, after) = der_read(value)?;
+            if tag == 0x01 {
+                value = der_read(after)?.1;
+            }
+            let (_, mut general, _) = der_read(value)?;
+            let mut out = Vec::new();
+            while let Some((tag, name, after)) = der_read(general) {
+                general = after;
+                match tag {
+                    0x82 => out.push(String::from_utf8_lossy(name).to_ascii_lowercase()),
+                    0x87 => {
+                        let v4 = <[u8; 4]>::try_from(name).map(IpAddr::from);
+                        let v6 = <[u8; 16]>::try_from(name).map(IpAddr::from);
+                        out.extend(v4.or(v6).ok().map(|ip| ip.to_string()));
+                    }
+                    _ => {}
+                }
+            }
+            return Some(out);
+        }
+        None
+    };
+    read().unwrap_or_default()
+}
+
+/// The first certificate in `cert_pem` is for `host`: an IP address, or a DNS name in
+/// lower case.
+pub fn is_for(cert_pem: &str, host: &str) -> bool {
+    names(cert_pem).iter().any(|name| name == host)
 }
 
 // ---- serving ---------------------------------------------------------------------

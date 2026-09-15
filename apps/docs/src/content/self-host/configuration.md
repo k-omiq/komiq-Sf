@@ -88,6 +88,7 @@ These variables override settings normally managed in the admin console.
 | `KOMIKA_INSTANCE_NAME`         | `komiq`             | Server name shown on page headers and reader screens.                |
 | `KOMIKA_REGISTRATION_OPEN`     | `false` (self-host) | Controls user registration. Pins the setting on or off.              |
 | `KOMIKA_MANGADEX`              | `false` (self-host) | Controls MangaDex integration. Pins the setting on or off.           |
+| `KOMIKA_MANGADEX_RATINGS`      | `true`              | Shows MangaDex ratings to readers. Pins the setting on or off.       |
 | `CATALOGUE_SYNC`               | unset               | Set to `on` to force MangaDex usage on and run catalogue crawl.      |
 | `KOMIKA_APPS_FETCH_THEMSELVES` | `false`             | Tells reader apps that have their own engine to fetch chapter pages. |
 
@@ -102,7 +103,8 @@ These variables configure Cloudflare and reverse proxies, services that forward 
 | ----------------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `TRUSTED_PROXY_CIDRS`   | empty               | Comma-separated CIDR blocks of trusted reverse proxies.                                                                                                                                             |
 | `CLOUDFLARED_BIN`       | unset               | Path to the `cloudflared` program for tunnels. Unset, the server searches `PATH`, then its tool folder, and tunnel setup downloads the program when it finds none. Set, the server never downloads. |
-| `KOMIKA_HTTPS_PORT`     | `443`               | Port used to bind HTTPS: Public IP mode, and "Public without a domain".                                                                                                                             |
+| `KOMIKA_HTTPS_PORT`     | `443`               | Port used to bind HTTPS: Public IP mode, and "Public without a domain". The address komiq shows names this port, so a change shows after a restart.                                                 |
+| `KOMIKA_PUBLISHED_PORT` | value of `PORT`     | The plain HTTP port as other machines reach it, when a container's host publishes the server's port under another number. The self-host compose file sets it from `KOMIQ_PORT`.                     |
 | `KOMIKA_ACME_PORT`      | `80`                | Port the server binds for the Let's Encrypt check. Let's Encrypt always connects to port 80 of the public address.                                                                                  |
 | `KOMIKA_ACME_DIRECTORY` | Let's Encrypt       | ACME directory address of another certificate authority.                                                                                                                                            |
 | `KOMIKA_ACME_CA_FILE`   | unset               | PEM root certificate to trust when talking to that directory.                                                                                                                                       |

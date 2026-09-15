@@ -60,7 +60,7 @@ Read the overview and click "Get started".
 
 - What it asks: "Only my devices", "Public on the internet" or "Public without a domain". The desktop app running its own server offers the first two, then **Home network**.
 - Why:
-  - "Only my devices" is for reading at home.
+  - "Only my devices" is for reading at home. The server then refuses plain HTTP from the internet. The step warns you if this console is open at a public address.
   - "Public on the internet" uses a domain of yours with Cloudflare in front. It adds **Internet**.
   - "Public without a domain" is for a server with a public address, such as a cloud VPS. It adds **Address**.
 

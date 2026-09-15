@@ -44,6 +44,9 @@ export async function installAdminSetupFixtures(page, initial = {}) {
 		// then is not `internet`, and `cloudflare` is still there.
 		cloudflare: null,
 		job: null,
+		// The server's own HTTPS, as `certificateStatus` reports it (`certificateExpires`,
+		// `certificateError`, `httpsError`, `plainHttpClosed`). Null: nothing to report.
+		certificate: null,
 		// The server refuses the `internet` mode with this message (e.g. its own HTTPS
 		// holds the port a Cloudflare public IP setup would use).
 		internetRefused: null,
@@ -200,8 +203,10 @@ export async function installAdminSetupFixtures(page, initial = {}) {
 					state.accessEncrypted = op === 'SetAccessModeEncrypted';
 					if (v.mode === 'direct') {
 						// Direct mode: the server stores the address as an origin.
+						// A bare IPv6 address goes in brackets.
+						const bare = !v.domain.startsWith('[') && v.domain.split(':').length > 2;
 						state.accessAddress = state.accessEncrypted
-							? `https://${v.domain.replace(/:\d+$/, '')}`
+							? `https://${bare ? `[${v.domain}]` : v.domain.replace(/:\d+$/, '')}`
 							: `http://${v.domain}`;
 					} else if (v.mode === 'internet' && v.domain) {
 						state.accessDomain = tidyDomain(v.domain);
@@ -215,7 +220,10 @@ export async function installAdminSetupFixtures(page, initial = {}) {
 							accessStatus: {
 								certificateExpires: null,
 								certificateError: null,
+								httpsError: null,
 								plainHttpClosed: false,
+								// What a test says about the server's own HTTPS.
+								...state.certificate,
 							},
 						}),
 					);

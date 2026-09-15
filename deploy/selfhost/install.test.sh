@@ -139,6 +139,24 @@ for mode in local tunnel public-ip direct; do
     pass "fresh $mode (--yes)"
 done
 
+# The server listens on 8080 inside its container whatever KOMIQ_PORT says. The compose
+# file hands it the published port, so the addresses it suggests name the right one.
+new_case published-port
+contains "$STUB_CASE/docker-compose.yml" "- '\${KOMIQ_BIND:-0.0.0.0}:\${KOMIQ_PORT:-8080}:8080'"
+contains "$STUB_CASE/docker-compose.yml" 'KOMIKA_PUBLISHED_PORT: ${KOMIQ_PORT:-8080}'
+run_ok --yes --port 9000 --access direct --encrypt no --firewall no --no-setup
+contains "$STUB_CASE/.env" 'KOMIQ_PORT=9000'
+contains "$STUB_CASE/output" 'Internet: use http://<public-IP>:9000/ and http://<public-IP>:9000/admin.'
+pass 'the server is told the published HTTP port'
+
+# "Only my devices": the server itself refuses plain HTTP from the internet. The line
+# does not say the server is in that mode: this run may not have set it (--no-setup, or
+# a server that is set up already keeps its own choice).
+new_case local-closed
+run_ok --yes --access local --firewall no --no-setup
+contains "$STUB_CASE/output" 'Internet: closed when the server is set to "Only my devices". It then refuses plain HTTP from the internet.'
+pass 'local says the internet is closed'
+
 # Without a domain and without HTTPS, readers use the HTTP port itself: it answers
 # every address, and ports 443 and 80 stay closed.
 new_case fresh-direct-plain

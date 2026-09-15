@@ -60,11 +60,14 @@ import type {
 	InstanceInfo,
 	ExtensionRepo,
 	MangadexSetting,
+	BlockRule,
 	BrowseSource,
 	ScanlatorAi,
 	ScanlatorPage,
 	ScanlatorQuery,
+	ScanlatorSite,
 	ScanlatorTag,
+	SourceAiTag,
 	SourceRateLimit,
 	MyComment,
 	PostCommentInput,
@@ -113,6 +116,13 @@ export interface BackendConfig {
  * variable required would force every caller to state a page it does not care about.
  */
 const pageArg = (page?: number | null): number => page ?? 1;
+
+/** A {@link BlockRule} as the `BlockRuleInput` the API takes: its two lists and nothing
+ *  else, so a rule object that carries extra view state is still a valid variable. */
+const blockRuleInput = (rule: BlockRule): BlockRule => ({
+	tags: rule.tags,
+	ratings: rule.ratings,
+});
 
 /**
  * A URL string in its WHATWG-normalized form — what `new URL(s).href` produces.
@@ -476,7 +486,7 @@ export class GraphQLBackend implements Backend {
 	}
 	/**
 	 * Root fields a server that predates them rejected (`browseSources`,
-	 * `scanlatorTags`). Same deploy-order handling as {@link tagsUnsupported}: one
+	 * `scanlatorTags`, `sourceAiTags`). Same deploy-order handling as {@link tagsUnsupported}: one
 	 * rejected request per process, then `[]` without asking.
 	 */
 	private static unsupportedLists = new Set<string>();
@@ -503,6 +513,9 @@ export class GraphQLBackend implements Backend {
 	}
 	scanlatorTags(): Promise<ScanlatorTag[]> {
 		return this.optionalList<ScanlatorTag>('scanlatorTags', ops.SCANLATOR_TAGS);
+	}
+	sourceAiTags(): Promise<SourceAiTag[]> {
+		return this.optionalList<SourceAiTag>('sourceAiTags', ops.SOURCE_AI_TAGS);
 	}
 	browseFilterSupported(): boolean {
 		return !GraphQLBackend.unsupportedArgs.has('filter');
@@ -820,9 +833,38 @@ export class GraphQLBackend implements Backend {
 		return d.setScanlatorAi;
 	}
 
+	async scanlatorSites(): Promise<ScanlatorSite[]> {
+		const d = await this.gql<{ scanlatorSites: ScanlatorSite[] }>(ops.SCANLATOR_SITES);
+		return d.scanlatorSites;
+	}
+
+	async setSourceAi(sourceId: string, ai: ScanlatorAi | null): Promise<boolean> {
+		const d = await this.gql<{ setSourceAi: boolean }>(ops.SET_SOURCE_AI, { sourceId, ai });
+		return d.setSourceAi;
+	}
+
+	async siteBlockRules(): Promise<BlockRule[]> {
+		const d = await this.gql<{ siteBlockRules: BlockRule[] }>(ops.SITE_BLOCK_RULES);
+		return d.siteBlockRules;
+	}
+
+	async setSiteBlockRules(rules: BlockRule[]): Promise<BlockRule[]> {
+		const d = await this.gql<{ setSiteBlockRules: BlockRule[] }>(ops.SET_SITE_BLOCK_RULES, {
+			rules: rules.map(blockRuleInput),
+		});
+		return d.setSiteBlockRules;
+	}
+
 	async setRegistrationOpen(open: boolean): Promise<boolean> {
 		const d = await this.gql<{ setRegistrationOpen: boolean }>(ops.SET_REGISTRATION_OPEN, { open });
 		return d.setRegistrationOpen;
+	}
+
+	async setShowMangadexRatings(shown: boolean): Promise<boolean> {
+		const d = await this.gql<{ setShowMangadexRatings: boolean }>(ops.SET_SHOW_MANGADEX_RATINGS, {
+			shown,
+		});
+		return d.setShowMangadexRatings;
 	}
 
 	// --- admin access + Cloudflare setup ---
@@ -1220,6 +1262,18 @@ export class GraphQLBackend implements Backend {
 	async setShowNsfw(value: boolean): Promise<boolean> {
 		const d = await this.gql<{ setShowNsfw: boolean }>(ops.SET_SHOW_NSFW, { value });
 		return d.setShowNsfw;
+	}
+
+	async myBlockRules(): Promise<BlockRule[]> {
+		const d = await this.gql<{ myBlockRules: BlockRule[] }>(ops.MY_BLOCK_RULES);
+		return d.myBlockRules;
+	}
+
+	async setMyBlockRules(rules: BlockRule[]): Promise<BlockRule[]> {
+		const d = await this.gql<{ setMyBlockRules: BlockRule[] }>(ops.SET_MY_BLOCK_RULES, {
+			rules: rules.map(blockRuleInput),
+		});
+		return d.setMyBlockRules;
 	}
 
 	// --- profile ---

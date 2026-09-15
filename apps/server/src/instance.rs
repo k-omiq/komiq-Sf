@@ -60,6 +60,16 @@ pub const MANGADEX_ENABLED: Setting = Setting {
     default: "true",
 };
 
+/// Whether the API hands out MangaDex's community rating next to our own readers'
+/// rating (`Series.mangadexRating`, `UpdateFeedRow.mangadexRating`). Off: every
+/// surface carries our own rating only. Separate from [`MANGADEX_ENABLED`]: that one
+/// decides whether the server talks to MangaDex, this one what the reader is shown.
+pub const SHOW_MANGADEX_RATINGS: Setting = Setting {
+    key: "show_mangadex_ratings",
+    env: "KOMIKA_MANGADEX_RATINGS",
+    default: "true",
+};
+
 /// The resolved usage switch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MangadexUsage {
@@ -204,8 +214,9 @@ pub const TRUSTED_PROXY_CIDRS: Setting = Setting {
 
 /// The wizard's access choice: `local` (only my devices), `internet` (a domain with
 /// Cloudflare in front) or `direct` (public at the server's own address, nothing in
-/// front). Display only: it decides what Settings › Access shows, not what the server
-/// listens on. Empty until someone chooses.
+/// front). It decides what Settings › Access shows, not what the server listens on.
+/// One choice acts: with `local`, the plain HTTP port refuses clients on the internet
+/// (`cloudflare::plain_http_guard`). Empty until someone chooses.
 pub const ACCESS_MODE: Setting = Setting {
     key: "access_mode",
     env: "",

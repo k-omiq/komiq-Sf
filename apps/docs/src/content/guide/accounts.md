@@ -108,6 +108,36 @@ When the switch is on:
 
 The setting is saved to your account on the connected server. It applies to all devices where you sign in to that account on that server.
 
+### MangaDex ratings
+
+A series can show two ratings. The yellow star is the rating from readers on the connected server. The orange star is the rating from MangaDex. Read [Ratings, comments, reports](/guide/community#two-ratings) for what each one means.
+
+To hide the MangaDex rating:
+
+1. Open **Settings**.
+2. Locate the **Content** section.
+3. Turn off the **Show MangaDex ratings** switch.
+
+You then see the yellow star only. This choice is kept on your device, so it works when you are signed out, and you set it again on each device.
+
+An administrator can turn MangaDex ratings off for the whole server. The switch is then off and you cannot change it.
+
+### Blocked content
+
+You can hide series that you do not want to see. A rule names tags, content ratings, or both. You must be signed in.
+
+1. Open **Settings**.
+2. Locate **Blocked content** in the **Content** section.
+3. Select the tags for the rule. Type in **Search tags** to find a tag. A series must have all the tags you select.
+4. Select the ratings under **Content rating**. A series must have one of them. Leave them empty for any rating.
+5. Select **Add rule**.
+
+The list shows each rule in words. `Gore + Harem` hides series with both tags. `Any series rated Erotica` hides series with that rating. `Gore, when rated Erotica or Pornographic` hides series with the tag and one of those ratings. A series is hidden when it matches any rule. To remove a rule, select the remove button next to it.
+
+Your rules hide series from Browse, search, the home screen and the update lists. Your library does not change, and a series that you open by its link still opens. The rules are saved to your account on the connected server, and you can keep up to 50.
+
+An administrator can also block content for the whole server. Those series are hidden for everyone and do not open.
+
 ### On-device chapter fetching
 
 In apps that include the embedded content engine, an additional setting titled **Fetch chapters on this device** appears under **Reading**. The desktop app includes the engine. An Android app includes it when it was built with it.

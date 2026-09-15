@@ -6,11 +6,11 @@ use super::*;
 use std::sync::{Arc, Mutex as StdMutex};
 
 /// What the mock engine was asked to remove, in order.
-type Removed = Arc<StdMutex<Vec<String>>>;
+pub(super) type Removed = Arc<StdMutex<Vec<String>>>;
 
 /// A mock Suwayomi engine holding two extension stores, answering `extensionStores`
 /// and `removeExtensionStore` the way the engine does (GQL-SCHEMA-FINDINGS §B1).
-async fn mock_engine() -> (String, Removed) {
+pub(super) async fn mock_engine() -> (String, Removed) {
     let stores = Arc::new(StdMutex::new(vec![
         serde_json::json!({"indexUrl": "https://github.com/keiyoushi/extensions/raw/repo/index.pb", "name": "Keiyoushi", "badgeLabel": "KEI"}),
         serde_json::json!({"indexUrl": "https://example.org/ext/index.min.json", "name": "Example", "badgeLabel": "EX"}),
@@ -53,7 +53,7 @@ async fn mock_engine() -> (String, Removed) {
 /// Schema + state with an admin (`admintok`) and a reader (`bobtok`). The MangaDex
 /// client starts OFF (as on a fresh install) and points at a dead port, so even a
 /// switched-on call can never leave the machine.
-async fn fixture(engine: &str) -> (ApiSchema, Arc<AppState>) {
+pub(super) async fn fixture(engine: &str) -> (ApiSchema, Arc<AppState>) {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -110,7 +110,11 @@ async fn fixture(engine: &str) -> (ApiSchema, Arc<AppState>) {
     (build_schema(state.clone(), false), state)
 }
 
-async fn run(schema: &ApiSchema, query: &str, token: Option<&str>) -> async_graphql::Response {
+pub(super) async fn run(
+    schema: &ApiSchema,
+    query: &str,
+    token: Option<&str>,
+) -> async_graphql::Response {
     schema
         .execute(
             async_graphql::Request::new(query)
@@ -122,12 +126,12 @@ async fn run(schema: &ApiSchema, query: &str, token: Option<&str>) -> async_grap
         .await
 }
 
-fn ok(resp: async_graphql::Response) -> serde_json::Value {
+pub(super) fn ok(resp: async_graphql::Response) -> serde_json::Value {
     assert!(resp.errors.is_empty(), "unexpected: {:?}", resp.errors);
     resp.data.into_json().unwrap()
 }
 
-fn err(resp: &async_graphql::Response) -> String {
+pub(super) fn err(resp: &async_graphql::Response) -> String {
     resp.errors
         .first()
         .map(|e| e.message.clone())

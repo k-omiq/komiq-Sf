@@ -15,6 +15,8 @@ try {
 		document.documentElement.style.setProperty('--k-seed', look.seed);
 	}
 	if (look.black === true) document.documentElement.dataset.black = '';
+	// MangaDex ratings turned off on this device (see $lib/components/Ratings.svelte).
+	if (look.md === false) document.documentElement.dataset.mdRatings = 'off';
 } catch (e) {}
 
 // Native app (Tauri): mark <html> before first paint so app.css can drop the

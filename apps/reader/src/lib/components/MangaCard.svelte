@@ -1,6 +1,6 @@
 <script lang="ts">
-	import Icon from './Icon.svelte';
 	import FlagBadge from './FlagBadge.svelte';
+	import Ratings from './Ratings.svelte';
 	import Cover from './Cover.svelte';
 	import TranslatorChips from './TranslatorChips.svelte';
 	import { slug, type ComicType } from '$lib/data/types';
@@ -16,6 +16,7 @@
 		sub = '',
 		subTitle = '',
 		rating = '',
+		mdRating = null,
 		cover = '',
 		id = '',
 		flagEmoji = '',
@@ -34,7 +35,10 @@
 		 * detected it — without adding a second visible line to the card.
 		 */
 		subTitle?: string;
+		/** Our own readers' rating. '' or a zero means nobody here rated it. */
 		rating?: string;
+		/** MangaDex's rating, shown under ours. See {@link Ratings}. */
+		mdRating?: number | null;
 		cover?: string;
 		id?: string;
 		flagEmoji?: string;
@@ -63,9 +67,7 @@
 		{:else if flagEmoji}
 			<span class="flag-emoji">{flagEmoji}</span>
 		{/if}
-		<span class="rating" aria-label={rating ? `Rating ${rating} out of 10` : 'Not rated yet'}
-			><Icon name="star" size={10} fill="var(--k-star)" />{rating || 'Unrated'}</span
-		>
+		<span class="rating"><Ratings own={rating} md={mdRating} chip stack unrated /></span>
 		{#if status}
 			<span class="status" style="color:{status.color}">
 				<span class="dot" style="background:{status.color}"></span>{status.label}
@@ -114,16 +116,7 @@
 		position: absolute;
 		top: 9px;
 		right: 9px;
-		display: inline-flex;
-		align-items: center;
-		gap: 3px;
-		font-weight: 700;
-		font-size: 11.5px;
-		color: #f7f6f3;
-		font-variant-numeric: tabular-nums;
-		background: rgba(12, 12, 13, 0.88);
-		border-radius: 5px;
-		padding: 3px 7px;
+		display: flex;
 	}
 	.flag-svg {
 		position: absolute;

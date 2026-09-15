@@ -2,9 +2,21 @@
 	import { onDestroy } from 'svelte';
 	import { page as pageState } from '$app/state';
 	import { queuePage, queueNavigate } from '$lib/url-state';
-	import type { BrowseSource, Scanlator, ScanlatorAi, ScanlatorAiFilter } from '@komika/api';
+	import type {
+		BrowseSource,
+		Scanlator,
+		ScanlatorAi,
+		ScanlatorAiFilter,
+		ScanlatorSite,
+	} from '@komika/api';
 	import { auth } from '$lib/auth.svelte';
-	import { loadBrowseSources, loadScanlators, setScanlatorAi } from '$lib/data';
+	import {
+		loadBrowseSources,
+		loadScanlatorSites,
+		loadScanlators,
+		setScanlatorAi,
+		setSourceAi,
+	} from '$lib/data';
 	import { toast } from '$lib/toast.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import LoadState from '$lib/components/LoadState.svelte';
@@ -30,7 +42,24 @@
 		return v === 'TAGGED' || v === 'AI' || v === 'PARTIAL' || v === 'UNTAGGED' ? v : null;
 	});
 	const source = $derived(pageState.url.searchParams.get('source') || null);
-	const filtered = $derived(search !== '' || tag !== null || source !== null);
+
+	/**
+	 * Two lists share this page. A group is the name a chapter credits. A site is a source
+	 * that translates its own series: its chapters credit no group, so the source is tagged.
+	 */
+	type View = 'groups' | 'sites';
+	const VIEWS: { label: string; value: View }[] = [
+		{ label: 'Groups', value: 'groups' },
+		{ label: 'Sites', value: 'sites' },
+	];
+	const view = $derived<View>(
+		pageState.url.searchParams.get('view') === 'sites' ? 'sites' : 'groups',
+	);
+	// A site is not filtered by source: it is one. A `source` left in the URL is kept for
+	// the way back to Groups and ignored here.
+	const filtered = $derived(
+		search !== '' || tag !== null || (view === 'groups' && source !== null),
+	);
 
 	/** `Segmented` needs string values, so "every tag" is `all` here and `null` everywhere else. */
 	type TagFilter = ScanlatorAiFilter | 'all';
@@ -95,9 +124,12 @@
 		}
 	});
 
+	// The site list is read whole and filtered here, so in that view the filters are not
+	// part of the fetch.
 	$effect(() => {
 		if (!auth.user) return;
-		void refresh(search, tag, source, page);
+		if (view === 'sites') void refreshSites();
+		else void refresh(search, tag, source, page);
 	});
 
 	/**
@@ -138,6 +170,52 @@
 		}
 	}
 
+	// ---- Sites view ---------------------------------------------------------------
+	// Its own rows, flags and request token: a fetch for one view never writes the state
+	// of the other, whichever view is on screen when it lands.
+	let sites = $state<ScanlatorSite[]>([]);
+	let sitesLoading = $state(false);
+	let sitesError = $state<string | null>(null);
+	let sitesSeq = 0;
+
+	async function refreshSites(quiet = false): Promise<void> {
+		const seq = ++sitesSeq;
+		if (!quiet) sitesLoading = true;
+		sitesError = null;
+		try {
+			const res = await loadScanlatorSites();
+			if (seq !== sitesSeq) return;
+			sites = res;
+		} catch (err) {
+			if (seq !== sitesSeq) return;
+			sitesError = err instanceof Error ? err.message : 'Failed to load sites.';
+			sites = [];
+		} finally {
+			if (seq === sitesSeq) sitesLoading = false;
+		}
+	}
+
+	/** The loaded sites the Name box and the Tag filter let through. */
+	const shownSites = $derived.by(() => {
+		const q = search.toLowerCase();
+		return sites.filter(
+			(s) =>
+				(q === '' || s.name.toLowerCase().includes(q)) &&
+				(tag === null ||
+					(tag === 'TAGGED' ? s.ai !== null : tag === 'UNTAGGED' ? s.ai === null : s.ai === tag)),
+		);
+	});
+
+	/** A source's language for a reader of the list: `en` is EN, `all` is every language. */
+	function langLabel(lang: string): string {
+		return lang === 'all' ? 'All languages' : lang.toUpperCase();
+	}
+
+	/** Two sites can share a name, so a control names its row with the language too. */
+	function siteName(row: ScanlatorSite): string {
+		return row.lang ? `${row.name} (${langLabel(row.lang)})` : row.name;
+	}
+
 	// The search box is a draft. Typing waits for a pause, then moves the search into the
 	// URL, which is what the list is fetched from.
 	let searchDraft = $state('');
@@ -166,6 +244,11 @@
 	}
 
 	onDestroy(() => clearTimeout(searchTimer));
+
+	function setView(v: View): void {
+		if (v === view) return;
+		void queueNavigate(pageState.url, { view: v === 'sites' ? v : null, page: 1 });
+	}
 
 	function setTagFilter(v: ScanlatorAiFilter | null): void {
 		if (v === tag) return;
@@ -204,6 +287,26 @@
 		}
 	}
 
+	/** The same for sites, by source id. A second list, so a group name and a source id
+	 * can never be taken for each other. */
+	let savingSites = $state<{ sourceId: string; ai: ScanlatorAi | null }[]>([]);
+
+	async function setSiteTag(row: ScanlatorSite, next: ScanlatorAi | null): Promise<void> {
+		if (next === row.ai || savingSites.some((s) => s.sourceId === row.sourceId)) return;
+		savingSites = [...savingSites, { sourceId: row.sourceId, ai: next }];
+		try {
+			await setSourceAi(row.sourceId, next);
+			sites = sites.map((x) => (x.sourceId === row.sourceId ? { ...x, ai: next } : x));
+			// A load that began before the save holds the old tag. This newer one outdates
+			// it. It also drops a site that now has no tag and no series.
+			void refreshSites(true);
+		} catch (err) {
+			toast.fromError(err, 'Could not save that tag.');
+		} finally {
+			savingSites = savingSites.filter((s) => s.sourceId !== row.sourceId);
+		}
+	}
+
 	const rangeStart = $derived((page - 1) * PAGE_SIZE + 1);
 	const pagerDetail = $derived(
 		rows.length > 0 && total != null
@@ -215,8 +318,12 @@
 <div class="k-page">
 	<PageHeader
 		title="Scanlators"
-		description="Tag the translation groups that use AI for all of their work (AI) or part of it (Partial AI)."
+		description="Tag the scanlators that use AI for all of their work (AI) or part of it (Partial AI). A group is the name a chapter credits. A site is a source that translates its own series."
 	/>
+
+	<div class="view">
+		<Segmented label="List" value={view} options={VIEWS} onchange={setView} />
+	</div>
 
 	<!-- Not disabled while a fetch is in flight, as on Reports: see `loadSeq`. -->
 	<div class="k-toolbar filters">
@@ -244,7 +351,7 @@
 				onchange={(v) => setTagFilter(v === 'all' ? null : v)}
 			/>
 		</div>
-		{#if sourceOptions.length > 0}
+		{#if view === 'groups' && sourceOptions.length > 0}
 			<label class="k-field source-filter">
 				<span class="k-label">Source</span>
 				<select
@@ -263,80 +370,136 @@
 		{/if}
 	</div>
 
-	<LoadState
-		loading={loading && rows.length === 0}
-		error={loadError}
-		empty={rows.length === 0}
-		loadingLabel="Loading scanlators. The first load can take a few seconds."
-		emptyIcon={filtered ? 'search' : 'globe'}
-		emptyTitle={filtered
-			? 'No scanlators match'
-			: page > 1
-				? 'No scanlators on this page'
-				: 'No scanlators yet'}
-		emptyHint={filtered
-			? 'Try another name, tag or source.'
-			: page > 1
-				? 'Go back a page to see the list.'
-				: 'A scanlator is listed here once a chapter credits it.'}
-		onretry={() => refresh(search, tag, source, page)}
-	>
-		<div class="k-table" class:is-dim={loading} role="table" aria-label="Scanlators">
-			<div class="k-tr k-tr--head" role="row">
-				<span role="columnheader">Name</span>
-				<span role="columnheader">Chapters</span>
-				<span role="columnheader">Series</span>
-				<span role="columnheader" class="k-td--end">AI tag</span>
-			</div>
-			{#each rows as row (row.name)}
-				{@const pending = saving.find((s) => s.name === row.name)}
-				<div class="k-tr" role="row">
-					<span class="who" role="cell">
-						<span class="name">{row.name}</span>
-						<!-- No tag of its own, but one applies: a joint credit ("A & B") takes the
-						     strongest tag of its members. The row can still get its own. -->
-						{#if !pending && row.ai === null && row.effectiveAi}
-							<span class="k-hint">{TAG_LABEL[row.effectiveAi]}, from a member group</span>
-						{/if}
-					</span>
-					<span class="k-num" role="cell" data-label="Chapters">
-						{row.chapterCount.toLocaleString()}
-					</span>
-					<span class="k-num" role="cell" data-label="Series">
-						{row.seriesCount.toLocaleString()}
-					</span>
-					<span class="k-td--end" class:saving={!!pending} role="cell">
-						<Segmented
-							label="AI tag for {row.name}"
-							value={(pending ? pending.ai : row.ai) ?? 'NONE'}
-							options={TAG_CHOICES}
-							disabled={!!pending}
-							onchange={(v) => setTag(row, v === 'NONE' ? null : v)}
-						/>
-					</span>
-				</div>
-			{/each}
-		</div>
-	</LoadState>
+	{#if view === 'sites'}
+		<p class="k-hint">
+			A tag on a site applies to every chapter read from it. A chapter that also credits a tagged
+			group takes the stronger tag.
+		</p>
 
-	<!--
-		Outside LoadState's empty branch on purpose, as on Reports: a page the list has
-		shrunk past is empty, and the pager is the way back from it.
-	-->
-	{#if !loadError && !(loading && rows.length === 0) && (rows.length > 0 || page > 1)}
-		<Pager
-			{page}
-			{hasNext}
-			busy={loading}
-			detail={pagerDetail}
-			onpage={(n) => queueNavigate(pageState.url, { page: Math.max(1, n) })}
-		/>
+		<LoadState
+			loading={sitesLoading && sites.length === 0}
+			error={sitesError}
+			empty={shownSites.length === 0}
+			loadingLabel="Loading sites."
+			emptyIcon={filtered ? 'search' : 'globe'}
+			emptyTitle={filtered ? 'No sites match' : 'No sites yet'}
+			emptyHint={filtered
+				? 'Try another name or tag.'
+				: 'A source is listed here once a series is added from it.'}
+			onretry={() => refreshSites()}
+		>
+			<div class="k-table sites" class:is-dim={sitesLoading} role="table" aria-label="Sites">
+				<div class="k-tr k-tr--head" role="row">
+					<span role="columnheader">Name</span>
+					<span role="columnheader">Series</span>
+					<span role="columnheader" class="k-td--end">AI tag</span>
+				</div>
+				{#each shownSites as row (row.sourceId)}
+					{@const pending = savingSites.find((s) => s.sourceId === row.sourceId)}
+					<div class="k-tr" role="row">
+						<span class="who" role="cell">
+							<span class="name">{row.name}</span>
+							{#if row.lang}<span class="k-hint">{langLabel(row.lang)}</span>{/if}
+						</span>
+						<span class="k-num" role="cell" data-label="Series">
+							{row.seriesCount.toLocaleString()}
+						</span>
+						<span class="k-td--end" class:saving={!!pending} role="cell">
+							<Segmented
+								label="AI tag for {siteName(row)}"
+								value={(pending ? pending.ai : row.ai) ?? 'NONE'}
+								options={TAG_CHOICES}
+								disabled={!!pending}
+								onchange={(v) => setSiteTag(row, v === 'NONE' ? null : v)}
+							/>
+						</span>
+					</div>
+				{/each}
+			</div>
+		</LoadState>
+	{:else}
+		<LoadState
+			loading={loading && rows.length === 0}
+			error={loadError}
+			empty={rows.length === 0}
+			loadingLabel="Loading scanlators. The first load can take a few seconds."
+			emptyIcon={filtered ? 'search' : 'globe'}
+			emptyTitle={filtered
+				? 'No scanlators match'
+				: page > 1
+					? 'No scanlators on this page'
+					: 'No scanlators yet'}
+			emptyHint={filtered
+				? 'Try another name, tag or source.'
+				: page > 1
+					? 'Go back a page to see the list.'
+					: 'A scanlator is listed here once a chapter credits it.'}
+			onretry={() => refresh(search, tag, source, page)}
+		>
+			<div class="k-table" class:is-dim={loading} role="table" aria-label="Scanlators">
+				<div class="k-tr k-tr--head" role="row">
+					<span role="columnheader">Name</span>
+					<span role="columnheader">Chapters</span>
+					<span role="columnheader">Series</span>
+					<span role="columnheader" class="k-td--end">AI tag</span>
+				</div>
+				{#each rows as row (row.name)}
+					{@const pending = saving.find((s) => s.name === row.name)}
+					<div class="k-tr" role="row">
+						<span class="who" role="cell">
+							<span class="name">{row.name}</span>
+							<!-- No tag of its own, but one applies: a joint credit ("A & B") takes the
+							     strongest tag of its members. The row can still get its own. -->
+							{#if !pending && row.ai === null && row.effectiveAi}
+								<span class="k-hint">{TAG_LABEL[row.effectiveAi]}, from a member group</span>
+							{/if}
+						</span>
+						<span class="k-num" role="cell" data-label="Chapters">
+							{row.chapterCount.toLocaleString()}
+						</span>
+						<span class="k-num" role="cell" data-label="Series">
+							{row.seriesCount.toLocaleString()}
+						</span>
+						<span class="k-td--end" class:saving={!!pending} role="cell">
+							<Segmented
+								label="AI tag for {row.name}"
+								value={(pending ? pending.ai : row.ai) ?? 'NONE'}
+								options={TAG_CHOICES}
+								disabled={!!pending}
+								onchange={(v) => setTag(row, v === 'NONE' ? null : v)}
+							/>
+						</span>
+					</div>
+				{/each}
+			</div>
+		</LoadState>
+
+		<!--
+			Outside LoadState's empty branch on purpose, as on Reports: a page the list has
+			shrunk past is empty, and the pager is the way back from it.
+		-->
+		{#if !loadError && !(loading && rows.length === 0) && (rows.length > 0 || page > 1)}
+			<Pager
+				{page}
+				{hasNext}
+				busy={loading}
+				detail={pagerDetail}
+				onpage={(n) => queueNavigate(pageState.url, { page: Math.max(1, n) })}
+			/>
+		{/if}
 	{/if}
 </div>
 
 <style>
 	.k-table {
 		--cols: minmax(0, 2.4fr) minmax(0, 0.7fr) minmax(0, 0.7fr) minmax(200px, 1.5fr);
+	}
+	.k-table.sites {
+		--cols: minmax(0, 2.4fr) minmax(0, 0.7fr) minmax(200px, 1.5fr);
+	}
+	/* A grid row would stretch the switch across the page. */
+	.view {
+		display: flex;
 	}
 	.filters {
 		align-items: flex-end;

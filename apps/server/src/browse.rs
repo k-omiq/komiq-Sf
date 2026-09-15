@@ -375,7 +375,16 @@ pub enum SourceFilter {
 /// BOUND, and canonicalized first ([`canonical_genres`], [`canonical_tag_ids`],
 /// [`canonical_languages`], [`parse_source`]) so the memo key does not depend on spelling or
 /// order.
+///
+/// The one exception to "client text is bound" is `blocks`: a rule's values are written
+/// into the SQL, which is safe because `block::BlockRule::new` admits a closed vocabulary
+/// only (see the `block` module header).
 pub struct BrowseQuery<'a> {
+    /// The viewer's content block rules (`block.rs`), or `None` for no rule. A work a
+    /// rule matches is left out of the page AND the total, like a work behind the NSFW
+    /// gate. Part of the memo key, so two viewers share a memoized page only when the
+    /// same works are blocked for both.
+    pub blocks: Option<&'a crate::block::BlockSet>,
     /// The viewer's NSFW posture. `false` pins `f.is_nsfw = 0`; `true` emits no predicate
     /// at all (not `is_nsfw IN (0,1)`) so the opted-in branch reads a different index.
     pub show_nsfw: bool,
@@ -436,6 +445,7 @@ impl Default for BrowseQuery<'_> {
     /// No filter at all, NSFW gate CLOSED (the safe default), newest first, page 1.
     fn default() -> Self {
         BrowseQuery {
+            blocks: None,
             show_nsfw: false,
             types: Vec::new(),
             statuses: Vec::new(),
@@ -789,6 +799,11 @@ fn count_key(q: &BrowseQuery<'_>) -> String {
     list(&mut key, &q.include_tags);
     list(&mut key, &q.exclude_tags);
     list(&mut key, q.genres);
+    // The block rules, as one more self-delimiting string. `BlockSet::key` is canonical
+    // (sorted rules, sorted members), so the key does not depend on the order the rules
+    // were saved in. No rule and an empty set are the same WHERE, and the same key.
+    let blocks = q.blocks.map(|b| b.key()).unwrap_or_default();
+    key.push_str(&format!("{}:{}", blocks.len(), blocks));
     key
 }
 
@@ -990,6 +1005,16 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
     // the index first, so the empty result costs a seek, not a scan.
     if q.nsfw_only {
         parts.push("f.is_nsfw = 1".into());
+    }
+    // The content block rules. ANDed like every other clause, so they can only narrow.
+    // The rating a rule names is this table's own column (the effective rating, index
+    // payload); a tag is one covering probe of `idx_work_tag_work_key` per candidate row,
+    // the same probe the tag filter's EXCLUDE-OR uses. No binds: see `BrowseQuery`.
+    if let Some(blocked) = q
+        .blocks
+        .and_then(|b| b.blocked_sql("f.work_id", Some("f.content_rating")))
+    {
+        parts.push(format!("NOT {blocked}"));
     }
     // An `= ?` for one value, `IN (…)` for several. "Branched" means the CLAUSE is present or
     // absent, not that the VALUE is interpolated — it is bound like everything else. What the
@@ -4041,6 +4066,113 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The viewer's content block rules are one more WHERE clause: they narrow the page
+    /// AND the total, they are part of the memo key, and a tag rule reads `work_tag` by a
+    /// covering seek per candidate row, never by a scan.
+    #[tokio::test]
+    async fn block_rules_narrow_the_page_and_the_total_and_key_the_memo() {
+        use crate::block::{BlockRule, BlockSet};
+        let pool = pool().await;
+        fixture(&pool).await;
+        // A: safe, B: suggestive, C: erotica, D: safe, E: pornographic.
+        for (work_id, tag) in [
+            ("w_a", "gore"),
+            ("w_b", "gore"),
+            ("w_c", "gore"),
+            ("w_d", "harem"),
+        ] {
+            sqlx::query(
+                "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) \
+                 VALUES (?, ?, 0, 'mangadex', ?)",
+            )
+            .bind(work_id)
+            .bind(tag)
+            .bind(tag)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let none: [&str; 0] = [];
+        let set = |rules: Vec<BlockRule>| BlockSet::new(rules);
+        let cases: [(BlockSet, &[&str]); 5] = [
+            (set(vec![]), &["A", "B", "C", "D", "E"]),
+            // A tag.
+            (
+                set(vec![BlockRule::new(["gore"], none).unwrap()]),
+                &["D", "E"],
+            ),
+            // A rating. `browse_catalogue.content_rating` is the effective rating.
+            (
+                set(vec![BlockRule::new(none, ["pornographic"]).unwrap()]),
+                &["A", "B", "C", "D"],
+            ),
+            // A tag and a rating: Gore, but only when adult.
+            (
+                set(vec![
+                    BlockRule::new(["gore"], ["erotica", "pornographic"]).unwrap()
+                ]),
+                &["A", "B", "D", "E"],
+            ),
+            // Two rules: either one blocks.
+            (
+                set(vec![
+                    BlockRule::new(["harem"], none).unwrap(),
+                    BlockRule::new(none, ["safe"]).unwrap(),
+                ]),
+                &["B", "C", "E"],
+            ),
+        ];
+        let mut keys: Vec<String> = Vec::new();
+        for (blocks, want) in &cases {
+            let query = BrowseQuery {
+                blocks: Some(blocks),
+                ..q(BrowseSort::Newest, 1)
+            };
+            let (total, got) = titles(&pool, &query).await;
+            assert_eq!(got, *want, "rules {:?}", blocks.key());
+            assert_eq!(total as usize, want.len(), "total for {:?}", blocks.key());
+            keys.push(count_key(&query));
+        }
+        // Five rule sets, five memo entries: a total is never served across them.
+        let unique: std::collections::HashSet<&String> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "{keys:?}");
+        // No rule and an empty set are one WHERE, so one key.
+        assert_eq!(keys[0], count_key(&q(BrowseSort::Newest, 1)));
+
+        // The rules cannot widen the NSFW gate: an opted-out viewer with a rule sees
+        // the gate's works minus the blocked ones.
+        let query = BrowseQuery {
+            blocks: Some(&cases[1].0),
+            show_nsfw: false,
+            ..q(BrowseSort::Newest, 1)
+        };
+        assert_eq!(titles(&pool, &query).await, (1, vec!["D".to_string()]));
+
+        // The tag probe is a covering seek.
+        use sqlx::Row;
+        let query = BrowseQuery {
+            blocks: Some(&cases[3].0),
+            ..q(BrowseSort::Newest, 1)
+        };
+        let (where_sql, binds, _) = build_where(&query);
+        assert!(binds.is_empty(), "a rule adds no bind");
+        let plan: Vec<String> = sqlx::query(&format!(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM browse_catalogue f WHERE {where_sql}"
+        ))
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<String, _>("detail"))
+        .collect();
+        let probes: Vec<&String> = plan.iter().filter(|l| l.contains(" bt ")).collect();
+        assert!(!probes.is_empty(), "no work_tag probe in {plan:?}");
+        for line in probes {
+            assert!(line.starts_with("SEARCH"), "{line}");
+            assert!(line.contains("COVERING INDEX"), "{line}");
         }
     }
 }

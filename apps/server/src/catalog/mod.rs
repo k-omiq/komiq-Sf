@@ -2307,6 +2307,7 @@ pub async fn search_works_fts(
     pool: &SqlitePool,
     query: &str,
     show_nsfw: bool,
+    blocks: &crate::block::BlockSet,
     page: i64,
     page_size: i64,
 ) -> Result<(i64, Vec<String>)> {
@@ -2314,14 +2315,18 @@ pub async fn search_works_fts(
         return Ok((0, Vec::new()));
     };
     let offset = (page.max(1) - 1) * page_size;
+    // The viewer's content block rules, in the candidate query like the NSFW gate, so
+    // `total` and the pages count the same works. Empty when there is no rule. It adds
+    // no bind (see `block.rs`), so the bind order below is unchanged.
+    let not_blocked = blocks.and_not_blocked("w.id", Some(&crate::block::work_rating_sql("w")));
     // NSFW gate mirrors map_canonical_series' effective flag (override wins). The FTS
     // table is referenced by NAME (`work_fts MATCH`), not the join alias — FTS5's
     // MATCH operator reads a bare alias as a column, not the table.
-    let total = sqlx::query_scalar::<_, i64>(
+    let total = sqlx::query_scalar::<_, i64>(&format!(
         "SELECT COUNT(*) FROM (SELECT 1 FROM work_fts JOIN work w ON w.id = work_fts.work_id \
-          WHERE work_fts MATCH ? AND (? = 1 OR COALESCE(w.is_nsfw_override, w.is_nsfw) = 0) \
-          LIMIT ?)",
-    )
+          WHERE work_fts MATCH ? AND (? = 1 OR COALESCE(w.is_nsfw_override, w.is_nsfw) = 0)\
+          {not_blocked} LIMIT ?)"
+    ))
     .bind(&match_expr)
     .bind(show_nsfw as i64)
     .bind(RANK_WINDOW)
@@ -2337,7 +2342,8 @@ pub async fn search_works_fts(
                   CAST(work_fts.chapters AS INTEGER) AS chapters, \
                   bm25(work_fts, 0.0, 0.0, 10.0, 1.0) AS rank \
              FROM work_fts JOIN work w ON w.id = work_fts.work_id \
-            WHERE work_fts MATCH ? AND (? = 1 OR COALESCE(w.is_nsfw_override, w.is_nsfw) = 0) \
+            WHERE work_fts MATCH ? AND (? = 1 OR COALESCE(w.is_nsfw_override, w.is_nsfw) = 0)\
+            {not_blocked} \
             ORDER BY bm25(work_fts, 0.0, 0.0, 10.0, 1.0) \
             LIMIT ?) \
          SELECT c.work_id FROM cand c JOIN work w ON w.id = c.work_id \
@@ -8729,7 +8735,7 @@ mod tests {
         refresh_work_fts(&pool).await.unwrap();
 
         let pos = |ids: &[String], w: &str| ids.iter().position(|i| i == w);
-        let (_, ids) = search_works_fts(&pool, "dr stone", false, 1, 20)
+        let (_, ids) = search_works_fts(&pool, "dr stone", false, &Default::default(), 1, 20)
             .await
             .unwrap();
         assert!(
@@ -8751,7 +8757,7 @@ mod tests {
 
         // Typed exactly, the RAW tier — which is why it must stay above the normalized
         // one — keeps the work itself above its re-release.
-        let (_, ids) = search_works_fts(&pool, "Dr.STONE", false, 1, 20)
+        let (_, ids) = search_works_fts(&pool, "Dr.STONE", false, &Default::default(), 1, 20)
             .await
             .unwrap();
         assert_eq!(ids.first().map(String::as_str), Some(main.as_str()));
@@ -8805,9 +8811,10 @@ mod tests {
 
         refresh_work_fts(&pool).await.unwrap();
 
-        let (total, ids) = search_works_fts(&pool, "my brother is a", false, 1, 20)
-            .await
-            .unwrap();
+        let (total, ids) =
+            search_works_fts(&pool, "my brother is a", false, &Default::default(), 1, 20)
+                .await
+                .unwrap();
         assert!(
             ids.contains(&suwa),
             "a Suwayomi-only work must be findable — this is the 0052 bug; got {ids:?}"
@@ -9307,7 +9314,7 @@ mod tests {
             browsed, 1,
             "the new work must be projected into browse_catalogue"
         );
-        let (_, found) = search_works_fts(&pool, "Series 501", false, 1, 10)
+        let (_, found) = search_works_fts(&pool, "Series 501", false, &Default::default(), 1, 10)
             .await
             .unwrap();
         assert!(

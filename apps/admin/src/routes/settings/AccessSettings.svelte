@@ -12,7 +12,7 @@
 		setAccessMode,
 	} from '$lib/data';
 	import { copyText } from '$lib/passwords';
-	import { addressFor } from '$lib/preflight';
+	import { addressFor, typedFromInternet } from '$lib/preflight';
 	import { toast } from '$lib/toast.svelte';
 	import Button from '$lib/components/Button.svelte';
 	import Checklist from '$lib/components/Checklist.svelte';
@@ -22,13 +22,8 @@
 	import HttpsMove from '$lib/components/HttpsMove.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import Qr from '$lib/components/Qr.svelte';
-	import {
-		followServer,
-		reachableFromOtherDevices,
-		runsLocalServer,
-		serverAddress,
-		target,
-	} from '$lib/config';
+	import { reachableFromOtherDevices, runsLocalServer, serverAddress, target } from '$lib/config';
+	import { moveTo } from '$lib/server-move.svelte';
 
 	// Settings › Access: how readers reach this server, what Cloudflare setup made, and
 	// the connector. Re-run and Remove ask for the API token again; it is not kept.
@@ -42,7 +37,8 @@
 	let directAddress = $state('');
 	let directError = $state<string | null>(null);
 	let directEncrypt = $state(true);
-	// Direct mode with HTTPS: the certificate's end date and the last renewal error.
+	// HTTPS on this server (direct mode, or Cloudflare's Public IP connection): the
+	// certificate's end date, what is wrong with it, and why HTTPS is not running.
 	let certificate = $state<CertificateStatus | null>(null);
 	const directHttps = $derived(
 		status?.mode === 'direct' && (status.address ?? '').startsWith('https://'),
@@ -103,7 +99,10 @@
 		try {
 			status = await loadAccessStatus();
 			loadError = null;
-			certificate = status.mode === 'direct' ? await loadCertificateStatus() : null;
+			certificate =
+				status.mode === 'direct' || status.cloudflare?.connection === 'PUBLIC_IP'
+					? await loadCertificateStatus()
+					: null;
 		} catch (err) {
 			loadError = err instanceof Error ? err.message : 'Access settings could not be loaded.';
 		}
@@ -222,11 +221,27 @@
 	function whatStops(s: AccessStatus): string {
 		const at = s.address ?? 'the public address';
 		const viaCloudflare = s.mode === 'internet' && !!s.cloudflare;
+		// A console that is open at a public address loses its way in with the switch: in
+		// this mode the server refuses plain HTTP from the internet, and the HTTPS that
+		// komiq serves or set up is turned off. (HTTPS of the owner's own proxy stays.)
+		const here = serverAddress();
+		const lockedOut = (
+			here.startsWith('http://')
+				? target !== 'hosted' && typedFromInternet(here)
+				: here === at && (viaCloudflare || directHttps)
+		)
+			? 'This console is open at a public address. After the switch it stops answering here. Open it on your home network, or run "komika-server setup" on the server to change the mode.'
+			: '';
 		if (!viaCloudflare && !directHttps) {
 			// Nothing of komiq's carries that address, so there is nothing to turn off.
-			return s.mode === 'internet'
-				? `komiq stops showing ${at} as the reader address. What you set up by hand at Cloudflare keeps running until you turn it off there.`
-				: `komiq stops showing ${at} as the reader address. The HTTP port still answers where your firewall lets it.`;
+			return [
+				s.mode === 'internet'
+					? `komiq stops showing ${at} as the reader address. What you set up by hand at Cloudflare keeps running until you turn it off there.`
+					: `komiq stops showing ${at} as the reader address. The HTTP port stops answering clients on the internet.`,
+				lockedOut,
+			]
+				.filter(Boolean)
+				.join(' ');
 		}
 		const off =
 			viaCloudflare && s.cloudflare?.connection !== 'PUBLIC_IP'
@@ -237,9 +252,7 @@
 			viaCloudflare
 				? 'The DNS record and the other things at Cloudflare stay until you choose "Remove".'
 				: '',
-			at === serverAddress()
-				? 'This console is open at that address too. Afterwards, open it at the server’s own address.'
-				: '',
+			lockedOut,
 		]
 			.filter(Boolean)
 			.join(' ');
@@ -275,8 +288,10 @@
 		try {
 			status = await setAccessMode('direct', directAddress.trim(), directEncrypt);
 			certificate = await loadCertificateStatus();
+			// The form stays busy while the desktop app moves to the new address: that can
+			// take half a minute. When it gets no answer there, `HttpsMove` below says so.
+			if (status.address) await moveTo(status.address, directAddress);
 			panel = null;
-			if (status.address) await followServer(status.address, directAddress);
 			toast.success('Readers now use this address.');
 		} catch (err) {
 			directError = err instanceof Error ? err.message : 'The address could not be saved.';
@@ -391,6 +406,10 @@
 						<span class="status" data-tone={status.https ? 'success' : 'warning'}
 							>{status.https ? 'On' : 'Not running'}</span
 						>
+						{#if certificate?.httpsError}
+							<span class="k-error">{certificate.httpsError} The server tries again by itself.</span
+							>
+						{/if}
 						{#if certificate?.certificateError}
 							<span class="k-error">{certificate.certificateError}</span>
 						{:else if certificate?.certificateExpires}
@@ -436,10 +455,23 @@
 				</dd>
 			{:else if cf?.connection === 'PUBLIC_IP' && !paused}
 				<dt>HTTPS</dt>
-				<dd>
+				<dd class="stack">
 					<span class="status" data-tone={status.https ? 'success' : 'warning'}
 						>{status.https ? 'Serving' : 'Not running'}</span
 					>
+					{#if certificate?.httpsError}
+						<span class="k-error">{certificate.httpsError} The server tries again by itself.</span>
+					{/if}
+					{#if certificate?.certificateError}
+						<span class="k-error">{certificate.certificateError}</span>
+					{:else if certificate?.certificateExpires}
+						<span class="k-hint"
+							>Cloudflare origin certificate, valid until {new Date(
+								certificate.certificateExpires,
+							).toLocaleDateString()}. Nothing renews it by itself: "Run setup again" gets a new one
+							in its last 30 days.</span
+						>
+					{/if}
 				</dd>
 			{/if}
 			<dt>Visitor addresses</dt>

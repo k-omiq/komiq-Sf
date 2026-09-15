@@ -24,6 +24,7 @@ type Query {
 	tags: [TagInfo!]! # [komika] Browse v2: the tag picker's vocabulary — stable slug ids, display names, MangaDex group, and a count of works carrying the tag that the viewer may see (NSFW-gated)
 	browseSources(includeNsfw: Boolean): [BrowseSource!]! # [komika] the sources Browse can filter by (`BrowseFilter.source`), biggest first — "mangadex" for the mirror, else a source id; each `count` is the number of works the filter returns for the viewer (NSFW-gated), and a source with none is not offered. `includeNsfw` is the admin-console escape hatch, as on `search`
 	scanlatorTags: [ScanlatorTag!]! # [komika] every scanlator an admin tagged as using AI — public, so a reader app can mark the chapter copies those names are credited on (match rule on ScanlatorTag.name)
+	sourceAiTags: [SourceAiTag!]! # [komika] every source an admin tagged as using AI — public. A source that translates its own series credits no group, so the source is the scanlator. A chapter copy takes the stronger of this tag (matched on ChapterSource.sourceId, or the series' sourceId) and the tag on its scanlator credit
 	genreFacets: [GenreFacet!]! # [komika] S4: the genre chips for Browse's filter, most common first then alphabetical, gated by the viewer's NSFW posture. Each `count` is now EXACTLY the number of results the same genre filter returns — it previously came from JSON-parsing 13.8k Suwayomi `genre` blobs per request (301 entries, ungated, top entry literally "Japanese") while the filter ran against the canonical catalogue, so the chip's number and its results disagreed. Empty until MangaDex tags are ingested into `work_tag`
 	searchAllSources(query: String!, page: Int = 1): FederatedSearchPage! # [komika] federated multi-extension search — fans out to every installed source, dedupes to one canonical work per series with its per-source translators; NSFW-gated by the viewer's posture. REQUIRES LOGIN (persists mappings); per-user rate-limited (~20/min); errors "Not authenticated" for anonymous callers
 	series(id: ID!): Series! # [suwayomi] MangaType by id
@@ -72,6 +73,9 @@ type Query {
 	mangadexSetting: MangadexSetting! # [komika] admin — the MangaDex usage switch and whether the server environment pins it (requires isAdmin)
 	sourceRateLimits: [SourceRateLimit!]! # [komika] admin — every per-source scan rate limit in force: the server's SCAN_SOURCE_RATE_LIMITS defaults (fromEnv) and the ones an admin set, which win (requires isAdmin)
 	scanlators(search: String, ai: ScanlatorAiFilter, source: String, page: Int = 1): ScanlatorPage! # [komika] admin scanlator list — every credit chapters carry, most chapters first, 50 per page, with its AI tag. `search` matches part of the name; `ai` filters by the tag that APPLIES; `source` (a BrowseSource.id) keeps credits with chapters on that source and counts that source only. Counts come from a scan the server reuses for ten minutes; tags are always current (requires isAdmin)
+	scanlatorSites: [ScanlatorSite!]! # [komika] admin site list — every source with a series in the catalogue (never "mangadex": MangaDex credits groups), biggest first, with its AI tag; a tagged source with no series left is still listed so the tag can be removed (requires isAdmin)
+	siteBlockRules: [BlockRule!]! # [komika] admin — the site-wide content block rules, in saved order (requires isAdmin)
+	myBlockRules: [BlockRule!]! # [komika] the viewer's own content block rules, in saved order (requires auth)
 	sources: [SourceInfo!]! # [komika] installed Suwayomi sources — the sourceBrowse picker. Every installed source is listed incl. NSFW ones, regardless of the admin's reader-side show_nsfw; each carries `isNsfw` for the UI to badge (requires isAdmin)
 	sourceBrowse(sourceId: ID!, type: SourceBrowseType!, page: Int = 1, query: String): SourceBrowsePage! # [komika] browse/search one source's catalogue for bulk ingest (requires isAdmin)
 	seriesSourcesBatch(seriesIds: [ID!]!): [SeriesSourceGroup!]! # [komika] catalogue provenance per Suwayomi series — linked work + source mappings, input order, ≤200 ids (requires isAdmin)
@@ -97,6 +101,7 @@ type Mutation {
 	createOwner(setupCode: String!, username: String!, email: String!, password: String!): Session! # [komika] first-run setup — create the first admin with the setup code from the server log; only while no admin exists; rate-limited per IP like login
 	changePassword(currentPassword: String!, newPassword: String!): SessionUser! # [komika] change the viewer's own password; clears mustChangePassword and signs out their other sessions (requires auth)
 	setShowNsfw(value: Boolean!): Boolean! # [komika] set the viewer's NSFW visibility preference (CATALOGUE.md §2)
+	setMyBlockRules(rules: [BlockRuleInput!]!): [BlockRule!]! # [komika] replace the viewer's own content block rules (at most 50; an empty list clears them). They hide matching series from the viewer's lists (browse, search, updates, discovery), on top of the site-wide rules; a series opened by its link still opens. Returns the stored list (requires auth)
 	updateProfile(input: UpdateProfileInput!): SessionUser! # [komika] update the viewer's display name + bio (avatar upload is REST: POST /avatar)
 	updateSeriesAdmin(input: SeriesAdminInput!): Series! # [komika] admin "manga DB" overrides (requires isAdmin)
 	triggerScan(seriesId: ID!): Series! # [komika] admin — force an immediate re-scan (requires isAdmin)
@@ -107,6 +112,7 @@ type Mutation {
 	resetUserPassword(userId: ID!, password: String!): Boolean! # [komika] admin — set another account's password; revokes its sessions and sets mustChangePassword (requires isAdmin)
 	setRegistrationOpen(open: Boolean!): Boolean! # [komika] admin — open/close sign-up (starts closed on a self-hosted install, open elsewhere); refused when KOMIKA_REGISTRATION_OPEN pins it (requires isAdmin)
 	setMangadexEnabled(enabled: Boolean!): Boolean! # [komika] admin — turn MangaDex usage on/off, applied live; refused when KOMIKA_MANGADEX or CATALOGUE_SYNC=on pins it (requires isAdmin)
+	setShowMangadexRatings(shown: Boolean!): Boolean! # [komika] admin — show/hide MangaDex's community rating next to our own readers' rating, for everyone; refused when KOMIKA_MANGADEX_RATINGS pins it (requires isAdmin)
 	setSourceRateLimit(sourceId: String!, requests: Int!, windowSecs: Int!): SourceRateLimit! # [komika] admin — check a source for new chapters with at most `requests` HTTP requests per `windowSecs` (one series check costs two); adds or replaces, wins over a SCAN_SOURCE_RATE_LIMITS default, applied live (requires isAdmin)
 	removeSourceRateLimit(sourceId: String!): Boolean! # [komika] admin — remove the admin's limit, applied live; the source falls back to its SCAN_SOURCE_RATE_LIMITS default when it has one; false when none was stored (requires isAdmin)
 	setAccessMode(mode: String!, domain: String): AccessStatus! # [komika] admin — record the wizard's access choice ("local" | "internet" | "direct"); domain is a domain set up by hand (internet) or the public address (direct, required)
@@ -142,6 +148,8 @@ type Mutation {
 	reconcileCatalogue: Int! # [komika] admin — background pass matching every provisional (Suwayomi-only) work against the MangaDex spine; merges confident matches, queues mid-confidence ones for review. Returns the pending count at kickoff, not the result. Single-flighted (requires isAdmin)
 	resyncCatalogue: Boolean! # [komika] admin — force a full catalogue re-seed: clears the catalogue/chapters sync cursors so the next cycle walks the whole createdAt history, and kicks one cycle in the background. Refused while any sync cycle is running (requires isAdmin)
 	setScanlatorAi(name: String!, ai: ScanlatorAi): Boolean! # [komika] admin — tag a scanlator as using AI (AI) or partly using it (PARTIAL); `ai: null` removes the tag. Kept by name, case-folded; applies to every chapter credited to the name on every source, now and later. false when nothing changed (requires isAdmin)
+	setSourceAi(sourceId: String!, ai: ScanlatorAi): Boolean! # [komika] admin — tag a whole source as using AI (AI) or partly using it (PARTIAL); `ai: null` removes the tag. Applies to every chapter copy read from the source, now and later. Not for "mangadex". false when nothing changed (requires isAdmin)
+	setSiteBlockRules(rules: [BlockRuleInput!]!): [BlockRule!]! # [komika] admin — replace the site-wide content block rules (at most 50; an empty list clears them). They apply to every viewer, signed in or not: a matching series is left out of every list and cannot be opened or read. Returns the stored list (requires isAdmin)
 	markSourceNsfw(sourceId: String!, isNsfw: Boolean!): Int! # [komika] admin — flag/unflag a whole Suwayomi source as adult and re-derive the NSFW flag of every work ingested from it; the flag is remembered (source_nsfw_pin), so a series ingested LATER from that source is stored adult too; returns works changed (requires isAdmin)
 	rederiveSuwayomiNsfw: Int! # [komika] admin — recompute the DERIVED is_nsfw for every Suwayomi-ingested work under the current rule (adult genre OR adult source, unless MangaDex rated it safe/suggestive). Conservative: only flips 0 -> 1, never un-flags, and leaves isNsfwOverride alone. Returns works flipped (requires isAdmin)
 	retryCover(workId: ID!): Boolean! # [komika] admin "Bugs" panel — clear a work's cover-issue skip marker and re-attempt the cover fetch/encode (requires isAdmin)
@@ -297,6 +305,28 @@ type Scanlator {
 	ai: ScanlatorAi # the tag stored for exactly this name
 	effectiveAi: ScanlatorAi # the tag that applies: `ai`, else one a joint credit takes from a member
 }
+# [komika] One tagged source.
+type SourceAiTag {
+	sourceId: String! # a Suwayomi source id; match to ChapterSource.sourceId
+	ai: ScanlatorAi!
+}
+# [komika] One row of the admin site list: a source, as a scanlator of its own.
+type ScanlatorSite {
+	sourceId: String!
+	name: String! # display name; the extension package name, then the id, when the engine did not answer
+	lang: String
+	seriesCount: Int! # series in the catalogue that have this source
+	ai: ScanlatorAi # the tag stored for the source
+}
+# [komika] One content block rule. It matches a series that carries ALL of `tags` and, when `ratings` is not empty, has ONE of them (the EFFECTIVE rating: a series the NSFW gate treats as adult is never below EROTICA, one with no rating is SAFE). A series is blocked when any rule matches.
+type BlockRule {
+	tags: [String!]! # tag ids (TagInfo.id), sorted
+	ratings: [ContentRating!]! # mildest first; empty = any rating
+}
+input BlockRuleInput {
+	tags: [String!] # at most 8; unknown ids are refused only when they are not [a-z0-9-]
+	ratings: [ContentRating!] # a rule needs a tag or a rating; all four ratings with no tag is refused
+}
 type ScanlatorPage {
 	items: [Scanlator!]!
 	page: Int!
@@ -329,6 +359,7 @@ type Series {
 	isFavorite: Boolean! # [komika] per-viewer favourite flag
 	isNsfw: Boolean! # [komika] canonical NSFW flag; false until catalogued (drives showNsfw filtering)
 	rating: RatingSummary! # [komika] the WORK's aggregate, not this id's. `reviews.series_id` holds whichever id the reader was addressing when they rated (a `w_…` work id from the canonical page, the numeric id of a source otherwise), so every rating reader resolves the id onto its work before aggregating — asking with the literal id is what made a work print a rating on one surface and "0 users rated" on another
+	mangadexRating: Float # [komika] MangaDex's community rating of the work, 0-10 (statistics cache, `work_stats`); `rating` above is ALWAYS our own readers'. Null when MangaDex has none or the admin turned MangaDex ratings off (Instance.showMangadexRatings)
 	scan: ScanPolicy! # [komika] adaptive-scan config (admin-overridable)
 	createdAt: String!
 	updatedAt: String! # [komika] last metadata touch — NOT chapter recency; moves on every poll. Use latestChapterAt for "recently updated".
@@ -589,6 +620,7 @@ type Instance {
 	version: String!
 	registrationOpen: Boolean!
 	mangadexEnabled: Boolean!
+	showMangadexRatings: Boolean! # false: the admin turned MangaDex ratings off, so no `mangadexRating` is ever returned and the reader hides its own switch
 	appsFetchThemselves: Boolean! # true: reader apps fetch chapter pages from the sources themselves; an app with its own engine does not offer fetching through this server
 }
 
@@ -637,7 +669,7 @@ type CloudflareSetup {
 type AccessPreflight {
 	cloudflared: String! # "found" | "download" | "unsupported"
 	cloudflaredDetail: String # path when found; what to do when unsupported
-	httpPort: Int!
+	httpPort: Int! # the plain HTTP port as other machines see it (KOMIKA_PUBLISHED_PORT in a container)
 	httpsPort: Int!
 	httpsPortState: String! # "free" | "serving" | "in_use" | "denied"; "unknown" for other OS errors
 	acmePort: Int!
@@ -655,7 +687,11 @@ type AccessStatus {
 	cloudflare: CloudflareSetup
 	connector: String! # "off" | "starting" | "running" | "failed" | "missing"
 	connectorMessage: String
-	https: Boolean! # public-IP origin HTTPS listener up
+	https: Boolean! # the HTTPS listener is up (public-IP origin, or direct mode with a certificate)
+	httpsError: String # why that listener is down while the mode needs it; the server keeps trying
+	certificateExpires: String # end of the served certificate (RFC 3339): direct mode, or the Origin CA one
+	certificateError: String # direct mode: why the last renewal failed. Public IP: the Origin CA certificate is due
+	plainHttpClosed: Boolean! # direct mode with HTTPS: the plain HTTP port refuses clients on the internet
 	trustedProxies: [String!]!
 	trustedProxiesPinned: Boolean! # TRUSTED_PROXY_CIDRS set on the server
 	job: CloudflareJob
@@ -890,6 +926,8 @@ type UpdateFeedRow {
 	announcedAt: String
 	detectedAt: String # when OUR scanner noticed; per-SERIES, Suwayomi-only, never stamped on a baseline scan. Tooltip only, never a sort key. NOT a substitute for announcedAt
 	rating: Float # aggregate rating 0-10: our readers' review average where they have rated the work, else MangaDex's community rating (statistics cache, `work_stats`); null ONLY when neither has one — the sole case the card labels "Unrated"
+	readerRating: Float # our own readers' review average; null when none of them rated the work. `rating` above is the MERGED number, kept for a reader that predates this split
+	mangadexRating: Float # MangaDex's community rating; null when it has none or the admin turned MangaDex ratings off
 	isNsfw: Boolean!
 }
 

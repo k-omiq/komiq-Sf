@@ -1,10 +1,10 @@
 <script lang="ts">
-	import { followServer } from '$lib/config';
 	import { setAccessMode } from '$lib/data';
+	import { moveTo } from '$lib/server-move.svelte';
 	import Button from '$lib/components/Button.svelte';
 	import DirectAddress from '$lib/components/DirectAddress.svelte';
 	import Onboarding from '$lib/components/Onboarding.svelte';
-	import { back, labels, next, stepNumber, wizard } from '../wizard.svelte';
+	import { back, labels, next, persist, stepNumber, wizard } from '../wizard.svelte';
 
 	// Public without a domain: readers use the server's own address. No Cloudflare is
 	// involved, so the server fetches everything itself, and gets its own certificate.
@@ -14,6 +14,8 @@
 	let encrypt = $state(wizard.extra.encrypt !== false);
 	let error = $state<string | null>(null);
 	let busy = $state(false);
+	// The certificate is there, and the desktop app is trying the new address.
+	let moving = $state(false);
 
 	async function save(): Promise<void> {
 		if (busy) return;
@@ -23,12 +25,25 @@
 			const status = await setAccessMode('direct', address.trim(), encrypt);
 			// The summary reads the full origin from the server (`Done.svelte`).
 			wizard.extra = { ...wizard.extra, address: address.trim(), encrypt };
-			next();
-			if (status.address) await followServer(status.address, address);
+			// The desktop app moves to the new address before the wizard goes on: it reloads
+			// when it moves, and that must not happen in the middle of a later step. The step
+			// is saved first, so the reload opens the next one. When the app gets no answer
+			// there, the summary says so (`HttpsMove` in `Done.svelte`).
+			let advanced = false;
+			const advance = () => {
+				if (advanced) return;
+				advanced = true;
+				next();
+				persist();
+			};
+			moving = true;
+			if (status.address) await moveTo(status.address, address, advance);
+			advance();
 		} catch (err) {
 			error = err instanceof Error ? err.message : 'The address could not be saved.';
 		} finally {
 			busy = false;
+			moving = false;
 		}
 	}
 </script>
@@ -40,7 +55,9 @@
 	lead="Readers connect straight to this server. Nothing sits in front of it."
 >
 	<DirectAddress bind:address bind:error bind:encrypt />
-	{#if busy && encrypt}
+	{#if moving}
+		<p class="k-hint" role="status">Moving to the new address.</p>
+	{:else if busy && encrypt}
 		<p class="k-hint" role="status">Getting a certificate. This can take a minute.</p>
 	{/if}
 	{#snippet footer()}
