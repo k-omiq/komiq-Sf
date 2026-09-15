@@ -1,6 +1,56 @@
 /* App-global styling that layers on top of @komika/ui reset + tokens.
    color-scheme is owned by the tokens (per data-theme), so it is not forced here. */
 
+/* Safe areas (notch, status bar, home indicator). app.html sets viewport-fit=cover,
+   so the page paints edge to edge and every pinned bar has to step in by these.
+   They are 0 wherever the device has no inset.
+   The app header grows by the top inset, and everything that offsets by the header
+   (sticky bars, scroll margins, min-heights) follows through --k-header-h.
+   The page gutter is the phone value; wider screens raise it below. It never drops
+   under the side insets, so a landscape notch cannot cover page content. */
+:root {
+	--k-safe-top: env(safe-area-inset-top, 0px);
+	--k-safe-right: env(safe-area-inset-right, 0px);
+	--k-safe-bottom: env(safe-area-inset-bottom, 0px);
+	--k-safe-left: env(safe-area-inset-left, 0px);
+	--k-header-h: calc(64px + var(--k-safe-top));
+	--k-gutter-base: 20px;
+	--k-gutter: max(var(--k-gutter-base), var(--k-safe-left), var(--k-safe-right));
+}
+@media (min-width: 641px) {
+	:root {
+		--k-gutter-base: 32px;
+	}
+}
+/* The phone shell: a bottom tab bar is the primary nav and the top bar has no nav links.
+   It is on for a narrow screen, and for a phone on its side (wide, but short and touch).
+   `--k-tabbar-h` is the space the bar takes: 56px of tabs (44px on its side) + 1px
+   border + the home indicator. BottomNav, Header and the app layout use the same two
+   conditions. */
+:root {
+	--k-tabbar-h: 0px;
+}
+@media (max-width: 640px), (max-height: 500px) and (pointer: coarse) {
+	:root {
+		--k-tabbar-h: calc(57px + var(--k-safe-bottom));
+	}
+}
+@media (min-width: 641px) and (max-height: 500px) and (pointer: coarse) {
+	:root {
+		--k-tabbar-h: calc(45px + var(--k-safe-bottom));
+	}
+}
+@media (min-width: 1025px) {
+	:root {
+		--k-gutter-base: 56px;
+	}
+}
+
+/* The root paints the area behind the page (overscroll, a zoomed-out WebView). */
+html {
+	background: var(--k-bg);
+}
+
 body {
 	font-family: var(--k-font-sans);
 	background: var(--k-bg);
@@ -157,12 +207,6 @@ select:focus-visible,
 	padding-right: var(--k-gutter);
 }
 
-@media (max-width: 640px) {
-	:root {
-		--k-gutter: 20px;
-	}
-}
-
 /* Stable reading rhythm across discovery, account and support surfaces. */
 .k-gutter {
 	max-width: var(--k-max-content);
@@ -177,17 +221,51 @@ h4 {
 p {
 	overflow-wrap: anywhere;
 }
-@media (min-width: 641px) and (max-width: 1024px) {
-	:root {
-		--k-gutter: 32px;
-	}
-}
-@media (max-width: 640px) {
-	input,
+/* ---- touch ---- */
+@media (pointer: coarse) {
+	/* iOS zooms the page when a focused field's text is under 16px. Components set
+	   their own (smaller) sizes with more specific selectors, so this floor has to be
+	   !important to hold everywhere. */
+	input:not([type='checkbox'], [type='radio'], [type='range'], [type='file']),
 	textarea,
 	select {
-		font-size: max(16px, 1em);
+		font-size: max(16px, 1em) !important;
 	}
+	/* A 44x44 touch target for a control that is drawn smaller: the control keeps its
+	   size and look, an invisible box centred on it takes the tap. A component that
+	   positions the control itself overrides the `position` here, which is fine: any
+	   positioned box holds the ::after. Not for a control with `overflow: hidden`. */
+	.k-hit {
+		position: relative;
+	}
+	.k-hit::after {
+		content: '';
+		position: absolute;
+		top: 50%;
+		left: 50%;
+		width: max(100%, 44px);
+		height: max(100%, 44px);
+		transform: translate(-50%, -50%);
+	}
+}
+
+/* ---- native app shell ----
+   `data-native` is set by static/theme-init.js inside the Tauri app only. There the
+   page is the app, so it must not behave like a document in a browser: no rubber-band
+   or pull-to-refresh past the edges, no long-press link/image preview, no grey tap
+   flash, and no text selection on controls (reading text stays selectable). */
+html[data-native],
+html[data-native] body {
+	overscroll-behavior: none;
+}
+html[data-native] {
+	-webkit-touch-callout: none;
+	-webkit-tap-highlight-color: transparent;
+}
+html[data-native] :is(a, button, summary, label, nav, header, img, [role='button'], [role='tab']) {
+	-webkit-user-select: none;
+	user-select: none;
+	-webkit-user-drag: none;
 }
 @media (prefers-reduced-transparency: reduce) {
 	:root {

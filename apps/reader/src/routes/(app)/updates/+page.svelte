@@ -185,13 +185,13 @@
 		     drops `page` (see facetHref). -->
 		<nav class="tabs" aria-label="Updates list">
 			<a
-				class="tab"
+				class="tab k-hit"
 				class:on={tab === 'new'}
 				href={facetHref({ tab: 'new' })}
 				aria-current={tab === 'new' ? 'page' : undefined}>New</a
 			>
 			<a
-				class="tab"
+				class="tab k-hit"
 				class:on={tab === 'hot'}
 				href={facetHref({ tab: 'hot' })}
 				aria-current={tab === 'hot' ? 'page' : undefined}
@@ -203,14 +203,14 @@
 
 	<nav class="type-tabs" aria-label="Format">
 		<a
-			class="ttab"
+			class="ttab k-hit"
 			class:on={typeFilter === null}
 			href={facetHref({ type: null })}
 			aria-current={typeFilter === null ? 'page' : undefined}>All</a
 		>
 		{#each TYPES as t (t)}
 			<a
-				class="ttab"
+				class="ttab k-hit"
 				class:on={typeFilter === t}
 				href={facetHref({ type: t })}
 				title={t}
@@ -259,7 +259,7 @@
 			<div class="empty-desc">
 				Something went wrong reaching the server. Check your connection and try again.
 			</div>
-			<button class="empty-btn" onclick={() => void invalidateAll()}>Retry</button>
+			<button class="empty-btn k-hit" onclick={() => void invalidateAll()}>Retry</button>
 		</div>
 	{:else}
 		<div class="empty">
@@ -270,7 +270,7 @@
 			</div>
 			<!-- A link to the bare route, so it clears tab, format AND page in one step and
 			     lands on the canonical URL. -->
-			<a class="empty-btn" href="/updates">Reset filters</a>
+			<a class="empty-btn k-hit" href="/updates">Reset filters</a>
 		</div>
 	{/if}
 

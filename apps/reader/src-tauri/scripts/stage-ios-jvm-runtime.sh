@@ -12,7 +12,7 @@
 # the folder it references:
 #
 #   gen/apple/jvm-runtime/lib/
-#     lib/modules      <- the class-library jimage (~149 MB)
+#     lib/modules      <- the class-library jimage (~115 MB)
 #     lib/tzdb.dat
 #     lib/security/
 #     lib/jfr/
@@ -57,6 +57,37 @@ cp -Rc "${JRE}/lib/jfr" "${STAGE}/lib/jfr"
 cp -Rc "${JRE}/conf" "${STAGE}/conf"
 cp -c "${JRE}/release" "${STAGE}/release"
 
+# ---- Runtime-payload guards ----------------------------------------------------------
+#
+# Both were found on a real iPhone (2026-10-05) and neither shows at build time, so a
+# staged runtime that has them is a script failure here (same checks as the end of
+# build-ios-jvm.sh; keep the two in step):
+#   1. jimage version. The libjimage.a linked into the app (pinned openjdk/mobile tree)
+#      opens major 1 / minor 0 ONLY. Anything else and JNI_CreateJavaVM ends the whole
+#      app with "Unable to load <app>/lib/lib/modules". Expected first 8 bytes: magic
+#      "da da fe ca", minor "00 00", major "01 00".
+#   2. Symlinks. `cp -R` above keeps links as links, and a link into the JDK build tree
+#      (how lib/security/cacerts was first vendored) points at nothing inside the app:
+#      no trust store, so no HTTPS. ANY link is rejected, dangling or not.
+JIMAGE_VERSION_HEX="dadafeca00000100"
+JIMAGE_HEAD="$(od -An -tx1 -N8 "${STAGE}/lib/modules" | tr -d ' \n')"
+if [[ "${JIMAGE_HEAD}" != "${JIMAGE_VERSION_HEX}" ]]; then
+  echo "error: ${STAGE}/lib/modules has jimage header ${JIMAGE_HEAD}, expected ${JIMAGE_VERSION_HEX}" >&2
+  echo "  (magic + minor 0 + major 1). The vendored libjimage cannot open it; re-link lib/modules" >&2
+  echo "  with a jlink that writes jimage 1.0 (see the LINK_JDK pin in scripts/build-ios-jvm.sh)." >&2
+  exit 1
+fi
+LINKS="$(find "${STAGE}" -type l)"
+if [[ -n "${LINKS}" ]]; then
+  echo "error: symlinks in the staged runtime (they point outside the app bundle):" >&2
+  echo "${LINKS}" | sed 's/^/  /' >&2
+  echo "  replace them with real files in ${JRE} and re-run this script." >&2
+  exit 1
+fi
+for f in cacerts blocked.certs public_suffix_list.dat; do
+  [[ -s "${STAGE}/lib/security/${f}" ]] || { echo "error: ${STAGE}/lib/security/${f} missing or empty" >&2; exit 1; }
+done
+
 # ---- The gen/apple/project.yml link recipe -------------------------------------------
 #
 # These entries are hand-maintained because gen/apple is generated + gitignored and
@@ -65,7 +96,8 @@ cp -c "${JRE}/release" "${STAGE}/release"
 # thing back (print_project_yml_recipe below) so a wiped project.yml is recoverable
 # from the repo alone.
 #
-# The 13 JDK static libs must be force-loaded: nothing references their
+# The 13 JDK static libs, and libzstdkmp.a (the zstd decoder of the engine's HTTP client,
+# made by scripts/build-ios-zstd.sh), must be force-loaded: nothing references their
 # `Java_*`/`JNI_OnLoad_*` members at link time (HotSpot dlsym's them off the app image
 # at runtime), so as ordinary archive members ld drops them and JNI_CreateJavaVM dies
 # during java.base bootstrap on device — with NO build-time error. See build.rs for the
@@ -73,7 +105,12 @@ cp -c "${JRE}/release" "${STAGE}/release"
 FORCE_LOAD_LIBS=(
   java nio net zip jimage verify prefs extnet
   syslookup fallbackLinker management management_ext rmi
+  zstdkmp
 )
+[[ -f "${JRE}/lib/libzstdkmp.a" ]] || {
+  echo "error: ${JRE}/lib/libzstdkmp.a missing; run scripts/build-ios-zstd.sh" >&2
+  exit 1
+}
 
 print_project_yml_recipe() {
   cat >&2 <<'YAML'
@@ -93,6 +130,9 @@ print_project_yml_recipe() {
         base:
           # A stripped link re-drops the force-loaded, dlsym-only members.
           DEAD_CODE_STRIPPING: false
+          # A release archive strips with STRIP_STYLE=all by default. That removes the
+          # exported names the VM looks up at run time (Java_*, JNI_OnLoad_*, ...).
+          STRIP_STYLE: non-global
           OTHER_LDFLAGS: >-
             -lz -liconv -lc++
 YAML
@@ -114,6 +154,7 @@ require_project_yml() {
 
 require_project_yml "the jvm-runtime/lib folder reference (-> Komika.app/lib)" "jvm-runtime/lib"
 require_project_yml "DEAD_CODE_STRIPPING: false" "DEAD_CODE_STRIPPING[[:space:]]*:[[:space:]]*[\"']?(false|NO|no)"
+require_project_yml "STRIP_STYLE: non-global (a release build must keep the names the VM looks up)" "STRIP_STYLE[[:space:]]*:[[:space:]]*[\"']?non-global"
 require_project_yml "the CoreFoundation framework dependency" "CoreFoundation\.framework"
 require_project_yml "the Foundation framework dependency" "Foundation\.framework"
 require_project_yml "-lz (libjvm's inflater)" "\-lz([^a-zA-Z0-9]|$)"
@@ -151,10 +192,11 @@ if (( STAGE_MB > STAGE_CEILING_MB )); then
   exit 1
 fi
 
-# The runtime is only half the payload; the pinned jar rides along as an app resource.
-# Bound the pair the way build-jre.sh bounds the desktop JRE, so an oversized .ipa is a
-# script failure rather than a codesign/App-Store surprise.
-JAR="${SRC_TAURI_DIR}/suwayomi/Suwayomi-Server.jar"
+# The runtime is only half the payload; the jar rides along as an app resource (the iOS
+# copy that scripts/prune-ios-jar.sh makes from the pinned jar; counted only when it is
+# there). Bound the pair the way build-jre.sh bounds the desktop JRE, so an oversized .ipa
+# is a script failure rather than a codesign/App-Store surprise.
+JAR="${SRC_TAURI_DIR}/suwayomi-ios/Suwayomi-Server.jar"
 PAYLOAD_MB="${STAGE_MB}"
 if [[ -f "${JAR}" ]]; then
   PAYLOAD_MB=$(( STAGE_MB + $(du -sk "${JAR}" | awk '{print $1}') / 1024 ))

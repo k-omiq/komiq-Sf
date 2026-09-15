@@ -1,0 +1,13 @@
+{
+	"$schema": "../gen/schemas/mobile-schema.json",
+	"identifier": "mobile",
+	"description": "phones only: scan a server's QR code on the Connect to a server screen",
+	"windows": ["main"],
+	"platforms": ["iOS", "android"],
+	"permissions": [
+		"barcode-scanner:allow-scan",
+		"barcode-scanner:allow-cancel",
+		"barcode-scanner:allow-check-permissions",
+		"barcode-scanner:allow-request-permissions"
+	]
+}

@@ -24,6 +24,16 @@ use types::*;
 
 const PAGE_SIZE: i64 = 20;
 
+/// The `postComment` limiter: 20 comments a minute per account. A person in a lively
+/// thread stays far below it; a script that fills threads does not.
+pub fn comment_limiter() -> RateLimiter {
+    RateLimiter::new(20, 60)
+}
+
+/// Replies one comment thread holds, at every depth together. `postComment` refuses
+/// the next one; `comments` returns whole threads, so this bounds a page.
+const MAX_THREAD_REPLIES: i64 = 200;
+
 /// Aggregate scan-scheduler health, updated once per tick by `scanner::tick`.
 #[derive(Default)]
 pub struct ScanHealth {
@@ -119,6 +129,22 @@ static TAGS_CACHE: std::sync::LazyLock<FeedCache<Vec<crate::tags::TagRow>>> =
 static TAGS_INFLIGHT: std::sync::LazyLock<KeyedLocks> =
     std::sync::LazyLock::new(KeyedLocks::default);
 
+/// Browse's source list (`browseSources`).
+static BROWSE_SOURCES_CACHE: std::sync::LazyLock<FeedCache<Vec<BrowseSource>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+/// Single-flight locks collapsing concurrent refills of [`BROWSE_SOURCES_CACHE`].
+static BROWSE_SOURCES_INFLIGHT: std::sync::LazyLock<KeyedLocks> =
+    std::sync::LazyLock::new(KeyedLocks::default);
+/// How long the `browseSources` payload stays usable. Longer than [`FEED_TTL`] because it
+/// is not a read of a materialized table: `browse::source_facets` joins every Browse row
+/// to its mappings (about 0.5 s), and which sources carry how many works moves slowly.
+/// An admin edit that changes it clears the memo ([`clear_feed_caches`]). Zero under test,
+/// for the reason [`FEED_TTL`] is.
+#[cfg(not(test))]
+const BROWSE_SOURCES_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+#[cfg(test)]
+const BROWSE_SOURCES_TTL: std::time::Duration = std::time::Duration::ZERO;
+
 /// Single-flight locks collapsing concurrent refills of [`DISCOVERY_CACHE`] (S1
 /// pattern). Keyed 0/1 by NSFW posture — a separate keyspace from
 /// [`GENRE_FACETS_INFLIGHT`] and from the AppState locks, whose keys are series ids,
@@ -200,6 +226,9 @@ pub(crate) fn clear_feed_caches() {
         map.clear();
     }
     if let Ok(mut map) = TAGS_CACHE.lock() {
+        map.clear();
+    }
+    if let Ok(mut map) = BROWSE_SOURCES_CACHE.lock() {
         map.clear();
     }
     crate::browse::clear_count_cache();
@@ -284,6 +313,8 @@ pub struct AppState {
     pub scan_health: Mutex<ScanHealth>,
     /// Per-key sliding-window limiter for `login` / `register`.
     pub auth_limiter: RateLimiter,
+    /// Per-user sliding-window limiter for `postComment` (see [`comment_limiter`]).
+    pub comment_limiter: RateLimiter,
     /// Bound concurrent 64 MiB password jobs across all client IPs.
     pub password_work: std::sync::Arc<tokio::sync::Semaphore>,
     /// Per-user sliding-window limiter for `searchAllSources` (C1). That endpoint
@@ -322,6 +353,29 @@ pub struct RequestAuth(pub Option<String>);
 /// cannot exhaust another account's budget.
 #[derive(Clone, Default)]
 pub struct ClientIp(pub Option<String>);
+
+/// Per-request: the request came in the clear from an address on the internet. Not
+/// over HTTPS, and not through a proxy this server trusts (which may end HTTPS
+/// itself). Set by the HTTP layer; `createOwner` refuses such a request, so the owner
+/// password never has to cross the internet unencrypted.
+#[derive(Clone, Default)]
+pub enum PlainFromInternet {
+    #[default]
+    No,
+    Yes,
+    /// In the clear, from a peer address that proves nothing, to this DNS name: the
+    /// internet when the name leads to a public address. Looked up only where the
+    /// answer is used.
+    Named(String),
+}
+
+async fn plain_from_internet(ctx: &Context<'_>) -> bool {
+    match ctx.data_opt::<PlainFromInternet>() {
+        Some(PlainFromInternet::Yes) => true,
+        Some(PlainFromInternet::Named(name)) => crate::cloudflare::name_on_internet(name).await,
+        _ => false,
+    }
+}
 
 /// Per-request memoization of the authenticated user. `current_user` is called
 /// once per series in a feed (via `is_marked`/`viewer_show_nsfw`/…), so without a
@@ -362,6 +416,14 @@ pub struct RequestLibraryCache(pub std::sync::Arc<std::sync::Mutex<LibraryCellMa
 /// Upper bound on password length accepted by `login`/`register`, enforced
 /// before hashing so an over-long password can't amplify Argon2 CPU cost (A7).
 const MAX_PASSWORD_LEN: usize = 1024;
+
+/// Longer than any username in bytes (sign-up allows 32 characters). `login` refuses
+/// a longer one without a lookup.
+const MAX_LOGIN_USERNAME_LEN: usize = 256;
+
+/// `login` attempts on one account, from all addresses together, as a multiple of
+/// what one address may make (`AppState::auth_limiter`).
+const LOGIN_ACCOUNT_FACTOR: u32 = 3;
 
 /// A fixed dummy Argon2 hash (of a random password nobody knows), used to run a
 /// constant-work verify on the login missing-user path so response time doesn't
@@ -746,16 +808,27 @@ fn client_ip(ctx: &Context<'_>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Resolve the authenticated user, or `None` if the request is anonymous.
+/// Resolve the authenticated user, or `None` if the request is anonymous. An
+/// account that still holds a temporary password counts as anonymous here: it can
+/// read its session and change its password ([`session_user`]) and nothing else.
+async fn current_user(ctx: &Context<'_>) -> Option<User> {
+    session_user(ctx)
+        .await
+        .filter(|u| u.must_change_password == 0)
+}
+
+/// The user owning the request's session, including one that must change its
+/// password first. Only the `session` query and `changePassword` call this;
+/// everything else goes through [`current_user`].
 /// Memoized per request via `RequestUserCache` so the `sessions⋈users` lookup
 /// runs at most once even when many resolvers ask (one per feed item).
-async fn current_user(ctx: &Context<'_>) -> Option<User> {
+async fn session_user(ctx: &Context<'_>) -> Option<User> {
     if let Some(cache) = ctx.data_opt::<RequestUserCache>() {
         return cache
             .0
             .get_or_init(|| async {
                 match token(ctx) {
-                    Some(tok) => auth::user_for_token(&state(ctx).pool, &tok)
+                    Some(tok) => auth::session_user_for_token(&state(ctx).pool, &tok)
                         .await
                         .ok()
                         .flatten(),
@@ -767,7 +840,7 @@ async fn current_user(ctx: &Context<'_>) -> Option<User> {
     }
     // Fallback when no cache was attached (e.g. a code path that builds a bare request).
     let tok = token(ctx)?;
-    auth::user_for_token(&state(ctx).pool, &tok)
+    auth::session_user_for_token(&state(ctx).pool, &tok)
         .await
         .ok()
         .flatten()
@@ -829,11 +902,17 @@ async fn viewer_library_row(ctx: &Context<'_>, series_id: &str) -> Option<Librar
         .clone()
 }
 
+/// What a signed-in account with a temporary password is told by everything but
+/// the session query and `changePassword`.
+const MUST_CHANGE_PASSWORD: &str = "Choose a new password first";
+
 /// Resolve the authenticated user or fail — for mutations that require sign-in.
 async fn require_user(ctx: &Context<'_>) -> Result<User> {
-    current_user(ctx)
-        .await
-        .ok_or_else(|| Error::new("Not authenticated"))
+    match session_user(ctx).await {
+        Some(u) if u.must_change_password == 0 => Ok(u),
+        Some(_) => Err(Error::new(MUST_CHANGE_PASSWORD)),
+        None => Err(Error::new("Not authenticated")),
+    }
 }
 
 /// Resolve the authenticated user and require the admin flag — for the console.
@@ -853,6 +932,18 @@ async fn require_admin(ctx: &Context<'_>) -> Result<User> {
 fn gql_err(e: impl std::fmt::Display) -> Error {
     tracing::error!(error = %e, "internal error");
     Error::new("Internal error")
+}
+
+/// A `scanner::EffectiveRateLimit` as the admin console reads it.
+fn source_rate_limit(l: crate::scanner::EffectiveRateLimit) -> SourceRateLimit {
+    use crate::scanner::LimitOrigin;
+    SourceRateLimit {
+        source_id: ID(l.limit.source_id),
+        requests: l.limit.requests.min(i32::MAX as u32) as i32,
+        window_secs: l.limit.window_secs.min(i32::MAX as u64) as i32,
+        from_env: l.origin == LimitOrigin::Env,
+        overrides_env: l.origin == LimitOrigin::AdminOverEnv,
+    }
 }
 
 /// What the admin console shows when the source engine cannot be reached.
@@ -5650,6 +5741,119 @@ impl QueryRoot {
             .collect())
     }
 
+    /// The sources Browse can filter by (`BrowseFilter.source`), biggest first, NSFW-gated
+    /// like `tags`: each `count` is the number of works the filter returns for the viewer,
+    /// and a source with none for them is not offered.
+    ///
+    /// `includeNsfw` is the admin console's escape hatch, as on `search`: honoured for an
+    /// admin only, so the console lists every source whatever the admin's own setting.
+    ///
+    /// Memoized per NSFW posture for [`BROWSE_SOURCES_TTL`], with a single-flight refill.
+    async fn browse_sources(
+        &self,
+        ctx: &Context<'_>,
+        include_nsfw: Option<bool>,
+    ) -> Result<Vec<BrowseSource>> {
+        let st = state(ctx);
+        let show_nsfw = if include_nsfw == Some(true) {
+            viewer_show_nsfw_or_admin(ctx, include_nsfw).await
+        } else {
+            viewer_show_nsfw(ctx).await
+        };
+        let key = feed_cache_key(show_nsfw);
+        if let Some(hit) = cached_feed(&BROWSE_SOURCES_CACHE, key, BROWSE_SOURCES_TTL) {
+            return Ok((*hit).clone());
+        }
+        let lock = BROWSE_SOURCES_INFLIGHT.lock_handle(i64::from(show_nsfw));
+        let _guard = lock.lock().await;
+        if let Some(hit) = cached_feed(&BROWSE_SOURCES_CACHE, key, BROWSE_SOURCES_TTL) {
+            return Ok((*hit).clone());
+        }
+        let sources = compute_browse_sources(st, show_nsfw)
+            .await
+            .map_err(gql_err)?;
+        store_feed(&BROWSE_SOURCES_CACHE, key, sources.clone());
+        Ok(sources)
+    }
+
+    /// Every scanlator an admin tagged as using AI. Public: a reader app marks the
+    /// chapter copies these names are credited on (see `ScanlatorTag.name` for the match
+    /// rule). One small table read, so it is not memoized.
+    async fn scanlator_tags(&self, ctx: &Context<'_>) -> Result<Vec<ScanlatorTag>> {
+        let tags = crate::scanlators::list_tags(&state(ctx).pool)
+            .await
+            .map_err(gql_err)?;
+        Ok(tags
+            .into_iter()
+            .map(|t| ScanlatorTag {
+                name: t.name,
+                ai: t.level.into(),
+            })
+            .collect())
+    }
+
+    /// Admin: the scanlator list. Every credit chapters carry, most chapters first, with
+    /// the AI tag stored for it and the one that applies. `search` matches part of the
+    /// name; `ai` filters by the tag that applies; `source` ("mangadex" or a source id,
+    /// as `browseSources` lists them) keeps the credits with chapters on that source and
+    /// counts that source only. 50 per page.
+    ///
+    /// The counts come from one scan of the chapter table that the server reuses for ten
+    /// minutes (`scanlators::group_stats`), so a credit that arrived a moment ago can be
+    /// missing; the tags are always current.
+    async fn scanlators(
+        &self,
+        ctx: &Context<'_>,
+        search: Option<String>,
+        ai: Option<ScanlatorAiFilter>,
+        source: Option<String>,
+        #[graphql(default = 1)] page: i32,
+    ) -> Result<ScanlatorPage> {
+        use crate::scanlators::{self as sc, AiFilter};
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let stats = sc::group_stats(&st.pool).await.map_err(gql_err)?;
+        let tags = sc::list_tags(&st.pool).await.map_err(gql_err)?;
+        let page = page.max(1);
+        let query = sc::ListQuery {
+            search: search.map(|s| s.chars().take(sc::MAX_NAME_LEN).collect()),
+            ai: ai.map(|f| match f {
+                ScanlatorAiFilter::Tagged => AiFilter::Tagged,
+                ScanlatorAiFilter::Ai => AiFilter::Ai,
+                ScanlatorAiFilter::Partial => AiFilter::Partial,
+                ScanlatorAiFilter::Untagged => AiFilter::Untagged,
+            }),
+            source: source
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    if s.eq_ignore_ascii_case(sc::MANGADEX_SOURCE) {
+                        sc::MANGADEX_SOURCE.to_string()
+                    } else {
+                        s
+                    }
+                }),
+            page: page as usize,
+        };
+        let (rows, total) = sc::page(&stats, &tags, &query);
+        let count = |n: i64| n.min(i64::from(i32::MAX)) as i32;
+        Ok(ScanlatorPage {
+            items: rows
+                .into_iter()
+                .map(|r| Scanlator {
+                    name: r.name,
+                    chapter_count: count(r.chapters),
+                    series_count: count(r.works),
+                    ai: r.own.map(Into::into),
+                    effective_ai: r.effective.map(Into::into),
+                })
+                .collect(),
+            page,
+            has_next_page: (page as usize).saturating_mul(sc::PAGE_SIZE) < total,
+            total: total.min(i32::MAX as usize) as i32,
+        })
+    }
+
     /// Federated multi-extension catalogue search (S3). Fans the query out to
     /// every installed Suwayomi source (bounded concurrency + per-source timeout,
     /// failures skipped), runs each hit through the dedup matcher against the
@@ -5791,6 +5995,56 @@ impl QueryRoot {
                 height: None,
             })
             .collect())
+    }
+
+    /// Where a Suwayomi chapter lives at its source, plus the extension that reads it —
+    /// for a reader app that fetches pages with its OWN engine instead of through
+    /// `pages` (which makes this server fetch the page list and proxy every image).
+    /// Answered from the engine's database and ours; nothing is requested from the
+    /// source. Null for an unknown chapter. Gated exactly like `pages`: knowing where an
+    /// NSFW chapter lives is as good as being served it.
+    async fn chapter_origin(
+        &self,
+        ctx: &Context<'_>,
+        chapter_id: ID,
+    ) -> Result<Option<ChapterOrigin>> {
+        let st = state(ctx);
+        let n = chapter_id.0.parse::<i64>().map_err(gql_err)?;
+        let Some(origin) = st.suwayomi.chapter_origin(n).await.map_err(gql_err)? else {
+            return Ok(None);
+        };
+        if canonical_is_nsfw(&st.pool, &origin.manga_id.to_string()).await
+            && !viewer_show_nsfw(ctx).await
+        {
+            return Err(Error::new("No such chapter"));
+        }
+        let extension =
+            sqlx::query_as::<_, (String, String, Option<String>, Option<i64>, Option<String>)>(
+                "SELECT pkg_name, repo_url, apk_name, version_code, lang \
+             FROM source_extension WHERE source_id = ?",
+            )
+            .bind(&origin.source_id)
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(gql_err)?
+            .map(
+                |(pkg_name, repo_url, apk_name, version_code, lang)| SourceExtension {
+                    pkg_name,
+                    repo_url,
+                    apk_name,
+                    version_code: version_code.map(|v| v as i32),
+                    lang,
+                },
+            );
+        Ok(Some(ChapterOrigin {
+            source_id: origin.source_id,
+            manga_url: origin.manga_url,
+            manga_title: origin.manga_title,
+            chapter_url: origin.chapter_url,
+            chapter_web_url: origin.chapter_web_url,
+            manga_web_url: origin.manga_web_url,
+            extension,
+        }))
     }
 
     async fn library(&self, ctx: &Context<'_>) -> Result<Vec<Series>> {
@@ -6257,13 +6511,16 @@ impl QueryRoot {
              FROM comments c JOIN users u ON u.id = c.user_id \
              LEFT JOIN comment_media m ON m.comment_id = c.id \
              WHERE c.id IN (SELECT id FROM thread) \
-             ORDER BY c.created_at ASC",
+             ORDER BY c.created_at ASC LIMIT ?",
         )
         .bind(target_type)
         .bind(target_id.0.clone())
         .bind(PAGE_SIZE)
         .bind(offset)
         .bind(&viewer_id)
+        // What full threads add up to. It cuts only threads from before the reply
+        // limit, and oldest first keeps every reply's parent in the answer.
+        .bind(PAGE_SIZE * (MAX_THREAD_REPLIES + 1))
         .fetch_all(&st.pool)
         .await
         .map_err(gql_err)?;
@@ -6781,16 +7038,20 @@ impl QueryRoot {
     async fn instance(&self, ctx: &Context<'_>) -> Result<Instance> {
         use crate::instance as inst;
         let pool = &state(ctx).pool;
+        let setup_required = !inst::admin_exists(pool).await.map_err(gql_err)?;
         Ok(Instance {
-            setup_required: !inst::admin_exists(pool).await.map_err(gql_err)?,
+            setup_required,
             name: inst::resolve(pool, &inst::INSTANCE_NAME).await.value,
             version: env!("CARGO_PKG_VERSION").to_string(),
-            registration_open: inst::resolve(pool, &inst::REGISTRATION_OPEN)
-                .await
-                .as_bool(),
+            registration_open: inst::resolve_registration(pool).await.as_bool(),
             // The live usage switch: set from `resolve_mangadex` at boot and by
             // `setMangadexEnabled`, and what every MangaDex request obeys.
             mangadex_enabled: state(ctx).mangadex.is_enabled(),
+            apps_fetch_themselves: inst::resolve(pool, &inst::APPS_FETCH_THEMSELVES)
+                .await
+                .as_bool(),
+            // Asked only while there is no owner: nothing reads it afterwards.
+            setup_needs_terminal: setup_required && plain_from_internet(ctx).await,
         })
     }
 
@@ -6808,6 +7069,17 @@ impl QueryRoot {
         })
     }
 
+    /// Admin: every per-source scan rate limit in force — the server's defaults
+    /// (`SCAN_SOURCE_RATE_LIMITS`, `fromEnv`) and the ones an admin set, which win.
+    #[graphql(cache_control(no_cache))]
+    async fn source_rate_limits(&self, ctx: &Context<'_>) -> Result<Vec<SourceRateLimit>> {
+        require_admin(ctx).await?;
+        let limits = crate::scanner::effective_source_rate_limits(&state(ctx).pool)
+            .await
+            .map_err(gql_err)?;
+        Ok(limits.into_iter().map(source_rate_limit).collect())
+    }
+
     /// Admin: Settings › Access — the access choice, the public address, what
     /// Cloudflare setup created, the connector, and the current setup/remove run.
     #[graphql(cache_control(no_cache))]
@@ -6816,11 +7088,23 @@ impl QueryRoot {
         Ok(cloudflare(ctx)?.status().await)
     }
 
+    /// Admin: check the connector, ports and public address before access setup.
+    #[graphql(cache_control(no_cache))]
+    async fn access_preflight(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::cloudflare::AccessPreflight> {
+        require_admin(ctx).await?;
+        Ok(cloudflare(ctx)?.preflight().await)
+    }
+
     async fn session(&self, ctx: &Context<'_>) -> Result<Option<Session>> {
         let Some(tok) = token(ctx) else {
             return Ok(None);
         };
-        match current_user(ctx).await {
+        // `session_user`: an account that must change its password still sees its
+        // session, which is how the apps know to show that screen.
+        match session_user(ctx).await {
             Some(u) => {
                 let show_nsfw = user_show_nsfw(&state(ctx).pool, &u.id).await;
                 Ok(Some(Session {
@@ -7751,6 +8035,66 @@ fn select_federated_sources(
         }
     }
     out
+}
+
+/// `browseSources`, uncached: the source facets, named. Display names exist only in the
+/// engine's installed-source list (see `workSourceRows`), so it is asked once, best
+/// effort: when it does not answer, a source is named by the last part of its extension
+/// package, then by its id, which still tells two sources apart.
+async fn compute_browse_sources(
+    st: &AppState,
+    show_nsfw: bool,
+) -> anyhow::Result<Vec<BrowseSource>> {
+    let facets = crate::browse::source_facets(&st.pool, show_nsfw).await?;
+    let mangadex = crate::scanlators::MANGADEX_SOURCE;
+    let live: HashMap<String, crate::suwayomi::SuwayomiSource> = if facets
+        .iter()
+        .any(|f| f.id != mangadex)
+    {
+        match st.suwayomi.list_sources().await {
+            Ok(list) => list.into_iter().map(|s| (s.id.clone(), s)).collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "browseSources: source list unavailable; falling back to package names");
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+    Ok(facets
+        .into_iter()
+        .map(|f| {
+            let count = f.count.min(i64::from(i32::MAX)) as i32;
+            if f.id == mangadex {
+                return BrowseSource {
+                    id: f.id,
+                    name: "MangaDex".to_string(),
+                    lang: None,
+                    count,
+                };
+            }
+            let source = live.get(&f.id);
+            let name = source
+                .map(|s| s.name.clone())
+                .or_else(|| {
+                    f.pkg_name
+                        .as_deref()
+                        .and_then(|p| p.rsplit('.').next())
+                        .map(str::to_string)
+                })
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| f.id.clone());
+            BrowseSource {
+                name,
+                lang: source
+                    .map(|s| s.lang.clone())
+                    .or(f.lang)
+                    .filter(|l| !l.is_empty()),
+                id: f.id,
+                count,
+            }
+        })
+        .collect())
 }
 
 /// Map a work's `WorkSource` rows onto `Translator`s, enriching each Suwayomi
@@ -8985,6 +9329,11 @@ impl MutationRoot {
         }
         let user = require_user(ctx).await?;
         let st = state(ctx);
+        if let Err(retry) = st.comment_limiter.check(&user.id) {
+            return Err(Error::new(format!(
+                "You are posting too fast. Try again in {retry}s."
+            )));
+        }
 
         // The thread's target must exist. `comments.target_id` is a free-form TEXT key
         // with no FK, so without this a signed-in user can open threads on arbitrary
@@ -9012,6 +9361,32 @@ impl MutationRoot {
             .map_err(gql_err)?;
             if ok.is_none() {
                 return Err(Error::new("reply target not found on this thread"));
+            }
+            // One thread (a top comment and everything under it) holds a bounded
+            // number of replies: `comments` returns whole threads, so without this
+            // one thread could make every read of its page as large as someone
+            // cares to post. Walk up to the top comment, then count what is under it.
+            let replies: i64 = sqlx::query_scalar(
+                "WITH RECURSIVE up(id, parent_id) AS ( \
+                     SELECT id, parent_id FROM comments WHERE id = ? \
+                     UNION ALL \
+                     SELECT c.id, c.parent_id FROM comments c JOIN up ON c.id = up.parent_id \
+                 ), \
+                 thread(id) AS ( \
+                     SELECT id FROM up WHERE parent_id IS NULL \
+                     UNION ALL \
+                     SELECT c.id FROM comments c JOIN thread t ON c.parent_id = t.id \
+                 ) \
+                 SELECT COUNT(*) - 1 FROM thread",
+            )
+            .bind(&parent.0)
+            .fetch_one(&st.pool)
+            .await
+            .map_err(gql_err)?;
+            if replies >= MAX_THREAD_REPLIES {
+                return Err(Error::new(
+                    "This thread is full. Post a new comment instead of a reply.",
+                ));
             }
         }
 
@@ -9304,12 +9679,23 @@ impl MutationRoot {
         }
         // Reject over-long passwords before any Argon2 work (A7). Such a password
         // can never be valid (registration caps at the same length), so this is
-        // just the wrong-credentials path.
-        if password.len() > MAX_PASSWORD_LEN {
+        // just the wrong-credentials path. The same for a name no account can have,
+        // which also keeps it out of the limiter's keys.
+        if password.len() > MAX_PASSWORD_LEN || username.len() > MAX_LOGIN_USERNAME_LEN {
             return Err(Error::new("Invalid username or password"));
         }
+        // Then per account, whatever the address: guesses at one account from many
+        // addresses each pass the limit above. Lower-cased, so spellings of one name
+        // share a budget. The budget is larger than one address has, so one address
+        // cannot use it up and keep the owner of the account out.
+        let account = format!("login-account:{}", username.to_lowercase());
+        if let Err(retry) = st.auth_limiter.check_scaled(&account, LOGIN_ACCOUNT_FACTOR) {
+            return Err(Error::new(format!(
+                "Too many login attempts — try again in {retry}s"
+            )));
+        }
         let row = sqlx::query_as::<_, User>(
-            "SELECT id, username, email, password_hash, avatar_url, is_admin, is_banned FROM users WHERE username = ?",
+            "SELECT id, username, email, password_hash, avatar_url, is_admin, is_banned, must_change_password FROM users WHERE username = ?",
         )
         .bind(&username)
         .fetch_optional(&st.pool)
@@ -9324,6 +9710,7 @@ impl MutationRoot {
             Some(u) => u.password_hash.clone(),
             None => DUMMY_PASSWORD_HASH.clone(),
         };
+        let checked_hash = phc.clone();
         let password_ok = {
             let permit = st
                 .password_work
@@ -9353,6 +9740,23 @@ impl MutationRoot {
             return Err(Error::new("This account has been suspended."));
         }
         let tok = new_session(&st.pool, &user.id, st.session_ttl_secs).await?;
+        // The password may have changed while this sign-in ran. `changePassword` ends
+        // every other session, but only those that exist when it commits: a session
+        // made from the old password just after would outlive it. So look again.
+        let current: Option<(String,)> =
+            sqlx::query_as("SELECT password_hash FROM users WHERE id = ?")
+                .bind(&user.id)
+                .fetch_optional(&st.pool)
+                .await
+                .map_err(gql_err)?;
+        if current.map(|(hash,)| hash) != Some(checked_hash) {
+            sqlx::query("DELETE FROM sessions WHERE token = ?")
+                .bind(auth::hash_token(&tok))
+                .execute(&st.pool)
+                .await
+                .map_err(gql_err)?;
+            return Err(Error::new("Invalid username or password"));
+        }
         let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
         Ok(Session {
             token: tok,
@@ -9373,8 +9777,9 @@ impl MutationRoot {
             )));
         }
         // Sign-up switch (`registration_open`): env, then the admin setting, then
-        // open. Checked after the rate limit so probing it costs budget too.
-        if !crate::instance::resolve(&st.pool, &crate::instance::REGISTRATION_OPEN)
+        // the default (closed on a self-hosted install, open elsewhere). Checked
+        // after the rate limit so probing it costs budget too.
+        if !crate::instance::resolve_registration(&st.pool)
             .await
             .as_bool()
         {
@@ -9460,6 +9865,14 @@ impl MutationRoot {
         password: String,
     ) -> Result<Session> {
         let st = state(ctx);
+        // The setup screens ask `instance.setupNeedsTerminal` first and do not show
+        // the form, so nothing is sent in the clear; this is for every other client.
+        if plain_from_internet(ctx).await {
+            return Err(Error::new(
+                "This connection is not encrypted, so the owner account cannot be created \
+                 over it. Run `komika-server setup` on the server instead.",
+            ));
+        }
         if let Err(retry) = st.auth_limiter.check(&format!("setup:{}", client_ip(ctx))) {
             return Err(Error::new(format!(
                 "Too many setup attempts — try again in {retry}s"
@@ -9527,7 +9940,10 @@ impl MutationRoot {
         current_password: String,
         new_password: String,
     ) -> Result<SessionUser> {
-        let user = require_user(ctx).await?;
+        // The one mutation an account with a temporary password may call.
+        let user = session_user(ctx)
+            .await
+            .ok_or_else(|| Error::new("Not authenticated"))?;
         let st = state(ctx);
         if let Err(retry) = st
             .auth_limiter
@@ -10220,8 +10636,12 @@ impl MutationRoot {
     /// enumeration or live source browse: a single UPDATE over `source_series → work`.
     /// `isNsfw: true` pins NSFW; `isNsfw: false` CLEARS the override (reverts to
     /// source-derived), so it's a clean undo. Returns how many works were updated.
-    /// Only marks series already INGESTED (they need a `work`); run `startSourceIngest`
-    /// first to catch a source's not-yet-catalogued series, then re-run this.
+    ///
+    /// The decision is also REMEMBERED for the source (`source_nsfw_pin`), so a series
+    /// added from it later is pinned adult on ingest exactly like the ones updated
+    /// here; no re-run is needed. `isNsfw: false` forgets it. One limit of the undo: a
+    /// work first created while the pin was on was created adult, and clearing the
+    /// override does not un-flag it (nothing un-flags a work automatically).
     async fn mark_source_nsfw(
         &self,
         ctx: &Context<'_>,
@@ -10231,6 +10651,13 @@ impl MutationRoot {
         require_admin(ctx).await?;
         let st = state(ctx);
         let now = Utc::now().to_rfc3339();
+        // Remember the decision BEFORE touching the works: if this fails nothing has
+        // changed, and once it is in place an ingest racing the UPDATE below already
+        // pins what it adds. Kept apart from `source_extension`, which the record pass
+        // rewrites from the engine and would overwrite.
+        catalog::set_source_nsfw_pin(&st.pool, &source_id, is_nsfw)
+            .await
+            .map_err(gql_err)?;
         // true → pin override = 1; false → clear (NULL) so it reverts to derived.
         let val: Option<i64> = is_nsfw.then_some(1);
         let res = sqlx::query(
@@ -10622,7 +11049,7 @@ impl MutationRoot {
         require_admin(ctx).await?;
         use crate::instance as inst;
         let pool = &state(ctx).pool;
-        if inst::resolve(pool, &inst::REGISTRATION_OPEN).await.source == inst::Source::Env {
+        if inst::resolve_registration(pool).await.source == inst::Source::Env {
             return Err(Error::new(
                 "Sign-up is set by KOMIKA_REGISTRATION_OPEN on this server and cannot be changed here.",
             ));
@@ -10634,9 +11061,7 @@ impl MutationRoot {
         )
         .await
         .map_err(gql_err)?;
-        Ok(inst::resolve(pool, &inst::REGISTRATION_OPEN)
-            .await
-            .as_bool())
+        Ok(inst::resolve_registration(pool).await.as_bool())
     }
 
     /// Admin: turn MangaDex on or off (`mangadex_enabled`). Refused when the server's
@@ -10672,17 +11097,108 @@ impl MutationRoot {
         Ok(st.mangadex.is_enabled())
     }
 
-    /// Admin: record the setup wizard's access choice (`local` or `internet`), and
-    /// the domain when the owner set Cloudflare up by hand.
+    /// Admin: tag a scanlator as using AI (`AI`), partly using it (`PARTIAL`), or with
+    /// `ai: null` remove its tag. The tag is kept by name, case-folded, and applies to
+    /// every chapter credited to that name on every source, now and later; a joint
+    /// credit ("A & B") with no tag of its own takes it too. `false` when nothing changed.
+    async fn set_scanlator_ai(
+        &self,
+        ctx: &Context<'_>,
+        name: String,
+        ai: Option<ScanlatorAi>,
+    ) -> Result<bool> {
+        let admin = require_admin(ctx).await?;
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > crate::scanlators::MAX_NAME_LEN {
+            return Err(Error::new("Choose a scanlator."));
+        }
+        let changed = crate::scanlators::set_tag(&state(ctx).pool, name, ai.map(Into::into))
+            .await
+            .map_err(gql_err)?;
+        if changed {
+            tracing::info!(scanlator = name, ai = ?ai, by = %admin.username, "scanlator AI tag set by an admin");
+        }
+        Ok(changed)
+    }
+
+    /// Admin: limit how often the server asks one source for new chapters — at most
+    /// `requests` HTTP requests per `windowSecs`, spaced evenly (one series check costs
+    /// two requests). Adds the limit or replaces the one already stored, and wins over
+    /// a `SCAN_SOURCE_RATE_LIMITS` default for the same source. Applied to the running
+    /// scan loop at once, without a restart.
+    async fn set_source_rate_limit(
+        &self,
+        ctx: &Context<'_>,
+        source_id: String,
+        requests: i32,
+        window_secs: i32,
+    ) -> Result<SourceRateLimit> {
+        let admin = require_admin(ctx).await?;
+        let st = state(ctx);
+        let source_id = source_id.trim();
+        if source_id.is_empty() || source_id.len() > 64 {
+            return Err(Error::new("Choose a source."));
+        }
+        if !(1..=10_000).contains(&requests) {
+            return Err(Error::new("Requests must be between 1 and 10000."));
+        }
+        if !(1..=86_400).contains(&window_secs) {
+            return Err(Error::new(
+                "The time window must be between 1 second and 24 hours.",
+            ));
+        }
+        crate::scanner::store_source_rate_limit(
+            &st.pool,
+            source_id,
+            requests as u32,
+            window_secs as u64,
+        )
+        .await
+        .map_err(gql_err)?;
+        crate::scanner::kick_supervisor();
+        tracing::info!(source_id, requests, window_secs, by = %admin.username, "source rate limit set by an admin");
+        Ok(SourceRateLimit {
+            source_id: ID(source_id.to_string()),
+            requests,
+            window_secs,
+            from_env: false,
+            overrides_env: crate::config::scan_source_rate_limits()
+                .iter()
+                .any(|l| l.source_id == source_id),
+        })
+    }
+
+    /// Admin: remove the limit an admin stored for a source. The source then falls back
+    /// to its `SCAN_SOURCE_RATE_LIMITS` default when it has one, and is checked at the
+    /// normal pace otherwise. Applied at once. `false` when no admin's limit was stored.
+    async fn remove_source_rate_limit(&self, ctx: &Context<'_>, source_id: String) -> Result<bool> {
+        let admin = require_admin(ctx).await?;
+        let source_id = source_id.trim();
+        let removed = crate::scanner::delete_source_rate_limit(&state(ctx).pool, source_id)
+            .await
+            .map_err(gql_err)?;
+        if removed {
+            crate::scanner::kick_supervisor();
+            tracing::info!(source_id, by = %admin.username, "source rate limit removed by an admin");
+        }
+        Ok(removed)
+    }
+
+    /// Admin: record the access choice (`local`, `internet` or `direct`). `domain` is
+    /// the domain when the owner set Cloudflare up by hand, or the server's public
+    /// address for `direct`. With `encrypt`, `direct` also gets a Let's Encrypt
+    /// certificate for that address and serves HTTPS with it; this answers when the
+    /// certificate is in place, which can take a minute.
     async fn set_access_mode(
         &self,
         ctx: &Context<'_>,
         mode: String,
         domain: Option<String>,
+        encrypt: Option<bool>,
     ) -> Result<crate::cloudflare::AccessStatus> {
         require_admin(ctx).await?;
         let cf = cloudflare(ctx)?;
-        crate::cloudflare::set_access(&state(ctx).pool, mode.trim(), domain.as_deref())
+        cf.set_access(mode.trim(), domain.as_deref(), encrypt.unwrap_or(false))
             .await
             .map_err(Error::new)?;
         Ok(cf.status().await)
@@ -10695,10 +11211,11 @@ impl MutationRoot {
         ctx: &Context<'_>,
         token: String,
         domain: String,
+        connection: Option<crate::cloudflare::Connection>,
     ) -> Result<crate::cloudflare::CloudflareTokenCheck> {
         require_admin(ctx).await?;
         cloudflare(ctx)?
-            .check_token(&token, &domain)
+            .check_token(&token, &domain, connection)
             .await
             .map_err(Error::new)
     }
@@ -10860,7 +11377,7 @@ impl MutationRoot {
                 .unwrap_or(None),
             None => None,
         };
-        let result = add_source_series_core(&st.pool, &m, cover_phash)
+        let result = add_source_series_checked(st, &m, cover_phash, false)
             .await
             .map_err(gql_err)?;
         // Register a "due now" scan-state row FIRST, independent of the scan-on-enrol
@@ -11162,6 +11679,12 @@ impl MutationRoot {
             .install_extension(&pkg_name)
             .await
             .map_err(gql_err)?;
+        // Record the new sources' extension rows NOW rather than at the next scheduled
+        // pass: ingest reads a source's NSFW flag from `source_extension`, and
+        // `chapterOrigin` its install coordinates. Best-effort — the extension IS
+        // installed, so a failure here is logged inside and never fails the mutation
+        // (ingest asks the engine itself when the row is missing).
+        crate::scanner::record_source_extensions(st).await;
         Ok(map_extension_info(st, e))
     }
 
@@ -11210,6 +11733,9 @@ impl MutationRoot {
             .update_extension(&pkg_name)
             .await
             .map_err(gql_err)?;
+        // An update can change the version, the NSFW flag and the set of sources;
+        // refresh the recorded rows as `installExtension` does. Best-effort.
+        crate::scanner::record_source_extensions(st).await;
         Ok(map_extension_info(st, e))
     }
 
@@ -11702,7 +12228,7 @@ pub(crate) async fn ingest_source_series(
             .unwrap_or(None),
         None => None,
     };
-    let result = add_source_series_core(&st.pool, &m, cover_phash).await?;
+    let result = add_source_series_checked(st, &m, cover_phash, false).await?;
     // Populate this series' chapters + chapter count + scan state NOW, so it shows a
     // real chapter count in Browse (and enters the updates feed) immediately instead
     // of reading 0 chapters until the next adaptive scan tick. This makes the bulk
@@ -12023,7 +12549,7 @@ async fn federated_ingest(st: &AppState, raw_id: &str) -> anyhow::Result<MatchRe
             .unwrap_or(None),
         None => None,
     };
-    add_source_series_core_ex(&st.pool, &m, cover_phash, true).await
+    add_source_series_checked(st, &m, cover_phash, true).await
 }
 
 /// Account-field checks shared by `register`, `createOwner` and `createUser`.
@@ -12995,12 +13521,118 @@ async fn reconcile_one(
 /// idempotency pre-check, dedup, provisional work creation, source-series link,
 /// and review-queue insert. `cover_phash` is the already-computed cover hash
 /// (None when unavailable).
+///
+/// TEST-ONLY entry: it takes the source's adult posture from what the database already
+/// holds and treats a missing `source_extension` row as "not adult", which is exactly the
+/// default that leaked adult sources in production. Production code goes through
+/// [`add_source_series_checked`], which asks the engine instead.
+#[cfg(test)]
 async fn add_source_series_core(
     pool: &SqlitePool,
     m: &crate::suwayomi::SuwayomiManga,
     cover_phash: Option<String>,
 ) -> anyhow::Result<MatchResult> {
-    add_source_series_core_ex(pool, m, cover_phash, false).await
+    let source = SourceNsfw {
+        adult: catalog::source_extension_nsfw(pool, &m.source_id)
+            .await?
+            .unwrap_or(false),
+        pinned: catalog::source_nsfw_pinned(pool, &m.source_id).await?,
+    };
+    add_source_series_core_ex(pool, m, cover_phash, false, source).await
+}
+
+/// What ingest knows about the adult posture of the Suwayomi source a series comes from.
+/// Built by [`resolve_source_nsfw`]; the core takes it as an argument so that no caller
+/// can reach the "is this work adult?" decision without having answered the question.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SourceNsfw {
+    /// The engine flags the source's extension NSFW.
+    pub(crate) adult: bool,
+    /// An admin pinned the whole source adult with `markSourceNsfw` (`source_nsfw_pin`).
+    pub(crate) pinned: bool,
+}
+
+/// Resolve [`SourceNsfw`] for a source a series is about to be added from.
+///
+/// The usual case is two primary-key reads and no network: the admin's pin, and the
+/// engine's flag cached in `source_extension`. When that table has NO ROW for the
+/// source the answer is unknown, and unknown must never be read as "not adult" — that
+/// default is how every series of a freshly installed adult extension was ingested as
+/// safe and served to signed-out visitors. So the engine is asked instead:
+///
+/// 1. `record_extension_of_source` reads the installed extensions once, writes the rows
+///    for the extension that owns this source and returns its flag. Every later series
+///    from the source then hits the row, so a 1,000-series ingest job pays for this
+///    once (a few times at most, if its first items race), not once per series.
+/// 2. If no installed extension owns the source (the Local source), or the listing
+///    failed, the source itself is asked (`source_meta`).
+///
+/// If neither answers, the add FAILS. A series that cannot be classified is not added
+/// as safe; the caller reports the error and the series can be added again later. The
+/// one exception is a pinned source, where the admin already answered.
+pub(crate) async fn resolve_source_nsfw(
+    st: &AppState,
+    source_id: &str,
+) -> anyhow::Result<SourceNsfw> {
+    let pinned = catalog::source_nsfw_pinned(&st.pool, source_id).await?;
+    if let Some(adult) = catalog::source_extension_nsfw(&st.pool, source_id).await? {
+        return Ok(SourceNsfw { adult, pinned });
+    }
+    let from_engine = match crate::scanner::record_extension_of_source(st, source_id).await {
+        Ok(Some(adult)) => Ok(adult),
+        listed => {
+            if let Err(e) = listed {
+                tracing::warn!(source_id, error = %e, "ingest: could not list extensions for an unrecorded source; asking the source itself");
+            }
+            st.suwayomi
+                .source_meta(source_id)
+                .await
+                .map(|(_, adult, _)| adult)
+        }
+    };
+    match from_engine {
+        Ok(adult) => Ok(SourceNsfw { adult, pinned }),
+        Err(_) if pinned => Ok(SourceNsfw {
+            adult: false,
+            pinned,
+        }),
+        Err(e) => Err(anyhow::anyhow!(
+            "cannot tell whether source {source_id} is an adult source (it is not recorded \
+             and the engine did not answer: {e}); not adding its series as safe"
+        )),
+    }
+}
+
+/// The production entry to the Tier-2 add flow: resolve the source's adult posture
+/// ([`resolve_source_nsfw`]) and run the core with it. Every enrol path goes through
+/// here — `addSourceSeries`, `ingest_source_series` (`bulkAddSourceSeries`, the
+/// source/extension ingest jobs, the background source-sync) and `federated_ingest`.
+async fn add_source_series_checked(
+    st: &AppState,
+    m: &crate::suwayomi::SuwayomiManga,
+    cover_phash: Option<String>,
+    consolidate: bool,
+) -> anyhow::Result<MatchResult> {
+    let source = resolve_source_nsfw(st, &m.source_id).await?;
+    add_source_series_core_ex(&st.pool, m, cover_phash, consolidate, source).await
+}
+
+/// Give a work linked to an admin-pinned source the same `is_nsfw_override = 1` that
+/// `markSourceNsfw` gave the works the source already had when it ran, so a series
+/// added later is pinned exactly like one added earlier. Needed on top of
+/// `mark_work_nsfw`, which yields to a MangaDex `safe`/`suggestive` rating — the admin's
+/// pin does not. A work whose override an admin already set by hand (either way) is
+/// left alone: that per-work decision is more specific than the per-source one.
+async fn pin_work_nsfw(pool: &SqlitePool, work_id: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE work SET is_nsfw_override = 1, updated_at = ? \
+         WHERE id = ? AND is_nsfw_override IS NULL",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(work_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// As `add_source_series_core`, but `consolidate` controls the mid-confidence
@@ -13016,6 +13648,7 @@ async fn add_source_series_core_ex(
     m: &crate::suwayomi::SuwayomiManga,
     cover_phash: Option<String>,
     consolidate: bool,
+    source: SourceNsfw,
 ) -> anyhow::Result<MatchResult> {
     let source_key = m.id.to_string();
 
@@ -13036,19 +13669,16 @@ async fn add_source_series_core_ex(
     }
 
     // N1/N5: NSFW if the series' own genres look adult OR its Suwayomi source is an
-    // adult source. The source flag (source_extension.is_nsfw, cached by the scan
-    // tick — a cheap PK lookup, no network) is the backstop for adult sources whose
+    // adult source. The source flag is the backstop for adult sources whose
     // per-series tags don't include an explicit adult genre: that gap ingested whole
     // adult sources (e.g. omegascans) as SFW and leaked them to the home page.
     // CATALOGUE.md §2.
-    let source_ext_nsfw =
-        sqlx::query_scalar::<_, i64>("SELECT is_nsfw FROM source_extension WHERE source_id = ?")
-            .bind(&m.source_id)
-            .fetch_optional(pool)
-            .await?
-            .unwrap_or(0)
-            != 0;
-    let source_nsfw = genre_is_nsfw(&m.genre) || source_ext_nsfw;
+    //
+    // The flag arrives as an ARGUMENT (`source`, see `resolve_source_nsfw`) and is not
+    // read from `source_extension` here: this function has no engine to ask, and a
+    // missing row read as "not adult" re-opened that same leak for every extension
+    // installed since the last record pass. An admin's pin on the source counts too.
+    let source_nsfw = genre_is_nsfw(&m.genre) || source.adult || source.pinned;
 
     // Exact MangaDex-identity consolidation. The MangaDex Suwayomi extension carries
     // the canonical MangaDex UUID in `MangaType.url` (e.g. `/manga/<uuid>`). When that
@@ -13078,6 +13708,9 @@ async fn add_source_series_core_ex(
             .await?;
             if source_nsfw {
                 crate::catalog::mark_work_nsfw(pool, &work_id).await?;
+                if source.pinned {
+                    pin_work_nsfw(pool, &work_id).await?;
+                }
                 // Push the escalation into the materialized feed copies immediately.
                 // Without this the flag reaches `work` but not `browse_catalogue`, and
                 // Browse gates on the copy — so an opted-out viewer keeps being served
@@ -13240,6 +13873,9 @@ async fn add_source_series_core_ex(
     // an `auto_merge` reuses an existing (possibly SFW) work, so OR the flag in there.
     if source_nsfw {
         crate::catalog::mark_work_nsfw(pool, &work_id).await?;
+        if source.pinned {
+            pin_work_nsfw(pool, &work_id).await?;
+        }
         // Same reason as the other `mark_work_nsfw` site: `work` is the authoritative
         // column, but Browse and the feeds gate on a materialized copy, so the escalation
         // has to be pushed there in the same breath or it is invisible to the gate for up
@@ -13689,7 +14325,7 @@ mod tests {
 
         let mut m = suwayomi_manga(7, "Twin Star Exorcists", &["Action"], "src-ext2");
         m.description = Some(blurb.into()); // corroborating description
-        let r = add_source_series_core_ex(&pool, &m, None, true)
+        let r = add_source_series_core_ex(&pool, &m, None, true, SourceNsfw::default())
             .await
             .unwrap();
         assert_eq!(r.decision, "review");
@@ -14662,7 +15298,7 @@ mod tests {
 
         let mut m = suwayomi_manga(7, "Twin Star Exorcists", &["Action"], "src-ext2");
         m.author = Some("Sukeno Yoshiak".into());
-        let r = add_source_series_core_ex(&pool, &m, None, true)
+        let r = add_source_series_core_ex(&pool, &m, None, true, SourceNsfw::default())
             .await
             .unwrap();
         assert_eq!(r.decision, "auto_merge", "exact title auto-merges");
@@ -14926,6 +15562,15 @@ mod tests {
     }
 
     async fn setup_with_state(max: u32) -> (ApiSchema, SqlitePool, std::sync::Arc<AppState>) {
+        setup_with_engine(max, "http://127.0.0.1:1").await
+    }
+
+    /// [`setup_with_state`] with the Suwayomi engine at `engine_url` — for the resolvers
+    /// that ask the engine something (the default address answers nothing).
+    async fn setup_with_engine(
+        max: u32,
+        engine_url: &str,
+    ) -> (ApiSchema, SqlitePool, std::sync::Arc<AppState>) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -14973,13 +15618,14 @@ mod tests {
         let state = std::sync::Arc::new(AppState {
             pool: pool.clone(),
             cover_pool: pool.clone(),
-            suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
+            suwayomi: crate::suwayomi::SuwayomiClient::new(engine_url.into(), None, None),
             mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
                 "test-ua", 5.0, 40.0,
             )),
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(max, 60),
+            comment_limiter: comment_limiter(),
             password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
@@ -14991,6 +15637,485 @@ mod tests {
             setup_code: crate::instance::SetupCode::default(),
         });
         (build_schema(state.clone(), false), pool, state)
+    }
+
+    /// `chapterOrigin` tells a reader app where a chapter lives so it can fetch the pages
+    /// itself. That is as good as serving them, so it carries the same NSFW gate as
+    /// `pages`; and it must hand out the source's keys and the extension, never our ids.
+    #[tokio::test]
+    async fn chapter_origin_is_nsfw_gated_and_carries_the_extension() {
+        let engine = crate::suwayomi::testsrv::spawn_status(
+            200,
+            "application/json",
+            br##"{"data":{"chapters":{"nodes":[{"url":"#/viewer/1030381",
+                "realUrl":"https://mangaplus.shueisha.co.jp/viewer/1030381","mangaId":77,
+                "manga":{"url":"#/titles/100020",
+                         "realUrl":"https://mangaplus.shueisha.co.jp/titles/100020",
+                         "title":"One Piece","sourceId":"src-9"}}]}}}"##
+                .to_vec(),
+            Duration::ZERO,
+        )
+        .await;
+        let (s, pool, _) = setup_with_engine(100, &engine.base_url).await;
+        sqlx::query(
+            "INSERT INTO source_extension (source_id, pkg_name, repo_url, is_nsfw, updated_at) \
+             VALUES ('src-9', 'org.example.ext', 'https://example/index.pb', 0, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        const Q: &str = r#"{ chapterOrigin(chapterId: "6") {
+            sourceId mangaUrl mangaTitle chapterUrl chapterWebUrl mangaWebUrl
+            extension { pkgName repoUrl } } }"#;
+
+        // Not linked to an NSFW work: anyone gets the coordinates.
+        let r = exec(&s, Q, None, "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        let j = data_json(&r);
+        for want in [
+            r##""sourceId":"src-9""##,
+            r##""mangaUrl":"#/titles/100020""##,
+            r##""mangaTitle":"One Piece""##,
+            r##""chapterUrl":"#/viewer/1030381""##,
+            // The pages a person can open — what "Read on source" links to.
+            r##""chapterWebUrl":"https://mangaplus.shueisha.co.jp/viewer/1030381""##,
+            r##""mangaWebUrl":"https://mangaplus.shueisha.co.jp/titles/100020""##,
+            r##""pkgName":"org.example.ext""##,
+            r##""repoUrl":"https://example/index.pb""##,
+        ] {
+            assert!(j.contains(want), "missing {want} in {j}");
+        }
+        assert!(
+            !j.contains("77"),
+            "our engine's manga id must not leak: {j}"
+        );
+
+        // The owning manga (engine id 77) belongs to an NSFW work.
+        sqlx::query(
+            "INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) \
+             VALUES ('w_adult', 'Adult', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
+             VALUES ('ss_adult', 'w_adult', 'suwayomi', 'src-9', '77', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Signed out, and signed in without the preference: refused, nothing leaks.
+        for token in [None, Some("bobtok")] {
+            let r = exec(&s, Q, token, "1.1.1.1").await;
+            assert!(!r.errors.is_empty(), "NSFW origin served to {token:?}");
+            assert!(
+                !data_json(&r).contains("viewer"),
+                "leaked: {}",
+                data_json(&r)
+            );
+        }
+        // Opted in: served.
+        sqlx::query("UPDATE users SET show_nsfw = 1 WHERE id = 'bob-id'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let r = exec(&s, Q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        assert!(data_json(&r).contains("#/viewer/1030381"));
+    }
+
+    /// One reply that answers every engine document the ingest and extension paths
+    /// send (the fake engine serves a single fixed body, and each caller reads only its
+    /// own key out of `data`): the manga detail, the library update, the installed
+    /// extensions with their sources, one source's own flags, an extension patch, and a
+    /// chapter's origin. One extension, `pkg.adult`, providing source `1534`.
+    fn engine_reply(extension_is_nsfw: bool) -> Vec<u8> {
+        serde_json::json!({ "data": {
+            "fetchMangaAndChapters": {
+                "manga": {
+                    "id": 501, "title": "Quiet Office Days", "url": "/series/quiet",
+                    "thumbnailUrl": null, "author": null, "artist": null,
+                    "description": null, "genre": ["Action"], "status": "ONGOING",
+                    "inLibrary": false, "inLibraryAt": null, "lastFetchedAt": null,
+                    "sourceId": "1534", "source": { "lang": "en" },
+                    "chapters": { "totalCount": 0 }
+                },
+                "chapters": []
+            },
+            "updateManga": { "manga": { "id": 501 } },
+            "extensions": { "nodes": [{
+                "pkgName": "pkg.adult", "repo": "https://example.org/index.pb",
+                "apkName": "adult-v7.apk", "versionCode": 7, "lang": "en",
+                "isNsfw": extension_is_nsfw, "source": { "nodes": [{ "id": "1534" }] }
+            }] },
+            "source": { "displayName": "Adult", "isNsfw": extension_is_nsfw, "lang": "en" },
+            "updateExtension": { "extension": {
+                "pkgName": "pkg.adult", "name": "Adult", "lang": "en",
+                "versionName": "1.4.7", "isInstalled": true, "hasUpdate": false,
+                "isNsfw": extension_is_nsfw, "iconUrl": null,
+                "repo": "https://example.org/index.pb"
+            } },
+            "chapters": { "nodes": [{
+                "url": "/ch/1", "mangaId": 501,
+                "manga": { "url": "/series/quiet", "title": "Quiet Office Days",
+                           "sourceId": "1534" }
+            }] }
+        } })
+        .to_string()
+        .into_bytes()
+    }
+
+    async fn recorded_source_nsfw(pool: &SqlitePool, source_id: &str) -> Option<i64> {
+        sqlx::query_scalar("SELECT is_nsfw FROM source_extension WHERE source_id = ?")
+            .bind(source_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The leak this guards: on a fresh server (or right after an extension install)
+    /// `source_extension` has no row for the source, and ingest read "no row" as "not an
+    /// adult source". Every series of an adult extension whose own genres are not adult
+    /// was stored safe and served to signed-out visitors. Driven through the real
+    /// `bulkAddSourceSeries` mutation against a fake engine that flags the source NSFW.
+    #[tokio::test]
+    async fn bulk_add_from_an_unrecorded_adult_source_stores_the_work_adult() {
+        let engine = crate::suwayomi::testsrv::spawn_status(
+            200,
+            "application/json",
+            engine_reply(true),
+            Duration::ZERO,
+        )
+        .await;
+        let (s, pool, _) = setup_with_engine(100, &engine.base_url).await;
+        assert_eq!(
+            recorded_source_nsfw(&pool, "1534").await,
+            None,
+            "precondition: the source is not recorded"
+        );
+
+        let r = exec(
+            &s,
+            r#"mutation { bulkAddSourceSeries(suwayomiMangaIds: ["501"]) {
+                succeeded failed entries { error } } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(
+            data_json(&r).contains(r#""succeeded":1"#),
+            "{}",
+            data_json(&r)
+        );
+
+        let work_id: String = sqlx::query_scalar(
+            "SELECT work_id FROM source_series \
+             WHERE source_type = 'suwayomi' AND source_id = '1534' AND source_key = '501'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (work_nsfw, series_nsfw): (i64, i64) = sqlx::query_as(
+            "SELECT w.is_nsfw, ss.is_nsfw FROM work w \
+             JOIN source_series ss ON ss.work_id = w.id WHERE w.id = ?",
+        )
+        .bind(&work_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (work_nsfw, series_nsfw),
+            (1, 1),
+            "an adult source's series is adult"
+        );
+        // The first miss recorded the source, so the next series is a plain row read.
+        assert_eq!(recorded_source_nsfw(&pool, "1534").await, Some(1));
+
+        // A signed-out visitor, and a signed-in one who has not opted in, get nothing.
+        let q = format!(r#"{{ aggregatedChapters(workId: "{work_id}") {{ number }} }}"#);
+        for token in [None, Some("bobtok")] {
+            let r = exec(&s, &q, token, "1.1.1.1").await;
+            assert_eq!(
+                r.errors.first().map(|e| e.message.as_str()),
+                Some("No such work"),
+                "adult work served to {token:?}"
+            );
+        }
+        sqlx::query("UPDATE users SET show_nsfw = 1 WHERE id = 'bob-id'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "opted in: {:?}", r.errors);
+    }
+
+    /// The other half of the same decision: an unrecorded source the engine calls safe
+    /// is ingested as safe (unknown is resolved, not assumed adult), and a source nobody
+    /// can classify is refused rather than added as safe.
+    #[tokio::test]
+    async fn an_unrecorded_source_is_asked_about_and_an_unanswerable_one_is_refused() {
+        let engine = crate::suwayomi::testsrv::spawn_status(
+            200,
+            "application/json",
+            engine_reply(false),
+            Duration::ZERO,
+        )
+        .await;
+        let (_, pool, st) = setup_with_engine(100, &engine.base_url).await;
+        assert_eq!(
+            resolve_source_nsfw(&st, "1534").await.unwrap(),
+            SourceNsfw {
+                adult: false,
+                pinned: false
+            }
+        );
+        assert_eq!(recorded_source_nsfw(&pool, "1534").await, Some(0));
+        // A source no installed extension provides (the Local source) is answered by
+        // the source itself, and writes no row.
+        assert_eq!(
+            resolve_source_nsfw(&st, "0").await.unwrap(),
+            SourceNsfw::default()
+        );
+        assert_eq!(recorded_source_nsfw(&pool, "0").await, None);
+
+        // No row and no engine (the default test engine address answers nothing).
+        let (_, pool, st) = setup_with_state(100).await;
+        let m = suwayomi_manga(77, "Unclassifiable", &["Action"], "ghost");
+        let err = add_source_series_checked(&st, &m, None, false)
+            .await
+            .err()
+            .expect("an unclassifiable source must not be added as safe");
+        assert!(err.to_string().contains("adult source"), "{err}");
+        let works: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM source_series WHERE source_type = 'suwayomi' AND source_id = 'ghost'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(works, 0, "nothing was linked");
+        // With the row there, the engine is not needed at all.
+        sqlx::query(
+            "INSERT INTO source_extension (source_id, pkg_name, repo_url, is_nsfw, updated_at) \
+             VALUES ('ghost', 'pkg', 'repo', 1, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let r = add_source_series_checked(&st, &m, None, false)
+            .await
+            .unwrap();
+        let nsfw: i64 = sqlx::query_scalar("SELECT is_nsfw FROM work WHERE id = ?")
+            .bind(&r.work_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(nsfw, 1);
+    }
+
+    /// `installExtension` / `updateExtension` record the extension's sources at once, so
+    /// `chapterOrigin` can hand a reader app the extension to install without waiting for
+    /// the scheduled record pass. A record step that fails does not fail the install.
+    #[tokio::test]
+    async fn install_and_update_extension_record_sources_for_chapter_origin() {
+        let engine = crate::suwayomi::testsrv::spawn_status(
+            200,
+            "application/json",
+            engine_reply(true),
+            Duration::ZERO,
+        )
+        .await;
+        let (s, pool, _) = setup_with_engine(100, &engine.base_url).await;
+        // The extension is NSFW; the admin has to have opted in to install it.
+        sqlx::query("UPDATE users SET show_nsfw = 1 WHERE id = 'admin-id'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        const ORIGIN: &str = r#"{ chapterOrigin(chapterId: "6") {
+            sourceId extension { pkgName repoUrl apkName versionCode lang } } }"#;
+
+        // Before: the bug's second symptom — no extension to install.
+        let r = exec(&s, ORIGIN, None, "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(
+            data_json(&r).contains(r#""extension":null"#),
+            "{}",
+            data_json(&r)
+        );
+
+        for mutation in ["installExtension", "updateExtension"] {
+            sqlx::query("DELETE FROM source_extension")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let r = exec(
+                &s,
+                &format!(r#"mutation {{ {mutation}(pkgName: "pkg.adult") {{ pkgName }} }}"#),
+                Some("admintok"),
+                "1.1.1.1",
+            )
+            .await;
+            assert!(r.errors.is_empty(), "{mutation}: {:?}", r.errors);
+            assert_eq!(
+                recorded_source_nsfw(&pool, "1534").await,
+                Some(1),
+                "{mutation} records the source with the extension's NSFW flag"
+            );
+            let r = exec(&s, ORIGIN, None, "1.1.1.1").await;
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            let j = data_json(&r);
+            for want in [
+                r#""sourceId":"1534""#,
+                r#""pkgName":"pkg.adult""#,
+                r#""repoUrl":"https://example.org/index.pb""#,
+                r#""apkName":"adult-v7.apk""#,
+                r#""versionCode":7"#,
+            ] {
+                assert!(j.contains(want), "{mutation}: missing {want} in {j}");
+            }
+        }
+
+        // An engine that installs but cannot list its extensions: the install stands.
+        let engine = crate::suwayomi::testsrv::spawn_status(
+            200,
+            "application/json",
+            br#"{"data":{"updateExtension":{"extension":{"pkgName":"pkg.adult","name":"Adult",
+                "lang":"en","versionName":"1.4.7","isInstalled":true,"hasUpdate":false,
+                "isNsfw":false,"iconUrl":null,"repo":null}}}}"#
+                .to_vec(),
+            Duration::ZERO,
+        )
+        .await;
+        let (s, pool, _) = setup_with_engine(100, &engine.base_url).await;
+        sqlx::query("UPDATE users SET show_nsfw = 1 WHERE id = 'admin-id'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let r = exec(
+            &s,
+            r#"mutation { installExtension(pkgName: "pkg.adult") { pkgName } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(
+            r.errors.is_empty(),
+            "record failure failed the install: {:?}",
+            r.errors
+        );
+        assert_eq!(recorded_source_nsfw(&pool, "1534").await, None);
+    }
+
+    /// `markSourceNsfw(true)` used to write only `work.is_nsfw_override` on the works
+    /// the source ALREADY had, and remember nothing: a series added from the source
+    /// afterwards came in safe whenever the engine did not flag the source itself. The
+    /// decision is now kept per source, survives the record pass, and is forgotten by
+    /// `markSourceNsfw(false)`.
+    #[tokio::test]
+    async fn mark_source_nsfw_sticks_for_series_added_later() {
+        let (s, pool, st) = setup_with_state(100).await;
+        // The engine calls source "1534" safe; that is what the record pass stores.
+        let safe = crate::catalog::SourceExtensionInput {
+            pkg_name: "pkg.x".into(),
+            repo_url: "https://r".into(),
+            apk_name: None,
+            version_code: Some(1),
+            lang: Some("en".into()),
+            is_nsfw: false,
+        };
+        crate::catalog::upsert_source_extension(&pool, "1534", &safe)
+            .await
+            .unwrap();
+        let before = add_source_series_checked(
+            &st,
+            &suwayomi_manga(601, "Harbour Lights", &["Action"], "1534"),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let r = exec(
+            &s,
+            r#"mutation { markSourceNsfw(sourceId:"1534", isNsfw:true) }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(data_json(&r).contains(r#""markSourceNsfw":1"#));
+        // The record pass runs again and re-writes the row from the engine: still safe.
+        crate::catalog::upsert_source_extension(&pool, "1534", &safe)
+            .await
+            .unwrap();
+        assert_eq!(recorded_source_nsfw(&pool, "1534").await, Some(0));
+
+        // A series added AFTER the admin's decision, with no adult genre of its own.
+        let after = add_source_series_checked(
+            &st,
+            &suwayomi_manga(602, "Winter Ferry", &["Action"], "1534"),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        // ...and one from another source, which the pin must not touch.
+        crate::catalog::upsert_source_extension(&pool, "9999", &safe)
+            .await
+            .unwrap();
+        let other = add_source_series_checked(
+            &st,
+            &suwayomi_manga(603, "Salt Road", &["Action"], "9999"),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        async fn flags(pool: &SqlitePool, id: &str) -> (i64, Option<i64>) {
+            sqlx::query_as("SELECT is_nsfw, is_nsfw_override FROM work WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+        assert_eq!(flags(&pool, &before.work_id).await, (0, Some(1)));
+        assert_eq!(
+            flags(&pool, &after.work_id).await,
+            (1, Some(1)),
+            "a later series from a pinned source is pinned like the earlier ones"
+        );
+        assert_eq!(flags(&pool, &other.work_id).await, (0, None));
+        for id in [&before.work_id, &after.work_id] {
+            let q = format!(r#"{{ aggregatedChapters(workId: "{id}") {{ number }} }}"#);
+            let r = exec(&s, &q, None, "1.1.1.1").await;
+            assert_eq!(
+                r.errors.first().map(|e| e.message.as_str()),
+                Some("No such work"),
+                "pinned source's work {id} served to a signed-out visitor"
+            );
+        }
+
+        // Undo forgets the decision: the next series is judged by the engine again.
+        let r = exec(
+            &s,
+            r#"mutation { markSourceNsfw(sourceId:"1534", isNsfw:false) }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let unpinned = add_source_series_checked(
+            &st,
+            &suwayomi_manga(604, "Paper Kites", &["Action"], "1534"),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(flags(&pool, &unpinned.work_id).await, (0, None));
+        assert_eq!(flags(&pool, &before.work_id).await, (0, None));
     }
 
     async fn exec(
@@ -16471,6 +17596,7 @@ mod tests {
                 admin_users: vec![],
                 scan_health: Mutex::new(ScanHealth::default()),
                 auth_limiter: RateLimiter::new(100, 60),
+                comment_limiter: comment_limiter(),
                 password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
                 federated_limiter: RateLimiter::new(100, 60),
                 session_ttl_secs: 30 * 24 * 60 * 60,
@@ -16672,6 +17798,7 @@ mod tests {
             admin_users: vec!["admin".into()],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
+            comment_limiter: comment_limiter(),
             password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
@@ -20392,6 +21519,10 @@ mod tests {
                 ("mu".into(), "abc123x".into()),
                 ("ap".into(), "../../evil".into()),
             ],
+            official_links: vec![
+                ("engtl".into(), "https://publisher.example/title".into()),
+                ("raw".into(), "javascript:alert(1)".into()),
+            ],
             ..Default::default()
         };
         let work = catalog::upsert_work_from_mangadex(&pool, mid, &input)
@@ -20414,7 +21545,10 @@ mod tests {
         let metadata = &data["canonicalSeries"]["metadata"];
         assert_eq!(metadata["year"], 2020);
         assert_eq!(metadata["tags"][0]["group"], "genre");
-        assert_eq!(metadata["trackers"].as_array().unwrap().len(), 3);
+        assert_eq!(metadata["trackers"].as_array().unwrap().len(), 4);
+        assert!(metadata["trackers"].as_array().unwrap().iter().any(|t| {
+            t["provider"] == "engtl" && t["url"] == "https://publisher.example/title"
+        }));
         assert!(metadata["trackers"]
             .as_array()
             .unwrap()
@@ -20427,6 +21561,7 @@ mod tests {
             .unwrap();
         sqlx::query("INSERT INTO work_tag (work_id, tag, ord, source) VALUES (?, 'My custom tag', 0, 'admin')").bind(&work).execute(&pool).await.unwrap();
         input.external_ids = vec![("al".into(), "456".into())];
+        input.official_links.clear();
         input.tags.clear();
         input.tag_details.clear();
         input.year = Some(2021);
@@ -22183,6 +23318,73 @@ mod tests {
         assert_eq!(d["instance"]["setupRequired"], false);
     }
 
+    /// Off unless the server says so, and then the stored value is what apps are told.
+    /// (The env half of the read order is `resolve_with`'s, covered in `instance.rs`.)
+    #[tokio::test]
+    async fn instance_tells_apps_whether_to_fetch_themselves() {
+        const Q: &str = "{ instance { appsFetchThemselves } }";
+        let (s, pool) = setup_full(100).await;
+        let d = data(exec(&s, Q, None, "1.1.1.1").await);
+        assert_eq!(d["instance"]["appsFetchThemselves"], false);
+
+        crate::instance::store(&pool, &crate::instance::APPS_FETCH_THEMSELVES, "true")
+            .await
+            .unwrap();
+        let d = data(exec(&s, Q, None, "1.1.1.1").await);
+        assert_eq!(d["instance"]["appsFetchThemselves"], true);
+    }
+
+    /// Plain HTTP from the internet: the right code is still refused, the code is not
+    /// used up, and `instance` tells the setup screens to send the owner to a terminal.
+    #[tokio::test]
+    async fn create_owner_is_refused_in_the_clear_from_the_internet() {
+        let (s, pool, st) = setup_without_admin().await;
+        let code = st.setup_code.issue();
+        let in_the_clear = |query: &str| {
+            async_graphql::Request::new(query)
+                .data(RequestAuth(None))
+                .data(ClientIp(Some("1.1.1.1".into())))
+                .data(PlainFromInternet::Yes)
+                .data(RequestUserCache::default())
+                .data(RequestLibraryCache::default())
+        };
+
+        let r = s
+            .execute(in_the_clear(&create_owner_q(&code, "owner")))
+            .await;
+        assert!(
+            first_error(&r).contains("komika-server setup"),
+            "{:?}",
+            r.errors
+        );
+        assert!(!crate::instance::admin_exists(&pool).await.unwrap());
+        let d = data(
+            s.execute(in_the_clear("{ instance { setupNeedsTerminal } }"))
+                .await,
+        );
+        assert_eq!(d["instance"]["setupNeedsTerminal"], true);
+
+        // A private peer proves nothing behind Docker Desktop or rootless Docker: the
+        // name the client typed decides. One that leads nowhere counts as public, one
+        // that leads to this computer does not.
+        for (name, terminal) in [("komiq-setup-test.invalid", true), ("localhost", false)] {
+            let named = async_graphql::Request::new("{ instance { setupNeedsTerminal } }")
+                .data(RequestAuth(None))
+                .data(ClientIp(Some("172.17.0.1".into())))
+                .data(PlainFromInternet::Named(name.into()))
+                .data(RequestUserCache::default())
+                .data(RequestLibraryCache::default());
+            let d = data(s.execute(named).await);
+            assert_eq!(d["instance"]["setupNeedsTerminal"], terminal, "{name}");
+        }
+
+        // The same code works from a terminal on the server (or over HTTPS).
+        let d = data(exec(&s, "{ instance { setupNeedsTerminal } }", None, "1.1.1.1").await);
+        assert_eq!(d["instance"]["setupNeedsTerminal"], false);
+        let d = data(exec(&s, &create_owner_q(&code, "owner"), None, "1.1.1.1").await);
+        assert_eq!(d["createOwner"]["user"]["isAdmin"], true);
+    }
+
     #[tokio::test]
     async fn create_owner_works_once_with_the_logged_code() {
         let (s, pool, st) = setup_without_admin().await;
@@ -22502,6 +23704,78 @@ mod tests {
         assert!(r.errors.is_empty(), "{:?}", r.errors);
     }
 
+    /// The forced password change is the server's rule, not only the apps': with the
+    /// flag set, a session reads itself and changes its password, and nothing else.
+    #[tokio::test]
+    async fn a_temporary_password_session_can_only_change_its_password() {
+        let (s, pool, _) = setup_with_state(100).await;
+        sqlx::query("UPDATE users SET must_change_password = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The session still resolves, so the apps can show the screen.
+        let d = data(
+            exec(
+                &s,
+                "{ session { user { username mustChangePassword } } }",
+                Some("bobtok"),
+                "1.1.1.1",
+            )
+            .await,
+        );
+        assert_eq!(d["session"]["user"]["username"], "bob");
+        assert_eq!(d["session"]["user"]["mustChangePassword"], true);
+
+        // A signed-in mutation and an admin query are both refused.
+        let r = exec(
+            &s,
+            "mutation { setShowNsfw(value: true) }",
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), MUST_CHANGE_PASSWORD);
+        let r = exec(
+            &s,
+            "{ mangadexSetting { enabled } }",
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&r), MUST_CHANGE_PASSWORD);
+        let stored: i64 = sqlx::query_scalar("SELECT show_nsfw FROM users WHERE id = 'bob-id'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 0, "the refused mutation wrote nothing");
+        // The REST uploads resolve the same way.
+        assert!(auth::user_for_token(&pool, "bobtok")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Changing the password lifts it.
+        let r = exec(
+            &s,
+            r#"mutation { changePassword(currentPassword:"password123", newPassword:"new-pass-123") { mustChangePassword } }"#,
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let d = data(
+            exec(
+                &s,
+                "mutation { setShowNsfw(value: true) }",
+                Some("bobtok"),
+                "1.1.1.1",
+            )
+            .await,
+        );
+        assert_eq!(d["setShowNsfw"], true);
+    }
+
     #[tokio::test]
     async fn login_succeeds_with_correct_password() {
         let s = setup().await;
@@ -22615,6 +23889,33 @@ mod tests {
             .await
             .errors
             .is_empty());
+    }
+
+    /// Guesses at ONE account from many addresses stop at the account's own budget
+    /// (3 times one address's), however the name is spelled. Other accounts go on.
+    #[tokio::test]
+    async fn rate_limit_also_keys_on_the_account() {
+        let s = setup_with_limit(1).await;
+        let guess = |name: &str| {
+            format!(r#"mutation {{ login(username:"{name}", password:"nope") {{ token }} }}"#)
+        };
+        for (ip, name) in [("9.9.9.1", "bob"), ("9.9.9.2", "BOB"), ("9.9.9.3", "Bob")] {
+            let r = exec(&s, &guess(name), None, ip).await;
+            assert_eq!(first_error(&r), "Invalid username or password");
+        }
+        // A new address, and even the right password: the account is closed for now.
+        let right = r#"mutation { login(username:"bob", password:"password123") { token } }"#;
+        let blocked = exec(&s, right, None, "9.9.9.4").await;
+        assert!(
+            first_error(&blocked).contains("Too many login attempts"),
+            "got: {}",
+            first_error(&blocked)
+        );
+        let other = exec(&s, &guess("admin"), None, "9.9.9.5").await;
+        assert_eq!(first_error(&other), "Invalid username or password");
+        // A name no account can have is refused before it becomes a limiter key.
+        let long = exec(&s, &guess(&"x".repeat(200)), None, "9.9.9.6").await;
+        assert_eq!(first_error(&long), "Invalid username or password");
     }
 
     #[tokio::test]
@@ -22817,6 +24118,82 @@ mod tests {
         assert_eq!(a["comments"]["total"], serde_json::json!(0));
         assert!(a["reviews"]["items"].as_array().unwrap().is_empty());
         assert_eq!(a["reviews"]["total"], serde_json::json!(0));
+    }
+
+    /// One account posts 20 comments a minute. The next is refused; another account
+    /// is not affected.
+    #[tokio::test]
+    async fn comments_are_rate_limited_per_account() {
+        let s = setup().await;
+        const POST: &str = r#"mutation { postComment(input:{ targetType:"series", targetId:"s1", body:"hi", hasSpoiler:false }) { id } }"#;
+        for _ in 0..20 {
+            let r = exec(&s, POST, Some("bobtok"), "1.1.1.1").await;
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+        }
+        // A new address does not help: the limit is on the account.
+        let r = exec(&s, POST, Some("bobtok"), "2.2.2.2").await;
+        assert!(
+            first_error(&r).contains("posting too fast"),
+            "{:?}",
+            r.errors
+        );
+        let r = exec(&s, POST, Some("admintok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+    }
+
+    /// A thread takes `MAX_THREAD_REPLIES` replies, counted at every depth. The next
+    /// one is refused wherever in the thread it goes; other threads are not affected.
+    #[tokio::test]
+    async fn a_full_thread_takes_no_more_replies() {
+        let (s, pool, _st) = setup_with_state(100).await;
+        // A top comment and a chain of replies under it, each a reply to the last.
+        let mut tx = pool.begin().await.unwrap();
+        for i in 0..=MAX_THREAD_REPLIES {
+            sqlx::query(
+                "INSERT INTO comments \
+                   (id, target_type, target_id, parent_id, user_id, body, has_spoiler, created_at) \
+                 VALUES (?, 'series', 's1', ?, 'bob-id', 'x', 0, ?)",
+            )
+            .bind(format!("full-{i}"))
+            .bind((i > 0).then(|| format!("full-{}", i - 1)))
+            .bind(format!("2024-01-01T00:00:00.{i:03}Z"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+        let post = |parent: Option<String>| {
+            let parent = parent.map_or(String::new(), |p| format!(r#"parentId:"{p}", "#));
+            format!(
+                r#"mutation {{ postComment(input:{{ targetType:"series", targetId:"s1", {parent}body:"more", hasSpoiler:false }}) {{ id }} }}"#
+            )
+        };
+
+        for parent in ["full-0".to_string(), format!("full-{MAX_THREAD_REPLIES}")] {
+            let r = exec(&s, &post(Some(parent)), Some("bobtok"), "1.1.1.1").await;
+            assert!(first_error(&r).contains("thread is full"), "{:?}", r.errors);
+        }
+        // A new top comment, and a reply to it, are fine.
+        let top = data(exec(&s, &post(None), Some("bobtok"), "1.1.1.1").await);
+        let top_id = top["postComment"]["id"].as_str().unwrap().to_string();
+        let r = exec(&s, &post(Some(top_id)), Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+
+        // The page still carries the whole full thread.
+        let page = data(
+            exec(
+                &s,
+                r#"{ comments(targetType:"series", targetId:"s1") { items { id } total } }"#,
+                None,
+                "1.1.1.1",
+            )
+            .await,
+        );
+        assert_eq!(page["comments"]["total"], 2);
+        assert_eq!(
+            page["comments"]["items"].as_array().unwrap().len() as i64,
+            MAX_THREAD_REPLIES + 1 + 2
+        );
     }
 
     #[tokio::test]
@@ -23276,6 +24653,7 @@ mod tests {
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
+            comment_limiter: comment_limiter(),
             password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
@@ -23792,6 +25170,7 @@ mod tests {
             admin_users: vec![],
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
+            comment_limiter: comment_limiter(),
             password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,

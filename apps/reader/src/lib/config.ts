@@ -5,7 +5,6 @@ import {
 	PUBLIC_KOMIKA_BACKEND_KIND,
 	PUBLIC_SUWAYOMI_URL,
 	PUBLIC_KOMIKA_IMG_MODE,
-	PUBLIC_KOMIKA_NATIVE_ENGINE,
 } from '$env/static/public';
 import { isTauri } from '@komika/api';
 
@@ -64,6 +63,12 @@ function savedServer(): string | null {
 }
 
 /**
+ * Where the native app keeps reading progress and library changes that could not be
+ * sent yet (`OfflineWriteQueue`). They belong to the server they were made on.
+ */
+export const OFFLINE_WRITES_KEY = 'komika.offlineWrites';
+
+/**
  * Remember the server on this device. Every client is built once at load, so the
  * caller reloads the app afterwards.
  */
@@ -83,6 +88,46 @@ export const chosenServer = savedServer();
  * address baked in at build time. The app then opens on the connect screen.
  */
 export const needsServer = canChooseServer && !chosenServer && !PUBLIC_KOMIKA_API;
+
+/**
+ * Where chapters are fetched from their sources: by the engine inside this app, or by
+ * the server. Only the native app has an engine, and only where the Rust side says so
+ * (`engine_supported`: desktop today); everywhere else the server fetches whatever this
+ * says.
+ *
+ * It is a choice kept on the device, made on the connect screen and changed in
+ * Settings › Reading, and "the server" until someone says otherwise. A server can take
+ * the choice away (`instance.appsFetchThemselves`, which the shared public server sets
+ * so that its readers do not all fetch through it): both screens then show "the server"
+ * greyed out, and `loadInstance` keeps the stored value on "this device".
+ */
+const FETCH_KEY = 'komiq-fetch';
+
+/** The native app, once it has a server, picks where fetches run. */
+export const canChooseFetch = canChooseServer && !needsServer;
+
+function savedFetchOnDevice(): boolean {
+	try {
+		return localStorage.getItem(FETCH_KEY) === 'device';
+	} catch {
+		return false;
+	}
+}
+
+/** True when this app fetches chapters itself rather than through the server. */
+export const fetchOnDevice = canChooseFetch && savedFetchOnDevice();
+
+/**
+ * Remember where fetches run on this device. Every client is built once at load, so
+ * the caller reloads the app afterwards.
+ */
+export function saveFetchOnDevice(onDevice: boolean): void {
+	try {
+		localStorage.setItem(FETCH_KEY, onDevice ? 'device' : 'server');
+	} catch {
+		/* private mode: the choice cannot be kept */
+	}
+}
 
 export const config = {
 	apiEndpoint: embedded ? '/graphql' : chosenServer ? `${chosenServer}/graphql` : PUBLIC_KOMIKA_API,
@@ -114,12 +159,11 @@ export const config = {
 	imgDirect: !embedded && PUBLIC_KOMIKA_IMG_MODE === 'direct',
 	imgServerProxy: embedded || PUBLIC_KOMIKA_IMG_MODE === 'server',
 	/**
-	 * Native content engine (embedded Suwayomi). Off by default. When on AND running
-	 * inside Tauri, the reader fetches chapter lists/pages on-device via a
-	 * CompositeBackend; otherwise it uses the hosted backend unchanged. The engine
-	 * transport itself lands later — this flag only selects the composite wrapper.
+	 * Native content engine (embedded Suwayomi): the reader fetches chapter pages
+	 * on-device via a CompositeBackend, which falls back to the server whenever the
+	 * engine cannot answer. See {@link fetchOnDevice} for who gets it.
 	 */
-	nativeEngine: !embedded && !chosenServer && PUBLIC_KOMIKA_NATIVE_ENGINE === 'on',
+	nativeEngine: fetchOnDevice,
 };
 
 /**

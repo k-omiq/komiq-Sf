@@ -84,10 +84,10 @@ impl RateLimiter {
         }
     }
 
-    /// Retry-after seconds for a pruned, non-empty entry at/over the limit; `None`
+    /// Retry-after seconds for a pruned, non-empty entry at/over `max`; `None`
     /// if still under it.
-    fn limited_after_prune(&self, entry: &[Instant], now: Instant) -> Option<u64> {
-        if entry.len() as u32 >= self.max {
+    fn limited_after_prune(&self, entry: &[Instant], now: Instant, max: u32) -> Option<u64> {
+        if entry.len() as u32 >= max {
             let oldest = entry.first().copied().unwrap_or(now);
             let retry = self.window.saturating_sub(now.duration_since(oldest));
             Some(retry.as_secs().max(1))
@@ -110,7 +110,7 @@ impl RateLimiter {
             map.remove(key);
             return None;
         }
-        self.limited_after_prune(entry, now)
+        self.limited_after_prune(entry, now, self.max)
     }
 
     /// Record one attempt against `key` (prunes stale timestamps first).
@@ -126,6 +126,13 @@ impl RateLimiter {
     /// Check-and-record: `Err(retry)` if already at the limit, else records a hit.
     /// One shard-lock acquisition for the whole operation.
     pub fn check(&self, key: &str) -> std::result::Result<(), u64> {
+        self.check_scaled(key, 1)
+    }
+
+    /// [`check`](Self::check) with `factor` times the limit, for a key that several
+    /// clients share (one account, signed in to from many addresses).
+    pub fn check_scaled(&self, key: &str, factor: u32) -> std::result::Result<(), u64> {
+        let max = self.max.saturating_mul(factor);
         let now = Instant::now();
         let mut map = Self::lock_shard(self.shard(key));
         self.sweep_if_large(&mut map, now);
@@ -135,7 +142,7 @@ impl RateLimiter {
         // old `is_limited` semantics, which evicted such keys and reported "not
         // limited" before `record` re-inserted them.
         if !entry.is_empty() {
-            if let Some(retry) = self.limited_after_prune(entry, now) {
+            if let Some(retry) = self.limited_after_prune(entry, now, max) {
                 return Err(retry);
             }
         }

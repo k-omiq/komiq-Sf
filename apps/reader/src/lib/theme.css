@@ -1,0 +1,62 @@
+/* Colour palettes and the pure-black background (see $lib/theme.svelte.ts).
+ *
+ * A palette is one seed colour, `--k-seed`, set on <html> next to `data-palette`.
+ * Every rule here mixes that seed into the tokens' own light or dark values, so a
+ * preset and a colour the reader picked need no rules of their own. Without
+ * `data-palette` nothing here applies and the tokens stay as @komika/ui ships them.
+ *
+ * The accent tokens derived in tokens.css (`--k-accent-soft`, `--k-focus-ring`, …)
+ * read `--k-accent` through var(), so they follow the palette too.
+ *
+ * Loaded after tokens.css. Each selector carries `data-theme` so that it outranks the
+ * tokens' own `:root[data-theme='light']` block instead of depending on file order.
+ */
+:root[data-theme='dark'][data-palette] {
+	--k-bg: color-mix(in oklab, var(--k-seed) 5%, #0c0c0d);
+	--k-surface: color-mix(in oklab, var(--k-seed) 6%, #0f0f10);
+	--k-surface-2: color-mix(in oklab, var(--k-seed) 7%, #141415);
+	--k-surface-3: color-mix(in oklab, var(--k-seed) 8%, #161617);
+	--k-surface-4: color-mix(in oklab, var(--k-seed) 9%, #1a1a1b);
+	--k-surface-5: color-mix(in oklab, var(--k-seed) 10%, #1f1f21);
+	--k-avatar: color-mix(in oklab, var(--k-seed) 9%, #1b1b1c);
+	--k-cover: color-mix(in oklab, var(--k-seed) 7%, #141415);
+	--k-glass: color-mix(in oklab, var(--k-seed) 5%, rgba(12, 12, 13, 0.78));
+	--k-glass-strong: color-mix(in oklab, var(--k-seed) 5%, rgba(12, 12, 13, 0.9));
+
+	/* Lifted towards white so a dark seed still reads on the dark background. */
+	--k-accent: color-mix(in oklab, var(--k-seed) 78%, white);
+	--k-primary: color-mix(in oklab, var(--k-seed) 62%, white);
+	--k-primary-hover: color-mix(in oklab, var(--k-seed) 46%, white);
+	--k-on-primary: color-mix(in oklab, var(--k-seed) 16%, #0c0c0d);
+	--k-on-accent: color-mix(in oklab, var(--k-seed) 16%, #0c0c0d);
+}
+
+:root[data-theme='light'][data-palette] {
+	--k-bg: color-mix(in oklab, var(--k-seed) 6%, #f4f2ee);
+	--k-surface: color-mix(in oklab, var(--k-seed) 2%, #ffffff);
+	--k-surface-2: color-mix(in oklab, var(--k-seed) 4%, #faf9f6);
+	--k-surface-3: color-mix(in oklab, var(--k-seed) 6%, #f4f2ee);
+	--k-surface-4: color-mix(in oklab, var(--k-seed) 8%, #ece9e3);
+	--k-surface-5: color-mix(in oklab, var(--k-seed) 10%, #e4e1da);
+	--k-avatar: color-mix(in oklab, var(--k-seed) 9%, #e7e4dd);
+	--k-cover: color-mix(in oklab, var(--k-seed) 8%, #ece9e3);
+	--k-glass: color-mix(in oklab, var(--k-seed) 5%, rgba(247, 246, 243, 0.82));
+	--k-glass-strong: color-mix(in oklab, var(--k-seed) 5%, rgba(247, 246, 243, 0.94));
+
+	/* Pulled towards black so a pale seed still reads on the light background. */
+	--k-accent: color-mix(in oklab, var(--k-seed) 74%, black);
+	--k-primary: color-mix(in oklab, var(--k-seed) 68%, black);
+	--k-primary-hover: color-mix(in oklab, var(--k-seed) 54%, black);
+	--k-on-primary: #ffffff;
+	--k-on-accent: #ffffff;
+}
+
+/* Pure black: only the page and the first surface go to black, so cards and
+   controls (palette-tinted or not) still stand out from it. Dark theme only. Same
+   specificity as the palette block above, and later, so it wins when both are on. */
+:root[data-theme='dark'][data-black] {
+	--k-bg: #000000;
+	--k-surface: #070707;
+	--k-glass: rgba(0, 0, 0, 0.78);
+	--k-glass-strong: rgba(0, 0, 0, 0.9);
+}

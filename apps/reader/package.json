@@ -13,7 +13,9 @@
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"tauri": "tauri",
 		"desktop:dev": "tauri dev",
-		"desktop:build": "tauri build"
+		"desktop:build": "tauri build",
+		"android:dev": "tauri android dev",
+		"android:build": "CARGO_PROFILE_RELEASE_LTO=true CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_OPT_LEVEL=s CARGO_PROFILE_RELEASE_STRIP=true tauri android build --apk --target aarch64"
 	},
 	"dependencies": {
 		"@fontsource-variable/bricolage-grotesque": "^5.1.0",
@@ -21,7 +23,8 @@
 		"@komika/api": "workspace:*",
 		"@komika/types": "workspace:*",
 		"@komika/ui": "workspace:*",
-		"@tauri-apps/api": "^2.5.0"
+		"@tauri-apps/api": "^2.5.0",
+		"@tauri-apps/plugin-barcode-scanner": "~2.4.6"
 	},
 	"devDependencies": {
 		"@sveltejs/adapter-cloudflare": "^7.2.4",

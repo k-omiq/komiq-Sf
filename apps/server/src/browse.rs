@@ -119,8 +119,8 @@ pub enum SortKey {
     Title,
     /// `year`. NULL sorts last.
     Year,
-    /// OUR users' review average (v1 `RATING`), two-phase. Not on the v2 wire — v2's
-    /// HIGHEST_RATED is MangaDex's rating — but kept so a v1 client's RATING is unchanged.
+    /// OUR users' review average, two-phase: v1 `RATING` and v2 `READER_RATED`. Distinct
+    /// from v2's HIGHEST_RATED, which is MangaDex's rating.
     CommunityRating,
 }
 
@@ -1919,6 +1919,49 @@ pub async fn genre_facets(pool: &SqlitePool, show_nsfw: bool) -> Result<Vec<(Str
         .await?)
 }
 
+/// One source the `source` filter can name, with the number of Browse works it carries.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct SourceFacet {
+    /// What [`parse_source`] takes: `"mangadex"`, or a Suwayomi source id.
+    pub id: String,
+    /// The source's extension package (`source_extension`), when one is recorded. NULL
+    /// for the MangaDex mirror.
+    pub pkg_name: Option<String>,
+    pub lang: Option<String>,
+    pub count: i64,
+}
+
+/// The sources Browse can filter by, biggest first. Each `count` is the number of rows
+/// the same `source` filter returns for the viewer: it counts `browse_catalogue`, under
+/// the same NSFW gate, so a source whose works are all adult is not offered to a viewer
+/// who has not opted in.
+///
+/// A Suwayomi mapping with no source id (`''`, a backfilled row) is left out: there is no
+/// id to filter by.
+///
+/// NOT a materialized table like the tag facets: it joins every Browse row to its
+/// mappings (about 0.5 s over 115k works), so the resolver memoizes it for minutes.
+pub async fn source_facets(pool: &SqlitePool, show_nsfw: bool) -> Result<Vec<SourceFacet>> {
+    // One of two hard-coded fragments, never input.
+    let gate = if show_nsfw { "" } else { "AND f.is_nsfw = 0" };
+    let sql = format!(
+        "SELECT CASE WHEN ss.source_type = 'mangadex' THEN 'mangadex' ELSE ss.source_id END AS id, \
+                MAX(e.pkg_name) AS pkg_name, MAX(e.lang) AS lang, \
+                COUNT(DISTINCT ss.work_id) AS count \
+           FROM source_series ss \
+           JOIN browse_catalogue f ON f.work_id = ss.work_id \
+           LEFT JOIN source_extension e \
+                  ON e.source_id = ss.source_id AND ss.source_type = 'suwayomi' \
+          WHERE (ss.source_type = 'mangadex' \
+                 OR (ss.source_type = 'suwayomi' AND ss.source_id != '')) {gate} \
+          GROUP BY 1 \
+          ORDER BY count DESC, id"
+    );
+    Ok(sqlx::query_as::<_, SourceFacet>(&sql)
+        .fetch_all(pool)
+        .await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3282,6 +3325,78 @@ mod tests {
         );
     }
 
+    /// The source list offers what the `source` filter can return for the viewer, with
+    /// the same count, and never a source the NSFW gate would leave empty.
+    #[tokio::test]
+    async fn source_facets_count_what_the_source_filter_returns() {
+        let pool = pool().await;
+        seed(&pool, "w_a", "A", "manga", "ONGOING", "safe", 0, 5, Some(4)).await;
+        seed(&pool, "w_b", "B", "manga", "ONGOING", "safe", 0, 5, Some(3)).await;
+        seed(
+            &pool,
+            "w_c",
+            "C",
+            "manga",
+            "ONGOING",
+            "erotica",
+            1,
+            5,
+            Some(2),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
+             VALUES ('md1', 'w_a', 'mangadex', 'mangadex', 'u-a', '2026-01-01T00:00:00Z'), \
+                    ('md2', 'w_b', 'mangadex', 'mangadex', 'u-b', '2026-01-01T00:00:00Z'), \
+                    ('sw1', 'w_b', 'suwayomi', '777', '1', '2026-01-01T00:00:00Z'), \
+                    ('sw2', 'w_b', 'suwayomi', '777', '2', '2026-01-01T00:00:00Z'), \
+                    ('sw3', 'w_c', 'suwayomi', '888', '3', '2026-01-01T00:00:00Z'), \
+                    ('sw4', 'w_a', 'suwayomi', '', '4', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO source_extension (source_id, pkg_name, repo_url, lang, updated_at) \
+             VALUES ('777', 'ext.en.example', 'https://example.org/repo', 'en', \
+                     '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let facet = |id: &str, pkg: Option<&str>, lang: Option<&str>, count| SourceFacet {
+            id: id.into(),
+            pkg_name: pkg.map(Into::into),
+            lang: lang.map(Into::into),
+            count,
+        };
+        // Opted out: the adult-only source 888 is not offered; a work mapped twice on one
+        // source counts once; the mapping with no source id is not a filter.
+        assert_eq!(
+            source_facets(&pool, false).await.unwrap(),
+            vec![
+                facet("mangadex", None, None, 2),
+                facet("777", Some("ext.en.example"), Some("en"), 1),
+            ]
+        );
+        assert_eq!(
+            source_facets(&pool, true).await.unwrap(),
+            vec![
+                facet("mangadex", None, None, 2),
+                facet("777", Some("ext.en.example"), Some("en"), 1),
+                facet("888", None, None, 1),
+            ]
+        );
+        // Each count is the filter's own total.
+        for f in source_facets(&pool, true).await.unwrap() {
+            let mut query = q(BrowseSort::Newest, 1);
+            query.source = parse_source(Some(&f.id));
+            let (total, _) = browse_catalogue(&pool, &query).await.unwrap();
+            assert_eq!(total, f.count, "source {}", f.id);
+        }
+    }
+
     /// Every v2 sort, both directions: the key, then `work_id` in the same direction, and
     /// unknown (NULL) keys LAST in BOTH directions.
     #[tokio::test]
@@ -3369,6 +3484,30 @@ mod tests {
         }
         assert_eq!(order(MostViewed, true).await, "CEBADF");
         assert_eq!(order(MostViewed, false).await, "BECADF");
+
+        // READER_RATED (our own reviews): rated works by average, the unrated remainder
+        // newest-first, and ASC reverses only the rated prefix — unrated is still last.
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, created_at) \
+             VALUES ('u1','u','u@e','h','t')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (i, (w, score)) in [("w_d", 9), ("w_a", 4)].iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) \
+                 VALUES (?, ?, 'u1', ?, 'b', 't', 't')",
+            )
+            .bind(format!("rv{i}"))
+            .bind(*w)
+            .bind(*score)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(order(CommunityRating, true).await, "DABCEF");
+        assert_eq!(order(CommunityRating, false).await, "ADBCEF");
     }
 
     /// A nullable key sorted ASC is a two-phase walk; the pages must stitch across the
@@ -3551,6 +3690,41 @@ mod tests {
             .await,
             set(&["Solo Camping", "Solo Leveling", "Solo Nights"])
         );
+        // READER_RATED re-orders the matches by OUR review average, both directions, with
+        // the unrated matches after the rated ones either way.
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, created_at) \
+             VALUES ('u1','u','u@e','h','t')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (i, (w, score)) in [("w_3", 9), ("w_1", 4)].iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) \
+                 VALUES (?, ?, 'u1', ?, 'b', 't', 't')",
+            )
+            .bind(format!("rv{i}"))
+            .bind(*w)
+            .bind(*score)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (desc, rated) in [
+            (true, ["Solo Camping", "Solo"]),
+            (false, ["Solo", "Solo Camping"]),
+        ] {
+            let (t, titles) = search(&|q| {
+                q.sort = Sort {
+                    key: SortKey::CommunityRating,
+                    desc,
+                }
+            })
+            .await;
+            assert_eq!(t, 4, "a sort never changes the total");
+            assert_eq!(titles[..2], rated, "reader rating desc={desc}");
+        }
         // A too-short query is no query: (0, []), exactly like `search_works_fts`.
         let none = search_text(&pool, "so", &BrowseQuery::default())
             .await

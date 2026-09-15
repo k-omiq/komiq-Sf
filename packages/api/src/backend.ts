@@ -1,4 +1,5 @@
 import type {
+	ChapterOrigin,
 	AdminUser,
 	CoverIssue,
 	AggregatedChapter,
@@ -162,6 +163,18 @@ export interface Backend {
 	 */
 	tags?(): Promise<TagInfo[]>;
 	/**
+	 * The sources Browse can filter by ({@link BrowseFilter.source}), biggest first, each
+	 * with the number of works the viewer may see from it. `includeNsfw` is the admin
+	 * console's escape hatch (honoured for an admin only). Resolves to `[]` against a
+	 * server that predates the query. Optional: only the unified API.
+	 */
+	browseSources?(includeNsfw?: boolean): Promise<BrowseSource[]>;
+	/**
+	 * Every scanlator an admin tagged as using AI. Public. Resolves to `[]` against a
+	 * server that predates the query. Optional: only the unified API.
+	 */
+	scanlatorTags?(): Promise<ScanlatorTag[]>;
+	/**
 	 * Whether `search(filter:)` is (still believed to be) understood by the server.
 	 * Turns false once the API rejects the argument and it is stripped from the
 	 * document, so a caller can say honestly that only the legacy subset of the filter
@@ -261,6 +274,12 @@ export interface Backend {
 	 * client (embedded Suwayomi) can fetch it directly. `workId` is the `w_`-prefixed
 	 * canonical id. Optional: only the unified Komika API implements it. */
 	workSources?(workId: Id): Promise<WorkSource[]>;
+	/** Where a Suwayomi chapter (a numeric chapter id) lives at its source: the source's
+	 * own keys, so a native client can fetch its pages with its own engine instead of
+	 * through {@link pages}, and its page on the source's website, for "Read on source".
+	 * `null` = unknown chapter; `undefined` = the server predates the query. Optional:
+	 * the unified Komika API and the direct Suwayomi backend implement it. */
+	chapterOrigin?(chapterId: Id): Promise<ChapterOrigin | null | undefined>;
 	/** {@link workSources} for many works at once, grouped by `workId` — for warming
 	 * a native client's source routing over a list. Optional: only the unified
 	 * Komika API implements it. */
@@ -378,16 +397,62 @@ export interface Backend {
 	/** Turn MangaDex on or off; returns the new effective value. Refused when the
 	 * server pins it by env (`KOMIKA_MANGADEX`, `CATALOGUE_SYNC=on`). Optional. */
 	setMangadexEnabled?(enabled: boolean): Promise<boolean>;
+	/** Every per-source scan rate limit in force. Optional. */
+	sourceRateLimits?(): Promise<SourceRateLimit[]>;
+	/** Add or replace the scan rate limit of one source; applied live. Wins over the
+	 * server's `SCAN_SOURCE_RATE_LIMITS` default for that source. Optional. */
+	setSourceRateLimit?(sourceId: Id, requests: number, windowSecs: number): Promise<SourceRateLimit>;
+	/** Remove an admin's scan rate limit; the source falls back to the server's default
+	 * when it has one. `false` when none was stored. Optional. */
+	removeSourceRateLimit?(sourceId: Id): Promise<boolean>;
+	/** The admin scanlator list: every credit chapters carry, most chapters first, with
+	 * its AI tag. 50 per page. Optional. */
+	scanlators?(query?: ScanlatorQuery): Promise<ScanlatorPage>;
+	/** Tag a scanlator as using AI, or with `null` remove its tag. `false` when nothing
+	 * changed. Optional. */
+	setScanlatorAi?(name: string, ai: ScanlatorAi | null): Promise<boolean>;
 
 	// --- admin access + Cloudflare setup (requires an admin session) ---
 	/** Settings › Access: access choice, public address, Cloudflare setup and the
 	 * current setup/remove run. Optional. */
 	accessStatus?(): Promise<AccessStatus>;
-	/** Record the setup wizard's access choice (and a domain set up by hand). Optional. */
-	setAccessMode?(mode: AccessMode, domain?: string | null): Promise<AccessStatus>;
+	/** `http://<address>:<port>` for each way a device on the home network reaches the
+	 * server, best first. Empty when it only answers on its own computer, or cannot
+	 * know (a container). Optional. */
+	lanAddresses?(): Promise<string[]>;
+	/** Record the setup wizard's access choice. `domain` is a domain set up by hand for
+	 * `internet`, and the server's public address for `direct` (required). With
+	 * `encrypt` (direct only) the server also gets a Let's Encrypt certificate for that
+	 * address and serves HTTPS; the call answers once it is in place, which can take a
+	 * minute. Optional. */
+	setAccessMode?(
+		mode: AccessMode,
+		domain?: string | null,
+		encrypt?: boolean,
+	): Promise<AccessStatus>;
+	/** Whether this connection is plain HTTP from the internet, where the server
+	 * refuses `createOwner`: setup must run in a terminal on the server. Optional. */
+	setupNeedsTerminal?(): Promise<boolean>;
+	/** Direct mode with HTTPS: the certificate's end date and the last renewal error.
+	 * Optional. */
+	certificateStatus?(): Promise<CertificateStatus>;
+	/** What the access screens can say before setup runs: whether the tunnel connector
+	 * is on the machine, what the HTTPS ports are doing, the public address. Rejects on
+	 * a server that predates it; the screens then show no such lines. Optional. */
+	accessPreflight?(): Promise<AccessPreflight>;
+	/** The last time a device on the home network reached this server since it started
+	 * (RFC 3339), or null when none has. Rejects with `Unknown field` on a server that
+	 * predates it. Optional. */
+	lanClientSeenAt?(): Promise<string | null>;
 	/** Verify a Cloudflare API token and find the zone for `domain`. Nothing is
-	 * changed and the token is not kept. Optional. */
-	checkCloudflareToken?(token: string, domain: string): Promise<CloudflareTokenCheck>;
+	 * changed and the token is not kept. With `connection`, the answer also lists the
+	 * permission rows the token seems to lack for that connection (`missing`); a server
+	 * that predates the argument answers with none. Optional. */
+	checkCloudflareToken?(
+		token: string,
+		domain: string,
+		connection?: CloudflareConnection,
+	): Promise<CloudflareTokenCheck>;
 	/** Start the Cloudflare checklist in the background; poll {@link accessStatus}.
 	 * The token is used for this run only. Optional. */
 	startCloudflareSetup?(input: CloudflareSetupInput): Promise<AccessStatus>;
@@ -668,6 +733,7 @@ export type BrowseSortField =
 	| 'MOST_VIEWED'
 	| 'MOST_FOLLOWS'
 	| 'HIGHEST_RATED'
+	| 'READER_RATED'
 	| 'MOST_CHAPTERS'
 	| 'TITLE'
 	| 'YEAR';
@@ -743,6 +809,12 @@ export interface InstanceInfo {
 	version: string;
 	registrationOpen: boolean;
 	mangadexEnabled: boolean;
+	/**
+	 * True when the server tells reader apps to fetch chapter pages from the sources
+	 * themselves: an app with its own engine then does not offer fetching through the
+	 * server. Absent on a server that predates the field, which reads as false.
+	 */
+	appsFetchThemselves?: boolean;
 }
 
 /** The MangaDex switch as the admin sees it. */
@@ -754,6 +826,72 @@ export interface MangadexSetting {
 	pinnedBy: string | null;
 }
 
+/** One per-source scan rate limit: at most `requests` HTTP requests per `windowSecs`. */
+export interface SourceRateLimit {
+	sourceId: Id;
+	requests: number;
+	windowSecs: number;
+	/** The limit in force is the server's default (`SCAN_SOURCE_RATE_LIMITS`). */
+	fromEnv: boolean;
+	/** An admin's limit replaces the server's default; removing it restores the default. */
+	overridesEnv: boolean;
+}
+
+/** One source Browse can filter by (`browseSources`). */
+export interface BrowseSource {
+	/** What {@link BrowseFilter.source} takes: `mangadex`, or a source id. */
+	id: string;
+	/** Display name; the extension package name or the id when the engine did not answer. */
+	name: string;
+	/** Language code (`en`, `all`), when known. Null for the MangaDex mirror. */
+	lang: string | null;
+	/** Works from this source the viewer may see in Browse (NSFW-gated). */
+	count: number;
+}
+
+/** What an admin says about a scanlator: `AI` = machine made, `PARTIAL` = AI is part of
+ *  the work (for example machine translation that a person edits). */
+export type ScanlatorAi = 'AI' | 'PARTIAL';
+
+/** One tagged scanlator. Match `name` to a chapter copy's `scanlator` trimmed and
+ *  case-folded; a joint credit ("A & B") with no tag of its own takes the strongest tag
+ *  of its members (`AI` over `PARTIAL`). */
+export interface ScanlatorTag {
+	name: string;
+	ai: ScanlatorAi;
+}
+
+/** Which scanlators the admin list shows, by the tag that applies to them. */
+export type ScanlatorAiFilter = 'TAGGED' | 'AI' | 'PARTIAL' | 'UNTAGGED';
+
+export interface ScanlatorQuery {
+	/** Part of the name, any case. */
+	search?: string;
+	ai?: ScanlatorAiFilter;
+	/** A {@link BrowseSource.id}: only credits with chapters on that source, counted
+	 *  on that source. */
+	source?: string;
+	page?: number;
+}
+
+/** One row of the admin scanlator list. */
+export interface Scanlator {
+	name: string;
+	chapterCount: number;
+	seriesCount: number;
+	/** The tag stored for exactly this name. */
+	ai: ScanlatorAi | null;
+	/** The tag that applies: `ai`, else one a joint credit takes from a member. */
+	effectiveAi: ScanlatorAi | null;
+}
+
+export interface ScanlatorPage {
+	items: Scanlator[];
+	page: number;
+	hasNextPage: boolean;
+	total: number;
+}
+
 /** One extension repo configured on the engine. */
 export interface ExtensionRepo {
 	/** Canonical index URL: the repo's identity, and each extension's `repo`. */
@@ -762,7 +900,8 @@ export interface ExtensionRepo {
 	badgeLabel: string;
 }
 
-export type AccessMode = 'local' | 'internet';
+/** `direct`: public at the server's own address, with no domain and no Cloudflare. */
+export type AccessMode = 'local' | 'internet' | 'direct';
 export type CloudflareConnection = 'TUNNEL' | 'PUBLIC_IP';
 
 /** One line of the Cloudflare checklist. */
@@ -793,9 +932,11 @@ export interface CloudflareSetup {
 
 /** Settings › Access (see {@link Backend.accessStatus}). */
 export interface AccessStatus {
-	/** `local`, `internet`, or empty while nobody chose. */
+	/** `local`, `internet`, `direct`, or empty while nobody chose. */
 	mode: AccessMode | '';
 	domain: string | null;
+	/** What readers type: `https://<domain>` (internet) or the public address (direct:
+	 * `https://<address>`, or `http://<address>:<port>` without encryption). */
 	address: string | null;
 	cloudflare: CloudflareSetup | null;
 	connector: 'off' | 'starting' | 'running' | 'failed' | 'missing';
@@ -806,10 +947,52 @@ export interface AccessStatus {
 	job: CloudflareJob | null;
 }
 
+/** The certificate of direct mode with HTTPS. Both null when that is off. */
+export interface CertificateStatus {
+	/** When the current certificate stops being valid (RFC 3339). The server renews
+	 * it long before. */
+	certificateExpires: string | null;
+	/** Why the last renewal failed, until one succeeds. */
+	certificateError: string | null;
+	/** The plain HTTP port refuses clients on the internet. It starts to after the
+	 * first visit from the internet over HTTPS. */
+	plainHttpClosed: boolean;
+}
+
 export interface CloudflareTokenCheck {
 	zoneName: string;
 	zoneStatus: string;
 	accountName: string;
+	/** Permission rows the token seems to lack, e.g. `Zone › DNS`. Advice only: setup
+	 * may still work. Empty when nothing is missing, or the server cannot tell. */
+	missing: string[];
+}
+
+/** What a port on the server's machine is doing: nothing listens there (`free`), komiq
+ * itself listens there (`serving`), another program does (`in_use`), the server is not
+ * allowed to open it (`denied`), or the check itself failed (`unknown`). */
+export type PortState = 'free' | 'serving' | 'in_use' | 'denied' | 'unknown';
+
+/** What the server knows about its machine before access setup runs
+ * (see {@link Backend.accessPreflight}). */
+export interface AccessPreflight {
+	/** The tunnel connector: `found` on the machine, `download` (tunnel setup fetches
+	 * the pinned release by itself), or `unsupported` (no release fits this machine). */
+	cloudflared: 'found' | 'download' | 'unsupported';
+	/** A sentence about the connector, e.g. why it is unsupported. */
+	cloudflaredDetail: string | null;
+	/** The plain HTTP port the server listens on. */
+	httpPort: number;
+	/** The port HTTPS is served on (Cloudflare public IP, and direct mode). */
+	httpsPort: number;
+	httpsPortState: PortState;
+	/** The port a Let's Encrypt check arrives on (direct mode with HTTPS). */
+	acmePort: number;
+	acmePortState: PortState;
+	/** The server runs in a container: its ports must be published by the host too. */
+	inContainer: boolean;
+	/** The server's public address as the internet sees it, when it could be found. */
+	publicIp: string | null;
 }
 
 export interface CloudflareSetupInput {

@@ -35,8 +35,19 @@
 #   ./scripts/build-ios-jvm.sh                     # uses $BOOT_JDK (must be JDK 25/26/27)
 #   BOOT_JDK=/path/to/jdk-26 ./scripts/build-ios-jvm.sh
 #   KOMIKA_FETCH_BOOT_JDK=1 ./scripts/build-ios-jvm.sh   # auto-fetch pinned Temurin 26
+#   ./scripts/build-ios-jvm.sh --relink-modules    # no JDK build: link lib/modules again from
+#                                                  # the classes of the image that is already
+#                                                  # in ../jre-ios (after a change of
+#                                                  # IOS_MODULES below). Minutes, not hours.
 #
 set -euo pipefail
+
+MODE="build"
+case "${1:-}" in
+  "") ;;
+  --relink-modules) MODE="relink" ;;
+  *) echo "error: unknown argument '$1' (the only one is --relink-modules)" >&2; exit 1 ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_TAURI_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -96,9 +107,34 @@ BOOT_JDK_SHA256="10c436258e24693ce8baf13dbffce98b77275797455e8b72510967547f13234
 #   * the boot JDK (26) cannot parse the tree's v71 (JDK 27) classfiles;
 #   * a macOS-hosted build of the same tree needs the Xcode Metal toolchain component,
 #     which is not a reasonable prerequisite for this recipe.
+#
+# !!! PIN RATIONALE (found on hardware, 2026-10-05) !!!  The Linker JDK must WRITE jimage 1.0.
+# mainline commit 4edfc387f160 (2026-05-12, JDK-8377070 "Update jimage format to support
+# classes compiled with preview feature enabled") bumped the jimage version to 1.1; it is in
+# every tag from jdk-27+22 on. The pinned tree (2026-03-16) predates it, and its libjimage
+# (ImageFileReader::open) and its Java BasicImageReader both accept major 1 / minor 0 ONLY.
+# An image linked by a 1.1 jlink (the earlier pin here was jdk-27+30) is rejected on device:
+# JNI_CreateJavaVM exits with "Unable to load <java.home>/lib/modules". So this pin is the
+# EA build closest to the tree: jdk-27+14 (tag 2026-03-18, two days after the pinned commit).
+# When bumping MOBILE_COMMIT past 4edfc387f160, bump this to a 1.1 build in the same change;
+# the header check at the end of this script compares against JIMAGE_VERSION_HEX below.
 # Temurin 27 EA, macOS aarch64. Adoptium-published SHA-256.
-LINK_JDK_URL="https://github.com/adoptium/temurin27-binaries/releases/download/jdk-27%2B30-ea-beta/OpenJDK27U-jdk_aarch64_mac_hotspot_27_30-ea.tar.gz"
-LINK_JDK_SHA256="7c14a75ec4a0eeb7db30379975089ff8541db9209a18ab68df910143d85b41ce"
+LINK_JDK_URL="https://github.com/adoptium/temurin27-binaries/releases/download/jdk-27%2B14-ea-beta/OpenJDK-jdk_aarch64_mac_hotspot_27_14-ea.tar.gz"
+LINK_JDK_SHA256="260a62a613eca70e75e711c02470b48178919cb3e501c11251b8dbda998631fe"
+# First 8 bytes of a jimage the pinned tree's readers accept: magic 0xCAFEDADA then the
+# version word, both little-endian on arm64 -> "da da fe ca" + minor 0 "00 00" + major 1 "01 00".
+JIMAGE_VERSION_HEX="dadafeca00000100"
+
+# The modules that go into lib/modules. This is the set the DESKTOP engine runs the same jar
+# on (MODULES in build-jre.sh, validated there by real use), less jdk.jsobject, which JDK 27
+# no longer has. Keep the two lists in step. Before 2026-10-06 this script linked
+# ALL-MODULE-PATH: 63 modules, 149 MB, of which 33 MB were tools a phone never runs
+# (jdk.compiler, jdk.javadoc, jdk.jshell, jdk.jdi, jdk.jlink, ...). With this list: 31
+# modules, 115 MB. If the engine ever fails with NoClassDefFoundError or "module not found"
+# for a JDK class, add the module here and run this script with --relink-modules.
+# NOT trimmed on purpose: jdk.localedata (28 MB). Extensions for sources in other languages
+# read chapter dates with the month names of that language.
+IOS_MODULES="java.base,java.desktop,java.sql,java.sql.rowset,java.naming,java.management,java.instrument,java.logging,java.net.http,java.scripting,java.security.jgss,java.security.sasl,java.xml,java.xml.crypto,java.transaction.xa,java.datatransfer,java.compiler,java.rmi,java.prefs,jdk.crypto.ec,jdk.crypto.cryptoki,jdk.unsupported,jdk.zipfs,jdk.net,jdk.httpserver,jdk.management,jdk.dynalink,jdk.charsets,jdk.localedata,jdk.security.auth,jdk.security.jgss"
 
 CONF_NAME="ios-aarch64-zero-release"
 OUT_DIR="${SRC_TAURI_DIR}/jre-ios/aarch64-ios"
@@ -106,7 +142,7 @@ WORK_DIR="${KOMIKA_IOS_JVM_WORKDIR:-${SRC_TAURI_DIR}/.ios-jvm-build}"   # large;
 
 # ---- Preconditions -------------------------------------------------------------------------
 [[ "$(uname -s)" == "Darwin" ]] || { echo "error: iOS JVM must be built on macOS" >&2; exit 1; }
-command -v autoconf >/dev/null 2>&1 || { echo "error: autoconf missing (brew install autoconf)" >&2; exit 1; }
+[[ "${MODE}" == "relink" ]] || command -v autoconf >/dev/null 2>&1 || { echo "error: autoconf missing (brew install autoconf)" >&2; exit 1; }
 
 SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
 [[ -d "${SYSROOT}" ]] || { echo "error: iPhoneOS SDK not found (install Xcode)" >&2; exit 1; }
@@ -128,6 +164,94 @@ verify_sha256() {
 }
 
 mkdir -p "${WORK_DIR}"
+
+# ---- The jimage link, shared by the full build and by --relink-modules ----------------------
+# Sets LINK_JDK to the pinned, SHA-256-verified Linker JDK (see the pin rationale above).
+fetch_link_jdk() {
+  echo "fetching pinned Temurin 27 EA linker JDK (jmod/jlink host tooling)"
+  local tgz="${WORK_DIR}/link-jdk.tar.gz"
+  if [[ ! -f "${tgz}" ]] || ! verify_sha256 "${tgz}" "${LINK_JDK_SHA256}" 2>/dev/null; then
+    curl -fSL --retry 3 -o "${tgz}" "${LINK_JDK_URL}"
+    verify_sha256 "${tgz}" "${LINK_JDK_SHA256}"
+  fi
+  rm -rf "${WORK_DIR}/link-jdk"; mkdir -p "${WORK_DIR}/link-jdk"
+  tar xzf "${tgz}" -C "${WORK_DIR}/link-jdk"
+  LINK_JDK="$(dirname "$(dirname "$(find "${WORK_DIR}/link-jdk" -name java -path '*/bin/java' | head -1)")")"
+}
+
+# link_jimage <dir of exploded modules> [extra jlink options...]
+# Links IOS_MODULES out of <dir> into ${JIMAGE_WORK}/image/lib/modules.
+#   1. Package java.base as a jmod with --target-platform ios-aarch64 (the exact value the
+#      real build would use: spec.gmk OPENJDK_MODULE_TARGET_PLATFORM). jlink requires the
+#      ModuleTarget attribute on java.base for a cross-platform link, and exploded modules
+#      lack it (it is normally injected at jmod-packaging time).
+#   2. Run jlink with TWO java.base patches applied to the RUNNING jlink VM (not the image):
+#      * jdk/internal/util/OperatingSystem.class from the ios build — teaches mainline jlink
+#        the `ios` platform (a mobile-repo patch, JDK-8374522, not yet in mainline 27);
+#      * jdk/internal/misc/resources/release.txt copied from the target — jlink refuses to
+#        link when its own release string differs from the target java.base's; patching the
+#        *running* side keeps the *image's* release string truthful.
+#      The produced lib/modules therefore records the true ios-aarch64 target and the true
+#      27-internal build string.
+link_jimage() {
+  local modules_dir="$1"; shift
+  [[ -d "${modules_dir}/java.base" ]] || { echo "error: no java.base under ${modules_dir}" >&2; exit 1; }
+  JIMAGE_WORK="${WORK_DIR}/jimage-work"
+  rm -rf "${JIMAGE_WORK}"; mkdir -p "${JIMAGE_WORK}/jmods" "${JIMAGE_WORK}/jb-patch/jdk/internal/util" "${JIMAGE_WORK}/jb-patch/jdk/internal/misc/resources"
+  cp "${modules_dir}/java.base/jdk/internal/util/OperatingSystem.class" "${JIMAGE_WORK}/jb-patch/jdk/internal/util/"
+  cp "${modules_dir}/java.base/jdk/internal/misc/resources/release.txt" "${JIMAGE_WORK}/jb-patch/jdk/internal/misc/resources/"
+  "${LINK_JDK}/bin/jmod" create --class-path "${modules_dir}/java.base" \
+      --target-platform ios-aarch64 "${JIMAGE_WORK}/jmods/java.base.jmod"
+  "${LINK_JDK}/bin/jlink" -J--patch-module=java.base="${JIMAGE_WORK}/jb-patch" \
+      --module-path "${JIMAGE_WORK}/jmods:${modules_dir}" \
+      --add-modules "${IOS_MODULES}" "$@" --output "${JIMAGE_WORK}/image"
+  [[ -f "${JIMAGE_WORK}/image/lib/modules" ]] || { echo "error: jlink did not produce lib/modules" >&2; exit 1; }
+  local want got
+  want="$(tr ',' '\n' <<<"${IOS_MODULES}" | sort | tr '\n' ' ')"
+  got="$("${LINK_JDK}/bin/jimage" list "${JIMAGE_WORK}/image/lib/modules" | sed -n 's/^Module: //p' | sort | tr '\n' ' ')"
+  [[ "${want}" == "${got}" ]] || { echo "error: linked modules differ from IOS_MODULES:" >&2; echo "  want: ${want}" >&2; echo "  got:  ${got}" >&2; exit 1; }
+}
+
+# The pinned libjimage refuses anything but major 1 / minor 0 (found on a phone, 2026-10-05).
+check_jimage_version() {
+  local head
+  head="$(od -An -tx1 -N8 "$1" | tr -d ' \n')"
+  if [[ "${head}" != "${JIMAGE_VERSION_HEX}" ]]; then
+    echo "error: $1 has jimage header ${head}, expected ${JIMAGE_VERSION_HEX}" >&2
+    echo "  (magic + minor 0 + major 1). The Linker JDK writes a jimage version the pinned tree" >&2
+    echo "  cannot read; see the LINK_JDK pin rationale." >&2
+    exit 1
+  fi
+}
+
+# ---- --relink-modules: a new lib/modules from the classes of the current one ----------------
+# For a change of IOS_MODULES when the JDK build tree is gone (it is several GB and a full
+# build is tens of minutes). The classes come out of the image that is in ../jre-ios, so they
+# are the ones the pinned tree compiled. That image already holds the classes a first jlink
+# GENERATED (the java.lang.invoke species and holder classes); generating them again fails
+# with "Resource ... already present", so that one plugin is off and the old ones are carried
+# over. The system-modules plugin stays ON: it writes the classes that list the modules of
+# the image, and they must match the new list.
+if [[ "${MODE}" == "relink" ]]; then
+  CUR="${OUT_DIR}/lib/modules"
+  [[ -f "${CUR}" ]] || { echo "error: ${CUR} missing; nothing to link from. Run a full build." >&2; exit 1; }
+  fetch_link_jdk
+  OLD="${WORK_DIR}/relink-classes"
+  rm -rf "${OLD}"
+  "${LINK_JDK}/bin/jimage" extract --dir "${OLD}" "${CUR}"
+  for m in $(tr ',' ' ' <<<"${IOS_MODULES}"); do
+    [[ -d "${OLD}/${m}" ]] || { echo "error: module ${m} is not in ${CUR}; it cannot be added by a re-link. Run a full build." >&2; exit 1; }
+  done
+  link_jimage "${OLD}" --disable-plugin generate-jli-classes
+  check_jimage_version "${JIMAGE_WORK}/image/lib/modules"
+  cp "${CUR}" "${WORK_DIR}/modules.before-relink"
+  cp "${JIMAGE_WORK}/image/lib/modules" "${CUR}"
+  rm -rf "${OLD}"
+  echo "ok: ${CUR} linked again with $(tr ',' '\n' <<<"${IOS_MODULES}" | wc -l | tr -d ' ') modules, $(( $(wc -c < "${CUR}") / 1000000 )) MB"
+  echo "    the image before this run is kept at ${WORK_DIR}/modules.before-relink"
+  echo "    next: scripts/stage-ios-jvm-runtime.sh, then build and test on a phone"
+  exit 0
+fi
 
 # ---- Boot JDK ------------------------------------------------------------------------------
 if [[ -z "${BOOT_JDK:-}" && "${KOMIKA_FETCH_BOOT_JDK:-0}" == "1" ]]; then
@@ -204,51 +328,39 @@ cp -R "${IMG}/lib" "${OUT_DIR}/lib"
 # ---- Build the class-library runtime (lib/modules jimage) ----------------------------------
 # `make static-libs-image` compiles every module's classes into the exploded image at
 # build/<conf>/jdk/modules but produces no jimage (see LINK_JDK rationale above). We produce
-# it with the pinned same-feature-version Linker JDK's jmod+jlink:
-#   1. Package java.base as a jmod with --target-platform ios-aarch64 (the exact value the
-#      real build would use: spec.gmk OPENJDK_MODULE_TARGET_PLATFORM). jlink requires the
-#      ModuleTarget attribute on java.base for a cross-platform link, and exploded modules
-#      lack it (it is normally injected at jmod-packaging time).
-#   2. Run jlink with TWO java.base patches applied to the RUNNING jlink VM (not the image):
-#      * jdk/internal/util/OperatingSystem.class from the ios build — teaches mainline jlink
-#        the `ios` platform (a mobile-repo patch, JDK-8374522, not yet in mainline 27);
-#      * jdk/internal/misc/resources/release.txt copied from the target — jlink refuses to
-#        link when its own release string differs from the target java.base's; patching the
-#        *running* side keeps the *image's* release string truthful.
-#      The produced lib/modules therefore records the true ios-aarch64 target and the true
-#      27-internal build string.
-echo "fetching pinned Temurin 27 EA linker JDK (jmod/jlink host tooling)"
-LINK_TGZ="${WORK_DIR}/link-jdk.tar.gz"
-if [[ ! -f "${LINK_TGZ}" ]] || ! verify_sha256 "${LINK_TGZ}" "${LINK_JDK_SHA256}" 2>/dev/null; then
-  curl -fSL --retry 3 -o "${LINK_TGZ}" "${LINK_JDK_URL}"
-  verify_sha256 "${LINK_TGZ}" "${LINK_JDK_SHA256}"
-fi
-rm -rf "${WORK_DIR}/link-jdk"; mkdir -p "${WORK_DIR}/link-jdk"
-tar xzf "${LINK_TGZ}" -C "${WORK_DIR}/link-jdk"
-LINK_JDK="$(dirname "$(dirname "$(find "${WORK_DIR}/link-jdk" -name java -path '*/bin/java' | head -1)")")"
-
+# it with the pinned same-feature-version Linker JDK's jmod+jlink (link_jimage above).
+fetch_link_jdk
 EXPLODED="${MOBILE_DIR}/build/${CONF_NAME}/jdk"
 [[ -d "${EXPLODED}/modules/java.base" ]] || { echo "error: exploded modules missing at ${EXPLODED}/modules" >&2; exit 1; }
-
-JIMAGE_WORK="${WORK_DIR}/jimage-work"
-rm -rf "${JIMAGE_WORK}"; mkdir -p "${JIMAGE_WORK}/jmods" "${JIMAGE_WORK}/jb-patch/jdk/internal/util" "${JIMAGE_WORK}/jb-patch/jdk/internal/misc/resources"
-cp "${EXPLODED}/modules/java.base/jdk/internal/util/OperatingSystem.class" "${JIMAGE_WORK}/jb-patch/jdk/internal/util/"
-cp "${EXPLODED}/modules/java.base/jdk/internal/misc/resources/release.txt" "${JIMAGE_WORK}/jb-patch/jdk/internal/misc/resources/"
-"${LINK_JDK}/bin/jmod" create --class-path "${EXPLODED}/modules/java.base" \
-    --target-platform ios-aarch64 "${JIMAGE_WORK}/jmods/java.base.jmod"
-"${LINK_JDK}/bin/jlink" -J--patch-module=java.base="${JIMAGE_WORK}/jb-patch" \
-    --module-path "${JIMAGE_WORK}/jmods:${EXPLODED}/modules" \
-    --add-modules ALL-MODULE-PATH --output "${JIMAGE_WORK}/image"
-[[ -f "${JIMAGE_WORK}/image/lib/modules" ]] || { echo "error: jlink did not produce lib/modules" >&2; exit 1; }
+link_jimage "${EXPLODED}/modules"
 cp "${JIMAGE_WORK}/image/lib/modules" "${OUT_DIR}/lib/modules"
 
 # Runtime support files the VM/class-library read from java.home (tz data, security config,
 # JFR profiles, jvm.cfg) — taken from the target build's exploded image, same revision.
-cp -R "${EXPLODED}/lib/security" "${OUT_DIR}/lib/security"
-cp -R "${EXPLODED}/lib/jfr" "${OUT_DIR}/lib/jfr"
-cp "${EXPLODED}/lib/tzdb.dat" "${EXPLODED}/lib/jvm.cfg" "${OUT_DIR}/lib/"
-cp -R "${EXPLODED}/conf" "${OUT_DIR}/conf"
-cp "${EXPLODED}/release" "${OUT_DIR}/release"
+# -L is REQUIRED: in the exploded image lib/security/{cacerts,blocked.certs,
+# public_suffix_list.dat} and lib/jfr/*.jfc are symlinks into build/<conf>/support/modules_libs.
+# Copied as links they dangle outside the build tree, and the engine then has no trust store
+# (no HTTPS at all). -L copies the files they point at.
+cp -RL "${EXPLODED}/lib/security" "${OUT_DIR}/lib/security"
+cp -RL "${EXPLODED}/lib/jfr" "${OUT_DIR}/lib/jfr"
+cp -L "${EXPLODED}/lib/tzdb.dat" "${EXPLODED}/lib/jvm.cfg" "${OUT_DIR}/lib/"
+cp -RL "${EXPLODED}/conf" "${OUT_DIR}/conf"
+cp -L "${EXPLODED}/release" "${OUT_DIR}/release"
+
+# ---- Sanity: the runtime must be loadable by the pinned tree and self-contained -------------
+# Both failures below are silent at build time and only show up on a phone (2026-10-05), so
+# they fail the script here instead.
+#   1. jimage version: the pinned libjimage refuses anything but major 1 / minor 0.
+#   2. Symlinks: the bundle ships files, not the build tree. ANY symlink is rejected, not only
+#      a dangling one, because a link that resolves on this Mac still points outside the app.
+check_jimage_version "${OUT_DIR}/lib/modules"
+LINKS="$(find "${OUT_DIR}" -type l)"
+if [[ -n "${LINKS}" ]]; then
+  echo "error: symlinks in ${OUT_DIR} (they do not survive bundling into the app):" >&2
+  echo "${LINKS}" | sed 's/^/  /' >&2
+  exit 1
+fi
+[[ -s "${OUT_DIR}/lib/security/cacerts" ]] || { echo "error: ${OUT_DIR}/lib/security/cacerts missing or empty (no trust store)" >&2; exit 1; }
 
 # ---- Sanity: confirm the mach-o is arm64 iOS -----------------------------------------------
 echo "=== libjvm.a arch/platform ==="

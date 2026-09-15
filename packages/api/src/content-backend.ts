@@ -1,10 +1,18 @@
 import type { Chapter, Id, Page, Series } from '@komika/types';
 
+/**
+ * Prefix on every image URL the on-device engine hands out (`engine:/api/v1/manga/…`).
+ * The engine's own paths are relative, and so are the paths of a server the app is
+ * connected to; the prefix is what tells the image provider to point the image at the
+ * engine (an `engine-image` address) instead of resolving the path against that server.
+ */
+export const ENGINE_URL_PREFIX = 'engine:';
+
 /** Identifies a specific series within a specific source, resolved from `workSources`. */
 export interface SourceRef {
 	/** Suwayomi source id (or "mangadex"). */
 	sourceId: string;
-	/** Manga id/slug within that source — corresponds to `MangaType.url`. */
+	/** The source's own key for the manga — `MangaType.url`. NOT a server-side row id. */
 	sourceKey: string;
 	/**
 	 * Extension package id, used for on-device provisioning. Sourced from
@@ -38,6 +46,12 @@ export interface ContentBackend {
 	series(ref: SourceRef): Promise<Series>;
 	/** Live chapter list for one source mapping. */
 	chapters(ref: SourceRef): Promise<Chapter[]>;
+	/**
+	 * The engine's chapter id for the chapter a source identifies by `chapterUrl`
+	 * (`ChapterType.url`) inside the manga `ref` names, or null when this engine cannot
+	 * find it. The result is what {@link pages} takes.
+	 */
+	resolveChapter(ref: SourceRef, chapterUrl: string): Promise<Id | null>;
 	/**
 	 * Page image URLs for a chapter. `chapterId` is the engine's internal integer
 	 * chapter id (passed as a string `Id`) — the same value returned as `Chapter.id`

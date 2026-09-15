@@ -725,7 +725,9 @@ fn is_paused(status: SeriesStatus, admin: &ScanAdmin) -> bool {
 /// upstream schema mismatch, a write error) is logged and swallowed so it never
 /// affects the scan. Additive: it only writes `source_extension` rows. Called from the
 /// daily source-sync reconcile (extensions change rarely, so a per-scan-tick refresh was
-/// wasteful once the scan tick stopped touching Suwayomi).
+/// wasteful once the scan tick stopped touching Suwayomi), and from `installExtension` /
+/// `updateExtension`, so a source's row exists from the moment the source does — ingest
+/// reads the source's NSFW flag from it and `chapterOrigin` its install coordinates.
 pub(crate) async fn record_source_extensions(state: &AppState) {
     let extensions = match state.suwayomi.fetch_extensions().await {
         Ok(e) => e,
@@ -735,26 +737,53 @@ pub(crate) async fn record_source_extensions(state: &AppState) {
         }
     };
     for ext in extensions {
-        // An extension with no repo can't be installed from coordinates; skip it.
-        let Some(repo_url) = ext.repo.clone() else {
-            continue;
-        };
-        let input = crate::catalog::SourceExtensionInput {
-            pkg_name: ext.pkg_name.clone(),
-            repo_url,
-            apk_name: ext.apk_name.clone(),
-            version_code: ext.version_code,
-            lang: ext.lang.clone(),
-            is_nsfw: ext.is_nsfw,
-        };
-        for source_id in &ext.source_ids {
-            if let Err(e) =
-                crate::catalog::upsert_source_extension(&state.pool, source_id, &input).await
-            {
-                tracing::warn!(source_id, error = %e, "scan tick: failed to record source extension");
-            }
+        record_extension(&state.pool, &ext).await;
+    }
+}
+
+/// Write one extension's `source_extension` rows (one per source it provides).
+async fn record_extension(pool: &SqlitePool, ext: &crate::suwayomi::SuwayomiExtension) {
+    // An extension with no repo can't be installed from coordinates; skip it.
+    let Some(repo_url) = ext.repo.clone() else {
+        return;
+    };
+    let input = crate::catalog::SourceExtensionInput {
+        pkg_name: ext.pkg_name.clone(),
+        repo_url,
+        apk_name: ext.apk_name.clone(),
+        version_code: ext.version_code,
+        lang: ext.lang.clone(),
+        is_nsfw: ext.is_nsfw,
+    };
+    for source_id in &ext.source_ids {
+        if let Err(e) = crate::catalog::upsert_source_extension(pool, source_id, &input).await {
+            tracing::warn!(source_id, error = %e, "scan tick: failed to record source extension");
         }
     }
+}
+
+/// [`record_source_extensions`] narrowed to the ONE installed extension that provides
+/// `source_id`, returning that extension's NSFW flag. The ingest path calls this when
+/// `source_extension` has no row for a source it is about to add a series from, so the
+/// row is written once and every later series from the source is a plain row read.
+///
+/// `Ok(None)`: the engine lists no installed extension for the source (the Local
+/// source, or an extension uninstalled since). The flag is returned even when the
+/// extension has no repo and so no row can be written. Unlike the full pass this one
+/// reports an engine failure — its caller needs to know the answer is missing.
+pub(crate) async fn record_extension_of_source(
+    state: &AppState,
+    source_id: &str,
+) -> anyhow::Result<Option<bool>> {
+    let extensions = state.suwayomi.fetch_extensions().await?;
+    let Some(ext) = extensions
+        .into_iter()
+        .find(|e| e.source_ids.iter().any(|s| s == source_id))
+    else {
+        return Ok(None);
+    };
+    record_extension(&state.pool, &ext).await;
+    Ok(Some(ext.is_nsfw))
 }
 
 /// Max due series scanned in a single tick — bounds a cold-start/backlog tick so it
@@ -2503,10 +2532,188 @@ const HEALTH_CHECK_MIN_SECONDS: u64 = 300;
 /// Shared across every source loop: the global concurrency ceiling, plus a failure counter
 /// the supervisor drains to decide whether to run the (library-wide) E4.3 health check, plus
 /// the per-source request throttles (`SCAN_SOURCE_RATE_LIMITS`), keyed by `source_id`.
+///
+/// The throttle map is behind a lock because an admin can add, change or remove a limit
+/// while the loops run (`source_rate_limit`); the supervisor swaps entries on its reconcile.
 struct ScanCoord {
     sem: Semaphore,
     failures_since_health: AtomicUsize,
-    throttles: HashMap<String, Arc<SourceThrottle>>,
+    throttles: std::sync::RwLock<HashMap<String, Arc<SourceThrottle>>>,
+}
+
+impl ScanCoord {
+    /// The throttle for one source right now, if it has a limit.
+    fn throttle(&self, source_id: &str) -> Option<Arc<SourceThrottle>> {
+        self.throttles
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(source_id)
+            .cloned()
+    }
+
+    /// Make the live throttles match `limits`: add the new ones, re-pace the changed ones
+    /// IN PLACE (their recent starts survive, so an edit never hands a source a fresh
+    /// window on top of the one it just spent), and drop the ones no longer listed.
+    fn apply_limits(&self, limits: &[EffectiveRateLimit]) {
+        let mut map = self.throttles.write().unwrap_or_else(|e| e.into_inner());
+        map.retain(|source_id, _| {
+            let keep = limits.iter().any(|l| &l.limit.source_id == source_id);
+            if !keep {
+                tracing::info!(source_id = %source_id, "scan supervisor: per-source rate limit removed");
+            }
+            keep
+        });
+        for l in limits {
+            let l = &l.limit;
+            let changed = match map.get(&l.source_id) {
+                Some(t) => t.set_limit(l),
+                None => {
+                    map.insert(l.source_id.clone(), Arc::new(SourceThrottle::new(l)));
+                    true
+                }
+            };
+            if changed {
+                // Logged per source so the effective cap is answerable from the logs alone
+                // (the same reason `global_permits` is logged): a throttle that silently
+                // did not apply is the failure mode that gets a source banned twice.
+                tracing::info!(
+                    source_id = %l.source_id,
+                    requests = l.requests,
+                    window_secs = l.window_secs,
+                    requests_per_scan = l.requests_per_scan,
+                    scans_per_window = l.scans_per_window(),
+                    gap_secs = l.window_secs / l.scans_per_window() as u64,
+                    "scan supervisor: per-source rate limit active"
+                );
+            }
+        }
+    }
+}
+
+/// One per-source limit as the scanner applies it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectiveRateLimit {
+    pub limit: crate::config::SourceRateLimit,
+    pub origin: LimitOrigin,
+}
+
+/// Where the limit in force for a source comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitOrigin {
+    /// `SCAN_SOURCE_RATE_LIMITS` only: the server's default for this source.
+    Env,
+    /// An admin's row; the env does not name the source.
+    Admin,
+    /// An admin's row replacing the env default. Removing the row restores the default.
+    AdminOverEnv,
+}
+
+/// The limits an admin stored (`source_rate_limit`, migration 0115). One series scan is
+/// counted as the default two requests, as for an env entry without `@cost`.
+pub async fn stored_source_rate_limits(
+    pool: &SqlitePool,
+) -> sqlx::Result<Vec<crate::config::SourceRateLimit>> {
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT source_id, requests, window_secs FROM source_rate_limit ORDER BY source_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(source_id, requests, window_secs)| crate::config::SourceRateLimit {
+                source_id,
+                requests: requests.max(1) as u32,
+                window_secs: window_secs.max(1) as u64,
+                requests_per_scan: crate::config::DEFAULT_REQUESTS_PER_SCAN,
+            },
+        )
+        .collect())
+}
+
+/// Store (or replace) an admin's limit for one source.
+pub async fn store_source_rate_limit(
+    pool: &SqlitePool,
+    source_id: &str,
+    requests: u32,
+    window_secs: u64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO source_rate_limit (source_id, requests, window_secs, updated_at) \
+         VALUES (?, ?, ?, ?) \
+         ON CONFLICT(source_id) DO UPDATE SET requests = excluded.requests, \
+             window_secs = excluded.window_secs, updated_at = excluded.updated_at",
+    )
+    .bind(source_id)
+    .bind(requests as i64)
+    .bind(window_secs as i64)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Forget an admin's limit. `false` when the source had none.
+pub async fn delete_source_rate_limit(pool: &SqlitePool, source_id: &str) -> sqlx::Result<bool> {
+    let res = sqlx::query("DELETE FROM source_rate_limit WHERE source_id = ?")
+        .bind(source_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Env limits and stored limits as one list, env sources first.
+///
+/// An admin's row WINS over the env entry for the same source. That is the opposite of
+/// `instance_setting` (env always wins), on purpose: an env entry here is a shipped default
+/// for one known site, and when that site asks for fewer requests the admin must be able to
+/// tighten it at once, without a redeploy. The env entry still does its job as the floor a
+/// source falls back to: removing the row restores it, so an env-listed source can never
+/// be left without a limit from the console.
+pub fn merge_source_rate_limits(
+    env: Vec<crate::config::SourceRateLimit>,
+    stored: Vec<crate::config::SourceRateLimit>,
+) -> Vec<EffectiveRateLimit> {
+    let mut out: Vec<EffectiveRateLimit> = Vec::with_capacity(env.len() + stored.len());
+    for limit in env {
+        match out
+            .iter_mut()
+            .find(|e| e.limit.source_id == limit.source_id)
+        {
+            // A source listed twice in the env: the last entry wins, as it always has.
+            Some(e) => e.limit = limit,
+            None => out.push(EffectiveRateLimit {
+                limit,
+                origin: LimitOrigin::Env,
+            }),
+        }
+    }
+    for limit in stored {
+        match out
+            .iter_mut()
+            .find(|e| e.limit.source_id == limit.source_id)
+        {
+            Some(e) => {
+                e.limit = limit;
+                e.origin = LimitOrigin::AdminOverEnv;
+            }
+            None => out.push(EffectiveRateLimit {
+                limit,
+                origin: LimitOrigin::Admin,
+            }),
+        }
+    }
+    out
+}
+
+/// Every per-source limit in force: `SCAN_SOURCE_RATE_LIMITS` plus the admin's own.
+pub async fn effective_source_rate_limits(
+    pool: &SqlitePool,
+) -> sqlx::Result<Vec<EffectiveRateLimit>> {
+    Ok(merge_source_rate_limits(
+        crate::config::scan_source_rate_limits(),
+        stored_source_rate_limits(pool).await?,
+    ))
 }
 
 /// A hard per-source cap on outbound scan rate: at most `scans_per_window` series scans in
@@ -2527,29 +2734,59 @@ struct ScanCoord {
 /// In-process, not persisted: a restart starts an empty window, so the first scan after boot
 /// is immediate and the rest follow at `min_gap` — a restart never produces a burst.
 pub(crate) struct SourceThrottle {
-    scans_per_window: u32,
-    window: Duration,
-    min_gap: Duration,
+    /// Behind a lock so a changed limit re-paces this same throttle (`set_limit`). Never
+    /// held across an await.
+    pace: std::sync::Mutex<Pace>,
     starts: tokio::sync::Mutex<std::collections::VecDeque<tokio::time::Instant>>,
 }
 
-impl SourceThrottle {
-    pub(crate) fn new(limit: &crate::config::SourceRateLimit) -> Self {
+/// What a [`SourceRateLimit`](crate::config::SourceRateLimit) means for the scan loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Pace {
+    scans_per_window: u32,
+    window: Duration,
+    min_gap: Duration,
+}
+
+impl Pace {
+    fn of(limit: &crate::config::SourceRateLimit) -> Self {
         let scans_per_window = limit.scans_per_window();
         let window = Duration::from_secs(limit.window_secs);
         Self {
             scans_per_window,
             window,
             min_gap: window / scans_per_window,
+        }
+    }
+}
+
+impl SourceThrottle {
+    pub(crate) fn new(limit: &crate::config::SourceRateLimit) -> Self {
+        let pace = Pace::of(limit);
+        Self {
+            pace: std::sync::Mutex::new(pace),
             starts: tokio::sync::Mutex::new(std::collections::VecDeque::with_capacity(
-                scans_per_window as usize + 1,
+                pace.scans_per_window as usize + 1,
             )),
         }
     }
 
+    fn pace(&self) -> Pace {
+        *self.pace.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Re-pace to `limit`, keeping the recent starts. Returns whether anything changed.
+    fn set_limit(&self, limit: &crate::config::SourceRateLimit) -> bool {
+        let next = Pace::of(limit);
+        let mut pace = self.pace.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = *pace != next;
+        *pace = next;
+        changed
+    }
+
     /// Series scans this throttle admits per window — the per-tick batch size for its loop.
     pub(crate) fn scans_per_window(&self) -> u32 {
-        self.scans_per_window
+        self.pace().scans_per_window
     }
 
     /// Wait until one scan may start, then record it. Returns `false` (without recording)
@@ -2561,21 +2798,26 @@ impl SourceThrottle {
             if *shutdown.borrow() {
                 return false;
             }
+            // Read each pass: a limit changed while this caller slept applies to it too.
+            let pace = self.pace();
             let now = tokio::time::Instant::now();
             while starts
                 .front()
-                .is_some_and(|t| now.duration_since(*t) >= self.window)
+                .is_some_and(|t| now.duration_since(*t) >= pace.window)
             {
                 starts.pop_front();
             }
             let mut wait = Duration::ZERO;
-            if starts.len() >= self.scans_per_window as usize {
-                if let Some(oldest) = starts.front() {
-                    wait = wait.max(self.window.saturating_sub(now.duration_since(*oldest)));
+            if starts.len() >= pace.scans_per_window as usize {
+                // The start that must age out before one more fits. It is the front one
+                // unless the limit was just lowered below what the window already holds.
+                let blocking = starts.len() - pace.scans_per_window as usize;
+                if let Some(t) = starts.get(blocking) {
+                    wait = wait.max(pace.window.saturating_sub(now.duration_since(*t)));
                 }
             }
             if let Some(last) = starts.back() {
-                wait = wait.max(self.min_gap.saturating_sub(now.duration_since(*last)));
+                wait = wait.max(pace.min_gap.saturating_sub(now.duration_since(*last)));
             }
             if wait.is_zero() {
                 starts.push_back(now);
@@ -2717,15 +2959,17 @@ async fn tick_source(
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> TickOutcome {
     use futures::StreamExt as _;
-    // A rate-limited source (`SCAN_SOURCE_RATE_LIMITS`) is scanned strictly one at a time,
+    // A rate-limited source (`SCAN_SOURCE_RATE_LIMITS`, or an admin's `source_rate_limit`
+    // row) is scanned strictly one at a time,
     // and a tick takes no more than one window's budget from the due-set — so one tick is at
     // most one window long and the health snapshot keeps moving. The due-query is ordered by
     // `next_scan_at`, so a permanently over-subscribed source round-robins oldest-due first
     // rather than starving the tail.
-    let throttle = match sel {
-        SourceSel::Id(id) => coord.throttles.get(id).cloned(),
+    let limited_id = match sel {
+        SourceSel::Id(id) => Some(id.as_str()),
         SourceSel::Unassigned { .. } => None,
     };
+    let throttle = limited_id.and_then(|id| coord.throttle(id));
     let (limit, concurrency) = match &throttle {
         Some(t) => (t.scans_per_window() as i64, 1),
         None => (DUE_BATCH_LIMIT, SCAN_CONCURRENCY),
@@ -2742,6 +2986,13 @@ async fn tick_source(
             let throttle = throttle.clone();
             async move {
                 if *shutdown.borrow() {
+                    return;
+                }
+                // An admin limited this source while its unthrottled batch (up to
+                // `DUE_BATCH_LIMIT` scans, 3 at a time) was running: stop here. The rest
+                // stays due, and the next tick takes it at the new pace.
+                if throttle.is_none() && limited_id.is_some_and(|id| coord.throttle(id).is_some())
+                {
                     return;
                 }
                 // Per-source rate cap FIRST, before taking a global permit: a throttled
@@ -3019,23 +3270,10 @@ async fn supervisor(state: Arc<AppState>, mut shutdown: tokio::sync::watch::Rece
     // Read ONCE, here: the permit count is fixed for the life of the semaphore, so re-reading
     // it per loop could only produce loops that disagree about the ceiling.
     let permits = crate::config::scan_global_concurrency();
+    // The env limits go in first and unconditionally, so a database that cannot be read at
+    // boot still leaves every env-listed source throttled. The admin's own limits
+    // (`source_rate_limit`) join on the first reconcile below, before any loop is spawned.
     let limits = crate::config::scan_source_rate_limits();
-    let mut throttles: HashMap<String, Arc<SourceThrottle>> = HashMap::new();
-    for l in &limits {
-        // Logged per source so the effective cap is answerable from the logs alone (the same
-        // reason `global_permits` is logged below): a throttle that silently did not apply is
-        // the failure mode that gets a source banned twice.
-        tracing::info!(
-            source_id = %l.source_id,
-            requests = l.requests,
-            window_secs = l.window_secs,
-            requests_per_scan = l.requests_per_scan,
-            scans_per_window = l.scans_per_window(),
-            gap_secs = l.window_secs / l.scans_per_window() as u64,
-            "scan supervisor: per-source rate limit active"
-        );
-        throttles.insert(l.source_id.clone(), Arc::new(SourceThrottle::new(l)));
-    }
     if let Ok(raw) = std::env::var("SCAN_SOURCE_RATE_LIMITS") {
         let declared = raw.split(',').filter(|e| !e.trim().is_empty()).count();
         if declared != limits.len() {
@@ -3051,8 +3289,9 @@ async fn supervisor(state: Arc<AppState>, mut shutdown: tokio::sync::watch::Rece
     let coord = Arc::new(ScanCoord {
         sem: Semaphore::new(permits),
         failures_since_health: AtomicUsize::new(0),
-        throttles,
+        throttles: Default::default(),
     });
+    coord.apply_limits(&merge_source_rate_limits(limits.clone(), Vec::new()));
     let mut children: HashMap<String, Child> = HashMap::new();
     // The sweeper always runs, so a row with no `source_id` yet (or an unmappable one, or one
     // on a source the loop cap left unassigned) is never orphaned by the sharding.
@@ -3085,6 +3324,16 @@ async fn supervisor(state: Arc<AppState>, mut shutdown: tokio::sync::watch::Rece
         // and a no-op once drained. Once per reconcile, not per source tick.
         reclaim_absurd_schedules(&state.pool, now).await;
         heal_null_source_ids(&state.pool).await;
+
+        // Pick up the limits an admin added, changed or removed (`setSourceRateLimit` kicks
+        // this loop, so it is immediate). A failed read changes nothing: dropping a throttle
+        // because the database was busy is how a source gets banned.
+        match stored_source_rate_limits(&state.pool).await {
+            Ok(stored) => coord.apply_limits(&merge_source_rate_limits(limits.clone(), stored)),
+            Err(e) => {
+                tracing::warn!(error = %e, "scan supervisor: could not read source_rate_limit — keeping the current limits")
+            }
+        }
 
         // The sources that get their own loop: the first `SOURCE_LOOP_SLOTS` distinct ids in
         // ascending order. Anything past that boundary is covered by the sweeper's residual
@@ -3516,7 +3765,127 @@ mod tests {
         );
         let v = crate::config::parse_scan_source_rate_limits("8358420357808595754=10/300");
         assert_eq!(v[0].scans_per_window(), 5);
-        assert_eq!(SourceThrottle::new(&v[0]).min_gap, Duration::from_secs(60));
+        assert_eq!(
+            SourceThrottle::new(&v[0]).pace().min_gap,
+            Duration::from_secs(60)
+        );
+    }
+
+    /// An admin's limit joins the env ones and replaces the env default for the same source;
+    /// removing it brings the default back.
+    #[tokio::test]
+    async fn stored_source_limits_join_and_override_the_env_ones() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let env = || crate::config::parse_scan_source_rate_limits("eris=10/300, quiet=6/60");
+        let brief = |merged: Vec<EffectiveRateLimit>| -> Vec<(String, u32, u64, LimitOrigin)> {
+            merged
+                .into_iter()
+                .map(|e| {
+                    (
+                        e.limit.source_id,
+                        e.limit.requests,
+                        e.limit.window_secs,
+                        e.origin,
+                    )
+                })
+                .collect()
+        };
+
+        store_source_rate_limit(&pool, "eris", 4, 300)
+            .await
+            .unwrap();
+        store_source_rate_limit(&pool, "other", 6, 60)
+            .await
+            .unwrap();
+        store_source_rate_limit(&pool, "other", 4, 120)
+            .await
+            .unwrap(); // replaces
+        let stored = stored_source_rate_limits(&pool).await.unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(
+            brief(merge_source_rate_limits(env(), stored)),
+            vec![
+                ("eris".to_string(), 4, 300, LimitOrigin::AdminOverEnv),
+                ("quiet".to_string(), 6, 60, LimitOrigin::Env),
+                ("other".to_string(), 4, 120, LimitOrigin::Admin),
+            ]
+        );
+
+        // Removing the admin's row restores the env default: never "no limit".
+        assert!(delete_source_rate_limit(&pool, "eris").await.unwrap());
+        assert!(!delete_source_rate_limit(&pool, "eris").await.unwrap());
+        let stored = stored_source_rate_limits(&pool).await.unwrap();
+        assert_eq!(
+            brief(merge_source_rate_limits(env(), stored))[0],
+            ("eris".to_string(), 10, 300, LimitOrigin::Env)
+        );
+    }
+
+    /// The live map follows the list: a new limit appears, a changed one re-paces the SAME
+    /// throttle (its recent starts survive, so an edit is not a fresh window), a dropped
+    /// one goes.
+    #[tokio::test(start_paused = true)]
+    async fn the_live_throttles_follow_the_limit_list() {
+        let coord = ScanCoord {
+            sem: Semaphore::new(1),
+            failures_since_health: AtomicUsize::new(0),
+            throttles: Default::default(),
+        };
+        let list = |raw: &str| {
+            merge_source_rate_limits(crate::config::parse_scan_source_rate_limits(raw), vec![])
+        };
+        assert!(coord.throttle("s").is_none());
+
+        coord.apply_limits(&list("s=10/300"));
+        let t = coord.throttle("s").expect("added");
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        assert!(t.acquire(&rx).await, "first scan is immediate");
+
+        // Halve the rate: same throttle, and the scan just made still counts.
+        coord.apply_limits(&list("s=10/600"));
+        let same = coord.throttle("s").unwrap();
+        assert!(Arc::ptr_eq(&t, &same), "an edit must not reset the window");
+        let t0 = tokio::time::Instant::now();
+        assert!(same.acquire(&rx).await);
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(t0),
+            Duration::from_secs(120),
+            "the next scan waits the NEW gap from the scan before the edit"
+        );
+
+        coord.apply_limits(&[]);
+        assert!(coord.throttle("s").is_none());
+    }
+
+    /// Lowering a limit below what the window already holds must wait for enough old scans
+    /// to age out, not just the oldest one.
+    #[tokio::test(start_paused = true)]
+    async fn a_lowered_limit_counts_the_scans_already_made() {
+        let limit = |raw: &str| {
+            crate::config::parse_scan_source_rate_limits(raw)
+                .pop()
+                .unwrap()
+        };
+        let t = SourceThrottle::new(&limit("s=8/400")); // 4 scans / 400 s, one per 100 s
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let t0 = tokio::time::Instant::now();
+        for _ in 0..4 {
+            assert!(t.acquire(&rx).await); // at 0, 100, 200, 300
+        }
+        assert!(t.set_limit(&limit("s=4/400"))); // now 2 scans / 400 s
+        assert!(!t.set_limit(&limit("s=4/400")), "unchanged");
+        assert!(t.acquire(&rx).await);
+        // Two fit per 400 s, so the scans at 0, 100 AND 200 must all be out of the window:
+        // 200 + 400. Waiting only for the oldest (400) would make it 4 scans in 400 s.
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(t0),
+            Duration::from_secs(600)
+        );
     }
 
     /// Unit A wiring: the env var name must match `deploy/docker-compose.yml` exactly, and so

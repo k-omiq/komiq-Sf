@@ -16,6 +16,7 @@ mod graphql;
 mod img_proxy;
 mod ingest;
 mod instance;
+mod lan;
 mod maintenance;
 mod mangadex;
 mod media;
@@ -23,8 +24,10 @@ mod notify;
 mod phase_f;
 mod phash;
 mod rate_limit;
+mod scanlators;
 mod scanner;
 mod series_cache;
+mod setup_cli;
 mod source_health;
 mod suwayomi;
 mod sync;
@@ -57,6 +60,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 // so the binary routes are untouched.
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
@@ -302,14 +306,51 @@ impl FromRef<RouterState> for Arc<graphql::AppState> {
     }
 }
 
+/// Whether a request came in the clear from an address on the internet: not over
+/// HTTPS (`OverTls` marks the HTTPS listener), and not through a trusted proxy, which
+/// may have ended HTTPS itself. The home network, a VPN and this computer are not
+/// "the internet". See `graphql::PlainFromInternet`.
+///
+/// A public peer is the proof. A private peer proves nothing behind Docker Desktop or
+/// rootless Docker, where every connection comes from Docker's own address. So the
+/// address the client typed counts too (`cloudflare::TypedHost`), unless HTTPS ended
+/// in front of this server (`cloudflare::https_in_front`).
+fn plain_from_internet(
+    tls: Option<axum::Extension<cloudflare::origin_tls::OverTls>>,
+    peer: SocketAddr,
+    trusted: &[Cidr],
+    headers: &HeaderMap,
+) -> graphql::PlainFromInternet {
+    use cloudflare::TypedHost;
+    use graphql::PlainFromInternet as Plain;
+    let ip = peer.ip().to_canonical();
+    if tls.is_some() || trusted.iter().any(|c| c.contains(ip)) {
+        return Plain::No;
+    }
+    if cloudflare::from_internet(ip) {
+        return Plain::Yes;
+    }
+    if cloudflare::https_in_front(headers) {
+        return Plain::No;
+    }
+    let typed = headers.get(header::HOST).and_then(|h| h.to_str().ok());
+    match typed.map(cloudflare::typed_host) {
+        Some(TypedHost::Public) => Plain::Yes,
+        Some(TypedHost::Name(name)) => Plain::Named(name),
+        _ => Plain::No,
+    }
+}
+
 async fn graphql_handler(
     State(schema): State<ApiSchema>,
     State(trusted): State<Arc<TrustedProxies>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    tls: Option<axum::Extension<cloudflare::origin_tls::OverTls>>,
     headers: HeaderMap,
     req: GraphQLRequest,
 ) -> GraphQLResponse {
     let auth = RequestAuth(bearer(&headers));
+    let plain = plain_from_internet(tls, peer, &trusted.current(), &headers);
     let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted.current())));
     // Fresh per-request caches so `current_user` does at most one session lookup, the
     // viewer's NSFW preference at most one `users` read, and each series' `user_library`
@@ -322,6 +363,7 @@ async fn graphql_handler(
             req.into_inner()
                 .data(auth)
                 .data(ip)
+                .data(plain)
                 .data(user_cache)
                 .data(nsfw_cache)
                 .data(library_cache),
@@ -355,11 +397,13 @@ async fn graphql_get_handler(
     State(schema): State<ApiSchema>,
     State(trusted): State<Arc<TrustedProxies>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    tls: Option<axum::Extension<cloudflare::origin_tls::OverTls>>,
     headers: HeaderMap,
     req: GraphQLRequest,
 ) -> axum::response::Response {
     let anonymous = bearer(&headers).is_none();
-    let mut res = graphql_get_response(schema, trusted, peer, headers, req).await;
+    let plain = plain_from_internet(tls, peer, &trusted.current(), &headers);
+    let mut res = graphql_get_response(schema, trusted, peer, plain, headers, req).await;
     if anonymous {
         allow_any_origin(res.headers_mut());
     }
@@ -405,6 +449,7 @@ async fn graphql_get_response(
     schema: ApiSchema,
     trusted: Arc<TrustedProxies>,
     peer: SocketAddr,
+    plain: graphql::PlainFromInternet,
     headers: HeaderMap,
     req: GraphQLRequest,
 ) -> axum::response::Response {
@@ -431,6 +476,7 @@ async fn graphql_get_response(
             inner
                 .data(auth)
                 .data(ip)
+                .data(plain)
                 .data(user_cache)
                 .data(nsfw_cache)
                 .data(library_cache),
@@ -596,6 +642,7 @@ async fn upload_avatar(
     };
 
     // Decoding + resizing + encoding is CPU-bound: keep it off the async runtime.
+    let _decoding = UPLOAD_DECODE_LIMIT.acquire().await;
     let webp = match tokio::task::spawn_blocking(move || avatar::process_avatar(&bytes)).await {
         Ok(Ok(w)) => w,
         Ok(Err(e)) => return avatar_error(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -798,13 +845,28 @@ async fn serve_ext_icon(
         Some(_) => None,
         None => Some(app.suwayomi.get_extension(pkg).await),
     };
-    let repo = match (&recorded, &engine) {
-        (Some(r), _) => ext_icon::RepoLookup::Repo(r),
-        (None, Some(Ok(e))) => match e.repo.as_deref() {
+    // An extension the engine knows without a repo (installed before repos were
+    // tracked): on a server whose admin added Keiyoushi's repo, treat it as one of
+    // Keiyoushi's, as before. A server without that repo asks nobody.
+    let keiyoushi_store = match &engine {
+        Some(Ok(e)) if e.repo.is_none() => {
+            Some(app.suwayomi.list_extension_stores().await.map(|stores| {
+                stores.into_iter().map(|s| s.index_url).find(|url| {
+                    ext_icon::repo_base(url).as_deref() == Some(ext_icon::KEIYOUSHI_REPO_BASE)
+                })
+            }))
+        }
+        _ => None,
+    };
+    let repo = match (&recorded, &engine, &keiyoushi_store) {
+        (Some(r), _, _) => ext_icon::RepoLookup::Repo(r),
+        (None, Some(Ok(e)), None) => match e.repo.as_deref() {
             Some(r) => ext_icon::RepoLookup::Repo(r),
             None => ext_icon::RepoLookup::Unknown,
         },
-        (None, _) => ext_icon::RepoLookup::Unavailable,
+        (None, _, Some(Ok(Some(url)))) => ext_icon::RepoLookup::Repo(url),
+        (None, _, Some(Ok(None))) => ext_icon::RepoLookup::Unknown,
+        (None, _, _) => ext_icon::RepoLookup::Unavailable,
     };
     match ext_icon::fetch_and_cache(&pool, pkg, repo).await {
         Some(bytes) => png_icon_response(bytes),
@@ -1288,6 +1350,14 @@ fn webp_cover_response(bytes: Vec<u8>) -> axum::response::Response {
         .into_response()
 }
 
+/// The most a `POST /graphql` body may be.
+const GRAPHQL_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// How many uploaded images are decoded at once, over all accounts. Decoding one large
+/// image takes hundreds of megabytes; the per-account upload limit alone would let one
+/// account start twenty at the same moment.
+static UPLOAD_DECODE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 /// Immutable-cached response for a raw proxied image (chapter pages, un-resizable
 /// covers) — passes the upstream `Content-Type` through.
 fn raw_image_response(content_type: String, bytes: Vec<u8>) -> axum::response::Response {
@@ -1299,6 +1369,13 @@ fn raw_image_response(content_type: String, bytes: Vec<u8>) -> axum::response::R
             (
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=31536000, immutable"),
+            ),
+            // The bytes come from a source and are not re-encoded, and `image/*`
+            // includes SVG, which can carry script. Opened as a page of its own, it
+            // must not run with this origin's rights. An `<img>` is not affected.
+            (
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static("sandbox; default-src 'none'"),
             ),
         ],
         bytes,
@@ -1383,6 +1460,7 @@ async fn upload_comment_media(
     };
 
     // Decoding + resizing + encoding is CPU-bound: keep it off the async runtime.
+    let _decoding = UPLOAD_DECODE_LIMIT.acquire().await;
     let processed =
         match tokio::task::spawn_blocking(move || media::process_comment_image(&bytes)).await {
             Ok(Ok(p)) => p,
@@ -1605,6 +1683,11 @@ async fn main() -> anyhow::Result<()> {
     // dry run unless `--apply` is passed, and the destructive one additionally needs
     // `--confirm <token>`; see `phase_f`. It exits when the stage is done.
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // `komika-server setup` — the first-run wizard in a terminal (`setup_cli`). It is a
+    // client of the server that is already running, so it builds no server state.
+    if argv.first().map(String::as_str) == Some("setup") {
+        return setup_cli::run(cfg.port, &argv[1..]).await;
+    }
     if argv.first().map(String::as_str) == Some("phase-f") {
         let pool = db::init(&cfg.database_url).await?;
         let cover_pool = db::init_covers(&cfg.covers_database_url).await?;
@@ -1691,6 +1774,7 @@ async fn main() -> anyhow::Result<()> {
         admin_users: cfg.admin_users.clone(),
         scan_health: std::sync::Mutex::new(ScanHealth::default()),
         auth_limiter: RateLimiter::new(cfg.auth_rate_limit_max, cfg.auth_rate_limit_window_secs),
+        comment_limiter: graphql::comment_limiter(),
         password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         federated_limiter: RateLimiter::new(
             cfg.federated_rate_limit_max,
@@ -1962,7 +2046,15 @@ async fn main() -> anyhow::Result<()> {
     // POST is uncacheable by every CDN). Mutations over GET are rejected in the
     // handler. GraphiQL moved to its own GET /graphiql when enabled; introspection
     // stays disabled in the same off state (see build_schema above).
-    let mut app = Router::new().route("/graphql", get(graphql_get_handler).post(graphql_handler));
+    let mut app = Router::new().route(
+        "/graphql",
+        get(graphql_get_handler)
+            .post(graphql_handler)
+            // The GraphQL extractor reads the whole body, and a multipart one into a
+            // temporary file, before any resolver checks who is asking. Nothing the
+            // apps send comes near this size; files have their own upload routes.
+            .layer(RequestBodyLimitLayer::new(GRAPHQL_BODY_LIMIT)),
+    );
     if cfg.graphiql_enabled {
         app = app.route("/graphiql", get(graphiql));
     }
@@ -2043,6 +2135,12 @@ async fn main() -> anyhow::Result<()> {
         // and every outer layer observe the final (encoded) body. The default
         // predicate leaves image/* and already-encoded responses alone.
         .layer(CompressionLayer::new())
+        // Self-host "public without a domain" with HTTPS: plain HTTP from the internet
+        // is sent to the HTTPS address instead of being handled. A no-op otherwise.
+        .layer(axum::middleware::from_fn_with_state(
+            cloudflare.clone(),
+            cloudflare::plain_http_guard,
+        ))
         // Request-id + access-log span. SetRequestId runs first (generates an
         // x-request-id when the client didn't send one), TraceLayer's span picks
         // it up, and PropagateRequestId echoes it back on the response.
@@ -2192,6 +2290,123 @@ async fn shutdown_signal(shutdown_tx: tokio::sync::watch::Sender<bool>) {
 mod tests {
     use super::*;
 
+    /// "In the clear from the internet" is plain HTTP, a public peer, and no trusted
+    /// proxy in between. `createOwner` is refused only there.
+    #[test]
+    fn plain_from_internet_is_a_public_peer_without_https_or_a_proxy() {
+        use graphql::PlainFromInternet as Plain;
+        let tls = || Some(axum::Extension(cloudflare::origin_tls::OverTls));
+        let peer = |ip: &str| -> SocketAddr { format!("{ip}:5000").parse().unwrap() };
+        let proxy = [Cidr::parse("203.0.113.0/24").unwrap()];
+        let none = HeaderMap::new();
+        let yes = |p: Plain| matches!(p, Plain::Yes);
+
+        assert!(yes(plain_from_internet(
+            None,
+            peer("198.51.100.7"),
+            &proxy,
+            &none
+        )));
+        // IPv4 on a dual-stack socket.
+        assert!(yes(plain_from_internet(
+            None,
+            peer("[::ffff:198.51.100.7]"),
+            &[],
+            &none
+        )));
+        assert!(!yes(plain_from_internet(
+            tls(),
+            peer("198.51.100.7"),
+            &[],
+            &none
+        )));
+        assert!(!yes(plain_from_internet(
+            None,
+            peer("203.0.113.9"),
+            &proxy,
+            &none
+        )));
+        for home in [
+            "127.0.0.1",
+            "192.168.1.20",
+            "10.0.0.4",
+            "100.64.0.9",
+            "[::1]",
+        ] {
+            assert!(
+                matches!(plain_from_internet(None, peer(home), &[], &none), Plain::No),
+                "{home}"
+            );
+        }
+    }
+
+    /// Behind Docker Desktop or rootless Docker every peer is Docker's own private
+    /// address. There the address the client typed decides.
+    #[test]
+    fn a_private_peer_is_judged_by_the_address_the_client_typed() {
+        use graphql::PlainFromInternet as Plain;
+        let docker: SocketAddr = "172.17.0.1:5000".parse().unwrap();
+        let headers = |pairs: &[(&'static str, &str)]| {
+            let mut map = HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(*name, HeaderValue::from_str(value).unwrap());
+            }
+            map
+        };
+        let judge = |pairs: &[(&'static str, &str)]| {
+            plain_from_internet(None, docker, &[], &headers(pairs))
+        };
+
+        assert!(matches!(judge(&[("host", "203.0.113.5:8080")]), Plain::Yes));
+        // A name is looked up only where the answer is used (`createOwner`).
+        assert!(matches!(
+            judge(&[("host", "read.example.com:8080")]),
+            Plain::Named(name) if name == "read.example.com"
+        ));
+        for home in [
+            "localhost:8080",
+            "127.0.0.1:8080",
+            "192.168.1.20:8080",
+            "100.64.0.9:8080",
+            "komiq.local:8080",
+            "server:8080",
+        ] {
+            assert!(matches!(judge(&[("host", home)]), Plain::No), "{home}");
+        }
+        // HTTPS ended in front of the server: a proxy says so, or the browser's page does.
+        assert!(matches!(
+            judge(&[("host", "203.0.113.5"), ("x-forwarded-proto", "https")]),
+            Plain::No
+        ));
+        assert!(matches!(
+            judge(&[
+                ("host", "read.example.com"),
+                ("origin", "https://read.example.com")
+            ]),
+            Plain::No
+        ));
+        // The desktop app's own origin says nothing about this connection.
+        assert!(matches!(
+            judge(&[
+                ("host", "203.0.113.5:8080"),
+                ("origin", "https://tauri.localhost")
+            ]),
+            Plain::Yes
+        ));
+        // A trusted proxy and the HTTPS listener are never "in the clear".
+        let trusted = [Cidr::parse("172.17.0.0/16").unwrap()];
+        let public = headers(&[("host", "203.0.113.5:8080")]);
+        assert!(matches!(
+            plain_from_internet(None, docker, &trusted, &public),
+            Plain::No
+        ));
+        let tls = Some(axum::Extension(cloudflare::origin_tls::OverTls));
+        assert!(matches!(
+            plain_from_internet(tls, docker, &[], &public),
+            Plain::No
+        ));
+    }
+
     /// The lazy `/covers/` fetch follows the MangaDex switch: off, a miss is a plain
     /// uncacheable 404 — no fetch, and no redirect that would move the MangaDex request
     /// into the browser; on, the cover is fetched, stored and served.
@@ -2238,6 +2453,7 @@ mod tests {
             admin_users: vec![],
             scan_health: std::sync::Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
+            comment_limiter: graphql::comment_limiter(),
             password_work: Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 3600,

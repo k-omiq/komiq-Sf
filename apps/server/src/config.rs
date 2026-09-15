@@ -157,7 +157,8 @@ pub struct Config {
     /// `/ext-icons/{pkgName}.png`. Populated from `assets/ext-icons/` in the repo
     /// (see `scripts/fetch-ext-icons.mjs`) and copied into the image by
     /// `deploy/server.Dockerfile`. Override with `EXT_ICONS_DIR`; a missing
-    /// directory is not fatal — the route falls back to its lazy Keiyoushi fetch.
+    /// directory is not fatal — the route falls back to its lazy fetch from the
+    /// extension's own repo (a self-hosted install ships no snapshot).
     pub ext_icons_dir: String,
     /// Optional folder holding the built web apps (`KOMIKA_WEB_DIR`): `reader/` is
     /// served at `/` and `admin/` at `/admin`, each with an `index.html` SPA

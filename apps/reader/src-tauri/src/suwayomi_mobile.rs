@@ -1,16 +1,17 @@
-//! Mobile stubs for the embedded Suwayomi engine — Android and the iOS SIMULATOR.
+//! Stubs for the embedded Suwayomi engine where a phone build has none: the iOS
+//! SIMULATOR.
 //!
 //! The desktop engine (`suwayomi.rs`) is a child-process JVM supervisor: it spawns a
 //! `java` sidecar, brokers a loopback port, and runs a WebView Cloudflare shim
 //! (`cloudflare.rs`). None of that applies on mobile — there is no `java` to spawn and
 //! no child-process model on iOS — so on those targets the whole desktop implementation
-//! is compiled out (`#[cfg(desktop)]`) and this module takes its place under the same
+//! is compiled out (`#[cfg(desktop)]`) and another module takes its place under the same
 //! `suwayomi` module name (see `lib.rs`'s `#[path]` alias).
 //!
-//! REAL iOS devices no longer use this stub: they boot an in-process Zero JVM
-//! (`suwayomi_ios.rs`, N4.2). The stub remains for Android (in-process JVM is a later
-//! phase there) and for the iOS SIMULATOR, whose builds must keep compiling+linking
-//! even though the vendored static JVM has no sim slice. These stubs keep the
+//! REAL iOS devices and Android do not use this stub: they boot a JVM inside the app
+//! process (`suwayomi_inprocess.rs`). The stub remains for the iOS SIMULATOR, whose
+//! builds must keep compiling+linking even though the vendored static JVM has no sim
+//! slice. These stubs keep the
 //! four IPC commands REGISTERED (the JS side always invokes them by name), but they
 //! report the engine as unavailable so the JS fallback ladder routes to the hosted
 //! backend rather than hanging or crashing:
@@ -98,6 +99,14 @@ pub async fn suwayomi_gql(
   _query: String,
   _variables: Option<Value>,
 ) -> Result<Value, String> {
+  Err("suwayomi engine not available on this platform".to_string())
+}
+
+/// What the `engine-image` address handler in `lib.rs` calls: there is no engine here.
+pub async fn engine_image(
+  _sup: &SuwayomiSupervisor,
+  _path: &str,
+) -> Result<(Vec<u8>, Option<String>), String> {
   Err("suwayomi engine not available on this platform".to_string())
 }
 

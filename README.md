@@ -72,6 +72,7 @@ pnpm install
 ```sh
 pnpm dev:reader          # reader app (web) at http://localhost:5173
 pnpm dev:admin           # admin console at http://localhost:5273
+pnpm dev:docs            # docs site at http://localhost:5410
 
 # desktop app (Rust + webview)
 pnpm --filter @komika/reader desktop:dev
@@ -90,6 +91,7 @@ pnpm --filter @komika/reader desktop:build   # desktop binaries
 | ---------------- | ------------------------------------------------ |
 | `@komika/reader` | user app (SvelteKit SPA + `src-tauri` Rust core) |
 | `@komika/admin`  | admin "manga DB" console (web-only SPA)          |
+| `@komika/docs`   | docs site, docs.komiq.cc (prerendered)           |
 | `@komika/types`  | shared domain types                              |
 | `@komika/api`    | data layer — `Backend` + `ImageProvider`         |
 | `@komika/ui`     | design tokens + shared components                |

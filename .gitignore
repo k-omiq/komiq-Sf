@@ -10,7 +10,11 @@ build/
 
 # tauri / rust
 target/
-apps/reader/src-tauri/gen/
+# gen/android is the Android Studio project and is tracked: it holds hand edits (app
+# icons, the cleartext switch in app/build.gradle.kts) and has its own .gitignore files
+# for build output. The rest of gen/ (apple, schemas) is regenerated.
+apps/reader/src-tauri/gen/*
+!apps/reader/src-tauri/gen/android/
 
 # env & secrets
 .env

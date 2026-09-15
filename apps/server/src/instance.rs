@@ -35,8 +35,10 @@ pub const INSTANCE_NAME: Setting = Setting {
     default: "komiq",
 };
 
-/// Whether `register` accepts new accounts. Defaults open: that is how every
-/// deployment behaved before this setting existed.
+/// Whether `register` accepts new accounts. Read it through
+/// [`resolve_registration`], not the generic [`resolve`]: the built-in default below
+/// (open, how every deployment behaved before this setting existed) holds everywhere
+/// except a self-hosted install, which starts closed.
 pub const REGISTRATION_OPEN: Setting = Setting {
     key: "registration_open",
     env: "KOMIKA_REGISTRATION_OPEN",
@@ -131,6 +133,27 @@ pub async fn resolve_mangadex(pool: &SqlitePool) -> MangadexUsage {
     resolve_mangadex_with(pool, |name| std::env::var(name).ok()).await
 }
 
+/// Resolve the sign-up switch: `KOMIKA_REGISTRATION_OPEN`, then the owner's stored
+/// choice, then the default. The default is CLOSED on a self-hosted install ("Only
+/// people I add" is the wizard's default, and a fresh server must not take strangers'
+/// accounts before its owner has chosen) and open everywhere else.
+pub async fn resolve_registration_with(
+    pool: &SqlitePool,
+    env: impl Fn(&str) -> Option<String>,
+) -> Resolved {
+    let self_host = is_self_host(&env);
+    let mut r = resolve_with(pool, &REGISTRATION_OPEN, env).await;
+    if r.source == Source::Default && self_host {
+        r.value = "false".to_string();
+    }
+    r
+}
+
+/// [`resolve_registration_with`] against the process environment.
+pub async fn resolve_registration(pool: &SqlitePool) -> Resolved {
+    resolve_registration_with(pool, |name| std::env::var(name).ok()).await
+}
+
 /// Whether this process runs the MangaDex catalogue crawl (the catalogue/chapter
 /// sync and its backfill drains).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +179,18 @@ pub fn catalogue_crawl(env: impl Fn(&str) -> Option<String>) -> CatalogueCrawl {
     }
 }
 
+/// Whether reader apps must fetch chapter pages from the sources themselves instead of
+/// through this server ("this server does not fetch for apps"). A statement of policy
+/// the apps obey where they can: an app that has its own source engine then offers no
+/// way to fetch through the server. Nothing is refused here — the web reader, and an
+/// app without an engine, still read through `pages` as before. Off by default; the
+/// shared public server turns it on so its readers do not all fetch through it.
+pub const APPS_FETCH_THEMSELVES: Setting = Setting {
+    key: "apps_fetch_themselves",
+    env: "KOMIKA_APPS_FETCH_THEMSELVES",
+    default: "false",
+};
+
 /// Proxies whose `X-Forwarded-For` / `CF-Connecting-IP` the server believes, as
 /// comma-separated CIDRs. A deployment that sets `TRUSTED_PROXY_CIDRS` (the hosted
 /// instance) keeps exactly its list; otherwise Cloudflare setup fills the stored value
@@ -167,9 +202,10 @@ pub const TRUSTED_PROXY_CIDRS: Setting = Setting {
     default: "",
 };
 
-/// The wizard's access choice: `local` (only my devices) or `internet`. Display only:
-/// it decides what Settings › Access shows, not what the server listens on. Empty
-/// until someone chooses.
+/// The wizard's access choice: `local` (only my devices), `internet` (a domain with
+/// Cloudflare in front) or `direct` (public at the server's own address, nothing in
+/// front). Display only: it decides what Settings › Access shows, not what the server
+/// listens on. Empty until someone chooses.
 pub const ACCESS_MODE: Setting = Setting {
     key: "access_mode",
     env: "",
@@ -180,6 +216,33 @@ pub const ACCESS_MODE: Setting = Setting {
 /// Cloudflare setup or by an owner who did it by hand. Display only.
 pub const PUBLIC_DOMAIN: Setting = Setting {
     key: "public_domain",
+    env: "",
+    default: "",
+};
+
+/// The address readers type in direct mode, as an origin (`https://203.0.113.5`, or
+/// `http://203.0.113.5:8080` without encryption): the server's own public address, with
+/// no domain and no Cloudflare. Display only.
+pub const PUBLIC_ADDRESS: Setting = Setting {
+    key: "public_address",
+    env: "",
+    default: "",
+};
+
+/// Direct mode with HTTPS: the IP address or name the server holds a Let's Encrypt
+/// certificate for, and keeps renewing (`cloudflare/direct.rs`). Empty: direct mode is
+/// plain HTTP, or not in use.
+pub const DIRECT_TLS_HOST: Setting = Setting {
+    key: "direct_tls_host",
+    env: "",
+    default: "",
+};
+
+/// Direct mode with HTTPS: `1` once a client on the internet has used the HTTPS
+/// address. From then on the plain HTTP port refuses clients on the internet
+/// (`cloudflare/direct.rs`). Empty before that, so a closed port 443 locks nobody out.
+pub const DIRECT_HTTPS_SEEN: Setting = Setting {
+    key: "direct_https_seen",
     env: "",
     default: "",
 };
@@ -405,6 +468,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn sign_up_starts_closed_only_on_a_self_hosted_install() {
+        let pool = pool().await;
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        const WEB: (&str, &str) = ("KOMIKA_WEB_DIR", "/srv/web");
+
+        // Hosted (no web dir): open, as before the setting existed.
+        let r = resolve_registration_with(&pool, env(&[])).await;
+        assert!(r.as_bool());
+        assert_eq!(r.source, Source::Default);
+        // Self-host: closed until the owner says otherwise.
+        let r = resolve_registration_with(&pool, env(&[WEB])).await;
+        assert!(!r.as_bool());
+        assert_eq!(r.source, Source::Default);
+        // The owner's stored choice beats the default, both ways.
+        store(&pool, &REGISTRATION_OPEN, "true").await.unwrap();
+        assert!(resolve_registration_with(&pool, env(&[WEB]))
+            .await
+            .as_bool());
+        store(&pool, &REGISTRATION_OPEN, "false").await.unwrap();
+        assert!(!resolve_registration_with(&pool, env(&[])).await.as_bool());
+        // Env beats both.
+        let r =
+            resolve_registration_with(&pool, env(&[("KOMIKA_REGISTRATION_OPEN", "on"), WEB])).await;
+        assert!(r.as_bool());
+        assert_eq!(r.source, Source::Env);
     }
 
     /// The deployment matrix: what each kind of server uses and crawls.

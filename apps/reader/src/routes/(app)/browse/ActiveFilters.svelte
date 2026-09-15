@@ -26,7 +26,7 @@
 			<li>
 				<button
 					type="button"
-					class="fchip {c.tone}"
+					class="fchip k-hit {c.tone}"
 					aria-label={c.ariaLabel}
 					onclick={() => onapply(c.remove())}
 				>
@@ -37,7 +37,7 @@
 			</li>
 		{/each}
 		<li>
-			<button type="button" class="clear" onclick={onclear}>Clear all</button>
+			<button type="button" class="clear k-hit" onclick={onclear}>Clear all</button>
 		</li>
 	</ul>
 {/if}

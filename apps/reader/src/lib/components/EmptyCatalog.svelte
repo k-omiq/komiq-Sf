@@ -27,7 +27,7 @@
 		{#if canChooseServer}
 			<p class="empty-desc">Open <code>{adminAddress}</code> in a browser.</p>
 		{:else}
-			<a class="empty-btn" href={adminHref}>Open admin</a>
+			<a class="empty-btn k-hit" href={adminHref}>Open admin</a>
 		{/if}
 	{:else}
 		<svelte:element this={heading} id="empty-catalog-title" class="empty-title">

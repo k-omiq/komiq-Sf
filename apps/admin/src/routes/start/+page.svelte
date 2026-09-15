@@ -110,7 +110,17 @@
 	function normalize(raw: string): string | null {
 		let v = raw.trim();
 		if (!v) return null;
-		if (!/^https?:\/\//i.test(v)) v = `http://${v}`;
+		if (!/^https?:\/\//i.test(v)) {
+			// A home-network address (an IP, `localhost`, a `.local` name, or anything with
+			// a port) gets `http://`. A plain domain gets `https://`: a password must not
+			// go to a public name in the clear because nobody typed the scheme.
+			const host = v.split(/[/?#]/)[0];
+			const home =
+				/:\d+$/.test(host) ||
+				/^(\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:.]+\]|localhost)$/i.test(host) ||
+				/\.local$/i.test(host);
+			v = `${home ? 'http' : 'https'}://${v}`;
+		}
 		try {
 			return new URL(v).origin;
 		} catch {

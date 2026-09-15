@@ -22,12 +22,15 @@ type Query {
 	updates(page: Int = 1): SeriesPage! # [komika] library series the adaptive scanner found new chapters for, ordered by latestChapterAt (real upstream release time) DESC — the clock the cards display. Membership is the scanner's detection; only the ORDER is upstream's. Undated rows sort last.
 	search(query: String!, page: Int = 1, genres: [String!], minRating: Float, maxRating: Float, types: [ComicType!], status: SeriesStatus, sort: BrowseSort, contentRating: ContentRatingFilter, includeNsfw: Boolean, hasChapters: Boolean, filter: BrowseFilter): SeriesPage! # [komika] Browse v2: `filter` applies TOGETHER with a text query and wins over every legacy argument; optional so an older server can be stripped of it (OPTIONAL_ARGUMENTS). S4: catalogue search + BROWSE. An EMPTY query browses the whole BROWSABLE canonical catalogue (115.6k works, from the materialized `browse_catalogue`) with every filter and sort applied in SQL, so `total`/`hasNextPage` describe the filtered set — it used to browse only the 13.8k-work Suwayomi library subset with one fixed order, then the 48.5k works that have a DATED chapter. A TEXT query runs full-text search over the canonical works instead; `types`/`status`/`sort`/`contentRating` apply to the BROWSE path only. Page size is 30 on both. `genres` matches ANY (capped at 12); `minRating`/`maxRating` filter by aggregate user rating 0–10 (minRating>0 drops unrated). `contentRating` can only NARROW within the viewer's NSFW posture, never widen past it (see ContentRatingFilter). `includeNsfw` is the ADMIN CONSOLE escape hatch: honoured only for an admin (silently ignored for anonymous + ordinary users), it ignores the admin's own show_nsfw so the console can find NSFW-flagged works — including the ~2.5k mainstream titles that are mis-flagged — and unflag them. `hasChapters` (BROWSE only) narrows to works we know a chapter for (`true`) or know none for (`false`); ABSENT means no clause, i.e. the ~67k works whose chapters MangaDex removed on licensing (Boku no Hero Academia, Nausicaä) or that will get them from a Suwayomi source are INCLUDED and sorted last on the recency ordering — hiding them hid exactly what people search for
 	tags: [TagInfo!]! # [komika] Browse v2: the tag picker's vocabulary — stable slug ids, display names, MangaDex group, and a count of works carrying the tag that the viewer may see (NSFW-gated)
+	browseSources(includeNsfw: Boolean): [BrowseSource!]! # [komika] the sources Browse can filter by (`BrowseFilter.source`), biggest first — "mangadex" for the mirror, else a source id; each `count` is the number of works the filter returns for the viewer (NSFW-gated), and a source with none is not offered. `includeNsfw` is the admin-console escape hatch, as on `search`
+	scanlatorTags: [ScanlatorTag!]! # [komika] every scanlator an admin tagged as using AI — public, so a reader app can mark the chapter copies those names are credited on (match rule on ScanlatorTag.name)
 	genreFacets: [GenreFacet!]! # [komika] S4: the genre chips for Browse's filter, most common first then alphabetical, gated by the viewer's NSFW posture. Each `count` is now EXACTLY the number of results the same genre filter returns — it previously came from JSON-parsing 13.8k Suwayomi `genre` blobs per request (301 entries, ungated, top entry literally "Japanese") while the filter ran against the canonical catalogue, so the chip's number and its results disagreed. Empty until MangaDex tags are ingested into `work_tag`
 	searchAllSources(query: String!, page: Int = 1): FederatedSearchPage! # [komika] federated multi-extension search — fans out to every installed source, dedupes to one canonical work per series with its per-source translators; NSFW-gated by the viewer's posture. REQUIRES LOGIN (persists mappings); per-user rate-limited (~20/min); errors "Not authenticated" for anonymous callers
 	series(id: ID!): Series! # [suwayomi] MangaType by id
 	chapters(seriesId: ID!): [Chapter!]! # [suwayomi] chapters(condition:{mangaId}) — one source's chapter list (served from the DB cache, S1)
 	aggregatedChapters(workId: ID!): [AggregatedChapter!]! # [komika] S2: a canonical work's chapters aggregated across ALL sources (installed Suwayomi sources + MangaDex mirror), deduped by number, each carrying per-source availability so the reader can pick a translator
 	pages(chapterId: ID!): [Page!]! # [suwayomi] fetchChapterPages -> normalized pages
+	chapterOrigin(chapterId: ID!): ChapterOrigin # [komika] where a Suwayomi chapter lives at its source, for a reader app that fetches pages with its own engine; null when unknown; NSFW-gated like pages
 	canonicalUpdates(page: Int = 1, includeNsfw: Boolean): [CanonicalUpdate!]! # [komika] MangaDex mirror updates, newest chapter first, NSFW-filtered (data feed). `includeNsfw` is the same admin-console-only escape hatch as on `search` — honoured for admins, ignored for everyone else
 	updatesFeed(page: Int = 1, type: ComicType): UpdateFeedPage! # [komika] the reader's merged Updates feed: the union of `updates` (scanner detections on Suwayomi library series) and `canonicalUpdates` (the MangaDex mirror), taken server-side and keyed by canonical work, newest REAL upstream release first. Supersedes merging page 1 of each in the client, which could not be paginated — a page of the merged list is not page N of either feed, and the client-side title dedupe left short pages that made `total`/`hasNextPage` wrong. `type` filters by format over the WHOLE feed; NSFW-gated by the viewer's own preference (no admin escape hatch — this is a reader surface)
 	# Canonical (MangaDex-mirrored) reader path — workId is the `w_`-prefixed canonical
@@ -51,6 +54,7 @@ type Query {
 	# auth
 	session: Session # [komika] current session or null
 	instance: Instance! # [komika] public server facts (setup state, sign-up switch); no auth
+	accessPreflight: AccessPreflight! # [komika] admin — connector, listener ports and public address before setup (requires isAdmin)
 	accessStatus: AccessStatus! # [komika] admin — Settings › Access: access choice, address, Cloudflare setup + current run (requires isAdmin)
 	myActivity(limit: Int = 20): [Activity!]! # [komika] the signed-in user's recent activity feed (empty when signed out)
 	myComments(page: Int = 1): MyCommentPage! # [komika] the signed-in user's OWN comments (top-level + replies), newest first, 20 per page, each with its tallies, direct reply count and resolved series/chapter (empty page when signed out)
@@ -63,7 +67,11 @@ type Query {
 	workReviewDetail(workId: ID!): WorkReviewDetail! # [komika] expand one side of a dedup candidate — metadata, cover, alt titles and source mappings for a single work; reads the canonical work directly so it also resolves the Suwayomi-only / NSFW works `canonicalSeries` refuses (requires isAdmin)
 	coverIssues(page: Int = 1): CoverIssuePage! # [komika] admin "Bugs" panel — works whose cover the crawl could not process, most recent first; each carries the failure reason + a best-effort current cover URL (requires isAdmin)
 	reports(status: ReportStatus, kind: ReportKind, page: Int = 1): ReportPage! # [komika] reader-report queue (Support → Report an issue), newest first; null status/kind mean "every value". `total` counts the FILTERED set, `openCount` is always the global open backlog (requires isAdmin)
-	extensions(installedOnly: Boolean = false, lang: String, nsfw: Boolean, refresh: Boolean = false): [ExtensionInfo!]! # [komika] Keiyoushi/Mihon extensions known to the engine; first use seeds the Keiyoushi store; refresh re-fetches the store indexes. NSFW extensions are ALWAYS listed: this is an admin management view, so the admin's reader-side show_nsfw is deliberately ignored — filter explicitly with the `nsfw` argument (requires isAdmin)
+	extensions(installedOnly: Boolean = false, lang: String, nsfw: Boolean, refresh: Boolean = false): [ExtensionInfo!]! # [komika] Mihon-format extensions from the repos the admin added (none are shipped or seeded); refresh re-fetches the repo indexes. NSFW extensions are ALWAYS listed: this is an admin management view, so the admin's reader-side show_nsfw is deliberately ignored — filter explicitly with the `nsfw` argument (requires isAdmin)
+	extensionRepos: [ExtensionRepo!]! # [komika] admin — the extension repos configured on the engine, asked live (requires isAdmin)
+	mangadexSetting: MangadexSetting! # [komika] admin — the MangaDex usage switch and whether the server environment pins it (requires isAdmin)
+	sourceRateLimits: [SourceRateLimit!]! # [komika] admin — every per-source scan rate limit in force: the server's SCAN_SOURCE_RATE_LIMITS defaults (fromEnv) and the ones an admin set, which win (requires isAdmin)
+	scanlators(search: String, ai: ScanlatorAiFilter, source: String, page: Int = 1): ScanlatorPage! # [komika] admin scanlator list — every credit chapters carry, most chapters first, 50 per page, with its AI tag. `search` matches part of the name; `ai` filters by the tag that APPLIES; `source` (a BrowseSource.id) keeps credits with chapters on that source and counts that source only. Counts come from a scan the server reuses for ten minutes; tags are always current (requires isAdmin)
 	sources: [SourceInfo!]! # [komika] installed Suwayomi sources — the sourceBrowse picker. Every installed source is listed incl. NSFW ones, regardless of the admin's reader-side show_nsfw; each carries `isNsfw` for the UI to badge (requires isAdmin)
 	sourceBrowse(sourceId: ID!, type: SourceBrowseType!, page: Int = 1, query: String): SourceBrowsePage! # [komika] browse/search one source's catalogue for bulk ingest (requires isAdmin)
 	seriesSourcesBatch(seriesIds: [ID!]!): [SeriesSourceGroup!]! # [komika] catalogue provenance per Suwayomi series — linked work + source mappings, input order, ≤200 ids (requires isAdmin)
@@ -97,9 +105,12 @@ type Mutation {
 	setUserAdmin(userId: ID!, isAdmin: Boolean!): AdminUser! # [komika] admin — grant/revoke admin (requires isAdmin)
 	createUser(input: CreateUserInput!): AdminUser! # [komika] admin — create an account directly, works with sign-up closed (requires isAdmin)
 	resetUserPassword(userId: ID!, password: String!): Boolean! # [komika] admin — set another account's password; revokes its sessions and sets mustChangePassword (requires isAdmin)
-	setRegistrationOpen(open: Boolean!): Boolean! # [komika] admin — open/close sign-up; refused when KOMIKA_REGISTRATION_OPEN pins it (requires isAdmin)
-	setAccessMode(mode: String!, domain: String): AccessStatus! # [komika] admin — record the wizard's access choice ("local" | "internet") and a domain set up by hand
-	checkCloudflareToken(token: String!, domain: String!): CloudflareTokenCheck! # [komika] admin — verify a Cloudflare API token, find the zone; changes nothing, keeps no token
+	setRegistrationOpen(open: Boolean!): Boolean! # [komika] admin — open/close sign-up (starts closed on a self-hosted install, open elsewhere); refused when KOMIKA_REGISTRATION_OPEN pins it (requires isAdmin)
+	setMangadexEnabled(enabled: Boolean!): Boolean! # [komika] admin — turn MangaDex usage on/off, applied live; refused when KOMIKA_MANGADEX or CATALOGUE_SYNC=on pins it (requires isAdmin)
+	setSourceRateLimit(sourceId: String!, requests: Int!, windowSecs: Int!): SourceRateLimit! # [komika] admin — check a source for new chapters with at most `requests` HTTP requests per `windowSecs` (one series check costs two); adds or replaces, wins over a SCAN_SOURCE_RATE_LIMITS default, applied live (requires isAdmin)
+	removeSourceRateLimit(sourceId: String!): Boolean! # [komika] admin — remove the admin's limit, applied live; the source falls back to its SCAN_SOURCE_RATE_LIMITS default when it has one; false when none was stored (requires isAdmin)
+	setAccessMode(mode: String!, domain: String): AccessStatus! # [komika] admin — record the wizard's access choice ("local" | "internet" | "direct"); domain is a domain set up by hand (internet) or the public address (direct, required)
+	checkCloudflareToken(token: String!, domain: String!, connection: Connection): CloudflareTokenCheck! # [komika] admin — verify a Cloudflare API token, find the zone; changes nothing, keeps no token
 	startCloudflareSetup(input: CloudflareSetupInput!): AccessStatus! # [komika] admin — run the Cloudflare checklist in the background; token used for this run only
 	retryCloudflareSetup(token: String!): AccessStatus! # [komika] admin — rerun the stored setup from where it failed
 	removeCloudflareSetup(token: String!): AccessStatus! # [komika] admin — delete exactly what setup created, stop the connector
@@ -108,9 +119,10 @@ type Mutation {
 	mergeWorks(sourceWorkId: ID!, targetWorkId: ID!): MergeWorksResult! # [komika] D1: fold one existing canonical work into another (dedup cleanup) — source's mappings + user data re-point to target, source deleted; pick target as the enriched/MangaDex-anchored one (requires isAdmin)
 	splitSourceSeries(workId: ID!, sourceSeriesIds: [ID!]!): SplitSourcesResult! # [komika] detach source mappings onto a NEW work — the fix for two different series merged together on a shared title. The counterpart to `mergeWorks`, NOT its inverse (that one deletes the losing work row and keeps no record of it). Lossless where it counts: `chapter` is keyed by `source_series_id`, so the mappings carry their whole chapter runs and nothing is deleted; reviews/library/progress/view-counts stay on the original, which has no per-source attribution to route them by. Refuses to detach the LAST source — a work with none vanishes from Browse and search (requires isAdmin)
 	addExtensionRepo(indexUrl: String!): Int! # [komika] register an extension repo (store) + refresh; returns the extension count (requires isAdmin)
-	installExtension(pkgName: String!): ExtensionInfo! # [komika] install a store extension; NSFW-gated by show_nsfw (requires isAdmin)
+	removeExtensionRepo(indexUrl: String!): Boolean! # [komika] admin — remove a repo by the index URL `extensionRepos` lists; "No such repo." otherwise (requires isAdmin)
+	installExtension(pkgName: String!): ExtensionInfo! # [komika] install a store extension, then record its sources' coordinates and NSFW flag in source_extension; NSFW-gated by show_nsfw (requires isAdmin)
 	uninstallExtension(pkgName: String!): ExtensionInfo! # [komika] uninstall an extension (requires isAdmin)
-	updateExtension(pkgName: String!): ExtensionInfo! # [komika] update an installed extension; NSFW-gated (requires isAdmin)
+	updateExtension(pkgName: String!): ExtensionInfo! # [komika] update an installed extension, then re-record its sources in source_extension; NSFW-gated (requires isAdmin)
 	bulkAddSourceSeries(suwayomiMangaIds: [ID!]!): BulkAddResult! # [komika] bulk Tier-2 catalogue ingest, ≤100 ids; per-id failures don't abort (requires isAdmin)
 	setSeriesPaused(seriesId: ID!, paused: Boolean!): Series! # [komika] targeted pause/unpause of one series' scanning; unpause re-scans immediately (requires isAdmin)
 	startSourceIngest(sourceId: ID!): SourceIngestJob! # [komika] start a background "add all from source" ingest; refused if one already running or NSFW source not opted in (requires isAdmin)
@@ -129,7 +141,8 @@ type Mutation {
 	consolidateExactDuplicates(limit: Int = 100): DuplicateSweepResult! # [komika] admin duplicate sweep, one resumable batch: sorts up to `limit` waiting reviews, then up to `limit` groups of works sharing a title or alt title (articles ignored). Each pair is merged on evidence, closed as two different works, or left in mergeQueue with a score. `done` marks the end of a run. Single-flighted against reconcileCatalogue (requires isAdmin)
 	reconcileCatalogue: Int! # [komika] admin — background pass matching every provisional (Suwayomi-only) work against the MangaDex spine; merges confident matches, queues mid-confidence ones for review. Returns the pending count at kickoff, not the result. Single-flighted (requires isAdmin)
 	resyncCatalogue: Boolean! # [komika] admin — force a full catalogue re-seed: clears the catalogue/chapters sync cursors so the next cycle walks the whole createdAt history, and kicks one cycle in the background. Refused while any sync cycle is running (requires isAdmin)
-	markSourceNsfw(sourceId: String!, isNsfw: Boolean!): Int! # [komika] admin — flag/unflag a whole Suwayomi source as adult and re-derive the NSFW flag of every work ingested from it; returns works changed (requires isAdmin)
+	setScanlatorAi(name: String!, ai: ScanlatorAi): Boolean! # [komika] admin — tag a scanlator as using AI (AI) or partly using it (PARTIAL); `ai: null` removes the tag. Kept by name, case-folded; applies to every chapter credited to the name on every source, now and later. false when nothing changed (requires isAdmin)
+	markSourceNsfw(sourceId: String!, isNsfw: Boolean!): Int! # [komika] admin — flag/unflag a whole Suwayomi source as adult and re-derive the NSFW flag of every work ingested from it; the flag is remembered (source_nsfw_pin), so a series ingested LATER from that source is stored adult too; returns works changed (requires isAdmin)
 	rederiveSuwayomiNsfw: Int! # [komika] admin — recompute the DERIVED is_nsfw for every Suwayomi-ingested work under the current rule (adult genre OR adult source, unless MangaDex rated it safe/suggestive). Conservative: only flips 0 -> 1, never un-flags, and leaves isNsfwOverride alone. Returns works flipped (requires isAdmin)
 	retryCover(workId: ID!): Boolean! # [komika] admin "Bugs" panel — clear a work's cover-issue skip marker and re-attempt the cover fetch/encode (requires isAdmin)
 	submitReport(input: ReportInput!): Report! # [komika] file a reader report (Support → Report an issue). NO AUTH REQUIRED by design — most catalogue-accuracy reports come from signed-out readers — so it is rate-limited per IP, length-caps every field, enforces the per-kind required fields, requires `subjectId` to name a series we know, and snapshots the reported comment's author/body (the comment may later be hard-deleted)
@@ -208,6 +221,7 @@ enum BrowseSortField {
 	MOST_VIEWED # our own view counts
 	MOST_FOLLOWS # MangaDex follows
 	HIGHEST_RATED # MangaDex bayesian rating
+	READER_RATED # our own readers' review average (the v1 RATING); unrated works last
 	MOST_CHAPTERS # en chapter count
 	TITLE # A-Z (ASC default for this one)
 	YEAR # publication year
@@ -249,9 +263,45 @@ input BrowseFilter {
 	minRating: Float # MangaDex bayesian 0..10
 	minFollows: Int
 	hasChapters: Boolean # true = only works with a readable chapter
-	source: String
+	source: String # a BrowseSource.id: "mangadex", or a Suwayomi source id ("suwayomi" = any Suwayomi source)
 	sort: BrowseSortField # default RELEVANCE with a query, LATEST_UPDATE without
 	direction: SortDirection # default DESC (TITLE: ASC)
+}
+# [komika] One source Browse can filter by.
+type BrowseSource {
+	id: String! # what BrowseFilter.source takes: "mangadex", or a Suwayomi source id
+	name: String! # display name; the extension package name, then the id, when the engine did not answer
+	lang: String # "en", "all", …; null for the MangaDex mirror
+	count: Int! # works from this source the viewer may see in Browse
+}
+# [komika] What an admin says about a scanlator's use of AI.
+enum ScanlatorAi {
+	AI # the translation is machine made
+	PARTIAL # AI is part of the work (for example machine translation that a person edits)
+}
+enum ScanlatorAiFilter {
+	TAGGED # AI or PARTIAL
+	AI
+	PARTIAL
+	UNTAGGED
+}
+type ScanlatorTag {
+	name: String! # the credit as tagged. Match to Chapter.scanlator / ChapterSource.scanlator trimmed and case-folded; a joint credit ("A & B") with no tag of its own takes the strongest tag of its members (AI over PARTIAL)
+	ai: ScanlatorAi!
+}
+# [komika] One row of the admin scanlator list.
+type Scanlator {
+	name: String! # the credit as chapters carry it
+	chapterCount: Int! # chapter copies credited to the name (on the filtered source, when one is given)
+	seriesCount: Int!
+	ai: ScanlatorAi # the tag stored for exactly this name
+	effectiveAi: ScanlatorAi # the tag that applies: `ai`, else one a joint credit takes from a member
+}
+type ScanlatorPage {
+	items: [Scanlator!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int! # the FILTERED count
 }
 type TagInfo {
 	id: String! # URL-safe slug of the canonical English name: "action", "boys-love"
@@ -529,7 +579,7 @@ type SessionUser {
 	isAdmin: Boolean!
 	showNsfw: Boolean! # [komika] viewer's NSFW visibility preference (CATALOGUE.md §2)
 	joinedAt: String! # [komika] account creation timestamp (profile "joined" date)
-	mustChangePassword: Boolean! # [komika] set by createUser/resetUserPassword; cleared by changePassword
+	mustChangePassword: Boolean! # [komika] set by createUser/resetUserPassword; cleared by changePassword. While true the account can only read `session`, call `changePassword` and `logout`; everything else treats it as signed out
 }
 
 # Public server facts (`instance` query). Settings resolve env → admin setting → default.
@@ -539,10 +589,11 @@ type Instance {
 	version: String!
 	registrationOpen: Boolean!
 	mangadexEnabled: Boolean!
+	appsFetchThemselves: Boolean! # true: reader apps fetch chapter pages from the sources themselves; an app with its own engine does not offer fetching through this server
 }
 
 # Self-host access (admin). The Cloudflare API token is never stored or returned.
-enum CloudflareConnection {
+enum Connection {
 	TUNNEL
 	PUBLIC_IP
 }
@@ -550,7 +601,7 @@ enum CloudflareConnection {
 input CloudflareSetupInput {
 	token: String!
 	domain: String!
-	connection: CloudflareConnection!
+	connection: Connection!
 	publicIp: String # public IP only; empty detects the server's address
 }
 
@@ -558,6 +609,7 @@ type CloudflareTokenCheck {
 	zoneName: String!
 	zoneStatus: String!
 	accountName: String!
+	missing: [String!]! # permission rows refused by read probes; cannot prove Edit access
 }
 
 type CloudflareStep {
@@ -576,16 +628,30 @@ type CloudflareJob {
 
 type CloudflareSetup {
 	domain: String!
-	connection: CloudflareConnection
+	connection: Connection
 	zoneName: String
 	complete: Boolean!
 	removable: Boolean! # anything left for removeCloudflareSetup
 }
 
+type AccessPreflight {
+	cloudflared: String! # "found" | "download" | "unsupported"
+	cloudflaredDetail: String # path when found; what to do when unsupported
+	httpPort: Int!
+	httpsPort: Int!
+	httpsPortState: String! # "free" | "serving" | "in_use" | "denied"; "unknown" for other OS errors
+	acmePort: Int!
+	acmePortState: String! # same states as httpsPortState
+	inContainer: Boolean! # the host must also publish the ports
+	publicIp: String # detected public address; null when unknown
+}
+
 type AccessStatus {
-	mode: String! # "local" | "internet" | "" (not chosen)
+	mode: String! # "local" | "internet" | "direct" | "" (not chosen)
 	domain: String
-	address: String # https://<domain> in internet mode
+	address: String # https://<domain> in internet mode; the public address in direct mode
+	lanAddresses: [String!]! # http://<address>:<port> on the home network; empty if unknown
+	lanClientSeenAt: String # last private socket peer since boot (RFC 3339); null when none or in a container
 	cloudflare: CloudflareSetup
 	connector: String! # "off" | "starting" | "running" | "failed" | "missing"
 	connectorMessage: String
@@ -851,6 +917,19 @@ type SourceExtension {
 	lang: String
 }
 
+# [komika] Where a Suwayomi chapter lives at its source: the source's own keys for
+# the manga and the chapter, plus the extension that reads them. Ids of the
+# server's engine are absent on purpose: they mean nothing to another engine.
+type ChapterOrigin {
+	sourceId: String!
+	mangaUrl: String! # MangaType.url
+	mangaTitle: String! # search hint for an engine that has never seen the manga
+	chapterUrl: String! # ChapterType.url
+	chapterWebUrl: String # ChapterType.realUrl: the chapter's page on the source's website ("Read on source"); validate http(s) before linking
+	mangaWebUrl: String # MangaType.realUrl: the series' page on the source's website
+	extension: SourceExtension # null when the source has no catalogued extension
+}
+
 # [komika] All source mappings resolved for one canonical work (batch grouping).
 type WorkSourceGroup {
 	workId: ID!
@@ -894,7 +973,30 @@ type SeriesSourceGroup {
 	sources: [WorkSource!]!
 }
 
-# [komika] One Keiyoushi/Mihon extension as known to the Suwayomi engine (admin
+# One extension repo on the engine (`extensionRepos`).
+type ExtensionRepo {
+	indexUrl: String! # canonical index URL: the repo's identity, what removeExtensionRepo takes
+	name: String!
+	badgeLabel: String! # short label
+}
+
+# One per-source scan rate limit (`sourceRateLimits`).
+type SourceRateLimit {
+	sourceId: ID! # the Suwayomi source id (`sources { id }`)
+	requests: Int! # HTTP requests allowed per window
+	windowSecs: Int!
+	fromEnv: Boolean! # the limit in force is the server's SCAN_SOURCE_RATE_LIMITS default
+	overridesEnv: Boolean! # an admin's limit replaces that default; removing it restores the default
+}
+
+# The MangaDex usage switch (`mangadexSetting`).
+type MangadexSetting {
+	enabled: Boolean!
+	pinned: Boolean! # the server environment fixes it; setMangadexEnabled is refused
+	pinnedBy: String # KOMIKA_MANGADEX or CATALOGUE_SYNC
+}
+
+# [komika] One Mihon-format extension as known to the Suwayomi engine (admin
 # management view, installed or not).
 type ExtensionInfo {
 	pkgName: String!

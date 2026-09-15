@@ -37,9 +37,9 @@ services:
       # can open komiq. KOMIQ_BIND=127.0.0.1: this machine only, which is what you
       # want on a VPS that is reached through a Cloudflare Tunnel.
       - '${KOMIQ_BIND:-0.0.0.0}:${KOMIQ_PORT:-8080}:8080'
-      # Public-IP mode of the Cloudflare setup serves HTTPS on port 443 inside the
-      # container. Uncomment when you choose that mode (see docs/self-host.md).
-      # - '443:443'
+      # HTTPS and certificate checks use docker-compose.https.yml (443) and
+      # docker-compose.acme.yml (80). Run install.sh, or set COMPOSE_FILE in
+      # .env as shown in .env.example. No YAML edits are needed.
     volumes:
       - server-data:/data
     depends_on:

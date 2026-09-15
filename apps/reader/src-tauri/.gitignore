@@ -7,6 +7,9 @@
 # The jar is 174 MB (fetched + SHA-256-verified); the JRE is jlink-built per target.
 # jre/.gitkeep IS tracked so the bundle.resources dir exists on a fresh checkout.
 /suwayomi/Suwayomi-Server.jar
+# The copy for the iOS app, made from the jar above by scripts/prune-ios-jar.sh. It stays
+# outside suwayomi/ because the desktop apps bundle that whole directory.
+/suwayomi-ios/
 /jre/*
 !/jre/.gitkeep
 
@@ -15,3 +18,12 @@
 # jre-ios/.gitkeep IS tracked so the bundle path exists on a fresh checkout.
 /jre-ios/*
 !/jre-ios/.gitkeep
+# Work dir of scripts/build-ios-jvm.sh and scripts/relink-ios-jimage.sh (JDK source tree,
+# the pinned linker JDK, link output). Several GB.
+/.ios-jvm-build/
+
+# JVM runtime for the Android on-device engine (libraries, jlink modules, zstd overlay).
+# Made from pinned Termux packages by scripts/build-android-jvm.sh; never committed.
+/jre-android/
+# Work dir of scripts/build-android-jvm.sh (downloaded packages, the jlink image).
+/.android-jvm-build/

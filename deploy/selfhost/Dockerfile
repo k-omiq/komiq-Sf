@@ -25,8 +25,7 @@ ENV PUBLIC_KOMIKA_BACKEND=on \
     PUBLIC_KOMIKA_API= \
     PUBLIC_KOMIKA_IMG_MODE=direct \
     PUBLIC_KOMIKA_IMG_WORKER= \
-    PUBLIC_SUWAYOMI_URL= \
-    PUBLIC_KOMIKA_NATIVE_ENGINE=off
+    PUBLIC_SUWAYOMI_URL=
 RUN KOMIKA_TARGET=embedded pnpm --filter @komika/reader build \
     && ADMIN_TARGET=embedded ADMIN_BASE_PATH=/admin pnpm --filter @komika/admin build \
     && mkdir -p /web \
@@ -45,7 +44,9 @@ RUN cargo build --release --locked --bin komika-server
 # Pinned release, verified by checksum. The server starts it as a child process
 # when Cloudflare Tunnel setup runs (found on PATH; override with CLOUDFLARED_BIN).
 # To update: download both assets of the new release, `sha256sum` them, and
-# replace the version and the two sums below.
+# replace the version and the two sums below. Change the same pin in
+# apps/server/src/cloudflare/fetch_connector.rs with it: the server downloads
+# that release by itself where no cloudflared is installed (the desktop app).
 FROM debian:bookworm-slim AS cloudflared
 ARG CLOUDFLARED_VERSION=2026.9.3
 ARG CLOUDFLARED_SHA256_AMD64=77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2
@@ -80,8 +81,6 @@ RUN apt-get update \
 COPY --from=server /build/target/release/komika-server /usr/local/bin/komika-server
 COPY --from=cloudflared /cloudflared /usr/local/bin/cloudflared
 COPY --from=web /web /srv/web
-# Extension icons served at /ext-icons/{pkgName}.png (see apps/server/src/ext_icon.rs).
-COPY assets/ext-icons/ /srv/ext-icons/
 
 USER komika
 WORKDIR /data
@@ -98,7 +97,6 @@ ENV BIND_ADDR=0.0.0.0 \
     PORT=8080 \
     DATABASE_URL=sqlite:///data/komika.sqlite3 \
     KOMIKA_WEB_DIR=/srv/web \
-    EXT_ICONS_DIR=/srv/ext-icons \
     SUWAYOMI_URL=http://suwayomi:4567 \
     SUWAYOMI_PUBLIC_URL=/ \
     CORS_ORIGINS=tauri://localhost,http://tauri.localhost,https://tauri.localhost \

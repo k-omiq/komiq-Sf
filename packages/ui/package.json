@@ -6,6 +6,7 @@
 	"type": "module",
 	"exports": {
 		"./tokens.css": "./tokens.css",
-		"./reset.css": "./reset.css"
+		"./reset.css": "./reset.css",
+		"./console.css": "./console.css"
 	}
 }

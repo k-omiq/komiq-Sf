@@ -1,5 +1,10 @@
 {
+	"build": {
+		"beforeBuildCommand": "bash src-tauri/scripts/fetch-suwayomi-jar.sh && bash src-tauri/scripts/prune-ios-jar.sh && pnpm build"
+	},
 	"bundle": {
-		"resources": ["suwayomi/Suwayomi-Server.jar"]
+		"resources": {
+			"suwayomi-ios/Suwayomi-Server.jar": "suwayomi/Suwayomi-Server.jar"
+		}
 	}
 }

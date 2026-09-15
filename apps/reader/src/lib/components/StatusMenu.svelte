@@ -134,7 +134,7 @@
 <div class="sm" class:open class:chip={variant === 'chip'} bind:this={root}>
 	<button
 		type="button"
-		class="trigger {variant}"
+		class="trigger k-hit {variant}"
 		bind:this={trigger}
 		onkeydown={triggerKey}
 		aria-label={`Change shelf: ${label}`}
@@ -249,6 +249,9 @@
 		bottom: calc(100% + 6px);
 		left: auto;
 		right: 0;
+		/* Narrower than the default: right-aligned to a chip in a two-column phone
+		   grid, a 176px menu ran past the left edge of the screen. */
+		min-width: 150px;
 	}
 	.item {
 		display: flex;
@@ -282,5 +285,10 @@
 		height: 8px;
 		border-radius: 50%;
 		flex: 0 0 auto;
+	}
+	@media (pointer: coarse) {
+		.item {
+			min-height: 44px;
+		}
 	}
 </style>

@@ -319,7 +319,7 @@
 			{#each shelfDefs as d (d.key)}
 				<button
 					type="button"
-					class="shelf-tab"
+					class="shelf-tab k-hit"
 					class:on={shelf === d.key}
 					aria-pressed={shelf === d.key}
 					onclick={(e) => selectShelf(d.key, e.currentTarget)}
@@ -363,7 +363,7 @@
 				/>
 				<button
 					type="button"
-					class="dir-btn"
+					class="dir-btn k-hit"
 					aria-label={`Order: ${DIR_LABEL[sort][dir]}`}
 					title={`Order: ${DIR_LABEL[sort][dir]} — switch to ${DIR_LABEL[sort][dir === 'asc' ? 'desc' : 'asc']}`}
 					onclick={() => (dir = dir === 'asc' ? 'desc' : 'asc')}
@@ -397,7 +397,7 @@
 				{/if}
 			</span>
 			{#if filtersActive}
-				<button type="button" class="clear-btn" onclick={clearFilters}>
+				<button type="button" class="clear-btn k-hit" onclick={clearFilters}>
 					<Icon name="x" size={13} strokeWidth={2.4} />Clear filters
 				</button>
 			{/if}
@@ -432,7 +432,7 @@
 							>
 						{/if}
 						<button
-							class="fav-chip"
+							class="fav-chip k-hit"
 							class:on={item.favorite}
 							aria-pressed={item.favorite}
 							aria-label={item.favorite ? 'Remove from favourites' : 'Add to favourites'}
@@ -470,7 +470,7 @@
 					? ` in ${format}`
 					: ''}. Try a different title or format.
 			</div>
-			<button type="button" class="empty-btn" onclick={clearFilters}>Clear filters</button>
+			<button type="button" class="empty-btn k-hit" onclick={clearFilters}>Clear filters</button>
 		</div>
 	{:else if counts.all === 0 && catalogEmpty !== false}
 		{#if catalogEmpty}<EmptyCatalog heading="h2" />{/if}
@@ -485,7 +485,7 @@
 					? 'Add series to your library and they’ll show up here, sorted by shelf.'
 					: 'Move a series onto this shelf, or browse for something new to read.'}
 			</div>
-			<a class="empty-btn" href="/browse">Browse series</a>
+			<a class="empty-btn k-hit" href="/browse">Browse series</a>
 		</div>
 	{/if}
 </div>
@@ -618,10 +618,17 @@
 		flex-direction: column;
 		gap: 16px;
 	}
-	/* The strip scrolls sideways instead of wrapping into a ragged second row. */
+	/* The strip scrolls sideways instead of wrapping into a ragged second row.
+	   Sideways only: `overflow-x: auto` alone makes the other axis `auto` too, and the
+	   tabs' 44px `.k-hit` area is taller than the 40px tab, so the strip could be
+	   dragged up and down. The padding (cancelled by the margin) keeps that hit area
+	   and the focus ring inside the box instead of clipped. */
 	.shelf-scroll {
 		min-width: 0;
+		margin: -4px;
+		padding: 4px;
 		overflow-x: auto;
+		overflow-y: hidden;
 		scrollbar-width: none;
 		overscroll-behavior-x: contain;
 	}
@@ -931,13 +938,6 @@
 			background-color 0.12s,
 			border-color 0.12s;
 	}
-	/* Grow the touch target to 40px without growing the chip itself. */
-	.fav-chip::after,
-	.status-slot :global(.trigger.chip)::after {
-		content: '';
-		position: absolute;
-		inset: -6px;
-	}
 	.fav-chip:hover:not(:disabled) {
 		color: #e96e6e;
 		border-color: rgba(233, 110, 110, 0.5);
@@ -1114,6 +1114,11 @@
 		}
 		.empty {
 			padding: 56px 0;
+		}
+	}
+	@media (pointer: coarse) {
+		.search input {
+			height: 44px;
 		}
 	}
 </style>

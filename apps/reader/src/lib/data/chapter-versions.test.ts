@@ -64,6 +64,25 @@ test('the adjacent number prefers the open copy’s group, then the default copy
 	assert.equal(fromU4.next?.id, 'u5');
 });
 
+test('the default source wins a number it carries; another source fills the ones it lacks', () => {
+	// Source A (the default) has no ch. 2. Source B has every chapter.
+	const a = [ch('a1', 1, 'Group A'), ch('a3', 3, 'Group A')];
+	const b = [ch('b1', 1, 'Group B'), ch('b2', 2, 'Group B'), ch('b3', 3, 'Group B')];
+	const tier = (c: VersionedChapter) => (c.id.startsWith('a') ? 0 : 1);
+	const fromA1 = adjacentChapters([...b, ...a], a[0], () => true, tier);
+	assert.equal(fromA1.next?.id, 'b2', 'ch. 2 opens from the other source');
+	// One row per number, the default source's copy wherever it has one.
+	assert.deepEqual(
+		fromA1.order.map((c) => c.id),
+		['a1', 'b2', 'a3'],
+	);
+	// From that borrowed chapter both neighbours go back to the default source, even
+	// though source B carries them by the open copy's own group.
+	const fromB2 = adjacentChapters([...b, ...a], b[1], () => true, tier);
+	assert.equal(fromB2.prev?.id, 'a1');
+	assert.equal(fromB2.next?.id, 'a3');
+});
+
 test('"No Group" and unknown groups are not an identity to follow', () => {
 	const list = [
 		ch('n1', 1, NO_GROUP),

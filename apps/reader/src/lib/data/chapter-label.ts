@@ -103,9 +103,9 @@ const MANGADEX_CHAPTER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
  *   - A MangaDex copy (`src === null`, the spine) is `mangadex.org/chapter/<uuid>`. The id
  *     shape is checked, not assumed: a numeric Suwayomi-only series also reads with no
  *     `src`, and its integer ids must not become a dead MangaDex link.
- *   - A Suwayomi copy is `null`. The engine knows a `realUrl`, but the server neither
- *     fetches nor caches it (`SuwayomiChapter` has no URL field), and a link built from
- *     the source's manga page would name the wrong page — so the button hides.
+ *   - A Suwayomi copy is `null` HERE, because the chapter list does not carry its link.
+ *     The engine does know it (`realUrl`), and the reader asks for it on demand, for the
+ *     one chapter that is open — see `getChapterSourceLinks` in `source.ts`.
  *
  * Every result goes through {@link externalChapterHref}: http(s) only, absolute only.
  */

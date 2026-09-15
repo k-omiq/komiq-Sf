@@ -1,5 +1,6 @@
 import type {
 	Chapter,
+	ChapterOrigin,
 	Comment,
 	CommentTargetType,
 	DiscoveryFeed,
@@ -249,6 +250,25 @@ function toIso(v: string | null): string {
 	}
 }
 
+/** Where one chapter lives at its source — the engine's own record of it, nothing fetched
+ *  from the source. `realUrl` is the page a person can open ("Read on source"). */
+const CHAPTER_ORIGIN = /* GraphQL */ `
+	query ChapterOrigin($id: Int!) {
+		chapters(condition: { id: $id }) {
+			nodes {
+				url
+				realUrl
+				manga {
+					url
+					realUrl
+					title
+					sourceId
+				}
+			}
+		}
+	}
+`;
+
 export class SuwayomiBackend implements Backend {
 	private sourceId: string | null = null;
 
@@ -444,6 +464,36 @@ export class SuwayomiBackend implements Backend {
 			id: Number(chapterId),
 		});
 		return d.fetchChapterPages.pages.map((url, index) => ({ index, sourceUrl: this.abs(url) }));
+	}
+
+	/**
+	 * Where a chapter lives at its source, read from the engine this backend talks to.
+	 * The Komika server answers the same question for its own engine; with no server in
+	 * front, the engine is asked directly. `extension` is always null: install
+	 * coordinates are a Komika catalogue fact this path does not have. `null` for an
+	 * unknown chapter.
+	 */
+	async chapterOrigin(chapterId: Id): Promise<ChapterOrigin | null> {
+		const d = await this.gql<{
+			chapters: {
+				nodes: {
+					url: string;
+					realUrl: string | null;
+					manga: { url: string; realUrl: string | null; title: string; sourceId: string };
+				}[];
+			};
+		}>(CHAPTER_ORIGIN, { id: Number(chapterId) });
+		const c = d.chapters.nodes[0];
+		if (!c) return null;
+		return {
+			sourceId: c.manga.sourceId,
+			mangaUrl: c.manga.url,
+			mangaTitle: c.manga.title,
+			chapterUrl: c.url,
+			chapterWebUrl: c.realUrl,
+			mangaWebUrl: c.manga.realUrl,
+			extension: null,
+		};
 	}
 
 	// --- library & progress ---

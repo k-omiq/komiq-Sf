@@ -52,19 +52,21 @@
 
 <header>
 	<div class="left">
-		<a class="brand" href="/" aria-label="komiq">
+		<a class="brand k-hit" href="/" aria-label="komiq">
 			<img class="brand-mark" width="32" height="32" src={mark} alt="" />
 			<span>omiq</span>
 		</a>
 		<nav>
 			{#each nav as item (item.href)}
-				<a href={item.href} class="nav-link" class:active={isActive(item.href)}>{item.label}</a>
+				<a href={item.href} class="nav-link k-hit" class:active={isActive(item.href)}
+					>{item.label}</a
+				>
 			{/each}
 		</nav>
 	</div>
 	<div class="right">
 		<button
-			class="icon-btn"
+			class="icon-btn k-hit"
 			aria-label="Theme: {themeTitle}"
 			title="Theme: {themeTitle} (click to change)"
 			onclick={cycleTheme}
@@ -101,7 +103,7 @@
 				</svg>
 			{/if}
 		</button>
-		<button class="icon-btn" aria-label="Search" onclick={() => (searchOpen = true)}>
+		<button class="icon-btn k-hit" aria-label="Search" onclick={() => (searchOpen = true)}>
 			<Icon name="search" size={21} />
 		</button>
 		{#if !auth.ready && !auth.user}
@@ -110,7 +112,7 @@
 			<NotificationBell />
 			<div class="account">
 				<button
-					class="avatar"
+					class="avatar k-hit"
 					class:on={menuOpen || isActive('/profile')}
 					aria-label="Account menu"
 					aria-haspopup="menu"
@@ -138,6 +140,9 @@
 						<a class="menu-item" role="menuitem" href="/library" onclick={() => (menuOpen = false)}
 							>Library</a
 						>
+						<a class="menu-item" role="menuitem" href="/settings" onclick={() => (menuOpen = false)}
+							>Settings</a
+						>
 						<a class="menu-item" role="menuitem" href="/support" onclick={() => (menuOpen = false)}
 							>Support</a
 						>
@@ -156,7 +161,7 @@
 			     signed out, so these must never become URL-only. -->
 			<div class="account">
 				<button
-					class="icon-btn"
+					class="icon-btn k-hit"
 					class:on={menuOpen}
 					aria-label="More"
 					aria-haspopup="menu"
@@ -173,6 +178,9 @@
 					<button class="backdrop" aria-label="Close menu" onclick={() => (menuOpen = false)}
 					></button>
 					<div class="menu" role="menu">
+						<a class="menu-item" role="menuitem" href="/settings" onclick={() => (menuOpen = false)}
+							>Settings</a
+						>
 						<a class="menu-item" role="menuitem" href="/support" onclick={() => (menuOpen = false)}
 							>Support</a
 						>
@@ -182,7 +190,7 @@
 					</div>
 				{/if}
 			</div>
-			<a class="signin" href={loginHref}>Sign in</a>
+			<a class="signin k-hit" href={loginHref}>Sign in</a>
 		{/if}
 	</div>
 </header>
@@ -210,19 +218,21 @@
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
+		/* --k-header-h includes the top safe area (see app.css): the bar's glass reaches
+		   the screen edge under the status bar / notch and its controls sit below it. */
 		height: var(--k-header-h);
-		/* viewport-fit=cover lets landscape notches overlap the edges. */
-		padding: 0 max(var(--k-gutter), env(safe-area-inset-right, 0px)) 0
-			max(var(--k-gutter), env(safe-area-inset-left, 0px));
+		padding: var(--k-safe-top) var(--k-gutter) 0;
 		background: var(--k-glass);
 		-webkit-backdrop-filter: blur(14px);
 		backdrop-filter: blur(14px);
 		border-bottom: 1px solid var(--k-border);
 	}
+	/* Phone first. Primary nav is the bottom tab bar there, so only the brand is on the
+	   left; the wider layouts below bring the inline nav back and open the gaps up. */
 	.left {
 		display: flex;
 		align-items: center;
-		gap: 48px;
+		gap: 0;
 	}
 	.brand {
 		display: inline-flex;
@@ -242,8 +252,8 @@
 		transform: translateY(0.07em);
 	}
 	nav {
-		display: flex;
-		gap: 32px;
+		display: none;
+		gap: 20px;
 	}
 	.nav-link {
 		color: var(--k-text-dimmer);
@@ -259,11 +269,14 @@
 	.right {
 		display: flex;
 		align-items: center;
-		gap: 14px;
+		gap: 6px;
 	}
+	/* Support/About live in a menu that renders for signed-out visitors too, so nothing
+	   here may hide that menu button: it is the only route to /support and the /about
+	   takedown page for anonymous users. */
 	.icon-btn {
-		width: 40px;
-		height: 40px;
+		width: 38px;
+		height: 38px;
 		padding: 0;
 		border-radius: 50%;
 		background: transparent;
@@ -326,7 +339,7 @@
 		flex: 0 0 auto;
 		white-space: nowrap;
 		height: 36px;
-		padding: 0 18px;
+		padding: 0 14px;
 		border-radius: var(--k-radius-pill);
 		background: var(--k-primary);
 		color: var(--k-on-primary);
@@ -356,9 +369,16 @@
 	.account {
 		position: relative;
 	}
+	/* Sized in viewport units, not `inset: 0`: the header's backdrop-filter makes the
+	   header the containing block of its fixed children, so `inset: 0` covered the
+	   header only and a tap on the page did not close the menu. */
 	.backdrop {
 		position: fixed;
-		inset: 0;
+		top: 0;
+		left: 0;
+		width: 100vw;
+		height: 100vh;
+		height: 100dvh;
 		z-index: 25;
 		background: transparent;
 		border: none;
@@ -425,39 +445,62 @@
 	.menu-item.danger:hover {
 		color: var(--k-accent);
 	}
+	/* Touch: menu rows are full 44px targets, and the avatar lets its (round) hit box
+	   reach past its own circle. */
+	@media (pointer: coarse) {
+		.menu-item {
+			display: flex;
+			align-items: center;
+			min-height: 44px;
+		}
+		.avatar {
+			overflow: visible;
+		}
+	}
+	/* 320px phones have no room to spare with brand, three buttons and Sign in on one
+	   row; from 360px the row breathes again. */
+	@media (min-width: 360px) {
+		.right {
+			gap: 8px;
+		}
+		.signin {
+			padding: 0 18px;
+		}
+	}
 	/* 641–900px is the one band where EVERYTHING renders at once — brand, the four nav
-	   links, the icon buttons and Sign in — and stops fitting. `justify-content:
-	   space-between` has no slack to give and nothing shrinks, so at 768px `Library` slid
-	   underneath the theme button and `Sign in` wrapped onto two lines. Tightening the two
-	   generous desktop gaps is enough; no control has to be dropped. */
-	@media (min-width: 641px) and (max-width: 900px) {
+	   links, the icon buttons and Sign in — and stops fitting unless the gaps stay
+	   tight; no control has to be dropped. */
+	@media (min-width: 641px) {
+		nav {
+			display: flex;
+		}
 		.left {
 			gap: 24px;
-		}
-		nav {
-			gap: 20px;
 		}
 		.right {
 			gap: 10px;
 		}
-	}
-	@media (max-width: 640px) {
-		/* Primary nav moves to the bottom tab bar; keep only the brand on the left. */
-		nav {
-			display: none;
+		.icon-btn {
+			width: 40px;
+			height: 40px;
 		}
+	}
+	@media (min-width: 901px) {
 		.left {
-			gap: 0;
+			gap: 48px;
+		}
+		nav {
+			gap: 32px;
 		}
 		.right {
-			gap: 8px;
+			gap: 14px;
 		}
-		/* Support/About now live in a menu that renders for signed-out visitors too, so
-		   nothing here may hide that menu button: it is the only route to /support and the
-		   /about takedown page for anonymous users. */
-		.icon-btn {
-			width: 38px;
-			height: 38px;
+	}
+	/* A phone on its side is wide, but it is still a phone: the bottom tab bar stays the
+	   primary nav (see `--k-tabbar-h` in app.css), so the links do not show twice. */
+	@media (min-width: 641px) and (max-height: 500px) and (pointer: coarse) {
+		nav {
+			display: none;
 		}
 	}
 </style>

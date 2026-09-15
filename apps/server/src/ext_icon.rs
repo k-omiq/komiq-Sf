@@ -24,11 +24,13 @@
 //! WHERE THE ICON COMES FROM. The extension's OWN repo ([`icon_candidates`]): a
 //! Mihon-format repo keeps `icon/{pkgName}.png` next to its index, so the URL is
 //! derived from the repo the engine reports for the extension. Keiyoushi is the one
-//! repo known not to (its `icon/` directory is the one that was emptied), so for a
-//! Keiyoushi extension the source-tree layout is tried after it — the same fetch
-//! the snapshot was originally built from. The snapshot itself stays the first
-//! tier, because it is local disk and answers the hosted instance's ~1,300
-//! Keiyoushi icons without a single outbound request.
+//! repo known not to (its `icon/` directory is the one that was emptied), so for an
+//! extension whose repo IS Keiyoushi's the source-tree layout is tried after it —
+//! the same fetch the snapshot was originally built from. That is a quirk of one
+//! repo an operator may add, never a default: an extension the engine cannot place
+//! in a repo is not looked up anywhere. The snapshot itself stays the first tier on
+//! the hosted instance, because it is local disk and answers its ~1,300 Keiyoushi
+//! icons without a single outbound request; a self-hosted install ships none.
 
 use sqlx::SqlitePool;
 use std::time::Duration;
@@ -92,20 +94,16 @@ pub fn repo_base(repo: &str) -> Option<String> {
 /// for it (`None` = the extension is not known to the engine).
 ///
 /// 1. The extension's own repo: `{base}/icon/{pkg}.png`, the Mihon repo layout.
-/// 2. For a Keiyoushi extension (its repo is Keiyoushi's, or unknown and the
-///    package is Keiyoushi-shaped): Keiyoushi's source tree, since their `icon/`
-///    directory no longer holds the icons.
+/// 2. Only when that repo is Keiyoushi's: Keiyoushi's source tree, since their
+///    `icon/` directory no longer holds the icons.
+///
+/// No repo, no candidates: a server that never added Keiyoushi never asks it.
 pub fn icon_candidates(repo: Option<&str>, pkg: &str) -> Vec<String> {
-    let base = repo.and_then(repo_base);
-    let mut out = Vec::new();
-    if let Some(base) = &base {
-        out.push(format!("{base}/icon/{pkg}.png"));
-    }
-    let keiyoushi_repo = match &base {
-        Some(b) => b == KEIYOUSHI_REPO_BASE,
-        None => repo.is_none(),
+    let Some(base) = repo.and_then(repo_base) else {
+        return Vec::new();
     };
-    if keiyoushi_repo {
+    let mut out = vec![format!("{base}/icon/{pkg}.png")];
+    if base == KEIYOUSHI_REPO_BASE {
         out.extend(keiyoushi_source_url(pkg));
     }
     out
@@ -168,9 +166,70 @@ fn http() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(FETCH_TIMEOUT)
+            // A redirect is followed by hand, with `redirect_http`.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .expect("icon HTTP client")
     })
+}
+
+/// How many hops a repo's redirect may take after the first.
+const MAX_REDIRECTS: usize = 3;
+
+/// The client for a redirect. The repo URL is the owner's word, so the first request
+/// goes where it says, a home-network repo included. Where a redirect points is the
+/// word of whoever answers there, and the route that starts this fetch is public: so
+/// a redirect is followed only to an address on the internet, never to this computer,
+/// the home network or a cloud metadata address.
+fn redirect_http() -> &'static reqwest::Client {
+    static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    HTTP.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(FETCH_TIMEOUT)
+            .dns_resolver(std::sync::Arc::new(PublicOnly))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() > MAX_REDIRECTS || !public_target(attempt.url()) {
+                    attempt.stop()
+                } else {
+                    attempt.follow()
+                }
+            }))
+            .build()
+            .expect("icon redirect HTTP client")
+    })
+}
+
+/// Whether a redirect may go to `url`: http(s), and not an address that is written
+/// out and is not on the internet. A name is checked when it is resolved
+/// ([`PublicOnly`]), which also covers a name that changes its answer.
+fn public_target(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let address = host.trim_start_matches('[').trim_end_matches(']');
+    matches!(url.scheme(), "http" | "https")
+        && address
+            .parse::<std::net::IpAddr>()
+            .map_or(true, crate::cloudflare::from_internet)
+}
+
+/// Resolves a name to its addresses on the internet only.
+struct PublicOnly;
+
+impl reqwest::dns::Resolve for PublicOnly {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let public: Vec<std::net::SocketAddr> = tokio::net::lookup_host((name.as_str(), 0))
+                .await?
+                .filter(|addr| crate::cloudflare::from_internet(addr.ip()))
+                .collect();
+            if public.is_empty() {
+                return Err("no address on the internet".into());
+            }
+            Ok(Box::new(public.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 /// Extension icons are small (launcher PNGs are a few KB); anything near this is not
@@ -180,7 +239,19 @@ const MAX_ICON_BYTES: usize = 1024 * 1024;
 /// GET a PNG, or `None` for any failure — transport error, non-success status,
 /// a body over [`MAX_ICON_BYTES`], or a body that isn't actually a PNG.
 async fn fetch_png(url: &str) -> Option<Vec<u8>> {
-    let mut res = http().get(url).timeout(FETCH_TIMEOUT).send().await.ok()?;
+    let mut res = http().get(url).send().await.ok()?;
+    if res.status().is_redirection() {
+        let to = res
+            .headers()
+            .get(reqwest::header::LOCATION)?
+            .to_str()
+            .ok()?;
+        let to = res.url().join(to).ok()?;
+        if !public_target(&to) {
+            return None;
+        }
+        res = redirect_http().get(to).send().await.ok()?;
+    }
     if !res.status().is_success()
         || res
             .content_length()
@@ -210,9 +281,9 @@ pub enum RepoLookup<'a> {
     Unavailable,
 }
 
-/// Fetch a package's icon from its own repo (then the Keiyoushi fallback, see
-/// [`icon_candidates`]) and record the outcome — the bytes on success, an
-/// empty-BLOB tombstone on a definite miss. Returns the bytes to serve.
+/// Fetch a package's icon from its own repo ([`icon_candidates`]) and record the
+/// outcome — the bytes on success, an empty-BLOB tombstone on a definite miss.
+/// Returns the bytes to serve.
 ///
 /// Cache writes are best-effort: a failed write costs a repeat fetch next time,
 /// which is not worth failing an image request over.
@@ -439,11 +510,8 @@ mod tests {
                 keiyoushi_source_url(pkg).unwrap(),
             ]
         );
-        // Unknown to the engine: only the legacy Keiyoushi derivation, if any.
-        assert_eq!(
-            icon_candidates(None, pkg),
-            vec![keiyoushi_source_url(pkg).unwrap()]
-        );
+        // Unknown to the engine: nothing is asked, however the package is named.
+        assert!(icon_candidates(None, pkg).is_empty());
         assert!(icon_candidates(None, "com.example.custom").is_empty());
         // A repo URL with no index file: no guess at all.
         assert!(icon_candidates(Some("https://example.org/store"), "com.example.x").is_empty());
@@ -486,6 +554,75 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{addr}/repo/index.min.json"), hits)
+    }
+
+    /// A repo cannot send the server to an address that is not on the internet: its
+    /// redirect to this computer is not followed, by address or by name.
+    #[tokio::test]
+    async fn a_redirect_off_the_internet_is_not_followed() {
+        use axum::{extract::Path, http::header, response::Redirect, routing::get, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let inside = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits = inside.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route(
+                "/repo/icon/{file}",
+                get(move |Path(file): Path<String>| async move {
+                    let host = if file.starts_with("by.name") {
+                        "localhost"
+                    } else {
+                        "127.0.0.1"
+                    };
+                    Redirect::temporary(&format!("http://{host}:{port}/inside.png"))
+                }),
+            )
+            .route(
+                "/inside.png",
+                get(move || {
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            [(header::CONTENT_TYPE, "image/png")],
+                            b"\x89PNG\r\n\x1a\ninside".to_vec(),
+                        )
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let pool = cache_pool().await;
+        let repo = format!("http://127.0.0.1:{port}/repo/index.min.json");
+
+        for pkg in ["by.address", "by.name"] {
+            assert_eq!(
+                fetch_and_cache(&pool, pkg, RepoLookup::Repo(&repo)).await,
+                None
+            );
+        }
+        assert_eq!(inside.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn redirect_targets_are_checked() {
+        let ok = |url: &str| public_target(&reqwest::Url::parse(url).unwrap());
+        assert!(ok("https://raw.githubusercontent.com/a/b/icon/x.png"));
+        assert!(ok("http://198.51.100.7/icon/x.png"));
+        for inside in [
+            "http://127.0.0.1:4567/api",
+            "http://169.254.169.254/latest/meta-data",
+            "http://192.168.1.1/",
+            "http://10.0.0.5/",
+            "http://[::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://100.64.0.1/",
+            "file:///etc/passwd",
+        ] {
+            assert!(!ok(inside), "{inside}");
+        }
     }
 
     #[tokio::test]

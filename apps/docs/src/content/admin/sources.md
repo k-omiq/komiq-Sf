@@ -1,0 +1,119 @@
+---
+title: Extensions and source health
+description: Manage your server’s extensions, browse sources for new titles, and monitor source health.
+---
+
+The Sources section in the admin app connects your server to comic sources. It contains four pages: Extensions, Browse & add, Health, and Scanlators. Learn each page’s controls.
+
+## Why NSFW settings gate source tools
+
+When your admin account has NSFW (adult) content turned off, your server blocks browsing and ingestion of sources flagged NSFW, and installation or updates of extensions flagged NSFW. A warning notice appears at the top of the Sources section, linking to the Content section in [Settings](/admin/settings).
+
+External sources and extensions may host adult content alongside general titles. To prevent unwanted exposure, these operations check the source or extension's NSFW flag against your account preference.
+
+A series you add from a source is marked adult when its own genres are adult or when its source is flagged NSFW. The server learns the source flag when you install the extension. If it does not know the source yet, it asks the source engine before it adds the series. If it cannot get an answer, it refuses the add. It does not store the series as safe. Adult series stay hidden from signed-out readers and from readers who have adult content turned off.
+
+Catalog searches and updates in the admin console still display NSFW records to an administrator. This allows you to inspect and correct records that were flagged incorrectly. Source browsing and extension installation instead check source or extension flags and your account preference.
+
+## Extensions
+
+The Extensions page lists every extension known to your server’s Suwayomi engine. Suwayomi is the source engine, and extensions connect it to external sources. When no extension repository has been added, the page displays a link to add one in [Settings](/admin/settings).
+
+### Header and filter controls
+
+- `Refresh`: Fetches the latest repository indexes. This updates package availability, versions, and update badges across the table.
+- `Show`: Segmented control filtering extensions by status: `All`, `Installed`, or `Available`. Each option displays its count.
+- `Language`: Dropdown menu filtering extensions by language code or all languages.
+- `Name`: Search field filtering by extension name or package identifier.
+- `Clear filters`: Resets active filters when no extensions match.
+
+### Extension list items
+
+Each row shows an extension and its actions:
+
+- Details: Shows the icon, name, package identifier, an `Installed` badge, and an `NSFW` badge if the extension contains adult content.
+- Language and version: Shows the language code and version string. An `Update available` badge appears when a newer release exists in the repository.
+- Background updates: A switch on installed extensions. Subscribing instructs your server to periodically scan the extension's sources for new series and chapters. Enabling it also triggers an immediate update pass.
+- Actions:
+  - `Install`: Downloads and installs an extension from the repository.
+  - `Browse`: Opens Browse & add scoped to this extension's sources.
+  - `Update`: Upgrades an installed extension to the latest version.
+  - `Uninstall`: Prompts for confirmation and removes the extension and its sources from your server.
+
+## Browse & add
+
+Browse & add lets you explore sources, preview chapters, and add titles to your server’s catalogue.
+
+### Scoping and source selection
+
+Navigating to this page from an extension scopes the view to that extension's sources. The header shows the source count and an `Add all from this extension` button to start jobs for its installed English sources. Sources flagged NSFW are skipped if your account has NSFW content off. Click `Show all sources` to clear the scope.
+
+Controls include:
+
+- `Source`: Selects an installed source and language variant.
+- `Listing`: Switch between `Popular`, `Latest`, and `Search` modes. `Search` opens an input to query the source by title.
+
+### Background ingestion
+
+- `Add all from this source`: Walks the source's Popular and Latest listings in the background, up to 1,000 pages per listing. Only English sources are accepted. A confirmation modal warns that this can add thousands of titles.
+- Ingest panel: Displays active and completed jobs, polling progress every 2 seconds with automatic backoff. It reports pages read, series found, succeeded, added as new, merged, sent to [Duplicates](/admin/duplicates), already in catalogue, and failed.
+- You can stop a running job with `Stop` or `Stop all`. Titles added before stopping remain in your catalogue. Click `Dismiss` to hide finished jobs.
+
+### Browsing and previewing titles
+
+The grid shows each title returned by the source:
+
+- Each card shows a cover, title, and `In catalogue` badge if already in the Suwayomi library.
+- Clicking a card opens the reader preview. Chapter lists use your server's database cache and fetch through Suwayomi when needed. Previewing can fill that cache, but does not add the title to the catalogue or alter reading history.
+- The selection button (`+` or checkmark) selects up to 100 titles.
+
+### Adding selected series
+
+Selecting titles displays a sticky bottom bar showing the count, a `Clear` button, and `Add selected to catalogue`. Submitting sends the batch to the deduplication pipeline.
+
+When complete, `Result of the last add` shows the outcome for each series: merged into an existing work, added as a new work, sent to [Duplicates](/admin/duplicates) for review, already present, or failed.
+
+## Health
+
+The Health page monitors your server’s scan reliability and request failures across sources with tracked series or recorded requests, listing the worst sources first.
+
+### Outage notices
+
+When sources experience an outage, a notice appears at the top. It reports the number of down sources and how many exclusive works exist only on them. Exclusive works cannot be read while their source is down.
+
+### Scan health metrics
+
+The table shows each source’s metrics:
+
+- `Source`: Source name, falling back to its package identifier or source ID when the name is unavailable.
+- `Status`: Overall availability state and status badges (`OK`, `Failing`, `Down`, `Not installed`, `Updates paused`, `Updates off`).
+- `Series`: Total series tracked from this source.
+- `Failing`: Series whose last scan failed, with a confirmed failure count after repeated consecutive failures.
+- `Stale data`: Series where the remote site failed to answer and Suwayomi fell back to cached database data.
+- `Errors`: Series where requests failed outright.
+- `No chapters`: Series whose tracked chapter count is zero or unknown. If this is most of a source's series, the source has probably never worked.
+- `Exclusive works`: Works found only on this source.
+- `Last check` and `Last failure`: UTC timestamps for the latest scan and error.
+
+### Request failure breakdown
+
+Troubled sources show diagnostic details below their rows:
+
+- Outage details: How long the source has been down, the failure reason, and when checks will resume.
+- 24-hour request health: Summarizes failures across chapter opens (`pages`), page images (`image`), chapter lists (`chapters`), and listings (`browse`).
+- Failure reasons: Displays failure counts for codes such as `Blocked` (HTTP 403 or Cloudflare challenge), `Rate limited` (HTTP 429), `Solver down` (FlareSolverr failure), `Not found` (HTTP 404), `Timeout`, `Unreachable` (DNS or TLS errors), `Site error` (HTTP 5xx), `Extension broken`, and `Engine`. Each request category also shows a timestamp and any stored message for its most frequent failure reason.
+
+## Scanlators
+
+The Scanlators page lists every scanlation group that a chapter on your server credits, with the most chapters first. Use it to tell readers which groups translate with AI.
+
+- `Name`: Search field for part of a group name.
+- `Tag`: Segmented control showing `All`, `Tagged`, `AI`, `Partial AI`, or `Not tagged` groups.
+- `Source`: Dropdown menu showing only groups with chapters on one source. The chapter and series counts then cover that source only.
+- `AI tag`: Sets each row to `None`, `Partial AI`, or `AI`. Use `AI` for machine translation and `Partial AI` when AI is part of the work, such as a machine translation that a person edits.
+
+A tag is kept by group name. It applies to every chapter credited to that group, on every source, including chapters added later. A joint credit such as "A & B" takes the strongest tag of its members unless you give it its own tag. The row then shows where its tag comes from.
+
+Readers see an AI or Partial AI badge next to the group name in the chapter list and in the reader menu.
+
+Your server counts the list at most once every ten minutes. The first load can take a few seconds, and a new group can take ten minutes to appear. Tags save at once.

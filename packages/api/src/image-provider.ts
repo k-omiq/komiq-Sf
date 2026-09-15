@@ -1,4 +1,5 @@
 import type { Page } from '@komika/types';
+import { ENGINE_URL_PREFIX } from './content-backend.js';
 import { isTauri } from './platform.js';
 
 /**
@@ -97,13 +98,19 @@ export interface WebImageProviderConfig {
 	 * Its images (relative `/api/…`, `/covers/…`, `/avatars/…` paths and absolute URLs
 	 * on its origin) load straight from it in the WebView instead of through the Rust
 	 * fetch, whose address guard rightly refuses a LAN host it was not built for. Unset
-	 * keeps the built-in routing below (relative `/api/…` = the embedded engine).
+	 * keeps the built-in routing below.
 	 */
 	serverOrigin?: string | null;
 }
 
 /** API-origin asset paths the reader serves itself (never Worker-proxied). */
 const OWN_ASSET_PREFIXES = ['/covers/', '/avatars/'];
+
+/**
+ * The address scheme the native app answers engine images on (`ENGINE_IMAGE_SCHEME` in
+ * `apps/reader/src-tauri/src/lib.rs`; the two must stay the same).
+ */
+const ENGINE_IMAGE_SCHEME = 'engine-image';
 
 /**
  * MangaDex host patterns (uploads.mangadex.org + *.mangadex.network). Doubles as
@@ -272,13 +279,13 @@ export class WebImageProvider implements ImageProvider {
  * for the web target.
  *
  * Resolution is source-aware, checked in order:
- *  0. With `serverOrigin` set (a server chosen on the connect screen), anything on
+ *  0. Engine image (`engine:/api/…`, tagged by the on-device backend) → an
+ *     `engine-image` address that the app's Rust side answers from the embedded
+ *     loopback Suwayomi engine (the extension's per-source request context is applied
+ *     inside the engine). It is a plain address, not bytes: the web view loads each
+ *     `<img>` by itself, so a chapter shows its first page without waiting for the last.
+ *  1. With `serverOrigin` set (a server chosen on the connect screen), anything on
  *     that server loads directly from it.
- *  1. Relative engine path (`/api/…`) → `suwayomi_image`, which streams the
- *     bytes from the embedded loopback Suwayomi engine (the extension's
- *     per-source request context is applied inside the engine). This is the
- *     primary native content path — the embedded engine hands back page/cover
- *     image URLs as relative proxy paths, not CDN URLs.
  *  2. Absolute MangaDex host → `fetch_image`, which sets MangaDex's UA/Referer.
  *  3. Everything else (absolute non-engine URLs) → `resolveViaLocalProxy`.
  */
@@ -291,32 +298,33 @@ export class NativeImageProvider implements ImageProvider {
 		return invoke<ArrayBuffer>('fetch_image', { url: sourceUrl });
 	}
 
-	/**
-	 * Fetch bytes for a relative embedded-engine proxy path (`/api/…`). Rust
-	 * `suwayomi_image` streams them from the loopback Suwayomi engine and returns
-	 * the raw bytes as an ArrayBuffer, mirroring `fetch_image`.
-	 */
-	private async fetchEngineBytes(path: string): Promise<ArrayBuffer> {
-		const { invoke } = await import('@tauri-apps/api/core');
-		return invoke<ArrayBuffer>('suwayomi_image', { path });
-	}
-
 	private async toBlobUrl(sourceUrl: string): Promise<string> {
 		const bytes = await this.fetchBytes(sourceUrl);
 		const blob = new Blob([bytes]);
 		return URL.createObjectURL(blob);
 	}
 
-	/** Resolve a relative embedded-engine path (`/api/…`) to a blob URL via `suwayomi_image`. */
-	private async engineToBlobUrl(path: string): Promise<string> {
-		const bytes = await this.fetchEngineBytes(path);
-		const blob = new Blob([bytes]);
-		return URL.createObjectURL(blob);
+	/**
+	 * The address prefix engine images load from, asked for once. The Android app answers
+	 * with its loopback image listener (`engine_image_base` in the reader's `lib.rs` says
+	 * why). Every other system uses the `engine-image` scheme, and Tauri knows the shape a
+	 * custom scheme has there (`engine-image://localhost` or `http://engine-image.localhost`).
+	 */
+	private engineBase: Promise<string> | undefined;
+
+	/** The loadable address of a relative embedded-engine path (`/api/…`). */
+	private async engineUrl(path: string): Promise<string> {
+		this.engineBase ??= (async () => {
+			const { invoke, convertFileSrc } = await import('@tauri-apps/api/core');
+			const base = await invoke<string | null>('engine_image_base').catch(() => null);
+			return base ?? convertFileSrc('', ENGINE_IMAGE_SCHEME).replace(/\/$/, '');
+		})();
+		return (await this.engineBase) + path;
 	}
 
-	/** True for the embedded engine's relative proxy paths (e.g. `/api/v1/manga/…`). */
+	/** True for an image the on-device engine serves (`engine:/api/v1/manga/…`). */
 	private isEnginePath(sourceUrl: string): boolean {
-		return sourceUrl.startsWith('/api/');
+		return sourceUrl.startsWith(ENGINE_URL_PREFIX);
 	}
 
 	/** True when `sourceUrl` is a MangaDex upload/network host; relative/invalid URLs → false. */
@@ -334,7 +342,7 @@ export class NativeImageProvider implements ImageProvider {
 	 * Resolve an absolute non-MangaDex source image (e.g. a hosted-fallback CDN
 	 * URL) to a blob URL. Falls back to the generic `fetch_image` command, which
 	 * does not carry any per-source request context. Native embedded-engine
-	 * content now flows through the relative `/api/…` → `suwayomi_image` path
+	 * content now flows through the tagged `engine:/api/…` → `engine-image` address
 	 * (see `resolve`) instead of this fallback.
 	 */
 	private async resolveViaLocalProxy(sourceUrl: string): Promise<string> {
@@ -342,8 +350,8 @@ export class NativeImageProvider implements ImageProvider {
 	}
 
 	/**
-	 * Source-aware byte resolution, in order: relative engine path (`/api/…`) →
-	 * `suwayomi_image`; absolute MangaDex host → `fetch_image`; everything else →
+	 * Source-aware resolution, in order: tagged engine path (`engine:/api/…`) → an
+	 * address the web view loads by itself (`engineUrl`); absolute MangaDex host → `fetch_image`; everything else →
 	 * local proxy. Empty input → empty string (reader renders a placeholder).
 	 */
 	/** `sourceUrl` as a loadable URL on the chosen server, or null when it is not one. */
@@ -357,9 +365,13 @@ export class NativeImageProvider implements ImageProvider {
 
 	private async resolve(sourceUrl: string): Promise<string> {
 		if (!sourceUrl) return '';
+		// Before the chosen-server check: an engine path is relative too, and must not be
+		// resolved against the server.
+		if (this.isEnginePath(sourceUrl)) {
+			return this.engineUrl(sourceUrl.slice(ENGINE_URL_PREFIX.length));
+		}
 		const direct = this.onChosenServer(sourceUrl);
 		if (direct) return direct;
-		if (this.isEnginePath(sourceUrl)) return this.engineToBlobUrl(sourceUrl);
 		// Covers/avatars cached on the hosted API origin: fetch the absolute URL
 		// (relative `/covers/…` resolved against apiOrigin) via the generic path.
 		if (OWN_ASSET_PREFIXES.some((p) => sourceUrl.startsWith(p))) {

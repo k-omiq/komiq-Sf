@@ -71,7 +71,7 @@
 
 <div class="bell-wrap">
 	<button
-		class="icon-btn"
+		class="icon-btn k-hit"
 		class:on={open}
 		aria-label={unread > 0 ? `Notifications, ${unread} unread` : 'Notifications'}
 		aria-haspopup="menu"
@@ -166,21 +166,30 @@
 		text-align: center;
 		box-shadow: 0 0 0 2px var(--k-bg, #0c0c0d);
 	}
+	/* Viewport units, not `inset: 0`: this lives inside the app header, whose
+	   backdrop-filter makes the header the containing block of fixed children. */
 	.backdrop {
 		position: fixed;
-		inset: 0;
+		top: 0;
+		left: 0;
+		width: 100vw;
+		height: 100vh;
+		height: 100dvh;
 		z-index: 60;
 		border: none;
 		background: transparent;
 		cursor: default;
 	}
+	/* Phone: the bell is not at the screen edge, so a panel hung off it ran off the
+	   left side. It is pinned under the header across the page gutters instead (fixed
+	   to the header box, see .backdrop). Wider screens hang it off the bell. */
 	.panel {
-		position: absolute;
+		position: fixed;
 		z-index: 61;
-		top: calc(100% + 10px);
-		right: 0;
-		width: min(360px, calc(100vw - 32px));
-		max-height: 460px;
+		top: calc(var(--k-header-h) + 6px);
+		left: var(--k-gutter);
+		right: var(--k-gutter);
+		max-height: min(460px, calc(100dvh - var(--k-header-h) - 96px));
 		overflow-y: auto;
 		background: var(--k-surface-3, var(--k-surface));
 		border: 1px solid var(--k-border-3);
@@ -285,5 +294,15 @@
 		border-radius: 50%;
 		background: var(--k-primary);
 		margin-top: 6px;
+	}
+	@media (min-width: 641px) {
+		.panel {
+			position: absolute;
+			top: calc(100% + 10px);
+			left: auto;
+			right: 0;
+			width: min(360px, calc(100vw - 32px));
+			max-height: 460px;
+		}
 	}
 </style>

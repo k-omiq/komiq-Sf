@@ -153,7 +153,7 @@
 						of their own, with their chapters.
 					</p>
 				</div>
-				<button class="icon-btn" onclick={close} disabled={splitting} aria-label="Close">
+				<button class="icon-btn k-hit" onclick={close} disabled={splitting} aria-label="Close">
 					<Icon name="x" size={18} />
 				</button>
 			</header>
@@ -257,14 +257,14 @@
 			<footer>
 				<span class="count">{picked.length} selected</span>
 				{#if confirming}
-					<button class="ghost" onclick={() => (confirming = false)} disabled={splitting}>
+					<button class="ghost k-hit" onclick={() => (confirming = false)} disabled={splitting}>
 						Back
 					</button>
 					<button class="danger" onclick={run} disabled={splitting || !canSplit}>
 						{splitting ? 'Splitting…' : `Split off ${picked.length}`}
 					</button>
 				{:else}
-					<button class="ghost" onclick={close}>Cancel</button>
+					<button class="ghost k-hit" onclick={close}>Cancel</button>
 					<button class="primary" onclick={() => (confirming = true)} disabled={!canSplit}>
 						Review split
 					</button>

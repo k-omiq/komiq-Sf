@@ -14,10 +14,11 @@
  *      rebuilt — ascending by number, unnumbered chapters (oneshots/extras) last — and
  *      prev/next move to the adjacent DISTINCT number.
  *
- *   2. WHICH COPY of the adjacent number. The one from the SAME scanlation group as the
- *      open copy when there is one (reading a group's run should keep reading that group),
- *      otherwise the caller's default copy — exactly what the reader opened before copies
- *      were visible at all.
+ *   2. WHICH COPY of the adjacent number. First the SOURCE: the series' default source
+ *      when it carries the number, otherwise another source for that one chapter (the
+ *      caller ranks sources with `tier`). Then, among that source's copies, the one from
+ *      the SAME scanlation group as the open copy when there is one (reading a group's run
+ *      should keep reading that group), otherwise the caller's default copy.
  *
  * Dependency-free (no backend, no Svelte) so it is unit-testable on its own, like
  * `chapter-owner.ts`; `source.ts` owns the I/O around it.
@@ -105,45 +106,48 @@ function sameGroup(a: string | null | undefined, b: string | null | undefined): 
 }
 
 /**
- * The previous and next chapter NUMBER around `target`, each resolved to one copy.
+ * The reading order around `target` — ONE copy per chapter number — and the previous and
+ * next number in it.
  *
- * `pool` is every copy the reader can open from the ACTIVE source (it may hold several per
- * number, in any order). `isDefault` marks the caller's default copy of a number (for the
- * MangaDex spine: the copy `canonicalChapters` chose; for a Suwayomi source: the copies in
- * its own list). Per adjacent number the pick is: same group as `target` → a default copy
- * → the first copy.
+ * `pool` is every copy the reader can open (several per number, from several sources, in
+ * any order). Per number the pick is, in this order:
  *
- * `target` need not be in `pool` (a non-default copy opened by id); its number is located
- * by value.
+ *   1. the lowest `tier` present — the caller's source ranking, lower wins. The reader
+ *      passes 0 for the series' default source, so a chapter is read from another source
+ *      only when the default one lacks that number, and the chapter after it goes back;
+ *   2. among those: same group as `target` → a default copy → the first copy. `isDefault`
+ *      marks the caller's default copy of a number (for the MangaDex spine: the copy
+ *      `canonicalChapters` chose; for a Suwayomi source: the copies in its own list).
+ *
+ * The open number is always represented by `target` itself. `target` need not be in
+ * `pool` (a non-default copy opened by id); its number is located by value.
  */
 export function adjacentChapters<C extends VersionedChapter>(
 	pool: readonly C[],
 	target: C,
 	isDefault: (c: C) => boolean = () => true,
-): { prev?: C; next?: C } {
+	tier: (c: C) => number = () => 0,
+): { prev?: C; next?: C; order: C[] } {
 	const asc = sortChaptersAsc(pool.some((c) => c.id === target.id) ? pool : [...pool, target]);
-	// Distinct numbers, in reading order, each with its copies.
-	const slots: C[][] = [];
-	const index = new Map<string, number>();
+	// Distinct numbers, in reading order (a Map keeps insertion order), each with its copies.
+	const slots = new Map<string, C[]>();
 	for (const c of asc) {
 		const key = slotKey(c);
-		const at = index.get(key);
-		if (at === undefined) {
-			index.set(key, slots.length);
-			slots.push([c]);
-		} else {
-			slots[at].push(c);
-		}
+		const slot = slots.get(key);
+		if (slot) slot.push(c);
+		else slots.set(key, [c]);
 	}
-	const here = index.get(slotKey(target));
-	if (here === undefined) return {};
-	const pick = (slot: C[] | undefined): C | undefined => {
-		if (!slot?.length) return undefined;
+	const order = [...slots.values()].map((slot) => {
+		const open = slot.find((c) => c.id === target.id);
+		if (open) return open;
+		const best = Math.min(...slot.map(tier));
+		const top = slot.filter((c) => tier(c) === best);
 		return (
-			slot.find((c) => sameGroup(c.scanlator, target.scanlator)) ??
-			slot.find((c) => isDefault(c)) ??
-			slot[0]
+			top.find((c) => sameGroup(c.scanlator, target.scanlator)) ??
+			top.find((c) => isDefault(c)) ??
+			top[0]
 		);
-	};
-	return { prev: pick(slots[here - 1]), next: pick(slots[here + 1]) };
+	});
+	const here = order.findIndex((c) => c.id === target.id);
+	return { prev: order[here - 1], next: order[here + 1], order };
 }

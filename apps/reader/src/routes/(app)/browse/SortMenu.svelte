@@ -140,7 +140,7 @@
 		<button
 			bind:this={button}
 			type="button"
-			class="menu-btn"
+			class="menu-btn k-hit"
 			aria-haspopup="listbox"
 			aria-expanded={open}
 			aria-controls="{uid}-list"
@@ -191,7 +191,7 @@
 	{#if dirApplies(value)}
 		<button
 			type="button"
-			class="dir-btn"
+			class="dir-btn k-hit"
 			onclick={ontoggledir}
 			aria-label="Order: {dirLabel(value, dir)}. Switch to {dirLabel(
 				value,
@@ -317,6 +317,11 @@
 			width: 36px;
 			padding: 0;
 			justify-content: center;
+		}
+	}
+	@media (pointer: coarse) {
+		.menu li {
+			min-height: 44px;
 		}
 	}
 </style>

@@ -44,6 +44,7 @@ async fn fixture() -> (AppState, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) 
         admin_users: vec![],
         scan_health: Mutex::new(ScanHealth::default()),
         auth_limiter: RateLimiter::new(100, 60),
+        comment_limiter: comment_limiter(),
         password_work: Arc::new(tokio::sync::Semaphore::new(4)),
         federated_limiter: RateLimiter::new(100, 60),
         session_ttl_secs: 3600,

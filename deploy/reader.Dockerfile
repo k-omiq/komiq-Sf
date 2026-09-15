@@ -39,14 +39,12 @@ ARG PUBLIC_KOMIKA_IMG_WORKER=http://localhost:8787
 # here is a HARD BUILD ERROR (a missing export), not a silent default — every var
 # config.ts imports must be declared in this block.
 ARG PUBLIC_SUWAYOMI_URL=http://localhost:4567
-ARG PUBLIC_KOMIKA_NATIVE_ENGINE=off
 ENV PUBLIC_KOMIKA_BACKEND=$PUBLIC_KOMIKA_BACKEND \
     PUBLIC_KOMIKA_BACKEND_KIND=$PUBLIC_KOMIKA_BACKEND_KIND \
     PUBLIC_KOMIKA_API=$PUBLIC_KOMIKA_API \
     PUBLIC_KOMIKA_IMG_MODE=$PUBLIC_KOMIKA_IMG_MODE \
     PUBLIC_KOMIKA_IMG_WORKER=$PUBLIC_KOMIKA_IMG_WORKER \
-    PUBLIC_SUWAYOMI_URL=$PUBLIC_SUWAYOMI_URL \
-    PUBLIC_KOMIKA_NATIVE_ENGINE=$PUBLIC_KOMIKA_NATIVE_ENGINE
+    PUBLIC_SUWAYOMI_URL=$PUBLIC_SUWAYOMI_URL
 
 # Force the static SPA target (adapter-static → apps/reader/build). Without this,
 # the default build targets Cloudflare and would not emit `build/`.

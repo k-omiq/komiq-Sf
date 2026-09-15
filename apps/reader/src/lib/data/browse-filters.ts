@@ -27,6 +27,7 @@ import type {
 	BrowseFilter,
 	BrowseSort,
 	BrowseSortField,
+	BrowseSource,
 	ContentRating,
 	ContentRatingFilter,
 	Demographic,
@@ -52,6 +53,7 @@ export const SORT_FIELDS: readonly BrowseSortField[] = [
 	'MOST_VIEWED',
 	'MOST_FOLLOWS',
 	'HIGHEST_RATED',
+	'READER_RATED',
 	'MOST_CHAPTERS',
 	'TITLE',
 	'YEAR',
@@ -62,7 +64,8 @@ export const SORT_LABEL: Record<BrowseSortField, string> = {
 	RECENTLY_ADDED: 'Recently added',
 	MOST_VIEWED: 'Most viewed',
 	MOST_FOLLOWS: 'Most follows',
-	HIGHEST_RATED: 'Highest rated',
+	HIGHEST_RATED: 'MangaDex rating',
+	READER_RATED: 'Reader rating',
 	MOST_CHAPTERS: 'Most chapters',
 	TITLE: 'Title A–Z',
 	YEAR: 'Year',
@@ -76,6 +79,7 @@ const SORT_TOKEN: Record<BrowseSortField, string> = {
 	MOST_VIEWED: 'views',
 	MOST_FOLLOWS: 'follows',
 	HIGHEST_RATED: 'rating',
+	READER_RATED: 'reader-rating',
 	MOST_CHAPTERS: 'chapters',
 	TITLE: 'title',
 	YEAR: 'year',
@@ -186,6 +190,18 @@ const TAG_ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const TAG_ID_MAX = 64;
 /** `ja`, `zh-hk`, `pt-br`, `es-la` — ISO-ish, lowercase, as MangaDex reports them. */
 const LANG_RE = /^[a-z]{2,3}(?:-[a-z0-9]{2,8})?$/;
+/**
+ * A `BrowseSource.id` as the server accepts it. The server turns anything else into a
+ * source no row has, so such a value is dropped here rather than sent as a filter that
+ * could only empty the grid.
+ */
+const SOURCE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+/**
+ * The two ids the server reads in ANY case: the MangaDex mirror, and every extension
+ * source at once. Folded to lower case so one result set keeps one URL. Every other id
+ * is one source's own id, which is matched exactly and must keep its spelling.
+ */
+const SOURCE_FAMILIES: readonly string[] = ['mangadex', 'suwayomi'];
 
 // ---- the state ---------------------------------------------------------------
 
@@ -207,6 +223,9 @@ export interface BrowseState {
 	demographics: Demographic[];
 	contentRatings: ContentRating[];
 	languages: string[];
+	/** A `BrowseSource.id`, or `null` for every source. ONE value, not a list: the wire
+	 *  filter takes a single source. */
+	source: string | null;
 	yearFrom: number | null;
 	yearTo: number | null;
 	minChapters: number | null;
@@ -233,6 +252,7 @@ export function emptyState(): BrowseState {
 		demographics: [],
 		contentRatings: [],
 		languages: [],
+		source: null,
 		yearFrom: null,
 		yearTo: null,
 		minChapters: null,
@@ -319,6 +339,14 @@ export function isTagId(id: string): boolean {
 	return id.length <= TAG_ID_MAX && TAG_ID_RE.test(id);
 }
 
+/** A source id in its one canonical spelling, or null when the server could not match it. */
+function canonSource(raw: string | null | undefined): string | null {
+	const id = (raw ?? '').trim();
+	if (!SOURCE_ID_RE.test(id)) return null;
+	const lower = id.toLowerCase();
+	return SOURCE_FAMILIES.includes(lower) ? lower : id;
+}
+
 /**
  * Bring any state into canonical form: bounded, deduped, ordered, defaults as null.
  * Idempotent; every mutator and both URL directions go through it, so two states that
@@ -371,6 +399,7 @@ export function normalize(s: BrowseState): BrowseState {
 		languages: uniq(s.languages.map((l) => l.toLowerCase()).filter((l) => LANG_RE.test(l)))
 			.sort()
 			.slice(0, MAX_LANGUAGES),
+		source: canonSource(s.source),
 		yearFrom,
 		yearTo,
 		minChapters,
@@ -398,6 +427,7 @@ export const BROWSE_PARAMS = [
 	'demo',
 	'content',
 	'lang',
+	'source',
 	'from',
 	'to',
 	'minch',
@@ -507,6 +537,9 @@ export function parseBrowseUrl(sp: URLSearchParams): BrowseState {
 		demographics: pickEnum(many(sp, 'demo'), DEMOGRAPHICS),
 		contentRatings,
 		languages: many(sp, 'lang'),
+		// Single-valued: a repeated `source=` keeps the first. `normalize` trims it and
+		// drops anything that is not a well-formed id.
+		source: sp.get('source'),
 		yearFrom: num(sp.get('from')),
 		yearTo: num(sp.get('to')),
 		minChapters: num(sp.get('minch')),
@@ -539,6 +572,7 @@ export function toSearchParams(state: BrowseState): URLSearchParams {
 	for (const v of s.demographics) sp.append('demo', v.toLowerCase());
 	for (const v of s.contentRatings) sp.append('content', v.toLowerCase());
 	for (const v of s.languages) sp.append('lang', v);
+	if (s.source) sp.set('source', s.source);
 	if (s.yearFrom != null) sp.set('from', String(s.yearFrom));
 	if (s.yearTo != null) sp.set('to', String(s.yearTo));
 	if (s.minChapters != null) sp.set('minch', String(s.minChapters));
@@ -654,6 +688,7 @@ export function toFilterInput(state: BrowseState): BrowseFilter {
 	if (s.demographics.length) f.demographics = s.demographics;
 	if (s.contentRatings.length) f.contentRatings = s.contentRatings;
 	if (s.languages.length) f.originalLanguages = s.languages;
+	if (s.source) f.source = s.source;
 	if (s.yearFrom != null) f.yearFrom = s.yearFrom;
 	if (s.yearTo != null) f.yearTo = s.yearTo;
 	if (s.minChapters != null) f.minChapters = s.minChapters;
@@ -669,7 +704,8 @@ const LEGACY_SORT: Partial<Record<BrowseSortField, BrowseSort>> = {
 	LATEST_UPDATE: 'NEWEST',
 	RECENTLY_ADDED: 'LATEST_ADDED',
 	MOST_VIEWED: 'TRENDING',
-	HIGHEST_RATED: 'RATING',
+	// The legacy RATING is the readers' review average, not MangaDex's rating.
+	READER_RATED: 'RATING',
 	MOST_CHAPTERS: 'CHAPTERS',
 };
 const RATING_LADDER: readonly ContentRating[] = CONTENT_RATINGS;
@@ -732,6 +768,8 @@ export function legacyUnapplied(state: BrowseState): string[] {
 	if (s.contentRatings.length && (q || !legacyContentRating(s.contentRatings)))
 		out.push('Content rating');
 	if (s.languages.length) out.push('Original language');
+	// No legacy argument names a source at all, with or without a query.
+	if (s.source) out.push('Source');
 	if (s.yearFrom != null || s.yearTo != null) out.push('Year');
 	if (s.minChapters != null) out.push('Min chapters');
 	if (s.minRating != null) out.push('Min rating');
@@ -820,6 +858,7 @@ export function toggleIn<K extends ListKey>(
 type ScalarKey =
 	| 'inclMode'
 	| 'exclMode'
+	| 'source'
 	| 'yearFrom'
 	| 'yearTo'
 	| 'minChapters'
@@ -833,6 +872,17 @@ export function withField<K extends ScalarKey>(
 	value: BrowseState[K],
 ): BrowseState {
 	return normalize({ ...s, [key]: value, page: 1 });
+}
+
+/**
+ * One tap on a source: pick it, or clear the filter when it is already the one picked.
+ * The facet is single-select, so a second tap is its only way back to "every source".
+ */
+export function toggleSource(s: BrowseState, id: string): BrowseState {
+	const next = canonSource(id);
+	// Not an id at all: leave the state alone rather than read it as "clear".
+	if (!next) return s;
+	return withField(s, 'source', s.source === next ? null : next);
 }
 
 /** Every FILTER back to default; the query and the chosen sort survive — "clear
@@ -881,10 +931,15 @@ const fmtInt = (n: number) => n.toLocaleString('en-US');
  * The active-filter chip row, in panel order. Sort and query are NOT chips — they have
  * their own controls in the header — and neither are the tag MODES on their own (they
  * qualify the tag chips; "Clear all" resets them).
+ *
+ * `sourceNames` maps a source id to its display name ({@link sourceLabels}). Optional:
+ * the callers that only count or compare chips have no use for it, and without it (or
+ * for a source the list does not have) the chip reads "Source".
  */
 export function activeChips(
 	state: BrowseState,
 	names: (id: string) => string | undefined,
+	sourceNames?: (id: string) => string | undefined,
 ): FilterChip[] {
 	const s = normalize(state);
 	const chips: FilterChip[] = [];
@@ -932,6 +987,18 @@ export function activeChips(
 		const label = languageLabel(v);
 		push(`lang:${v}`, label, 'neutral', `Remove original language ${label}`, () =>
 			toggleIn(s, 'languages', v),
+		);
+	}
+	if (s.source) {
+		// The id is in the KEY, so two different sources are two different chips even
+		// where neither has a name — `draftChanges` compares chips with no names at all.
+		const name = sourceNames?.(s.source);
+		push(
+			`source:${s.source}`,
+			name || 'Source',
+			'neutral',
+			name ? `Remove source ${name}` : 'Remove source filter',
+			() => withField(s, 'source', null),
 		);
 	}
 	if (s.yearFrom != null || s.yearTo != null) {
@@ -1024,13 +1091,58 @@ export function tagsFromGenreFacets(
 	return out;
 }
 
+// ---- sources -----------------------------------------------------------------------
+
+export interface SourceOption {
+	/** A {@link BrowseState.source} value. */
+	value: string;
+	label: string;
+	/** Works the viewer would get by picking it. */
+	count: number;
+}
+
+/**
+ * The Source facet's options, in the order the server sent them (biggest first).
+ *
+ * The label is the source's name. Several sources can share one (an extension can serve
+ * each language as its own source, and its name can match the mirror's), so where a name
+ * repeats, each source that has a language carries it: `MangaDex` and `MangaDex · ALL`.
+ *
+ * An id the URL could not carry is dropped, since picking it would be a tap that does
+ * nothing, and so is a repeated id (the panel keys its rows on it).
+ */
+export function sourceOptions(sources: readonly BrowseSource[]): SourceOption[] {
+	const seen = new Set<string>();
+	const rows: { id: string; name: string; lang: string | null; count: number }[] = [];
+	for (const src of sources) {
+		const id = canonSource(src.id);
+		if (!id || seen.has(id)) continue;
+		seen.add(id);
+		// Never a blank row: the server falls back to the id itself, and so does this.
+		rows.push({ id, name: src.name.trim() || id, lang: src.lang, count: src.count });
+	}
+	const uses = new Map<string, number>();
+	for (const r of rows) uses.set(r.name, (uses.get(r.name) ?? 0) + 1);
+	return rows.map((r) => ({
+		value: r.id,
+		label: (uses.get(r.name) ?? 0) > 1 && r.lang ? `${r.name} · ${r.lang.toUpperCase()}` : r.name,
+		count: r.count,
+	}));
+}
+
+/** Source id → label ({@link sourceOptions}), for the active-filter chip. */
+export function sourceLabels(sources: readonly BrowseSource[]): Map<string, string> {
+	return new Map(sourceOptions(sources).map((o) => [o.value, o.label]));
+}
+
 // ---- federated rows --------------------------------------------------------------
 
 /**
  * Client-side filtering for the FEDERATED (external sources) rows, which come from live
  * extension searches that take no filter arguments. Only the facets those rows actually
- * carry can be honoured — tags by name, format, status; everything else is reported by
- * the page as not applying rather than pretended.
+ * carry can be honoured — tags by name, format, status; everything else (the catalogue
+ * `source` included: these rows are not catalogue rows) is reported by the page as not
+ * applying rather than pretended.
  */
 export function matchesFederated(
 	row: { genres: readonly string[]; type: string; status: string },

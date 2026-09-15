@@ -1,5 +1,5 @@
 import type { Chapter, Id, Page, Series, SeriesStatus, ComicType } from '@komika/types';
-import type { ContentBackend, SourceRef } from './content-backend.js';
+import { ENGINE_URL_PREFIX, type ContentBackend, type SourceRef } from './content-backend.js';
 import { isTauri } from './platform.js';
 import { suwayomiChapterLabel } from './chapter-label';
 
@@ -22,6 +22,23 @@ const MANGADEX_PKG = 'eu.kanade.tachiyomi.extension.all.mangadex';
  */
 const KEIYOUSHI_REPO = 'https://github.com/keiyoushi/extensions/raw/repo/index.pb';
 
+/** An extension the server asked this device to install. */
+export interface ExtensionInstallAsk {
+	pkgName: string;
+	/** The store to add and install from. Absent: a store the engine already has. */
+	repoUrl?: string;
+}
+
+export interface LocalSuwayomiOptions {
+	/**
+	 * Asked before the engine installs an extension the SERVER named (every install
+	 * but the built-in MangaDex one). An extension is code that runs on this device,
+	 * so the person decides, not the server. False, a throw or no callback refuses the
+	 * install; the content call then throws and the composite reads from the server.
+	 */
+	confirmInstall?: (ask: ExtensionInstallAsk) => Promise<boolean>;
+}
+
 /**
  * The minimal structural view of a hosted `WorkSource` that {@link LocalSuwayomiBackend.refFor}
  * consumes — only the fields it reads. Declared locally (rather than importing the full
@@ -33,7 +50,8 @@ export interface WorkSourceLike {
 	sourceType: string;
 	/** Engine source id for a suwayomi source; the literal `"mangadex"` for a MangaDex work. */
 	sourceId: string;
-	/** Source-local manga key (= `MangaType.url`); the bare MangaDex uuid for a MangaDex work. */
+	/** The bare MangaDex uuid for a MangaDex work; for a suwayomi source, the manga's row id
+	 *  in the SERVER's engine (which is why {@link LocalSuwayomiBackend.refFor} skips those). */
 	sourceKey: string;
 	/** Preferred language of this mapping (e.g. `en`); selects the MangaDex `SourceType`. */
 	lang?: string | null;
@@ -58,12 +76,38 @@ export interface WorkSourceLike {
  * Tauri) and on the Wave C content-routing branches being wired.
  */
 export class LocalSuwayomiBackend implements ContentBackend {
+	private readonly confirmInstall?: LocalSuwayomiOptions['confirmInstall'];
+
 	/**
-	 * Cache of resolved `sourceKey` (= `MangaType.url`) → internal engine `id`. Ids are
-	 * stable within a single engine datadir, so once resolved a key never needs the
-	 * browse/search round-trip again for the lifetime of this instance.
+	 * Cache of resolved `(sourceId, sourceKey)` → internal engine `id`. Ids are stable
+	 * within a single engine datadir, so once resolved a key never needs the
+	 * browse/search round-trip again for the lifetime of this instance. Keyed on the
+	 * pair: two sources routinely use the same url shape (`/manga/123`).
 	 */
 	private readonly idCache = new Map<string, number>();
+
+	/**
+	 * Whether this app build has an engine at all (`engine_supported`), asked once. Where
+	 * it has none — phones, today — {@link isReady} answers false without a round trip
+	 * per content call.
+	 */
+	private readonly supported: Promise<boolean>;
+
+	constructor(opts: LocalSuwayomiOptions = {}) {
+		this.confirmInstall = opts.confirmInstall;
+		// The engine boots on demand (the app does not start a JVM nobody asked for), so
+		// ask for it as soon as this backend exists. Idempotent on the Rust side. Any
+		// failure just leaves the engine not-ready and content stays on the server.
+		this.supported = isTauri()
+			? import('@tauri-apps/api/core')
+					.then(async ({ invoke }) => {
+						const supported = await invoke<boolean>('engine_supported');
+						if (supported) await invoke('suwayomi_start');
+						return supported;
+					})
+					.catch(() => false)
+			: Promise.resolve(false);
+	}
 
 	/**
 	 * Extension package ids known to be installed this session, so `ensureProvisioned`
@@ -110,11 +154,11 @@ export class LocalSuwayomiBackend implements ContentBackend {
 	 * Queries the `suwayomi_status` Tauri command and returns true iff the engine
 	 * reports `state === "ready"`; any other state (`starting` / `degraded` /
 	 * `stopped`) yields false. Never throws: on the web target `@tauri-apps/api` is
-	 * absent, so we short-circuit via {@link isTauri} before importing it, and any
+	 * absent, so {@link supported} is false there without importing it, and any
 	 * failure of the invoke (engine not up, command missing) is swallowed as false.
 	 */
 	async isReady(): Promise<boolean> {
-		if (!isTauri()) return false;
+		if (!(await this.supported)) return false;
 		try {
 			const { invoke } = await import('@tauri-apps/api/core');
 			const status = await invoke<{ state?: string }>('suwayomi_status');
@@ -151,20 +195,45 @@ export class LocalSuwayomiBackend implements ContentBackend {
 		const d = await this.gql<{ fetchChapterPages: { pages: string[] } }>(FETCH_PAGES, {
 			id: Number(chapterId),
 		});
-		// No base-URL rewrite here: the engine is reached over IPC, not an HTTP base
-		// URL, so page URLs (relative Suwayomi proxy paths like
-		// `/api/v1/manga/3/chapter/1/page/0`) are passed through unchanged. The
-		// NativeImageProvider / local proxy resolves them against the engine base URL.
-		return (d.fetchChapterPages?.pages ?? []).map((url, index) => ({ index, sourceUrl: url }));
+		// The engine is reached over IPC, not an HTTP base URL, so its page URLs are
+		// relative proxy paths (`/api/v1/manga/3/chapter/1/page/0`). They are tagged
+		// rather than passed through bare: a relative path is also what a connected
+		// server hands out, and the two must never be confused.
+		return (d.fetchChapterPages?.pages ?? []).map((url, index) => ({
+			index,
+			sourceUrl: ENGINE_URL_PREFIX + url,
+		}));
+	}
+
+	/**
+	 * Find the engine's id for the chapter the source calls `chapterUrl`. Cheapest first:
+	 * the engine's own database (a chapter list fetched earlier, this session or a past
+	 * one), and only on a miss one chapter-list request to the source — which is also
+	 * how a chapter published after the last fetch gets picked up.
+	 */
+	async resolveChapter(ref: SourceRef, chapterUrl: string): Promise<Id | null> {
+		await this.ensureProvisioned(ref);
+		const mangaId = await this.resolveMangaId(ref);
+		if (mangaId == null)
+			throw new Error(`Suwayomi: cannot resolve ${ref.sourceId}/${ref.sourceKey}`);
+		const known = await this.gql<{ chapters: { nodes: { id: number }[] } }>(CHAPTER_BY_URL, {
+			mid: mangaId,
+			url: chapterUrl,
+		}).catch(() => null);
+		const hit = known?.chapters.nodes[0];
+		if (hit) return String(hit.id);
+		const d = await this.gql<{
+			fetchMangaAndChapters: { chapters: { id: number; url: string }[] };
+		}>(FETCH_CHAPTER_URLS, { id: mangaId });
+		const match = d.fetchMangaAndChapters?.chapters?.find((c) => c.url === chapterUrl);
+		return match ? String(match.id) : null;
 	}
 
 	/**
 	 * Map a hosted {@link WorkSourceLike} to the engine {@link SourceRef} the content
 	 * methods consume, or null when the mapping can't be resolved on-device.
 	 *
-	 * Two cases, per Komika's two-tier source strategy:
-	 *   - **suwayomi source** — straight passthrough: the engine source id and key
-	 *     already match, and the extension coords ride along from `ws.extension`.
+	 * Only a MangaDex mapping resolves here:
 	 *   - **mangadex source** — the client supplies the MangaDex provisioning coords
 	 *     ({@link MANGADEX_PKG} / {@link KEIYOUSHI_REPO}) because `ws.extension` is null
 	 *     for MangaDex works. The engine source id is resolved DYNAMICALLY from the
@@ -177,15 +246,10 @@ export class LocalSuwayomiBackend implements ContentBackend {
 	 * composite's catch.
 	 */
 	async refFor(ws: WorkSourceLike, title?: string): Promise<SourceRef | null> {
-		if (ws.sourceType === 'suwayomi') {
-			return {
-				sourceId: ws.sourceId,
-				sourceKey: ws.sourceKey,
-				pkgName: ws.extension?.pkgName,
-				repoUrl: ws.extension?.repoUrl,
-				title,
-			};
-		}
+		// A suwayomi mapping cannot be resolved from here: its `sourceKey` is the manga's row
+		// id in the SERVER's engine, not the source's own key, and this engine has no way to
+		// look that up. Those chapters are read on-device through `resolveChapter`, which is
+		// handed the source's own keys.
 		if (ws.sourceType === 'mangadex') {
 			// Install MangaDex before the `sources` query — the SourceType only exists
 			// once the extension is present. A provisioning failure is swallowed here so
@@ -237,7 +301,8 @@ export class LocalSuwayomiBackend implements ContentBackend {
 	 * The resolved id is memoised for the instance lifetime.
 	 */
 	async resolveMangaId(ref: SourceRef): Promise<number | null> {
-		const cached = this.idCache.get(ref.sourceKey);
+		const cacheKey = `${ref.sourceId}\n${ref.sourceKey}`;
+		const cached = this.idCache.get(cacheKey);
 		if (cached != null) return cached;
 
 		// 1. Fast path: already persisted.
@@ -246,21 +311,21 @@ export class LocalSuwayomiBackend implements ContentBackend {
 			{ sid: ref.sourceId, url: ref.sourceKey },
 		).catch(() => null);
 		if (found && found.mangas.totalCount >= 1 && found.mangas.nodes[0]) {
-			return this.cacheId(ref.sourceKey, found.mangas.nodes[0].id);
+			return this.cacheId(cacheKey, found.mangas.nodes[0].id);
 		}
 
 		// 2. MangaDex resolve+persist by uuid handle.
 		const uuid = ref.sourceKey.match(/\/manga\/([0-9a-f-]{36})/i)?.[1];
 		if (uuid) {
 			const id = await this.searchForKey(ref, `id:${uuid}`, ref.sourceKey);
-			if (id != null) return this.cacheId(ref.sourceKey, id);
+			if (id != null) return this.cacheId(cacheKey, id);
 		}
 
 		// 3. General fallback: title search, match by url. The `id:` handle above is
 		//    MangaDex-specific, so this covers other sources (and MangaDex misses).
 		if (ref.title) {
 			const id = await this.searchForKey(ref, ref.title, ref.sourceKey);
-			if (id != null) return this.cacheId(ref.sourceKey, id);
+			if (id != null) return this.cacheId(cacheKey, id);
 		}
 
 		return null;
@@ -335,6 +400,13 @@ export class LocalSuwayomiBackend implements ContentBackend {
 			pkg,
 		}).catch(() => null);
 		if (state?.extension?.isInstalled) return;
+
+		// An extension is code that runs on this device, and the package and its store
+		// are named by the server. Only the app's own pair installs without a question.
+		const builtIn = pkg === MANGADEX_PKG && repoUrl === KEIYOUSHI_REPO;
+		if (!builtIn && !(await this.confirmInstall?.({ pkgName: pkg, repoUrl }))) {
+			throw new Error(`Suwayomi: installing ${pkg} was not allowed`);
+		}
 
 		// Register the store (idempotent — adding an existing store is fine; tolerate errors).
 		if (repoUrl) {
@@ -441,6 +513,29 @@ const FETCH_CHAPTERS = /* GraphQL */ `
 		fetchMangaAndChapters(input: { id: $id, fetchManga: false, fetchChapters: true }) {
 			chapters {
 				...ChapterFields
+			}
+		}
+	}
+`;
+
+// A chapter already in the engine's database, by the source's own key for it.
+const CHAPTER_BY_URL = /* GraphQL */ `
+	query ChapterByUrl($mid: Int!, $url: String!) {
+		chapters(condition: { mangaId: $mid, url: $url }) {
+			nodes {
+				id
+			}
+		}
+	}
+`;
+
+// The chapter list from the source, reduced to what matching by key needs.
+const FETCH_CHAPTER_URLS = /* GraphQL */ `
+	mutation FetchChapterUrls($id: Int!) {
+		fetchMangaAndChapters(input: { id: $id, fetchManga: false, fetchChapters: true }) {
+			chapters {
+				id
+				url
 			}
 		}
 	}
@@ -652,6 +747,6 @@ function mapChapter(c: SuwayomiChapter): Chapter {
 	};
 }
 
-export function createLocalSuwayomiBackend(): ContentBackend {
-	return new LocalSuwayomiBackend();
+export function createLocalSuwayomiBackend(opts: LocalSuwayomiOptions = {}): ContentBackend {
+	return new LocalSuwayomiBackend(opts);
 }

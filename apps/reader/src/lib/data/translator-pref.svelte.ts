@@ -47,3 +47,9 @@ export function setPreferredTranslator(workId: string, key: string): void {
 	translatorPrefs.map = { ...translatorPrefs.map, [workId]: key };
 	save(translatorPrefs.map);
 }
+
+/** Forget every chosen translator on this device: each series goes back to its default. */
+export function clearPreferredTranslators(): void {
+	translatorPrefs.map = {};
+	save(translatorPrefs.map);
+}

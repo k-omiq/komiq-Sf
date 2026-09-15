@@ -154,7 +154,7 @@
 <div class="dd {className}" class:open bind:this={root}>
 	<button
 		type="button"
-		class="dd-trigger"
+		class="dd-trigger k-hit"
 		bind:this={trigger}
 		{disabled}
 		aria-haspopup="listbox"
@@ -349,6 +349,11 @@
 	@media (max-width: 640px) {
 		.dd-prefix {
 			display: none;
+		}
+	}
+	@media (pointer: coarse) {
+		.dd-opt {
+			min-height: 44px;
 		}
 	}
 </style>

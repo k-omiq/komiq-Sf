@@ -78,11 +78,13 @@
 		{#if canRegister}
 			<div class="tabs" role="group" aria-label="Account access">
 				<button
+					class="k-hit"
 					aria-pressed={mode === 'login'}
 					class:active={mode === 'login'}
 					onclick={() => switchMode('login')}>Sign in</button
 				>
 				<button
+					class="k-hit"
 					aria-pressed={mode === 'register'}
 					class:active={mode === 'register'}
 					onclick={() => switchMode('register')}>Create account</button
@@ -151,17 +153,17 @@
 				New here? Ask the owner for an account.
 			{:else if mode === 'login'}
 				New to komiq?
-				<button class="link" onclick={() => switchMode('register')}>Create an account</button>
+				<button class="link k-hit" onclick={() => switchMode('register')}>Create an account</button>
 			{:else}
 				Already have an account?
-				<button class="link" onclick={() => switchMode('login')}>Sign in</button>
+				<button class="link k-hit" onclick={() => switchMode('login')}>Sign in</button>
 			{/if}
 		</p>
 
 		{#if canChooseServer}
 			<p class="server">
 				<span class="server-host" title={serverHost}>{serverHost}</span>
-				<button class="link" type="button" onclick={() => (connectScreen.open = true)}
+				<button class="link k-hit" type="button" onclick={() => (connectScreen.open = true)}
 					>Change server</button
 				>
 			</p>
@@ -170,12 +172,20 @@
 </div>
 
 <style>
+	/* Short phones (568px tall) get a tight top gap so the submit button is on screen
+	   above the tab bar; taller screens open it up. */
 	.wrap {
 		min-height: calc(100vh - var(--k-header-h));
+		min-height: calc(100dvh - var(--k-header-h));
 		display: flex;
 		align-items: flex-start;
 		justify-content: center;
-		padding: var(--k-space-14) var(--k-space-4) var(--k-space-10);
+		padding: var(--k-space-4) var(--k-space-4) var(--k-space-10);
+	}
+	@media (min-height: 700px) {
+		.wrap {
+			padding-top: var(--k-space-14);
+		}
 	}
 	.card {
 		width: 100%;

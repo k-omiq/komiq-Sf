@@ -57,34 +57,44 @@ fi
 
 PORT="${SUWA_PORT:-4572}"
 export SUWA_PORT="$PORT"
+# A second, EMPTY engine: "the device" for the self-fetch checks, where the first one
+# plays the server's engine. It has no extension and has never seen the manga.
+DEVICE_PORT="${SUWA_DEVICE_PORT:-$((PORT + 1))}"
+export SUWA_DEVICE_PORT="$DEVICE_PORT"
 
 DATADIR="$(mktemp -d "${TMPDIR:-/tmp}/suwa-harness.XXXXXX")"
-PIDFILE="$OUT/engine.pid"
-ENGINE_LOG="$OUT/engine.log"
+DEVICE_DATADIR="$(mktemp -d "${TMPDIR:-/tmp}/suwa-harness-device.XXXXXX")"
 BUNDLE="$OUT/harness.mjs"
-ENGINE_PID=""
+ENGINE_PIDS=()
 
 cleanup() {
   echo "=== TEARDOWN ==="
-  if [[ -n "$ENGINE_PID" ]] && kill -0 "$ENGINE_PID" 2>/dev/null; then
-    kill "$ENGINE_PID" 2>/dev/null
-    for i in $(seq 1 20); do kill -0 "$ENGINE_PID" 2>/dev/null || break; sleep 0.3; done
-    kill -9 "$ENGINE_PID" 2>/dev/null || true
-  fi
-  # Belt-and-suspenders: nuke any stragglers rooted at OUR datadir only.
+  for pid in "${ENGINE_PIDS[@]:-}"; do
+    [[ -n "$pid" ]] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      for i in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.3; done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
+  # Belt-and-suspenders: nuke any stragglers rooted at OUR datadirs only.
   pkill -f "suwayomi.tachidesk.config.server.rootDir=$DATADIR" 2>/dev/null || true
+  pkill -f "suwayomi.tachidesk.config.server.rootDir=$DEVICE_DATADIR" 2>/dev/null || true
   sleep 0.5
   echo "-- pgrep -fl Suwayomi after teardown --"
   pgrep -fl Suwayomi || echo "(clean: no Suwayomi processes)"
-  rm -rf "$DATADIR" "$PIDFILE"
-  echo "removed datadir $DATADIR"
+  rm -rf "$DATADIR" "$DEVICE_DATADIR"
+  echo "removed datadirs $DATADIR $DEVICE_DATADIR"
 }
 trap cleanup EXIT
 
-echo "=== BOOT === datadir=$DATADIR port=$PORT slug=$SLUG"
-cat > "$DATADIR/server.conf" <<EOF
+# boot_engine <name> <port> <datadir>: start one engine and wait until it answers.
+boot_engine() {
+  local name="$1" port="$2" datadir="$3" log="$OUT/engine-$1.log"
+  echo "=== BOOT $name === datadir=$datadir port=$port slug=$SLUG"
+  cat > "$datadir/server.conf" <<EOF
 server.ip = "127.0.0.1"
-server.port = $PORT
+server.port = $port
 server.webUIEnabled = false
 server.initialOpenInBrowserEnabled = false
 server.systemTrayEnabled = false
@@ -93,28 +103,30 @@ server.localSourcePath = ""
 server.flareSolverrEnabled = false
 EOF
 
-"$JAVA" -Djava.awt.headless=true -Xmx512m \
-  -Dsuwayomi.tachidesk.config.server.rootDir="$DATADIR" \
-  -jar "$JAR" > "$ENGINE_LOG" 2>&1 &
-ENGINE_PID=$!
-echo "$ENGINE_PID" > "$PIDFILE"
-echo "engine pid=$ENGINE_PID (log: $ENGINE_LOG)"
+  "$JAVA" -Djava.awt.headless=true -Xmx512m \
+    -Dsuwayomi.tachidesk.config.server.rootDir="$datadir" \
+    -jar "$JAR" > "$log" 2>&1 &
+  local pid=$!
+  ENGINE_PIDS+=("$pid")
+  echo "engine $name pid=$pid (log: $log)"
 
-# Poll aboutServer until ready (up to ~60s).
-READY=0
-for i in $(seq 1 60); do
-  if ! kill -0 "$ENGINE_PID" 2>/dev/null; then echo "engine died early"; tail -30 "$ENGINE_LOG"; exit 3; fi
-  RESP="$(curl -s -m 3 -X POST "http://127.0.0.1:$PORT/api/graphql" \
-    -H 'content-type: application/json' \
-    --data '{"query":"query{aboutServer{version buildType}}"}' 2>/dev/null)"
-  if echo "$RESP" | grep -q '"version"'; then
-    READY=1
-    echo "engine ready after ${i}s: $RESP"
-    break
-  fi
-  sleep 1
-done
-if [[ "$READY" != "1" ]]; then echo "engine never became ready"; tail -40 "$ENGINE_LOG"; exit 4; fi
+  # Poll aboutServer until ready (up to ~60s).
+  for i in $(seq 1 60); do
+    if ! kill -0 "$pid" 2>/dev/null; then echo "engine $name died early"; tail -30 "$log"; exit 3; fi
+    RESP="$(curl -s -m 3 -X POST "http://127.0.0.1:$port/api/graphql" \
+      -H 'content-type: application/json' \
+      --data '{"query":"query{aboutServer{version buildType}}"}' 2>/dev/null)"
+    if echo "$RESP" | grep -q '"version"'; then
+      echo "engine $name ready after ${i}s: $RESP"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "engine $name never became ready"; tail -40 "$log"; exit 4
+}
+
+boot_engine server "$PORT" "$DATADIR"
+boot_engine device "$DEVICE_PORT" "$DEVICE_DATADIR"
 
 echo "=== BUNDLE === (${ESBUILD[*]})"
 "${ESBUILD[@]}" "$SCRIPT_DIR/harness.entry.ts" \

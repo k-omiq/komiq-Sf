@@ -10,7 +10,7 @@
 //! database; the CSR is a minimal PKCS#10 encoded by hand below (one subject CN plus the
 //! same name as a SAN), which keeps a certificate-builder crate out of the tree.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,8 +35,19 @@ pub fn generate_key() -> Result<Vec<u8>, String> {
 
 /// A PEM certificate request for `hostname`, signed with `pkcs8`.
 pub fn csr_pem(pkcs8: &[u8], hostname: &str) -> Result<String, String> {
-    let der = csr_der(pkcs8, hostname)?;
+    let der = csr_der(pkcs8, &der_name(hostname), &der_san_extension(hostname))?;
     Ok(pem("CERTIFICATE REQUEST", &der))
+}
+
+/// A DER certificate request for an ACME order (`acme.rs`): `host`, an IP address or a
+/// DNS name, as the only subject alternative name. The subject is empty: an IP address
+/// is not allowed as a common name, and the CA ignores the field anyway.
+pub fn acme_csr_der(pkcs8: &[u8], host: &str) -> Result<Vec<u8>, String> {
+    let san = match host.parse::<IpAddr>() {
+        Ok(ip) => der_san_ip_extension(ip),
+        Err(_) => der_san_extension(host),
+    };
+    csr_der(pkcs8, &seq(&[]), &san)
 }
 
 // ---- DER, just enough for PKCS#10 -------------------------------------------------
@@ -87,6 +98,16 @@ pub(crate) fn der_san_extension(hostname: &str) -> Vec<u8> {
     seq(&[&tlv(0x06, OID_SUBJECT_ALT_NAME), &tlv(0x04, &names)])
 }
 
+/// `subjectAltName` extension value: one iPAddress (4 or 16 bytes).
+pub(crate) fn der_san_ip_extension(ip: IpAddr) -> Vec<u8> {
+    let bytes = match ip {
+        IpAddr::V4(v4) => v4.octets().to_vec(),
+        IpAddr::V6(v6) => v6.octets().to_vec(),
+    };
+    let names = seq(&[&tlv(0x87, &bytes)]);
+    seq(&[&tlv(0x06, OID_SUBJECT_ALT_NAME), &tlv(0x04, &names)])
+}
+
 pub(crate) fn der_ecdsa_sha256() -> Vec<u8> {
     seq(&[&tlv(0x06, OID_ECDSA_SHA256)])
 }
@@ -97,15 +118,15 @@ pub(crate) fn der_bit_string(bytes: &[u8]) -> Vec<u8> {
     tlv(0x03, &bits)
 }
 
-fn csr_der(pkcs8: &[u8], hostname: &str) -> Result<Vec<u8>, String> {
+fn csr_der(pkcs8: &[u8], subject: &[u8], san: &[u8]) -> Result<Vec<u8>, String> {
     let rng = SystemRandom::new();
     let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8, &rng)
         .map_err(|_| "The stored private key is not usable.".to_string())?;
-    let extensions = seq(&[&der_san_extension(hostname)]);
+    let extensions = seq(&[san]);
     let attribute = seq(&[&tlv(0x06, OID_EXTENSION_REQUEST), &tlv(0x31, &extensions)]);
     let info = seq(&[
         &tlv(0x02, &[0]),
-        &der_name(hostname),
+        subject,
         &der_spki(key.public_key().as_ref()),
         // [0] IMPLICIT SET OF Attribute
         &tlv(0xA0, &attribute),
@@ -131,15 +152,78 @@ pub(crate) fn pem(label: &str, der: &[u8]) -> String {
     out
 }
 
+// ---- reading a certificate's dates -------------------------------------------------
+
+/// (tag, content, rest) of the DER element at the start of `b`.
+fn der_read(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let tag = *b.first()?;
+    let first = *b.get(1)?;
+    let (len, header) = if first < 0x80 {
+        (first as usize, 2)
+    } else {
+        let n = (first & 0x7F) as usize;
+        if n == 0 || n > 4 {
+            return None;
+        }
+        let len = b
+            .get(2..2 + n)?
+            .iter()
+            .fold(0usize, |a, x| (a << 8) | *x as usize);
+        (len, 2 + n)
+    };
+    let end = header.checked_add(len)?;
+    Some((tag, b.get(header..end)?, b.get(end..)?))
+}
+
+/// UTCTime (`YYMMDDHHMMSSZ`) or GeneralizedTime (`YYYYMMDDHHMMSSZ`).
+fn der_time(tag: u8, content: &[u8]) -> Option<chrono::DateTime<chrono::Utc>> {
+    let text = std::str::from_utf8(content).ok()?;
+    let full = match tag {
+        // X.509 reads a two-digit year of 50 and later as 19xx (RFC 5280 4.1.2.5.1).
+        0x17 => {
+            let century = if text.get(..2)? >= "50" { "19" } else { "20" };
+            format!("{century}{text}")
+        }
+        0x18 => text.to_string(),
+        _ => return None,
+    };
+    chrono::NaiveDateTime::parse_from_str(&full, "%Y%m%d%H%M%SZ")
+        .ok()
+        .map(|t| t.and_utc())
+}
+
+/// When the first certificate in `cert_pem` starts and stops being valid.
+pub fn validity(
+    cert_pem: &str,
+) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    let cert = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .next()?
+        .ok()?;
+    let (_, certificate, _) = der_read(cert.as_ref())?;
+    let (_, mut tbs, _) = der_read(certificate)?;
+    // version (optional, tagged [0]), then serial, signature algorithm and issuer.
+    if tbs.first() == Some(&0xA0) {
+        tbs = der_read(tbs)?.2;
+    }
+    for _ in 0..3 {
+        tbs = der_read(tbs)?.2;
+    }
+    let (_, dates, _) = der_read(tbs)?;
+    let (tag, from, rest) = der_read(dates)?;
+    let from = der_time(tag, from)?;
+    let (tag, until, _) = der_read(rest)?;
+    Some((from, der_time(tag, until)?))
+}
+
 // ---- serving ---------------------------------------------------------------------
 
 /// A rustls server config from a PEM certificate chain and a PKCS#8 key.
 pub fn server_config(cert_pem: &str, pkcs8: &[u8]) -> Result<Arc<rustls::ServerConfig>, String> {
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<Result<_, _>>()
-        .map_err(|_| "The origin certificate is not valid PEM.".to_string())?;
+        .map_err(|_| "The certificate is not valid PEM.".to_string())?;
     if certs.is_empty() {
-        return Err("The origin certificate file is empty.".to_string());
+        return Err("The certificate file is empty.".to_string());
     }
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec()));
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -149,8 +233,10 @@ pub fn server_config(cert_pem: &str, pkcs8: &[u8]) -> Result<Arc<rustls::ServerC
     .map_err(|e| format!("TLS setup failed: {e}"))?
     .with_no_client_auth()
     .with_single_cert(certs, key)
-    .map_err(|e| format!("The origin certificate does not match its key: {e}"))?;
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    .map_err(|e| format!("The certificate does not match its key: {e}"))?;
+    // HTTP/1.1 only: that is what `serve` speaks (axum without its `http2` feature).
+    // Offering `h2` here makes every browser pick it, and its first request then dies.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
 
@@ -224,6 +310,11 @@ impl axum::serve::Listener for TlsListener {
     }
 }
 
+/// Request extension on everything that arrives through [`serve`]: the request came
+/// over HTTPS. The plain listener never sets it.
+#[derive(Clone, Copy, Debug)]
+pub struct OverTls;
+
 /// Serve `app` over TLS until the task is aborted. The handlers read the client
 /// address from `ConnectInfo<SocketAddr>`; axum provides that for any listener whose
 /// `Addr` is `SocketAddr` once it is wrapped in `tap_io`, so the no-op tap is what
@@ -231,6 +322,7 @@ impl axum::serve::Listener for TlsListener {
 pub async fn serve(listener: TlsListener, app: axum::Router) {
     use axum::serve::ListenerExt;
     let listener = listener.tap_io(|_| {});
+    let app = app.layer(axum::Extension(OverTls));
     if let Err(e) = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -247,10 +339,16 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("tmp");
+    // Never write a key through something that is already there (a link, or a file
+    // with other permissions): remove it, and insist on creating the file.
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
     {
         use std::io::Write;
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;

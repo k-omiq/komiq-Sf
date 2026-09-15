@@ -37,7 +37,7 @@
 	import { beforeNavigate, goto } from '$app/navigation';
 	import { tick, untrack } from 'svelte';
 	import type { TagInfo } from '@komika/types';
-	import type { BrowseSortField } from '@komika/api';
+	import type { BrowseSortField, BrowseSource } from '@komika/api';
 	import Icon from '$lib/components/Icon.svelte';
 	import MangaCard from '$lib/components/MangaCard.svelte';
 	import CardGridSkeleton from '$lib/components/CardGridSkeleton.svelte';
@@ -60,6 +60,7 @@
 		matchesFederated,
 		parseBrowseUrl,
 		sortOptions,
+		sourceLabels,
 		toggleDir,
 		toSearchParams,
 		withPageNum,
@@ -98,6 +99,23 @@
 	const tagIndex = $derived(new Map(tagData.tags.map((t) => [t.id, t])));
 	const tagName = (id: string): string | undefined => tagIndex.get(id)?.name;
 
+	// ---- source list ----------------------------------------------------------------
+	// `data.sources` never rejects either. It only feeds the panel's Source group and the
+	// chip's name: a `?source=` in the URL is applied whether or not the list has landed,
+	// or knows that source at all. An empty list (an older server) hides the group.
+	let sources = $state<BrowseSource[]>([]);
+	$effect(() => {
+		let live = true;
+		data.sources.then((s) => {
+			if (live) sources = s;
+		});
+		return () => {
+			live = false;
+		};
+	});
+	const sourceNames = $derived(sourceLabels(sources));
+	const sourceName = (id: string): string | undefined => sourceNames.get(id);
+
 	// ---- state: THE URL -----------------------------------------------------------
 	// Every filter, the sort and the page are read straight off the URL (see
 	// $lib/data/browse-filters for the parse/canonicalise rules). There is no component
@@ -112,7 +130,7 @@
 	const applied = $derived(
 		applicableState(urlState, { nsfw, tagSource: tagsLoading ? 'tags' : tagData.source }),
 	);
-	const chips = $derived(activeChips(applied, tagName));
+	const chips = $derived(activeChips(applied, tagName, sourceName));
 
 	/** Navigate to a state. Discrete changes PUSH (Back undoes them); typing REPLACES. */
 	function navigate(next: BrowseState, replace = false) {
@@ -464,7 +482,8 @@
 	const unapplied = $derived(
 		!rowsLoading && !rowsAreFederated && !filterApplied ? legacyUnapplied(applied) : [],
 	);
-	// External-source rows can only be narrowed by what they carry.
+	// External-source rows can only be narrowed by what they carry. Any other chip, a
+	// catalogue source included, shows the note that says so.
 	const federatedIgnores = $derived(
 		rowsAreFederated && chips.some((c) => !/^(tag[+-]|type|status):/.test(c.key)),
 	);
@@ -513,7 +532,7 @@
 				placeholder="Search series, authors…"
 			/>
 			{#if qInput}
-				<button type="button" class="clear" aria-label="Clear search" onclick={clearSearch}
+				<button type="button" class="clear k-hit" aria-label="Clear search" onclick={clearSearch}
 					><Icon name="x" size={18} /></button
 				>
 			{/if}
@@ -528,6 +547,7 @@
 			tags={tagData.tags}
 			tagSource={tagData.source}
 			{tagsLoading}
+			{sources}
 			{nsfw}
 			signedIn={!!auth.user}
 			changes={pendingChanges}
@@ -555,7 +575,7 @@
 				<div class="controls">
 					<button
 						type="button"
-						class="filter-trigger"
+						class="filter-trigger k-hit"
 						aria-haspopup="dialog"
 						aria-expanded={filtersOpen}
 						onclick={() => (filtersOpen = true)}
@@ -609,7 +629,7 @@
 					<p class="empty-desc">
 						Something went wrong reaching the server. Check your connection and try again.
 					</p>
-					<button type="button" class="empty-btn" onclick={retryRows}>Retry</button>
+					<button type="button" class="empty-btn k-hit" onclick={retryRows}>Retry</button>
 				</div>
 			{:else if results.length}
 				<div class="grid">
@@ -629,7 +649,7 @@
 				{#if canSearchExternal}
 					<div class="ext-search">
 						<span class="ext-hint">Not finding it in the catalogue?</span>
-						<button type="button" class="ext-btn" onclick={requestFederated}>
+						<button type="button" class="ext-btn k-hit" onclick={requestFederated}>
 							<Icon name="search" size={15} />Search external sources
 						</button>
 					</div>
@@ -648,11 +668,13 @@
 								: 'Remove a filter or two, or clear them all.'}
 						</p>
 						<div class="empty-actions">
-							<button type="button" class="empty-btn" onclick={() => go(clearFilters(applied))}
-								>Clear filters</button
+							<button
+								type="button"
+								class="empty-btn k-hit"
+								onclick={() => go(clearFilters(applied))}>Clear filters</button
 							>
 							{#if canSearchExternal}
-								<button type="button" class="empty-btn secondary" onclick={requestFederated}
+								<button type="button" class="empty-btn k-hit secondary" onclick={requestFederated}
 									>Search external sources</button
 								>
 							{/if}
@@ -665,11 +687,13 @@
 								: 'Check the spelling, or try a shorter or alternative title.'}
 						</p>
 						{#if canSearchExternal}
-							<button type="button" class="empty-btn" onclick={requestFederated}
+							<button type="button" class="empty-btn k-hit" onclick={requestFederated}
 								>Search external sources</button
 							>
 						{:else}
-							<button type="button" class="empty-btn" onclick={clearSearch}>Clear search</button>
+							<button type="button" class="empty-btn k-hit" onclick={clearSearch}
+								>Clear search</button
+							>
 						{/if}
 					{:else}
 						<h3 class="empty-title">Nothing to browse yet</h3>
@@ -731,6 +755,7 @@
 	}
 	.searchbar input {
 		flex: 1;
+		align-self: stretch;
 		min-width: 0;
 		background: transparent;
 		border: none;

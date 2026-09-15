@@ -1321,10 +1321,37 @@ fn parse_chapter_page(raw: Vec<Value>) -> (Vec<MdChapter>, Vec<(String, String)>
 
 const EXTERNAL_LINK_KEYS: &[&str] = &["al", "mal", "mu", "kt", "ap", "nu"];
 
-/// Construct only known HTTPS tracker destinations, never upstream raw URLs.
-/// MangaDex stores provider IDs/slugs (documented in its links enumeration).
+/// Publisher and store links. Kept apart from [`EXTERNAL_LINK_KEYS`] because those feed
+/// `work_external_id`, whose key is globally unique and drives identity matching: two
+/// works that share a publisher page must never be folded together because of it.
+const OFFICIAL_LINK_KEYS: &[&str] = &["raw", "engtl", "bw", "amz", "ebj", "cdj"];
+
+/// The [`OFFICIAL_LINK_KEYS`] that MangaDex stores as a full URL instead of an id.
+const OFFICIAL_URL_KEYS: &[&str] = &["raw", "engtl", "amz", "ebj", "cdj"];
+
+/// An upstream URL is passed through only as plain HTTPS to a named host: no
+/// credentials, no port, no IP literal, no bare hostname.
+fn official_url(value: &str) -> Option<String> {
+    if value.len() > 512 {
+        return None;
+    }
+    let url = reqwest::Url::parse(value).ok()?;
+    (url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url.domain().is_some_and(|d| d.contains('.')))
+    .then(|| url.to_string())
+}
+
+/// Tracker destinations are built from the provider IDs/slugs MangaDex stores
+/// (documented in its links enumeration), never from an upstream URL. The official
+/// links in [`OFFICIAL_URL_KEYS`] have no id form, so those go through [`official_url`].
 pub fn tracker_url(provider: &str, value: &str) -> Option<String> {
     let value = value.trim();
+    if OFFICIAL_URL_KEYS.contains(&provider) {
+        return official_url(value);
+    }
     if value.is_empty() || value.len() > 128 {
         return None;
     }
@@ -1346,6 +1373,13 @@ pub fn tracker_url(provider: &str, value: &str) -> Option<String> {
         "kt" if slug => format!("https://kitsu.io/manga/{value}"),
         "ap" if slug => format!("https://www.anime-planet.com/manga/{value}"),
         "nu" if slug => format!("https://www.novelupdates.com/series/{value}"),
+        // Stored as a path, e.g. `series/13002/list`.
+        "bw" if value.split('/').all(|part| {
+            !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        }) =>
+        {
+            format!("https://bookwalker.jp/{value}")
+        }
         _ => return None,
     };
     Some(url)
@@ -1461,6 +1495,14 @@ pub fn to_work_input(m: &MdManga) -> (String, WorkInput) {
             }
         }
     }
+    let mut official_links: Vec<(String, String)> = Vec::new();
+    for key in OFFICIAL_LINK_KEYS {
+        if let Some(v) = a.links.get(*key) {
+            if tracker_url(key, v).is_some() {
+                official_links.push(((*key).to_string(), v.trim().to_string()));
+            }
+        }
+    }
 
     let content_rating = a.content_rating.clone();
     let is_nsfw = matches!(
@@ -1504,6 +1546,7 @@ pub fn to_work_input(m: &MdManga) -> (String, WorkInput) {
             cover_file_name: cover_file_name(m),
             aliases,
             external_ids,
+            official_links,
             descriptions,
             credits,
             // Upstream genres (migration 0066). Written as the `source = 'mangadex'`
@@ -2169,7 +2212,8 @@ pub async fn sync_catalogue(
 /// would wait years to acquire a genre. `_v3` re-walks the catalogue with the genre
 /// top-up branch active (see `refresh_source_tags` at the presence check).
 // v4 revisits existing works for structured tags and current tracker snapshots.
-const BACKFILL_FLAG: &str = "mangadex_catalogue_backfill_v4";
+// v5 revisits them again for the official publisher and store links.
+const BACKFILL_FLAG: &str = "mangadex_catalogue_backfill_v5";
 
 /// The `catalogue_sync_state` job key holding the backfill's window cursor. A key of its
 /// own so it never disturbs the `catalogue`/`chapters` rows the recurring sweep reads;
@@ -2188,7 +2232,7 @@ const BACKFILL_FLAG: &str = "mangadex_catalogue_backfill_v4";
 /// completion, so its cursor sits at the NEWEST end of the catalogue, and renaming only
 /// the flag would resume there and skip every work that needs genres. A fresh job key has
 /// no row, so `since` stays `None` and the walk restarts from 2018-01.
-const BACKFILL_JOB: &str = "catalogue_backfill_v4";
+const BACKFILL_JOB: &str = "catalogue_backfill_v5";
 
 /// How many extra times a backfill page fetch that already survived `get_with_retry`'s
 /// own four attempts is re-tried, after a much longer cool-down, before the window is
@@ -6365,23 +6409,53 @@ mod tests {
 
     #[test]
     fn tracker_destinations_reject_raw_urls_and_unsafe_ids() {
-        for provider in [
-            "al", "mal", "mu", "kt", "ap", "nu", "mangadex", "raw", "engtl",
-        ] {
+        for provider in ["al", "mal", "mu", "kt", "ap", "nu", "mangadex", "bw"] {
             for invalid in [
                 "javascript:alert(1)",
                 "https://evil.example",
                 "../private",
                 "123?token=secret",
                 "a#fragment",
-                "x/y",
                 "a%2fb",
+                "/x",
+                "x//y",
             ] {
                 assert!(
                     tracker_url(provider, invalid).is_none(),
                     "{provider}: {invalid}"
                 );
             }
+        }
+        assert!(tracker_url("al", "x/y").is_none());
+        assert_eq!(
+            tracker_url("bw", "series/13002/list").unwrap(),
+            "https://bookwalker.jp/series/13002/list"
+        );
+        // Official links arrive as URLs: plain HTTPS to a named host, nothing else.
+        for provider in ["raw", "engtl", "amz", "ebj", "cdj"] {
+            for invalid in [
+                "javascript:alert(1)",
+                "http://publisher.example/title",
+                "https://user:pass@publisher.example/",
+                "https://user@publisher.example/",
+                "https://publisher.example:8443/",
+                "https://127.0.0.1/",
+                "https://[::1]/",
+                "https://localhost/",
+                "//publisher.example/title",
+                "../private",
+                "series/123",
+                "",
+            ] {
+                assert!(
+                    tracker_url(provider, invalid).is_none(),
+                    "{provider}: {invalid}"
+                );
+            }
+            assert_eq!(
+                tracker_url(provider, " https://publisher.example/title/1?v=2 ").unwrap(),
+                "https://publisher.example/title/1?v=2"
+            );
         }
         assert_eq!(
             tracker_url("mu", "abc123x").unwrap(),
@@ -6401,13 +6475,21 @@ mod tests {
         );
         assert!(tracker_url("al", "not-numeric").is_none());
         let mut json = manga_json();
-        json["attributes"]["links"] = serde_json::json!({"al": "123", "mal": "https://evil.example", "nu": "novel-name", "raw": "https://publisher.example"});
+        json["attributes"]["links"] = serde_json::json!({"al": "123", "mal": "https://evil.example", "nu": "novel-name", "raw": "https://publisher.example", "engtl": "http://publisher.example", "bw": "series/13002/list"});
         let (_, input) = to_work_input(&serde_json::from_value::<MdManga>(json).unwrap());
         assert_eq!(
             input.external_ids,
             vec![
                 ("al".into(), "123".into()),
                 ("nu".into(), "novel-name".into())
+            ]
+        );
+        // Official links never join the identity ids.
+        assert_eq!(
+            input.official_links,
+            vec![
+                ("raw".into(), "https://publisher.example".into()),
+                ("bw".into(), "series/13002/list".into())
             ]
         );
     }

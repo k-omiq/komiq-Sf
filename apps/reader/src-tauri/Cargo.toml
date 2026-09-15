@@ -26,12 +26,23 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
+# Links to other sites (`target="_blank"`: "Read on source", a source's page) open in the
+# system's default browser. Without it the web view loads them over the app itself.
+tauri-plugin-opener = "2"
 # Native direct-fetch of source images (bypasses the web-only Worker proxy).
 # rustls avoids a system OpenSSL dependency, keeping mobile/desktop builds lean.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-# Async DNS resolution for the pre-fetch host guard (client-side SSRF defense) and the
-# embedded Suwayomi sidecar supervisor (child process, readiness poll, log pumps).
-tokio = { version = "1", features = ["net", "process", "time", "sync", "rt", "macros", "io-util"] }
+# Async DNS resolution for the pre-fetch host guard (client-side SSRF defense), the
+# image-fetch permit pool and the retry/readiness sleeps. Every platform needs these.
+tokio = { version = "1", features = ["net", "time", "sync"] }
+
+# Desktop only: the embedded Suwayomi sidecar (`suwayomi.rs`) and its Cloudflare shim
+# (`cloudflare.rs`). Both modules are `#[cfg(desktop)]`, so a phone build must not pay
+# for what only they use. Cargo cannot see tauri's `desktop` cfg; "not a phone" is the
+# same set.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# The sidecar supervisor: child process, log pumps, `select!` over its lifetime.
+tokio = { version = "1", features = ["process", "rt", "macros", "io-util"] }
 # Tiny sync HTTP listener for the on-device Cloudflare FlareSolverr-v1 shim (N-CF).
 # Chosen over axum/hyper to keep the dep tree small: tiny_http pulls only ascii /
 # chunked_transfer / httpdate / log. It runs on a dedicated thread and bridges to the
@@ -45,6 +56,46 @@ tiny_http = "0.12"
 # across toolchains); the sim build compiles the stub module and never references it.
 [target.'cfg(target_os = "ios")'.dependencies]
 jni-sys = "0.3"
+# One Objective-C message to tao's view controller, to hide the status bar in the chapter
+# reader (`set_status_bar_hidden`). Already in the tree through wry; no new crate.
+objc2 = "0.6"
+
+# In-process engine on Android (`suwayomi_inprocess_android.rs`): the JNI types, `dlopen`
+# of the bundled libjvm.so, and a zip reader to unpack the engine's files from the APK.
+[target.'cfg(target_os = "android")'.dependencies]
+jni-sys = "0.3"
+libc = "0.2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# The loopback listener for engine images (`engine_image_server.rs`) reads and writes
+# its sockets with tokio's `AsyncReadExt` / `AsyncWriteExt`.
+tokio = { version = "1", features = ["io-util"] }
+
+# QR scan on the "Connect to a server" screen. Phones only: the plugin has no desktop
+# implementation, and a desktop has no use for one. Keep the minor version the same as
+# `@tauri-apps/plugin-barcode-scanner` in package.json: the Tauri CLI refuses a build
+# where the crate and the npm package differ.
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-barcode-scanner = "~2.4.6"
+
+# iOS release builds on Xcode 27 with swift-rs 1.0.8 (2026-10-06). Xcode 27's SwiftPM
+# turns the `@_cdecl` functions of a RELEASE Swift package into local symbols, so the
+# Rust side cannot link them. swift-rs makes them global again (it needs `llvm-objcopy`,
+# see build.rs), but only for the package it builds, not for its own SwiftRs module:
+# `retain_object`, `release_object` and `string_from_bytes` stay local and the link
+# fails with "Undefined symbols". swift-rs builds a package in the Swift DEBUG
+# configuration when cargo's `DEBUG` is true, and a debug package keeps every symbol
+# global. Line tables for this one crate switch that on: tauri's Swift package then
+# brings a SwiftRs module the linker can use. Cost: tauri's small Swift glue (plugin
+# registration and dispatch) is not optimized. Remove this when swift-rs makes its own
+# exports global.
+[profile.release.package.tauri]
+debug = "line-tables-only"
+
+# Cargo strips debug info from a release build by itself, but only while no package of
+# the build asks for debug info. The override above ends that, so say it outright: no
+# released binary (desktop ones included) carries the line tables or std's debug info.
+[profile.release]
+strip = "debuginfo"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "process", "time", "sync", "rt", "macros", "io-util"] }

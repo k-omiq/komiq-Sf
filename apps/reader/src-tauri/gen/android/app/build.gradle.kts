@@ -1,0 +1,95 @@
+import java.util.Properties
+
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("rust")
+}
+
+val tauriProperties = Properties().apply {
+    val propFile = file("tauri.properties")
+    if (propFile.exists()) {
+        propFile.inputStream().use { load(it) }
+    }
+}
+
+android {
+    compileSdk = 36
+    namespace = "app.komika.reader"
+    defaultConfig {
+        // Plain HTTP stays allowed in release too. The reader connects to the server its
+        // user picks, and a self-hosted server on a home network is usually reached as
+        // http://<LAN address>:<port> with no certificate. Android's network security
+        // config can only allow cleartext per domain name, not per address range, so
+        // there is no narrower switch that keeps those servers reachable.
+        manifestPlaceholders["usesCleartextTraffic"] = "true"
+        applicationId = "app.komika.reader"
+        minSdk = 24
+        targetSdk = 36
+        versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
+        versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+    }
+    buildTypes {
+        getByName("debug") {
+            applicationIdSuffix = ".debug"
+            manifestPlaceholders["usesCleartextTraffic"] = "true"
+            isDebuggable = true
+            isJniDebuggable = true
+            isMinifyEnabled = false
+            packaging {                jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
+                jniLibs.keepDebugSymbols.add("*/armeabi-v7a/*.so")
+                jniLibs.keepDebugSymbols.add("*/x86/*.so")
+                jniLibs.keepDebugSymbols.add("*/x86_64/*.so")
+            }
+        }
+        getByName("release") {
+            isMinifyEnabled = true
+            // Drop the resources no code reaches (most of what the AndroidX, Material
+            // and camera libraries bring along).
+            isShrinkResources = true
+            proguardFiles(
+                *fileTree(".") { include("**/*.pro") }
+                    .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
+                    .toList().toTypedArray()
+            )
+        }
+    }
+    kotlinOptions {
+        jvmTarget = "1.8"
+    }
+    // The app's own text lives in the web view. The libraries ship their few native
+    // strings in about 80 languages; keep English only (0.8 MB less).
+    androidResources {
+        localeFilters += listOf("en")
+    }
+    buildFeatures {
+        buildConfig = true
+    }
+    // The on-device engine (src/suwayomi_inprocess_android.rs): the JVM's libraries and
+    // the engine's files, made by src-tauri/scripts/build-android-jvm.sh. When that
+    // script has not run, these directories do not exist and the app has no engine.
+    sourceSets["main"].jniLibs.srcDir("../../../jre-android/jniLibs")
+    sourceSets["main"].assets.srcDir("../../../jre-android/assets")
+    // Install the native libraries as files (not left inside the APK): HotSpot opens its
+    // own libraries by path. They are also compressed in the APK this way.
+    packaging {
+        jniLibs.useLegacyPackaging = true
+    }
+}
+
+rust {
+    rootDirRel = "../../../"
+}
+
+dependencies {
+    implementation("androidx.webkit:webkit:1.14.0")
+    implementation("androidx.appcompat:appcompat:1.7.1")
+    implementation("androidx.activity:activity-ktx:1.10.1")
+    implementation("com.google.android.material:material:1.12.0")
+    implementation("androidx.lifecycle:lifecycle-process:2.10.0")
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test.ext:junit:1.1.4")
+    androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")
+}
+
+apply(from = "tauri.build.gradle.kts")

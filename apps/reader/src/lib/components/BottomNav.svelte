@@ -78,7 +78,8 @@
 	.bottom-nav {
 		display: none;
 	}
-	@media (max-width: 640px) {
+	/* Narrow screens, and a phone on its side (see `--k-tabbar-h` in app.css). */
+	@media (max-width: 640px), (max-height: 500px) and (pointer: coarse) {
 		.bottom-nav {
 			position: fixed;
 			left: 0;
@@ -96,6 +97,8 @@
 			   insets keep the outer tabs clear of the notch in landscape. */
 			padding: 0 env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px)
 				env(safe-area-inset-left, 0px);
+			/* Come back a moment after a field loses focus (see the :focus rule below). */
+			transition: visibility 0s 0.25s;
 		}
 		/* A skirt of bar background hanging below the bar. iOS Safari re-anchors fixed
 		   elements a frame late while its toolbar collapses/expands and during the bottom
@@ -134,7 +137,10 @@
 				)
 			)
 			.bottom-nav {
-			display: none;
+			/* Not display: none. A tap on a button moves focus off the field first; if the
+			   bar came back at once it would land under the finger and take the tap. */
+			visibility: hidden;
+			transition-delay: 0s;
 		}
 		.tab {
 			display: flex;
@@ -165,6 +171,22 @@
 			font-size: 10.5px;
 			font-weight: 700;
 			letter-spacing: 0.01em;
+		}
+	}
+	/* A phone on its side has little height: one compact row, icon beside the label. */
+	@media (min-width: 641px) and (max-height: 500px) and (pointer: coarse) {
+		.tab {
+			flex-direction: row;
+			gap: 8px;
+			min-height: 44px;
+			padding: 0;
+		}
+		.ic {
+			width: 20px;
+			height: 20px;
+		}
+		.lbl {
+			font-size: 12px;
 		}
 	}
 </style>

@@ -139,6 +139,8 @@ interface FakeOpts {
 	publication?: ReaderFormatMetadata;
 	/** Pages per MangaDex chapter id; an id not listed REJECTS (taken down upstream). */
 	mdPages?: Record<string, string[]>;
+	/** The MangaDex spine's chapter list; the fixture's two chapters when omitted. */
+	spineChapters?: ReturnType<typeof chapter>[];
 	/** The Suwayomi source's chapter list as the server reports it (`[]` = engine down). */
 	suwChapters?: ReturnType<typeof chapter>[];
 	/** The aggregation as the bundle carries it. */
@@ -162,7 +164,7 @@ function fakeBackend(opts: FakeOpts = {}) {
 		seriesPage: async (workId: string) => ({
 			workId,
 			series: { id: WORK, title: 'Fixture Work', ...opts.publication },
-			spineChapters: SPINE,
+			spineChapters: opts.spineChapters ?? SPINE,
 			sources: [
 				{
 					source: {
@@ -339,6 +341,46 @@ test('a failed aggregation (degraded to []) still opens the chapter from the lis
 	assert.deepEqual(
 		view.versions?.map((v) => v.id),
 		['md-5a'],
+	);
+});
+
+test('a chapter the default source lacks opens from another source, for that chapter only', async () => {
+	// The spine (the default: it reaches ch. 7) has no ch. 6; the Suwayomi source has it.
+	const gap = {
+		mdPages: { 'md-5a': ['a1.webp'] },
+		spineChapters: [...SPINE, chapter('md-7', 7, 'Group A')],
+		suwChapters: [...SUW_CHAPTERS, chapter('9006', 6, 'MANGA Plus')],
+		aggregated: [
+			...AGGREGATED,
+			{ number: 6, label: '6', title: null, sources: [copy('9006', SUW, 'MANGA Plus')] },
+			{ number: 7, label: '7', title: null, sources: [copy('md-7', null, 'Group A')] },
+		],
+	};
+	fakeBackend(gap);
+	const five = await getReaderChapter(WORK, 'md-5a', null);
+	assert.equal(five.nextChapterId, '9006');
+	// One row per NUMBER, each with the source it opens from.
+	assert.deepEqual(
+		five.chapters.map((c) => [c.id, c.src]),
+		[
+			['md-7', null],
+			['9006', SUW],
+			['md-5a', null],
+			['md-4', null],
+		],
+	);
+
+	fakeBackend(gap);
+	const six = await getReaderChapter(WORK, '9006', SUW);
+	assert.equal(six.chapterId, '9006');
+	assert.equal(six.readingSrc, SUW);
+	// Both neighbours go back to the default source, which stays the default.
+	assert.equal(six.prevChapterId, 'md-5a');
+	assert.equal(six.nextChapterId, 'md-7');
+	assert.equal(six.selectedTranslatorKey, five.selectedTranslatorKey);
+	assert.equal(
+		six.translators.find((t) => t.key === six.selectedTranslatorKey)?.suwayomiMangaId,
+		null,
 	);
 });
 

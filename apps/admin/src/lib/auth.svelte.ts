@@ -4,10 +4,9 @@
  * it into the backend so the admin mutations carry it.
  */
 import type { Session } from '@komika/api';
+import { TOKEN_KEY } from './config';
 import { backend } from './context';
 import { setShowNsfw } from './data';
-
-const TOKEN_KEY = 'komika-admin-token';
 
 type User = Session['user'];
 

@@ -11,6 +11,7 @@
 	"scripts": {
 		"dev:reader": "pnpm --filter @komika/reader dev",
 		"dev:admin": "pnpm --filter @komika/admin dev",
+		"dev:docs": "pnpm --filter @komika/docs dev",
 		"build": "pnpm -r build",
 		"check": "pnpm -r check",
 		"lint": "prettier --check .",

@@ -24,20 +24,33 @@
 //! restarts; they live in 0600 files next to the database (see `connector.rs`).
 //!
 //! Nothing here runs unless an admin starts it: with no stored setup, boot does nothing.
+//!
+//! **Without a domain.** The same manager also owns the "public without a domain" mode
+//! (`direct.rs`): HTTPS at the server's own address, with a Let's Encrypt certificate
+//! that the server gets and renews by itself (`acme.rs`). No Cloudflare is involved.
 
+pub mod acme;
 pub mod api;
 pub mod connector;
+mod direct;
+mod fetch_connector;
 pub mod origin_tls;
+
+pub use direct::{
+    from_internet, https_in_front, name_on_internet, plain_http_guard, typed_host, TypedHost,
+};
 #[cfg(test)]
 mod tests;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use crate::instance;
@@ -49,20 +62,37 @@ use connector::Connector;
 pub struct Options {
     /// Cloudflare v4 API base (`KOMIKA_CLOUDFLARE_API`; tests point it at a mock).
     pub api_base: String,
+    /// Replaces the pinned release base URL (`KOMIKA_CLOUDFLARED_DOWNLOAD_BASE`).
+    pub download_base: String,
     /// Where "detect my public address" asks (`KOMIKA_CLOUDFLARE_TRACE_URL`); answers
     /// `ip=<addr>` lines like Cloudflare's `/cdn-cgi/trace`.
     pub trace_url: String,
     /// Replaces `https://<domain>` for the final health check
     /// (`KOMIKA_CLOUDFLARE_HEALTH_BASE`). For tests against a mock only.
     pub health_base: Option<String>,
-    /// `CLOUDFLARED_BIN`; unset searches `PATH`.
+    /// `CLOUDFLARED_BIN`; unset searches PATH, then `<data_dir>/bin`.
     pub cloudflared_bin: Option<String>,
+    /// Where `cloudflared` is looked for when that is unset: the server's `PATH`.
+    pub search_path: std::ffi::OsString,
     /// Holds the tunnel token and the origin key/certificate (0600 files).
     pub data_dir: PathBuf,
     /// What the tunnel routes to: this server's plain HTTP listener.
     pub origin_service: String,
-    /// The HTTPS listener for public-IP mode (`KOMIKA_HTTPS_PORT`, default 443).
+    /// Where that plain HTTP listener is bound (`BIND_ADDR`, `PORT`).
+    pub listen: SocketAddr,
+    /// The HTTPS listener for public-IP mode and for direct mode
+    /// (`KOMIKA_HTTPS_PORT`, default 443).
     pub https_addr: SocketAddr,
+    /// Direct mode: the plain HTTP listener the certificate authority checks
+    /// (`KOMIKA_ACME_PORT`, default 80; Let's Encrypt always connects to port 80).
+    pub acme_addr: SocketAddr,
+    /// Direct mode: the ACME directory (`KOMIKA_ACME_DIRECTORY`). Let's Encrypt unless
+    /// set: a private certificate authority, or a mock in tests.
+    pub acme_directory: String,
+    /// A PEM root to trust when talking to that directory (`KOMIKA_ACME_CA_FILE`).
+    pub acme_ca_file: Option<PathBuf>,
+    /// Direct mode: how often the server looks whether its certificate is due.
+    pub renew_check: Duration,
     pub health_attempts: u32,
     pub health_delay: Duration,
     pub connector_timeout: Duration,
@@ -87,15 +117,29 @@ impl Options {
         Self {
             api_base: env("KOMIKA_CLOUDFLARE_API")
                 .unwrap_or_else(|| "https://api.cloudflare.com/client/v4".into()),
+            download_base: env("KOMIKA_CLOUDFLARED_DOWNLOAD_BASE")
+                .unwrap_or_else(|| fetch_connector::BASE.into()),
             trace_url: env("KOMIKA_CLOUDFLARE_TRACE_URL")
                 .unwrap_or_else(|| "https://www.cloudflare.com/cdn-cgi/trace".into()),
             health_base: env("KOMIKA_CLOUDFLARE_HEALTH_BASE"),
             cloudflared_bin: env("CLOUDFLARED_BIN"),
+            search_path: std::env::var_os("PATH").unwrap_or_default(),
             data_dir: env("KOMIKA_CLOUDFLARE_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| data_dir_for(&cfg.database_url)),
             origin_service: format!("http://{origin_host}:{}", cfg.port),
+            listen: SocketAddr::new(bind, cfg.port),
             https_addr: SocketAddr::new(bind, https_port),
+            acme_addr: SocketAddr::new(
+                bind,
+                env("KOMIKA_ACME_PORT")
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(80),
+            ),
+            acme_directory: env("KOMIKA_ACME_DIRECTORY")
+                .unwrap_or_else(|| acme::LETS_ENCRYPT.into()),
+            acme_ca_file: env("KOMIKA_ACME_CA_FILE").map(PathBuf::from),
+            renew_check: Duration::from_secs(3600),
             health_attempts: 30,
             health_delay: Duration::from_secs(4),
             connector_timeout: Duration::from_secs(45),
@@ -141,6 +185,9 @@ pub struct Stored {
     pub connection: Option<Connection>,
     #[serde(default)]
     pub public_ip: Option<String>,
+    /// Re-detect on retry while keeping an address the owner entered.
+    #[serde(default)]
+    pub public_ip_detected: bool,
     #[serde(default)]
     pub zone_id: Option<String>,
     #[serde(default)]
@@ -219,6 +266,7 @@ async fn save_stored(pool: &SqlitePool, s: Option<&Stored>) -> Result<(), String
 enum Step {
     Token,
     Zone,
+    GetConnector,
     Tunnel,
     Connector,
     TunnelDns,
@@ -245,6 +293,7 @@ impl Step {
         match self {
             Step::Token => "token",
             Step::Zone => "zone",
+            Step::GetConnector => "get_connector",
             Step::Tunnel => "tunnel",
             Step::Connector => "connector",
             Step::TunnelDns => "tunnel_dns",
@@ -270,6 +319,7 @@ impl Step {
         match self {
             Step::Token => "Check the token".into(),
             Step::Zone => format!("Find the zone for {domain}"),
+            Step::GetConnector => "Get the connector (cloudflared)".into(),
             Step::Tunnel => "Create the tunnel and route it to this server".into(),
             Step::Connector => "Start the connector".into(),
             Step::TunnelDns => format!("Point {domain} at the tunnel"),
@@ -298,6 +348,7 @@ fn setup_steps(c: Connection) -> Vec<Step> {
     let mut v = vec![Step::Token, Step::Zone];
     match c {
         Connection::Tunnel => v.extend([
+            Step::GetConnector,
             Step::Tunnel,
             Step::Connector,
             Step::ClientIp,
@@ -391,17 +442,33 @@ pub struct CloudflareSetup {
 /// Settings › Access.
 #[derive(async_graphql::SimpleObject, Clone, Debug)]
 pub struct AccessStatus {
-    /// `local`, `internet`, or empty when nobody chose yet.
+    /// `local`, `internet`, `direct`, or empty when nobody chose yet.
     pub mode: String,
     pub domain: Option<String>,
-    /// `https://<domain>` in internet mode.
+    /// What readers type: `https://<domain>` in internet mode, the stored public
+    /// address in direct mode.
     pub address: Option<String>,
+    /// `http://<address>:<port>` for each way a device on the home network reaches
+    /// this server, best first. Empty when the server only answers on this computer,
+    /// or runs in a container and cannot know.
+    pub lan_addresses: Vec<String>,
+    /// Last private socket peer seen since boot (RFC 3339); unknown in a container.
+    pub lan_client_seen_at: Option<String>,
     pub cloudflare: Option<CloudflareSetup>,
     /// `off`, `starting`, `running`, `failed` or `missing`.
     pub connector: String,
     pub connector_message: Option<String>,
-    /// The public-IP HTTPS listener is up.
+    /// The HTTPS listener is up (Cloudflare public-IP mode, or direct mode with a
+    /// certificate).
     pub https: bool,
+    /// Direct mode with HTTPS: when the current certificate stops being valid
+    /// (RFC 3339). The server renews it long before.
+    pub certificate_expires: Option<String>,
+    /// Direct mode with HTTPS: why the last renewal failed, until one succeeds.
+    pub certificate_error: Option<String>,
+    /// Direct mode with HTTPS: the plain HTTP port refuses clients on the internet.
+    /// It starts to after the first visit from the internet over HTTPS.
+    pub plain_http_closed: bool,
     pub trusted_proxies: Vec<String>,
     /// `TRUSTED_PROXY_CIDRS` is set on the server, so setup leaves it alone.
     pub trusted_proxies_pinned: bool,
@@ -414,6 +481,24 @@ pub struct CloudflareTokenCheck {
     pub zone_name: String,
     pub zone_status: String,
     pub account_name: String,
+    /// Read probes can suggest missing rows, but cannot prove Edit permission.
+    pub missing: Vec<String>,
+}
+
+/// Dependency checks for Settings › Access. No setup changes are made.
+#[derive(async_graphql::SimpleObject, Clone, Debug)]
+pub struct AccessPreflight {
+    /// `found`, `download` or `unsupported`.
+    pub cloudflared: String,
+    pub cloudflared_detail: Option<String>,
+    pub http_port: i32,
+    pub https_port: i32,
+    /// `free`, `serving`, `in_use` or `denied`; `unknown` for other OS errors.
+    pub https_port_state: String,
+    pub acme_port: i32,
+    pub acme_port_state: String,
+    pub in_container: bool,
+    pub public_ip: Option<String>,
 }
 
 #[derive(async_graphql::InputObject)]
@@ -437,13 +522,31 @@ pub struct Manager {
     router: OnceLock<axum::Router>,
     /// The HTTPS server task and its accept loop.
     https: Mutex<Option<[tokio::task::JoinHandle<()>; 2]>>,
+    /// Direct mode with HTTPS (`direct.rs`): its port-80 listener, its renewal loop,
+    /// the answers to the certificate authority's checks, a lock so that one
+    /// certificate is requested at a time, and why the last renewal failed.
+    challenge_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    renew_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    challenges: acme::Challenges,
+    issuing: tokio::sync::Mutex<()>,
+    certificate_error: Mutex<Option<String>>,
+    /// Direct mode with HTTPS, for `plain_http_guard`: the HTTPS address, and whether
+    /// a client on the internet has used it (`instance::DIRECT_HTTPS_SEEN`).
+    direct_origin: Arc<RwLock<Option<String>>>,
+    https_seen: AtomicBool,
+    lan_client_seen_at: AtomicI64,
+    in_container: bool,
 }
 
 type StepResult = Result<Option<String>, String>;
 
 impl Manager {
     pub fn new(pool: SqlitePool, opts: Options, trusted: Arc<crate::TrustedProxies>) -> Self {
-        let connector = Connector::new(opts.cloudflared_bin.clone());
+        let connector = Connector::new(
+            opts.cloudflared_bin.clone(),
+            opts.search_path.clone(),
+            &opts.data_dir,
+        );
         Self {
             pool,
             opts,
@@ -452,6 +555,15 @@ impl Manager {
             job: Mutex::new(None),
             router: OnceLock::new(),
             https: Mutex::new(None),
+            challenge_task: Mutex::new(None),
+            renew_task: Mutex::new(None),
+            challenges: acme::Challenges::default(),
+            issuing: tokio::sync::Mutex::new(()),
+            certificate_error: Mutex::new(None),
+            direct_origin: Arc::new(RwLock::new(None)),
+            https_seen: AtomicBool::new(false),
+            lan_client_seen_at: AtomicI64::new(0),
+            in_container: crate::lan::in_container(),
         }
     }
 
@@ -461,22 +573,41 @@ impl Manager {
 
     /// Boot: bring back what a completed or partial setup left running (connector,
     /// HTTPS listener). No stored setup, no work — the hosted instance never gets here.
-    pub async fn resume(&self) {
+    pub async fn resume(self: &Arc<Self>) {
+        self.resume_direct_tls().await;
+        let mode = instance::resolve(&self.pool, &instance::ACCESS_MODE)
+            .await
+            .value;
+        if !matches!(mode.as_str(), "local" | "direct") {
+            if let Err(e) = self.resume_cloudflare().await {
+                tracing::warn!("cloudflare not resumed: {e}");
+            }
+        }
+    }
+
+    /// Keep Cloudflare's resources and credentials for a later return or removal.
+    async fn pause_cloudflare(&self) {
+        self.connector.stop().await;
+        if self.direct_tls_host().await.is_none()
+            && load_stored(&self.pool)
+                .await
+                .is_some_and(|s| s.certificate_id.is_some())
+        {
+            self.stop_https().await;
+        }
+    }
+
+    async fn resume_cloudflare(&self) -> Result<(), String> {
         let Some(s) = load_stored(&self.pool).await else {
-            return;
+            return Ok(());
         };
         if s.tunnel_id.is_some() && self.token_file().is_file() {
-            match self.connector.start(&self.token_file()) {
-                Ok(()) => tracing::info!(domain = %s.domain, "cloudflare tunnel connector started"),
-                Err(e) => tracing::warn!("cloudflare tunnel connector not started: {e}"),
-            }
+            self.connector.start(&self.token_file())?;
         }
         if s.certificate_id.is_some() {
-            match self.start_https().await {
-                Ok(()) => tracing::info!(addr = %self.opts.https_addr, "origin HTTPS listening"),
-                Err(e) => tracing::warn!("origin HTTPS not started: {e}"),
-            }
+            self.start_https(ORIGIN_KEY_FILE, ORIGIN_CERT_FILE).await?;
         }
+        Ok(())
     }
 
     fn token_file(&self) -> PathBuf {
@@ -525,16 +656,25 @@ impl Manager {
         .filter(|d| !d.is_empty())
         .or_else(|| stored.as_ref().map(|s| s.domain.clone()));
         let (connector, connector_message) = self.connector.status();
-        let https = self
-            .https
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .is_some_and(|h| !h[0].is_finished());
+        let https = self.https_up();
+        let direct_tls = mode == "direct" && self.direct_tls_host().await.is_some();
+        let address = match mode.as_str() {
+            "internet" => domain.as_ref().map(|d| format!("https://{d}")),
+            "direct" => Some(
+                instance::resolve(&self.pool, &instance::PUBLIC_ADDRESS)
+                    .await
+                    .value,
+            )
+            .filter(|a| !a.is_empty()),
+            _ => None,
+        };
         AccessStatus {
-            address: (mode == "internet")
-                .then(|| domain.as_ref().map(|d| format!("https://{d}")))
-                .flatten(),
+            address,
+            lan_addresses: crate::lan::addresses(self.opts.listen.ip(), self.opts.listen.port()),
+            lan_client_seen_at: match self.lan_client_seen_at.load(Ordering::Relaxed) {
+                0 => None,
+                at => chrono::DateTime::from_timestamp(at, 0).map(|t| t.to_rfc3339()),
+            },
             mode,
             domain,
             cloudflare: stored.map(|s| CloudflareSetup {
@@ -547,10 +687,76 @@ impl Manager {
             connector: connector.as_str().into(),
             connector_message,
             https,
+            certificate_expires: direct_tls
+                .then(|| self.certificate_dates())
+                .flatten()
+                .map(|(_, until)| until.to_rfc3339()),
+            certificate_error: self
+                .certificate_error
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+                .filter(|_| direct_tls),
+            plain_http_closed: direct_tls && self.https_seen.load(Ordering::Relaxed),
             trusted_proxies: self.trusted.raw(),
             trusted_proxies_pinned: self.trusted.is_pinned(),
             job: self.job_view(),
         }
+    }
+
+    pub fn record_lan_peer(&self, peer: IpAddr) {
+        if !self.in_container && crate::lan::is_lan_client(peer) {
+            self.lan_client_seen_at
+                .store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+        }
+    }
+
+    pub async fn preflight(&self) -> AccessPreflight {
+        let (cloudflared, cloudflared_detail) = match self.connector.resolve_bin() {
+            Ok(path) => ("found", Some(path.display().to_string())),
+            Err(message) if self.opts.cloudflared_bin.is_some() => ("unsupported", Some(message)),
+            Err(_) if fetch_connector::current_release().is_some() => ("download", None),
+            Err(_) => ("unsupported", Some(fetch_connector::UNSUPPORTED.into())),
+        };
+        let acme_serving = self
+            .challenge_task
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|task| !task.is_finished());
+        let (https_state, acme_state, public_ip) = tokio::join!(
+            port_state(self.opts.https_addr, self.https_up()),
+            port_state(self.opts.acme_addr, acme_serving),
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                detect_public_ip(&self.opts.trace_url)
+            ),
+        );
+        AccessPreflight {
+            cloudflared: cloudflared.into(),
+            cloudflared_detail,
+            http_port: self.opts.listen.port().into(),
+            https_port: self.opts.https_addr.port().into(),
+            https_port_state: https_state.into(),
+            acme_port: self.opts.acme_addr.port().into(),
+            acme_port_state: acme_state.into(),
+            in_container: self.in_container,
+            public_ip: public_ip.ok().and_then(Result::ok),
+        }
+    }
+
+    async fn get_connector(&self) -> StepResult {
+        match self.connector.resolve_bin() {
+            Ok(path) => return Ok(Some(format!("Found at {}.", path.display()))),
+            Err(message) if self.opts.cloudflared_bin.is_some() => return Err(message),
+            Err(_) => {}
+        }
+        let pin = fetch_connector::current_release().ok_or(fetch_connector::UNSUPPORTED)?;
+        fetch_connector::fetch(&self.opts.data_dir, &self.opts.download_base, &pin).await?;
+        Ok(Some(format!(
+            "Downloaded cloudflared {}.",
+            fetch_connector::VERSION
+        )))
     }
 
     /// "Check token": verify it and find the zone for `domain`. Nothing is changed.
@@ -558,16 +764,19 @@ impl Manager {
         &self,
         token: &str,
         domain: &str,
+        connection: Option<Connection>,
     ) -> Result<CloudflareTokenCheck, String> {
         let domain = normalize_domain(domain)?;
         let token = ApiToken::new(token).ok_or("Paste the API token first.")?;
         let api = Client::new(&self.opts.api_base, token);
         verify(&api).await?;
         let zone = find_zone(&api, &domain).await?;
+        let missing = api.missing_permissions(&zone, connection).await;
         Ok(CloudflareTokenCheck {
             zone_name: zone.name,
             zone_status: zone.status,
             account_name: zone.account.name,
+            missing,
         })
     }
 
@@ -618,6 +827,13 @@ impl Manager {
         if let Some(ip) = &public_ip {
             check_public_ip(ip)?;
         }
+        if input.connection == Connection::PublicIp && self.direct_tls_host().await.is_some() {
+            return Err(
+                "This server serves HTTPS at its own address, on the port Cloudflare would \
+                 use. Choose \"Only my devices\" first, or use a Tunnel."
+                    .into(),
+            );
+        }
         let existing = load_stored(&self.pool).await;
         let stored = match existing {
             Some(s)
@@ -631,15 +847,15 @@ impl Manager {
             }
             Some(mut s) if s.domain == domain => {
                 s.connection = Some(input.connection);
-                if public_ip.is_some() {
-                    s.public_ip = public_ip;
-                }
+                s.public_ip_detected = public_ip.is_none();
+                s.public_ip = public_ip;
                 s.complete = false;
                 s
             }
             _ => Stored {
                 domain: domain.clone(),
                 connection: Some(input.connection),
+                public_ip_detected: public_ip.is_none(),
                 public_ip,
                 ..Stored::default()
             },
@@ -668,7 +884,11 @@ impl Manager {
             token: token.to_string(),
             domain: s.domain,
             connection,
-            public_ip: s.public_ip,
+            public_ip: if s.public_ip_detected {
+                None
+            } else {
+                s.public_ip
+            },
         })
         .await
     }
@@ -714,8 +934,6 @@ impl Manager {
                 JobKind::Setup => {
                     s.complete = true;
                     let _ = save_stored(&self.pool, Some(&s)).await;
-                    let _ = instance::store(&self.pool, &instance::ACCESS_MODE, "internet").await;
-                    let _ = instance::store(&self.pool, &instance::PUBLIC_DOMAIN, &s.domain).await;
                 }
                 JobKind::Remove => {
                     let _ = save_stored(&self.pool, None).await;
@@ -723,6 +941,9 @@ impl Manager {
                     let _ = instance::store(&self.pool, &instance::ACCESS_MODE, "local").await;
                 }
             }
+            // Either way the server is no longer public at its own address.
+            let _one = self.issuing.lock().await;
+            self.disable_direct_tls().await;
         }
         self.finish();
     }
@@ -738,8 +959,10 @@ impl Manager {
                 s.zone_id = Some(zone.id);
                 s.zone_name = Some(zone.name);
                 s.account_id = Some(zone.account.id);
+                save_stored(&self.pool, Some(s)).await?;
                 Ok(Some(msg))
             }
+            Step::GetConnector => self.get_connector().await,
             Step::Tunnel => self.step_tunnel(api, s).await,
             Step::Connector => {
                 self.connector.start(&self.token_file())?;
@@ -762,6 +985,7 @@ impl Manager {
                     .map_err(|e| e.message)?;
                 if s.ssl_previous.is_none() {
                     s.ssl_previous = Some(current.clone());
+                    save_stored(&self.pool, Some(s)).await?;
                 }
                 if current != json!("strict") {
                     api.set_zone_setting(&zone, "ssl", json!("strict"))
@@ -778,6 +1002,7 @@ impl Manager {
                     None => {
                         let ip = detect_public_ip(&self.opts.trace_url).await?;
                         s.public_ip = Some(ip.clone());
+                        s.public_ip_detected = true;
                         ip
                     }
                 };
@@ -805,6 +1030,7 @@ impl Manager {
                     .map_err(|_| "The server could not save the trusted proxies.".to_string())?;
                 self.trusted.replace(&list);
                 s.trusted_proxies_set = true;
+                save_stored(&self.pool, Some(s)).await?;
                 Ok(Some(match s.connection {
                     Some(Connection::PublicIp) => {
                         format!("Trusting Cloudflare's {} address ranges.", list.len())
@@ -821,6 +1047,7 @@ impl Manager {
                     .map_err(|e| e.message)?;
                 if s.browser_cache_ttl_previous.is_none() {
                     s.browser_cache_ttl_previous = Some(current.clone());
+                    save_stored(&self.pool, Some(s)).await?;
                 }
                 // 0 is "Respect Existing Headers".
                 if current != json!(0) {
@@ -830,7 +1057,16 @@ impl Manager {
                 }
                 Ok(Some("Browsers keep what the server's headers say.".into()))
             }
-            Step::Health => self.step_health(s).await,
+            Step::Health => {
+                let message = self.step_health(s).await?;
+                instance::store(&self.pool, &instance::PUBLIC_DOMAIN, &s.domain)
+                    .await
+                    .map_err(|_| "Could not save the domain.".to_string())?;
+                instance::store(&self.pool, &instance::ACCESS_MODE, "internet")
+                    .await
+                    .map_err(|_| "Could not save the access choice.".to_string())?;
+                Ok(message)
+            }
 
             Step::DeleteDns => {
                 let zone = zone_id(s);
@@ -945,6 +1181,7 @@ impl Manager {
                     .await
                     .map_err(|e| e.message)?;
                 s.tunnel_id = Some(t.id.clone());
+                save_stored(&self.pool, Some(s)).await?;
                 t.id
             }
         };
@@ -963,7 +1200,7 @@ impl Manager {
         )))
     }
 
-    /// Create the proxied record for the domain, or confirm ours still exists.
+    /// Repair only our record; another server on the zone keeps its own.
     async fn ensure_record(
         &self,
         api: &Client,
@@ -977,13 +1214,23 @@ impl Manager {
             .await
             .map_err(|e| e.message)?;
         if let Some(r) = existing.iter().find(|r| s.dns_record_ids.contains(&r.id)) {
-            return Ok(Some(format!("{} record already in place.", r.kind)));
+            if r.kind == kind && r.content == content && r.proxied {
+                return Ok(Some(format!("{kind} record already in place.")));
+            }
+            if r.kind == kind {
+                api.update_dns_record(&zone, &r.id, kind, &s.domain, content)
+                    .await
+                    .map_err(|e| e.message)?;
+                return Ok(Some(format!("Proxied {kind} record to {content}.")));
+            }
+            gone_ok(api.delete_dns_record(&zone, &r.id).await)?;
         }
-        // Ours went missing (deleted by hand): forget it and create it again.
-        s.dns_record_ids.clear();
+        // Ours is gone or needs a new type: record that before creating its replacement.
+        let owned = std::mem::take(&mut s.dns_record_ids);
+        save_stored(&self.pool, Some(s)).await?;
         if let Some(r) = existing
             .iter()
-            .find(|r| matches!(r.kind.as_str(), "A" | "AAAA" | "CNAME"))
+            .find(|r| !owned.contains(&r.id) && matches!(r.kind.as_str(), "A" | "AAAA" | "CNAME"))
         {
             return Err(format!(
                 "{} already has a {} record ({}). Delete it in Cloudflare, or pick another \
@@ -996,6 +1243,7 @@ impl Manager {
             .await
             .map_err(|e| e.message)?;
         s.dns_record_ids.push(r.id);
+        save_stored(&self.pool, Some(s)).await?;
         Ok(Some(format!("Proxied {kind} record to {content}.")))
     }
 
@@ -1016,23 +1264,26 @@ impl Manager {
                 .await
                 .map_err(|e| e.message)?;
             s.certificate_id = Some(cert.id);
+            save_stored(&self.pool, Some(s)).await?;
             origin_tls::write_private(&cert_path, cert.certificate.as_bytes())
                 .map_err(|e| format!("Could not save the origin certificate: {e}"))?;
         }
-        self.start_https().await?;
+        self.start_https(ORIGIN_KEY_FILE, ORIGIN_CERT_FILE).await?;
         Ok(Some(format!(
             "Serving HTTPS on port {}.",
             self.opts.https_addr.port()
         )))
     }
 
-    async fn start_https(&self) -> Result<(), String> {
-        self.stop_https().await;
-        let key = std::fs::read(self.opts.data_dir.join(ORIGIN_KEY_FILE))
-            .map_err(|_| "The origin key file is missing. Run setup again.".to_string())?;
-        let cert = std::fs::read_to_string(self.opts.data_dir.join(ORIGIN_CERT_FILE))
-            .map_err(|_| "The origin certificate file is missing. Run setup again.".to_string())?;
+    /// Serve the public router over HTTPS with the key and certificate in these two
+    /// files of the data directory, in place of whatever the HTTPS port served before.
+    async fn start_https(&self, key_file: &str, cert_file: &str) -> Result<(), String> {
+        let key = std::fs::read(self.opts.data_dir.join(key_file))
+            .map_err(|_| "The HTTPS key file is missing. Run setup again.".to_string())?;
+        let cert = std::fs::read_to_string(self.opts.data_dir.join(cert_file))
+            .map_err(|_| "The HTTPS certificate file is missing. Run setup again.".to_string())?;
         let config = origin_tls::server_config(&cert, &key)?;
+        self.stop_https().await;
         let router = self
             .router
             .get()
@@ -1051,6 +1302,14 @@ impl Manager {
         let serve = tokio::spawn(origin_tls::serve(listener, router));
         *self.https.lock().unwrap_or_else(|p| p.into_inner()) = Some([serve, accept]);
         Ok(())
+    }
+
+    fn https_up(&self) -> bool {
+        self.https
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|h| !h[0].is_finished())
     }
 
     /// Stop the HTTPS listener and wait until its port is free again.
@@ -1084,33 +1343,58 @@ impl Manager {
                     .filter(|x| refs.contains(&x.reference))
                     .map(|x| x.id.clone())
                     .collect();
+                save_stored(&self.pool, Some(s)).await?;
                 return Ok(Some(format!("{} rules created.", s.rule_ids.len())));
             }
         };
         if s.ruleset_id.as_deref() != Some(&ruleset.id) {
             s.ruleset_id = Some(ruleset.id.clone());
             s.ruleset_created = false;
+            save_stored(&self.pool, Some(s)).await?;
         }
         let mut current = ruleset.rules;
         let mut added = 0;
         for rule in wanted {
             let r#ref = rule["ref"].as_str().unwrap_or_default().to_string();
-            if !current.iter().any(|x| x.reference == r#ref) {
+            let old_ref = r#ref
+                .rsplit_once('_')
+                .map(|(old, _)| old)
+                .unwrap_or_default();
+            let host = format!("http.host eq \"{}\"", s.domain);
+            let owned = |x: &&api::Rule| {
+                x.reference == r#ref || (x.reference == old_ref && x.expression.contains(&host))
+            };
+            let mut id = current.iter().find(owned).map(|x| x.id.clone());
+            if id.is_none() {
                 current = api
                     .add_rule(&zone, &ruleset.id, rule)
                     .await
                     .map_err(|e| e.message)?
                     .rules;
                 added += 1;
+                id = current.iter().find(owned).map(|x| x.id.clone());
             }
             // Record the id at once (also adopts our rule left by an earlier run).
-            if let Some(x) = current.iter().find(|x| x.reference == r#ref) {
-                if !s.rule_ids.contains(&x.id) {
-                    s.rule_ids.push(x.id.clone());
+            if let Some(id) = id {
+                if !s.rule_ids.contains(&id) {
+                    s.rule_ids.push(id);
+                    save_stored(&self.pool, Some(s)).await?;
                 }
             }
         }
-        s.rule_ids.retain(|id| current.iter().any(|x| &x.id == id));
+        let host = format!("http.host eq \"{}\"", s.domain);
+        s.rule_ids.retain(|id| {
+            current.iter().any(|x| {
+                &x.id == id
+                    && refs.iter().any(|reference| {
+                        x.reference == *reference
+                            || (reference
+                                .rsplit_once('_')
+                                .is_some_and(|(old, _)| x.reference == old)
+                                && x.expression.contains(&host))
+                    })
+            })
+        });
         Ok(Some(if added == 0 {
             "Cache rules already in place.".into()
         } else {
@@ -1210,10 +1494,12 @@ async fn find_zone(api: &Client, domain: &str) -> Result<api::Zone, String> {
 /// server's own `Cache-Control` for both edge and browser (covers, pages and hashed
 /// assets are `immutable`; `/img` passes its upstream's lifetime).
 fn cache_rules(domain: &str) -> Vec<Value> {
+    let suffix = hex::encode(Sha256::digest(domain.as_bytes()));
+    let suffix = &suffix[..8];
     let host = format!("http.host eq \"{domain}\"");
     let rule = |r#ref: &str, what: &str, paths: &str| {
         json!({
-            "ref": r#ref,
+            "ref": format!("{}_{suffix}", r#ref),
             "description": format!("komiq: cache {what}"),
             "expression": format!("({host} and ({paths}))"),
             "action": "set_cache_settings",
@@ -1252,6 +1538,44 @@ fn cache_rules(domain: &str) -> Vec<Value> {
 
 /// `https://Read.Example.com/` → `read.example.com`; rejects anything that is not a
 /// plain hostname with at least one dot.
+/// The public address for direct mode as an origin: `203.0.113.5:8080` and
+/// `http://203.0.113.5:8080/` both become `http://203.0.113.5:8080`. Plain HTTP unless
+/// the owner wrote `https://` (their own TLS in front). An address of this computer
+/// only (loopback) is refused: nobody else can use it.
+pub fn normalize_address(raw: &str) -> Result<String, String> {
+    const HELP: &str = "Enter this server's public address, like 203.0.113.5:8080.";
+    let raw = raw.trim();
+    let with_scheme = if let Ok(ip) = raw.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(_) => format!("http://{ip}"),
+            IpAddr::V6(_) => format!("http://[{ip}]"),
+        }
+    } else if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+    let url = reqwest::Url::parse(&with_scheme).map_err(|_| HELP.to_string())?;
+    let plain = matches!(url.scheme(), "http" | "https")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(url.path(), "" | "/")
+        && url.query().is_none()
+        && url.fragment().is_none();
+    let Some(host) = url.host_str().filter(|_| plain) else {
+        return Err(HELP.into());
+    };
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let local = match bare.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Err(_) => bare == "localhost" || bare.ends_with(".localhost"),
+    };
+    if local {
+        return Err("That address only works on this computer. Enter the public one.".into());
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
 pub fn normalize_domain(raw: &str) -> Result<String, String> {
     let mut d = raw.trim().to_ascii_lowercase();
     for p in ["https://", "http://"] {
@@ -1329,17 +1653,29 @@ async fn detect_public_ip(trace_url: &str) -> Result<String, String> {
 }
 
 /// Record the wizard's access choice (and the domain an owner set up by hand).
+/// Record the access choice. `domain` is the domain for `internet` (optional: set by
+/// Cloudflare setup otherwise) and the server's public address for `direct` (required).
 pub async fn set_access(pool: &SqlitePool, mode: &str, domain: Option<&str>) -> Result<(), String> {
-    if !matches!(mode, "local" | "internet") {
-        return Err("Access must be local or internet.".into());
+    if !matches!(mode, "local" | "internet" | "direct") {
+        return Err("Access must be local, internet or direct.".into());
     }
-    let domain = match domain.map(str::trim).filter(|d| !d.is_empty()) {
-        Some(d) => normalize_domain(d)?,
-        None => String::new(),
-    };
+    let given = domain.map(str::trim).filter(|d| !d.is_empty());
     let store = |s, v: &str| {
         let v = v.to_string();
         async move { instance::store(pool, s, &v).await }
+    };
+    if mode == "direct" {
+        let address = normalize_address(given.unwrap_or_default())?;
+        store(&instance::PUBLIC_ADDRESS, &address)
+            .await
+            .map_err(|_| "Could not save the address.".to_string())?;
+        return store(&instance::ACCESS_MODE, mode)
+            .await
+            .map_err(|_| "Could not save the access choice.".to_string());
+    }
+    let domain = match given {
+        Some(d) => normalize_domain(d)?,
+        None => String::new(),
     };
     store(&instance::ACCESS_MODE, mode)
         .await
@@ -1350,4 +1686,24 @@ pub async fn set_access(pool: &SqlitePool, mode: &str, domain: Option<&str>) -> 
             .map_err(|_| "Could not save the domain.".to_string())?;
     }
     Ok(())
+}
+
+/// Bind briefly unless our listener already holds the address. Unexpected OS errors
+/// use `unknown`: never claim a busy port or a permission problem without evidence.
+async fn port_state(addr: SocketAddr, serving: bool) -> &'static str {
+    if serving {
+        return "serving";
+    }
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(_) => "free",
+        Err(e) => port_error_state(e.kind()),
+    }
+}
+
+fn port_error_state(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::AddrInUse => "in_use",
+        std::io::ErrorKind::PermissionDenied => "denied",
+        _ => "unknown",
+    }
 }

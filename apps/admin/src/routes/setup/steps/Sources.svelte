@@ -378,6 +378,10 @@
 	}
 	.picker {
 		display: grid;
+		/* Rows as tall as their content. With the default (auto), the max-height below
+		   pins every row to the li's min-height, and a row that shows an install error
+		   spills under the next one. */
+		grid-auto-rows: max-content;
 		gap: 2px;
 		max-height: 320px;
 		margin: 0;

@@ -4,16 +4,15 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-// The embedded engine has three per-platform implementations under the SAME
-// `suwayomi` module name, so the rest of `run()` (manage/start/invoke_handler/exit)
-// stays platform-agnostic:
-//   * desktop            -> suwayomi.rs        (child-process JVM supervisor + the
+// The embedded engine has three implementations under the SAME `suwayomi` module name,
+// so the rest of `run()` (manage/start/invoke_handler/exit) stays platform-agnostic:
+//   * desktop            -> suwayomi.rs           (child-process JVM supervisor + the
 //                           WebView Cloudflare shim `cloudflare.rs`, both desktop-only)
-//   * iOS REAL DEVICE    -> suwayomi_ios.rs    (in-process JNI boot of the statically
-//                           linked Zero JVM, N4.2 — device only: the vendored .a files
-//                           have no simulator slice, so the sim keeps the stub)
-//   * other mobile       -> suwayomi_mobile.rs ("engine unavailable" stubs; Android
-//                           and the iOS simulator)
+//   * iOS REAL DEVICE,   -> suwayomi_inprocess.rs (a JVM inside the app process, booted
+//     Android               over JNI. iOS: device only, the vendored .a files have no
+//                           simulator slice. The per-system half is
+//                           suwayomi_inprocess_{ios,android}.rs)
+//   * iOS simulator      -> suwayomi_mobile.rs    ("engine unavailable" stubs)
 //
 // The device arm matches the bare-ABI iOS triple by ALLOWLIST (`target_abi = ""`, which
 // is what aarch64-apple-ios reports) rather than by excluding `sim`: any other Apple ABI
@@ -24,12 +23,18 @@ use std::time::{Duration, Instant};
 mod cloudflare;
 #[cfg(desktop)]
 mod suwayomi;
-#[cfg(all(target_os = "ios", target_abi = ""))]
-#[path = "suwayomi_ios.rs"]
+#[cfg(any(all(target_os = "ios", target_abi = ""), target_os = "android"))]
+#[path = "suwayomi_inprocess.rs"]
 mod suwayomi;
-#[cfg(all(not(desktop), not(all(target_os = "ios", target_abi = ""))))]
+#[cfg(all(
+  not(desktop),
+  not(target_os = "android"),
+  not(all(target_os = "ios", target_abi = ""))
+))]
 #[path = "suwayomi_mobile.rs"]
 mod suwayomi;
+#[cfg(any(target_os = "android", test))]
+mod engine_image_server;
 
 /// Total budget for a single native image fetch (connect + transfer).
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -403,15 +408,15 @@ async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, String> {
 /// supervision task can exist at all.
 static ENGINE_STARTED: AtomicBool = AtomicBool::new(false);
 
-/// Should the embedded engine boot during `setup`?
+/// Should the embedded engine boot during `setup`, before anyone asked for it?
 ///
-/// The product switch is the frontend's build-time `PUBLIC_KOMIKA_NATIVE_ENGINE` (default
-/// off) and Rust cannot read `$env/static/public`, so we accept the same value from the
-/// two places visible here — the process env (works on an already-built binary) and a
-/// compile-time env var — and fall back to the historical "always start" so no existing
-/// build silently loses its engine. With it off, a flag-off desktop build stops paying
-/// for a `-Xmx512m` JVM, an H2 data dir, a lockfile and the loopback CF shim it will
-/// never call; JS can still bring the engine up on demand via `suwayomi_start`.
+/// No, by default. Where source fetches run is the reader's own setting (see
+/// `fetchOnDevice` in `src/lib/config.ts`): when it says "this device" the frontend calls
+/// `suwayomi_start`, and when it says "the server" nothing should pay for a `-Xmx512m`
+/// JVM, an H2 data dir, a lockfile and the loopback CF shim it will never call. The two
+/// env overrides stay for running the engine without the frontend's say-so: the process
+/// env on an already-built binary, and a compile-time var (which is also the only way to
+/// boot it on a platform `engine_supported` does not list yet, e.g. a device test).
 fn engine_autostart_enabled() -> bool {
   fn parse(v: &str) -> Option<bool> {
     match v.trim().to_ascii_lowercase().as_str() {
@@ -425,7 +430,26 @@ fn engine_autostart_enabled() -> bool {
     .as_deref()
     .and_then(parse)
     .or_else(|| option_env!("PUBLIC_KOMIKA_NATIVE_ENGINE").and_then(parse))
-    .unwrap_or(true)
+    .unwrap_or(false)
+}
+
+/// Can this build fetch from sources itself, i.e. may the frontend offer and use
+/// "fetch on this device"?
+///
+/// Desktop, and an Android build that carries the engine runtime on a phone that can run
+/// it (`runtime_bundled`). The iOS device engine (`suwayomi_inprocess.rs`) boots on a
+/// phone, but the reader's own path through it is not tested there (2026-10-05), so on
+/// iOS the choice is not offered and `suwayomi_start` does nothing; it joins this list
+/// when its engine is verified on a device. Until then a build that was explicitly told
+/// to run the engine (the autostart overrides) counts as supported too, so that a device
+/// test reads through it.
+#[tauri::command]
+fn engine_supported() -> bool {
+  #[cfg(target_os = "android")]
+  if suwayomi::runtime_bundled() {
+    return true;
+  }
+  cfg!(desktop) || engine_autostart_enabled()
 }
 
 /// Start the engine at most once. `suwayomi::start` is not itself idempotent (a second
@@ -440,12 +464,96 @@ fn start_engine_once(app: &tauri::AppHandle) {
   }
 }
 
-/// Bring the embedded engine up on demand, for builds where autostart is off. Idempotent
-/// and cheap to call — JS invokes it when the native-engine flag is on, before it starts
-/// polling `suwayomi_status`.
+/// Bring the embedded engine up on demand. Idempotent and cheap to call — the frontend
+/// invokes it when source fetches are set to run on this device, before it starts polling
+/// `suwayomi_status`. Does nothing where the engine is not supported yet.
 #[tauri::command]
 fn suwayomi_start(app: tauri::AppHandle) {
-  start_engine_once(&app);
+  if engine_supported() {
+    start_engine_once(&app);
+  }
+}
+
+/// Show or hide the system status bar (clock, battery). The chapter reader hides it
+/// together with its own top bar. Only iOS has one the app can hide this way; the
+/// command does nothing on every other platform, so the frontend calls it unguarded.
+#[tauri::command]
+fn set_status_bar_hidden(window: tauri::WebviewWindow, hidden: bool) {
+  #[cfg(target_os = "ios")]
+  {
+    // The root view controller is tao's: it stores the flag behind
+    // `prefersStatusBarHidden` and asks UIKit to re-read it. `with_webview` runs the
+    // closure on the main thread, which UIKit requires.
+    let _ = window.with_webview(move |webview| {
+      use objc2::runtime::{AnyObject, Bool};
+      use objc2::{msg_send, sel};
+      let controller = webview.view_controller() as *mut AnyObject;
+      if controller.is_null() {
+        return;
+      }
+      unsafe {
+        // The setter is tao's own, not UIKit's. Ask first, so a tao that renames it
+        // leaves the bar visible instead of stopping the app.
+        let known: bool =
+          msg_send![controller, respondsToSelector: sel!(setPrefersStatusBarHidden:)];
+        if known {
+          let _: () = msg_send![controller, setPrefersStatusBarHidden: Bool::new(hidden)];
+        }
+      }
+    });
+  }
+  #[cfg(not(target_os = "ios"))]
+  let _ = (window, hidden);
+}
+
+/// The address scheme of an engine image. The web view asks for
+/// `engine-image://localhost/api/v1/…` (`http://engine-image.localhost/api/v1/…` on
+/// Windows); `packages/api/src/image-provider.ts` builds those addresses. Android does
+/// not use the scheme while its loopback listener runs (see `engine_image_base`).
+const ENGINE_IMAGE_SCHEME: &str = "engine-image";
+
+/// The address prefix the web view loads engine images from when that is not the
+/// `engine-image` scheme: on Android, the loopback listener in `engine_image_server.rs`
+/// (that file says why). `None` everywhere else, and the page then uses the scheme.
+#[tauri::command]
+fn engine_image_base(
+  #[cfg_attr(not(target_os = "android"), allow(unused_variables))] supervisor: tauri::State<
+    '_,
+    Arc<suwayomi::SuwayomiSupervisor>,
+  >,
+) -> Option<&'static str> {
+  #[cfg(target_os = "android")]
+  return engine_image_server::base_url(&supervisor);
+  #[cfg(not(target_os = "android"))]
+  None
+}
+
+/// Answer one `engine-image` request. The path is the engine's own image path; the engine
+/// module checks it (`/api/` routes only) and adds the engine's password, so the page
+/// never sees the port or the credential. A failure is a 502: the reader shows its
+/// placeholder for that page and the rest of the chapter loads.
+async fn engine_image_response(
+  supervisor: &suwayomi::SuwayomiSupervisor,
+  path: &str,
+) -> tauri::http::Response<Vec<u8>> {
+  use tauri::http::{header, Response, StatusCode};
+  match suwayomi::engine_image(supervisor, path).await {
+    Ok((bytes, content_type)) => {
+      let mut response = Response::builder().status(StatusCode::OK);
+      if let Some(content_type) = content_type {
+        response = response.header(header::CONTENT_TYPE, content_type);
+      }
+      response.body(bytes)
+    }
+    Err(err) => {
+      log::warn!(target: "suwayomi", "engine image {path}: {err}");
+      Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(err.into_bytes())
+    }
+  }
+  .expect("status and a content type are a valid response")
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -473,11 +581,18 @@ pub fn run() {
           ])
           .build(),
       )?;
+      // Links to other sites open in the default browser, not in the app's web view. The
+      // plugin's own script catches a click on any `target="_blank"` link, so the pages
+      // need no code for it (see capabilities/default.json).
+      app.handle().plugin(tauri_plugin_opener::init())?;
+      // QR scan for "Connect to a server" (phones only; see capabilities/mobile.json).
+      #[cfg(mobile)]
+      app.handle().plugin(tauri_plugin_barcode_scanner::init())?;
       // Embedded Suwayomi sidecar (N1.1). On desktop this starts the JVM supervisor; a
       // start failure only logs + sets a degraded state and never aborts app startup. The
       // engine binds loopback only and JS reaches it via the `suwayomi_gql` IPC proxy. On
-      // mobile (`suwayomi_mobile.rs`) both `new()` and `start()` are inert no-ops: the
-      // engine reports "unavailable" and JS routes content to the hosted backend.
+      // the iOS simulator (`suwayomi_mobile.rs`) both `new()` and `start()` are inert
+      // no-ops: the engine reports "unavailable" and JS routes content to the hosted backend.
       use tauri::Manager;
       app.manage(Arc::new(suwayomi::SuwayomiSupervisor::new()));
       if engine_autostart_enabled() {
@@ -487,9 +602,31 @@ pub fn run() {
       }
       Ok(())
     })
+    // Engine images as plain addresses, so the web view loads a chapter's pages by itself,
+    // one by one, the way it loads any `<img>`. A page that waits for all of its images
+    // as bytes over IPC shows nothing until the last one is in.
+    .register_asynchronous_uri_scheme_protocol(ENGINE_IMAGE_SCHEME, |ctx, request, responder| {
+      use tauri::Manager;
+      let supervisor = ctx
+        .app_handle()
+        .state::<Arc<suwayomi::SuwayomiSupervisor>>()
+        .inner()
+        .clone();
+      let path = request
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_default();
+      tauri::async_runtime::spawn(async move {
+        responder.respond(engine_image_response(&supervisor, &path).await);
+      });
+    })
     .invoke_handler(tauri::generate_handler![
       fetch_image,
+      engine_supported,
+      engine_image_base,
       suwayomi_start,
+      set_status_bar_hidden,
       suwayomi::suwayomi_gql,
       suwayomi::suwayomi_image,
       suwayomi::suwayomi_status,

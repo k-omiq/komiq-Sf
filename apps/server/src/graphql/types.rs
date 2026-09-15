@@ -141,6 +141,8 @@ pub enum BrowseSortField {
     MostFollows,
     /// MangaDex's bayesian rating (0-10).
     HighestRated,
+    /// Our own readers' review average (the v1 `RATING`). Unrated works sort last.
+    ReaderRated,
     /// English chapter count.
     MostChapters,
     /// A-Z; the one sort whose default direction is ASC.
@@ -230,6 +232,95 @@ pub struct TagInfo {
     pub count: i32,
 }
 
+/// One source Browse can filter by (`browseSources`).
+#[derive(SimpleObject, Clone, Debug)]
+pub struct BrowseSource {
+    /// What `BrowseFilter.source` takes: "mangadex", or a Suwayomi source id.
+    pub id: String,
+    /// The source's display name; its extension package name, then its id, when the
+    /// engine could not be asked.
+    pub name: String,
+    /// The source's language code ("en", "all", …), when known.
+    pub lang: Option<String>,
+    /// Works from this source that the VIEWER may see in Browse (NSFW-gated). The same
+    /// number the `source` filter returns on its own.
+    pub count: i32,
+}
+
+/// What an admin says about a scanlator's use of AI.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ScanlatorAi {
+    /// The translation is machine made.
+    Ai,
+    /// AI is part of the work, for example machine translation that a person edits.
+    Partial,
+}
+
+impl From<crate::scanlators::AiLevel> for ScanlatorAi {
+    fn from(level: crate::scanlators::AiLevel) -> Self {
+        match level {
+            crate::scanlators::AiLevel::Ai => ScanlatorAi::Ai,
+            crate::scanlators::AiLevel::Partial => ScanlatorAi::Partial,
+        }
+    }
+}
+
+impl From<ScanlatorAi> for crate::scanlators::AiLevel {
+    fn from(ai: ScanlatorAi) -> Self {
+        match ai {
+            ScanlatorAi::Ai => crate::scanlators::AiLevel::Ai,
+            ScanlatorAi::Partial => crate::scanlators::AiLevel::Partial,
+        }
+    }
+}
+
+/// Which scanlators the admin list shows, by the tag that APPLIES to them (their own, or
+/// one a joint credit takes from a member).
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ScanlatorAiFilter {
+    /// Tagged AI or partial AI.
+    Tagged,
+    Ai,
+    Partial,
+    Untagged,
+}
+
+/// One tagged scanlator (`scanlatorTags`): what a reader app needs to mark a chapter
+/// copy as AI.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct ScanlatorTag {
+    /// The credit as the admin tagged it. Match it to `Chapter.scanlator` /
+    /// `ChapterSource.scanlator` trimmed and case-folded; a joint credit ("A & B") with
+    /// no tag of its own takes the strongest tag of its members (AI over PARTIAL).
+    pub name: String,
+    pub ai: ScanlatorAi,
+}
+
+/// One row of the admin scanlator list (`scanlators`).
+#[derive(SimpleObject, Clone, Debug)]
+pub struct Scanlator {
+    /// The credit as chapters carry it (the most common spelling).
+    pub name: String,
+    /// Chapter copies credited to this name; on the filtered source when one is given.
+    pub chapter_count: i32,
+    /// Series with at least one such chapter.
+    pub series_count: i32,
+    /// The tag stored for exactly this name; null when it has none.
+    pub ai: Option<ScanlatorAi>,
+    /// The tag that applies: `ai`, else the strongest tag among the members of a joint
+    /// credit ("A & B"). This is what readers see.
+    pub effective_ai: Option<ScanlatorAi>,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct ScanlatorPage {
+    pub items: Vec<Scanlator>,
+    pub page: i32,
+    pub has_next_page: bool,
+    /// The FILTERED count.
+    pub total: i32,
+}
+
 /// `TagGroup` from the stored `tag.tag_group` word. Anything unrecognized is filed under
 /// GENRE, matching `tags::rebuild_tag_table`'s default for free-text admin tags.
 pub fn tag_group_from_word(w: &str) -> TagGroup {
@@ -299,6 +390,7 @@ pub fn browse_sort(
         BrowseSortField::MostViewed => SortKey::MostViewed,
         BrowseSortField::MostFollows => SortKey::MostFollows,
         BrowseSortField::HighestRated => SortKey::HighestRated,
+        BrowseSortField::ReaderRated => SortKey::CommunityRating,
         BrowseSortField::MostChapters => SortKey::MostChapters,
         BrowseSortField::Title => SortKey::Title,
         BrowseSortField::Year => SortKey::Year,
@@ -611,6 +703,31 @@ pub struct WorkSource {
     /// The extension's language (there is no per-source lang on `source_series`);
     /// null when the source has no catalogued extension.
     pub lang: Option<String>,
+    pub extension: Option<SourceExtension>,
+}
+
+/// Where a Suwayomi chapter lives at its source (`chapterOrigin`): what a reader app
+/// that runs its own engine needs to find the SAME chapter there and fetch the pages
+/// itself, instead of asking this server to fetch them. Ids of this server's engine are
+/// deliberately absent — they mean nothing to another engine.
+#[derive(SimpleObject, Clone)]
+pub struct ChapterOrigin {
+    pub source_id: String,
+    /// The source's own key for the manga (`MangaType.url`).
+    pub manga_url: String,
+    /// Title as the source gives it — a search hint for an engine that has never seen
+    /// the manga.
+    pub manga_title: String,
+    /// The source's own key for the chapter (`ChapterType.url`).
+    pub chapter_url: String,
+    /// The chapter's page on the source's own website (`ChapterType.realUrl`) — what the
+    /// reader's "Read on source" opens. Null when the extension reports none. This is
+    /// extension-controlled text, passed through verbatim: the client must accept only
+    /// absolute http(s) before using it as a link.
+    pub chapter_web_url: Option<String>,
+    /// The series' page on the source's website (`MangaType.realUrl`); same caveats.
+    pub manga_web_url: Option<String>,
+    /// Null when the source has no catalogued extension yet.
     pub extension: Option<SourceExtension>,
 }
 
@@ -929,6 +1046,16 @@ pub struct Instance {
     /// Whether this server uses MangaDex (the usage switch; the catalogue crawl is a
     /// separate per-replica setting).
     pub mangadex_enabled: bool,
+    /// True when reader apps must fetch chapter pages from the sources themselves
+    /// (`KOMIKA_APPS_FETCH_THEMSELVES`): an app with its own engine then does not offer
+    /// fetching through this server.
+    pub apps_fetch_themselves: bool,
+    /// True when the server has no owner yet and THIS request came over plain HTTP from
+    /// the internet: from a public address, or to a public address the client typed
+    /// (the peer address proves nothing behind Docker Desktop or rootless Docker).
+    /// `createOwner` is refused there (the owner password would travel in the clear):
+    /// the setup screens show how to run `komika-server setup` on the server instead.
+    pub setup_needs_terminal: bool,
 }
 
 /// The MangaDex switch as the admin console sees it (`mangadexSetting`).
@@ -941,6 +1068,22 @@ pub struct MangadexSetting {
     pub pinned: bool,
     /// The env variable that pins it: `KOMIKA_MANGADEX` or `CATALOGUE_SYNC`.
     pub pinned_by: Option<String>,
+}
+
+/// One per-source scan rate limit (`sourceRateLimits`): the server sends this source
+/// at most `requests` HTTP requests per `window_secs` when it checks for new chapters.
+#[derive(SimpleObject, Clone)]
+pub struct SourceRateLimit {
+    /// The Suwayomi source id (`sources { id }`).
+    pub source_id: ID,
+    pub requests: i32,
+    pub window_secs: i32,
+    /// True when the limit in force is the server's default for this source
+    /// (`SCAN_SOURCE_RATE_LIMITS`), with no admin's limit over it.
+    pub from_env: bool,
+    /// True when an admin's limit replaces the server's default for this source.
+    /// `removeSourceRateLimit` then restores the default instead of lifting the limit.
+    pub overrides_env: bool,
 }
 
 /// Admin "manga DB" overrides. Every field is the desired whole state for the

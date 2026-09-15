@@ -1,0 +1,8 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. DayNight: values-night/colors.xml holds the dark colors. -->
+    <style name="Theme.komika" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <!-- The page background (tokens.css, k-bg), so the window is not white before
+             the web view paints its first frame. -->
+        <item name="android:windowBackground">@color/app_background</item>
+    </style>
+</resources>

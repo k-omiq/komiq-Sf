@@ -1,0 +1,23 @@
+# Cloudflare Worker (static assets) config for the komiq docs site.
+#
+# The docs are fully prerendered by adapter-static (see vite.config.ts), so there
+# is no `main` and no Worker code: Wrangler serves the HTML files from the edge.
+#
+# Build:   pnpm -C apps/docs build
+# Deploy:  cd apps/docs && wrangler deploy
+name = "komika-docs"
+compatibility_date = "2024-11-06"
+
+# This account has no workers.dev subdomain, so serve ONLY on the custom domain.
+# custom_domain = true provisions the proxied DNS record + edge cert for the host.
+workers_dev = false
+routes = [
+  { pattern = "docs.komiq.cc", custom_domain = true },
+]
+
+# `/self-host/docker` serves `self-host/docker.html`. An unknown path gets the
+# prerendered 404 page with a 404 status.
+[assets]
+directory = "build"
+html_handling = "auto-trailing-slash"
+not_found_handling = "404-page"

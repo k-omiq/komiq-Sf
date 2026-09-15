@@ -1,6 +1,7 @@
 import adapterStatic from '@sveltejs/adapter-static';
 import adapterCloudflare from '@sveltejs/adapter-cloudflare';
 import { sveltekit } from '@sveltejs/kit/vite';
+import { rmSync } from 'node:fs';
 import { defineConfig, loadEnv } from 'vite';
 import { readerConnectSources } from './csp';
 
@@ -27,6 +28,39 @@ const target = isEmbeddedBuild ? 'embedded' : isTauriBuild ? 'tauri' : 'web';
 // `__KOMIKA_SSR__` gates the per-route `ssr` flags (see $lib/ssr): public pages
 // SSR on the web build, but stay client-only in the Tauri/static SPA build.
 const ssrEnabled = !isTauriBuild;
+
+// Files in static/ that only a browser asks for: tab icons, the home-screen install
+// manifest and its icons, the link-preview image, robots.txt. A native app window has
+// no tab, no install prompt and no crawler, so the app package leaves them out (1.1 MB,
+// most of it og-image.png). Only the Tauri CLI sets TAURI_ENV_PLATFORM: the static SPA
+// built for a web host (KOMIKA_TARGET=tauri or embedded) is opened by browsers and
+// keeps every file. The root layout leaves the matching <link> tags out at runtime.
+const WEB_ONLY_STATIC = [
+	'apple-touch-icon.png',
+	'favicon-16.png',
+	'favicon-32.png',
+	'favicon.ico',
+	'favicon.png',
+	'icon-192.png',
+	'icon-512-maskable.png',
+	'icon-512.png',
+	'manifest.webmanifest',
+	'og-image.png',
+	'robots.txt',
+];
+const isNativeAppBuild = !!process.env.TAURI_ENV_PLATFORM;
+
+function staticAdapter() {
+	const adapter = adapterStatic({ fallback: 'index.html' });
+	if (!isNativeAppBuild) return adapter;
+	return {
+		...adapter,
+		async adapt(builder: Parameters<typeof adapter.adapt>[0]) {
+			await adapter.adapt(builder);
+			for (const file of WEB_ONLY_STATIC) rmSync(`build/${file}`, { force: true });
+		},
+	};
+}
 
 export default defineConfig(({ command, mode, isPreview }) => {
 	const publicEnv = loadEnv(mode, process.cwd(), 'PUBLIC_');
@@ -81,7 +115,7 @@ export default defineConfig(({ command, mode, isPreview }) => {
 				// Web build → Cloudflare (edge SSR for public routes). Tauri/static build
 				// → static SPA with an index.html fallback so client routing resolves for
 				// every path.
-				adapter: isTauriBuild ? adapterStatic({ fallback: 'index.html' }) : adapterCloudflare(),
+				adapter: isTauriBuild ? staticAdapter() : adapterCloudflare(),
 			}),
 		],
 		// --- Tauri-friendly dev server ---

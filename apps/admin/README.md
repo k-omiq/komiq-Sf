@@ -83,6 +83,17 @@ reader's `src/suwayomi.rs`, compiled into this crate by path, not copied; so is 
 on-device Cloudflare shim (`src/cloudflare.rs`), which solves Cloudflare challenges for
 the engine in a hidden window of the app.
 
+The wizard's Home network step ("Allow other devices", `HomeNetwork.svelte`, also in
+Settings › Access) follows the Access step for either choice. It restarts the server on every
+interface through the bridge, then asks the server whether a device on the network has
+reached it (`accessStatus.lanClientSeenAt`) and says so when one has. Its help section
+can add the firewall rule for the server's port (`src-tauri/src/firewall.rs`, bridge
+commands `firewall_info` and `open_firewall`): one elevated PowerShell on Windows,
+`pkexec` with firewalld or ufw on Linux, each behind the system's own permission prompt.
+macOS asks by itself, so nothing is done there. Links that open a new tab (Cloudflare's
+token page, the Let's Encrypt agreement) go to the system browser through
+`tauri-plugin-opener`; the window itself never navigates away.
+
 The server and the engine end with the app, even when it is force-killed
 (`src-tauri/src/child.rs`): `PR_SET_PDEATHSIG` on Linux, a Job Object with
 `KILL_ON_JOB_CLOSE` on Windows. macOS has no such kernel feature, so there the app

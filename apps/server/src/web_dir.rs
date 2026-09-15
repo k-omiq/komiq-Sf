@@ -9,17 +9,41 @@
 //! admin build is nested under `/admin` (static route segments such as
 //! `/admin/cover/{work_id}` still match first) and the reader is the router's
 //! fallback, which only runs when no API route matched.
+//!
+//! Every HTML answer says `Cache-Control: no-cache`. The page names its scripts by
+//! content hash, so a browser that reuses an old page after an upgrade asks for
+//! scripts that are gone, gets the page again in their place, and shows nothing.
 
 use std::path::{Path, PathBuf};
 
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use axum::http::{HeaderValue, Response};
 use axum::Router;
+use tower_http::services::fs::ServeFileSystemResponseBody;
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeader;
+
+type HtmlNoCache = fn(&Response<ServeFileSystemResponseBody>) -> Option<HeaderValue>;
+
+/// `no-cache` for a page (always checked with the server before reuse); nothing for
+/// any other file.
+fn html_no_cache(res: &Response<ServeFileSystemResponseBody>) -> Option<HeaderValue> {
+    res.headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/html"))
+        .then(|| HeaderValue::from_static("no-cache"))
+}
 
 /// `root` as an SPA: real files as-is, anything else answers `index.html` with
 /// 200 (`fallback`, not `not_found_service`, which would force a 404).
-fn spa(root: PathBuf) -> ServeDir<ServeFile> {
+fn spa(root: PathBuf) -> SetResponseHeader<ServeDir<ServeFile>, HtmlNoCache> {
     let index = root.join("index.html");
-    ServeDir::new(root).fallback(ServeFile::new(index))
+    SetResponseHeader::overriding(
+        ServeDir::new(root).fallback(ServeFile::new(index)),
+        CACHE_CONTROL,
+        html_no_cache as HtmlNoCache,
+    )
 }
 
 /// Mount the reader and admin builds from `dir` under the already-routed `app`.
@@ -128,6 +152,35 @@ mod tests {
             get_body(&app, "POST", "/admin/cover/w1").await.1,
             "api-cover"
         );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn pages_are_never_reused_without_asking() {
+        let dir = fixture();
+        // The fixture's files have no extension the server maps to HTML except these.
+        std::fs::write(dir.join("admin/index.html"), "<!doctype html>").unwrap();
+        let app = app(&dir);
+        let cache = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let res = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                res.headers()
+                    .get("cache-control")
+                    .map(|v| v.to_str().unwrap().to_string())
+            }
+        };
+        // The page itself, a client route that falls back to it, and the reader's.
+        for uri in ["/admin/", "/admin/setup", "/", "/series/42"] {
+            assert_eq!(cache(uri).await.as_deref(), Some("no-cache"), "{uri}");
+        }
+        // Hashed files keep the browser's own handling.
+        assert_eq!(cache("/admin/_app/admin.js").await, None);
+        assert_eq!(cache("/app.js").await, None);
 
         std::fs::remove_dir_all(dir).ok();
     }

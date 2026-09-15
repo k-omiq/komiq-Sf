@@ -49,7 +49,7 @@
 		<button class="scrim" aria-label="Close search" onclick={close}></button>
 		<div class="panel">
 			<div class="bar">
-				<button class="search-btn" aria-label="Search" onclick={submit}>
+				<button class="search-btn k-hit" aria-label="Search" onclick={submit}>
 					<Icon name="search" size={21} stroke="var(--k-text-dim)" />
 				</button>
 				<input
@@ -62,7 +62,7 @@
 					{placeholder}
 					onkeydown={onkey}
 				/>
-				<button class="esc" onclick={close}>ESC</button>
+				<button class="esc k-hit" onclick={close}>ESC</button>
 			</div>
 		</div>
 	</div>
@@ -82,7 +82,8 @@
 		overscroll-behavior: contain;
 		position: fixed;
 		z-index: 50;
-		top: 84px;
+		/* Clear of the header, and so of the status bar / notch. */
+		top: calc(var(--k-header-h) + 20px);
 		left: 50%;
 		transform: translateX(-50%);
 		width: min(700px, calc(100vw - 40px));

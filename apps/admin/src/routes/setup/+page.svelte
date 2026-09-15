@@ -6,6 +6,7 @@
 	import { instance } from '$lib/instance.svelte';
 	import { runsLocalServer, target } from '$lib/config';
 	import Access from './steps/Access.svelte';
+	import Direct from './steps/Direct.svelte';
 	import Accounts from './steps/Accounts.svelte';
 	import Done from './steps/Done.svelte';
 	import Internet from './steps/Internet.svelte';
@@ -26,14 +27,23 @@
 			id: 'lan',
 			label: 'Home network',
 			component: Lan,
-			// Only the desktop app's own server can be opened to the home network.
-			show: () => target === 'desktop' && runsLocalServer && wizard.extra.access !== 'internet',
+			// Only the desktop app's own server can be opened to the home network. Offered
+			// next to a domain too: devices at home then reach this computer without it. It
+			// comes before the Internet step, so its restart of the server ends before the
+			// tunnel starts.
+			show: () => target === 'desktop' && runsLocalServer && wizard.extra.access !== 'direct',
 		},
 		{
 			id: 'internet',
 			label: 'Internet',
 			component: Internet,
 			show: () => wizard.extra.access === 'internet',
+		},
+		{
+			id: 'direct',
+			label: 'Address',
+			component: Direct,
+			show: () => wizard.extra.access === 'direct',
 		},
 		{ id: 'accounts', label: 'Accounts', component: Accounts },
 		{ id: 'sources', label: 'Sources', component: Sources },
@@ -55,6 +65,18 @@
 	$effect(() => {
 		void [wizard.current, wizard.signup, wizard.added.length, JSON.stringify(wizard.extra)];
 		persist();
+	});
+
+	// A server with no owner has nothing saved past the owner step. Progress this browser
+	// kept from an earlier install on the same address starts over, instead of opening a
+	// later step where every save answers "Not authenticated". The choices go whatever
+	// step is open: a saved step this install does not have already fell back to Welcome.
+	$effect(() => {
+		if (!instance.info?.setupRequired) return;
+		if (stepNumber(wizard.current) > stepNumber('owner')) wizard.current = 'welcome';
+		if (wizard.signup !== 'closed') wizard.signup = 'closed';
+		if (wizard.added.length) wizard.added = [];
+		if (Object.keys(wizard.extra).length) wizard.extra = {};
 	});
 
 	// A finished server opens the catalog instead, unless this browser is mid-wizard

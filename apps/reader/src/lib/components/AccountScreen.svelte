@@ -42,7 +42,11 @@
 		display: flex;
 		flex-direction: column;
 		align-items: center;
-		padding: clamp(40px, 14vh, 128px) var(--k-space-4) var(--k-space-10);
+		/* No app chrome here, so the screen itself keeps clear of the status bar / notch,
+		   the home indicator and a landscape notch. */
+		padding: max(clamp(40px, 14vh, 128px), calc(var(--k-safe-top) + var(--k-space-6)))
+			max(var(--k-space-4), var(--k-safe-right)) calc(var(--k-space-10) + var(--k-safe-bottom))
+			max(var(--k-space-4), var(--k-safe-left));
 		background: var(--k-bg);
 	}
 	.brand {
@@ -176,5 +180,11 @@
 	}
 	.foot :global(.link:hover) {
 		color: var(--k-text);
+	}
+	@media (pointer: coarse) {
+		.foot :global(.link) {
+			min-width: 44px;
+			min-height: 44px;
+		}
 	}
 </style>

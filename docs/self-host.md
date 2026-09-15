@@ -18,6 +18,75 @@ Docker, use the desktop app instead.
 
 ## Install
 
+Run the installer from the repository folder:
+
+```sh
+bash deploy/selfhost/install.sh
+```
+
+It asks for the port and how people will reach komiq, and does the rest:
+
+1. It checks that Docker runs, that Compose is v2 or newer, that the CPU is amd64 or
+   arm64, and how much memory and free disk Docker has. It warns under 4 GB of memory or
+   5 GB of free disk. Under 2 GB of memory it stops, unless you pass `--yes`.
+2. It asks for the HTTP port (default `8080`) and for one of four ways to reach komiq:
+
+   | Choice      | Meaning                                                          |
+   | ----------- | ---------------------------------------------------------------- |
+   | `local`     | This machine or your home network, over HTTP. The default.       |
+   | `tunnel`    | A domain through a Cloudflare Tunnel. No inbound ports.          |
+   | `public-ip` | A domain through Cloudflare DNS. Needs HTTPS port 443.           |
+   | `direct`    | Your public IP address, no domain. HTTPS needs ports 443 and 80. |
+
+   For `direct` it then asks "Encrypt the connection with a free certificate (HTTPS)?
+   Needs ports 443 and 80." The default is yes. With no, readers use plain HTTP on the
+   HTTP port, and ports 443 and 80 are not needed.
+
+3. It asks whether other devices on your home network may connect over HTTP on that
+   port. The default is yes for `local`. For the other three it is no: the plain HTTP
+   port then stays on this machine only (`KOMIQ_BIND=127.0.0.1`). It does not ask for
+   `direct` without HTTPS: readers use that port, so it is open to every address
+   (`KOMIQ_BIND=0.0.0.0`).
+4. It checks that the ports it needs are free, and stops with a message when one is not.
+5. It writes `.env`. An existing `.env` is copied to `.env.bak` once, and only
+   `KOMIQ_PORT`, `KOMIQ_BIND` and `COMPOSE_FILE` are changed.
+6. When ufw or firewalld is active, it offers to open the needed ports in it. It asks
+   first and uses `sudo`. On macOS it leaves the firewall alone. On a cloud server, open
+   the same ports in your provider's firewall yourself.
+7. It builds and starts komiq, and waits up to 5 minutes until the server is healthy.
+8. It reads the setup code from the server log and starts the
+   [terminal setup](#set-up-from-a-terminal) with it. It passes your access choice, and
+   the HTTPS answer for `direct`, so setup does not ask them again.
+
+At the end it prints the reader and console addresses, and the command that changes a
+choice later: `docker compose exec server komika-server setup`.
+
+| Option                            | What it does                                                                                                                                               |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--port PORT`                     | The HTTP port. Default: `8080`, or the value already in `.env`.                                                                                            |
+| `--access MODE`                   | `local`, `tunnel`, `public-ip` or `direct`. Default: `local`.                                                                                              |
+| `--encrypt yes` or `--encrypt no` | Only with `--access direct`. `yes`: HTTPS with a free certificate. `no`: plain HTTP on the HTTP port. Default: `yes`.                                      |
+| `--lan yes` or `--lan no`         | Open the HTTP port to your home network, or keep it on this machine. Default: `yes` for `local`, `no` for the others. Refused as `no` with `--encrypt no`. |
+| `--firewall yes`, `no` or `ask`   | Open the needed ports in the machine's firewall. Default: `ask`.                                                                                           |
+| `--yes`                           | Accept the defaults without questions. Allows a build with under 2 GB of memory.                                                                           |
+| `--no-setup`                      | Do not start the terminal setup.                                                                                                                           |
+| `--help`                          | Print the options.                                                                                                                                         |
+
+A second run takes the port, the bind address and the Compose files in `.env` as its
+defaults. Without a terminal (in a script, for example), pass `--yes` or give every answer
+as an option. The terminal setup itself needs a terminal: without one, the installer
+prints the command to run later.
+
+On a server that already has an owner, a second run changes the ports and leaves setup
+alone. The installer prints "The server is already set up.", or the setup command answers
+"This server already has an owner. Nothing was changed." when the log still held the old
+setup code. To change how people reach the server, use **Settings › Access** in the
+console, or run the setup command without a setup code.
+
+### By hand
+
+The installer is optional. The same stack starts with:
+
 ```sh
 cd deploy/selfhost
 docker compose up -d
@@ -40,14 +109,18 @@ To change the port or who can reach it, copy the settings file first, edit it, t
 cp .env.example .env
 ```
 
-| Setting      | Default   | What it does                                                                   |
-| ------------ | --------- | ------------------------------------------------------------------------------ |
-| `KOMIQ_PORT` | `8080`    | Port komiq answers on.                                                         |
-| `KOMIQ_BIND` | `0.0.0.0` | `0.0.0.0`: every device on your network. `127.0.0.1`: this machine only.       |
-| `TZ`         | `UTC`     | Time zone for logs.                                                            |
-| FlareSolverr | off       | For sources behind "checking your browser" pages. See the comment in the file. |
+| Setting        | Default   | What it does                                                                               |
+| -------------- | --------- | ------------------------------------------------------------------------------------------ |
+| `KOMIQ_PORT`   | `8080`    | Port komiq answers on.                                                                     |
+| `KOMIQ_BIND`   | `0.0.0.0` | `0.0.0.0`: every device on your network. `127.0.0.1`: this machine only.                   |
+| `COMPOSE_FILE` | unset     | Publishes ports 443 and 80. See [Reach it from the internet](#reach-it-from-the-internet). |
+| `TZ`           | `UTC`     | Time zone for logs.                                                                        |
+| FlareSolverr   | off       | For sources behind "checking your browser" pages. See the comment in the file.             |
 
 ## Set up
+
+The installer runs setup in your terminal. If you started komiq by hand, or passed
+`--no-setup`, use a browser:
 
 1. Find the setup code. It is printed in the server log at every start until setup is
    done; use the last one:
@@ -65,34 +138,217 @@ cp .env.example .env
 The setup code works only until the owner account exists. Restarting the server before
 that prints a new one.
 
+### Set up from a terminal
+
+A server with no screen can do the same steps over SSH, without a browser. The installer
+starts this command for you. To run it yourself:
+
+```sh
+docker compose exec server komika-server setup
+```
+
+It asks the same questions as the setup screens: the owner account (with the setup
+code), who can reach the server, who can sign up, and sources. Each answer is applied when
+you give it. On a first run the sign-up question starts at "Only people I add", like the
+setup screens.
+
+Run the command again, without a setup code, to continue or to change a choice. It then
+asks you to sign in as the owner. An account that still has a temporary password must
+choose a new one first. A setup code is for a first run only: given to a server that
+already has an owner, the command changes nothing and says "This server already has an
+owner. Nothing was changed."
+
+| Option                  | What it does                                                                                                                             |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `--setup-code <code>`   | Gives the setup code, so the command does not ask for it. The environment variable `KOMIKA_SETUP_CODE` does the same.                    |
+| `--access <choice>`     | Skips the access question. `local`, `internet` and `direct` pick the mode. `tunnel` and `public-ip` also pick the Cloudflare connection. |
+| `--encrypt yes` or `no` | Only with `--access direct`: answers the HTTPS question, so the command does not ask it.                                                 |
+| `--server <address>`    | Where the running server answers. Default: `http://127.0.0.1:<PORT>`.                                                                    |
+
+Before a public choice, the command says what it found on the server:
+
+- For a tunnel: whether the connector (`cloudflared`) is on the server, or setup will
+  download it.
+- For a public IP, and for no domain with HTTPS: whether port 443 (and port 80, without
+  a domain) is free, already served by komiq, used by another program, or one the server
+  has no permission to open. In a container it adds that the ports must be published too.
+
+For Cloudflare it first asks for the domain. A scheme and a path are dropped:
+`https://Read.Example.com/` is read as `read.example.com`. The connection question has
+four answers: "Cloudflare Tunnel", "Public IP", "I will do it by hand" and "Set up
+later". "Set up later" changes nothing, and you finish in **Settings › Access**.
+
+It then prints "You do these 3 things once" and "komiq does the rest", a link that opens
+Cloudflare's token page with part of the form filled in, and the permission rows to add
+by hand. After you paste the token it names any permission the token may lack and asks
+whether to continue. When the server refuses to start the run, the command asks "Try
+again?" and sends the start again. "Try the failed step again?" comes only after a step
+of a run the server accepted has failed. The details are in
+[self-host-cloudflare.md](./self-host-cloudflare.md).
+
+Without a domain, the address the command offers fits the HTTPS answer: the bare address
+for HTTPS, the address and the HTTP port for plain HTTP. If the server cannot save the
+address, the command asks "Try again?". With no, the address stays unsaved, setup goes
+on, and you finish in **Settings › Access**. For plain HTTP in a container it adds that
+the port must also answer other machines (`KOMIQ_BIND=0.0.0.0`).
+
+Choosing "Only my devices" on a server that was public on a domain prints that Cloudflare
+is turned off on this server, and that what setup made at Cloudflare stays until you
+remove it in the console. See [Switch back to "Only my devices"](#switch-back-to-only-my-devices).
+
+Outside Docker, run `komika-server setup` on the machine the server runs on. It talks to
+`http://127.0.0.1:<PORT>`; use `--server <address>` when the server answers somewhere
+else. It refuses a plain `http://` address on the internet before it asks for any
+password: run it on the server, or give an `https://` address.
+
 ## Use it from other devices
 
-With the default `KOMIQ_BIND=0.0.0.0`, any device on the same network opens komiq at
-`http://<server address>:8080`. Find the address with `hostname -I` (Linux),
+With `KOMIQ_BIND=0.0.0.0`, any device on the same network opens komiq at
+`http://<server address>:8080`. That is the default, and what the installer writes when
+you answer yes to its home-network question. Find the address with `hostname -I` (Linux),
 `ipconfig getifaddr en0` (macOS) or `ipconfig` (Windows).
 
 If a phone cannot connect:
 
-- Allow the port in the server's firewall, for example `sudo ufw allow 8080/tcp`.
+- Allow the port in the server's firewall, for example `sudo ufw allow 8080/tcp`. The
+  installer offers to do this when ufw or firewalld is active.
 - Check the phone is on the same network, not on mobile data or a guest network.
 
 The native reader apps ask for the server address on their "Connect to a server"
-screen. Enter the same address, for example `192.168.1.20:8080`.
+screen. Enter the same address, for example `192.168.1.20:8080`. On a phone, "Scan a
+QR code" reads it from the code shown at the end of setup and in Settings › Access.
+With Docker, open the admin at the address other devices use, not `localhost`, to see
+the code: a server in a container cannot find the address of the machine it runs on.
 
-Plain `http://` is fine at home. Do not open the port to the internet: use the next
-section instead.
+Plain `http://` is fine at home. Before you open the port to the internet, read the next
+section: both ways to reach komiq from the internet give you HTTPS.
 
 ## Reach it from the internet
 
-Internet access runs through Cloudflare, set up from the admin console: the setup
-wizard's Access step, or later **Settings › Access**. It supports a Cloudflare Tunnel
-(nothing to open on your router or VPS) and a public IP with DNS. The details are in
-[self-host-cloudflare.md](./self-host-cloudflare.md).
+There are two ways, both chosen in the setup wizard's Access step or later in
+**Settings › Access**: with a domain and Cloudflare, or without a domain.
 
-- **Tunnel:** the image includes `cloudflared`, which komiq starts for you. Set
-  `KOMIQ_BIND=127.0.0.1` afterwards so the plain-HTTP port is closed to the network.
-- **Public IP:** komiq serves HTTPS on port 443 inside the container. Uncomment the
-  `443:443` line under `ports:` in `docker-compose.yml` and run `docker compose up -d`.
+The installer prepares Docker for either. Answer `tunnel`, `public-ip` or `direct` at its
+prompt, or pass `--access`. It publishes the ports that way needs, offers to open them in
+ufw or firewalld, and keeps the plain HTTP port on this machine only
+(`KOMIQ_BIND=127.0.0.1`) unless you answer yes to the home-network question. The
+exception is `direct` without HTTPS (`--encrypt no`): readers use the HTTP port itself,
+so the installer opens it to every address, publishes no extra port and offers only that
+port to the firewall.
+
+By hand, ports 443 and 80 are published by two extra Compose files,
+`docker-compose.https.yml` (443) and `docker-compose.acme.yml` (80). Switch them on with
+`COMPOSE_FILE` in `.env`, then run `docker compose up -d`. You do not edit
+`docker-compose.yml`.
+
+| Way to reach komiq           | `COMPOSE_FILE` in `.env`                                              |
+| ---------------------------- | --------------------------------------------------------------------- |
+| Local, or Cloudflare Tunnel  | unset                                                                 |
+| Cloudflare public IP         | `docker-compose.yml:docker-compose.https.yml`                         |
+| Without a domain, HTTPS      | `docker-compose.yml:docker-compose.https.yml:docker-compose.acme.yml` |
+| Without a domain, plain HTTP | unset, with `KOMIQ_BIND=0.0.0.0`                                      |
+
+Before you commit to a way, the Internet and Address steps, **Settings › Access** and
+the terminal setup say what the server found on its machine: whether `cloudflared` is
+there or will be downloaded, whether ports 443 and 80 are free, used by another program
+or closed to the server for lack of permission, and whether the server runs in a
+container, where the ports must be published too. In a container the console also shows
+the installer command that publishes them.
+
+### With a domain
+
+Cloudflare sits in front of komiq and gives it HTTPS and caching. It supports a
+Cloudflare Tunnel (nothing to open on your router or VPS) and a public IP with DNS. The
+details are in [self-host-cloudflare.md](./self-host-cloudflare.md).
+
+- **Tunnel:** the image includes `cloudflared`, which komiq starts for you. Keep
+  `KOMIQ_BIND=127.0.0.1` so the plain HTTP port is closed to the network. The installer
+  writes that for `tunnel`.
+- **Public IP:** komiq serves HTTPS on port 443 inside the container. Publish it with
+  `COMPOSE_FILE`, as in the table above. The installer does that for `public-ip`.
+
+### Without a domain
+
+For a server with a public address, such as a cloud VPS. Readers type the server's
+address, like `203.0.113.5`. Nothing sits in front of komiq: no Cloudflare account, no
+DNS, and the server fetches covers and pages itself.
+
+The connection is HTTPS. komiq gets a free certificate for the IP address from Let's
+Encrypt and renews it by itself. Such a certificate lasts about six days, and komiq
+gets a new one every three. Using it means you agree to the
+[Let's Encrypt Subscriber Agreement](https://letsencrypt.org/repository/).
+
+1. Publish ports 443 and 80: run the installer with `direct`, or set `COMPOSE_FILE` as in
+   the table above and run `docker compose up -d`. Open ports 80 and 443 in your cloud
+   firewall. Let's Encrypt checks the server on port 80 before each certificate, so keep
+   it open.
+2. In the Access step, choose **Public without a domain** and enter the address. Saving
+   can take a minute. If it fails, the message says why; the usual reason is a closed
+   port 80.
+3. Readers use `https://203.0.113.5`, and you open the console at
+   `https://203.0.113.5/admin`.
+
+The plain HTTP port (`KOMIQ_PORT`) keeps answering this machine, for the terminal setup,
+and your home network when `KOMIQ_BIND` is `0.0.0.0`. After the first visit from the
+internet over HTTPS, komiq no longer handles requests from the internet on it: a page
+load is sent to the HTTPS address, and a sign-in is refused with that address. It waits
+for that first visit so that a closed port 443 on the server cannot lock you out.
+
+On a VPS, the first-run screens themselves still open over plain HTTP, because the
+certificate comes later. The server does not accept the owner account over plain HTTP
+from the internet: the Owner step shows no form there, and `createOwner` is refused. Run
+the setup in a terminal instead (`komika-server setup`, see above). The home network,
+this computer, HTTPS and a trusted proxy are not affected.
+
+For both rules, the server knows a request comes from the internet by the connection's
+own address. Behind Docker Desktop or rootless Docker every connection looks local, so
+there the server goes by the address you typed: a public IP address, or a name that
+leads to one, counts as the internet. `localhost`, a home-network address and a name
+such as `komiq.local` do not. A proxy of yours that ends HTTPS in front of the server is
+not affected when it sends `X-Forwarded-Proto: https`, as most do.
+
+The address must be public: Let's Encrypt does not sign for home-network addresses. An
+IPv6 address works too, typed without brackets, like `2001:db8::1`. If the address of the
+server changes, enter the new one in **Settings › Access**.
+
+The server settings `KOMIKA_HTTPS_PORT` and `KOMIKA_ACME_PORT` change the two ports the
+server binds. The form then says what to open: another HTTPS port becomes part of the
+address, like `https://203.0.113.5:8443`, and public port 80 must be forwarded to the
+other port, because Let's Encrypt always connects to port 80.
+
+You can switch **Encrypt the connection** off. Readers then type the address and port,
+like `203.0.113.5:8080`, over plain HTTP, and people on the network between a reader and
+the server can see passwords and pages. The address field follows the switch: the bare
+address for HTTPS, the address and the HTTP port for plain HTTP.
+
+With Docker, plain HTTP needs the HTTP port open to other machines, not only to this one:
+`KOMIQ_BIND=0.0.0.0` in `.env`, and no extra Compose files. This command sets both, offers
+to open that one port in ufw or firewalld, and prints `http://<public-IP>:<port>/` as the
+address:
+
+```sh
+bash deploy/selfhost/install.sh --access direct --encrypt no
+```
+
+Open the same port in your cloud firewall. In a container, the form and the terminal
+setup both say that the port must answer other machines.
+
+### Switch back to "Only my devices"
+
+While the server is public, **Settings › Access** has an **Only my devices** action. It
+asks first, then turns the public way in off. Nothing is deleted:
+
+- With Cloudflare, the tunnel connector stops, or with a public IP the HTTPS listener
+  that setup started. A restart does not start them again. The DNS record, the cache
+  rules and the tunnel or certificate stay at Cloudflare until you choose **Remove**.
+- Without a domain, HTTPS at the server's address stops, and so do the certificate
+  renewals. The plain HTTP port still answers where your firewall lets it.
+
+Choosing **Public without a domain** turns a finished Cloudflare setup off in the same
+way. The Cloudflare line in **Settings › Access** then says "Turned off", with **Turn
+on** and **Remove**. **Turn on** needs no API token, because the server kept what it
+needs. From "Public without a domain" it asks first ("Turn Cloudflare on?"): the domain
+then takes the place of the address readers use.
 
 ## Update
 
@@ -101,6 +357,10 @@ git pull
 cd deploy/selfhost
 docker compose up -d --build
 ```
+
+Or run `git pull` and then `bash deploy/selfhost/install.sh` again. It takes its defaults
+from your `.env`, rebuilds and restarts. Add `--no-setup` to leave the setup questions
+out.
 
 Your data stays in the Docker volumes. Updates that change the database migrate it at
 start. Take a backup first.
@@ -148,6 +408,22 @@ docker compose down -v     # stop and delete all data
 
 ## Troubleshooting
 
+**The installer stops with "problem:".** The line says what to fix. "Port 8080 is in use.
+Try --port 8081." means another program has the HTTP port: run it again with the port it
+names. "Port 443 is in use. Free it before continuing." means another program, often a
+web server, holds a port komiq needs: stop it, or choose `tunnel`. "Could not check
+ports" means none of `ss`, `lsof` and `netstat` is installed. "--lan no does not fit
+--encrypt no" means plain HTTP without a domain needs the HTTP port open: leave `--lan`
+out.
+
+**"This server already has an owner. Nothing was changed."** The setup command got a
+setup code, from you or from the installer, which found an old one in the log. Nothing is
+wrong. To change a setting, use the console, or run
+`docker compose exec server komika-server setup` without a setup code.
+
+**The installer says "Server did not become healthy".** It waited 5 minutes.
+`docker compose logs server`, run from `deploy/selfhost`, shows why.
+
 **No setup code in the log.** The server prints it only while no owner exists. If setup
 was finished, sign in at `/admin` instead. If the log is empty, the server did not start:
 `docker compose logs server`.
@@ -157,6 +433,32 @@ log and type it with its dashes.
 
 **`server` is not healthy.** `docker compose logs server` shows why. A port already in
 use shows as an error from `docker compose up`; pick another `KOMIQ_PORT`.
+
+**Port 443 or 80 does not answer.** komiq answers on them inside the container. Docker
+publishes them only when `COMPOSE_FILE` in `.env` names the extra Compose files (see
+[Reach it from the internet](#reach-it-from-the-internet)). Then check the machine's
+firewall and your cloud provider's firewall.
+
+**Readers cannot open `http://<public-IP>:<port>/`.** Without a domain and without HTTPS,
+readers use the HTTP port. With Docker it must be open to every address:
+`KOMIQ_BIND=0.0.0.0` in `.env`. Run the installer with `--access direct --encrypt no`,
+then open the port in your cloud firewall.
+
+**The domain stopped answering after you changed the access mode.** "Only my devices"
+and "Public without a domain" turn Cloudflare off on the server. **Settings › Access**
+shows "Turned off": choose **Turn on**.
+
+**The DNS record was edited or deleted, or the public IP changed.** Choose **Run setup
+again** in **Settings › Access** and paste the API token. Setup corrects its record, or
+makes it again. It detects the public IP again, unless you typed one during setup.
+
+**"Get the connector (cloudflared)" fails.** Outside Docker, tunnel setup downloads
+`cloudflared` when the server has none. Check that the server can reach GitHub, then
+retry the step. Or install `cloudflared` yourself and set `CLOUDFLARED_BIN` to its path.
+
+**"This token may lack: …".** The token check found a permission row it could not read.
+It is advice: you can still run setup. If a step fails, add the row to the token in
+Cloudflare and retry.
 
 **The catalogue is empty.** A new install has no sources. Add an extension repo and
 install a source in the admin console under **Sources**. If adding fails, the engine may

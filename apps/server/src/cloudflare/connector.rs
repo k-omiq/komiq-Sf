@@ -2,7 +2,7 @@
 //!
 //! The server starts `cloudflared` as a child when tunnel setup reaches that step and
 //! again at every boot while a tunnel is set up, restarts it with a backoff when it
-//! exits, and stops it on "Remove". The binary comes from `CLOUDFLARED_BIN` or `PATH`.
+//! exits, and stops it on "Remove". The binary comes from `CLOUDFLARED_BIN`, `PATH`, or the server's tool folder.
 //!
 //! **The run token.** The connector authenticates with a tunnel token: whoever holds it
 //! can serve traffic for the tunnel's hostname. It must survive restarts (the setup's
@@ -54,6 +54,9 @@ struct Inner {
 
 pub struct Connector {
     bin: Option<String>,
+    /// The program search path (`PATH`), read once at boot.
+    search_path: std::ffi::OsString,
+    tool_dir: PathBuf,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -61,10 +64,12 @@ pub struct Connector {
 const CONNECTED_MARKERS: &[&str] = &["Registered tunnel connection", "Connection registered"];
 
 impl Connector {
-    /// `bin`: an explicit path (`CLOUDFLARED_BIN`); `None` searches `PATH`.
-    pub fn new(bin: Option<String>) -> Self {
+    /// `bin`: an explicit path (`CLOUDFLARED_BIN`); otherwise PATH, then the tool folder.
+    pub fn new(bin: Option<String>, search_path: std::ffi::OsString, data_dir: &Path) -> Self {
         Self {
             bin,
+            search_path,
+            tool_dir: data_dir.join("bin"),
             inner: Arc::new(Mutex::new(Inner::default())),
         }
     }
@@ -82,7 +87,7 @@ impl Connector {
 
     /// The binary to run, or a message saying how to provide one.
     pub fn resolve_bin(&self) -> Result<PathBuf, String> {
-        if let Some(b) = self.bin.as_deref().filter(|b| !b.trim().is_empty()) {
+        if let Some(b) = self.bin.as_deref() {
             let p = PathBuf::from(b);
             return if p.is_file() {
                 Ok(p)
@@ -93,9 +98,19 @@ impl Connector {
                 ))
             };
         }
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        std::env::split_paths(&path)
-            .map(|d| d.join("cloudflared"))
+        self.search_paths(&self.search_path, cfg!(windows))
+    }
+
+    fn search_paths(&self, path: &std::ffi::OsStr, windows: bool) -> Result<PathBuf, String> {
+        std::env::split_paths(path)
+            .chain(std::iter::once(self.tool_dir.clone()))
+            .map(|d| {
+                d.join(if windows {
+                    "cloudflared.exe"
+                } else {
+                    "cloudflared"
+                })
+            })
             .find(|p| p.is_file())
             .ok_or_else(|| {
                 "cloudflared was not found. Install cloudflared on this machine, or set \
@@ -290,5 +305,53 @@ async fn wait_or_stop(stop: &mut watch::Receiver<bool>, d: Duration) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(d) => *stop.borrow(),
         _ = stop.changed() => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_platform_filename_on_path_before_tool_folder() {
+        let dir = std::env::temp_dir().join(format!("komika-resolve-{}", uuid::Uuid::new_v4()));
+        let path_dir = dir.join("path");
+        std::fs::create_dir_all(&path_dir).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        for windows in [false, true] {
+            let name = if windows {
+                "cloudflared.exe"
+            } else {
+                "cloudflared"
+            };
+            let tool = dir.join("bin").join(name);
+            std::fs::write(&tool, "tool").unwrap();
+            let connector = Connector::new(None, Default::default(), &dir);
+            let path = std::env::join_paths([&path_dir]).unwrap();
+            assert_eq!(connector.search_paths(&path, windows).unwrap(), tool);
+            let on_path = path_dir.join(name);
+            std::fs::write(&on_path, "path").unwrap();
+            assert_eq!(connector.search_paths(&path, windows).unwrap(), on_path);
+            assert_eq!(
+                Connector::new(Some(tool.display().to_string()), Default::default(), &dir)
+                    .resolve_bin()
+                    .unwrap(),
+                tool
+            );
+        }
+        assert!(Connector::new(
+            Some(dir.join("missing").display().to_string()),
+            Default::default(),
+            &dir
+        )
+        .resolve_bin()
+        .unwrap_err()
+        .contains("CLOUDFLARED_BIN"));
+        assert!(
+            Connector::new(Some(String::new()), Default::default(), &dir)
+                .resolve_bin()
+                .is_err()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

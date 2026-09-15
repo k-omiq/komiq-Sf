@@ -107,6 +107,8 @@ pub struct DnsRecord {
     pub kind: String,
     #[serde(default)]
     pub content: String,
+    #[serde(default)]
+    pub proxied: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +129,8 @@ pub struct Rule {
     pub id: String,
     #[serde(default, rename = "ref")]
     pub reference: String,
+    #[serde(default)]
+    pub expression: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -221,6 +225,52 @@ impl Client {
         Ok(zones
             .into_iter()
             .find(|z| z.name.eq_ignore_ascii_case(name)))
+    }
+
+    /// Only 401/403 advise that a permission row is missing. Read access cannot
+    /// prove Edit access; other failures give no advice and never stop setup.
+    pub async fn missing_permissions(
+        &self,
+        zone: &Zone,
+        connection: Option<super::Connection>,
+    ) -> Vec<String> {
+        let z = &zone.id;
+        let mut probes = vec![
+            ("Zone › DNS", format!("/zones/{z}/dns_records?per_page=1")),
+            (
+                "Zone › Zone Settings",
+                format!("/zones/{z}/settings/browser_cache_ttl"),
+            ),
+            (
+                "Zone › Cache Rules",
+                format!("/zones/{z}/rulesets/phases/{CACHE_PHASE}/entrypoint"),
+            ),
+        ];
+        match connection {
+            Some(super::Connection::Tunnel) => probes.push((
+                "Account › Cloudflare Tunnel",
+                format!("/accounts/{}/cfd_tunnel?per_page=1", zone.account.id),
+            )),
+            Some(super::Connection::PublicIp) => probes.push((
+                "Zone › SSL and Certificates",
+                format!("/certificates?zone_id={}", enc(z)),
+            )),
+            None => {}
+        }
+        let mut missing = Vec::new();
+        for (label, path) in probes {
+            let response = self
+                .http
+                .get(format!("{}{path}", self.base))
+                .bearer_auth(&self.token.0)
+                .timeout(Duration::from_secs(3))
+                .send()
+                .await;
+            if response.is_ok_and(|r| matches!(r.status().as_u16(), 401 | 403)) {
+                missing.push(label.into());
+            }
+        }
+        missing
     }
 
     // ---- tunnel ------------------------------------------------------------
@@ -320,6 +370,29 @@ impl Client {
                 "proxied": true,
                 "ttl": 1,
                 "comment": "Created by komiq setup"
+            })),
+        )
+        .await
+    }
+
+    /// Repair our record without replacing its id.
+    pub async fn update_dns_record(
+        &self,
+        zone: &str,
+        id: &str,
+        kind: &str,
+        name: &str,
+        content: &str,
+    ) -> ApiResult<DnsRecord> {
+        self.call(
+            reqwest::Method::PATCH,
+            &format!("/zones/{zone}/dns_records/{id}"),
+            Some(json!({
+                "type": kind,
+                "name": name,
+                "content": content,
+                "proxied": true,
+                "ttl": 1
             })),
         )
         .await

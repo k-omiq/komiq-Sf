@@ -304,6 +304,25 @@ pub struct SuwayomiChapter {
     pub page_count: i64,
 }
 
+/// A chapter's coordinates at its source — see [`SuwayomiClient::chapter_origin`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChapterOrigin {
+    /// Owning manga's row id in THIS engine (for the NSFW gate; never sent to a client).
+    pub manga_id: i64,
+    pub source_id: String,
+    pub manga_url: String,
+    pub manga_title: String,
+    pub chapter_url: String,
+    /// The chapter's page on the source's own WEBSITE (`ChapterType.realUrl`), as the
+    /// extension reports it. Unlike `chapter_url` this is for a person, not an engine:
+    /// it is what "Read on source" links to. `None` when the extension gives none (a
+    /// local or non-HTTP source). Extension-controlled text — callers must validate the
+    /// scheme before it reaches an `href`.
+    pub chapter_web_url: Option<String>,
+    /// The series' page on the source's website (`MangaType.realUrl`); same caveats.
+    pub manga_web_url: Option<String>,
+}
+
 /// One extension row from the configured extension stores — the admin-facing
 /// management view (EXT-1), covering the FULL store index, not just installed
 /// ones (`SuwayomiExtension` is the installed-only catalogue view). Verified
@@ -1010,6 +1029,55 @@ impl SuwayomiClient {
         Ok(d.chapters.nodes.first().map(|n| n.manga_id))
     }
 
+    /// Where a chapter lives AT ITS SOURCE: the source id plus the source's own keys for
+    /// the manga and the chapter (`MangaType.url` / `ChapterType.url`).
+    ///
+    /// Our chapter and manga ids are row ids of THIS engine and mean nothing to another
+    /// one; the urls are what the extension itself assigns, so a reader app running its
+    /// own engine can find the same chapter with them and fetch the pages itself. Reads
+    /// the engine's database only — nothing is requested from the source. `None` if the
+    /// chapter is unknown.
+    pub async fn chapter_origin(&self, chapter_id: i64) -> Result<Option<ChapterOrigin>> {
+        let doc = "query CO($id: Int!) { chapters(condition: { id: $id }) { nodes { \
+                   url realUrl mangaId manga { url realUrl title sourceId } } } }";
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Manga {
+            url: String,
+            #[serde(default)]
+            real_url: Option<String>,
+            title: String,
+            source_id: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Node {
+            url: String,
+            #[serde(default)]
+            real_url: Option<String>,
+            manga_id: i64,
+            manga: Manga,
+        }
+        #[derive(Deserialize)]
+        struct Nodes {
+            nodes: Vec<Node>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            chapters: Nodes,
+        }
+        let d: Data = self.gql(doc, json!({ "id": chapter_id })).await?;
+        Ok(d.chapters.nodes.into_iter().next().map(|n| ChapterOrigin {
+            manga_id: n.manga_id,
+            source_id: n.manga.source_id,
+            manga_url: n.manga.url,
+            manga_title: n.manga.title,
+            chapter_url: n.url,
+            chapter_web_url: n.real_url,
+            manga_web_url: n.manga.real_url,
+        }))
+    }
+
     /// Page size for the paginated library walk. The in-library set can be 100k+, so a
     /// single unpaginated `mangas` query returns one enormous response; page it instead.
     const LIBRARY_PAGE_SIZE: i64 = 500;
@@ -1622,6 +1690,70 @@ mod tests {
 
     fn client(base: &str) -> SuwayomiClient {
         SuwayomiClient::new(base.to_string(), None, Some("1".into()))
+    }
+
+    /// An engine that answers every GraphQL request with `body`.
+    async fn engine_answering(body: &str) -> testsrv::TestOrigin {
+        testsrv::spawn_status(
+            200,
+            "application/json",
+            body.as_bytes().to_vec(),
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    /// The body is what Suwayomi v2.3.2243 really answers for this document (captured by
+    /// `apps/reader/src-tauri/e2e/native-read`, which also runs the document live). MANGA
+    /// Plus on purpose: its keys are `#/…` fragments, nothing like a row id or a path.
+    #[tokio::test]
+    async fn chapter_origin_reads_the_sources_own_keys() {
+        let engine = engine_answering(
+            r##"{"data":{"chapters":{"nodes":[{"url":"#/viewer/1030381",
+                "realUrl":"https://mangaplus.shueisha.co.jp/viewer/1030381","mangaId":1,
+                "manga":{"url":"#/titles/100020",
+                         "realUrl":"https://mangaplus.shueisha.co.jp/titles/100020",
+                         "title":"One Piece","sourceId":"1998944621602463790"}}]}}}"##,
+        )
+        .await;
+        let origin = client(&engine.base_url).chapter_origin(6).await.unwrap();
+        assert_eq!(
+            origin,
+            Some(ChapterOrigin {
+                manga_id: 1,
+                source_id: "1998944621602463790".into(),
+                manga_url: "#/titles/100020".into(),
+                manga_title: "One Piece".into(),
+                chapter_url: "#/viewer/1030381".into(),
+                chapter_web_url: Some("https://mangaplus.shueisha.co.jp/viewer/1030381".into()),
+                manga_web_url: Some("https://mangaplus.shueisha.co.jp/titles/100020".into()),
+            })
+        );
+    }
+
+    /// A source with no website (the local source) answers `realUrl: null`, and an
+    /// engine that omits the field altogether must read the same way.
+    #[tokio::test]
+    async fn chapter_origin_tolerates_a_missing_web_url() {
+        let engine = engine_answering(
+            r##"{"data":{"chapters":{"nodes":[{"url":"/ch/1","realUrl":null,"mangaId":1,
+                "manga":{"url":"/m/1","title":"Local","sourceId":"0"}}]}}}"##,
+        )
+        .await;
+        let origin = client(&engine.base_url)
+            .chapter_origin(6)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(origin.chapter_web_url, None);
+        assert_eq!(origin.manga_web_url, None);
+    }
+
+    #[tokio::test]
+    async fn chapter_origin_is_none_for_an_unknown_chapter() {
+        let engine = engine_answering(r#"{"data":{"chapters":{"nodes":[]}}}"#).await;
+        let origin = client(&engine.base_url).chapter_origin(6).await.unwrap();
+        assert_eq!(origin, None);
     }
 
     /// The self-host image sets `SUWAYOMI_PUBLIC_URL=/` so cover and page URLs stay

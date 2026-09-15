@@ -3,13 +3,16 @@
 	import '@fontsource-variable/manrope';
 	import '@komika/ui/reset.css';
 	import '@komika/ui/tokens.css';
+	import '$lib/theme.css';
 	import '$lib/app.css';
 	import { page } from '$app/state';
+	import { isTauri } from '@komika/api';
 	import { auth, initAuth } from '$lib/auth.svelte';
 	import { initTheme } from '$lib/theme.svelte';
 	import { markHydrated } from '$lib/stream';
 	import { config, needsServer, target } from '$lib/config';
 	import { connectScreen } from '$lib/server-connect.svelte';
+	import { extensionConsent } from '$lib/extension-consent.svelte';
 	import { instance, loadInstance } from '$lib/instance.svelte';
 	import ChoosePassword from '$lib/components/ChoosePassword.svelte';
 	import NotSetUp from '$lib/components/NotSetUp.svelte';
@@ -74,11 +77,15 @@
 	{#if !config.imgDirect && !config.imgServerProxy && config.imgWorkerBaseUrl}
 		<link rel="preconnect" href={config.imgWorkerBaseUrl} />
 	{/if}
-	<link rel="icon" href="/favicon.ico" sizes="any" />
-	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
-	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
-	<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-	<link rel="manifest" href="/manifest.webmanifest" />
+	<!-- Browser only: the native app has no tab and no home-screen install, and its
+	     package does not carry these files (WEB_ONLY_STATIC in vite.config.ts). -->
+	{#if !isTauri()}
+		<link rel="icon" href="/favicon.ico" sizes="any" />
+		<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+		<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+		<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+		<link rel="manifest" href="/manifest.webmanifest" />
+	{/if}
 	<meta name="theme-color" content="#0c0c0d" />
 	<meta name="apple-mobile-web-app-title" content="komiq" />
 
@@ -105,4 +112,11 @@
 	<ChoosePassword />
 {:else if !waiting}
 	{@render children()}
+{/if}
+<!-- Native app with its own engine: the server named an extension to install. Loaded
+     on demand, so no other build carries the dialog. -->
+{#if extensionConsent.pending.length}
+	{#await import('$lib/components/ExtensionConsent.svelte') then { default: ExtensionConsent }}
+		<ExtensionConsent />
+	{/await}
 {/if}

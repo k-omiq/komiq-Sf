@@ -17,11 +17,9 @@
 		min-height: calc(100vh - var(--k-header-h));
 		min-height: calc(100dvh - var(--k-header-h));
 	}
-	/* Clear the fixed mobile bottom-nav (56px tabs + 1px top border + home-indicator
-	   safe area) so page content / footer isn't hidden behind it. */
-	@media (max-width: 640px) {
-		main {
-			padding-bottom: calc(57px + env(safe-area-inset-bottom, 0px));
-		}
+	/* Clear the fixed bottom tab bar, where there is one (`--k-tabbar-h`, app.css), so
+	   page content / footer isn't hidden behind it. */
+	main {
+		padding-bottom: var(--k-tabbar-h);
 	}
 </style>

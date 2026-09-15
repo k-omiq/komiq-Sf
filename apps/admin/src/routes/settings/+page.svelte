@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { href } from '$lib/paths';
-	import type { ExtensionAutoUpdate, ExtensionInfo } from '@komika/types';
-	import type { ExtensionRepo, MangadexSetting } from '@komika/api';
+	import type { ExtensionAutoUpdate, ExtensionInfo, SourceInfo } from '@komika/types';
+	import type { ExtensionRepo, MangadexSetting, SourceRateLimit } from '@komika/api';
 	import { auth, toggleNsfwVisibility } from '$lib/auth.svelte';
 	import { config, serverAddress, target } from '$lib/config';
 	import { confirm } from '$lib/confirm.svelte';
@@ -10,8 +10,12 @@
 		isEngineUnreachable,
 		loadExtensionRepos,
 		loadMangadexSetting,
+		loadSourceRateLimits,
+		loadSources,
 		removeExtensionRepo,
+		removeSourceRateLimit,
 		setMangadexEnabled,
+		setSourceRateLimit,
 		consolidateDuplicates,
 		loadExtensionAutoUpdate,
 		loadExtensions,
@@ -199,6 +203,135 @@
 		}
 	}
 
+	// ---- Sources: request limits -----------------------------------------------
+	// Some sites block a server that asks too often. A limit makes the scanner check
+	// that source one series at a time, evenly spaced. The server applies a change
+	// at once. A limit from the server environment (`fromEnv`) is the server's default:
+	// an admin can change it here, and removing that change restores the default.
+	/** `null`: an older server without the feature, so the row is hidden. */
+	let limits = $state<SourceRateLimit[] | null>(null);
+	let limitSources = $state<SourceInfo[]>([]);
+	let limitSourceId = $state('');
+	let limitRequests = $state(10);
+	let limitMinutes = $state(5);
+	let limitRequestsInput = $state<HTMLInputElement | null>(null);
+	let savingLimit = $state(false);
+	let removingLimit = $state<string | null>(null);
+
+	function limitSourceName(sourceId: string): string {
+		const src = limitSources.find((x) => x.id === sourceId);
+		return src ? `${src.name} (${src.lang})` : `Source ${sourceId}`;
+	}
+
+	/** The sources the form offers: every installed one, and any limited source the
+	 * engine does not list (its extension was removed, or the engine is down). */
+	const limitChoices = $derived(
+		[...new Set([...limitSources.map((src) => src.id), ...(limits ?? []).map((l) => l.sourceId)])]
+			.map((id) => ({ id, label: limitSourceName(id) }))
+			.sort((a, b) => a.label.localeCompare(b.label)),
+	);
+	const limitExisting = $derived(limits?.find((l) => l.sourceId === limitSourceId) ?? null);
+
+	function plural(n: number, unit: string): string {
+		return `${n} ${unit}${n === 1 ? '' : 's'}`;
+	}
+
+	function span(secs: number): string {
+		return secs % 60 === 0 ? plural(secs / 60, 'minute') : plural(secs, 'second');
+	}
+
+	function limitRule(l: SourceRateLimit): string {
+		return `${plural(l.requests, 'request')} every ${span(l.windowSecs)}`;
+	}
+
+	/** What the limit means for the scanner: one series check costs two requests. */
+	function limitPace(l: SourceRateLimit): string {
+		const checks = Math.max(1, Math.floor(l.requests / 2));
+		return `One series checked every ${span(Math.round(l.windowSecs / checks))}`;
+	}
+
+	async function refreshLimits(): Promise<void> {
+		try {
+			limits = await loadSourceRateLimits();
+		} catch {
+			limits = null;
+			return;
+		}
+		try {
+			limitSources = await loadSources();
+		} catch {
+			limitSources = []; // Names are a nicety: the list falls back to source ids.
+		}
+	}
+
+	/** Put a limit's numbers in the form, so saving changes that limit. */
+	function loadLimit(l: SourceRateLimit): void {
+		limitSourceId = l.sourceId;
+		limitRequests = l.requests;
+		limitMinutes = Math.max(1, Math.round(l.windowSecs / 60));
+	}
+
+	function onPickLimitSource(): void {
+		if (limitExisting) loadLimit(limitExisting);
+	}
+
+	function onEditLimit(l: SourceRateLimit): void {
+		loadLimit(l);
+		limitRequestsInput?.focus(); // Also scrolls the form into view.
+		limitRequestsInput?.select();
+	}
+
+	async function onSaveLimit(ev: SubmitEvent): Promise<void> {
+		ev.preventDefault();
+		if (savingLimit || !limitSourceId) return;
+		savingLimit = true;
+		try {
+			const saved = await setSourceRateLimit(limitSourceId, limitRequests, limitMinutes * 60);
+			toast.success(`${limitSourceName(saved.sourceId)}: ${limitRule(saved)}.`);
+			limitSourceId = '';
+			await refreshLimits();
+		} catch (err) {
+			toast.fromError(err, 'The limit could not be saved.');
+		} finally {
+			savingLimit = false;
+		}
+	}
+
+	/** Remove an admin's limit. A source with a server default goes back to it. */
+	async function onRemoveLimit(l: SourceRateLimit): Promise<void> {
+		if (removingLimit) return;
+		const name = limitSourceName(l.sourceId);
+		const ok = await confirm(
+			l.overridesEnv
+				? {
+						title: `Go back to the server limit for ${name}?`,
+						message: 'Your limit is removed. The limit set on the server applies again.',
+						confirmLabel: 'Use server limit',
+					}
+				: {
+						title: `Remove the limit for ${name}?`,
+						message:
+							'The server then checks this source at full speed again. A site that asked for fewer requests can block the server.',
+						confirmLabel: 'Remove limit',
+						danger: true,
+					},
+		);
+		if (!ok) return;
+		removingLimit = l.sourceId;
+		try {
+			await removeSourceRateLimit(l.sourceId);
+			toast.success(
+				l.overridesEnv ? `${name} uses the server limit again.` : `Removed the limit for ${name}.`,
+			);
+			if (limitSourceId === l.sourceId) limitSourceId = '';
+			await refreshLimits();
+		} catch (err) {
+			toast.fromError(err, 'The limit could not be removed.');
+		} finally {
+			removingLimit = null;
+		}
+	}
+
 	// ---- Extension updater ----------------------------------------------------
 	// The server updates installed extensions on a timer; this is its status and
 	// history, plus a way to run it now.
@@ -260,6 +393,7 @@
 		if (!auth.user) return;
 		void refreshRepos();
 		void refreshMangadex();
+		void refreshLimits();
 		void refreshAutoUpdate().then(followUpdates);
 	});
 	// Stop following a running update pass, and stop a merge run between batches, when
@@ -640,6 +774,120 @@
 							{/if}
 						{/if}
 					</div>
+
+					{#if limits}
+						<div id="limits" class="setting repos">
+							<div class="setting-text">
+								<p class="setting-name">Request limits</p>
+								<p class="k-hint">
+									Some sites block a server that asks too often. A limit makes the server check that
+									source for new chapters slowly, one series at a time. One check uses 2 requests. A
+									change applies at once.
+								</p>
+							</div>
+							{#if limitChoices.length > 0}
+								<form class="repo-form limit-form" onsubmit={onSaveLimit}>
+									<select
+										class="k-select"
+										name="source"
+										autocomplete="off"
+										aria-label="Source to limit"
+										bind:value={limitSourceId}
+										onchange={onPickLimitSource}
+										required
+									>
+										<option value="" disabled>Choose a source</option>
+										{#each limitChoices as c (c.id)}
+											<option value={c.id}>{c.label}</option>
+										{/each}
+									</select>
+									<label class="limit-field">
+										<input
+											class="k-input"
+											type="number"
+											name="requests"
+											autocomplete="off"
+											min="1"
+											max="10000"
+											step="1"
+											bind:value={limitRequests}
+											bind:this={limitRequestsInput}
+											required
+										/>
+										<span>requests every</span>
+									</label>
+									<label class="limit-field">
+										<input
+											class="k-input"
+											type="number"
+											name="minutes"
+											autocomplete="off"
+											min="1"
+											max="1440"
+											step="1"
+											bind:value={limitMinutes}
+											required
+										/>
+										<span>minutes</span>
+									</label>
+									<Button
+										type="submit"
+										variant="primary"
+										icon={limitExisting ? undefined : 'plus'}
+										busy={savingLimit}>{limitExisting ? 'Save limit' : 'Add limit'}</Button
+									>
+								</form>
+							{:else}
+								<p class="k-hint">
+									Install an extension first. Then you can limit its source here.
+								</p>
+							{/if}
+
+							{#if limits.length > 0}
+								<ul class="repo-list" aria-label="Request limits">
+									{#each limits as l (l.sourceId)}
+										{@const name = limitSourceName(l.sourceId)}
+										<li>
+											<span class="repo-text">
+												<span class="repo-name">{name}</span>
+												<span class="k-muted">{limitRule(l)}. {limitPace(l)}.</span>
+												{#if l.fromEnv}
+													<span class="k-hint">Set on the server. You can change it here.</span>
+												{:else if l.overridesEnv}
+													<span class="k-hint"
+														>Your limit. It replaces the one set on the server.</span
+													>
+												{/if}
+											</span>
+											<Button
+												variant="ghost"
+												size="sm"
+												icon="edit"
+												iconOnly
+												aria-label="Change the limit for {name}"
+												disabled={!!removingLimit}
+												onclick={() => onEditLimit(l)}
+											/>
+											{#if !l.fromEnv}
+												<Button
+													variant="ghost"
+													size="sm"
+													icon="trash"
+													iconOnly
+													aria-label={l.overridesEnv
+														? `Go back to the server limit for ${name}`
+														: `Remove the limit for ${name}`}
+													busy={removingLimit === l.sourceId}
+													disabled={!!removingLimit && removingLimit !== l.sourceId}
+													onclick={() => onRemoveLimit(l)}
+												/>
+											{/if}
+										</li>
+									{/each}
+								</ul>
+							{/if}
+						</div>
+					{/if}
 				</div>
 				<div class="group-foot">
 					<a class="k-link" href={href('/sources')}>Manage installed extensions</a>
@@ -990,6 +1238,22 @@
 	}
 	.repo-text .k-mono {
 		font-size: var(--k-text-xs);
+	}
+	.limit-form .k-select {
+		flex: 1 1 200px;
+		min-width: 0;
+	}
+	.limit-field {
+		display: flex;
+		align-items: center;
+		gap: var(--k-space-2);
+		color: var(--k-text-2);
+		font-size: var(--k-text-sm);
+		white-space: nowrap;
+	}
+	.repo-form .limit-field .k-input {
+		flex: none;
+		width: 84px;
 	}
 	.calm {
 		display: flex;

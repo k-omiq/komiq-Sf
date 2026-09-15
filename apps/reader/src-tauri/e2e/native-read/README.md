@@ -12,7 +12,7 @@ Using a real MangaDex series pulled live through the engine, it asserts:
 - **A — identity preserved:** `canonicalChapters()` returns the hosted canned list
   unchanged (ids + order intact); reconciliation never rewrites hosted chapter identity.
 - **B — reconciliation → local path:** a canonical chapter whose number matches an engine
-  chapter (D7 number-match) resolves its pages to engine `/api/v1/manga/.../page/N` paths.
+  chapter (D7 number-match) resolves its pages to engine paths (`engine:/api/v1/manga/.../page/N`).
 - **C — real image bytes:** that local page path yields decodable image bytes (JPEG/PNG/WEBP
   magic, > 1000 B) through the engine proxy.
 - **D — hosted fallback:** a canonical chapter matching **no** engine chapter falls back to
@@ -20,6 +20,18 @@ Using a real MangaDex series pulled live through the engine, it asserts:
 - **E — scanlator tiebreak:** on a same-number multi-scanlator collision, the scanlator
   disambiguates to the correct engine chapter id (skipped if the picked series has no
   such collision).
+
+And for a Suwayomi chapter (any extension) read through `pages()`, with a **second,
+empty engine** playing the device and the first one playing the server's engine:
+
+- **F — the server's lookup:** the document behind the server's `chapterOrigin` query
+  returns the source's own keys for the manga and the chapter from a real engine.
+- **G — self-fetch on a fresh engine:** given only those keys, an engine that has no
+  extension and has never seen the manga installs the extension, finds the same chapter
+  and returns its own pages (`engine:/api/v1/manga/.../page/N`). The server is not asked
+  for pages.
+- **H — real image bytes** from the device engine for that chapter.
+- **I — warm open:** a new session finds the chapter in the engine's database by its key.
 
 ## Prerequisites
 
@@ -40,9 +52,10 @@ cd apps/reader/src-tauri/e2e/native-read
 bash run.sh
 ```
 
-`run.sh` boots the engine on `SUWA_PORT` (default `4572`), bundles `harness.entry.ts` with
+`run.sh` boots two engines — the server's on `SUWA_PORT` (default `4572`) and the device's
+on `SUWA_DEVICE_PORT` (default `SUWA_PORT + 1`) — bundles `harness.entry.ts` with
 esbuild (aliasing `@tauri-apps/api/core` → `tauri-core-stub.mjs`), runs it, and always tears
-the engine down via an `EXIT` trap. Override the port with `SUWA_PORT=NNNN bash run.sh`.
+both engines down via an `EXIT` trap. Override the port with `SUWA_PORT=NNNN bash run.sh`.
 
 Expected tail:
 
@@ -52,8 +65,12 @@ Expected tail:
 [PASS] C image-bytes — ...
 [PASS] D hosted-fallback — ...
 [PASS] E scanlator-tiebreak — ...
+[PASS] F server-chapter-origin — ...
+[PASS] G self-fetch-on-fresh-engine — ...
+[PASS] H self-fetch-image-bytes — ...
+[PASS] I self-fetch-warm-open — ...
 
-[harness] 5 passed, 0 failed
+[harness] 9 passed, 0 failed
 ```
 
 Exit code is `0` only when 0 assertions fail. (E may report `[SKIP]` for a series with no

@@ -74,11 +74,15 @@ fn alive(pid: &str) -> bool {
 }
 
 /// An engine the test steers.
-struct FakeEngine(Mutex<Option<Result<EngineLink, String>>>);
+struct FakeEngine(
+  Mutex<Option<Result<EngineLink, String>>>,
+  /// How often the start sequence asked for the engine.
+  std::sync::atomic::AtomicUsize,
+);
 
 impl FakeEngine {
   fn ready(port: u16) -> Arc<Self> {
-    Arc::new(FakeEngine(Mutex::new(Some(Ok(link(port))))))
+    Arc::new(FakeEngine(Mutex::new(Some(Ok(link(port)))), Default::default()))
   }
   fn set(&self, v: Option<Result<EngineLink, String>>) {
     *lock(&self.0) = v;
@@ -86,7 +90,9 @@ impl FakeEngine {
 }
 
 impl Engine for FakeEngine {
-  fn ensure_started(&self) {}
+  fn ensure_started(&self) {
+    self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+  }
   fn state(&self) -> EngineState {
     match lock(&self.0).clone() {
       None => EngineState::Starting,
@@ -123,6 +129,42 @@ fn free_port() -> u16 {
 }
 
 // ---- boot_server ---------------------------------------------------------------------
+
+/// No processes are started: changing the saved choice must not pretend the old
+/// loopback listener is ready for other devices while its restart is still pending.
+#[test]
+fn firewall_uses_actual_listener() {
+  let s = LocalServer::new(
+    Launch {
+      bin: PathBuf::new(),
+      web_dir: None,
+      data_dir: PathBuf::new(),
+    },
+    FakeEngine::ready(1),
+    LogBuf::new(),
+    false,
+  );
+  assert_eq!(s.firewall_port(), None);
+  lock(&s.state).running = true;
+  s.set_ready(7580, false, None);
+  lock(&s.prefs).lan = true;
+  assert_eq!(
+    s.firewall_port(),
+    None,
+    "preference changed before loopback restarted"
+  );
+  s.set_ready(7580, true, None);
+  assert_eq!(s.firewall_port(), Some(7580));
+  lock(&s.prefs).lan = false;
+  assert_eq!(s.firewall_port(), None, "turning LAN off rejects immediately");
+  lock(&s.prefs).lan = true;
+  s.set_stage(Stage::Server);
+  assert_eq!(s.firewall_port(), None, "restarting listener is not ready");
+  s.set_ready(7581, true, None);
+  assert_eq!(s.firewall_port(), Some(7581), "use the current port");
+  lock(&s.state).running = false;
+  assert_eq!(s.firewall_port(), None, "stopped server is not listening");
+}
 
 #[tokio::test]
 async fn boot_waits_for_health_and_catches_the_code() {
@@ -308,6 +350,8 @@ async fn an_engine_failure_is_reported_and_retry_recovers() {
   s.start(); // Retry
   let st = settle(&s, 30).await;
   assert_eq!((st.stage, st.error), ("ready", None));
+  // Retry asks for the engine again: one that never launched gets a second start.
+  assert_eq!(engine.1.load(std::sync::atomic::Ordering::SeqCst), 2);
   s.stop().await;
 }
 

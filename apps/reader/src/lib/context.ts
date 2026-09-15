@@ -9,7 +9,8 @@ import {
 	isTauri,
 	OfflineWriteQueue,
 } from '@komika/api';
-import { apiOrigin, chosenServer, config } from './config';
+import { apiOrigin, chosenServer, config, OFFLINE_WRITES_KEY } from './config';
+import { confirmExtensionInstall } from './extension-consent.svelte';
 
 /**
  * App-wide singletons. The UI only ever talks to these two seams:
@@ -29,10 +30,11 @@ export const backend =
 		: config.nativeEngine && isTauri()
 			? createCompositeBackend({
 					hosted: komikaHosted,
-					local: createLocalSuwayomiBackend(),
+					// The server names the extensions; the person allows each repository.
+					local: createLocalSuwayomiBackend({ confirmInstall: confirmExtensionInstall }),
 					// Durable offline write-queue (native only; plan §9): captures failed
 					// `mark`/`setProgress` writes and replays them when connectivity returns.
-					queue: new OfflineWriteQueue(createLocalStorageAdapter('komika.offlineWrites')),
+					queue: new OfflineWriteQueue(createLocalStorageAdapter(OFFLINE_WRITES_KEY)),
 				})
 			: komikaHosted;
 export const images = createImageProvider({

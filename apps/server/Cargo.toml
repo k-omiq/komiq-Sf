@@ -18,7 +18,9 @@ async-graphql = "7"
 async-graphql-axum = "7"
 tower = "0.5"
 # `fs` serves the optional self-host web folder (`KOMIKA_WEB_DIR`, see `web_dir.rs`).
-tower-http = { version = "0.6", features = ["cors", "trace", "set-header", "catch-panic", "request-id", "compression-gzip", "fs"] }
+# `limit` caps the body of `POST /graphql` (main.rs): async-graphql reads the raw body,
+# past axum's own `DefaultBodyLimit`.
+tower-http = { version = "0.6", features = ["cors", "trace", "set-header", "catch-panic", "request-id", "compression-gzip", "fs", "limit"] }
 async-trait = "0.1"
 # Stream combinators (buffer_unordered) for bounded-concurrency background crawls
 # (cover.rs). Only the façade over futures-util, already vendored transitively.
@@ -43,6 +45,8 @@ hex = "0.4"
 # Session tokens are hashed at rest (SHA-256 hex) so a leaked DB snapshot doesn't
 # expose usable bearer tokens (defense-in-depth). Already vendored transitively.
 sha2 = "0.10"
+# The pinned macOS cloudflared release is gzip-compressed (already locked).
+flate2 = "1"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 anyhow = "1"
@@ -57,6 +61,9 @@ dotenvy = "0.15"
 ring = "0.17"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 base64 = "0.22"
+# `komika-server setup` (setup_cli.rs) reads the owner password and the Cloudflare token
+# from the terminal without echoing them.
+rpassword = "7"
 
 [profile.release]
 opt-level = 3

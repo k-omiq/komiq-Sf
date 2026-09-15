@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { invalidateAll } from '$app/navigation';
 	import { auth, changeOwnPassword, logout, needsCurrentPassword } from '$lib/auth.svelte';
 	import AccountScreen from './AccountScreen.svelte';
 
@@ -24,6 +25,9 @@
 		busy = true;
 		try {
 			await changeOwnPassword(password, askCurrent ? current : undefined);
+			// Pages behind this screen loaded while the server still answered this
+			// account as signed out (an empty library); load them again as the user.
+			await invalidateAll();
 		} catch (err) {
 			const message = err instanceof Error ? err.message : 'The password could not be saved.';
 			const m = message.toLowerCase();

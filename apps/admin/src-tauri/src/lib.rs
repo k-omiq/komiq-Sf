@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use tauri::{Manager, State};
 
+mod firewall;
 mod local;
 mod logbuf;
 mod network;
@@ -55,13 +56,15 @@ struct EngineStarted(Arc<AtomicBool>);
 impl local::Engine for BundledEngine {
   fn ensure_started(&self) {
     // `suwayomi::start` spawns a supervision loop per call: claim it once per app run.
-    // That loop restarts a crashed engine by itself.
+    // That loop restarts a crashed engine by itself. A start that launched no loop (the
+    // bundled engine could not be resolved) gives the claim back, so Retry starts again.
     if self
       .started
       .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
       .is_ok()
+      && !suwayomi::start(self.app.clone())
     {
-      suwayomi::start(self.app.clone());
+      self.started.store(false, Ordering::SeqCst);
     }
   }
 
@@ -146,6 +149,19 @@ async fn set_local_network(
   server.set_network(enabled).await
 }
 
+#[tauri::command]
+fn firewall_info() -> firewall::Info {
+  firewall::info()
+}
+
+#[tauri::command]
+async fn open_firewall(server: State<'_, Arc<local::LocalServer>>) -> Result<String, String> {
+  let port = server
+    .firewall_port()
+    .ok_or_else(|| "Turn on Allow other devices first.".to_string())?;
+  firewall::open(port).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   let engine_log = logbuf::LogBuf::new();
@@ -159,6 +175,8 @@ pub fn run() {
   }
 
   let app = tauri::Builder::default()
+    // Links that open a new tab go to the system browser (see Cargo.toml).
+    .plugin(tauri_plugin_opener::init())
     .setup(move |app| {
       let data_dir = app.path().app_data_dir()?;
       // Children die with the app, even a force-killed one (see child.rs).
@@ -194,7 +212,9 @@ pub fn run() {
       local_server_status,
       local_server_log,
       local_network,
-      set_local_network
+      set_local_network,
+      firewall_info,
+      open_firewall
     ])
     .build(tauri::generate_context!())
     .expect("error while building tauri application");

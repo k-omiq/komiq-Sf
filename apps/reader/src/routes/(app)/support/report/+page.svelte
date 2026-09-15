@@ -266,7 +266,7 @@
 </svelte:head>
 
 <div class="wrap k-gutter">
-	<a class="back" href="/support#report"><Icon name="chevron-left" size={16} /> Support</a>
+	<a class="back k-hit" href="/support#report"><Icon name="chevron-left" size={16} /> Support</a>
 
 	{#if done}
 		<!-- `tabindex="-1"` so `submit` can move focus here. The panel REPLACES the form, so

@@ -33,16 +33,24 @@ import type {
 } from '@komika/types';
 import type {
 	AccessMode,
+	AccessPreflight,
 	AccessStatus,
+	BrowseSource,
+	CertificateStatus,
 	AdminChapter,
 	ChapterOverrideInput,
+	CloudflareConnection,
 	CloudflareSetupInput,
 	CloudflareTokenCheck,
 	CreateOwnerInput,
 	CreateUserInput,
 	ExtensionRepo,
 	MangadexSetting,
+	ScanlatorAi,
+	ScanlatorPage,
+	ScanlatorQuery,
 	Session,
+	SourceRateLimit,
 	SeriesAdminInput,
 	SeriesAdminMeta,
 	SeriesMetadataInput,
@@ -322,6 +330,28 @@ export async function loadMangadexSetting(): Promise<MangadexSetting> {
 export async function setMangadexEnabled(enabled: boolean): Promise<boolean> {
 	if (!backend.setMangadexEnabled) setupUnavailable();
 	return backend.setMangadexEnabled(enabled);
+}
+
+/** Every per-source scan rate limit in force, the server's own sources first. */
+export async function loadSourceRateLimits(): Promise<SourceRateLimit[]> {
+	if (!backend.sourceRateLimits) setupUnavailable();
+	return backend.sourceRateLimits();
+}
+
+/** Add or replace the scan rate limit of one source; the server applies it at once. */
+export async function setSourceRateLimit(
+	sourceId: Id,
+	requests: number,
+	windowSecs: number,
+): Promise<SourceRateLimit> {
+	if (!backend.setSourceRateLimit) setupUnavailable();
+	return backend.setSourceRateLimit(sourceId, requests, windowSecs);
+}
+
+/** Remove an admin's limit; the source falls back to the server's default, if any. */
+export async function removeSourceRateLimit(sourceId: Id): Promise<boolean> {
+	if (!backend.removeSourceRateLimit) setupUnavailable();
+	return backend.removeSourceRateLimit(sourceId);
 }
 
 /** The message the server uses when the source engine is down or still starting. */
@@ -663,6 +693,34 @@ export const STATUS_OPTIONS: SeriesStatus[] = [
 	'UNKNOWN',
 ];
 
+// ---- scanlators ---------------------------------------------------------------
+
+/**
+ * One page of the scanlator list (50 rows, most chapters first), each with its AI tag.
+ * The server counts the list with one slow scan and reuses it for ten minutes, so the
+ * first call can take a few seconds.
+ */
+export async function loadScanlators(query: ScanlatorQuery = {}): Promise<ScanlatorPage> {
+	if (!backend.scanlators) throw new Error('Scanlator tags are unavailable on this backend.');
+	return backend.scanlators(query);
+}
+
+/** Tag a scanlator as using AI; `null` removes the tag. False when nothing changed. */
+export async function setScanlatorAi(name: string, ai: ScanlatorAi | null): Promise<boolean> {
+	if (!backend.setScanlatorAi) throw new Error('Scanlator tags are unavailable on this backend.');
+	return backend.setScanlatorAi(name, ai);
+}
+
+/**
+ * The sources the scanlator list can be filtered by, biggest first.
+ *
+ * Always NSFW-inclusive — see {@link ADMIN_INCLUDE_NSFW}.
+ */
+export async function loadBrowseSources(): Promise<BrowseSource[]> {
+	if (!backend.browseSources) throw new Error('Source filters are unavailable on this backend.');
+	return backend.browseSources(ADMIN_INCLUDE_NSFW);
+}
+
 // ---- first-run setup ---------------------------------------------------------
 
 function setupUnavailable(): never {
@@ -713,21 +771,102 @@ export async function loadAccessStatus(): Promise<AccessStatus> {
 	return backend.accessStatus();
 }
 
-/** Record the wizard's access choice (and a domain the owner set up by hand). */
+/**
+ * The server's address for other devices on the home network, when the console's own
+ * address is this computer's loopback. Null when there is none to show: the server only
+ * answers on its own computer, runs in a container, or predates the question.
+ */
+export async function loadLanAddress(): Promise<string | null> {
+	try {
+		return (await backend.lanAddresses?.())?.[0] ?? null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Record the wizard's access choice (and a domain the owner set up by hand). With
+ * `encrypt`, direct mode gets a certificate first: the answer can take a minute.
+ */
 export async function setAccessMode(
 	mode: AccessMode,
 	domain?: string | null,
+	encrypt?: boolean,
 ): Promise<AccessStatus> {
 	if (!backend.setAccessMode) accessUnavailable();
-	return backend.setAccessMode(mode, domain);
+	return backend.setAccessMode(mode, domain, encrypt);
 }
 
+/**
+ * Whether the owner must be created in a terminal on the server: this console talks
+ * to it over plain HTTP from the internet, where the server refuses `createOwner`.
+ * False on a server that predates the check (it does not know the field). Null when the
+ * question got no answer: the caller must not show the owner form on a guess.
+ */
+export async function loadSetupNeedsTerminal(): Promise<boolean | null> {
+	if (!backend.setupNeedsTerminal) return false;
+	try {
+		return await backend.setupNeedsTerminal();
+	} catch (err) {
+		const message = err instanceof Error ? err.message : '';
+		return /(Unknown|Cannot query) field "setupNeedsTerminal"/.test(message) ? false : null;
+	}
+}
+
+/**
+ * The certificate of direct mode with HTTPS. Null when there is nothing to show: that
+ * mode is off, or the server predates it.
+ */
+export async function loadCertificateStatus(): Promise<CertificateStatus | null> {
+	try {
+		return (await backend.certificateStatus?.()) ?? null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * What the server knows about its machine before access setup: the tunnel connector,
+ * the HTTPS ports, the public address. Null when there is nothing to show (the server
+ * predates the question, or did not answer): the screens then leave those lines out.
+ */
+export async function loadAccessPreflight(): Promise<AccessPreflight | null> {
+	try {
+		return (await backend.accessPreflight?.()) ?? null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The last time a device on the home network reached this server since it started, or
+ * null when none has yet. `undefined` when the server cannot say (it predates the
+ * field): stop asking. Any other failure rejects, e.g. the server is restarting; ask
+ * again later.
+ */
+export async function loadLanClientSeenAt(): Promise<string | null | undefined> {
+	if (!backend.lanClientSeenAt) return undefined;
+	try {
+		return await backend.lanClientSeenAt();
+	} catch (err) {
+		if (err instanceof Error && err.message.includes('Unknown field "lanClientSeenAt"')) {
+			return undefined;
+		}
+		throw err;
+	}
+}
+
+/**
+ * Check the token and find the zone. `connection` also asks which permission rows the
+ * token seems to lack for it (`missing`, advice only; empty on an older server).
+ */
 export async function checkCloudflareToken(
 	token: string,
 	domain: string,
+	connection?: CloudflareConnection,
 ): Promise<CloudflareTokenCheck> {
 	if (!backend.checkCloudflareToken) accessUnavailable();
-	return backend.checkCloudflareToken(token, domain);
+	return backend.checkCloudflareToken(token, domain, connection);
 }
 
 export async function startCloudflareSetup(input: CloudflareSetupInput): Promise<AccessStatus> {

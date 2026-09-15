@@ -279,7 +279,7 @@
 	<div class="signin-prompt">
 		<span>Sign in to join the discussion.</span>
 		<a
-			class="signin-link"
+			class="signin-link k-hit"
 			href={`/login?redirect=${encodeURIComponent(page.url.pathname + page.url.search)}`}
 		>
 			Sign in
@@ -319,7 +319,7 @@
 				</label>
 				<div class="foot-actions">
 					<button
-						class="attach"
+						class="attach k-hit"
 						onclick={() => rootFileInput?.click()}
 						disabled={uploading || !!media}
 						title="Attach an image"
@@ -328,7 +328,7 @@
 						{#if uploading}<span class="spin"></span>{:else}<Icon name="image" size={17} />{/if}
 					</button>
 					<button
-						class="post"
+						class="post k-hit"
 						class:enabled={canPostRoot}
 						onclick={postRoot}
 						disabled={!canPostRoot}
@@ -403,7 +403,7 @@
 			{/if}
 			<div class="c-actions">
 				<button
-					class="act vote"
+					class="act k-hit vote"
 					class:on={c.myVote === 1}
 					disabled={!canVote || voting === c.id}
 					aria-pressed={c.myVote === 1}
@@ -413,7 +413,7 @@
 					<Icon name="thumbs-up" size={14} />{c.likes || ''}
 				</button>
 				<button
-					class="act vote"
+					class="act k-hit vote"
 					class:on={c.myVote === -1}
 					disabled={!canVote || voting === c.id}
 					aria-pressed={c.myVote === -1}
@@ -424,7 +424,7 @@
 				</button>
 				{#if !needsAuth}
 					<button
-						class="act"
+						class="act k-hit"
 						onclick={() => (replyingTo === c.id ? cancelReply() : openReply(c.id))}
 					>
 						<Icon name="reply" size={14} />{replyingTo === c.id ? 'Cancel' : 'Reply'}
@@ -436,16 +436,16 @@
 					     an admin cannot verify and which vanishes if the comment is deleted.
 					     With the id the server snapshots the body and takes the author from the
 					     DB. Not shown on your own comments — deleting is what you want there. -->
-					<a class="act" href={reportHref(c)} title="Report this comment to a moderator">
+					<a class="act k-hit" href={reportHref(c)} title="Report this comment to a moderator">
 						<Icon name="flag" size={14} />Report
 					</a>
 				{/if}
 				{#if canMod}
-					<button class="act mod" onclick={() => removeComment(c.id)}>
+					<button class="act k-hit mod" onclick={() => removeComment(c.id)}>
 						<Icon name="x" size={14} />Delete
 					</button>
 					{#if !c.mine && c.authorId}
-						<button class="act mod danger" onclick={() => banAuthor(c)}>
+						<button class="act k-hit mod danger" onclick={() => banAuthor(c)}>
 							<Icon name="alert" size={14} />Ban
 						</button>
 					{/if}
@@ -486,7 +486,7 @@
 						</label>
 						<div class="foot-actions">
 							<button
-								class="attach"
+								class="attach k-hit"
 								onclick={() => replyFileInput?.click()}
 								disabled={replyUploading || !!replyMedia}
 								aria-label="Attach an image"
@@ -497,7 +497,7 @@
 									/>{/if}
 							</button>
 							<button
-								class="post sm"
+								class="post k-hit sm"
 								class:enabled={canPostReply}
 								onclick={() => postReply(c.id)}
 								disabled={!canPostReply}
@@ -606,11 +606,14 @@
 		font-size: 12.5px;
 		margin: 8px 0 0;
 	}
+	/* On a phone the toggle and the buttons do not fit on one line: the row wraps
+	   (buttons stay right-aligned) instead of squeezing each label onto two lines. */
 	.composer-foot {
 		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
 		justify-content: space-between;
-		gap: 12px;
+		gap: 4px 12px;
 		margin-top: 10px;
 	}
 	.spoiler-toggle {
@@ -620,11 +623,13 @@
 		font-size: 13px;
 		color: var(--k-text-dimmer);
 		cursor: pointer;
+		white-space: nowrap;
 	}
 	.foot-actions {
 		display: flex;
 		align-items: center;
 		gap: 10px;
+		margin-left: auto;
 	}
 	.attach {
 		display: inline-flex;
@@ -698,6 +703,7 @@
 		color: var(--k-text-faint);
 		font-weight: 700;
 		font-size: 13.5px;
+		white-space: nowrap;
 		cursor: not-allowed;
 	}
 	.post.sm {
@@ -813,10 +819,12 @@
 		font-size: 13px;
 		cursor: pointer;
 	}
+	/* Wraps: with the moderator actions the row is wider than a 320px phone. */
 	.c-actions {
 		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
-		gap: 16px;
+		gap: 4px 16px;
 		margin-top: 10px;
 	}
 	/* Also matches the Report link, which is an <a> (it navigates) among buttons — hence
@@ -864,5 +872,15 @@
 		border: 1px solid var(--k-border-1);
 		border-radius: 12px;
 		background: var(--k-surface);
+	}
+	/* Touch: the actions keep their size (each carries the shared 44px target); a
+	   wrapped second row just needs room so the two rows' targets do not overlap. */
+	@media (pointer: coarse) {
+		.c-actions {
+			row-gap: 20px;
+		}
+		.spoiler-toggle {
+			min-height: 44px;
+		}
 	}
 </style>

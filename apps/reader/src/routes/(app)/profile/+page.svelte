@@ -1,6 +1,5 @@
 <script lang="ts">
-	import { tick, untrack } from 'svelte';
-	import { page } from '$app/state';
+	import { untrack } from 'svelte';
 	import { protectUnsaved } from '$lib/unsaved.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
@@ -15,24 +14,6 @@
 	import { auth, revalidateSession } from '$lib/auth.svelte';
 	import { backend } from '$lib/context';
 
-	// NSFW visibility preference (CATALOGUE.md §2). Reflects the signed-in user's
-	// server-side setting; the toggle persists via `setShowNsfw` and updates auth.
-	const showNsfw = $derived(auth.user?.showNsfw ?? false);
-	let savingNsfw = $state(false);
-	let nsfwError = $state('');
-	async function toggleNsfw(): Promise<void> {
-		if (!auth.user || savingNsfw || !backend.setShowNsfw) return;
-		savingNsfw = true;
-		nsfwError = '';
-		try {
-			const next = await backend.setShowNsfw(!auth.user.showNsfw);
-			if (auth.user) auth.user.showNsfw = next;
-		} catch (err) {
-			nsfwError = err instanceof Error ? err.message : 'Could not update the setting.';
-		} finally {
-			savingNsfw = false;
-		}
-	}
 	// The profile is fetched HERE, once, and only once auth is ready.
 	//
 	// There used to be a `+page.ts` that awaited `getProfile()` as well, so every
@@ -141,37 +122,6 @@
 		}
 	}
 
-	// --- Settings ---------------------------------------------------------------
-	// The settings card sits right under the stats on a phone (above the comment
-	// list, which can be long) and in the sticky side column on desktop. The gear
-	// scrolls to it explicitly, and an incoming `/profile#profile-preferences` link
-	// (Browse's "Show NSFW content" hint) is honoured once the profile has rendered —
-	// the browser's own hash jump fires before the async fetch, when the card doesn't
-	// exist yet, which is why that link used to land at the top of the page.
-	let settingsEl = $state<HTMLElement | null>(null);
-	let settingsFlash = $state(false);
-	async function showSettings(): Promise<void> {
-		await tick();
-		if (!settingsEl) return;
-		const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-		settingsEl.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'start' });
-		settingsEl.focus({ preventScroll: true });
-		settingsFlash = false;
-		requestAnimationFrame(() => (settingsFlash = true));
-	}
-	// Once per arrival — a later profile refetch (after saving the bio) mustn't yank
-	// the page back to the settings card.
-	let settingsHashHandled = false;
-	$effect(() => {
-		if (!profile || page.url.hash !== '#profile-preferences') {
-			settingsHashHandled = false;
-			return;
-		}
-		if (settingsHashHandled) return;
-		settingsHashHandled = true;
-		void showSettings();
-	});
-
 	// --- My comments ---------------------------------------------------------------
 	// Paged separately from the profile so a long comment history never holds up the
 	// header, and "Load more" appends rather than refetching.
@@ -249,7 +199,6 @@
 			{/each}
 		</div>
 		<div class="body">
-			<div class="side"><div class="k-skeleton sk-card"></div></div>
 			<div class="main">
 				<div class="k-skeleton sk-line sk-section"></div>
 				{#each Array(3) as _, i (i)}<div class="k-skeleton sk-comment"></div>{/each}
@@ -261,8 +210,8 @@
 	<div class="signed-out k-gutter">
 		<div class="so-icon"><Icon name="bookmark" size={26} /></div>
 		<h1>Your profile</h1>
-		<p>Sign in to see your reading stats, your comments, and your settings.</p>
-		<a class="so-btn" href="/login?redirect=%2Fprofile">Sign in</a>
+		<p>Sign in to see your reading stats and your comments.</p>
+		<a class="so-btn k-hit" href="/login?redirect=%2Fprofile">Sign in</a>
 	</div>
 {:else if profile}
 	<div class="profile k-gutter">
@@ -277,7 +226,7 @@
 				/>
 				{#if canEdit}
 					<button
-						class="avatar-edit"
+						class="avatar-edit k-hit"
 						aria-label="Change profile photo"
 						title="Change profile photo"
 						disabled={uploadingAvatar}
@@ -312,11 +261,13 @@
 			{#if auth.user}
 				<div class="actions">
 					{#if canEdit}
-						<button class="edit" onclick={openEditor} aria-expanded={editing}>Edit profile</button>
+						<button class="edit k-hit" onclick={openEditor} aria-expanded={editing}
+							>Edit profile</button
+						>
 					{/if}
-					<button class="gear" onclick={showSettings} aria-controls="profile-preferences">
+					<a class="gear k-hit" href="/settings">
 						<Icon name="gear" size={17} /><span>Settings</span>
-					</button>
+					</a>
 				</div>
 			{/if}
 		</div>
@@ -347,10 +298,10 @@
 				</label>
 				{#if profileError}<p class="setting-error" role="alert">{profileError}</p>{/if}
 				<div class="editor-actions">
-					<button class="cancel" onclick={() => (editing = false)} disabled={savingProfile}
+					<button class="cancel k-hit" onclick={() => (editing = false)} disabled={savingProfile}
 						>Cancel</button
 					>
-					<button class="save" onclick={saveProfile} disabled={savingProfile}>
+					<button class="save k-hit" onclick={saveProfile} disabled={savingProfile}>
 						{savingProfile ? 'Saving…' : 'Save changes'}
 					</button>
 				</div>
@@ -367,66 +318,6 @@
 		</div>
 
 		<div class="body">
-			<!-- Settings come FIRST in source order: on a phone the single column puts them
-			     right under the stats instead of below the whole comment history. -->
-			{#if auth.user}
-				<aside class="side">
-					<section
-						class="card settings"
-						class:flash={settingsFlash}
-						id="profile-preferences"
-						aria-labelledby="settings-title"
-						tabindex="-1"
-						bind:this={settingsEl}
-						onanimationend={() => (settingsFlash = false)}
-					>
-						<h2 class="card-title" id="settings-title">Settings</h2>
-						<div class="setting-group">
-							<span class="group-label">Content</span>
-							<div class="setting-row">
-								<label class="setting-text" for="nsfw-switch">
-									<span class="setting-label">Show NSFW content</span>
-									<span class="setting-desc" id="nsfw-desc">
-										Include adult-rated series in browse, search, and updates.
-									</span>
-								</label>
-								<button
-									type="button"
-									id="nsfw-switch"
-									class="switch"
-									class:on={showNsfw}
-									role="switch"
-									aria-checked={showNsfw}
-									aria-label="Show NSFW content"
-									aria-describedby="nsfw-desc"
-									disabled={savingNsfw || !backend.setShowNsfw}
-									onclick={toggleNsfw}
-								>
-									<span class="knob"></span>
-								</button>
-							</div>
-							{#if nsfwError}<p class="setting-error" role="alert">{nsfwError}</p>{/if}
-						</div>
-						<div class="setting-group">
-							<span class="group-label">Profile</span>
-							<div class="setting-links">
-								{#if canEdit}
-									<button class="setting-link" onclick={openEditor}>
-										<span>Edit display name &amp; bio</span><Icon name="chevron-right" size={16} />
-									</button>
-									<button class="setting-link" onclick={() => fileInput?.click()}>
-										<span>Change profile photo</span><Icon name="chevron-right" size={16} />
-									</button>
-								{/if}
-								<a class="setting-link" href="/library">
-									<span>Your library &amp; shelves</span><Icon name="chevron-right" size={16} />
-								</a>
-							</div>
-						</div>
-					</section>
-				</aside>
-			{/if}
-
 			<section class="main" aria-labelledby="comments-title">
 				<div class="section-head">
 					<h2 class="section-label" id="comments-title">Your comments</h2>
@@ -440,7 +331,7 @@
 				{:else if commentsError && comments.length === 0}
 					<div class="empty">
 						<p>Couldn't load your comments.</p>
-						<button class="ghost-btn" onclick={() => loadComments(1)}>Retry</button>
+						<button class="ghost-btn k-hit" onclick={() => loadComments(1)}>Retry</button>
 					</div>
 				{:else if comments.length === 0}
 					<div class="empty">
@@ -498,7 +389,7 @@
 					{/if}
 					{#if commentsHasNext}
 						<button
-							class="ghost-btn more"
+							class="ghost-btn k-hit more"
 							disabled={commentsLoading}
 							onclick={() => loadComments(commentsPage + 1)}
 						>
@@ -516,14 +407,14 @@
 		<div class="so-icon"><Icon name="bookmark" size={26} /></div>
 		<h1>Couldn't load your profile</h1>
 		<p>Something went wrong reaching the server. Check your connection and try again.</p>
-		<button class="so-btn" onclick={() => refreshProfile()}>Retry</button>
+		<button class="so-btn k-hit" onclick={() => refreshProfile()}>Retry</button>
 	</div>
 {/if}
 
 <style>
 	/* ---- Layout ------------------------------------------------------------
-	   Desktop: header row, stats, then comments (wide) beside a sticky settings
-	   column. Phone (≤ 820px): one column, settings first — see the markup. */
+	   Header row, stats, then the comments in one readable column. Settings have
+	   their own screen (/settings); the gear in the header row links there. */
 	.profile {
 		padding-top: 44px;
 		padding-bottom: 32px;
@@ -560,25 +451,13 @@
 		align-self: end;
 	}
 	.body {
-		display: grid;
-		grid-template-columns: minmax(0, 1fr) 340px;
-		grid-template-areas: 'main side';
-		gap: 40px;
 		margin-top: 40px;
-		align-items: start;
 	}
 	.main {
-		grid-area: main;
-		min-width: 0;
+		max-width: 860px;
 		display: flex;
 		flex-direction: column;
 		gap: 14px;
-	}
-	.side {
-		grid-area: side;
-		min-width: 0;
-		position: sticky;
-		top: calc(var(--k-header-h) + 20px);
 	}
 
 	/* ---- Loading skeleton ---------------------------------------------------- */
@@ -616,10 +495,6 @@
 	.sk-section {
 		width: 160px;
 		height: 14px;
-	}
-	.sk-card {
-		height: 200px;
-		border-radius: 12px;
 	}
 	.sk-comment {
 		height: 112px;
@@ -799,6 +674,7 @@
 		color: var(--k-on-primary);
 	}
 	.gear {
+		text-decoration: none;
 		background: transparent;
 		border: 1px solid var(--k-border-4);
 		color: var(--k-text-3);
@@ -909,147 +785,6 @@
 		color: var(--k-text-dimmer);
 	}
 
-	/* ---- Settings card -------------------------------------------------------- */
-	.card {
-		border: 1px solid var(--k-border-1);
-		border-radius: 12px;
-		padding: 20px 22px;
-		background: var(--k-surface);
-		display: flex;
-		flex-direction: column;
-		gap: 18px;
-	}
-	.settings {
-		scroll-margin-top: calc(var(--k-header-h) + 16px);
-		outline: none;
-	}
-	.settings.flash {
-		animation: flash 1.2s ease-out;
-	}
-	@keyframes flash {
-		0%,
-		30% {
-			border-color: var(--k-primary);
-			box-shadow: 0 0 0 3px color-mix(in srgb, var(--k-primary) 30%, transparent);
-		}
-		100% {
-			border-color: var(--k-border-1);
-			box-shadow: 0 0 0 0 transparent;
-		}
-	}
-	@media (prefers-reduced-motion: reduce) {
-		.settings.flash {
-			animation-duration: 0.01s;
-		}
-	}
-	.card-title {
-		font-family: var(--k-font-display);
-		font-weight: 700;
-		font-size: 16px;
-		margin: 0;
-		color: var(--k-text);
-	}
-	.setting-group {
-		display: flex;
-		flex-direction: column;
-		gap: 10px;
-	}
-	.group-label {
-		font-size: 11.5px;
-		font-weight: 700;
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-		color: var(--k-text-faint);
-	}
-	.setting-row {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 16px;
-	}
-	.setting-text {
-		display: flex;
-		flex-direction: column;
-		gap: 3px;
-		min-width: 0;
-		cursor: pointer;
-	}
-	.setting-label {
-		font-weight: 600;
-		font-size: 14px;
-		color: var(--k-text-1);
-	}
-	.setting-desc {
-		font-size: 12.5px;
-		color: var(--k-text-faint);
-		line-height: 1.4;
-	}
-	.switch {
-		flex: 0 0 auto;
-		width: 48px;
-		height: 28px;
-		border-radius: 999px;
-		border: 1px solid var(--k-border-4);
-		background: var(--k-border-1);
-		padding: 0;
-		cursor: pointer;
-		position: relative;
-		transition:
-			background 0.15s,
-			border-color 0.15s;
-	}
-	.switch:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-	.switch.on {
-		background: var(--k-primary);
-		border-color: var(--k-primary);
-	}
-	.switch .knob {
-		position: absolute;
-		top: 2px;
-		left: 2px;
-		width: 22px;
-		height: 22px;
-		border-radius: 50%;
-		background: var(--k-on-primary, #fff);
-		transition: transform 0.15s;
-	}
-	.switch.on .knob {
-		transform: translateX(20px);
-	}
-	.setting-links {
-		display: flex;
-		flex-direction: column;
-		margin: 0 -10px;
-	}
-	.setting-link {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 12px;
-		min-height: 44px;
-		padding: 0 10px;
-		border-radius: 8px;
-		border: none;
-		background: transparent;
-		color: var(--k-text-2);
-		font-family: inherit;
-		font-size: 14px;
-		font-weight: 600;
-		text-align: left;
-		text-decoration: none;
-		cursor: pointer;
-	}
-	.setting-link:hover {
-		background: rgba(255, 255, 255, 0.04);
-		color: var(--k-text);
-	}
-	.setting-link :global(svg) {
-		color: var(--k-text-fainter);
-		flex: 0 0 auto;
-	}
 	.setting-error {
 		margin: 4px 0 0;
 		font-size: 12.5px;
@@ -1259,15 +994,7 @@
 	/* ---- Tablet / phone --------------------------------------------------------- */
 	@media (max-width: 820px) {
 		.body {
-			grid-template-columns: minmax(0, 1fr);
-			grid-template-areas:
-				'side'
-				'main';
-			gap: 28px;
 			margin-top: 28px;
-		}
-		.side {
-			position: static;
 		}
 	}
 	@media (max-width: 640px) {
@@ -1322,9 +1049,6 @@
 		}
 		.stat-value {
 			font-size: 22px;
-		}
-		.card {
-			padding: 18px;
 		}
 		.editor {
 			padding: 18px;

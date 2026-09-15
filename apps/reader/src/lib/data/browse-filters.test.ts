@@ -20,9 +20,12 @@ import {
 	MAX_TAGS,
 	normalize,
 	parseBrowseUrl,
+	sameState,
 	setTagState,
 	shelveTags,
 	sortOptions,
+	sourceLabels,
+	sourceOptions,
 	tagLabel,
 	tagSlug,
 	tagsFromGenreFacets,
@@ -30,6 +33,7 @@ import {
 	toFilterInput,
 	toggleDir,
 	toggleIn,
+	toggleSource,
 	toLegacyFilters,
 	toSearchParams,
 	withField,
@@ -57,6 +61,7 @@ function fullState(): BrowseState {
 		demographics: ['SEINEN', 'NONE'],
 		contentRatings: ['SAFE', 'SUGGESTIVE'],
 		languages: ['ja', 'zh-hk'],
+		source: 'mangadex',
 		yearFrom: 2001,
 		yearTo: 2020,
 		minChapters: 50,
@@ -111,9 +116,32 @@ test('defaults are omitted: AND include mode, OR exclude mode, DESC, page 1, cha
 	assert.equal(canon('tagmode=or&xtagmode=and'), '');
 });
 
+test('a source round-trips, in its fixed place in the canonical URL', () => {
+	assert.equal(parse('source=mangadex').source, 'mangadex');
+	assert.equal(canon('source=mangadex'), 'source=mangadex');
+	// A source's own id is matched exactly by the server, so its spelling is kept.
+	assert.equal(canon('source=2499283573021220255'), 'source=2499283573021220255');
+	assert.equal(canon('source=Ab_C-9'), 'source=Ab_C-9');
+	assert.equal(
+		canon('page=2&from=2000&source=mangadex&lang=ja&q=x'),
+		'q=x&lang=ja&source=mangadex&from=2000&page=2',
+	);
+	assert.deepEqual(parseBrowseUrl(toSearchParams(parse('source=7'))), parse('source=7'));
+});
+
+test('the ids the server reads in any case have one spelling; padding is trimmed', () => {
+	assert.equal(canon('source=MangaDex'), 'source=mangadex');
+	assert.equal(canon('source=%20MANGADEX%20'), 'source=mangadex');
+	assert.equal(canon('source=Suwayomi'), 'source=suwayomi');
+	assert.ok(sameState(parse('source=MangaDex'), parse('source=mangadex')));
+});
+
 test('filterSig ignores the page; sameness of filters is page-independent', () => {
 	assert.equal(filterSig(parse('tag=action&page=4')), filterSig(parse('tag=action')));
 	assert.notEqual(filterSig(parse('tag=action')), filterSig(parse('tag=romance')));
+	assert.notEqual(filterSig(parse('source=1')), filterSig(parse('source=2')));
+	assert.notEqual(filterSig(parse('source=1')), filterSig(parse('')));
+	assert.ok(!sameState(parse('source=1'), parse('source=2')));
 });
 
 test('the panel draft key ignores query, sort and page', () => {
@@ -122,6 +150,12 @@ test('the panel draft key ignores query, sort and page', () => {
 		filtersOnlySig(parse('tag=x')),
 	);
 	assert.notEqual(filtersOnlySig(parse('tag=x')), filtersOnlySig(parse('tag=x&tagmode=or')));
+	// The source IS a filter: a draft must re-base when it changes underneath.
+	assert.notEqual(filtersOnlySig(parse('tag=x')), filtersOnlySig(parse('tag=x&source=mangadex')));
+	assert.equal(
+		filtersOnlySig(parse('q=a&sort=title&page=3&source=mangadex')),
+		filtersOnlySig(parse('source=mangadex')),
+	);
 });
 
 test('applying a draft keeps the current query and sort, takes the draft filters, page 1', () => {
@@ -129,6 +163,10 @@ test('applying a draft keeps the current query and sort, takes the draft filters
 	const draft = parse('q=stale&sort=title&type=manga');
 	const out = applyDraft(applied, draft, 'new');
 	assert.equal(toSearchParams(out).toString(), 'q=new&sort=follows&type=manga');
+	// The source is the draft's to set and to clear, like any other filter.
+	const picked = applyDraft(parse('q=a&page=2'), parse('source=mangadex'), 'a');
+	assert.equal(toSearchParams(picked).toString(), 'q=a&source=mangadex');
+	assert.equal(applyDraft(parse('source=mangadex&page=2'), parse(''), '').source, null);
 });
 
 test('draftChanges counts added, removed and changed clauses', () => {
@@ -139,15 +177,46 @@ test('draftChanges counts added, removed and changed clauses', () => {
 	// A changed year range is one chip removed + one added.
 	assert.equal(draftChanges(applied, parse('tag=a&tag=b&status=ongoing&from=2001')), 2);
 	assert.equal(draftChanges(applied, parse('tag=a&tag=b&tagmode=or&status=ongoing&from=2000')), 1);
+	// Picking or clearing a source is one change. Swapping it is counted like a changed
+	// year: one chip removed + one added (and never zero, though neither has a name here).
+	assert.equal(draftChanges(parse(''), parse('source=1')), 1);
+	assert.equal(draftChanges(parse('source=1'), parse('')), 1);
+	assert.equal(draftChanges(parse('source=1'), parse('source=2')), 2);
+	assert.equal(draftChanges(parse('source=1'), parse('source=1')), 0);
 });
 
 // ---- tolerant parsing ---------------------------------------------------------------
 
 test('invalid values are dropped, not rejected', () => {
 	const s = parse(
-		'sort=bogus&dir=sideways&status=alive&type=novel&demo=kids&content=extreme&lang=Japanese!&from=abc&minch=-5&minrating=x&page=-2&tag=Not%20A%20Slug&xtag=%3Cscript%3E',
+		'sort=bogus&dir=sideways&status=alive&type=novel&demo=kids&content=extreme&lang=Japanese!&from=abc&minch=-5&minrating=x&page=-2&tag=Not%20A%20Slug&xtag=%3Cscript%3E&source=no%2Fsuch',
 	);
 	assert.deepEqual(s, emptyState());
+});
+
+test('a source id the server could not match is dropped, never sent', () => {
+	for (const bad of [
+		'',
+		'%20%20',
+		'two%20words',
+		'a%2Fb',
+		'a.b',
+		'%3Cscript%3E',
+		'm%C3%A1ngadex',
+		'x'.repeat(65),
+	]) {
+		assert.equal(parse(`source=${bad}`).source, null, bad);
+		assert.equal(canon(`source=${bad}`), '', bad);
+		assert.equal(toFilterInput(parse(`source=${bad}`)).source, undefined, bad);
+	}
+	// 64 is the longest the server takes.
+	assert.equal(parse(`source=${'x'.repeat(64)}`).source, 'x'.repeat(64));
+	// One source only: a repeated param keeps the first, even when the first is junk.
+	assert.equal(parse('source=1&source=2').source, '1');
+	assert.equal(parse('source=a.b&source=2').source, null);
+	// The same rule guards a state built in code, not just one read from a URL.
+	assert.equal(normalize({ ...emptyState(), source: ' no such ' }).source, null);
+	assert.equal(normalize({ ...emptyState(), source: ' MangaDex ' }).source, 'mangadex');
 });
 
 test('enum values are case-insensitive and deduped', () => {
@@ -219,6 +288,7 @@ test('legacy sort words map onto the new sorts', () => {
 	assert.equal(parse('sort=newest').sort, null); // LATEST_UPDATE is the no-query default
 	assert.equal(parse('q=x&sort=newest').sort, 'LATEST_UPDATE');
 	assert.equal(parse('sort=rating').sort, 'HIGHEST_RATED');
+	assert.equal(parse('sort=reader-rating').sort, 'READER_RATED');
 	assert.equal(parse('sort=added').sort, 'RECENTLY_ADDED');
 	assert.equal(parse('sort=chapters').sort, 'MOST_CHAPTERS');
 });
@@ -351,6 +421,7 @@ test('every active filter has a chip, with unique keys', () => {
 			'Suggestive',
 			'Japanese',
 			'Cantonese',
+			'Source',
 			'2001–2020',
 			'50+ chapters',
 			'Rated 7.5+',
@@ -383,6 +454,29 @@ test('year chip wording', () => {
 	assert.deepEqual(label('from=2005&to=2005'), ['Year 2005']);
 });
 
+test('the source chip takes its name from the list, and reads "Source" without one', () => {
+	const names = (id: string) => (id === 'mangadex' ? 'MangaDex' : undefined);
+	const chipOf = (qs: string, lookup?: typeof names) =>
+		activeChips(parse(qs), noNames, lookup).filter((c) => c.key.startsWith('source:'));
+
+	const [named] = chipOf('source=mangadex', names);
+	assert.equal(named.label, 'MangaDex');
+	assert.equal(named.ariaLabel, 'Remove source MangaDex');
+	assert.equal(named.tone, 'neutral');
+
+	// A source the list does not have, and a caller with no list at all (the two-argument
+	// call sites): the filter is still applied, so it still has a chip.
+	for (const [unnamed] of [chipOf('source=77', names), chipOf('source=77')]) {
+		assert.equal(unnamed.label, 'Source');
+		assert.equal(unnamed.ariaLabel, 'Remove source filter');
+	}
+	assert.equal(chipOf('', names).length, 0);
+
+	const next = chipOf('q=x&sort=follows&tag=action&source=mangadex&page=4', names)[0].remove();
+	assert.equal(toSearchParams(next).toString(), 'q=x&sort=follows&tag=action');
+	assert.equal(activeFilterCount(parse('source=mangadex')), 1);
+});
+
 test('an unknown tag id still gets a readable chip', () => {
 	assert.equal(tagLabel('slice-of-life', noNames), 'Slice Of Life');
 	assert.equal(
@@ -397,6 +491,8 @@ test('clear all keeps the query and sort', () => {
 	assert.equal(s.sort, 'MOST_FOLLOWS');
 	assert.equal(activeChips(s, noNames).length, 0);
 	assert.equal(s.page, 1);
+	assert.equal(s.source, null);
+	assert.equal(toSearchParams(clearFilters(parse('q=x&source=mangadex&page=3'))).toString(), 'q=x');
 });
 
 // ---- applicability -------------------------------------------------------------------------
@@ -419,6 +515,12 @@ test('the legacy genre fallback is include-only and matches any', () => {
 	assert.deepEqual(a.includedTags, ['action', 'drama']);
 });
 
+test('a source applies for every viewer: no gate removes it', () => {
+	const s = parse('source=mangadex');
+	assert.equal(applicableState(s, { nsfw: false, tagSource: 'tags' }).source, 'mangadex');
+	assert.equal(applicableState(s, { nsfw: false, tagSource: 'genres' }).source, 'mangadex');
+});
+
 // ---- wire ---------------------------------------------------------------------------------------
 
 test('toFilterInput sends only set clauses, never empty lists', () => {
@@ -434,6 +536,7 @@ test('toFilterInput sends only set clauses, never empty lists', () => {
 		demographics: ['SEINEN', 'NONE'],
 		contentRatings: ['SAFE', 'SUGGESTIVE'],
 		originalLanguages: ['ja', 'zh-hk'],
+		source: 'mangadex',
 		yearFrom: 2001,
 		yearTo: 2020,
 		minChapters: 50,
@@ -443,6 +546,17 @@ test('toFilterInput sends only set clauses, never empty lists', () => {
 		sort: 'MOST_FOLLOWS',
 		direction: 'ASC',
 	});
+	// The source goes out exactly as the URL holds it, and only when one is set.
+	assert.deepEqual(toFilterInput(parse('source=MangaDex')), {
+		source: 'mangadex',
+		sort: 'LATEST_UPDATE',
+		direction: 'DESC',
+	});
+	assert.equal(
+		toFilterInput(parse('q=x&source=2499283573021220255')).source,
+		'2499283573021220255',
+	);
+	assert.ok(!('source' in toFilterInput(parse('q=x'))));
 });
 
 test('legacy arguments carry only what they can express', () => {
@@ -455,9 +569,14 @@ test('legacy arguments carry only what they can express', () => {
 		contentRating: 'SUGGESTIVE',
 		hasChapters: true,
 	});
+	// No legacy argument can say "this source", so a source adds nothing at all.
+	assert.deepEqual(
+		toLegacyFilters(parse('source=mangadex'), names),
+		toLegacyFilters(emptyState(), names),
+	);
 	assert.deepEqual(
 		toLegacyFilters(
-			parse('status=ongoing&sort=rating&content=erotica&content=pornographic'),
+			parse('status=ongoing&sort=reader-rating&content=erotica&content=pornographic'),
 			names,
 		),
 		{
@@ -467,7 +586,9 @@ test('legacy arguments carry only what they can express', () => {
 		},
 	);
 	// An ascending order can't be said with the legacy sort at all.
-	assert.equal(toLegacyFilters(parse('sort=rating&dir=asc'), names).sort, undefined);
+	assert.equal(toLegacyFilters(parse('sort=reader-rating&dir=asc'), names).sort, undefined);
+	// MangaDex's rating is not the legacy RATING (that one is the readers' average).
+	assert.equal(toLegacyFilters(parse('sort=rating'), names).sort, undefined);
 	// Neither can a non-prefix rating set.
 	assert.equal(toLegacyFilters(parse('content=suggestive'), names).contentRating, undefined);
 	// The legacy genre list is capped at 12.
@@ -477,7 +598,11 @@ test('legacy arguments carry only what they can express', () => {
 
 test('legacyUnapplied names what an old server ignored', () => {
 	assert.deepEqual(legacyUnapplied(emptyState()), []);
-	assert.deepEqual(legacyUnapplied(parse('tag=action&tagmode=or&type=manga&sort=rating')), []);
+	assert.deepEqual(
+		legacyUnapplied(parse('tag=action&tagmode=or&type=manga&sort=reader-rating')),
+		[],
+	);
+	assert.deepEqual(legacyUnapplied(parse('sort=rating')), ['Sort']);
 	assert.deepEqual(legacyUnapplied(parse('tag=a&tag=b')), ['Match all tags']);
 	assert.deepEqual(legacyUnapplied(parse('q=x&type=manga&sort=follows')), ['Format', 'Sort']);
 	assert.deepEqual(legacyUnapplied(parse('xtag=gore&lang=ja&from=2000&minfollows=5')), [
@@ -486,6 +611,91 @@ test('legacyUnapplied names what an old server ignored', () => {
 		'Year',
 		'Min follows',
 	]);
+	// A source is never applied by an old server, with a query or without.
+	assert.deepEqual(legacyUnapplied(parse('source=mangadex')), ['Source']);
+	assert.deepEqual(legacyUnapplied(parse('q=x&source=77')), ['Source']);
+	assert.deepEqual(legacyUnapplied(parse('lang=ja&source=mangadex&from=2000')), [
+		'Original language',
+		'Source',
+		'Year',
+	]);
+});
+
+// ---- sources ------------------------------------------------------------------------------------
+
+const SOURCES = [
+	{ id: 'mangadex', name: 'MangaDex', lang: null, count: 71234 },
+	{ id: '2499283573021220255', name: 'MangaDex', lang: 'all', count: 900 },
+	{ id: '77', name: 'Asura Scans', lang: 'en', count: 512 },
+	{ id: '78', name: 'Comick', lang: null, count: 40 },
+	{ id: '79', name: 'Comick', lang: null, count: 3 },
+];
+
+test('source labels are the names; a shared name gains the language where there is one', () => {
+	assert.deepEqual(
+		[...sourceLabels(SOURCES)],
+		[
+			['mangadex', 'MangaDex'],
+			['2499283573021220255', 'MangaDex · ALL'],
+			// A name used once is left alone, language or not.
+			['77', 'Asura Scans'],
+			// Shared, but neither has a language to tell them apart by.
+			['78', 'Comick'],
+			['79', 'Comick'],
+		],
+	);
+	assert.deepEqual(
+		[
+			...sourceLabels([
+				{ id: '1', name: 'Toon', lang: 'en', count: 2 },
+				{ id: '2', name: 'Toon', lang: 'pt-br', count: 1 },
+			]).values(),
+		],
+		['Toon · EN', 'Toon · PT-BR'],
+	);
+	assert.equal(sourceLabels([]).size, 0);
+});
+
+test('source options keep the server order and counts, and only ids a URL can carry', () => {
+	assert.deepEqual(sourceOptions(SOURCES.slice(0, 3)), [
+		{ value: 'mangadex', label: 'MangaDex', count: 71234 },
+		{ value: '2499283573021220255', label: 'MangaDex · ALL', count: 900 },
+		{ value: '77', label: 'Asura Scans', count: 512 },
+	]);
+	assert.deepEqual(
+		sourceOptions([
+			{ id: 'MangaDex', name: 'MangaDex', lang: null, count: 9 },
+			// Unpickable: the URL would drop it.
+			{ id: 'no such', name: 'Broken', lang: 'en', count: 5 },
+			// A repeat of the first once its id is folded; the first wins.
+			{ id: 'mangadex', name: 'MangaDex', lang: 'all', count: 4 },
+			// No name: the id stands in, never a blank row.
+			{ id: '5', name: '  ', lang: 'en', count: 1 },
+		]),
+		[
+			{ value: 'mangadex', label: 'MangaDex', count: 9 },
+			{ value: '5', label: '5', count: 1 },
+		],
+	);
+	// Every option is a value the state accepts as it is.
+	for (const o of sourceOptions(SOURCES)) assert.equal(parse(`source=${o.value}`).source, o.value);
+});
+
+test('picking a source selects it, another replaces it, the same one again clears it', () => {
+	let s = toggleSource(parse('q=x&tag=action&page=5'), 'mangadex');
+	assert.equal(s.source, 'mangadex');
+	assert.equal(s.page, 1);
+	s = toggleSource(s, '77');
+	assert.equal(s.source, '77');
+	s = toggleSource(s, '77');
+	assert.equal(s.source, null);
+	assert.equal(toSearchParams(s).toString(), 'q=x&tag=action');
+	// The spelling the list uses does not matter for "is this the one picked".
+	assert.equal(toggleSource(parse('source=mangadex'), 'MangaDex').source, null);
+	// Something that is not an id changes nothing; it must not read as "clear".
+	const kept = parse('source=77&page=2');
+	assert.equal(toggleSource(kept, 'no such'), kept);
+	assert.equal(withField(parse('source=77&page=2'), 'source', null).page, 1);
 });
 
 // ---- picker -------------------------------------------------------------------------------------
@@ -544,6 +754,16 @@ test('federated rows honour tags (by name), format and status client-side', () =
 	assert.ok(!matchesFederated(row, parse('type=manga'), noNames));
 	assert.ok(!matchesFederated(row, parse('status=completed'), noNames));
 	assert.ok(matchesFederated(row, parse('type=manhwa&status=ongoing'), noNames));
+});
+
+test('a catalogue source does not narrow federated rows (the page says so instead)', () => {
+	const row = { genres: ['Action'], type: 'Manhwa', status: 'ongoing' };
+	assert.ok(matchesFederated(row, parse('source=mangadex'), noNames));
+	assert.ok(matchesFederated(row, parse('source=77&tag=action'), noNames));
+	// It still counts as a chip that is not one of the three these rows honour, which is
+	// what makes the page show its "only tags, format and status narrow them" note.
+	const keys = activeChips(parse('source=77&tag=action'), noNames).map((c) => c.key);
+	assert.deepEqual(keys, ['tag+:action', 'source:77']);
 });
 
 // ---- small helpers ---------------------------------------------------------------------------

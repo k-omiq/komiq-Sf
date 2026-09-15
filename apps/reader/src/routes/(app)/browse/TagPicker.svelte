@@ -116,7 +116,7 @@
 	{@const state = tagState(draft, tag.id)}
 	<button
 		type="button"
-		class="tag {state}"
+		class="tag k-hit {state}"
 		aria-label="{tag.name}, {STATE_TEXT[state]}"
 		aria-describedby="{uid}-hint"
 		title="{tag.count.toLocaleString()} series"
@@ -143,7 +143,7 @@
 		{#if needle}
 			<button
 				type="button"
-				class="tclear"
+				class="tclear k-hit"
 				aria-label="Clear tag search"
 				onclick={() => (needle = '')}
 			>
@@ -202,7 +202,7 @@
 		{#if !needle.trim() && (shelves[0]?.tags.length ?? 0) > previewCount}
 			<button
 				type="button"
-				class="show-all"
+				class="show-all k-hit"
 				aria-expanded={showAll}
 				onclick={() => (showAll = !showAll)}
 			>
@@ -212,7 +212,7 @@
 		{/if}
 		{#if triState}
 			<details class="match-options">
-				<summary>Tag options<Icon name="chevron-down" size={13} /></summary>
+				<summary class="k-hit">Tag options<Icon name="chevron-down" size={13} /></summary>
 				<p class="thint" id="{uid}-hint">Click to cycle: include (+), exclude (-), clear.</p>
 				<div class="modes">
 					{@render modeToggle('inclMode', 'Include', 'AND')}
@@ -469,6 +469,14 @@
 		}
 		.tsearch input {
 			font-size: 16px;
+		}
+	}
+	/* Touch: full 44px rows. */
+	@media (pointer: coarse) {
+		.categories button,
+		.seg button,
+		.tsearch {
+			min-height: 44px;
 		}
 	}
 </style>

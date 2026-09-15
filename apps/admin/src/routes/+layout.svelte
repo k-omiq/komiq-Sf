@@ -4,7 +4,7 @@
 	import '@fontsource-variable/manrope';
 	import '@komika/ui/reset.css';
 	import '@komika/ui/tokens.css';
-	import '$lib/admin.css';
+	import '@komika/ui/console.css';
 	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { auth, initAuth, logout } from '$lib/auth.svelte';
@@ -120,6 +120,8 @@
 					alarm: sourceHealth.down,
 					alarmLabel: 'sources down',
 				},
+				// The groups chapters are credited to, and which of them use AI.
+				{ href: '/scanlators', label: 'Scanlators', icon: 'globe' },
 			],
 		},
 		{

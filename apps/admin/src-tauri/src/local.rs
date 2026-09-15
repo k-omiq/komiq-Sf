@@ -135,6 +135,8 @@ struct State {
   stage: Stage,
   error: Option<String>,
   port: Option<u16>,
+  /// The active listener's bind mode, which can lag the saved preference on restart.
+  lan: bool,
   /// Taken by the first status read after `Ready`; never stored anywhere else.
   setup_code: Option<String>,
   /// Bumped on every transition to `Ready`.
@@ -178,6 +180,7 @@ impl LocalServer {
         stage: Stage::Engine,
         error: None,
         port: None,
+        lan: false,
         setup_code: None,
         ready_gen: 0,
         running: false,
@@ -275,6 +278,16 @@ impl LocalServer {
     }
   }
 
+  /// Firewall repair needs the active LAN listener, not a preference saved before
+  /// restart completes. Also reject once the owner has requested loopback again.
+  pub fn firewall_port(&self) -> Option<u16> {
+    let enabled = lock(&self.prefs).lan;
+    let st = lock(&self.state);
+    (enabled && st.lan && st.running && st.stage == Stage::Ready)
+      .then_some(st.port)
+      .flatten()
+  }
+
   /// `set_local_network`: remember the choice and, when the server runs, restart it on
   /// the new address. Resolves once it answers again, or with the reason it did not.
   pub async fn set_network(self: &Arc<Self>, enabled: bool) -> Result<Network, String> {
@@ -351,11 +364,12 @@ impl LocalServer {
     lock(&self.state).error = None;
   }
 
-  fn set_ready(&self, port: u16, setup_code: Option<String>) {
+  fn set_ready(&self, port: u16, lan: bool, setup_code: Option<String>) {
     let mut st = lock(&self.state);
     st.stage = Stage::Ready;
     st.error = None;
     st.port = Some(port);
+    st.lan = lan;
     st.setup_code = setup_code;
     st.ready_gen += 1;
   }
@@ -392,7 +406,11 @@ impl LocalServer {
         }
         tokio::select! {
           cmd = rx.recv() => match cmd {
-            Some(Cmd::Retry) | Some(Cmd::Restart) => self.clear_error(),
+            // From the top: an engine that never launched is started again.
+            Some(Cmd::Retry) | Some(Cmd::Restart) => {
+              self.clear_error();
+              continue 'start;
+            }
             Some(Cmd::Stop) | None => return self.finish(None).await,
           },
           _ = tokio::time::sleep(POLL) => {}
@@ -401,7 +419,7 @@ impl LocalServer {
 
       // 2. The server.
       self.set_stage(Stage::Server);
-      let (mut child, port) = match self.boot(&link).await {
+      let (mut child, port, lan) = match self.boot(&link).await {
         Ok(ok) => ok,
         Err(e) => {
           self.fail(e);
@@ -412,7 +430,7 @@ impl LocalServer {
         }
       };
       let code = self.wait_for_code(port).await;
-      self.set_ready(port, code);
+      self.set_ready(port, lan, code);
       self
         .server_log
         .push(&format!("[komiq] server ready on port {port}"));
@@ -476,7 +494,10 @@ impl LocalServer {
 
   /// Start the server on the remembered port (or the next free one), retrying on another
   /// port when the chosen one was taken in between.
-  async fn boot(&self, link: &EngineLink) -> Result<(tokio::process::Child, u16), String> {
+  async fn boot(
+    &self,
+    link: &EngineLink,
+  ) -> Result<(tokio::process::Child, u16, bool), String> {
     let (lan, preferred) = {
       let prefs = lock(&self.prefs);
       (prefs.lan, prefs.port.unwrap_or(DEFAULT_PORT))
@@ -514,7 +535,7 @@ impl LocalServer {
             prefs.port = Some(port);
             self.save_prefs(&prefs);
           }
-          return Ok((child, port));
+          return Ok((child, port, lan));
         }
         Err(BootError::PortInUse) => {
           avoid.push(port);

@@ -1,14 +1,34 @@
 <script lang="ts">
 	import { modalFocus } from '$lib/modal-focus';
+	import { allowPageZoom, setStatusBarHidden } from '$lib/native';
 	import { goto, beforeNavigate, preloadData } from '$app/navigation';
 	import { navigating } from '$app/state';
 	import { untrack, onDestroy, tick } from 'svelte';
-	import { saveProgress, recordView } from '$lib/data/source';
+	import { saveProgress, recordView, getChapterSourceLinks } from '$lib/data/source';
 	import { externalChapterHost, externalChapterHref } from '$lib/data/chapter-label';
 	import { chapterAttribution } from '$lib/data/chapter-versions';
 	import { stripProgress } from '$lib/data/reader-format';
 	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
-	import Icon, { type IconName } from '$lib/components/Icon.svelte';
+	import AiBadge from '$lib/components/AiBadge.svelte';
+	import Icon from '$lib/components/Icon.svelte';
+	import {
+		BARS,
+		DIRS,
+		FITS,
+		HEADERS,
+		MODES,
+		WIDTH_MAX,
+		WIDTH_MIN,
+		WIDTH_STEP,
+		loadReaderPrefs,
+		saveReaderPrefs,
+		type Bar,
+		type Dir,
+		type Fit,
+		type HeaderMode,
+		type Mode,
+		type Opt,
+	} from '$lib/reader-prefs';
 	import CommentThread from '$lib/components/CommentThread.svelte';
 
 	let { data } = $props();
@@ -40,35 +60,37 @@
 	// source's series page. The data layer already validated both; re-checked here because
 	// the string becomes an `href` and the check is the whole XSS defence. Null when neither
 	// is known: the menu then explains instead of offering a dead link.
+	//
+	// A Suwayomi copy (any extension that is not MangaDex) has no link in `data`: only the
+	// engine knows it. `engineLinks` holds the answer for ONE chapter id, looked up when the
+	// menu that shows the link is on screen — see the effect below `drawerShown`.
+	let engineLinks = $state<{
+		chapterId: string;
+		chapter: string | null;
+		series: string | null;
+	} | null>(null);
 	const readOnSource = $derived.by(() => {
-		const chapterHref = externalChapterHref(data.sourceUrl);
-		const href = chapterHref ?? externalChapterHref(data.seriesSourceUrl);
+		const engine = engineLinks?.chapterId === data.chapterId ? engineLinks : null;
+		const chapterHref = externalChapterHref(data.sourceUrl) ?? externalChapterHref(engine?.chapter);
+		const href =
+			chapterHref ??
+			externalChapterHref(engine?.series) ??
+			externalChapterHref(data.seriesSourceUrl);
 		return href ? { href, host: externalChapterHost(href), chapter: !!chapterHref } : null;
 	});
 
-	// Translators (sources) for this work — switchable from the reader menu. Picking
-	// a different source persists the preference and reopens the work under it
-	// (chapter ids differ per source, so we land on the new source's first/unread
-	// chapter rather than a stale ch param).
+	// Translators (sources) for this work. `selectedTranslatorKey` is the series' DEFAULT
+	// source: chapters open from it, and a chapter it lacks opens from another source for
+	// that chapter only. The source of the OPEN chapter is `readingSrc`.
 	const translators = $derived(data.translators ?? []);
 	const activeTranslator = $derived(
-		translators.find((t) => t.key === data.selectedTranslatorKey) ?? null,
+		translators.find((t) => t.suwayomiMangaId === data.readingSrc) ?? null,
 	);
-	function switchTranslator(key: string): void {
-		if (!data.workId || key === data.selectedTranslatorKey) return;
-		setPreferredTranslator(data.workId, key);
-		// Progress for the chapter being left is saved by `beforeNavigate`.
-		closeMenu();
-		// Drop any `?ch=` (chapter ids differ per source) and force the load to re-run
-		// even when we're already at the bare `/read/<workId>` URL — otherwise
-		// SvelteKit treats it as the same URL and the source wouldn't actually swap.
-		goto(`/read/${data.workId}`, { invalidateAll: true });
-	}
 
 	// Copies of the OPEN chapter number — one per (source, scanlation group) upload, so
 	// a chapter two groups translated can be swapped without leaving the reader. Unlike
-	// the translator switch above this is a one-off pick: it opens that exact copy and
-	// does not change the series' default source.
+	// the default-source switch below this is a one-off pick: it opens that exact copy
+	// and does not change the series' default source.
 	const versions = $derived(data.versions ?? []);
 	const currentVersion = $derived(versions.find((v) => v.current) ?? null);
 	// The open copy's group: the view's own field first, else the current version row.
@@ -86,43 +108,26 @@
 		resetWindowScroll();
 	}
 
+	// Picking a default source persists it and stays on the open chapter NUMBER: the new
+	// default's copy of it when it has one (chapter ids differ per source), else the copy
+	// that is open. `invalidateAll` re-runs the load even when the URL does not change, so
+	// the chapter list and prev/next follow the new default.
+	async function switchTranslator(t: { key: string; suwayomiMangaId: string | null }) {
+		if (!data.workId || t.key === data.selectedTranslatorKey) return;
+		setPreferredTranslator(data.workId, t.key);
+		// Progress for the chapter being left is saved by `beforeNavigate`.
+		closeMenu();
+		const copy = versions.find((v) => v.src === t.suwayomiMangaId);
+		const stay = data.chapterId ? { id: data.chapterId, src: data.readingSrc } : null;
+		const open = copy ?? stay;
+		await goto(open ? versionHref(open) : `/read/${data.workId}`, { invalidateAll: true });
+		if (copy && !copy.current) resetWindowScroll();
+	}
+
 	// ---- reader preferences --------------------------------------------------
 	// Every display choice lives in one persisted object. Each control in the menu is a
 	// cycle button (tap to step to the next value), so the option lists below are also
 	// the cycle order and the source of each button's label + icon.
-	type Mode = 'strip' | 'page' | 'double';
-	type Fit = 'both' | 'width' | 'height' | 'none';
-	type Dir = 'ltr' | 'rtl';
-	type HeaderMode = 'auto' | 'shown' | 'hidden';
-	type Bar = 'segments' | 'thin' | 'hidden';
-	type Opt<T> = { value: T; label: string; icon: IconName };
-
-	const MODES: Opt<Mode>[] = [
-		{ value: 'strip', label: 'Long strip', icon: 'list' },
-		{ value: 'page', label: 'Single page', icon: 'file' },
-		{ value: 'double', label: 'Double page', icon: 'columns' },
-	];
-	const FITS: Opt<Fit>[] = [
-		{ value: 'both', label: 'Fit to screen', icon: 'maximize' },
-		{ value: 'width', label: 'Fit width', icon: 'arrow-left-right' },
-		{ value: 'height', label: 'Fit height', icon: 'chevrons-down' },
-		{ value: 'none', label: 'Original size', icon: 'image' },
-	];
-	const DIRS: Opt<Dir>[] = [
-		{ value: 'ltr', label: 'Left to right', icon: 'arrow-right' },
-		{ value: 'rtl', label: 'Right to left', icon: 'chevron-left' },
-	];
-	const HEADERS: Opt<HeaderMode>[] = [
-		{ value: 'auto', label: 'Header auto-hides', icon: 'panel-top' },
-		{ value: 'shown', label: 'Header always shown', icon: 'panel-top' },
-		{ value: 'hidden', label: 'Header hidden', icon: 'x' },
-	];
-	const BARS: Opt<Bar>[] = [
-		{ value: 'segments', label: 'Page bar', icon: 'progress' },
-		{ value: 'thin', label: 'Thin progress line', icon: 'progress' },
-		{ value: 'hidden', label: 'Progress hidden', icon: 'x' },
-	];
-
 	// Keep manga preferences intact when a webtoon enforces continuous reading.
 	const longStrip = $derived(data.longStrip === true);
 	let preferredMode = $state<Mode>('strip');
@@ -136,9 +141,6 @@
 	let gaps = $state(false);
 	let pinned = $state(false);
 
-	function pick<T>(list: Opt<T>[], v: unknown, fallback: T): T {
-		return list.some((o) => o.value === v) ? (v as T) : fallback;
-	}
 	function optOf<T>(list: Opt<T>[], v: T): Opt<T> {
 		return list.find((o) => o.value === v) ?? list[0];
 	}
@@ -148,23 +150,16 @@
 	}
 
 	function persist() {
-		try {
-			localStorage.setItem(
-				'komiq-reader',
-				JSON.stringify({
-					mode: preferredMode,
-					fit,
-					dir,
-					header: headerMode,
-					bar: preferredBar,
-					width,
-					gaps,
-					pinned,
-				}),
-			);
-		} catch {
-			/* ignore */
-		}
+		saveReaderPrefs({
+			mode: preferredMode,
+			fit,
+			dir,
+			header: headerMode,
+			bar: preferredBar,
+			width,
+			gaps,
+			pinned,
+		});
 	}
 
 	let pageIdx = $state(0);
@@ -188,6 +183,24 @@
 	});
 	const docked = $derived(pinned && wide);
 	const drawerShown = $derived(menuOpen || docked);
+
+	// Ask the engine where the open chapter lives on its source's website, once per
+	// chapter, and only while the menu is showing — that is the only place the link is
+	// drawn. Skipped when `data` already has the chapter's own link (MangaDex, off-site).
+	// A late answer for a chapter the reader has left is dropped by the cleanup, and
+	// `readOnSource` ignores an answer whose id is not the open one.
+	$effect(() => {
+		const id = data.chapterId;
+		if (!drawerShown || !id || data.sourceUrl) return;
+		if (untrack(() => engineLinks?.chapterId) === id) return;
+		let cancelled = false;
+		void getChapterSourceLinks(id).then((links) => {
+			if (!cancelled && links) engineLinks = { chapterId: id, ...links };
+		});
+		return () => {
+			cancelled = true;
+		};
+	});
 
 	function openMenu() {
 		menuOpen = true;
@@ -376,10 +389,19 @@
 	});
 	onDestroy(() => saveCurrentProgress());
 
+	// The native app locks zoom everywhere else; chapter pages may be zoomed in on.
+	$effect(() => allowPageZoom());
+
+	// The native app hides the system status bar (clock, battery) together with the
+	// reader's own top bar, and shows it again with the bar and on the way out.
+	$effect(() => setStatusBarHidden(chromeHidden));
+	$effect(() => () => setStatusBarHidden(false));
+
 	function chapterHref(id: string) {
-		// Keep prev/next on the same source (S2) — chapter ids are per-source.
-		const src = data.readingSrc ? `&src=${encodeURIComponent(data.readingSrc)}` : '';
-		return `/read/${data.seriesId}?ch=${encodeURIComponent(id)}${src}`;
+		// Chapter ids are per-source, and each row names its own (S2): a number the default
+		// source lacks opens from another one.
+		const row = data.chapters.find((c) => c.id === id);
+		return versionHref({ id, src: row ? (row.src ?? null) : data.readingSrc });
 	}
 
 	async function openChapter(id?: string) {
@@ -504,19 +526,15 @@
 	$effect(() => {
 		if (!restored) {
 			restored = true;
-			try {
-				const saved = JSON.parse(localStorage.getItem('komiq-reader') || '{}') ?? {};
-				preferredMode = pick(MODES, saved.mode, 'strip');
-				fit = pick(FITS, saved.fit, 'both');
-				dir = pick(DIRS, saved.dir, 'ltr');
-				headerMode = pick(HEADERS, saved.header, 'auto');
-				preferredBar = pick(BARS, saved.bar, 'segments');
-				width = typeof saved.width === 'number' ? saved.width : 720;
-				gaps = saved.gaps === true;
-				pinned = saved.pinned === true;
-			} catch {
-				/* ignore */
-			}
+			const saved = loadReaderPrefs();
+			preferredMode = saved.mode;
+			fit = saved.fit;
+			dir = saved.dir;
+			headerMode = saved.header;
+			preferredBar = saved.bar;
+			width = saved.width;
+			gaps = saved.gaps;
+			pinned = saved.pinned;
 		}
 		// Coalesce scroll work into one rAF per frame — reading layout + writing
 		// reactive state on every scroll event is a jank source on fast scrolls.
@@ -721,6 +739,34 @@
 		});
 	}
 
+	// Paged mode: a sideways swipe turns the page, like a tap on a screen edge. The page
+	// follows the finger, so a swipe to the left shows what is on the right. Not while
+	// the page is zoomed in or wider than the screen (the swipe moves the page then), and
+	// not with two fingers (that is a pinch).
+	let swipe: { x: number; y: number; at: number } | null = null;
+	function onSwipeStart(e: TouchEvent) {
+		swipe = null;
+		if (isStrip || e.touches.length !== 1) return;
+		const paged = (e.target as Element).closest?.('main')?.querySelector('.paged');
+		if (!paged || !(e.target as Element).closest('.paged, .zone')) return;
+		if ((window.visualViewport?.scale ?? 1) > 1.01) return;
+		if (paged.scrollWidth > paged.clientWidth + 1) return;
+		const t = e.touches[0];
+		swipe = { x: t.clientX, y: t.clientY, at: e.timeStamp };
+	}
+	function onSwipeEnd(e: TouchEvent) {
+		const start = swipe;
+		swipe = null;
+		if (!start || e.touches.length > 0) return;
+		const t = e.changedTouches[0];
+		const dx = t.clientX - start.x;
+		const dy = t.clientY - start.y;
+		if (Math.abs(dx) < 56 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
+		if (e.timeStamp - start.at > 700) return;
+		if (dx < 0) goRight();
+		else goLeft();
+	}
+
 	// Tap on the reading surface (not a page-turn zone).
 	function stageClick() {
 		if (headerMode === 'auto') chromeVisible = !chromeVisible;
@@ -875,7 +921,7 @@
 {#snippet menu()}
 	<div class="dr-head">
 		<button
-			class="icon-btn"
+			class="icon-btn k-hit"
 			aria-label="Close menu"
 			onclick={() => (docked ? togglePin() : closeMenu())}><Icon name="x" size={18} /></button
 		>
@@ -893,7 +939,7 @@
 	</div>
 
 	<div class="dr-body">
-		<a class="dr-series" href={seriesHref}>
+		<a class="dr-series k-hit" href={seriesHref}>
 			<Icon name="book-open" size={16} />
 			<span>{seriesTitle || 'Back to series'}</span>
 		</a>
@@ -944,7 +990,7 @@
 		{#if hasPages}
 			<div class="stepper">
 				<button
-					class="step"
+					class="step k-hit"
 					aria-label="Previous page"
 					disabled={currentIdx === 0 && !data.prevChapterId}
 					onclick={() => (isStrip ? jumpTo(currentIdx - 1) : prevPage())}
@@ -964,7 +1010,7 @@
 					<Icon name="chevron-down" size={14} />
 				</label>
 				<button
-					class="step"
+					class="step k-hit"
 					aria-label="Next page"
 					disabled={currentEnd >= total - 1 && !data.nextChapterId}
 					onclick={() => (isStrip ? jumpTo(currentIdx + 1) : nextPage())}
@@ -976,7 +1022,7 @@
 		{#if data.chapters.length}
 			<div class="stepper">
 				<button
-					class="step"
+					class="step k-hit"
 					aria-label="Previous chapter"
 					disabled={!data.prevChapterId}
 					{...warmOn(data.prevChapterId)}
@@ -999,7 +1045,7 @@
 					<Icon name="chevron-down" size={14} />
 				</label>
 				<button
-					class="step"
+					class="step k-hit"
 					aria-label="Next chapter"
 					disabled={!data.nextChapterId}
 					{...warmOn(data.nextChapterId)}
@@ -1032,6 +1078,7 @@
 								<span class="ver-text">
 									<span class="tr-name">{label}</span>
 								</span>
+								<AiBadge group={v.group} />
 								{#if v.current}<Icon name="check" size={14} strokeWidth={2.6} />{/if}
 							</button>
 						{/each}
@@ -1046,6 +1093,7 @@
 									>{chapterAttribution(srcName || 'Unknown source', openGroup)}</span
 								>
 							</span>
+							<AiBadge group={openGroup} />
 							<Icon name="check" size={14} strokeWidth={2.6} />
 						</div>
 					{/if}
@@ -1054,7 +1102,8 @@
 		{/if}
 
 		<!-- The series-wide preference: which source chapters open from by default (and
-		     where prev/next go). Distinct from the one-off copy pick above. -->
+		     where prev/next go whenever it carries the number). Distinct from the one-off
+		     copy pick above. -->
 		{#if translators.length > 1}
 			<div class="dr-sec">
 				<span class="dr-label">Default source for this series</span>
@@ -1064,7 +1113,7 @@
 							class="tr-opt"
 							class:on={t.key === data.selectedTranslatorKey}
 							aria-pressed={t.key === data.selectedTranslatorKey}
-							onclick={() => switchTranslator(t.key)}
+							onclick={() => switchTranslator(t)}
 							title={t.lang ? `${t.name} · ${t.lang.toUpperCase()}` : t.name}
 						>
 							{@render srcLogo(t.iconUrl, t.name)}
@@ -1100,9 +1149,9 @@
 						type="range"
 						name="pageWidth"
 						aria-label="Page width"
-						min="480"
-						max="1400"
-						step="20"
+						min={WIDTH_MIN}
+						max={WIDTH_MAX}
+						step={WIDTH_STEP}
 						bind:value={width}
 						oninput={persist}
 					/>
@@ -1165,7 +1214,7 @@
 			{/if}
 		</div>
 
-		<a class="dr-report" href={reportHref}><Icon name="flag" size={14} />Report a problem</a>
+		<a class="dr-report k-hit" href={reportHref}><Icon name="flag" size={14} />Report a problem</a>
 		<p class="dr-keys">
 			<kbd>M</kbd> menu · <kbd>←</kbd><kbd>→</kbd> turn pages · <kbd>Esc</kbd> close
 		</p>
@@ -1185,11 +1234,11 @@
 >
 	<!-- top header -->
 	<header class="chrome" class:hidden={chromeHidden}>
-		<a class="icon-btn" href={seriesHref} aria-label="Back to series"
+		<a class="icon-btn k-hit" href={seriesHref} aria-label="Back to series"
 			><Icon name="chevron-left" size={18} /></a
 		>
 		<div class="titlebox">
-			<a class="series" href={seriesHref}>{seriesTitle || 'Back to series'}</a>
+			<a class="series k-hit" href={seriesHref}>{seriesTitle || 'Back to series'}</a>
 			<!-- The group shrinks (and ellipsises) before the chapter label does. -->
 			{#if data.chapterId}<span class="chapter"
 					><span class="ch-label">{chapterLabel({ n: chNum, title: chTitle })}</span
@@ -1204,7 +1253,7 @@
 			<!-- Prev/next chapter stay on phones (icon-only): going BACK a chapter must
 			     never depend on finding the chapter picker inside the menu. -->
 			<button
-				class="icon-btn"
+				class="icon-btn k-hit"
 				aria-label="Previous chapter"
 				title="Previous chapter"
 				disabled={!data.prevChapterId}
@@ -1213,7 +1262,7 @@
 				><Icon name="chevrons-left" size={16} /></button
 			>
 			<button
-				class="icon-btn"
+				class="icon-btn k-hit"
 				aria-label="Next chapter"
 				title="Next chapter"
 				disabled={!data.nextChapterId}
@@ -1222,7 +1271,11 @@
 				><Icon name="chevrons-right" size={16} /></button
 			>
 			{#if !docked}
-				<button class="menu-btn" aria-haspopup="dialog" aria-expanded={menuOpen} onclick={openMenu}
+				<button
+					class="menu-btn k-hit"
+					aria-haspopup="dialog"
+					aria-expanded={menuOpen}
+					onclick={openMenu}
 					><Icon name="sliders" size={16} /><span class="hide-sm">Menu</span></button
 				>
 			{/if}
@@ -1245,7 +1298,12 @@
 	<button class="chrome-toggle" aria-label="Toggle reader controls" onclick={stageClick}></button>
 
 	<!-- reading area -->
-	<main class:loading={chapterLoading}>
+	<main
+		class:loading={chapterLoading}
+		ontouchstart={onSwipeStart}
+		ontouchend={onSwipeEnd}
+		ontouchcancel={() => (swipe = null)}
+	>
 		{#if externalUrl}
 			<!-- An off-site chapter. It has no pages BY DESIGN, so it must not fall
 			     through to the no-pages state below. `rel="noopener noreferrer"` because
@@ -1469,12 +1527,31 @@
 </div>
 
 <style>
+	/* --head and --bar are the space the top bar and the page bar hold, INCLUDING the
+	   safe areas they sit in (status bar / notch above, home indicator below), so the
+	   page area, the turn zones and "fit to screen" all stay clear of both. */
 	.reader {
 		--dock: 0px;
-		--head: 56px;
-		--bar: 22px;
+		--head: calc(56px + var(--k-safe-top));
+		--bar: calc(22px + var(--k-safe-bottom));
 		min-height: 100vh;
 		min-height: 100dvh;
+	}
+	/* Status-bar scrim. When the top bar slides away (or is switched off) the pages
+	   scroll up to the screen edge; this keeps them from running under the clock.
+	   It has no height on a device without a top inset. */
+	.reader::before {
+		content: '';
+		position: fixed;
+		top: 0;
+		left: 0;
+		right: var(--dock);
+		z-index: 49;
+		height: var(--k-safe-top);
+		background: var(--k-glass-strong);
+		-webkit-backdrop-filter: blur(16px);
+		backdrop-filter: blur(16px);
+		pointer-events: none;
 	}
 	@media (min-width: 1024px) {
 		.reader.docked {
@@ -1482,7 +1559,7 @@
 		}
 	}
 	.reader.header-off {
-		--head: 0px;
+		--head: var(--k-safe-top);
 	}
 
 	/* ---- header ---- */
@@ -1492,12 +1569,16 @@
 		left: 0;
 		right: var(--dock);
 		z-index: 50;
-		height: 56px;
+		--pad: 10px;
+		height: calc(56px + var(--k-safe-top));
 		display: flex;
 		align-items: center;
-		gap: 12px;
-		padding: 0 16px;
+		gap: 8px;
+		/* Controls sit below the status bar / notch and inside a landscape notch. */
+		padding: var(--k-safe-top) max(var(--pad), var(--k-safe-right)) 0
+			max(var(--pad), var(--k-safe-left));
 		background: var(--k-glass-strong);
+		-webkit-backdrop-filter: blur(16px);
 		backdrop-filter: blur(16px);
 		border-bottom: 1px solid var(--k-border);
 		transition: transform 0.26s cubic-bezier(0.4, 0, 0.2, 1);
@@ -1543,16 +1624,17 @@
 	.ch-label {
 		flex: 0 1 auto;
 	}
-	/* Shrinks far faster than the label, so a long group name gives way first. */
+	/* The group only takes the room the label leaves (basis 0), so a long group name
+	   gives way first and the chapter number is never the part that is cut off. */
 	.ch-group {
-		flex: 0 100 auto;
+		flex: 1 1 0;
 		font-weight: 600;
 		color: var(--k-text-dim);
 	}
 	.head-right {
 		display: flex;
 		align-items: center;
-		gap: 8px;
+		gap: 6px;
 		flex: 0 0 auto;
 	}
 	.pg-chip {
@@ -1633,6 +1715,8 @@
 		flex-direction: column;
 		background: var(--k-surface-3);
 		border-left: 1px solid var(--k-border-3);
+		/* Landscape notch on the right: the panel reaches the edge, its content does not. */
+		padding-right: var(--k-safe-right);
 	}
 	.drawer.floating {
 		box-shadow: -24px 0 70px rgba(0, 0, 0, 0.5);
@@ -1850,7 +1934,10 @@
 		border-radius: 50%;
 		background: #fff;
 	}
+	/* The slider starts at 480px, so on a narrower screen it cannot change anything:
+	   the strip is already as wide as the screen. Shown from where it has an effect. */
 	.width-row {
+		display: none;
 		padding: 8px 12px 10px;
 		border-radius: var(--k-radius);
 		background: var(--k-surface-5);
@@ -2033,6 +2120,7 @@
 		position: relative;
 		z-index: 1;
 		min-height: 100vh;
+		min-height: 100dvh;
 		margin-right: var(--dock);
 		padding: var(--head) 0 var(--bar);
 		display: flex;
@@ -2363,7 +2451,9 @@
 		right: var(--dock);
 		bottom: 0;
 		z-index: 45;
-		padding: 0 12px calc(6px + env(safe-area-inset-bottom));
+		--pad: 8px;
+		padding: 0 max(var(--pad), var(--k-safe-right)) calc(6px + var(--k-safe-bottom))
+			max(var(--pad), var(--k-safe-left));
 		pointer-events: none;
 	}
 	.pbar-wrap.thin {
@@ -2462,14 +2552,30 @@
 		transform-origin: right;
 	}
 
-	@media (max-width: 640px) {
+	/* Wider than a phone: the bars get their roomier spacing back, the side panel
+	   (full height here, a bottom sheet on phones) clears the status bar, and the
+	   page-width slider has something to do. */
+	@media (min-width: 520px) {
+		.width-row {
+			display: block;
+		}
+	}
+	@media (min-width: 641px) {
 		.chrome {
-			padding: 0 10px;
-			gap: 8px;
+			--pad: 16px;
+			gap: 12px;
 		}
 		.head-right {
-			gap: 6px;
+			gap: 8px;
 		}
+		.drawer {
+			padding-top: var(--k-safe-top);
+		}
+		.pbar-wrap {
+			--pad: 12px;
+		}
+	}
+	@media (max-width: 640px) {
 		.chapter {
 			font-size: 14px;
 		}
@@ -2509,10 +2615,6 @@
 			padding: 0 12px;
 			font-size: 14px;
 		}
-		.pbar-wrap {
-			padding-left: 8px;
-			padding-right: 8px;
-		}
 		.pbar {
 			gap: 2px;
 		}
@@ -2527,6 +2629,25 @@
 	@keyframes slide-up {
 		from {
 			transform: translateY(100%);
+		}
+	}
+	/* Touch: the page bar and the strip scrubber are thin lines; give the finger a
+	   44px band around them (it reaches down over the home-indicator padding). */
+	@media (pointer: coarse) {
+		.pbar::after {
+			content: '';
+			position: absolute;
+			left: 0;
+			right: 0;
+			top: -20px;
+			bottom: -8px;
+		}
+		.continuous-progress input {
+			inset: -14px 0 -8px;
+			height: auto;
+		}
+		.tr-opt {
+			min-height: 44px;
 		}
 	}
 </style>

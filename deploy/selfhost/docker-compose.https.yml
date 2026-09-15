@@ -1,0 +1,6 @@
+# HTTPS for Cloudflare public IP and public access without a domain.
+# Selected by COMPOSE_FILE in .env; see .env.example or run install.sh.
+services:
+  server:
+    ports:
+      - '443:443'

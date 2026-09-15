@@ -469,7 +469,7 @@ function mergeByRecency(...feeds: Card[][]): Card[] {
 /**
  * Dedupe a series list by TITLE, preserving first-seen order.
  *
- * `dedupeSeries` (by id) cannot help the hero: the duplicate it shows is one series
+ * Deduping by id cannot help the hero: the duplicate it shows is one series
  * present under two ids — its numeric Suwayomi identity and its `w_` canonical mirror —
  * which are two different ids and one title. In an 8-slide carousel that is the same
  * cover twice, three seconds apart.
@@ -481,19 +481,6 @@ function dedupeSeriesByTitle(list: Series[]): Series[] {
 		const key = s.title.trim().toLowerCase();
 		if (!seen.has(key)) {
 			seen.add(key);
-			out.push(s);
-		}
-	}
-	return out;
-}
-
-/** Dedupe a series list by id, preserving first-seen order. */
-function dedupeSeries(list: Series[]): Series[] {
-	const seen = new Set<string>();
-	const out: Series[] = [];
-	for (const s of list) {
-		if (!seen.has(s.id)) {
-			seen.add(s.id);
 			out.push(s);
 		}
 	}
@@ -579,16 +566,6 @@ function toFeatured(s: Series): FeaturedView {
 		cover: s.coverUrl,
 		id: s.id,
 	};
-}
-
-/** The most common genres across the live catalog sample, most-frequent first. */
-function deriveGenres(pool: Series[]): string[] {
-	const freq = new Map<string, number>();
-	for (const s of pool) for (const g of s.genres) freq.set(g, (freq.get(g) ?? 0) + 1);
-	return [...freq.entries()]
-		.sort((a, b) => b[1] - a[1])
-		.slice(0, 9)
-		.map(([g]) => g);
 }
 
 /** Whether a series' publication has ENDED, so catching up on it really is finishing
@@ -1206,6 +1183,18 @@ export async function getBrowseTags(
 	return { tags: tagsFromGenreFacets(facets), source: 'genres' };
 }
 
+/**
+ * The sources Browse can filter by, biggest first, each with the number of works the
+ * viewer would get from it. Empty against a server that predates the query, on a backend
+ * without it, and on an outage: the page then offers no source filter. Never rejects.
+ */
+export async function getBrowseSources(
+	fetch?: LoadFetch,
+): Promise<import('@komika/api').BrowseSource[]> {
+	const b = api(fetch);
+	return live(async () => (b.browseSources ? b.browseSources() : []), []);
+}
+
 /** One Browse v2 result page. */
 export interface BrowseSearchResult {
 	items: FederatedResultView[];
@@ -1272,6 +1261,11 @@ function toCatalogEntryFull(
 
 // ---- per-screen getters ----------------------------------------------------
 
+/** Rows in Home's "Latest Updates" list: two columns of six, about as tall as the
+ *  ten-row Trending ranking beside it. Exported so the loading skeleton draws the
+ *  same number. */
+export const HOME_UPDATES = 12;
+
 export function getHome(fetch?: LoadFetch) {
 	const b = api(fetch);
 	const fallback = {
@@ -1279,7 +1273,6 @@ export function getHome(fetch?: LoadFetch) {
 		latestUpdates: [] as Card[],
 		trending: [] as Card[],
 		latestAdded: [] as Card[],
-		homeGenres: [] as string[],
 	};
 	return live(async () => {
 		// Discovery drives the curated rows; "Latest Updates" merges OUR scanner's
@@ -1303,7 +1296,6 @@ export function getHome(fetch?: LoadFetch) {
 		]);
 		const byKind = (k: string) => feeds.find((f) => f.kind === k)?.items ?? [];
 		const popular = byKind('POPULAR');
-		const pool = dedupeSeries(feeds.flatMap((f) => f.items));
 		// The hero is the "trending" showcase, so it reads the TRENDING feed first and
 		// only falls back to Popular (then to whatever feed came back) when trending is
 		// empty — the label on the slide has to be true. Deduped by title for the same
@@ -1331,7 +1323,7 @@ export function getHome(fetch?: LoadFetch) {
 		// the interleave from the server for free, and drops a round trip. `fetchUpdatesFeed`
 		// keeps its own deploy-order guard, so an older server still degrades to the old
 		// two-feed merge rather than emptying the row.
-		const latestUpdates = latest.items.map(toFeedCard).slice(0, 10);
+		const latestUpdates = latest.items.map(toFeedCard).slice(0, HOME_UPDATES);
 		return {
 			featured,
 			latestUpdates,
@@ -1340,7 +1332,6 @@ export function getHome(fetch?: LoadFetch) {
 			// which would collide on the home row's `{#each}` key and could show twice.
 			trending: dedupeCardsByTitle(byKind('TRENDING').map(toCard)).slice(0, 10),
 			latestAdded: added.map(toAddedCard),
-			homeGenres: deriveGenres(pool),
 		};
 	}, fallback);
 }
@@ -1482,11 +1473,21 @@ async function fetchUpdatesFeed(
 			// to the screen, and this path is a successful degradation, not an error.
 		}
 	}
+	let failed = 0;
 	const [updates, canonical] = await Promise.all([
-		b.updates().catch(() => ({ items: [] as Series[] })),
-		b.canonicalUpdates?.().catch(() => [] as CanonicalUpdate[]) ??
-			Promise.resolve([] as CanonicalUpdate[]),
+		b.updates().catch(() => {
+			failed++;
+			return { items: [] as Series[] };
+		}),
+		b.canonicalUpdates?.().catch(() => {
+			failed++;
+			return [] as CanonicalUpdate[];
+		}) ?? Promise.resolve([] as CanonicalUpdate[]),
 	]);
+	// Every request of the fallback failed too: that is an outage, not an empty feed.
+	// Throw, so `getUpdates` sets `error` and the screen shows "Couldn't load updates"
+	// with Retry instead of "No updates here". One half failing is still a degradation.
+	if (failed === (b.canonicalUpdates ? 2 : 1)) throw new Error('updates feed unavailable');
 	// Legacy shape: merge by release time, dedupe by title, cap, and project onto the
 	// feed-row shape so `toFeedCard` stays the single card mapper. `workId` echoes `id`
 	// (it is only a dedupe key, which the server side already applied); `latestChapter`
@@ -2682,6 +2683,9 @@ export interface ReaderChapterRef {
 	id?: string;
 	n: number;
 	title: string;
+	/** The Suwayomi manga id of the source THIS row opens from (`?src=`); null = the
+	 *  MangaDex mirror. Rows differ: a number the default source lacks opens from another. */
+	src?: string | null;
 	/** Set when this chapter is hosted off-site (see {@link ReaderView.externalUrl}), so
 	 *  the chapter list can BADGE it — a reader shouldn't have to click to find out that
 	 *  a chapter opens somewhere else. Validated, so it is safe to put in an `href`. */
@@ -2703,11 +2707,13 @@ export interface ReaderView {
 	nextChapterId?: string;
 	/** Available translators (sources) for the work; empty for single-source series. */
 	translators: TranslatorOption[];
+	/** The series' DEFAULT source — not necessarily the one the open chapter is read from
+	 *  (see {@link readingSrc}): a chapter the default lacks opens from another source. */
 	selectedTranslatorKey: string | null;
 	/** Canonical `w_` workId to switch translators against; null for single-source. */
 	workId: string | null;
-	/** The Suwayomi manga id of the source these chapters are read from (S2), so
-	 *  prev/next stay on the same source; null = the MangaDex mirror / default. */
+	/** The Suwayomi manga id of the source the OPEN chapter is read from (S2); null = the
+	 *  MangaDex mirror / default. */
 	readingSrc: string | null;
 	/**
 	 * Set when the OPEN chapter is hosted off-site and there are no pages for us to serve
@@ -2731,6 +2737,41 @@ export interface ReaderView {
 	 *  the open chapter's own URL is unknown (Suwayomi copies). Validated http/s; null
 	 *  when the mapping carries no URL. */
 	seriesSourceUrl?: string | null;
+}
+
+/** A Suwayomi chapter id: a row id of the server's engine. MangaDex copies are uuids. */
+const SUWAYOMI_CHAPTER_ID = /^\d+$/;
+
+/**
+ * Where a SUWAYOMI copy lives on its source's own website — "Read on source" for every
+ * extension that is not MangaDex.
+ *
+ * Asked for on demand rather than carried on {@link ReaderView}: the link is known only
+ * to the engine, not to the chapter lists the reader is built from, and it is shown in a
+ * menu most readers never open. One small request when that menu is on screen is cheaper
+ * than a URL column on every chapter of every list.
+ *
+ * `chapter` is the open chapter's own page and `series` the series page, the fallback
+ * when the extension reports no chapter page. Both are extension-controlled text, so both
+ * go through {@link externalChapterHref} — http(s) and absolute, or null. Resolves to
+ * `null` when there is nothing to ask (a MangaDex copy, a backend without the query, an
+ * older server) or the lookup failed: the menu then shows what it showed before.
+ */
+export async function getChapterSourceLinks(
+	chapterId: string,
+): Promise<{ chapter: string | null; series: string | null } | null> {
+	if (!SUWAYOMI_CHAPTER_ID.test(chapterId) || !backend.chapterOrigin) return null;
+	try {
+		const origin = await backend.chapterOrigin(chapterId);
+		if (!origin) return null;
+		return {
+			chapter: externalChapterHref(origin.chapterWebUrl),
+			series: externalChapterHref(origin.mangaWebUrl),
+		};
+	} catch {
+		// A link in a menu is not worth an error state; the menu keeps its fallback.
+		return null;
+	}
 }
 
 /** Honest empty reader view — no chapter/pages available for this series. */
@@ -2808,12 +2849,12 @@ function chapterExternalUrl(c: Chapter): string | null {
 interface ReaderCopyContext {
 	longStrip?: boolean;
 	/**
-	 * Every copy the reader can open from the ACTIVE source, for prev/next. Defaults to the
-	 * list itself. On the MangaDex spine this is wider than the list: `canonicalChapters`
-	 * keeps ONE copy per number, the other groups' uploads exist only in the aggregation,
-	 * and "next chapter, same group" can only find them here.
+	 * Every copy the reader can open, from EVERY source of the work, for the chapter list
+	 * and prev/next. Defaults to the list itself. See {@link readerCopyPool}.
 	 */
 	pool?: Chapter[];
+	/** What the reading order needs to know about each `pool` copy, by chapter id. */
+	copyMeta?: Map<string, PoolCopyMeta>;
 	/** Every copy of the OPEN number across sources and groups (the version switcher). */
 	versions?: ReaderChapterVersion[];
 	/** Name/icon of the active source, for versions built from the list alone. */
@@ -2835,7 +2876,7 @@ interface ReaderCopyContext {
  * (`select_reader_chapters`), not of the query under it, which is ordered newest-FIRST.
  * {@link sortChaptersAsc} rebuilds ascending order from the labels (oneshots last, never
  * as "chapter 0") and {@link adjacentChapters} steps to the adjacent DISTINCT number,
- * preferring the open copy's scanlation group.
+ * preferring the series' default source, then the open copy's scanlation group.
  */
 function buildReaderView(
 	seriesId: string,
@@ -2847,23 +2888,21 @@ function buildReaderView(
 	readingSrc: string | null,
 	ctx: ReaderCopyContext = {},
 ): ReaderView {
-	// The dropdown lists one row per entry of the source's own list. When the open copy is
-	// NOT in that list (a non-default spine copy, opened by id from the version switcher),
-	// it stands in for its number's default copy, so the dropdown still highlights what is
-	// actually open instead of a sibling upload.
-	const listed = chs.some((c) => c.id === target.id)
-		? chs
-		: (() => {
-				const sameNumber = new Set(copiesOf(chs, target).map((c) => c.id));
-				return [...chs.filter((c) => !sameNumber.has(c.id)), target];
-			})();
-	const asc = sortChaptersAsc(listed);
+	// The dropdown lists one row per chapter NUMBER, each resolved to the copy prev/next
+	// would open; the open copy stands in for its own number, so the dropdown highlights
+	// what is actually open instead of a sibling upload.
+	const meta = ctx.copyMeta;
 	const listIds = new Set(chs.map((c) => c.id));
-	const { prev, next } = adjacentChapters(ctx.pool ?? chs, target, (c) => listIds.has(c.id));
+	const { prev, next, order } = adjacentChapters(
+		ctx.pool ?? chs,
+		target,
+		(c) => meta?.get(c.id)?.listed ?? listIds.has(c.id),
+		(c) => meta?.get(c.id)?.tier ?? 0,
+	);
 	const group = normalizeGroup(target.scanlator);
 	const versions: ReaderChapterVersion[] =
 		ctx.versions ??
-		copiesOf(asc, target).map((c) => ({
+		copiesOf(listIds.has(target.id) ? chs : [...chs, target], target).map((c) => ({
 			id: c.id,
 			src: readingSrc,
 			source: ctx.sourceName ?? 'Source',
@@ -2887,15 +2926,16 @@ function buildReaderView(
 			label: String(index + 1).padStart(2, '0'),
 			dim: '',
 		})),
-		chapters: asc
-			.slice()
-			.reverse()
-			.map((c) => ({
+		chapters: order.reverse().map((c) => {
+			const m = meta?.get(c.id);
+			return {
 				id: c.id,
 				n: c.number,
 				title: c.title || `Chapter ${c.number}`,
+				src: m ? m.src : readingSrc,
 				externalUrl: chapterExternalUrl(c),
-			})),
+			};
+		}),
 		prevChapterId: prev?.id,
 		nextChapterId: next?.id,
 		translators: tmeta.translators,
@@ -2978,9 +3018,10 @@ function startPages(chapterId: string): Promise<Page[]> {
  * sequential order would have. Speculation is a latency trick; it must never change what
  * comes back.
  *
- * A Suwayomi id always resolves through `pages`, which every backend (including the
- * native composite) forwards straight to the hosted API — no ordering dependency, safe
- * everywhere. A canonical id resolves through `canonicalPages`, and the native
+ * A Suwayomi id always resolves through `pages`, which looks the chapter up by its id
+ * alone on every backend (the native composite included, whether it then fetches the
+ * pages on-device or from the hosted API) — no ordering dependency, safe everywhere. A
+ * canonical id resolves through `canonicalPages`, and the native
  * CompositeBackend serves those from the embedded engine ONLY for chapters a PRECEDING
  * `canonicalChapters` reconciled into its local chapter map. Jumping that queue would
  * silently demote the first open of a work to the hosted proxy, so the native build keeps
@@ -3030,6 +3071,64 @@ function copyPool(
 		}
 	}
 	return extra.length ? [...list, ...extra] : list;
+}
+
+/** One {@link readerCopyPool} copy, as the reading order sees it. */
+interface PoolCopyMeta {
+	/** Suwayomi manga id to open it from (`?src=`); null = the MangaDex mirror. */
+	src: string | null;
+	/** How strongly a chapter number prefers this copy's source; lower wins. */
+	tier: number;
+	/** In its source's own list, as opposed to known to the aggregation only. */
+	listed: boolean;
+}
+
+/**
+ * Every copy of every chapter number the reader can open, across ALL of a work's sources,
+ * with the source ranking the reading order follows:
+ *
+ *   0. the series' DEFAULT source (the reader's saved choice, else the resolver's pick);
+ *   1. the source being read right now, when that is another one;
+ *   2. any other source, in `resolveWork`'s order (spine first);
+ *   3. the all.mangadex extension that shadows a readable spine — the spine's own uploads
+ *      by the slow route, so only where nothing else carries the number.
+ *
+ * So a number the default source lacks is read from another source FOR THAT CHAPTER, and
+ * the chapter after it goes back to the default. Before this the pool was the open source
+ * alone: "next" skipped every number that source lacked, and one chapter opened from a
+ * second source kept the reader on it from then on.
+ *
+ * `activeChs`/`readingSrc` are added for a `?src=` that is not one of the work's mappings
+ * (a hand-edited URL, a mapping dropped since the link was made).
+ */
+function readerCopyPool(
+	seriesId: string,
+	agg: AggregatedChapter[],
+	resolved: ResolvedWork,
+	activeChs: Chapter[],
+	readingSrc: string | null,
+): { pool: Chapter[]; copyMeta: Map<string, PoolCopyMeta> } {
+	const defaultSrc = resolved.selected.suwayomiMangaId ?? null;
+	const sources = resolved.candidates.map((c) => ({
+		chapters: c.chapters,
+		src: c.suwayomiMangaId,
+		redundant: c.redundant,
+	}));
+	if (!sources.some((s) => s.src === readingSrc)) {
+		sources.push({ chapters: activeChs, src: readingSrc, redundant: false });
+	}
+	const pool: Chapter[] = [];
+	const copyMeta = new Map<string, PoolCopyMeta>();
+	for (const { chapters, src, redundant } of sources) {
+		const tier = src === defaultSrc ? 0 : src === readingSrc ? 1 : redundant ? 3 : 2;
+		const listed = new Set(chapters.map((c) => c.id));
+		for (const c of copyPool(seriesId, agg, chapters, src)) {
+			if (copyMeta.has(c.id)) continue;
+			copyMeta.set(c.id, { src, tier, listed: listed.has(c.id) });
+			pool.push(c);
+		}
+	}
+	return { pool, copyMeta };
 }
 
 /**
@@ -3227,9 +3326,11 @@ export function getReaderChapter(
 			const srcTranslator = readFromSrc
 				? resolved.translators.find((t) => t.suwayomiMangaId === srcParam)
 				: undefined;
+			// The picker shows the series' DEFAULT source, whatever source the open chapter
+			// turns out to be read from — `readingSrc` and the version switcher say that.
 			const tmeta: TranslatorMeta = {
 				translators: resolved.translators,
-				selectedTranslatorKey: srcTranslator?.key ?? resolved.selected.key,
+				selectedTranslatorKey: resolved.selected.key,
 				workId: effectiveId,
 			};
 			const spine = readFromSrc ? false : resolved.selected.suwayomiMangaId === null;
@@ -3314,7 +3415,6 @@ export function getReaderChapter(
 					activeChs = spineCand.chapters;
 					activeSrc = null;
 					activeSpine = true;
-					tmeta.selectedTranslatorKey = translatorKey('mangadex', null);
 				} else {
 					target = owner.chapter;
 					activeChs = owner.candidate.chapters;
@@ -3322,15 +3422,6 @@ export function getReaderChapter(
 					// Only the spine reads through `canonicalPages` — track the source we
 					// actually landed on.
 					activeSpine = owner.candidate.suwayomiMangaId === null;
-					// Reflect the real source in the picker, so the switcher doesn't claim a
-					// source that isn't the one being read. If the owning source is HIDDEN from
-					// the picker — a redundant all.mangadex extension the direct spine stands in
-					// for — highlight the spine instead of a key the picker never renders (else no
-					// chip shows as selected). The content is MangaDex either way, so the spine is
-					// the honest highlight.
-					const ownerKey = owner.candidate.key;
-					const ownerVisible = resolved.translators.some((t) => t.key === ownerKey);
-					tmeta.selectedTranslatorKey = ownerVisible ? ownerKey : translatorKey('mangadex', null);
 				}
 			}
 			const asc = sortChaptersAsc(activeChs);
@@ -3354,14 +3445,12 @@ export function getReaderChapter(
 				chs: Chapter[];
 				src: string | null;
 				spine: boolean;
-				key: string | null;
 			};
 			const primary: PageAttempt = {
 				chapter: chosen,
 				chs: activeChs,
 				src: activeSrc,
 				spine: activeSpine,
-				key: null,
 			};
 			// Every OTHER copy of the chosen number, in `resolveWork`'s candidate order (spine
 			// first) — the ACTIVE source included: on the spine, the open group's upload and
@@ -3382,7 +3471,6 @@ export function getReaderChapter(
 								chs: cand.chapters,
 								src: cand.suwayomiMangaId,
 								spine: cand.suwayomiMangaId === null,
-								key: cand.key,
 							}));
 					});
 			const opened = await loadFirstReadable<PageAttempt, Page>(
@@ -3408,25 +3496,16 @@ export function getReaderChapter(
 			);
 			target = opened.copy.chapter;
 			if (opened.copy !== primary) {
-				// Read from the copy that actually loaded — list, prev/next and the picker
-				// all describe ITS source, exactly like the owner switch above.
+				// Read from the copy that actually loaded, exactly like the owner switch above.
 				activeChs = opened.copy.chs;
 				activeSrc = opened.copy.src;
-				const key = opened.copy.key;
-				tmeta.selectedTranslatorKey =
-					key && resolved.translators.some((t) => t.key === key)
-						? key
-						: translatorKey('mangadex', null);
 			}
 			const urls = opened.pages.length ? await resolvePageUrls(opened.pages) : [];
 			const readingSrc = activeSrc;
 			const activeCand = resolved.candidates.find((c) => c.suwayomiMangaId === activeSrc);
-			// `activeChs`, not `chs`: the list, the prev/next links and the target must
-			// all describe the SAME source, or navigation walks a list the reader is
-			// not actually on. The POOL widens that same source by the copies only the
-			// aggregation carries (the spine's other groups' uploads), so "next chapter"
-			// can stay with the open group; a Suwayomi source's list already holds all of
-			// its copies, so nothing is added for it.
+			// `activeChs`, not `chs`: the source the open copy was actually read from. The
+			// chapter list and prev/next come from the POOL — every source's copies, the
+			// default source first per number — see {@link readerCopyPool}.
 			return buildReaderView(
 				effectiveId,
 				activeChs,
@@ -3437,7 +3516,7 @@ export function getReaderChapter(
 				readingSrc,
 				{
 					longStrip: isLongStripSeries(resolved.canonSeries) || isLongStripSeries(resolved.meta),
-					pool: copyPool(effectiveId, agg, activeChs, readingSrc),
+					...readerCopyPool(effectiveId, agg, resolved, activeChs, readingSrc),
 					versions: readerVersions(agg, resolved, target, readingSrc, activeCand),
 					sourceName: activeCand?.name,
 					iconUrl: activeCand?.iconUrl ?? null,

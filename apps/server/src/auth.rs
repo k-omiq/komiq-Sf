@@ -17,6 +17,9 @@ pub struct User {
     pub avatar_url: Option<String>,
     pub is_admin: i64,
     pub is_banned: i64,
+    /// Set while the account holds a temporary password (`createUser`,
+    /// `resetUserPassword`); cleared by `changePassword`.
+    pub must_change_password: i64,
 }
 
 /// Argon2id parameters pinned by the 2026-09 security review: 64 MiB memory,
@@ -79,16 +82,28 @@ pub fn format_ts(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+/// Resolve the user a session token may ACT as: [`session_user_for_token`], minus
+/// accounts that still hold a temporary password. Those are anonymous to everything
+/// until they choose their own, so this is the lookup every handler uses.
+pub async fn user_for_token(pool: &SqlitePool, token: &str) -> Result<Option<User>> {
+    Ok(session_user_for_token(pool, token)
+        .await?
+        .filter(|u| u.must_change_password == 0))
+}
+
 /// Resolve the user owning a session token, if the token is valid and unexpired.
 /// Banned users are treated as anonymous (their existing tokens stop resolving),
-/// as are sessions whose `expires_at` is in the past or NULL.
-pub async fn user_for_token(pool: &SqlitePool, token: &str) -> Result<Option<User>> {
+/// as are sessions whose `expires_at` is in the past or NULL. Includes accounts
+/// that must change their password first: only the session query and
+/// `changePassword` want those; everything else calls [`user_for_token`].
+pub async fn session_user_for_token(pool: &SqlitePool, token: &str) -> Result<Option<User>> {
     let now = format_ts(Utc::now());
     // The column stores `sha256(token)` (hex), never the raw token — hash the
     // presented token the same way before looking it up.
     let token_hash = hash_token(token);
     let user = sqlx::query_as::<_, User>(
-        "SELECT u.id, u.username, u.email, u.password_hash, u.avatar_url, u.is_admin, u.is_banned \
+        "SELECT u.id, u.username, u.email, u.password_hash, u.avatar_url, u.is_admin, u.is_banned, \
+                u.must_change_password \
          FROM sessions s JOIN users u ON u.id = s.user_id \
          WHERE s.token = ? AND u.is_banned = 0 AND s.expires_at > ?",
     )

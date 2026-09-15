@@ -4,6 +4,7 @@ import type {
 	BulkAddResult,
 	CanonicalUpdate,
 	Chapter,
+	ChapterOrigin,
 	ComicType,
 	Comment,
 	CommentVote,
@@ -51,6 +52,12 @@ import type {
 	InstanceInfo,
 	ExtensionRepo,
 	MangadexSetting,
+	BrowseSource,
+	ScanlatorAi,
+	ScanlatorPage,
+	ScanlatorQuery,
+	ScanlatorTag,
+	SourceRateLimit,
 	MyComment,
 	PostCommentInput,
 	PostReviewInput,
@@ -63,6 +70,9 @@ import type {
 	UpdateProfileInput,
 	AccessMode,
 	AccessStatus,
+	AccessPreflight,
+	CertificateStatus,
+	CloudflareConnection,
 	CloudflareSetupInput,
 	CloudflareTokenCheck,
 } from './backend.js';
@@ -163,8 +173,12 @@ export class CompositeBackend implements Backend {
 	private readonly localChapterMap = new Map<string, string>();
 
 	/**
-	 * Best-effort, session-lifetime memo of canonical work ids (as strings) whose local
-	 * resolution GENUINELY failed — no engine-resolvable source, {@link RefMapper.refFor}
+	 * Best-effort, session-lifetime memo of what cannot be read on-device: canonical work
+	 * ids (see below), and for {@link pages} a manga at its source (`sourceId\nmangaUrl`)
+	 * or a single Suwayomi chapter id. The three key shapes cannot collide.
+	 *
+	 * For canonical work ids (as strings) it records a local
+	 * resolution that GENUINELY failed — no engine-resolvable source, {@link RefMapper.refFor}
 	 * returned null / threw (extension can't install, repo down, incompatible), or the
 	 * engine's `chapters` fetch threw. Once memoed, {@link canonicalChapters} skips the
 	 * expensive provision+resolve+reconcile for that work and serves hosted-only, so a
@@ -255,6 +269,12 @@ export class CompositeBackend implements Backend {
 	tags(): Promise<TagInfo[]> {
 		return this.opts.hosted.tags?.() ?? Promise.resolve([]);
 	}
+	browseSources(includeNsfw?: boolean): Promise<BrowseSource[]> {
+		return this.opts.hosted.browseSources?.(includeNsfw) ?? Promise.resolve([]);
+	}
+	scanlatorTags(): Promise<ScanlatorTag[]> {
+		return this.opts.hosted.scanlatorTags?.() ?? Promise.resolve([]);
+	}
 	browseFilterSupported(): boolean {
 		return this.opts.hosted.browseFilterSupported?.() ?? false;
 	}
@@ -273,10 +293,66 @@ export class CompositeBackend implements Backend {
 	aggregatedChapters(workId: Id): Promise<AggregatedChapter[]> {
 		return this.opts.hosted.aggregatedChapters!(workId);
 	}
-	pages(chapterId: Id): Promise<Page[]> {
-		// Always hosted — see `series` above. On-device page bytes for canonical works
-		// are served by `canonicalPages`, not here.
-		return this.opts.hosted.pages(chapterId);
+	/**
+	 * Pages of a Suwayomi chapter (a numeric id of the SERVER's engine). Fetched by the
+	 * on-device engine when it can find the same chapter at the source, so the server
+	 * neither fetches the page list nor proxies the images; otherwise, and on any local
+	 * failure, the hosted answer. The chapter id never changes hands: identity, list and
+	 * progress stay on the server, only the page fetch moves.
+	 */
+	async pages(chapterId: Id): Promise<Page[]> {
+		const local = this.localPages(chapterId).catch((err) => {
+			console.warn('[composite] local pages failed, using hosted:', err);
+			return null;
+		});
+		// A first open may have to install an extension and ask the source for its chapter
+		// list. Past the budget the reader gets the hosted pages now, and the local work
+		// carries on in the background so the next open is served on-device.
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const pages = await Promise.race([
+			local,
+			new Promise<null>((resolve) => (timer = setTimeout(resolve, LOCAL_PAGES_BUDGET_MS, null))),
+		]);
+		clearTimeout(timer);
+		return pages ?? this.opts.hosted.pages(chapterId);
+	}
+
+	/** {@link pages} from the on-device engine, or null when it has no answer. */
+	private async localPages(chapterId: Id): Promise<Page[] | null> {
+		const { hosted, local } = this.opts;
+		if (this.localUnusable.has(String(chapterId))) return null;
+		if (!hosted.chapterOrigin || !local || !(await this.localReady())) return null;
+		// A HOSTED read: a throw is a server-side failure, not a fault of the source, so it
+		// leaves the memo alone (the caller falls back to hosted, which reports it).
+		const origin = await hosted.chapterOrigin(chapterId);
+		if (!origin) return null;
+		const mangaKey = `${origin.sourceId}\n${origin.mangaUrl}`;
+		if (this.localUnusable.has(mangaKey)) return null;
+		let engineId: Id | null;
+		try {
+			engineId = await local.resolveChapter(
+				{
+					sourceId: origin.sourceId,
+					sourceKey: origin.mangaUrl,
+					pkgName: origin.extension?.pkgName,
+					repoUrl: origin.extension?.repoUrl,
+					title: origin.mangaTitle,
+				},
+				origin.chapterUrl,
+			);
+		} catch (err) {
+			// The extension cannot be installed here, or the source does not know the manga:
+			// true of every chapter of it, so stop trying for the session.
+			this.localUnusable.add(mangaKey);
+			throw err;
+		}
+		if (engineId == null) {
+			// The source's list does not carry this one chapter. Remember only the chapter.
+			this.localUnusable.add(String(chapterId));
+			return null;
+		}
+		const pages = await local.pages(engineId);
+		return pages.length ? pages : null;
 	}
 
 	// --- library & progress ---
@@ -402,9 +478,11 @@ export class CompositeBackend implements Backend {
 			// A local backend with no `refFor` is a missing capability (instance-wide, not a
 			// per-work failure), so skip without memoing — nothing to provision here.
 			if (typeof mapper.refFor !== 'function') return chs;
-			// MangaDex-preferred is already first; require a usable mapping (MangaDex, or
-			// a suwayomi source carrying extension provisioning coords).
-			const ws = sources.find((s) => s.sourceType === 'mangadex' || s.extension != null);
+			// Only the MangaDex mapping can be reconciled here: this list IS the MangaDex
+			// spine, and a suwayomi mapping's `sourceKey` is a row id of the server's engine,
+			// which the on-device engine cannot look up. Suwayomi chapters are read on-device
+			// through `pages` instead, by the source's own keys.
+			const ws = sources.find((s) => s.sourceType === 'mangadex');
 			if (!ws) {
 				// No source this engine can resolve/provision → unusable on-device for this work.
 				this.localUnusable.add(String(workId));
@@ -468,6 +546,11 @@ export class CompositeBackend implements Backend {
 	}
 	workSources(workId: Id): Promise<WorkSource[]> {
 		return this.opts.hosted.workSources!(workId);
+	}
+	/** A HOSTED read, passed straight through: it describes the server's chapter, which is
+	 *  the id every caller holds. `undefined` when the server cannot answer it. */
+	async chapterOrigin(chapterId: Id): Promise<ChapterOrigin | null | undefined> {
+		return this.opts.hosted.chapterOrigin?.(chapterId);
 	}
 	workSourcesBatch(workIds: Id[]): Promise<WorkSourceGroup[]> {
 		return this.opts.hosted.workSourcesBatch!(workIds);
@@ -587,6 +670,21 @@ export class CompositeBackend implements Backend {
 	setMangadexEnabled(enabled: boolean): Promise<boolean> {
 		return this.opts.hosted.setMangadexEnabled!(enabled);
 	}
+	sourceRateLimits(): Promise<SourceRateLimit[]> {
+		return this.opts.hosted.sourceRateLimits!();
+	}
+	setSourceRateLimit(sourceId: Id, requests: number, windowSecs: number): Promise<SourceRateLimit> {
+		return this.opts.hosted.setSourceRateLimit!(sourceId, requests, windowSecs);
+	}
+	removeSourceRateLimit(sourceId: Id): Promise<boolean> {
+		return this.opts.hosted.removeSourceRateLimit!(sourceId);
+	}
+	scanlators(query?: ScanlatorQuery): Promise<ScanlatorPage> {
+		return this.opts.hosted.scanlators!(query);
+	}
+	setScanlatorAi(name: string, ai: ScanlatorAi | null): Promise<boolean> {
+		return this.opts.hosted.setScanlatorAi!(name, ai);
+	}
 	setRegistrationOpen(open: boolean): Promise<boolean> {
 		return this.opts.hosted.setRegistrationOpen!(open);
 	}
@@ -595,11 +693,31 @@ export class CompositeBackend implements Backend {
 	accessStatus(): Promise<AccessStatus> {
 		return this.opts.hosted.accessStatus!();
 	}
-	setAccessMode(mode: AccessMode, domain?: string | null): Promise<AccessStatus> {
-		return this.opts.hosted.setAccessMode!(mode, domain);
+	setAccessMode(
+		mode: AccessMode,
+		domain?: string | null,
+		encrypt?: boolean,
+	): Promise<AccessStatus> {
+		return this.opts.hosted.setAccessMode!(mode, domain, encrypt);
 	}
-	checkCloudflareToken(token: string, domain: string): Promise<CloudflareTokenCheck> {
-		return this.opts.hosted.checkCloudflareToken!(token, domain);
+	setupNeedsTerminal(): Promise<boolean> {
+		return this.opts.hosted.setupNeedsTerminal!();
+	}
+	certificateStatus(): Promise<CertificateStatus> {
+		return this.opts.hosted.certificateStatus!();
+	}
+	accessPreflight(): Promise<AccessPreflight> {
+		return this.opts.hosted.accessPreflight!();
+	}
+	lanClientSeenAt(): Promise<string | null> {
+		return this.opts.hosted.lanClientSeenAt!();
+	}
+	checkCloudflareToken(
+		token: string,
+		domain: string,
+		connection?: CloudflareConnection,
+	): Promise<CloudflareTokenCheck> {
+		return this.opts.hosted.checkCloudflareToken!(token, domain, connection);
 	}
 	startCloudflareSetup(input: CloudflareSetupInput): Promise<AccessStatus> {
 		return this.opts.hosted.startCloudflareSetup!(input);
@@ -730,6 +848,10 @@ export class CompositeBackend implements Backend {
 		return this.opts.hosted.recordView?.(seriesId) ?? Promise.resolve();
 	}
 }
+
+/** How long {@link CompositeBackend.pages} waits for the on-device engine before it
+ *  answers from the server instead. Well inside the reader's own page deadline. */
+const LOCAL_PAGES_BUDGET_MS = 8_000;
 
 /** Build a {@link CompositeBackend} from a hosted backend and an optional local
  * content engine (mirrors {@link createBackend}). */

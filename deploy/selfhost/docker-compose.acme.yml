@@ -1,0 +1,7 @@
+# Certificate checks for public access without a domain.
+# Keep port 80 open: Let's Encrypt checks it again every few days.
+# Selected together with docker-compose.https.yml by install.sh.
+services:
+  server:
+    ports:
+      - '80:80'

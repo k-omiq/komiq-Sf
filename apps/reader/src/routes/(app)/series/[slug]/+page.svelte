@@ -3,6 +3,7 @@
 	import { page } from '$app/state';
 	import { goto, replaceState } from '$app/navigation';
 	import { tick, untrack } from 'svelte';
+	import AiBadge from '$lib/components/AiBadge.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import Stars from '$lib/components/Stars.svelte';
 	import MangaCard from '$lib/components/MangaCard.svelte';
@@ -37,6 +38,7 @@
 	import type { SeriesResult } from '$lib/data/source';
 	import { volumeHeaders } from '$lib/data/chapter-volumes';
 	import { chapterAttribution } from '$lib/data/chapter-versions';
+	import { setPreferredTranslator } from '$lib/data/translator-pref.svelte';
 
 	let { data } = $props();
 
@@ -455,10 +457,32 @@
 		return sort === 'newest' ? asc.reverse() : asc;
 	});
 
-	// The sources available for this work — a static provenance list (no picker: the
-	// chapter list below is the cross-source union, one row per chapter number).
+	// The sources available for this work. The chapter list below is the cross-source
+	// union, one row per chapter number; the DEFAULT source is the one each row opens from
+	// whenever it carries that number (another source fills the numbers it lacks). It is
+	// picked under "More info" here and in the reader's menu, and kept on this device.
 	const translators = $derived(view?.translators ?? []);
 	const workId = $derived(view?.workId ?? null);
+	// The pick shows at once; the rows follow when the refetch lands.
+	let sourcePending = $state<string | null>(null);
+	const defaultSourceKey = $derived(sourcePending ?? view?.selectedTranslatorKey ?? null);
+	async function selectTranslator(key: string): Promise<void> {
+		if (!workId || key === defaultSourceKey) return;
+		setPreferredTranslator(workId, key);
+		sourcePending = key;
+		// Pin the slug so a mid-flight navigation can't be clobbered; a newer pick owns
+		// `sourcePending`, so an older answer landing late is dropped.
+		const slug = data.slug;
+		try {
+			const r = await getSeries(workId);
+			if (data.slug === slug && sourcePending === key && r.view) override = r;
+		} finally {
+			if (sourcePending === key) sourcePending = null;
+		}
+	}
+
+	// Chapter rows whose other copies (other groups and sources) are shown.
+	let openCopies = $state<Record<string, boolean>>({});
 
 	// --- admin: fold duplicate works into this one ---
 	//
@@ -1085,7 +1109,7 @@
 								     store a scoreless review), so on a body-bearing row this would
 								     silently destroy text the reader wrote. -->
 								{#if userRating > 0 && !needsAuth && !myBody.trim()}
-									<button class="clear" onclick={clearRating}>Remove</button>
+									<button class="clear k-hit" onclick={clearRating}>Remove</button>
 								{/if}
 							</div>
 						</div>
@@ -1259,14 +1283,23 @@
 					</div>
 				{/if}
 				{#if translators.length}
-					<!-- A static provenance list (no picker): the chapter list is the
-					     cross-source union, so each source's name, language and chapter
-					     count is the whole answer to "where can this be read from". -->
+					<!-- Where this can be read from, and the default-source picker: chapters
+					     open from the pressed source, and a chapter it lacks opens from
+					     another one. -->
 					<div class="info">
 						<h3>Sources</h3>
-						<div class="chips">
+						<div class="chips" role="group" aria-label="Default source for this series">
 							{#each translators as t (t.key)}
-								<span class="chip src-chip">
+								<button
+									type="button"
+									class="chip src-chip"
+									class:on={t.key === defaultSourceKey}
+									aria-pressed={t.key === defaultSourceKey}
+									title={t.key === defaultSourceKey
+										? 'Chapters open from this source'
+										: 'Open chapters from this source'}
+									onclick={() => selectTranslator(t.key)}
+								>
 									{#if t.iconUrl}
 										<img
 											class="src-logo"
@@ -1283,7 +1316,7 @@
 									{/if}
 									{t.name}{#if t.lang}<span class="chip-sub">{t.lang.toUpperCase()}</span>{/if}
 									<span class="chip-sub">{t.chapterCount} ch</span>
-								</span>
+								</button>
 							{/each}
 						</div>
 					</div>
@@ -1304,7 +1337,7 @@
 			{/if}
 		</div>
 		<button
-			class="more"
+			class="more k-hit"
 			aria-expanded={aboutOpen}
 			aria-controls="series-about"
 			onclick={() => (aboutOpen = !aboutOpen)}
@@ -1318,6 +1351,7 @@
 	<div class="tabs-wrap k-gutter" id="chapters">
 		<div class="tabs" role="tablist" aria-label="Series sections">
 			<button
+				class="k-hit"
 				role="tab"
 				id="tab-chapters"
 				aria-selected={tab === 'chapters'}
@@ -1326,6 +1360,7 @@
 				onclick={() => (tab = 'chapters')}>Chapters<span class="tab-n">{totalCh}</span></button
 			>
 			<button
+				class="k-hit"
 				role="tab"
 				id="tab-discussion"
 				aria-selected={tab === 'discussion'}
@@ -1335,6 +1370,7 @@
 			>
 			{#if covers.length > 1}
 				<button
+					class="k-hit"
 					role="tab"
 					id="tab-covers"
 					aria-selected={tab === 'covers'}
@@ -1345,6 +1381,7 @@
 			{/if}
 			{#if relatedSeries.length}
 				<button
+					class="k-hit"
 					role="tab"
 					id="tab-related"
 					aria-selected={tab === 'related'}
@@ -1361,7 +1398,7 @@
 			<div class="ch-tools">
 				<div class="sort-wrap">
 					<button
-						class="tool"
+						class="tool k-hit"
 						bind:this={sortBtn}
 						aria-haspopup="menu"
 						aria-expanded={sortOpen}
@@ -1439,17 +1476,21 @@
 						<li class="ch-vol">{pagedVolumeHeaders[ci]}</li>
 					{/if}
 					<!-- One card per chapter NUMBER (the cross-source union). No nested
-					     interactive elements: the main row links to the sensible default
-					     source, and each per-source copy below is a sibling link. -->
+					     interactive elements: the main row links to the default source's copy
+					     and names it; the other copies sit in a dropdown, each a sibling link. -->
 					{@const multi = (c.sources?.length ?? 0) > 1}
 					{@const isRead = isChapterRead(c)}
+					{@const rowCopy =
+						c.sources?.find((s) => s.id === c.id && s.src === (c.src ?? null)) ?? c.sources?.[0]}
+					{@const rowKey = c.id ?? String(c.n)}
+					{@const copiesOpen = multi && !!openCopies[rowKey]}
 					<li class="ch-card" class:read={isRead} class:multi>
 						<!-- The read mark is a SIBLING of the row link, never inside it: a button
 						     nested in an <a> is invalid and screen readers announce it badly. -->
 						<div class="ch-head">
 							{#if canMarkRead && c.id}
 								<button
-									class="ch-mark-btn"
+									class="ch-mark-btn k-hit"
 									aria-pressed={isRead}
 									aria-label={isRead
 										? `Mark chapter ${c.n} as unread`
@@ -1483,17 +1524,19 @@
 											>{/if}
 									</span>
 								</span>
-								<!-- One copy: the group (else the source) sits in the compact row. Several
-							     copies: each gets its own sub-row below instead. -->
-								{#if c.sources?.length === 1}
-									{@const s = c.sources[0]}
-									<span class="ch-by" title={chapterAttribution(s.name, s.group)}>
-										{@render srcLogo(s.iconUrl, s.name)}
-										<span class="ch-src-name">{chapterAttribution(s.name, s.group)}</span>
+								<!-- The copy this row opens: its source and group. -->
+								{#if rowCopy}
+									<span class="ch-by" title={chapterAttribution(rowCopy.name, rowCopy.group)}>
+										{@render srcLogo(rowCopy.iconUrl, rowCopy.name)}
+										<span class="ch-src-name"
+											>{chapterAttribution(rowCopy.name, rowCopy.group)}</span
+										>
+										<AiBadge group={rowCopy.group} />
 									</span>
-								{:else if !c.sources?.length && c.group}
+								{:else if c.group}
 									<span class="ch-by"
-										><Icon name="users" size={14} /><span class="ch-src-name">{c.group}</span></span
+										><Icon name="users" size={14} /><span class="ch-src-name">{c.group}</span
+										><AiBadge group={c.group} /></span
 									>
 								{/if}
 								<!-- TWO CLOCKS, NAMED: a source that holds chapters behind early
@@ -1501,33 +1544,58 @@
 							     only renders where the data layer allows it (recent or
 							     newest-3); never a placeholder date. -->
 								<span class="ch-dates">
-									<!-- With per-copy rows the release dates live on those rows. -->
-									{#if c.date && !(multi && c.sources?.some((s) => s.date))}<span
-											>Released {c.date}</span
-										>{/if}
+									{#if c.date}<span>Released {c.date}</span>{/if}
 									{#if c.foundDate}<span
 											class="ch-found"
 											title="When we first had this chapter available to read"
 											>Found {c.foundDate}</span
 										>{/if}
 								</span>
-								<Icon name="chevron-right" size={16} />
+								<!-- Same width on every row, so the columns line up: the arrow, or
+								     the room the versions button below sits in. -->
+								<span class="ch-tail"
+									>{#if !multi}<Icon name="chevron-right" size={16} />{/if}</span
+								>
 							</a>
+							{#if multi && c.sources}
+								<button
+									type="button"
+									class="ch-more k-hit"
+									aria-expanded={copiesOpen}
+									aria-controls={`ch-copies-${ci}`}
+									aria-label={`Chapter ${c.n}: ${copiesOpen ? 'hide' : 'show'} all ${c.sources.length} versions`}
+									title="Other groups and sources"
+									onclick={() => (openCopies[rowKey] = !copiesOpen)}
+								>
+									+{c.sources.length - 1}
+									<span class="more-icon" class:flip={copiesOpen}
+										><Icon name="chevron-down" size={14} /></span
+									>
+								</button>
+							{/if}
 						</div>
 						{#if multi && c.sources}
-							<!-- MangaDex-style: one sub-row per (source, group) copy, each a
-							     sibling link to exactly that upload. -->
-							<ul class="ch-copies" aria-label={`Chapter ${c.n} versions`}>
+							<!-- One sub-row per (source, group) copy, each a sibling link to
+							     exactly that upload. Rendered while closed too (`hidden`), so the
+							     button always has a list to control. -->
+							<ul
+								class="ch-copies"
+								id={`ch-copies-${ci}`}
+								aria-label={`Chapter ${c.n} versions`}
+								hidden={!copiesOpen}
+							>
 								{#each c.sources as s, i (`${s.src ?? 'spine'}:${s.id ?? i}`)}
 									<li>
 										<a
 											class="ch-copy"
+											class:on={s === rowCopy}
 											href={chapterHref(s.id, s.src)}
 											aria-label={`Read Chapter ${c.n} on ${chapterAttribution(s.name, s.group)}`}
 										>
 											{@render srcLogo(s.iconUrl, s.name)}
 											<span class="cp-text">
 												<span class="cp-group">{chapterAttribution(s.name, s.group)}</span>
+												<AiBadge group={s.group} />
 											</span>
 											{#if s.date}<span class="cp-date">{s.date}</span>{/if}
 										</a>
@@ -1695,9 +1763,12 @@
 	}
 
 	/* ---- hero ---- */
+	/* Above the sections that follow (they are z-index 1 too, and later in the page):
+	   the rating popover and the shelf menu open out of the hero and, on a phone, land
+	   over the description, which otherwise painted through them. */
 	.hero {
 		position: relative;
-		z-index: 1;
+		z-index: 2;
 		padding-top: 40px;
 	}
 	.hero-grid {
@@ -1740,6 +1811,8 @@
 		line-height: 1.05;
 		color: var(--k-text-bright);
 		overflow-wrap: anywhere;
+		-webkit-hyphens: auto;
+		hyphens: auto;
 	}
 	.alt-title {
 		margin: 8px 0 0;
@@ -2132,6 +2205,32 @@
 		font-weight: 700;
 		color: var(--k-text-faint);
 	}
+	/* The source picker: a chip is a button, and the default source has accented edges. */
+	.src-chip {
+		font: inherit;
+		font-size: 12.5px;
+		font-weight: 600;
+		cursor: pointer;
+		transition:
+			border-color 0.15s,
+			background-color 0.15s,
+			color 0.15s;
+	}
+	.src-chip:hover {
+		border-color: var(--k-border-strong);
+		color: var(--k-text);
+	}
+	.src-chip.on {
+		border-color: var(--k-accent);
+		box-shadow: 0 0 0 1px var(--k-accent);
+		background: var(--k-accent-soft);
+		color: var(--k-text-bright);
+		cursor: default;
+	}
+	.src-chip:focus-visible {
+		outline: 2px solid var(--k-accent);
+		outline-offset: 2px;
+	}
 	.src-logo {
 		width: 18px;
 		height: 18px;
@@ -2362,6 +2461,7 @@
 	}
 	/* Mark + row link side by side: the mark is its own control (see the markup). */
 	.ch-head {
+		position: relative;
 		display: flex;
 		align-items: center;
 		padding-left: 14px;
@@ -2500,7 +2600,45 @@
 	.ch-found {
 		color: var(--k-text-ghost);
 	}
-	/* Per-copy sub-rows (a chapter with more than one source/group upload). */
+	.ch-tail {
+		flex: 0 0 40px;
+		display: inline-flex;
+		justify-content: flex-end;
+	}
+	/* The versions dropdown button: over the row's tail, a sibling of the row link. */
+	.ch-more {
+		position: absolute;
+		top: 50%;
+		right: 8px;
+		transform: translateY(-50%);
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 2px;
+		min-width: 46px;
+		height: 30px;
+		padding: 0 6px 0 9px;
+		border: 0;
+		border-radius: var(--k-radius-pill);
+		background: var(--k-surface-4);
+		color: var(--k-text-dim);
+		font: inherit;
+		font-size: 12px;
+		font-weight: 700;
+		font-variant-numeric: tabular-nums;
+		cursor: pointer;
+	}
+	.ch-more:hover,
+	.ch-more[aria-expanded='true'] {
+		background: var(--k-surface-5);
+		color: var(--k-text);
+	}
+	.ch-more:focus-visible {
+		outline: 2px solid var(--k-accent);
+		outline-offset: 1px;
+	}
+	/* Per-copy sub-rows (a chapter with more than one source/group upload), shown by the
+	   versions button. */
 	.ch-copies {
 		list-style: none;
 		margin: 0;
@@ -2550,6 +2688,10 @@
 	}
 	.read .cp-group {
 		color: var(--k-text-faint);
+	}
+	/* The copy the row itself opens. */
+	.ch-copy.on .cp-group {
+		color: var(--k-accent);
 	}
 	.ch-src-logo {
 		width: 16px;
@@ -2853,8 +2995,9 @@
 		.head {
 			align-self: end;
 		}
+		/* Scales down on the narrowest phones, so a long word fits beside the cover. */
 		h1 {
-			font-size: 24px;
+			font-size: clamp(20px, 6.4vw, 24px);
 		}
 		.alt-title {
 			font-size: 14px;
@@ -2902,8 +3045,18 @@
 		.ch-text {
 			flex-basis: 100%;
 		}
-		.ch-main > :global(svg) {
+		.ch-tail {
 			display: none;
+		}
+		/* The versions button sits beside the first line (number + title), so the source
+		   and date beneath keep the full width, like a row with one copy. */
+		.multi .ch-text {
+			padding-right: 54px;
+		}
+		.ch-more {
+			top: 7px;
+			transform: none;
+			height: 26px;
 		}
 		.ch-by {
 			flex: 0 1 auto;

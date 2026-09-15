@@ -10,6 +10,12 @@ export const target = __ADMIN_TARGET__;
 const SERVER_KEY = 'komiq-server';
 const LOCAL = 'local';
 /**
+ * The admin session token. The app keeps one, and a token is only for the server that
+ * issued it: choosing another server drops it (`saveServer`, `saveLocalServer`), or the
+ * next request would hand it to that other server.
+ */
+export const TOKEN_KEY = 'komika-admin-token';
+/**
  * Where the app's own server answers in THIS run of the app. Session-only on purpose:
  * every launch starts that server again through `/start`, which records it here.
  */
@@ -42,9 +48,11 @@ function savedServer(): string | null {
 
 /**
  * Remember a remote server for the desktop app. The backend is built once at load, so
- * the caller reloads the app after saving.
+ * the caller reloads the app after saving. `sameServer`: the server only moved to a new
+ * address (`followServer`), so the session stays.
  */
-export function saveServer(origin: string): void {
+export function saveServer(origin: string, sameServer = false): void {
+	if (!sameServer && read(local, SERVER_KEY) !== origin) write(local, TOKEN_KEY, null);
 	write(local, SERVER_KEY, origin);
 	write(session, LOCAL_ADDRESS_KEY, null);
 }
@@ -54,8 +62,39 @@ export function saveServer(origin: string): void {
  * on now. Later launches start that server by themselves (`/start`). Reload after.
  */
 export function saveLocalServer(address: string): void {
+	if (read(local, SERVER_KEY) !== LOCAL) write(local, TOKEN_KEY, null);
 	write(local, SERVER_KEY, LOCAL);
 	write(session, LOCAL_ADDRESS_KEY, address);
+}
+
+/**
+ * The server moved to `address` ("public without a domain" turned HTTPS on). The
+ * desktop app follows it, once it answers there: its old plain HTTP address stops
+ * answering from the internet. Reloads the app when it follows. The console a server
+ * serves itself cannot follow (another origin): see `HttpsMove.svelte`.
+ *
+ * `typed` is the address the owner entered. The app follows to that host only: the
+ * answer that names `address` came over plain HTTP, where someone on the network path
+ * could have changed it to send the app, and its session, to another server.
+ */
+export async function followServer(address: string, typed: string): Promise<void> {
+	if (target !== 'desktop' || runsLocalServer) return;
+	if (!address.startsWith('https://') || address === serverAddress()) return;
+	try {
+		const entered = typed.trim();
+		const wanted = new URL(entered.includes('://') ? entered : `http://${entered}`).hostname;
+		if (new URL(address).hostname !== wanted) return;
+	} catch {
+		return;
+	}
+	try {
+		const health = await fetch(`${address}/health`, { signal: AbortSignal.timeout(6000) });
+		if (!health.ok) return;
+	} catch {
+		return; // port 443 is not open yet: stay on the address that works
+	}
+	saveServer(address, true);
+	location.reload();
 }
 
 /** Forget the desktop app's server (back to `/start`). */
@@ -104,6 +143,17 @@ const apiOrigin = config.apiEndpoint.replace(/\/graphql\/?$/, '');
 /** The server's public address as a person would type it (no `/graphql`). */
 export function serverAddress(): string {
 	return apiOrigin || (typeof location === 'undefined' ? '' : location.origin);
+}
+
+/**
+ * Whether another device can open `address` (so a QR code of it is worth showing):
+ * anything but this computer's own loopback.
+ */
+export function reachableFromOtherDevices(address: string): boolean {
+	return (
+		/^https?:\/\//i.test(address) &&
+		!/^https?:\/\/(localhost|127(\.\d{1,3}){3}|\[::1\])(:\d+)?(\/|$)/i.test(address)
+	);
 }
 
 /**

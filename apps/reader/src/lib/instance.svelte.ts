@@ -8,6 +8,7 @@
  */
 import type { InstanceInfo } from '@komika/api';
 import { backend } from './context';
+import { canChooseFetch, fetchOnDevice, saveFetchOnDevice } from './config';
 
 export const instance = $state<{ info: InstanceInfo | null; ready: boolean }>({
 	info: null,
@@ -28,6 +29,11 @@ export function loadInstance(): Promise<void> {
 					timer = setTimeout(() => resolve(null), WAIT_MS);
 				});
 				instance.info = await Promise.race([backend.instance(), gaveUp]);
+				// The server does not fetch for apps and this one is still set to ask it (the
+				// server changed its mind, or the app was built for it and never went through
+				// the connect screen): store "this device". Clients are built once at load,
+				// so it takes effect at the next start instead of restarting the app mid-use.
+				if (canChooseFetch && !fetchOnDevice && fetchLocked()) saveFetchOnDevice(true);
 			}
 		} catch {
 			instance.info = null;
@@ -37,6 +43,11 @@ export function loadInstance(): Promise<void> {
 		instance.ready = true;
 	})();
 	return pending;
+}
+
+/** True when the server leaves no choice: apps fetch chapters themselves. */
+export function fetchLocked(): boolean {
+	return instance.info?.appsFetchThemselves === true;
 }
 
 /** False only when the server says sign-up is closed. */

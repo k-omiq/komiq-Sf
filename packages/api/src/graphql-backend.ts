@@ -1,4 +1,5 @@
 import type {
+	ChapterOrigin,
 	AdminUser,
 	CoverIssue,
 	AggregatedChapter,
@@ -59,6 +60,12 @@ import type {
 	InstanceInfo,
 	ExtensionRepo,
 	MangadexSetting,
+	BrowseSource,
+	ScanlatorAi,
+	ScanlatorPage,
+	ScanlatorQuery,
+	ScanlatorTag,
+	SourceRateLimit,
 	MyComment,
 	PostCommentInput,
 	PostReviewInput,
@@ -71,6 +78,9 @@ import type {
 	UpdateProfileInput,
 	AccessMode,
 	AccessStatus,
+	AccessPreflight,
+	CertificateStatus,
+	CloudflareConnection,
 	CloudflareSetupInput,
 	CloudflareTokenCheck,
 } from './backend.js';
@@ -359,9 +369,27 @@ export class GraphQLBackend implements Backend {
 	async logout(): Promise<void> {
 		await this.gql<{ logout: boolean }>(ops.LOGOUT);
 	}
+	/** Process-wide, like {@link seriesPageUnsupported}: one `Unknown field` answer means
+	 *  every later call would get it too. */
+	private static fetchPolicyUnsupported = false;
 	async instance(): Promise<InstanceInfo> {
-		const d = await this.gql<{ instance: InstanceInfo }>(ops.INSTANCE);
-		return d.instance;
+		try {
+			const d = await this.gql<{ instance: InstanceInfo }>(
+				ops.instanceQuery(!GraphQLBackend.fetchPolicyUnsupported),
+			);
+			return d.instance;
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			// The server predates the field — deploy-order drift, not a server to refuse.
+			if (
+				!GraphQLBackend.fetchPolicyUnsupported &&
+				msg.includes('Unknown field "appsFetchThemselves"')
+			) {
+				GraphQLBackend.fetchPolicyUnsupported = true;
+				return this.instance();
+			}
+			throw e;
+		}
 	}
 	async createOwner(input: CreateOwnerInput): Promise<Session> {
 		const d = await this.gql<{ createOwner: Session }>(ops.CREATE_OWNER, { ...input });
@@ -445,6 +473,36 @@ export class GraphQLBackend implements Backend {
 			GraphQLBackend.tagsUnsupported = true;
 			return [];
 		}
+	}
+	/**
+	 * Root fields a server that predates them rejected (`browseSources`,
+	 * `scanlatorTags`). Same deploy-order handling as {@link tagsUnsupported}: one
+	 * rejected request per process, then `[]` without asking.
+	 */
+	private static unsupportedLists = new Set<string>();
+	private async optionalList<T>(
+		field: string,
+		query: string,
+		variables?: Record<string, unknown>,
+	): Promise<T[]> {
+		if (GraphQLBackend.unsupportedLists.has(field)) return [];
+		try {
+			const d = await this.gql<Record<string, T[]>>(query, variables);
+			return d[field];
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			if (!msg.includes(`Unknown field "${field}"`)) throw err;
+			GraphQLBackend.unsupportedLists.add(field);
+			return [];
+		}
+	}
+	browseSources(includeNsfw?: boolean): Promise<BrowseSource[]> {
+		return this.optionalList<BrowseSource>('browseSources', ops.BROWSE_SOURCES, {
+			includeNsfw: includeNsfw ?? null,
+		});
+	}
+	scanlatorTags(): Promise<ScanlatorTag[]> {
+		return this.optionalList<ScanlatorTag>('scanlatorTags', ops.SCANLATOR_TAGS);
 	}
 	browseFilterSupported(): boolean {
 		return !GraphQLBackend.unsupportedArgs.has('filter');
@@ -722,6 +780,46 @@ export class GraphQLBackend implements Backend {
 		return d.setMangadexEnabled;
 	}
 
+	async sourceRateLimits(): Promise<SourceRateLimit[]> {
+		const d = await this.gql<{ sourceRateLimits: SourceRateLimit[] }>(ops.SOURCE_RATE_LIMITS);
+		return d.sourceRateLimits;
+	}
+
+	async setSourceRateLimit(
+		sourceId: Id,
+		requests: number,
+		windowSecs: number,
+	): Promise<SourceRateLimit> {
+		const d = await this.gql<{ setSourceRateLimit: SourceRateLimit }>(ops.SET_SOURCE_RATE_LIMIT, {
+			sourceId,
+			requests,
+			windowSecs,
+		});
+		return d.setSourceRateLimit;
+	}
+
+	async removeSourceRateLimit(sourceId: Id): Promise<boolean> {
+		const d = await this.gql<{ removeSourceRateLimit: boolean }>(ops.REMOVE_SOURCE_RATE_LIMIT, {
+			sourceId,
+		});
+		return d.removeSourceRateLimit;
+	}
+
+	async scanlators(query: ScanlatorQuery = {}): Promise<ScanlatorPage> {
+		const d = await this.gql<{ scanlators: ScanlatorPage }>(ops.SCANLATORS, {
+			search: query.search?.trim() || null,
+			ai: query.ai ?? null,
+			source: query.source ?? null,
+			page: pageArg(query.page),
+		});
+		return d.scanlators;
+	}
+
+	async setScanlatorAi(name: string, ai: ScanlatorAi | null): Promise<boolean> {
+		const d = await this.gql<{ setScanlatorAi: boolean }>(ops.SET_SCANLATOR_AI, { name, ai });
+		return d.setScanlatorAi;
+	}
+
 	async setRegistrationOpen(open: boolean): Promise<boolean> {
 		const d = await this.gql<{ setRegistrationOpen: boolean }>(ops.SET_REGISTRATION_OPEN, { open });
 		return d.setRegistrationOpen;
@@ -733,20 +831,74 @@ export class GraphQLBackend implements Backend {
 		return d.accessStatus;
 	}
 
-	async setAccessMode(mode: AccessMode, domain?: string | null): Promise<AccessStatus> {
-		const d = await this.gql<{ setAccessMode: AccessStatus }>(ops.SET_ACCESS_MODE, {
-			mode,
-			domain: domain ?? null,
-		});
+	async lanAddresses(): Promise<string[]> {
+		const d = await this.gql<{ accessStatus: { lanAddresses: string[] } }>(ops.LAN_ADDRESSES);
+		return d.accessStatus.lanAddresses;
+	}
+
+	async setAccessMode(
+		mode: AccessMode,
+		domain?: string | null,
+		encrypt?: boolean,
+	): Promise<AccessStatus> {
+		const d = await this.gql<{ setAccessMode: AccessStatus }>(
+			encrypt ? ops.SET_ACCESS_MODE_ENCRYPTED : ops.SET_ACCESS_MODE,
+			{ mode, domain: domain ?? null },
+		);
 		return d.setAccessMode;
 	}
 
-	async checkCloudflareToken(token: string, domain: string): Promise<CloudflareTokenCheck> {
-		const d = await this.gql<{ checkCloudflareToken: CloudflareTokenCheck }>(
-			ops.CHECK_CLOUDFLARE_TOKEN,
-			{ token, domain },
+	async setupNeedsTerminal(): Promise<boolean> {
+		const d = await this.gql<{ instance: { setupNeedsTerminal: boolean } }>(
+			ops.SETUP_NEEDS_TERMINAL,
 		);
-		return d.checkCloudflareToken;
+		return d.instance.setupNeedsTerminal;
+	}
+
+	async certificateStatus(): Promise<CertificateStatus> {
+		const d = await this.gql<{ accessStatus: CertificateStatus }>(ops.CERTIFICATE_STATUS);
+		return d.accessStatus;
+	}
+
+	async accessPreflight(): Promise<AccessPreflight> {
+		const d = await this.gql<{ accessPreflight: AccessPreflight }>(ops.ACCESS_PREFLIGHT);
+		return d.accessPreflight;
+	}
+
+	async lanClientSeenAt(): Promise<string | null> {
+		const d = await this.gql<{ accessStatus: { lanClientSeenAt: string | null } }>(
+			ops.LAN_CLIENT_SEEN_AT,
+		);
+		return d.accessStatus.lanClientSeenAt ?? null;
+	}
+
+	async checkCloudflareToken(
+		token: string,
+		domain: string,
+		connection?: CloudflareConnection,
+	): Promise<CloudflareTokenCheck> {
+		type Found = Omit<CloudflareTokenCheck, 'missing'> & { missing?: string[] | null };
+		if (connection) {
+			try {
+				const d = await this.gql<{ checkCloudflareToken: Found }>(
+					ops.checkCloudflareTokenFor(connection),
+					{ token, domain },
+				);
+				return { ...d.checkCloudflareToken, missing: d.checkCloudflareToken.missing ?? [] };
+			} catch (e) {
+				// The server predates the argument or the field: both fail validation, before
+				// anything runs, so the plain check below is the first one Cloudflare sees.
+				const msg = e instanceof Error ? e.message : String(e);
+				if (!msg.includes('argument "connection"') && !msg.includes('Unknown field "missing"')) {
+					throw e;
+				}
+			}
+		}
+		const d = await this.gql<{ checkCloudflareToken: Found }>(ops.CHECK_CLOUDFLARE_TOKEN, {
+			token,
+			domain,
+		});
+		return { ...d.checkCloudflareToken, missing: [] };
 	}
 
 	async startCloudflareSetup(input: CloudflareSetupInput): Promise<AccessStatus> {
@@ -1142,6 +1294,27 @@ export class GraphQLBackend implements Backend {
 	}
 
 	// --- native-embedded-Suwayomi source routing ---
+	/** Process-wide, like {@link seriesPageUnsupported}: one `Unknown field` answer means
+	 *  every later call would get it too. */
+	private static chapterOriginUnsupported = false;
+	async chapterOrigin(chapterId: Id): Promise<ChapterOrigin | null | undefined> {
+		if (GraphQLBackend.chapterOriginUnsupported) return undefined;
+		try {
+			const d = await this.gql<{ chapterOrigin: ChapterOrigin | null }>(ops.CHAPTER_ORIGIN, {
+				chapterId,
+			});
+			return d.chapterOrigin;
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			// The server predates the query — deploy-order drift, not an outage.
+			if (msg.includes('Unknown field "chapterOrigin"')) {
+				GraphQLBackend.chapterOriginUnsupported = true;
+				return undefined;
+			}
+			throw e;
+		}
+	}
+
 	async workSources(workId: Id): Promise<WorkSource[]> {
 		const d = await this.gql<{ workSources: WorkSource[] }>(ops.WORK_SOURCES, { workId });
 		return d.workSources;

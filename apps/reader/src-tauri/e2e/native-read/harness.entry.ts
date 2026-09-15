@@ -241,6 +241,139 @@ function magic(buf: Uint8Array): string {
 	return `${kind} (${hex})`;
 }
 
+// The exact document the SERVER sends its engine for `chapterOrigin`
+// (apps/server/src/suwayomi.rs `chapter_origin`). Keep the two in step.
+const SERVER_CHAPTER_ORIGIN_DOC =
+	'query CO($id: Int!) { chapters(condition: { id: $id }) { nodes { url mangaId manga { url title sourceId } } } }';
+
+/**
+ * F–I: a Suwayomi chapter read by a DEVICE engine that has never seen the manga.
+ *
+ * The engine booted first plays the server's engine: it holds the chapter under its own
+ * row ids. The second engine is empty — no extension, no manga. The only thing that
+ * crosses from one to the other is what `chapterOrigin` hands out: the source's own keys.
+ */
+async function selfFetch(facts: Facts): Promise<void> {
+	const serverChapter = facts.chapters[0];
+
+	// ---- F: the server's lookup works against a real engine ----
+	const co = await gql<{
+		chapters: {
+			nodes: {
+				url: string;
+				mangaId: number;
+				manga: { url: string; title: string; sourceId: string };
+			}[];
+		};
+	}>(SERVER_CHAPTER_ORIGIN_DOC, { id: serverChapter.id });
+	const node = co.chapters.nodes[0];
+	assert(
+		'F server-chapter-origin',
+		!!node &&
+			!!node.url &&
+			node.manga.url.includes(facts.uuid) &&
+			node.manga.sourceId === facts.sourceId,
+		`chapter ${serverChapter.id} -> chapterUrl=${node?.url} mangaUrl=${node?.manga.url} sourceId=${node?.manga.sourceId}`,
+	);
+	if (!node) return;
+
+	// From here on "the device" is the second, empty engine.
+	const devicePort = process.env.SUWA_DEVICE_PORT;
+	if (!devicePort) {
+		assert('G self-fetch-on-fresh-engine', false, 'SUWA_DEVICE_PORT not set (run via run.sh)');
+		return;
+	}
+	(globalThis as any).__SUWA_DEVICE_PORT = devicePort;
+	const deviceGql = async <T = any>(query: string, variables?: Record<string, unknown>) => {
+		const res = await fetch(`http://127.0.0.1:${devicePort}/api/graphql`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ query, variables }),
+		});
+		const json = await res.json();
+		if (json.errors?.length) throw new Error(json.errors.map((e: any) => e.message).join('; '));
+		return json.data as T;
+	};
+	const before = await deviceGql<{ mangas: { totalCount: number } }>(
+		`query($sid: LongString!, $url: String!){ mangas(condition:{ sourceId:$sid, url:$url }){ totalCount } }`,
+		{ sid: node.manga.sourceId, url: node.manga.url },
+	);
+
+	let hostedPagesCalls = 0;
+	const hosted = {
+		chapterOrigin: async (_chapterId: string) => ({
+			sourceId: node.manga.sourceId,
+			mangaUrl: node.manga.url,
+			mangaTitle: node.manga.title,
+			chapterUrl: node.url,
+			extension: { pkgName: MANGADEX_PKG, repoUrl: KEIYOUSHI },
+		}),
+		pages: async (_chapterId: string) => {
+			hostedPagesCalls++;
+			return [{ index: 0, sourceUrl: HOSTED_SENTINEL }];
+		},
+		setToken: () => {},
+	} as unknown as Backend;
+	const composite = createCompositeBackend({ hosted, local: createLocalSuwayomiBackend() });
+
+	// ---- G: the device finds the chapter by the source's keys and returns ITS pages ----
+	// The first open has to install the extension and ask the source for the manga and its
+	// chapter list, so it may run past the composite's budget and answer from the server;
+	// the work carries on, and a later open is served on-device.
+	const started = Date.now();
+	let pages = await composite.pages(String(serverChapter.id));
+	const firstWasHosted = pages[0]?.sourceUrl === HOSTED_SENTINEL;
+	while (pages[0]?.sourceUrl === HOSTED_SENTINEL && Date.now() - started < 120_000) {
+		await new Promise((r) => setTimeout(r, 2000));
+		pages = await composite.pages(String(serverChapter.id));
+	}
+	const p0 = pages[0]?.sourceUrl ?? '';
+	const local = p0.startsWith('engine:/api/');
+	assert(
+		'G self-fetch-on-fresh-engine',
+		local && before.mangas.totalCount === 0,
+		`device knew the manga before: ${before.mangas.totalCount}; first open from ${firstWasHosted ? 'server (budget)' : 'device'}; ` +
+			`after ${Math.round((Date.now() - started) / 1000)}s -> ${pages.length} pages; page[0]=${p0}; hosted pages calls=${hostedPagesCalls}`,
+	);
+	if (!local) return;
+
+	// ---- H: those pages are real image bytes from the device engine ----
+	const { invoke } = await import('@tauri-apps/api/core');
+	const ab = (await invoke('suwayomi_image', { path: p0.slice('engine:'.length) })) as ArrayBuffer;
+	const bytes = new Uint8Array(ab);
+	const okMagic =
+		(bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) ||
+		(bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) ||
+		(bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46);
+	assert(
+		'H self-fetch-image-bytes',
+		bytes.length > 1000 && okMagic,
+		`size=${bytes.length}B magic=${magic(bytes)}`,
+	);
+
+	// ---- I: a later session finds the chapter in the engine's own database ----
+	// A new backend has empty caches, like the app after a restart. The by-key lookup is
+	// asserted directly too: inside the backend a rejected query only falls through to
+	// the source, which would hide a document the engine does not accept.
+	const known = await deviceGql<{ chapters: { nodes: { id: number }[] } }>(
+		`query($mid: Int!, $url: String!){ chapters(condition:{ mangaId:$mid, url:$url }){ nodes{ id } } }`,
+		{ mid: Number(p0.match(/\/manga\/(\d+)\//)?.[1]), url: node.url },
+	);
+	const hostedBefore = hostedPagesCalls;
+	const t = Date.now();
+	const again = await createCompositeBackend({
+		hosted,
+		local: createLocalSuwayomiBackend(),
+	}).pages(String(serverChapter.id));
+	assert(
+		'I self-fetch-warm-open',
+		known.chapters.nodes.length === 1 &&
+			(again[0]?.sourceUrl ?? '').startsWith('engine:/api/') &&
+			hostedPagesCalls === hostedBefore,
+		`by-key lookup -> ${known.chapters.nodes.length} row; new session -> ${again.length} pages in ${Date.now() - t}ms; server fetched pages: ${hostedPagesCalls - hostedBefore}`,
+	);
+}
+
 async function main() {
 	console.log(`[harness] engine base = ${BASE}`);
 	const facts = await bootstrapMangaDex();
@@ -267,7 +400,7 @@ async function main() {
 	);
 	const pages = await composite.canonicalPages!(matchable.id);
 	const p0 = pages[0]?.sourceUrl ?? '';
-	const isLocal = typeof p0 === 'string' && p0.startsWith('/api/') && p0 !== HOSTED_SENTINEL;
+	const isLocal = typeof p0 === 'string' && p0.startsWith('engine:/api/');
 	assert(
 		'B reconciliation-local-path',
 		isLocal,
@@ -277,7 +410,9 @@ async function main() {
 	// ---- C: the local page path yields real image bytes (JPEG/PNG magic, > 1000 B) ----
 	if (isLocal) {
 		const { invoke } = await import('@tauri-apps/api/core');
-		const ab = (await invoke('suwayomi_image', { path: p0 })) as ArrayBuffer;
+		const ab = (await invoke('suwayomi_image', {
+			path: p0.slice('engine:'.length),
+		})) as ArrayBuffer;
 		const bytes = new Uint8Array(ab);
 		const okMagic =
 			(bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) ||
@@ -319,6 +454,8 @@ async function main() {
 		);
 		console.log(results[results.length - 1]);
 	}
+
+	await selfFetch(facts);
 
 	console.log(`\n[harness] ${pass} passed, ${fail} failed`);
 	// Emit a machine-readable summary for the orchestrator.

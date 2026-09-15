@@ -28,6 +28,7 @@
 		amz: 'Amazon',
 		amazon: 'Amazon',
 		ebj: 'ebookjapan',
+		cdj: 'CDJapan',
 		raw: 'Official Original',
 		engtl: 'Official English',
 	};

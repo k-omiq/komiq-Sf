@@ -55,7 +55,7 @@
 			What komiq does with comics, what it keeps, and what it doesn't. If you're a rights holder,
 			the same page explains how to reach us.
 		</p>
-		<a class="link" href="/about">Read about komiq <Icon name="arrow-right" size={15} /></a>
+		<a class="link k-hit" href="/about">Read about komiq <Icon name="arrow-right" size={15} /></a>
 	</section>
 </div>
 

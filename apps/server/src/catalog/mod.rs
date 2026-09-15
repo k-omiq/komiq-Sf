@@ -68,6 +68,10 @@ pub struct WorkInput {
     pub aliases: Vec<Alias>,
     /// `(provider, external_id)` — e.g. `("al", "12345")`, `("mangadex", "<uuid>")`.
     pub external_ids: Vec<(String, String)>,
+    /// `(provider, value)` publisher and store links — e.g. `("engtl", "https://…")`.
+    /// Shown beside the trackers, but never written to `work_external_id`: they are
+    /// not identities.
+    pub official_links: Vec<(String, String)>,
     /// Every localized description as `(lang, text)` (S2). The singular
     /// `description` above stays the English-preferred primary.
     pub descriptions: Vec<(String, String)>,
@@ -2757,7 +2761,7 @@ async fn replace_mangadex_details(
         .bind(work_id)
         .execute(&mut **tx)
         .await?;
-    for (provider, external_id) in &input.external_ids {
+    for (provider, external_id) in input.external_ids.iter().chain(&input.official_links) {
         if crate::mangadex::tracker_url(provider, external_id).is_some() {
             sqlx::query("INSERT OR REPLACE INTO work_tracker_link (work_id, provider, external_id) VALUES (?, ?, ?)")
                 .bind(work_id).bind(provider).bind(external_id).execute(&mut **tx).await?;
@@ -3152,6 +3156,51 @@ pub async fn upsert_source_extension(
     .bind(&now)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// The engine's NSFW flag for one source as last recorded in `source_extension`.
+/// `None` means there is NO ROW — the source has not been recorded yet (a fresh server,
+/// an extension installed since the last record pass, an extension with no repo). That
+/// is "unknown", never "safe": the caller must ask the engine rather than default.
+pub async fn source_extension_nsfw(pool: &SqlitePool, source_id: &str) -> Result<Option<bool>> {
+    Ok(
+        sqlx::query_scalar::<_, i64>("SELECT is_nsfw FROM source_extension WHERE source_id = ?")
+            .bind(source_id)
+            .fetch_optional(pool)
+            .await?
+            .map(|v| v != 0),
+    )
+}
+
+/// Whether an admin pinned this whole source adult (`markSourceNsfw`, migration 0114).
+pub async fn source_nsfw_pinned(pool: &SqlitePool, source_id: &str) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar::<_, i64>("SELECT 1 FROM source_nsfw_pin WHERE source_id = ?")
+            .bind(source_id)
+            .fetch_optional(pool)
+            .await?
+            .is_some(),
+    )
+}
+
+/// Set or clear the admin's "this source is adult" pin. Idempotent both ways.
+pub async fn set_source_nsfw_pin(pool: &SqlitePool, source_id: &str, pinned: bool) -> Result<()> {
+    if pinned {
+        sqlx::query(
+            "INSERT INTO source_nsfw_pin (source_id, created_at) VALUES (?, ?) \
+             ON CONFLICT(source_id) DO NOTHING",
+        )
+        .bind(source_id)
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query("DELETE FROM source_nsfw_pin WHERE source_id = ?")
+            .bind(source_id)
+            .execute(pool)
+            .await?;
+    }
     Ok(())
 }
 
@@ -6013,6 +6062,47 @@ mod tests {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn official_links_are_shown_but_are_not_identities() {
+        let pool = pool().await;
+        let work = upsert_work_from_mangadex(
+            &pool,
+            "md-official-links",
+            &WorkInput {
+                external_ids: vec![("al".into(), "500".into())],
+                official_links: vec![
+                    ("engtl".into(), "https://publisher.example/title".into()),
+                    ("raw".into(), "http://publisher.example/insecure".into()),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let links: Vec<(String, String)> = sqlx::query_as(
+            "SELECT provider, external_id FROM work_tracker_link WHERE work_id = ? ORDER BY provider",
+        )
+        .bind(&work)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            links,
+            vec![
+                ("al".into(), "500".into()),
+                ("engtl".into(), "https://publisher.example/title".into())
+            ]
+        );
+        let identities: Vec<String> = sqlx::query_scalar(
+            "SELECT provider FROM work_external_id WHERE work_id = ? ORDER BY provider",
+        )
+        .bind(&work)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(identities, vec!["al".to_string(), "mangadex".to_string()]);
     }
 
     #[tokio::test]

@@ -153,7 +153,7 @@
 						Everything you pick is folded into <strong>{targetTitle}</strong> and then deleted.
 					</p>
 				</div>
-				<button class="icon-btn" onclick={close} disabled={merging} aria-label="Close">
+				<button class="icon-btn k-hit" onclick={close} disabled={merging} aria-label="Close">
 					<Icon name="x" size={18} />
 				</button>
 			</header>
@@ -260,13 +260,14 @@
 					selected
 				</span>
 				{#if confirming}
-					<button class="ghost" onclick={() => (confirming = false)} disabled={merging}>Back</button
+					<button class="ghost k-hit" onclick={() => (confirming = false)} disabled={merging}
+						>Back</button
 					>
 					<button class="danger" onclick={run} disabled={merging}>
 						{merging ? 'Merging…' : `Merge & delete ${picked.length}`}
 					</button>
 				{:else}
-					<button class="ghost" onclick={close}>Cancel</button>
+					<button class="ghost k-hit" onclick={close}>Cancel</button>
 					<button class="primary" onclick={() => (confirming = true)} disabled={!picked.length}>
 						Review merge
 					</button>

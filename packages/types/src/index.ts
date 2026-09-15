@@ -588,6 +588,33 @@ export interface WorkSource {
 	extension: SourceExtension | null;
 }
 
+/**
+ * Where a Suwayomi chapter lives at its source: the source's own keys for the manga
+ * and the chapter, plus the extension that reads them. A reader app that runs its own
+ * engine uses this to find the SAME chapter there and fetch the pages itself. Ids of
+ * the server's engine are absent on purpose — they mean nothing to another engine.
+ */
+export interface ChapterOrigin {
+	sourceId: string;
+	/** The source's own key for the manga (`MangaType.url`). */
+	mangaUrl: string;
+	/** Title as the source gives it — a search hint for an engine that has never seen it. */
+	mangaTitle: string;
+	/** The source's own key for the chapter (`ChapterType.url`). */
+	chapterUrl: string;
+	/**
+	 * The chapter's page on the source's own website — what "Read on source" opens.
+	 * Extension-controlled text passed through verbatim: accept only absolute http(s)
+	 * before putting it in an `href`. Null when the extension reports none; absent on a
+	 * server that predates the field.
+	 */
+	chapterWebUrl?: string | null;
+	/** The series' page on the source's website; same caveats. */
+	mangaWebUrl?: string | null;
+	/** Install coordinates; null when the source has no catalogued extension. */
+	extension: Pick<SourceExtension, 'pkgName' | 'repoUrl'> | null;
+}
+
 /** All source mappings resolved for one canonical work (batch grouping). */
 export interface WorkSourceGroup {
 	workId: Id;

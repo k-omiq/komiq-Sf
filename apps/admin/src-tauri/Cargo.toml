@@ -24,6 +24,9 @@ serde = { version = "1.0", features = ["derive"] }
 # `log`; src/logbuf.rs installs the logger that keeps those lines for the log view.
 log = "0.4"
 tauri = { version = "2.11.3", features = [] }
+# Opens `target="_blank"` links (Cloudflare's token page, Let's Encrypt's agreement) in
+# the system browser: the window itself never navigates away. Same plugin as the reader.
+tauri-plugin-opener = "2"
 # Used by the shared engine supervisor (readiness poll) and by src/local.rs (`/health`).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # Child processes (engine, server), their output pumps, timers.

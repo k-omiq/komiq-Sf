@@ -83,6 +83,14 @@ export const OPTIONAL_SERIES_FIELDS = [
 	// load-bearing elsewhere (`UpdateFeedRow.releasedAt`, `Chapter.externalUrl`).
 	'copyReleasedAt',
 	'copyExternalUrl',
+	// `ChapterOrigin.chapterWebUrl` / `.mangaWebUrl` — a Suwayomi chapter's page on its
+	// source's own website, for the reader's "Read on source". Optional for the usual
+	// deploy-ordering reason, and it matters more than usual here: the SAME document is
+	// what a fetch-on-device app uses to find a chapter's pages, so an older server
+	// rejecting it would break reading, not just a link. Stripped, the link falls back to
+	// what it was before the fields existed.
+	'chapterWebUrl',
+	'mangaWebUrl',
 	// `SessionUser.mustChangePassword` (self-host accounts): set on an account an admin
 	// created or reset, so the apps can ask for a new password at first sign-in. Optional
 	// so the shared session fragment keeps working against a server that predates it;
@@ -310,6 +318,31 @@ export const TAGS = /* GraphQL */ `
 			name
 			group
 			count
+		}
+	}
+`;
+
+// The sources Browse can filter by. Like `TAGS`, the only root selection, so a server
+// that predates it is handled by the caller: `GraphQLBackend.browseSources()` maps its
+// `Unknown field "browseSources"` to `[]`, and the reader then offers no source filter.
+export const BROWSE_SOURCES = /* GraphQL */ `
+	query BrowseSources($includeNsfw: Boolean) {
+		browseSources(includeNsfw: $includeNsfw) {
+			id
+			name
+			lang
+			count
+		}
+	}
+`;
+
+// Every scanlator an admin tagged as using AI. Handled like `BROWSE_SOURCES` against a
+// server that predates it: `[]`, so nothing is marked.
+export const SCANLATOR_TAGS = /* GraphQL */ `
+	query ScanlatorTags {
+		scanlatorTags {
+			name
+			ai
 		}
 	}
 `;
@@ -752,7 +785,10 @@ export const LOGOUT = /* GraphQL */ `
 
 // ---- self-host setup + passwords ---------------------------------------------
 
-export const INSTANCE = /* GraphQL */ `
+/** `fetchPolicy` false leaves out `appsFetchThemselves`, for a server that predates it:
+ *  an unknown field fails the whole document, and this one decides whether an app can
+ *  connect at all. */
+export const instanceQuery = (fetchPolicy: boolean) => /* GraphQL */ `
 	query Instance {
 		instance {
 			setupRequired
@@ -760,6 +796,7 @@ export const INSTANCE = /* GraphQL */ `
 			version
 			registrationOpen
 			mangadexEnabled
+			${fetchPolicy ? 'appsFetchThemselves' : ''}
 		}
 	}
 `;
@@ -931,11 +968,83 @@ export const ACCESS_STATUS = /* GraphQL */ `
 	}
 `;
 
+/** Its own document, not a field of `ACCESS_STATUS_FIELDS`: a server that predates
+ *  `lanAddresses` fails any document that names it, and Settings › Access must still
+ *  load there. */
+export const LAN_ADDRESSES = /* GraphQL */ `
+	query LanAddresses {
+		accessStatus {
+			lanAddresses
+		}
+	}
+`;
+
+/** Its own document, like `LAN_ADDRESSES`: an older server does not know the field,
+ *  and the reader shares `instanceQuery`. */
+export const SETUP_NEEDS_TERMINAL = /* GraphQL */ `
+	query SetupNeedsTerminal {
+		instance {
+			setupNeedsTerminal
+		}
+	}
+`;
+
+/** Its own document, like `LAN_ADDRESSES`: a server that predates HTTPS in direct mode
+ *  does not know these fields. */
+export const CERTIFICATE_STATUS = /* GraphQL */ `
+	query CertificateStatus {
+		accessStatus {
+			certificateExpires
+			certificateError
+			plainHttpClosed
+		}
+	}
+`;
+
+/** Direct mode with HTTPS. Its own document for the same reason: `encrypt` is an
+ *  argument an older server refuses. */
+export const SET_ACCESS_MODE_ENCRYPTED = /* GraphQL */ `
+	${ACCESS_STATUS_FIELDS}
+	mutation SetAccessModeEncrypted($mode: String!, $domain: String) {
+		setAccessMode(mode: $mode, domain: $domain, encrypt: true) {
+			...AccessStatusFields
+		}
+	}
+`;
+
 export const SET_ACCESS_MODE = /* GraphQL */ `
 	${ACCESS_STATUS_FIELDS}
 	mutation SetAccessMode($mode: String!, $domain: String) {
 		setAccessMode(mode: $mode, domain: $domain) {
 			...AccessStatusFields
+		}
+	}
+`;
+
+/** Its own document, like `LAN_ADDRESSES`: a server that predates the preflight does
+ *  not know the field, and the access screens must still open there. */
+export const ACCESS_PREFLIGHT = /* GraphQL */ `
+	query AccessPreflight {
+		accessPreflight {
+			cloudflared
+			cloudflaredDetail
+			httpPort
+			httpsPort
+			httpsPortState
+			acmePort
+			acmePortState
+			inContainer
+			publicIp
+		}
+	}
+`;
+
+/** Its own document, like `LAN_ADDRESSES`: polled by the home network step, and an
+ *  older server does not know the field. */
+export const LAN_CLIENT_SEEN_AT = /* GraphQL */ `
+	query LanClientSeenAt {
+		accessStatus {
+			lanClientSeenAt
 		}
 	}
 `;
@@ -949,6 +1058,23 @@ export const CHECK_CLOUDFLARE_TOKEN = /* GraphQL */ `
 		}
 	}
 `;
+
+/** The check for one connection type, with the permission rows the token seems to
+ *  lack. Its own document: `connection` and `missing` are refused by an older server,
+ *  which gets `CHECK_CLOUDFLARE_TOKEN` instead. The connection is written into the
+ *  document (like `encrypt: true` above), so nothing here names the enum's type. */
+export function checkCloudflareTokenFor(connection: 'TUNNEL' | 'PUBLIC_IP'): string {
+	return /* GraphQL */ `
+	mutation CheckCloudflareTokenFor($token: String!, $domain: String!) {
+		checkCloudflareToken(token: $token, domain: $domain, connection: ${connection}) {
+			zoneName
+			zoneStatus
+			accountName
+			missing
+		}
+	}
+`;
+}
 
 export const START_CLOUDFLARE_SETUP = /* GraphQL */ `
 	${ACCESS_STATUS_FIELDS}
@@ -1276,6 +1402,59 @@ export const SET_MANGADEX_ENABLED = /* GraphQL */ `
 	}
 `;
 
+export const SOURCE_RATE_LIMITS = /* GraphQL */ `
+	query SourceRateLimits {
+		sourceRateLimits {
+			sourceId
+			requests
+			windowSecs
+			fromEnv
+			overridesEnv
+		}
+	}
+`;
+
+export const SET_SOURCE_RATE_LIMIT = /* GraphQL */ `
+	mutation SetSourceRateLimit($sourceId: String!, $requests: Int!, $windowSecs: Int!) {
+		setSourceRateLimit(sourceId: $sourceId, requests: $requests, windowSecs: $windowSecs) {
+			sourceId
+			requests
+			windowSecs
+			fromEnv
+			overridesEnv
+		}
+	}
+`;
+
+export const REMOVE_SOURCE_RATE_LIMIT = /* GraphQL */ `
+	mutation RemoveSourceRateLimit($sourceId: String!) {
+		removeSourceRateLimit(sourceId: $sourceId)
+	}
+`;
+
+export const SCANLATORS = /* GraphQL */ `
+	query Scanlators($search: String, $ai: ScanlatorAiFilter, $source: String, $page: Int) {
+		scanlators(search: $search, ai: $ai, source: $source, page: $page) {
+			items {
+				name
+				chapterCount
+				seriesCount
+				ai
+				effectiveAi
+			}
+			page
+			hasNextPage
+			total
+		}
+	}
+`;
+
+export const SET_SCANLATOR_AI = /* GraphQL */ `
+	mutation SetScanlatorAi($name: String!, $ai: ScanlatorAi) {
+		setScanlatorAi(name: $name, ai: $ai)
+	}
+`;
+
 export const INSTALL_EXTENSION = /* GraphQL */ `
 	${EXTENSION_FIELDS}
 	mutation InstallExtension($pkgName: String!) {
@@ -1542,6 +1721,23 @@ const WORK_SOURCE_FIELDS = /* GraphQL */ `
 			apkName
 			versionCode
 			lang
+		}
+	}
+`;
+
+export const CHAPTER_ORIGIN = /* GraphQL */ `
+	query ChapterOrigin($chapterId: ID!) {
+		chapterOrigin(chapterId: $chapterId) {
+			sourceId
+			mangaUrl
+			mangaTitle
+			chapterUrl
+			chapterWebUrl
+			mangaWebUrl
+			extension {
+				pkgName
+				repoUrl
+			}
 		}
 	}
 `;

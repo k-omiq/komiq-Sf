@@ -10,6 +10,7 @@
 
 <script lang="ts">
 	import type { TagInfo } from '@komika/types';
+	import type { BrowseSource } from '@komika/api';
 	import Icon from '$lib/components/Icon.svelte';
 	import { mobileModalFocus } from '$lib/modal-focus';
 	import {
@@ -30,7 +31,9 @@
 		languageLabel,
 		normalize,
 		parseNumberInput,
+		sourceOptions,
 		toggleIn,
+		toggleSource,
 		withField,
 		type BrowseState,
 	} from '$lib/data/browse-filters';
@@ -55,6 +58,7 @@
 		tags,
 		tagSource,
 		tagsLoading,
+		sources,
 		nsfw,
 		signedIn,
 		changes,
@@ -70,6 +74,9 @@
 		tags: TagInfo[];
 		tagSource: 'tags' | 'genres';
 		tagsLoading: boolean;
+		/** The sources the viewer can filter by. Empty (still loading, or a server that
+		 *  has no such list) hides the Source group. */
+		sources: BrowseSource[];
 		/** The viewer opted into NSFW — gates the Erotica/Pornographic chips. */
 		nsfw: boolean;
 		signedIn: boolean;
@@ -103,6 +110,16 @@
 		...draft.languages
 			.filter((c) => !LANGUAGES.some((l) => l.code === c))
 			.map((c) => ({ value: c, label: languageLabel(c) })),
+	]);
+	// The server's list, plus the draft's source when the list lacks it (a shared link to
+	// a source this viewer is not offered, or one since removed): it is still applied, so
+	// it has to be visible, and removable, where it is set. Its name is not known here.
+	const listedSources = $derived(sourceOptions(sources));
+	const sourceOpts = $derived([
+		...listedSources,
+		...(draft.source && !listedSources.some((o) => o.value === draft.source)
+			? [{ value: draft.source, label: 'Unlisted source' }]
+			: []),
 	]);
 
 	type NumKey = 'yearFrom' | 'yearTo' | 'minChapters' | 'minRating' | 'minFollows';
@@ -172,8 +189,9 @@
 	<header class="panel-head">
 		<h2 class="panel-title" id="{uid}-title">Filters</h2>
 		<div class="head-actions">
-			<button type="button" class="reset" disabled={!canReset} onclick={onreset}>Reset</button>
-			<button type="button" class="close" aria-label="Close filters" onclick={onclose}>
+			<button type="button" class="reset k-hit" disabled={!canReset} onclick={onreset}>Reset</button
+			>
+			<button type="button" class="close k-hit" aria-label="Close filters" onclick={onclose}>
 				<Icon name="x" size={20} />
 			</button>
 		</div>
@@ -219,10 +237,10 @@
 					     actually lives instead. -->
 					{#if signedIn}
 						Erotica and Pornographic are hidden by your content settings. Turn on
-						<a href="/profile#profile-preferences">Show NSFW content</a> to filter by them.
+						<a href="/settings#content">Show NSFW content</a> to filter by them.
 					{:else}
 						Erotica and Pornographic are hidden. <a href="/login">Sign in</a> and turn on Show NSFW content
-						in your profile to filter by them.
+						in Settings to filter by them.
 					{/if}
 				{:else}
 					Pick none to see every rating your settings allow.
@@ -235,6 +253,21 @@
 			selected={draft.languages}
 			ontoggle={(v) => onchange(toggleIn(draft, 'languages', v))}
 		/>
+		<!-- Keyed on the LIST, not on the draft: with nothing to offer there is no group,
+		     and a source the URL carries is then removed from its chip above the results.
+		     The filter takes one source, so ticking another moves the tick and ticking the
+		     same one again clears it. -->
+		{#if listedSources.length}
+			<ChipGroup
+				legend="Source"
+				stacked
+				options={sourceOpts}
+				selected={draft.source ? [draft.source] : []}
+				ontoggle={(v) => onchange(toggleSource(draft, v))}
+			>
+				{#snippet hint()}One source at a time.{/snippet}
+			</ChipGroup>
+		{/if}
 
 		<details class="facet" open={draft.yearFrom != null || draft.yearTo != null}>
 			<summary>Year<Icon name="chevron-down" size={14} /></summary>
@@ -299,7 +332,7 @@
 			</span>
 			<button
 				type="button"
-				class="switch"
+				class="switch k-hit"
 				role="switch"
 				aria-checked={draft.hasChapters}
 				aria-labelledby="{uid}-hc"
@@ -629,6 +662,12 @@
 			z-index: 59;
 			border: none;
 			background: rgba(8, 8, 9, 0.55);
+		}
+	}
+	/* Touch: full 44px rows. */
+	@media (pointer: coarse) {
+		.num input {
+			height: 44px;
 		}
 	}
 </style>

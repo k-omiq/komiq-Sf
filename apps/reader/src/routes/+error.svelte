@@ -23,12 +23,14 @@
 <style>
 	.err {
 		min-height: 100vh;
+		min-height: 100dvh;
 		display: flex;
 		flex-direction: column;
 		align-items: center;
 		justify-content: center;
 		gap: 12px;
-		padding: 40px 20px;
+		padding: calc(40px + var(--k-safe-top)) max(20px, var(--k-safe-right))
+			calc(40px + var(--k-safe-bottom)) max(20px, var(--k-safe-left));
 		text-align: center;
 	}
 	.err-code {

@@ -11,14 +11,18 @@
 		hint,
 		initialOpen = false,
 		segmented = false,
+		stacked = false,
 	}: {
 		legend: string;
-		options: readonly { value: T; label: string }[];
+		/** `count`, when given, is how many series the option matches; it trails the label. */
+		options: readonly { value: T; label: string; count?: number }[];
 		selected: readonly T[];
 		ontoggle: (value: T) => void;
 		hint?: Snippet;
 		initialOpen?: boolean;
 		segmented?: boolean;
+		/** One option per row: for long labels, and for labels that carry a count. */
+		stacked?: boolean;
 	} = $props();
 
 	let expanded = $state(false);
@@ -35,7 +39,7 @@
 	</summary>
 	<fieldset>
 		<legend class="sr-only">{legend}</legend>
-		<div class="options" class:segmented>
+		<div class="options" class:segmented class:stacked>
 			{#each options as option (option.value)}
 				<label class="option">
 					<input
@@ -44,6 +48,11 @@
 						onchange={() => ontoggle(option.value)}
 					/>
 					<span>{option.label}</span>
+					{#if option.count != null}
+						<span class="n"
+							>{option.count.toLocaleString()}<span class="sr-only">&nbsp;series</span></span
+						>
+					{/if}
 				</label>
 			{/each}
 		</div>
@@ -124,6 +133,17 @@
 		accent-color: var(--k-primary);
 		cursor: pointer;
 	}
+	.stacked {
+		grid-template-columns: minmax(0, 1fr);
+	}
+	.n {
+		margin-left: auto;
+		padding-left: 8px;
+		flex-shrink: 0;
+		color: var(--k-text-dim);
+		font-size: 11px;
+		font-variant-numeric: tabular-nums;
+	}
 	.segmented {
 		grid-template-columns: repeat(3, minmax(0, 1fr));
 		gap: 6px;
@@ -177,6 +197,13 @@
 		}
 		.segmented .option {
 			min-height: 40px;
+		}
+	}
+	/* Touch: full 44px rows. */
+	@media (pointer: coarse) {
+		.option,
+		.segmented .option {
+			min-height: 44px;
 		}
 	}
 </style>

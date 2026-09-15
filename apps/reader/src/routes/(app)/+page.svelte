@@ -1,6 +1,7 @@
 <script lang="ts">
 	import MangaCard from '$lib/components/MangaCard.svelte';
 	import Cover from '$lib/components/Cover.svelte';
+	import FlagBadge from '$lib/components/FlagBadge.svelte';
 	import CardRowSkeleton from '$lib/components/CardRowSkeleton.svelte';
 	import EmptyCatalog from '$lib/components/EmptyCatalog.svelte';
 	import Icon from '$lib/components/Icon.svelte';
@@ -11,7 +12,7 @@
 		FLAG,
 		STATUS_META,
 	} from '$lib/data/types';
-	import type { FeaturedView } from '$lib/data/source';
+	import { HOME_UPDATES, type FeaturedView } from '$lib/data/source';
 	import { catalogIsEmpty, checksCatalogEmpty } from '$lib/data/catalog-empty';
 
 	let { data } = $props();
@@ -57,8 +58,19 @@
 		heroIndex = (slide + delta + n) % n;
 	}
 
-	function seriesHref(f: FeaturedView): string {
-		return `/series/${f.id ?? slug(f.title)}`;
+	/**
+	 * Whether a row has a score worth printing. The feeds format an unrated series as
+	 * `''` or as `'0.0'` depending on which one it came through; a compact row prints
+	 * neither, because "★ 0.0" reads as a terrible score rather than as no score.
+	 */
+	function rated(rating: string): boolean {
+		return Number(rating) > 0;
+	}
+
+	/** A series' page — by id, or by title slug when the row carries none. The same
+	 *  rule MangaCard applies, so a list row and a card for one series agree. */
+	function seriesHref(s: { id?: string; title: string }): string {
+		return `/series/${s.id || slug(s.title)}`;
 	}
 
 	// The hero slides. This is a $derived, NOT an $effect: effects don't run during
@@ -200,10 +212,20 @@
 	{@render content(data.home)}
 {/if}
 
+{#snippet head(title: string, href?: string)}
+	<div class="row-head">
+		<h2>{title}</h2>
+		{#if href}
+			<a class="view-all k-hit" {href}>View all<Icon name="chevron-right" size={14} /></a>
+		{/if}
+	</div>
+{/snippet}
+
 {#snippet loading()}
 	<!-- LOADING -->
-	<!-- Reuses `.hero-slide` / `.hero-cover` / `.hero-text` / `.hero-foot` verbatim, so its
-	     geometry is the real hero's by construction and the swap doesn't shift layout. -->
+	<!-- Reuses `.hero-slide` / `.hero-cover` / `.hero-text` / `.hero-foot` and the
+	     `.updates` / `.rank` grids verbatim, so its geometry is the real page's by
+	     construction and the swap doesn't shift layout. -->
 	<section class="hero">
 		<div class="hero-slide">
 			<div class="hero-cover k-skeleton"></div>
@@ -217,15 +239,25 @@
 			</div>
 		</div>
 	</section>
-	<div class="sections k-gutter">
-		<section class="block">
-			<div class="k-skeleton head-sk"></div>
-			<CardRowSkeleton />
-		</section>
-		<section class="block">
-			<div class="k-skeleton head-sk"></div>
-			<CardRowSkeleton />
-		</section>
+	<div class="sections k-gutter" aria-hidden="true">
+		<div class="split">
+			<section class="block">
+				<div class="k-skeleton head-sk"></div>
+				<div class="updates">
+					{#each Array(HOME_UPDATES) as _, i (i)}
+						<div class="k-skeleton upd-sk"></div>
+					{/each}
+				</div>
+			</section>
+			<section class="block">
+				<div class="k-skeleton head-sk"></div>
+				<div class="rank">
+					{#each Array(10) as _, i (i)}
+						<div class="k-skeleton rank-sk"></div>
+					{/each}
+				</div>
+			</section>
+		</div>
 		<section class="block">
 			<div class="k-skeleton head-sk"></div>
 			<CardRowSkeleton />
@@ -289,7 +321,7 @@
 					{#if current.genres.length}
 						<div class="hero-tags">
 							{#each current.genres.slice(0, HERO_GENRES) as g (g)}
-								<a class="hero-tag" href={`/browse?genre=${encodeURIComponent(g)}`}>{g}</a>
+								<a class="hero-tag k-hit" href={`/browse?genre=${encodeURIComponent(g)}`}>{g}</a>
 							{/each}
 						</div>
 					{/if}
@@ -313,7 +345,7 @@
 						     can render this snippet, but it is a SECOND source of truth for a
 						     control whose whole job is to move within the first one. -->
 						<button
-							class="hero-arrow"
+							class="hero-arrow k-hit"
 							onclick={() => stepHero(-1)}
 							disabled={featured.length < 2}
 							aria-label="Previous featured series"
@@ -321,7 +353,7 @@
 							<Icon name="chevron-left" size={26} />
 						</button>
 						<button
-							class="hero-arrow"
+							class="hero-arrow k-hit"
 							onclick={() => stepHero(1)}
 							disabled={featured.length < 2}
 							aria-label="Next featured series"
@@ -335,61 +367,89 @@
 	{/if}
 
 	<div class="sections k-gutter">
-		<!-- LATEST UPDATES -->
-		{#if home.latestUpdates.length}
-			<section class="block">
-				<div class="row-head">
-					<h2>Latest Updates</h2>
-					<a class="view-all" href="/updates">View all</a>
-				</div>
-				<div class="row">
-					{#each home.latestUpdates as item (item.id ?? item.title + item.ch)}
-						<MangaCard
-							title={item.title}
-							sub={cardSub(item)}
-							subTitle={timeTooltip(item)}
-							rating={item.rating}
-							cover={item.cover}
-							id={item.id}
-							flagType={item.type ?? null}
-							status={item.status ? STATUS_META[item.status] : null}
-							fixed
-						/>
-					{/each}
-				</div>
-			</section>
-		{/if}
+		{#if home.latestUpdates.length || home.trending.length}
+			<div class="split" class:solo={!home.latestUpdates.length || !home.trending.length}>
+				<!-- LATEST UPDATES — a dense list, not a rail: this is the section a returning
+				     reader scans top to bottom for the series they follow. -->
+				{#if home.latestUpdates.length}
+					<section class="block">
+						{@render head('Latest Updates', '/updates')}
+						<div class="updates">
+							{#each home.latestUpdates as item (item.id ?? item.title + item.ch)}
+								<a class="upd" href={seriesHref(item)}>
+									<span class="upd-cover">
+										<Cover src={item.cover} alt="" loading="lazy" sizing="card" />
+									</span>
+									<span class="upd-body">
+										<span class="upd-title">{item.title}</span>
+										<span class="upd-line">
+											{#if item.ch}<span class="upd-ch">{item.ch}</span>{/if}
+											{#if item.time}
+												<span class="upd-time" title={timeTooltip(item) || undefined}
+													>{item.time}</span
+												>
+											{/if}
+										</span>
+										<span class="upd-foot">
+											{#if item.type}<FlagBadge type={item.type} width={18} height={12} />{/if}
+											{#if rated(item.rating)}
+												<span class="upd-rating" aria-label={`Rating ${item.rating} out of 10`}
+													><Icon name="star" size={11} fill="var(--k-star)" />{item.rating}</span
+												>
+											{/if}
+											{#if item.status}
+												<span class="upd-status" style="color:{STATUS_META[item.status].color}"
+													>{STATUS_META[item.status].label}</span
+												>
+											{/if}
+										</span>
+									</span>
+								</a>
+							{/each}
+						</div>
+					</section>
+				{/if}
 
-		<!-- TRENDING -->
-		{#if home.trending.length}
-			<section class="block">
-				<h2>Trending</h2>
-				<div class="row">
-					{#each home.trending as item (item.id ?? item.title + item.ch)}
-						<MangaCard
-							title={item.title}
-							sub={cardSub(item)}
-							subTitle={timeTooltip(item)}
-							rating={item.rating}
-							cover={item.cover}
-							id={item.id}
-							flagType={item.type ?? null}
-							status={item.status ? STATUS_META[item.status] : null}
-							fixed
-						/>
-					{/each}
-				</div>
-			</section>
+				<!-- TRENDING — ranked. The feed's order IS the ranking, so the numeral is the
+				     row's position in it and nothing else. -->
+				{#if home.trending.length}
+					<section class="block">
+						{@render head('Trending', '/updates?tab=hot')}
+						<ol class="rank">
+							{#each home.trending as item, i (item.id ?? item.title + item.ch)}
+								<li>
+									<a class="rank-row" href={seriesHref(item)}>
+										<span class="rank-n" class:top={i < 3} aria-hidden="true">{i + 1}</span>
+										<span class="rank-cover">
+											<Cover src={item.cover} alt="" loading="lazy" sizing="card" />
+										</span>
+										<span class="rank-body">
+											<span class="rank-title">{item.title}</span>
+											{#if cardSub(item)}
+												<span class="rank-sub" title={timeTooltip(item) || undefined}
+													>{cardSub(item)}</span
+												>
+											{/if}
+										</span>
+										{#if rated(item.rating)}
+											<span class="rank-rating" aria-label={`Rating ${item.rating} out of 10`}
+												><Icon name="star" size={11} fill="var(--k-star)" />{item.rating}</span
+											>
+										{/if}
+									</a>
+								</li>
+							{/each}
+						</ol>
+					</section>
+				{/if}
+			</div>
 		{/if}
 
 		<!-- LATEST ADDED -->
 		{#if home.latestAdded.length}
 			<section class="block">
-				<div class="row-head">
-					<h2>Latest Added</h2>
-					<a class="view-all" href="/browse?sort=added">View all</a>
-				</div>
-				<div class="row">
+				{@render head('Latest Added', '/browse?sort=added')}
+				<div class="row k-scrollbar-slim">
 					{#each home.latestAdded as item (item.id ?? item.title + item.ch)}
 						<MangaCard
 							title={item.title}
@@ -401,18 +461,6 @@
 							status={item.status ? STATUS_META[item.status] : null}
 							fixed
 						/>
-					{/each}
-				</div>
-			</section>
-		{/if}
-
-		<!-- GENRES -->
-		{#if home.homeGenres.length}
-			<section class="block">
-				<h2>Genres</h2>
-				<div class="genres">
-					{#each home.homeGenres as g (g)}
-						<a class="genre" href={`/browse?genre=${encodeURIComponent(g)}`}>{g}</a>
 					{/each}
 				</div>
 			</section>
@@ -461,6 +509,8 @@
 		text-transform: uppercase;
 		color: var(--k-accent);
 	}
+
+	/* ---- hero ---- */
 	/* SOLID, not the slide's cover blurred into a colour field. The wash was the only
 	   thing tinting the banner, but it was also what every piece of hero text had its
 	   contrast computed against — and the art behind it is arbitrary, so the dimmest
@@ -470,6 +520,9 @@
 	   supplies the banner's colour — it is just the real cover now, bled to the edge,
 	   rather than a 48px-blurred copy of it behind glass. */
 	.hero {
+		/* Full-bleed, except under a landscape notch: the banner steps in by the side
+		   insets (0 everywhere else) so the cover is not cut by it. */
+		width: calc(100% - var(--k-safe-left) - var(--k-safe-right));
 		max-width: var(--k-max-content);
 		margin: 24px auto 0;
 		border: 1px solid var(--k-border-1);
@@ -480,11 +533,6 @@
 		background: var(--k-bg);
 		/* The page below is the same token, so the band needs an edge of its own. */
 		border-bottom: 1px solid var(--k-border-1);
-	}
-	.head-sk {
-		width: 180px;
-		height: 22px;
-		border-radius: 6px;
 	}
 	/*
 	 * cover │ text
@@ -677,36 +725,248 @@
 	.line-sk.short {
 		width: min(420px, 60%);
 	}
+
+	/* ---- sections ---- */
 	.sections {
 		display: flex;
 		flex-direction: column;
-		gap: 48px;
+		gap: 56px;
 		padding-top: 48px;
 		padding-bottom: 80px;
+	}
+	/* Latest Updates beside the Trending ranking. `.solo` is the case where only one of
+	   the two feeds came back: it takes the full width rather than leaving a hole. */
+	.split {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) 360px;
+		gap: 48px;
+		align-items: start;
+	}
+	.split.solo {
+		grid-template-columns: minmax(0, 1fr);
 	}
 	.block {
 		display: flex;
 		flex-direction: column;
 		gap: 20px;
-	}
-	.block h2 {
-		font-size: 21px;
-		margin: 0;
-		color: var(--k-text);
+		min-width: 0;
 	}
 	.row-head {
 		display: flex;
-		align-items: baseline;
+		align-items: center;
 		justify-content: space-between;
+		gap: 16px;
 	}
-	.view-all {
-		font-size: 13px;
-		color: var(--k-text-dimmer);
-		text-decoration: none;
-	}
-	.view-all:hover {
+	.row-head h2 {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		font-size: 22px;
+		letter-spacing: -0.01em;
+		margin: 0;
 		color: var(--k-text);
 	}
+	.row-head h2::before {
+		content: '';
+		width: 4px;
+		height: 20px;
+		border-radius: var(--k-radius-pill);
+		background: var(--k-accent);
+	}
+	.head-sk {
+		width: 180px;
+		height: 26px;
+		border-radius: 6px;
+	}
+	.view-all {
+		display: inline-flex;
+		align-items: center;
+		gap: 2px;
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--k-text-dimmer);
+		text-decoration: none;
+		white-space: nowrap;
+	}
+	.view-all:hover {
+		color: var(--k-accent);
+	}
+
+	/* ---- latest updates ---- */
+	/* Rows sit straight on the page: no card, no outline. The only fill is the hover
+	   state, and the negative margin lets that fill extend past the column while the
+	   covers stay lined up with the heading above them. */
+	.updates {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 8px 24px;
+		margin-inline: -10px;
+	}
+	.upd {
+		display: flex;
+		gap: 14px;
+		min-width: 0;
+		padding: 10px;
+		border-radius: var(--k-radius-lg);
+		text-decoration: none;
+		transition: background var(--k-dur) var(--k-ease);
+	}
+	.upd:hover {
+		background: var(--k-surface-4);
+	}
+	.upd-cover,
+	.rank-cover {
+		position: relative;
+		flex: 0 0 auto;
+		aspect-ratio: 2 / 3;
+		overflow: hidden;
+		border-radius: var(--k-radius-sm);
+		background: var(--k-cover);
+	}
+	.upd-cover {
+		width: 60px;
+	}
+	.upd-body {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		padding-block: 2px;
+	}
+	.upd-title,
+	.rank-title {
+		font-weight: 700;
+		line-height: 1.3;
+		color: var(--k-text);
+		display: -webkit-box;
+		-webkit-box-orient: vertical;
+		overflow: hidden;
+	}
+	.upd-title {
+		font-size: 14.5px;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
+	}
+	.upd:hover .upd-title,
+	.rank-row:hover .rank-title {
+		color: var(--k-accent);
+	}
+	.upd-line {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 10px;
+		font-size: 13px;
+	}
+	.upd-ch {
+		font-weight: 700;
+		color: var(--k-text-2);
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.upd-time {
+		flex: 0 0 auto;
+		/* Hard right even when the chapter label is absent. */
+		margin-left: auto;
+		font-size: 12px;
+		color: var(--k-text-dim);
+	}
+	.upd-foot {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		margin-top: auto;
+		font-size: 12px;
+		font-weight: 600;
+	}
+	.upd-foot :global(svg[role='img']) {
+		border-radius: 2px;
+		flex: 0 0 auto;
+	}
+	.upd-rating,
+	.rank-rating {
+		display: inline-flex;
+		align-items: center;
+		gap: 3px;
+		font-variant-numeric: tabular-nums;
+		color: var(--k-text-3);
+	}
+	.upd-sk {
+		height: 112px;
+		border-radius: var(--k-radius-lg);
+	}
+
+	/* ---- trending ---- */
+	.rank {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: grid;
+		/* Same idea as `.updates`: hover fill may overhang, content stays aligned. */
+		margin-inline: -4px -10px;
+	}
+	.rank-row {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		padding: 8px 10px 8px 4px;
+		border-radius: var(--k-radius);
+		text-decoration: none;
+		transition: background var(--k-dur) var(--k-ease);
+	}
+	.rank-row:hover {
+		background: var(--k-surface-4);
+	}
+	.rank-n {
+		flex: 0 0 34px;
+		text-align: center;
+		font-family: var(--k-font-display);
+		font-size: 24px;
+		font-weight: 800;
+		font-variant-numeric: tabular-nums;
+		line-height: 1;
+		color: var(--k-text-ghost);
+	}
+	.rank-n.top {
+		color: var(--k-accent);
+	}
+	.rank-cover {
+		width: 42px;
+	}
+	.rank-body {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.rank-title {
+		font-size: 14px;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
+	}
+	.rank-sub {
+		font-size: 12px;
+		color: var(--k-text-dim);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.rank-rating {
+		flex: 0 0 auto;
+		font-size: 12px;
+		font-weight: 700;
+	}
+	.rank-sk {
+		height: 79px;
+		margin: 2px;
+		border-radius: var(--k-radius);
+	}
+
+	/* ---- latest added ---- */
 	.row {
 		display: flex;
 		gap: 22px;
@@ -714,23 +974,22 @@
 		padding: 4px 4px 12px;
 		scroll-padding-inline: 4px;
 	}
-	.genres {
-		display: flex;
-		gap: 10px;
-		flex-wrap: wrap;
-	}
-	.genre {
-		font-size: 15px;
-		color: var(--k-text-muted);
-		text-decoration: none;
-		padding: 9px 14px;
-		border: 1px solid var(--k-border-2);
-		border-radius: var(--k-radius-pill);
-		background: var(--k-surface-2);
-	}
-	.genre:hover {
-		color: var(--k-text);
-		border-bottom-color: rgba(255, 255, 255, 0.3);
+
+	/* The sidebar needs ~360px and two update columns need ~300px each; under 1180px
+	   they do not both fit, so Trending drops below and spreads into two columns. */
+	@media (max-width: 1180px) {
+		.split {
+			grid-template-columns: minmax(0, 1fr);
+			gap: 56px;
+		}
+		/* Column-major: 1–5 down the left, 6–10 down the right, so the ranking still
+		   reads top to bottom. */
+		.rank {
+			grid-template-rows: repeat(5, auto);
+			grid-auto-flow: column;
+			grid-auto-columns: minmax(0, 1fr);
+			column-gap: 6px;
+		}
 	}
 	/* The cover column and the banner height shrink TOGETHER at every breakpoint, so the
 	   column stays near 2:3 and `object-fit: cover` has almost nothing to crop. While the
@@ -839,20 +1098,29 @@
 		}
 		.sections {
 			gap: 40px;
-			padding-top: 40px;
+			padding-top: 32px;
 			padding-bottom: 56px;
 		}
-		.block h2 {
+		.row-head h2 {
 			font-size: 19px;
 		}
-		/* Snappy, touch-friendly horizontal carousels. */
+		.updates {
+			grid-template-columns: minmax(0, 1fr);
+			gap: 4px;
+		}
+		/* One column is a long scroll before Trending; the rest are one tap away. */
+		.upd:nth-child(n + 9) {
+			display: none;
+		}
+		.rank {
+			grid-template-rows: none;
+			grid-auto-flow: row;
+		}
+		/* Snappy, touch-friendly horizontal carousel. */
 		.row {
 			gap: 16px;
 			scroll-snap-type: x proximity;
 			-webkit-overflow-scrolling: touch;
-		}
-		.genres {
-			gap: 8px;
 		}
 	}
 </style>

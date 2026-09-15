@@ -1,18 +1,22 @@
 <script lang="ts">
+	import type { AccessMode } from '@komika/api';
+	import { runsLocalServer } from '$lib/config';
 	import { setAccessMode } from '$lib/data';
 	import Button from '$lib/components/Button.svelte';
 	import Choice from '$lib/components/Choice.svelte';
 	import Onboarding from '$lib/components/Onboarding.svelte';
 	import { labels, next, stepNumber, wizard } from '../wizard.svelte';
 
-	// B3: who reaches this server. "Internet" adds the Cloudflare step; on the desktop
-	// app's own server, "Only my devices" adds the home-network step.
+	// B3: who reaches this server. "Internet" adds the Cloudflare step and "without a
+	// domain" the address step; on the desktop app's own server, the home-network step
+	// follows either choice. The app's own server is not offered "without a domain":
+	// that is for a server on a public address (a cloud host), not a home computer.
 	let busy = $state(false);
 	let error = $state<string | null>(null);
 
-	const access = $derived(wizard.extra.access as 'local' | 'internet' | undefined);
+	const access = $derived(wizard.extra.access as AccessMode | undefined);
 
-	function choose(value: 'local' | 'internet'): void {
+	function choose(value: AccessMode): void {
 		wizard.extra = { ...wizard.extra, access: value };
 		error = null;
 	}
@@ -23,7 +27,7 @@
 			error = 'Choose one to continue.';
 			return;
 		}
-		// Internet mode is recorded once Cloudflare is set up (or done by hand).
+		// The public modes are recorded by their own step, with the domain or address.
 		if (access === 'local') {
 			busy = true;
 			try {
@@ -59,6 +63,15 @@
 			selected={access === 'internet'}
 			onselect={() => choose('internet')}
 		/>
+		{#if !runsLocalServer}
+			<Choice
+				icon="server"
+				title="Public without a domain"
+				detail="Readers type this server’s address. No Cloudflare. Encrypted with a free certificate."
+				selected={access === 'direct'}
+				onselect={() => choose('direct')}
+			/>
+		{/if}
 	</div>
 	{#if error}<p class="k-error" role="alert">{error}</p>{/if}
 	{#snippet footer()}

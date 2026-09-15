@@ -9,7 +9,7 @@ use std::path::PathBuf;
 /// FINAL link is done by Xcode via gen/apple):
 ///
 ///   * build.rs (here): bundles `libjvm.a` (the Zero VM — `JNI_CreateJavaVM` is
-///     referenced directly from `suwayomi_ios.rs`, so ld pulls the VM's members
+///     referenced directly from `suwayomi_inprocess_ios.rs`, so ld pulls the VM's members
 ///     transitively) and `libffi.a` (Zero calls native functions through libffi;
 ///     its symbols are referenced by the VM's objects) into the emitted
 ///     `libapp.a`. rustc's default `+bundle` semantics for `static=` libs makes
@@ -37,6 +37,15 @@ use std::path::PathBuf;
 ///     interposer), jli (launcher machinery; we invoke JNI directly), jdwp,
 ///     dt_socket, attach, instrument, management_agent (debug/agent infra),
 ///     j2pkcs11, j2gss, j2pcsc (smartcard/kerberos providers).
+///
+///   * One gap that no link flag can close: `libprefs.a` IS linked and kept, but the
+///     iOS build compiles it from the macOS sources, so it holds the natives of
+///     `MacOSXPreferencesFile` only, while the Java side defaults to
+///     `FileSystemPreferences` on iOS (`chmod`/`lockFile0`/`unlockFile0`: no such
+///     symbols anywhere in the artifact). `suwayomi_inprocess_ios.rs` selects the macOS backend
+///     with a VM option instead (`PREFS_FACTORY_OPT`). An audit of every `native`
+///     method in the jimage against the app binary (2026-10-05) found no other gap in
+///     a linked library.
 ///
 /// If the N4.1 artifact is absent this prints a warning and emits nothing:
 /// desktop and sim builds are unaffected, and an iOS DEVICE build fails at link
@@ -105,7 +114,7 @@ fn build_wx_shim(manifest_dir: &std::path::Path) {
 
   let clang = std::process::Command::new("xcrun")
     .args(["--sdk", "iphoneos", "clang++"])
-    .args(["-target", "arm64-apple-ios14.0", "-O2", "-c"])
+    .args(["-target", "arm64-apple-ios15.0", "-O2", "-c"])
     .arg(&src)
     .arg("-o")
     .arg(&obj)
@@ -126,7 +135,34 @@ fn build_wx_shim(manifest_dir: &std::path::Path) {
   println!("cargo:rustc-link-lib=static=ios_jvm_wx_shim");
 }
 
+/// A release build for iOS on Xcode 27 needs `llvm-objcopy` from rustup's `llvm-tools`
+/// component: swift-rs uses it to make the `@_cdecl` functions of each Swift package
+/// global again (Xcode 27 makes them local in a release build). Without the tool swift-rs
+/// skips that step, and the only message it prints is a warning of a dependency, which
+/// cargo does not show. The build then fails much later with "Undefined symbols:
+/// _register_plugin, _tauri_log, …". Say so here, where cargo does show it.
+fn warn_if_ios_release_lacks_objcopy() {
+  let ios = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios");
+  let release = std::env::var("PROFILE").as_deref() == Ok("release");
+  if !ios || !release {
+    return;
+  }
+  let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+  let Ok(out) = std::process::Command::new(rustc).args(["--print", "sysroot"]).output() else {
+    return;
+  };
+  let sysroot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+  let host = std::env::var("HOST").unwrap_or_default();
+  if !sysroot.join("lib/rustlib").join(host).join("bin/llvm-objcopy").exists() {
+    println!(
+      "cargo:warning=llvm-objcopy not found: an iOS release build on Xcode 27 will fail to \
+       link the Swift plugin symbols. Run `rustup component add llvm-tools` and build again."
+    );
+  }
+}
+
 fn main() {
+  warn_if_ios_release_lacks_objcopy();
   ios_device_jvm_link();
   tauri_build::build()
 }

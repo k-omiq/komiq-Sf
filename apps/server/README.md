@@ -31,10 +31,19 @@ provisioned at startup, never through registration). Needs the Suwayomi containe
 
 Self-host settings: `BIND_ADDR` (listener address, default `0.0.0.0`), `KOMIKA_WEB_DIR`
 (optional; serves `reader/` at `/` and `admin/` at `/admin` with an `index.html` SPA
-fallback, below every API route), `KOMIKA_INSTANCE_NAME` and `KOMIKA_REGISTRATION_OPEN`.
+fallback, below every API route), `KOMIKA_INSTANCE_NAME`, `KOMIKA_REGISTRATION_OPEN` and
+`KOMIKA_APPS_FETCH_THEMSELVES` (on: reader apps with their own source engine fetch chapter
+pages themselves and do not offer fetching through this server; the web reader is not
+affected).
 Instance settings read the env variable first, then the `instance_setting` table (changed
 from the admin console), then a default, so a value pinned in env cannot be changed at
-runtime. `registration_open` defaults to open.
+runtime. `registration_open` defaults to open, except on a self-hosted install
+(`KOMIKA_WEB_DIR` set), which starts closed until the owner opens it.
+
+An account created or reset by an admin holds a temporary password
+(`must_change_password`). Until it calls `changePassword`, the server answers only the
+`session` query (and `logout`) for it: calls that need a signed-in user are refused,
+and calls that work signed out answer as if it were signed out.
 
 MangaDex has two separate settings. **Usage** (`mangadex_enabled`: may this server talk
 to MangaDex at all — reading, covers, metadata, `/img`) resolves `KOMIKA_MANGADEX`
@@ -54,6 +63,45 @@ setup code to the log. The public `instance { setupRequired }` query reports the
 and `createOwner(setupCode, username, email, password)` creates the first admin with that
 code. The code lives in memory only, is never returned by the API, and is retired once the
 owner exists; a restart before then prints a new one.
+
+`komika-server setup` runs the same first-run steps in a terminal (`src/setup_cli.rs`),
+for a server with no screen. It is a GraphQL client of the running server
+(`http://127.0.0.1:$PORT`, or `--server <address>`): it opens no database and builds no
+server state, so every rule stays the server's own. `--setup-code <code>` (or
+`KOMIKA_SETUP_CODE`) supplies the setup code, and
+`--access <local|internet|tunnel|public-ip|direct>` skips the access question; `tunnel`
+and `public-ip` also choose the Cloudflare connection. `--encrypt <yes|no>` goes with
+`--access direct` only and answers the HTTPS question. `deploy/selfhost/install.sh` passes
+all three. The command refuses a plain `http://` `--server` address on the internet before
+any password is typed, and asks an account with a temporary password to choose a new one.
+A setup code given to a server that already has an owner changes nothing: the command says
+so and stops.
+
+Before a public choice, the terminal setup and the console show what the server found on
+its own machine (`accessPreflight`, `cloudflare::Manager::preflight`): whether
+`cloudflared` is found, will be downloaded or cannot be had, the state of the HTTPS port
+and of the certificate-check port (`free`, `serving`, `in_use`, `denied` or `unknown`),
+whether the server runs in a container, and its public address. Tunnel setup looks for
+`cloudflared` in `CLOUDFLARED_BIN`, then `PATH`, then `bin/` inside the Cloudflare folder
+(`KOMIKA_CLOUDFLARE_DIR`, default `cloudflare/` next to the database). When it finds none,
+the checklist line "Get the connector (cloudflared)" downloads the release pinned in
+`src/cloudflare/fetch_connector.rs` and checks its SHA-256 before saving it there. With
+`CLOUDFLARED_BIN` set it never downloads.
+
+The access choice (`setAccessMode`, shown by `accessStatus`) is `local`, `internet` (a
+domain with Cloudflare in front) or `direct` (public at the server's own address, no
+domain and no Cloudflare; `domain` then carries that address). `local`, `internet` and
+plain `direct` are display only: they do not change what the server listens on.
+`direct` with `encrypt: true` does: the server gets a Let's Encrypt certificate for the
+address (`src/cloudflare/acme.rs`, http-01 on port 80), serves HTTPS on
+`KOMIKA_HTTPS_PORT` and renews the certificate by itself (`src/cloudflare/direct.rs`).
+`cloudflare::plain_http_guard`, a layer of the public router, then stops handling plain
+HTTP requests from internet addresses once one of them has used HTTPS. `accessStatus.lanAddresses` lists the
+server's home network addresses (`src/lan.rs`); it is empty for a loopback-only listener
+and inside a container. `accessStatus.lanClientSeenAt` is the last time since boot that a
+device on the home network reached the server (never set inside a container); the desktop
+app's Home network step waits on it. HTML served from `KOMIKA_WEB_DIR` is sent with
+`Cache-Control: no-cache`, so a browser never reuses a page from before an update.
 
 The admin "manga DB" console (`apps/admin`) uses the admin-gated `updateSeriesAdmin`
 mutation to upsert per-series overrides (`series_admin` table): scan-interval override,

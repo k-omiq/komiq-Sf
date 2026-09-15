@@ -11,11 +11,11 @@
 //! *allowed* here (the opposite of the image path), so this module uses its own plain
 //! `reqwest::Client`, NOT `image_client()`. Loopback is not an authorization boundary
 //! on a shared desktop, so the engine additionally runs behind HTTP Basic auth with a
-//! per-run credential (see [`engine_password`]); every request this module makes
+//! per-run credential (see `engine_auth.rs`); every request this module makes
 //! carries it as a client default header.
 //!
 //! Nothing here runs unless the app spawns it; it does not touch `fetch_image` or any
-//! existing behavior. The boot recipe follows `suwayomi/SPIKE-FINDINGS.md` exactly
+//! existing behavior. The boot recipe follows `docs/plans/suwayomi/SPIKE-FINDINGS.md` exactly
 //! (pin: Suwayomi-Server v2.3.2243).
 
 use std::collections::VecDeque;
@@ -29,6 +29,15 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, State};
 use tokio::io::AsyncBufReadExt;
+
+// The engine credential, the authenticated client and the `server.conf` template are
+// shared with the in-process phone engine (`suwayomi_inprocess.rs`). Re-exported because the admin desktop
+// shell includes this module (`apps/admin/src-tauri`) and hands the credential to the
+// server it runs.
+#[path = "engine_auth.rs"]
+mod engine_auth;
+#[allow(unused_imports)] // read only by the admin desktop shell
+pub(crate) use engine_auth::{engine_password, ENGINE_AUTH_USER};
 
 /// Cold-start budget for the readiness gate (spike: ~5 s warm; recipe allows ~30 s).
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -52,10 +61,6 @@ const LOCK_HEARTBEAT: Duration = Duration::from_secs(15);
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(60);
 /// How often a refused engine lock is retried before the engine can start.
 const LOCK_RETRY: Duration = Duration::from_secs(5);
-/// Basic-auth username for the embedded engine; the password is the per-run secret.
-/// `pub(crate)` (with [`engine_password`]) because the admin desktop shell includes this
-/// module (`apps/admin/src-tauri`) and hands the credential to the server it runs.
-pub(crate) const ENGINE_AUTH_USER: &str = "komika";
 
 /// Lifecycle state, surfaced to JS as a lowercase string via `suwayomi_status`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -134,81 +139,6 @@ impl Drop for LockGuard {
   }
 }
 
-/// The engine's Basic-auth password, generated once per app run. The conf is rewritten
-/// with it before every (re)launch and the supervisor's client sends it on every request,
-/// so an in-run engine restart keeps working while a credential never outlives the process.
-pub(crate) fn engine_password() -> &'static str {
-  static PASSWORD: OnceLock<String> = OnceLock::new();
-  PASSWORD.get_or_init(random_token)
-}
-
-/// 128 bits of process-local entropy as hex, without adding an RNG dependency for one
-/// loopback credential: `RandomState`'s SipHash keys are seeded from the OS the first
-/// time the process uses them and are not observable from another process.
-fn random_token() -> String {
-  use std::collections::hash_map::RandomState;
-  use std::hash::{BuildHasher, Hasher};
-  let nonce = std::time::SystemTime::now()
-    .duration_since(std::time::UNIX_EPOCH)
-    .map(|d| d.as_nanos() as u64)
-    .unwrap_or_default()
-    ^ u64::from(std::process::id());
-  let mut token = String::with_capacity(32);
-  for round in 0..2u64 {
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u64(nonce ^ round);
-    token.push_str(&format!("{:016x}", hasher.finish()));
-  }
-  token
-}
-
-/// Render an `Authorization: Basic …` value. Base64 is inlined rather than pulled in as a
-/// dependency: this is the only encoder the crate needs and the input shape is fixed.
-fn basic_auth_value(user: &str, password: &str) -> String {
-  const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  let raw = format!("{user}:{password}");
-  let bytes = raw.as_bytes();
-  let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-  for chunk in bytes.chunks(3) {
-    let triple = ((chunk[0] as u32) << 16)
-      | ((*chunk.get(1).unwrap_or(&0) as u32) << 8)
-      | (*chunk.get(2).unwrap_or(&0) as u32);
-    encoded.push(ALPHABET[((triple >> 18) & 0x3f) as usize] as char);
-    encoded.push(ALPHABET[((triple >> 12) & 0x3f) as usize] as char);
-    // The trailing group is padded, not truncated: 1 byte → "xx==", 2 bytes → "xxx=".
-    encoded.push(if chunk.len() > 1 {
-      ALPHABET[((triple >> 6) & 0x3f) as usize] as char
-    } else {
-      '='
-    });
-    encoded.push(if chunk.len() > 2 {
-      ALPHABET[(triple & 0x3f) as usize] as char
-    } else {
-      '='
-    });
-  }
-  format!("Basic {encoded}")
-}
-
-/// Build the supervisor's HTTP client. The engine credential rides as a default header so
-/// every caller of this client — the readiness poll, the `suwayomi_gql`/`suwayomi_image`
-/// proxies, and `cloudflare::apply_settings` (handed a clone) — is authenticated without
-/// the secret being threaded through each call site.
-fn build_client() -> reqwest::Client {
-  let mut auth =
-    reqwest::header::HeaderValue::from_str(&basic_auth_value(ENGINE_AUTH_USER, engine_password()))
-      .expect("basic auth header is ascii");
-  auth.set_sensitive(true);
-  let mut headers = reqwest::header::HeaderMap::new();
-  headers.insert(reqwest::header::AUTHORIZATION, auth);
-  reqwest::Client::builder()
-    .timeout(HTTP_TIMEOUT)
-    .default_headers(headers)
-    // No redirect policy / SSRF host guard here on purpose: loopback is allowed.
-    .build()
-    .expect("build suwayomi http client")
-}
-
 /// Owns the embedded engine's shared state, HTTP client, and shutdown signal.
 pub struct SuwayomiSupervisor {
   inner: Mutex<Inner>,
@@ -227,7 +157,7 @@ pub struct SuwayomiSupervisor {
 
 impl SuwayomiSupervisor {
   pub fn new() -> Self {
-    let client = build_client();
+    let client = engine_auth::build_client(HTTP_TIMEOUT);
     SuwayomiSupervisor {
       inner: Mutex::new(Inner {
         port: None,
@@ -335,39 +265,11 @@ fn broker_port() -> std::io::Result<u16> {
   Ok(port)
 }
 
-/// Render the authoritative HOCON `server.conf`. The persisted conf is authoritative
-/// (JVM `-Dserver.*` sysprops do NOT reliably override Suwayomi's reactive config), so
-/// this is rewritten before every launch. `kcefEnabled = false` is CRITICAL (else the
-/// server downloads 226 MB of Chromium and SIGTRAPs headless).
-///
-/// The `authMode`/`authUsername`/`authPassword` trio is v2.3.2243's authentication
-/// surface (the older `basicAuth*` keys are deprecated and migrate onto these), and
-/// `BASIC_AUTH` is the enum constant name the config parser expects. It is not optional
-/// hardening: the engine's GraphQL API can add extension repos and install extensions,
-/// i.e. run arbitrary JVM code in-process, and a loopback bind keeps out *remote* callers
-/// only — every other process on the machine can reach 127.0.0.1 just as easily as we can.
-fn render_server_conf(port: u16) -> String {
-  format!(
-    "server.ip = \"127.0.0.1\"\n\
-     server.port = {port}\n\
-     server.webUIEnabled = false\n\
-     server.initialOpenInBrowserEnabled = false\n\
-     server.systemTrayEnabled = false\n\
-     server.kcefEnabled = false\n\
-     server.flareSolverrEnabled = false\n\
-     server.authMode = \"BASIC_AUTH\"\n\
-     server.authUsername = \"{user}\"\n\
-     server.authPassword = \"{password}\"\n",
-    user = ENGINE_AUTH_USER,
-    password = engine_password()
-  )
-}
-
 /// Write `server.conf` into the data dir (creating it), and best-effort remove any
 /// previously downloaded kcef payload so a stale copy can't be re-used.
 fn prepare_data_dir(data_dir: &Path, port: u16) -> Result<(), String> {
   std::fs::create_dir_all(data_dir).map_err(|e| format!("create data dir: {e}"))?;
-  std::fs::write(data_dir.join("server.conf"), render_server_conf(port))
+  std::fs::write(data_dir.join("server.conf"), engine_auth::render_server_conf(port))
     .map_err(|e| format!("write server.conf: {e}"))?;
   let kcef = data_dir.join("bin").join("kcef");
   let _ = std::fs::remove_dir_all(&kcef);
@@ -828,12 +730,15 @@ async fn run_lock_heartbeat(sup: Arc<SuwayomiSupervisor>) {
 /// sets `Degraded`, and returns — it never aborts app startup, and a held lock only defers
 /// the launch (see `run_engine`). The supervisor is always started; the JS-side flag gates
 /// *use*, and an unused engine is harmless (nothing calls it).
-pub fn start(app: AppHandle) {
+///
+/// Returns whether the supervision loop was launched. `false` means nothing runs (the
+/// bundled engine could not be resolved), so a caller may call `start` again later.
+pub fn start(app: AppHandle) -> bool {
   let sup = match app.try_state::<Arc<SuwayomiSupervisor>>() {
     Some(s) => s.inner().clone(),
     None => {
       log::error!(target: "suwayomi", "supervisor state not managed; skipping start");
-      return;
+      return false;
     }
   };
 
@@ -842,11 +747,12 @@ pub fn start(app: AppHandle) {
     Err(e) => {
       log::warn!(target: "suwayomi", "engine unavailable: {e}");
       sup.transition(EngineState::Degraded, Some(e));
-      return;
+      return false;
     }
   };
 
   tauri::async_runtime::spawn(run_engine(app, sup, cfg));
+  true
 }
 
 /// Take the single-instance lock, wire the Cloudflare shim, then run the supervision
@@ -992,30 +898,29 @@ fn percent_decode_once(s: &str) -> String {
   String::from_utf8_lossy(&out).into_owned()
 }
 
-/// IPC-proxy transport for engine image bytes: stream a page/proxy image from the
-/// LOOPBACK engine's own `/api/` routes over IPC and hand the raw bytes to JS. This is
-/// the image counterpart to `suwayomi_gql` — the native `NativeImageProvider` passes a
-/// relative Suwayomi path (e.g. `/api/v1/manga/3/chapter/1/page/0`) and gets back an
-/// `ArrayBuffer`, so the engine (not the JS side) applies the extension's request
-/// context, the port stays hidden, and CSP stays `connect-src 'self' ipc:`.
+/// One image from the LOOPBACK engine's own `/api/` routes: its bytes and the content
+/// type the engine gave it. The caller passes a relative Suwayomi path (e.g.
+/// `/api/v1/manga/3/chapter/1/page/0`), so the engine (not the JS side) applies the
+/// extension's request context and the port and the password stay hidden. The reader's
+/// `engine-image` address handler (`lib.rs`) serves this to the web view, which then
+/// loads a chapter's pages by itself, one by one.
 ///
 /// Loopback is INTENTIONAL here (the inverse of `fetch_image`, whose host guard blocks
 /// 127.0.0.1). The SSRF containment is the `/api/` path guard in `validate_image_path`:
-/// this command can only ever hit the engine's own routes, never an arbitrary URL. The
+/// this can only ever hit the engine's own routes, never an arbitrary URL. The
 /// body is size-capped exactly like `fetch_image`'s `read_capped` (`MAX_IMAGE_BYTES`).
-#[tauri::command]
-pub async fn suwayomi_image(
-  state: State<'_, Arc<SuwayomiSupervisor>>,
-  path: String,
-) -> Result<tauri::ipc::Response, String> {
-  validate_image_path(&path)?;
+pub async fn engine_image(
+  sup: &SuwayomiSupervisor,
+  path: &str,
+) -> Result<(Vec<u8>, Option<String>), String> {
+  validate_image_path(path)?;
   // Share the process-wide image concurrency cap with `fetch_image` so the two
   // paths together can't stack N × MAX_IMAGE_BYTES of native heap.
   let _permit = crate::image_fetch_semaphore()
     .acquire()
     .await
     .map_err(|_| "image fetch pool closed".to_string())?;
-  let (port, client) = state
+  let (port, client) = sup
     .ready_endpoint()
     .ok_or_else(|| "suwayomi engine not ready".to_string())?;
   let resp = client
@@ -1034,6 +939,11 @@ pub async fn suwayomi_image(
       return Err(format!("image too large: {len} bytes"));
     }
   }
+  let content_type = resp
+    .headers()
+    .get(reqwest::header::CONTENT_TYPE)
+    .and_then(|value| value.to_str().ok())
+    .map(str::to_owned);
   let mut buf: Vec<u8> = Vec::new();
   let mut resp = resp;
   while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
@@ -1042,7 +952,18 @@ pub async fn suwayomi_image(
     }
     buf.extend_from_slice(&chunk);
   }
-  Ok(tauri::ipc::Response::new(buf))
+  Ok((buf, content_type))
+}
+
+/// IPC transport for the same bytes. The reader's pages use the `engine-image` address
+/// (`lib.rs`) now; this stays for callers that want the bytes in JavaScript.
+#[tauri::command]
+pub async fn suwayomi_image(
+  state: State<'_, Arc<SuwayomiSupervisor>>,
+  path: String,
+) -> Result<tauri::ipc::Response, String> {
+  let (bytes, _) = engine_image(&state, &path).await?;
+  Ok(tauri::ipc::Response::new(bytes))
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -1050,44 +971,6 @@ pub async fn suwayomi_image(
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn server_conf_has_required_lines_and_kcef_off() {
-    let conf = render_server_conf(54321);
-    assert!(conf.contains("server.ip = \"127.0.0.1\""));
-    assert!(conf.contains("server.port = 54321"));
-    assert!(conf.contains("server.webUIEnabled = false"));
-    assert!(conf.contains("server.initialOpenInBrowserEnabled = false"));
-    assert!(conf.contains("server.systemTrayEnabled = false"));
-    // The two lines that keep the JVM from crashing / phoning out.
-    assert!(conf.contains("server.kcefEnabled = false"));
-    assert!(conf.contains("server.flareSolverrEnabled = false"));
-    // Auth is mandatory: loopback keeps remote callers out, not local ones.
-    assert!(conf.contains("server.authMode = \"BASIC_AUTH\""));
-    assert!(conf.contains(&format!("server.authUsername = \"{ENGINE_AUTH_USER}\"")));
-    assert!(conf.contains(&format!("server.authPassword = \"{}\"", engine_password())));
-  }
-
-  #[test]
-  fn engine_password_is_stable_and_unguessable() {
-    let password = engine_password();
-    assert_eq!(password, engine_password(), "one credential per process");
-    assert_eq!(password.len(), 32, "128 bits of hex");
-    assert!(password.chars().all(|c| c.is_ascii_hexdigit()));
-    // Two fresh draws must not collide (a constant token would defeat the whole point).
-    assert_ne!(random_token(), random_token());
-  }
-
-  #[test]
-  fn basic_auth_value_matches_rfc_vector() {
-    // RFC 7617's own example, which also exercises both padding lengths.
-    assert_eq!(
-      basic_auth_value("Aladdin", "open sesame"),
-      "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
-    );
-    assert_eq!(basic_auth_value("a", "b"), "Basic YTpi");
-    assert_eq!(basic_auth_value("ab", "c"), "Basic YWI6Yw==");
-  }
 
   #[test]
   fn image_path_guard_accepts_engine_api_routes() {
@@ -1223,7 +1106,7 @@ mod tests {
     };
     // Must be the supervisor's own client: the conf we write enables Basic auth, so a
     // credential-less client would poll a 401 until the readiness gate gave up.
-    let client = build_client();
+    let client = engine_auth::build_client(HTTP_TIMEOUT);
 
     // Boot: broker port, write conf, spawn, poll aboutServer.
     let (mut child, port, version) = boot_engine(&cfg, &client, Duration::from_secs(60))
@@ -1231,6 +1114,33 @@ mod tests {
       .expect("engine should boot and report aboutServer");
     assert!(port > 0);
     assert!(!version.is_empty(), "aboutServer returned a version");
+
+    // The engine itself must refuse a caller without the credential. This is the same
+    // jar and the same `server.conf` template the iOS engine runs.
+    let url = format!("http://127.0.0.1:{port}/api/graphql");
+    let about = json!({ "query": "{ aboutServer { version } }" }).to_string();
+    let post = |c: &reqwest::Client| {
+      c.post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(about.clone())
+        .send()
+    };
+    let anonymous = reqwest::Client::new();
+    assert_eq!(
+      post(&anonymous).await.expect("anonymous request").status(),
+      reqwest::StatusCode::UNAUTHORIZED,
+      "a request with no Authorization header must get 401"
+    );
+    let wrong = anonymous
+      .post(&url)
+      .header(reqwest::header::CONTENT_TYPE, "application/json")
+      .basic_auth(ENGINE_AUTH_USER, Some("not-the-password"))
+      .body(about.clone())
+      .send()
+      .await
+      .expect("wrong-password request");
+    assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(post(&client).await.expect("authenticated request").status().is_success());
 
     // The conf we wrote must have kcef disabled (else the JVM would SIGTRAP).
     let conf = std::fs::read_to_string(data_dir.join("server.conf")).unwrap();

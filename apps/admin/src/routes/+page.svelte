@@ -17,6 +17,7 @@
 	import Button from '$lib/components/Button.svelte';
 	import Cover from '$lib/components/Cover.svelte';
 	import Dialog from '$lib/components/Dialog.svelte';
+	import GettingStarted from '$lib/components/GettingStarted.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import LoadState from '$lib/components/LoadState.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
@@ -115,6 +116,10 @@
 	);
 	/** A page is on screen (not the first load, not a failed one), so a count means something. */
 	const listed = $derived(!loadError && !(loading && series.length === 0));
+	/** A catalogue request has answered at least once (before that, `series` is just empty). */
+	let answered = $state(false);
+	/** The first page of the whole catalogue is on screen: what the first-run card reads. */
+	const unfiltered = $derived(answered && listed && !loading && !appliedQuery && page === 1);
 
 	// ---- source/extension provenance (seriesSourcesBatch) ----
 	let provenance = $state<Record<string, SeriesSourceGroup>>({});
@@ -346,6 +351,7 @@
 			series = res.items;
 			total = res.total;
 			hasNextPage = res.hasNextPage;
+			answered = true;
 			// Learn the server's page size from any full page (a page with more to
 			// follow is full); keep the last known size otherwise.
 			if (res.hasNextPage && res.items.length > 0) pageSize = res.items.length;
@@ -657,6 +663,11 @@
 	<PageHeader
 		title="Catalog"
 		description="Find a series, set how often it is scanned, add it to the catalogue, or merge duplicates."
+	/>
+
+	<GettingStarted
+		empty={unfiltered && series.length === 0}
+		hasSeries={unfiltered ? series.length > 0 : null}
 	/>
 
 	<div class="find">

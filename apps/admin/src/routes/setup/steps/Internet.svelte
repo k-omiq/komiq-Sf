@@ -64,11 +64,21 @@
 	{#snippet footer()}
 		<Button variant="ghost" icon="arrow-left" onclick={back} disabled={busy}>Back</Button>
 		{#if phase === 'form'}
-			<Button variant="primary" {busy} onclick={() => setup?.start()}>Set up</Button>
+			<!-- "Set up later" saves no access mode: the summary then says so. -->
+			<span class="actions">
+				<Button variant="ghost" onclick={next} disabled={busy}>Set up later</Button>
+				<Button variant="primary" {busy} onclick={() => setup?.start()}>Set up</Button>
+			</span>
 		{:else if phase === 'running'}
 			<Button variant="primary" busy>Setting up…</Button>
 		{:else if phase === 'manual'}
 			<Button variant="primary" busy={saving} onclick={finishManual}>Continue</Button>
+		{:else if phase === 'paused'}
+			<!-- Set up before, then turned off by another access choice. -->
+			<span class="actions">
+				<Button variant="ghost" onclick={next} disabled={busy}>Set up later</Button>
+				<Button variant="primary" {busy} onclick={() => setup?.turnOn()}>Turn on</Button>
+			</span>
 		{:else if phase === 'failed'}
 			<Button variant="ghost" onclick={next}>Skip for now</Button>
 		{:else}
@@ -76,3 +86,10 @@
 		{/if}
 	{/snippet}
 </Onboarding>
+
+<style>
+	.actions {
+		display: inline-flex;
+		gap: var(--k-space-2);
+	}
+</style>
