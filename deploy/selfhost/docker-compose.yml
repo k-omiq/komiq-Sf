@@ -27,6 +27,8 @@ services:
       dockerfile: deploy/selfhost/Dockerfile
     image: komiq-selfhost:local
     restart: unless-stopped
+    # The server drains requests and buffered writes within 20s.
+    stop_grace_period: 30s
     # Reaps child processes (cloudflared, when a tunnel is set up) and forwards
     # stop signals.
     init: true

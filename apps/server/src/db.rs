@@ -1,9 +1,130 @@
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::SqlitePool;
+use sqlx::{ConnectOptions, SqlitePool};
+
+static WRITE_QUEUE_WAIT_MICROS: AtomicU64 = AtomicU64::new(0);
+static WRITE_QUEUE_ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
+static LOCK_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+pub fn write_queue_wait_seconds() -> f64 {
+    WRITE_QUEUE_WAIT_MICROS.load(Ordering::Relaxed) as f64 / 1_000_000.0
+}
+
+pub fn write_queue_acquisitions() -> u64 {
+    WRITE_QUEUE_ACQUISITIONS.load(Ordering::Relaxed)
+}
+
+pub fn lock_error_count() -> u64 {
+    LOCK_ERRORS.load(Ordering::Relaxed)
+}
+
+fn database_file(database_url: &str) -> Result<Option<PathBuf>> {
+    let opts = SqliteConnectOptions::from_str(database_url)?;
+    if opts
+        .to_url_lossy()
+        .query_pairs()
+        .any(|(key, value)| key == "mode" && value == "memory")
+    {
+        return Ok(None);
+    }
+    Ok(Some(opts.get_filename().to_owned()))
+}
+
+/// Keep this guard alive until the server exits. SQLite's sqlx migrator has no
+/// inter-process lock, and a second server must not run on the same data directory.
+pub struct DataDirectoryLock {
+    _file: Option<File>,
+}
+
+impl DataDirectoryLock {
+    pub fn acquire(database_url: &str) -> Result<Self> {
+        let Some(database) = database_file(database_url)? else {
+            return Ok(Self { _file: None });
+        };
+        let directory = database.parent().unwrap_or_else(|| Path::new("."));
+        let lock_path = directory.join(".komiq-server.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("open data-directory lock {}", lock_path.display()))?;
+        file.try_lock().with_context(|| {
+            format!(
+                "cannot lock {}; another server may be using this data directory",
+                lock_path.display()
+            )
+        })?;
+        Ok(Self { _file: Some(file) })
+    }
+}
+
+/// Connect beside a running server without creating the file or changing schema.
+/// Validate every embedded migration, including checksums, before permitting CLI work.
+pub async fn connect_existing(database_url: &str) -> Result<SqlitePool> {
+    let opts = SqliteConnectOptions::from_str(database_url)?
+        .create_if_missing(false)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(15));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(3))
+        .connect_with(opts)
+        .await?;
+    let schema = validate_schema(&pool).await;
+    if let Err(error) = schema {
+        pool.close().await;
+        return Err(error);
+    }
+    Ok(pool)
+}
+
+async fn validate_schema(pool: &SqlitePool) -> Result<()> {
+    let applied: Vec<(i64, Vec<u8>, bool)> =
+        sqlx::query_as("SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(pool)
+            .await
+            .context(
+                "schema is behind or uninitialized; start the server to apply migrations first",
+            )?;
+    let migrations = sqlx::migrate!("./migrations");
+    for migration in migrations
+        .iter()
+        .filter(|migration| !migration.migration_type.is_down_migration())
+    {
+        let Some((_, checksum, success)) = applied
+            .iter()
+            .find(|(version, _, _)| *version == migration.version)
+        else {
+            anyhow::bail!(
+                "schema is behind: missing migration {}; start the server to migrate first",
+                migration.version
+            );
+        };
+        anyhow::ensure!(*success, "migration {} is unfinished", migration.version);
+        anyhow::ensure!(
+            checksum.as_slice() == migration.checksum.as_ref(),
+            "migration {} checksum differs from this binary",
+            migration.version
+        );
+    }
+    for (version, _, _) in applied {
+        anyhow::ensure!(
+            migrations
+                .iter()
+                .any(|migration| migration.version == version),
+            "database migration {version} is unknown to this binary"
+        );
+    }
+    Ok(())
+}
 
 /// True if `e` is a transient SQLite lock/BUSY error worth retrying, rather than a
 /// real failure.
@@ -21,7 +142,11 @@ use sqlx::SqlitePool;
 /// sqlx/libsqlite error wrapping used by the different call sites.
 pub fn is_locked_error(e: &anyhow::Error) -> bool {
     let s = e.to_string();
-    s.contains("database is locked") || s.contains("database table is locked")
+    let locked = s.contains("database is locked") || s.contains("database table is locked");
+    if locked {
+        LOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
+    locked
 }
 
 /// Open (creating if needed) the SQLite database and run migrations.
@@ -70,6 +195,80 @@ pub async fn init(database_url: &str) -> Result<SqlitePool> {
 /// migration directory) — there is no FK to `work` because that table lives in the
 /// other DB; an orphaned blob (its work deleted) is harmless and re-derivable.
 pub async fn init_covers(database_url: &str) -> Result<SqlitePool> {
+    match open_covers(database_url).await {
+        Ok(pool) => Ok(pool),
+        Err(error) if covers_file_failure(&error) => {
+            let Some(path) = database_file(database_url)? else {
+                return Err(error);
+            };
+            if !path.try_exists()? {
+                return Err(error);
+            }
+            let quarantined = quarantine_covers(&path)?;
+            tracing::warn!(error = %error, file = %quarantined.display(),
+                "cover cache unavailable; preserved old files and recreating derived covers");
+            open_covers(database_url).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn covers_file_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|error| {
+        error
+            .downcast_ref::<sqlx::Error>()
+            .and_then(sqlx::Error::as_database_error)
+            .and_then(|error| error.code())
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some_and(|code| matches!(code & 0xff, 11 | 14 | 26))
+    })
+}
+
+fn quarantine_covers(path: &Path) -> Result<PathBuf> {
+    let mut destination = path.as_os_str().to_owned();
+    destination.push(format!(".quarantined-{}", uuid::Uuid::new_v4()));
+    let destination = PathBuf::from(destination);
+    // All handles are closed before renaming. Preserve the WAL and shared-memory
+    // siblings too; leaving them beside the new DB can replay stale cache pages.
+    // Move sidecars before the database. If a sidecar cannot be moved, boot aborts
+    // with the original main file still present rather than creating a new file
+    // alongside an old WAL on the next attempt.
+    for suffix in ["-wal", "-shm"] {
+        let mut source = path.as_os_str().to_owned();
+        source.push(suffix);
+        let source = PathBuf::from(source);
+        if source.try_exists()? {
+            let mut target = destination.as_os_str().to_owned();
+            target.push(suffix);
+            std::fs::rename(source, target).context("preserve cover-cache SQLite sidecar")?;
+        }
+    }
+    std::fs::rename(path, &destination).context("preserve unavailable cover cache")?;
+    Ok(destination)
+}
+
+/// Maintenance commands must never recreate or upgrade a live cover cache.
+pub async fn connect_existing_covers(database_url: &str) -> Result<SqlitePool> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(3))
+        .connect_with(
+            SqliteConnectOptions::from_str(database_url)?
+                .create_if_missing(false)
+                .busy_timeout(Duration::from_secs(15)),
+        )
+        .await?;
+    if let Err(error) = sqlx::query("SELECT work_id, version FROM work_cover_blob LIMIT 1")
+        .fetch_optional(&pool)
+        .await
+    {
+        pool.close().await;
+        return Err(error.into());
+    }
+    Ok(pool)
+}
+
+async fn open_covers(database_url: &str) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
@@ -91,85 +290,163 @@ pub async fn init_covers(database_url: &str) -> Result<SqlitePool> {
         .max_connections(4)
         .connect_with(opts)
         .await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS work_cover_blob (\
+    let schema = async {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS work_cover_blob (\
              work_id    TEXT PRIMARY KEY,\
              webp       BLOB NOT NULL,\
              version    INTEGER NOT NULL,\
              updated_at TEXT NOT NULL\
          )",
-    )
-    .execute(&pool)
-    .await?;
-    // Resized, origin-cached Suwayomi SOURCE covers, keyed by numeric Suwayomi manga
-    // id. The discovery/browse/search feeds hand back the raw `/api/v1/manga/{id}/
-    // thumbnail` proxy path (full-resolution, up to several MB), so `serve_suwayomi_image`
-    // downscales each cover to a bounded WebP on first request and caches it here.
-    // Same rationale as `work_cover_blob`: large, re-derivable, and deliberately
-    // excluded from Litestream backup.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS suwayomi_cover_blob (\
+        )
+        .execute(&pool)
+        .await?;
+        // Resized, origin-cached Suwayomi SOURCE covers, keyed by numeric Suwayomi manga
+        // id. The discovery/browse/search feeds hand back the raw `/api/v1/manga/{id}/
+        // thumbnail` proxy path (full-resolution, up to several MB), so `serve_suwayomi_image`
+        // downscales each cover to a bounded WebP on first request and caches it here.
+        // Same rationale as `work_cover_blob`: large, re-derivable, and deliberately
+        // excluded from Litestream backup.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS suwayomi_cover_blob (\
              manga_id   INTEGER PRIMARY KEY,\
              webp       BLOB NOT NULL,\
              updated_at TEXT NOT NULL\
          )",
-    )
-    .execute(&pool)
-    .await?;
-    // Card-sized derivatives of the two cover masters above, generated lazily when a
-    // request asks for an allowlisted `?w=` (see `cover::VARIANT_WIDTHS`). `asset_key`
-    // namespaces the families that share this table: `w_…` for a canonical work,
-    // `s:<manga_id>` for a Suwayomi source cover. Purely derived and re-generable from
-    // the master on the next request, so — like the masters — it is deliberately
-    // excluded from Litestream backup, and dropping the table is always safe.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS cover_variant (\
+        )
+        .execute(&pool)
+        .await?;
+        // Card-sized derivatives of the two cover masters above, generated lazily when a
+        // request asks for an allowlisted `?w=` (see `cover::VARIANT_WIDTHS`). `asset_key`
+        // namespaces the families that share this table: `w_…` for a canonical work,
+        // `s:<manga_id>` for a Suwayomi source cover. Purely derived and re-generable from
+        // the master on the next request, so — like the masters — it is deliberately
+        // excluded from Litestream backup, and dropping the table is always safe.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS cover_variant (\
              asset_key  TEXT NOT NULL,\
              width      INTEGER NOT NULL,\
              webp       BLOB NOT NULL,\
              updated_at TEXT NOT NULL,\
              PRIMARY KEY (asset_key, width)\
          )",
-    )
-    .execute(&pool)
-    .await?;
-    // Durable cursors for one-shot maintenance passes over this DB. One row per pass,
-    // holding the highest key it has already handled, so a restart resumes instead of
-    // re-scanning 20 GB of blobs. Lives here (not the main DB) because both the data it
-    // walks and the progress marker are cover-cache state: dropping this file loses the
-    // cursor and the covers together, which is consistent, and neither needs backup.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS cover_maintenance (\
+        )
+        .execute(&pool)
+        .await?;
+        // Durable cursors for one-shot maintenance passes over this DB. One row per pass,
+        // holding the highest key it has already handled, so a restart resumes instead of
+        // re-scanning 20 GB of blobs. Lives here (not the main DB) because both the data it
+        // walks and the progress marker are cover-cache state: dropping this file loses the
+        // cursor and the covers together, which is consistent, and neither needs backup.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS cover_maintenance (\
              key        TEXT PRIMARY KEY,\
              cursor     TEXT NOT NULL,\
              done       INTEGER NOT NULL DEFAULT 0,\
              updated_at TEXT NOT NULL\
          )",
-    )
-    .execute(&pool)
-    .await?;
-    // Extension icons Keiyoushi published AFTER the vendored snapshot in
-    // `assets/ext-icons/` was taken (refreshed by `scripts/fetch-ext-icons.mjs`).
-    // The baked-in set is authoritative and answers essentially every request;
-    // this table only backfills extensions added upstream since, so the icons
-    // don't go stale between snapshot refreshes. Same rationale as the cover
-    // tables for living here: re-derivable from Keiyoushi, so deliberately
-    // excluded from Litestream backup.
-    //
-    // An EMPTY `png` is a tombstone, not an icon: ~41 extensions publish no icon
-    // in either source, and without a recorded miss every request for one would
-    // re-fetch from Keiyoushi. `serve_ext_icon` serves 404 for a tombstone and
-    // only re-checks upstream once it ages past its TTL.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS extension_icon_blob (\
+        )
+        .execute(&pool)
+        .await?;
+        // Extension icons Keiyoushi published AFTER the vendored snapshot in
+        // `assets/ext-icons/` was taken (refreshed by `scripts/fetch-ext-icons.mjs`).
+        // The baked-in set is authoritative and answers essentially every request;
+        // this table only backfills extensions added upstream since, so the icons
+        // don't go stale between snapshot refreshes. Same rationale as the cover
+        // tables for living here: re-derivable from Keiyoushi, so deliberately
+        // excluded from Litestream backup.
+        //
+        // An EMPTY `png` is a tombstone, not an icon: ~41 extensions publish no icon
+        // in either source, and without a recorded miss every request for one would
+        // re-fetch from Keiyoushi. `serve_ext_icon` serves 404 for a tombstone and
+        // only re-checks upstream once it ages past its TTL.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS extension_icon_blob (\
              pkg_name   TEXT PRIMARY KEY,\
              png        BLOB NOT NULL,\
              updated_at TEXT NOT NULL\
          )",
-    )
-    .execute(&pool)
-    .await?;
+        )
+        .execute(&pool)
+        .await?;
+        // Touch every cache table's key index, without reading the 20 GB of blobs.
+        // Open/schema failures and corruption found here take the same recovery path.
+        for table in [
+            "work_cover_blob",
+            "suwayomi_cover_blob",
+            "cover_variant",
+            "cover_maintenance",
+            "extension_icon_blob",
+        ] {
+            sqlx::query(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await?;
+        }
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if let Err(error) = schema {
+        pool.close().await;
+        return Err(error.into());
+    }
     Ok(pool)
+}
+
+/// Repair dangling pointers even when only part of the cover cache is missing.
+/// Each write is bounded and conditional on the value we inspected, so another
+/// materializer cannot have its freshly updated pointer cleared by this pass.
+pub async fn reconcile_cover_pointers(pool: &SqlitePool, covers: &SqlitePool) -> Result<u64> {
+    const BATCH: i64 = 256;
+    let mut cursor = String::new();
+    let mut cleared = 0;
+    loop {
+        let pointers: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT id, cover_cached_version FROM work \
+             WHERE id > ? AND cover_cached_version IS NOT NULL ORDER BY id LIMIT ?",
+        )
+        .bind(&cursor)
+        .bind(BATCH)
+        .fetch_all(pool)
+        .await?;
+        let Some((last, _)) = pointers.last() else {
+            break;
+        };
+        cursor.clone_from(last);
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT work_id FROM work_cover_blob WHERE work_id IN (",
+        );
+        let mut ids = query.separated(",");
+        for (id, _) in &pointers {
+            ids.push_bind(id);
+        }
+        ids.push_unseparated(")");
+        let present: std::collections::HashSet<String> = query
+            .build_query_scalar()
+            .fetch_all(covers)
+            .await?
+            .into_iter()
+            .collect();
+        let missing: Vec<_> = pointers
+            .iter()
+            .filter(|(id, _)| !present.contains(id))
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+        for (id, version) in missing {
+            cleared += sqlx::query(
+                "UPDATE work SET cover_cached_version = NULL WHERE id = ? AND cover_cached_version = ?",
+            )
+            .bind(id)
+            .bind(version)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+        }
+        transaction.commit().await?;
+    }
+    Ok(cleared)
 }
 
 /// Tables whose `sqlite_stat1` rows the planner actually depends on, and whose row
@@ -278,4 +555,220 @@ async fn refresh_statistics(pool: &SqlitePool) {
         elapsed_ms = started.elapsed().as_millis() as u64,
         "analyze: query statistics refreshed"
     );
+}
+
+#[cfg(test)]
+mod boot_tests {
+    use super::*;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("komiq-boot-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn url(&self, name: &str) -> String {
+            format!("sqlite://{}", self.0.join(name).display())
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn data_directory_lock_excludes_a_second_process_and_releases_on_drop() {
+        let scratch = Scratch::new();
+        let url = scratch.url("main.sqlite3");
+        let guard = DataDirectoryLock::acquire(&url).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "db::boot_tests::lock_child", "--nocapture"])
+            .env("KOMIQ_TEST_LOCK_DATABASE", &url)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "child could acquire the server's lifetime lock"
+        );
+        drop(guard);
+        let _next_server = DataDirectoryLock::acquire(&url).unwrap();
+    }
+
+    #[test]
+    fn lock_child() {
+        if let Ok(url) = std::env::var("KOMIQ_TEST_LOCK_DATABASE") {
+            assert!(DataDirectoryLock::acquire(&url).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_connection_rejects_a_missing_database_without_creating_it() {
+        let scratch = Scratch::new();
+        assert!(connect_existing(&scratch.url("missing.sqlite3"))
+            .await
+            .is_err());
+        assert!(!scratch.0.join("missing.sqlite3").exists());
+    }
+
+    #[tokio::test]
+    async fn maintenance_connection_refuses_behind_schema_without_migrating() {
+        let scratch = Scratch::new();
+        let url = scratch.url("main.sqlite3");
+        let server = init(&url).await.unwrap();
+        let latest = sqlx::migrate!("./migrations")
+            .iter()
+            .last()
+            .unwrap()
+            .version;
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = ?")
+            .bind(latest)
+            .execute(&server)
+            .await
+            .unwrap();
+        let error = connect_existing(&url).await.unwrap_err();
+        assert!(error.to_string().contains("schema is behind"));
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ?")
+                .bind(latest)
+                .fetch_one(&server)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows, 0,
+            "maintenance command ran a migration beside the server"
+        );
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_connection_accepts_current_schema_and_checks_checksums() {
+        let scratch = Scratch::new();
+        let url = scratch.url("main.sqlite3");
+        let server = init(&url).await.unwrap();
+        let maintenance = connect_existing(&url).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT 1")
+                .fetch_one(&maintenance)
+                .await
+                .unwrap(),
+            1
+        );
+        maintenance.close().await;
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = 1")
+            .execute(&server)
+            .await
+            .unwrap();
+        assert!(connect_existing(&url)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("checksum differs"));
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_covers_are_preserved_and_recreated() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("covers.sqlite3");
+        let original = b"not a SQLite database: preserve this cover cache";
+        std::fs::write(&path, original).unwrap();
+        let covers = init_covers(&scratch.url("covers.sqlite3")).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_blob")
+            .fetch_one(&covers)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        covers.close().await;
+        let preserved: Vec<_> = std::fs::read_dir(&scratch.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".quarantined-")
+            })
+            .collect();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(std::fs::read(&preserved[0]).unwrap(), original);
+    }
+
+    #[test]
+    fn quarantine_preserves_database_and_sidecars_together() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("covers.sqlite3");
+        for (suffix, bytes) in [("", b"main".as_slice()), ("-wal", b"wal"), ("-shm", b"shm")] {
+            std::fs::write(format!("{}{suffix}", path.display()), bytes).unwrap();
+        }
+        let destination = quarantine_covers(&path).unwrap();
+        for (suffix, bytes) in [("", b"main".as_slice()), ("-wal", b"wal"), ("-shm", b"shm")] {
+            assert_eq!(
+                std::fs::read(format!("{}{suffix}", destination.display())).unwrap(),
+                bytes
+            );
+            assert!(!Path::new(&format!("{}{suffix}", path.display())).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_never_recreates_corrupt_covers() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("covers.sqlite3");
+        std::fs::write(&path, b"corrupt cache").unwrap();
+        assert!(connect_existing_covers(&scratch.url("covers.sqlite3"))
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"corrupt cache");
+    }
+
+    #[tokio::test]
+    async fn partly_missing_covers_clear_only_dangling_pointers_across_chunks() {
+        let scratch = Scratch::new();
+        let main = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(
+                SqliteConnectOptions::from_str(&scratch.url("main.sqlite3"))
+                    .unwrap()
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal),
+            )
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE work (id TEXT PRIMARY KEY, cover_cached_version INTEGER)")
+            .execute(&main)
+            .await
+            .unwrap();
+        let covers = init_covers(&scratch.url("covers.sqlite3")).await.unwrap();
+        for n in 0..600 {
+            sqlx::query("INSERT INTO work VALUES (?, ?)")
+                .bind(format!("w_{n:04}"))
+                .bind(if n == 599 { None } else { Some(7_i64) })
+                .execute(&main)
+                .await
+                .unwrap();
+        }
+        for id in ["w_0000", "w_0300", "w_0598"] {
+            sqlx::query("INSERT INTO work_cover_blob VALUES (?, X'01', 7, 'now')")
+                .bind(id)
+                .execute(&covers)
+                .await
+                .unwrap();
+        }
+        assert_eq!(reconcile_cover_pointers(&main, &covers).await.unwrap(), 596);
+        let remaining: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM work WHERE cover_cached_version IS NOT NULL ORDER BY id",
+        )
+        .fetch_all(&main)
+        .await
+        .unwrap();
+        assert_eq!(remaining, ["w_0000", "w_0300", "w_0598"]);
+        assert_eq!(reconcile_cover_pointers(&main, &covers).await.unwrap(), 0);
+        main.close().await;
+        covers.close().await;
+    }
 }

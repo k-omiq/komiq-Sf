@@ -21,6 +21,8 @@ Your data persists across updates because it is stored in Docker named volumes o
 
 When an update includes changes to the database structure, komiq applies database migrations automatically when the server boots. Always make a backup before applying updates so you can revert if necessary.
 
+Only one server can use a data directory at a time. The server holds a file lock on `.komiq-server.lock` in that directory until it exits. If startup reports that the directory is locked, stop the other server using the same volume. Deleting the lock file while a server is running can allow a second server to start.
+
 ### Clean up disk space
 
 Docker keeps old image layers and build cache on disk after each build. Over time, these files consume disk space.
@@ -46,6 +48,12 @@ For the Docker installation, your server’s persistent data resides in two name
 Komiq uses SQLite to store your account and library data. The server writes to the database frequently using Write-Ahead Logging (WAL). If you copy the database files while the server is actively writing, the resulting copy may be corrupted or unreadable.
 
 Always stop the containers before creating a backup.
+
+Both Docker configurations give the server 30 seconds to stop. The server spends up to 20 seconds finishing active requests and buffered writes. Wait for `docker compose stop` to return before copying files. A forced stop can interrupt that drain.
+
+The cover cache is a separate `covers.sqlite3` file in the server volume. Its contents can be fetched again. If SQLite cannot open it or finds corruption during the startup checks, komiq renames it to `covers.sqlite3.quarantined-<id>` and creates a fresh cache. SQLite's related `-wal` and `-shm` files move with it when present. The main account and library database stays in place.
+
+After a cache loss, komiq clears saved cover pointers in small batches when the corresponding cover is missing. Covers return as the cache fills. The quarantined files remain in the volume for inspection and consume disk space until you remove them. Keep them until the new cache is working.
 
 > [!NOTE]
 > Timed automated backups are planned for a later release. For now, create backups manually before system maintenance.

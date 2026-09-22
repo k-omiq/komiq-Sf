@@ -1542,11 +1542,8 @@ async fn health() -> &'static str {
 
 /// Prometheus-format operational gauges, scraped on demand.
 ///
-/// A first cut: these are all DERIVED FROM DB STATE at scrape time, so they need no
-/// request-path instrumentation. That deliberately omits request-latency histograms
-/// and error-rate counters, which would require threading a metric registry through
-/// the resolvers — a separate change. What's here is what the plan's verification
-/// steps actually need to read without grepping `docker logs`: scan-scheduler health
+/// Database gauges and small process counters expose writer contention without
+/// requiring a metrics registry. The remaining gauges track scan-scheduler health
 /// (the herd/backoff signals), the subscription circuit breaker, and updates-feed
 /// freshness. Served on its OWN listener bound to 127.0.0.1:{metrics_port}, so it
 /// is unreachable from outside the host by construction (no reliance on ingress
@@ -1561,6 +1558,18 @@ async fn metrics(State(pool): State<sqlx::SqlitePool>) -> impl IntoResponse {
             .unwrap_or(-1)
     }
 
+    let mut wal_path = pool.connect_options().get_filename().as_os_str().to_owned();
+    wal_path.push("-wal");
+    let wal_bytes = match std::fs::metadata(std::path::Path::new(&wal_path)) {
+        Ok(metadata) => metadata.len() as i64,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(_) => -1,
+    };
+    let pool_size = pool.size();
+    let pool_idle = pool.num_idle();
+    let write_queue_wait = db::write_queue_wait_seconds();
+    let write_queue_acquisitions = db::write_queue_acquisitions();
+    let lock_errors = db::lock_error_count();
     let now = chrono::Utc::now().to_rfc3339();
     let scan_total = scalar(&pool, "SELECT COUNT(*) FROM series_scan_state").await;
     let scan_due = sqlx::query_scalar::<_, i64>(
@@ -1606,7 +1615,25 @@ async fn metrics(State(pool): State<sqlx::SqlitePool>) -> impl IntoResponse {
     .unwrap_or(-1);
 
     let body = format!(
-        "# HELP komika_scan_state_total Series tracked by the scan scheduler\n\
+        "# HELP komika_sqlite_wal_bytes Main database WAL file size\n\
+         # TYPE komika_sqlite_wal_bytes gauge\n\
+         komika_sqlite_wal_bytes {wal_bytes}\n\
+         # HELP komika_sqlite_pool_connections Main database read pool connections\n\
+         # TYPE komika_sqlite_pool_connections gauge\n\
+         komika_sqlite_pool_connections {pool_size}\n\
+         # HELP komika_sqlite_pool_idle Main database idle read connections\n\
+         # TYPE komika_sqlite_pool_idle gauge\n\
+         komika_sqlite_pool_idle {pool_idle}\n\
+         # HELP komika_sqlite_write_queue_wait_seconds_total Time waiting for the in-process writer\n\
+         # TYPE komika_sqlite_write_queue_wait_seconds_total counter\n\
+         komika_sqlite_write_queue_wait_seconds_total {write_queue_wait}\n\
+         # HELP komika_sqlite_write_queue_acquisitions_total Writer acquisitions\n\
+         # TYPE komika_sqlite_write_queue_acquisitions_total counter\n\
+         komika_sqlite_write_queue_acquisitions_total {write_queue_acquisitions}\n\
+         # HELP komika_sqlite_lock_errors_total Observed SQLite lock errors\n\
+         # TYPE komika_sqlite_lock_errors_total counter\n\
+         komika_sqlite_lock_errors_total {lock_errors}\n\
+         # HELP komika_scan_state_total Series tracked by the scan scheduler\n\
          # TYPE komika_scan_state_total gauge\n\
          komika_scan_state_total {scan_total}\n\
          # HELP komika_scan_due Series currently overdue for a scan\n\
@@ -1689,8 +1716,8 @@ async fn main() -> anyhow::Result<()> {
         return setup_cli::run(cfg.port, &argv[1..]).await;
     }
     if argv.first().map(String::as_str) == Some("phase-f") {
-        let pool = db::init(&cfg.database_url).await?;
-        let cover_pool = db::init_covers(&cfg.covers_database_url).await?;
+        let pool = db::connect_existing(&cfg.database_url).await?;
+        let cover_pool = db::connect_existing_covers(&cfg.covers_database_url).await?;
         let result =
             phase_f::run_cli(&pool, Some(&cover_pool), &cfg.suwayomi_url, &argv[1..]).await;
         // Close both pools explicitly: a `merge` stage holds a WAL that a still-open
@@ -1702,32 +1729,21 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(?cfg, "starting komika-server");
 
+    let _data_directory_lock = db::DataDirectoryLock::acquire(&cfg.database_url)?;
     let pool = db::init(&cfg.database_url).await?;
     // Separate, un-replicated DB for cover blobs — see `db::init_covers`. Kept out
     // of the main DB so Litestream ships only accounts/social/catalogue to R2, never
     // the large (re-derivable) cover thumbnails.
     let cover_pool = db::init_covers(&cfg.covers_database_url).await?;
 
-    // DR reconciliation: if the covers DB is empty (e.g. a fresh host that restored
-    // the main DB from R2 but has no covers.sqlite3), clear any surviving
-    // `cover_cached_version` pointers so cover URLs fall back to the Worker proxy
-    // until the drainer re-materializes them — otherwise those pointers would 404.
-    // Cheap no-op in steady state (covers DB non-empty → skip the UPDATE).
-    let cover_blob_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_blob")
-        .fetch_one(&cover_pool)
-        .await?;
-    if cover_blob_count == 0 {
-        let cleared = sqlx::query(
-            "UPDATE work SET cover_cached_version = NULL WHERE cover_cached_version IS NOT NULL",
-        )
-        .execute(&pool)
-        .await?;
-        if cleared.rows_affected() > 0 {
-            tracing::warn!(
-                cleared = cleared.rows_affected(),
-                "covers DB empty — cleared stale cover version pointers; covers will re-cache"
-            );
-        }
+    // Covers are re-derivable. Repair dangling pointers in bounded transactions,
+    // including a partly lost cache and a cache recreated after corruption.
+    let cleared = db::reconcile_cover_pointers(&pool, &cover_pool).await?;
+    if cleared > 0 {
+        tracing::warn!(
+            cleared,
+            "cleared missing cover pointers; covers will re-cache"
+        );
     }
 
     // Provision/promote configured admin accounts (idempotent). This is the only
@@ -2230,23 +2246,54 @@ async fn main() -> anyhow::Result<()> {
     let addr = SocketAddr::new(bind_ip, cfg.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on http://{addr}/graphql");
-    axum::serve(
+    let shutdown_deadline = shutdown_tx.subscribe();
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(shutdown_tx))
-    .await?;
+    .with_graceful_shutdown(shutdown_signal(shutdown_tx));
     // Wait for the view flusher's final drain so buffered views hit the DB — then
     // drain ONCE more: the flusher's shutdown flush races axum's graceful drain, so
     // a `recordView` served while connections were draining can land in the buffer
     // AFTER that flush (and if the flusher died in its supervisor backoff, its
     // shutdown flush never ran at all). This last call catches both.
-    let _ = views_flusher.await;
-    let _ = health_flusher.await;
-    if let Err(e) = views::flush(&pool).await {
-        tracing::warn!(error = %e, "post-shutdown view flush failed; buffered views lost");
-    }
+    finish_with_shutdown_deadline(shutdown_deadline, async {
+        server.await?;
+        let _ = views_flusher.await;
+        let _ = health_flusher.await;
+        if let Err(e) = views::flush(&pool).await {
+            tracing::warn!(error = %e, "post-shutdown view flush failed; buffered views lost");
+        }
+        Ok(())
+    })
+    .await?;
     Ok(())
+}
+
+/// Leave ten seconds of Compose's 30s stop window for Litestream's final sync.
+/// The deadline covers both HTTP connections and the final buffered-write drain.
+async fn finish_with_shutdown_deadline<F>(
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    drain: F,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let deadline = async {
+        while !*shutdown.borrow() {
+            if shutdown.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+    };
+    tokio::select! {
+        result = drain => result,
+        _ = deadline => {
+            tracing::warn!("shutdown drain reached its 20s deadline; leaving time for backup sync");
+            Ok(())
+        }
+    }
 }
 
 /// Turn a caught panic into a JSON 500 (GraphQL-shaped) and log it with the
@@ -2289,6 +2336,67 @@ async fn shutdown_signal(shutdown_tx: tokio::sync::watch::Sender<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_deadline_bounds_a_hanging_drain_after_the_signal() {
+        let (signal, receiver) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(finish_with_shutdown_deadline(
+            receiver,
+            std::future::pending(),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        assert!(!task.is_finished(), "deadline started before shutdown");
+        signal.send(true).unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(19)).await;
+        assert!(!task.is_finished());
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_keeps_completed_drain_errors() {
+        let (_signal, receiver) = tokio::sync::watch::channel(false);
+        let error = finish_with_shutdown_deadline(receiver, async { anyhow::bail!("drain error") })
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "drain error");
+    }
+
+    #[tokio::test]
+    async fn database_metrics_include_wal_pool_and_contention_counters() {
+        let directory =
+            std::env::temp_dir().join(format!("komiq-metrics-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let database = directory.join("main.sqlite3");
+        let pool = db::init(&format!("sqlite://{}", database.display()))
+            .await
+            .unwrap();
+        let response = metrics(State(pool.clone())).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), 100_000)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        let wal_bytes = std::fs::metadata(directory.join("main.sqlite3-wal"))
+            .unwrap()
+            .len();
+        assert!(body.contains(&format!("komika_sqlite_wal_bytes {wal_bytes}\n")));
+        for metric in [
+            "komika_sqlite_pool_connections ",
+            "komika_sqlite_pool_idle ",
+            "komika_sqlite_write_queue_wait_seconds_total ",
+            "komika_sqlite_write_queue_acquisitions_total ",
+            "komika_sqlite_lock_errors_total ",
+        ] {
+            assert!(
+                body.lines().any(|line| line.starts_with(metric)),
+                "missing {metric}"
+            );
+        }
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     /// "In the clear from the internet" is plain HTTP, a public peer, and no trusted
     /// proxy in between. `createOwner` is refused only there.

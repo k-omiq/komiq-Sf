@@ -11,10 +11,11 @@ if [ -n "${LITESTREAM_BUCKET:-}" ] && [ -n "${LITESTREAM_ACCESS_KEY_ID:-}" ] && 
   echo "[entrypoint] Litestream backup ENABLED → bucket=${LITESTREAM_BUCKET} endpoint=${LITESTREAM_ENDPOINT:-default}"
   # Restore the latest snapshot only if this volume has no DB yet AND a replica
   # exists (first boot on a fresh host / after a wipe). No-op on an existing DB.
-  litestream restore -if-db-not-exists -if-replica-exists -config /etc/litestream.yml "$DB" \
-    || echo "[entrypoint] nothing to restore (fresh replica or first ever run)"
+  # Litestream 0.3.13 returns success for both skip conditions. Any other failure
+  # must stop boot before the server creates a DB and replication overwrites backup.
+  litestream restore -if-db-not-exists -if-replica-exists -config /etc/litestream.yml "$DB"
   # Replicate continuously while running the server as a supervised child; on
-  # SIGTERM Litestream flushes a final snapshot before exiting.
+  # SIGTERM Litestream performs its final replication sync before exiting.
   exec litestream replicate -config /etc/litestream.yml -exec "komika-server"
 else
   # Warn loudly on a partial config, so an operator who set some but not all of

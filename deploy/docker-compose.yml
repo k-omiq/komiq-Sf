@@ -138,6 +138,8 @@ services:
       context: ..
       dockerfile: deploy/server.Dockerfile
     restart: unless-stopped
+    # Bounded application drain (20s), then time for Litestream's final sync.
+    stop_grace_period: 30s
     # Measured baseline (cgroup v2 memory.stat, steady state at 42h uptime):
     # memory.current 2.14 GiB = 1.73 GiB anon + 0.38 GiB file. Only the ANON part
     # is unreclaimable, so 6g is ~3.2x the number that can actually OOM us.

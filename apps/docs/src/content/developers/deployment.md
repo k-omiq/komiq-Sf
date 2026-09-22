@@ -128,7 +128,13 @@ Litestream runs alongside the server process inside the `server` container. It i
 - Litestream monitors the WAL and streams changes to an S3-compatible bucket, such as Cloudflare R2.
 - The synchronization interval is set to 10 seconds (`sync-interval: 10s`), giving a recovery point objective (RPO) of approximately 10 seconds.
 - A full database snapshot is generated every 24 hours (`snapshot-interval: 24h`).
-- WAL segments older than 24 hours are pruned automatically (`retention: 24h`) to bound storage costs.
+- Litestream checks retention hourly. It keeps snapshots inside `retention: 24h` and removes earlier snapshots and WAL segments before the oldest retained snapshot. The restore window therefore depends on when snapshots were taken; a 24-hour setting does not promise 24 hours of usable history.
+
+The separate `/data/covers.sqlite3` cache is excluded from Litestream. The server checks its tables at startup. An open or corruption failure preserves the file and its SQLite sidecars with a `.quarantined-<id>` suffix, then recreates the derived cache. It clears main-database cover pointers whose blobs are missing in batches of 256. A partly missing cache receives the same reconciliation.
+
+The server holds `.komiq-server.lock` in the main database's directory for its lifetime, before running migrations. A second server using that directory fails to start. The `phase-f` maintenance command connects to existing files without running migrations or recreating covers. It refuses a missing, behind or incompatible main schema.
+
+The Compose server service has a 30-second stop grace period. The application bounds its request and buffered-write drain to 20 seconds after the stop signal, leaving time for Litestream's final sync.
 
 ### Recovery and restoration
 
@@ -139,6 +145,8 @@ litestream restore -if-db-not-exists -if-replica-exists -config /etc/litestream.
 ```
 
 This downloads the latest snapshot and replays recent WAL files, recovering database state up to the last replicated transaction.
+
+With the pinned Litestream 0.3.13, both skip conditions return success: the local database already exists, or no replica exists yet. Any other nonzero restore result aborts startup before replication or the application can create a database. Correct the restore error before restarting the container.
 
 Administrators can also perform manual point-in-time restores:
 

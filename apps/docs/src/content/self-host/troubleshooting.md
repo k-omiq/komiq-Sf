@@ -3,7 +3,7 @@ title: Fix server problems
 description: Fix setup, container and source problems on the komiq server you host with Docker.
 ---
 
-Use this page when the server you run with the admin app’s Docker installation has a setup, container or source problem. Check your own server’s logs and settings for each symptom below. For problems using the reader app after it connects, read [Reader troubleshooting](/guide/troubleshooting).
+Use this page to fix setup, container or source problems with your Docker installation. Check your server's logs for the symptoms below. For reader app problems, read [Reader troubleshooting](/guide/troubleshooting).
 
 ## The installer stops with "problem:"
 
@@ -16,19 +16,17 @@ Use this page when the server you run with the admin app’s Docker installation
 
 ## No setup code in the server log
 
-Running `docker compose logs server | grep "setup code"` returns no matching lines.
-
-The server issues a setup code only while no administrator account exists. After setup it prints none. If the container failed before the application started, the log is empty.
+The server issues a setup code only while no administrator account exists. It prints none after setup or if startup fails.
 
 If you already created an owner account, open `http://192.168.1.20:8080/admin` and sign in.
 
-If this is a fresh installation, inspect the full container log:
+For a fresh installation, inspect the log:
 
 ```sh
 docker compose logs server
 ```
 
-Check for initialization errors, such as missing directory permissions or an invalid environment variable.
+Check directory permissions and environment variables if initialization fails.
 
 ## Setup displays "Invalid setup code"
 
@@ -42,7 +40,7 @@ Type the code shown in the last log line. The server ignores spaces, dashes and 
 
 ## Setup displays "Too many setup attempts"
 
-The server limits setup attempts per client IP address. Wait for the time the message names, confirm the code in the server log, and submit the form again.
+Wait for the time the message names, check the setup code in the server log, and try again.
 
 ## The Owner step cannot check the connection
 
@@ -50,11 +48,9 @@ The step shows "komiq could not check this connection." when your server did not
 
 ## Server container is not healthy
 
-Running `docker compose ps` shows the `server` container in an `unhealthy` state.
+The health check queries `http://localhost:8080/health/ready` every 30 seconds to check the server and database.
 
-The container health check queries `http://localhost:8080/health/ready` every 30 seconds. It tests that the server answers and that the database accepts queries.
-
-Inspect the server logs for the cause:
+Read the logs:
 
 ```sh
 docker compose logs server
@@ -63,6 +59,10 @@ docker compose logs server
 If the log shows an address binding error, another service on your host is using port 8080. Open `.env`, set `KOMIQ_PORT` to an unused port number (such as `8081`), and restart with `docker compose up -d`.
 
 If the log shows database permission errors, check file ownership in the data directory. The server container runs as user ID `10001`. Ensure the `komiq_server-data` volume permits write access to that user.
+
+If the data directory is locked, stop the duplicate container or desktop server. `.komiq-server.lock` prevents two servers using the same files. The lock releases when the process exits. Do not delete it while a server is running.
+
+For a Litestream restore error, fix backup credentials, network access or the replica before restarting. Startup stops on restore failures to protect the backup. An existing local database or a bucket without a replica is a normal skip.
 
 ## Port 443 or 80 does not answer
 
@@ -76,9 +76,7 @@ If the checklist fails at "Get the connector (cloudflared)", your server could n
 
 ## Source engine container fails or stays in starting
 
-Running `docker compose ps` shows the `suwayomi` container remaining in a `starting` status or marked `unhealthy`.
-
-On first start, the Suwayomi engine unpacks assets and creates its initial database structure. This initialization takes one to two minutes.
+On first start, Suwayomi unpacks assets and creates its database. Allow one to two minutes.
 
 Inspect the engine logs:
 
@@ -99,11 +97,11 @@ To add sources:
 3. Navigate to **Sources › Extensions** to install extensions from your added repository. Read [Add sources](/self-host/sources) for details.
 4. If you read from MangaDex, open **Settings › Sources** and toggle the **MangaDex** switch.
 
-If adding a repository fails, check `docker compose ps` to ensure the `suwayomi` container is `healthy`. The server cannot install extensions while the engine is still booting.
+If adding a repository fails, check `docker compose ps`. The server cannot install extensions while the engine is booting.
 
 ## Covers or chapter pages do not load
 
-Cover thumbnails appear blank, or chapter pages fail to load in the reader.
+If the log says the cover cache was recreated, komiq preserved an unavailable or corrupt cache beside `covers.sqlite3` with a `.quarantined-<id>` suffix. Accounts and libraries live in a separate database. Covers fill again after missing pointers are cleared at startup. Check disk space while both cache files exist.
 
 This issue occurs if the source engine is stopped, an extension is down, or the upstream source website uses Cloudflare bot protection.
 
@@ -126,11 +124,9 @@ Apply the changes by running `docker compose up -d`. FlareSolverr runs a headles
 
 ## Build fails or the machine runs out of memory
 
-Running `docker compose up -d` fails during the container build stage with compiler errors or process termination.
-
 Compiling the server requires approximately 4 GB of RAM. The installer warns below that. On a small virtual private server, Linux stops the compiler when memory runs out.
 
-You can resolve this issue in two ways:
+Choose one fix:
 
 - Configure a swap file on your server to provide additional temporary memory. A 2 GB to 4 GB swap file allows low-memory servers to finish compiling.
 - Build the image on another computer with sufficient RAM, then transfer the image to your server:
@@ -143,11 +139,9 @@ After loading the image onto the server, run `docker compose up -d` without the 
 
 ## Disk space runs low after updates
 
-The host system runs low on available disk space after updating komiq.
-
 Docker preserves earlier container images, intermediate build steps, and compiler caches on disk.
 
-To free storage space, remove unused Docker images and build caches:
+Remove unused images and build caches:
 
 ```sh
 docker image prune
