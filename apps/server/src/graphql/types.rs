@@ -314,6 +314,7 @@ pub struct Scanlator {
 
 #[derive(SimpleObject, Clone, Debug)]
 pub struct ScanlatorPage {
+    #[graphql(complexity = "50 * child_complexity")]
     pub items: Vec<Scanlator>,
     pub page: i32,
     pub has_next_page: bool,
@@ -756,6 +757,7 @@ pub struct DiscoveryFeed {
     pub kind: DiscoveryFeedKind,
     pub title: String,
     pub genre: Option<String>,
+    #[graphql(complexity = "20 * child_complexity")]
     pub items: Vec<Series>,
 }
 
@@ -921,6 +923,7 @@ pub struct AdminUser {
 
 #[derive(SimpleObject, Clone)]
 pub struct AdminUserPage {
+    #[graphql(complexity = "50 * child_complexity")]
     pub items: Vec<AdminUser>,
     pub page: i32,
     pub has_next_page: bool,
@@ -929,6 +932,7 @@ pub struct AdminUserPage {
 
 #[derive(SimpleObject, Clone)]
 pub struct SeriesPage {
+    #[graphql(complexity = "30 * child_complexity")]
     pub items: Vec<Series>,
     pub page: i32,
     pub has_next_page: bool,
@@ -937,6 +941,7 @@ pub struct SeriesPage {
 
 #[derive(SimpleObject, Clone)]
 pub struct ReviewPage {
+    #[graphql(complexity = "20 * child_complexity")]
     pub items: Vec<Review>,
     pub page: i32,
     pub has_next_page: bool,
@@ -945,6 +950,7 @@ pub struct ReviewPage {
 
 #[derive(SimpleObject, Clone)]
 pub struct CommentPage {
+    #[graphql(complexity = "20 * child_complexity")]
     pub items: Vec<Comment>,
     pub page: i32,
     pub has_next_page: bool,
@@ -981,6 +987,7 @@ pub struct MyComment {
 
 #[derive(SimpleObject, Clone)]
 pub struct MyCommentPage {
+    #[graphql(complexity = "20 * child_complexity")]
     pub items: Vec<MyComment>,
     pub page: i32,
     pub has_next_page: bool,
@@ -1391,6 +1398,7 @@ pub struct SourceBrowseEntry {
 /// A page of source-browse results.
 #[derive(SimpleObject)]
 pub struct SourceBrowsePage {
+    #[graphql(complexity = "30 * child_complexity")]
     pub items: Vec<SourceBrowseEntry>,
     pub page: i32,
     pub has_next_page: bool,
@@ -1496,6 +1504,7 @@ pub struct FederatedSeries {
 /// A page of federated search results (S3).
 #[derive(SimpleObject)]
 pub struct FederatedSearchPage {
+    #[graphql(complexity = "30 * child_complexity")]
     pub items: Vec<FederatedSeries>,
     pub page: i32,
     pub has_next_page: bool,

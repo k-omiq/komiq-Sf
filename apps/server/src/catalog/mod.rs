@@ -447,7 +447,7 @@ pub struct CanonicalChapter {
 /// The tiers do NOT merge: mixing a human's deliberate short list with ~6 upstream tags
 /// would make curation unable to REMOVE a tag, which is most of what it is for.
 ///
-/// A page of feed items should use [`work_effective_genres_batch`] instead: this issues
+/// A page of feed items should use [`work_effective_genres_batch_checked`] instead: this issues
 /// up to three round-trips per work.
 pub async fn work_effective_genres(pool: &Database, work_id: &str) -> Vec<String> {
     let curated = sqlx::query_scalar::<_, String>(
@@ -513,13 +513,15 @@ pub async fn work_effective_genres(pool: &Database, work_id: &str) -> Vec<String
 /// Suwayomi series are catalogued, and the CURATED half of `work_tag` is empty in
 /// production, so tier 1 never fires). Since migration 0066 most works are answered by
 /// tier 2, an indexed (work_id, source) seek, and never reach the Suwayomi join at all.
-pub async fn work_effective_genres_batch(
+/// Fallible batch lookup for request paths: a database failure must not produce a
+/// partial genre map that the caller can memoize as a successful response.
+pub async fn work_effective_genres_batch_checked(
     pool: &Database,
     work_ids: &[String],
-) -> std::collections::HashMap<String, Vec<String>> {
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
     let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
     if work_ids.is_empty() {
-        return out;
+        return Ok(out);
     }
     let ph = std::iter::repeat_n("?", work_ids.len())
         .collect::<Vec<_>>()
@@ -534,7 +536,7 @@ pub async fn work_effective_genres_batch(
     for id in work_ids {
         q = q.bind(id);
     }
-    for (wid, tag) in q.fetch_all(pool).await.unwrap_or_default() {
+    for (wid, tag) in q.fetch_all(pool).await? {
         out.entry(wid).or_default().push(tag);
     }
 
@@ -553,7 +555,7 @@ pub async fn work_effective_genres_batch(
         for id in &uncurated {
             qu = qu.bind(*id);
         }
-        for (wid, tag) in qu.fetch_all(pool).await.unwrap_or_default() {
+        for (wid, tag) in qu.fetch_all(pool).await? {
             out.entry(wid).or_default().push(tag);
         }
     }
@@ -562,7 +564,7 @@ pub async fn work_effective_genres_batch(
     //    cast-the-non-indexed-side join as the single-work path above.
     let remaining: Vec<&String> = work_ids.iter().filter(|w| !out.contains_key(*w)).collect();
     if remaining.is_empty() {
-        return out;
+        return Ok(out);
     }
     let ph2 = std::iter::repeat_n("?", remaining.len())
         .collect::<Vec<_>>()
@@ -579,7 +581,7 @@ pub async fn work_effective_genres_batch(
     }
     let mut seen: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
         Default::default();
-    for (wid, json) in q2.fetch_all(pool).await.unwrap_or_default() {
+    for (wid, json) in q2.fetch_all(pool).await? {
         let Ok(list) = serde_json::from_str::<Vec<String>>(&json) else {
             continue;
         };
@@ -593,7 +595,7 @@ pub async fn work_effective_genres_batch(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Load a canonical work with its MangaDex anchor + cover fileName + alt titles, for
@@ -2401,6 +2403,10 @@ const MIN_FTS_QUERY_CHARS: usize = 3;
 /// window so pagination never promises a page the window can't serve.
 pub(crate) const RANK_WINDOW: i64 = 500;
 
+/// Bound anonymous search work before allocating tokens or constructing ranking binds.
+pub(crate) const MAX_FTS_QUERY_CHARS: usize = 256;
+const MAX_FTS_TERMS: usize = 12;
+
 /// Build an FTS5 MATCH expression from raw user input: split into unicode
 /// alphanumeric word tokens, quote each (so an FTS keyword like `and`/`or`/`near`
 /// or a stray operator char is treated as a literal, never as syntax), and append
@@ -2412,6 +2418,11 @@ pub(crate) const RANK_WINDOW: i64 = 500;
 /// complete words and starring them only widens the postings list scanned ("one
 /// piece" scanned every work containing a word starting with "one").
 pub(crate) fn fts_match_query(raw: &str) -> Option<String> {
+    if raw.len() > MAX_FTS_QUERY_CHARS * 4
+        || raw.chars().take(MAX_FTS_QUERY_CHARS + 1).count() > MAX_FTS_QUERY_CHARS
+    {
+        return None;
+    }
     let mut terms: Vec<String> = Vec::new();
     let mut cur = String::new();
     for ch in raw.chars() {
@@ -2424,20 +2435,34 @@ pub(crate) fn fts_match_query(raw: &str) -> Option<String> {
     if !cur.is_empty() {
         terms.push(cur);
     }
-    let (last, head) = terms.split_last()?;
-    // Too-short queries are refused rather than served slowly — EXCEPT when the query
-    // carries a non-ASCII character, where a short token is a whole CJK word rather
-    // than a one-letter prefix over the entire catalogue.
-    let chars: usize = terms.iter().map(|t| t.chars().count()).sum();
-    let has_non_ascii = terms.iter().any(|t| !t.is_ascii());
-    if chars < MIN_FTS_QUERY_CHARS && !has_non_ascii {
+    let last = terms.last()?;
+    // A repeated final token already has an exact clause, so its prefix clause is
+    // redundant. Retaining the exact clause preserves the original AND semantics.
+    let prefix_last = terms.iter().filter(|term| *term == last).count() == 1;
+    let mut seen = std::collections::HashSet::new();
+    terms.retain(|term| seen.insert(term.clone()));
+    if terms.len() > MAX_FTS_TERMS {
         return None;
     }
-    // Quote each token; a `"` can't appear (we kept only alphanumerics), so no
-    // escaping is needed. `"tok"*` = prefix match on a quoted string literal.
-    let mut out: Vec<String> = head.iter().map(|t| format!("\"{t}\"")).collect();
-    out.push(format!("\"{last}\"*"));
-    Some(out.join(" "))
+    let chars: usize = terms.iter().map(|t| t.chars().count()).sum();
+    if chars < MIN_FTS_QUERY_CHARS && terms.iter().all(|t| t.is_ascii()) {
+        return None;
+    }
+    let last_index = terms.len() - 1;
+    Some(
+        terms
+            .iter()
+            .enumerate()
+            .map(|(i, term)| {
+                if prefix_last && i == last_index {
+                    format!("\"{term}\"*")
+                } else {
+                    format!("\"{term}\"")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 /// Escape SQLite `LIKE` metacharacters (`\`, `%`, `_`) so a user query is matched
@@ -2518,6 +2543,73 @@ pub(crate) fn fts_title_tier(query: &str) -> (&'static str, Vec<String>) {
     }
 }
 
+/// A search owns one reader until its SQLite statements have stopped. The progress
+/// handler interrupts the SQLite VM itself; dropping a cancelled request also trips it.
+/// An unfinished connection is closed rather than returned with a stale handler.
+pub(crate) struct SearchConnection {
+    connection: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl std::ops::Deref for SearchConnection {
+    type Target = sqlx::SqliteConnection;
+    fn deref(&self) -> &Self::Target {
+        self.connection.as_deref().unwrap()
+    }
+}
+
+impl std::ops::DerefMut for SearchConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection.as_deref_mut().unwrap()
+    }
+}
+
+impl Drop for SearchConnection {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(connection) = &mut self.connection {
+            connection.close_on_drop();
+        }
+    }
+}
+
+impl SearchConnection {
+    pub(crate) async fn new(pool: &Database) -> Result<Self> {
+        Self::with_budget(pool, std::time::Duration::from_secs(2)).await
+    }
+
+    async fn with_budget(pool: &Database, budget: std::time::Duration) -> Result<Self> {
+        let mut connection = pool.acquire().await?;
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let check_cancelled = cancelled.clone();
+        let deadline = std::time::Instant::now() + budget;
+        {
+            let mut handle = connection.lock_handle().await?;
+            handle.set_progress_handler(1_000, move || {
+                !check_cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                    && std::time::Instant::now() < deadline
+            });
+        }
+        Ok(Self {
+            connection: Some(connection),
+            cancelled,
+        })
+    }
+
+    pub(crate) async fn finish(mut self) -> Result<()> {
+        self.connection
+            .as_mut()
+            .unwrap()
+            .lock_handle()
+            .await?
+            .remove_progress_handler();
+        // Only a connection with its handler removed may return to the shared reader pool.
+        self.connection.take();
+        Ok(())
+    }
+}
+
 /// Full-text search over the canonical catalogue (AD-5). Returns `(total, page)`
 /// where `page` is the `w_` work ids for the requested page. NSFW works are gated in
 /// SQL (before LIMIT) unless `show_nsfw`, so `total` and pagination stay honest. An
@@ -2559,6 +2651,7 @@ pub async fn search_works_fts(
     let Some(match_expr) = fts_match_query(query) else {
         return Ok((0, Vec::new()));
     };
+    let mut connection = SearchConnection::new(pool).await?;
     let offset = (page.max(1) - 1) * page_size;
     // NSFW gate mirrors map_canonical_series' effective flag (override wins). The FTS
     // table is referenced by NAME (`work_fts MATCH`), not the join alias — FTS5's
@@ -2571,9 +2664,10 @@ pub async fn search_works_fts(
     .bind(&match_expr)
     .bind(show_nsfw as i64)
     .bind(RANK_WINDOW)
-    .fetch_one(pool)
+    .fetch_one(&mut *connection)
     .await?;
     if offset >= RANK_WINDOW {
+        connection.finish().await?;
         return Ok((total, Vec::new()));
     }
     let (tier, tier_params) = fts_title_tier(query);
@@ -2600,8 +2694,9 @@ pub async fn search_works_fts(
     let ids = q
         .bind(page_size.min(RANK_WINDOW))
         .bind(offset)
-        .fetch_all(pool)
+        .fetch_all(&mut *connection)
         .await?;
+    connection.finish().await?;
     Ok((total, ids))
 }
 
@@ -6146,19 +6241,19 @@ pub async fn purge_foreign_language_suwayomi(pool: &Database) -> Result<Vec<i64>
         // dangle forever (e.g. a purged series stuck in a user's library, re-rendered live
         // on every view) since none carry an enforced FK to the refreshable cache.
         for stmt in [
-        format!("DELETE FROM user_library      WHERE series_id  IN {non_en_text}"),
-        format!("DELETE FROM suwayomi_progress  WHERE series_id  IN {non_en_text}"),
-        format!("DELETE FROM series_admin       WHERE series_id  IN {non_en_text}"),
-        format!("DELETE FROM series_views       WHERE series_key IN {non_en_text}"),
-        format!("DELETE FROM series_view_bucket WHERE series_key IN {non_en_text}"),
-        format!("DELETE FROM series_scan_state  WHERE series_id  IN {non_en_text}"),
-        format!(
-            "DELETE FROM source_series WHERE source_type = 'suwayomi' AND source_key IN {non_en_text}"
-        ),
-        format!("DELETE FROM suwayomi_chapter WHERE manga_id IN ({NON_EN})"),
-    ] {
-        sqlx::query(&stmt).execute(&mut *tx).await?;
-    }
+            format!("DELETE FROM user_library      WHERE series_id  IN {non_en_text}"),
+            format!("DELETE FROM suwayomi_progress  WHERE series_id  IN {non_en_text}"),
+            format!("DELETE FROM series_admin       WHERE series_id  IN {non_en_text}"),
+            format!("DELETE FROM series_views       WHERE series_key IN {non_en_text}"),
+            format!("DELETE FROM series_view_bucket WHERE series_key IN {non_en_text}"),
+            format!("DELETE FROM series_scan_state  WHERE series_id  IN {non_en_text}"),
+            format!(
+                "DELETE FROM source_series WHERE source_type = 'suwayomi' AND source_key IN {non_en_text}"
+            ),
+            format!("DELETE FROM suwayomi_chapter WHERE manga_id IN ({NON_EN})"),
+        ] {
+            sqlx::query(&stmt).execute(&mut *tx).await?;
+        }
 
         // Cascade the orphaned works + their child rows, in the same transaction. Mirrors
         // `delete_work_cascade`'s table set (kept in sync with it), but set-based so a
@@ -6318,6 +6413,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checked_genres_propagate_query_failure() {
+        let pool = pool().await;
+        assert!(work_effective_genres_batch_checked(&pool, &[])
+            .await
+            .unwrap()
+            .is_empty());
+        sqlx::query("DROP TABLE work_tag")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = work_effective_genres_batch_checked(&pool, &["w_missing".into()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("work_tag"));
+    }
+
+    #[tokio::test]
     async fn official_links_are_shown_but_are_not_identities() {
         let pool = pool().await;
         let work = upsert_work_from_mangadex(
@@ -6440,7 +6552,9 @@ mod tests {
             "CREATE TABLE browse_catalogue(work_id TEXT PRIMARY KEY, title TEXT NOT NULL, comic_type TEXT NOT NULL)",
             "INSERT INTO work VALUES ('keep'), ('prune'), ('update')",
             "INSERT INTO browse_catalogue VALUES ('keep','original','MANGA'), ('prune','original','MANGA'), ('update','original','MANGA')",
-        ] { sqlx::query(sql).execute(&pool).await.unwrap(); }
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
         // Staging still completes while another connection owns the main writer.
         let writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
         let mut snapshot = refresh_snapshot(&pool, &["browse_catalogue"])
@@ -6500,11 +6614,15 @@ mod tests {
             .connect_with(options)
             .await
             .unwrap();
-        for sql in ["CREATE TABLE work(id TEXT PRIMARY KEY)",
+        for sql in [
+            "CREATE TABLE work(id TEXT PRIMARY KEY)",
             "CREATE TABLE browse_catalogue(work_id TEXT PRIMARY KEY, title TEXT NOT NULL, comic_type TEXT NOT NULL)",
-            "CREATE TABLE writer_turns(n INTEGER NOT NULL)", "INSERT INTO writer_turns VALUES (0)",
+            "CREATE TABLE writer_turns(n INTEGER NOT NULL)",
+            "INSERT INTO writer_turns VALUES (0)",
             "WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n < 385) INSERT INTO work SELECT printf('%04d', n) FROM ids",
-        ] { sqlx::query(sql).execute(&pool).await.unwrap(); }
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
         let mut snapshot = refresh_snapshot(&pool, &["browse_catalogue"])
             .await
             .unwrap();
@@ -6545,6 +6663,107 @@ mod tests {
         drop(snapshot);
         pool.close().await;
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fts_match_query_bounds_input_and_deduplicates_terms() {
+        assert!(fts_match_query(&"x".repeat(MAX_FTS_QUERY_CHARS)).is_some());
+        assert!(fts_match_query(&"x".repeat(MAX_FTS_QUERY_CHARS + 1)).is_none());
+        assert!(fts_match_query(&"界".repeat(MAX_FTS_QUERY_CHARS)).is_some());
+        assert!(fts_match_query(&"界".repeat(MAX_FTS_QUERY_CHARS + 1)).is_none());
+        let terms = (0..MAX_FTS_TERMS)
+            .map(|i| format!("term{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(fts_match_query(&terms).is_some());
+        assert!(fts_match_query(&format!("{terms} excess")).is_none());
+        assert_eq!(
+            fts_match_query("Solo solo lev").as_deref(),
+            Some("\"solo\" \"lev\"*")
+        );
+        assert_eq!(
+            fts_match_query("Naruto NARUTO").as_deref(),
+            Some("\"naruto\"")
+        );
+        assert_eq!(fts_match_query("a a a a a"), None);
+    }
+
+    #[tokio::test]
+    async fn search_deadline_interrupts_sqlite_and_cleans_up_for_the_next_reader() {
+        let pool = crate::database::TestPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut connection =
+            SearchConnection::with_budget(&pool, std::time::Duration::from_millis(10))
+                .await
+                .unwrap();
+        let started = std::time::Instant::now();
+        let error = sqlx::query_scalar::<_, i64>(
+            "WITH RECURSIVE n(x) AS \
+            (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 1000000000) SELECT SUM(x) FROM n",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("9")
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        connection.finish().await.unwrap();
+        // More than 1,000 opcodes ensures this actually tests handler removal.
+        let sum: i64 = sqlx::query_scalar(
+            "WITH RECURSIVE n(x) AS \
+            (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 10000) SELECT SUM(x) FROM n",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(sum, 50_005_000);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_search_interrupts_worker_and_does_not_poison_the_reader_pool() {
+        let pool = crate::database::TestPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let search_pool = pool.clone();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let search = tokio::spawn(async move {
+            let mut connection =
+                SearchConnection::with_budget(&search_pool, std::time::Duration::from_secs(60))
+                    .await
+                    .unwrap();
+            ready.send(()).unwrap();
+            let _ = sqlx::query_scalar::<_, i64>(
+                "WITH RECURSIVE n(x) AS \
+                (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 1000000000) SELECT SUM(x) FROM n",
+            )
+            .fetch_one(&mut *connection)
+            .await;
+        });
+        started.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        search.abort();
+        let _ = search.await;
+        let replacement = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            sqlx::query_scalar::<_, i64>(
+                "WITH RECURSIVE n(x) AS \
+                (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 10000) SELECT SUM(x) FROM n",
+            )
+            .fetch_one(&pool),
+        )
+        .await
+        .expect("cancelled statement must release its worker promptly")
+        .unwrap();
+        assert_eq!(replacement, 50_005_000);
+        pool.close().await;
     }
 
     #[test]

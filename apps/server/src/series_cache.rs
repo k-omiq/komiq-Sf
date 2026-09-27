@@ -606,19 +606,79 @@ pub async fn get_series(pool: &Database, id: i64) -> Result<Option<SuwayomiManga
 /// within `SERIES_TTL_SECS`). `None` on a cache miss. The reader uses the flag to
 /// decide whether to revalidate upstream on a cache hit.
 pub async fn get_series_fresh(pool: &Database, id: i64) -> Result<Option<(SuwayomiManga, bool)>> {
-    let row = sqlx::query_as::<_, SeriesRow>(&format!("{SERIES_SELECT} WHERE id = ?"))
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
-    let Some(row) = row else { return Ok(None) };
-    let fetched: Option<String> =
-        sqlx::query_scalar("SELECT series_fetched_at FROM suwayomi_series WHERE id = ?")
-            .bind(id)
-            .fetch_optional(pool)
-            .await?
-            .flatten();
-    let fresh = is_fresh(fetched.as_deref(), SERIES_TTL_SECS);
-    Ok(Some((row.into(), fresh)))
+    Ok(get_series_fresh_batch(pool, &[id]).await?.remove(&id))
+}
+
+/// Metadata and freshness for a page in bounded grouped queries, including misses.
+pub async fn get_series_fresh_batch(
+    pool: &Database,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, (SuwayomiManga, bool)>> {
+    #[derive(sqlx::FromRow)]
+    struct FreshRow {
+        #[sqlx(flatten)]
+        series: SeriesRow,
+        series_fetched_at: Option<String>,
+    }
+    let mut out = std::collections::HashMap::new();
+    for chunk in ids.chunks(256) {
+        let ph = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "{} WHERE id IN ({ph})",
+            SERIES_SELECT.replace("chapter_count ", "chapter_count, series_fetched_at ")
+        );
+        let mut query = sqlx::query_as::<_, FreshRow>(&sql);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        for row in query.fetch_all(pool).await? {
+            let fresh = is_fresh(row.series_fetched_at.as_deref(), SERIES_TTL_SECS);
+            out.insert(row.series.id, (row.series.into(), fresh));
+        }
+    }
+    Ok(out)
+}
+
+/// Chapter lists and freshness for all sources of one page, without per-source reads.
+pub async fn get_chapters_fresh_batch(
+    pool: &Database,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, (Vec<SuwayomiChapter>, bool)>> {
+    #[derive(sqlx::FromRow)]
+    struct FreshRow {
+        #[sqlx(flatten)]
+        chapter: ChapterRow,
+        last_fetched_at: Option<String>,
+    }
+    let mut out: std::collections::HashMap<i64, (Vec<SuwayomiChapter>, bool)> =
+        std::collections::HashMap::new();
+    for chunk in ids.chunks(256) {
+        let ph = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, manga_id, name, chapter_number, scanlator, upload_date, \
+             is_read, is_bookmarked, is_downloaded, last_page_read, page_count, \
+             MAX(updated_at) OVER (PARTITION BY manga_id) AS last_fetched_at \
+             FROM suwayomi_chapter WHERE manga_id IN ({ph}) \
+             ORDER BY manga_id, chapter_number DESC, id DESC"
+        );
+        let mut query = sqlx::query_as::<_, FreshRow>(&sql);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        for row in query.fetch_all(pool).await? {
+            let id = row.chapter.manga_id;
+            let fresh = is_fresh(row.last_fetched_at.as_deref(), CHAPTERS_TTL_SECS)
+                || memoized_chapters_fetched(id)
+                    .is_some_and(|at| is_fresh(Some(&at.to_rfc3339()), CHAPTERS_TTL_SECS));
+            let entry = out.entry(id).or_insert_with(|| (Vec::new(), fresh));
+            entry.0.push(row.chapter.into());
+        }
+    }
+    Ok(out)
 }
 
 /// When this manga's cached chapter list was last fetched, or `None` if it never was.

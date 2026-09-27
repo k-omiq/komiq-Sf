@@ -66,6 +66,8 @@ pub const BROWSE_PAGE_SIZE: i64 = 30;
 /// past any useful ANY-match: MangaDex carries ~50 genre tags total, so a 12-way OR
 /// already selects most of the catalogue.
 pub const MAX_GENRE_FILTERS: usize = 12;
+/// Bound free-text genre names in both SQL binds and memo signatures.
+pub const MAX_GENRE_NAME_BYTES: usize = 128;
 
 /// How many trending keys the TRENDING sort ranks before falling back to newest-first.
 ///
@@ -513,15 +515,22 @@ fn placeholders(n: usize) -> String {
 /// total. Sorting also makes the key deterministic across clients that build the list
 /// differently (chip order vs. alphabetical).
 pub fn canonical_genres(genres: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = genres
-        .iter()
-        .map(|g| g.trim().to_string())
-        .filter(|g| !g.is_empty())
-        .collect();
-    out.sort();
-    out.dedup();
-    out.truncate(MAX_GENRE_FILTERS);
-    out
+    let mut out = std::collections::BTreeSet::new();
+    for genre in genres {
+        let genre = genre.trim();
+        if genre.is_empty() {
+            continue;
+        }
+        out.insert(if genre.len() > MAX_GENRE_NAME_BYTES {
+            UNMATCHABLE.to_string()
+        } else {
+            genre.to_string()
+        });
+        if out.len() > MAX_GENRE_FILTERS {
+            out.pop_last();
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// A tag id no tag can have: [`crate::tags::slug`] only ever produces `[a-z0-9-]`. An
@@ -788,7 +797,7 @@ fn count_key(q: &BrowseQuery<'_>) -> String {
     list(&mut key, &q.languages);
     list(&mut key, &q.include_tags);
     list(&mut key, &q.exclude_tags);
-    list(&mut key, q.genres);
+    list(&mut key, &canonical_genres(q.genres));
     key
 }
 
@@ -1171,12 +1180,13 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
     //
     // `work_tag`'s PRIMARY KEY is (work_id, tag), so a work cannot carry a tag twice and
     // `EXISTS` needs no DISTINCT.
-    if !q.genres.is_empty() {
+    let genres = canonical_genres(q.genres);
+    if !genres.is_empty() {
         parts.push(format!(
             "EXISTS (SELECT 1 FROM work_tag t WHERE t.work_id = f.work_id AND t.tag IN ({}))",
-            placeholders(q.genres.len())
+            placeholders(genres.len())
         ));
-        for g in q.genres {
+        for g in &genres {
             binds.push(Bind::Text(g.clone()));
         }
     }
@@ -1335,6 +1345,14 @@ pub async fn search_text(
     let Some(match_expr) = crate::catalog::fts_match_query(raw_query) else {
         return Ok((0, Vec::new()));
     };
+    // Resolve optional view rankings before owning a reader: this helper acquires from
+    // the pool itself and would deadlock with a single-reader pool otherwise.
+    let trending = if q.sort.key == SortKey::MostViewed {
+        Some(trending_work_ids(pool, TRENDING_KEY_LIMIT).await)
+    } else {
+        None
+    };
+    let mut connection = crate::catalog::SearchConnection::new(pool).await?;
     let (where_sql, where_binds, uses_rated) = build_where(q);
     let page_size = BROWSE_PAGE_SIZE;
     let page = q.page.max(1);
@@ -1393,13 +1411,14 @@ pub async fn search_text(
                 )
             };
             let t = bind_count(sqlx::query_scalar::<_, i64>(&sql), &binds)
-                .fetch_one(pool)
+                .fetch_one(&mut *connection)
                 .await?;
             store_count(ckey, t);
             t
         }
     };
     if offset >= total {
+        connection.finish().await?;
         return Ok((total, Vec::new()));
     }
 
@@ -1420,8 +1439,9 @@ pub async fn search_text(
         let rows = bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), &binds)
             .bind(page_size.min(window))
             .bind(offset)
-            .fetch_all(pool)
+            .fetch_all(&mut *connection)
             .await?;
+        connection.finish().await?;
         return Ok((total, rows));
     }
 
@@ -1435,7 +1455,7 @@ pub async fn search_text(
             // The view ranking as a VALUES table of (work_id, position) — positions are our
             // own integers, formatted; the ids are bound. Unviewed works (no row) sort last
             // in both directions, then newest-first like Browse's remainder.
-            let ranked = trending_work_ids(pool, TRENDING_KEY_LIMIT).await;
+            let ranked = trending.unwrap_or_default();
             if ranked.is_empty() {
                 NEWEST_ORDER.to_string()
             } else {
@@ -1473,8 +1493,9 @@ pub async fn search_text(
     let rows = bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), &binds)
         .bind(page_size)
         .bind(offset)
-        .fetch_all(pool)
+        .fetch_all(&mut *connection)
         .await?;
+    connection.finish().await?;
     Ok((total, rows))
 }
 
@@ -2813,6 +2834,38 @@ mod tests {
     /// escaped to make the boundary unforgeable. This key holds RAW tags, where no
     /// character is off-limits, so ANY separator would be forgeable — `["a","b"]` vs
     /// `["a<sep>b"]`. The length prefix is what replaces that argument.
+    #[test]
+    fn genre_names_bound_sql_binds_and_memo_keys_even_for_uncanonicalized_queries() {
+        let huge = vec!["界".repeat(100_000), "Action".to_string()];
+        assert_eq!(
+            canonical_genres(&huge),
+            vec![UNMATCHABLE.to_string(), "Action".to_string()]
+        );
+        assert!(canonical_genres(&["界".repeat(42)])[0].len() <= MAX_GENRE_NAME_BYTES);
+        assert_eq!(
+            canonical_genres(&["界".repeat(43)]),
+            vec![UNMATCHABLE.to_string()]
+        );
+        let q = BrowseQuery {
+            genres: &huge,
+            ..Default::default()
+        };
+        let key = count_key(&q);
+        assert!(
+            key.len() < 512,
+            "genre memo key must be bounded: {}",
+            key.len()
+        );
+        let (_, binds, _) = build_where(&q);
+        assert!(binds.iter().all(|bind| match bind {
+            Bind::Text(value) => value.len() <= MAX_GENRE_NAME_BYTES,
+            _ => true,
+        }));
+        assert!(binds
+            .iter()
+            .any(|bind| matches!(bind, Bind::Text(value) if value == UNMATCHABLE)));
+    }
+
     #[test]
     fn count_key_cannot_be_forged_by_a_crafted_genre_name() {
         let k = |v: &[&str]| {
