@@ -27,8 +27,8 @@
 //! costs ~15 minutes of gentle background writes rather than one lock-holding burst
 //! against a 15 s `busy_timeout`.
 
+use crate::db::Database;
 use anyhow::Result;
-use sqlx::SqlitePool;
 use std::time::Duration;
 
 use super::{replace_source_chapters, spine_key_and_label, suwayomi_spine_input, ChapterInput};
@@ -77,7 +77,7 @@ impl DrainOutcome {
 /// obviously wrong: `CAST('Extra' AS REAL)` is `0.0`, so every one of the 23,254
 /// non-numeric chapters would be keyed as chapter 0 and collide with real chapter zeros —
 /// which is precisely the bug the `x:<external_id>` namespace exists to prevent.
-pub async fn drain_chapter_keys(pool: &SqlitePool) -> Result<u64> {
+pub async fn drain_chapter_keys(pool: &Database) -> Result<u64> {
     let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT id, external_id, number, title FROM chapter \
          WHERE chapter_key IS NULL LIMIT ?",
@@ -117,7 +117,7 @@ pub async fn drain_chapter_keys(pool: &SqlitePool) -> Result<u64> {
 /// index probes, and the outer scan is bounded by the 14,103 Suwayomi `source_series`
 /// rows, so this stays a cheap query even when it returns nothing — which is what it will
 /// do for the rest of the deployment's life once the drain finishes.
-pub async fn drain_suwayomi_series(pool: &SqlitePool) -> Result<u64> {
+pub async fn drain_suwayomi_series(pool: &Database) -> Result<u64> {
     let pending: Vec<(String, i64)> = sqlx::query_as(
         "SELECT ss.id, CAST(ss.source_key AS INTEGER) \
          FROM source_series ss \
@@ -167,7 +167,7 @@ pub async fn drain_suwayomi_series(pool: &SqlitePool) -> Result<u64> {
 }
 
 /// One pass of both drains.
-pub async fn drain_once(pool: &SqlitePool) -> Result<DrainOutcome> {
+pub async fn drain_once(pool: &Database) -> Result<DrainOutcome> {
     Ok(DrainOutcome {
         keyed: drain_chapter_keys(pool).await?,
         series_materialised: drain_suwayomi_series(pool).await?,
@@ -186,7 +186,7 @@ pub async fn drain_once(pool: &SqlitePool) -> Result<DrainOutcome> {
 ///
 /// So the seed does not start until both spine drains report genuinely empty. Returns
 /// `None` while the spine is still filling.
-pub async fn seed_ledger_if_spine_complete(pool: &SqlitePool) -> Result<Option<u64>> {
+pub async fn seed_ledger_if_spine_complete(pool: &Database) -> Result<Option<u64>> {
     if remaining(pool).await? != (0, 0) {
         return Ok(None);
     }
@@ -198,7 +198,7 @@ pub async fn seed_ledger_if_spine_complete(pool: &SqlitePool) -> Result<Option<u
 /// Only called once the drains report idle, i.e. when both answers should be 0 — so
 /// `COUNT(*)` over migration 0090's partial index reads an index that is by then empty,
 /// not the 877k-row table.
-pub async fn remaining(pool: &SqlitePool) -> Result<(i64, i64)> {
+pub async fn remaining(pool: &Database) -> Result<(i64, i64)> {
     let unkeyed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chapter WHERE chapter_key IS NULL")
         .fetch_one(pool)
         .await?;
@@ -216,7 +216,7 @@ pub async fn remaining(pool: &SqlitePool) -> Result<(i64, i64)> {
 
 /// One unit of background work: spine first, ledger once the spine is complete. Returns
 /// how much moved — `0` means everything is caught up.
-async fn pass(pool: &SqlitePool) -> Result<u64> {
+async fn pass(pool: &Database) -> Result<u64> {
     let spine = drain_once(pool).await?;
     if !spine.is_idle() {
         return Ok(spine.keyed + spine.series_materialised);
@@ -227,7 +227,7 @@ async fn pass(pool: &SqlitePool) -> Result<u64> {
 /// Say what state we ended in, once, on the transition to idle. A `warn` rather than an
 /// `info` when work remains: "the drains report nothing to do but there IS something left"
 /// means rows are unreachable, not merely pending, and that is a bug to look at.
-async fn report(pool: &SqlitePool) {
+async fn report(pool: &Database) {
     match remaining(pool).await {
         Ok((0, 0)) => match super::ledger::remaining(pool).await {
             Ok((events, 0)) => {
@@ -259,7 +259,7 @@ async fn report(pool: &SqlitePool) {
 }
 
 /// Run the drains to completion in the background, then keep idling cheaply.
-pub fn spawn(pool: SqlitePool, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+pub fn spawn(pool: Database, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     tokio::spawn(async move {
         /// Sleep unless shutdown fires first. `true` => stop.
         ///

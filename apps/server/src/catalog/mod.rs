@@ -13,9 +13,9 @@ pub mod pair;
 pub mod similarity;
 pub mod spine;
 
+use crate::db::Database;
 use anyhow::Result;
 use chrono::Utc;
-use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use normalize::normalize_title;
@@ -197,7 +197,7 @@ fn new_id(prefix: &str) -> String {
 /// Find the work already claiming `(provider, external_id)`, if any. The
 /// highest-precision match key (CATALOGUE.md §4, step 1).
 pub async fn find_work_by_external(
-    pool: &SqlitePool,
+    pool: &Database,
     provider: &str,
     external_id: &str,
 ) -> Result<Option<String>> {
@@ -213,7 +213,7 @@ pub async fn find_work_by_external(
 
 /// Distinct work ids whose alias index contains this exact normalized title
 /// (step 2). More than one means an ambiguous title that step 4 must disambiguate.
-pub async fn find_works_by_alias(pool: &SqlitePool, normalized: &str) -> Result<Vec<String>> {
+pub async fn find_works_by_alias(pool: &Database, normalized: &str) -> Result<Vec<String>> {
     if normalized.is_empty() {
         return Ok(Vec::new());
     }
@@ -230,7 +230,7 @@ pub async fn find_works_by_alias(pool: &SqlitePool, normalized: &str) -> Result<
 /// (`normalize::match_key`) is `key`, so "The X" finds "X". Weaker than
 /// [`find_works_by_alias`]: callers treat a hit as a LOOSE title match and use it only
 /// when the exact lookup found nothing.
-pub async fn find_works_by_match_key(pool: &SqlitePool, key: &str) -> Result<Vec<String>> {
+pub async fn find_works_by_match_key(pool: &Database, key: &str) -> Result<Vec<String>> {
     if key.is_empty() {
         return Ok(Vec::new());
     }
@@ -255,7 +255,7 @@ pub async fn find_works_by_match_key(pool: &SqlitePool, key: &str) -> Result<Vec
 /// and every alias word is indexed — so a distinctive mid/end-title word like "slime"
 /// in "...as a Slime" still matches, now via the index instead of a scan.
 pub async fn candidate_work_ids_by_token(
-    pool: &SqlitePool,
+    pool: &Database,
     token: &str,
     limit: i64,
 ) -> Result<Vec<String>> {
@@ -301,7 +301,7 @@ async fn insert_alias_tokens(
 }
 
 /// Load the corroboration fields + normalized aliases for one work.
-pub async fn load_match_data(pool: &SqlitePool, work_id: &str) -> Result<Option<WorkMatchData>> {
+pub async fn load_match_data(pool: &Database, work_id: &str) -> Result<Option<WorkMatchData>> {
     let row = sqlx::query_as::<_, MatchDataRow>(&format!(
         "SELECT {MATCH_DATA_COLUMNS} FROM work w WHERE w.id = ?"
     ))
@@ -329,7 +329,7 @@ pub async fn load_match_data(pool: &SqlitePool, work_id: &str) -> Result<Option<
 /// `work_ids` is bounded by the fuzzy-block limits (a few hundred), well under SQLite's
 /// bound-parameter ceiling, so the `IN (...)` list is not chunked.
 pub async fn load_match_data_batch(
-    pool: &SqlitePool,
+    pool: &Database,
     work_ids: &[String],
 ) -> Result<std::collections::HashMap<String, WorkMatchData>> {
     let mut out: std::collections::HashMap<String, WorkMatchData> =
@@ -449,7 +449,7 @@ pub struct CanonicalChapter {
 ///
 /// A page of feed items should use [`work_effective_genres_batch`] instead: this issues
 /// up to three round-trips per work.
-pub async fn work_effective_genres(pool: &SqlitePool, work_id: &str) -> Vec<String> {
+pub async fn work_effective_genres(pool: &Database, work_id: &str) -> Vec<String> {
     let curated = sqlx::query_scalar::<_, String>(
         "SELECT tag FROM work_tag WHERE work_id = ? AND source = 'admin' ORDER BY ord, tag",
     )
@@ -514,7 +514,7 @@ pub async fn work_effective_genres(pool: &SqlitePool, work_id: &str) -> Vec<Stri
 /// production, so tier 1 never fires). Since migration 0066 most works are answered by
 /// tier 2, an indexed (work_id, source) seek, and never reach the Suwayomi join at all.
 pub async fn work_effective_genres_batch(
-    pool: &SqlitePool,
+    pool: &Database,
     work_ids: &[String],
 ) -> std::collections::HashMap<String, Vec<String>> {
     let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
@@ -598,10 +598,7 @@ pub async fn work_effective_genres_batch(
 
 /// Load a canonical work with its MangaDex anchor + cover fileName + alt titles, for
 /// the reader's canonical series path. `None` if the work id is unknown.
-pub async fn load_canonical_work(
-    pool: &SqlitePool,
-    work_id: &str,
-) -> Result<Option<CanonicalWork>> {
+pub async fn load_canonical_work(pool: &Database, work_id: &str) -> Result<Option<CanonicalWork>> {
     #[derive(sqlx::FromRow)]
     struct Row {
         primary_title: Option<String>,
@@ -682,7 +679,7 @@ pub async fn load_canonical_work(
 /// rows are excluded here (belt-and-suspenders alongside the English-only sync); a
 /// number with several English scanlations is collapsed by `select_reader_chapters`.
 pub async fn load_canonical_chapters(
-    pool: &SqlitePool,
+    pool: &Database,
     work_id: &str,
 ) -> Result<Vec<CanonicalChapter>> {
     let rows = sqlx::query_as::<_, CanonicalChapter>(
@@ -729,7 +726,7 @@ pub async fn load_canonical_chapters(
 /// multi-language and a Spanish chapter must not set an English reader's recency; the
 /// Suwayomi half is English-by-construction and stamps `lang = 'en'` on every spine row it
 /// writes (`suwayomi_spine_input`), so keeping the language filter admits it in full.
-pub async fn latest_english_chapter_at(pool: &SqlitePool, work_id: &str) -> Result<Option<String>> {
+pub async fn latest_english_chapter_at(pool: &Database, work_id: &str) -> Result<Option<String>> {
     let at = sqlx::query_scalar::<_, Option<String>>(
         // `readable_at` first (migration 0073): a work whose newest chapter is external
         // carries a 2037 `publish_at`, which would otherwise report a "last updated" a
@@ -752,10 +749,9 @@ pub async fn latest_english_chapter_at(pool: &SqlitePool, work_id: &str) -> Resu
 /// background, instead of on every page view. The resolver then reads ~20 indexed rows
 /// instead of grouping 800k chapter rows through two temp B-trees (3.4s → sub-ms).
 ///
-/// Rebuilt wholesale under one transaction: the table is small (one row per work with
-/// a released chapter) and a full REPLACE is simpler and race-free versus incremental
-/// upserts. `now` bounds out MangaDex's far-future scheduled `publishAt` values, so
-/// unreleased chapters never enter the feed.
+/// Aggregate into private TEMP tables on a read-only-main connection, then publish fully
+/// derived rows in bounded transactions. `now` excludes future scheduled chapters.
+/// Rows changed by concurrent incremental writers are preserved for the next reconcile.
 ///
 /// `is_nsfw` materializes the EFFECTIVE flag `COALESCE(is_nsfw_override, is_nsfw)`, not
 /// the raw column: both admin "mark NSFW"/"mark SFW" mutations write only the override,
@@ -811,9 +807,342 @@ fn feed_updates_select(scope: &str) -> String {
     )
 }
 
-pub async fn refresh_feed_updates(pool: &SqlitePool) -> Result<u64> {
+async fn repair_catalogue_tag_keys(pool: &Database) -> Result<u64> {
+    let mut cursor = 0i64;
+    let mut changed = 0;
+    loop {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT rowid, tag FROM work_tag WHERE rowid > ? \
+             AND (tag_key IS NULL OR tag_group IS NULL) ORDER BY rowid LIMIT 128",
+        )
+        .bind(cursor)
+        .fetch_all(pool)
+        .await?;
+        if rows.is_empty() {
+            return Ok(changed);
+        }
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        for (rowid, name) in rows {
+            cursor = rowid;
+            let group = crate::tags::known_tag(&name).map(|(_, group)| group);
+            changed += sqlx::query(
+                "UPDATE work_tag SET tag_key = COALESCE(tag_key, ?), \
+                tag_group = COALESCE(tag_group, ?) WHERE rowid = ? AND tag = ? \
+                AND (tag_key IS NULL OR (tag_group IS NULL AND ? IS NOT NULL))",
+            )
+            .bind(crate::tags::slug(&name))
+            .bind(group)
+            .bind(rowid)
+            .bind(name)
+            .bind(group)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        tx.commit().await?;
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Keep expensive catalogue SELECTs off the main database's writer. The connection opens
+/// the main file read-only; only its private TEMP tables can be modified. Each staged row
+/// is complete (including type and count facets) before a bounded publication transaction.
+struct RefreshSnapshot(sqlx::SqliteConnection);
+
+impl std::ops::Deref for RefreshSnapshot {
+    type Target = sqlx::SqliteConnection;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for RefreshSnapshot {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+const REFRESH_BATCH_ROWS: i64 = 128;
+
+async fn refresh_snapshot(pool: &Database, tables: &[&str]) -> Result<RefreshSnapshot> {
+    use sqlx::Connection;
+    let options = (*pool.connect_options())
+        .clone()
+        .read_only(true)
+        .foreign_keys(false)
+        .pragma("query_only", "OFF");
+    let mut conn = sqlx::SqliteConnection::connect_with(&options).await?;
+    for table in tables {
+        let schema: String = sqlx::query_scalar(
+            "SELECT sql FROM main.sqlite_schema WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(&mut conn)
+        .await?;
+        let create = if *table == "work_fts" {
+            // This shadow is never searched with MATCH. A regular keyed table avoids
+            // repeated full scans when publishing/pruning FTS's UNINDEXED work_id.
+            "CREATE TEMP TABLE work_fts (work_id TEXT PRIMARY KEY, chapters INTEGER, title TEXT, aliases TEXT)".to_owned()
+        } else {
+            let (_, definition) = schema
+                .split_once('(')
+                .ok_or_else(|| anyhow::anyhow!("invalid catalogue table schema: {table}"))?;
+            format!("CREATE TEMP TABLE {table} ({definition}")
+        };
+        // Save the old version so a scanner/admin write during staging wins over stale
+        // snapshot data. Publication and pruning both compare against this version.
+        sqlx::query(&format!(
+            "CREATE TEMP TABLE previous_{table} AS \
+            SELECT rowid AS snapshot_rowid, * FROM main.{table}"
+        ))
+        .execute(&mut conn)
+        .await?;
+        let key = match *table {
+            "tag" => "id",
+            "feed_genre_facet" => "tag",
+            _ => "work_id",
+        };
+        sqlx::query(&format!(
+            "CREATE INDEX temp.previous_{table}_key \
+            ON previous_{table}({key})"
+        ))
+        .execute(&mut conn)
+        .await?;
+        sqlx::query(&create).execute(&mut conn).await?;
+    }
+    Ok(RefreshSnapshot(conn))
+}
+
+#[derive(Debug, PartialEq)]
+enum RefreshValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+fn refresh_values(
+    row: &sqlx::sqlite::SqliteRow,
+    start: usize,
+    count: usize,
+) -> Result<Vec<RefreshValue>> {
+    use sqlx::{Row, TypeInfo, ValueRef};
+    (start..start + count)
+        .map(|i| {
+            let value = row.try_get_raw(i)?;
+            Ok(if value.is_null() {
+                RefreshValue::Null
+            } else {
+                match value.type_info().name() {
+                    "INTEGER" | "BOOLEAN" => RefreshValue::Integer(row.try_get(i)?),
+                    "REAL" | "NUMERIC" => RefreshValue::Real(row.try_get(i)?),
+                    "BLOB" => RefreshValue::Blob(row.try_get(i)?),
+                    _ => RefreshValue::Text(row.try_get(i)?),
+                }
+            })
+        })
+        .collect()
+}
+
+fn bind_refresh_values<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    values: &'q [RefreshValue],
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+    for value in values {
+        query = match value {
+            RefreshValue::Null => query.bind(Option::<String>::None),
+            RefreshValue::Integer(v) => query.bind(*v),
+            RefreshValue::Real(v) => query.bind(*v),
+            RefreshValue::Text(v) => query.bind(v),
+            RefreshValue::Blob(v) => query.bind(v),
+        };
+    }
+    query
+}
+
+/// Publish in short FIFO writer turns. A failed batch leaves earlier complete rows usable;
+/// a subsequent reconcile converges. Never replace a row changed since staging began.
+async fn publish_snapshot(
+    pool: &Database,
+    snapshot: &mut RefreshSnapshot,
+    table: &str,
+) -> Result<u64> {
+    use sqlx::Row;
+    let columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+        sqlx::query_as(&format!("PRAGMA temp.table_info({table})"))
+            .fetch_all(&mut **snapshot)
+            .await?;
+    let names: Vec<&str> = columns.iter().map(|c| c.1.as_str()).collect();
+    let key = match table {
+        "tag" => "id",
+        "feed_genre_facet" => "tag",
+        _ => "work_id",
+    };
+    let key_index = names.iter().position(|name| *name == key).unwrap();
+    let column_list = names.join(", ");
+    let placeholders = vec!["?"; names.len()].join(", ");
+    let same_previous = names
+        .iter()
+        .map(|c| format!("{c} IS ?"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let mutable = names
+        .iter()
+        .filter(|c| **c != key)
+        .map(|c| format!("{c} = excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let staged_names = names
+        .iter()
+        .map(|c| format!("s.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let previous_names = names
+        .iter()
+        .map(|c| format!("p.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let is_fts = table == "work_fts";
+    let upsert = format!(
+        "INSERT INTO main.{table} ({column_list}) SELECT {placeholders} \
+        WHERE (? = 0 OR EXISTS (SELECT 1 FROM main.{table} WHERE {key} = ?)) {} \
+        ON CONFLICT({key}) DO UPDATE SET {mutable} WHERE ? AND {same_previous}",
+        if matches!(
+            table,
+            "feed_updates" | "feed_series_updates" | "browse_catalogue"
+        ) {
+            "AND EXISTS (SELECT 1 FROM main.work WHERE id = ?)"
+        } else {
+            ""
+        }
+    );
+    let select = format!(
+        "SELECT {staged_names}, p.snapshot_rowid, {previous_names} \
+        FROM temp.{table} s LEFT JOIN temp.previous_{table} p ON p.{key} = s.{key} \
+        WHERE s.{key} > ? ORDER BY s.{key} LIMIT {REFRESH_BATCH_ROWS}"
+    );
+    let mut cursor = String::new();
+    let mut changed = 0;
+    let mut longest_hold = std::time::Duration::ZERO;
+    loop {
+        let rows = sqlx::query(&select)
+            .bind(&cursor)
+            .fetch_all(&mut **snapshot)
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let started = std::time::Instant::now();
+        for row in rows {
+            if started.elapsed() >= std::time::Duration::from_millis(100) {
+                break;
+            }
+            let values = refresh_values(&row, 0, names.len())?;
+            let old_rowid: Option<i64> = row.try_get(names.len())?;
+            let old = refresh_values(&row, names.len() + 1, names.len())?;
+            let id = match &values[key_index] {
+                RefreshValue::Text(s) => s,
+                _ => anyhow::bail!("non-text refresh key"),
+            };
+            cursor.clone_from(id);
+            if old_rowid.is_some() && values == old {
+                continue;
+            }
+            if is_fts {
+                if let Some(rowid) = old_rowid {
+                    let sql =
+                        format!("DELETE FROM main.work_fts WHERE rowid = ? AND {same_previous}");
+                    if bind_refresh_values(sqlx::query(&sql).bind(rowid), &old)
+                        .execute(&mut *tx)
+                        .await?
+                        .rows_affected()
+                        == 0
+                    {
+                        continue;
+                    }
+                }
+                let sql = format!(
+                    "INSERT INTO main.work_fts ({column_list}) SELECT {placeholders} \
+                    WHERE EXISTS (SELECT 1 FROM main.work WHERE id = ?) \
+                      AND (? OR NOT EXISTS (SELECT 1 FROM main.work_fts WHERE work_id = ?))"
+                );
+                changed += bind_refresh_values(sqlx::query(&sql), &values)
+                    .bind(id)
+                    .bind(old_rowid.is_some())
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+            } else {
+                let mut query = bind_refresh_values(sqlx::query(&upsert), &values)
+                    .bind(old_rowid.is_some())
+                    .bind(id);
+                if matches!(
+                    table,
+                    "feed_updates" | "feed_series_updates" | "browse_catalogue"
+                ) {
+                    query = query.bind(id);
+                }
+                changed += bind_refresh_values(query.bind(old_rowid.is_some()), &old)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+            }
+        }
+        tx.commit().await?;
+        longest_hold = longest_hold.max(started.elapsed());
+        tokio::task::yield_now().await;
+    }
+    let prune = format!(
+        "SELECT p.snapshot_rowid, {previous_names} FROM temp.previous_{table} p \
+        WHERE p.{key} > ? AND NOT EXISTS (SELECT 1 FROM temp.{table} s WHERE s.{key} = p.{key}) \
+        ORDER BY p.{key} LIMIT {REFRESH_BATCH_ROWS}"
+    );
+    cursor.clear();
+    loop {
+        let rows = sqlx::query(&prune)
+            .bind(&cursor)
+            .fetch_all(&mut **snapshot)
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let started = std::time::Instant::now();
+        for row in rows {
+            if started.elapsed() >= std::time::Duration::from_millis(100) {
+                break;
+            }
+            let old = refresh_values(&row, 1, names.len())?;
+            let id = match &old[key_index] {
+                RefreshValue::Text(s) => s,
+                _ => anyhow::bail!("non-text refresh key"),
+            };
+            cursor.clone_from(id);
+            let sql = format!("DELETE FROM main.{table} WHERE rowid = ? AND {same_previous}");
+            changed += bind_refresh_values(sqlx::query(&sql).bind(row.try_get::<i64, _>(0)?), &old)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        }
+        tx.commit().await?;
+        longest_hold = longest_hold.max(started.elapsed());
+        tokio::task::yield_now().await;
+    }
+    tracing::info!(
+        table,
+        changed,
+        longest_writer_hold_ms = longest_hold.as_millis(),
+        "catalogue snapshot published"
+    );
+    Ok(changed)
+}
+
+pub async fn refresh_feed_updates(pool: &Database) -> Result<u64> {
     let now = Utc::now().to_rfc3339();
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = refresh_snapshot(pool, &["feed_updates"]).await?;
     sqlx::query("DELETE FROM feed_updates")
         .execute(&mut *tx)
         .await?;
@@ -825,7 +1154,7 @@ pub async fn refresh_feed_updates(pool: &SqlitePool) -> Result<u64> {
     .execute(&mut *tx)
     .await?
     .rows_affected();
-    tx.commit().await?;
+    publish_snapshot(pool, &mut tx, "feed_updates").await?;
     // The reader's merged Updates feed is derived FROM the table we just rebuilt (plus
     // the scanner's half), so it is refreshed here rather than wired separately: every
     // existing caller of this function — boot (`main`) and each post-sync pass
@@ -845,38 +1174,11 @@ pub async fn refresh_feed_updates(pool: &SqlitePool) -> Result<u64> {
 /// fetch page 1 of each, merge, dedupe by lowercased title and cap at 60 — see the
 /// migration for why that cannot be paginated.
 ///
-/// Wholesale DELETE + INSERT under one IMMEDIATE transaction, exactly like
-/// [`refresh_feed_updates`] and [`refresh_work_fts`]: the table is ~48k rows of small
-/// scalars, and a full rebuild is simpler and race-free versus maintaining upserts
-/// across every chapter-write and scan-write path.
+/// Build both halves, types, counts and clocks in a private read-only-main snapshot.
+/// Publish complete rows in bounded transactions; a reader can see adjacent batches from
+/// different reconciles, but never an untyped or incompletely counted row. Concurrent
+/// incremental cache writes win over stale snapshot data.
 ///
-/// ATOMICITY INCLUDES `comic_type`. The three INSERT/UPDATE phases below — mirror half,
-/// scanner half, and the Rust-side [`fill_feed_series_updates_types`] pass — all run in
-/// THIS ONE transaction, so no reader ever observes the new generation half-typed. It was
-/// briefly split: the rebuild committed and the type fill ran after it, which left every
-/// row with `comic_type IS NULL` for the duration of the fill — and `updatesFeed(type:)`
-/// filters on a single equality, so the reader's format tabs returned an EMPTY feed
-/// (`total: 0` included) on every rebuild. A partial visible state is worse than a slower
-/// invisible one for a table whose whole purpose is being read consistently.
-///
-/// The cost is a longer write lock: the fill's three reads measure ~0.6 s warm on a copy
-/// of production (48,409 rows), on top of the ~3 s the DELETE + two INSERTs already hold.
-/// `resolve_comic_type` itself is a handful of `str::contains` and Unicode-script scans
-/// per row and does not register. That is within the same envelope as the existing
-/// writers this DB already schedules around — `refresh_feed_updates` is documented as a
-/// ~3 s transaction and the periodic `ANALYZE` as a ~3.5 s one — and well inside the
-/// pool's 15 s `busy_timeout`, so the scanner rides through it as a wait, not a failure.
-/// This runs at boot and once per catalogue-sync cycle, not per request.
-///
-/// The fill being inside the transaction also means a failure there ROLLS BACK the whole
-/// rebuild, leaving the previous generation intact, instead of committing an untyped one.
-///
-/// STALENESS. Both halves are as fresh as this call, i.e. boot + each catalogue sync.
-/// That is the right cadence for the mirror half (canonical chapters only change then)
-/// but NOT for the scanner half, which changes continuously: a series the scanner
-/// detects a chapter for appears in `/updates` only after the next refresh. Closing that
-/// gap means a one-row UPSERT in `scanner::persist_scan`, which already writes both
-/// source columns — see the report/PR notes; it is deliberately not done here.
 /// Overwrite `feed_series_updates`' release clock and chapter label from the release
 /// ledger — for one work, or for every work when `work_id` is `None`. Returns rows changed.
 ///
@@ -982,7 +1284,7 @@ pub async fn project_feed_from_ledger(
 
 /// The work a `source_series` belongs to, or `None` if the row has gone.
 pub async fn work_id_for_source_series(
-    pool: &SqlitePool,
+    pool: &Database,
     source_series_id: &str,
 ) -> Result<Option<String>> {
     Ok(
@@ -997,9 +1299,9 @@ pub async fn work_id_for_source_series(
 /// complete. This is the incremental counterpart of the rebuild's pass (5) — the two run the
 /// same statement over the same table, which is what makes them converge by construction
 /// rather than by a field-mapping agreement that has to be tested into place.
-pub async fn project_feed_from_ledger_for_work(pool: &SqlitePool, work_id: &str) -> Result<u64> {
+pub async fn project_feed_from_ledger_for_work(pool: &Database, work_id: &str) -> Result<u64> {
     let complete = ledger::is_complete(pool).await.unwrap_or(false);
-    let mut conn = pool.acquire().await?;
+    let mut conn = pool.write().acquire().await?;
     let n = if complete {
         project_feed_from_ledger(&mut conn, Some(work_id)).await?
     } else {
@@ -1064,14 +1366,10 @@ pub async fn default_announced_at(
     Ok(q.execute(&mut *conn).await?.rows_affected())
 }
 
-pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
-    // Asked BEFORE the transaction opens, not inside it. The check scans, and this
-    // transaction is already ~13 s of held write lock against a 15 s `busy_timeout` — the
-    // margin the two-transaction split in this function exists to protect. A stale answer
-    // is harmless in both directions: `false` means one more rebuild behaves exactly as
-    // today, `true` means the ledger finished moments ago and the projection is correct.
+pub async fn refresh_feed_series_updates(pool: &Database) -> Result<u64> {
+    // This gate is a read; the expensive derivations below only modify TEMP tables.
     let ledger_ready = ledger::is_complete(pool).await.unwrap_or(false);
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = refresh_snapshot(pool, &["feed_series_updates"]).await?;
     sqlx::query("DELETE FROM feed_series_updates")
         .execute(&mut *tx)
         .await?;
@@ -1228,10 +1526,10 @@ pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
     //     real function keeps this feed's format facet identical to every other surface's
     //     format badge, instead of a SQL approximation that disagrees with them.
     //
-    //     INSIDE the transaction, deliberately — see the atomicity note in the doc
+    //     In the private snapshot, deliberately — see the atomicity note in the doc
     //     comment. It reads the rows the two INSERTs above just wrote, which are visible
-    //     to this connection and to nobody else until the commit below, so the new
-    //     generation becomes visible fully typed or not at all.
+    //     to this connection and to nobody else until the publication below, so each published
+    //     row becomes visible fully typed.
     let typed = fill_comic_types(&mut tx, "feed_series_updates", None).await?;
 
     // (4) `en_chapter_count` (migration 0068) — Browse's CHAPTERS sort key and the number
@@ -1241,7 +1539,7 @@ pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
     //     no English chapter (the same precedence `map_canonical_series` applies between its
     //     English count and `aggregate_chapter_count`).
     //
-    //     STILL INSIDE the transaction, for the reason the doc comment gives about
+    //     STILL In the private snapshot, for the reason the doc comment gives about
     //     `comic_type`: this is a SORT KEY, and a committed generation where every row reads
     //     0 would make `sort: CHAPTERS` degenerate to the `work_id DESC` tiebreaker — a
     //     silently wrong ordering rather than a visibly empty one, which is worse.
@@ -1257,10 +1555,10 @@ pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
 
     // (6) THE SORT KEY'S FLOOR (migration 0099). UNGATED, and that is the point: pass (5) is
     //     the only thing that can supply a real announce clock and it does not run until the
-    //     ledger is complete, so without this the `DELETE` at the top of this function would
+    //     ledger is complete, so without this a freshly staged row would
     //     leave `announced_at` NULL for the whole table and `updates_feed`'s ORDER BY would
     //     have nothing to sort on. Defaulting to `released_at` reproduces the pre-0099 order
-    //     exactly. INSIDE the transaction for the same reason pass (3) is — this is a SORT
+    //     exactly. In the private snapshot for the same reason pass (3) is — this is a SORT
     //     KEY, and a committed generation that cannot be ordered is worse than a missing one.
     let defaulted = default_announced_at(&mut tx, None).await?;
     tracing::info!(
@@ -1268,63 +1566,18 @@ pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
         "feed: announce clock defaulted to the release clock"
     );
 
-    tx.commit().await?;
+    publish_snapshot(pool, &mut tx, "feed_series_updates").await?;
 
-    // Browse's own table (migration 0069), which is DERIVED FROM the generation we just
-    // committed — for a work with a feed row it copies that row's columns verbatim, so it has
-    // to run after this commit, not before. Best-effort for the same reason
-    // `refresh_feed_updates` treats this function as best-effort: a Browse rebuild failing
-    // must not make the updates feed's rebuild look like it failed.
-    //
-    // A SEPARATE TRANSACTION, and that is a measured decision rather than a stylistic one.
-    // 0064 folded the type fill into the rebuild's transaction so no reader could see a
-    // half-typed generation, and the same argument holds WITHIN `refresh_browse_catalogue`
-    // (which owns its own transaction for exactly that). What does not hold is sharing THIS
-    // one: no query reads both tables (Browse reads only `browse_catalogue`, `updatesFeed`
-    // only `feed_series_updates`), so cross-table atomicity buys nothing — and it costs
-    // everything. Measured on a copy of production: the transaction above is already
-    // ~12.0 s of SQL (`DELETE` 4.7 s + mirror INSERT 3.1 s + `en_chapter_count` 3.3 s + the
-    // rest) plus ~0.6 s of type fill and a ~0.5 s commit, and Browse's rebuild adds ~6 s.
-    // One shared transaction would therefore hold the write lock for ~19 s against the
-    // pool's 15 s `busy_timeout` (db.rs) — past that ceiling the scanner's concurrent writes
-    // stop being a wait and start being `SQLITE_BUSY` failures. Two transactions of ~13 s and
-    // ~6 s each stay inside it.
+    // Derive Browse after the feed's bounded publication has completed.
     if let Err(e) = refresh_browse_catalogue(pool).await {
         tracing::warn!(error = %e, "browse_catalogue: refresh failed");
     }
 
-    // Search's index (migration 0052/0071), on the same cadence and for the same reason.
-    //
-    // It used to be called separately alongside this function at both call sites (boot and
-    // post-sync), which happened to give it the same freshness but stated no such contract
-    // — and the two tables MUST agree on which works exist, because a work that is in
-    // `browse_catalogue` but not in `work_fts` is browsable-but-unsearchable, exactly the
-    // 0052 bug that migration 0071 fixes. Folding it into the chain makes that agreement
-    // structural: the resolver hydrates FTS hits THROUGH `browse_catalogue` (for
-    // `reader_id`), so an id in the index with no row in that table is a dropped result.
-    // Best-effort and last, for the same reason Browse's rebuild is: it derives from the
-    // generation already committed above, and its failure must not look like this one's.
-    //
-    // A SEPARATE TRANSACTION, matching the note above: no query reads both tables, and the
-    // ~13 s + ~6 s already spent here is close enough to the pool's 15 s `busy_timeout`
-    // that folding another rebuild in would push concurrent scanner writes into
-    // `SQLITE_BUSY`. `refresh_work_fts` owns its own IMMEDIATE transaction.
+    // Search follows Browse so search hits can be hydrated through its reader ids.
     if let Err(e) = refresh_work_fts(pool).await {
         tracing::warn!(error = %e, "work_fts: refresh failed");
     }
 
-    // Give the planner statistics for a table that did not exist when the periodic
-    // `ANALYZE` list in `db.rs` was written. Without a `sqlite_stat1` row the planner
-    // assumes ~1M rows for it (see the note on that list). Run AFTER the rebuild so the
-    // stats describe a populated table, and outside the transaction so it never extends
-    // the write lock. `feed_genre_facet` is ~100 rows and always read in full, so it needs
-    // no statistics of its own.
-    if let Err(e) = sqlx::query("ANALYZE feed_series_updates")
-        .execute(pool)
-        .await
-    {
-        tracing::warn!(error = %e, "feed_series_updates: ANALYZE failed");
-    }
     tracing::info!(
         mirror,
         scanner,
@@ -1382,7 +1635,7 @@ pub async fn refresh_feed_series_updates(pool: &SqlitePool) -> Result<u64> {
 /// contradiction, and it is why C3's drift reporter counts rows rather than trusting this.
 ///
 /// Returns `true` when the work now has a `feed_series_updates` row from this half.
-pub async fn publish_mirror_feed_row(pool: &SqlitePool, work_id: &str) -> Result<bool> {
+pub async fn publish_mirror_feed_row(pool: &Database, work_id: &str) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
 
     // (1) The work's `feed_updates` row (migration 0051). Maintained here rather than left to
@@ -1463,7 +1716,7 @@ pub async fn publish_mirror_feed_row(pool: &SqlitePool, work_id: &str) -> Result
     //        a NULL type is invisible to the reader's format tabs and to Browse's format
     //        chips, so a brand-new work would sit in the unfiltered feed and vanish from
     //        every tab until the next rebuild.
-    let mut conn = pool.acquire().await?;
+    let mut conn = pool.write().acquire().await?;
     fill_comic_types(&mut conn, "feed_series_updates", Some(work_id)).await?;
     fill_en_chapter_count(&mut conn, Some(work_id)).await?;
     drop(conn);
@@ -1719,7 +1972,7 @@ pub(crate) const BROWSE_CATALOGUE_MUTABLE: &[&str] = &[
 ///   `NOT IN` measured 1,628 ms for the same 0 rows, and the extra 1.4 s only buys the
 ///   title-went-empty case — where the upsert already does the safe thing by leaving the row
 ///   at its last known title rather than writing a NULL into a `NOT NULL` column.
-pub async fn refresh_browse_catalogue(pool: &SqlitePool) -> Result<u64> {
+pub async fn refresh_browse_catalogue(pool: &Database) -> Result<u64> {
     // Suwayomi-only works' tags (migration 0106): map their sources' free-text genres onto
     // the MangaDex vocabulary BEFORE the rebuild, so the tag counts below — and the tag filter
     // — see this cycle's result. Its own (short, diff-only) transaction, ahead of this one,
@@ -1737,7 +1990,8 @@ pub async fn refresh_browse_catalogue(pool: &SqlitePool) -> Result<u64> {
         Err(e) => tracing::warn!(error = %e, "tags: Suwayomi genre sync failed"),
     }
 
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let keyed = repair_catalogue_tag_keys(pool).await?;
+    let mut tx = refresh_snapshot(pool, &["browse_catalogue", "tag", "feed_genre_facet"]).await?;
 
     let set = BROWSE_CATALOGUE_MUTABLE
         .iter()
@@ -1778,7 +2032,6 @@ pub async fn refresh_browse_catalogue(pool: &SqlitePool) -> Result<u64> {
     // below: `tag.work_count` is the number on a tag chip, and it must count the generation
     // the tag filter is about to query. Keys first (the safety net under every `work_tag`
     // writer — see `tags::fill_tag_keys`), then the counts over them.
-    let keyed = crate::tags::fill_tag_keys(&mut tx).await?;
     let tags = crate::tags::rebuild_tag_table(&mut tx).await?;
 
     // The genre facet list Browse renders as chips (migration 0068), MOVED here from the feed
@@ -1808,7 +2061,9 @@ pub async fn refresh_browse_catalogue(pool: &SqlitePool) -> Result<u64> {
     .await?
     .rows_affected();
 
-    tx.commit().await?;
+    publish_snapshot(pool, &mut tx, "browse_catalogue").await?;
+    publish_snapshot(pool, &mut tx, "tag").await?;
+    publish_snapshot(pool, &mut tx, "feed_genre_facet").await?;
 
     // Browse's `total` is memoized for up to `browse::COUNT_TTL`, and we have just rewritten
     // the table those totals counted. A surviving entry would promise a page that no longer
@@ -1816,13 +2071,7 @@ pub async fn refresh_browse_catalogue(pool: &SqlitePool) -> Result<u64> {
     // "showing 115,531-115,560 of 115,530". One `HashMap::clear`, twice a day.
     crate::browse::clear_count_cache();
 
-    // Statistics for a table `db.rs`' periodic `ANALYZE` list predates. Without a
-    // `sqlite_stat1` row the planner assumes ~1M rows for it and can pick the wrong index of
-    // the eight. AFTER the rebuild so the stats describe the current generation, and outside
-    // the transaction so it never extends the write lock.
-    if let Err(e) = sqlx::query("ANALYZE browse_catalogue").execute(pool).await {
-        tracing::warn!(error = %e, "browse_catalogue: ANALYZE failed");
-    }
+    // The centralized bounded ANALYZE pass owns statistics for both catalogue tables.
     let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM browse_catalogue")
         .fetch_one(pool)
         .await
@@ -2093,12 +2342,9 @@ async fn fill_en_chapter_count(
     Ok(counted)
 }
 
-/// Rebuild the `work_fts` full-text index (migration 0052, AD-5; corpus widened in 0071).
-///
-/// Like `refresh_feed_updates`, this is a wholesale DELETE + INSERT under one
-/// IMMEDIATE transaction: the corpus (one row per sourced, titled work) is small text and
-/// a full rebuild is simpler and race-free versus maintaining per-upsert triggers across
-/// `work` + `work_alias` + `source_series`.
+/// Rebuild `work_fts` without a long main-database write transaction. Read-only-main
+/// staging computes the entire corpus; short batches update changed rows and prune stale
+/// ones. Unchanged rows retain their rowids and concurrent incremental updates win.
 ///
 /// THE CORPUS IS EVERY SOURCED WORK, not just the MangaDex-anchored ones. 0052 restricted
 /// it to MangaDex because `canonicalSeries` rejects a work with no MangaDex anchor, so a
@@ -2113,8 +2359,8 @@ async fn fill_en_chapter_count(
 /// MangaDex catalogue sync, on exactly the cadence that rebuilds `browse_catalogue`. Search
 /// and Browse therefore go stale together rather than one lagging the other, which is the
 /// property that made this bug invisible: the work was in the grid but not in the index.
-pub async fn refresh_work_fts(pool: &SqlitePool) -> Result<u64> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+pub async fn refresh_work_fts(pool: &Database) -> Result<u64> {
+    let mut tx = refresh_snapshot(pool, &["work_fts"]).await?;
     sqlx::query("DELETE FROM work_fts")
         .execute(&mut *tx)
         .await?;
@@ -2136,7 +2382,7 @@ pub async fn refresh_work_fts(pool: &SqlitePool) -> Result<u64> {
     .execute(&mut *tx)
     .await?
     .rows_affected();
-    tx.commit().await?;
+    publish_snapshot(pool, &mut tx, "work_fts").await?;
     Ok(n)
 }
 
@@ -2304,7 +2550,7 @@ pub(crate) fn fts_title_tier(query: &str) -> (&'static str, Vec<String>) {
 /// strips noise tails ("Naruto (Official Colored)" normalizes to "naruto"), which
 /// would let a re-release tie with the work itself in the exact tier.
 pub async fn search_works_fts(
-    pool: &SqlitePool,
+    pool: &Database,
     query: &str,
     show_nsfw: bool,
     page: i64,
@@ -2361,7 +2607,7 @@ pub async fn search_works_fts(
 
 /// NSFW flag of the work owning a mirrored MangaDex chapter (by chapter uuid), for
 /// gating `canonicalPages`. `None` if the chapter isn't in the mirror.
-pub async fn chapter_owner_is_nsfw(pool: &SqlitePool, external_id: &str) -> Result<Option<bool>> {
+pub async fn chapter_owner_is_nsfw(pool: &Database, external_id: &str) -> Result<Option<bool>> {
     let v = sqlx::query_scalar::<_, i64>(
         "SELECT COALESCE(w.is_nsfw_override, w.is_nsfw) FROM chapter c \
          JOIN source_series ss ON ss.id = c.source_series_id \
@@ -2445,7 +2691,7 @@ fn select_reader_chapters(rows: Vec<CanonicalChapter>) -> Vec<CanonicalChapter> 
 /// to one; otherwise mints a new work. Aliases + external ids are added
 /// idempotently, and a `mangadex` source_series is ensured. Returns the work id.
 pub async fn upsert_work_from_mangadex(
-    pool: &SqlitePool,
+    pool: &Database,
     mangadex_id: &str,
     input: &WorkInput,
 ) -> Result<String> {
@@ -2548,7 +2794,7 @@ pub async fn upsert_work_from_mangadex(
 
 /// Create a brand-new first-class canonical work (no MangaDex anchor) from an input.
 /// Used by the Tier-2 add flow when the matcher decides "new work".
-pub async fn create_work(pool: &SqlitePool, input: &WorkInput) -> Result<String> {
+pub async fn create_work(pool: &Database, input: &WorkInput) -> Result<String> {
     // IMMEDIATE: a write-only transaction here today, but it shares the single writer
     // with the sync/scan/cover paths — taking the lock up front keeps it out of the
     // un-retryable SQLITE_BUSY_SNAPSHOT class if a read is ever added ahead of the
@@ -2604,7 +2850,7 @@ pub async fn create_work(pool: &SqlitePool, input: &WorkInput) -> Result<String>
 /// `reviews`, or `user_library` rows yet, only the child metadata `create_work`
 /// wrote. Explicit child deletes make this correct regardless of the connection's
 /// `foreign_keys` pragma (mirrors the `merge_works` cleanup).
-pub async fn delete_work_cascade(pool: &SqlitePool, work_id: &str) -> Result<()> {
+pub async fn delete_work_cascade(pool: &Database, work_id: &str) -> Result<()> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     // `canonical_library` and `work_cover_issue` carry no enforced FK the app can rely
     // on (the pragma is per-connection), so leaving them out left rows pointing at a
@@ -2779,7 +3025,7 @@ async fn replace_mangadex_details(
 /// taxonomy/tracker snapshot. Publication facts follow the normal full upsert
 /// so NSFW/source/materialized projections keep their existing refresh semantics.
 pub async fn refresh_mangadex_details(
-    pool: &SqlitePool,
+    pool: &Database,
     work_id: &str,
     input: &WorkInput,
 ) -> Result<()> {
@@ -2790,7 +3036,7 @@ pub async fn refresh_mangadex_details(
 }
 
 /// Load a work's cover set (F2), primary first then by volume/file name.
-pub async fn load_work_covers(pool: &SqlitePool, work_id: &str) -> Result<Vec<Cover>> {
+pub async fn load_work_covers(pool: &Database, work_id: &str) -> Result<Vec<Cover>> {
     let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, i64)>(
         "SELECT cover_file_name, lang, volume, is_primary FROM work_cover WHERE work_id = ? \
          ORDER BY is_primary DESC, \
@@ -2841,7 +3087,7 @@ async fn insert_aliases(
 /// repeat). Returns the normalized key it indexed, or `""` if the title had no
 /// indexable content (nothing written). The caller uses the key to look for exact
 /// matches on OTHER works to auto-merge.
-pub async fn add_work_alias(pool: &SqlitePool, work_id: &str, raw_title: &str) -> Result<String> {
+pub async fn add_work_alias(pool: &Database, work_id: &str, raw_title: &str) -> Result<String> {
     let raw = raw_title.trim();
     let norm = normalize_title(raw);
     if norm.is_empty() {
@@ -2867,7 +3113,7 @@ pub async fn add_work_alias(pool: &SqlitePool, work_id: &str, raw_title: &str) -
 /// survivor keeps its description/cover/credits, avoiding the metadata loss that
 /// folding a rich work into a bare one would cause. Returns the sole id for a
 /// singleton; errors only on a query failure.
-pub async fn pick_survivor(pool: &SqlitePool, work_ids: &[String]) -> Result<String> {
+pub async fn pick_survivor(pool: &Database, work_ids: &[String]) -> Result<String> {
     if work_ids.len() == 1 {
         return Ok(work_ids[0].clone());
     }
@@ -2993,7 +3239,7 @@ pub async fn unpin_work_field(
 }
 
 /// The `work` columns an admin has pinned on this work.
-pub async fn pinned_work_fields(pool: &SqlitePool, work_id: &str) -> Result<Vec<String>> {
+pub async fn pinned_work_fields(pool: &Database, work_id: &str) -> Result<Vec<String>> {
     Ok(
         sqlx::query_scalar("SELECT field FROM work_field_pin WHERE work_id = ? ORDER BY field")
             .bind(work_id)
@@ -3005,7 +3251,7 @@ pub async fn pinned_work_fields(pool: &SqlitePool, work_id: &str) -> Result<Vec<
 /// Admin: remove an alt-title from a work — matched by its normalized key OR its exact
 /// raw text — then rebuild the work's token index (tokens can be shared across
 /// aliases, so a per-token delete is unsafe; rebuild from what remains).
-pub async fn remove_work_alias(pool: &SqlitePool, work_id: &str, raw_title: &str) -> Result<()> {
+pub async fn remove_work_alias(pool: &Database, work_id: &str, raw_title: &str) -> Result<()> {
     let raw = raw_title.trim();
     let norm = normalize_title(raw);
     let mut tx = pool.begin().await?;
@@ -3087,7 +3333,7 @@ async fn ensure_source_series(
 /// Public, non-transactional variant of `ensure_source_series` for the add flow.
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_source_series(
-    pool: &SqlitePool,
+    pool: &Database,
     work_id: &str,
     source_type: &str,
     source_id: &str,
@@ -3132,7 +3378,7 @@ pub struct SourceExtensionInput {
 /// (the same value carried on `source_series.source_id`). Idempotent — a re-scan
 /// overwrites all columns with the freshly-observed values and bumps `updated_at`.
 pub async fn upsert_source_extension(
-    pool: &SqlitePool,
+    pool: &Database,
     source_id: &str,
     input: &SourceExtensionInput,
 ) -> Result<()> {
@@ -3163,7 +3409,7 @@ pub async fn upsert_source_extension(
 /// `None` means there is NO ROW — the source has not been recorded yet (a fresh server,
 /// an extension installed since the last record pass, an extension with no repo). That
 /// is "unknown", never "safe": the caller must ask the engine rather than default.
-pub async fn source_extension_nsfw(pool: &SqlitePool, source_id: &str) -> Result<Option<bool>> {
+pub async fn source_extension_nsfw(pool: &Database, source_id: &str) -> Result<Option<bool>> {
     Ok(
         sqlx::query_scalar::<_, i64>("SELECT is_nsfw FROM source_extension WHERE source_id = ?")
             .bind(source_id)
@@ -3174,7 +3420,7 @@ pub async fn source_extension_nsfw(pool: &SqlitePool, source_id: &str) -> Result
 }
 
 /// Whether an admin pinned this whole source adult (`markSourceNsfw`, migration 0114).
-pub async fn source_nsfw_pinned(pool: &SqlitePool, source_id: &str) -> Result<bool> {
+pub async fn source_nsfw_pinned(pool: &Database, source_id: &str) -> Result<bool> {
     Ok(
         sqlx::query_scalar::<_, i64>("SELECT 1 FROM source_nsfw_pin WHERE source_id = ?")
             .bind(source_id)
@@ -3185,7 +3431,7 @@ pub async fn source_nsfw_pinned(pool: &SqlitePool, source_id: &str) -> Result<bo
 }
 
 /// Set or clear the admin's "this source is adult" pin. Idempotent both ways.
-pub async fn set_source_nsfw_pin(pool: &SqlitePool, source_id: &str, pinned: bool) -> Result<()> {
+pub async fn set_source_nsfw_pin(pool: &Database, source_id: &str, pinned: bool) -> Result<()> {
     if pinned {
         sqlx::query(
             "INSERT INTO source_nsfw_pin (source_id, created_at) VALUES (?, ?) \
@@ -3207,7 +3453,7 @@ pub async fn set_source_nsfw_pin(pool: &SqlitePool, source_id: &str, pinned: boo
 /// Mark the works behind these MangaDex ids as metadata-attempted (H1), so the
 /// backfill advances past ids MangaDex didn't return. Idempotent; a no-op for ids
 /// with no `mangadex` source_series.
-pub async fn mark_metadata_synced(pool: &SqlitePool, mangadex_ids: &[String]) -> Result<()> {
+pub async fn mark_metadata_synced(pool: &Database, mangadex_ids: &[String]) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     for mid in mangadex_ids {
         sqlx::query(
@@ -3225,7 +3471,7 @@ pub async fn mark_metadata_synced(pool: &SqlitePool, mangadex_ids: &[String]) ->
 
 /// Mark the works behind these MangaDex ids as full-cover-fetched (F2), so the
 /// cover backfill advances past ids `/cover` returned nothing for. Idempotent.
-pub async fn mark_covers_synced(pool: &SqlitePool, mangadex_ids: &[String]) -> Result<()> {
+pub async fn mark_covers_synced(pool: &Database, mangadex_ids: &[String]) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     for mid in mangadex_ids {
         sqlx::query(
@@ -3252,7 +3498,7 @@ pub async fn mark_covers_synced(pool: &SqlitePool, mangadex_ids: &[String]) -> R
 /// this is what wrongly hid One Piece / Chainsaw Man from anonymous viewers). Matches
 /// `genre_is_nsfw`'s own rule that "suggestive is kept SFW-visible". Migration 0053
 /// backfilled the historical over-flags; this guard stops them recurring.
-pub async fn mark_work_nsfw(pool: &SqlitePool, work_id: &str) -> Result<()> {
+pub async fn mark_work_nsfw(pool: &Database, work_id: &str) -> Result<()> {
     sqlx::query(
         "UPDATE work SET is_nsfw = 1, updated_at = ? \
          WHERE id = ? AND is_nsfw = 0 \
@@ -3288,7 +3534,7 @@ pub struct MergeOutcome {
 /// out-of-tree callers that haven't been converted yet.
 #[allow(dead_code)] // no non-test caller left; kept as the covers-pool-free entry point
 pub async fn merge_works(
-    pool: &SqlitePool,
+    pool: &Database,
     source_work: &str,
     target_work: &str,
 ) -> Result<MergeOutcome> {
@@ -3306,8 +3552,8 @@ pub async fn merge_works(
 /// between leaks one blob, exactly the harmless, re-derivable state we already tolerate,
 /// whereas deleting first could strip a live cover if the merge then rolled back.
 pub async fn merge_works_ex(
-    pool: &SqlitePool,
-    covers: Option<&SqlitePool>,
+    pool: &Database,
+    covers: Option<&Database>,
     source_work: &str,
     target_work: &str,
 ) -> Result<MergeOutcome> {
@@ -3356,8 +3602,8 @@ pub struct WorkIdentity {
 /// explicitly asked for (`mergeWorks`, `resolveMergeCandidate`): the admin IS the
 /// authority whose intent a precondition would be protecting.
 pub async fn merge_works_checked(
-    pool: &SqlitePool,
-    covers: Option<&SqlitePool>,
+    pool: &Database,
+    covers: Option<&Database>,
     source_work: &str,
     target_work: &str,
     expected: Option<(&WorkIdentity, &WorkIdentity)>,
@@ -3368,8 +3614,8 @@ pub async fn merge_works_checked(
 /// Claim a waiting review and merge under the same write lock. A rejection or
 /// metadata edit that wins the lock prevents the automatic merge.
 pub async fn merge_pending_candidate_checked(
-    pool: &SqlitePool,
-    covers: Option<&SqlitePool>,
+    pool: &Database,
+    covers: Option<&Database>,
     source_work: &str,
     target_work: &str,
     expected: (&WorkIdentity, &WorkIdentity),
@@ -3387,8 +3633,8 @@ pub async fn merge_pending_candidate_checked(
 }
 
 async fn merge_works_guarded(
-    pool: &SqlitePool,
-    covers: Option<&SqlitePool>,
+    pool: &Database,
+    covers: Option<&Database>,
     source_work: &str,
     target_work: &str,
     expected: Option<(&WorkIdentity, &WorkIdentity)>,
@@ -3885,7 +4131,7 @@ async fn merge_works_guarded(
 /// not-found branches used to return "No such work" for every id that a merge retired.
 /// Reading through the redirect there turns a permanently dead bookmark back into the
 /// surviving series.
-pub async fn redirect_work_id(pool: &SqlitePool, old_id: &str) -> Result<Option<String>> {
+pub async fn redirect_work_id(pool: &Database, old_id: &str) -> Result<Option<String>> {
     let new_id =
         sqlx::query_scalar::<_, String>("SELECT new_id FROM work_redirect WHERE old_id = ?")
             .bind(old_id)
@@ -3901,7 +4147,7 @@ pub async fn redirect_work_id(pool: &SqlitePool, old_id: &str) -> Result<Option<
 /// main DB and simply accumulates — a live audit measured 8,868 orphans / 1.53 GB of a
 /// 20.4 GB store. Blobs are re-derivable from MangaDex, so a failure here is logged by
 /// the caller rather than being allowed to fail a merge that already committed.
-pub async fn reclaim_cover_blob(covers: &SqlitePool, work_id: &str) -> Result<()> {
+pub async fn reclaim_cover_blob(covers: &Database, work_id: &str) -> Result<()> {
     sqlx::query("DELETE FROM work_cover_blob WHERE work_id = ?")
         .bind(work_id)
         .execute(covers)
@@ -3948,7 +4194,7 @@ pub struct SourceSeriesRow {
 /// `graphql::load_work_sources` (MangaDex anchor first, then by recency) so one work's
 /// sources don't appear in two different orders on two admin surfaces.
 pub async fn work_source_series_rows(
-    pool: &SqlitePool,
+    pool: &Database,
     work_id: &str,
 ) -> Result<Vec<SourceSeriesRow>> {
     let rows = sqlx::query_as::<_, SourceSeriesRow>(
@@ -4031,7 +4277,7 @@ pub struct SplitOutcome {
 /// `is_nsfw`. Under-gating a split-off work would expose it to anonymous viewers on the
 /// strength of an admin action that was about identity, not about rating.
 pub async fn split_source_series(
-    pool: &SqlitePool,
+    pool: &Database,
     work_id: &str,
     source_series_ids: &[String],
     actor_user_id: Option<&str>,
@@ -4296,7 +4542,7 @@ pub async fn split_source_series(
 /// BY CONSTRUCTION — that shared title is what caused the bad merge in the first place — so
 /// without this they are re-merged on the next pass, destructively: `merge_works` deletes
 /// the loser.
-pub async fn is_split_pair(pool: &SqlitePool, one: &str, other: &str) -> Result<bool> {
+pub async fn is_split_pair(pool: &Database, one: &str, other: &str) -> Result<bool> {
     let (a, b) = if one < other {
         (one, other)
     } else {
@@ -4329,7 +4575,7 @@ pub async fn is_split_pair(pool: &SqlitePool, one: &str, other: &str) -> Result<
 /// NOT called from the hot path. Two `work_fts` statements scan the FTS table (its
 /// `work_id` column is `UNINDEXED`), which is fine for a one-shot admin action and would
 /// not be for a per-scan write.
-pub async fn reproject_work_caches(pool: &SqlitePool, work_id: &str) -> Result<()> {
+pub async fn reproject_work_caches(pool: &Database, work_id: &str) -> Result<()> {
     // (1) `reader_id`, by the rule both feed writers apply — the MangaDex anchor wins, else
     //     the numeric Suwayomi id. `MIN(ss.id)` (via ORDER BY ... LIMIT 1) matches the
     //     `sw` sub-select in `browse_catalogue_select`, so the two surfaces agree on WHICH
@@ -4376,7 +4622,7 @@ pub async fn reproject_work_caches(pool: &SqlitePool, work_id: &str) -> Result<(
     // `comic_type` is not in the SELECT (see `fill_comic_types`), and a NULL type is
     // invisible to Browse's format tabs — so a row this call just INSERTED would sit out
     // of every tab until the next wholesale rebuild.
-    let mut conn = pool.acquire().await?;
+    let mut conn = pool.write().acquire().await?;
     fill_comic_types(&mut conn, "browse_catalogue", Some(work_id)).await?;
     drop(conn);
 
@@ -4473,7 +4719,7 @@ pub struct AuthMapping {
 /// most-recent `last_seen`, then lowest `id`), so `aggregatedChapters`,
 /// `workSources`/translators, and live `chapters()` all agree on ONE readable id.
 pub async fn authoritative_suwayomi_mappings(
-    pool: &SqlitePool,
+    pool: &Database,
     work_id: &str,
 ) -> Result<Vec<AuthMapping>> {
     let rows = sqlx::query_as::<_, (String, String, String, i64)>(
@@ -4516,7 +4762,7 @@ pub async fn authoritative_suwayomi_mappings(
 /// point of Phase B.
 #[cfg(test)]
 async fn work_source_chapters_two_branch(
-    pool: &SqlitePool,
+    pool: &Database,
     work_id: &str,
 ) -> Result<Vec<WorkChapterRow>> {
     let auth = authoritative_suwayomi_mappings(pool, work_id).await?;
@@ -4640,7 +4886,7 @@ async fn work_source_chapters_two_branch(
 /// (`graphql::group_aggregated_chapters`) re-sorts into a `BTreeMap` keyed by
 /// `(number, key)`. The `ORDER BY` here exists to keep the Suwayomi-then-MangaDex shape
 /// the two-branch version happened to produce, not to promise one.
-pub async fn work_source_chapters(pool: &SqlitePool, work_id: &str) -> Result<Vec<WorkChapterRow>> {
+pub async fn work_source_chapters(pool: &Database, work_id: &str) -> Result<Vec<WorkChapterRow>> {
     // A PARTIALLY-DRAINED SPINE GETS NO GUARD, AND THIS IS THE ARGUMENT FOR THAT.
     //
     // Between boot and drain-completion this returns FEWER Suwayomi chapters than the
@@ -4810,7 +5056,7 @@ pub fn main_chapter_count_str(chapters: &[CanonicalChapter]) -> i64 {
 /// its sources (see `main_chapter_count`). This is the count the reader should see — a
 /// work whose MangaDex spine has 0 chapters but whose asurascans source has 201
 /// reports 201, not 0.
-pub async fn aggregate_chapter_count(pool: &SqlitePool, work_id: &str) -> Result<i64> {
+pub async fn aggregate_chapter_count(pool: &Database, work_id: &str) -> Result<i64> {
     let rows = work_source_chapters(pool, work_id).await?;
     // UNNUMBERED chapters count as one main chapter each: a oneshot work has exactly one
     // chapter, and reporting 0 is what left 21,422 works reading "No chapters yet" in
@@ -4834,7 +5080,7 @@ pub async fn aggregate_chapter_count(pool: &SqlitePool, work_id: &str) -> Result
 /// 151), which is why it could only ever be used as a zero-fallback. A MAX over per-source
 /// counts has no such failure mode and can therefore be trusted to RAISE a non-zero English
 /// count — which is what fixes the works whose MangaDex spine is a stub.
-pub async fn suwayomi_chapter_count(pool: &SqlitePool, work_id: &str) -> Result<i64> {
+pub async fn suwayomi_chapter_count(pool: &Database, work_id: &str) -> Result<i64> {
     let n = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT MAX(sy.chapter_count) FROM source_series ss \
            JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
@@ -4850,7 +5096,7 @@ pub async fn suwayomi_chapter_count(pool: &SqlitePool, work_id: &str) -> Result<
 
 /// Resolve the id of an existing source_series by its natural key.
 pub async fn find_source_series_id(
-    pool: &SqlitePool,
+    pool: &Database,
     source_type: &str,
     source_id: &str,
     source_key: &str,
@@ -4870,7 +5116,7 @@ pub async fn find_source_series_id(
 /// for the idempotency pre-check in the Tier-2 add flow, which needs the linked
 /// work to report back without re-running the matcher (DD2).
 pub async fn find_source_series(
-    pool: &SqlitePool,
+    pool: &Database,
     source_type: &str,
     source_id: &str,
     source_key: &str,
@@ -4894,7 +5140,7 @@ pub async fn find_source_series(
 /// only way it would otherwise learn the `source_id`), so a re-enrol of an
 /// already-linked series issues no upstream call.
 pub async fn find_source_series_by_key(
-    pool: &SqlitePool,
+    pool: &Database,
     source_type: &str,
     source_key: &str,
 ) -> Result<Option<(String, String)>> {
@@ -4937,7 +5183,7 @@ const CHAPTER_UPSERT_SQL: &str = "INSERT INTO chapter \
 
 /// Upsert one mirrored chapter under a source_series (idempotent on external id).
 pub async fn upsert_chapter(
-    pool: &SqlitePool,
+    pool: &Database,
     source_series_id: &str,
     ch: &ChapterInput,
 ) -> Result<()> {
@@ -5058,7 +5304,7 @@ pub fn suwayomi_spine_input(
 /// rows are updated in place, new ones inserted, and only genuinely-vanished ones deleted
 /// — which is rare enough that the DELETE is skipped entirely when nothing vanished.
 pub async fn replace_source_chapters(
-    pool: &SqlitePool,
+    pool: &Database,
     source_series_id: &str,
     chapters: &[ChapterInput],
 ) -> Result<()> {
@@ -5142,7 +5388,7 @@ pub async fn replace_source_chapters(
 /// writer a concurrent enqueue of the same pair loses the race and inserts nothing,
 /// rather than erroring out of the ingest path a plain `INSERT` + unique index would.
 pub async fn insert_merge_candidate(
-    pool: &SqlitePool,
+    pool: &Database,
     source_series_id: &str,
     candidate_work_id: &str,
     score: f64,
@@ -5188,7 +5434,7 @@ pub struct SyncState {
 
 /// Read a job's full sync state (cursor + whether its initial seed has finished).
 /// `None` means the job has never run → do a fresh full `createdAt` seed.
-pub async fn get_sync_state(pool: &SqlitePool, job: &str) -> Result<Option<SyncState>> {
+pub async fn get_sync_state(pool: &Database, job: &str) -> Result<Option<SyncState>> {
     let row = sqlx::query_as::<_, (String, i64)>(
         "SELECT last_synced_at, seed_done FROM catalogue_sync_state WHERE job = ?",
     )
@@ -5203,7 +5449,7 @@ pub async fn get_sync_state(pool: &SqlitePool, job: &str) -> Result<Option<SyncS
 
 /// Persist provisional seed progress (leaving `seed_done = 0`) so an interrupted
 /// full seed resumes from `since` instead of restarting at `createdAt`=0 (M6).
-pub async fn set_seed_progress(pool: &SqlitePool, job: &str, since: &str) -> Result<()> {
+pub async fn set_seed_progress(pool: &Database, job: &str, since: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO catalogue_sync_state (job, last_synced_at, updated_at, seed_done) \
@@ -5221,7 +5467,7 @@ pub async fn set_seed_progress(pool: &SqlitePool, job: &str, since: &str) -> Res
 
 /// Mark a job's initial full seed complete and set its incremental cursor to
 /// `since` (the wall-clock at the completed cycle's start).
-pub async fn mark_seed_done(pool: &SqlitePool, job: &str, since: &str) -> Result<()> {
+pub async fn mark_seed_done(pool: &Database, job: &str, since: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO catalogue_sync_state (job, last_synced_at, updated_at, seed_done) \
@@ -5238,7 +5484,7 @@ pub async fn mark_seed_done(pool: &SqlitePool, job: &str, since: &str) -> Result
 }
 
 /// Whether a one-time maintenance pass (migration 0055) has already completed.
-pub async fn maintenance_flag_present(pool: &SqlitePool, key: &str) -> Result<bool> {
+pub async fn maintenance_flag_present(pool: &Database, key: &str) -> Result<bool> {
     let n: Option<i64> = sqlx::query_scalar("SELECT 1 FROM maintenance_flag WHERE key = ?")
         .bind(key)
         .fetch_optional(pool)
@@ -5247,7 +5493,7 @@ pub async fn maintenance_flag_present(pool: &SqlitePool, key: &str) -> Result<bo
 }
 
 /// Record a one-time maintenance pass as complete (idempotent).
-pub async fn set_maintenance_flag(pool: &SqlitePool, key: &str) -> Result<()> {
+pub async fn set_maintenance_flag(pool: &Database, key: &str) -> Result<()> {
     sqlx::query("INSERT OR IGNORE INTO maintenance_flag (key, done_at) VALUES (?, ?)")
         .bind(key)
         .bind(Utc::now().to_rfc3339())
@@ -5259,7 +5505,7 @@ pub async fn set_maintenance_flag(pool: &SqlitePool, key: &str) -> Result<()> {
 /// Persist the sync cursor for a job. `since` is the MangaDex `since` timestamp to use
 /// as `updatedAtSince` on the next incremental cycle (typically the wall-clock at the
 /// start of the cycle just completed, so anything updated during it is caught next time).
-pub async fn set_sync_cursor(pool: &SqlitePool, job: &str, since: &str) -> Result<()> {
+pub async fn set_sync_cursor(pool: &Database, job: &str, since: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO catalogue_sync_state (job, last_synced_at, updated_at) VALUES (?, ?, ?) \
@@ -5278,7 +5524,7 @@ pub async fn set_sync_cursor(pool: &SqlitePool, job: &str, since: &str) -> Resul
 /// (`get_sync_state` → `None` → full createdAt sweep from scratch). Used by the admin
 /// `resyncCatalogue` mutation, since `seed_done` can't be reset via raw SQL (the DB is
 /// container-owned and there's no sqlite3 in the image).
-pub async fn reset_sync_state(pool: &SqlitePool, job: &str) -> Result<()> {
+pub async fn reset_sync_state(pool: &Database, job: &str) -> Result<()> {
     sqlx::query("DELETE FROM catalogue_sync_state WHERE job = ?")
         .bind(job)
         .execute(pool)
@@ -5292,7 +5538,7 @@ pub async fn reset_sync_state(pool: &SqlitePool, job: &str) -> Result<()> {
 /// (a re-enable keeps the original `created_at` and prior sync stats); disabling drops
 /// the row so it's no longer walked by the background source-sync job.
 pub async fn set_extension_subscription(
-    pool: &SqlitePool,
+    pool: &Database,
     pkg_name: &str,
     subscribed: bool,
 ) -> Result<()> {
@@ -5315,7 +5561,7 @@ pub async fn set_extension_subscription(
 }
 
 /// Every subscribed extension's package id — the work-list for one source-sync pass.
-pub async fn subscribed_extensions(pool: &SqlitePool) -> Result<Vec<String>> {
+pub async fn subscribed_extensions(pool: &Database) -> Result<Vec<String>> {
     // Breaker-disabled subscriptions are skipped — see SUBSCRIPTION_FAILURE_LIMIT.
     // They stay in the table (so the admin surface can show why they stopped and
     // offer a re-enable) but are not walked.
@@ -5330,7 +5576,7 @@ pub async fn subscribed_extensions(pool: &SqlitePool) -> Result<Vec<String>> {
 /// The subscribed package ids as a set, for badging the admin `extensions` listing
 /// with `subscribed` in one query instead of a per-row lookup.
 pub async fn subscribed_extension_set(
-    pool: &SqlitePool,
+    pool: &Database,
 ) -> Result<std::collections::HashSet<String>> {
     Ok(subscribed_extensions(pool).await?.into_iter().collect())
 }
@@ -5347,7 +5593,7 @@ pub const SUBSCRIPTION_FAILURE_LIMIT: i64 = 5;
 /// `SUBSCRIPTION_FAILURE_LIMIT`, trips the breaker by stamping `disabled_at`. Returns
 /// `true` if this call disabled the subscription, so the caller can log it once.
 pub async fn mark_subscription_synced(
-    pool: &SqlitePool,
+    pool: &Database,
     pkg_name: &str,
     added: i64,
     error: Option<&str>,
@@ -5406,7 +5652,7 @@ pub async fn mark_subscription_synced(
 /// (`setExtensionSubscription`, `graphql/mod.rs`), where the human is asserting the
 /// source is healthy and the prior strikes are stale. It is WRONG for the automatic
 /// timed re-arm — see [`rearm_subscription_breaker_probe`].
-pub async fn reset_subscription_breaker(pool: &SqlitePool, pkg_name: &str) -> Result<()> {
+pub async fn reset_subscription_breaker(pool: &Database, pkg_name: &str) -> Result<()> {
     sqlx::query(
         "UPDATE extension_subscription \
          SET disabled_at = NULL, consecutive_failures = 0, last_error = NULL \
@@ -5442,7 +5688,7 @@ pub async fn reset_subscription_breaker(pool: &SqlitePool, pkg_name: &str) -> Re
 /// `rearm_subscription_breaker_probe` for the fix to take effect. `sync.rs` belongs to
 /// another agent, so the swap is not made here — see the fix report.
 #[allow(dead_code)]
-pub async fn rearm_subscription_breaker_probe(pool: &SqlitePool, pkg_name: &str) -> Result<()> {
+pub async fn rearm_subscription_breaker_probe(pool: &Database, pkg_name: &str) -> Result<()> {
     sqlx::query(
         "UPDATE extension_subscription \
          SET disabled_at = NULL, consecutive_failures = MAX(? - 1, 0) \
@@ -5458,7 +5704,7 @@ pub async fn rearm_subscription_breaker_probe(pool: &SqlitePool, pkg_name: &str)
 /// Every enrolled Suwayomi manga id (the `source_key`), for the library-reconcile pass
 /// that re-asserts `inLibrary=true` upstream so drifted/single-added series keep being
 /// scanned. Manga ids are globally unique across sources, so the source_id is not needed.
-pub async fn suwayomi_source_keys(pool: &SqlitePool) -> Result<Vec<String>> {
+pub async fn suwayomi_source_keys(pool: &Database) -> Result<Vec<String>> {
     let rows: Vec<(String,)> =
         sqlx::query_as("SELECT source_key FROM source_series WHERE source_type = 'suwayomi'")
             .fetch_all(pool)
@@ -5514,7 +5760,7 @@ pub struct SourceScanHealth {
 /// joined to `source_series` (via `idx_source_series_suwayomi_key`, migration 0072) and
 /// `source_extension`, so it is cheap enough for both the admin surface and the scanner's
 /// post-tick outage check.
-pub async fn source_scan_health(pool: &SqlitePool) -> Result<Vec<SourceScanHealth>> {
+pub async fn source_scan_health(pool: &Database) -> Result<Vec<SourceScanHealth>> {
     Ok(sqlx::query_as::<_, SourceScanHealth>(
         "SELECT ss.source_id AS source_id, \
                 MAX(se.pkg_name) AS pkg_name, \
@@ -5559,7 +5805,7 @@ pub const SOURCE_OUTAGE_MIN_STREAK: i64 = 3;
 /// only wanted by the admin panel, whereas the health aggregate runs after ticks. Measured
 /// on production, 53 works hang off Genz Toons alone.
 pub async fn source_exclusive_work_counts(
-    pool: &SqlitePool,
+    pool: &Database,
 ) -> Result<std::collections::HashMap<String, i64>> {
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT ss.source_id, COUNT(DISTINCT ss.work_id) \
@@ -5603,7 +5849,7 @@ pub struct SourceOutage {
 /// showing up here after a trigger is one that did NOT reopen, and re-checking it weekly is
 /// the intended cost.
 pub async fn paused_series_due_for_trigger(
-    pool: &SqlitePool,
+    pool: &Database,
     source_keys: &[String],
     parked_after: &str,
     scanned_before: &str,
@@ -5646,10 +5892,7 @@ pub async fn paused_series_due_for_trigger(
 /// a source in that state re-baselines on EVERY pass, so it can never flag anything again,
 /// permanently, while every pass still reports success. That is the same silent-inertness
 /// class as the dead `w.comic_type` lookup above, and the reason this arm now logs.
-pub async fn source_latest_snapshot(
-    pool: &SqlitePool,
-    source_id: &str,
-) -> Result<Option<Vec<i64>>> {
+pub async fn source_latest_snapshot(pool: &Database, source_id: &str) -> Result<Option<Vec<i64>>> {
     let row: Option<(String,)> =
         sqlx::query_as("SELECT ordered_ids FROM source_latest_snapshot WHERE source_id = ?")
             .bind(source_id)
@@ -5678,7 +5921,7 @@ pub async fn source_latest_snapshot(
 /// Phase E5. Overwrite one source's page-1 LATEST snapshot. `ids` is already capped to
 /// the discovery window and stored newest-first, as a JSON array.
 pub async fn put_source_latest_snapshot(
-    pool: &SqlitePool,
+    pool: &Database,
     source_id: &str,
     ids: &[i64],
 ) -> Result<()> {
@@ -5701,7 +5944,7 @@ pub async fn put_source_latest_snapshot(
 /// loop can cheaply decide whether a clean pass still needs the health check run (a
 /// recovering source's pass has successes, not failures, so gating only on failures would
 /// leave the outage row and the tripped breaker behind after recovery).
-pub async fn any_source_outage(pool: &SqlitePool) -> Result<bool> {
+pub async fn any_source_outage(pool: &Database) -> Result<bool> {
     let row: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM source_scan_outage LIMIT 1")
         .fetch_optional(pool)
         .await?;
@@ -5709,7 +5952,7 @@ pub async fn any_source_outage(pool: &SqlitePool) -> Result<bool> {
 }
 
 /// Every currently-open source outage, oldest first.
-pub async fn source_outages(pool: &SqlitePool) -> Result<Vec<SourceOutage>> {
+pub async fn source_outages(pool: &Database) -> Result<Vec<SourceOutage>> {
     Ok(sqlx::query_as::<_, SourceOutage>(
         "SELECT source_id, detected_at, last_alert_at, kind, parked_until \
            FROM source_scan_outage ORDER BY detected_at ASC",
@@ -5728,7 +5971,7 @@ pub async fn source_outages(pool: &SqlitePool) -> Result<Vec<SourceOutage>> {
 /// decision is worth being able to read.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_source_outage(
-    pool: &SqlitePool,
+    pool: &Database,
     source_id: &str,
     pkg_name: Option<&str>,
     series: i64,
@@ -5786,7 +6029,7 @@ pub async fn record_source_outage(
 
 /// Close a source's outage. Returns `true` if a row was actually removed, so the caller can
 /// log the recovery once.
-pub async fn clear_source_outage(pool: &SqlitePool, source_id: &str) -> Result<bool> {
+pub async fn clear_source_outage(pool: &Database, source_id: &str) -> Result<bool> {
     let res = sqlx::query("DELETE FROM source_scan_outage WHERE source_id = ?")
         .bind(source_id)
         .execute(pool)
@@ -5804,7 +6047,7 @@ pub async fn clear_source_outage(pool: &SqlitePool, source_id: &str) -> Result<b
 /// `last_error`. No-op when there is no subscription row (the source may never have had one)
 /// or when the breaker is already tripped. Returns `true` if this call tripped it.
 pub async fn trip_subscription_breaker(
-    pool: &SqlitePool,
+    pool: &Database,
     pkg_name: &str,
     reason: &str,
 ) -> Result<bool> {
@@ -5835,69 +6078,74 @@ pub async fn trip_subscription_breaker(
 /// drained (the target set is then empty), so it is safe to run every reconcile pass.
 /// `lang IS NULL` rows are deliberately NOT touched: an unknown language must not be
 /// mistaken for non-English and delete a legitimate series.
-pub async fn purge_foreign_language_suwayomi(pool: &SqlitePool) -> Result<Vec<i64>> {
+pub async fn purge_foreign_language_suwayomi(pool: &Database) -> Result<Vec<i64>> {
     // The non-English target set, as manga ids (INTEGER) and as TEXT (the form every
     // satellite table keys the Suwayomi id in).
-    const NON_EN: &str = "SELECT id FROM suwayomi_series WHERE lang IS NOT NULL AND lang <> 'en'";
+    const NON_EN: &str = "SELECT id FROM suwayomi_series WHERE lang IS NOT NULL AND lang <> 'en' ORDER BY id LIMIT 128";
     let non_en_text = format!("(SELECT CAST(id AS TEXT) FROM ({NON_EN}) t)");
 
     // Cheap pre-check OUTSIDE the write lock: the steady state is "nothing to purge"
     // (this runs every reconcile pass), and opening a write transaction just to discover
     // that would contend with ingest for the single SQLite writer for no reason.
-    let any: Option<i64> = sqlx::query_scalar(&format!("{NON_EN} LIMIT 1"))
+    let any: Option<i64> = sqlx::query_scalar(&format!("SELECT id FROM ({NON_EN}) LIMIT 1"))
         .fetch_optional(pool)
         .await?;
     if any.is_none() {
         return Ok(Vec::new());
     }
 
-    // Everything in ONE write transaction so recovery is atomic and idempotent: a crash
-    // before commit rolls back wholesale and the next reconcile re-runs cleanly; a
-    // commit finishes the job (the previous version cascaded orphans AFTER the commit,
-    // so an ill-timed restart — which a server rebuild causes — permanently leaked the
-    // orphaned works). Delete every row that references `suwayomi_series` via subquery
-    // BEFORE deleting `suwayomi_series` itself, so the subqueries still resolve.
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut purged_ids = Vec::new();
+    loop {
+        // Each bounded group stays in ONE write transaction so recovery is atomic and idempotent: a crash
+        // before commit rolls back wholesale and the next reconcile re-runs cleanly; a
+        // commit finishes the job (the previous version cascaded orphans AFTER the commit,
+        // so an ill-timed restart — which a server rebuild causes — permanently leaked the
+        // orphaned works). Delete every row that references `suwayomi_series` via subquery
+        // BEFORE deleting `suwayomi_series` itself, so the subqueries still resolve.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
-    // BOTH reads happen INSIDE the write lock, and this is load-bearing, not tidiness.
-    //
-    // `orphan_works` is a snapshot of "works whose every source_series is about to be
-    // deleted", and it is applied as an unconditional `DELETE FROM work WHERE id IN (…)`.
-    // Read outside the transaction, a concurrent ingest linking a NEW source_series to
-    // one of those works in the gap — the federated/admin add path does exactly this —
-    // leaves the work no longer orphaned, but it is cascade-deleted anyway, taking a
-    // live series with it. `BEGIN IMMEDIATE` holds the writer for the whole span, so the
-    // set cannot go stale between being computed and being applied.
-    //
-    // `series_ids` is read here for the same reason: it is RETURNED so the caller can
-    // best-effort `inLibrary=false` those ids upstream, while the deletes below are
-    // driven by the `NON_EN` subquery re-evaluated inside the transaction. Read outside,
-    // a series arriving in the gap would be deleted but not reported, so Suwayomi would
-    // keep it enrolled and re-mirror it on the next scan.
-    let series_ids: Vec<i64> = sqlx::query_scalar(NON_EN).fetch_all(&mut *tx).await?;
-    if series_ids.is_empty() {
-        tx.rollback().await?;
-        return Ok(Vec::new());
-    }
+        // BOTH reads happen INSIDE the write lock, and this is load-bearing, not tidiness.
+        //
+        // `orphan_works` is a snapshot of "works whose every source_series is about to be
+        // deleted", and it is applied as an unconditional `DELETE FROM work WHERE id IN (…)`.
+        // Read outside the transaction, a concurrent ingest linking a NEW source_series to
+        // one of those works in the gap — the federated/admin add path does exactly this —
+        // leaves the work no longer orphaned, but it is cascade-deleted anyway, taking a
+        // live series with it. `BEGIN IMMEDIATE` holds the writer for the whole span, so the
+        // set cannot go stale between being computed and being applied.
+        //
+        // `series_ids` is read here for the same reason: it is RETURNED so the caller can
+        // best-effort `inLibrary=false` those ids upstream, while the deletes below are
+        // driven by the `NON_EN` subquery re-evaluated inside the transaction. Read outside,
+        // a series arriving in the gap would be deleted but not reported, so Suwayomi would
+        // keep it enrolled and re-mirror it on the next scan.
+        let series_ids: Vec<i64> = sqlx::query_scalar(NON_EN).fetch_all(&mut *tx).await?;
+        if series_ids.is_empty() {
+            tx.rollback().await?;
+            return Ok(purged_ids);
+        }
 
-    // Works that will be ORPHANED by the purge: every one of their source_series is a
-    // to-be-purged Suwayomi link. Computed BEFORE the deletes (it needs the links
-    // intact). A work still anchored to the MangaDex catalogue or an English source is
-    // excluded (the non-purged branch count is > 0), so consolidated works survive and
-    // merely lose the foreign-language translator mapping.
-    let orphan_works: Vec<String> = sqlx::query_scalar(&format!(
-        "SELECT ss.work_id FROM source_series ss GROUP BY ss.work_id \
+        // Works that will be ORPHANED by the purge: every one of their source_series is a
+        // to-be-purged Suwayomi link. Computed BEFORE the deletes (it needs the links
+        // intact). A work still anchored to the MangaDex catalogue or an English source is
+        // excluded (the non-purged branch count is > 0), so consolidated works survive and
+        // merely lose the foreign-language translator mapping.
+        let orphan_works: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT ss.work_id FROM source_series ss \
+         WHERE ss.work_id IN (SELECT work_id FROM source_series \
+             WHERE source_type = 'suwayomi' AND source_key IN {non_en_text}) \
+         GROUP BY ss.work_id \
          HAVING SUM(CASE WHEN ss.source_type = 'suwayomi' AND ss.source_key IN {non_en_text} \
                          THEN 0 ELSE 1 END) = 0"
-    ))
-    .fetch_all(&mut *tx)
-    .await?;
+        ))
+        .fetch_all(&mut *tx)
+        .await?;
 
-    // Satellite rows keyed by the numeric Suwayomi id (as TEXT): per-user library +
-    // reading progress, admin overrides, and view counters. Left uncleaned these
-    // dangle forever (e.g. a purged series stuck in a user's library, re-rendered live
-    // on every view) since none carry an enforced FK to the refreshable cache.
-    for stmt in [
+        // Satellite rows keyed by the numeric Suwayomi id (as TEXT): per-user library +
+        // reading progress, admin overrides, and view counters. Left uncleaned these
+        // dangle forever (e.g. a purged series stuck in a user's library, re-rendered live
+        // on every view) since none carry an enforced FK to the refreshable cache.
+        for stmt in [
         format!("DELETE FROM user_library      WHERE series_id  IN {non_en_text}"),
         format!("DELETE FROM suwayomi_progress  WHERE series_id  IN {non_en_text}"),
         format!("DELETE FROM series_admin       WHERE series_id  IN {non_en_text}"),
@@ -5912,60 +6160,62 @@ pub async fn purge_foreign_language_suwayomi(pool: &SqlitePool) -> Result<Vec<i6
         sqlx::query(&stmt).execute(&mut *tx).await?;
     }
 
-    // Cascade the orphaned works + their child rows, in the same transaction. Mirrors
-    // `delete_work_cascade`'s table set (kept in sync with it), but set-based so a
-    // first-run purge of thousands doesn't fan out into per-work round-trips.
-    if !orphan_works.is_empty() {
-        let ph = std::iter::repeat_n("?", orphan_works.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        for (table, col) in [
-            ("work_alias", "work_id"),
-            ("work_alias_token", "work_id"),
-            ("work_external_id", "work_id"),
-            ("work_description", "work_id"),
-            ("work_credit", "work_id"),
-            ("work_cover", "work_id"),
-            ("work_cover_issue", "work_id"),
-            ("work_tag", "work_id"),
-            ("chapter_override", "work_id"),
-            ("canonical_library", "work_id"),
-            ("merge_candidate", "candidate_work_id"),
-            ("work", "id"),
-        ] {
-            let sql = format!("DELETE FROM {table} WHERE {col} IN ({ph})");
-            let mut q = sqlx::query(&sql);
-            for w in &orphan_works {
-                q = q.bind(w);
+        // Cascade the orphaned works + their child rows, in the same transaction. Mirrors
+        // `delete_work_cascade`'s table set (kept in sync with it), but set-based so a
+        // first-run purge of thousands doesn't fan out into per-work round-trips.
+        if !orphan_works.is_empty() {
+            let ph = std::iter::repeat_n("?", orphan_works.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            for (table, col) in [
+                ("work_alias", "work_id"),
+                ("work_alias_token", "work_id"),
+                ("work_external_id", "work_id"),
+                ("work_description", "work_id"),
+                ("work_credit", "work_id"),
+                ("work_cover", "work_id"),
+                ("work_cover_issue", "work_id"),
+                ("work_tag", "work_id"),
+                ("chapter_override", "work_id"),
+                ("canonical_library", "work_id"),
+                ("merge_candidate", "candidate_work_id"),
+                ("work", "id"),
+            ] {
+                let sql = format!("DELETE FROM {table} WHERE {col} IN ({ph})");
+                let mut q = sqlx::query(&sql);
+                for w in &orphan_works {
+                    q = q.bind(w);
+                }
+                q.execute(&mut *tx).await?;
             }
-            q.execute(&mut *tx).await?;
         }
-    }
 
-    // Drop review candidates whose source_series was just removed (dangling by
-    // source_series_id — the candidate_work_id ones are handled by the cascade above).
-    sqlx::query(
+        // Drop review candidates whose source_series was just removed (dangling by
+        // source_series_id — the candidate_work_id ones are handled by the cascade above).
+        sqlx::query(
         "DELETE FROM merge_candidate WHERE source_series_id NOT IN (SELECT id FROM source_series)",
     )
     .execute(&mut *tx)
     .await?;
 
-    // suwayomi_series LAST — every subquery above resolves against it.
-    sqlx::query(&format!(
-        "DELETE FROM suwayomi_series WHERE id IN ({NON_EN})"
-    ))
-    .execute(&mut *tx)
-    .await?;
+        // suwayomi_series LAST — every subquery above resolves against it.
+        sqlx::query(&format!(
+            "DELETE FROM suwayomi_series WHERE id IN ({NON_EN})"
+        ))
+        .execute(&mut *tx)
+        .await?;
 
-    tx.commit().await?;
-    Ok(series_ids)
+        tx.commit().await?;
+        purged_ids.extend(series_ids);
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Backfill a "due now" scan-state row for every enrolled Suwayomi series that lacks one,
 /// so the DB-driven scanner (which selects work from `series_scan_state`) picks up series
 /// enrolled by paths that don't scan-on-enrol (federated search) or predate scan-state.
 /// One set-based INSERT…SELECT (no per-row round-trips); returns how many rows it added.
-pub async fn backfill_pending_scan_states(pool: &SqlitePool) -> Result<u64> {
+pub async fn backfill_pending_scan_states(pool: &Database) -> Result<u64> {
     // `ON CONFLICT DO NOTHING` in addition to the `NOT EXISTS` guard: a concurrent
     // `ensure_pending` (federated ingest) can insert the same series_id between this
     // statement's NOT-EXISTS check and its insert; without the conflict clause that race
@@ -5990,7 +6240,7 @@ pub async fn backfill_pending_scan_states(pool: &SqlitePool) -> Result<u64> {
 /// of a per-key round-trip (audit #10, the source-sync LATEST walk). Returns the subset
 /// of `keys` that exist; unknown keys are the caller's "new" set.
 pub async fn existing_source_keys(
-    pool: &SqlitePool,
+    pool: &Database,
     source_type: &str,
     keys: &[String],
 ) -> Result<std::collections::HashSet<String>> {
@@ -6018,7 +6268,7 @@ pub async fn existing_source_keys(
 
 /// Record that a full source-sync pass just completed, for restart-throttling
 /// (`source_sync_due`). Singleton row keyed on id=1.
-pub async fn mark_source_sync_pass(pool: &SqlitePool) -> Result<()> {
+pub async fn mark_source_sync_pass(pool: &Database) -> Result<()> {
     sqlx::query(
         "INSERT INTO sync_state (id, last_full_pass_at) VALUES (1, ?) \
          ON CONFLICT(id) DO UPDATE SET last_full_pass_at = excluded.last_full_pass_at",
@@ -6040,7 +6290,7 @@ pub async fn mark_source_sync_pass(pool: &SqlitePool) -> Result<()> {
 /// ~2 intervals. The 10% slack absorbs any pass shorter than `0.1 * interval` (e.g. ~2.4h
 /// at the 1-day default) so scheduled ticks run on time while restart ticks are still
 /// skipped when a pass ran recently.
-pub async fn source_sync_due(pool: &SqlitePool, interval_seconds: u64) -> bool {
+pub async fn source_sync_due(pool: &Database, interval_seconds: u64) -> bool {
     let last: Option<String> =
         sqlx::query_scalar("SELECT last_full_pass_at FROM sync_state WHERE id = 1")
             .fetch_optional(pool)
@@ -6058,9 +6308,12 @@ pub async fn source_sync_due(pool: &SqlitePool, interval_seconds: u64) -> bool {
 mod tests {
     use super::*;
 
-    async fn pool() -> SqlitePool {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    async fn pool() -> Database {
+        let pool = Database::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
@@ -6169,6 +6422,131 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    #[tokio::test]
+    async fn staged_catalogue_refresh_never_locks_main_and_preserves_newer_writes() {
+        let path = std::env::temp_dir().join(format!("komiq-refresh-{}.sqlite3", Uuid::new_v4()));
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_millis(100));
+        let pool = crate::database::TestPoolOptions::new()
+            .max_connections(3)
+            .connect_with(options)
+            .await
+            .unwrap();
+        for sql in [
+            "CREATE TABLE work(id TEXT PRIMARY KEY)",
+            "CREATE TABLE browse_catalogue(work_id TEXT PRIMARY KEY, title TEXT NOT NULL, comic_type TEXT NOT NULL)",
+            "INSERT INTO work VALUES ('keep'), ('prune'), ('update')",
+            "INSERT INTO browse_catalogue VALUES ('keep','original','MANGA'), ('prune','original','MANGA'), ('update','original','MANGA')",
+        ] { sqlx::query(sql).execute(&pool).await.unwrap(); }
+        // Staging still completes while another connection owns the main writer.
+        let writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let mut snapshot = refresh_snapshot(&pool, &["browse_catalogue"])
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO temp.browse_catalogue VALUES ('keep','snapshot','MANGA'), ('update','snapshot','MANHWA')")
+            .execute(&mut *snapshot).await.unwrap();
+        assert!(
+            sqlx::query("UPDATE main.browse_catalogue SET title = 'forbidden'")
+                .execute(&mut *snapshot)
+                .await
+                .is_err(),
+            "main is opened read-only"
+        );
+        writer.rollback().await.unwrap();
+        // A concurrent cache writer wins over both a stale replacement and stale prune.
+        sqlx::query(
+            "UPDATE browse_catalogue SET title = 'newer' WHERE work_id IN ('keep','prune')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            publish_snapshot(&pool, &mut snapshot, "browse_catalogue")
+                .await
+                .unwrap(),
+            1
+        );
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT work_id, title, comic_type FROM browse_catalogue ORDER BY work_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("keep".into(), "newer".into(), "MANGA".into()),
+                ("prune".into(), "newer".into(), "MANGA".into()),
+                ("update".into(), "snapshot".into(), "MANHWA".into())
+            ]
+        );
+        drop(snapshot);
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn staged_catalogue_refresh_publishes_complete_rows_in_multiple_writer_turns() {
+        let path = std::env::temp_dir().join(format!("komiq-refresh-{}.sqlite3", Uuid::new_v4()));
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        let pool = crate::database::TestPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        for sql in ["CREATE TABLE work(id TEXT PRIMARY KEY)",
+            "CREATE TABLE browse_catalogue(work_id TEXT PRIMARY KEY, title TEXT NOT NULL, comic_type TEXT NOT NULL)",
+            "CREATE TABLE writer_turns(n INTEGER NOT NULL)", "INSERT INTO writer_turns VALUES (0)",
+            "WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n < 385) INSERT INTO work SELECT printf('%04d', n) FROM ids",
+        ] { sqlx::query(sql).execute(&pool).await.unwrap(); }
+        let mut snapshot = refresh_snapshot(&pool, &["browse_catalogue"])
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO temp.browse_catalogue SELECT id, 'typed', 'MANGA' FROM main.work")
+            .execute(&mut *snapshot)
+            .await
+            .unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_pool = pool.clone();
+        let writer_stop = stop.clone();
+        let writer = tokio::spawn(async move {
+            while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                sqlx::query("UPDATE writer_turns SET n = n + 1")
+                    .execute(&writer_pool)
+                    .await
+                    .unwrap();
+                let incomplete: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM browse_catalogue WHERE comic_type IS NULL OR title <> 'typed'")
+                    .fetch_one(&writer_pool).await.unwrap();
+                assert_eq!(incomplete, 0);
+            }
+        });
+        assert_eq!(
+            publish_snapshot(&pool, &mut snapshot, "browse_catalogue")
+                .await
+                .unwrap(),
+            385
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.await.unwrap();
+        let turns: i64 = sqlx::query_scalar("SELECT n FROM writer_turns")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            turns >= 2,
+            "other writers must make progress between batches: {turns}"
+        );
+        drop(snapshot);
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn fts_match_query_stars_only_the_last_token_and_refuses_tiny_queries() {
         // Only the trailing (still-being-typed) token is prefix-matched; starring the
@@ -6213,7 +6591,7 @@ mod tests {
         }
     }
 
-    async fn insert_suwayomi_series(pool: &SqlitePool, id: i64, lang: Option<&str>) {
+    async fn insert_suwayomi_series(pool: &Database, id: i64, lang: Option<&str>) {
         sqlx::query(
             "INSERT INTO suwayomi_series (id, title, status, source_id, lang, in_library, updated_at) \
              VALUES (?, ?, 'ONGOING', 'src', ?, 1, '2026-01-01T00:00:00Z')",
@@ -6676,7 +7054,7 @@ mod tests {
                 .unwrap()
             }
         };
-        let mut conn = pool.acquire().await.unwrap();
+        let mut conn = pool.write().acquire().await.unwrap();
         pin_work_field(&mut conn, &id, PinnedField::Author, Some("Fuse"))
             .await
             .unwrap();
@@ -6707,7 +7085,7 @@ mod tests {
         );
 
         // Unpinning restores what the source last wrote, and syncs apply again.
-        let mut conn = pool.acquire().await.unwrap();
+        let mut conn = pool.write().acquire().await.unwrap();
         for field in [
             PinnedField::Author,
             PinnedField::Year,
@@ -8207,7 +8585,7 @@ mod tests {
 
         merge_works(&pool, &source, &target).await.unwrap();
 
-        async fn count(pool: &SqlitePool, sql: &str, wid: &str) -> i64 {
+        async fn count(pool: &Database, sql: &str, wid: &str) -> i64 {
             sqlx::query_scalar::<_, i64>(sql)
                 .bind(wid)
                 .fetch_one(pool)
@@ -9183,7 +9561,7 @@ mod tests {
     /// it DESC, and that order decides which detached row NAMES the new work — a test that
     /// let two rows tie on the same timestamp would assert on an arbitrary winner.
     async fn work_with_suwayomi_sources(
-        pool: &SqlitePool,
+        pool: &Database,
         title: &str,
         keys: &[i64],
     ) -> (String, Vec<String>) {
@@ -9221,7 +9599,7 @@ mod tests {
         (work, ids)
     }
 
-    async fn add_chapter(pool: &SqlitePool, ss_id: &str, chapter_key: &str) -> String {
+    async fn add_chapter(pool: &Database, ss_id: &str, chapter_key: &str) -> String {
         let id = format!("ch_{ss_id}_{chapter_key}");
         sqlx::query(
             "INSERT INTO chapter (id, source_series_id, external_id, number, lang, chapter_key, created_at) \
@@ -9238,7 +9616,7 @@ mod tests {
         id
     }
 
-    async fn work_of(pool: &SqlitePool, ss_id: &str) -> String {
+    async fn work_of(pool: &Database, ss_id: &str) -> String {
         sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
             .bind(ss_id)
             .fetch_one(pool)
@@ -9456,3 +9834,6 @@ mod tests {
         assert_eq!(keys_of(&out.new_work_id).await, vec!["9".to_string()]);
     }
 }
+
+#[cfg(test)]
+include!("../../bench/sqlite_contention.rs");

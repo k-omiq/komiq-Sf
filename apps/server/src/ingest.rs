@@ -23,9 +23,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::db::Database;
 use anyhow::Result;
 use chrono::Utc;
-use sqlx::SqlitePool;
 
 use crate::graphql::AppState;
 use crate::suwayomi::{FetchType, SuwayomiClient, SuwayomiManga};
@@ -134,7 +134,7 @@ impl Progress {
 /// Try to create a `running` job for a source. `None` when another job is
 /// already running for it — the partial unique index makes this race-free (the
 /// losing concurrent INSERT violates `uq_source_ingest_running`).
-pub async fn try_start_job(pool: &SqlitePool, source_id: &str) -> Result<Option<IngestJob>> {
+pub async fn try_start_job(pool: &Database, source_id: &str) -> Result<Option<IngestJob>> {
     let id = format!("ing_{}", uuid::Uuid::new_v4().simple());
     let now = Utc::now().to_rfc3339();
     let res = sqlx::query(
@@ -164,7 +164,7 @@ fn is_unique_violation(e: &dyn sqlx::error::DatabaseError) -> bool {
 
 /// Load the currently-running job for a source, if any (F1: so an extension-level
 /// start can report the already-running source alongside the newly-started ones).
-pub async fn load_running_job(pool: &SqlitePool, source_id: &str) -> Result<Option<IngestJob>> {
+pub async fn load_running_job(pool: &Database, source_id: &str) -> Result<Option<IngestJob>> {
     Ok(sqlx::query_as::<_, IngestJob>(
         "SELECT * FROM source_ingest_job WHERE source_id = ? AND state = 'running' LIMIT 1",
     )
@@ -176,7 +176,7 @@ pub async fn load_running_job(pool: &SqlitePool, source_id: &str) -> Result<Opti
 /// Cancel every running job among `source_ids` (F1: extension-level cancel).
 /// Returns the affected job rows (their post-cancel state).
 pub async fn cancel_running_for_sources(
-    pool: &SqlitePool,
+    pool: &Database,
     source_ids: &[String],
 ) -> Result<Vec<IngestJob>> {
     let mut out = Vec::new();
@@ -194,7 +194,7 @@ pub async fn cancel_running_for_sources(
 /// observes the state between items/pages and stops. Returns the updated row,
 /// or `None` when the job doesn't exist. A job already terminal is returned
 /// unchanged (cancel is then a no-op, not an error).
-pub async fn cancel_job(pool: &SqlitePool, job_id: &str) -> Result<Option<IngestJob>> {
+pub async fn cancel_job(pool: &Database, job_id: &str) -> Result<Option<IngestJob>> {
     sqlx::query(
         "UPDATE source_ingest_job SET state = ?, finished_at = ? WHERE id = ? AND state = ?",
     )
@@ -208,7 +208,7 @@ pub async fn cancel_job(pool: &SqlitePool, job_id: &str) -> Result<Option<Ingest
 }
 
 /// The job's current state string (the runner's cancellation check).
-async fn job_state(pool: &SqlitePool, job_id: &str) -> Result<Option<String>> {
+async fn job_state(pool: &Database, job_id: &str) -> Result<Option<String>> {
     Ok(
         sqlx::query_scalar("SELECT state FROM source_ingest_job WHERE id = ?")
             .bind(job_id)
@@ -217,7 +217,7 @@ async fn job_state(pool: &SqlitePool, job_id: &str) -> Result<Option<String>> {
     )
 }
 
-pub async fn load_job(pool: &SqlitePool, job_id: &str) -> Result<Option<IngestJob>> {
+pub async fn load_job(pool: &Database, job_id: &str) -> Result<Option<IngestJob>> {
     Ok(
         sqlx::query_as::<_, IngestJob>("SELECT * FROM source_ingest_job WHERE id = ?")
             .bind(job_id)
@@ -227,7 +227,7 @@ pub async fn load_job(pool: &SqlitePool, job_id: &str) -> Result<Option<IngestJo
 }
 
 /// List jobs, newest first. `active_only` keeps only `running` ones.
-pub async fn list_jobs(pool: &SqlitePool, active_only: bool) -> Result<Vec<IngestJob>> {
+pub async fn list_jobs(pool: &Database, active_only: bool) -> Result<Vec<IngestJob>> {
     let sql = if active_only {
         "SELECT * FROM source_ingest_job WHERE state = 'running' ORDER BY started_at DESC LIMIT 100"
     } else {
@@ -238,7 +238,7 @@ pub async fn list_jobs(pool: &SqlitePool, active_only: bool) -> Result<Vec<Inges
 
 /// Flush the in-memory progress counters onto the row. Progress-only — never
 /// touches `state`, so it can't resurrect a row the admin just cancelled.
-async fn write_progress(pool: &SqlitePool, job_id: &str, p: &Progress) -> Result<()> {
+async fn write_progress(pool: &Database, job_id: &str, p: &Progress) -> Result<()> {
     sqlx::query(
         "UPDATE source_ingest_job SET pages_done = ?, items_seen = ?, succeeded = ?, \
          failed = ?, new_works = ?, auto_merged = ?, queued_for_review = ?, \
@@ -260,12 +260,7 @@ async fn write_progress(pool: &SqlitePool, job_id: &str, p: &Progress) -> Result
 
 /// Terminal transition. Guarded on `state = 'running'` so a cancel that landed
 /// first wins (the runner's completed/failed write then becomes a no-op).
-async fn finish_job(
-    pool: &SqlitePool,
-    job_id: &str,
-    state: &str,
-    error: Option<&str>,
-) -> Result<()> {
+async fn finish_job(pool: &Database, job_id: &str, state: &str, error: Option<&str>) -> Result<()> {
     sqlx::query(
         "UPDATE source_ingest_job SET state = ?, error = ?, finished_at = ? \
          WHERE id = ? AND state = 'running'",
@@ -282,7 +277,7 @@ async fn finish_job(
 /// Startup recovery: any job still `running` was interrupted by a restart —
 /// its task is gone, so mark it failed (the row would otherwise block new jobs
 /// for its source forever via the partial unique index).
-pub async fn mark_interrupted_jobs(pool: &SqlitePool) -> Result<u64> {
+pub async fn mark_interrupted_jobs(pool: &Database) -> Result<u64> {
     let res = sqlx::query(
         "UPDATE source_ingest_job SET state = 'failed', \
          error = 'interrupted by server restart', finished_at = ? WHERE state = 'running'",
@@ -518,16 +513,19 @@ async fn walk_listing(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use crate::database::TestPoolOptions;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    async fn pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
+    async fn pool() -> Database {
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 

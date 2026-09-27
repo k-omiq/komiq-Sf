@@ -104,7 +104,7 @@ fn stopping(shutdown: &watch::Receiver<bool>) -> bool {
 /// `catalog::source_sync_due` answers the yes/no question; the scheduler additionally
 /// needs the elapsed time, so it can defer a restart-skipped tick by the REMAINDER of
 /// the interval rather than by a whole fresh one (P1-3).
-async fn seconds_since_last_pass(pool: &sqlx::SqlitePool) -> Option<u64> {
+async fn seconds_since_last_pass(pool: &crate::db::Database) -> Option<u64> {
     let last: Option<String> =
         sqlx::query_scalar("SELECT last_full_pass_at FROM sync_state WHERE id = 1")
             .fetch_optional(pool)
@@ -902,8 +902,13 @@ mod tests {
     /// the reconcile pass never runs at all.
     #[tokio::test]
     async fn restart_skip_defers_by_the_remainder_not_a_full_interval() {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let pool = crate::db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         assert_eq!(
             seconds_since_last_pass(&pool).await,
             None,

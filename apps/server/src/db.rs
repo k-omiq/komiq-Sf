@@ -4,9 +4,9 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+pub use crate::database::Database;
 use anyhow::{Context, Result};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{ConnectOptions, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 
 static WRITE_QUEUE_WAIT_MICROS: AtomicU64 = AtomicU64::new(0);
 static WRITE_QUEUE_ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
@@ -26,10 +26,11 @@ pub fn lock_error_count() -> u64 {
 
 fn database_file(database_url: &str) -> Result<Option<PathBuf>> {
     let opts = SqliteConnectOptions::from_str(database_url)?;
-    if opts
-        .to_url_lossy()
-        .query_pairs()
-        .any(|(key, value)| key == "mode" && value == "memory")
+    if opts.get_filename() == Path::new(":memory:")
+        || opts
+            .get_filename()
+            .to_string_lossy()
+            .starts_with("file:sqlx-in-memory-")
     {
         return Ok(None);
     }
@@ -68,16 +69,12 @@ impl DataDirectoryLock {
 
 /// Connect beside a running server without creating the file or changing schema.
 /// Validate every embedded migration, including checksums, before permitting CLI work.
-pub async fn connect_existing(database_url: &str) -> Result<SqlitePool> {
+pub async fn connect_existing(database_url: &str) -> Result<Database> {
     let opts = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(false)
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(15));
-    let pool = SqlitePoolOptions::new()
-        .max_connections(2)
-        .acquire_timeout(Duration::from_secs(3))
-        .connect_with(opts)
-        .await?;
+    let pool = Database::connect_with(opts, 2).await?;
     let schema = validate_schema(&pool).await;
     if let Err(error) = schema {
         pool.close().await;
@@ -86,7 +83,7 @@ pub async fn connect_existing(database_url: &str) -> Result<SqlitePool> {
     Ok(pool)
 }
 
-async fn validate_schema(pool: &SqlitePool) -> Result<()> {
+async fn validate_schema(pool: &Database) -> Result<()> {
     let applied: Vec<(i64, Vec<u8>, bool)> =
         sqlx::query_as("SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version")
             .fetch_all(pool)
@@ -138,15 +135,53 @@ async fn validate_schema(pool: &SqlitePool) -> Result<()> {
 ///     transaction's read snapshot is stale, so the only correct recovery is to
 ///     abort and re-run the whole transaction. Callers must retry, not just wait.
 ///
-/// Matching on the message rather than a code keeps this working across the
-/// sqlx/libsqlite error wrapping used by the different call sites.
-pub fn is_locked_error(e: &anyhow::Error) -> bool {
-    let s = e.to_string();
-    let locked = s.contains("database is locked") || s.contains("database table is locked");
-    if locked {
+pub fn is_locked_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        .any(sqlite_locked)
+}
+
+fn sqlite_locked(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .and_then(|code| code.parse::<u32>().ok())
+        .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+}
+
+pub(crate) fn record_sqlite_error(error: &sqlx::Error) {
+    if sqlite_locked(error) {
         LOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
     }
-    locked
+}
+
+pub(crate) fn record_write_wait(wait: Duration) {
+    WRITE_QUEUE_WAIT_MICROS.fetch_add(wait.as_micros() as u64, Ordering::Relaxed);
+    WRITE_QUEUE_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Retry a complete database operation, including its BEGIN and all reads. The
+/// callback must begin a fresh transaction on every attempt and must not perform
+/// external side effects. Never retry just the failed statement in a transaction.
+pub async fn retry_transaction<T, F, Fut>(mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    use rand_core::RngCore;
+    for retry in 0..5u32 {
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) if retry < 4 && is_locked_error(&error) => {
+                let base = 25u64 << retry;
+                let jitter = rand_core::OsRng.next_u64() % (base + 1);
+                tokio::time::sleep(Duration::from_millis(base + jitter)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("last retry returns")
 }
 
 /// Open (creating if needed) the SQLite database and run migrations.
@@ -155,34 +190,19 @@ pub fn is_locked_error(e: &anyhow::Error) -> bool {
 /// to object storage) and lets the background scan scheduler write without
 /// blocking readers; `synchronous = NORMAL` is the WAL-safe durability level, and
 /// a busy timeout absorbs the brief writer contention from scanner ticks.
-pub async fn init(database_url: &str) -> Result<SqlitePool> {
+pub async fn init(database_url: &str) -> Result<Database> {
     let opts = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
         .foreign_keys(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
-        // 15s (was 5s) absorbs longer write stalls when the catalogue sync, cover
-        // drainer and scan scheduler contend for SQLite's single writer during a
-        // full seed. All PRAGMAs below are per-connection and invisible to Litestream
-        // (which only ships the WAL) — the memory-map + ~16 MB page cache serve the
-        // read-heavy catalogue from RAM, and temp B-trees (sorts, GROUP BY) stay off
-        // disk.
-        //
-        // mmap_size is 1.5 GiB, up from 256 MB: the main DB is ~1,375 MB, so a quarter
-        // of it was mmap-able and the rest paid a read() + page-cache copy per page.
-        // This is address space, not an allocation — only pages actually touched become
-        // resident — and the host has 23.4 GB of RAM, so covering the whole file costs
-        // nothing and removes the copy for the catalogue-wide scans (`search_catalogue`
-        // count, ANALYZE, feed/FTS rebuilds) that read most of it.
-        .busy_timeout(Duration::from_secs(15))
-        .pragma("mmap_size", "1610612736")
+        // Map projected growth up to 8 GiB. This reserves virtual address space;
+        // only pages actually read become resident. Litestream owns checkpoints.
+        .pragma("mmap_size", "8589934592")
         .pragma("cache_size", "-16000")
         .pragma("temp_store", "MEMORY");
-    let pool = SqlitePoolOptions::new()
-        .max_connections(8)
-        .connect_with(opts)
-        .await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    let pool = Database::connect_with(opts, 8).await?;
+    sqlx::migrate!("./migrations").run(pool.write()).await?;
     Ok(pool)
 }
 
@@ -194,7 +214,7 @@ pub async fn init(database_url: &str) -> Result<SqlitePool> {
 /// still served from our own origin. Schema is a single table, created inline (no
 /// migration directory) — there is no FK to `work` because that table lives in the
 /// other DB; an orphaned blob (its work deleted) is harmless and re-derivable.
-pub async fn init_covers(database_url: &str) -> Result<SqlitePool> {
+pub async fn init_covers(database_url: &str) -> Result<Database> {
     match open_covers(database_url).await {
         Ok(pool) => Ok(pool),
         Err(error) if covers_file_failure(&error) => {
@@ -248,16 +268,12 @@ fn quarantine_covers(path: &Path) -> Result<PathBuf> {
 }
 
 /// Maintenance commands must never recreate or upgrade a live cover cache.
-pub async fn connect_existing_covers(database_url: &str) -> Result<SqlitePool> {
-    let pool = SqlitePoolOptions::new()
-        .max_connections(2)
-        .acquire_timeout(Duration::from_secs(3))
-        .connect_with(
-            SqliteConnectOptions::from_str(database_url)?
-                .create_if_missing(false)
-                .busy_timeout(Duration::from_secs(15)),
-        )
-        .await?;
+pub async fn connect_existing_covers(database_url: &str) -> Result<Database> {
+    let pool = Database::connect_with(
+        SqliteConnectOptions::from_str(database_url)?.create_if_missing(false),
+        2,
+    )
+    .await?;
     if let Err(error) = sqlx::query("SELECT work_id, version FROM work_cover_blob LIMIT 1")
         .fetch_optional(&pool)
         .await
@@ -268,7 +284,7 @@ pub async fn connect_existing_covers(database_url: &str) -> Result<SqlitePool> {
     Ok(pool)
 }
 
-async fn open_covers(database_url: &str) -> Result<SqlitePool> {
+async fn open_covers(database_url: &str) -> Result<Database> {
     let opts = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
@@ -286,10 +302,7 @@ async fn open_covers(database_url: &str) -> Result<SqlitePool> {
         .pragma("mmap_size", "268435456")
         .pragma("cache_size", "-16000")
         .pragma("temp_store", "MEMORY");
-    let pool = SqlitePoolOptions::new()
-        .max_connections(4)
-        .connect_with(opts)
-        .await?;
+    let pool = Database::connect_with(opts, 4).await?;
     let schema = async {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS work_cover_blob (\
@@ -395,7 +408,7 @@ async fn open_covers(database_url: &str) -> Result<SqlitePool> {
 /// Repair dangling pointers even when only part of the cover cache is missing.
 /// Each write is bounded and conditional on the value we inspected, so another
 /// materializer cannot have its freshly updated pointer cleared by this pass.
-pub async fn reconcile_cover_pointers(pool: &SqlitePool, covers: &SqlitePool) -> Result<u64> {
+pub async fn reconcile_cover_pointers(pool: &Database, covers: &Database) -> Result<u64> {
     const BATCH: i64 = 256;
     let mut cursor = String::new();
     let mut cleared = 0;
@@ -479,13 +492,8 @@ const ANALYZE_TABLES: &[&str] = &[
 /// How often stats are refreshed. Well under the rate at which these tables change
 /// shape, and cheap enough that the interval is set by "don't be stale", not by cost.
 ///
-/// Measured on a copy of the production DB: 125 ms for the whole list with the pages
-/// warm, 4.6 s with the page cache evicted (feed_updates 3.5 s + source_series 1.0 s
-/// dominate). `ANALYZE` holds a write transaction on `sqlite_stat1` for the duration of
-/// each table, so the worst case is a ~3.5 s write stall once every 6 h — comfortably
-/// inside the pool's 15 s `busy_timeout`, which is why the scanner riding through it is
-/// a wait rather than a failure. The 300 s boot offset below keeps even the cold pass
-/// clear of the boot burst.
+/// Each table is analyzed separately with a fixed sample budget, releasing the
+/// writer between tables instead of scanning millions of entries under one lock.
 const ANALYZE_INTERVAL_SECS: u64 = 6 * 60 * 60;
 
 /// Spawn the recurring statistics refresh.
@@ -495,15 +503,7 @@ const ANALYZE_INTERVAL_SECS: u64 = 6 * 60 * 60;
 /// held only 48 rows, leaving the newest tables with no stat rows at all and the planner
 /// assuming ~1M rows for each of them.
 ///
-/// This runs exact per-table `ANALYZE`, NOT `PRAGMA optimize`. `PRAGMA optimize` on a DB
-/// this size needs `PRAGMA analysis_limit` to be affordable (a bare `ANALYZE` scans
-/// everything), and a limited analysis pins "average rows per key" at the sample limit:
-/// measured, it reports `source_series.source_type` as selecting 401 of 123k rows rather
-/// than the true 61,515. Those are exactly the selectivities 0058's new indexes are
-/// chosen on, so a sampled optimize would overwrite good stats with wrong ones and could
-/// de-select `idx_source_series_type_created`. Per-table `ANALYZE` has no such limit —
-/// and confined to this list it costs ~70 ms, so there is nothing to buy with sampling.
-pub fn spawn_analyze(pool: SqlitePool, shutdown: tokio::sync::watch::Receiver<bool>) {
+pub fn spawn_analyze(pool: Database, shutdown: tokio::sync::watch::Receiver<bool>) {
     tokio::spawn(crate::task::supervise(
         "analyze",
         Duration::from_secs(60),
@@ -512,7 +512,7 @@ pub fn spawn_analyze(pool: SqlitePool, shutdown: tokio::sync::watch::Receiver<bo
     ));
 }
 
-async fn analyze_loop(pool: SqlitePool, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+async fn analyze_loop(pool: Database, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     // 300s behind boot: the last slot in the background-loop stagger (scanner at 0,
     // feed/FTS rebuild at 20s, mangadex at 60s, GC at 150s), so refreshing stats never
     // lands inside the boot write burst.
@@ -538,20 +538,46 @@ async fn analyze_loop(pool: SqlitePool, mut shutdown: tokio::sync::watch::Receiv
     }
 }
 
-/// One `ANALYZE` pass over [`ANALYZE_TABLES`]. Best-effort per table: a missing table or
-/// a transient lock must not abort the rest of the pass or kill the loop.
-async fn refresh_statistics(pool: &SqlitePool) {
+/// Refresh one index at a time so even a cold statistics pass releases the writer.
+async fn refresh_statistics(pool: &Database) {
     let started = std::time::Instant::now();
     let mut ok = 0usize;
     for table in ANALYZE_TABLES {
-        // `table` is a compile-time constant from the list above, never user input.
-        match sqlx::query(&format!("ANALYZE {table}")).execute(pool).await {
-            Ok(_) => ok += 1,
-            Err(e) => tracing::warn!(table, error = %e, "analyze: table failed"),
+        let indices = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = ? ORDER BY name",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await;
+        let indices = match indices {
+            Ok(indices) => indices,
+            Err(error) => {
+                tracing::warn!(table, %error, "analyze: index inventory failed");
+                continue;
+            }
+        };
+        for index in indices {
+            let result = async {
+                let mut connection = pool.write().acquire().await?;
+                sqlx::query("PRAGMA analysis_limit = 400")
+                    .execute(&mut *connection)
+                    .await?;
+                // Names come from SQLite's schema, with identifier quoting retained.
+                let quoted = index.replace('"', r#""""#);
+                sqlx::query(&format!("ANALYZE \"{quoted}\""))
+                    .execute(&mut *connection)
+                    .await
+            }
+            .await;
+            match result {
+                Ok(_) => ok += 1,
+                Err(error) => tracing::warn!(%index, %error, "analyze: index failed"),
+            }
+            tokio::task::yield_now().await;
         }
     }
     tracing::info!(
-        tables = ok,
+        indices = ok,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "analyze: query statistics refreshed"
     );
@@ -729,7 +755,7 @@ mod boot_tests {
     #[tokio::test]
     async fn partly_missing_covers_clear_only_dangling_pointers_across_chunks() {
         let scratch = Scratch::new();
-        let main = SqlitePoolOptions::new()
+        let main = crate::database::TestPoolOptions::new()
             .max_connections(2)
             .connect_with(
                 SqliteConnectOptions::from_str(&scratch.url("main.sqlite3"))

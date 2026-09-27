@@ -48,10 +48,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
+use crate::db::Database;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
 
 use crate::instance;
 use api::{ApiToken, Client};
@@ -235,7 +235,7 @@ impl Stored {
     }
 }
 
-pub async fn load_stored(pool: &SqlitePool) -> Option<Stored> {
+pub async fn load_stored(pool: &Database) -> Option<Stored> {
     let raw = instance::resolve(pool, &instance::CLOUDFLARE_STATE)
         .await
         .value;
@@ -247,7 +247,7 @@ pub async fn load_stored(pool: &SqlitePool) -> Option<Stored> {
         .ok()
 }
 
-async fn save_stored(pool: &SqlitePool, s: Option<&Stored>) -> Result<(), String> {
+async fn save_stored(pool: &Database, s: Option<&Stored>) -> Result<(), String> {
     let raw = match s {
         Some(s) => serde_json::to_string(s).map_err(|e| e.to_string())?,
         None => String::new(),
@@ -513,7 +513,7 @@ pub struct CloudflareSetupInput {
 // ---- manager -------------------------------------------------------------------
 
 pub struct Manager {
-    pool: SqlitePool,
+    pool: Database,
     opts: Options,
     trusted: Arc<crate::TrustedProxies>,
     connector: Connector,
@@ -541,7 +541,7 @@ pub struct Manager {
 type StepResult = Result<Option<String>, String>;
 
 impl Manager {
-    pub fn new(pool: SqlitePool, opts: Options, trusted: Arc<crate::TrustedProxies>) -> Self {
+    pub fn new(pool: Database, opts: Options, trusted: Arc<crate::TrustedProxies>) -> Self {
         let connector = Connector::new(
             opts.cloudflared_bin.clone(),
             opts.search_path.clone(),
@@ -1655,7 +1655,7 @@ async fn detect_public_ip(trace_url: &str) -> Result<String, String> {
 /// Record the wizard's access choice (and the domain an owner set up by hand).
 /// Record the access choice. `domain` is the domain for `internet` (optional: set by
 /// Cloudflare setup otherwise) and the server's public address for `direct` (required).
-pub async fn set_access(pool: &SqlitePool, mode: &str, domain: Option<&str>) -> Result<(), String> {
+pub async fn set_access(pool: &Database, mode: &str, domain: Option<&str>) -> Result<(), String> {
     if !matches!(mode, "local" | "internet" | "direct") {
         return Err("Access must be local, internet or direct.".into());
     }

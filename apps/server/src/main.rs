@@ -7,6 +7,7 @@ mod cloudflare;
 mod config;
 mod cover;
 mod cover_recompress;
+mod database;
 mod db;
 mod dedup;
 mod discovery;
@@ -164,7 +165,7 @@ impl TrustedProxies {
     }
 
     /// Env first, then the stored setting (`instance::TRUSTED_PROXY_CIDRS`).
-    async fn load(pool: &sqlx::SqlitePool) -> Self {
+    async fn load(pool: &crate::db::Database) -> Self {
         let r = instance::resolve(pool, &instance::TRUSTED_PROXY_CIDRS).await;
         let raw = r
             .value
@@ -258,10 +259,10 @@ fn resolve_client_ip(headers: &HeaderMap, peer: SocketAddr, trusted: &[Cidr]) ->
 #[derive(Clone)]
 struct RouterState {
     schema: ApiSchema,
-    pool: sqlx::SqlitePool,
+    pool: crate::db::Database,
     /// Un-replicated cover-cache DB (`work_cover_blob`); served by `serve_cover`.
     /// A newtype (`CoverDb`) distinguishes it from the main `pool` in `FromRef`.
-    cover_pool: sqlx::SqlitePool,
+    cover_pool: crate::db::Database,
     trusted_proxies: Arc<TrustedProxies>,
     /// Per-user sliding-window limiter for the CPU-bound upload routes
     /// (`/avatar`, `/comment-media`), so a single account can't flood the
@@ -276,15 +277,15 @@ impl FromRef<RouterState> for ApiSchema {
         s.schema.clone()
     }
 }
-impl FromRef<RouterState> for sqlx::SqlitePool {
+impl FromRef<RouterState> for crate::db::Database {
     fn from_ref(s: &RouterState) -> Self {
         s.pool.clone()
     }
 }
 /// Newtype for the cover-cache pool so a handler can extract it via `State`
-/// without colliding with the main-pool `FromRef<RouterState> for SqlitePool`.
+/// without colliding with the main-pool `FromRef<RouterState> for Database`.
 #[derive(Clone)]
-struct CoverDb(sqlx::SqlitePool);
+struct CoverDb(crate::db::Database);
 impl FromRef<RouterState> for CoverDb {
     fn from_ref(s: &RouterState) -> Self {
         CoverDb(s.cover_pool.clone())
@@ -348,7 +349,7 @@ async fn graphql_handler(
     tls: Option<axum::Extension<cloudflare::origin_tls::OverTls>>,
     headers: HeaderMap,
     req: GraphQLRequest,
-) -> GraphQLResponse {
+) -> axum::response::Response {
     let auth = RequestAuth(bearer(&headers));
     let plain = plain_from_internet(tls, peer, &trusted.current(), &headers);
     let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted.current())));
@@ -358,7 +359,7 @@ async fn graphql_handler(
     let user_cache = RequestUserCache::default();
     let nsfw_cache = RequestNsfwPref::default();
     let library_cache = RequestLibraryCache::default();
-    schema
+    let response = schema
         .execute(
             req.into_inner()
                 .data(auth)
@@ -368,8 +369,74 @@ async fn graphql_handler(
                 .data(nsfw_cache)
                 .data(library_cache),
         )
-        .await
-        .into()
+        .await;
+    let unavailable = graphql_unavailable(&response);
+    let mut response = GraphQLResponse::from(response).into_response();
+    if unavailable {
+        mark_unavailable(&mut response);
+    }
+    response
+}
+
+fn graphql_unavailable(response: &async_graphql::Response) -> bool {
+    response.errors.iter().any(|error| {
+        error
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get("code"))
+            == Some(&async_graphql::Value::String("SERVICE_UNAVAILABLE".into()))
+    })
+}
+
+fn mark_unavailable(response: &mut axum::response::Response) {
+    *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+}
+
+fn busy_response() -> axum::response::Response {
+    let mut response = Json(serde_json::json!({
+        "data": null,
+        "errors": [{ "message": "Server busy; retry soon", "extensions": { "code": "SERVICE_UNAVAILABLE" } }]
+    })).into_response();
+    mark_unavailable(&mut response);
+    response
+}
+
+fn database_error_response(
+    error: impl Into<anyhow::Error>,
+    message: &str,
+) -> axum::response::Response {
+    let error = error.into();
+    if error.chain().any(|cause| {
+        cause.downcast_ref::<sqlx::Error>().is_some_and(|cause| {
+            matches!(cause, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
+        })
+    }) {
+        busy_response()
+    } else {
+        avatar_error(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+}
+
+/// Fixed admission bound prevents a queue of requests from growing behind the
+/// bounded database pools. Dropping a timed-out request releases its permit.
+async fn limit_requests(
+    State(admission): State<Arc<tokio::sync::Semaphore>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Ok(_permit) = admission.try_acquire_owned() else {
+        return busy_response();
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(20), next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => busy_response(),
+    }
 }
 
 /// Browser cache lifetime for anonymous GET /graphql responses. Matches the lower
@@ -485,14 +552,8 @@ async fn graphql_get_response(
     // Only a clean anonymous response is cacheable: errors (rate limits, transient
     // failures) must never be replayed from an edge cache for 60 s.
     //
-    // KNOWN, ACCEPTED GAP: resolvers that deliberately swallow an upstream failure
-    // and answer Ok with a degraded result (empty search rows, a seriesPage source
-    // whose fetch failed, …) look clean here and CAN be edge-cached for up to 60 s.
-    // An empty list is also a legitimate answer, so the two are indistinguishable
-    // at this layer; the alternative — surfacing those failures as GraphQL errors —
-    // would break the clients' tolerant-degradation contracts. Bounded (s-maxage)
-    // and self-healing, and no worse than the in-process feed memos already allow.
     let cacheable = get_response_cacheable(anonymous, &resp);
+    let unavailable = graphql_unavailable(&resp);
     let body = match serde_json::to_vec(&resp) {
         Ok(b) => b,
         Err(e) => {
@@ -501,7 +562,7 @@ async fn graphql_get_response(
         }
     };
     if !cacheable {
-        return (
+        let mut response = (
             [
                 (header::CONTENT_TYPE, "application/json"),
                 (header::CACHE_CONTROL, "private, no-store"),
@@ -509,6 +570,10 @@ async fn graphql_get_response(
             body,
         )
             .into_response();
+        if unavailable {
+            mark_unavailable(&mut response);
+        }
+        return response;
     }
     let etag = weak_etag(&body);
     let cache_control =
@@ -589,7 +654,7 @@ fn avatar_error(status: StatusCode, message: &str) -> axum::response::Response {
 /// stored as a BLOB in `user_avatars`, and the resulting path stored on the user
 /// row. Returns `{ "avatarUrl": "/avatars/<id>.webp?v=<ts>" }`.
 async fn upload_avatar(
-    State(pool): State<sqlx::SqlitePool>,
+    State(pool): State<crate::db::Database>,
     State(limiter): State<Arc<RateLimiter>>,
     headers: HeaderMap,
     mut multipart: Multipart,
@@ -602,7 +667,7 @@ async fn upload_avatar(
         Ok(None) => return avatar_error(StatusCode::UNAUTHORIZED, "Not authenticated"),
         Err(e) => {
             tracing::warn!(error = %e, "avatar upload: token lookup failed");
-            return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+            return database_error_response(e, "Internal error");
         }
     };
     if limiter.check(&format!("upload:{}", user.id)).is_err() {
@@ -682,7 +747,7 @@ async fn upload_avatar(
     .await;
     if let Err(e) = stored {
         tracing::error!(error = %e, "avatar save failed");
-        return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Could not save avatar");
+        return database_error_response(e, "Could not save avatar");
     }
     Json(serde_json::json!({ "avatarUrl": url })).into_response()
 }
@@ -707,7 +772,7 @@ async fn upload_cover(
         Ok(None) => return avatar_error(StatusCode::UNAUTHORIZED, "Not authenticated"),
         Err(e) => {
             tracing::warn!(error = %e, "cover upload: token lookup failed");
-            return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+            return database_error_response(e, "Internal error");
         }
     };
     if user.is_admin == 0 {
@@ -730,7 +795,7 @@ async fn upload_cover(
         Ok(None) => return avatar_error(StatusCode::NOT_FOUND, "No such work"),
         Err(e) => {
             tracing::warn!(error = %e, "cover upload: work lookup failed");
-            return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+            return database_error_response(e, "Internal error");
         }
     }
 
@@ -773,7 +838,7 @@ async fn upload_cover(
 
     if let Err(e) = cover::put_work_cover(&app.pool, &app.cover_pool, &work_id, &webp).await {
         tracing::error!(error = %e, work_id = %work_id, "cover upload: store failed");
-        return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Could not save cover");
+        return database_error_response(e, "Could not save cover");
     }
     cover::clear_cover_issue(&app.pool, &work_id).await;
     graphql::clear_feed_caches();
@@ -893,7 +958,7 @@ fn png_icon_response(bytes: Vec<u8>) -> axum::response::Response {
 /// the cache. `{file}` is `<user_id>.webp`; the id is looked up as a bind param
 /// (no path/SQL injection surface), returning 404 for a bad shape or unknown id.
 async fn serve_avatar(
-    State(pool): State<sqlx::SqlitePool>,
+    State(pool): State<crate::db::Database>,
     UrlPath(file): UrlPath<String>,
 ) -> axum::response::Response {
     let Some(user_id) = file.strip_suffix(".webp") else {
@@ -908,7 +973,7 @@ async fn serve_avatar(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "avatar read failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                return database_error_response(e, "Internal error");
             }
         };
     match webp {
@@ -954,7 +1019,7 @@ async fn serve_cover(
         Ok(None) => {} // fall through to lazy fetch
         Err(e) => {
             tracing::warn!(error = %e, "cover read failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return database_error_response(e, "Internal error");
         }
     }
     // Lazy cache: this URL is only built for MangaDex-anchored works, so look up the
@@ -982,14 +1047,15 @@ async fn serve_cover(
     let resized = tokio::task::spawn_blocking(move || cover::process_cover(&bytes)).await;
     match resized {
         Ok(Ok(webp)) => {
-            if let Err(e) = cover::put_work_cover(&app.pool, &pool, work_id, &webp).await {
-                tracing::warn!(error = %e, work_id, "lazy cover cache store failed");
-            } else {
-                // This lazy materialization is an "auto success": if the crawl had
-                // recorded a cover issue for this work, clear it so it drops out of the
-                // admin Bugs panel and stops being excluded from the drainer's SELECTs.
-                cover::clear_cover_issue(&app.pool, work_id).await;
-            }
+            let work = work_id.to_owned();
+            let bytes = webp.clone();
+            let main = app.pool.clone();
+            let covers = pool.clone();
+            app.pool.defer(async move {
+                cover::put_work_cover(&main, &covers, &work, &bytes).await?;
+                cover::clear_cover_issue(&main, &work).await;
+                Ok(())
+            });
             cover_response_at_width(&pool, work_id, width, webp).await
         }
         Ok(Err(e)) => {
@@ -1119,7 +1185,7 @@ fn thumbnail_manga_id(rest: &str) -> Option<i64> {
 /// resize is retried on a later request.
 async fn serve_suwayomi_cover(
     app: &graphql::AppState,
-    covers: &sqlx::SqlitePool,
+    covers: &crate::db::Database,
     manga_id: i64,
     width: Option<u32>,
 ) -> axum::response::Response {
@@ -1167,9 +1233,9 @@ async fn serve_suwayomi_cover(
     .await;
     match resized {
         Ok(Ok(webp)) => {
-            if let Err(e) = cover::put_suwayomi_cover(covers, manga_id, &webp).await {
-                tracing::warn!(error = %e, manga_id, "suwayomi cover cache store failed");
-            }
+            let writer = covers.clone();
+            let bytes = webp.clone();
+            covers.defer(async move { cover::put_suwayomi_cover(&writer, manga_id, &bytes).await });
             cover_response_at_width(covers, &variant_key, width, webp).await
         }
         Ok(Err((err, bytes))) => {
@@ -1198,7 +1264,7 @@ async fn serve_suwayomi_cover(
 /// identical blob.
 fn spawn_suwayomi_cover_materialize(
     app: &graphql::AppState,
-    covers: &sqlx::SqlitePool,
+    covers: &crate::db::Database,
     manga_id: i64,
 ) {
     let Some(slot) = app.suwayomi.try_background_slot() else {
@@ -1290,7 +1356,7 @@ fn query_param<'a>(raw: &'a Option<String>, key: &str) -> Option<&'a str> {
 /// Every failure mode falls back to the master: a cover that renders slightly too large
 /// is strictly better than a hole in the grid.
 async fn cover_response_at_width(
-    covers: &sqlx::SqlitePool,
+    covers: &crate::db::Database,
     asset_key: &str,
     width: Option<u32>,
     master: Vec<u8>,
@@ -1319,9 +1385,11 @@ async fn cover_response_at_width(
         // The master is already at or under `w` — serve it, store nothing.
         Ok(Ok(None)) => webp_cover_response(master),
         Ok(Ok(Some(bytes))) => {
-            if let Err(e) = cover::put_cover_variant(covers, asset_key, w, &bytes).await {
-                tracing::warn!(error = %e, asset_key, width = w, "cover variant store failed");
-            }
+            let writer = covers.clone();
+            let asset = asset_key.to_owned();
+            let cached = bytes.clone();
+            covers
+                .defer(async move { cover::put_cover_variant(&writer, &asset, w, &cached).await });
             webp_cover_response(bytes)
         }
         Ok(Err(e)) => {
@@ -1391,7 +1459,7 @@ fn raw_image_response(content_type: String, bytes: Vec<u8>) -> axum::response::R
 /// to `postComment`, which links the row to the new comment. Unlinked rows are
 /// drafts the user never posted.
 async fn upload_comment_media(
-    State(pool): State<sqlx::SqlitePool>,
+    State(pool): State<crate::db::Database>,
     State(limiter): State<Arc<RateLimiter>>,
     headers: HeaderMap,
     mut multipart: Multipart,
@@ -1404,7 +1472,7 @@ async fn upload_comment_media(
         Ok(None) => return avatar_error(StatusCode::UNAUTHORIZED, "Not authenticated"),
         Err(e) => {
             tracing::warn!(error = %e, "comment media upload: token lookup failed");
-            return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+            return database_error_response(e, "Internal error");
         }
     };
     if limiter.check(&format!("upload:{}", user.id)).is_err() {
@@ -1487,7 +1555,7 @@ async fn upload_comment_media(
     .await;
     if let Err(e) = stored {
         tracing::error!(error = %e, "comment media save failed");
-        return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Could not save image");
+        return database_error_response(e, "Could not save image");
     }
     Json(serde_json::json!({
         "mediaId": id,
@@ -1503,7 +1571,7 @@ async fn upload_comment_media(
 /// `{file}` is `<id>.webp`; the id is looked up as a bind param (no injection
 /// surface), returning 404 for a bad shape or unknown id.
 async fn serve_comment_media(
-    State(pool): State<sqlx::SqlitePool>,
+    State(pool): State<crate::db::Database>,
     UrlPath(file): UrlPath<String>,
 ) -> axum::response::Response {
     let Some(id) = file.strip_suffix(".webp") else {
@@ -1518,7 +1586,7 @@ async fn serve_comment_media(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "comment media read failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                return database_error_response(e, "Internal error");
             }
         };
     match webp {
@@ -1548,10 +1616,10 @@ async fn health() -> &'static str {
 /// freshness. Served on its OWN listener bound to 127.0.0.1:{metrics_port}, so it
 /// is unreachable from outside the host by construction (no reliance on ingress
 /// filtering). Even leaked it discloses only aggregate counts, not user data.
-async fn metrics(State(pool): State<sqlx::SqlitePool>) -> impl IntoResponse {
+async fn metrics(State(pool): State<crate::db::Database>) -> impl IntoResponse {
     // One helper so a single failed query degrades to a `-1` gauge rather than 500ing
     // the whole scrape (a metrics endpoint that fails is worse than one with a hole).
-    async fn scalar(pool: &sqlx::SqlitePool, sql: &str) -> i64 {
+    async fn scalar(pool: &crate::db::Database, sql: &str) -> i64 {
         sqlx::query_scalar::<_, i64>(sql)
             .fetch_one(pool)
             .await
@@ -1673,8 +1741,11 @@ async fn metrics(State(pool): State<sqlx::SqlitePool>) -> impl IntoResponse {
 
 /// Readiness: verifies the process can actually serve — i.e. the DB answers.
 /// For a load balancer / orchestrator readiness gate, not the liveness probe.
-async fn ready(State(pool): State<sqlx::SqlitePool>) -> impl IntoResponse {
-    match sqlx::query("SELECT 1").execute(&pool).await {
+async fn ready(State(pool): State<crate::db::Database>) -> impl IntoResponse {
+    match sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(&pool)
+        .await
+    {
         Ok(_) => (axum::http::StatusCode::OK, "ready"),
         Err(e) => {
             tracing::warn!(error = %e, "readiness check failed");
@@ -2151,6 +2222,10 @@ async fn main() -> anyhow::Result<()> {
         // and every outer layer observe the final (encoded) body. The default
         // predicate leaves image/* and already-encoded responses alone.
         .layer(CompressionLayer::new())
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(tokio::sync::Semaphore::new(64)),
+            limit_requests,
+        ))
         // Self-host "public without a domain" with HTTPS: plain HTTP from the internet
         // is sent to the HTTPS address instead of being handled. A no-op otherwise.
         .layer(axum::middleware::from_fn_with_state(
@@ -2218,7 +2293,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Loopback-only metrics listener, separate from the public router: binding to
     // 127.0.0.1 makes the scrape endpoint unreachable off-host by construction.
-    // The handler extracts `State<SqlitePool>`, so a minimal router over the main
+    // The handler extracts `State<Database>`, so a minimal router over the main
     // pool is all it needs. No graceful shutdown of its own — a detached task lets
     // the process exit when `axum::serve` on the public port returns (an in-flight
     // metrics scrape dying at shutdown is immaterial).
@@ -2398,6 +2473,78 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[tokio::test]
+    async fn saturated_http_admission_returns_retryable_503_without_running_handler() {
+        use tower::ServiceExt;
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = admission.clone().acquire_owned().await.unwrap();
+        let app = Router::new()
+            .route("/", get(|| async { "should not run" }))
+            .layer(axum::middleware::from_fn_with_state(
+                admission,
+                limit_requests,
+            ));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_http_request_times_out_and_releases_its_admission_slot() {
+        use tower::ServiceExt;
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    std::future::pending::<()>().await;
+                    "done"
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                admission.clone(),
+                limit_requests,
+            ));
+        let started = tokio::time::Instant::now();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(20));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[test]
+    fn graphql_pool_saturation_is_a_retryable_http_failure() {
+        use async_graphql::ErrorExtensions;
+        let error = async_graphql::Error::new("Server busy; retry soon")
+            .extend_with(|_, extensions| extensions.set("code", "SERVICE_UNAVAILABLE"))
+            .into_server_error(async_graphql::Pos::default());
+        let graph = async_graphql::Response::from_errors(vec![error]);
+        assert!(graphql_unavailable(&graph));
+        let mut response = GraphQLResponse::from(graph).into_response();
+        mark_unavailable(&mut response);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
     /// "In the clear from the internet" is plain HTTP, a public peer, and no trusted
     /// proxy in between. `createOwner` is refused only there.
     #[test]
@@ -2520,15 +2667,18 @@ mod tests {
     /// into the browser; on, the cover is fetched, stored and served.
     #[tokio::test]
     async fn lazy_cover_fetch_follows_the_mangadex_switch() {
-        use sqlx::sqlite::SqlitePoolOptions;
+        use crate::database::TestPoolOptions;
         use std::sync::atomic::Ordering;
-        let main = SqlitePoolOptions::new()
+        let main = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&main).await.unwrap();
-        let covers = SqlitePoolOptions::new()
+        sqlx::migrate!("./migrations")
+            .run(main.write())
+            .await
+            .unwrap();
+        let covers = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
@@ -2591,9 +2741,29 @@ mod tests {
         );
 
         mangadex.set_enabled(true);
-        let res = get().await;
+        let held_main_writer = main.begin().await.unwrap();
+        let held_cover_writer = covers.begin().await.unwrap();
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), get())
+            .await
+            .expect("cover GET waited for a cache writer");
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(cdn.hits.load(Ordering::SeqCst), 1);
+        held_cover_writer.commit().await.unwrap();
+        held_main_writer.commit().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_blob")
+                    .fetch_one(&covers)
+                    .await
+                    .unwrap();
+                if stored > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred cover cache did not persist");
         // Stored: served from our origin from now on, whatever the switch says.
         mangadex.set_enabled(false);
         assert_eq!(get().await.status(), StatusCode::OK);

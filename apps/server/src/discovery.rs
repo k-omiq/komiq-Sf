@@ -579,7 +579,7 @@ mod tests {
     // that is the assertion the Phase E bug class walks into.
     // =====================================================================================
 
-    use sqlx::SqlitePool;
+    use crate::db::Database;
 
     const SUBSCRIBED_PKG: &str = "eu.kanade.tachiyomi.extension.en.fake";
     const EN_SOURCE: &str = "9001";
@@ -587,15 +587,18 @@ mod tests {
     /// from `trigger_due_now`.
     const FUTURE: &str = "2999-01-01T00:00:00+00:00";
 
-    async fn migrated_pool() -> SqlitePool {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    async fn migrated_pool() -> Database {
+        let pool = Database::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
     /// A minimal `AppState` around a migrated pool and a fake Suwayomi origin. Discovery
     /// touches only `pool` and `suwayomi`; the rest are defaults so the struct is whole.
-    fn state(pool: SqlitePool, suwayomi_base: &str) -> AppState {
+    fn state(pool: Database, suwayomi_base: &str) -> AppState {
         AppState {
             pool: pool.clone(),
             cover_pool: pool,
@@ -617,7 +620,7 @@ mod tests {
         }
     }
 
-    async fn subscribe(pool: &SqlitePool, pkg: &str) {
+    async fn subscribe(pool: &Database, pkg: &str) {
         sqlx::query("INSERT INTO extension_subscription (pkg_name, created_at) VALUES (?, ?)")
             .bind(pkg)
             .bind(chrono::Utc::now().to_rfc3339())
@@ -626,7 +629,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn enrol(pool: &SqlitePool, id: i64) {
+    async fn enrol(pool: &Database, id: i64) {
         sqlx::query(
             "INSERT INTO series_scan_state (series_id, next_scan_at, updated_at) \
              VALUES (?, ?, ?)",
@@ -639,7 +642,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn next_scan_at(pool: &SqlitePool, id: i64) -> String {
+    async fn next_scan_at(pool: &Database, id: i64) -> String {
         sqlx::query_scalar("SELECT next_scan_at FROM series_scan_state WHERE series_id = ?")
             .bind(id.to_string())
             .fetch_one(pool)

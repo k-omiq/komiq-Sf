@@ -302,7 +302,7 @@ async fn start_acme(challenge_port: u16) -> (String, SharedAcme) {
 struct Rig {
     mgr: Arc<Manager>,
     acme: SharedAcme,
-    pool: SqlitePool,
+    pool: Database,
     opts: Options,
     data: std::path::PathBuf,
 }

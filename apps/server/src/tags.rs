@@ -16,8 +16,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use crate::db::Database;
 use anyhow::Result;
-use sqlx::{SqliteConnection, SqlitePool};
+use sqlx::SqliteConnection;
 
 /// Longest tag id the filter accepts. Real slugs top out around 20 characters ("traditional-
 /// games"); this only bounds what a client can make the server bind and memo-key.
@@ -384,7 +385,7 @@ pub struct SuwayomiTagSync {
 /// when the work has none AND no MangaDex anchor. MangaDex is authoritative where it exists —
 /// a NULL there means "MangaDex says none", which a source's genre string must not overrule —
 /// and the `IS NULL` guard means a value, once set (by anyone), is never changed by this pass.
-pub async fn sync_suwayomi_tags(pool: &SqlitePool) -> Result<SuwayomiTagSync> {
+pub async fn sync_suwayomi_tags(pool: &Database) -> Result<SuwayomiTagSync> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT ss.work_id, sy.genre FROM source_series ss \
            JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
@@ -572,7 +573,7 @@ pub struct TagRow {
 /// viewer gets the count over `is_nsfw = 0` works, and a tag only NSFW works carry is not
 /// offered at all (its chip would promise results the gate then removes). Ordered by group
 /// (genre, theme, format, content — MangaDex's own order), then name.
-pub async fn list_tags(pool: &SqlitePool, show_nsfw: bool) -> Result<Vec<TagRow>> {
+pub async fn list_tags(pool: &Database, show_nsfw: bool) -> Result<Vec<TagRow>> {
     // One of two hard-coded identifiers, never input.
     let col = if show_nsfw {
         "work_count"
@@ -787,17 +788,20 @@ mod tests {
         assert!(plan.insert.iter().all(|(_, _, _, ord)| *ord >= 1000));
     }
 
-    async fn pool() -> SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+    async fn pool() -> Database {
+        let pool = crate::database::TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
-    async fn work(pool: &SqlitePool, id: &str, demographic: Option<&str>) {
+    async fn work(pool: &Database, id: &str, demographic: Option<&str>) {
         sqlx::query(
             "INSERT INTO work (id, primary_title, demographic, created_at, updated_at) \
              VALUES (?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
@@ -810,7 +814,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn suwayomi_source(pool: &SqlitePool, work_id: &str, sid: i64, genres: &str) {
+    async fn suwayomi_source(pool: &Database, work_id: &str, sid: i64, genres: &str) {
         sqlx::query(
             "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
              VALUES (?, ?, 'suwayomi', ?, '2026-01-01T00:00:00Z')",
@@ -832,7 +836,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn tags_of(pool: &SqlitePool, work_id: &str) -> Vec<(String, String, Option<String>)> {
+    async fn tags_of(pool: &Database, work_id: &str) -> Vec<(String, String, Option<String>)> {
         sqlx::query_as(
             "SELECT tag, source, tag_key FROM work_tag WHERE work_id = ? ORDER BY tag, source",
         )
@@ -979,7 +983,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let mut conn = pool.acquire().await.unwrap();
+        let mut conn = pool.write().acquire().await.unwrap();
         assert_eq!(fill_tag_keys(&mut conn).await.unwrap(), 6);
         assert_eq!(fill_tag_keys(&mut conn).await.unwrap(), 0, "idempotent");
         rebuild_tag_table(&mut conn).await.unwrap();

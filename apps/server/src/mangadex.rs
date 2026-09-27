@@ -48,7 +48,7 @@ const EMPTY_PAGE_RETRIES: u32 = 3;
 /// "database is locked" (BUSY). During a full seed the cover drainer + scan scheduler
 /// also write the main DB, and even with `busy_timeout` a burst can return BUSY; a
 /// dropped work stays missing until the next full seed, so it's worth a few retries.
-const UPSERT_LOCK_RETRIES: u32 = 4;
+
 /// Cap on a cover-thumbnail body read. The 512px thumbnails are tens of KB, so this is
 /// purely a safety bound against an unbounded/hostile body (`Response::bytes` is
 /// otherwise limited only by the 30s client timeout). Matches the 8 MB pre-decode cap
@@ -57,7 +57,6 @@ const MAX_COVER_FETCH_BYTES: usize = 8 * 1024 * 1024;
 
 /// Transient SQLite lock/BUSY predicate. Single definition in `db` so the scanner's
 /// retry loop and this one agree on what "transient" means.
-use crate::db::is_locked_error;
 
 /// Which timestamp a sweep windows on. The full seed walks the whole catalogue by
 /// `createdAt`; recurring incremental refreshes walk only recently-changed records by
@@ -1917,7 +1916,7 @@ pub struct SweepOutcome {
 /// that did not get mirrored. What is NOT unchanged is the silence: every arm now counts, and
 /// the return value is the number of works that reached the feed.
 async fn flush_touched_feed_rows(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::db::Database,
     touched: &mut std::collections::HashSet<String>,
 ) -> u64 {
     let mut published = 0u64;
@@ -1951,7 +1950,7 @@ async fn flush_touched_feed_rows(
 /// is left unchanged, so the next cycle retries the same window. Pass
 /// `initial_since` to resume/incrementally refresh from a known timestamp.
 pub async fn sync_catalogue(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::db::Database,
     client: &MangaDexClient,
     window: SyncWindow,
     initial_since: Option<String>,
@@ -2017,16 +2016,10 @@ pub async fn sync_catalogue(
                 // Retry a lock-contended upsert a few times (the cover drainer +
                 // scanner write the main DB during the seed) so transient BUSY doesn't
                 // silently drop a work from the spine.
-                let mut result = catalog::upsert_work_from_mangadex(pool, &id, &input).await;
-                let mut lock_retry = 0u32;
-                while let Err(e) = &result {
-                    if lock_retry >= UPSERT_LOCK_RETRIES || !is_locked_error(e) {
-                        break;
-                    }
-                    lock_retry += 1;
-                    tokio::time::sleep(Duration::from_millis(150 * lock_retry as u64)).await;
-                    result = catalog::upsert_work_from_mangadex(pool, &id, &input).await;
-                }
+                let result = crate::db::retry_transaction(|| {
+                    catalog::upsert_work_from_mangadex(pool, &id, &input)
+                })
+                .await;
                 match result {
                     Ok(_) => out.upserted += 1,
                     // COUNTED, not just warned (F9). `out.failed` is what
@@ -2363,7 +2356,7 @@ impl BackfillOutcome {
 /// once that much wall-clock has elapsed, so the pass can release the catalogue
 /// single-flight lock and resume later.
 pub async fn backfill_missing_catalogue(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::db::Database,
     client: &MangaDexClient,
     cover_phash: bool,
     budget: Option<Duration>,
@@ -2485,18 +2478,10 @@ pub async fn backfill_missing_catalogue(
                     // existing works, including removal of now-empty upstream lists.
                     // Curated tags and admin override columns remain untouched.
                     {
-                        let mut res =
-                            catalog::refresh_mangadex_details(pool, &work_id, &input).await;
-                        let mut lock_retry = 0u32;
-                        while let Err(e) = &res {
-                            if lock_retry >= UPSERT_LOCK_RETRIES || !is_locked_error(e) {
-                                break;
-                            }
-                            lock_retry += 1;
-                            tokio::time::sleep(Duration::from_millis(150 * lock_retry as u64))
-                                .await;
-                            res = catalog::refresh_mangadex_details(pool, &work_id, &input).await;
-                        }
+                        let res = crate::db::retry_transaction(|| {
+                            catalog::refresh_mangadex_details(pool, &work_id, &input)
+                        })
+                        .await;
                         match res {
                             Ok(()) => out.tagged += 1,
                             Err(e) => {
@@ -2519,16 +2504,10 @@ pub async fn backfill_missing_catalogue(
                         input.cover_phash = client.cover_phash(&id, &fname).await;
                     }
                 }
-                let mut result = catalog::upsert_work_from_mangadex(pool, &id, &input).await;
-                let mut lock_retry = 0u32;
-                while let Err(e) = &result {
-                    if lock_retry >= UPSERT_LOCK_RETRIES || !is_locked_error(e) {
-                        break;
-                    }
-                    lock_retry += 1;
-                    tokio::time::sleep(Duration::from_millis(150 * lock_retry as u64)).await;
-                    result = catalog::upsert_work_from_mangadex(pool, &id, &input).await;
-                }
+                let result = crate::db::retry_transaction(|| {
+                    catalog::upsert_work_from_mangadex(pool, &id, &input)
+                })
+                .await;
                 match result {
                     Ok(_) => out.ingested += 1,
                     Err(e) => {
@@ -2643,8 +2622,8 @@ enum PassResult {
 
 /// One bounded backfill pass, under the catalogue single-flight lock.
 async fn run_backfill_pass(
-    pool: &sqlx::SqlitePool,
-    covers: &sqlx::SqlitePool,
+    pool: &crate::db::Database,
+    covers: &crate::db::Database,
     client: &MangaDexClient,
     cover_phash: bool,
 ) -> PassResult {
@@ -2768,8 +2747,8 @@ async fn run_backfill_pass(
 /// the signal; the in-flight pass itself is not cancelled mid-record (its cursor is
 /// checkpointed per page, so the next boot resumes within one page).
 pub fn spawn_backfill_if_needed(
-    pool: sqlx::SqlitePool,
-    covers: sqlx::SqlitePool,
+    pool: crate::db::Database,
+    covers: crate::db::Database,
     client: Arc<MangaDexClient>,
     cover_phash: bool,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -3022,7 +3001,7 @@ fn resolve_readable_at(row: &PendingChapter, upstream: Option<&MdChapterAttrs>) 
 /// migration 0073's partial index was created for. (Both plans verified with
 /// `EXPLAIN QUERY PLAN` against the migrated schema.)
 async fn chapters_needing_readable_at(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::db::Database,
     limit: i64,
 ) -> Result<Vec<PendingChapter>> {
     let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
@@ -3052,7 +3031,7 @@ async fn chapters_needing_readable_at(
 /// How many rows are still to do, for the completion log line. Same predicate as the
 /// work-list — a `COUNT` that disagreed with the batch query would report "drained" over
 /// rows the drain can still see, or spin over rows it cannot.
-async fn readable_backfill_remaining(pool: &sqlx::SqlitePool) -> Result<i64> {
+async fn readable_backfill_remaining(pool: &crate::db::Database) -> Result<i64> {
     Ok(sqlx::query_scalar(
         "SELECT COUNT(*) FROM chapter c \
           WHERE c.readable_at IS NULL \
@@ -3069,7 +3048,7 @@ async fn readable_backfill_remaining(pool: &sqlx::SqlitePool) -> Result<i64> {
 /// termination and resumability properties are testable without touching MangaDex — this
 /// drain is ~8,779 requests against a third party and a test must never be one of them.
 async fn write_readable_backfill(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::db::Database,
     pending: &[PendingChapter],
     upstream: &[MdChapter],
 ) -> Result<ReadableFill> {
@@ -3124,7 +3103,7 @@ async fn write_readable_backfill(
 /// runs. There is deliberately no completion marker: "done" is an empty work-list, and a
 /// marker could latch over rows that were never filled.
 pub async fn backfill_chapter_external_urls(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::db::Database,
     client: &MangaDexClient,
 ) -> Result<ReadableFill> {
     let pending = chapters_needing_readable_at(pool, READABLE_BACKFILL_BATCH).await?;
@@ -3157,7 +3136,7 @@ pub async fn backfill_chapter_external_urls(
 /// logging, and an idle re-check rather than an exit — so a row that becomes eligible after
 /// the drain finishes is still picked up, without a restart.
 pub fn spawn_readable_backfill(
-    pool: sqlx::SqlitePool,
+    pool: crate::db::Database,
     client: Arc<MangaDexClient>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -3414,7 +3393,7 @@ pub struct GroupFill {
 /// forever on the first doubly-hot work, which is precisely the work most likely to be
 /// looked at. [`chapters_needing_group`] and [`group_batch_ids`] each de-dup again, so no
 /// single layer is load-bearing for that property.
-async fn group_backfill_hot_works(pool: &sqlx::SqlitePool) -> Result<Vec<String>> {
+async fn group_backfill_hot_works(pool: &crate::db::Database) -> Result<Vec<String>> {
     const HOT_WORKS_SQL: &str = "WITH keys(k) AS ( \
              SELECT series_id FROM user_library \
              UNION SELECT work_id FROM canonical_library \
@@ -3456,7 +3435,7 @@ async fn group_backfill_hot_works(pool: &sqlx::SqlitePool) -> Result<Vec<String>
 /// stalled drain — see [`group_backfill_hot_works`] — so this does not rely on it), and both
 /// halves merge through one `seen` set.
 async fn chapters_needing_group(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::db::Database,
     hot: &[String],
     limit: i64,
 ) -> Result<Vec<PendingGroupChapter>> {
@@ -3523,7 +3502,7 @@ fn group_batch_ids(pending: &[PendingGroupChapter]) -> Vec<String> {
 }
 
 /// Rows still to do, for the completion line. Same predicate as the work-list.
-async fn group_backfill_remaining(pool: &sqlx::SqlitePool) -> Result<i64> {
+async fn group_backfill_remaining(pool: &crate::db::Database) -> Result<i64> {
     Ok(sqlx::query_scalar(&format!(
         "SELECT COUNT(*) FROM chapter c WHERE {GROUP_WORKLIST_WHERE}"
     ))
@@ -3539,7 +3518,7 @@ async fn group_backfill_remaining(pool: &sqlx::SqlitePool) -> Result<i64> {
 /// SELECT and this UPDATE; that row has left the work-list anyway, and its value is fresher
 /// than ours, so not overwriting it is the correct outcome and the drain still terminates.
 async fn write_group_backfill(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::db::Database,
     pending: &[PendingGroupChapter],
     upstream: &[MdChapter],
 ) -> Result<GroupFill> {
@@ -3579,7 +3558,7 @@ async fn write_group_backfill(
 /// `hot` is the caller's cached [`group_backfill_hot_works`]; it orders the batch and
 /// nothing else, so a stale or empty one cannot make `filled == 0` lie.
 pub async fn backfill_chapter_groups(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::db::Database,
     client: &MangaDexClient,
     hot: &[String],
 ) -> Result<GroupFill> {
@@ -3616,7 +3595,7 @@ async fn nap_or_shutdown(d: Duration, shutdown: &mut tokio::sync::watch::Receive
 /// Run the scanlation-group backfill to completion in the background, then idle cheaply.
 /// Structured exactly like [`spawn_readable_backfill`].
 pub fn spawn_group_backfill(
-    pool: sqlx::SqlitePool,
+    pool: crate::db::Database,
     client: Arc<MangaDexClient>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -3747,7 +3726,7 @@ pub fn spawn_group_backfill(
 /// filter: "I could not tell" must degrade to mirroring the chapter (where a real failure
 /// is then counted into `SweepOutcome::failed`), not to silently skipping it.
 async fn chapter_row_unchanged(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::db::Database,
     source_series_id: &str,
     ch: &catalog::ChapterInput,
 ) -> bool {
@@ -3813,7 +3792,7 @@ async fn chapter_row_unchanged(
 /// Pagination is driven by the RAW page length exactly as the catalogue sweep's is —
 /// see `ChapterPage` for the truncation bug that cost.
 pub async fn sync_chapters(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::db::Database,
     client: &MangaDexClient,
     window: SyncWindow,
     initial_since: Option<String>,
@@ -4074,7 +4053,7 @@ impl Drop for SyncGuard {
 
 /// Guarded entry point for the recurring loop: run one cycle unless one is already in
 /// flight, in which case skip this tick.
-async fn sync_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_phash: bool) {
+async fn sync_cycle(pool: &crate::db::Database, client: &MangaDexClient, cover_phash: bool) {
     if CATALOGUE_SYNC_RUNNING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -4093,7 +4072,7 @@ async fn sync_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_phas
 /// held for the whole re-seed so a recurring tick can't interleave its own cursor write
 /// between the reset and the seed.
 pub fn spawn_resync(
-    pool: sqlx::SqlitePool,
+    pool: crate::db::Database,
     client: Arc<MangaDexClient>,
     cover_phash: bool,
 ) -> bool {
@@ -4126,7 +4105,7 @@ pub fn spawn_resync(
 /// so a failed or interrupted cycle safely retries the same window next tick. Catalogue
 /// runs before chapters (chapters attach to already-catalogued works). Call via
 /// `sync_cycle` (recurring) or `spawn_resync` (admin) — both hold the single-flight lock.
-async fn run_one_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_phash: bool) {
+async fn run_one_cycle(pool: &crate::db::Database, client: &MangaDexClient, cover_phash: bool) {
     // Wall-clock at cycle start, in MangaDex `since` form. Anything updated during the
     // cycle is >= this, so it's caught by the next cycle rather than missed.
     let run_start = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -4208,7 +4187,7 @@ async fn run_one_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, cover_p
 /// The chapter half of a cycle, on its own schedule (Phase D). Takes the same single-flight
 /// lock as the catalogue sweep: they write the same tables, and the chapter sweep's
 /// uncatalogued-work skip reads state the catalogue sweep is mutating.
-pub async fn chapter_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient) {
+pub async fn chapter_cycle(pool: &crate::db::Database, client: &MangaDexClient) {
     if CATALOGUE_SYNC_RUNNING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -4257,7 +4236,7 @@ fn catalogue_seed_may_latch(o: &SweepOutcome) -> bool {
 /// chapter can surface already labelled "5h ago"). `run_start` is the wall-clock at the
 /// caller's cycle start in MangaDex `since` form: anything updated during the cycle is
 /// >= it, so it's caught next cycle rather than missed.
-async fn run_chapter_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, run_start: &str) {
+async fn run_chapter_cycle(pool: &crate::db::Database, client: &MangaDexClient, run_start: &str) {
     // Gate the chapter seed on the catalogue seed having completed (M3): until
     // every work is catalogued, a chapter whose work is missing is skipped, and
     // the chapters cursor would advance past it (updatedAtSince never revisits an
@@ -4330,7 +4309,7 @@ async fn run_chapter_cycle(pool: &sqlx::SqlitePool, client: &MangaDexClient, run
 /// (seeding on startup), then every `interval_secs`. Exits cleanly when `shutdown`
 /// fires. Mirrors the `scanner::spawn` background-task pattern.
 pub fn spawn_recurring(
-    pool: sqlx::SqlitePool,
+    pool: crate::db::Database,
     client: Arc<MangaDexClient>,
     cover_phash: bool,
     interval_secs: u64,
@@ -4371,7 +4350,7 @@ pub fn spawn_recurring(
 }
 
 async fn run_recurring(
-    pool: sqlx::SqlitePool,
+    pool: crate::db::Database,
     client: Arc<MangaDexClient>,
     cover_phash: bool,
     interval_secs: u64,
@@ -4484,9 +4463,14 @@ mod tests {
     use super::*;
 
     /// A migrated in-memory DB, as in the `catalog` tests.
-    async fn pool() -> sqlx::SqlitePool {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    async fn pool() -> crate::db::Database {
+        let pool = crate::db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
@@ -4501,7 +4485,7 @@ mod tests {
     /// column for the same reason: a row whose contents depend on WHICH writer touched it
     /// last is a row that appears, disappears or re-sorts depending on firehose timing.
     /// `~` stands in for NULL so a NULL cannot swallow the concatenation.
-    async fn feed_digest(pool: &sqlx::SqlitePool, work_id: &str) -> Option<String> {
+    async fn feed_digest(pool: &crate::db::Database, work_id: &str) -> Option<String> {
         sqlx::query_scalar(
             "SELECT work_id || '|' || reader_id || '|' || title \
                  || '|' || COALESCE(cover_url, '~') || '|' || COALESCE(suwayomi_thumbnail, '~') \
@@ -4522,7 +4506,7 @@ mod tests {
 
     /// The same for `feed_updates` (migration 0051), which `canonicalUpdates` reads directly
     /// — the OTHER surface this writer has to keep honest.
-    async fn canonical_digest(pool: &sqlx::SqlitePool, work_id: &str) -> Option<String> {
+    async fn canonical_digest(pool: &crate::db::Database, work_id: &str) -> Option<String> {
         sqlx::query_scalar(
             "SELECT work_id || '|' || COALESCE(mangadex_id, '~') || '|' || title \
                  || '|' || is_nsfw || '|' || COALESCE(cover_url, '~') \
@@ -4537,7 +4521,7 @@ mod tests {
     }
 
     /// One MangaDex-anchored work, its `source_series` id, and no chapters yet.
-    async fn mirror_work(pool: &sqlx::SqlitePool, uuid: &str, title: &str) -> (String, String) {
+    async fn mirror_work(pool: &crate::db::Database, uuid: &str, title: &str) -> (String, String) {
         let work = catalog::upsert_work_from_mangadex(
             pool,
             uuid,
@@ -4558,7 +4542,13 @@ mod tests {
         (work, ssid)
     }
 
-    async fn mirror_chapter(pool: &sqlx::SqlitePool, ssid: &str, id: &str, number: &str, at: &str) {
+    async fn mirror_chapter(
+        pool: &crate::db::Database,
+        ssid: &str,
+        id: &str,
+        number: &str,
+        at: &str,
+    ) {
         catalog::upsert_chapter(
             pool,
             ssid,
@@ -4577,7 +4567,7 @@ mod tests {
 
     /// Drive the extracted writer exactly as `sync_chapters` does: a set of the
     /// `source_series` this page wrote to, drained.
-    async fn flush(pool: &sqlx::SqlitePool, ssid: &str) -> u64 {
+    async fn flush(pool: &crate::db::Database, ssid: &str) -> u64 {
         let mut touched = std::collections::HashSet::new();
         touched.insert(ssid.to_string());
         let n = flush_touched_feed_rows(pool, &mut touched).await;

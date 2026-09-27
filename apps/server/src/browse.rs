@@ -48,8 +48,8 @@
 //! SAME WHERE applied to a full-text match set, so a text query no longer discards every
 //! filter. v1 requests map onto it unchanged (`From<BrowseSort> for Sort`).
 
+use crate::db::Database;
 use anyhow::Result;
-use sqlx::SqlitePool;
 
 use crate::graphql::types::BrowseSort;
 
@@ -1239,7 +1239,7 @@ fn order_by(col: &str, desc: bool) -> String {
 // the arguments into a struct would just move the same eight names one level down.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_page(
-    pool: &SqlitePool,
+    pool: &Database,
     cte: bool,
     where_sql: &str,
     extra: &str,
@@ -1272,7 +1272,7 @@ async fn fetch_page(
 /// (`refresh_feed_updates`), so a miss means the work lost its last source or its title
 /// between the two rebuilds — exactly the shell Browse also refuses to show. Silent by
 /// design: the caller logs the count difference.
-pub async fn rows_by_work_ids(pool: &SqlitePool, ids: &[String]) -> Result<Vec<BrowseRow>> {
+pub async fn rows_by_work_ids(pool: &Database, ids: &[String]) -> Result<Vec<BrowseRow>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1328,7 +1328,7 @@ pub async fn rows_by_work_ids(pool: &SqlitePool, ids: &[String]) -> Result<Vec<B
 /// override written since the last Browse rebuild is honoured here immediately, and the
 /// resolver's `filter_nsfw` backstop still runs after hydration.
 pub async fn search_text(
-    pool: &SqlitePool,
+    pool: &Database,
     raw_query: &str,
     q: &BrowseQuery<'_>,
 ) -> Result<(i64, Vec<BrowseRow>)> {
@@ -1481,7 +1481,7 @@ pub async fn search_text(
 /// Catalogue-wide Browse. Returns `(total, page)` where `total` counts exactly the row set
 /// the page query walks.
 pub async fn browse_catalogue(
-    pool: &SqlitePool,
+    pool: &Database,
     q: &BrowseQuery<'_>,
 ) -> Result<(i64, Vec<BrowseRow>)> {
     let (where_sql, binds, uses_rated) = build_where(q);
@@ -1582,7 +1582,7 @@ fn key_for_nulls(col: &str, q: &BrowseQuery<'_>) -> String {
 
 /// What a phase function needs to run statements over the shared WHERE.
 struct PageCtx<'a> {
-    pool: &'a SqlitePool,
+    pool: &'a Database,
     uses_rated: bool,
     where_sql: &'a str,
     binds: &'a [Bind],
@@ -1683,7 +1683,7 @@ fn split_two_phase(prefix_len: i64, offset: i64, page_size: i64) -> (i64, i64, i
 /// the rated works only. Phase 1's `USE TEMP B-TREE FOR ORDER BY` is over THAT set (5 rows
 /// today), not over the feed — which is the entire point of splitting.
 async fn rating_page(
-    pool: &SqlitePool,
+    pool: &Database,
     where_sql: &str,
     binds: &[Bind],
     desc: bool,
@@ -1751,7 +1751,7 @@ async fn rating_page(
 /// nearly empty today and almost every page is served entirely by phase 2. That is the
 /// expected state, not a bug.
 async fn trending_page(
-    pool: &SqlitePool,
+    pool: &Database,
     where_sql: &str,
     binds: &[Bind],
     uses_rated: bool,
@@ -1845,7 +1845,7 @@ async fn trending_page(
 ///
 /// Failures degrade to an empty ranking, i.e. Browse falls back to newest-first, rather
 /// than failing the request: this is a popularity ORDERING, not a filter.
-async fn trending_work_ids(pool: &SqlitePool, limit: i64) -> Vec<String> {
+async fn trending_work_ids(pool: &Database, limit: i64) -> Vec<String> {
     let keys = crate::views::trending_keys(pool, limit)
         .await
         .inspect_err(|e| tracing::warn!(error = %e, "browse: trending ranking unavailable"))
@@ -1907,7 +1907,7 @@ async fn trending_work_ids(pool: &SqlitePool, limit: i64) -> Vec<String> {
 /// `WHERE {col} > 0` drops a tag that only NSFW works carry. Offering it to an opted-out
 /// viewer would render a chip labelled "0" that returns an empty page — the facet's whole
 /// purpose is that its number equals the filter's result count.
-pub async fn genre_facets(pool: &SqlitePool, show_nsfw: bool) -> Result<Vec<(String, i64)>> {
+pub async fn genre_facets(pool: &Database, show_nsfw: bool) -> Result<Vec<(String, i64)>> {
     // One of two hard-coded identifiers, never input.
     let col = if show_nsfw { "all_count" } else { "safe_count" };
     let sql = format!(
@@ -1941,7 +1941,7 @@ pub struct SourceFacet {
 ///
 /// NOT a materialized table like the tag facets: it joins every Browse row to its
 /// mappings (about 0.5 s over 115k works), so the resolver memoizes it for minutes.
-pub async fn source_facets(pool: &SqlitePool, show_nsfw: bool) -> Result<Vec<SourceFacet>> {
+pub async fn source_facets(pool: &Database, show_nsfw: bool) -> Result<Vec<SourceFacet>> {
     // One of two hard-coded fragments, never input.
     let gate = if show_nsfw { "" } else { "AND f.is_nsfw = 0" };
     let sql = format!(
@@ -1965,15 +1965,18 @@ pub async fn source_facets(pool: &SqlitePool, show_nsfw: bool) -> Result<Vec<Sou
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use crate::database::TestPoolOptions;
 
-    async fn pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
+    async fn pool() -> Database {
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
@@ -1984,7 +1987,7 @@ mod tests {
     /// dated chapter, which `feed_series_updates` cannot represent at all.
     #[allow(clippy::too_many_arguments)]
     async fn seed(
-        pool: &SqlitePool,
+        pool: &Database,
         work_id: &str,
         title: &str,
         comic_type: &str,
@@ -2036,13 +2039,13 @@ mod tests {
         }
     }
 
-    async fn titles(pool: &SqlitePool, query: &BrowseQuery<'_>) -> (i64, Vec<String>) {
+    async fn titles(pool: &Database, query: &BrowseQuery<'_>) -> (i64, Vec<String>) {
         let (t, rows) = browse_catalogue(pool, query).await.unwrap();
         (t, rows.into_iter().map(|r| r.title).collect())
     }
 
     /// A five-work catalogue with distinct sort keys on every axis.
-    async fn fixture(pool: &SqlitePool) {
+    async fn fixture(pool: &Database) {
         //     id    title  type      status      rating       nsfw  ch   released
         seed(
             pool,
@@ -2284,7 +2287,7 @@ mod tests {
         let pool = pool().await;
         fixture(&pool).await;
         async fn tier(
-            pool: &SqlitePool,
+            pool: &Database,
             r: Option<&'static [&'static str]>,
             nsfw: bool,
         ) -> (i64, Vec<String>) {
@@ -2324,7 +2327,7 @@ mod tests {
     async fn nsfw_only_selects_the_complement_and_still_cannot_widen_the_gate() {
         let pool = pool().await;
         fixture(&pool).await;
-        async fn only(pool: &SqlitePool, nsfw: bool) -> (i64, Vec<String>) {
+        async fn only(pool: &Database, nsfw: bool) -> (i64, Vec<String>) {
             let mut query = q(BrowseSort::Newest, 1);
             query.nsfw_only = true;
             query.show_nsfw = nsfw;
@@ -2995,7 +2998,7 @@ mod tests {
     /// Migration 0106's columns on an already-seeded row, plus its tag KEYS.
     #[allow(clippy::too_many_arguments)]
     async fn v2(
-        pool: &SqlitePool,
+        pool: &Database,
         work_id: &str,
         demographic: Option<&str>,
         lang: Option<&str>,
@@ -3023,7 +3026,7 @@ mod tests {
     }
 
     /// One `work_tag` row with an explicit display name and key.
-    async fn tag(pool: &SqlitePool, work_id: &str, name: &str, key: &str, source: &str) {
+    async fn tag(pool: &Database, work_id: &str, name: &str, key: &str, source: &str) {
         sqlx::query(
             "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) VALUES (?, ?, 0, ?, ?)",
         )
@@ -3058,7 +3061,7 @@ mod tests {
         &'a [&'a str],
     );
 
-    async fn fixture_v2(pool: &SqlitePool) {
+    async fn fixture_v2(pool: &Database) {
         fixture(pool).await;
         let rows: [V2Row<'_>; 5] = [
             (
@@ -3582,7 +3585,7 @@ mod tests {
         );
     }
 
-    async fn fts(pool: &SqlitePool, work_id: &str, title: &str, chapters: i64) {
+    async fn fts(pool: &Database, work_id: &str, title: &str, chapters: i64) {
         sqlx::query(
             "INSERT INTO work_fts (work_id, chapters, title, aliases) VALUES (?, ?, ?, '')",
         )
@@ -3912,7 +3915,7 @@ mod tests {
         tx.commit().await.unwrap();
         sqlx::query("ANALYZE").execute(&pool).await.unwrap();
 
-        async fn plan(pool: &SqlitePool, sql: &str, binds: &[Bind]) -> Vec<String> {
+        async fn plan(pool: &Database, sql: &str, binds: &[Bind]) -> Vec<String> {
             use sqlx::Row;
             let text = format!("EXPLAIN QUERY PLAN {sql}");
             let mut qq = sqlx::query(&text);

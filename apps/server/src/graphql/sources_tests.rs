@@ -54,12 +54,15 @@ async fn mock_engine() -> (String, Removed) {
 /// client starts OFF (as on a fresh install) and points at a dead port, so even a
 /// switched-on call can never leave the machine.
 async fn fixture(engine: &str) -> (ApiSchema, Arc<AppState>) {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+    let pool = crate::database::TestPoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::migrate!("./migrations")
+        .run(pool.write())
+        .await
+        .unwrap();
     for (id, name, admin, tok) in [
         ("admin-id", "admin", 1, "admintok"),
         ("bob-id", "bob", 0, "bobtok"),

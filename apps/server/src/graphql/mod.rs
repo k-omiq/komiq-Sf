@@ -9,11 +9,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::db::Database;
 use async_graphql::{
-    ComplexObject, Context, EmptySubscription, Error, Object, Result, Schema, SimpleObject, ID,
+    ComplexObject, Context, EmptySubscription, Error, ErrorExtensions, Object, Result, Schema,
+    SimpleObject, ID,
 };
 use chrono::Utc;
-use sqlx::SqlitePool;
 
 use crate::auth::{self, User};
 use crate::browse::BROWSE_PAGE_SIZE;
@@ -299,10 +300,10 @@ impl KeyedLocks {
 
 /// Shared, request-independent application state.
 pub struct AppState {
-    pub pool: SqlitePool,
+    pub pool: Database,
     /// Separate, un-replicated DB for cover blobs (`work_cover_blob`). Kept out of
     /// `pool` so Litestream/R2 backs up only the main DB; see `db::init_covers`.
-    pub cover_pool: SqlitePool,
+    pub cover_pool: Database,
     pub suwayomi: SuwayomiClient,
     /// Direct MangaDex client — page resolution for canonical (MangaDex-mirrored)
     /// works via MangaDex@Home (CATALOGUE.md §5). Shared with the catalogue sync.
@@ -383,7 +384,7 @@ async fn plain_from_internet(ctx: &Context<'_>) -> bool {
 /// lookup per item. A fresh `OnceCell` is attached per HTTP request, so the DB
 /// lookup runs at most once regardless of how many resolvers ask.
 #[derive(Clone, Default)]
-pub struct RequestUserCache(pub std::sync::Arc<tokio::sync::OnceCell<Option<User>>>);
+pub struct RequestUserCache(pub std::sync::Arc<tokio::sync::OnceCell<Result<Option<User>>>>);
 
 /// Per-request memoization of the viewer's `show_nsfw` preference. `viewer_show_nsfw`
 /// is consulted by nearly every feed resolver (`discovery`, `updates`, `search`,
@@ -392,7 +393,7 @@ pub struct RequestUserCache(pub std::sync::Arc<tokio::sync::OnceCell<Option<User
 /// so one home render paid it several times over. A fresh cell is attached per HTTP
 /// request; the flag is request-stable, so one query suffices.
 #[derive(Clone, Default)]
-pub struct RequestNsfwPref(pub std::sync::Arc<tokio::sync::OnceCell<bool>>);
+pub struct RequestNsfwPref(pub std::sync::Arc<tokio::sync::OnceCell<Result<bool>>>);
 
 /// One viewer's `user_library` row for a series — the shared payload behind the
 /// `is_marked` / `library_status` / `is_favorite` resolvers.
@@ -629,7 +630,7 @@ impl Series {
     /// Per-viewer, resolved dynamically so every feed reflects the caller's own
     /// library; `false` for anonymous viewers (no made-up membership).
     async fn is_marked(&self, ctx: &Context<'_>) -> Result<bool> {
-        Ok(viewer_library_row(ctx, &self.id.0).await.is_some())
+        Ok(viewer_library_row(ctx, &self.id.0).await?.is_some())
     }
 
     /// The shelf the viewer has explicitly filed this series under
@@ -638,7 +639,7 @@ impl Series {
     /// anonymous viewers and series not in the viewer's library.
     async fn library_status(&self, ctx: &Context<'_>) -> Result<Option<String>> {
         Ok(viewer_library_row(ctx, &self.id.0)
-            .await
+            .await?
             .and_then(|r| r.status))
     }
 
@@ -646,7 +647,7 @@ impl Series {
     /// anonymous viewers and series not in the viewer's library.
     async fn is_favorite(&self, ctx: &Context<'_>) -> Result<bool> {
         Ok(viewer_library_row(ctx, &self.id.0)
-            .await
+            .await?
             .map(|r| r.is_favorite)
             .unwrap_or(false))
     }
@@ -811,50 +812,35 @@ fn client_ip(ctx: &Context<'_>) -> String {
 /// Resolve the authenticated user, or `None` if the request is anonymous. An
 /// account that still holds a temporary password counts as anonymous here: it can
 /// read its session and change its password ([`session_user`]) and nothing else.
-async fn current_user(ctx: &Context<'_>) -> Option<User> {
-    session_user(ctx)
-        .await
-        .filter(|u| u.must_change_password == 0)
+async fn current_user(ctx: &Context<'_>) -> Result<Option<User>> {
+    Ok(session_user(ctx)
+        .await?
+        .filter(|u| u.must_change_password == 0))
 }
 
-/// The user owning the request's session, including one that must change its
-/// password first. Only the `session` query and `changePassword` call this;
-/// everything else goes through [`current_user`].
-/// Memoized per request via `RequestUserCache` so the `sessions⋈users` lookup
-/// runs at most once even when many resolvers ask (one per feed item).
-async fn session_user(ctx: &Context<'_>) -> Option<User> {
+/// The session owner, including accounts that must change their password first.
+/// Memoize both success and failure so a database outage cannot turn one field
+/// anonymous while another field in the same request remains authenticated.
+async fn session_user(ctx: &Context<'_>) -> Result<Option<User>> {
+    let lookup = || async {
+        match token(ctx) {
+            Some(tok) => auth::session_user_for_token(&state(ctx).pool, &tok)
+                .await
+                .map_err(gql_err),
+            None => Ok(None),
+        }
+    };
     if let Some(cache) = ctx.data_opt::<RequestUserCache>() {
-        return cache
-            .0
-            .get_or_init(|| async {
-                match token(ctx) {
-                    Some(tok) => auth::session_user_for_token(&state(ctx).pool, &tok)
-                        .await
-                        .ok()
-                        .flatten(),
-                    None => None,
-                }
-            })
-            .await
-            .clone();
+        return cache.0.get_or_init(lookup).await.clone();
     }
-    // Fallback when no cache was attached (e.g. a code path that builds a bare request).
-    let tok = token(ctx)?;
-    auth::session_user_for_token(&state(ctx).pool, &tok)
-        .await
-        .ok()
-        .flatten()
+    lookup().await
 }
 
 /// Fetch the viewer's `user_library` row for one series in a single SELECT. `None` when
 /// the row doesn't exist (series not in the viewer's library); a transient DB error is
 /// also folded to `None` so a feed degrades to "not in library" rather than erroring the
 /// whole response (matching how anonymous viewers already resolve these flags to false).
-async fn fetch_library_row(
-    pool: &SqlitePool,
-    user_id: &str,
-    series_id: &str,
-) -> Option<LibraryRow> {
+async fn fetch_library_row(pool: &Database, user_id: &str, series_id: &str) -> Option<LibraryRow> {
     let rows = sqlx::query_as::<_, (i64, Option<String>)>(
         "WITH target(work_id) AS ( \
            SELECT COALESCE((SELECT work_id FROM source_series \
@@ -884,8 +870,10 @@ async fn fetch_library_row(
 /// `None` for anonymous viewers or a series not in the viewer's library. Backs all three
 /// of `is_marked` / `library_status` / `is_favorite` so they share one query per series
 /// (see [`RequestLibraryCache`]).
-async fn viewer_library_row(ctx: &Context<'_>, series_id: &str) -> Option<LibraryRow> {
-    let user = current_user(ctx).await?;
+async fn viewer_library_row(ctx: &Context<'_>, series_id: &str) -> Result<Option<LibraryRow>> {
+    let Some(user) = current_user(ctx).await? else {
+        return Ok(None);
+    };
     let cell = match ctx.data_opt::<RequestLibraryCache>() {
         Some(cache) => cache
             .0
@@ -895,11 +883,12 @@ async fn viewer_library_row(ctx: &Context<'_>, series_id: &str) -> Option<Librar
             .or_default()
             .clone(),
         // No cache attached (bare request) — fall back to a direct fetch.
-        None => return fetch_library_row(&state(ctx).pool, &user.id, series_id).await,
+        None => return Ok(fetch_library_row(&state(ctx).pool, &user.id, series_id).await),
     };
-    cell.get_or_init(|| fetch_library_row(&state(ctx).pool, &user.id, series_id))
+    Ok(cell
+        .get_or_init(|| fetch_library_row(&state(ctx).pool, &user.id, series_id))
         .await
-        .clone()
+        .clone())
 }
 
 /// What a signed-in account with a temporary password is told by everything but
@@ -908,7 +897,7 @@ const MUST_CHANGE_PASSWORD: &str = "Choose a new password first";
 
 /// Resolve the authenticated user or fail — for mutations that require sign-in.
 async fn require_user(ctx: &Context<'_>) -> Result<User> {
-    match session_user(ctx).await {
+    match session_user(ctx).await? {
         Some(u) if u.must_change_password == 0 => Ok(u),
         Some(_) => Err(Error::new(MUST_CHANGE_PASSWORD)),
         None => Err(Error::new("Not authenticated")),
@@ -929,9 +918,28 @@ async fn require_admin(ctx: &Context<'_>) -> Result<User> {
 /// server-side only; the client receives a generic message so the API surface
 /// isn't leaked. Deliberately user-facing errors are built with `Error::new(...)`
 /// directly and never routed through here, so they're preserved.
-fn gql_err(e: impl std::fmt::Display) -> Error {
+fn gql_err(e: impl std::fmt::Display + Send + Sync + 'static) -> Error {
     tracing::error!(error = %e, "internal error");
-    Error::new("Internal error")
+    let source: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(e);
+    let unavailable = source
+        .downcast_ref::<sqlx::Error>()
+        .is_some_and(|error| matches!(error, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed))
+        || source.downcast_ref::<anyhow::Error>().is_some_and(|error| {
+            error.chain().any(|cause| {
+                cause.downcast_ref::<sqlx::Error>().is_some_and(|error| {
+                    matches!(error, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
+                })
+            })
+        });
+    let mut error = if unavailable {
+        Error::new("Server busy; retry soon").extend_with(|_, extensions| {
+            extensions.set("code", "SERVICE_UNAVAILABLE");
+        })
+    } else {
+        Error::new("Internal error")
+    };
+    error.source = Some(source);
+    error
 }
 
 /// A `scanner::EffectiveRateLimit` as the admin console reads it.
@@ -995,7 +1003,7 @@ fn parse_chapter_number(raw: &str) -> Option<f64> {
 /// `last_page_read` is only ever written on INSERT, so a chapter the viewer had genuinely
 /// stopped partway through keeps the position it stopped at.
 async fn catch_up_canonical(
-    pool: &SqlitePool,
+    pool: &Database,
     user_id: &str,
     work_id: &str,
     number: f64,
@@ -1032,7 +1040,7 @@ async fn catch_up_canonical(
 /// Simpler only because `suwayomi_chapter.chapter_number` is already REAL, so the
 /// numeric-label guard is a plain `IS NOT NULL`.
 async fn catch_up_suwayomi(
-    pool: &SqlitePool,
+    pool: &Database,
     user_id: &str,
     series_id: &str,
     number: f64,
@@ -1080,7 +1088,7 @@ struct AdminOverrides {
 /// Whether a federated Suwayomi series is NSFW per the canonical model (CATALOGUE.md
 /// §2). True once it's linked to a `work` flagged NSFW; false when uncatalogued (we
 /// only hide what we positively know is NSFW).
-async fn canonical_is_nsfw(pool: &SqlitePool, suwayomi_id: &str) -> bool {
+async fn canonical_is_nsfw(pool: &Database, suwayomi_id: &str) -> bool {
     sqlx::query_scalar::<_, i64>(
         "SELECT COALESCE(MAX(COALESCE(w.is_nsfw_override, w.is_nsfw)), 0) FROM source_series ss \
          JOIN work w ON w.id = ss.work_id \
@@ -1104,7 +1112,7 @@ async fn canonical_is_nsfw(pool: &SqlitePool, suwayomi_id: &str) -> bool {
 /// Fails CLOSED on a DB error (treats the work as NSFW). An id with no `work` row is
 /// NOT NSFW — an unknown work has nothing to hide, and the caller's own lookup will
 /// come back empty anyway.
-async fn work_is_nsfw(pool: &SqlitePool, work_id: &str) -> bool {
+async fn work_is_nsfw(pool: &Database, work_id: &str) -> bool {
     sqlx::query_scalar::<_, i64>(
         "SELECT COALESCE(is_nsfw_override, is_nsfw) FROM work WHERE id = ?",
     )
@@ -1118,10 +1126,7 @@ async fn work_is_nsfw(pool: &SqlitePool, work_id: &str) -> bool {
 /// Batched `work_is_nsfw`: the subset of `work_ids` that are NSFW. Fails CLOSED — a
 /// query error returns EVERY input id, so an opted-out viewer sees nothing rather than
 /// everything.
-async fn nsfw_work_ids(
-    pool: &SqlitePool,
-    work_ids: &[String],
-) -> std::collections::HashSet<String> {
+async fn nsfw_work_ids(pool: &Database, work_ids: &[String]) -> std::collections::HashSet<String> {
     if work_ids.is_empty() {
         return std::collections::HashSet::new();
     }
@@ -1172,7 +1177,7 @@ async fn nsfw_work_ids(
 /// exactly the status quo it is closing — it must not fail the admin's edit, which has
 /// already been committed to `work` (the authoritative column every non-feed surface
 /// reads).
-async fn resync_feed_nsfw(pool: &SqlitePool, work_ids: &[String]) {
+async fn resync_feed_nsfw(pool: &Database, work_ids: &[String]) {
     if work_ids.is_empty() {
         return;
     }
@@ -1229,21 +1234,21 @@ struct SuwayomiWorkOverrides {
 /// Memoized per request via [`RequestNsfwPref`] — this is read by every feed resolver
 /// and per-series gate, and the underlying `users` lookup must run once per request,
 /// not once per resolver. The fallback path (no cache attached) still computes.
-async fn viewer_show_nsfw(ctx: &Context<'_>) -> bool {
+async fn viewer_show_nsfw(ctx: &Context<'_>) -> Result<bool> {
     if let Some(cache) = ctx.data_opt::<RequestNsfwPref>() {
-        return *cache
+        return cache
             .0
-            .get_or_init(|| async { resolve_viewer_show_nsfw(ctx).await })
-            .await;
+            .get_or_init(|| resolve_viewer_show_nsfw(ctx))
+            .await
+            .clone();
     }
     resolve_viewer_show_nsfw(ctx).await
 }
 
-/// The unmemoized body of [`viewer_show_nsfw`].
-async fn resolve_viewer_show_nsfw(ctx: &Context<'_>) -> bool {
-    match current_user(ctx).await {
+async fn resolve_viewer_show_nsfw(ctx: &Context<'_>) -> Result<bool> {
+    match current_user(ctx).await? {
         Some(u) => user_show_nsfw(&state(ctx).pool, &u.id).await,
-        None => false,
+        None => Ok(false),
     }
 }
 
@@ -1383,26 +1388,27 @@ async fn search_v2(
     })
 }
 
-async fn viewer_show_nsfw_or_admin(ctx: &Context<'_>, include_nsfw: Option<bool>) -> bool {
-    let Some(user) = current_user(ctx).await else {
-        return false; // anonymous: never, regardless of the argument
+async fn viewer_show_nsfw_or_admin(ctx: &Context<'_>, include_nsfw: Option<bool>) -> Result<bool> {
+    let Some(user) = current_user(ctx).await? else {
+        return Ok(false);
     };
     if include_nsfw == Some(true) && user.is_admin != 0 {
-        return true;
+        return Ok(true);
     }
     user_show_nsfw(&state(ctx).pool, &user.id).await
 }
 
-/// Read a user's persisted `show_nsfw` flag (default false on any lookup failure).
-async fn user_show_nsfw(pool: &SqlitePool, user_id: &str) -> bool {
-    sqlx::query_scalar::<_, i64>("SELECT show_nsfw FROM users WHERE id = ?")
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(0)
-        != 0
+/// A failed preference read is an error, so it cannot seed a degraded feed cache.
+async fn user_show_nsfw(pool: &Database, user_id: &str) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar::<_, i64>("SELECT show_nsfw FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(gql_err)?
+            .unwrap_or(0)
+            != 0,
+    )
 }
 
 /// Drop NSFW series from a feed unless the viewer opted in. Pure over the already-set
@@ -1671,7 +1677,7 @@ fn in_placeholders(n: usize) -> String {
 
 /// Batched `rating_summary`: one grouped query for all series → per-series summary.
 /// Missing ids (no reviews) are simply absent; the caller defaults them to empty.
-async fn rating_summary_batch(pool: &SqlitePool, ids: &[String]) -> HashMap<String, RatingSummary> {
+async fn rating_summary_batch(pool: &Database, ids: &[String]) -> HashMap<String, RatingSummary> {
     if ids.is_empty() {
         return HashMap::new();
     }
@@ -1743,7 +1749,7 @@ fn fold_rating_rows(rows: Vec<(String, i64, i64)>) -> HashMap<String, RatingSumm
 /// both arms yield a WORK id. Keeping them structurally identical is what makes "sorted by
 /// rating" agree with the star each card prints.
 async fn rating_summary_by_work_batch(
-    pool: &SqlitePool,
+    pool: &Database,
     work_ids: &[String],
 ) -> HashMap<String, RatingSummary> {
     if work_ids.is_empty() {
@@ -1772,7 +1778,7 @@ async fn rating_summary_by_work_batch(
 /// the work it belongs to. Ids with no catalogue mapping are simply absent.
 ///
 /// One grouped query, not one per id: this sits on the series-detail and feed paths.
-async fn work_ids_for_series_ids(pool: &SqlitePool, ids: &[String]) -> HashMap<String, String> {
+async fn work_ids_for_series_ids(pool: &Database, ids: &[String]) -> HashMap<String, String> {
     let mut out: HashMap<String, String> = HashMap::new();
     if ids.is_empty() {
         return out;
@@ -1829,7 +1835,7 @@ async fn work_ids_for_series_ids(pool: &SqlitePool, ids: &[String]) -> HashMap<S
 /// catalogue can't resolve (an uncatalogued Suwayomi series — production has two rated ones)
 /// fall back to the literal-key aggregate, so no existing rating is dropped by this change.
 async fn rating_summary_for_series_ids(
-    pool: &SqlitePool,
+    pool: &Database,
     ids: &[String],
 ) -> HashMap<String, RatingSummary> {
     if ids.is_empty() {
@@ -1868,7 +1874,7 @@ async fn rating_summary_for_series_ids(
 /// Ids with no stored value are simply absent — the caller keeps whatever
 /// `assemble_series` derived. Non-numeric (`w_…`) ids never match and cost nothing.
 async fn suwayomi_latest_chapter_at_batch(
-    pool: &SqlitePool,
+    pool: &Database,
     ids: &[String],
 ) -> HashMap<String, String> {
     if ids.is_empty() {
@@ -1911,7 +1917,7 @@ async fn suwayomi_latest_chapter_at_batch(
 /// alone in that case, which is the pre-existing behaviour and never a count wearing a
 /// "Ch." label. Non-numeric (`w_…`) ids never match and cost nothing.
 async fn suwayomi_latest_chapter_label_batch(
-    pool: &SqlitePool,
+    pool: &Database,
     ids: &[String],
 ) -> HashMap<String, String> {
     if ids.is_empty() {
@@ -1943,10 +1949,7 @@ async fn suwayomi_latest_chapter_label_batch(
 }
 
 /// Batched `admin_overrides`: one query for all series → per-series overrides.
-async fn admin_overrides_batch(
-    pool: &SqlitePool,
-    ids: &[String],
-) -> HashMap<String, AdminOverrides> {
+async fn admin_overrides_batch(pool: &Database, ids: &[String]) -> HashMap<String, AdminOverrides> {
     if ids.is_empty() {
         return HashMap::new();
     }
@@ -1976,7 +1979,7 @@ async fn admin_overrides_batch(
 
 /// Batched `scan_state`: one query for all series → per-series scan state.
 async fn scan_state_batch(
-    pool: &SqlitePool,
+    pool: &Database,
     ids: &[String],
 ) -> HashMap<String, crate::scanner::ScanState> {
     if ids.is_empty() {
@@ -2011,7 +2014,7 @@ async fn scan_state_batch(
 /// Batched `canonical_alt_titles`: one query for all source keys → per-key alt
 /// titles, each ordered by `raw_title` (identical to the single-key path).
 async fn canonical_alt_titles_batch(
-    pool: &SqlitePool,
+    pool: &Database,
     keys: &[String],
 ) -> HashMap<String, Vec<String>> {
     if keys.is_empty() {
@@ -2045,7 +2048,7 @@ async fn canonical_alt_titles_batch(
 /// so a transient failure can't surface NSFW content to an opted-out viewer. On
 /// success, keys absent from the result are unlinked/SFW (the caller defaults them
 /// to false).
-async fn canonical_is_nsfw_batch(pool: &SqlitePool, keys: &[String]) -> HashMap<String, bool> {
+async fn canonical_is_nsfw_batch(pool: &Database, keys: &[String]) -> HashMap<String, bool> {
     if keys.is_empty() {
         return HashMap::new();
     }
@@ -2074,7 +2077,7 @@ async fn canonical_is_nsfw_batch(pool: &SqlitePool, keys: &[String]) -> HashMap<
 /// Batched `canonical_overrides`: one query for all source keys, then keep the first
 /// row per key by `w.id` — byte-identical to the single-key `ORDER BY w.id LIMIT 1`.
 async fn canonical_overrides_batch(
-    pool: &SqlitePool,
+    pool: &Database,
     keys: &[String],
 ) -> HashMap<String, SuwayomiWorkOverrides> {
     if keys.is_empty() {
@@ -2341,7 +2344,7 @@ fn updates_count_key(show_nsfw: bool) -> String {
 /// with `series_cache::NSFW_GATE_SQL`. Two copies of an NSFW predicate drifting apart is how
 /// adult content reaches an anonymous viewer, which is categorically worse than a slow COUNT.
 async fn updates_total(
-    pool: &SqlitePool,
+    pool: &Database,
     count_sql: &str,
     show_nsfw: bool,
     ttl: std::time::Duration,
@@ -2379,7 +2382,7 @@ fn chapter_key(number: f64) -> String {
 /// Admin chapter overrides for a work, keyed by aggregate bucket key → (hidden,
 /// title_override). Empty (and best-effort) when the work has none.
 async fn chapter_overrides(
-    pool: &SqlitePool,
+    pool: &Database,
     work_id: &str,
 ) -> std::collections::HashMap<String, (bool, Option<String>)> {
     #[derive(sqlx::FromRow)]
@@ -2403,7 +2406,7 @@ async fn chapter_overrides(
 /// Resolve a catalog series id (numeric Suwayomi id or `w_` canonical id) to the
 /// canonical work id its admin overrides live on. `None` when the series isn't
 /// catalogued (numeric id with no `source_series` row, or an unknown `w_` id).
-async fn resolve_work_id(pool: &SqlitePool, series_id: &str) -> Option<String> {
+async fn resolve_work_id(pool: &Database, series_id: &str) -> Option<String> {
     if series_id.starts_with("w_") {
         return sqlx::query_scalar::<_, String>("SELECT id FROM work WHERE id = ?")
             .bind(series_id)
@@ -2433,7 +2436,7 @@ async fn resolve_work_id(pool: &SqlitePool, series_id: &str) -> Option<String> {
 ///
 /// Returns just `[series_id]` for an id the catalogue can't resolve (an uncatalogued Suwayomi
 /// series), which keeps the old behaviour exactly for those.
-async fn review_key_set(pool: &SqlitePool, series_id: &str) -> Vec<String> {
+async fn review_key_set(pool: &Database, series_id: &str) -> Vec<String> {
     let Some(work_id) = resolve_work_id(pool, series_id).await else {
         return vec![series_id.to_string()];
     };
@@ -2458,7 +2461,7 @@ async fn review_key_set(pool: &SqlitePool, series_id: &str) -> Vec<String> {
 /// reject junk ids on the unauthenticated `recordView` write before they can seed the
 /// view tables. Fails CLOSED (false) on a DB error — a counter write is best-effort and
 /// must never be the thing that trusts a broken query.
-async fn known_series_id(pool: &SqlitePool, series_id: &str) -> bool {
+async fn known_series_id(pool: &Database, series_id: &str) -> bool {
     if resolve_work_id(pool, series_id).await.is_some() {
         return true;
     }
@@ -2477,7 +2480,7 @@ async fn known_series_id(pool: &SqlitePool, series_id: &str) -> bool {
 /// Whether `chapter_id` names a chapter we know: a mirrored MangaDex chapter
 /// (`chapter.external_id`, a uuid) or a cached Suwayomi chapter (numeric id). Used to
 /// stop comment threads being opened on arbitrary ids. Fails CLOSED on a DB error.
-async fn known_chapter_id(pool: &SqlitePool, chapter_id: &str) -> bool {
+async fn known_chapter_id(pool: &Database, chapter_id: &str) -> bool {
     if let Ok(n) = chapter_id.parse::<i64>() {
         return sqlx::query_scalar::<_, i64>("SELECT 1 FROM suwayomi_chapter WHERE id = ?")
             .bind(n)
@@ -2511,7 +2514,7 @@ async fn known_chapter_id(pool: &SqlitePool, chapter_id: &str) -> bool {
 /// A redirect-table read failure is downgraded to "not found" (logged): the redirect is
 /// a recovery path, and it must never convert a plain 404 into a request error.
 async fn load_work_following_redirect(
-    pool: &SqlitePool,
+    pool: &Database,
     work_id: &str,
 ) -> Result<Option<catalog::CanonicalWork>> {
     if let Some(w) = catalog::load_canonical_work(pool, work_id)
@@ -2555,7 +2558,7 @@ async fn reload_series_in_shape(
         let chapters = catalog::load_canonical_chapters(&st.pool, &work.work_id)
             .await
             .map_err(gql_err)?;
-        let user = current_user(ctx).await;
+        let user = current_user(ctx).await?;
         Ok(map_canonical_series(
             &st.pool,
             user.as_ref().map(|u| u.id.as_str()),
@@ -2581,7 +2584,11 @@ async fn resolve_series_cached(st: &AppState, id: i64) -> anyhow::Result<Suwayom
                 tokio::spawn(async move {
                     let (_guard, _slot) = (guard, slot);
                     if let Ok(refreshed) = client.series(id).await {
-                        let _ = crate::series_cache::put_series(&pool, &refreshed).await;
+                        let writer = pool.clone();
+                        pool.defer(async move {
+                            crate::series_cache::put_series(&writer, &refreshed).await?;
+                            Ok(())
+                        });
                     }
                 });
             }
@@ -2602,7 +2609,12 @@ async fn resolve_series_cached(st: &AppState, id: i64) -> anyhow::Result<Suwayom
 
     match st.suwayomi.series(id).await {
         Ok(m) => {
-            let _ = crate::series_cache::put_series(&st.pool, &m).await;
+            let pool = st.pool.clone();
+            let cached = m.clone();
+            st.pool.defer(async move {
+                crate::series_cache::put_series(&pool, &cached).await?;
+                Ok(())
+            });
             // The live-fetched manga REPLACES the cached row we were holding, and the wire
             // shape has no `latestChapterAt` — so from here on the only newest-chapter
             // time we have is the one in `suwayomi_series` (migration 0050), one SELECT
@@ -2638,8 +2650,12 @@ async fn resolve_chapters_cached(
                 tokio::spawn(async move {
                     let (_guard, _slot) = (guard, slot);
                     if let Ok(refreshed) = client.chapters(manga_id).await {
-                        let _ =
-                            crate::series_cache::put_chapters(&pool, manga_id, &refreshed).await;
+                        let writer = pool.clone();
+                        pool.defer(async move {
+                            crate::series_cache::put_chapters(&writer, manga_id, &refreshed)
+                                .await?;
+                            Ok(())
+                        });
                     }
                 });
             }
@@ -2662,7 +2678,12 @@ async fn resolve_chapters_cached(
 
     match st.suwayomi.chapters(manga_id).await {
         Ok(list) => {
-            let _ = crate::series_cache::put_chapters(&st.pool, manga_id, &list).await;
+            let pool = st.pool.clone();
+            let cached = list.clone();
+            st.pool.defer(async move {
+                crate::series_cache::put_chapters(&pool, manga_id, &cached).await?;
+                Ok(())
+            });
             Ok(list)
         }
         // Refetch failed: serve stale cached rows if we have any, else propagate.
@@ -2738,7 +2759,7 @@ async fn series_by_keys(st: &AppState, keys: &[String]) -> Vec<Series> {
 /// Fields Komika doesn't mirror for MangaDex works (genres, ratings, library/scan
 /// state) are empty/defaulted; reading is fully functional without them.
 async fn map_canonical_series(
-    pool: &SqlitePool,
+    pool: &Database,
     // `isMarked` is now resolved per-viewer in the ComplexObject impl, so the
     // caller's user id is no longer needed here; kept in the signature so the
     // several call sites don't need to change.
@@ -3185,7 +3206,7 @@ fn map_canonical_chapter(
 ///
 /// Absent keys are absent, not defaulted: see `Chapter::found_at` on why a missing announce
 /// clock must reach the UI as a null.
-async fn announce_map_for_work(pool: &SqlitePool, work_id: &str) -> HashMap<String, String> {
+async fn announce_map_for_work(pool: &Database, work_id: &str) -> HashMap<String, String> {
     let rows = sqlx::query_as::<_, (String, Option<i64>)>(
         "SELECT chapter_key, announce_at FROM release_event WHERE work_id = ?",
     )
@@ -3205,7 +3226,7 @@ async fn announce_map_for_work(pool: &SqlitePool, work_id: &str) -> HashMap<Stri
 /// chapter uuid. One query per series (not per chapter), matching the cost `map_series`
 /// already pays. Anonymous viewers get an empty map (all chapters read as unread).
 async fn canonical_progress_map(
-    pool: &SqlitePool,
+    pool: &Database,
     user_id: Option<&str>,
     work_id: &str,
 ) -> HashMap<String, (i32, bool)> {
@@ -3232,7 +3253,7 @@ async fn canonical_progress_map(
 /// numeric chapter id. One query per series (mirrors `canonical_progress_map`).
 /// Anonymous viewers get an empty map (all chapters read as unread).
 async fn suwayomi_progress_map(
-    pool: &SqlitePool,
+    pool: &Database,
     user_id: Option<&str>,
     series_id: i64,
 ) -> HashMap<i64, (i32, bool)> {
@@ -3303,7 +3324,7 @@ fn canonical_chapter_key(c: &catalog::CanonicalChapter) -> String {
 /// `work_id`/`series_id` as `''` for a chapter that isn't mirrored, and the callers keep
 /// their per-source progress map as the fallback that still reads those.
 async fn work_read_keys(
-    pool: &SqlitePool,
+    pool: &Database,
     user_id: Option<&str>,
     work_id: &str,
 ) -> std::collections::HashSet<String> {
@@ -3344,7 +3365,7 @@ async fn work_read_keys(
 /// The work a numeric Suwayomi series belongs to, if it is catalogued. `None` means the
 /// series has no `source_series` mapping yet, and the caller falls back to per-source read
 /// state — there is no work to gather sibling sources from.
-async fn suwayomi_series_work_id(pool: &SqlitePool, series_id: i64) -> Option<String> {
+async fn suwayomi_series_work_id(pool: &Database, series_id: i64) -> Option<String> {
     sqlx::query_scalar::<_, String>(
         "SELECT work_id FROM source_series \
          WHERE source_type = 'suwayomi' AND source_key = ? \
@@ -3479,7 +3500,7 @@ impl From<AdminUserRow> for AdminUser {
 /// (`display_name`, `bio`, `created_at`, `must_change_password`). Falls back to
 /// empties on any lookup failure so building a session never fails on a cold profile.
 async fn user_profile_fields(
-    pool: &SqlitePool,
+    pool: &Database,
     user_id: &str,
 ) -> (Option<String>, Option<String>, String, bool) {
     sqlx::query_as::<_, (Option<String>, Option<String>, String, bool)>(
@@ -3498,7 +3519,7 @@ async fn user_profile_fields(
 /// Build the client-facing `SessionUser` for a resolved auth `User`, loading its
 /// profile fields. Every session-returning path funnels through this so the
 /// shape stays consistent.
-async fn build_session_user(pool: &SqlitePool, u: &User, show_nsfw: bool) -> SessionUser {
+async fn build_session_user(pool: &Database, u: &User, show_nsfw: bool) -> SessionUser {
     let (display_name, bio, joined_at, must_change_password) =
         user_profile_fields(pool, &u.id).await;
     SessionUser {
@@ -3518,7 +3539,7 @@ async fn build_session_user(pool: &SqlitePool, u: &User, show_nsfw: bool) -> Ses
 /// logged and swallowed so it can never fail the user's actual action (posting
 /// a review/comment, adding to the library).
 async fn log_activity(
-    pool: &SqlitePool,
+    pool: &Database,
     user_id: &str,
     kind: &str,
     target_type: Option<&str>,
@@ -4329,7 +4350,7 @@ impl QueryRoot {
         let st = state(ctx);
         // The NSFW posture is BOTH a compute input (SQL gates + `filter_nsfw`) and the
         // cache key — resolving it once here keeps the two from ever disagreeing.
-        let show_nsfw = viewer_show_nsfw(ctx).await;
+        let show_nsfw = viewer_show_nsfw(ctx).await?;
         let key = feed_cache_key(show_nsfw);
         if let Some(hit) = cached_feed(&DISCOVERY_CACHE, key, FEED_TTL) {
             return Ok((*hit).clone());
@@ -4361,7 +4382,7 @@ impl QueryRoot {
         #[graphql(default = 1)] page: i32,
     ) -> Result<SeriesPage> {
         let st = state(ctx);
-        let show_nsfw = viewer_show_nsfw(ctx).await;
+        let show_nsfw = viewer_show_nsfw(ctx).await?;
         let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
         // NSFW is filtered in SQL (like canonical_updates) rather than after the page
         // slice, so `total`/`has_next` count only the rows the viewer can see — no skew
@@ -4544,7 +4565,7 @@ impl QueryRoot {
         include_nsfw: Option<bool>,
     ) -> Result<Vec<CanonicalUpdate>> {
         let st = state(ctx);
-        let show_nsfw = viewer_show_nsfw_or_admin(ctx, include_nsfw).await;
+        let show_nsfw = viewer_show_nsfw_or_admin(ctx, include_nsfw).await?;
         let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
         // Reads the materialized `feed_updates` table (migration 0051, refreshed in the
         // background by catalog::refresh_feed_updates) instead of grouping the whole
@@ -4613,7 +4634,7 @@ impl QueryRoot {
         r#type: Option<ComicType>,
     ) -> Result<UpdateFeedPage> {
         let st = state(ctx);
-        let show_nsfw = viewer_show_nsfw(ctx).await;
+        let show_nsfw = viewer_show_nsfw(ctx).await?;
         let page = page.max(1);
         let offset = (page as i64 - 1) * PAGE_SIZE;
         // Collapse to the three stored words. Asking for WEBTOON returns the manhwa set
@@ -4801,13 +4822,13 @@ impl QueryRoot {
         if work.mangadex_id.is_none() {
             return Err(Error::new("No such work"));
         }
-        if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await {
+        if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await? {
             return Err(Error::new("No such work"));
         }
         let chapters = catalog::load_canonical_chapters(&st.pool, &work_id.0)
             .await
             .map_err(gql_err)?;
-        let user = current_user(ctx).await;
+        let user = current_user(ctx).await?;
         Ok(map_canonical_series(
             &st.pool,
             user.as_ref().map(|u| u.id.as_str()),
@@ -4836,13 +4857,13 @@ impl QueryRoot {
         if work.mangadex_id.is_none() {
             return Err(Error::new("No such work"));
         }
-        if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await {
+        if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await? {
             return Err(Error::new("No such work"));
         }
         let chapters = catalog::load_canonical_chapters(&st.pool, &work_id.0)
             .await
             .map_err(gql_err)?;
-        let user = current_user(ctx).await;
+        let user = current_user(ctx).await?;
         let uid = user.as_ref().map(|u| u.id.as_str());
         // Two lookups, two different jobs. `progress` is this SOURCE's own rows and is what
         // carries `last_page_read` (a resume position belongs to the copy it was earned in).
@@ -4884,7 +4905,7 @@ impl QueryRoot {
             .await?
             .ok_or_else(|| Error::new("No such work"))?;
         let work_id = ID(work.work_id.clone());
-        if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await {
+        if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await? {
             return Err(Error::new("No such work"));
         }
         let rows = catalog::work_source_chapters(&st.pool, &work_id.0)
@@ -4906,7 +4927,7 @@ impl QueryRoot {
         // Cross-source read state (F-switch): the aggregated list is the ONLY list the
         // series page renders once a work has several sources, and every row a translator
         // does not carry used to render unread by construction.
-        let user = current_user(ctx).await;
+        let user = current_user(ctx).await?;
         let read_keys =
             work_read_keys(&st.pool, user.as_ref().map(|u| u.id.as_str()), &work_id.0).await;
         if !read_keys.is_empty() {
@@ -4931,11 +4952,11 @@ impl QueryRoot {
             .await?
             .ok_or_else(|| Error::new("No such work"))?;
         let effective_id = work.work_id.clone();
-        if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await {
+        if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await? {
             return Err(Error::new("No such work"));
         }
-        let show_nsfw = viewer_show_nsfw(ctx).await;
-        let user = current_user(ctx).await;
+        let show_nsfw = viewer_show_nsfw(ctx).await?;
+        let user = current_user(ctx).await?;
         let user_id = user.as_ref().map(|u| u.id.as_str());
 
         // WORK-LEVEL ENRICHMENT, ONCE, FOR EVERY ARM BELOW.
@@ -5216,7 +5237,7 @@ impl QueryRoot {
             .await
             .map_err(gql_err)?
         {
-            if !viewer_show_nsfw(ctx).await {
+            if !viewer_show_nsfw(ctx).await? {
                 return Err(Error::new("No such chapter"));
             }
         }
@@ -5240,7 +5261,7 @@ impl QueryRoot {
     /// doesn't see NSFW source mappings.
     async fn work_sources(&self, ctx: &Context<'_>, work_id: ID) -> Result<Vec<WorkSource>> {
         let st = state(ctx);
-        let show_nsfw = viewer_show_nsfw(ctx).await;
+        let show_nsfw = viewer_show_nsfw(ctx).await?;
         // Gate on the OWNING WORK, not just the per-source rows. VERIFIED LEAK: for a
         // work `canonicalSeries` refuses to serve anonymously, this returned the full
         // mapping including the MangaDex UUID — the per-`source_series` gate below only
@@ -5373,7 +5394,7 @@ impl QueryRoot {
             )));
         }
         let st = state(ctx);
-        let show_nsfw = viewer_show_nsfw(ctx).await;
+        let show_nsfw = viewer_show_nsfw(ctx).await?;
         // Single IN(...) query instead of a serial per-id loop.
         let ids: Vec<String> = work_ids.iter().map(|w| w.0.clone()).collect();
         // Work-level gate, identical to `workSources` (see the leak note there): drop
@@ -5492,7 +5513,7 @@ impl QueryRoot {
     ) -> Result<SeriesPage> {
         let st = state(ctx);
         let trimmed = query.trim();
-        let show_nsfw = viewer_show_nsfw_or_admin(ctx, include_nsfw).await;
+        let show_nsfw = viewer_show_nsfw_or_admin(ctx, include_nsfw).await?;
         if let Some(filter) = filter {
             return search_v2(st, trimmed, page, show_nsfw, &filter).await;
         }
@@ -5675,7 +5696,7 @@ impl QueryRoot {
         let st = state(ctx);
         // Same read-through shape as `discovery`: the facet table is viewer-invariant
         // given the NSFW posture, which is the whole cache key (see [`GENRE_FACETS_CACHE`]).
-        let show_nsfw = viewer_show_nsfw(ctx).await;
+        let show_nsfw = viewer_show_nsfw(ctx).await?;
         let key = feed_cache_key(show_nsfw);
         let facets = if let Some(hit) = cached_feed(&GENRE_FACETS_CACHE, key, FEED_TTL) {
             (*hit).clone()
@@ -5713,7 +5734,7 @@ impl QueryRoot {
     /// the whole key — see [`feed_cache_key`]), with the same single-flight refill.
     async fn tags(&self, ctx: &Context<'_>) -> Result<Vec<TagInfo>> {
         let st = state(ctx);
-        let show_nsfw = viewer_show_nsfw(ctx).await;
+        let show_nsfw = viewer_show_nsfw(ctx).await?;
         let key = feed_cache_key(show_nsfw);
         let rows = if let Some(hit) = cached_feed(&TAGS_CACHE, key, FEED_TTL) {
             (*hit).clone()
@@ -5756,9 +5777,9 @@ impl QueryRoot {
     ) -> Result<Vec<BrowseSource>> {
         let st = state(ctx);
         let show_nsfw = if include_nsfw == Some(true) {
-            viewer_show_nsfw_or_admin(ctx, include_nsfw).await
+            viewer_show_nsfw_or_admin(ctx, include_nsfw).await?
         } else {
-            viewer_show_nsfw(ctx).await
+            viewer_show_nsfw(ctx).await?
         };
         let key = feed_cache_key(show_nsfw);
         if let Some(hit) = cached_feed(&BROWSE_SOURCES_CACHE, key, BROWSE_SOURCES_TTL) {
@@ -5885,7 +5906,7 @@ impl QueryRoot {
                 "Too many source searches — retry in {retry}s"
             )));
         }
-        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
+        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await?;
         federated_search(&st, &trimmed, page.max(1), show_nsfw, Some(user)).await
     }
 
@@ -5894,7 +5915,7 @@ impl QueryRoot {
         let n = id.0.parse::<i64>().map_err(gql_err)?;
         // Suwayomi ids are sequential integers, so gate before the source round-trip:
         // an opted-out viewer must not read the detail of an NSFW series by id (N2).
-        if canonical_is_nsfw(&st.pool, &id.0).await && !viewer_show_nsfw(ctx).await {
+        if canonical_is_nsfw(&st.pool, &id.0).await && !viewer_show_nsfw(ctx).await? {
             return Err(Error::new("No such series"));
         }
         // S1: serve from the DB cache; only live-fetch (and cache) on a miss.
@@ -5917,14 +5938,14 @@ impl QueryRoot {
         let st = state(ctx);
         let n = series_id.0.parse::<i64>().map_err(gql_err)?;
         // Gate the chapter list on the owning series' NSFW flag (same as `series`, N2).
-        if canonical_is_nsfw(&st.pool, &series_id.0).await && !viewer_show_nsfw(ctx).await {
+        if canonical_is_nsfw(&st.pool, &series_id.0).await && !viewer_show_nsfw(ctx).await? {
             return Err(Error::new("No such series"));
         }
         // S1: serve from the DB cache; only live-fetch (and cache) on a miss.
         let list = resolve_chapters_cached(st, n).await.map_err(gql_err)?;
         // Overlay the VIEWER's per-user read state (`suwayomi_progress`) — the cached
         // `suwayomi_chapter` read flags are global and no longer authoritative (CR6).
-        let user = current_user(ctx).await;
+        let user = current_user(ctx).await?;
         let uid = user.as_ref().map(|u| u.id.as_str());
         let progress = suwayomi_progress_map(&st.pool, uid, n).await;
         // …plus what the viewer read of the SAME chapters under any SIBLING source of the
@@ -5969,7 +5990,7 @@ impl QueryRoot {
         let manga_id = st.suwayomi.chapter_manga_id(n).await.map_err(gql_err)?;
         if let Some(manga_id) = manga_id {
             if canonical_is_nsfw(&st.pool, &manga_id.to_string()).await
-                && !viewer_show_nsfw(ctx).await
+                && !viewer_show_nsfw(ctx).await?
             {
                 return Err(Error::new("No such chapter"));
             }
@@ -6014,7 +6035,7 @@ impl QueryRoot {
             return Ok(None);
         };
         if canonical_is_nsfw(&st.pool, &origin.manga_id.to_string()).await
-            && !viewer_show_nsfw(ctx).await
+            && !viewer_show_nsfw(ctx).await?
         {
             return Err(Error::new("No such chapter"));
         }
@@ -6054,7 +6075,7 @@ impl QueryRoot {
         // return empty rather than the whole catalogue. (This replaced returning
         // Suwayomi's shared in-library set, which showed every visitor the same
         // ~571-series "library".)
-        let Some(user) = current_user(ctx).await else {
+        let Some(user) = current_user(ctx).await? else {
             return Ok(Vec::new());
         };
         let stored_rows = sqlx::query_as::<_, (String, String, i64, Option<String>)>(
@@ -6185,7 +6206,7 @@ impl QueryRoot {
             }
         }
         // Hide NSFW series from the library too, unless the viewer opted in (N2).
-        Ok(filter_nsfw(viewer_show_nsfw(ctx).await, out))
+        Ok(filter_nsfw(viewer_show_nsfw(ctx).await?, out))
     }
 
     /// Per-series read progress for the viewer's library, in two grouped queries. The
@@ -6222,7 +6243,7 @@ impl QueryRoot {
     /// drained yet still sorts correctly.
     async fn library_progress(&self, ctx: &Context<'_>) -> Result<Vec<SeriesProgress>> {
         let st = state(ctx);
-        let Some(user) = current_user(ctx).await else {
+        let Some(user) = current_user(ctx).await? else {
             return Ok(Vec::new());
         };
         // Read side. Each branch maps one progress row to the spine key it read, via a
@@ -6436,7 +6457,7 @@ impl QueryRoot {
     /// returns the viewer's OWN review and the viewer is authenticated (a banned
     /// user can't sign in), so the ban filter is both unnecessary and wrong.
     async fn my_review(&self, ctx: &Context<'_>, series_id: ID) -> Result<Option<Review>> {
-        let Some(user) = current_user(ctx).await else {
+        let Some(user) = current_user(ctx).await? else {
             return Ok(None);
         };
         let st = state(ctx);
@@ -6477,7 +6498,7 @@ impl QueryRoot {
         let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
         // The viewer's own vote per comment is selected inline; '' (anonymous) matches
         // no vote row, yielding my_vote = 0.
-        let viewer_id = current_user(ctx).await.map(|u| u.id).unwrap_or_default();
+        let viewer_id = current_user(ctx).await?.map(|u| u.id).unwrap_or_default();
         // Pagination is over ROOT comments (whole threads); a page returns those
         // roots plus *all* their descendants (flat, ascending) so the client can
         // assemble the full reply tree without extra round-trips. Banned authors'
@@ -7104,9 +7125,9 @@ impl QueryRoot {
         };
         // `session_user`: an account that must change its password still sees its
         // session, which is how the apps know to show that screen.
-        match session_user(ctx).await {
+        match session_user(ctx).await? {
             Some(u) => {
-                let show_nsfw = user_show_nsfw(&state(ctx).pool, &u.id).await;
+                let show_nsfw = user_show_nsfw(&state(ctx).pool, &u.id).await?;
                 Ok(Some(Session {
                     token: tok,
                     user: build_session_user(&state(ctx).pool, &u, show_nsfw).await,
@@ -7123,7 +7144,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         #[graphql(default = 20)] limit: i32,
     ) -> Result<Vec<Activity>> {
-        let Some(user) = current_user(ctx).await else {
+        let Some(user) = current_user(ctx).await? else {
             return Ok(vec![]);
         };
         let limit = limit.clamp(1, 50) as i64;
@@ -7154,7 +7175,7 @@ impl QueryRoot {
         #[graphql(default = 1)] page: i32,
     ) -> Result<MyCommentPage> {
         let page = page.max(1);
-        let Some(user) = current_user(ctx).await else {
+        let Some(user) = current_user(ctx).await? else {
             return Ok(MyCommentPage {
                 items: vec![],
                 page,
@@ -7249,7 +7270,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         #[graphql(default = 1)] page: i32,
     ) -> Result<Vec<Notification>> {
-        let Some(user) = current_user(ctx).await else {
+        let Some(user) = current_user(ctx).await? else {
             return Ok(vec![]);
         };
         let st = state(ctx);
@@ -7291,7 +7312,7 @@ impl QueryRoot {
     /// Count of the viewer's UNREAD notifications — drives the bell badge. 0 for
     /// anonymous viewers.
     async fn unread_notification_count(&self, ctx: &Context<'_>) -> Result<i32> {
-        let Some(user) = current_user(ctx).await else {
+        let Some(user) = current_user(ctx).await? else {
             return Ok(0);
         };
         let n: i64 = sqlx::query_scalar(
@@ -7603,7 +7624,7 @@ impl QueryRoot {
             return Err(Error::new("At most 200 ids per seriesSourcesBatch call"));
         }
         let st = state(ctx);
-        let show_nsfw = viewer_show_nsfw(ctx).await;
+        let show_nsfw = viewer_show_nsfw(ctx).await?;
         if series_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -7683,7 +7704,7 @@ impl QueryRoot {
     ) -> Result<SourceBrowsePage> {
         let user = require_admin(ctx).await?;
         let st = state(ctx);
-        if !user_show_nsfw(&st.pool, &user.id).await {
+        if !user_show_nsfw(&st.pool, &user.id).await? {
             let (_, source_nsfw, _) = st
                 .suwayomi
                 .source_meta(&source_id.0)
@@ -7889,7 +7910,7 @@ const WORK_SOURCE_SELECT: &str =
 /// the mapping with the most cached chapters. Used to drop redundant same-source
 /// mappings from `workSources`/translators so they agree with `aggregatedChapters`.
 async fn authoritative_key_set(
-    pool: &SqlitePool,
+    pool: &Database,
     work_id: &str,
 ) -> Result<std::collections::HashSet<String>> {
     Ok(catalog::authoritative_suwayomi_mappings(pool, work_id)
@@ -7919,7 +7940,7 @@ fn retain_authoritative(
 /// so translators agree with `aggregatedChapters`). The extension is populated only
 /// when the LEFT JOIN matched; `WorkSource.lang` is the extension's lang.
 async fn load_work_sources(
-    pool: &SqlitePool,
+    pool: &Database,
     work_id: &str,
     show_nsfw: bool,
 ) -> Result<Vec<WorkSource>> {
@@ -7943,7 +7964,7 @@ async fn load_work_sources(
 /// `work_id -> [WorkSource]`. Each work's list keeps the same MangaDex-first,
 /// recency order as the single-work loader. Empty input → empty map.
 async fn load_work_sources_batch(
-    pool: &SqlitePool,
+    pool: &Database,
     work_ids: &[String],
     show_nsfw: bool,
 ) -> Result<HashMap<String, Vec<WorkSource>>> {
@@ -8455,17 +8476,33 @@ fn tidy_chapter_number(raw: &str) -> String {
 /// Store library membership once per work, folding historical source-scoped rows.
 /// Preserve favorites, the explicit shelf, and original addition date on consolidation.
 async fn consolidate_library_identity(
-    pool: &SqlitePool,
+    pool: &Database,
     user_id: &str,
     series_id: &str,
 ) -> Result<String> {
-    let identity = resolve_work_id(pool, series_id)
+    crate::db::retry_transaction(|| consolidate_library_identity_once(pool, user_id, series_id))
         .await
-        .unwrap_or_else(|| series_id.to_string());
+        .map_err(gql_err)
+}
+
+async fn consolidate_library_identity_once(
+    pool: &Database,
+    user_id: &str,
+    series_id: &str,
+) -> anyhow::Result<String> {
+    let mut tx = pool.begin().await?;
+    let identity = if series_id.starts_with("w_") {
+        sqlx::query_scalar::<_, String>("SELECT id FROM work WHERE id = ?")
+            .bind(series_id).fetch_optional(&mut *tx).await?
+    } else {
+        sqlx::query_scalar::<_, String>(
+            "SELECT work_id FROM source_series WHERE source_type = 'suwayomi' AND source_key = ? ORDER BY work_id LIMIT 1",
+        ).bind(series_id).fetch_optional(&mut *tx).await?
+    }.unwrap_or_else(|| series_id.to_string());
     if identity == series_id && !identity.starts_with("w_") {
+        tx.commit().await?;
         return Ok(identity);
     }
-    let mut tx = pool.begin().await.map_err(gql_err)?;
     let rows = sqlx::query_as::<_, (String, String, i64, Option<String>)>(
         "SELECT series_id, created_at, is_favorite, status FROM user_library \
          WHERE user_id = ?1 AND (series_id = ?2 OR series_id IN ( \
@@ -8475,8 +8512,7 @@ async fn consolidate_library_identity(
     .bind(user_id)
     .bind(&identity)
     .fetch_all(&mut *tx)
-    .await
-    .map_err(gql_err)?;
+    .await?;
     if !rows.is_empty() {
         let created = rows.iter().map(|r| &r.1).min().unwrap();
         let favorite = rows.iter().any(|r| r.2 != 0);
@@ -8493,7 +8529,7 @@ async fn consolidate_library_identity(
         .bind(status)
         .execute(&mut *tx)
         .await
-        .map_err(gql_err)?;
+        ?;
         sqlx::query(
             "DELETE FROM user_library WHERE user_id = ?1 AND series_id != ?2 AND series_id IN ( \
                SELECT source_key FROM source_series WHERE work_id = ?2 AND source_type = 'suwayomi' \
@@ -8503,9 +8539,9 @@ async fn consolidate_library_identity(
         .bind(&identity)
         .execute(&mut *tx)
         .await
-        .map_err(gql_err)?;
+        ?;
     }
-    tx.commit().await.map_err(gql_err)?;
+    tx.commit().await?;
     Ok(identity)
 }
 
@@ -8541,6 +8577,214 @@ async fn reload_series(st: &AppState, user_id: &str, series_id: &str) -> Result<
         None => st.suwayomi.series(n).await.map_err(gql_err)?,
     };
     Ok(map_series(st, m).await)
+}
+
+#[derive(Debug)]
+struct MutationValidation(&'static str);
+
+impl std::fmt::Display for MutationValidation {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str(self.0)
+    }
+}
+
+impl std::error::Error for MutationValidation {}
+
+fn mutation_write_error(error: anyhow::Error) -> Error {
+    if let Some(validation) = error.downcast_ref::<MutationValidation>() {
+        return Error::new(validation.0);
+    }
+    gql_err(error)
+}
+
+async fn set_chapter_read_once(
+    pool: &Database,
+    user_id: &str,
+    id: &str,
+    read: bool,
+) -> anyhow::Result<bool> {
+    // Same id-shape routing as `set_progress` (CR6): numeric = Suwayomi, else MangaDex.
+    let numeric = id.bytes().all(|b| b.is_ascii_digit());
+    let now = Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    if read {
+        if numeric {
+            // The owning Suwayomi series: from the engine's chapter cache, or — when that
+            // cache never held the chapter (the engine is down, or the row came in through
+            // the spine drain) — from the spine mapping, whose `source_key` IS the series
+            // id `suwayomi_progress.series_id` stores.
+            let series_id: String = sqlx::query_scalar::<_, String>(
+                "SELECT CAST(manga_id AS TEXT) FROM suwayomi_chapter WHERE id = ?1 \
+                 UNION ALL \
+                 SELECT ss.source_key FROM chapter c \
+                   JOIN source_series ss ON ss.id = c.source_series_id \
+                  WHERE c.external_id = ?2 AND ss.source_type = 'suwayomi' \
+                 LIMIT 1",
+            )
+            .bind(id.parse::<i64>()?)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| MutationValidation("No such chapter"))?;
+            sqlx::query(
+                "INSERT INTO suwayomi_progress \
+                   (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
+                 VALUES (?, ?, ?, 0, 1, ?) \
+                 ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
+                   read = 1, updated_at = excluded.updated_at",
+            )
+            .bind(user_id)
+            .bind(id)
+            .bind(&series_id)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            let work_id: String = sqlx::query_scalar::<_, String>(
+                "SELECT ss.work_id FROM chapter c \
+                   JOIN source_series ss ON ss.id = c.source_series_id \
+                  WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| MutationValidation("No such chapter"))?;
+            sqlx::query(
+                "INSERT INTO canonical_progress \
+                   (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
+                 VALUES (?, ?, ?, 0, 1, ?) \
+                 ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
+                   read = 1, updated_at = excluded.updated_at",
+            )
+            .bind(user_id)
+            .bind(id)
+            .bind(&work_id)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        return Ok(true);
+    }
+    // Unread. The clicked copy first, by id — this alone is the whole answer for a
+    // chapter the spine does not know (no key to fold on).
+    let own = if numeric {
+        "UPDATE suwayomi_progress SET read = 0, updated_at = ? \
+          WHERE user_id = ? AND chapter_id = ? AND read = 1"
+    } else {
+        "UPDATE canonical_progress SET read = 0, updated_at = ? \
+          WHERE user_id = ? AND chapter_id = ? AND read = 1"
+    };
+    sqlx::query(own)
+        .bind(&now)
+        .bind(user_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    // Then every sibling copy of the same chapter in the same work, on both stores.
+    let ident: Option<(String, String)> = sqlx::query_as(
+        "SELECT ss.work_id, c.chapter_key FROM chapter c \
+           JOIN source_series ss ON ss.id = c.source_series_id \
+          WHERE c.external_id = ? AND ss.source_type = ? AND c.chapter_key IS NOT NULL \
+          LIMIT 1",
+    )
+    .bind(id)
+    .bind(if numeric { "suwayomi" } else { "mangadex" })
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((work_id, key)) = ident {
+        // Two static statements rather than one formatted over the table name: identical
+        // but for the store, and kept literal so no SQL text is ever assembled at runtime.
+        const CLEAR_CANONICAL: &str = "UPDATE canonical_progress SET read = 0, updated_at = ?1 \
+              WHERE user_id = ?2 AND read = 1 AND chapter_id IN ( \
+                SELECT c.external_id FROM chapter c \
+                  JOIN source_series ss ON ss.id = c.source_series_id \
+                 WHERE ss.work_id = ?3 AND ss.source_type = 'mangadex' \
+                   AND c.chapter_key = ?4)";
+        const CLEAR_SUWAYOMI: &str = "UPDATE suwayomi_progress SET read = 0, updated_at = ?1 \
+              WHERE user_id = ?2 AND read = 1 AND chapter_id IN ( \
+                SELECT c.external_id FROM chapter c \
+                  JOIN source_series ss ON ss.id = c.source_series_id \
+                 WHERE ss.work_id = ?3 AND ss.source_type = 'suwayomi' \
+                   AND c.chapter_key = ?4)";
+        for sql in [CLEAR_CANONICAL, CLEAR_SUWAYOMI] {
+            sqlx::query(sql)
+                .bind(&now)
+                .bind(user_id)
+                .bind(&work_id)
+                .bind(&key)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+async fn set_chapter_override_once(
+    pool: &Database,
+    input: &ChapterOverrideInput,
+) -> anyhow::Result<bool> {
+    use async_graphql::MaybeUndefined::{Null, Undefined, Value};
+    let mut tx = pool.begin().await?;
+    let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM work WHERE id = ?")
+        .bind(&input.work_id.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if exists.is_none() {
+        return Err(MutationValidation("No such work").into());
+    }
+    // Read-modify-write under ONE transaction so two concurrent partial edits (one
+    // toggling `hidden`, one renaming) can't clobber each other's field.
+    let existing = sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT hidden, title_override FROM chapter_override WHERE work_id = ? AND chapter_key = ?",
+    )
+    .bind(&input.work_id.0)
+    .bind(&input.chapter_key)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (mut hidden, mut title) = existing.map(|(h, t)| (h != 0, t)).unwrap_or((false, None));
+    match &input.hidden {
+        Undefined => {}
+        Null => hidden = false,
+        Value(b) => hidden = *b,
+    }
+    match &input.title {
+        Undefined => {}
+        Null => title = None,
+        Value(v) => {
+            let v = v.trim().to_string();
+            title = if v.is_empty() { None } else { Some(v) };
+        }
+    }
+    // A no-op override (visible + no rename) is stored as the absence of a row.
+    if !hidden && title.is_none() {
+        sqlx::query("DELETE FROM chapter_override WHERE work_id = ? AND chapter_key = ?")
+            .bind(&input.work_id.0)
+            .bind(&input.chapter_key)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(true);
+    }
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO chapter_override (work_id, chapter_key, hidden, title_override, updated_at) \
+         VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT(work_id, chapter_key) DO UPDATE SET \
+           hidden = excluded.hidden, \
+           title_override = excluded.title_override, \
+           updated_at = excluded.updated_at",
+    )
+    .bind(&input.work_id.0)
+    .bind(&input.chapter_key)
+    .bind(hidden as i64)
+    .bind(&title)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 // ---- Mutation --------------------------------------------------------------
@@ -8699,7 +8943,7 @@ impl MutationRoot {
         // Admin reads must stay silent: don't let a staff account's own browsing move
         // Trending or the view counters. `current_user` is `None` for anonymous callers
         // (no token, or a token that doesn't resolve), which is the common case here.
-        let is_admin_viewer = current_user(ctx).await.is_some_and(|u| u.is_admin != 0);
+        let is_admin_viewer = current_user(ctx).await?.is_some_and(|u| u.is_admin != 0);
         if !is_admin_viewer {
             if let Err(e) = crate::views::record(&st.pool, sid).await {
                 tracing::warn!(series_id = %sid, error = %e, "recordView failed");
@@ -8829,7 +9073,7 @@ impl MutationRoot {
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
-        let user = current_user(ctx).await;
+        let user = current_user(ctx).await?;
 
         sqlx::query(
             "INSERT INTO report (id, kind, status, user_id, subject_id, subject_id_secondary, \
@@ -9056,130 +9300,9 @@ impl MutationRoot {
         if id.is_empty() || id.len() > 128 {
             return Err(Error::new("Invalid chapter id"));
         }
-        // Same id-shape routing as `set_progress` (CR6): numeric = Suwayomi, else MangaDex.
-        let numeric = id.bytes().all(|b| b.is_ascii_digit());
-        let now = Utc::now().to_rfc3339();
-        let mut tx = st.pool.begin().await.map_err(gql_err)?;
-        if read {
-            if numeric {
-                // The owning Suwayomi series: from the engine's chapter cache, or — when that
-                // cache never held the chapter (the engine is down, or the row came in through
-                // the spine drain) — from the spine mapping, whose `source_key` IS the series
-                // id `suwayomi_progress.series_id` stores.
-                let series_id: String = sqlx::query_scalar::<_, String>(
-                    "SELECT CAST(manga_id AS TEXT) FROM suwayomi_chapter WHERE id = ?1 \
-                     UNION ALL \
-                     SELECT ss.source_key FROM chapter c \
-                       JOIN source_series ss ON ss.id = c.source_series_id \
-                      WHERE c.external_id = ?2 AND ss.source_type = 'suwayomi' \
-                     LIMIT 1",
-                )
-                .bind(id.parse::<i64>().map_err(gql_err)?)
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(gql_err)?
-                .ok_or_else(|| Error::new("No such chapter"))?;
-                sqlx::query(
-                    "INSERT INTO suwayomi_progress \
-                       (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
-                     VALUES (?, ?, ?, 0, 1, ?) \
-                     ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-                       read = 1, updated_at = excluded.updated_at",
-                )
-                .bind(&user.id)
-                .bind(id)
-                .bind(&series_id)
-                .bind(&now)
-                .execute(&mut *tx)
-                .await
-                .map_err(gql_err)?;
-            } else {
-                let work_id: String = sqlx::query_scalar::<_, String>(
-                    "SELECT ss.work_id FROM chapter c \
-                       JOIN source_series ss ON ss.id = c.source_series_id \
-                      WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
-                )
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(gql_err)?
-                .ok_or_else(|| Error::new("No such chapter"))?;
-                sqlx::query(
-                    "INSERT INTO canonical_progress \
-                       (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
-                     VALUES (?, ?, ?, 0, 1, ?) \
-                     ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-                       read = 1, updated_at = excluded.updated_at",
-                )
-                .bind(&user.id)
-                .bind(id)
-                .bind(&work_id)
-                .bind(&now)
-                .execute(&mut *tx)
-                .await
-                .map_err(gql_err)?;
-            }
-            tx.commit().await.map_err(gql_err)?;
-            return Ok(true);
-        }
-        // Unread. The clicked copy first, by id — this alone is the whole answer for a
-        // chapter the spine does not know (no key to fold on).
-        let own = if numeric {
-            "UPDATE suwayomi_progress SET read = 0, updated_at = ? \
-              WHERE user_id = ? AND chapter_id = ? AND read = 1"
-        } else {
-            "UPDATE canonical_progress SET read = 0, updated_at = ? \
-              WHERE user_id = ? AND chapter_id = ? AND read = 1"
-        };
-        sqlx::query(own)
-            .bind(&now)
-            .bind(&user.id)
-            .bind(id)
-            .execute(&mut *tx)
+        crate::db::retry_transaction(|| set_chapter_read_once(&st.pool, &user.id, id, read))
             .await
-            .map_err(gql_err)?;
-        // Then every sibling copy of the same chapter in the same work, on both stores.
-        let ident: Option<(String, String)> = sqlx::query_as(
-            "SELECT ss.work_id, c.chapter_key FROM chapter c \
-               JOIN source_series ss ON ss.id = c.source_series_id \
-              WHERE c.external_id = ? AND ss.source_type = ? AND c.chapter_key IS NOT NULL \
-              LIMIT 1",
-        )
-        .bind(id)
-        .bind(if numeric { "suwayomi" } else { "mangadex" })
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(gql_err)?;
-        if let Some((work_id, key)) = ident {
-            // Two static statements rather than one formatted over the table name: identical
-            // but for the store, and kept literal so no SQL text is ever assembled at runtime.
-            const CLEAR_CANONICAL: &str =
-                "UPDATE canonical_progress SET read = 0, updated_at = ?1 \
-                  WHERE user_id = ?2 AND read = 1 AND chapter_id IN ( \
-                    SELECT c.external_id FROM chapter c \
-                      JOIN source_series ss ON ss.id = c.source_series_id \
-                     WHERE ss.work_id = ?3 AND ss.source_type = 'mangadex' \
-                       AND c.chapter_key = ?4)";
-            const CLEAR_SUWAYOMI: &str = "UPDATE suwayomi_progress SET read = 0, updated_at = ?1 \
-                  WHERE user_id = ?2 AND read = 1 AND chapter_id IN ( \
-                    SELECT c.external_id FROM chapter c \
-                      JOIN source_series ss ON ss.id = c.source_series_id \
-                     WHERE ss.work_id = ?3 AND ss.source_type = 'suwayomi' \
-                       AND c.chapter_key = ?4)";
-            for sql in [CLEAR_CANONICAL, CLEAR_SUWAYOMI] {
-                sqlx::query(sql)
-                    .bind(&now)
-                    .bind(&user.id)
-                    .bind(&work_id)
-                    .bind(&key)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(gql_err)?;
-            }
-        }
-        tx.commit().await.map_err(gql_err)?;
-        Ok(true)
+            .map_err(mutation_write_error)
     }
 
     async fn post_review(&self, ctx: &Context<'_>, input: PostReviewInput) -> Result<Review> {
@@ -9757,7 +9880,7 @@ impl MutationRoot {
                 .map_err(gql_err)?;
             return Err(Error::new("Invalid username or password"));
         }
-        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
+        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await?;
         Ok(Session {
             token: tok,
             user: build_session_user(&st.pool, &user, show_nsfw).await,
@@ -9942,7 +10065,7 @@ impl MutationRoot {
     ) -> Result<SessionUser> {
         // The one mutation an account with a temporary password may call.
         let user = session_user(ctx)
-            .await
+            .await?
             .ok_or_else(|| Error::new("Not authenticated"))?;
         let st = state(ctx);
         if let Err(retry) = st
@@ -9988,7 +10111,7 @@ impl MutationRoot {
             .await
             .map_err(gql_err)?;
         tx.commit().await.map_err(gql_err)?;
-        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
+        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await?;
         Ok(build_session_user(&st.pool, &user, show_nsfw).await)
     }
 
@@ -10047,7 +10170,7 @@ impl MutationRoot {
             .execute(&st.pool)
             .await
             .map_err(gql_err)?;
-        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await;
+        let show_nsfw = user_show_nsfw(&st.pool, &user.id).await?;
         Ok(build_session_user(&st.pool, &user, show_nsfw).await)
     }
 
@@ -10418,7 +10541,7 @@ impl MutationRoot {
             let chapters = catalog::load_canonical_chapters(&st.pool, &work_id)
                 .await
                 .map_err(gql_err)?;
-            let user = current_user(ctx).await;
+            let user = current_user(ctx).await?;
             Ok(map_canonical_series(
                 &st.pool,
                 user.as_ref().map(|u| u.id.as_str()),
@@ -10845,72 +10968,11 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: ChapterOverrideInput,
     ) -> Result<bool> {
-        use async_graphql::MaybeUndefined::{Null, Undefined, Value};
         require_admin(ctx).await?;
         let st = state(ctx);
-        let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM work WHERE id = ?")
-            .bind(&input.work_id.0)
-            .fetch_optional(&st.pool)
+        crate::db::retry_transaction(|| set_chapter_override_once(&st.pool, &input))
             .await
-            .map_err(gql_err)?;
-        if exists.is_none() {
-            return Err(Error::new("No such work"));
-        }
-        // Read-modify-write under ONE transaction so two concurrent partial edits (one
-        // toggling `hidden`, one renaming) can't clobber each other's field.
-        let mut tx = st.pool.begin().await.map_err(gql_err)?;
-        let existing = sqlx::query_as::<_, (i64, Option<String>)>(
-            "SELECT hidden, title_override FROM chapter_override WHERE work_id = ? AND chapter_key = ?",
-        )
-        .bind(&input.work_id.0)
-        .bind(&input.chapter_key)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(gql_err)?;
-        let (mut hidden, mut title) = existing.map(|(h, t)| (h != 0, t)).unwrap_or((false, None));
-        match input.hidden {
-            Undefined => {}
-            Null => hidden = false,
-            Value(b) => hidden = b,
-        }
-        match input.title {
-            Undefined => {}
-            Null => title = None,
-            Value(v) => {
-                let v = v.trim().to_string();
-                title = if v.is_empty() { None } else { Some(v) };
-            }
-        }
-        // A no-op override (visible + no rename) is stored as the absence of a row.
-        if !hidden && title.is_none() {
-            sqlx::query("DELETE FROM chapter_override WHERE work_id = ? AND chapter_key = ?")
-                .bind(&input.work_id.0)
-                .bind(&input.chapter_key)
-                .execute(&mut *tx)
-                .await
-                .map_err(gql_err)?;
-            tx.commit().await.map_err(gql_err)?;
-            return Ok(true);
-        }
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO chapter_override (work_id, chapter_key, hidden, title_override, updated_at) \
-             VALUES (?, ?, ?, ?, ?) \
-             ON CONFLICT(work_id, chapter_key) DO UPDATE SET \
-               hidden = excluded.hidden, \
-               title_override = excluded.title_override, \
-               updated_at = excluded.updated_at",
-        )
-        .bind(&input.work_id.0)
-        .bind(&input.chapter_key)
-        .bind(hidden as i64)
-        .bind(&title)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await
-        .map_err(gql_err)?;
-        tx.commit().await.map_err(gql_err)?;
-        Ok(true)
+            .map_err(mutation_write_error)
     }
 
     /// Admin moderation: suspend or restore a user account. A banned user can't
@@ -11662,7 +11724,7 @@ impl MutationRoot {
     ) -> Result<ExtensionInfo> {
         let user = require_admin(ctx).await?;
         let st = state(ctx);
-        if !user_show_nsfw(&st.pool, &user.id).await {
+        if !user_show_nsfw(&st.pool, &user.id).await? {
             let ext = st
                 .suwayomi
                 .get_extension(&pkg_name)
@@ -11716,7 +11778,7 @@ impl MutationRoot {
     async fn update_extension(&self, ctx: &Context<'_>, pkg_name: String) -> Result<ExtensionInfo> {
         let user = require_admin(ctx).await?;
         let st = state(ctx);
-        if !user_show_nsfw(&st.pool, &user.id).await {
+        if !user_show_nsfw(&st.pool, &user.id).await? {
             let ext = st
                 .suwayomi
                 .get_extension(&pkg_name)
@@ -11972,7 +12034,7 @@ impl MutationRoot {
             .source_meta(&source_id.0)
             .await
             .map_err(gql_err)?;
-        if source_nsfw && !user_show_nsfw(&st_arc.pool, &user.id).await {
+        if source_nsfw && !user_show_nsfw(&st_arc.pool, &user.id).await? {
             return Err(Error::new(
                 "This source is NSFW — enable NSFW in your settings to ingest it",
             ));
@@ -12024,7 +12086,7 @@ impl MutationRoot {
     ) -> Result<Vec<SourceIngestJob>> {
         let user = require_admin(ctx).await?;
         let st_arc = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
-        let show_nsfw = user_show_nsfw(&st_arc.pool, &user.id).await;
+        let show_nsfw = user_show_nsfw(&st_arc.pool, &user.id).await?;
         let sources = st_arc.suwayomi.list_sources().await.map_err(gql_err)?;
         let matching: Vec<_> = sources
             .into_iter()
@@ -12348,7 +12410,7 @@ fn genre_is_nsfw(genre: &[String]) -> bool {
 /// So this predicate currently matches 100% of the catalogue and the drain would
 /// re-enrich every already-enriched work. Narrowing it is a behaviour change, not a perf
 /// fix, so it is deliberately NOT done here.
-async fn works_needing_enrichment(pool: &SqlitePool, batch: i64) -> Result<Vec<String>> {
+async fn works_needing_enrichment(pool: &Database, batch: i64) -> Result<Vec<String>> {
     sqlx::query_scalar(
         "SELECT ss.source_key FROM source_series ss \
          WHERE ss.source_type = 'mangadex' \
@@ -12596,7 +12658,7 @@ fn validate_new_password(password: &str) -> Result<()> {
 /// Friendly case-insensitive "username taken" pre-check. The database triggers
 /// installed by migration 0103 enforce this atomically for simultaneous writers,
 /// while preserving legacy identities that already have case collisions.
-async fn ensure_username_free(pool: &SqlitePool, username: &str) -> Result<()> {
+async fn ensure_username_free(pool: &Database, username: &str) -> Result<()> {
     let taken: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM users WHERE username = ? COLLATE NOCASE")
             .bind(username)
@@ -12654,7 +12716,7 @@ async fn verify_password_bounded(st: &AppState, password: &str, phc: &str) -> Re
 }
 
 /// Create a session row and return its opaque token.
-async fn new_session(pool: &SqlitePool, user_id: &str, ttl_secs: i64) -> Result<String> {
+async fn new_session(pool: &Database, user_id: &str, ttl_secs: i64) -> Result<String> {
     let (is_admin,): (i64,) = sqlx::query_as("SELECT is_admin FROM users WHERE id = ?")
         .bind(user_id)
         .fetch_one(pool)
@@ -12740,7 +12802,7 @@ const RECONCILE_PENDING_WHERE: &str = "EXISTS (SELECT 1 FROM source_series ss \
         WHERE ss.work_id = w.id AND mc.status = 'pending')";
 
 /// How many provisional (Suwayomi-only) works still need reconciling against the spine.
-async fn pending_reconcile_count(pool: &SqlitePool) -> anyhow::Result<i64> {
+async fn pending_reconcile_count(pool: &Database) -> anyhow::Result<i64> {
     let n: i64 = sqlx::query_scalar(&format!(
         "SELECT COUNT(*) FROM work w WHERE {RECONCILE_PENDING_WHERE}"
     ))
@@ -12760,8 +12822,8 @@ enum ReconcileAction {
 /// selectable (they're simply left past the cursor for this run). Returns
 /// `(merged, queued, skipped)`.
 pub(crate) async fn reconcile_provisional_works(
-    pool: &SqlitePool,
-    covers: Option<&SqlitePool>,
+    pool: &Database,
+    covers: Option<&Database>,
 ) -> anyhow::Result<(i64, i64, i64)> {
     const BATCH: i64 = 200;
     let mut cursor = String::new();
@@ -12851,8 +12913,8 @@ struct ConsolidateOutcome {
 /// `match_key` lower bound): a pass that merges nothing still advances, instead of
 /// re-examining the same first `limit` groups forever.
 async fn consolidate_exact_duplicates_from(
-    pool: &SqlitePool,
-    covers: Option<&SqlitePool>,
+    pool: &Database,
+    covers: Option<&Database>,
     limit: i64,
     cursor: &str,
 ) -> anyhow::Result<ConsolidateOutcome> {
@@ -13042,7 +13104,7 @@ async fn consolidate_exact_duplicates_from(
 /// it is `reconcile_one` that produced all five duplicate pairs found in production.
 /// One guard in the shared writer, not one guard per caller.
 async fn queue_consolidate_review(
-    pool: &SqlitePool,
+    pool: &Database,
     loser: &str,
     survivor: &str,
     score: f64,
@@ -13079,7 +13141,7 @@ struct ReviewOutcome {
 /// work that carries either title, that the rules would also merge `loser` into, and
 /// that is not itself a duplicate of `survivor`. Such a pair has no single right target.
 async fn has_rival_target(
-    pool: &SqlitePool,
+    pool: &Database,
     loser: &catalog::WorkMatchData,
     survivor: &catalog::WorkMatchData,
 ) -> anyhow::Result<bool> {
@@ -13121,8 +13183,8 @@ async fn has_rival_target(
 /// `dismissed` is the rules' answer, not a person's: unlike `rejected` it does not bar
 /// a later automatic merge, should the works' metadata change.
 async fn sort_pending_reviews(
-    pool: &SqlitePool,
-    covers: Option<&SqlitePool>,
+    pool: &Database,
+    covers: Option<&Database>,
     after: &str,
     limit: i64,
 ) -> anyhow::Result<ReviewOutcome> {
@@ -13246,30 +13308,20 @@ async fn sort_pending_reviews(
 /// Sort the whole review queue (see `sort_pending_reviews`), yielding between batches so
 /// the live sync and the cover drainer keep getting the single SQLite writer.
 ///
-/// A batch that loses the writer to another job (see `db::is_locked_error`) is run again
+/// A batch that loses the writer to another job uses the shared bounded retry helper
 /// from the same cursor: a row it already settled is no longer waiting, so the repeat
 /// only does the rest.
 pub(crate) async fn auto_merge_pending_reviews(
-    pool: &SqlitePool,
-    covers: Option<&SqlitePool>,
+    pool: &Database,
+    covers: Option<&Database>,
 ) -> anyhow::Result<u64> {
     const BATCH: i64 = 200;
-    const LOCK_RETRIES: u32 = 8;
     let mut cursor = String::new();
     let (mut merged, mut dismissed) = (0u64, 0i64);
-    let mut lock_retry = 0u32;
     loop {
-        let out = match sort_pending_reviews(pool, covers, &cursor, BATCH).await {
-            Ok(out) => out,
-            Err(e) if crate::db::is_locked_error(&e) && lock_retry < LOCK_RETRIES => {
-                lock_retry += 1;
-                tracing::debug!(lock_retry, "review batch lost the writer; running it again");
-                tokio::time::sleep(std::time::Duration::from_secs(5 * u64::from(lock_retry))).await;
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        lock_retry = 0;
+        let out =
+            crate::db::retry_transaction(|| sort_pending_reviews(pool, covers, &cursor, BATCH))
+                .await?;
         merged += out.merged.len() as u64;
         dismissed += out.dismissed;
         if out.seen < BATCH {
@@ -13301,8 +13353,8 @@ pub struct DuplicateSweepResult {
 /// and, once the queue is exhausted, examine up to `limit` duplicate-key groups. Reads
 /// and advances `CONSOLIDATE_CURSOR`; the caller holds `RECONCILE_RUNNING`.
 async fn sweep_duplicates_once(
-    pool: &SqlitePool,
-    covers: Option<&SqlitePool>,
+    pool: &Database,
+    covers: Option<&Database>,
     limit: i64,
 ) -> anyhow::Result<DuplicateSweepResult> {
     let mut cursor = CONSOLIDATE_CURSOR
@@ -13366,7 +13418,7 @@ async fn sweep_duplicates_once(
 /// COVER BLOBS: pass `Some(covers)` so the merges reclaim the losing works' cached
 /// cover blobs (see `catalog::merge_works_ex`). Passing `None` leaks them, and is only
 /// correct where no covers pool exists.
-pub(crate) async fn run_post_ingest_dedup_ex(pool: &SqlitePool, covers: Option<&SqlitePool>) {
+pub(crate) async fn run_post_ingest_dedup_ex(pool: &Database, covers: Option<&Database>) {
     if RECONCILE_RUNNING
         .compare_exchange(
             false,
@@ -13448,8 +13500,8 @@ pub(crate) async fn run_post_ingest_dedup_ex(pool: &SqlitePool, covers: Option<&
 /// Reconcile one provisional work: build a candidate from its own metadata, match it
 /// against the spine (excluding itself), then merge / queue / skip.
 async fn reconcile_one(
-    pool: &SqlitePool,
-    covers: Option<&SqlitePool>,
+    pool: &Database,
+    covers: Option<&Database>,
     work_id: &str,
 ) -> anyhow::Result<ReconcileAction> {
     let Some(md) = catalog::load_match_data(pool, work_id).await? else {
@@ -13528,7 +13580,7 @@ async fn reconcile_one(
 /// [`add_source_series_checked`], which asks the engine instead.
 #[cfg(test)]
 async fn add_source_series_core(
-    pool: &SqlitePool,
+    pool: &Database,
     m: &crate::suwayomi::SuwayomiManga,
     cover_phash: Option<String>,
 ) -> anyhow::Result<MatchResult> {
@@ -13623,7 +13675,7 @@ async fn add_source_series_checked(
 /// `mark_work_nsfw`, which yields to a MangaDex `safe`/`suggestive` rating — the admin's
 /// pin does not. A work whose override an admin already set by hand (either way) is
 /// left alone: that per-work decision is more specific than the per-source one.
-async fn pin_work_nsfw(pool: &SqlitePool, work_id: &str) -> anyhow::Result<()> {
+async fn pin_work_nsfw(pool: &Database, work_id: &str) -> anyhow::Result<()> {
     sqlx::query(
         "UPDATE work SET is_nsfw_override = 1, updated_at = ? \
          WHERE id = ? AND is_nsfw_override IS NULL",
@@ -13644,7 +13696,7 @@ async fn pin_work_nsfw(pool: &SqlitePool, work_id: &str) -> anyhow::Result<()> {
 /// consolidation is optimistic and does NOT enqueue a review row (that would
 /// re-split the very entry the feature is meant to unify).
 async fn add_source_series_core_ex(
-    pool: &SqlitePool,
+    pool: &Database,
     m: &crate::suwayomi::SuwayomiManga,
     cover_phash: Option<String>,
     consolidate: bool,
@@ -13913,7 +13965,7 @@ async fn add_source_series_core_ex(
 /// after verifying its current password. Existing admins are never re-passworded.
 /// Ambiguous legacy usernames fail closed; provisioning does not merge identities.
 pub async fn provision_admins(
-    pool: &SqlitePool,
+    pool: &Database,
     admin_users: &[String],
     admin_password: Option<&str>,
     admin_email: Option<&str>,
@@ -14004,7 +14056,7 @@ pub async fn provision_admins(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use crate::database::TestPoolOptions;
 
     // ---- MangaDex UUID extraction (exact-identity consolidation) ----
 
@@ -14158,13 +14210,16 @@ mod tests {
         }
     }
 
-    async fn migrated_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
+    async fn migrated_pool() -> Database {
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
@@ -14343,7 +14398,7 @@ mod tests {
     }
 
     async fn waiting_pair(
-        pool: &SqlitePool,
+        pool: &Database,
         title: &str,
         other_title: &str,
         author: Option<&str>,
@@ -14529,7 +14584,7 @@ mod tests {
     /// Create a work with the given titles (first = primary) and one source of
     /// `source_type`, for the sweep tests.
     async fn sweep_work(
-        pool: &SqlitePool,
+        pool: &Database,
         source_type: &str,
         titles: &[&str],
         author: Option<&str>,
@@ -14557,7 +14612,7 @@ mod tests {
         id
     }
 
-    async fn work_exists(pool: &SqlitePool, id: &str) -> bool {
+    async fn work_exists(pool: &Database, id: &str) -> bool {
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work WHERE id = ?)")
             .bind(id)
             .fetch_one(pool)
@@ -15502,7 +15557,7 @@ mod tests {
 
     // ---- GraphQL security integration tests (no Suwayomi needed) ----
 
-    async fn seed_user(pool: &SqlitePool, id: &str, username: &str, is_admin: i64, is_banned: i64) {
+    async fn seed_user(pool: &Database, id: &str, username: &str, is_admin: i64, is_banned: i64) {
         let hash = auth::hash_password("password123").unwrap();
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, avatar_url, is_admin, is_banned, created_at) \
@@ -15532,7 +15587,7 @@ mod tests {
     /// Seed a catalogued series reachable under the reader-facing key `key`: a `work`
     /// plus the Suwayomi `source_series` mapping `resolve_work_id` follows. Enough to
     /// satisfy the `known_series_id` existence check on the social mutations.
-    async fn seed_target_series(pool: &SqlitePool, key: &str) {
+    async fn seed_target_series(pool: &Database, key: &str) {
         let work_id = format!("w_{key}");
         sqlx::query(
             "INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) \
@@ -15556,12 +15611,93 @@ mod tests {
         .unwrap();
     }
 
-    async fn setup_full(max: u32) -> (ApiSchema, SqlitePool) {
+    async fn setup_full(max: u32) -> (ApiSchema, Database) {
         let (schema, pool, _) = setup_with_state(max).await;
         (schema, pool)
     }
 
-    async fn setup_with_state(max: u32) -> (ApiSchema, SqlitePool, std::sync::Arc<AppState>) {
+    #[tokio::test]
+    async fn session_database_failure_is_an_error_for_authenticated_fields() {
+        let (schema, pool) = setup_full(100).await;
+        pool.close().await;
+        for query in ["{ session { token } }", "{ library { id } }"] {
+            let response = exec(&schema, query, Some("bobtok"), "1.1.1.1").await;
+            assert!(
+                !response.errors.is_empty(),
+                "database outage appeared anonymous: {query}"
+            );
+            assert_eq!(response.errors[0].message, "Server busy; retry soon");
+            assert_eq!(
+                response.errors[0].extensions.as_ref().unwrap().get("code"),
+                Some(&async_graphql::Value::String("SERVICE_UNAVAILABLE".into()))
+            );
+        }
+        let anonymous = exec(&schema, "{ session { token } }", None, "1.1.1.1").await;
+        assert!(anonymous.errors.is_empty());
+        assert_eq!(
+            anonymous.data.into_json().unwrap()["session"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn library_identity_retries_a_fresh_transaction_after_an_external_writer() {
+        let (_, pool) = setup_full(100).await;
+        sqlx::query("INSERT INTO user_library (user_id, series_id, created_at) VALUES ('bob-id', 's1', 't')")
+            .execute(&pool).await.unwrap();
+        let external = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                (*pool.connect_options())
+                    .clone()
+                    .pragma("query_only", "OFF"),
+            )
+            .await
+            .unwrap();
+        let writer = external.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let task_pool = pool.clone();
+        let task = tokio::spawn(async move {
+            consolidate_library_identity(&task_pool, "bob-id", "w_s1").await
+        });
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        writer.commit().await.unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), "w_s1");
+        let identities: Vec<String> =
+            sqlx::query_scalar("SELECT series_id FROM user_library WHERE user_id = 'bob-id'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(identities, ["w_s1"]);
+        external.close().await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_partial_chapter_overrides_preserve_both_fields() {
+        let (schema, pool) = setup_full(100).await;
+        let hide = exec(
+            &schema,
+            r#"mutation { setChapterOverride(input: {workId: "w_s1", chapterKey: "1", hidden: true}) }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        );
+        let rename = exec(
+            &schema,
+            r#"mutation { setChapterOverride(input: {workId: "w_s1", chapterKey: "1", title: "Renamed"}) }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        );
+        let (hide, rename) = tokio::join!(hide, rename);
+        assert!(hide.errors.is_empty(), "{:?}", hide.errors);
+        assert!(rename.errors.is_empty(), "{:?}", rename.errors);
+        let row: (i64, Option<String>) = sqlx::query_as(
+            "SELECT hidden, title_override FROM chapter_override WHERE work_id = 'w_s1' AND chapter_key = '1'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(row, (1, Some("Renamed".into())));
+        pool.close().await;
+    }
+
+    async fn setup_with_state(max: u32) -> (ApiSchema, Database, std::sync::Arc<AppState>) {
         setup_with_engine(max, "http://127.0.0.1:1").await
     }
 
@@ -15570,13 +15706,16 @@ mod tests {
     async fn setup_with_engine(
         max: u32,
         engine_url: &str,
-    ) -> (ApiSchema, SqlitePool, std::sync::Arc<AppState>) {
-        let pool = SqlitePoolOptions::new()
+    ) -> (ApiSchema, Database, std::sync::Arc<AppState>) {
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         seed_user(&pool, "admin-id", "admin", 1, 0).await;
         seed_user(&pool, "bob-id", "bob", 0, 0).await;
         seed_user(&pool, "banned-id", "carol", 0, 1).await;
@@ -15766,7 +15905,7 @@ mod tests {
         .into_bytes()
     }
 
-    async fn recorded_source_nsfw(pool: &SqlitePool, source_id: &str) -> Option<i64> {
+    async fn recorded_source_nsfw(pool: &Database, source_id: &str) -> Option<i64> {
         sqlx::query_scalar("SELECT is_nsfw FROM source_extension WHERE source_id = ?")
             .bind(source_id)
             .fetch_optional(pool)
@@ -16073,7 +16212,7 @@ mod tests {
         .await
         .unwrap();
 
-        async fn flags(pool: &SqlitePool, id: &str) -> (i64, Option<i64>) {
+        async fn flags(pool: &Database, id: &str) -> (i64, Option<i64>) {
             sqlx::query_as("SELECT is_nsfw, is_nsfw_override FROM work WHERE id = ?")
                 .bind(id)
                 .fetch_one(pool)
@@ -16286,7 +16425,7 @@ mod tests {
     /// `in_library` is a parameter because the difference between 0 and 1 is exactly what
     /// `updates_total_matches_paged_row_count` is about.
     async fn seed_feed_member(
-        pool: &SqlitePool,
+        pool: &Database,
         id: i64,
         title: &str,
         latest_ms: Option<&str>,
@@ -17343,7 +17482,7 @@ mod tests {
         .await
         .unwrap();
 
-        async fn total_and_bucket(pool: &SqlitePool) -> (i64, i64) {
+        async fn total_and_bucket(pool: &Database) -> (i64, i64) {
             let total: Option<i64> =
                 sqlx::query_scalar("SELECT total FROM series_views WHERE series_key = '778'")
                     .fetch_optional(pool)
@@ -17575,12 +17714,15 @@ mod tests {
 
     #[tokio::test]
     async fn introspection_toggles_with_flag() {
-        let pool = SqlitePoolOptions::new()
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         let mk_state = || {
             std::sync::Arc::new(AppState {
                 pool: pool.clone(),
@@ -17632,12 +17774,15 @@ mod tests {
 
     #[tokio::test]
     async fn provision_admins_creates_promotes_and_is_idempotent() {
-        let pool = SqlitePoolOptions::new()
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
 
         // Missing admin + password → created as admin with the configured email.
         provision_admins(&pool, &["admin".into()], Some("s3cret-pw"), Some("a@b.com"))
@@ -17782,12 +17927,15 @@ mod tests {
 
     #[tokio::test]
     async fn register_rejects_reserved_admin_username() {
-        let pool = SqlitePoolOptions::new()
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         let state = std::sync::Arc::new(AppState {
             pool: pool.clone(),
             cover_pool: pool.clone(),
@@ -17865,7 +18013,7 @@ mod tests {
         assert_eq!(first_error(&r), "Not authenticated");
     }
 
-    async fn seed_canonical(pool: &SqlitePool, md_id: &str, title: &str, nsfw: bool, ch: &str) {
+    async fn seed_canonical(pool: &Database, md_id: &str, title: &str, nsfw: bool, ch: &str) {
         let input = crate::catalog::WorkInput {
             primary_title: Some(title.to_string()),
             is_nsfw: nsfw,
@@ -18230,7 +18378,7 @@ mod tests {
     /// `latest_ms` is epoch-millis TEXT (migration 0050's encoding) or `None` for a series
     /// with no datable chapter — which the feed EXCLUDES rather than sorting last.
     async fn seed_suwayomi_half(
-        pool: &SqlitePool,
+        pool: &Database,
         work_id: &str,
         id: i64,
         title: &str,
@@ -18275,7 +18423,7 @@ mod tests {
     }
 
     /// The `w_` id of the work anchored to a MangaDex key.
-    async fn work_id_of(pool: &SqlitePool, md_id: &str) -> String {
+    async fn work_id_of(pool: &Database, md_id: &str) -> String {
         sqlx::query_scalar::<_, String>(
             "SELECT work_id FROM source_series WHERE source_type = 'mangadex' AND source_key = ?",
         )
@@ -19282,7 +19430,7 @@ mod tests {
     /// English chapters so `en_chapter_count` is a real number.
     #[allow(clippy::too_many_arguments)]
     async fn seed_browse_work(
-        pool: &SqlitePool,
+        pool: &Database,
         md_id: &str,
         title: &str,
         lang: &str,
@@ -23282,7 +23430,7 @@ mod tests {
     }
 
     /// A fresh server: the shared fixture with nobody holding admin.
-    async fn setup_without_admin() -> (ApiSchema, SqlitePool, std::sync::Arc<AppState>) {
+    async fn setup_without_admin() -> (ApiSchema, Database, std::sync::Arc<AppState>) {
         let (s, pool, st) = setup_with_state(100).await;
         sqlx::query("UPDATE users SET is_admin = 0")
             .execute(&pool)
@@ -24608,12 +24756,15 @@ mod tests {
     #[tokio::test]
     async fn updates_total_counts_exactly_the_rows_the_page_returns() {
         // Build state directly so we can seed series_scan_state, then query updates.
-        let pool = SqlitePoolOptions::new()
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         for (sid, ts) in [
             ("10", Some("2026-02-01T00:00:00Z")),
             ("11", Some("2026-03-01T00:00:00Z")),
@@ -24848,7 +24999,7 @@ mod tests {
     }
 
     /// Seed Suwayomi chapters 1..=n for series `manga_id`, ids `manga_id * 1000 + number`.
-    async fn seed_suwayomi_chapters(pool: &SqlitePool, manga_id: i64, n: i64) {
+    async fn seed_suwayomi_chapters(pool: &Database, manga_id: i64, n: i64) {
         for i in 1..=n {
             sqlx::query(
                 "INSERT INTO suwayomi_chapter \
@@ -24868,7 +25019,7 @@ mod tests {
     /// `(chapter number, read, last page read)` for bob, ordered by number.
     /// `chapter_number` is REAL in the schema, so it decodes as f64 and is rounded here —
     /// the fixtures are whole chapters and comparing floats in assertions is noise.
-    async fn read_rows(pool: &SqlitePool, manga_id: i64) -> Vec<(i64, i64, i64)> {
+    async fn read_rows(pool: &Database, manga_id: i64) -> Vec<(i64, i64, i64)> {
         sqlx::query_as::<_, (f64, i64, i64)>(
             "SELECT sc.chapter_number, p.read, p.last_page_read \
                FROM suwayomi_progress p JOIN suwayomi_chapter sc \
@@ -25036,7 +25187,7 @@ mod tests {
             "{}",
             data_json(&r)
         );
-        async fn override_of(pool: &SqlitePool, id: &str) -> Option<i64> {
+        async fn override_of(pool: &Database, id: &str) -> Option<i64> {
             sqlx::query_scalar::<_, Option<i64>>("SELECT is_nsfw_override FROM work WHERE id = ?")
                 .bind(id)
                 .fetch_one(pool)
@@ -25135,7 +25286,7 @@ mod tests {
             "{}",
             data_json(&r)
         );
-        async fn nsfw_of(pool: &SqlitePool, id: &str) -> i64 {
+        async fn nsfw_of(pool: &Database, id: &str) -> i64 {
             sqlx::query_scalar("SELECT is_nsfw FROM work WHERE id = ?")
                 .bind(id)
                 .fetch_one(pool)
@@ -25159,7 +25310,7 @@ mod tests {
 
     /// Build a minimal `AppState` around a migrated pool (Suwayomi points at a
     /// dead port; `map_series` never dials it, so read-shape tests stay offline).
-    fn state_with_pool(pool: SqlitePool) -> std::sync::Arc<AppState> {
+    fn state_with_pool(pool: Database) -> std::sync::Arc<AppState> {
         std::sync::Arc::new(AppState {
             pool: pool.clone(),
             cover_pool: pool.clone(),

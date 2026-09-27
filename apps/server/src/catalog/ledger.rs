@@ -14,8 +14,8 @@
 //! `COALESCE(chapter.readable_at, chapter.published_at)` and refuses anything it cannot
 //! date — and [`assert_no_future_events`] is the backstop that proves it.
 
+use crate::db::Database;
 use anyhow::{bail, Result};
-use sqlx::SqlitePool;
 
 /// Works seeded per batch. Each is one grouped INSERT over that work's chapters.
 const SEED_BATCH: i64 = 100;
@@ -102,7 +102,7 @@ fn seedable_where() -> String {
 /// restarts, and self-healing when a work gains chapters later. The cost is that the idle
 /// check is a scan rather than a flag read; at a 30-minute idle interval that is a few
 /// seconds an hour, which is a fair price for having no second piece of state to get wrong.
-pub async fn seed_batch(pool: &SqlitePool) -> Result<u64> {
+pub async fn seed_batch(pool: &Database) -> Result<u64> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let works: Vec<String> = sqlx::query_scalar(&format!(
         "SELECT DISTINCT ss.work_id \
@@ -141,7 +141,7 @@ pub async fn seed_batch(pool: &SqlitePool) -> Result<u64> {
 /// min/max aggregate, every bare column is taken from the row that produced it — so they
 /// come from the EARLIEST-released row, i.e. from the source that actually won the race.
 /// The same rule is what `refresh_feed_series_updates` already relies on.
-async fn seed_work(pool: &SqlitePool, work_id: &str, now_ms: i64) -> Result<u64> {
+async fn seed_work(pool: &Database, work_id: &str, now_ms: i64) -> Result<u64> {
     let n = sqlx::query(&format!(
         "INSERT OR IGNORE INTO release_event \
              (work_id, chapter_key, first_seen_at, first_source_series_id, label, announce_at) \
@@ -174,7 +174,7 @@ async fn seed_work(pool: &SqlitePool, work_id: &str, now_ms: i64) -> Result<u64>
 /// goes to the updates page" requirement. It is deliberately the SAME statement shape as
 /// the seed, narrowed to one series, so the two writers cannot disagree about what a
 /// release event looks like.
-pub async fn record_source_series(pool: &SqlitePool, source_series_id: &str) -> Result<u64> {
+pub async fn record_source_series(pool: &Database, source_series_id: &str) -> Result<u64> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let n = sqlx::query(&format!(
         "INSERT OR IGNORE INTO release_event \
@@ -251,7 +251,7 @@ pub async fn merge_release_events(
 /// The deployment guard from §9's risk table: no event may claim to have happened in the
 /// future. A single future row means something dated an event from `publishAt`, or from
 /// `now()`, and page 1 of /updates is about to be wrong.
-pub async fn assert_no_future_events(pool: &SqlitePool) -> Result<()> {
+pub async fn assert_no_future_events(pool: &Database) -> Result<()> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let (future, max): (i64, Option<i64>) = sqlx::query_as(
         "SELECT COUNT(*), MAX(first_seen_at) FROM release_event WHERE first_seen_at > ?",
@@ -282,7 +282,7 @@ pub async fn assert_no_future_events(pool: &SqlitePool) -> Result<()> {
 ///
 /// So the projection is inert until this returns true, and the feed keeps behaving exactly as
 /// it does today. It then switches on by itself, atomically, at the next rebuild.
-pub async fn is_complete(pool: &SqlitePool) -> Result<bool> {
+pub async fn is_complete(pool: &Database) -> Result<bool> {
     // THE MEMO IS PRODUCTION-ONLY, and that is about test isolation, not about the memo
     // being untestable: it is process-global state, and the test binary runs every test in
     // one process, in parallel, each against its own in-memory database — so one test
@@ -314,7 +314,7 @@ pub async fn is_complete(pool: &SqlitePool) -> Result<bool> {
 ///
 /// While still false, re-check at most once a `READY_RECHECK_MS`, so the seed's own progress
 /// is noticed promptly without the check itself becoming the load.
-async fn is_complete_memoised(pool: &SqlitePool, memo: &ReadyMemo, now_ms: i64) -> Result<bool> {
+async fn is_complete_memoised(pool: &Database, memo: &ReadyMemo, now_ms: i64) -> Result<bool> {
     if let Some(answer) = memo.poll(now_ms) {
         return Ok(answer);
     }
@@ -439,7 +439,7 @@ const DRIFT_COLUMNS: &str = "SELECT work_id, released_at, latest_chapter FROM fe
 ///
 /// Note the reconciler CORRECTS as it measures — it is a real rebuild, not a dry run. So a
 /// non-zero `drifted` describes a window that has already closed, not a live fault.
-pub async fn reconcile_feed(pool: &SqlitePool) -> Result<DriftReport> {
+pub async fn reconcile_feed(pool: &Database) -> Result<DriftReport> {
     use std::collections::HashMap;
     let started = std::time::Instant::now();
 
@@ -509,7 +509,7 @@ pub async fn reconcile_feed(pool: &SqlitePool) -> Result<DriftReport> {
 }
 
 /// How many ledger rows exist, and how many spine chapters still have none.
-pub async fn remaining(pool: &SqlitePool) -> Result<(i64, i64)> {
+pub async fn remaining(pool: &Database) -> Result<(i64, i64)> {
     let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_event")
         .fetch_one(pool)
         .await?;
@@ -538,9 +538,12 @@ mod tests {
 
     /// `foreign_keys = ON` deliberately, matching `db.rs`. The cascade from `work` is
     /// load-bearing here — it is exactly what `merge_release_events` has to get ahead of.
-    async fn pool() -> SqlitePool {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    async fn pool() -> Database {
+        let pool = Database::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         sqlx::query("PRAGMA foreign_keys = ON")
             .execute(&pool)
             .await
@@ -555,7 +558,7 @@ mod tests {
             .timestamp_millis()
     }
 
-    async fn work_with_two_sources(pool: &SqlitePool) -> (String, String, String) {
+    async fn work_with_two_sources(pool: &Database) -> (String, String, String) {
         // A title, because `feed_updates.title` is NOT NULL and the C3 reconciler builds
         // the real feed chain rather than a stub of it.
         let work = upsert_work_from_mangadex(
@@ -1062,10 +1065,11 @@ mod tests {
         .await
         .unwrap();
 
-        let mut conn = pool.acquire().await.unwrap();
+        let mut conn = pool.write().acquire().await.unwrap();
         crate::catalog::project_feed_from_ledger(&mut conn, None)
             .await
             .unwrap();
+        drop(conn);
         let (before, label): (i64, Option<String>) = sqlx::query_as(
             "SELECT released_at, latest_chapter FROM feed_series_updates WHERE work_id = ?",
         )
@@ -1092,9 +1096,11 @@ mod tests {
         .unwrap();
         while seed_batch(&pool).await.unwrap() > 0 {}
         record_source_series(&pool, &md).await.unwrap();
+        let mut conn = pool.write().acquire().await.unwrap();
         crate::catalog::project_feed_from_ledger(&mut conn, None)
             .await
             .unwrap();
+        drop(conn);
 
         let after: i64 =
             sqlx::query_scalar("SELECT released_at FROM feed_series_updates WHERE work_id = ?")
@@ -1123,9 +1129,11 @@ mod tests {
         .await
         .unwrap();
         while seed_batch(&pool).await.unwrap() > 0 {}
+        let mut conn = pool.write().acquire().await.unwrap();
         crate::catalog::project_feed_from_ledger(&mut conn, None)
             .await
             .unwrap();
+        drop(conn);
         let (moved, label2): (i64, Option<String>) = sqlx::query_as(
             "SELECT released_at, latest_chapter FROM feed_series_updates WHERE work_id = ?",
         )

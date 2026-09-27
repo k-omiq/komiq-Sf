@@ -26,9 +26,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::db::Database;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
-use sqlx::SqlitePool;
 
 use crate::mangadex::MangaDexClient;
 
@@ -171,7 +171,7 @@ const STALE_SQL: &str = "SELECT s.work_id, \
 ///
 /// A work with two MangaDex sources appears once (deduped here, keeping its oldest anchor).
 pub async fn works_needing_stats(
-    pool: &SqlitePool,
+    pool: &Database,
     limit: i64,
     stale_before: &str,
 ) -> Result<Vec<PendingStats>> {
@@ -244,7 +244,7 @@ pub struct StatsFill {
 /// rebuild's own rule (`browse_catalogue.follows/rating` = the `work_stats` row, see
 /// `catalog::browse_catalogue_select_for`), so the two writers converge.
 pub async fn write_work_stats(
-    pool: &SqlitePool,
+    pool: &Database,
     pending: &[PendingStats],
     stats: &HashMap<String, MdStats>,
     now: &str,
@@ -310,7 +310,7 @@ fn stamps(now: chrono::DateTime<chrono::Utc>) -> (String, String) {
 }
 
 /// Works still on the list (never fetched, or stale), for the completion line.
-async fn stats_remaining(pool: &SqlitePool, stale_before: &str) -> Result<i64> {
+async fn stats_remaining(pool: &Database, stale_before: &str) -> Result<i64> {
     Ok(sqlx::query_scalar(
         "SELECT (SELECT COUNT(DISTINCT ss.work_id) FROM source_series ss \
                   WHERE ss.source_type = 'mangadex' \
@@ -323,7 +323,7 @@ async fn stats_remaining(pool: &SqlitePool, stale_before: &str) -> Result<i64> {
 }
 
 /// One batch of the statistics drain. `fetched == 0` means nothing is due.
-pub async fn backfill_work_stats(pool: &SqlitePool, client: &MangaDexClient) -> Result<StatsFill> {
+pub async fn backfill_work_stats(pool: &Database, client: &MangaDexClient) -> Result<StatsFill> {
     let (now, stale_before) = stamps(chrono::Utc::now());
     let pending = works_needing_stats(pool, STATS_IDS_LIMIT as i64, &stale_before).await?;
     if pending.is_empty() {
@@ -356,7 +356,7 @@ async fn nap(d: Duration, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> 
 /// `mangadex::spawn_group_backfill`. Waits on the MangaDex switch between batches (it
 /// shares the in-process MangaDex limiter, so the one-replica rule applies to it verbatim).
 pub fn spawn_stats_backfill(
-    pool: SqlitePool,
+    pool: Database,
     client: Arc<MangaDexClient>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -455,7 +455,7 @@ pub fn spawn_stats_backfill(
 ///
 /// Fails OPEN to "no rating" — a query error logs and yields an empty map — because this only
 /// ever decorates a card; it must not take a feed page down with it.
-pub async fn display_rating_batch(pool: &SqlitePool, work_ids: &[String]) -> HashMap<String, f64> {
+pub async fn display_rating_batch(pool: &Database, work_ids: &[String]) -> HashMap<String, f64> {
     if work_ids.is_empty() {
         return HashMap::new();
     }
@@ -545,18 +545,21 @@ mod tests {
             .is_empty());
     }
 
-    async fn pool() -> SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+    async fn pool() -> Database {
+        let pool = crate::database::TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
     /// A work with a MangaDex anchor `key` created at `created`, plus its Browse row.
-    async fn anchored(pool: &SqlitePool, work_id: &str, key: &str, created: &str) {
+    async fn anchored(pool: &Database, work_id: &str, key: &str, created: &str) {
         sqlx::query(
             "INSERT OR IGNORE INTO work (id, primary_title, created_at, updated_at) \
              VALUES (?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
@@ -589,7 +592,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn stats_row(pool: &SqlitePool, work_id: &str, fetched_at: &str) {
+    async fn stats_row(pool: &Database, work_id: &str, fetched_at: &str) {
         sqlx::query(
             "INSERT INTO work_stats (work_id, follows, rating, rating_avg, fetched_at) \
              VALUES (?, 1, 1.0, 1.0, ?)",

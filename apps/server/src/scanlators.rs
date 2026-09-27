@@ -20,9 +20,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::db::Database;
 use anyhow::Result;
 use chrono::Utc;
-use sqlx::SqlitePool;
 
 /// How MangaDex joins the groups of a joint release (`mangadex::chapter_scanlator`).
 const JOINT_SEPARATOR: &str = " & ";
@@ -107,7 +107,7 @@ pub struct Tag {
 
 /// Every tag, by name. Small (one row per decision an admin made), so it is read on
 /// every request and never memoized.
-pub async fn list_tags(pool: &SqlitePool) -> Result<Vec<Tag>> {
+pub async fn list_tags(pool: &Database) -> Result<Vec<Tag>> {
     let rows: Vec<(String, String)> =
         sqlx::query_as("SELECT name, ai_level FROM scanlator_tag ORDER BY name_key")
             .fetch_all(pool)
@@ -125,7 +125,7 @@ pub fn tag_index(tags: &[Tag]) -> HashMap<String, AiLevel> {
 
 /// Set, change or (with `None`) remove the tag on a credit. `false` when nothing changed.
 /// The caller validates `name` ([`MAX_NAME_LEN`], not empty).
-pub async fn set_tag(pool: &SqlitePool, name: &str, level: Option<AiLevel>) -> Result<bool> {
+pub async fn set_tag(pool: &Database, name: &str, level: Option<AiLevel>) -> Result<bool> {
     let key = name_key(name);
     let res = match level {
         Some(level) => {
@@ -185,7 +185,7 @@ impl GroupStat {
 
 /// Count every credit in `chapter`, per source. The one slow query of this module; see
 /// the module header. "No Group" and the backfill's empty string are not credits.
-async fn count_groups(pool: &SqlitePool) -> Result<Vec<GroupStat>> {
+async fn count_groups(pool: &Database) -> Result<Vec<GroupStat>> {
     // Grouped by the folded name so two spellings on one series count the series once.
     // SQLite folds ASCII only; the loop below folds the rest. `MIN` picks the spelling
     // that sorts first, which is the capitalized one ("Robo Scans" before "robo scans").
@@ -261,7 +261,7 @@ fn cached_stats() -> Option<Arc<Vec<GroupStat>>> {
 }
 
 /// Every credit with its counts: memoized for [`STATS_TTL`], counted otherwise.
-pub async fn group_stats(pool: &SqlitePool) -> Result<Arc<Vec<GroupStat>>> {
+pub async fn group_stats(pool: &Database) -> Result<Arc<Vec<GroupStat>>> {
     if let Some(hit) = cached_stats() {
         return Ok(hit);
     }
@@ -373,15 +373,18 @@ pub fn page(stats: &[GroupStat], tags: &[Tag], q: &ListQuery) -> (Vec<ListRow>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use crate::database::TestPoolOptions;
 
-    async fn pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
+    async fn pool() -> Database {
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
@@ -451,7 +454,7 @@ mod tests {
     }
 
     /// Two works: `w1` on MangaDex and on Suwayomi source 77, `w2` on MangaDex only.
-    async fn seed(pool: &SqlitePool) {
+    async fn seed(pool: &Database) {
         for work in ["w1", "w2"] {
             sqlx::query(
                 "INSERT INTO work (id, primary_title, created_at, updated_at) \

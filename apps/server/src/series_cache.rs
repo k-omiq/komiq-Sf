@@ -7,9 +7,9 @@
 //! and read them back, so subsequent loads are served from SQLite. Only the cover
 //! REFERENCE is stored (Worker-proxied) — never cover bytes (memory posture).
 
+use crate::db::Database;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use sqlx::SqlitePool;
 
 use crate::suwayomi::{ChapterCount, SuwayomiChapter, SuwayomiManga, SuwayomiSourceLang};
 
@@ -42,7 +42,7 @@ pub fn is_fresh(fetched_at: Option<&str>, ttl_secs: i64) -> bool {
 /// must distinguish the two: a refusal is a successful no-op, not a persist, and the id
 /// must not be queued for a follow-up chapter fetch whose results `put_chapters` would
 /// then discard.
-pub async fn put_series(pool: &SqlitePool, m: &SuwayomiManga) -> Result<bool> {
+pub async fn put_series(pool: &Database, m: &SuwayomiManga) -> Result<bool> {
     let lang = m.source.as_ref().and_then(|s| s.lang.clone());
     // English-only backstop. Komika serves English only, but this cache is the
     // persistence chokepoint EVERY Suwayomi path funnels through — reader re-cache
@@ -255,7 +255,7 @@ fn derive_latest_chapter_at(chapters: &[SuwayomiChapter]) -> Option<String> {
 ///
 /// A manga that already carries a value (i.e. one read out of the cache) is left alone,
 /// and a series we have never chaptered stays `None` — never a clock value.
-pub async fn hydrate_latest_chapter_at(pool: &SqlitePool, m: &mut SuwayomiManga) {
+pub async fn hydrate_latest_chapter_at(pool: &Database, m: &mut SuwayomiManga) {
     if m.latest_chapter_at.is_some() {
         return;
     }
@@ -285,7 +285,7 @@ pub async fn hydrate_latest_chapter_at(pool: &SqlitePool, m: &mut SuwayomiManga)
 /// When the list HAS changed, the per-row INSERT loop is replaced by chunked multi-row
 /// INSERTs (measured 24.0 ms → 2.6 ms per 48-chapter series).
 pub async fn put_chapters(
-    pool: &SqlitePool,
+    pool: &Database,
     manga_id: i64,
     chapters: &[SuwayomiChapter],
 ) -> Result<()> {
@@ -455,7 +455,7 @@ pub async fn put_chapters(
 /// take the *scanner* down with it, and the scanner's chapter cache is what the reader
 /// actually serves from.
 pub(crate) async fn write_chapters_to_spine(
-    pool: &SqlitePool,
+    pool: &Database,
     manga_id: i64,
     chapters: &[SuwayomiChapter],
 ) -> Result<()> {
@@ -594,7 +594,7 @@ const SERIES_SELECT: &str = "SELECT id, title, thumbnail_url, author, artist, de
      FROM suwayomi_series";
 
 /// Load one cached series, or `None` on a cache miss.
-pub async fn get_series(pool: &SqlitePool, id: i64) -> Result<Option<SuwayomiManga>> {
+pub async fn get_series(pool: &Database, id: i64) -> Result<Option<SuwayomiManga>> {
     let row = sqlx::query_as::<_, SeriesRow>(&format!("{SERIES_SELECT} WHERE id = ?"))
         .bind(id)
         .fetch_optional(pool)
@@ -605,7 +605,7 @@ pub async fn get_series(pool: &SqlitePool, id: i64) -> Result<Option<SuwayomiMan
 /// Load one cached series together with whether its METADATA is still fresh (fetched
 /// within `SERIES_TTL_SECS`). `None` on a cache miss. The reader uses the flag to
 /// decide whether to revalidate upstream on a cache hit.
-pub async fn get_series_fresh(pool: &SqlitePool, id: i64) -> Result<Option<(SuwayomiManga, bool)>> {
+pub async fn get_series_fresh(pool: &Database, id: i64) -> Result<Option<(SuwayomiManga, bool)>> {
     let row = sqlx::query_as::<_, SeriesRow>(&format!("{SERIES_SELECT} WHERE id = ?"))
         .bind(id)
         .fetch_optional(pool)
@@ -633,7 +633,7 @@ pub async fn get_series_fresh(pool: &SqlitePool, id: i64) -> Result<Option<(Suwa
 ///
 /// `put_series` never touches either, so this still cleanly tracks chapter fetches
 /// rather than metadata fetches.
-pub async fn chapters_last_fetched(pool: &SqlitePool, manga_id: i64) -> Result<Option<String>> {
+pub async fn chapters_last_fetched(pool: &Database, manga_id: i64) -> Result<Option<String>> {
     let stored: Option<String> = sqlx::query_scalar::<_, Option<String>>(
         "SELECT MAX(updated_at) FROM suwayomi_chapter WHERE manga_id = ?",
     )
@@ -658,7 +658,7 @@ pub async fn chapters_last_fetched(pool: &SqlitePool, manga_id: i64) -> Result<O
 }
 
 /// Load the cached chapter list for a manga (source order: newest first by number).
-pub async fn get_chapters(pool: &SqlitePool, manga_id: i64) -> Result<Vec<SuwayomiChapter>> {
+pub async fn get_chapters(pool: &Database, manga_id: i64) -> Result<Vec<SuwayomiChapter>> {
     let rows = sqlx::query_as::<_, ChapterRow>(
         "SELECT id, manga_id, name, chapter_number, scanlator, upload_date, \
                 is_read, is_bookmarked, is_downloaded, last_page_read, page_count \
@@ -735,7 +735,7 @@ const NSFW_GATE_SQL: &str = "(? = 1 OR NOT EXISTS ( \
 /// had most of them stripped — `discovery` was observed live returning 0 POPULAR
 /// items and 1 TRENDING item, i.e. the home page looked broken rather than
 /// filtered. Filtering first means a full page is always returned.
-pub async fn library(pool: &SqlitePool, limit: i64, show_nsfw: bool) -> Result<Vec<SuwayomiManga>> {
+pub async fn library(pool: &Database, limit: i64, show_nsfw: bool) -> Result<Vec<SuwayomiManga>> {
     // Ordered by REAL newest-chapter time (migration 0050), not `last_fetched_at`
     // (= poll time). NULLs (no datable chapter yet) sort last automatically under DESC,
     // then id for a stable total order — matching idx_suwayomi_series_latest_chapter so
@@ -758,7 +758,7 @@ pub async fn library(pool: &SqlitePool, limit: i64, show_nsfw: bool) -> Result<V
 /// (recently-updated upstream): this is "what the catalogue gained most recently".
 /// `limit` caps the result. NSFW is gated in SQL before `LIMIT` — see {@link library}.
 pub async fn recently_added(
-    pool: &SqlitePool,
+    pool: &Database,
     limit: i64,
     show_nsfw: bool,
 ) -> Result<Vec<SuwayomiManga>> {
@@ -774,7 +774,7 @@ pub async fn recently_added(
 }
 
 /// How many series are cached (any). Lets `discovery` decide DB-vs-live.
-pub async fn count(pool: &SqlitePool) -> Result<i64> {
+pub async fn count(pool: &Database) -> Result<i64> {
     Ok(sqlx::query_scalar("SELECT COUNT(*) FROM suwayomi_series")
         .fetch_one(pool)
         .await?)
@@ -783,15 +783,18 @@ pub async fn count(pool: &SqlitePool) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use crate::database::TestPoolOptions;
 
-    async fn pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
+    async fn pool() -> Database {
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
@@ -1114,7 +1117,7 @@ mod tests {
     async fn latest_chapter_at_is_never_derived_from_our_clock() {
         let pool = pool().await;
         let mid = 777_101_i64;
-        let stored = |pool: SqlitePool| async move {
+        let stored = |pool: Database| async move {
             sqlx::query_scalar::<_, Option<String>>(
                 "SELECT latest_chapter_at FROM suwayomi_series WHERE id = ?",
             )
@@ -1227,7 +1230,7 @@ mod tests {
         let chs = [ch];
         put_chapters(&pool, mid, &chs).await.unwrap();
 
-        let series_row = |pool: SqlitePool| async move {
+        let series_row = |pool: Database| async move {
             sqlx::query_as::<_, (Option<String>, String)>(
                 "SELECT latest_chapter_at, updated_at FROM suwayomi_series WHERE id = ?",
             )
@@ -1236,7 +1239,7 @@ mod tests {
             .await
             .unwrap()
         };
-        let chapter_stamp = |pool: SqlitePool| async move {
+        let chapter_stamp = |pool: Database| async move {
             sqlx::query_scalar::<_, String>(
                 "SELECT MAX(updated_at) FROM suwayomi_chapter WHERE manga_id = ?",
             )
@@ -1299,7 +1302,7 @@ mod tests {
         ];
         put_chapters(&pool, mid, &chs).await.unwrap();
 
-        let stamp = |pool: SqlitePool| async move {
+        let stamp = |pool: Database| async move {
             let ch: Option<String> = sqlx::query_scalar(
                 "SELECT MAX(updated_at) FROM suwayomi_chapter WHERE manga_id = ?",
             )

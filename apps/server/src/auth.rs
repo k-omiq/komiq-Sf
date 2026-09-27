@@ -1,10 +1,10 @@
+use crate::db::Database;
 use anyhow::{anyhow, Result};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chrono::{DateTime, Utc};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
 
 /// A persisted user (row from `users`).
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -85,7 +85,7 @@ pub fn format_ts(t: DateTime<Utc>) -> String {
 /// Resolve the user a session token may ACT as: [`session_user_for_token`], minus
 /// accounts that still hold a temporary password. Those are anonymous to everything
 /// until they choose their own, so this is the lookup every handler uses.
-pub async fn user_for_token(pool: &SqlitePool, token: &str) -> Result<Option<User>> {
+pub async fn user_for_token(pool: &Database, token: &str) -> Result<Option<User>> {
     Ok(session_user_for_token(pool, token)
         .await?
         .filter(|u| u.must_change_password == 0))
@@ -96,7 +96,7 @@ pub async fn user_for_token(pool: &SqlitePool, token: &str) -> Result<Option<Use
 /// as are sessions whose `expires_at` is in the past or NULL. Includes accounts
 /// that must change their password first: only the session query and
 /// `changePassword` want those; everything else calls [`user_for_token`].
-pub async fn session_user_for_token(pool: &SqlitePool, token: &str) -> Result<Option<User>> {
+pub async fn session_user_for_token(pool: &Database, token: &str) -> Result<Option<User>> {
     let now = format_ts(Utc::now());
     // The column stores `sha256(token)` (hex), never the raw token — hash the
     // presented token the same way before looking it up.
@@ -120,7 +120,7 @@ mod tests {
 
     #[tokio::test]
     async fn username_guard_closes_races_without_merging_legacy_accounts() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        let pool = crate::database::TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
@@ -230,13 +230,16 @@ mod tests {
 
     #[tokio::test]
     async fn session_token_round_trips_and_is_stored_hashed() {
-        use sqlx::sqlite::SqlitePoolOptions;
-        let pool = SqlitePoolOptions::new()
+        use crate::database::TestPoolOptions;
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, created_at) \
              VALUES ('u1', 'alice', 'a@e', 'h', 't')",

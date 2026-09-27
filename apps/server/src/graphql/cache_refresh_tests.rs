@@ -5,12 +5,15 @@ use std::sync::{
 };
 
 async fn fixture() -> (AppState, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+    let pool = crate::database::TestPoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::migrate!("./migrations")
+        .run(pool.write())
+        .await
+        .unwrap();
     let requests = Arc::new(AtomicUsize::new(0));
     let count = requests.clone();
     let router = axum::Router::new().route(
@@ -193,6 +196,44 @@ async fn cold_cache_misses_still_fetch_and_persist_data() {
         .unwrap()
         .is_some());
     assert_eq!(requests.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn cold_cache_reads_return_while_the_writer_is_held() {
+    let (state, _, server) = fixture().await;
+    let writer = state.pool.begin().await.unwrap();
+    let manga = tokio::time::timeout(Duration::from_secs(2), resolve_series_cached(&state, 88005))
+        .await
+        .expect("metadata miss waited for its cache write")
+        .unwrap();
+    assert_eq!(manga.title, "Refreshed");
+    let chapters = tokio::time::timeout(
+        Duration::from_secs(2),
+        resolve_chapters_cached(&state, 88005),
+    )
+    .await
+    .expect("chapter miss waited for its cache write")
+    .unwrap();
+    assert_eq!(chapters[0].name, "New chapter");
+    writer.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let manga = crate::series_cache::get_series(&state.pool, 88005)
+                .await
+                .unwrap();
+            let chapters = crate::series_cache::get_chapters(&state.pool, 88005)
+                .await
+                .unwrap();
+            if manga.is_some() && !chapters.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("derived cache writes did not finish");
+    state.pool.close().await;
     server.abort();
 }
 

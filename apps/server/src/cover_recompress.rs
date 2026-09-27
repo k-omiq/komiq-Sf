@@ -49,9 +49,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::db::Database;
 use anyhow::Result;
 use chrono::Utc;
-use sqlx::SqlitePool;
 
 use crate::cover;
 
@@ -82,7 +82,7 @@ pub struct Progress {
 
 /// Read the stored cursor. A missing row means "never run" — start from before every
 /// possible `work_id`, i.e. the empty string.
-async fn load_cursor(covers: &SqlitePool) -> Result<Option<String>> {
+async fn load_cursor(covers: &Database) -> Result<Option<String>> {
     let row: Option<(String, i64)> =
         sqlx::query_as("SELECT cursor, done FROM cover_maintenance WHERE key = ?")
             .bind(CURSOR_KEY)
@@ -97,7 +97,7 @@ async fn load_cursor(covers: &SqlitePool) -> Result<Option<String>> {
 }
 
 /// Persist the cursor (and, at the end of the walk, the terminal `done` flag).
-async fn save_cursor(covers: &SqlitePool, cursor: &str, done: bool) -> Result<()> {
+async fn save_cursor(covers: &Database, cursor: &str, done: bool) -> Result<()> {
     sqlx::query(
         "INSERT INTO cover_maintenance (key, cursor, done, updated_at) VALUES (?, ?, ?, ?) \
          ON CONFLICT(key) DO UPDATE SET cursor = excluded.cursor, done = excluded.done, \
@@ -118,7 +118,7 @@ async fn save_cursor(covers: &SqlitePool, cursor: &str, done: bool) -> Result<()
 /// Never returns an error for a single bad row — a master that will not decode is left
 /// alone and the cursor moves past it, because a cover we cannot re-encode is still a
 /// cover we can serve.
-pub async fn run_batch(main: &SqlitePool, covers: &SqlitePool, batch: i64) -> Result<Progress> {
+pub async fn run_batch(main: &Database, covers: &Database, batch: i64) -> Result<Progress> {
     let Some(start) = load_cursor(covers).await? else {
         return Ok(Progress {
             finished: true,
@@ -221,8 +221,8 @@ pub async fn run_batch(main: &SqlitePool, covers: &SqlitePool, batch: i64) -> Re
 /// only shared write is `work.cover_cached_version`, where two replicas agreeing on
 /// "some fresh version" is all the correctness the `?v=` bust needs.
 pub fn spawn(
-    main: SqlitePool,
-    covers: SqlitePool,
+    main: Database,
+    covers: Database,
     interval_secs: u64,
     batch: i64,
     shutdown: tokio::sync::watch::Receiver<bool>,
@@ -244,8 +244,8 @@ pub fn spawn(
 }
 
 async fn run_loop(
-    main: SqlitePool,
-    covers: SqlitePool,
+    main: Database,
+    covers: Database,
     interval_secs: u64,
     batch: i64,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -334,8 +334,8 @@ mod tests {
     }
 
     /// Main DB with the version pointer and materialized URLs `put_work_cover` publishes.
-    async fn main_db() -> SqlitePool {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    async fn main_db() -> Database {
+        let pool = Database::connect("sqlite::memory:").await.unwrap();
         sqlx::query("CREATE TABLE work (id TEXT PRIMARY KEY, cover_cached_version INTEGER)")
             .execute(&pool)
             .await
@@ -352,8 +352,8 @@ mod tests {
     }
 
     /// Covers DB with the two tables this pass reads and writes.
-    async fn covers_db() -> SqlitePool {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    async fn covers_db() -> Database {
+        let pool = Database::connect("sqlite::memory:").await.unwrap();
         for ddl in [
             "CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, \
              version INTEGER NOT NULL, updated_at TEXT NOT NULL)",
@@ -367,7 +367,7 @@ mod tests {
         pool
     }
 
-    async fn insert_master(main: &SqlitePool, covers: &SqlitePool, id: &str, webp: &[u8]) {
+    async fn insert_master(main: &Database, covers: &Database, id: &str, webp: &[u8]) {
         sqlx::query("INSERT INTO work (id, cover_cached_version) VALUES (?, 1)")
             .bind(id)
             .execute(main)
@@ -384,7 +384,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn stored(covers: &SqlitePool, id: &str) -> Vec<u8> {
+    async fn stored(covers: &Database, id: &str) -> Vec<u8> {
         sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id = ?")
             .bind(id)
             .fetch_one(covers)

@@ -7,7 +7,7 @@
 //! Writes follow the fire-and-forget pattern of `log_activity`: a notification must
 //! never fail the mutation that triggered it, so errors are logged and swallowed.
 
-use sqlx::SqlitePool;
+use crate::db::Database;
 
 /// Like counts that produce a `like_milestone` notification. The first like (1) doubles
 /// as the "someone liked your comment" signal; the rest celebrate growth without a
@@ -20,7 +20,7 @@ pub const LIKE_MILESTONES: &[i64] = &[1, 5, 10, 25, 50, 100, 250, 500, 1000, 250
 /// deep-linking; `count` is the milestone value (`like_milestone` only).
 #[allow(clippy::too_many_arguments)]
 pub async fn record(
-    pool: &SqlitePool,
+    pool: &Database,
     recipient_id: &str,
     kind: &str,
     actor_id: Option<&str>,
@@ -55,7 +55,7 @@ pub async fn record(
 /// no-op via `INSERT OR IGNORE`, so concurrent likes crossing the same milestone — or a
 /// like that re-crosses it after an unlike — notify exactly once. Fire-and-forget.
 pub async fn record_like_milestone(
-    pool: &SqlitePool,
+    pool: &Database,
     recipient_id: &str,
     comment_id: &str,
     target_type: &str,

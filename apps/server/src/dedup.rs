@@ -15,8 +15,8 @@
 
 use std::collections::HashSet;
 
+use crate::db::Database;
 use anyhow::Result;
-use sqlx::SqlitePool;
 
 use crate::catalog::{
     self,
@@ -69,7 +69,7 @@ const FUZZY_BLOCK_LIMIT: i64 = 50;
 /// wasn't the longest; unioning the top-N candidate sets closes that recall gap.
 const FUZZY_BLOCK_TOKENS: usize = 3;
 /// Resolve `cand` against the canonical works in `pool`.
-pub async fn resolve(pool: &SqlitePool, cand: &Candidate) -> Result<Decision> {
+pub async fn resolve(pool: &Database, cand: &Candidate) -> Result<Decision> {
     resolve_ex(pool, cand, None).await
 }
 
@@ -78,7 +78,7 @@ pub async fn resolve(pool: &SqlitePool, cand: &Candidate) -> Result<Decision> {
 /// where the work's own title is one of its aliases — without excluding it, the work
 /// would always "match itself". `None` is the normal add-time path.
 pub async fn resolve_ex(
-    pool: &SqlitePool,
+    pool: &Database,
     cand: &Candidate,
     exclude_work_id: Option<&str>,
 ) -> Result<Decision> {
@@ -374,13 +374,16 @@ mod tests {
     use super::*;
     use crate::catalog::{Alias, WorkInput};
 
-    async fn pool() -> SqlitePool {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    async fn pool() -> Database {
+        let pool = Database::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
-    async fn seed_slime(pool: &SqlitePool) -> String {
+    async fn seed_slime(pool: &Database) -> String {
         let input = WorkInput {
             primary_title: Some("That Time I Got Reincarnated as a Slime".into()),
             description: Some(

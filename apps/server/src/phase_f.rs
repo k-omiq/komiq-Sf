@@ -58,9 +58,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::db::Database;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use sqlx::SqlitePool;
 
 /// The Suwayomi extension package that backs every `all.mangadex` source id.
 pub const ALL_MANGADEX_PKG: &str = "eu.kanade.tachiyomi.extension.all.mangadex";
@@ -140,7 +140,7 @@ fn is_uuid(s: &str) -> bool {
 /// Read from `source_extension` (refreshed daily by `scanner::record_source_extensions`)
 /// rather than hardcoded, so a language source added upstream is excluded the day it is
 /// recorded.
-pub async fn all_mangadex_source_ids(pool: &SqlitePool) -> Result<Vec<String>> {
+pub async fn all_mangadex_source_ids(pool: &Database) -> Result<Vec<String>> {
     let ids = sqlx::query_scalar::<_, String>(
         "SELECT source_id FROM source_extension WHERE pkg_name = ? ORDER BY source_id",
     )
@@ -156,7 +156,7 @@ pub async fn all_mangadex_source_ids(pool: &SqlitePool) -> Result<Vec<String>> {
 /// Returned as a set (not a filter closure) so the caller can log the size — a silent
 /// exclusion that quietly matched nothing is exactly the failure mode §4.12 documents
 /// for the suryascans uninstall.
-pub async fn enrolment_excluded_source_ids(pool: &SqlitePool) -> Result<HashSet<String>> {
+pub async fn enrolment_excluded_source_ids(pool: &Database) -> Result<HashSet<String>> {
     Ok(all_mangadex_source_ids(pool).await?.into_iter().collect())
 }
 
@@ -200,7 +200,7 @@ pub struct UuidReport {
 /// `all_mangadex_uuid` ledger (survives the delete) and `source_series.source_url` (dies
 /// with the row, but makes the mapping legible in place while it lives).
 pub async fn record_uuids(
-    pool: &SqlitePool,
+    pool: &Database,
     uuid_by_suwayomi_key: &HashMap<String, String>,
     apply: Apply,
 ) -> Result<UuidReport> {
@@ -415,7 +415,7 @@ impl ClassifiedRow {
 /// LEFT JOIN on `all_mangadex_uuid`, deliberately: a row whose UUID was never resolved
 /// must appear as [`Verdict::Unresolved`] rather than vanish from the report. A row that
 /// is missing from the classification is a row nobody proved anything about.
-pub async fn classify(pool: &SqlitePool) -> Result<Vec<ClassifiedRow>> {
+pub async fn classify(pool: &Database) -> Result<Vec<ClassifiedRow>> {
     let ids = all_mangadex_source_ids(pool).await?;
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -568,7 +568,7 @@ impl GateReport {
 /// merges the anchorless works out of existence, so they cannot be verified as having
 /// anything — and unsafe: 54 rows satisfy it while pointing at a different MangaDex
 /// entry, and deleting them cascades 4,178 chapters.
-pub async fn gate(pool: &SqlitePool) -> Result<GateReport> {
+pub async fn gate(pool: &Database) -> Result<GateReport> {
     let rows = classify(pool).await?;
     let mut report = GateReport::default();
     for r in rows {
@@ -640,8 +640,8 @@ pub struct StepReport {
 /// [`split_mismatched`], which re-points it onto its own UUID's owner. Composing the two
 /// steps resolves all 496 without either one having to guess.
 pub async fn merge_anchorless(
-    pool: &SqlitePool,
-    covers: Option<&SqlitePool>,
+    pool: &Database,
+    covers: Option<&Database>,
     apply: Apply,
 ) -> Result<StepReport> {
     let rows = classify(pool).await?;
@@ -756,7 +756,7 @@ pub async fn merge_anchorless(
 /// out `disposition = 'split'` unless separately opted in) — §8g's step 4 says do not
 /// delete them, and a re-point does not by itself prove per-chapter-key parity with the
 /// direct anchor.
-pub async fn split_mismatched(pool: &SqlitePool, apply: Apply) -> Result<StepReport> {
+pub async fn split_mismatched(pool: &Database, apply: Apply) -> Result<StepReport> {
     let rows = classify(pool).await?;
     let mismatched: Vec<ClassifiedRow> = rows
         .into_iter()
@@ -897,7 +897,7 @@ pub struct DeleteReport {
 /// not `/covers/`), and removing the series from Suwayomi's own library is the owner's
 /// separate, engine-side step.
 pub async fn delete_redundant(
-    pool: &SqlitePool,
+    pool: &Database,
     apply: Apply,
     confirm: Option<&str>,
     include_split: bool,
@@ -992,8 +992,8 @@ pub async fn delete_redundant(
 ///   * `split`   — step 4.
 ///   * `delete`  — the destructive step; needs `--apply --confirm <token>`.
 pub async fn run_cli(
-    pool: &SqlitePool,
-    covers: Option<&SqlitePool>,
+    pool: &Database,
+    covers: Option<&Database>,
     suwayomi_url: &str,
     args: &[String],
 ) -> Result<()> {
@@ -1164,9 +1164,12 @@ mod tests {
     /// from the DDL production actually applies.
     const MIGRATION_0096: &str = include_str!("../migrations/0096_all_mangadex_uuid.sql");
 
-    async fn pool() -> SqlitePool {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    async fn pool() -> Database {
+        let pool = Database::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
@@ -1212,7 +1215,7 @@ mod tests {
 
     /// A miniature of production: one redundant row, one mismatch row (its work has an
     /// anchor, for a different entry), one anchorless row, one unresolved row.
-    async fn fixture() -> SqlitePool {
+    async fn fixture() -> Database {
         let pool = pool().await;
         sqlx::query(
             "INSERT INTO source_extension (source_id, pkg_name, repo_url, updated_at) \
@@ -1618,7 +1621,7 @@ mod tests {
             // into an hour. Production's pool keeps NORMAL (see `db::init`).
             .synchronous(sqlx::sqlite::SqliteSynchronous::Off)
             .busy_timeout(std::time::Duration::from_secs(30));
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        let pool = crate::database::TestPoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
             .await

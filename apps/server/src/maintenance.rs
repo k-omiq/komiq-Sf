@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use sqlx::SqlitePool;
+use crate::db::Database;
 use tokio::sync::watch;
 
 use crate::{graphql::AppState, suwayomi::SuwayomiClient};
@@ -60,7 +60,7 @@ pub struct UpdateLogEntry {
     pub error: Option<String>,
 }
 
-pub async fn recent_updates(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<UpdateLogEntry>> {
+pub async fn recent_updates(pool: &Database, limit: i64) -> anyhow::Result<Vec<UpdateLogEntry>> {
     Ok(sqlx::query_as::<_, UpdateLogEntry>(
         "SELECT at, pkg_name, from_version, to_version, origin, error \
            FROM extension_update_log ORDER BY id DESC LIMIT ?",
@@ -71,7 +71,7 @@ pub async fn recent_updates(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec
 }
 
 async fn log_attempts(
-    pool: &SqlitePool,
+    pool: &Database,
     attempts: &[UpdateAttempt],
     origin: &str,
 ) -> anyhow::Result<()> {

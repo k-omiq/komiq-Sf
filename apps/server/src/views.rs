@@ -27,8 +27,8 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
+use crate::db::Database;
 use anyhow::Result;
-use sqlx::SqlitePool;
 
 /// Retention for hourly buckets — the widest query window (7 days). Older buckets are
 /// swept by [`prune_buckets`]; the all-time `series_views` total is never pruned.
@@ -70,7 +70,7 @@ fn current_hour() -> i64 {
 /// its pre/post views across the two keys. Fully unifying those would need a persistent
 /// canonical-source-per-work concept; single-source works (the common case) unify
 /// exactly.
-pub async fn view_key(pool: &SqlitePool, series_id: &str) -> String {
+pub async fn view_key(pool: &Database, series_id: &str) -> String {
     if !series_id.is_empty() && series_id.bytes().all(|b| b.is_ascii_digit()) {
         return series_id.to_string();
     }
@@ -177,7 +177,7 @@ static GLOBAL_BUFFER: LazyLock<ViewBuffer> = LazyLock::new(ViewBuffer::new);
 /// seconds. Only when the buffer is full (shouldn't happen at sane traffic — see
 /// [`BUFFER_MAX_KEYS`]) does this fall back to the old direct write, so a view is
 /// never silently dropped while the DB is up.
-pub async fn record(pool: &SqlitePool, series_id: &str) -> Result<()> {
+pub async fn record(pool: &Database, series_id: &str) -> Result<()> {
     // Under `cargo test`, write through synchronously: integration tests assert
     // counts right after the mutation, and the PROCESS-GLOBAL buffer would leak
     // views across parallel tests' separate pools. The buffered path is covered by
@@ -196,7 +196,7 @@ pub async fn record(pool: &SqlitePool, series_id: &str) -> Result<()> {
 
 /// [`record`] against an explicit buffer (unit tests use a private one so parallel
 /// tests don't cross-contaminate through the global).
-async fn record_with(buf: &ViewBuffer, pool: &SqlitePool, series_id: &str) -> Result<()> {
+async fn record_with(buf: &ViewBuffer, pool: &Database, series_id: &str) -> Result<()> {
     let hour = current_hour();
     if buf.push_at(series_id, hour) {
         return Ok(());
@@ -210,17 +210,17 @@ async fn record_with(buf: &ViewBuffer, pool: &SqlitePool, series_id: &str) -> Re
 /// Drain the global buffer and persist it in one transaction. Called by the background
 /// flusher every tick and once more on graceful shutdown. On error the drained views
 /// are merged back for the next tick's retry.
-pub async fn flush(pool: &SqlitePool) -> Result<usize> {
+pub async fn flush(pool: &Database) -> Result<usize> {
     flush_buffer(&GLOBAL_BUFFER, pool).await
 }
 
-async fn flush_buffer(buf: &ViewBuffer, pool: &SqlitePool) -> Result<usize> {
+async fn flush_buffer(buf: &ViewBuffer, pool: &Database) -> Result<usize> {
     let drained = buf.drain();
     if drained.is_empty() {
         return Ok(0);
     }
     let n = drained.len();
-    match write_batch(pool, drained.clone()).await {
+    match crate::db::retry_transaction(|| write_batch(pool, drained.clone())).await {
         Ok(()) => Ok(n),
         Err(e) => {
             buf.merge_back(drained);
@@ -235,7 +235,7 @@ async fn flush_buffer(buf: &ViewBuffer, pool: &SqlitePool) -> Result<usize> {
 /// instead of once per view as the old per-view `record` did. Distinct raw ids that
 /// normalise to the same view key (a `w_` work and its numeric Suwayomi source) are
 /// summed before writing so the upsert count matches the old per-view arithmetic.
-async fn write_batch(pool: &SqlitePool, views: HashMap<(String, i64), i64>) -> Result<()> {
+async fn write_batch(pool: &Database, views: HashMap<(String, i64), i64>) -> Result<()> {
     // Resolve raw ids -> normalised keys (reads, outside the write transaction).
     let mut key_of: HashMap<String, String> = HashMap::new();
     for (series_id, _) in views.keys() {
@@ -282,7 +282,7 @@ async fn write_batch(pool: &SqlitePool, views: HashMap<(String, i64), i64>) -> R
 /// shutdown. Panic-supervised like the other background loops. The returned handle
 /// lets `main` await the final flush before the process exits.
 pub fn spawn_flusher(
-    pool: SqlitePool,
+    pool: Database,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(crate::task::supervise(
@@ -293,7 +293,7 @@ pub fn spawn_flusher(
     ))
 }
 
-async fn run_flush_loop(pool: SqlitePool, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+async fn run_flush_loop(pool: Database, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut tick = tokio::time::interval(Duration::from_secs(FLUSH_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -321,7 +321,7 @@ async fn run_flush_loop(pool: SqlitePool, mut shutdown: tokio::sync::watch::Rece
 /// by per-row `CASE`s. Since 7d ⊇ 24h, the row filter bounds to the 7d cutoff and the 24h
 /// `CASE` narrows within it. This is 2 awaits (`view_key` + this) instead of the former 4 —
 /// every `Series.views` resolver in a feed pays the difference per item.
-pub async fn counts_for(pool: &SqlitePool, series_id: &str) -> ViewCounts {
+pub async fn counts_for(pool: &Database, series_id: &str) -> ViewCounts {
     let key = view_key(pool, series_id).await;
     let hour = current_hour();
     let since24h = hour - 24;
@@ -353,7 +353,7 @@ pub async fn counts_for(pool: &SqlitePool, series_id: &str) -> ViewCounts {
 /// The most-viewed series keys over the last 24 hours, most-viewed first — the ranking
 /// behind Trending. Returns up to `limit` `(series_key, views)` pairs; empty until reads
 /// accumulate (the caller pads a cold-start list with another feed).
-pub async fn trending_keys(pool: &SqlitePool, limit: i64) -> Result<Vec<(String, i64)>> {
+pub async fn trending_keys(pool: &Database, limit: i64) -> Result<Vec<(String, i64)>> {
     let hour = current_hour();
     let rows = sqlx::query_as::<_, (String, i64)>(
         "SELECT series_key, SUM(views) AS v FROM series_view_bucket \
@@ -371,7 +371,7 @@ pub async fn trending_keys(pool: &SqlitePool, limit: i64) -> Result<Vec<(String,
 /// boundary uses `<=` to match the windows' strict `hour_ts > now - N` — the bucket at
 /// exactly `now - RETENTION` is never summed by any window, so it's pruned rather than
 /// kept forever.
-pub async fn prune_buckets(pool: &SqlitePool) -> Result<u64> {
+pub async fn prune_buckets(pool: &Database) -> Result<u64> {
     let cutoff = current_hour() - BUCKET_RETENTION_HOURS;
     let r = sqlx::query("DELETE FROM series_view_bucket WHERE hour_ts <= ?")
         .bind(cutoff)
@@ -384,16 +384,19 @@ pub async fn prune_buckets(pool: &SqlitePool) -> Result<u64> {
 mod tests {
     use super::*;
 
-    async fn pool() -> SqlitePool {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    async fn pool() -> Database {
+        let pool = Database::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
     /// Record + immediately flush through a PRIVATE buffer. Tests never touch the
     /// global buffer — `cargo test` runs tests in parallel in one process, and views
     /// buffered by one test must not flush into another test's pool.
-    async fn record_flushed(pool: &SqlitePool, series_id: &str) {
+    async fn record_flushed(pool: &Database, series_id: &str) {
         let buf = ViewBuffer::new();
         record_with(&buf, pool, series_id).await.unwrap();
         flush_buffer(&buf, pool).await.unwrap();
@@ -529,7 +532,7 @@ mod tests {
     async fn failed_flush_keeps_views_for_retry() {
         // Flush into a pool with NO tables (migrations never ran): the write fails,
         // and the drained views must be merged back rather than lost.
-        let broken = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let broken = Database::connect("sqlite::memory:").await.unwrap();
         let buf = ViewBuffer::new();
         record_with(&buf, &broken, "42").await.unwrap();
         record_with(&buf, &broken, "42").await.unwrap();

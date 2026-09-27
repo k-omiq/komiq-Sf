@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use sqlx::SqlitePool;
+use crate::db::Database;
 
 /// Staged (unlinked) uploads older than this are swept. A user posting a comment
 /// always links its image within seconds, so a day is a generous grace period for
@@ -23,7 +23,7 @@ const STAGED_TTL_HOURS: i64 = 24;
 const SWEEP_INTERVAL_SECS: u64 = 3600;
 
 /// Spawn the recurring GC sweep. Runs until `shutdown` resolves.
-pub fn spawn(pool: SqlitePool, covers: SqlitePool, shutdown: tokio::sync::watch::Receiver<bool>) {
+pub fn spawn(pool: Database, covers: Database, shutdown: tokio::sync::watch::Receiver<bool>) {
     // Panic-supervised (crate::task::supervise): a panic in `sweep` used to end the GC
     // job silently for the process lifetime, letting the staged-media BLOB store grow
     // unbounded. `factory` re-clones the pools + shutdown handle on each restart.
@@ -36,8 +36,8 @@ pub fn spawn(pool: SqlitePool, covers: SqlitePool, shutdown: tokio::sync::watch:
 }
 
 async fn run_loop(
-    pool: SqlitePool,
-    covers: SqlitePool,
+    pool: Database,
+    covers: Database,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     // Start 150s behind the scanner so the boot burst is spread across the five
@@ -67,7 +67,7 @@ async fn run_loop(
 /// Delete staged (`comment_id IS NULL`) comment-media rows older than the TTL.
 /// Best-effort: any error is logged and swallowed so a transient DB blip doesn't
 /// kill the sweep loop.
-async fn sweep(pool: &SqlitePool) {
+async fn sweep(pool: &Database) {
     // created_at is written as `chrono::Utc::now().to_rfc3339()`, so a UTC RFC-3339
     // cutoff compares correctly against it lexically.
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(STAGED_TTL_HOURS)).to_rfc3339();
@@ -196,8 +196,8 @@ const COVER_MAX_ORPHAN_PCT: u64 = 25;
 /// (the store stops growing) — reclaiming the disk itself would need a `VACUUM`, which
 /// rewrites all 20.5 GB and is deliberately not done here.
 async fn sweep_cover_blobs(
-    pool: &SqlitePool,
-    covers: &SqlitePool,
+    pool: &Database,
+    covers: &Database,
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) {
     let cutoff =
@@ -221,7 +221,7 @@ async fn sweep_cover_blobs(
 /// Drop every derivative of the given cover keys. Called right after a master is
 /// reclaimed: `cover_variant` lives in the same file with no foreign key, so nothing
 /// else would ever remove these rows. A no-op on an empty slice.
-async fn purge_cover_variants<K>(covers: &SqlitePool, keys: &[K]) -> anyhow::Result<()>
+async fn purge_cover_variants<K>(covers: &Database, keys: &[K]) -> anyhow::Result<()>
 where
     K: AsRef<str>,
 {
@@ -241,8 +241,8 @@ where
 }
 
 async fn sweep_work_cover_blobs(
-    pool: &SqlitePool,
-    covers: &SqlitePool,
+    pool: &Database,
+    covers: &Database,
     cutoff: &str,
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<u64> {
@@ -356,7 +356,7 @@ fn orphan_rate_sane(orphans: usize, sampled: usize) -> bool {
 }
 
 /// Of `ids`, those with no `work` row. One `IN (...)` probe per batch.
-async fn missing_work_ids(pool: &SqlitePool, ids: &[String]) -> anyhow::Result<Vec<String>> {
+async fn missing_work_ids(pool: &Database, ids: &[String]) -> anyhow::Result<Vec<String>> {
     if ids.is_empty() {
         return Ok(Vec::new()); // `IN ()` is a syntax error; never build it
     }
@@ -379,7 +379,7 @@ async fn missing_work_ids(pool: &SqlitePool, ids: &[String]) -> anyhow::Result<V
 /// Of `ids`, those with no `suwayomi_series` row. Bound as `?` parameters rather than
 /// interpolated: the SQL text is then identical for every full batch, so sqlx's prepared
 /// statement cache holds ONE entry instead of one per batch.
-async fn missing_series_ids(pool: &SqlitePool, ids: &[i64]) -> anyhow::Result<Vec<i64>> {
+async fn missing_series_ids(pool: &Database, ids: &[i64]) -> anyhow::Result<Vec<i64>> {
     if ids.is_empty() {
         return Ok(Vec::new()); // `IN ()` is a syntax error; never build it
     }
@@ -400,8 +400,8 @@ async fn missing_series_ids(pool: &SqlitePool, ids: &[i64]) -> anyhow::Result<Ve
 }
 
 async fn sweep_suwayomi_cover_blobs(
-    pool: &SqlitePool,
-    covers: &SqlitePool,
+    pool: &Database,
+    covers: &Database,
     cutoff: &str,
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<u64> {
@@ -500,25 +500,28 @@ async fn sweep_suwayomi_cover_blobs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use crate::database::TestPoolOptions;
 
     /// Main DB with the real schema. `max_connections(1)` because a `sqlite::memory:`
     /// pool gives every connection its OWN empty database.
-    async fn main_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
+    async fn main_pool() -> Database {
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
     /// Covers DB, schema copied from `db::init_covers` (which can't be reused here: it
     /// opens a 4-connection pool, and four `sqlite::memory:` connections are four
     /// different databases).
-    async fn covers_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
+    async fn covers_pool() -> Database {
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
@@ -538,7 +541,7 @@ mod tests {
 
     /// `w_%05d` works for `lo..hi`, generated in SQL so a 10k-row fixture is one
     /// statement rather than 10k round trips.
-    async fn seed_works(pool: &SqlitePool, lo: i64, hi: i64) {
+    async fn seed_works(pool: &Database, lo: i64, hi: i64) {
         sqlx::query(
             "INSERT INTO work (id, primary_title, created_at, updated_at) \
              WITH RECURSIVE n(i) AS (SELECT ? UNION ALL SELECT i + 1 FROM n WHERE i < ?) \
@@ -552,7 +555,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn seed_work_blobs(covers: &SqlitePool, lo: i64, hi: i64, updated_at: &str) {
+    async fn seed_work_blobs(covers: &Database, lo: i64, hi: i64, updated_at: &str) {
         sqlx::query(
             "INSERT INTO work_cover_blob (work_id, webp, version, updated_at) \
              WITH RECURSIVE n(i) AS (SELECT ? UNION ALL SELECT i + 1 FROM n WHERE i < ?) \
@@ -566,7 +569,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn blob_count(covers: &SqlitePool) -> i64 {
+    async fn blob_count(covers: &Database) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_blob")
             .fetch_one(covers)
             .await

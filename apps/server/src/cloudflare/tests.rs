@@ -7,6 +7,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::database::TestPoolOptions;
+use crate::db::Database;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
@@ -15,8 +17,6 @@ use axum::Router;
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use serde_json::{json, Value};
-use sqlx::sqlite::SqlitePoolOptions;
-use sqlx::SqlitePool;
 
 use super::origin_tls::{der_bit_string, der_ecdsa_sha256, der_name, der_san_extension, pem};
 use super::*;
@@ -481,13 +481,16 @@ impl TestCa {
 
 // ---- harness -----------------------------------------------------------------
 
-async fn pool() -> SqlitePool {
-    let pool = SqlitePoolOptions::new()
+async fn pool() -> Database {
+    let pool = TestPoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::migrate!("./migrations")
+        .run(pool.write())
+        .await
+        .unwrap();
     pool
 }
 
@@ -561,7 +564,7 @@ fn options_with_ports(
     }
 }
 
-fn manager(pool: &SqlitePool, opts: Options, trusted: Arc<crate::TrustedProxies>) -> Arc<Manager> {
+fn manager(pool: &Database, opts: Options, trusted: Arc<crate::TrustedProxies>) -> Arc<Manager> {
     let m = Arc::new(Manager::new(pool.clone(), opts, trusted));
     m.set_router(Router::new().route("/health", axum::routing::get(|| async { "ok" })));
     m

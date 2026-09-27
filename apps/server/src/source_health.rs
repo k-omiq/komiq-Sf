@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
+use crate::db::Database;
 use anyhow::Result;
-use sqlx::SqlitePool;
 
 /// Retention for the hourly buckets — the widest window the admin surface asks for.
 pub const BUCKET_RETENTION_HOURS: i64 = 24 * 7;
@@ -304,11 +304,11 @@ pub fn observe<T, E: std::fmt::Display>(
 
 /// Drain the global buffer and persist it. Called by the flusher every tick and once
 /// more on graceful shutdown.
-pub async fn flush(pool: &SqlitePool) -> Result<usize> {
+pub async fn flush(pool: &Database) -> Result<usize> {
     flush_buffer(&GLOBAL_BUFFER, pool).await
 }
 
-async fn flush_buffer(buf: &Buffer, pool: &SqlitePool) -> Result<usize> {
+async fn flush_buffer(buf: &Buffer, pool: &Database) -> Result<usize> {
     let drained = buf.drain();
     if drained.is_empty() {
         return Ok(0);
@@ -385,7 +385,7 @@ async fn flush_buffer(buf: &Buffer, pool: &SqlitePool) -> Result<usize> {
 /// Spawn the background flusher: drains the buffer every [`FLUSH_INTERVAL_SECS`], and
 /// once more when the shutdown watch flips. Panic-supervised like the other loops.
 pub fn spawn_flusher(
-    pool: SqlitePool,
+    pool: Database,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(crate::task::supervise(
@@ -396,7 +396,7 @@ pub fn spawn_flusher(
     ))
 }
 
-async fn run_flush_loop(pool: SqlitePool, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+async fn run_flush_loop(pool: Database, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut tick = tokio::time::interval(Duration::from_secs(FLUSH_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -417,7 +417,7 @@ async fn run_flush_loop(pool: SqlitePool, mut shutdown: tokio::sync::watch::Rece
 }
 
 /// Delete buckets past [`BUCKET_RETENTION_HOURS`]. Called by the GC sweep.
-pub async fn prune_buckets(pool: &SqlitePool) -> Result<u64> {
+pub async fn prune_buckets(pool: &Database) -> Result<u64> {
     let cutoff = chrono::Utc::now().timestamp() / 3600 - BUCKET_RETENTION_HOURS;
     let r = sqlx::query("DELETE FROM source_health_bucket WHERE hour_ts <= ?")
         .bind(cutoff)
@@ -443,7 +443,7 @@ pub struct Stat {
 ///
 /// `last_message` rides on the single `MAX(last_at)`: with exactly one min/max aggregate
 /// SQLite takes the bare columns from the row that holds it, i.e. the newest bucket.
-pub async fn stats(pool: &SqlitePool, hours: i64) -> Result<Vec<Stat>> {
+pub async fn stats(pool: &Database, hours: i64) -> Result<Vec<Stat>> {
     let since = chrono::Utc::now().timestamp() / 3600 - hours.clamp(1, BUCKET_RETENTION_HOURS);
     Ok(sqlx::query_as::<_, Stat>(
         "SELECT source_id, surface, reason, SUM(count) AS count, \
@@ -502,7 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_charges_a_manga_to_its_source_and_stats_sum_the_window() {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let pool = Database::connect("sqlite::memory:").await.unwrap();
         sqlx::query(
             "CREATE TABLE source_series (source_type TEXT, source_key TEXT, source_id TEXT)",
         )

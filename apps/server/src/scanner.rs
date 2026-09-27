@@ -48,9 +48,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use crate::db::Database;
 use chrono::{DateTime, Utc};
 use rand_core::RngCore;
-use sqlx::SqlitePool;
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::{interval, interval_at, MissedTickBehavior};
 
@@ -507,7 +507,7 @@ const SCAN_STATE_SELECT: &str =
 /// due ids directly and `record_scan` re-reads state in its own transaction, so this
 /// standalone pooled read is now only used by tests.
 #[cfg(test)]
-pub async fn scan_state(pool: &SqlitePool, series_id: &str) -> Option<ScanState> {
+pub async fn scan_state(pool: &Database, series_id: &str) -> Option<ScanState> {
     sqlx::query_as::<_, ScanState>(SCAN_STATE_SELECT)
         .bind(series_id)
         .fetch_optional(pool)
@@ -528,7 +528,7 @@ struct ScanAdmin {
     status_override: Option<String>,
 }
 
-async fn scan_admin(pool: &SqlitePool, series_id: &str) -> ScanAdmin {
+async fn scan_admin(pool: &Database, series_id: &str) -> ScanAdmin {
     sqlx::query_as::<_, ScanAdmin>(
         "SELECT override_interval_hours, poll_every_minutes, paused_override, status_override \
          FROM series_admin WHERE series_id = ?",
@@ -742,7 +742,7 @@ pub(crate) async fn record_source_extensions(state: &AppState) {
 }
 
 /// Write one extension's `source_extension` rows (one per source it provides).
-async fn record_extension(pool: &SqlitePool, ext: &crate::suwayomi::SuwayomiExtension) {
+async fn record_extension(pool: &Database, ext: &crate::suwayomi::SuwayomiExtension) {
     // An extension with no repo can't be installed from coordinates; skip it.
     let Some(repo_url) = ext.repo.clone() else {
         return;
@@ -924,7 +924,7 @@ const ERROR_BACKOFF_BASE_MINUTES: i64 = 30;
 /// How many times to re-run the whole `record_scan` transaction when it fails with a
 /// transient SQLite lock. Mirrors `mangadex::UPSERT_LOCK_RETRIES` — the same
 /// contention, from the other side of the single writer.
-const SCAN_LOCK_RETRIES: u32 = 4;
+
 /// Cap on the error-backoff so a permanently-failing series stops growing its delay and
 /// settles into a daily re-check (it might come back). Independent of `PAUSED_PARK_HOURS`:
 /// a dead/erroring id is retried ~daily, more often than a genuinely paused series' 14-day
@@ -964,7 +964,7 @@ struct TickOutcome {
 /// Library-wide variant, retained as the scheduling tests' oracle; production sharded onto
 /// `due_series_ids_for_source` in Phase E3.
 #[cfg(test)]
-async fn due_series_ids(pool: &SqlitePool, now_iso: &str, limit: i64) -> Vec<String> {
+async fn due_series_ids(pool: &Database, now_iso: &str, limit: i64) -> Vec<String> {
     sqlx::query_scalar::<_, String>(
         "SELECT series_id FROM series_scan_state \
          WHERE next_scan_at <= ? \
@@ -989,7 +989,7 @@ async fn due_series_ids(pool: &SqlitePool, now_iso: &str, limit: i64) -> Vec<Str
 /// range seek off `idx_scan_state_next_scan`), and self-extinguishing: once the tail is
 /// drained the subselect matches nothing and this is a no-op. Non-fatal — a failure is
 /// logged and the tick proceeds. Returns how many rows were reclaimed.
-async fn reclaim_absurd_schedules(pool: &SqlitePool, now: DateTime<Utc>) -> u64 {
+async fn reclaim_absurd_schedules(pool: &Database, now: DateTime<Utc>) -> u64 {
     let horizon = (now + chrono::Duration::hours(ABSURD_HORIZON_HOURS)).to_rfc3339();
     // Spread over the next hour so a reclaimed cohort doesn't arrive as one herd.
     let res = sqlx::query(
@@ -1024,7 +1024,7 @@ async fn reclaim_absurd_schedules(pool: &SqlitePool, now: DateTime<Utc>) -> u64 
 }
 
 /// Count of tracked series — the health snapshot's "library size".
-async fn scan_state_count(pool: &SqlitePool) -> usize {
+async fn scan_state_count(pool: &Database) -> usize {
     sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM series_scan_state")
         .fetch_one(pool)
         .await
@@ -1174,35 +1174,17 @@ impl FailureKind {
 /// increment), but there is no reason for it to be the odd one out, and the IMMEDIATE
 /// lock is what lets `busy_timeout` absorb contention instead of returning BUSY_SNAPSHOT.
 async fn record_scan_failure(
-    pool: &SqlitePool,
+    pool: &Database,
     series_id: &str,
     now: DateTime<Utc>,
     kind: FailureKind,
 ) -> anyhow::Result<()> {
-    let mut delay_ms = 50_u64;
-    for attempt in 0..=SCAN_LOCK_RETRIES {
-        match record_scan_failure_once(pool, series_id, now, kind).await {
-            Ok(()) => return Ok(()),
-            Err(e) if crate::db::is_locked_error(&e) && attempt < SCAN_LOCK_RETRIES => {
-                tracing::debug!(
-                    series_id,
-                    attempt = attempt + 1,
-                    delay_ms,
-                    "scan: backoff write lock contention; retrying transaction"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                let spread = rand_core::OsRng.next_u64() % (delay_ms / 2).max(1);
-                delay_ms = (delay_ms * 2 + spread).min(2_000);
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    unreachable!("loop returns on the final attempt")
+    crate::db::retry_transaction(|| record_scan_failure_once(pool, series_id, now, kind)).await
 }
 
 /// One attempt at the failure-backoff read-modify-write. See `record_scan_failure`.
 async fn record_scan_failure_once(
-    pool: &SqlitePool,
+    pool: &Database,
     series_id: &str,
     now: DateTime<Utc>,
     kind: FailureKind,
@@ -1267,7 +1249,7 @@ fn park_offset_hours() -> i64 {
 /// Park a paused series' next scan far out so it drops out of the frequent due-set,
 /// leaving its other scan-state fields intact. Upsert so a never-scanned paused series
 /// (a pending row, or none yet) is parked too.
-async fn park_paused(pool: &SqlitePool, series_id: &str, now: DateTime<Utc>) -> anyhow::Result<()> {
+async fn park_paused(pool: &Database, series_id: &str, now: DateTime<Utc>) -> anyhow::Result<()> {
     let next = (now + chrono::Duration::hours(park_offset_hours())).to_rfc3339();
     let now_iso = now.to_rfc3339();
     // Also clear any stale `awaiting_since` (a paused series is not "awaiting a late
@@ -1315,7 +1297,7 @@ pub const TRIGGER_COOLDOWN_HOURS: i64 = 24 * 7;
 /// scanning here would make it longer and would bypass every piece of failure handling the
 /// scheduler already has (error backoff, lock retries, cached-fallback honesty). Writing
 /// the due-now sentinel costs one indexed UPDATE and reuses all of it.
-pub async fn trigger_due_now(pool: &SqlitePool, series_ids: &[String]) -> u64 {
+pub async fn trigger_due_now(pool: &Database, series_ids: &[String]) -> u64 {
     if series_ids.is_empty() {
         return 0;
     }
@@ -1343,7 +1325,7 @@ pub async fn trigger_due_now(pool: &SqlitePool, series_ids: &[String]) -> u64 {
 /// an existing one. Used by enrol paths that DON'T scan-on-enrol (federated search) and by
 /// the daily reconcile to backfill any pre-existing enrolled series that lacks a row. The
 /// sentinel (not NULL) is required by the due-query's `<= ?` completeness invariant.
-pub async fn ensure_pending(pool: &SqlitePool, series_id: &str) -> anyhow::Result<()> {
+pub async fn ensure_pending(pool: &Database, series_id: &str) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO series_scan_state (series_id, next_scan_at, updated_at) VALUES (?, ?, ?) \
          ON CONFLICT(series_id) DO NOTHING",
@@ -1415,7 +1397,7 @@ pub async fn scan_series(
 /// preferred because this module keeps it filled itself (`fill_missing_feed_comic_type`).
 /// An unmapped series, or one whose feed row has not been typed yet, falls back to Manga —
 /// the slow, safe tier, and self-healing once the rebuild types it.
-async fn scan_comic_type(pool: &SqlitePool, series_id: &str) -> ComicType {
+async fn scan_comic_type(pool: &Database, series_id: &str) -> ComicType {
     let word = sqlx::query_scalar::<_, Option<String>>(
         "SELECT COALESCE(f.comic_type, b.comic_type) \
            FROM source_series ss \
@@ -1521,7 +1503,7 @@ async fn persist_scan(
 /// feed row is a pure cache and the periodic rebuild reconstructs it; failing a scan
 /// (and with it the scan-state write and the reschedule) over one would be strictly
 /// worse than being one refresh stale.
-async fn touch_feed_series_update(pool: &SqlitePool, series_id: &str, new_found: bool) {
+async fn touch_feed_series_update(pool: &Database, series_id: &str, new_found: bool) {
     if !new_found {
         return;
     }
@@ -1603,7 +1585,7 @@ async fn touch_feed_series_update(pool: &SqlitePool, series_id: &str, new_found:
 /// Finally, [`mirror_feed_row_into_browse_catalogue`] copies the finished row onto Browse's
 /// own table (migration 0069). Browse stopped reading THIS table, so without that copy the
 /// detection would be invisible on the surface that pages the whole catalogue.
-async fn upsert_feed_series_update(pool: &SqlitePool, series_id: &str) -> anyhow::Result<u64> {
+async fn upsert_feed_series_update(pool: &Database, series_id: &str) -> anyhow::Result<u64> {
     let status_sql = crate::catalog::FSU_STATUS_SQL;
     let n = sqlx::query(&format!(
         "INSERT INTO feed_series_updates \
@@ -1731,7 +1713,7 @@ use crate::catalog::BROWSE_CATALOGUE_MUTABLE as BROWSE_MIRROR_MUTABLE;
 /// The mutable-column set lives in [`BROWSE_MIRROR_MUTABLE`], which is pinned equal to
 /// `catalog::BROWSE_CATALOGUE_MUTABLE`.
 async fn mirror_feed_row_into_browse_catalogue(
-    pool: &SqlitePool,
+    pool: &Database,
     series_id: &str,
 ) -> anyhow::Result<()> {
     // Same mutable columns, same "write only when something differs" guard as
@@ -1811,7 +1793,7 @@ async fn mirror_feed_row_into_browse_catalogue(
 /// indexed single-work lookups and this only runs on a scan that actually DETECTED something
 /// (~5% of ~475 scans/hr), so the cost is negligible; correctness here is the point, because
 /// the two writers are proven byte-identical by that same test.
-async fn fill_feed_en_chapter_count(pool: &SqlitePool, series_id: &str) -> anyhow::Result<()> {
+async fn fill_feed_en_chapter_count(pool: &Database, series_id: &str) -> anyhow::Result<()> {
     let scope = "work_id IN (SELECT work_id FROM source_series \
                              WHERE source_type = 'suwayomi' AND source_key = ?)";
     // The English mirror count. `COALESCE(…, 0)` and not a `WHERE EXISTS` guard: a work whose
@@ -1860,7 +1842,7 @@ async fn fill_feed_en_chapter_count(pool: &SqlitePool, series_id: &str) -> anyho
 /// type the rebuild computed. The rebuild derives the type from the FEED row's title,
 /// which on conflict stays the mirror half's; leaving an existing type alone keeps this
 /// path from disagreeing with it.
-async fn fill_missing_feed_comic_type(pool: &SqlitePool, series_id: &str) -> anyhow::Result<()> {
+async fn fill_missing_feed_comic_type(pool: &Database, series_id: &str) -> anyhow::Result<()> {
     let Some((work_id, title, override_word, original_language)) =
         sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
             "SELECT f.work_id, f.title, w.content_type_override, w.original_language \
@@ -1952,7 +1934,7 @@ async fn fill_missing_feed_comic_type(pool: &SqlitePool, series_id: &str) -> any
 /// `scan_series`) goes through [`record_scan_policy`] with a real `comic_type`.
 #[cfg(test)]
 async fn record_scan(
-    pool: &SqlitePool,
+    pool: &Database,
     series_id: &str,
     title: &str,
     admin: &ScanAdmin,
@@ -1966,7 +1948,7 @@ async fn record_scan(
 /// recency TARGET from [`scan_interval_hours`] and `awaiting` is off (E5's LATEST-diff push
 /// signal replaces it). `None` falls back to the legacy inferred-cadence behaviour.
 async fn record_scan_policy(
-    pool: &SqlitePool,
+    pool: &Database,
     series_id: &str,
     title: &str,
     admin: &ScanAdmin,
@@ -1982,32 +1964,15 @@ async fn record_scan_policy(
     // recover. `BEGIN IMMEDIATE` (below) takes the write lock up front, which lets
     // `busy_timeout` do its job and makes 517 rare; this loop covers the remainder
     // plus plain BUSY (code 5) when the 15s timeout is exhausted.
-    let mut delay_ms = 50_u64;
-    for attempt in 0..=SCAN_LOCK_RETRIES {
-        match record_scan_once(pool, series_id, title, admin, chapters, comic_type, now).await {
-            Ok(found) => return Ok(found),
-            Err(e) if crate::db::is_locked_error(&e) && attempt < SCAN_LOCK_RETRIES => {
-                tracing::debug!(
-                    series_id,
-                    attempt = attempt + 1,
-                    delay_ms,
-                    "scan: write lock contention; retrying transaction"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                // Exponential with a small jittered spread, so several scan workers
-                // that collided do not line up and collide again on the same beat.
-                let spread = rand_core::OsRng.next_u64() % (delay_ms / 2).max(1);
-                delay_ms = (delay_ms * 2 + spread).min(2_000);
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    unreachable!("loop returns on the final attempt")
+    crate::db::retry_transaction(|| {
+        record_scan_once(pool, series_id, title, admin, chapters, comic_type, now)
+    })
+    .await
 }
 
 /// One attempt at the scan-state read-modify-write. See `record_scan_policy` for retries.
 async fn record_scan_once(
-    pool: &SqlitePool,
+    pool: &Database,
     series_id: &str,
     title: &str,
     admin: &ScanAdmin,
@@ -2399,7 +2364,7 @@ async fn check_source_health(state: &AppState) {
 /// Only touches rows scheduled inside half the horizon, so re-running it on every failing
 /// tick is a near-no-op instead of rewriting the whole cohort — and, importantly, does not
 /// keep pushing the trickle of already-parked probes further away.
-async fn park_source_series(pool: &SqlitePool, source_id: &str) -> Option<String> {
+async fn park_source_series(pool: &Database, source_id: &str) -> Option<String> {
     let base_minutes = SOURCE_OUTAGE_PARK_HOURS * 60;
     let spread_minutes = (base_minutes / 5).max(1); // ±10%
     let horizon = Utc::now() + chrono::Duration::minutes(base_minutes);
@@ -2448,7 +2413,7 @@ async fn park_source_series(pool: &SqlitePool, source_id: &str) -> Option<String
 /// per paused series, once, on a recovery that only happens when a source comes back — and
 /// the alternative, remembering which rows this function parked, is per-series state for a
 /// self-correcting cost.
-async fn unpark_source_series(pool: &SqlitePool, source_id: &str) -> u64 {
+async fn unpark_source_series(pool: &Database, source_id: &str) -> u64 {
     let soon = (Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
     sqlx::query(
         "UPDATE series_scan_state \
@@ -2611,7 +2576,7 @@ pub enum LimitOrigin {
 /// The limits an admin stored (`source_rate_limit`, migration 0115). One series scan is
 /// counted as the default two requests, as for an env entry without `@cost`.
 pub async fn stored_source_rate_limits(
-    pool: &SqlitePool,
+    pool: &Database,
 ) -> sqlx::Result<Vec<crate::config::SourceRateLimit>> {
     let rows: Vec<(String, i64, i64)> = sqlx::query_as(
         "SELECT source_id, requests, window_secs FROM source_rate_limit ORDER BY source_id",
@@ -2633,7 +2598,7 @@ pub async fn stored_source_rate_limits(
 
 /// Store (or replace) an admin's limit for one source.
 pub async fn store_source_rate_limit(
-    pool: &SqlitePool,
+    pool: &Database,
     source_id: &str,
     requests: u32,
     window_secs: u64,
@@ -2654,7 +2619,7 @@ pub async fn store_source_rate_limit(
 }
 
 /// Forget an admin's limit. `false` when the source had none.
-pub async fn delete_source_rate_limit(pool: &SqlitePool, source_id: &str) -> sqlx::Result<bool> {
+pub async fn delete_source_rate_limit(pool: &Database, source_id: &str) -> sqlx::Result<bool> {
     let res = sqlx::query("DELETE FROM source_rate_limit WHERE source_id = ?")
         .bind(source_id)
         .execute(pool)
@@ -2708,7 +2673,7 @@ pub fn merge_source_rate_limits(
 
 /// Every per-source limit in force: `SCAN_SOURCE_RATE_LIMITS` plus the admin's own.
 pub async fn effective_source_rate_limits(
-    pool: &SqlitePool,
+    pool: &Database,
 ) -> sqlx::Result<Vec<EffectiveRateLimit>> {
     Ok(merge_source_rate_limits(
         crate::config::scan_source_rate_limits(),
@@ -2910,7 +2875,7 @@ pub fn kick_supervisor() {
 /// (64), which is 4× today's source count, and paying a full due-scan there is strictly
 /// better than the alternative of not scanning those series at all.
 async fn due_series_ids_for_source(
-    pool: &SqlitePool,
+    pool: &Database,
     sel: &SourceSel,
     now_iso: &str,
     limit: i64,
@@ -3200,7 +3165,7 @@ fn spawn_source_child(state: Arc<AppState>, sel: SourceSel, coord: Arc<ScanCoord
 /// enrolled), so it moves from the unassigned sweeper onto its own source's loop. Cheap: the
 /// `EXISTS` guard stops it rewriting genuinely-unmappable rows every pass, so it is bounded by
 /// the (normally zero) count of newly-enrolled NULL rows. Returns rows healed.
-async fn heal_null_source_ids(pool: &SqlitePool) -> u64 {
+async fn heal_null_source_ids(pool: &Database) -> u64 {
     sqlx::query(
         "UPDATE series_scan_state \
             SET source_id = (SELECT ss.source_id FROM source_series ss \
@@ -3227,7 +3192,7 @@ async fn heal_null_source_ids(pool: &SqlitePool) -> u64 {
 /// the sorted id space, so its complement is the single range `source_id > last` that
 /// [`sweeper_cutoff`] hands to the sweeper. An unordered `LIMIT` would leave an arbitrary,
 /// reconcile-to-reconcile-varying hole that no range can describe.
-async fn distinct_scan_source_ids(pool: &SqlitePool, limit: usize) -> Vec<String> {
+async fn distinct_scan_source_ids(pool: &Database, limit: usize) -> Vec<String> {
     sqlx::query_scalar::<_, String>(
         "SELECT DISTINCT source_id FROM series_scan_state WHERE source_id IS NOT NULL \
          ORDER BY source_id ASC LIMIT ?",
@@ -3472,7 +3437,7 @@ async fn supervisor(state: Arc<AppState>, mut shutdown: tokio::sync::watch::Rece
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use crate::database::TestPoolOptions;
 
     thread_local! {
         /// Schedule jitter is OFF by default in tests — see `jitter_interval_hours`.
@@ -3775,12 +3740,15 @@ mod tests {
     /// removing it brings the default back.
     #[tokio::test]
     async fn stored_source_limits_join_and_override_the_env_ones() {
-        let pool = SqlitePoolOptions::new()
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         let env = || crate::config::parse_scan_source_rate_limits("eris=10/300, quiet=6/60");
         let brief = |merged: Vec<EffectiveRateLimit>| -> Vec<(String, u32, u64, LimitOrigin)> {
             merged
@@ -4031,13 +3999,16 @@ mod tests {
             .collect()
     }
 
-    async fn migrated_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
+    async fn migrated_pool() -> Database {
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
@@ -4168,7 +4139,7 @@ mod tests {
 
     // ---- record_scan bookkeeping (DB-backed) ----
 
-    async fn persisted(pool: &SqlitePool, series_id: &str) -> ScanState {
+    async fn persisted(pool: &Database, series_id: &str) -> ScanState {
         scan_state(pool, series_id)
             .await
             .expect("scan state row should exist")
@@ -4372,7 +4343,7 @@ mod tests {
     }
 
     /// Hours between `now` and a series' persisted `next_scan_at`.
-    async fn hours_until_next_scan(pool: &SqlitePool, series_id: &str, now: DateTime<Utc>) -> f64 {
+    async fn hours_until_next_scan(pool: &Database, series_id: &str, now: DateTime<Utc>) -> f64 {
         let next = persisted(pool, series_id)
             .await
             .next_scan_at
@@ -5052,7 +5023,7 @@ mod tests {
     /// Insert a scan-state row. `None` models a "due now" series — stored as the
     /// `DUE_NOW_SENTINEL` (the real representation), NOT a raw NULL, so it matches the
     /// bounded `next_scan_at <= ?` due-query like a real freshly-enrolled row.
-    async fn put_state(pool: &SqlitePool, id: &str, next_scan_at: Option<&str>) {
+    async fn put_state(pool: &Database, id: &str, next_scan_at: Option<&str>) {
         sqlx::query(
             "INSERT INTO series_scan_state (series_id, next_scan_at, updated_at) VALUES (?, ?, ?)",
         )
@@ -5064,7 +5035,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn next_scan_of(pool: &SqlitePool, id: &str) -> Option<String> {
+    async fn next_scan_of(pool: &Database, id: &str) -> Option<String> {
         sqlx::query_scalar("SELECT next_scan_at FROM series_scan_state WHERE series_id = ?")
             .bind(id)
             .fetch_one(pool)
@@ -5146,7 +5117,7 @@ mod tests {
         );
     }
 
-    async fn failures_of(pool: &SqlitePool, id: &str) -> i64 {
+    async fn failures_of(pool: &Database, id: &str) -> i64 {
         sqlx::query_scalar("SELECT consecutive_failures FROM series_scan_state WHERE series_id = ?")
             .bind(id)
             .fetch_one(pool)
@@ -5933,7 +5904,7 @@ mod tests {
     /// `source_series` mapping, and the cached `suwayomi_series` row carrying the
     /// release clock. `latest_chapter_at` is 13-digit epoch-millis TEXT, exactly as
     /// `series_cache::derive_latest_chapter_at` stores it.
-    async fn seed_feed_fixture(pool: &SqlitePool, latest_chapter_at: Option<&str>) {
+    async fn seed_feed_fixture(pool: &Database, latest_chapter_at: Option<&str>) {
         sqlx::query(
             "INSERT INTO work (id, primary_title, original_language, created_at, updated_at) \
              VALUES ('w1', 'Canonical Title', 'ko', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
@@ -6054,7 +6025,7 @@ mod tests {
     /// comic_type, chapter_count, detected_at).
     #[allow(clippy::type_complexity)]
     async fn feed_row(
-        pool: &SqlitePool,
+        pool: &Database,
     ) -> Option<(
         String,
         i64,
@@ -6084,7 +6055,7 @@ mod tests {
     /// twelve are: two of them are Browse FILTER keys and one is a SORT key, so a row whose
     /// value depends on which writer touched it last is a row that appears or disappears
     /// from Browse depending on scan timing.
-    async fn feed_digest(pool: &SqlitePool) -> Option<String> {
+    async fn feed_digest(pool: &Database) -> Option<String> {
         sqlx::query_scalar(
             "SELECT work_id || '|' || reader_id || '|' || title \
                  || '|' || COALESCE(cover_url, '~') || '|' || COALESCE(suwayomi_thumbnail, '~') \
@@ -6114,7 +6085,7 @@ mod tests {
     /// — the two halves of one card disagreeing, which is F4 wearing a different hat. It was
     /// in fact missing from the mirror's `MUT` list when 0095 landed (§8h); this digest is
     /// what stops that recurring.
-    async fn browse_digest(pool: &SqlitePool) -> Option<String> {
+    async fn browse_digest(pool: &Database) -> Option<String> {
         sqlx::query_scalar(
             "SELECT work_id || '|' || reader_id || '|' || title \
                  || '|' || COALESCE(cover_url, '~') || '|' || COALESCE(suwayomi_thumbnail, '~') \
@@ -6772,7 +6743,7 @@ mod tests {
 
     /// `EXPLAIN QUERY PLAN` lines for a statement, joined — the substrate for the
     /// sargability assertions below.
-    async fn query_plan(pool: &SqlitePool, sql: &str) -> String {
+    async fn query_plan(pool: &Database, sql: &str) -> String {
         sqlx::query_as::<_, (i64, i64, i64, String)>(&format!("EXPLAIN QUERY PLAN {sql}"))
             .fetch_all(pool)
             .await

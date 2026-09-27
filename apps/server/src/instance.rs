@@ -13,9 +13,9 @@
 
 use std::sync::Mutex;
 
+use crate::db::Database;
 use chrono::Utc;
 use rand_core::{OsRng, RngCore};
-use sqlx::SqlitePool;
 
 /// One runtime-changeable instance setting.
 pub struct Setting {
@@ -97,7 +97,7 @@ fn env_value(env: &impl Fn(&str) -> Option<String>, name: &str) -> Option<String
 /// `COVER_CACHE=off` still stops the whole cover drainer, Suwayomi covers included
 /// (with it on and usage off, the drainer still caches Suwayomi covers).
 pub async fn resolve_mangadex_with(
-    pool: &SqlitePool,
+    pool: &Database,
     env: impl Fn(&str) -> Option<String>,
 ) -> MangadexUsage {
     if let Some(v) = env_value(&env, "KOMIKA_MANGADEX") {
@@ -129,7 +129,7 @@ pub async fn resolve_mangadex_with(
 }
 
 /// [`resolve_mangadex_with`] against the process environment.
-pub async fn resolve_mangadex(pool: &SqlitePool) -> MangadexUsage {
+pub async fn resolve_mangadex(pool: &Database) -> MangadexUsage {
     resolve_mangadex_with(pool, |name| std::env::var(name).ok()).await
 }
 
@@ -138,7 +138,7 @@ pub async fn resolve_mangadex(pool: &SqlitePool) -> MangadexUsage {
 /// people I add" is the wizard's default, and a fresh server must not take strangers'
 /// accounts before its owner has chosen) and open everywhere else.
 pub async fn resolve_registration_with(
-    pool: &SqlitePool,
+    pool: &Database,
     env: impl Fn(&str) -> Option<String>,
 ) -> Resolved {
     let self_host = is_self_host(&env);
@@ -150,7 +150,7 @@ pub async fn resolve_registration_with(
 }
 
 /// [`resolve_registration_with`] against the process environment.
-pub async fn resolve_registration(pool: &SqlitePool) -> Resolved {
+pub async fn resolve_registration(pool: &Database) -> Resolved {
     resolve_registration_with(pool, |name| std::env::var(name).ok()).await
 }
 
@@ -284,14 +284,14 @@ pub fn parse_bool(v: &str) -> bool {
 }
 
 /// Resolve `s` against the process environment.
-pub async fn resolve(pool: &SqlitePool, s: &Setting) -> Resolved {
+pub async fn resolve(pool: &Database, s: &Setting) -> Resolved {
     resolve_with(pool, s, |name| std::env::var(name).ok()).await
 }
 
 /// Resolve `s` with an injected env lookup, so tests can exercise the read order
 /// without racing sibling tests over process-global env variables.
 pub async fn resolve_with(
-    pool: &SqlitePool,
+    pool: &Database,
     s: &Setting,
     env: impl Fn(&str) -> Option<String>,
 ) -> Resolved {
@@ -331,7 +331,7 @@ pub async fn resolve_with(
 
 /// Store `value` for `s` (upsert). The caller decides whether an env override
 /// makes the write pointless; this only touches the table.
-pub async fn store(pool: &SqlitePool, s: &Setting, value: &str) -> sqlx::Result<()> {
+pub async fn store(pool: &Database, s: &Setting, value: &str) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO instance_setting (key, value, updated_at) VALUES (?, ?, ?) \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -345,7 +345,7 @@ pub async fn store(pool: &SqlitePool, s: &Setting, value: &str) -> sqlx::Result<
 }
 
 /// True once any admin account exists — the definition of "set up".
-pub async fn admin_exists(pool: &SqlitePool) -> sqlx::Result<bool> {
+pub async fn admin_exists(pool: &Database) -> sqlx::Result<bool> {
     let exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE is_admin = 1)")
         .fetch_one(pool)
         .await?;
@@ -403,7 +403,7 @@ impl SetupCode {
 
 /// Boot step: when no admin exists, issue a setup code and print it once.
 /// Runs after `provision_admins`, so an env-seeded admin means no code at all.
-pub async fn issue_setup_code_if_needed(pool: &SqlitePool, code: &SetupCode) -> anyhow::Result<()> {
+pub async fn issue_setup_code_if_needed(pool: &Database, code: &SetupCode) -> anyhow::Result<()> {
     if admin_exists(pool).await? {
         return Ok(());
     }
@@ -418,15 +418,18 @@ pub async fn issue_setup_code_if_needed(pool: &SqlitePool, code: &SetupCode) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use crate::database::TestPoolOptions;
 
-    async fn pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
+    async fn pool() -> Database {
+        let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
         pool
     }
 
