@@ -313,6 +313,10 @@ async fn flush_buffer(buf: &Buffer, pool: &Database) -> Result<usize> {
     if drained.is_empty() {
         return Ok(0);
     }
+    crate::db::retry_transaction(|| persist_buffer(pool, drained.clone())).await
+}
+
+async fn persist_buffer(pool: &Database, drained: HashMap<Key, Entry>) -> Result<usize> {
     // Manga → source, once per distinct manga (reads, outside the write transaction). A
     // manga with no `source_series` row is one we never enrolled (a browse preview); it
     // has no source to charge, so its counts are dropped.
@@ -498,6 +502,30 @@ mod tests {
         );
         // …and a chapter number is not a status.
         assert_eq!(upstream_status("http error at chapter 404"), None);
+    }
+
+    #[tokio::test]
+    async fn source_health_flush_retries_an_external_writer() {
+        let pool = Database::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0110_source_health.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let external = Database::connect_with((*pool.connect_options()).clone(), 2)
+            .await
+            .unwrap();
+        let held = external.begin().await.unwrap();
+        let buf = std::sync::Arc::new(Buffer::new());
+        buf.push(Subject::Source("src-a"), Surface::Pages, REASON_OK, None);
+        let writer = pool.clone();
+        let worker_buf = buf.clone();
+        let worker = tokio::spawn(async move { flush_buffer(&worker_buf, &writer).await });
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        held.commit().await.unwrap();
+        assert_eq!(worker.await.unwrap().unwrap(), 1);
+        assert_eq!(stats(&pool, 24).await.unwrap()[0].count, 1);
+        external.close().await;
+        pool.close().await;
     }
 
     #[tokio::test]

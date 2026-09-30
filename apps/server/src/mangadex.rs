@@ -2114,15 +2114,13 @@ pub async fn sync_catalogue(
         }
     }
     if out.dropped > 0 {
-        // Deliberately not "completion will be withheld": that is only true of a sweep
-        // that is still seeding. On an already-seeded (incremental) sweep the cursor
-        // advances regardless — see `run_one_cycle` — because refusing to advance it
-        // would freeze catalogue updates entirely on one permanently-malformed record.
+        // A dirty incremental sweep retains its cursor, so the next cycle replays
+        // this window. A malformed upstream record stays visible in the error log.
         tracing::error!(
             upserted = out.upserted,
             dropped = out.dropped,
             "mangadex: catalogue sweep DROPPED records — they were fetched and never \
-             reached the spine; the gap backfill is what repairs them"
+             reached the spine; cursor advancement is withheld"
         );
     }
     tracing::info!(
@@ -2524,7 +2522,7 @@ pub async fn backfill_missing_catalogue(
             // Resuming from an already-processed record's `createdAt` only re-enumerates
             // a little, and present ids are skipped, so the overlap costs nothing.
             if let Some(s) = last_created.as_deref().and_then(to_since) {
-                if let Err(e) = catalog::set_seed_progress(pool, BACKFILL_JOB, &s).await {
+                if let Err(e) = checkpoint_backfill(pool, &s, &out).await {
                     tracing::warn!(error = %e, "backfill: failed to checkpoint the window cursor");
                 }
             }
@@ -2573,7 +2571,7 @@ pub async fn backfill_missing_catalogue(
         }
         // Checkpoint after every completed window so a crash/failure resumes here.
         if let Some(ref s) = since {
-            if let Err(e) = catalog::set_seed_progress(pool, BACKFILL_JOB, s).await {
+            if let Err(e) = checkpoint_backfill(pool, s, &out).await {
                 tracing::warn!(error = %e, "backfill: failed to checkpoint the window cursor");
             }
         }
@@ -2711,7 +2709,8 @@ async fn run_backfill_pass(
                      the cursor so the next pass re-walks from the start"
                 );
                 if let Err(e) = catalog::reset_sync_state(pool, BACKFILL_JOB).await {
-                    tracing::warn!(error = %e, "backfill: failed to rewind the window cursor");
+                    tracing::error!(error = %e, "backfill: rewind failed; stopping before another pass can mark completion");
+                    return PassResult::Stop;
                 }
             }
             PassResult::Retry {
@@ -4137,39 +4136,14 @@ async fn run_one_cycle(pool: &crate::db::Database, client: &MangaDexClient, cove
                 incremental = catalogue_seeded,
                 "mangadex: catalogue cycle done"
             );
-            // Completing a fresh/resumed seed flips seed_done and sets the
-            // incremental cursor; an already-seeded run just advances the cursor.
-            let res = if catalogue_seeded {
-                catalog::set_sync_cursor(pool, "catalogue", &run_start).await
-            } else if !catalogue_seed_may_latch(&o) {
-                // A seed that FETCHED records and did not land them must not latch
-                // `seed_done` — whether they failed to PARSE (`dropped`) or failed to WRITE
-                // (`failed`; F9): doing so switches the sweep to the forward-only
-                // `updatedAtSince` window, which never revisits an old `createdAt`, so
-                // those records become unreachable without a full manual re-seed. That is
-                // precisely how the 4,493-record gap became permanent.
-                //
-                // BE CLEAR ABOUT WHAT THIS DOES AND DOESN'T BUY. The per-page cursor is
-                // kept (`set_seed_progress` already wrote it, advanced to the last PARSED
-                // record — which is normally past the dropped ones), so the next cycle
-                // resumes AHEAD of the drops and, finding none of its own, marks the seed
-                // done. This is therefore a one-cycle delay plus a loud, attributable
-                // ERROR — not a recovery mechanism. Recovering the dropped records is the
-                // gap backfill's job (`backfill_missing_catalogue`), which rewinds its
-                // cursor and re-walks from 2018 on any dirty pass. The alternative here —
-                // rewinding the seed cursor — would re-walk 113k records every cycle
-                // forever on a single permanently-malformed upstream record.
-                tracing::error!(
-                    dropped = o.dropped,
-                    failed = o.failed,
-                    "mangadex: catalogue seed lost records — withholding seed_done so \
-                     the seed keeps resuming instead of switching to the forward-only \
-                     incremental window"
-                );
-                Ok(())
-            } else {
-                catalog::mark_seed_done(pool, "catalogue", &run_start).await
-            };
+            let res = persist_cycle_outcome(
+                pool,
+                "catalogue",
+                catalogue_seeded,
+                catalogue_seed_may_latch(&o),
+                &run_start,
+            )
+            .await;
             if let Err(e) = res {
                 tracing::warn!(error = %e, "mangadex: failed to persist catalogue cursor");
             }
@@ -4182,6 +4156,42 @@ async fn run_one_cycle(pool: &crate::db::Database, client: &MangaDexClient, cove
     // The chapter half USED to run here, on the catalogue's 6-hourly cadence. It has its
     // own ticker now (Phase D) — see `run_recurring`.
     let _ = run_start;
+}
+
+/// Only a clean sweep may advance a forward-only updatedAtSince cursor.
+async fn persist_cycle_outcome(
+    pool: &crate::db::Database,
+    job: &str,
+    seeded: bool,
+    clean: bool,
+    run_start: &str,
+) -> Result<()> {
+    if !clean {
+        tracing::warn!(
+            job,
+            "mangadex: sweep lost records; retaining the previous cursor"
+        );
+        return Ok(());
+    }
+    crate::db::retry_transaction(|| async {
+        if seeded {
+            catalog::set_sync_cursor(pool, job, run_start).await
+        } else {
+            catalog::mark_seed_done(pool, job, run_start).await
+        }
+    })
+    .await
+}
+
+async fn checkpoint_backfill(
+    pool: &crate::db::Database,
+    cursor: &str,
+    outcome: &BackfillOutcome,
+) -> Result<()> {
+    if outcome.is_dirty() {
+        return Ok(());
+    }
+    crate::db::retry_transaction(|| catalog::set_seed_progress(pool, BACKFILL_JOB, cursor)).await
 }
 
 /// The chapter half of a cycle, on its own schedule (Phase D). Takes the same single-flight
@@ -4276,25 +4286,14 @@ async fn run_chapter_cycle(pool: &crate::db::Database, client: &MangaDexClient, 
                 incremental = chapters_seeded,
                 "mangadex: chapter cycle done"
             );
-            let res = if chapters_seeded {
-                catalog::set_sync_cursor(pool, "chapters", run_start).await
-            } else if !chapter_seed_may_latch(&o) {
-                // Same rule as the catalogue seed: a seed that fetched records and did not
-                // land them must not flip `seed_done`, because that switches the sweep to
-                // the forward-only `updatedAtSince` window which never revisits an old
-                // `createdAt`. The per-window `set_seed_progress` checkpoint is kept, so
-                // the next cycle resumes rather than restarting.
-                tracing::error!(
-                    dropped = o.dropped,
-                    failed = o.failed,
-                    "mangadex: chapter seed lost records (dropped = unparseable, failed = \
-                     the write errored) — withholding seed_done so the seed keeps resuming \
-                     instead of switching to the incremental window"
-                );
-                Ok(())
-            } else {
-                catalog::mark_seed_done(pool, "chapters", run_start).await
-            };
+            let res = persist_cycle_outcome(
+                pool,
+                "chapters",
+                chapters_seeded,
+                chapter_seed_may_latch(&o),
+                run_start,
+            )
+            .await;
             if let Err(e) = res {
                 tracing::warn!(error = %e, "mangadex: failed to persist chapter cursor");
             }
@@ -4843,6 +4842,66 @@ mod tests {
             4,
             "the incremental window needs the ratings too, or the forward path re-opens \
              the same hole"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_incremental_sweeps_retain_the_cursor_until_replayed_cleanly() {
+        let pool = pool().await;
+        for job in ["catalogue", "chapters"] {
+            catalog::mark_seed_done(&pool, job, "2026-01-01T00:00:00")
+                .await
+                .unwrap();
+            persist_cycle_outcome(&pool, job, true, false, "2026-02-01T00:00:00")
+                .await
+                .unwrap();
+            assert_eq!(
+                catalog::get_sync_state(&pool, job)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .cursor,
+                "2026-01-01T00:00:00"
+            );
+            persist_cycle_outcome(&pool, job, true, true, "2026-02-01T00:00:00")
+                .await
+                .unwrap();
+            assert_eq!(
+                catalog::get_sync_state(&pool, job)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .cursor,
+                "2026-02-01T00:00:00"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dirty_backfill_cannot_checkpoint_past_missing_records_even_if_rewind_fails() {
+        let pool = pool().await;
+        checkpoint_backfill(&pool, "2026-01-01T00:00:00", &BackfillOutcome::default())
+            .await
+            .unwrap();
+        let dirty = BackfillOutcome {
+            failed: 1,
+            ..Default::default()
+        };
+        checkpoint_backfill(&pool, "2026-02-01T00:00:00", &dirty)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER reject_rewind BEFORE DELETE ON catalogue_sync_state BEGIN SELECT RAISE(ABORT, 'rewind unavailable'); END")
+            .execute(&pool).await.unwrap();
+        assert!(catalog::reset_sync_state(&pool, BACKFILL_JOB)
+            .await
+            .is_err());
+        assert_eq!(
+            catalog::get_sync_state(&pool, BACKFILL_JOB)
+                .await
+                .unwrap()
+                .unwrap()
+                .cursor,
+            "2026-01-01T00:00:00"
         );
     }
 

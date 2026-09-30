@@ -1433,7 +1433,9 @@ async fn persist_scan(
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
     let series_id = m.id.to_string();
-    if let Err(e) = crate::series_cache::put_series(&state.pool, m).await {
+    if let Err(e) =
+        crate::db::retry_transaction(|| crate::series_cache::put_series(&state.pool, m)).await
+    {
         tracing::warn!(series_id, error = %e, "scan: series cache write failed");
     }
     if let Err(e) = crate::series_cache::put_chapters(&state.pool, m.id, chapters).await {

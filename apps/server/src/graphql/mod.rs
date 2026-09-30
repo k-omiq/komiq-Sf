@@ -10473,12 +10473,9 @@ impl MutationRoot {
         // cleared/loosened override.
         if let Err(e) = scan_series(st, &m, Utc::now()).await {
             tracing::warn!(series_id = n, error = %e, "updateSeriesAdmin: re-scan failed; marking due-now");
-            let _ =
-                sqlx::query("UPDATE series_scan_state SET next_scan_at = ? WHERE series_id = ?")
-                    .bind(Utc::now().to_rfc3339())
-                    .bind(&input.series_id.0)
-                    .execute(&st.pool)
-                    .await;
+            mark_scan_due_now(&st.pool, &input.series_id.0)
+                .await
+                .map_err(gql_err)?;
         }
         Ok(map_series(st, m).await?)
     }
@@ -11797,95 +11794,41 @@ impl MutationRoot {
     ) -> Result<bool> {
         require_admin(ctx).await?;
         let st = state(ctx);
-
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            source_series_id: String,
-            candidate_work_id: String,
-            status: String,
-        }
-        let row: Option<Row> = sqlx::query_as(
+        let row: Option<(String, String, String)> = sqlx::query_as(
             "SELECT source_series_id, candidate_work_id, status FROM merge_candidate WHERE id = ?",
         )
         .bind(&id.0)
         .fetch_optional(&st.pool)
         .await
         .map_err(gql_err)?;
-        let Some(row) = row else {
+        let Some((source_series_id, target_work, status)) = row else {
             return Err(Error::new("No such merge candidate."));
         };
-        // Fast-path only — the correctness guard is the atomic claim below.
-        if row.status != "pending" {
+        if status != "pending" {
             return Err(Error::new("This merge candidate is already resolved."));
         }
-
-        let mut tx = st.pool.begin().await.map_err(gql_err)?;
-
-        // Atomically claim the candidate: only the admin whose UPDATE flips a
-        // still-`pending` row proceeds. A concurrent resolver that already claimed
-        // it leaves `rows_affected() == 0` here, so the loser never repoints.
-        let now = Utc::now().to_rfc3339();
-        let claim = sqlx::query(
-            "UPDATE merge_candidate SET status = ?, resolved_at = ? \
-             WHERE id = ? AND status = 'pending'",
-        )
-        .bind(if accept { "confirmed" } else { "rejected" })
-        .bind(&now)
-        .bind(&id.0)
-        .execute(&mut *tx)
+        // Preserve the owner the admin approved throughout retries. A concurrent split
+        // must not make a retried request approve a different source work.
+        let source_work: Option<String> =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
+                .bind(&source_series_id)
+                .fetch_optional(&st.pool)
+                .await
+                .map_err(gql_err)?;
+        crate::db::retry_transaction(|| {
+            resolve_merge_review_once(
+                &st.pool,
+                &st.cover_pool,
+                &id.0,
+                &source_series_id,
+                source_work.as_deref(),
+                &target_work,
+                accept,
+            )
+        })
         .await
-        .map_err(gql_err)?;
-        if claim.rows_affected() == 0 {
-            tx.rollback().await.map_err(gql_err)?;
-            return Err(Error::new("This merge candidate is already resolved."));
-        }
-
-        // Claimed the row. Commit the status flip first, then (on accept) fold the
-        // whole source work into the candidate. merge_works runs its own transaction,
-        // so the claim must be committed before it — otherwise the two contend for the
-        // single SQLite writer and deadlock.
-        tx.commit().await.map_err(gql_err)?;
-
-        if accept {
-            let old_work: Option<String> =
-                sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
-                    .bind(&row.source_series_id)
-                    .fetch_optional(&st.pool)
-                    .await
-                    .map_err(gql_err)?;
-            // Fold the ENTIRE source work into the candidate work, not just this one
-            // source series. A reconcile-originated candidate represents a duplicate
-            // WORK that may carry several sources (the 3-works-across-5-sources case);
-            // moving one source would leave the duplicate behind. merge_works folds
-            // aliases/external-ids/sources/user-data and drops the emptied work — the
-            // same consolidation reconcile's AutoMerge path uses. Skip if the source
-            // already belongs to the candidate (self-referential; nothing to do).
-            if let Some(old) = old_work {
-                if old != row.candidate_work_id {
-                    // The status flip is already committed. If the fold fails, revert the
-                    // candidate to `pending` — otherwise it's stuck `confirmed` with the
-                    // duplicate un-merged and the admin can't retry it via the console.
-                    if let Err(e) = catalog::merge_works_ex(
-                        &st.pool,
-                        Some(&st.cover_pool),
-                        &old,
-                        &row.candidate_work_id,
-                    )
-                    .await
-                    {
-                        let _ = sqlx::query(
-                            "UPDATE merge_candidate SET status = 'pending', resolved_at = NULL \
-                             WHERE id = ?",
-                        )
-                        .bind(&id.0)
-                        .execute(&st.pool)
-                        .await;
-                        return Err(gql_err(e));
-                    }
-                }
-            }
-        }
-
+        .map_err(mutation_write_error)?;
+        clear_feed_caches();
         Ok(true)
     }
 
@@ -12751,55 +12694,127 @@ pub(crate) async fn enrich_works(st: &AppState, ids: &[String]) -> Result<i32> {
             })
             .collect();
         // Fetch every work's full cover set concurrently, yielding upsert-ready inputs.
-        let prepared: Vec<(String, catalog::WorkInput)> = futures::stream::iter(base)
+        let prepared: Vec<(String, catalog::WorkInput, bool)> = futures::stream::iter(base)
             .map(|(id, mut input, primary)| async move {
                 // F2: fetch the full per-volume cover set and mark the primary (the one
                 // the sweep mirrors on work.cover_file_name). Best-effort — a /cover
                 // failure just leaves the sweep's primary cover.
-                match st.mangadex.list_covers(&id, 100).await {
+                let covers_ok = match st.mangadex.list_covers(&id, 100).await {
                     Ok(fetched) if !fetched.is_empty() => {
                         input.covers =
                             crate::mangadex::covers_from_fetch(fetched, primary.as_deref());
+                        true
                     }
-                    Ok(_) => {}
+                    Ok(_) => true,
                     Err(e) => {
-                        tracing::warn!(manga = %id, error = %e, "enrich: /cover fetch failed")
+                        tracing::warn!(manga = %id, error = %e, "enrich: /cover fetch failed");
+                        false
                     }
-                }
-                (id, input)
+                };
+                (id, input, covers_ok)
             })
             .buffer_unordered(COVER_FETCH_CONCURRENCY)
             .collect()
             .await;
-        // Upserts stay serial — SQLite has a single writer, so concurrency there buys
-        // nothing and only contends on the busy-timeout.
-        for (id, input) in &prepared {
-            match catalog::upsert_work_from_mangadex(&st.pool, id, input).await {
-                Ok(_) => refreshed += 1,
-                Err(e) => tracing::warn!(manga = %id, error = %e, "enrich: upsert failed"),
-            }
-        }
-        // Advance the cursor past every requested id — including ones MangaDex
-        // didn't return — so the drain can't loop (H1/F2).
-        //
-        // The cost, stated plainly because it is NOT self-healing: an id MangaDex did
-        // return but whose record we failed to deserialize (`get_manga_by_ids` drops it
-        // loudly — see `mangadex::log_manga_drops`) is marked synced here just the same,
-        // so `works_needing_enrichment` never re-offers it. The work row survives; it
-        // just never receives S2 metadata or F2 covers. That is deliberately the lesser
-        // evil — the alternative re-fetches a permanently-unparseable id on every sweep
-        // forever — but it means a parse regression silently costs enrichment coverage
-        // rather than announcing itself. Making this self-healing needs a bounded retry
-        // (an attempt counter, hence a migration), not simply narrowing this call to the
-        // ids actually received.
-        catalog::mark_metadata_synced(&st.pool, chunk)
-            .await
-            .map_err(gql_err)?;
-        catalog::mark_covers_synced(&st.pool, chunk)
-            .await
-            .map_err(gql_err)?;
+        refreshed += persist_enrichment(&st.pool, &prepared).await?;
     }
     Ok(refreshed)
+}
+
+/// Only successfully persisted records receive completion markers. Missing upstream
+/// rows and failed upserts remain selectable on the next enrichment pass.
+async fn persist_enrichment(
+    pool: &Database,
+    prepared: &[(String, catalog::WorkInput, bool)],
+) -> Result<i32> {
+    let mut metadata_ok = Vec::new();
+    let mut covers_ok = Vec::new();
+    for (id, input, fetched_covers) in prepared {
+        match crate::db::retry_transaction(|| catalog::upsert_work_from_mangadex(pool, id, input))
+            .await
+        {
+            Ok(_) => {
+                metadata_ok.push(id.clone());
+                if *fetched_covers {
+                    covers_ok.push(id.clone());
+                }
+            }
+            Err(error) => {
+                tracing::warn!(manga = %id, error = %error, "enrich: upsert failed; retained for retry")
+            }
+        }
+    }
+    catalog::mark_metadata_synced(pool, &metadata_ok)
+        .await
+        .map_err(gql_err)?;
+    catalog::mark_covers_synced(pool, &covers_ok)
+        .await
+        .map_err(gql_err)?;
+    Ok(metadata_ok.len() as i32)
+}
+
+/// Resolve one review from the original owner snapshot. The actual fold and claim
+/// are atomic; rejection or a no-op approval also rechecks the pair under the writer.
+async fn resolve_merge_review_once(
+    pool: &Database,
+    covers: &Database,
+    id: &str,
+    source_series_id: &str,
+    source_work: Option<&str>,
+    target_work: &str,
+    accept: bool,
+) -> anyhow::Result<()> {
+    if accept && source_work.is_some_and(|source| source != target_work) {
+        catalog::merge_pending_candidate(pool, Some(covers), source_work.unwrap(), target_work, id)
+            .await?;
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    let current: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT source_series_id, candidate_work_id, status FROM merge_candidate WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if current
+        != Some((
+            source_series_id.to_string(),
+            target_work.to_string(),
+            "pending".to_string(),
+        ))
+    {
+        return Err(MutationValidation("This merge candidate is already resolved.").into());
+    }
+    if accept {
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
+                .bind(source_series_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if owner.as_deref() != source_work {
+            return Err(
+                MutationValidation("This merge candidate changed; reload and try again.").into(),
+            );
+        }
+    }
+    sqlx::query("UPDATE merge_candidate SET status = ?, resolved_at = ? WHERE id = ? AND status = 'pending'")
+        .bind(if accept { "confirmed" } else { "rejected" }).bind(Utc::now().to_rfc3339()).bind(id)
+        .execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// An upstream scan failure must not hide a failed attempt to reschedule the series.
+async fn mark_scan_due_now(pool: &Database, series_id: &str) -> anyhow::Result<()> {
+    crate::db::retry_transaction(|| async {
+        sqlx::query("UPDATE series_scan_state SET next_scan_at = ? WHERE series_id = ?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(series_id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    })
+    .await
 }
 
 /// Federated-search persist (S3): like `ingest_source_series` but consolidating —
@@ -13506,9 +13521,7 @@ async fn sort_pending_reviews(
                     continue;
                 }
                 Err(e) if is_precondition_failure(&e) => {}
-                Err(e) => {
-                    tracing::warn!(candidate_id = %id, error = %e, "review merge failed; will retry")
-                }
+                Err(error) => return Err(error),
             }
         }
         if (verdict.score - old_score).abs() > f64::EPSILON {
@@ -27578,5 +27591,206 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>()
         };
         assert_eq!(ids(library), ids(progress));
+    }
+
+    #[tokio::test]
+    async fn durable_writes_review_claim_rolls_back_with_failed_merge() {
+        let (schema, pool, _) = setup_with_state(100).await;
+        let (source, target, review) = waiting_pair(
+            &pool,
+            "Ao",
+            "AO!",
+            Some("Same Author"),
+            Some("Same Author"),
+            "pending",
+        )
+        .await;
+        sqlx::query(&format!("CREATE TRIGGER fail_review_merge BEFORE DELETE ON work WHEN OLD.id='{source}' BEGIN SELECT RAISE(ABORT,'forced merge failure'); END"))
+            .execute(&pool).await.unwrap();
+        // This defeats the former compensating write, proving that the status flip
+        // has to roll back with the merge rather than be repaired afterwards.
+        sqlx::query("CREATE TRIGGER fail_review_compensation BEFORE UPDATE OF status ON merge_candidate WHEN NEW.status='pending' BEGIN SELECT RAISE(ABORT,'forced compensation failure'); END")
+            .execute(&pool).await.unwrap();
+        let query = format!("mutation{{resolveMergeCandidate(id:\"{review}\",accept:true)}}");
+        let response = exec(&schema, &query, Some("admintok"), "durable-review").await;
+        assert!(!response.errors.is_empty());
+        let status: String = sqlx::query_scalar("SELECT status FROM merge_candidate WHERE id=?")
+            .bind(&review)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending", "failed merge left a confirmed review");
+        assert!(work_exists(&pool, &source).await);
+        assert!(work_exists(&pool, &target).await);
+        sqlx::query("DROP TRIGGER fail_review_merge")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = exec(&schema, &query, Some("admintok"), "durable-review").await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert!(!work_exists(&pool, &source).await);
+        assert!(work_exists(&pool, &target).await);
+        let status: String = sqlx::query_scalar("SELECT status FROM merge_candidate WHERE id=?")
+            .bind(&review)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "confirmed");
+    }
+
+    #[tokio::test]
+    async fn durable_writes_review_sort_does_not_swallow_merge_errors() {
+        let pool = migrated_pool().await;
+        let (source, _, review) = waiting_pair(
+            &pool,
+            "Ao",
+            "AO!",
+            Some("Masashi Kishimoto"),
+            Some("Kishimot Masashi"),
+            "pending",
+        )
+        .await;
+        sqlx::query(&format!("CREATE TRIGGER fail_sorted_merge BEFORE DELETE ON work WHEN OLD.id='{source}' BEGIN SELECT RAISE(ABORT,'forced merge failure'); END"))
+            .execute(&pool).await.unwrap();
+        assert!(
+            auto_merge_pending_reviews(&pool, None).await.is_err(),
+            "review sort hid a database failure from its retry caller"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM merge_candidate WHERE id=?")
+            .bind(&review)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending");
+        sqlx::query("DROP TRIGGER fail_sorted_merge")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(auto_merge_pending_reviews(&pool, None).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn durable_writes_explicit_review_checks_the_original_source_owner() {
+        let (_, pool, state) = setup_with_state(100).await;
+        let (source, target, review) =
+            waiting_pair(&pool, "Ao", "AO!", None, None, "pending").await;
+        let source_series: String =
+            sqlx::query_scalar("SELECT source_series_id FROM merge_candidate WHERE id=?")
+                .bind(&review)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let detached = catalog::create_work(
+            &pool,
+            &catalog::WorkInput {
+                primary_title: Some("Detached".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE source_series SET work_id=? WHERE id=?")
+            .bind(&detached)
+            .bind(&source_series)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(resolve_merge_review_once(
+            &pool,
+            &state.cover_pool,
+            &review,
+            &source_series,
+            Some(&source),
+            &target,
+            true
+        )
+        .await
+        .is_err());
+        for id in [&source, &target, &detached] {
+            assert!(work_exists(&pool, id).await);
+        }
+        let status: String = sqlx::query_scalar("SELECT status FROM merge_candidate WHERE id=?")
+            .bind(&review)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending");
+    }
+
+    #[tokio::test]
+    async fn durable_writes_enrichment_marks_only_persisted_records_and_fetched_covers() {
+        let pool = migrated_pool().await;
+        let mut works = HashMap::new();
+        for mid in ["good", "failed", "cover-failed", "missing"] {
+            let work = catalog::upsert_work_from_mangadex(
+                &pool,
+                mid,
+                &catalog::WorkInput {
+                    primary_title: Some(mid.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE work SET metadata_synced_at=NULL,mangadex_details_synced_at=NULL,covers_synced_at=NULL WHERE id=?")
+                .bind(&work).execute(&pool).await.unwrap();
+            works.insert(mid, work);
+        }
+        sqlx::query(&format!("CREATE TRIGGER fail_enrichment BEFORE UPDATE ON work WHEN OLD.id='{}' BEGIN SELECT RAISE(ABORT,'forced enrichment failure'); END", works["failed"]))
+            .execute(&pool).await.unwrap();
+        let prepared = ["good", "failed", "cover-failed"].map(|mid| {
+            (
+                mid.to_string(),
+                catalog::WorkInput {
+                    primary_title: Some(format!("{mid} refreshed")),
+                    ..Default::default()
+                },
+                mid != "cover-failed",
+            )
+        });
+        assert_eq!(persist_enrichment(&pool, &prepared).await.unwrap(), 2);
+        for mid in ["good", "failed", "cover-failed", "missing"] {
+            let (metadata, covers): (Option<String>, Option<String>) =
+                sqlx::query_as("SELECT metadata_synced_at,covers_synced_at FROM work WHERE id=?")
+                    .bind(&works[mid])
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                metadata.is_some(),
+                matches!(mid, "good" | "cover-failed"),
+                "{mid}"
+            );
+            assert_eq!(covers.is_some(), mid == "good", "{mid}");
+        }
+        let pending = works_needing_enrichment(&pool, 100).await.unwrap();
+        for mid in ["failed", "cover-failed", "missing"] {
+            assert!(pending.contains(&mid.to_string()), "{mid} was stranded");
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_writes_due_now_fallback_propagates_write_failures() {
+        let pool = migrated_pool().await;
+        sqlx::query("INSERT INTO series_scan_state(series_id,next_scan_at,updated_at) VALUES('42','2999-01-01T00:00:00Z','t')").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TRIGGER fail_due_now BEFORE UPDATE OF next_scan_at ON series_scan_state BEGIN SELECT RAISE(ABORT,'forced due-now failure'); END").execute(&pool).await.unwrap();
+        assert!(mark_scan_due_now(&pool, "42").await.is_err());
+        let next: String =
+            sqlx::query_scalar("SELECT next_scan_at FROM series_scan_state WHERE series_id='42'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(next, "2999-01-01T00:00:00Z");
+        sqlx::query("DROP TRIGGER fail_due_now")
+            .execute(&pool)
+            .await
+            .unwrap();
+        mark_scan_due_now(&pool, "42").await.unwrap();
+        let next: String =
+            sqlx::query_scalar("SELECT next_scan_at FROM series_scan_state WHERE series_id='42'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(next < "2999-01-01T00:00:00Z".to_string());
     }
 }

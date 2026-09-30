@@ -260,6 +260,35 @@ async fn save_stored(pool: &Database, s: Option<&Stored>) -> Result<(), String> 
         })
 }
 
+/// Persist the final local state atomically after external setup/removal steps.
+/// Retain the saved checkpoint when persistence fails so the job can be retried.
+async fn save_completed(pool: &Database, kind: JobKind, state: &Stored) -> Result<(), String> {
+    let values = match kind {
+        JobKind::Setup => vec![(
+            &instance::CLOUDFLARE_STATE,
+            serde_json::to_string(state).map_err(|e| e.to_string())?,
+        )],
+        JobKind::Remove => vec![
+            (&instance::CLOUDFLARE_STATE, String::new()),
+            (&instance::PUBLIC_DOMAIN, String::new()),
+            (&instance::ACCESS_MODE, "local".to_owned()),
+        ],
+    };
+    crate::db::retry_transaction(|| async {
+        let mut transaction = pool.begin().await?;
+        for (setting, value) in &values {
+            instance::store(&mut *transaction, setting, value).await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "saving completed Cloudflare state failed");
+        "The server could not save its progress. Check its log and retry.".to_owned()
+    })
+}
+
 // ---- checklist -----------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -930,16 +959,15 @@ impl Manager {
             }
         }
         if ok {
-            match kind {
-                JobKind::Setup => {
-                    s.complete = true;
-                    let _ = save_stored(&self.pool, Some(&s)).await;
-                }
-                JobKind::Remove => {
-                    let _ = save_stored(&self.pool, None).await;
-                    let _ = instance::store(&self.pool, &instance::PUBLIC_DOMAIN, "").await;
-                    let _ = instance::store(&self.pool, &instance::ACCESS_MODE, "local").await;
-                }
+            s.complete = true;
+            if let Err(message) = save_completed(&self.pool, kind, &s).await {
+                self.mark(
+                    steps.len().saturating_sub(1),
+                    LineState::Failed,
+                    Some(message),
+                );
+                self.finish();
+                return;
             }
             // Either way the server is no longer public at its own address.
             let _one = self.issuing.lock().await;

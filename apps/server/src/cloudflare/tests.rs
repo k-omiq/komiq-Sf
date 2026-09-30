@@ -634,6 +634,62 @@ fn mode(p: &std::path::Path) -> u32 {
 // ---- tests -------------------------------------------------------------------
 
 #[tokio::test]
+async fn completed_remove_save_failure_is_reported_and_preserves_the_checkpoint() {
+    let pool = pool().await;
+    let state = Stored {
+        domain: "read.example.com".into(),
+        ..Default::default()
+    };
+    save_stored(&pool, Some(&state)).await.unwrap();
+    instance::store(&pool, &instance::PUBLIC_DOMAIN, &state.domain)
+        .await
+        .unwrap();
+    instance::store(&pool, &instance::ACCESS_MODE, "internet")
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER reject_final_domain BEFORE UPDATE ON instance_setting WHEN NEW.key='public_domain' AND NEW.value='' BEGIN SELECT RAISE(ABORT, 'save unavailable'); END")
+        .execute(&pool).await.unwrap();
+    let dir = temp_dir("terminal-save-failure");
+    let mgr = manager(
+        &pool,
+        options("http://127.0.0.1:1", &dir, None),
+        Arc::new(crate::TrustedProxies::for_tests(vec![], false)),
+    );
+    mgr.begin(JobKind::Remove, &[Step::ResetClientIp], &state.domain)
+        .unwrap();
+    // All external steps have finished; exercise only terminal persistence.
+    mgr.clone()
+        .run(
+            JobKind::Remove,
+            vec![],
+            state.clone(),
+            ApiToken::new(TOKEN).unwrap(),
+        )
+        .await;
+    let job = mgr.status().await.job.unwrap();
+    assert!(job.failed);
+    assert!(!job.running);
+    assert_eq!(load_stored(&pool).await, Some(state));
+    assert_eq!(
+        instance::resolve(&pool, &instance::ACCESS_MODE).await.value,
+        "internet"
+    );
+    sqlx::query("DROP TRIGGER reject_final_domain")
+        .execute(&pool)
+        .await
+        .unwrap();
+    save_completed(&pool, JobKind::Remove, &Stored::default())
+        .await
+        .unwrap();
+    assert!(load_stored(&pool).await.is_none());
+    assert_eq!(
+        instance::resolve(&pool, &instance::ACCESS_MODE).await.value,
+        "local"
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn tunnel_setup_then_remove_deletes_exactly_what_it_created() {
     let (api, mock) = start_mock(base_mock()).await;
     let dir = temp_dir("tunnel");

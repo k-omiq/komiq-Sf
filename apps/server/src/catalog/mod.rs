@@ -3706,6 +3706,26 @@ pub async fn merge_works_checked(
     merge_works_guarded(pool, covers, source_work, target_work, expected, None).await
 }
 
+/// An explicit approval claims its pending review and folds its original owner
+/// under one write transaction. Human approval does not need a metadata identity gate.
+pub async fn merge_pending_candidate(
+    pool: &Database,
+    covers: Option<&Database>,
+    source_work: &str,
+    target_work: &str,
+    candidate_id: &str,
+) -> Result<MergeOutcome> {
+    merge_works_guarded(
+        pool,
+        covers,
+        source_work,
+        target_work,
+        None,
+        Some(candidate_id),
+    )
+    .await
+}
+
 /// Claim a waiting review and merge under the same write lock. A rejection or
 /// metadata edit that wins the lock prevents the automatic merge.
 pub async fn merge_pending_candidate_checked(
@@ -4204,9 +4224,8 @@ async fn merge_works_guarded(
     // Cross-DB, so necessarily outside the transaction and AFTER it commits — which is
     // exactly why this must not use `?`. The merge is already durable at this point; a
     // failure here would report an error for work that DID happen, and the callers act
-    // on that: `resolve_merge_candidate` reverts the review row to `pending` (leaving a
-    // resolved merge stuck as unresolved), and `reconcile`/`consolidate` abort the whole
-    // sweep. A leaked blob is re-derivable from MangaDex and is the same harmless state
+    // on that: `reconcile`/`consolidate` would abort the whole sweep after a durable
+    // merge. A leaked blob is re-derivable from MangaDex and is the same harmless state
     // a crash in this window already leaves behind, so log it and carry on.
     if let Some(covers) = covers {
         if let Err(e) = reclaim_cover_blob(covers, source_work).await {
@@ -5403,6 +5422,23 @@ pub async fn replace_source_chapters(
     source_series_id: &str,
     chapters: &[ChapterInput],
 ) -> Result<()> {
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        replace_source_chapters_on(&mut tx, source_series_id, chapters).await?;
+        tx.commit().await?;
+        Ok(())
+    })
+    .await
+}
+
+/// Replace and prune on the caller's writer connection. The existing-row read must
+/// share its transaction with the writes so a concurrent replacement cannot make
+/// the prune list stale, and cache writers can commit both structures atomically.
+pub(crate) async fn replace_source_chapters_on(
+    conn: &mut sqlx::SqliteConnection,
+    source_series_id: &str,
+    chapters: &[ChapterInput],
+) -> Result<()> {
     use std::collections::HashSet;
 
     let incoming: HashSet<&str> = chapters
@@ -5413,7 +5449,7 @@ pub async fn replace_source_chapters(
     let existing: Vec<(String, String)> =
         sqlx::query_as("SELECT id, external_id FROM chapter WHERE source_series_id = ?")
             .bind(source_series_id)
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?;
     let vanished: Vec<String> = existing
         .into_iter()
@@ -5422,7 +5458,6 @@ pub async fn replace_source_chapters(
         .collect();
 
     let now = Utc::now().to_rfc3339();
-    let mut tx = pool.begin().await?;
     for ch in chapters {
         if ch.external_id.is_empty() {
             continue;
@@ -5443,16 +5478,15 @@ pub async fn replace_source_chapters(
             .bind(&chapter_key)
             .bind(&label)
             .bind(&now)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
     }
     for id in &vanished {
         sqlx::query("DELETE FROM chapter WHERE id = ?")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 

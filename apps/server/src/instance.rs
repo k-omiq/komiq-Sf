@@ -331,7 +331,10 @@ pub async fn resolve_with(
 
 /// Store `value` for `s` (upsert). The caller decides whether an env override
 /// makes the write pointless; this only touches the table.
-pub async fn store(pool: &Database, s: &Setting, value: &str) -> sqlx::Result<()> {
+pub async fn store<'e, E>(executor: E, s: &Setting, value: &str) -> sqlx::Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query(
         "INSERT INTO instance_setting (key, value, updated_at) VALUES (?, ?, ?) \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -339,7 +342,7 @@ pub async fn store(pool: &Database, s: &Setting, value: &str) -> sqlx::Result<()
     .bind(s.key)
     .bind(value)
     .bind(Utc::now().to_rfc3339())
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
