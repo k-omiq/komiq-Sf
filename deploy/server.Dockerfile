@@ -9,7 +9,9 @@
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
 
-# Copy only the server crate (its Cargo.toml has no workspace parent).
+# Keep bundled SQLite build flags identical to local and CI builds.
+COPY .cargo/config.toml ./.cargo/config.toml
+# The server crate has no workspace parent.
 COPY apps/server/ ./apps/server/
 
 WORKDIR /build/apps/server

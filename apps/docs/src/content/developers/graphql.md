@@ -80,6 +80,7 @@ These operations retrieve comic metadata, chapter lists, page image links and se
 - `genreFacets`: genre counts matching current search criteria.
 - `browseSources`: the sources the `source` filter of `search` accepts, each with the number of works the viewer may see.
 - `scanlatorTags`: the scanlators an administrator tagged as AI or partial AI. A client matches the names to a chapter copy's `scanlator`.
+- `sourceAiTags`: the Suwayomi sources an administrator tagged as AI or partial AI, for a site that translates its own series. A client matches the ids to a chapter copy's source and shows the stronger of the two tags.
 - `series`: series details by Suwayomi identifier.
 - `canonicalSeries`: canonical work details by work identifier (`w_...`).
 - `chapters`: chapter list for a specific source series.
@@ -107,6 +108,13 @@ query BrowseManga($filter: BrowseFilter) {
 	}
 }
 ```
+
+A content block rule names tag ids, content ratings, or both, for example `{ tags: ["gore"], ratings: [EROTICA, PORNOGRAPHIC] }`. It matches a work that has all of its tags and, when it names ratings, one of them. An adult work is never rated below `EROTICA` for this test. A work is blocked when any rule matches it.
+
+- A site-wide rule applies to every viewer. The list queries and `library` leave the work out. The queries that take an identifier answer as they do for an unknown work. So do `reviews`, the `comments` of a series and the library mutations. The server also refuses the chapter page images of a blocked series from the engine. Covers stay open, because the admin console still lists the series.
+- A user's own rule applies to that user's lists only: `search`, `discovery`, `updates`, `updatesFeed` and `canonicalUpdates`. A work the user opens by its identifier still opens, and `library` keeps it.
+- The counts of `tags`, `genreFacets` and `browseSources` do not change with the rules.
+- An administrator who sends `includeNsfw: true` to `search` or `canonicalUpdates` gets the list without the rules. The admin console does this.
 
 ### Library and reading progress
 
@@ -147,14 +155,15 @@ These operations manage account registration, login and profile updates:
 - `changePassword`: update user password and clear forced change flag.
 - `updateProfile`: update display name and biography.
 - `setShowNsfw`: toggle adult content visibility preference.
+- `myBlockRules` and `setMyBlockRules`: read and replace the signed-in user's content block rules.
 
 ### Administration and operations
 
 Operations in this category require `isAdmin: true` on the authenticated user:
 
-- **Instance settings**: `accessStatus`, `accessPreflight`, `setAccessMode`, `checkCloudflareToken`, `startCloudflareSetup`, `retryCloudflareSetup`, `removeCloudflareSetup`, `setRegistrationOpen`.
+- **Instance settings**: `accessStatus`, `accessPreflight`, `setAccessMode`, `checkCloudflareToken`, `startCloudflareSetup`, `retryCloudflareSetup`, `removeCloudflareSetup`, `setRegistrationOpen`, `siteBlockRules`, `setSiteBlockRules`.
 - **User moderation**: `users`, `createUser`, `setUserAdmin`, `resetUserPassword`, `banUser`, `deleteComment`.
-- **Sources and extensions**: `extensions`, `extensionRepos`, `sources`, `sourceBrowse`, `installExtension`, `uninstallExtension`, `updateExtension`, `addExtensionRepo`, `removeExtensionRepo`, `mangadexSetting`, `setMangadexEnabled`, `sourceRateLimits`, `setSourceRateLimit`, `removeSourceRateLimit`, `scanlators`, `setScanlatorAi`, `startSourceIngest`, `cancelSourceIngest`, `startExtensionIngest`, `cancelExtensionIngest`, `setExtensionSubscription`.
+- **Sources and extensions**: `extensions`, `extensionRepos`, `sources`, `sourceBrowse`, `installExtension`, `uninstallExtension`, `updateExtension`, `addExtensionRepo`, `removeExtensionRepo`, `mangadexSetting`, `setMangadexEnabled`, `sourceRateLimits`, `setSourceRateLimit`, `removeSourceRateLimit`, `scanlators`, `setScanlatorAi`, `scanlatorSites`, `setSourceAi`, `startSourceIngest`, `cancelSourceIngest`, `startExtensionIngest`, `cancelExtensionIngest`, `setExtensionSubscription`.
 - **Catalog curation**: `mergeQueue`, `resolveMergeCandidate`, `mergeWorks`, `splitSourceSeries`, `workSourceRows`, `workReviewDetail`, `consolidateExactDuplicates`, `reconcileCatalogue`, `resyncCatalogue`, `addSourceSeries`, `bulkAddSourceSeries`, `coverIssues`, `retryCover`, `materializeCatalogueCovers`, `persistCatalogue`, `backfillMangadexMetadata`.
 - **Scanner and series administration**: `scanStatus`, `triggerScan`, `setSeriesPaused`, `rescanWork`, `updateSeriesAdmin`, `seriesAdminMeta`, `updateSeriesMetadata`, `addSeriesAltTitle`, `removeSeriesAltTitle`, `workChaptersAdmin`, `setChapterOverride`.
 - **Adult sources**: `markSourceNsfw` flags a whole Suwayomi source as adult, updates the works already added from it, and remembers the choice for series added later. `rederiveSuwayomiNsfw` recomputes the flag for every work added from a Suwayomi source. The admin console has no control for these two; call them through GraphQL.
@@ -241,3 +250,4 @@ curl -s http://localhost:8080/graphql \
 - `packages/api/src/graphql-backend.ts`: TypeScript `GraphQLBackend` class with retry and field-stripping logic.
 - `apps/server/src/graphql/mod.rs`: Rust query and mutation resolver implementations and caching layers.
 - `apps/server/src/graphql/types.rs`: Async-graphql type mappings and converters between Suwayomi and komiq types.
+- `apps/server/src/block.rs`: content block rules, their validation and the SQL condition that every gated query shares.

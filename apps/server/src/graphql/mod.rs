@@ -1,6 +1,8 @@
 pub mod types;
 
 #[cfg(test)]
+mod block_tests;
+#[cfg(test)]
 mod cache_refresh_tests;
 #[cfg(test)]
 mod sources_tests;
@@ -416,6 +418,23 @@ pub struct RequestUserCache(pub std::sync::Arc<tokio::sync::OnceCell<Result<Opti
 /// request; the flag is request-stable, so one query suffices.
 #[derive(Clone, Default)]
 pub struct RequestNsfwPref(pub std::sync::Arc<tokio::sync::OnceCell<Result<bool>>>);
+
+/// The content block rules that apply to one request's viewer (`block.rs`).
+#[derive(Debug, Default)]
+pub struct ViewerBlocks {
+    /// The site-wide rules. They also close the by-id doors: a work they match cannot
+    /// be opened or read.
+    pub site: crate::block::BlockSet,
+    /// The site-wide rules plus the viewer's own: what every LIST is filtered by. A
+    /// viewer's own rule hides a series from their lists; it does not lock them out of
+    /// a series they open by its link, and it does not empty their library.
+    pub lists: crate::block::BlockSet,
+}
+
+/// Per-request memoization of [`ViewerBlocks`], like [`RequestNsfwPref`]: every list
+/// resolver and every by-id gate asks, and the rules are one read per request.
+#[derive(Clone, Default)]
+pub struct RequestBlocks(pub std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<ViewerBlocks>>>);
 
 /// One viewer's `user_library` row for a series — the shared payload behind the
 /// `is_marked` / `library_status` / `is_favorite` resolvers.
@@ -1366,6 +1385,11 @@ async fn nsfw_work_ids(
 /// the derived value) instead of setting it, so recomputing is the only form that is
 /// right for all of them.
 ///
+/// The content rating is the same kind of copy (`feed_series_updates.content_rating`, and
+/// the effective rating on `browse_catalogue`), and the same edits change it: a new
+/// rating, or an NSFW flag that lifts a mild rating to `erotica`. It is re-derived here
+/// too, in the same statements.
+///
 /// Best-effort. A failure here leaves the flag stale until the next refresh, which is
 /// exactly the status quo it is closing — it must not fail the admin's edit, which has
 /// already been committed to `work` (the authoritative column every non-feed surface
@@ -1386,10 +1410,27 @@ async fn resync_feed_nsfw(pool: &Database, work_ids: &[String]) {
             // without it one impossible orphan would abort the statement and leave all
             // 500 works in its chunk stale. `{table}` is one of the three literals above,
             // never input.
+            // The two tables that also store a COPY of the rating take it in the same
+            // statement, each in the form its own refresh writes (`refresh_feed_updates`,
+            // `browse_catalogue_select`). Browse filters and block rules read that copy:
+            // left stale, an admin who re-rates a work keeps it listed under a rule that
+            // now blocks it, while every by-id door (which reads `work`) refuses it.
+            let rating = match table {
+                "feed_series_updates" => Some("COALESCE(w.content_rating, 'safe')".to_string()),
+                "browse_catalogue" => Some(crate::block::work_rating_sql("w")),
+                _ => None,
+            }
+            .map(|expr| {
+                format!(
+                    ", content_rating = COALESCE( \
+                         (SELECT {expr} FROM work w WHERE w.id = {table}.work_id), content_rating)"
+                )
+            })
+            .unwrap_or_default();
             let sql = format!(
                 "UPDATE {table} SET is_nsfw = COALESCE( \
                      (SELECT COALESCE(w.is_nsfw_override, w.is_nsfw) \
-                      FROM work w WHERE w.id = {table}.work_id), is_nsfw) \
+                      FROM work w WHERE w.id = {table}.work_id), is_nsfw){rating} \
                  WHERE work_id IN ({ph})"
             );
             let mut q = sqlx::query(&sql);
@@ -1506,6 +1547,8 @@ fn browse_query_from_filter<'a>(
         f.direction,
     );
     Ok(b::BrowseQuery {
+        // Set by the resolver, not read from the client's filter (`search_v2`).
+        blocks: None,
         show_nsfw,
         types: filter_words(f.types.as_ref(), collapsed_comic_type_word),
         statuses: filter_words(f.status.as_ref(), status_word),
@@ -1558,13 +1601,17 @@ async fn search_v2(
     trimmed: &str,
     page: i32,
     show_nsfw: bool,
+    blocks: &crate::block::BlockSet,
     filter: &BrowseFilter,
 ) -> Result<SeriesPage> {
     // Clamped ONCE, so the page echoed back is the page the rows came from — `page: 0`
     // returns page-1 rows labelled page 1, as `updatesFeed` already does.
     let page = page.max(1);
     let ratings = filter_content_ratings(filter);
-    let bq = browse_query_from_filter(filter, show_nsfw, !trimmed.is_empty(), page, &ratings)?;
+    let mut bq = browse_query_from_filter(filter, show_nsfw, !trimmed.is_empty(), page, &ratings)?;
+    // The viewer's block rules are not part of the client's filter: the resolver adds
+    // them, so no filter a client sends can leave them out.
+    bq.blocks = Some(blocks);
     let (total, rows) = if trimmed.is_empty() {
         crate::browse::browse_catalogue(&st.pool, &bq).await
     } else {
@@ -1579,6 +1626,22 @@ async fn search_v2(
         has_next_page: has_next,
         total: Some(total.min(i64::from(i32::MAX)) as i32),
     })
+}
+
+/// The block rules a LIST is filtered by, with the same admin-console exemption as
+/// [`viewer_show_nsfw_or_admin`] and for the same reason: `search` and
+/// `canonicalUpdates` are also the console's catalogue and updates views, and a work a
+/// rule hides from readers must stay visible to the admin who has to fix its tags or
+/// its rating. `includeNsfw: true` from an admin is the console asking; everyone else
+/// gets the site's rules plus their own.
+async fn list_blocks_or_admin(
+    ctx: &Context<'_>,
+    include_nsfw: Option<bool>,
+) -> Result<crate::block::BlockSet> {
+    if include_nsfw == Some(true) && current_user(ctx).await?.is_some_and(|u| u.is_admin != 0) {
+        return Ok(crate::block::BlockSet::default());
+    }
+    Ok(viewer_blocks(ctx).await?.lists.clone())
 }
 
 async fn viewer_show_nsfw_or_admin(ctx: &Context<'_>, include_nsfw: Option<bool>) -> Result<bool> {
@@ -1611,6 +1674,224 @@ fn filter_nsfw(show_nsfw: bool, items: Vec<Series>) -> Vec<Series> {
         return items;
     }
     items.into_iter().filter(|s| !s.is_nsfw).collect()
+}
+
+/// The content block rules for this request's viewer: the site's, and their own on top
+/// when signed in. Memoized per request via [`RequestBlocks`].
+///
+/// Fails CLOSED: when the rules cannot be read the resolver fails, instead of listing
+/// what a rule may have hidden.
+async fn viewer_blocks(ctx: &Context<'_>) -> Result<std::sync::Arc<ViewerBlocks>> {
+    if let Some(cache) = ctx.data_opt::<RequestBlocks>() {
+        return cache
+            .0
+            .get_or_try_init(|| async { resolve_viewer_blocks(ctx).await })
+            .await
+            .cloned();
+    }
+    resolve_viewer_blocks(ctx).await
+}
+
+/// The unmemoized body of [`viewer_blocks`].
+async fn resolve_viewer_blocks(ctx: &Context<'_>) -> Result<std::sync::Arc<ViewerBlocks>> {
+    let pool = &state(ctx).pool;
+    let site = crate::block::load(pool, None).await.map_err(gql_err)?;
+    let lists = match current_user(ctx).await? {
+        Some(user) => crate::block::load(pool, Some(&user.id))
+            .await
+            .map_err(gql_err)?,
+        None => site.clone(),
+    };
+    Ok(std::sync::Arc::new(ViewerBlocks { site, lists }))
+}
+
+/// Drop the series `set` blocks from a list that is already built: a memoized feed, or
+/// a list whose query did not carry the rules. The block-rule twin of [`filter_nsfw`].
+/// One lookup for the whole list, and none when there is no rule.
+async fn filter_blocked(
+    pool: &Database,
+    set: &crate::block::BlockSet,
+    items: Vec<Series>,
+) -> Result<Vec<Series>> {
+    if set.is_empty() || items.is_empty() {
+        return Ok(items);
+    }
+    let ids: Vec<String> = items.iter().map(|s| s.id.0.clone()).collect();
+    let blocked = crate::block::blocked_series_ids(pool, set, &ids)
+        .await
+        .map_err(gql_err)?;
+    Ok(items
+        .into_iter()
+        .filter(|s| !blocked.contains(&s.id.0))
+        .collect())
+}
+
+/// [`filter_blocked`] over every rail of `discovery`, with ONE lookup for all of them.
+async fn discovery_without_blocked(
+    st: &AppState,
+    set: &crate::block::BlockSet,
+    mut feeds: Vec<DiscoveryFeed>,
+) -> Result<Vec<DiscoveryFeed>> {
+    if set.is_empty() {
+        return Ok(feeds);
+    }
+    let ids: Vec<String> = feeds
+        .iter()
+        .flat_map(|f| f.items.iter().map(|s| s.id.0.clone()))
+        .collect();
+    let blocked = crate::block::blocked_series_ids(&st.pool, set, &ids)
+        .await
+        .map_err(gql_err)?;
+    if !blocked.is_empty() {
+        for feed in &mut feeds {
+            feed.items.retain(|s| !blocked.contains(&s.id.0));
+        }
+    }
+    Ok(feeds)
+}
+
+/// Validate `rules` and replace `scope`'s rules with them. A rule that is refused is a
+/// message for the person who wrote it; nothing is stored then.
+async fn store_block_rules(
+    st: &AppState,
+    scope: crate::block::Scope<'_>,
+    rules: Vec<BlockRuleInput>,
+) -> Result<Vec<BlockRule>> {
+    use crate::block::{self, RuleError};
+    // Before the rules are parsed: a client cannot make the server validate a list
+    // it will refuse for its length anyway.
+    if rules.len() > block::MAX_RULES {
+        return Err(Error::new(RuleError::TooManyRules.to_string()));
+    }
+    let parsed: Vec<block::BlockRule> = rules
+        .into_iter()
+        .map(|r| {
+            block::BlockRule::new(
+                r.tags.unwrap_or_default(),
+                r.ratings
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(content_rating_word),
+            )
+        })
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| Error::new(e.to_string()))?;
+    block::replace(&st.pool, scope, &parsed)
+        .await
+        .map_err(gql_err)?;
+    let stored = block::list(&st.pool, scope).await.map_err(gql_err)?;
+    Ok(stored.iter().map(Into::into).collect())
+}
+
+/// The by-id door for a canonical work: an error when a SITE-WIDE rule blocks it. The
+/// message is the caller's own "no such" text, so a blocked work and a missing one
+/// look the same.
+async fn deny_blocked_work(ctx: &Context<'_>, work_id: &str, not_found: &str) -> Result<()> {
+    let blocks = viewer_blocks(ctx).await?;
+    if crate::block::is_blocked(&state(ctx).pool, &blocks.site, work_id)
+        .await
+        .map_err(gql_err)?
+    {
+        return Err(Error::new(not_found));
+    }
+    Ok(())
+}
+
+/// Whether a SITE-WIDE rule blocks this work. For a resolver that answers a blocked
+/// work with an empty list instead of an error (`workSources`).
+async fn site_blocks_work(ctx: &Context<'_>, work_id: &str) -> Result<bool> {
+    let blocks = viewer_blocks(ctx).await?;
+    crate::block::is_blocked(&state(ctx).pool, &blocks.site, work_id)
+        .await
+        .map_err(gql_err)
+}
+
+/// [`deny_blocked_work`] for a mirrored MangaDex chapter, by chapter uuid: blocked when
+/// its owning work is.
+///
+/// A chapter that is not in the mirror has no work to judge. While a site-wide rule
+/// exists it is refused too: the chapter lists a client reads ids from come from the
+/// mirror, so only a hand-made request names such a chapter, and letting it through
+/// would serve the new chapters of a blocked work until the mirror catches up. This is
+/// stricter than the NSFW gate (`catalog::chapter_owner_is_nsfw`), which passes it.
+async fn deny_blocked_chapter(ctx: &Context<'_>, external_id: &str, not_found: &str) -> Result<()> {
+    let blocks = viewer_blocks(ctx).await?;
+    if blocks.site.is_empty() {
+        return Ok(());
+    }
+    let pool = &state(ctx).pool;
+    let owner: Option<String> = sqlx::query_scalar(
+        "SELECT ss.work_id FROM chapter c \
+         JOIN source_series ss ON ss.id = c.source_series_id \
+         WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
+    )
+    .bind(external_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(gql_err)?;
+    let Some(work_id) = owner else {
+        return Err(Error::new(not_found));
+    };
+    if crate::block::is_blocked(pool, &blocks.site, &work_id)
+        .await
+        .map_err(gql_err)?
+    {
+        return Err(Error::new(not_found));
+    }
+    Ok(())
+}
+
+/// [`deny_blocked_work`] for an id as a `Series` carries it: a `w_` work id, or the
+/// numeric id of a Suwayomi series (blocked when the work it is mapped to is).
+///
+/// A numeric id is judged in its canonical form. The resolvers parse the id they are
+/// given, so `0902` and `+902` open series 902, and the rule lookup compares TEXT keys:
+/// judged as sent, such an id would walk past the gate. An id of neither shape names
+/// no series, and passes to the caller's own "no such" answer.
+async fn deny_blocked_series(ctx: &Context<'_>, series_id: &str, not_found: &str) -> Result<()> {
+    let blocks = viewer_blocks(ctx).await?;
+    if blocks.site.is_empty() {
+        return Ok(());
+    }
+    let key = if series_id.starts_with("w_") {
+        series_id.to_string()
+    } else {
+        match series_id.parse::<i64>() {
+            Ok(n) => n.to_string(),
+            Err(_) => return Ok(()),
+        }
+    };
+    let hit = crate::block::blocked_series_ids(&state(ctx).pool, &blocks.site, &[key])
+        .await
+        .map_err(gql_err)?;
+    if hit.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::new(not_found))
+    }
+}
+
+/// The "no such" answer for an id of either `Series` shape, as `reload_series` words it.
+fn no_such_series(series_id: &str) -> &'static str {
+    if series_id.starts_with("w_") {
+        "No such work"
+    } else {
+        "No such series"
+    }
+}
+
+/// Whether a SITE-WIDE rule blocks the Suwayomi series `manga_id`. For the image routes,
+/// which have no GraphQL context. One small read when no rule exists, two when one does.
+pub async fn site_blocks_engine_series(pool: &Database, manga_id: i64) -> anyhow::Result<bool> {
+    let site = crate::block::load(pool, None).await?;
+    if site.is_empty() {
+        return Ok(false);
+    }
+    Ok(
+        !crate::block::blocked_series_ids(pool, &site, &[manga_id.to_string()])
+            .await?
+            .is_empty(),
+    )
 }
 
 /// Map a single federated Suwayomi manga onto a Komika `Series`. One-off callers
@@ -1668,6 +1949,8 @@ fn assemble_series(
             _ => st.suwayomi.abs(m.thumbnail_url.as_deref()),
         },
         rating,
+        // Keyed by WORK, which the batch caller holds: filled there, like `detected_at`.
+        mangadex_rating: None,
         detected_at: None,
         scan: ScanPolicy {
             // Derived scan state (from the background scheduler) wins when present;
@@ -1794,6 +2077,8 @@ async fn map_series_batch(st: &AppState, list: Vec<SuwayomiManga>) -> Result<Vec
     let genres_by_work = catalog::work_effective_genres_batch_checked(&st.pool, &genre_work_ids)
         .await
         .map_err(gql_err)?;
+    // MangaDex's rating for the same catalogued works: the second number on the card.
+    let md_ratings = mangadex_rating_batch(&st.pool, &genre_work_ids).await?;
     // The REAL newest-chapter time for the whole page in one query. A live-fetched manga
     // carries `latest_chapter_at: None` (not part of Suwayomi's wire shape), and
     // `assemble_series` no longer papers over that with the poll time — so without this
@@ -1837,10 +2122,15 @@ async fn map_series_batch(st: &AppState, list: Vec<SuwayomiManga>) -> Result<Vec
         // `series_scan_state` per card at resolve time (~80 point queries per home
         // render); it now resolves from this field (see the `Series.detected_at` doc).
         let detected_at = scans.get(&id).and_then(|s| s.last_new_chapter_at.clone());
+        let mangadex_rating = ov_meta
+            .work_id
+            .as_ref()
+            .and_then(|wid| md_ratings.get(wid).copied());
         let mut s = assemble_series(
             st, m, rating, ov, scan, alt_titles, is_nsfw, ov_meta, genres,
         );
         s.detected_at = detected_at;
+        s.mangadex_rating = mangadex_rating;
         // Empty here means the manga came off the WIRE (a cache-read manga already
         // carries the column). Never overwrite a value the manga brought with it — that
         // one came from this same column and is what a single-series load would show.
@@ -1962,6 +2252,31 @@ async fn rating_summary_by_work_batch(
     }
     let rows = q.fetch_all(pool).await.map_err(gql_err)?;
     Ok(fold_rating_rows(rows))
+}
+
+/// MangaDex's community rating for a page of works, keyed by work id — or nothing at all
+/// when the admin turned MangaDex ratings off (`instance::SHOW_MANGADEX_RATINGS`).
+///
+/// THE one gate for that switch: every surface that hands a MangaDex rating to a client
+/// reads it through here, so none can carry one past the setting. The setting is read from
+/// the table on each call (one primary-key lookup per page) instead of being held in
+/// memory, so a change reaches every replica without a restart.
+async fn mangadex_rating_batch(
+    pool: &Database,
+    work_ids: &[String],
+) -> Result<HashMap<String, f64>> {
+    use crate::instance as inst;
+    if work_ids.is_empty()
+        || !inst::resolve_checked(pool, &inst::SHOW_MANGADEX_RATINGS)
+            .await
+            .map_err(gql_err)?
+            .as_bool()
+    {
+        return Ok(HashMap::new());
+    }
+    crate::work_stats::display_rating_batch_checked(pool, work_ids)
+        .await
+        .map_err(gql_err)
 }
 
 /// Map each id in `ids` (ANY shape — a `w_…` work id or a numeric Suwayomi source key) to
@@ -2497,8 +2812,12 @@ impl PartialOrd for OrderedNumber {
 /// cannot overlap; the version digit is here for the same reason Browse has one — if this
 /// count is ever repointed at a different table its SCALE changes, and a surviving entry
 /// under a colliding key would serve one scale's total for another.
-fn updates_count_key(show_nsfw: bool) -> String {
-    format!("updates:v1|{}", if show_nsfw { '1' } else { '0' })
+///
+/// `blocks` is the viewer's block rules as `BlockSet::key` gives them ("" for none): the
+/// rules are part of the predicate, so they are part of the key. It is last, and it is
+/// the only free-length part, so no two keys can run into each other.
+fn updates_count_key(show_nsfw: bool, blocks: &str) -> String {
+    format!("updates:v1|{}|{blocks}", if show_nsfw { '1' } else { '0' })
 }
 
 /// `updates`' `total`, memoized behind Browse's count cache.
@@ -2526,9 +2845,10 @@ async fn updates_total(
     pool: &Database,
     count_sql: &str,
     show_nsfw: bool,
+    blocks: &str,
     ttl: std::time::Duration,
 ) -> Result<i64, sqlx::Error> {
-    let key = updates_count_key(show_nsfw);
+    let key = updates_count_key(show_nsfw, blocks);
     if let Some(total) = crate::browse::cached_count_with(&key, ttl) {
         return Ok(total);
     }
@@ -2738,17 +3058,17 @@ async fn reload_series_in_shape(
             .await
             .map_err(gql_err)?;
         let user = current_user(ctx).await?;
-        Ok(map_canonical_series(
+        map_canonical_series(
             &st.pool,
             user.as_ref().map(|u| u.id.as_str()),
             work,
             catalog::main_chapter_count_str(&chapters) as i32,
         )
-        .await?)
+        .await
     } else {
         let n = series_id.parse::<i64>().map_err(gql_err)?;
         let m = resolve_series_cached(st, n).await.map_err(gql_err)?;
-        Ok(map_series(st, m).await?)
+        map_series(st, m).await
     }
 }
 
@@ -2826,6 +3146,7 @@ async fn resolve_series_with_cached(
 /// scanned). A refetch failure falls back to the stale cached rows. The returned
 /// rows carry GLOBAL chapter state; the per-viewer `suwayomi_progress` overlay is
 /// applied downstream by the caller and is unaffected by this freshness gate.
+#[cfg(test)]
 async fn resolve_chapters_cached(
     st: &AppState,
     manga_id: i64,
@@ -3001,6 +3322,9 @@ async fn map_canonical_series(
         .await?
         .remove(&work.work_id)
         .unwrap_or_else(RatingSummary::empty);
+    let mangadex_rating = mangadex_rating_batch(pool, std::slice::from_ref(&work.work_id))
+        .await?
+        .remove(&work.work_id);
     // chapterCount is the BEST-SOURCED count, not simply the English one.
     //
     // `chapter_count` as passed in is the English reader-list count (deduped to one row per
@@ -3075,6 +3399,7 @@ async fn map_canonical_series(
         chapter_count,
         is_nsfw: work.is_nsfw_override.unwrap_or(work.is_nsfw),
         rating,
+        mangadex_rating,
         scan: ScanPolicy {
             avg_interval_hours: 0.0,
             override_interval_hours: None,
@@ -3167,6 +3492,7 @@ async fn map_browse_rows(
         .map_err(gql_err)?;
     // (2) Ratings, keyed by work id across both `reviews.series_id` shapes.
     let ratings = rating_summary_by_work_batch(&st.pool, &work_ids).await?;
+    let md_ratings = mangadex_rating_batch(&st.pool, &work_ids).await?;
     // (2b) The LIVE NSFW flag, re-read from `work` rather than trusted from the row.
     //
     // `browse_catalogue.is_nsfw` is a MATERIALIZED copy of
@@ -3321,6 +3647,7 @@ async fn map_browse_rows(
                     .get(&r.work_id)
                     .cloned()
                     .unwrap_or_else(RatingSummary::empty),
+                mangadex_rating: md_ratings.get(&r.work_id).copied(),
                 // Not stored on the feed and not a Browse concern: scan policy belongs to
                 // the series page and the admin console. Same defaults
                 // `map_canonical_series` uses.
@@ -3896,7 +4223,15 @@ pub struct UpdateFeedRow {
     /// readers' review average where they have rated it, else MangaDex's community rating
     /// from the statistics cache (`work_stats`, migration 0106). Resolved per page (20
     /// rows, two batched queries), not materialized: both move independently of the feed.
+    ///
+    /// The MERGED number, kept for a reader that predates the two below and can print one
+    /// star only. It cannot say whose rating it is, so a current reader uses the two below.
     pub rating: Option<f64>,
+    /// Our own readers' review average, or null when none of them rated the work.
+    pub reader_rating: Option<f64>,
+    /// MangaDex's community rating, or null when it has none or the admin turned
+    /// MangaDex ratings off (`show_mangadex_ratings`).
+    pub mangadex_rating: Option<f64>,
     pub is_nsfw: bool,
 }
 
@@ -4595,20 +4930,25 @@ impl QueryRoot {
         // The NSFW posture is BOTH a compute input (SQL gates + `filter_nsfw`) and the
         // cache key — resolving it once here keeps the two from ever disagreeing.
         let show_nsfw = viewer_show_nsfw(ctx).await?;
+        // The content block rules are NOT part of the memo. The memoized rails are the
+        // same for every viewer with one NSFW posture; each request then drops what its
+        // own viewer's rules block. A rail can come back a few cards short, which is the
+        // price of keeping one shared payload instead of one per rule set.
+        let blocks = viewer_blocks(ctx).await?;
         let key = feed_cache_key(show_nsfw);
         if let Some(hit) = cached_feed(&DISCOVERY_CACHE, key, FEED_TTL) {
-            return Ok((*hit).clone());
+            return discovery_without_blocked(st, &blocks.lists, (*hit).clone()).await;
         }
         // Single-flight the refill: every task that missed awaits ONE per-key lock,
         // then re-checks — exactly one recomputation serves the whole burst.
         let lock = DISCOVERY_INFLIGHT.lock_handle(i64::from(show_nsfw));
         let _guard = lock.lock().await;
         if let Some(hit) = cached_feed(&DISCOVERY_CACHE, key, FEED_TTL) {
-            return Ok((*hit).clone());
+            return discovery_without_blocked(st, &blocks.lists, (*hit).clone()).await;
         }
         let feeds = compute_discovery(st, show_nsfw).await?;
         store_feed(&DISCOVERY_CACHE, key, feeds.clone());
-        Ok(feeds)
+        discovery_without_blocked(st, &blocks.lists, feeds).await
     }
 
     /// The reader's Updates feed: library series the adaptive scanner has detected new
@@ -4723,9 +5063,16 @@ impl QueryRoot {
         // `in_library = 1` matches the index's leading column and is also the honest
         // membership test — the feed is the reader's library. Fetch one extra row to
         // compute has_next without a second round-trip.
+        //
+        // `not_blocked` is the viewer's content block rules, in SQL for the reason the
+        // NSFW filter is: `total` and `has_next` must count what the pages return. It
+        // is empty when there is no rule and it adds no bind.
+        let blocks = viewer_blocks(ctx).await?;
+        let not_blocked =
+            crate::block::and_series_not_blocked(&blocks.lists, "CAST(suwayomi_series.id AS TEXT)");
         let ids: Vec<String> = sqlx::query_scalar(&format!(
             "SELECT CAST(id AS TEXT) FROM suwayomi_series \
-             WHERE in_library = 1 AND {DETECTED} AND {NSFW_FILTER} \
+             WHERE in_library = 1 AND {DETECTED} AND {NSFW_FILTER}{not_blocked} \
              ORDER BY latest_chapter_at DESC NULLS LAST, id DESC LIMIT ? OFFSET ?"
         ))
         .bind(show_nsfw as i64)
@@ -4750,9 +5097,10 @@ impl QueryRoot {
             &st.pool,
             &format!(
                 "SELECT COUNT(*) FROM suwayomi_series \
-                 WHERE in_library = 1 AND {DETECTED} AND {NSFW_FILTER}"
+                 WHERE in_library = 1 AND {DETECTED} AND {NSFW_FILTER}{not_blocked}"
             ),
             show_nsfw,
+            &blocks.lists.key(),
             crate::browse::COUNT_TTL,
         )
         .await
@@ -4833,13 +5181,24 @@ impl QueryRoot {
         // with no sort — and the anonymous path is the hot, edge-cacheable one.
         let base = "SELECT work_id, mangadex_id, title, is_nsfw, cover_url, \
                     latest_chapter, latest_chapter_title, latest_at FROM feed_updates";
-        let sql = if show_nsfw {
-            format!("{base} ORDER BY latest_at DESC, work_id DESC LIMIT ? OFFSET ?")
+        //
+        // The content block rules are one more condition, present only when there is a
+        // rule, so the two shapes above are unchanged for a server without rules.
+        let blocks = list_blocks_or_admin(ctx, include_nsfw).await?;
+        let mut conds: Vec<String> = Vec::new();
+        if !show_nsfw {
+            conds.push("is_nsfw = 0".into());
+        }
+        if let Some(blocked) = blocks.blocked_sql("feed_updates.work_id", None) {
+            conds.push(format!("NOT {blocked}"));
+        }
+        let where_sql = if conds.is_empty() {
+            String::new()
         } else {
-            format!(
-                "{base} WHERE is_nsfw = 0 ORDER BY latest_at DESC, work_id DESC LIMIT ? OFFSET ?"
-            )
+            format!(" WHERE {}", conds.join(" AND "))
         };
+        let sql =
+            format!("{base}{where_sql} ORDER BY latest_at DESC, work_id DESC LIMIT ? OFFSET ?");
         let mut rows = sqlx::query_as::<_, CanonicalUpdate>(&sql)
             .bind(PAGE_SIZE)
             .bind(offset)
@@ -4913,11 +5272,30 @@ impl QueryRoot {
         // avoiding the sort is enough for the planner to pick the right one here.
         // Migration 0099 adds the matching four on `announced_at`, which is what this now
         // orders by — without them the switch would put the temp B-tree straight back.
-        let where_sql = match (show_nsfw, type_word.is_some()) {
-            (false, false) => "WHERE is_nsfw = 0",
-            (false, true) => "WHERE is_nsfw = 0 AND comic_type = ?",
-            (true, false) => "",
-            (true, true) => "WHERE comic_type = ?",
+        //
+        // The content block rules are a fifth condition, present only when the viewer
+        // has a rule: without one the four shapes above are what is sent, word for word.
+        // With one, the page and the COUNT below both carry it (it has no bind), so
+        // `total` still counts what the pages walk; the COUNT is then no longer
+        // index-only, which is the cost of a rule.
+        let blocks = viewer_blocks(ctx).await?;
+        let mut conds: Vec<String> = Vec::new();
+        if !show_nsfw {
+            conds.push("is_nsfw = 0".into());
+        }
+        if type_word.is_some() {
+            conds.push("comic_type = ?".into());
+        }
+        if let Some(blocked) = blocks
+            .lists
+            .blocked_sql("feed_series_updates.work_id", None)
+        {
+            conds.push(format!("NOT {blocked}"));
+        }
+        let where_sql = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conds.join(" AND "))
         };
         // ORDERED BY `announced_at`, LABELLED BY `released_at`, AND THE TWO ARE DIFFERENT
         // CLOCKS ON PURPOSE (migration 0099, bug 3).
@@ -4987,10 +5365,11 @@ impl QueryRoot {
         let work_ids: Vec<String> = rows.iter().map(|r| r.work_id.clone()).collect();
         let (ratings, md_ratings) = futures::join!(
             rating_summary_by_work_batch(&st.pool, &work_ids),
-            crate::work_stats::display_rating_batch(&st.pool, &work_ids),
+            mangadex_rating_batch(&st.pool, &work_ids),
         );
 
         let ratings = ratings?;
+        let md_ratings = md_ratings?;
         let items = rows
             .into_iter()
             .map(|r| {
@@ -5004,11 +5383,11 @@ impl QueryRoot {
                         (!abs.is_empty()).then_some(abs)
                     }
                 };
-                let rating = ratings
+                let reader_rating = ratings
                     .get(&r.work_id)
                     .filter(|s| s.count > 0)
-                    .map(|s| s.average)
-                    .or_else(|| md_ratings.get(&r.work_id).copied());
+                    .map(|s| s.average);
+                let mangadex_rating = md_ratings.get(&r.work_id).copied();
                 UpdateFeedRow {
                     id: ID(r.reader_id),
                     work_id: r.work_id,
@@ -5038,7 +5417,9 @@ impl QueryRoot {
                     // indistinguishable from a real announce time here.
                     announced_at: r.announced_at.map(epoch_ms_to_iso),
                     detected_at: r.detected_at,
-                    rating,
+                    rating: reader_rating.or(mangadex_rating),
+                    reader_rating,
+                    mangadex_rating,
                     is_nsfw: r.is_nsfw,
                 }
             })
@@ -5079,17 +5460,18 @@ impl QueryRoot {
         if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await? {
             return Err(Error::new("No such work"));
         }
+        deny_blocked_work(ctx, &work.work_id, "No such work").await?;
         let chapters = catalog::load_canonical_chapters(&st.pool, &work_id.0)
             .await
             .map_err(gql_err)?;
         let user = current_user(ctx).await?;
-        Ok(map_canonical_series(
+        map_canonical_series(
             &st.pool,
             user.as_ref().map(|u| u.id.as_str()),
             work,
             catalog::main_chapter_count_str(&chapters) as i32,
         )
-        .await?)
+        .await
     }
 
     /// Chapters of a canonical work, from the stored `chapter` mirror, deduped to one
@@ -5115,6 +5497,7 @@ impl QueryRoot {
         if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await? {
             return Err(Error::new("No such work"));
         }
+        deny_blocked_work(ctx, &work.work_id, "No such work").await?;
         let chapters = catalog::load_canonical_chapters(&st.pool, &work_id.0)
             .await
             .map_err(gql_err)?;
@@ -5164,6 +5547,7 @@ impl QueryRoot {
         if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await? {
             return Err(Error::new("No such work"));
         }
+        deny_blocked_work(ctx, &work.work_id, "No such work").await?;
         let rows = catalog::work_source_chapters(&st.pool, &work_id.0)
             .await
             .map_err(gql_err)?;
@@ -5211,6 +5595,7 @@ impl QueryRoot {
         if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await? {
             return Err(Error::new("No such work"));
         }
+        deny_blocked_work(ctx, &work.work_id, "No such work").await?;
         let show_nsfw = viewer_show_nsfw(ctx).await?;
         let user = current_user(ctx).await?;
         let user_id = user.as_ref().map(|u| u.id.as_str());
@@ -5526,6 +5911,7 @@ impl QueryRoot {
                 return Err(Error::new("No such chapter"));
             }
         }
+        deny_blocked_chapter(ctx, &chapter_id.0, "No such chapter").await?;
         upstream_budget(Some(&client_ip(ctx))).map_err(gql_err)?;
         let urls = st.mangadex.at_home(&chapter_id.0).await.map_err(gql_err)?;
         Ok(urls
@@ -5556,6 +5942,11 @@ impl QueryRoot {
         if !show_nsfw && work_is_nsfw(&st.pool, &work_id.0).await {
             return Ok(Vec::new());
         }
+        // A work a site-wide rule blocks has no sources to hand out either: this is
+        // the list a client reads the work's chapters through.
+        if site_blocks_work(ctx, &work_id.0).await? {
+            return Ok(Vec::new());
+        }
         let sources = load_work_sources(&st.pool, &work_id.0, show_nsfw).await?;
         if !sources.is_empty() {
             return Ok(sources);
@@ -5579,6 +5970,9 @@ impl QueryRoot {
             return Ok(sources);
         };
         if !show_nsfw && work_is_nsfw(&st.pool, &new_id).await {
+            return Ok(Vec::new());
+        }
+        if site_blocks_work(ctx, &new_id).await? {
             return Ok(Vec::new());
         }
         load_work_sources(&st.pool, &new_id, show_nsfw).await
@@ -5691,15 +6085,22 @@ impl QueryRoot {
         } else {
             nsfw_work_ids(&st.pool, &ids).await?
         };
+        // And the works a site-wide rule blocks, in one more grouped query (none when
+        // the site has no rule).
+        let blocked_works =
+            crate::block::blocked_ids(&st.pool, &viewer_blocks(ctx).await?.site, &ids)
+                .await
+                .map_err(gql_err)?;
         let mut by_work = load_work_sources_batch(&st.pool, &ids, show_nsfw).await?;
         let groups = work_ids
             .into_iter()
             .map(|work_id| {
-                let sources = if nsfw_works.contains(&work_id.0) {
-                    Vec::new()
-                } else {
-                    by_work.remove(&work_id.0).unwrap_or_default()
-                };
+                let sources =
+                    if nsfw_works.contains(&work_id.0) || blocked_works.contains(&work_id.0) {
+                        Vec::new()
+                    } else {
+                        by_work.remove(&work_id.0).unwrap_or_default()
+                    };
                 WorkSourceGroup { work_id, sources }
             })
             .collect();
@@ -5801,8 +6202,11 @@ impl QueryRoot {
         let st = state(ctx);
         let trimmed = query.trim();
         let show_nsfw = viewer_show_nsfw_or_admin(ctx, include_nsfw).await?;
+        // The content block rules, on every branch below. Empty for the admin console
+        // (`includeNsfw` from an admin), which has to see what the rules hide.
+        let blocks = list_blocks_or_admin(ctx, include_nsfw).await?;
         if let Some(filter) = filter {
-            return search_v2(st, trimmed, page, show_nsfw, &filter).await;
+            return search_v2(st, trimmed, page, show_nsfw, &blocks, &filter).await;
         }
         if trimmed.is_empty() {
             // Collapse to the three words `feed_series_updates.comic_type` stores. Asking
@@ -5825,6 +6229,7 @@ impl QueryRoot {
             let nsfw_only = content_rating_nsfw_only(rating_filter);
             let genre_list = crate::browse::canonical_genres(&genres.unwrap_or_default());
             let bq = crate::browse::BrowseQuery {
+                blocks: Some(&blocks),
                 show_nsfw,
                 types: type_word,
                 statuses: status_word,
@@ -5907,6 +6312,7 @@ impl QueryRoot {
             &st.pool,
             trimmed,
             show_nsfw,
+            &blocks,
             page.max(1) as i64,
             BROWSE_PAGE_SIZE,
         )
@@ -6068,20 +6474,90 @@ impl QueryRoot {
         } else {
             viewer_show_nsfw(ctx).await?
         };
-        let key = feed_cache_key(show_nsfw);
-        if let Some(hit) = cached_feed(&BROWSE_SOURCES_CACHE, key, BROWSE_SOURCES_TTL) {
-            return Ok((*hit).clone());
-        }
-        let lock = BROWSE_SOURCES_INFLIGHT.lock_handle(i64::from(show_nsfw));
-        let _guard = lock.lock().await;
-        if let Some(hit) = cached_feed(&BROWSE_SOURCES_CACHE, key, BROWSE_SOURCES_TTL) {
-            return Ok((*hit).clone());
-        }
-        let sources = compute_browse_sources(st, show_nsfw)
+        browse_sources_memo(st, show_nsfw).await
+    }
+
+    /// Every source an admin tagged as using AI. Public, like `scanlatorTags`, and for
+    /// the same use: a reader app marks the chapter copies read from these sources. A
+    /// site that translates its own series credits no group on its chapters, so the
+    /// source is the scanlator. One small table read, so it is not memoized.
+    async fn source_ai_tags(&self, ctx: &Context<'_>) -> Result<Vec<SourceAiTag>> {
+        let tags = crate::scanlators::list_source_tags(&state(ctx).pool)
             .await
             .map_err(gql_err)?;
-        store_feed(&BROWSE_SOURCES_CACHE, key, sources.clone());
-        Ok(sources)
+        let mut tags: Vec<SourceAiTag> = tags
+            .into_iter()
+            .map(|(source_id, level)| SourceAiTag {
+                source_id,
+                ai: level.into(),
+            })
+            .collect();
+        tags.sort_by(|a, b| a.source_id.cmp(&b.source_id));
+        Ok(tags)
+    }
+
+    /// Admin: the site list. Every source with a series in the catalogue, biggest
+    /// first, with the AI tag stored for it. MangaDex is not in it: MangaDex credits
+    /// its groups, and the groups are what `scanlators` lists.
+    ///
+    /// The sources and their counts are `browseSources`' (every source, whatever the
+    /// admin's own NSFW setting, reused for ten minutes); the tags are always current.
+    /// A tagged source that has no series left is still listed, with a count of 0, so
+    /// its tag can be found and removed.
+    async fn scanlator_sites(&self, ctx: &Context<'_>) -> Result<Vec<ScanlatorSite>> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let mut tags = crate::scanlators::list_source_tags(&st.pool)
+            .await
+            .map_err(gql_err)?;
+        let mut sites: Vec<ScanlatorSite> = browse_sources_memo(st, true)
+            .await?
+            .into_iter()
+            .filter(|s| s.id != crate::scanlators::MANGADEX_SOURCE)
+            .map(|s| ScanlatorSite {
+                ai: tags.remove(&s.id).map(Into::into),
+                source_id: s.id,
+                name: s.name,
+                lang: s.lang,
+                series_count: s.count,
+            })
+            .collect();
+        let mut orphans: Vec<ScanlatorSite> = tags
+            .into_iter()
+            .map(|(source_id, level)| ScanlatorSite {
+                name: source_id.clone(),
+                source_id,
+                lang: None,
+                series_count: 0,
+                ai: Some(level.into()),
+            })
+            .collect();
+        orphans.sort_by(|a, b| a.source_id.cmp(&b.source_id));
+        sites.extend(orphans);
+        Ok(sites)
+    }
+
+    /// Admin: the site-wide content block rules, in the order they were saved. They
+    /// apply to every viewer: a series one of them matches is left out of every list
+    /// and cannot be opened or read. See `BlockRule` for what a rule matches.
+    async fn site_block_rules(&self, ctx: &Context<'_>) -> Result<Vec<BlockRule>> {
+        require_admin(ctx).await?;
+        let rules = crate::block::list(&state(ctx).pool, crate::block::Scope::Site)
+            .await
+            .map_err(gql_err)?;
+        Ok(rules.iter().map(Into::into).collect())
+    }
+
+    /// The viewer's own content block rules, in the order they were saved. They hide
+    /// matching series from the viewer's lists (Browse, search, updates, discovery), on
+    /// top of the site-wide rules. They do not lock a series the viewer opens by its
+    /// link, and they do not filter the viewer's library.
+    async fn my_block_rules(&self, ctx: &Context<'_>) -> Result<Vec<BlockRule>> {
+        let user = require_user(ctx).await?;
+        let rules = crate::block::list(&state(ctx).pool, crate::block::Scope::User(&user.id))
+            .await
+            .map_err(gql_err)?;
+        Ok(rules.iter().map(Into::into).collect())
     }
 
     /// Every scanlator an admin tagged as using AI. Public: a reader app marks the
@@ -6194,7 +6670,16 @@ impl QueryRoot {
             )));
         }
         let show_nsfw = user_show_nsfw(&st.pool, &user.id).await?;
-        federated_search(&st, &trimmed, page.max(1), show_nsfw, Some(user)).await
+        let blocks = viewer_blocks(ctx).await?;
+        federated_search(
+            &st,
+            &trimmed,
+            page.max(1),
+            show_nsfw,
+            &blocks.lists,
+            Some(user),
+        )
+        .await
     }
 
     async fn series(&self, ctx: &Context<'_>, id: ID) -> Result<Series> {
@@ -6202,9 +6687,13 @@ impl QueryRoot {
         let n = id.0.parse::<i64>().map_err(gql_err)?;
         // Suwayomi ids are sequential integers, so gate before the source round-trip:
         // an opted-out viewer must not read the detail of an NSFW series by id (N2).
-        if canonical_is_nsfw(&st.pool, &id.0).await && !viewer_show_nsfw(ctx).await? {
+        // Gated on the PARSED id: `0902` opens series 902 below, and the gates compare
+        // TEXT keys, so the id as sent would miss the row and pass.
+        let key = n.to_string();
+        if canonical_is_nsfw(&st.pool, &key).await && !viewer_show_nsfw(ctx).await? {
             return Err(Error::new("No such series"));
         }
+        deny_blocked_series(ctx, &key, "No such series").await?;
         // S1: serve from the DB cache; only live-fetch (and cache) on a miss.
         let cached = crate::series_cache::get_series_fresh(&st.pool, n)
             .await
@@ -6224,7 +6713,7 @@ impl QueryRoot {
         {
             return Err(Error::new("No such series"));
         }
-        Ok(map_series(st, m).await?)
+        map_series(st, m).await
     }
 
     #[graphql(complexity = "100 * child_complexity")]
@@ -6232,9 +6721,12 @@ impl QueryRoot {
         let st = state(ctx);
         let n = series_id.0.parse::<i64>().map_err(gql_err)?;
         // Gate the chapter list on the owning series' NSFW flag (same as `series`, N2).
-        if canonical_is_nsfw(&st.pool, &series_id.0).await && !viewer_show_nsfw(ctx).await? {
+        // On the parsed id, as in `series`.
+        let key = n.to_string();
+        if canonical_is_nsfw(&st.pool, &key).await && !viewer_show_nsfw(ctx).await? {
             return Err(Error::new("No such series"));
         }
+        deny_blocked_series(ctx, &key, "No such series").await?;
         // S1: serve from the DB cache; only live-fetch (and cache) on a miss.
         let cached = crate::series_cache::get_chapters_fresh_batch(&st.pool, &[n])
             .await
@@ -6297,6 +6789,7 @@ impl QueryRoot {
             {
                 return Err(Error::new("No such chapter"));
             }
+            deny_blocked_series(ctx, &manga_id.to_string(), "No such chapter").await?;
         }
         let urls = st.suwayomi.pages(n).await;
         // A reader opening a chapter is the request that matters most, and the scanner
@@ -6342,6 +6835,7 @@ impl QueryRoot {
         {
             return Err(Error::new("No such chapter"));
         }
+        deny_blocked_series(ctx, &origin.manga_id.to_string(), "No such chapter").await?;
         let extension =
             sqlx::query_as::<_, (String, String, Option<String>, Option<i64>, Option<String>)>(
                 "SELECT pkg_name, repo_url, apk_name, version_code, lang \
@@ -6497,7 +6991,11 @@ impl QueryRoot {
             }
         }
         // Hide NSFW series from the library too, unless the viewer opted in (N2).
-        Ok(filter_nsfw(viewer_show_nsfw(ctx).await?, out))
+        let out = filter_nsfw(viewer_show_nsfw(ctx).await?, out);
+        // The SITE-WIDE block rules only. The viewer's own rules decide what is offered
+        // to them; this list is what they chose themselves, and a rule they add later
+        // must not hide an entry they could then never find to remove.
+        filter_blocked(&st.pool, &viewer_blocks(ctx).await?.site, out).await
     }
 
     /// Per-series read progress for the viewer's library, in two grouped queries. The
@@ -6686,6 +7184,8 @@ impl QueryRoot {
         #[graphql(default = 1)] page: i32,
     ) -> Result<ReviewPage> {
         let st = state(ctx);
+        // The reviews of a series a site-wide rule blocks are closed with its page.
+        deny_blocked_series(ctx, &series_id.0, no_such_series(&series_id.0)).await?;
         let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
         // Every id this work's reviews may be filed under, not just the one asked with —
         // otherwise the same work shows a different thread depending on whether the reader
@@ -6753,6 +7253,7 @@ impl QueryRoot {
             return Ok(None);
         };
         let st = state(ctx);
+        deny_blocked_series(ctx, &series_id.0, no_such_series(&series_id.0)).await?;
         // Across every id shape the work's reviews may be filed under, newest first: the
         // reader's rating widget asks with the id the page is addressing, which is not
         // necessarily the id the rating was posted under (both shapes exist in production),
@@ -6787,6 +7288,11 @@ impl QueryRoot {
     ) -> Result<CommentPage> {
         let target_type = validate_comment_target(&target_type)?;
         let st = state(ctx);
+        // The thread of a series a site-wide rule blocks is closed with its page. A
+        // chapter thread is keyed by chapter id and is not resolved to its series here.
+        if target_type == "series" {
+            deny_blocked_series(ctx, &target_id.0, no_such_series(&target_id.0)).await?;
+        }
         let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
         // The viewer's own vote per comment is selected inline; '' (anonymous) matches
         // no vote row, yielding my_vote = 0.
@@ -7360,6 +7866,9 @@ impl QueryRoot {
             // The live usage switch: set from `resolve_mangadex` at boot and by
             // `setMangadexEnabled`, and what every MangaDex request obeys.
             mangadex_enabled: state(ctx).mangadex.is_enabled(),
+            show_mangadex_ratings: inst::resolve(pool, &inst::SHOW_MANGADEX_RATINGS)
+                .await
+                .as_bool(),
             apps_fetch_themselves: inst::resolve(pool, &inst::APPS_FETCH_THEMSELVES)
                 .await
                 .as_bool(),
@@ -7932,7 +8441,7 @@ impl QueryRoot {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT source_key, work_id, (source_id != '') AS is_real, last_seen \
+            "SELECT source_key, work_id, (NULLIF(source_id, '') IS NOT NULL) AS is_real, COALESCE(last_seen, '') AS last_seen \
              FROM source_series \
              WHERE source_type = 'suwayomi' AND source_key IN ({placeholders})"
         );
@@ -8194,7 +8703,7 @@ fn work_source_from_row(r: WorkSourceJoinRow, show_nsfw: bool) -> Option<WorkSou
 }
 
 const WORK_SOURCE_SELECT: &str =
-    "SELECT ss.work_id, ss.source_type, ss.source_id, ss.source_key, ss.source_url, ss.is_nsfw, \
+    "SELECT ss.work_id, ss.source_type, COALESCE(ss.source_id, '') AS source_id, ss.source_key, ss.source_url, ss.is_nsfw, \
             se.pkg_name, se.repo_url, se.apk_name, se.version_code, se.lang AS ext_lang \
      FROM source_series ss \
      LEFT JOIN source_extension se ON se.source_id = ss.source_id";
@@ -8351,6 +8860,25 @@ fn select_federated_sources(
     out
 }
 
+/// `browseSources` for one NSFW posture: memoized for [`BROWSE_SOURCES_TTL`], with a
+/// single-flight refill.
+async fn browse_sources_memo(st: &AppState, show_nsfw: bool) -> Result<Vec<BrowseSource>> {
+    let key = feed_cache_key(show_nsfw);
+    if let Some(hit) = cached_feed(&BROWSE_SOURCES_CACHE, key, BROWSE_SOURCES_TTL) {
+        return Ok((*hit).clone());
+    }
+    let lock = BROWSE_SOURCES_INFLIGHT.lock_handle(i64::from(show_nsfw));
+    let _guard = lock.lock().await;
+    if let Some(hit) = cached_feed(&BROWSE_SOURCES_CACHE, key, BROWSE_SOURCES_TTL) {
+        return Ok((*hit).clone());
+    }
+    let sources = compute_browse_sources(st, show_nsfw)
+        .await
+        .map_err(gql_err)?;
+    store_feed(&BROWSE_SOURCES_CACHE, key, sources.clone());
+    Ok(sources)
+}
+
 /// `browseSources`, uncached: the source facets, named. Display names exist only in the
 /// engine's installed-source list (see `workSourceRows`), so it is asked once, best
 /// effort: when it does not answer, a source is named by the last part of its extension
@@ -8477,6 +9005,7 @@ async fn federated_search(
     query: &str,
     page: i32,
     show_nsfw: bool,
+    blocks: &crate::block::BlockSet,
     user: Option<User>,
 ) -> Result<FederatedSearchPage> {
     // Installed sources → the fan-out set + a lookup for translator enrichment.
@@ -8608,8 +9137,18 @@ async fn federated_search(
 
     // Build one FederatedSeries per consolidated work, in discovery order.
     let uid = user.as_ref().map(|u| u.id.as_str());
+    // The works the viewer's block rules hide, in one lookup for the whole result. A
+    // hit is judged by the work it was matched or stored as. A series this search has
+    // only just stored already has the tags of its source's genres
+    // (`add_source_series_checked` derives them), so a rule reaches it too.
+    let blocked = crate::block::blocked_ids(&st.pool, blocks, &work_order)
+        .await
+        .map_err(gql_err)?;
     let mut items = Vec::new();
     for wid in work_order {
+        if blocked.contains(&wid) {
+            continue;
+        }
         let Some(work) = catalog::load_canonical_work(&st.pool, &wid)
             .await
             .map_err(gql_err)?
@@ -8902,13 +9441,13 @@ async fn reload_series(st: &AppState, user_id: &str, series_id: &str) -> Result<
         let chapters = catalog::load_canonical_chapters(&st.pool, &work.work_id)
             .await
             .map_err(gql_err)?;
-        return Ok(map_canonical_series(
+        return map_canonical_series(
             &st.pool,
             Some(user_id),
             work,
             catalog::main_chapter_count_str(&chapters) as i32,
         )
-        .await?);
+        .await;
     }
     let n = series_id.parse::<i64>().map_err(gql_err)?;
     // DB cache first, live source only on a miss — so filing a shelf / favouriting
@@ -8921,7 +9460,7 @@ async fn reload_series(st: &AppState, user_id: &str, series_id: &str) -> Result<
         Some(m) => m,
         None => st.suwayomi.series(n).await.map_err(gql_err)?,
     };
-    Ok(map_series(st, m).await?)
+    map_series(st, m).await
 }
 
 #[derive(Debug)]
@@ -8961,7 +9500,7 @@ async fn set_progress_once(
                 "SELECT ss.work_id, c.number FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
                  WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
             )
-            .bind(&chapter_id)
+            .bind(chapter_id)
             .fetch_optional(&mut *tx)
             .await
             ?;
@@ -8976,7 +9515,7 @@ async fn set_progress_once(
                    work_id = excluded.work_id, updated_at = excluded.updated_at",
             )
             .bind(user_id)
-            .bind(&chapter_id)
+            .bind(chapter_id)
             .bind(&work_id)
             .bind(last_page_read as i64)
             .bind(read)
@@ -8986,7 +9525,7 @@ async fn set_progress_once(
             ?;
         if read {
             if let Some(n) = number.as_deref().and_then(parse_chapter_number) {
-                catch_up_canonical(&mut *tx, user_id, &work_id, n, &now).await?;
+                catch_up_canonical(&mut tx, user_id, &work_id, n, &now).await?;
             }
         }
         tx.commit().await?;
@@ -9029,7 +9568,7 @@ async fn set_progress_once(
         ?;
     if read {
         if let Some(num) = number {
-            catch_up_suwayomi(&mut *tx, user_id, &series_id, num, &now).await?;
+            catch_up_suwayomi(&mut tx, user_id, &series_id, num, &now).await?;
         }
     }
     tx.commit().await?;
@@ -9064,7 +9603,7 @@ async fn set_chapter_read_once(
             .bind(id)
             .fetch_optional(&mut *tx)
             .await?
-            .ok_or_else(|| MutationValidation("No such chapter"))?;
+            .ok_or(MutationValidation("No such chapter"))?;
             sqlx::query(
                 "INSERT INTO suwayomi_progress \
                    (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
@@ -9087,7 +9626,7 @@ async fn set_chapter_read_once(
             .bind(id)
             .fetch_optional(&mut *tx)
             .await?
-            .ok_or_else(|| MutationValidation("No such chapter"))?;
+            .ok_or(MutationValidation("No such chapter"))?;
             sqlx::query(
                 "INSERT INTO canonical_progress \
                    (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
@@ -9245,6 +9784,10 @@ impl MutationRoot {
         if !series_id.0.starts_with("w_") && series_id.0.parse::<i64>().is_err() {
             return Err(Error::new("Invalid series id"));
         }
+        // A series a site-wide rule blocks is not in the catalogue for a reader: it
+        // cannot be filed, and this mutation's echo must not hand its detail out. The
+        // same holds for the other two library mutations.
+        deny_blocked_series(ctx, &series_id.0, no_such_series(&series_id.0)).await?;
         crate::db::retry_transaction(|| {
             write_library_once(
                 &st.pool,
@@ -9287,6 +9830,7 @@ impl MutationRoot {
                 ));
             }
         }
+        deny_blocked_series(ctx, &series_id.0, no_such_series(&series_id.0)).await?;
         crate::db::retry_transaction(|| {
             write_library_once(
                 &st.pool,
@@ -9310,6 +9854,7 @@ impl MutationRoot {
     ) -> Result<Series> {
         let st = state(ctx);
         let user = require_user(ctx).await?;
+        deny_blocked_series(ctx, &series_id.0, no_such_series(&series_id.0)).await?;
         crate::db::retry_transaction(|| {
             write_library_once(
                 &st.pool,
@@ -10590,7 +11135,7 @@ impl MutationRoot {
                 .await
                 .map_err(gql_err)?;
         }
-        Ok(map_series(st, m).await?)
+        map_series(st, m).await
     }
 
     /// Admin: pause or unpause one series' scanning — the targeted toggle
@@ -10627,7 +11172,7 @@ impl MutationRoot {
         if !paused {
             scan_series(st, &m, now).await.map_err(gql_err)?;
         }
-        Ok(map_series(st, m).await?)
+        map_series(st, m).await
     }
 
     /// Admin: force an immediate re-scan of one series, bypassing the adaptive
@@ -10638,7 +11183,7 @@ impl MutationRoot {
         let n = series_id.0.parse::<i64>().map_err(gql_err)?;
         let m = st.suwayomi.series(n).await.map_err(gql_err)?;
         scan_series(st, &m, Utc::now()).await.map_err(gql_err)?;
-        Ok(map_series(st, m).await?)
+        map_series(st, m).await
     }
 
     /// Admin series-detail editor: edit a canonical work's metadata. Each field is
@@ -10851,6 +11396,11 @@ impl MutationRoot {
             }
             .map_err(gql_err)?;
         }
+        // Project the title, aliases, tags and visibility under the metadata
+        // transaction, so a committed edit is immediately browsable and searchable.
+        catalog::upsert_browse_work(&mut tx, &work_id)
+            .await
+            .map_err(gql_err)?;
         tx.commit().await.map_err(gql_err)?;
         // `is_nsfw` above may have just changed the effective flag; push it into the two
         // feed tables that store a COPY of it, or `updatesFeed` keeps serving this work to
@@ -10872,17 +11422,17 @@ impl MutationRoot {
                 .await
                 .map_err(gql_err)?;
             let user = current_user(ctx).await?;
-            Ok(map_canonical_series(
+            map_canonical_series(
                 &st.pool,
                 user.as_ref().map(|u| u.id.as_str()),
                 work,
                 catalog::main_chapter_count_str(&chapters) as i32,
             )
-            .await?)
+            .await
         } else {
             let n = input.series_id.0.parse::<i64>().map_err(gql_err)?;
             let m = resolve_series_cached(st, n).await.map_err(gql_err)?;
-            Ok(map_series(st, m).await?)
+            map_series(st, m).await
         }
     }
 
@@ -11141,7 +11691,7 @@ impl MutationRoot {
         // other side turns `SCAN s LEFT-JOIN` into
         // `SEARCH s USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN`.
         let rows = sqlx::query_as::<_, (String, String, Option<String>, i64, i64, Option<String>)>(
-            "SELECT ss.work_id, ss.source_id, s.genre, w.is_nsfw, COALESCE(se.is_nsfw, 0), \
+            "SELECT ss.work_id, COALESCE(ss.source_id, '') AS source_id, s.genre, w.is_nsfw, COALESCE(se.is_nsfw, 0), \
                     w.content_rating \
              FROM source_series ss \
              JOIN work w ON w.id = ss.work_id \
@@ -11376,6 +11926,36 @@ impl MutationRoot {
         Ok(inst::resolve_registration(pool).await.as_bool())
     }
 
+    /// Admin: show or hide MangaDex's community rating next to our own readers' rating
+    /// (`show_mangadex_ratings`). Refused when the server pins it with
+    /// `KOMIKA_MANGADEX_RATINGS`, since env always wins. Returns the new effective value.
+    async fn set_show_mangadex_ratings(&self, ctx: &Context<'_>, shown: bool) -> Result<bool> {
+        require_admin(ctx).await?;
+        use crate::instance as inst;
+        let pool = &state(ctx).pool;
+        if inst::resolve(pool, &inst::SHOW_MANGADEX_RATINGS)
+            .await
+            .source
+            == inst::Source::Env
+        {
+            return Err(Error::new(
+                "MangaDex ratings are set by KOMIKA_MANGADEX_RATINGS on this server and cannot be changed here.",
+            ));
+        }
+        inst::store(
+            pool,
+            &inst::SHOW_MANGADEX_RATINGS,
+            if shown { "true" } else { "false" },
+        )
+        .await
+        .map_err(gql_err)?;
+        // The memoized home rails hold `Series.mangadexRating` from before the change.
+        clear_feed_caches();
+        Ok(inst::resolve(pool, &inst::SHOW_MANGADEX_RATINGS)
+            .await
+            .as_bool())
+    }
+
     /// Admin: turn MangaDex on or off (`mangadex_enabled`). Refused when the server's
     /// environment pins it (`KOMIKA_MANGADEX`, or `CATALOGUE_SYNC=on`), since env always
     /// wins. The change is stored AND applied to the live client, so the background
@@ -11431,6 +12011,60 @@ impl MutationRoot {
             tracing::info!(scanlator = name, ai = ?ai, by = %admin.username, "scanlator AI tag set by an admin");
         }
         Ok(changed)
+    }
+
+    /// Admin: tag a whole source as using AI (`AI`), partly using it (`PARTIAL`), or
+    /// with `ai: null` remove its tag. For a site that translates its own series: its
+    /// chapters credit no group, so there is no name for `setScanlatorAi` to tag. The
+    /// tag applies to every chapter copy read from the source, now and later; a copy
+    /// that also credits a tagged group takes the stronger of the two tags. Not for
+    /// "mangadex", whose groups are tagged by name. `false` when nothing changed.
+    async fn set_source_ai(
+        &self,
+        ctx: &Context<'_>,
+        source_id: String,
+        ai: Option<ScanlatorAi>,
+    ) -> Result<bool> {
+        let admin = require_admin(ctx).await?;
+        let source_id = source_id.trim();
+        if !crate::scanlators::is_taggable_source(source_id) {
+            return Err(Error::new("Choose a source."));
+        }
+        let changed =
+            crate::scanlators::set_source_tag(&state(ctx).pool, source_id, ai.map(Into::into))
+                .await
+                .map_err(gql_err)?;
+        if changed {
+            tracing::info!(source = source_id, ai = ?ai, by = %admin.username, "source AI tag set by an admin");
+        }
+        Ok(changed)
+    }
+
+    /// Admin: replace the site-wide content block rules with `rules` (at most 50; an
+    /// empty list removes them all). Applies at once, to every viewer. Returns the
+    /// stored list. A rule that names nothing, a tag that is not a tag id, more than 8
+    /// tags, or every rating with no tag is refused, and then nothing is stored.
+    async fn set_site_block_rules(
+        &self,
+        ctx: &Context<'_>,
+        rules: Vec<BlockRuleInput>,
+    ) -> Result<Vec<BlockRule>> {
+        let admin = require_admin(ctx).await?;
+        let stored = store_block_rules(state(ctx), crate::block::Scope::Site, rules).await?;
+        tracing::info!(rules = stored.len(), by = %admin.username, "site block rules set by an admin");
+        Ok(stored)
+    }
+
+    /// Replace the signed-in user's own content block rules with `rules` (at most 50;
+    /// an empty list removes them all). Returns the stored list. Refused like
+    /// `setSiteBlockRules`.
+    async fn set_my_block_rules(
+        &self,
+        ctx: &Context<'_>,
+        rules: Vec<BlockRuleInput>,
+    ) -> Result<Vec<BlockRule>> {
+        let user = require_user(ctx).await?;
+        store_block_rules(state(ctx), crate::block::Scope::User(&user.id), rules).await
     }
 
     /// Admin: limit how often the server asks one source for new chapters — at most
@@ -14040,7 +14674,17 @@ async fn add_source_series_checked(
     consolidate: bool,
 ) -> anyhow::Result<MatchResult> {
     let source = resolve_source_nsfw(st, &m.source_id).await?;
-    add_source_series_core_ex(&st.pool, m, cover_phash, consolidate, source).await
+    let result = add_source_series_core_ex(&st.pool, m, cover_phash, consolidate, source).await?;
+    // Derive the work's tags from this series' genres NOW, not at the next catalogue
+    // refresh (hours away): until a work has tags, the tag filter cannot find it and a
+    // content block rule that names one of its genres lets it through. Best-effort: a
+    // failure leaves the work as it was before this call existed, and the refresh
+    // derives the tags then.
+    if let Err(e) = crate::tags::sync_work_suwayomi_tags(&st.pool, &result.work_id, &m.genre).await
+    {
+        tracing::warn!(work_id = %result.work_id, error = %e, "enrol: tag derivation failed; the next catalogue refresh retries");
+    }
+    Ok(result)
 }
 
 /// Give a work linked to an admin-pinned source the same `is_nsfw_override = 1` that
@@ -16731,8 +17375,8 @@ mod tests {
             .unwrap();
             sqlx::query(
                 "INSERT INTO series_scan_state \
-                   (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at) \
-                 VALUES (?, 0, 5, ?, '2026-07-15T00:00:00+00:00')",
+                   (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at, next_scan_at) \
+                 VALUES (?, 0, 5, ?, '2026-07-15T00:00:00+00:00', '1970-01-01T00:00:00+00:00')",
             )
             .bind(id.to_string())
             .bind(new_at)
@@ -16820,8 +17464,8 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO series_scan_state \
-               (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at) \
-             VALUES (?, 0, 5, ?, '2026-07-15T00:00:00+00:00')",
+               (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at, next_scan_at) \
+             VALUES (?, 0, 5, ?, '2026-07-15T00:00:00+00:00', '1970-01-01T00:00:00+00:00')",
         )
         .bind(id.to_string())
         .bind(detected_at)
@@ -16910,28 +17554,36 @@ mod tests {
         assert_eq!(uncached(false).await, 1, "the fixture must actually differ");
         assert_eq!(uncached(true).await, 2, "…across the two audiences");
         assert_eq!(
-            updates_total(&pool, &count_sql, false, ttl).await.unwrap(),
+            updates_total(&pool, &count_sql, false, "", ttl)
+                .await
+                .unwrap(),
             1
         );
         assert_eq!(
-            updates_total(&pool, &count_sql, true, ttl).await.unwrap(),
+            updates_total(&pool, &count_sql, true, "", ttl)
+                .await
+                .unwrap(),
             2
         );
         // WARM, and the load-bearing assertion: the anonymous viewer must not be served the
         // opted-in total now that both are cached. A single un-keyed entry fails here.
         assert_eq!(
-            updates_total(&pool, &count_sql, false, ttl).await.unwrap(),
+            updates_total(&pool, &count_sql, false, "", ttl)
+                .await
+                .unwrap(),
             1,
             "an anonymous viewer must never be served the opted-in total"
         );
         assert_eq!(
-            updates_total(&pool, &count_sql, true, ttl).await.unwrap(),
+            updates_total(&pool, &count_sql, true, "", ttl)
+                .await
+                .unwrap(),
             2,
             "…nor the reverse"
         );
         assert_ne!(
-            updates_count_key(false),
-            updates_count_key(true),
+            updates_count_key(false, ""),
+            updates_count_key(true, ""),
             "the two audiences must not share a key"
         );
 
@@ -16943,7 +17595,9 @@ mod tests {
             .unwrap();
         assert_eq!(uncached(false).await, 0, "the data really did change");
         assert_eq!(
-            updates_total(&pool, &count_sql, false, ttl).await.unwrap(),
+            updates_total(&pool, &count_sql, false, "", ttl)
+                .await
+                .unwrap(),
             1,
             "a memoized total is allowed to be stale — that is what buys the 53 ms"
         );
@@ -16952,12 +17606,16 @@ mod tests {
         // end of every rebuild, i.e. the event that changes this number — closes it.
         crate::browse::clear_count_cache();
         assert_eq!(
-            updates_total(&pool, &count_sql, false, ttl).await.unwrap(),
+            updates_total(&pool, &count_sql, false, "", ttl)
+                .await
+                .unwrap(),
             0,
             "the rebuild's cache clear must invalidate the updates total too"
         );
         assert_eq!(
-            updates_total(&pool, &count_sql, true, ttl).await.unwrap(),
+            updates_total(&pool, &count_sql, true, "", ttl)
+                .await
+                .unwrap(),
             1,
             "…for both audiences"
         );
@@ -17078,8 +17736,8 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO series_scan_state \
-               (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at) \
-             VALUES ('2', 0, 5, NULL, '2026-07-15T00:00:00+00:00')",
+               (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at, next_scan_at) \
+             VALUES ('2', 0, 5, NULL, '2026-07-15T00:00:00+00:00', '1970-01-01T00:00:00+00:00')",
         )
         .execute(&pool)
         .await
@@ -18264,6 +18922,11 @@ mod tests {
             .await
             .unwrap();
         seed_user(&pool, "legacy-a", "legacy", 0, 0).await;
+        // Only usernames are ambiguous; the email guard remains in force.
+        sqlx::query("UPDATE users SET email='legacy-a@example.com' WHERE id='legacy-a'")
+            .execute(&pool)
+            .await
+            .unwrap();
         seed_user(&pool, "legacy-b", "LEGACY", 0, 0).await;
         provision_admins(&pool, &["legacy".into()], Some("password123"), None)
             .await
@@ -18778,8 +19441,8 @@ mod tests {
         if let Some(d) = detected_at {
             sqlx::query(
                 "INSERT INTO series_scan_state \
-                   (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at) \
-                 VALUES (?, 0, 5, ?, '2026-07-15T00:00:00+00:00')",
+                   (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at, next_scan_at) \
+                 VALUES (?, 0, 5, ?, '2026-07-15T00:00:00+00:00', '1970-01-01T00:00:00+00:00')",
             )
             .bind(id.to_string())
             .bind(d)
@@ -18939,6 +19602,116 @@ mod tests {
         assert!(
             rating("No stats row").is_null(),
             "no rating anywhere stays null"
+        );
+    }
+
+    /// The two ratings travel SEPARATELY, so the card can say whose each one is, and the
+    /// admin switch (`show_mangadex_ratings`) removes MangaDex's from every surface at once
+    /// while our own readers' rating stays.
+    #[tokio::test]
+    async fn mangadex_rating_is_its_own_field_and_obeys_the_admin_switch() {
+        let (s, pool) = setup_full(100).await;
+        seed_canonical(&pool, "md-two-both", "Both rated", false, "3").await;
+        seed_canonical(&pool, "md-two-md", "MangaDex rated", false, "3").await;
+        for (md, avg) in [("md-two-both", 9.1), ("md-two-md", 8.4)] {
+            let wid = work_id_of(&pool, md).await;
+            sqlx::query(
+                "INSERT INTO work_stats (work_id, follows, rating, rating_avg, fetched_at) \
+                 VALUES (?, 10, ?, ?, '2026-10-01T00:00:00Z')",
+            )
+            .bind(&wid)
+            .bind(avg)
+            .bind(avg)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let both = work_id_of(&pool, "md-two-both").await;
+        sqlx::query("INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) VALUES ('r-two', ?, 'bob-id', 6, '', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+            .bind(&both)
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::catalog::refresh_feed_updates(&pool).await.unwrap();
+
+        let read = || async {
+            let query = format!(
+                r#"{{ instance {{ showMangadexRatings }}
+                     updatesFeed {{ items {{ title rating readerRating mangadexRating }} }}
+                     canonicalSeries(workId: "{both}") {{ rating {{ average count }} mangadexRating }} }}"#
+            );
+            let response = exec(&s, &query, None, "1.1.1.1").await;
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            response.data.into_json().unwrap()
+        };
+        let row = |data: &serde_json::Value, title: &str| {
+            data["updatesFeed"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["title"] == title)
+                .unwrap_or_else(|| panic!("{title} missing from the feed"))
+                .clone()
+        };
+
+        let shown = read().await;
+        assert_eq!(shown["instance"]["showMangadexRatings"], true);
+        let r = row(&shown, "Both rated");
+        assert_eq!(r["readerRating"], 6.0);
+        assert_eq!(r["mangadexRating"], 9.1);
+        assert_eq!(r["rating"], 6.0, "the merged number still prefers ours");
+        let r = row(&shown, "MangaDex rated");
+        assert!(r["readerRating"].is_null(), "nobody here rated it");
+        assert_eq!(r["mangadexRating"], 8.4);
+        assert_eq!(shown["canonicalSeries"]["rating"]["average"], 6.0);
+        assert_eq!(shown["canonicalSeries"]["mangadexRating"], 9.1);
+
+        let set = "mutation { setShowMangadexRatings(shown: false) }";
+        let refused = exec(&s, set, Some("bobtok"), "1.1.1.1").await;
+        assert!(!refused.errors.is_empty(), "only an admin may change it");
+        let done = exec(&s, set, Some("admintok"), "1.1.1.1").await;
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(
+            done.data.into_json().unwrap()["setShowMangadexRatings"],
+            false
+        );
+
+        let hidden = read().await;
+        assert_eq!(hidden["instance"]["showMangadexRatings"], false);
+        let r = row(&hidden, "Both rated");
+        assert_eq!(r["readerRating"], 6.0, "our own rating stays");
+        assert!(r["mangadexRating"].is_null());
+        let r = row(&hidden, "MangaDex rated");
+        assert!(r["mangadexRating"].is_null());
+        assert!(
+            r["rating"].is_null(),
+            "the merged number must not carry it either"
+        );
+        assert_eq!(hidden["canonicalSeries"]["rating"]["count"], 1);
+        assert!(hidden["canonicalSeries"]["mangadexRating"].is_null());
+
+        let enabled = exec(
+            &s,
+            "mutation{setShowMangadexRatings(shown:true)}",
+            Some("admintok"),
+            "ratings-failure",
+        )
+        .await;
+        assert!(enabled.errors.is_empty(), "{:?}", enabled.errors);
+        sqlx::query("DROP TABLE work_stats")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let failed = exec(
+            &s,
+            "{updatesFeed{items{id mangadexRating}}}",
+            None,
+            "ratings-failure",
+        )
+        .await;
+        assert!(
+            !failed.errors.is_empty(),
+            "a failed rating read became a degraded successful feed"
         );
     }
 
@@ -23638,8 +24411,8 @@ mod tests {
             .await
             .unwrap();
             sqlx::query(
-                "INSERT INTO series_scan_state (series_id, last_new_chapter_at, updated_at) \
-                 VALUES (?, '2026-07-10T00:00:00Z', '2026-07-10T00:00:00Z')",
+                "INSERT INTO series_scan_state (series_id, last_new_chapter_at, updated_at, next_scan_at) \
+                 VALUES (?, '2026-07-10T00:00:00Z', '2026-07-10T00:00:00Z', '1970-01-01T00:00:00+00:00')",
             )
             .bind(sid)
             .execute(&pool)
@@ -25163,8 +25936,8 @@ mod tests {
             .unwrap();
             sqlx::query(
                 "INSERT INTO series_scan_state \
-                   (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at) \
-                 VALUES (?, 0, 0, ?, '2026-01-01T00:00:00Z')",
+                   (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at, next_scan_at) \
+                 VALUES (?, 0, 0, ?, '2026-01-01T00:00:00Z', '1970-01-01T00:00:00+00:00')",
             )
             .bind(sid)
             .bind(ts)
@@ -26261,6 +27034,7 @@ mod tests {
                 count,
                 distribution: vec![0; 10],
             },
+            mangadex_rating: None,
             scan: ScanPolicy {
                 avg_interval_hours: 0.0,
                 override_interval_hours: None,
@@ -27953,7 +28727,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert!(next < "2999-01-01T00:00:00Z".to_string());
+        assert!(next.as_str() < "2999-01-01T00:00:00Z");
     }
 
     #[tokio::test]
@@ -28146,7 +28920,7 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(identities, [target.clone()]);
+        assert_eq!(identities.as_slice(), std::slice::from_ref(&target));
         let redirected = write_library_once(&pool, "bob-id", &source, LibraryEdit::Favorite(true))
             .await
             .unwrap();
@@ -28216,5 +28990,45 @@ mod tests {
         assert!(response.errors.is_empty(), "{:?}", response.errors);
         let owner: String = sqlx::query_scalar("SELECT work_id FROM canonical_progress WHERE user_id='bob-id' AND chapter_id='canonical-race-chapter'").fetch_one(&pool).await.unwrap();
         assert_eq!(owner, target, "progress landed under the deleted owner");
+    }
+    #[tokio::test]
+    async fn schema_tidy_admin_title_edit_projects_search_atomically() {
+        let (schema, pool) = setup_full(100).await;
+        seed_canonical(&pool, "md-search-edit", "Original Shelf Title", false, "1").await;
+        let work = work_id_of(&pool, "md-search-edit").await;
+        let edit = format!(
+            r#"mutation{{updateSeriesMetadata(input:{{seriesId:"{work}",title:"Projected Search Needle"}}){{id title}}}}"#
+        );
+        let response = exec(&schema, &edit, Some("admintok"), "phase6-search-edit").await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let indexed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_fts WHERE work_fts MATCH 'Projected*' AND work_id=?",
+        )
+        .bind(&work)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(indexed, 1, "committed metadata edit remained unsearchable");
+        sqlx::query("CREATE TRIGGER fail_metadata_projection BEFORE UPDATE ON browse_catalogue BEGIN SELECT RAISE(ABORT,'forced metadata projection failure'); END")
+            .execute(&pool).await.unwrap();
+        let edit = format!(
+            r#"mutation{{updateSeriesMetadata(input:{{seriesId:"{work}",title:"Must Roll Back"}}){{id}}}}"#
+        );
+        let response = exec(&schema, &edit, Some("admintok"), "phase6-search-edit").await;
+        assert!(!response.errors.is_empty(), "projection failure was hidden");
+        let title: String = sqlx::query_scalar("SELECT title_override FROM work WHERE id=?")
+            .bind(&work)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(title, "Projected Search Needle");
+        let indexed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_fts WHERE work_fts MATCH 'Projected*' AND work_id=?",
+        )
+        .bind(&work)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(indexed, 1, "failed edit changed the search projection");
     }
 }

@@ -59,7 +59,9 @@ It asks for the port and how people will reach komiq, and does the rest:
    the HTTPS answer for `direct`, so setup does not ask them again.
 
 At the end it prints the reader and console addresses, and the command that changes a
-choice later: `docker compose exec server komika-server setup`.
+choice later: `docker compose exec server komika-server setup`. For `local` it adds
+`Internet: closed when the server is set to "Only my devices". It then refuses plain HTTP from the internet.`
+The installer does not change the mode of a server that is set up already.
 
 | Option                            | What it does                                                                                                                                               |
 | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -192,9 +194,10 @@ address, the command asks "Try again?". With no, the address stays unsaved, setu
 on, and you finish in **Settings › Access**. For plain HTTP in a container it adds that
 the port must also answer other machines (`KOMIQ_BIND=0.0.0.0`).
 
-Choosing "Only my devices" on a server that was public on a domain prints that Cloudflare
-is turned off on this server, and that what setup made at Cloudflare stays until you
-remove it in the console. See [Switch back to "Only my devices"](#switch-back-to-only-my-devices).
+Choosing "Only my devices" prints "From the internet, the server now refuses plain HTTP."
+On a server that was public on a domain it also prints that Cloudflare is turned off on
+this server, and that what setup made at Cloudflare stays until you remove it in the
+console. See [Switch back to "Only my devices"](#switch-back-to-only-my-devices).
 
 Outside Docker, run `komika-server setup` on the machine the server runs on. It talks to
 `http://127.0.0.1:<PORT>`; use `--server <address>` when the server answers somewhere
@@ -255,6 +258,16 @@ or closed to the server for lack of permission, and whether the server runs in a
 container, where the ports must be published too. In a container the console also shows
 the installer command that publishes them.
 
+If the server cannot open the HTTPS port when it starts (another program holds it, or it
+has no permission), it tries again by itself: after 5 seconds, then after waits that
+double, up to once every 5 minutes, until HTTPS is up or the access mode no longer needs
+it. This holds for a public IP with Cloudflare and for no domain with HTTPS.
+**Settings › Access** shows the reason in red under the HTTPS state (the `HTTPS` row with
+a public IP, the `Encryption` row without a domain), followed by "The server tries again
+by itself." For example: "Could not listen on port 443 (...). The server needs permission
+to use that port (with Docker, publish it), or set KOMIKA_HTTPS_PORT." A tunnel connector
+that fails to start does not keep HTTPS from starting.
+
 ### With a domain
 
 Cloudflare sits in front of komiq and gives it HTTPS and caching. It supports a
@@ -265,7 +278,9 @@ details are in [self-host-cloudflare.md](./self-host-cloudflare.md).
   `KOMIQ_BIND=127.0.0.1` so the plain HTTP port is closed to the network. The installer
   writes that for `tunnel`.
 - **Public IP:** komiq serves HTTPS on port 443 inside the container. Publish it with
-  `COMPOSE_FILE`, as in the table above. The installer does that for `public-ip`.
+  `COMPOSE_FILE`, as in the table above. The installer does that for `public-ip`. The
+  Origin CA certificate lasts 15 years and nothing renews it by itself. See
+  [Turned off, run again, removed](./self-host-cloudflare.md#turned-off-run-again-removed).
 
 ### Without a domain
 
@@ -275,7 +290,9 @@ DNS, and the server fetches covers and pages itself.
 
 The connection is HTTPS. komiq gets a free certificate for the IP address from Let's
 Encrypt and renews it by itself. Such a certificate lasts about six days, and komiq
-gets a new one every three. Using it means you agree to the
+gets a new one every three. At start and at each renewal check, a certificate on disk
+that is for another address than the stored one counts as due: komiq does not serve it
+and gets one for the stored address. Using it means you agree to the
 [Let's Encrypt Subscriber Agreement](https://letsencrypt.org/repository/).
 
 1. Publish ports 443 and 80: run the installer with `direct`, or set `COMPOSE_FILE` as in
@@ -287,6 +304,16 @@ gets a new one every three. Using it means you agree to the
    port 80.
 3. Readers use `https://203.0.113.5`, and you open the console at
    `https://203.0.113.5/admin`.
+
+The desktop app, when it is the console of a remote server, moves itself to the
+`https://` address once that address answers. It tries four times over about half a
+minute, and only for the host you typed. The form in Settings stays busy meanwhile, and
+the setup wizard waits on that step and shows "Moving to the new address." If the new
+address does not answer, the app stays on the old one. **Settings › Access** and the last
+setup step then show this notice, with a **Try again** button: "This app still uses the
+old address, without encryption. It got no answer at https://203.0.113.5. Check that port
+443 is open in your cloud firewall, then try again. After the first visit over HTTPS, the
+old address stops answering from the internet." The notice lasts until you close the app.
 
 The plain HTTP port (`KOMIQ_PORT`) keeps answering this machine, for the terminal setup,
 and your home network when `KOMIQ_BIND` is `0.0.0.0`. After the first visit from the
@@ -314,7 +341,9 @@ server changes, enter the new one in **Settings › Access**.
 The server settings `KOMIKA_HTTPS_PORT` and `KOMIKA_ACME_PORT` change the two ports the
 server binds. The form then says what to open: another HTTPS port becomes part of the
 address, like `https://203.0.113.5:8443`, and public port 80 must be forwarded to the
-other port, because Let's Encrypt always connects to port 80.
+other port, because Let's Encrypt always connects to port 80. The address komiq shows
+names the HTTPS port of the running server, so a changed `KOMIKA_HTTPS_PORT` shows after
+a restart.
 
 You can switch **Encrypt the connection** off. Readers then type the address and port,
 like `203.0.113.5:8080`, over plain HTTP, and people on the network between a reader and
@@ -333,6 +362,12 @@ bash deploy/selfhost/install.sh --access direct --encrypt no
 Open the same port in your cloud firewall. In a container, the form and the terminal
 setup both say that the port must answer other machines.
 
+Inside the container the server always listens on 8080. The compose file passes your
+`KOMIQ_PORT` to it as `KOMIKA_PUBLISHED_PORT`, so the address the form and the terminal
+setup suggest names the published port, like `203.0.113.5:9000` with `KOMIQ_PORT=9000`.
+The two extra Compose files publish HTTPS and the certificate check as fixed `443:443`
+and `80:80`, so those numbers are the same inside and outside.
+
 ### Switch back to "Only my devices"
 
 While the server is public, **Settings › Access** has an **Only my devices** action. It
@@ -342,7 +377,41 @@ asks first, then turns the public way in off. Nothing is deleted:
   that setup started. A restart does not start them again. The DNS record, the cache
   rules and the tunnel or certificate stay at Cloudflare until you choose **Remove**.
 - Without a domain, HTTPS at the server's address stops, and so do the certificate
-  renewals. The plain HTTP port still answers where your firewall lets it.
+  renewals.
+
+In "Only my devices" the server also refuses plain HTTP from the internet. It answers
+HTTP 403, and a GraphQL call gets the text as its error message:
+
+```text
+This server is set to "Only my devices". It does not answer from the internet. Use its address on your home network. To open it to the internet, run `komika-server setup` on the server.
+```
+
+"From the internet" means the client's address is a public one. This computer, your home
+network, and private and VPN ranges (including `100.64.0.0/10`) are not the internet. A
+proxy listed in `TRUSTED_PROXY_CIDRS` is let through. So is a request from one of those
+private addresses for which HTTPS ended in front of the server: your own reverse proxy
+on the same machine or network, which sends `X-Forwarded-Proto: https`.
+Before you choose an access mode nothing is refused, so a fresh server's setup screens
+still open. The other modes are unchanged.
+
+Behind Docker Desktop or rootless Docker the server goes by the address the client typed,
+as described under [Without a domain](#without-a-domain). A client can send a false
+address or header, so there the sure way to close the port is `KOMIQ_BIND=127.0.0.1` in
+`deploy/selfhost/.env` (the installer's `--lan no`), or a firewall.
+
+An owner who opens the console at `http://<public-ip>:<port>` is locked out after the
+switch. To get back in, use the server's address on your home network, or run
+`komika-server setup` on the server (`docker compose exec server komika-server setup`)
+and choose a public mode. An SSH tunnel to the server's port works too, because the
+request then arrives from the server's own computer.
+
+The console warns first. In the confirm step, when the console is open at a public
+address, it says "This console is open at a public address. After the switch it stops
+answering here. Open it on your home network, or run "komika-server setup" on the server
+to change the mode." For a server that was public without a domain and without HTTPS, the
+same step says "The HTTP port stops answering clients on the internet." The setup
+wizard's Access step shows a warning when you select "Only my devices" in a console
+opened at a public plain-HTTP address.
 
 Choosing **Public without a domain** turns a finished Cloudflare setup off in the same
 way. The Cloudflare line in **Settings › Access** then says "Turned off", with **Turn
@@ -439,6 +508,11 @@ publishes them only when `COMPOSE_FILE` in `.env` names the extra Compose files 
 [Reach it from the internet](#reach-it-from-the-internet)). Then check the machine's
 firewall and your cloud provider's firewall.
 
+**HTTPS shows "Not running" after a restart.** The server could not open its HTTPS port.
+**Settings › Access** shows why in red, and the server tries again by itself, at least
+every 5 minutes. Free the port, give the server permission to use it, or publish it with
+Docker. See [Reach it from the internet](#reach-it-from-the-internet).
+
 **Readers cannot open `http://<public-IP>:<port>/`.** Without a domain and without HTTPS,
 readers use the HTTP port. With Docker it must be open to every address:
 `KOMIQ_BIND=0.0.0.0` in `.env`. Run the installer with `--access direct --encrypt no`,
@@ -447,6 +521,12 @@ then open the port in your cloud firewall.
 **The domain stopped answering after you changed the access mode.** "Only my devices"
 and "Public without a domain" turn Cloudflare off on the server. **Settings › Access**
 shows "Turned off": choose **Turn on**.
+
+**The console stopped answering at the server's public address.** You chose "Only my
+devices", and the server refuses plain HTTP from the internet. Open the console at the
+server's home network address, or run `docker compose exec server komika-server setup`
+on the server and choose a public mode. See
+[Switch back to "Only my devices"](#switch-back-to-only-my-devices).
 
 **The DNS record was edited or deleted, or the public IP changed.** Choose **Run setup
 again** in **Settings › Access** and paste the API token. Setup corrects its record, or

@@ -120,6 +120,8 @@ Edit `.env`, then run `docker compose up -d` again.
 | `COMPOSE_PROFILES`     | empty     | Set to `flaresolverr` to start the FlareSolverr container.                                                        |
 | `FLARESOLVERR_ENABLED` | `false`   | Set to `true` with `COMPOSE_PROFILES=flaresolverr` to solve Cloudflare challenges.                                |
 
+Inside the container the server always listens on 8080. The Compose file passes `KOMIQ_PORT` to it as `KOMIKA_PUBLISHED_PORT`, so the address komiq suggests for "Public without a domain" without encryption names your port, such as `203.0.113.5:9000` with `KOMIQ_PORT=9000`.
+
 Use `KOMIQ_BIND=127.0.0.1` on a VPS that you reach through a Cloudflare Tunnel. Keep the default `0.0.0.0` if devices on your home network connect directly. Read [Connect your devices](/self-host/other-devices).
 
 > [!NOTE]

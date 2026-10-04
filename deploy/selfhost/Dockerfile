@@ -37,6 +37,7 @@ RUN KOMIKA_TARGET=embedded pnpm --filter @komika/reader build \
 # (link-time optimisation) and wants about 4 GB of memory.
 FROM rust:1-slim-bookworm AS server
 WORKDIR /build
+COPY .cargo/config.toml ./.cargo/config.toml
 COPY apps/server/ ./
 RUN cargo build --release --locked --bin komika-server
 

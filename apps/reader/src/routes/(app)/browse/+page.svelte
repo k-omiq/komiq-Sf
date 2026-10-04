@@ -69,6 +69,7 @@
 		type BrowseState,
 	} from '$lib/data/browse-filters';
 	import { auth } from '$lib/auth.svelte';
+	import { blockRulesVersion } from '$lib/block-rules.svelte';
 	import ActiveFilters from './ActiveFilters.svelte';
 	import FilterPanel from './FilterPanel.svelte';
 	import SortMenu from './SortMenu.svelte';
@@ -291,8 +292,9 @@
 		// federated results are per-user, native ones are NSFW-gated per viewer, and both
 		// survive login/logout in SPA memory. The native key is the canonical query string
 		// (every filter, the sort and the page); the federated one is the query only — its
-		// filters apply client-side and it has no pager.
-		const idTag = `${auth.user?.id ?? 'anon'}:${auth.user?.showNsfw ? 1 : 0}`;
+		// filters apply client-side and it has no pager. The viewer's block rules change the
+		// set too, and only their version says so (see $lib/block-rules.svelte).
+		const idTag = `${auth.user?.id ?? 'anon'}:${auth.user?.showNsfw ? 1 : 0}:${blockRulesVersion.n}`;
 		const sig = isFederated ? `fed:${idTag}:${q}` : `nat:${idTag}:${toSearchParams(s)}`;
 
 		const mayRestore = !didInitFromCache || restoreOnPop;
@@ -638,6 +640,7 @@
 							title={m.title}
 							sub={cardSub(m)}
 							rating={m.rating.toFixed(1)}
+							mdRating={m.mdRating}
 							cover={m.cover}
 							id={m.id}
 							flagType={m.type}

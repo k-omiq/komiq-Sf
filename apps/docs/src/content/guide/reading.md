@@ -74,7 +74,7 @@ When you are signed in to the connected server, reading progress is saved to you
 
 Some series exist on multiple sources or have uploads from different scanlation groups.
 
-The server's administrator can mark a scanlation group as AI translated. Chapters from such a group show an AI or Partial AI badge next to the group name, in the chapter list and under Group & source. Partial AI means AI is part of the work, for example a machine translation that a person edits.
+The server's administrator can mark a scanlation group as AI translated. The administrator can also mark a whole source, when the source translates its own series and its chapters name no group. Chapters from such a group or source show an AI or Partial AI badge, in the chapter list and under Group & source. Partial AI means AI is part of the work, for example a machine translation that a person edits.
 
 ### Switch a single chapter copy
 

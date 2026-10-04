@@ -52,6 +52,7 @@
 	--k-accent-purple: #c69cf0; /* manhwa */
 	--k-accent-teal: #5fc8cf; /* manhua */
 	--k-star: #f6b73c; /* rating gold */
+	--k-star-mangadex: #ff6740; /* MangaDex's rating, next to ours */
 
 	/* status */
 	--k-ongoing: #7fd39a;

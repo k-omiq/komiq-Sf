@@ -921,10 +921,6 @@ const PAUSED_PARK_HOURS: i64 = 24 * 14; // 14 days
 /// due-set instead of being retried every tick and starving healthy series (audit #4).
 const ERROR_BACKOFF_BASE_MINUTES: i64 = 30;
 
-/// How many times to re-run the whole `record_scan` transaction when it fails with a
-/// transient SQLite lock. Mirrors `mangadex::UPSERT_LOCK_RETRIES` — the same
-/// contention, from the other side of the single writer.
-
 /// Cap on the error-backoff so a permanently-failing series stops growing its delay and
 /// settles into a daily re-check (it might come back). Independent of `PAUSED_PARK_HOURS`:
 /// a dead/erroring id is retried ~daily, more often than a genuinely paused series' 14-day
@@ -1755,6 +1751,7 @@ async fn mirror_feed_row_into_browse_catalogue(
         effective_content_rating_sql, BROWSE_DEMOGRAPHIC_SQL, BROWSE_LANGUAGE_SQL, BROWSE_YEAR_SQL,
     };
     let rating = effective_content_rating_sql("f.content_rating", "f.is_nsfw");
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query(&format!(
         "INSERT INTO browse_catalogue \
              (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, status, \
@@ -1774,8 +1771,19 @@ async fn mirror_feed_row_into_browse_catalogue(
          ON CONFLICT(work_id) DO UPDATE SET {set} WHERE {changed}"
     ))
     .bind(series_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    let works: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT work_id FROM source_series \
+        WHERE source_type = 'suwayomi' AND source_key = ?",
+    )
+    .bind(series_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    for work in works {
+        crate::catalog::refresh_work_fts_in(&mut tx, &work).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3165,17 +3173,19 @@ fn spawn_source_child(state: Arc<AppState>, sel: SourceSel, coord: Arc<ScanCoord
 
 /// Assign a `source_id` to any scan-state row that can be mapped but hasn't been yet (freshly
 /// enrolled), so it moves from the unassigned sweeper onto its own source's loop. Cheap: the
-/// `EXISTS` guard stops it rewriting genuinely-unmappable rows every pass, so it is bounded by
-/// the (normally zero) count of newly-enrolled NULL rows. Returns rows healed.
+/// `EXISTS` guard requires a known source, so unknown mappings stay with the sweeper instead of
+/// being rewritten every pass. Work is bounded by newly mapped NULL rows. Returns rows healed.
 async fn heal_null_source_ids(pool: &Database) -> u64 {
     sqlx::query(
         "UPDATE series_scan_state \
             SET source_id = (SELECT ss.source_id FROM source_series ss \
                               WHERE ss.source_type = 'suwayomi' \
+                                AND ss.source_id IS NOT NULL \
                                 AND ss.source_key = series_scan_state.series_id LIMIT 1) \
           WHERE source_id IS NULL \
             AND EXISTS (SELECT 1 FROM source_series ss \
                          WHERE ss.source_type = 'suwayomi' \
+                           AND ss.source_id IS NOT NULL \
                            AND ss.source_key = series_scan_state.series_id)",
     )
     .execute(pool)
@@ -4995,7 +5005,7 @@ mod tests {
         top.id = i64::MAX;
         top.chapter_number = real_max + 1.0;
         plus.push(top);
-        sqlx::query("UPDATE series_scan_state SET next_scan_at = NULL WHERE series_id = ?")
+        sqlx::query("UPDATE series_scan_state SET next_scan_at = '1970-01-01T00:00:00+00:00' WHERE series_id = ?")
             .bind(&sid)
             .execute(&pool)
             .await
@@ -5046,7 +5056,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn due_query_takes_null_and_past_orders_nulls_first_and_limits() {
+    async fn due_query_takes_sentinel_and_past_orders_sentinel_first_and_limits() {
         let pool = migrated_pool().await;
         let now = at("2024-01-01T00:00:00Z");
         put_state(&pool, "sentinel", None).await; // never scanned (sentinel) -> due now
@@ -5424,7 +5434,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO series_scan_state \
                (series_id, next_scan_at, awaiting_since, consecutive_failures, updated_at) \
-             VALUES ('p', NULL, '2023-12-01T00:00:00Z', 3, '2024-01-01T00:00:00Z')",
+             VALUES ('p', '1970-01-01T00:00:00+00:00', '2023-12-01T00:00:00Z', 3, '2024-01-01T00:00:00Z')",
         )
         .execute(&pool)
         .await
@@ -6700,8 +6710,8 @@ mod tests {
     async fn heal_is_idempotent_and_terminates() {
         // §8b's infinite-loop class: a work-list query whose writer does not share its
         // predicate re-offers the same rows forever. Here the SELECT subquery and the EXISTS
-        // guard are the same predicate, and `source_series.source_id` is NOT NULL, so a healed
-        // row can never come back NULL. Second pass must affect ZERO rows.
+        // guard both require a known source ID, so a healed row cannot remain NULL.
+        // Unknown source IDs remain NULL for the sweeper. Second pass must affect ZERO rows.
         let pool = migrated_pool().await;
         sqlx::query(
             "INSERT INTO work (id, created_at, updated_at) \
@@ -6710,8 +6720,8 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        // Including the '' ("unknown, e.g. backfill") source id the schema allows — it must
-        // heal to a real (empty-string) shard rather than staying NULL forever.
+        // Legacy empty source IDs normalize to NULL. Their scan rows must remain unassigned
+        // until a later source lookup provides a known ID.
         for (ss_id, src, key) in [("ss_1", "srcA", "1"), ("ss_2", "", "2")] {
             sqlx::query(
                 "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
@@ -6735,11 +6745,56 @@ mod tests {
             .await
             .unwrap();
         }
-        assert_eq!(heal_null_source_ids(&pool).await, 2, "both mappable rows");
+        let unknown_source: Option<String> =
+            sqlx::query_scalar("SELECT source_id FROM source_series WHERE id = 'ss_2'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            unknown_source, None,
+            "legacy empty source ID normalizes to NULL"
+        );
+        assert_eq!(
+            heal_null_source_ids(&pool).await,
+            1,
+            "only the known source is assigned"
+        );
         assert_eq!(
             heal_null_source_ids(&pool).await,
             0,
             "a second pass rewrites nothing — the heal converges instead of spinning"
+        );
+        let scan_sources: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT series_id, source_id FROM series_scan_state ORDER BY series_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            scan_sources,
+            vec![
+                ("1".to_string(), Some("srcA".to_string())),
+                ("2".to_string(), None),
+                ("3".to_string(), None),
+            ],
+            "known source is assigned; unknown and absent mappings remain unassigned"
+        );
+        assert_eq!(
+            distinct_scan_source_ids(&pool, SOURCE_LOOP_SLOTS).await,
+            vec!["srcA".to_string()],
+            "only a known source receives its own loop"
+        );
+        let mut unassigned = due_series_ids_for_source(
+            &pool,
+            &SourceSel::Unassigned { above: None },
+            "2030-01-01T00:00:00Z",
+            10,
+        )
+        .await;
+        unassigned.sort();
+        assert_eq!(
+            unassigned,
+            vec!["2".to_string(), "3".to_string()],
+            "the sweeper retains both unknown and absent mappings"
         );
     }
 
@@ -6798,10 +6853,12 @@ mod tests {
             "UPDATE series_scan_state \
                 SET source_id = (SELECT ss.source_id FROM source_series ss \
                                   WHERE ss.source_type = 'suwayomi' \
+                                    AND ss.source_id IS NOT NULL \
                                     AND ss.source_key = series_scan_state.series_id LIMIT 1) \
               WHERE source_id IS NULL \
                 AND EXISTS (SELECT 1 FROM source_series ss \
                              WHERE ss.source_type = 'suwayomi' \
+                               AND ss.source_id IS NOT NULL \
                                AND ss.source_key = series_scan_state.series_id)",
         )
         .await;

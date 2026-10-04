@@ -1,5 +1,6 @@
 mod auth;
 mod avatar;
+mod block;
 mod browse;
 mod catalog;
 mod chapter_label;
@@ -69,8 +70,8 @@ use tracing::Level;
 
 use config::Config;
 use graphql::{
-    ApiSchema, AppState, ClientIp, KeyedLocks, RateLimiter, RequestAuth, RequestLibraryCache,
-    RequestNsfwPref, RequestUserCache, ScanHealth,
+    ApiSchema, AppState, ClientIp, KeyedLocks, RateLimiter, RequestAuth, RequestBlocks,
+    RequestLibraryCache, RequestNsfwPref, RequestUserCache, ScanHealth,
 };
 use suwayomi::SuwayomiClient;
 
@@ -358,6 +359,7 @@ async fn graphql_handler(
     // row is read at most once — even when many resolvers ask (one per feed item).
     let user_cache = RequestUserCache::default();
     let nsfw_cache = RequestNsfwPref::default();
+    let blocks_cache = RequestBlocks::default();
     let library_cache = RequestLibraryCache::default();
     let response = schema
         .execute(
@@ -367,6 +369,7 @@ async fn graphql_handler(
                 .data(plain)
                 .data(user_cache)
                 .data(nsfw_cache)
+                .data(blocks_cache)
                 .data(library_cache),
         )
         .await;
@@ -537,6 +540,7 @@ async fn graphql_get_response(
     let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted.current())));
     let user_cache = RequestUserCache::default();
     let nsfw_cache = RequestNsfwPref::default();
+    let blocks_cache = RequestBlocks::default();
     let library_cache = RequestLibraryCache::default();
     let resp = schema
         .execute(
@@ -546,6 +550,7 @@ async fn graphql_get_response(
                 .data(plain)
                 .data(user_cache)
                 .data(nsfw_cache)
+                .data(blocks_cache)
                 .data(library_cache),
         )
         .await;
@@ -1112,14 +1117,28 @@ async fn serve_suwayomi_image(
         let width = cover::variant_width(query_param(&query, "w"));
         return serve_suwayomi_cover(&app, &covers, manga_id, width).await;
     }
+    // The owning manga (`is_suwayomi_image_path` already proved the first segment numeric).
+    let manga_id = rest.split('/').next().and_then(|id| id.parse::<i64>().ok());
+    // A chapter page of a series a site-wide rule blocks is not served: `pages` refuses
+    // to list its URLs, but the URL is three guessable numbers. Covers stay open, as the
+    // admin console still lists a blocked series and its `<img>` carries no session.
+    // Fails closed: a rule that cannot be read must not let the page out.
+    if let Some(id) = manga_id {
+        match graphql::site_blocks_engine_series(&app.pool, id).await {
+            Ok(false) => {}
+            Ok(true) => return StatusCode::NOT_FOUND.into_response(),
+            Err(e) => {
+                tracing::warn!(error = %e, "suwayomi page: block rules unreadable");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
     let path = format!("/api/v1/manga/{rest}");
     // Bounded + timed page fetch (own pool, page timeout, byte cap). The old path called
     // the unbounded `fetch_image`, which shared the 30 s scan timeout and no concurrency
     // bound, so a burst of page requests (a chapter is tens of pages) could pile onto the
     // engine behind the scanner and each pay the full 30 s ceiling.
-    // The owning manga, for the per-source health buckets (`is_suwayomi_image_path`
-    // already proved the first segment numeric).
-    let manga_id = rest.split('/').next().and_then(|id| id.parse::<i64>().ok());
+    // Per-source health buckets, by the owning manga.
     let health = |outcome: Result<(), &anyhow::Error>| {
         if let Some(id) = manga_id {
             source_health::observe(
@@ -1964,9 +1983,14 @@ async fn main() -> anyhow::Result<()> {
     let health_flusher = source_health::spawn_flusher(pool.clone(), shutdown_tx.subscribe());
 
     // Keep `sqlite_stat1` current so the planner keeps choosing migration 0058's
-    // indexes. Background, not boot-blocking. See `db::spawn_analyze` for why this is
-    // an exact per-table ANALYZE rather than `PRAGMA optimize`.
+    // indexes. Refresh each sampled index in a separate writer turn.
     db::spawn_analyze(pool.clone(), shutdown_tx.subscribe());
+    // Local catalogue/search repair must run even with CATALOGUE_SYNC=off.
+    mangadex::spawn_reconciler(
+        pool.clone(),
+        cfg.feed_reconcile_interval_secs,
+        shutdown_tx.subscribe(),
+    );
 
     // Chapter-spine drains (Phase B3). Migration 0090 adds `chapter.chapter_key` and
     // `chapter.scanlator` and moves nothing; this is what backfills the 877,824 existing
@@ -1997,7 +2021,6 @@ async fn main() -> anyhow::Result<()> {
             cfg.catalogue_cover_phash,
             cfg.catalogue_sync_interval_secs,
             cfg.chapter_sync_interval_secs,
-            cfg.feed_reconcile_interval_secs,
             shutdown_tx.subscribe(),
         );
         // One-time top-up: fill catalogue series the original seed missed (the

@@ -80,6 +80,10 @@ pub struct Options {
     pub origin_service: String,
     /// Where that plain HTTP listener is bound (`BIND_ADDR`, `PORT`).
     pub listen: SocketAddr,
+    /// The plain HTTP port as other machines see it (`KOMIKA_PUBLISHED_PORT`). A
+    /// container's host can publish the listener on another port than `PORT`; the
+    /// self-host compose file passes it on. The listener's own port when unset.
+    pub published_port: u16,
     /// The HTTPS listener for public-IP mode and for direct mode
     /// (`KOMIKA_HTTPS_PORT`, default 443).
     pub https_addr: SocketAddr,
@@ -93,6 +97,9 @@ pub struct Options {
     pub acme_ca_file: Option<PathBuf>,
     /// Direct mode: how often the server looks whether its certificate is due.
     pub renew_check: Duration,
+    /// How long after boot the HTTPS port is tried again when it could not be opened.
+    /// Each later wait is twice as long, up to `HTTPS_RETRY_MAX`.
+    pub https_retry: Duration,
     pub health_attempts: u32,
     pub health_delay: Duration,
     pub connector_timeout: Duration,
@@ -129,6 +136,9 @@ impl Options {
                 .unwrap_or_else(|| data_dir_for(&cfg.database_url)),
             origin_service: format!("http://{origin_host}:{}", cfg.port),
             listen: SocketAddr::new(bind, cfg.port),
+            published_port: env("KOMIKA_PUBLISHED_PORT")
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(cfg.port),
             https_addr: SocketAddr::new(bind, https_port),
             acme_addr: SocketAddr::new(
                 bind,
@@ -140,6 +150,7 @@ impl Options {
                 .unwrap_or_else(|| acme::LETS_ENCRYPT.into()),
             acme_ca_file: env("KOMIKA_ACME_CA_FILE").map(PathBuf::from),
             renew_check: Duration::from_secs(3600),
+            https_retry: Duration::from_secs(5),
             health_attempts: 30,
             health_delay: Duration::from_secs(4),
             connector_timeout: Duration::from_secs(45),
@@ -169,6 +180,13 @@ const ORIGIN_KEY_FILE: &str = "origin-key.der";
 const ORIGIN_CERT_FILE: &str = "origin-cert.pem";
 
 const LOOPBACK_CIDRS: [&str; 2] = ["127.0.0.1/32", "::1/128"];
+
+/// The longest wait between two tries to open the HTTPS port (`Manager::retry_https`).
+const HTTPS_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// An Origin CA certificate lasts 15 years and nothing renews it by itself. "Run setup
+/// again" replaces one that ends within this time.
+const ORIGIN_RENEW_BEFORE: chrono::Duration = chrono::Duration::days(30);
 
 /// Connection type: a Cloudflare Tunnel, or a proxied record at the server's address.
 #[derive(async_graphql::Enum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -474,8 +492,8 @@ pub struct AccessStatus {
     /// `local`, `internet`, `direct`, or empty when nobody chose yet.
     pub mode: String,
     pub domain: Option<String>,
-    /// What readers type: `https://<domain>` in internet mode, the stored public
-    /// address in direct mode.
+    /// What readers type: `https://<domain>` in internet mode, the public address in
+    /// direct mode (with HTTPS: the stored host on the HTTPS port of this run).
     pub address: Option<String>,
     /// `http://<address>:<port>` for each way a device on the home network reaches
     /// this server, best first. Empty when the server only answers on this computer,
@@ -490,10 +508,16 @@ pub struct AccessStatus {
     /// The HTTPS listener is up (Cloudflare public-IP mode, or direct mode with a
     /// certificate).
     pub https: bool,
-    /// Direct mode with HTTPS: when the current certificate stops being valid
-    /// (RFC 3339). The server renews it long before.
+    /// Why the HTTPS listener is down while the access mode needs it (its port was
+    /// busy at boot, for one). The server keeps trying.
+    pub https_error: Option<String>,
+    /// When the certificate the HTTPS listener serves stops being valid (RFC 3339).
+    /// Direct mode with HTTPS: the server renews it long before. Cloudflare public-IP
+    /// mode: the Origin CA certificate, which "Run setup again" replaces.
     pub certificate_expires: Option<String>,
     /// Direct mode with HTTPS: why the last renewal failed, until one succeeds.
+    /// Cloudflare public-IP mode: the Origin CA certificate is due
+    /// (`origin_certificate_due`).
     pub certificate_error: Option<String>,
     /// Direct mode with HTTPS: the plain HTTP port refuses clients on the internet.
     /// It starts to after the first visit from the internet over HTTPS.
@@ -520,6 +544,8 @@ pub struct AccessPreflight {
     /// `found`, `download` or `unsupported`.
     pub cloudflared: String,
     pub cloudflared_detail: Option<String>,
+    /// The plain HTTP port as other machines see it: what a container's host
+    /// publishes (`KOMIKA_PUBLISHED_PORT`), else the listener's own.
     pub http_port: i32,
     pub https_port: i32,
     /// `free`, `serving`, `in_use` or `denied`; `unknown` for other OS errors.
@@ -551,6 +577,8 @@ pub struct Manager {
     router: OnceLock<axum::Router>,
     /// The HTTPS server task and its accept loop.
     https: Mutex<Option<[tokio::task::JoinHandle<()>; 2]>>,
+    /// Why boot could not bring that listener up, while `retry_https` still tries.
+    https_error: Mutex<Option<String>>,
     /// Direct mode with HTTPS (`direct.rs`): its port-80 listener, its renewal loop,
     /// the answers to the certificate authority's checks, a lock so that one
     /// certificate is requested at a time, and why the last renewal failed.
@@ -563,6 +591,11 @@ pub struct Manager {
     /// a client on the internet has used it (`instance::DIRECT_HTTPS_SEEN`).
     direct_origin: Arc<RwLock<Option<String>>>,
     https_seen: AtomicBool,
+    /// The access choice is "only my devices" (`note_access_mode`): `plain_http_guard`
+    /// refuses plain HTTP from the internet. With it, the last DNS name a client
+    /// typed, whether it leads to the internet, and when that was looked up.
+    local_only: AtomicBool,
+    typed_name: Mutex<Option<(String, bool, std::time::Instant)>>,
     lan_client_seen_at: AtomicI64,
     in_container: bool,
 }
@@ -584,6 +617,7 @@ impl Manager {
             job: Mutex::new(None),
             router: OnceLock::new(),
             https: Mutex::new(None),
+            https_error: Mutex::new(None),
             challenge_task: Mutex::new(None),
             renew_task: Mutex::new(None),
             challenges: acme::Challenges::default(),
@@ -591,6 +625,8 @@ impl Manager {
             certificate_error: Mutex::new(None),
             direct_origin: Arc::new(RwLock::new(None)),
             https_seen: AtomicBool::new(false),
+            local_only: AtomicBool::new(false),
+            typed_name: Mutex::new(None),
             lan_client_seen_at: AtomicI64::new(0),
             in_container: crate::lan::in_container(),
         }
@@ -603,15 +639,81 @@ impl Manager {
     /// Boot: bring back what a completed or partial setup left running (connector,
     /// HTTPS listener). No stored setup, no work — the hosted instance never gets here.
     pub async fn resume(self: &Arc<Self>) {
+        // Held to the end: the renewal loop waits for it, so the stored certificate
+        // serves before a new one is requested.
+        let _one = self.issuing.lock().await;
+        self.note_access_mode().await;
         self.resume_direct_tls().await;
+        if self.cloudflare_on().await {
+            if let Err(e) = self.start_connector().await {
+                tracing::warn!("cloudflare connector not started: {e}");
+            }
+        }
+        match self.ensure_https().await {
+            Ok(()) if self.https_up() => {
+                tracing::info!(addr = %self.opts.https_addr, "HTTPS listening")
+            }
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!("HTTPS not started, trying again: {e}");
+                self.set_https_error(Some(e));
+                self.retry_https();
+            }
+        }
+    }
+
+    /// The access choice leaves Cloudflare's side running: anything but "only my
+    /// devices" and "public without a domain".
+    async fn cloudflare_on(&self) -> bool {
         let mode = instance::resolve(&self.pool, &instance::ACCESS_MODE)
             .await
             .value;
-        if !matches!(mode.as_str(), "local" | "direct") {
-            if let Err(e) = self.resume_cloudflare().await {
-                tracing::warn!("cloudflare not resumed: {e}");
-            }
+        !matches!(mode.as_str(), "local" | "direct")
+    }
+
+    fn set_https_error(&self, error: Option<String>) {
+        *self.https_error.lock().unwrap_or_else(|p| p.into_inner()) = error;
+    }
+
+    /// Bring the HTTPS listener up when it is down and the access choice needs one:
+    /// direct mode with a certificate, or Cloudflare's public-IP mode. The caller
+    /// holds `issuing`.
+    async fn ensure_https(&self) -> Result<(), String> {
+        if self.https_up() {
+            return Ok(());
         }
+        if let Some(host) = self.direct_tls_host().await {
+            return self.serve_direct(&host).await;
+        }
+        let origin = load_stored(&self.pool)
+            .await
+            .is_some_and(|s| s.certificate_id.is_some());
+        if origin && self.cloudflare_on().await {
+            self.start_https(ORIGIN_KEY_FILE, ORIGIN_CERT_FILE).await?;
+        }
+        Ok(())
+    }
+
+    /// Boot could not open the HTTPS port (another program held it, perhaps). Try
+    /// again, less and less often, until HTTPS is up or the access choice needs none.
+    /// `accessStatus.httpsError` holds the reason meanwhile.
+    fn retry_https(self: &Arc<Self>) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut wait = me.opts.https_retry;
+            loop {
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(HTTPS_RETRY_MAX);
+                let _one = me.issuing.lock().await;
+                match me.ensure_https().await {
+                    Ok(()) => {
+                        me.set_https_error(None);
+                        return;
+                    }
+                    Err(e) => me.set_https_error(Some(e)),
+                }
+            }
+        });
     }
 
     /// Keep Cloudflare's resources and credentials for a later return or removal.
@@ -626,15 +728,20 @@ impl Manager {
         }
     }
 
+    /// Back to Cloudflare from another access choice. The caller holds `issuing`.
     async fn resume_cloudflare(&self) -> Result<(), String> {
-        let Some(s) = load_stored(&self.pool).await else {
-            return Ok(());
-        };
-        if s.tunnel_id.is_some() && self.token_file().is_file() {
+        // A connector that does not start must not keep HTTPS down, nor the reverse.
+        let connector = self.start_connector().await;
+        self.ensure_https().await?;
+        connector
+    }
+
+    async fn start_connector(&self) -> Result<(), String> {
+        let tunnel = load_stored(&self.pool)
+            .await
+            .is_some_and(|s| s.tunnel_id.is_some());
+        if tunnel && self.token_file().is_file() {
             self.connector.start(&self.token_file())?;
-        }
-        if s.certificate_id.is_some() {
-            self.start_https(ORIGIN_KEY_FILE, ORIGIN_CERT_FILE).await?;
         }
         Ok(())
     }
@@ -686,10 +793,13 @@ impl Manager {
         .or_else(|| stored.as_ref().map(|s| s.domain.clone()));
         let (connector, connector_message) = self.connector.status();
         let https = self.https_up();
-        let direct_tls = mode == "direct" && self.direct_tls_host().await.is_some();
-        let address = match mode.as_str() {
-            "internet" => domain.as_ref().map(|d| format!("https://{d}")),
-            "direct" => Some(
+        let direct_host = self.direct_tls_host().await.filter(|_| mode == "direct");
+        let direct_tls = direct_host.is_some();
+        let address = match (mode.as_str(), &direct_host) {
+            ("internet", _) => domain.as_ref().map(|d| format!("https://{d}")),
+            // Not the stored address: it names the HTTPS port of the run that saved it.
+            ("direct", Some(host)) => Some(self.direct_address(host)),
+            ("direct", None) => Some(
                 instance::resolve(&self.pool, &instance::PUBLIC_ADDRESS)
                     .await
                     .value,
@@ -697,6 +807,31 @@ impl Manager {
             .filter(|a| !a.is_empty()),
             _ => None,
         };
+        // Cloudflare's public-IP mode, turned on: the Origin CA certificate serves.
+        let origin_domain = stored
+            .as_ref()
+            .filter(|s| s.certificate_id.is_some() && !direct_tls)
+            .filter(|_| !matches!(mode.as_str(), "local" | "direct"))
+            .map(|s| s.domain.clone());
+        let certificate_dates = match &origin_domain {
+            Some(_) => self.origin_certificate_dates(),
+            None => direct_tls.then(|| self.certificate_dates()).flatten(),
+        };
+        let certificate_error = match &origin_domain {
+            Some(domain) => self.origin_certificate_due(domain),
+            None => self
+                .certificate_error
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+                .filter(|_| direct_tls),
+        };
+        let https_error = self
+            .https_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .filter(|_| !https && (direct_tls || origin_domain.is_some()));
         AccessStatus {
             address,
             lan_addresses: crate::lan::addresses(self.opts.listen.ip(), self.opts.listen.port()),
@@ -716,16 +851,9 @@ impl Manager {
             connector: connector.as_str().into(),
             connector_message,
             https,
-            certificate_expires: direct_tls
-                .then(|| self.certificate_dates())
-                .flatten()
-                .map(|(_, until)| until.to_rfc3339()),
-            certificate_error: self
-                .certificate_error
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone()
-                .filter(|_| direct_tls),
+            https_error,
+            certificate_expires: certificate_dates.map(|(_, until)| until.to_rfc3339()),
+            certificate_error,
             plain_http_closed: direct_tls && self.https_seen.load(Ordering::Relaxed),
             trusted_proxies: self.trusted.raw(),
             trusted_proxies_pinned: self.trusted.is_pinned(),
@@ -764,7 +892,7 @@ impl Manager {
         AccessPreflight {
             cloudflared: cloudflared.into(),
             cloudflared_detail,
-            http_port: self.opts.listen.port().into(),
+            http_port: self.opts.published_port.into(),
             https_port: self.opts.https_addr.port().into(),
             https_port_state: https_state.into(),
             acme_port: self.opts.acme_addr.port().into(),
@@ -973,6 +1101,7 @@ impl Manager {
             let _one = self.issuing.lock().await;
             self.disable_direct_tls().await;
         }
+        self.note_access_mode().await;
         self.finish();
     }
 
@@ -1131,6 +1260,9 @@ impl Manager {
                 Ok(None)
             }
             Step::RevokeCertificate => {
+                // The HTTPS retry waits (`retry_https`): it must not serve this
+                // certificate again while Cloudflare revokes it.
+                let _one = self.issuing.lock().await;
                 self.stop_https().await;
                 if let Some(id) = s.certificate_id.clone() {
                     gone_ok(api.revoke_origin_certificate(&id).await)?;
@@ -1275,32 +1407,82 @@ impl Manager {
         Ok(Some(format!("Proxied {kind} record to {content}.")))
     }
 
+    /// When the Origin CA certificate on disk starts and stops being valid.
+    fn origin_certificate_dates(&self) -> Option<direct::Dates> {
+        let pem = std::fs::read_to_string(self.opts.data_dir.join(ORIGIN_CERT_FILE)).ok()?;
+        origin_tls::validity(&pem)
+    }
+
+    /// Why the Origin CA certificate on disk needs a new one in its place: it is not
+    /// for `domain`, does not fit its key, or ends within `ORIGIN_RENEW_BEFORE`. Only
+    /// "Run setup again" can get one: it takes the API token, which is not kept.
+    fn origin_certificate_due(&self, domain: &str) -> Option<String> {
+        const AGAIN: &str = "Choose \"Run setup again\" to get a new one.";
+        let dir = &self.opts.data_dir;
+        let cert = std::fs::read_to_string(dir.join(ORIGIN_CERT_FILE)).ok();
+        let key = std::fs::read(dir.join(ORIGIN_KEY_FILE)).ok();
+        let Some((cert, key)) = cert.zip(key) else {
+            return Some(format!("The origin certificate is missing. {AGAIN}"));
+        };
+        if origin_tls::server_config(&cert, &key).is_err() {
+            return Some(format!(
+                "The origin certificate does not fit its key. {AGAIN}"
+            ));
+        }
+        if !origin_tls::is_for(&cert, domain) {
+            return Some(format!(
+                "The origin certificate is not for {domain}. {AGAIN}"
+            ));
+        }
+        let until = origin_tls::validity(&cert).map(|(_, until)| until);
+        let now = chrono::Utc::now();
+        match until {
+            Some(until) if until <= now => Some(format!(
+                "The origin certificate ended on {}. {AGAIN}",
+                until.format("%Y-%m-%d")
+            )),
+            Some(until) if until - now < ORIGIN_RENEW_BEFORE => Some(format!(
+                "The origin certificate ends on {}. {AGAIN}",
+                until.format("%Y-%m-%d")
+            )),
+            Some(_) => None,
+            None => Some(format!("The origin certificate cannot be read. {AGAIN}")),
+        }
+    }
+
     async fn step_certificate(&self, api: &Client, s: &mut Stored) -> StepResult {
         let key_path = self.opts.data_dir.join(ORIGIN_KEY_FILE);
         let cert_path = self.opts.data_dir.join(ORIGIN_CERT_FILE);
-        if s.certificate_id.is_none() || !key_path.is_file() || !cert_path.is_file() {
-            if let Some(old) = s.certificate_id.take() {
-                // Files lost: the old certificate is useless without its key.
-                let _ = gone_ok(api.revoke_origin_certificate(&old).await);
-            }
+        let mut revoked = Ok(());
+        if s.certificate_id.is_none() || self.origin_certificate_due(&s.domain).is_some() {
             let key = origin_tls::generate_key()?;
             let csr = origin_tls::csr_pem(&key, &s.domain)?;
-            origin_tls::write_private(&key_path, &key)
-                .map_err(|e| format!("Could not save the origin key: {e}"))?;
+            // Nothing on disk changes before Cloudflare has signed: a refused request
+            // leaves a certificate that still works serving.
             let cert = api
                 .create_origin_certificate(&csr, &s.domain)
                 .await
                 .map_err(|e| e.message)?;
-            s.certificate_id = Some(cert.id);
+            let old = s.certificate_id.replace(cert.id);
             save_stored(&self.pool, Some(s)).await?;
+            origin_tls::write_private(&key_path, &key)
+                .map_err(|e| format!("Could not save the origin key: {e}"))?;
             origin_tls::write_private(&cert_path, cert.certificate.as_bytes())
                 .map_err(|e| format!("Could not save the origin certificate: {e}"))?;
+            // Its key is gone from this server: nothing can serve the old one again.
+            if let Some(old) = old {
+                revoked = gone_ok(api.revoke_origin_certificate(&old).await);
+            }
         }
         self.start_https(ORIGIN_KEY_FILE, ORIGIN_CERT_FILE).await?;
-        Ok(Some(format!(
-            "Serving HTTPS on port {}.",
-            self.opts.https_addr.port()
-        )))
+        let serving = format!("Serving HTTPS on port {}.", self.opts.https_addr.port());
+        Ok(Some(match revoked {
+            Ok(()) => serving,
+            Err(e) => format!(
+                "{serving} The old certificate could not be revoked ({e}). Revoke it in the \
+                 Cloudflare dashboard: SSL/TLS, Origin Server."
+            ),
+        }))
     }
 
     /// Serve the public router over HTTPS with the key and certificate in these two

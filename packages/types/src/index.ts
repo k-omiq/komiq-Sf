@@ -342,8 +342,17 @@ export interface UpdateFeedRow {
 	detectedAt: string | null;
 	/** Aggregate rating 0-10: our readers' review average where they have rated the work,
 	 *  else MangaDex's community rating (the server's `work_stats` cache). Null ONLY when
-	 *  neither has one, which is the sole case a card should label "Unrated". */
+	 *  neither has one, which is the sole case a card should label "Unrated".
+	 *
+	 *  The MERGED number: it cannot say whose rating it is. Read it only when
+	 *  {@link readerRating} is absent, i.e. from a server that predates the split. */
 	rating: number | null;
+	/** Our own readers' review average; null when none of them rated the work. Absent on
+	 *  a server that predates the field. */
+	readerRating?: number | null;
+	/** MangaDex's community rating; null when it has none or the server's admin turned
+	 *  MangaDex ratings off. Absent on a server that predates the field. */
+	mangadexRating?: number | null;
 	isNsfw: boolean;
 }
 
@@ -702,7 +711,14 @@ export interface Series {
 	coverUrl: string;
 	/** Opaque backend source identifier (which Suwayomi extension it came from). */
 	sourceId: string;
+	/** Our own readers' rating. Never MangaDex's: see {@link mangadexRating}. */
 	rating: RatingSummary;
+	/**
+	 * MangaDex's community rating of the work, 0-10. Null when MangaDex has none or the
+	 * server's admin turned MangaDex ratings off; absent on a server that predates the
+	 * field. Both read as "no MangaDex rating".
+	 */
+	mangadexRating?: number | null;
 	chapterCount: number;
 	/** True if the current user marked it (raises scanning priority). */
 	isMarked: boolean;

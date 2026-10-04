@@ -41,6 +41,15 @@ home-network question, and for `public-ip` it publishes port 443. See
 The desktop app that runs its own server has no connection choice. It uses a tunnel: that
 server answers on its own computer, and cannot take port 443 from the internet.
 
+With a public IP, the server may fail to open port 443 when it starts: another program
+holds it, or it has no permission. It then tries again by itself, after 5 seconds and
+then after waits that double, up to once every 5 minutes, until HTTPS is up or the access
+mode no longer needs it. **Settings › Access** shows the reason in red under the HTTPS
+state, followed by "The server tries again by itself." For example: "Could not listen on
+port 443 (...). The server needs permission to use that port (with Docker, publish it),
+or set KOMIKA_HTTPS_PORT." A tunnel connector that fails to start does not keep HTTPS
+from starting.
+
 ## The connector (cloudflared)
 
 A tunnel needs the `cloudflared` program. The server looks for it in this order:
@@ -135,7 +144,9 @@ HTTPS listener that setup started stops (Public IP), and a restart does not star
 Nothing at Cloudflare changes: the DNS record, the cache rules and the tunnel or
 certificate stay, and so do the files the server keeps. Readers can no longer open the
 domain. Settings › Access shows "Turned off", with "Turn on" and "Remove". The wizard's
-Internet step shows "Turn on" too.
+Internet step shows "Turn on" too. "Only my devices" also makes the server refuse plain
+HTTP from the internet: see
+[Switch back to "Only my devices"](./self-host.md#switch-back-to-only-my-devices).
 
 "Turn on" sets the mode back to "Public on the internet" and starts the connector or the
 listener from the kept files. It asks for no token. Coming from "Public without a
@@ -147,6 +158,19 @@ with a token you paste. Steps whose result is in place pass quickly. It repairs 
 record: an edited record is corrected, a deleted one is made again, and a public IP that
 setup detected is detected again. A record somebody else put on the name is left alone:
 the step fails and names it.
+
+**The origin certificate.** With a public IP, the Origin CA certificate lasts 15 years.
+Nothing renews it by itself, because the server does not keep the API token.
+Settings › Access, row `HTTPS`, shows "Cloudflare origin certificate, valid until" and
+the end date, then "Nothing renews it by itself: "Run setup again" gets a new one in its
+last 30 days." When the certificate ends within 30 days, has ended, is not for the
+domain, does not fit its key or is missing, that row shows a red line instead, for
+example "The origin certificate ends on 2041-03-12. Choose "Run setup again" to get a new
+one." Run setup again and paste the token: setup gets a new certificate from Cloudflare,
+serves it, and revokes the old one. A certificate that is still good is kept. If
+Cloudflare refuses the request, the files on the server stay as they were. If the old
+certificate cannot be revoked, the checklist line says so. Revoke it in the Cloudflare
+dashboard under SSL/TLS, Origin Server.
 
 ## What the server keeps
 

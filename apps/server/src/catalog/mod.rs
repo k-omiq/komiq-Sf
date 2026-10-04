@@ -809,43 +809,6 @@ fn feed_updates_select(scope: &str) -> String {
     )
 }
 
-async fn repair_catalogue_tag_keys(pool: &Database) -> Result<u64> {
-    let mut cursor = 0i64;
-    let mut changed = 0;
-    loop {
-        let rows: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT rowid, tag FROM work_tag WHERE rowid > ? \
-             AND (tag_key IS NULL OR tag_group IS NULL) ORDER BY rowid LIMIT 128",
-        )
-        .bind(cursor)
-        .fetch_all(pool)
-        .await?;
-        if rows.is_empty() {
-            return Ok(changed);
-        }
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        for (rowid, name) in rows {
-            cursor = rowid;
-            let group = crate::tags::known_tag(&name).map(|(_, group)| group);
-            changed += sqlx::query(
-                "UPDATE work_tag SET tag_key = COALESCE(tag_key, ?), \
-                tag_group = COALESCE(tag_group, ?) WHERE rowid = ? AND tag = ? \
-                AND (tag_key IS NULL OR (tag_group IS NULL AND ? IS NOT NULL))",
-            )
-            .bind(crate::tags::slug(&name))
-            .bind(group)
-            .bind(rowid)
-            .bind(name)
-            .bind(group)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        }
-        tx.commit().await?;
-        tokio::task::yield_now().await;
-    }
-}
-
 /// Keep expensive catalogue SELECTs off the main database's writer. The connection opens
 /// the main file read-only; only its private TEMP tables can be modified. Each staged row
 /// is complete (including type and count facets) before a bounded publication transaction.
@@ -1727,6 +1690,11 @@ pub async fn publish_mirror_feed_row(pool: &Database, work_id: &str) -> Result<b
     //     runs, and gated on the same `ledger::is_complete`, so a half-seeded ledger cannot
     //     sink a live card.
     project_feed_from_ledger_for_work(pool, work_id).await?;
+    // Publish the matching Browse and search projection together, including the
+    // chapter count used for search ranking, after the feed's derivations settle.
+    let mut tx = pool.begin().await?;
+    upsert_browse_work(&mut tx, work_id).await?;
+    tx.commit().await?;
     Ok(true)
 }
 
@@ -1756,13 +1724,23 @@ fn browse_catalogue_select() -> String {
 
 /// [`browse_catalogue_select`] with an extra predicate appended to its WHERE — the ONE
 /// point of variation between the wholesale rebuild (`""`) and the per-work re-projection
-/// [`reproject_work_caches`] uses (`" AND w.id = ?"`).
+/// [`reproject_work_caches_on`] uses (`" AND w.id = ?"`).
 ///
 /// A parameter rather than a second copy of the SELECT, because a copy is precisely the
 /// failure this table has already had once: `scanner::mirror_feed_row_into_browse_catalogue`
 /// hand-copied the mutable-column list and drifted from it, freezing every incrementally
 /// mirrored card's chapter number (§8h). One expression, two scopes.
 fn browse_catalogue_select_for(scope: &str) -> String {
+    let source_scope = if scope.is_empty() {
+        ""
+    } else {
+        "AND work_id = ?1"
+    };
+    let joined_scope = if scope.is_empty() {
+        ""
+    } else {
+        "AND ss.work_id = ?1"
+    };
     format!(
         "SELECT w.id, \
             -- The ANCHOR decides first: a MangaDex-anchored work navigates to its canonical
@@ -1809,22 +1787,22 @@ fn browse_catalogue_select_for(scope: &str) -> String {
        LEFT JOIN feed_series_updates f ON f.work_id = w.id \
        LEFT JOIN work_stats st ON st.work_id = w.id \
        LEFT JOIN (SELECT work_id FROM source_series \
-                   WHERE source_type = 'mangadex' GROUP BY work_id) md ON md.work_id = w.id \
+                   WHERE source_type = 'mangadex' {source_scope} GROUP BY work_id) md ON md.work_id = w.id \
        LEFT JOIN (SELECT ss.work_id AS work_id, ss.source_key AS source_key, \
                          sy.title AS title, sy.thumbnail_url AS thumbnail_url, MIN(ss.id) \
                     FROM source_series ss \
                     LEFT JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
-                   WHERE ss.source_type = 'suwayomi' \
+                   WHERE ss.source_type = 'suwayomi' {joined_scope} \
                    GROUP BY ss.work_id) sw ON sw.work_id = w.id \
        LEFT JOIN (SELECT ss.work_id AS work_id, MAX(sy.chapter_count) AS n \
                     FROM source_series ss \
                     JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
-                   WHERE ss.source_type = 'suwayomi' \
+                   WHERE ss.source_type = 'suwayomi' {joined_scope} \
                    GROUP BY ss.work_id) swc ON swc.work_id = w.id \
        LEFT JOIN (SELECT ss.work_id AS work_id, COUNT(DISTINCT c.number) AS n \
                     FROM chapter c \
                     JOIN source_series ss ON ss.id = c.source_series_id \
-                   WHERE ss.source_type = 'mangadex' AND c.lang = 'en' \
+                   WHERE ss.source_type = 'mangadex' AND c.lang = 'en' {joined_scope} \
                    GROUP BY ss.work_id) en ON en.work_id = w.id \
       WHERE (md.work_id IS NOT NULL OR sw.work_id IS NOT NULL) \
         AND COALESCE(f.title, w.title_override, w.primary_title, sw.title, '') <> ''{scope}",
@@ -1992,7 +1970,7 @@ pub async fn refresh_browse_catalogue(pool: &Database) -> Result<u64> {
         Err(e) => tracing::warn!(error = %e, "tags: Suwayomi genre sync failed"),
     }
 
-    let keyed = repair_catalogue_tag_keys(pool).await?;
+    let keyed = crate::tags::fill_tag_keys(pool).await?;
     let mut tx = refresh_snapshot(pool, &["browse_catalogue", "tag", "feed_genre_facet"]).await?;
 
     let set = BROWSE_CATALOGUE_MUTABLE
@@ -2344,6 +2322,103 @@ async fn fill_en_chapter_count(
     Ok(counted)
 }
 
+/// Maintain the search row inside the transaction that updates its work/source/browse
+/// projection. The caller owns the connection; no nested pool acquisition is allowed.
+pub(crate) async fn refresh_work_fts_in(
+    conn: &mut sqlx::SqliteConnection,
+    work_id: &str,
+) -> Result<()> {
+    let desired: Option<(i64, String, String)> = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM chapter ch JOIN source_series ss ON ss.id = ch.source_series_id \
+                  WHERE ss.work_id = w.id), \
+                COALESCE(w.title_override, w.primary_title, ''), \
+                COALESCE((SELECT group_concat(a.raw_title, ' ') FROM work_alias a WHERE a.work_id = w.id), '') \
+           FROM work w WHERE w.id = ? AND COALESCE(w.title_override, w.primary_title, '') <> '' \
+            AND EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id)")
+        .bind(work_id).fetch_optional(&mut *conn).await?;
+    let previous: Vec<(i64, i64, String, String)> = sqlx::query_as(
+        "SELECT rowid, COALESCE(CAST(chapters AS INTEGER), 0), COALESCE(title, ''), COALESCE(aliases, '') FROM work_fts WHERE work_id = ?",
+    )
+    .bind(work_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    if let (Some((chapters, title, aliases)), [(.., old_chapters, old_title, old_aliases)]) =
+        (&desired, previous.as_slice())
+    {
+        if chapters == old_chapters && title == old_title && aliases == old_aliases {
+            return Ok(());
+        }
+    }
+    // work_id is UNINDEXED on FTS5. Find its rowids once, then delete by rowid instead of
+    // scanning the full corpus again for each delete. Also repair any historical duplicate.
+    for (rowid, ..) in previous {
+        sqlx::query("DELETE FROM work_fts WHERE rowid = ?")
+            .bind(rowid)
+            .execute(&mut *conn)
+            .await?;
+    }
+    if let Some((chapters, title, aliases)) = desired {
+        sqlx::query("INSERT INTO work_fts(work_id, chapters, title, aliases) VALUES (?, ?, ?, ?)")
+            .bind(work_id)
+            .bind(chapters)
+            .bind(title)
+            .bind(aliases)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn upsert_browse_work(
+    conn: &mut sqlx::SqliteConnection,
+    work_id: &str,
+) -> Result<()> {
+    upsert_browse_work_inner(conn, work_id, true).await
+}
+
+async fn upsert_browse_work_inner(
+    conn: &mut sqlx::SqliteConnection,
+    work_id: &str,
+    search_changed: bool,
+) -> Result<()> {
+    // The feed's cached title otherwise masks a fresh title override during projection.
+    sqlx::query(
+        "UPDATE feed_series_updates SET title = COALESCE( \
+        (SELECT COALESCE(w.title_override, w.primary_title) FROM work w WHERE w.id = ?1), title) \
+        WHERE work_id = ?1 AND title IS NOT COALESCE( \
+        (SELECT COALESCE(w.title_override, w.primary_title) FROM work w WHERE w.id = ?1), title)",
+    )
+    .bind(work_id)
+    .execute(&mut *conn)
+    .await?;
+    let set = BROWSE_CATALOGUE_MUTABLE
+        .iter()
+        .map(|c| format!("{c} = excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let changed = BROWSE_CATALOGUE_MUTABLE
+        .iter()
+        .map(|c| format!("browse_catalogue.{c} IS NOT excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let select = browse_catalogue_select_for(" AND w.id = ?1");
+    sqlx::query(&format!(
+        "INSERT INTO browse_catalogue ({BROWSE_CATALOGUE_COLUMNS}) {select} \
+        ON CONFLICT(work_id) DO UPDATE SET {set} WHERE {changed}"
+    ))
+    .bind(work_id)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query("DELETE FROM browse_catalogue WHERE work_id = ? \
+        AND NOT EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = browse_catalogue.work_id)")
+        .bind(work_id).execute(&mut *conn).await?;
+    fill_comic_types(conn, "browse_catalogue", Some(work_id)).await?;
+    if search_changed {
+        refresh_work_fts_in(conn, work_id).await?;
+    }
+    Ok(())
+}
+
 /// Rebuild `work_fts` without a long main-database write transaction. Read-only-main
 /// staging computes the entire corpus; short batches update changed rows and prune stale
 /// ones. Unchanged rows retain their rowids and concurrent incremental updates win.
@@ -2645,6 +2720,7 @@ pub async fn search_works_fts(
     pool: &Database,
     query: &str,
     show_nsfw: bool,
+    blocks: &crate::block::BlockSet,
     page: i64,
     page_size: i64,
 ) -> Result<(i64, Vec<String>)> {
@@ -2653,14 +2729,18 @@ pub async fn search_works_fts(
     };
     let mut connection = SearchConnection::new(pool).await?;
     let offset = (page.max(1) - 1) * page_size;
+    // The viewer's content block rules, in the candidate query like the NSFW gate, so
+    // `total` and the pages count the same works. Empty when there is no rule. It adds
+    // no bind (see `block.rs`), so the bind order below is unchanged.
+    let not_blocked = blocks.and_not_blocked("w.id", Some(&crate::block::work_rating_sql("w")));
     // NSFW gate mirrors map_canonical_series' effective flag (override wins). The FTS
     // table is referenced by NAME (`work_fts MATCH`), not the join alias — FTS5's
     // MATCH operator reads a bare alias as a column, not the table.
-    let total = sqlx::query_scalar::<_, i64>(
+    let total = sqlx::query_scalar::<_, i64>(&format!(
         "SELECT COUNT(*) FROM (SELECT 1 FROM work_fts JOIN work w ON w.id = work_fts.work_id \
-          WHERE work_fts MATCH ? AND (? = 1 OR COALESCE(w.is_nsfw_override, w.is_nsfw) = 0) \
-          LIMIT ?)",
-    )
+          WHERE work_fts MATCH ? AND (? = 1 OR COALESCE(w.is_nsfw_override, w.is_nsfw) = 0)\
+          {not_blocked} LIMIT ?)"
+    ))
     .bind(&match_expr)
     .bind(show_nsfw as i64)
     .bind(RANK_WINDOW)
@@ -2677,7 +2757,8 @@ pub async fn search_works_fts(
                   CAST(work_fts.chapters AS INTEGER) AS chapters, \
                   bm25(work_fts, 0.0, 0.0, 10.0, 1.0) AS rank \
              FROM work_fts JOIN work w ON w.id = work_fts.work_id \
-            WHERE work_fts MATCH ? AND (? = 1 OR COALESCE(w.is_nsfw_override, w.is_nsfw) = 0) \
+            WHERE work_fts MATCH ? AND (? = 1 OR COALESCE(w.is_nsfw_override, w.is_nsfw) = 0)\
+            {not_blocked} \
             ORDER BY bm25(work_fts, 0.0, 0.0, 10.0, 1.0) \
             LIMIT ?) \
          SELECT c.work_id FROM cand c JOIN work w ON w.id = c.work_id \
@@ -2797,13 +2878,16 @@ pub async fn upsert_work_from_mangadex(
     // ordinary, retryable writer contention.
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
-    let existing = sqlx::query_scalar::<_, String>(
-        "SELECT work_id FROM work_external_id WHERE provider = 'mangadex' AND external_id = ?",
+    let existing = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT e.work_id, w.primary_title FROM work_external_id e JOIN work w ON w.id = e.work_id WHERE e.provider = 'mangadex' AND e.external_id = ?",
     )
     .bind(mangadex_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let work_id = existing.unwrap_or_else(|| new_id("w_"));
+    let title_changed = existing
+        .as_ref()
+        .is_none_or(|(_, title)| title != &input.primary_title);
+    let work_id = existing.map(|(id, _)| id).unwrap_or_else(|| new_id("w_"));
     let now = Utc::now().to_rfc3339();
 
     // cover_phash uses COALESCE so a sync that hasn't computed the hash yet doesn't
@@ -2868,7 +2952,7 @@ pub async fn upsert_work_from_mangadex(
         .await?;
     }
 
-    insert_aliases(&mut tx, &work_id, &input.aliases).await?;
+    let aliases_changed = insert_aliases(&mut tx, &work_id, &input.aliases).await?;
     insert_descriptions_and_credits(&mut tx, &work_id, input).await?;
     replace_mangadex_details(&mut tx, &work_id, input).await?;
     ensure_source_series(
@@ -2883,6 +2967,7 @@ pub async fn upsert_work_from_mangadex(
     )
     .await?;
 
+    upsert_browse_work_inner(&mut tx, &work_id, title_changed || aliases_changed).await?;
     tx.commit().await?;
     Ok(work_id)
 }
@@ -2947,11 +3032,9 @@ pub async fn create_work(pool: &Database, input: &WorkInput) -> Result<String> {
 /// `foreign_keys` pragma (mirrors the `merge_works` cleanup).
 pub async fn delete_work_cascade(pool: &Database, work_id: &str) -> Result<()> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    // `canonical_library` and `work_cover_issue` carry no enforced FK the app can rely
-    // on (the pragma is per-connection), so leaving them out left rows pointing at a
-    // work that no longer exists — a phantom library entry, and a cover-issue row that
-    // permanently excludes a since-recycled id from the cover crawl. Kept in sync with
-    // the same lists in `merge_works` and `purge_foreign_language_suwayomi`.
+    // Explicitly remove work_cover_issue as well: its suppression record must not
+    // survive the work and exclude a later recycled id from the cover crawl. Keep
+    // this list aligned with merge_works and purge_foreign_language_suwayomi.
     for table in [
         "work_alias",
         "work_alias_token",
@@ -2963,7 +3046,6 @@ pub async fn delete_work_cascade(pool: &Database, work_id: &str) -> Result<()> {
         "work_cover_issue",
         "work_tag",
         "chapter_override",
-        "canonical_library",
         "merge_candidate",
     ] {
         let col = if table == "merge_candidate" {
@@ -3155,13 +3237,14 @@ async fn insert_aliases(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     work_id: &str,
     aliases: &[Alias],
-) -> Result<()> {
+) -> Result<bool> {
+    let mut changed = false;
     for a in aliases {
         let norm = normalize_title(&a.raw);
         if norm.is_empty() {
             continue;
         }
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT OR IGNORE INTO work_alias (id, work_id, normalized_title, raw_title, lang) \
              VALUES (?, ?, ?, ?, ?)",
         )
@@ -3171,11 +3254,13 @@ async fn insert_aliases(
         .bind(&a.raw)
         .bind(&a.lang)
         .execute(&mut **tx)
-        .await?;
+        .await?
+        .rows_affected();
+        changed |= inserted > 0;
         // H9: keep the token inverted index in lockstep with the alias write.
         insert_alias_tokens(tx, work_id, &norm).await?;
     }
-    Ok(())
+    Ok(changed)
 }
 
 /// Admin: add one raw alt-title to a work (idempotent — the alias `UNIQUE` key drops a
@@ -3198,6 +3283,7 @@ pub async fn add_work_alias(pool: &Database, work_id: &str, raw_title: &str) -> 
         }],
     )
     .await?;
+    upsert_browse_work(&mut tx, work_id).await?;
     tx.commit().await?;
     Ok(norm)
 }
@@ -3359,6 +3445,7 @@ pub async fn remove_work_alias(pool: &Database, work_id: &str, raw_title: &str) 
     .execute(&mut *tx)
     .await?;
     rebuild_work_alias_tokens(&mut tx, work_id).await?;
+    upsert_browse_work(&mut tx, work_id).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -3396,12 +3483,21 @@ async fn ensure_source_series(
     is_nsfw: bool,
     now: &str,
 ) -> Result<String> {
-    sqlx::query(
+    let id = sqlx::query_scalar::<_, String>(
         "INSERT INTO source_series \
            (id, work_id, source_type, source_id, source_key, source_url, is_nsfw, last_seen, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES (?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?) \
+         ON CONFLICT(source_key) WHERE source_type = 'suwayomi' DO UPDATE SET \
+           last_seen = excluded.last_seen, is_nsfw = excluded.is_nsfw, \
+           source_id = COALESCE(excluded.source_id, source_series.source_id), \
+           source_url = COALESCE(excluded.source_url, source_series.source_url) \
+         ON CONFLICT(source_type, source_key) WHERE source_id IS NULL DO UPDATE SET \
+           last_seen = excluded.last_seen, is_nsfw = excluded.is_nsfw, \
+           source_url = COALESCE(excluded.source_url, source_series.source_url) \
          ON CONFLICT(source_type, source_id, source_key) DO UPDATE SET \
-           last_seen = excluded.last_seen, is_nsfw = excluded.is_nsfw",
+           last_seen = excluded.last_seen, is_nsfw = excluded.is_nsfw, \
+           source_url = COALESCE(excluded.source_url, source_series.source_url) \
+         RETURNING id",
     )
     .bind(new_id("ss_"))
     .bind(work_id)
@@ -3412,14 +3508,6 @@ async fn ensure_source_series(
     .bind(is_nsfw as i64)
     .bind(now)
     .bind(now)
-    .execute(&mut **tx)
-    .await?;
-    let id = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM source_series WHERE source_type = ? AND source_id = ? AND source_key = ?",
-    )
-    .bind(source_type)
-    .bind(source_id)
-    .bind(source_key)
     .fetch_one(&mut **tx)
     .await?;
     Ok(id)
@@ -3451,6 +3539,11 @@ pub async fn upsert_source_series(
         &now,
     )
     .await?;
+    let linked_work: String = sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await?;
+    upsert_browse_work(&mut tx, &linked_work).await?;
     tx.commit().await?;
     Ok(id)
 }
@@ -4058,11 +4151,6 @@ async fn merge_works_guarded(
     for (table, col) in [
         ("merge_candidate", "candidate_work_id"),
         ("reviews", "series_id"),
-        // `canonical_library` is the superseded canonical-only library table
-        // (migration 0024 folded it into `user_library`, but the table and its rows
-        // remain). It was neither repointed nor deleted here, so any row in it would
-        // dangle the moment the source `work` row went away.
-        ("canonical_library", "work_id"),
     ] {
         sqlx::query(&format!(
             "UPDATE OR IGNORE {table} SET {col} = ? WHERE {col} = ?"
@@ -4075,12 +4163,7 @@ async fn merge_works_guarded(
     // Delete the folded library rows and any colliding reviews so the imminent
     // work delete can't orphan a row pointing at a nonexistent work. Reviews keep
     // the survivor's review when the same user reviewed both copies.
-    // `canonical_library` (PK (user_id, work_id)) skips the same way.
-    for (table, col) in [
-        ("reviews", "series_id"),
-        ("user_library", "series_id"),
-        ("canonical_library", "work_id"),
-    ] {
+    for (table, col) in [("reviews", "series_id"), ("user_library", "series_id")] {
         sqlx::query(&format!("DELETE FROM {table} WHERE {col} = ?"))
             .bind(source_work)
             .execute(&mut *tx)
@@ -4149,25 +4232,8 @@ async fn merge_works_guarded(
             .execute(&mut *tx)
             .await?;
     }
-    // DELIBERATELY NOT TOUCHED HERE — the two remaining tables that key on a `w_` id:
-    //
-    //   * `series_admin` — keyed by the same generic series id, but `setSeriesAdmin` /
-    //     `setSeriesPaused` reject a `w_` id outright ("seriesId must be a numeric
-    //     Suwayomi series id"), so a canonical work can never own a row. Verified on
-    //     production: 0 `w_`-prefixed rows out of the whole table.
-    //
-    //   * `work_fts` — a DERIVED index (migration 0052), rebuilt wholesale by
-    //     `refresh_work_fts` at boot and at the end of every MangaDex sync cycle — the
-    //     same tick that runs the bulk consolidation sweep. Not maintained per-merge ON
-    //     PURPOSE: `work_id` is an fts5 `UNINDEXED` column, so any `WHERE work_id = ?` is
-    //     a full virtual-table scan (measured 39-41 ms WARM over production's 109,246
-    //     rows), and paying that inside this IMMEDIATE transaction would hold the single
-    //     writer lock ~40 ms PER MERGE across a sweep that folds thousands — for an index
-    //     the next statement rebuilds anyway. A stale row is harmless to output too:
-    //     `search_works_fts` inner-joins `work`, so a merged-away id is filtered out of
-    //     both the page AND `total`. The residue is freshness only (the survivor is not
-    //     findable under the aliases it just absorbed until the next rebuild), the same
-    //     window every newly-added work already has.
+    // series_admin accepts numeric Suwayomi ids, so it has no canonical-work row
+    // to move. Browse/search projections update below before this commits.
 
     // Explicitly remove the source's remaining child rows before deleting it. Their
     // CONTENT has already been folded into the target above, so this only drops the
@@ -4248,6 +4314,9 @@ async fn merge_works_guarded(
         .execute(&mut *tx)
         .await?;
 
+    reproject_work_caches_on(&mut tx, target_work).await?;
+    reproject_work_caches_on(&mut tx, source_work).await?;
+
     tx.commit().await?;
     // Cross-DB, so necessarily outside the transaction and AFTER it commits — which is
     // exactly why this must not use `?`. The merge is already durable at this point; a
@@ -4302,8 +4371,8 @@ pub async fn reclaim_cover_blob(covers: &Database, work_id: &str) -> Result<()> 
 ///
 /// Distinct from `graphql::WorkSource`, which answers "how does a native client FETCH
 /// this source" and carries no primary key — and a key is the whole point here, because
-/// `(source_type, source_key)` is only unique in combination with `source_id` (the
-/// table's `UNIQUE (source_type, source_id, source_key)`).
+/// a Suwayomi manga's `(source_type, source_key)` is globally unique, while other
+/// source types retain their full natural key including `source_id`.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SourceSeriesRow {
     /// `source_series.id` — the detach key [`split_source_series`] takes.
@@ -4350,7 +4419,7 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
     let rows = sqlx::query_as::<_, SourceSeriesRow>(
-        "SELECT ss.id, ss.source_type, ss.source_id, ss.source_key, ss.source_url, ss.is_nsfw, \
+        "SELECT ss.id, ss.source_type, COALESCE(ss.source_id, '') AS source_id, ss.source_key, ss.source_url, ss.is_nsfw, \
                 COALESCE(NULLIF(sy.lang, ''), NULLIF(se.lang, '')) AS lang, \
                 COALESCE(NULLIF(sy.title, ''), w.title_override, w.primary_title, '') AS title, \
                 (SELECT COUNT(*) FROM chapter c WHERE c.source_series_id = ss.id) AS chapter_count, \
@@ -4666,23 +4735,11 @@ async fn split_source_series_attempt(
     .execute(&mut *tx)
     .await?;
 
+    // Source ownership, navigation and both projections publish together. A failed
+    // projection leaves the original split request safe to retry.
+    reproject_work_caches_on(&mut tx, work_id).await?;
+    reproject_work_caches_on(&mut tx, &new_work_id).await?;
     tx.commit().await?;
-
-    // Both works' derived caches are now wrong in ways a reader can see, so they are
-    // re-projected HERE rather than left to the periodic rebuild — the opposite of the
-    // choice `mergeWorks` and `phase_f::split_mismatched` make, and the difference is
-    // scope: those re-project nothing because they run over hundreds of works at a time
-    // (measured: 486 merges take ~5 s without the per-work projection and made no
-    // measurable progress in 90 s with it). This is ONE admin action on exactly two works,
-    // and both of them are wrong until it runs: the new work has no `browse_catalogue` or
-    // `work_fts` row at all, and the original may be pointing at a `reader_id` that just
-    // moved. Best-effort — the split is already durable, so a projection failure is logged,
-    // not returned.
-    for id in [work_id, new_work_id.as_str()] {
-        if let Err(e) = reproject_work_caches(pool, id).await {
-            tracing::warn!(work_id = %id, error = %e, "split: cache re-projection failed (the next refresh will fix it)");
-        }
-    }
 
     Ok(SplitOutcome {
         new_work_id,
@@ -4718,25 +4775,9 @@ pub async fn is_split_pair(pool: &Database, one: &str, other: &str) -> Result<bo
     Ok(hit.is_some())
 }
 
-/// Re-project ONE work's derived caches — `feed_series_updates.reader_id`,
-/// `browse_catalogue` and `work_fts` — without waiting for the periodic rebuild.
-///
-/// Every statement here is the corresponding wholesale refresh narrowed to one work, so
-/// the two converge by construction rather than by a field mapping that has to be kept in
-/// agreement: the `browse_catalogue` upsert runs [`browse_catalogue_select`] itself, and
-/// the `work_fts` write is [`refresh_work_fts`]'s INSERT with a `w.id = ?` added.
-///
-/// `reader_id` needs the explicit UPDATE because `browse_catalogue` COPIES it from
-/// `feed_series_updates` for a work with no MangaDex anchor, so a stale value there
-/// propagates rather than being recomputed. It goes stale in exactly one situation, which
-/// is the one this function exists for: [`split_source_series`] moved the Suwayomi mapping
-/// the id was derived from onto another work, leaving the original's Browse card linking
-/// to the series it just detached.
-///
-/// NOT called from the hot path. Two `work_fts` statements scan the FTS table (its
-/// `work_id` column is `UNINDEXED`), which is fine for a one-shot admin action and would
-/// not be for a per-scan write.
-pub async fn reproject_work_caches(pool: &Database, work_id: &str) -> Result<()> {
+/// Refresh navigation, Browse and search on an existing writer transaction.
+/// Aggregates are scoped to this work, keeping merge/split publication atomic.
+async fn reproject_work_caches_on(conn: &mut sqlx::SqliteConnection, work_id: &str) -> Result<()> {
     // (1) `reader_id`, by the rule both feed writers apply — the MangaDex anchor wins, else
     //     the numeric Suwayomi id. `MIN(ss.id)` (via ORDER BY ... LIMIT 1) matches the
     //     `sw` sub-select in `browse_catalogue_select`, so the two surfaces agree on WHICH
@@ -4756,64 +4797,10 @@ pub async fn reproject_work_caches(pool: &Database, work_id: &str) -> Result<()>
           WHERE work_id = ?",
     )
     .bind(work_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
-    // (2) `browse_catalogue`, the rebuild's own upsert narrowed to this work — same
-    //     columns, same conflict clause, same `IS NOT` change guard.
-    let set = BROWSE_CATALOGUE_MUTABLE
-        .iter()
-        .map(|c| format!("{c} = excluded.{c}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let changed = BROWSE_CATALOGUE_MUTABLE
-        .iter()
-        .map(|c| format!("browse_catalogue.{c} IS NOT excluded.{c}"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let select = browse_catalogue_select_for(" AND w.id = ?");
-    sqlx::query(&format!(
-        "INSERT INTO browse_catalogue ({BROWSE_CATALOGUE_COLUMNS}) {select} \
-         ON CONFLICT(work_id) DO UPDATE SET {set} WHERE {changed}"
-    ))
-    .bind(work_id)
-    .execute(pool)
-    .await?;
-
-    // `comic_type` is not in the SELECT (see `fill_comic_types`), and a NULL type is
-    // invisible to Browse's format tabs — so a row this call just INSERTED would sit out
-    // of every tab until the next wholesale rebuild.
-    let mut conn = pool.write().acquire().await?;
-    fill_comic_types(&mut conn, "browse_catalogue", Some(work_id)).await?;
-    drop(conn);
-
-    // (3) `work_fts`. A virtual FTS5 table has no unique key to upsert against, so this is
-    //     delete-then-insert; the INSERT is `refresh_work_fts`'s, scoped, and it carries
-    //     that function's exclusion rule (a title to label, a source to open) verbatim, so
-    //     a work that no longer qualifies is simply left deleted.
-    sqlx::query("DELETE FROM work_fts WHERE work_id = ?")
-        .bind(work_id)
-        .execute(pool)
-        .await?;
-    sqlx::query(
-        "INSERT INTO work_fts (work_id, chapters, title, aliases) \
-         SELECT w.id, COALESCE(cc.n, 0), \
-                COALESCE(w.title_override, w.primary_title, ''), \
-                COALESCE((SELECT group_concat(a.raw_title, ' ') \
-                          FROM work_alias a WHERE a.work_id = w.id), '') \
-         FROM work w \
-         LEFT JOIN (SELECT ss.work_id, COUNT(*) AS n FROM chapter ch \
-                    JOIN source_series ss ON ss.id = ch.source_series_id \
-                    WHERE ss.work_id = ? GROUP BY ss.work_id) cc ON cc.work_id = w.id \
-         WHERE w.id = ? \
-           AND COALESCE(w.title_override, w.primary_title, '') <> '' \
-           AND EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id)",
-    )
-    .bind(work_id)
-    .bind(work_id)
-    .execute(pool)
-    .await?;
-    Ok(())
+    upsert_browse_work(conn, work_id).await
 }
 
 /// One raw chapter row from any of a work's sources (S2 aggregation input).
@@ -4884,7 +4871,7 @@ pub async fn authoritative_suwayomi_mappings(
     work_id: &str,
 ) -> Result<Vec<AuthMapping>> {
     let rows = sqlx::query_as::<_, (String, String, String, i64)>(
-        "SELECT ss.id, ss.source_id, ss.source_key, \
+        "SELECT ss.id, COALESCE(ss.source_id, '') AS source_id, ss.source_key, \
                 (SELECT COUNT(*) FROM suwayomi_chapter sc \
                  WHERE sc.manga_id = CAST(ss.source_key AS INTEGER)) AS cached \
          FROM source_series ss \
@@ -4985,7 +4972,7 @@ async fn work_source_chapters_two_branch(
             Option<String>,
         ),
     >(
-        "SELECT c.number, c.title, ss.source_id, c.external_id, \
+        "SELECT c.number, c.title, COALESCE(ss.source_id, '') AS source_id, c.external_id, \
                 COALESCE(c.readable_at, c.published_at), c.scanlator, c.external_url, \
                 c.volume \
          FROM source_series ss \
@@ -5083,7 +5070,7 @@ pub async fn work_source_chapters(pool: &Database, work_id: &str) -> Result<Vec<
     // construction once the drain has run.
     let rows = sqlx::query_as::<_, SpineChapterRow>(
         "WITH authoritative AS ( \
-             SELECT ss.id AS ssid, ss.source_id, ss.source_key, \
+             SELECT ss.id AS ssid, COALESCE(ss.source_id, '') AS source_id, ss.source_key, \
                     ROW_NUMBER() OVER ( \
                         PARTITION BY ss.source_id \
                         ORDER BY (SELECT COUNT(*) FROM chapter c \
@@ -5100,7 +5087,7 @@ pub async fn work_source_chapters(pool: &Database, work_id: &str) -> Result<Vec<
            JOIN chapter c ON c.source_series_id = a.ssid \
           WHERE a.rn = 1 \
          UNION ALL \
-         SELECT c.number, c.title, ss.source_id, c.external_id, c.chapter_key, c.label, \
+         SELECT c.number, c.title, COALESCE(ss.source_id, '') AS source_id, c.external_id, c.chapter_key, c.label, \
                 'mangadex' AS source_type, NULL, NULLIF(c.scanlator, ''), \
                 COALESCE(c.readable_at, c.published_at), c.external_url, \
                 NULLIF(TRIM(c.volume), '') \
@@ -5263,7 +5250,8 @@ pub async fn find_source_series_id(
     source_key: &str,
 ) -> Result<Option<String>> {
     let id = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM source_series WHERE source_type = ? AND source_id = ? AND source_key = ?",
+        "SELECT id FROM source_series WHERE source_type = ?1 AND source_key = ?3 \
+           AND (source_type = 'suwayomi' OR source_id IS NULLIF(?2, ''))",
     )
     .bind(source_type)
     .bind(source_id)
@@ -5284,7 +5272,8 @@ pub async fn find_source_series(
 ) -> Result<Option<(String, String)>> {
     let row = sqlx::query_as::<_, (String, String)>(
         "SELECT id, work_id FROM source_series \
-         WHERE source_type = ? AND source_id = ? AND source_key = ?",
+         WHERE source_type = ?1 AND source_key = ?3 \
+           AND (source_type = 'suwayomi' OR source_id IS NULLIF(?2, ''))",
     )
     .bind(source_type)
     .bind(source_id)
@@ -5938,7 +5927,7 @@ pub struct SourceScanHealth {
 /// post-tick outage check.
 pub async fn source_scan_health(pool: &Database) -> Result<Vec<SourceScanHealth>> {
     Ok(sqlx::query_as::<_, SourceScanHealth>(
-        "SELECT ss.source_id AS source_id, \
+        "SELECT COALESCE(ss.source_id, '') AS source_id, \
                 MAX(se.pkg_name) AS pkg_name, \
                 COUNT(*) AS series, \
                 SUM(CASE WHEN st.consecutive_failures > 0 THEN 1 ELSE 0 END) AS failing, \
@@ -5984,7 +5973,7 @@ pub async fn source_exclusive_work_counts(
     pool: &Database,
 ) -> Result<std::collections::HashMap<String, i64>> {
     let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT ss.source_id, COUNT(DISTINCT ss.work_id) \
+        "SELECT COALESCE(ss.source_id, '') AS source_id, COUNT(DISTINCT ss.work_id) \
            FROM source_series ss \
           WHERE ss.source_type = 'suwayomi' \
             AND NOT EXISTS (SELECT 1 FROM source_series o \
@@ -6353,7 +6342,6 @@ pub async fn purge_foreign_language_suwayomi(pool: &Database) -> Result<Vec<i64>
                 ("work_cover_issue", "work_id"),
                 ("work_tag", "work_id"),
                 ("chapter_override", "work_id"),
-                ("canonical_library", "work_id"),
                 ("merge_candidate", "candidate_work_id"),
                 ("work", "id"),
             ] {
@@ -6746,6 +6734,390 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[tokio::test]
+    async fn incremental_browse_projection_indexes_new_works_and_alias_edits_immediately() {
+        let pool = pool().await;
+        let work = create_work(
+            &pool,
+            &WorkInput {
+                primary_title: Some("Silver Compass".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            search_works_fts(&pool, "silver", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .0,
+            0,
+            "unsourced shells are not searchable"
+        );
+        upsert_source_series(&pool, &work, "suwayomi", "local", "1234", None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            search_works_fts(&pool, "silver", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .1,
+            vec![work.clone()]
+        );
+        let browse: (String, String) =
+            sqlx::query_as("SELECT reader_id, comic_type FROM browse_catalogue WHERE work_id = ?")
+                .bind(&work)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(browse, ("1234".into(), "MANGA".into()));
+        add_work_alias(&pool, &work, "Hidden Stardust")
+            .await
+            .unwrap();
+        assert_eq!(
+            search_works_fts(&pool, "stardust", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .1,
+            vec![work.clone()]
+        );
+        remove_work_alias(&pool, &work, "Hidden Stardust")
+            .await
+            .unwrap();
+        assert_eq!(
+            search_works_fts(&pool, "stardust", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .0,
+            0
+        );
+        assert_eq!(
+            search_works_fts(&pool, "silver", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .1,
+            vec![work]
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_browse_and_search_projection_commit_with_the_title_edit() {
+        let pool = pool().await;
+        let work = upsert_work_from_mangadex(
+            &pool,
+            "md-live-index",
+            &WorkInput {
+                primary_title: Some("Dawn Emperor".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("UPDATE work SET title_override = 'Dusk Emperor' WHERE id = ?")
+            .bind(&work)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        upsert_browse_work(&mut tx, &work).await.unwrap();
+        assert_eq!(
+            search_works_fts(&pool, "dusk", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .0,
+            0
+        );
+        assert_eq!(
+            search_works_fts(&pool, "dawn", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .0,
+            1
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(
+            search_works_fts(&pool, "dusk", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .1,
+            vec![work.clone()]
+        );
+        let title: String =
+            sqlx::query_scalar("SELECT title FROM browse_catalogue WHERE work_id = ?")
+                .bind(&work)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(title, "Dusk Emperor");
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("UPDATE work SET title_override = 'Rolled Back' WHERE id = ?")
+            .bind(&work)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        upsert_browse_work(&mut tx, &work).await.unwrap();
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            search_works_fts(&pool, "rolled", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .0,
+            0
+        );
+        assert_eq!(
+            search_works_fts(&pool, "dusk", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .1,
+            vec![work]
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_chapter_publish_updates_browse_and_search_together() {
+        let pool = pool().await;
+        let work = upsert_work_from_mangadex(
+            &pool,
+            "md-incremental-chapters",
+            &WorkInput {
+                primary_title: Some("Ocean Almanac".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ssid = find_source_series_id(&pool, "mangadex", "mangadex", "md-incremental-chapters")
+            .await
+            .unwrap()
+            .unwrap();
+        upsert_chapter(
+            &pool,
+            &ssid,
+            &ChapterInput {
+                external_id: "ocean-1".into(),
+                number: Some("1".into()),
+                lang: Some("en".into()),
+                readable_at: Some("2026-01-01T00:00:00Z".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(publish_mirror_feed_row(&pool, &work).await.unwrap());
+        let browse_count: i64 =
+            sqlx::query_scalar("SELECT en_chapter_count FROM browse_catalogue WHERE work_id = ?")
+                .bind(&work)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let search_count: i64 =
+            sqlx::query_scalar("SELECT CAST(chapters AS INTEGER) FROM work_fts WHERE work_id = ?")
+                .bind(&work)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((browse_count, search_count), (1, 1));
+        assert_eq!(
+            search_works_fts(&pool, "ocean", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .1,
+            vec![work]
+        );
+    }
+
+    #[tokio::test]
+    async fn mangadex_title_edits_refresh_search_and_unchanged_upserts_preserve_the_index_row() {
+        let pool = pool().await;
+        let first = WorkInput {
+            primary_title: Some("Amber Odyssey".into()),
+            ..Default::default()
+        };
+        let work = upsert_work_from_mangadex(&pool, "md-live-edit", &first)
+            .await
+            .unwrap();
+        let before: i64 = sqlx::query_scalar("SELECT rowid FROM work_fts WHERE work_id = ?")
+            .bind(&work)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        upsert_work_from_mangadex(&pool, "md-live-edit", &first)
+            .await
+            .unwrap();
+        let after: i64 = sqlx::query_scalar("SELECT rowid FROM work_fts WHERE work_id = ?")
+            .bind(&work)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(before, after);
+        upsert_work_from_mangadex(
+            &pool,
+            "md-live-edit",
+            &WorkInput {
+                primary_title: Some("Violet Odyssey".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            search_works_fts(&pool, "amber", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .0,
+            0
+        );
+        assert_eq!(
+            search_works_fts(&pool, "violet", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .1,
+            vec![work]
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_projection_failure_rolls_back_identity_and_success_indexes_absorbed_aliases() {
+        let pool = pool().await;
+        let source = create_work(
+            &pool,
+            &WorkInput {
+                primary_title: Some("Source Compass".into()),
+                aliases: vec![Alias {
+                    raw: "Inherited Lantern".into(),
+                    lang: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ssid = upsert_source_series(&pool, &source, "suwayomi", "test", "880900", None, false)
+            .await
+            .unwrap();
+        let target = upsert_work_from_mangadex(
+            &pool,
+            "atomic-projection-target",
+            &WorkInput {
+                primary_title: Some("Target Compass".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(&format!(
+            "CREATE TRIGGER fail_merge_projection BEFORE INSERT ON browse_catalogue \
+             WHEN NEW.work_id = '{target}' BEGIN SELECT RAISE(ABORT, 'forced projection failure'); END"
+        )).execute(&pool).await.unwrap();
+        assert!(merge_works(&pool, &source, &target)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("forced projection failure"));
+        let owner: String = sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
+            .bind(&ssid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(owner, source);
+        assert_eq!(
+            search_works_fts(&pool, "lantern", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .1,
+            vec![source.clone()]
+        );
+        sqlx::query("DROP TRIGGER fail_merge_projection")
+            .execute(&pool)
+            .await
+            .unwrap();
+        merge_works(&pool, &source, &target).await.unwrap();
+        assert_eq!(
+            search_works_fts(&pool, "lantern", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .1,
+            vec![target]
+        );
+        let stale: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_fts WHERE work_id = ?")
+            .bind(&source)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stale, 0);
+    }
+
+    #[tokio::test]
+    async fn split_projection_failure_rolls_back_sources_and_the_same_split_retries() {
+        let pool = pool().await;
+        let work = create_work(
+            &pool,
+            &WorkInput {
+                primary_title: Some("Original Harbour".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for (id, title) in [(880901, "Detached Beacon"), (880902, "Kept Harbour")] {
+            sqlx::query(
+            "INSERT INTO suwayomi_series(id,title,status,source_id,lang,updated_at,created_at) \
+                 VALUES (?,?,'ONGOING','test','en','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(title)
+        .execute(&pool)
+        .await
+        .unwrap();
+        }
+        let detached =
+            upsert_source_series(&pool, &work, "suwayomi", "test", "880901", None, false)
+                .await
+                .unwrap();
+        upsert_source_series(&pool, &work, "suwayomi", "test", "880902", None, false)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_split_projection BEFORE INSERT ON browse_catalogue \
+             WHEN NEW.title = 'Detached Beacon' BEGIN SELECT RAISE(ABORT, 'forced projection failure'); END"
+        ).execute(&pool).await.unwrap();
+        assert!(
+            split_source_series(&pool, &work, std::slice::from_ref(&detached), None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("forced projection failure")
+        );
+        let owner: String = sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
+            .bind(&detached)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(owner, work);
+        let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            works, 1,
+            "the split's new work must roll back with its projections"
+        );
+        sqlx::query("DROP TRIGGER fail_split_projection")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let outcome = split_source_series(&pool, &work, std::slice::from_ref(&detached), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            search_works_fts(&pool, "beacon", true, &Default::default(), 1, 20)
+                .await
+                .unwrap()
+                .1,
+            vec![outcome.new_work_id]
+        );
+    }
+
     #[test]
     fn fts_match_query_bounds_input_and_deduplicates_terms() {
         assert!(fts_match_query(&"x".repeat(MAX_FTS_QUERY_CHARS)).is_some());
@@ -6953,7 +7325,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO series_scan_state (series_id, updated_at) VALUES ('200','now'),('201','now'),('100','now')")
+        sqlx::query("INSERT INTO series_scan_state (series_id, updated_at, next_scan_at) VALUES ('200','now', '1970-01-01T00:00:00+00:00'),('201','now', '1970-01-01T00:00:00+00:00'),('100','now', '1970-01-01T00:00:00+00:00')")
             .execute(&pool).await.unwrap();
 
         // --- purge ---
@@ -9407,7 +9779,7 @@ mod tests {
         refresh_work_fts(&pool).await.unwrap();
 
         let pos = |ids: &[String], w: &str| ids.iter().position(|i| i == w);
-        let (_, ids) = search_works_fts(&pool, "dr stone", false, 1, 20)
+        let (_, ids) = search_works_fts(&pool, "dr stone", false, &Default::default(), 1, 20)
             .await
             .unwrap();
         assert!(
@@ -9429,7 +9801,7 @@ mod tests {
 
         // Typed exactly, the RAW tier — which is why it must stay above the normalized
         // one — keeps the work itself above its re-release.
-        let (_, ids) = search_works_fts(&pool, "Dr.STONE", false, 1, 20)
+        let (_, ids) = search_works_fts(&pool, "Dr.STONE", false, &Default::default(), 1, 20)
             .await
             .unwrap();
         assert_eq!(ids.first().map(String::as_str), Some(main.as_str()));
@@ -9483,9 +9855,10 @@ mod tests {
 
         refresh_work_fts(&pool).await.unwrap();
 
-        let (total, ids) = search_works_fts(&pool, "my brother is a", false, 1, 20)
-            .await
-            .unwrap();
+        let (total, ids) =
+            search_works_fts(&pool, "my brother is a", false, &Default::default(), 1, 20)
+                .await
+                .unwrap();
         assert!(
             ids.contains(&suwa),
             "a Suwayomi-only work must be findable — this is the 0052 bug; got {ids:?}"
@@ -9985,7 +10358,7 @@ mod tests {
             browsed, 1,
             "the new work must be projected into browse_catalogue"
         );
-        let (_, found) = search_works_fts(&pool, "Series 501", false, 1, 10)
+        let (_, found) = search_works_fts(&pool, "Series 501", false, &Default::default(), 1, 10)
             .await
             .unwrap();
         assert!(
@@ -10137,6 +10510,9 @@ mod tests {
 
 #[cfg(test)]
 include!("../../bench/sqlite_contention.rs");
+
+#[cfg(test)]
+include!("../../bench/sqlite_projection.rs");
 
 #[cfg(test)]
 mod production_safety_tests;

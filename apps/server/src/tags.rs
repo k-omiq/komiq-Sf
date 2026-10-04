@@ -386,13 +386,53 @@ pub struct SuwayomiTagSync {
 /// a NULL there means "MangaDex says none", which a source's genre string must not overrule —
 /// and the `IS NULL` guard means a value, once set (by anyone), is never changed by this pass.
 pub async fn sync_suwayomi_tags(pool: &Database) -> Result<SuwayomiTagSync> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
+    sync_suwayomi_tags_in(pool, None).await
+}
+
+/// [`sync_suwayomi_tags`] for ONE work, run the moment a Suwayomi series is linked to it
+/// (`graphql::add_source_series_checked`).
+///
+/// The full pass runs once per catalogue refresh: six hours apart by default, and only at
+/// boot when the sync is off. Until it ran, a work that only a Suwayomi source carries had
+/// no tags at all, so nothing that reads `work_tag` could see it: the tag filter, and a
+/// content block rule (`block`), which would let a series through that it names.
+///
+/// `fresh` is the genre list of the series being linked. Its `suwayomi_series` cache row
+/// is written by the caller's scan, usually after this runs, so the list is passed in and
+/// added to what the cache already holds for the work's other sources. The next full pass
+/// reads the same genres from the cache and finds nothing to change.
+pub async fn sync_work_suwayomi_tags(
+    pool: &Database,
+    work_id: &str,
+    fresh: &[String],
+) -> Result<SuwayomiTagSync> {
+    sync_suwayomi_tags_in(pool, Some((work_id, fresh))).await
+}
+
+/// The pass behind both entry points: every Suwayomi-linked work, or the one in `only`
+/// with the extra genres it comes with. The four reads take the same ` AND … = ?` when
+/// scoped, so one work costs four index seeks, not four scans.
+async fn sync_suwayomi_tags_in(
+    pool: &Database,
+    only: Option<(&str, &[String])>,
+) -> Result<SuwayomiTagSync> {
+    let scope = |column: &str| match only {
+        Some(_) => format!(" AND {column} = ?"),
+        None => String::new(),
+    };
+    let work = only.map(|(work_id, _)| work_id);
+
+    let sql = format!(
         "SELECT ss.work_id, sy.genre FROM source_series ss \
            JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
-          WHERE ss.source_type = 'suwayomi' AND sy.genre IS NOT NULL",
-    )
-    .fetch_all(pool)
-    .await?;
+          WHERE ss.source_type = 'suwayomi' AND sy.genre IS NOT NULL{}",
+        scope("ss.work_id")
+    );
+    let mut query = sqlx::query_as::<_, (String, String)>(&sql);
+    if let Some(work_id) = work {
+        query = query.bind(work_id);
+    }
+    let rows = query.fetch_all(pool).await?;
     let mut genres_by_work: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (work_id, json) in rows {
         // A malformed blob is skipped, not fatal: it is one source's cache row, and failing
@@ -403,39 +443,57 @@ pub async fn sync_suwayomi_tags(pool: &Database) -> Result<SuwayomiTagSync> {
             }
         }
     }
-    let mangadex_tagged: HashSet<String> = sqlx::query_scalar(
+    if let Some((work_id, fresh)) = only {
+        if !fresh.is_empty() {
+            genres_by_work
+                .entry(work_id.to_string())
+                .or_default()
+                .extend(fresh.iter().cloned());
+        }
+    }
+
+    let sql = format!(
         "SELECT DISTINCT t.work_id FROM work_tag t \
           WHERE t.source = 'mangadex' \
-            AND t.work_id IN (SELECT work_id FROM source_series WHERE source_type = 'suwayomi')",
-    )
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .collect();
+            AND t.work_id IN (SELECT work_id FROM source_series WHERE source_type = 'suwayomi'){}",
+        scope("t.work_id")
+    );
+    let mut query = sqlx::query_scalar::<_, String>(&sql);
+    if let Some(work_id) = work {
+        query = query.bind(work_id);
+    }
+    let mangadex_tagged: HashSet<String> = query.fetch_all(pool).await?.into_iter().collect();
+
     // Every tier's rows for the Suwayomi-linked works (to skip names already carried), plus
     // every derived row anywhere (to delete the ones whose source went away).
-    let mut existing: HashMap<String, BTreeMap<String, String>> = HashMap::new();
-    for (work_id, tag, source) in sqlx::query_as::<_, (String, String, String)>(
+    let sql = format!(
         "SELECT work_id, tag, source FROM work_tag \
-          WHERE source = 'suwayomi' \
-             OR work_id IN (SELECT work_id FROM source_series WHERE source_type = 'suwayomi')",
-    )
-    .fetch_all(pool)
-    .await?
-    {
+          WHERE (source = 'suwayomi' \
+             OR work_id IN (SELECT work_id FROM source_series WHERE source_type = 'suwayomi')){}",
+        scope("work_id")
+    );
+    let mut query = sqlx::query_as::<_, (String, String, String)>(&sql);
+    if let Some(work_id) = work {
+        query = query.bind(work_id);
+    }
+    let mut existing: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+    for (work_id, tag, source) in query.fetch_all(pool).await? {
         existing.entry(work_id).or_default().insert(tag, source);
     }
-    let demographic_eligible: HashSet<String> = sqlx::query_scalar(
+
+    let sql = format!(
         "SELECT w.id FROM work w \
           WHERE w.demographic IS NULL \
             AND w.id IN (SELECT work_id FROM source_series WHERE source_type = 'suwayomi') \
             AND NOT EXISTS (SELECT 1 FROM source_series ss \
-                             WHERE ss.work_id = w.id AND ss.source_type = 'mangadex')",
-    )
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .collect();
+                             WHERE ss.work_id = w.id AND ss.source_type = 'mangadex'){}",
+        scope("w.id")
+    );
+    let mut query = sqlx::query_scalar::<_, String>(&sql);
+    if let Some(work_id) = work {
+        query = query.bind(work_id);
+    }
+    let demographic_eligible: HashSet<String> = query.fetch_all(pool).await?.into_iter().collect();
 
     let plan = plan_suwayomi_tags(
         &genres_by_work,
@@ -498,36 +556,43 @@ pub async fn sync_suwayomi_tags(pool: &Database) -> Result<SuwayomiTagSync> {
 /// only the `/manga` ingest that carries `tag_details` writes groups; an admin's "Gore", or an
 /// ingest that arrived without details, would otherwise file a content tag under GENRE.
 ///
-/// One UPDATE per DISTINCT name, through `idx_work_tag_tag(tag, work_id)`, so a backfill is
-/// ~100 statements rather than ~700k. A name whose only gap is a group we cannot know (admin
-/// free text) is skipped rather than rewritten every cycle, so a settled table costs one read.
-pub async fn fill_tag_keys(conn: &mut SqliteConnection) -> Result<u64> {
-    let names: Vec<(String, bool)> = sqlx::query_as(
-        "SELECT tag, MAX(tag_key IS NULL) FROM work_tag \
-          WHERE tag_key IS NULL OR tag_group IS NULL GROUP BY tag",
-    )
-    .fetch_all(&mut *conn)
-    .await?;
-    let mut n = 0;
-    for (name, needs_key) in names {
-        let group = known_tag(&name).map(|(_, g)| g);
-        if !needs_key && group.is_none() {
-            continue;
-        }
-        n += sqlx::query(
-            "UPDATE work_tag SET tag_key = COALESCE(tag_key, ?), \
-                                 tag_group = COALESCE(tag_group, ?) \
-              WHERE tag = ? AND (tag_key IS NULL OR (tag_group IS NULL AND ? IS NOT NULL))",
+/// Repair at most 128 rows per writer turn and release the writer between batches.
+/// Unknown free-text groups remain unset; settled rows are not rewritten.
+pub async fn fill_tag_keys(pool: &Database) -> Result<u64> {
+    let mut cursor = 0i64;
+    let mut changed = 0;
+    loop {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT rowid, tag FROM work_tag WHERE rowid > ? \
+             AND (tag_key IS NULL OR tag_group IS NULL) ORDER BY rowid LIMIT 128",
         )
-        .bind(slug(&name))
-        .bind(group)
-        .bind(&name)
-        .bind(group)
-        .execute(&mut *conn)
-        .await?
-        .rows_affected();
+        .bind(cursor)
+        .fetch_all(pool)
+        .await?;
+        if rows.is_empty() {
+            return Ok(changed);
+        }
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        for (rowid, name) in rows {
+            cursor = rowid;
+            let group = known_tag(&name).map(|(_, group)| group);
+            changed += sqlx::query(
+                "UPDATE work_tag SET tag_key = COALESCE(tag_key, ?), \
+                tag_group = COALESCE(tag_group, ?) WHERE rowid = ? AND tag = ? \
+                AND (tag_key IS NULL OR (tag_group IS NULL AND ? IS NOT NULL))",
+            )
+            .bind(slug(&name))
+            .bind(group)
+            .bind(rowid)
+            .bind(name)
+            .bind(group)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        tx.commit().await?;
+        tokio::task::yield_now().await;
     }
-    Ok(n)
 }
 
 /// Rebuild the `tag` table from `work_tag` joined to the CURRENT `browse_catalogue`.
@@ -941,6 +1006,96 @@ mod tests {
         );
     }
 
+    /// The one-work pass that runs when a series is linked: the work has its tags at once,
+    /// from the genres it is handed (its cache row is not written yet) and the ones already
+    /// cached for its other sources. No other work is read or written, and the full pass
+    /// that follows, with the cache row in place, has nothing left to do.
+    #[tokio::test]
+    async fn one_work_gets_its_tags_when_a_series_is_linked() {
+        let pool = pool().await;
+        // Another work the full pass has not reached yet: the one-work pass leaves it.
+        work(&pool, "w_other", None).await;
+        suwayomi_source(&pool, "w_other", 9, r#"["Drama"]"#).await;
+        // The work being linked: one source already cached, one arriving now.
+        work(&pool, "w_new", None).await;
+        suwayomi_source(&pool, "w_new", 1, r#"["Action"]"#).await;
+        sqlx::query(
+            "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
+             VALUES ('ss_2', 'w_new', 'suwayomi', '2', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let fresh = vec![
+            "Gore".to_string(),
+            "Action Comedy".to_string(),
+            "Seinen".to_string(),
+        ];
+        let first = sync_work_suwayomi_tags(&pool, "w_new", &fresh)
+            .await
+            .unwrap();
+        assert_eq!(
+            (first.inserted, first.deleted, first.demographics),
+            (2, 0, 1)
+        );
+        assert_eq!(
+            tags_of(&pool, "w_new").await,
+            vec![
+                ("Action".into(), "suwayomi".into(), Some("action".into())),
+                ("Gore".into(), "suwayomi".into(), Some("gore".into())),
+            ],
+            "an unmapped genre is dropped, as in the full pass"
+        );
+        assert!(tags_of(&pool, "w_other").await.is_empty());
+
+        // Again with the same genres: nothing to do.
+        assert_eq!(
+            sync_work_suwayomi_tags(&pool, "w_new", &fresh)
+                .await
+                .unwrap(),
+            SuwayomiTagSync::default()
+        );
+        // A work with MangaDex tags takes none from a source, here as in the full pass.
+        work(&pool, "w_md", None).await;
+        sqlx::query(
+            "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
+             VALUES ('ss_3', 'w_md', 'suwayomi', '3', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) \
+             VALUES ('w_md', 'Romance', 0, 'mangadex', 'romance')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            sync_work_suwayomi_tags(&pool, "w_md", &fresh[..2])
+                .await
+                .unwrap(),
+            SuwayomiTagSync::default()
+        );
+        assert_eq!(tags_of(&pool, "w_md").await.len(), 1);
+
+        // The caller's scan writes the cache row. The full pass then agrees with what the
+        // one-work pass wrote, and only reaches the work it had not seen.
+        sqlx::query(
+            "INSERT INTO suwayomi_series (id, title, genre, status, source_id, updated_at) \
+             VALUES (2, 'T', ?, 'ONGOING', '1', '2026-01-01T00:00:00Z')",
+        )
+        .bind(serde_json::to_string(&fresh).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let full = sync_suwayomi_tags(&pool).await.unwrap();
+        assert_eq!((full.inserted, full.deleted, full.demographics), (1, 0, 0));
+        assert_eq!(tags_of(&pool, "w_new").await.len(), 2);
+        assert_eq!(tags_of(&pool, "w_other").await.len(), 1);
+    }
+
     /// The key backfill and the tag table: a row without a key gets one (and a known name
     /// its group), names that slug alike share one key and are counted once per work, counts
     /// follow `browse_catalogue` and the NSFW gate, and the canonical name prefers MangaDex's.
@@ -983,9 +1138,9 @@ mod tests {
             .await
             .unwrap();
         }
+        assert_eq!(fill_tag_keys(&pool).await.unwrap(), 6);
+        assert_eq!(fill_tag_keys(&pool).await.unwrap(), 0, "idempotent");
         let mut conn = pool.write().acquire().await.unwrap();
-        assert_eq!(fill_tag_keys(&mut conn).await.unwrap(), 6);
-        assert_eq!(fill_tag_keys(&mut conn).await.unwrap(), 0, "idempotent");
         rebuild_tag_table(&mut conn).await.unwrap();
         drop(conn);
         let all = list_tags(&pool, true).await.unwrap();

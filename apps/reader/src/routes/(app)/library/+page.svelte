@@ -8,6 +8,7 @@
 	import EmptyCatalog from '$lib/components/EmptyCatalog.svelte';
 	import Dropdown, { type DropdownOption } from '$lib/components/Dropdown.svelte';
 	import FlagBadge from '$lib/components/FlagBadge.svelte';
+	import Ratings from '$lib/components/Ratings.svelte';
 	import StatusMenu from '$lib/components/StatusMenu.svelte';
 	import {
 		setLibraryStatus,
@@ -426,11 +427,7 @@
 						/>
 						<a class="cover-link" {href} aria-label={item.title}></a>
 						<span class="flag-svg"><FlagBadge type={item.type} /></span>
-						{#if Number(item.rating) > 0}
-							<span class="rating" aria-label={`Rating ${item.rating} out of 10`}
-								><Icon name="star" size={10} fill="var(--k-star)" />{item.rating}</span
-							>
-						{/if}
+						<span class="rating"><Ratings own={item.rating} md={item.mdRating} chip stack /></span>
 						<button
 							class="fav-chip k-hit"
 							class:on={item.favorite}
@@ -983,15 +980,7 @@
 		z-index: 2;
 		top: 9px;
 		right: 9px;
-		display: inline-flex;
-		align-items: center;
-		gap: 3px;
-		font-weight: 700;
-		font-size: 11.5px;
-		color: #f7f6f3;
-		background: rgba(12, 12, 13, 0.88);
-		border-radius: 5px;
-		padding: 3px 7px;
+		display: flex;
 	}
 	.progressbar {
 		position: absolute;

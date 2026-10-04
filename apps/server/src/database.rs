@@ -1,4 +1,5 @@
 //! SQLite access lanes: reads cannot occupy the single application writer.
+#[cfg(test)]
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

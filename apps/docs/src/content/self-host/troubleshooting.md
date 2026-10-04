@@ -66,7 +66,13 @@ For a Litestream restore error, fix backup credentials, network access or the re
 
 ## Port 443 or 80 does not answer
 
-With Docker, your server answers on these ports inside the container. Docker publishes them only when `COMPOSE_FILE` in `.env` names the extra Compose files. Run the installer with `--access public-ip` or `--access direct`, or read [Reach it from the internet](/self-host/internet-access). Then check the machine's firewall and your cloud provider's firewall.
+With Docker, your server answers on these ports inside the container, and Docker publishes them only when `COMPOSE_FILE` in `.env` names the extra Compose files. Run the installer with `--access public-ip` or `--access direct`, or read [Reach it from the internet](/self-host/internet-access). Then check the firewall on the machine and at your cloud provider.
+
+If **Settings › Access** shows HTTPS as "Not running", it names the reason, and the server tries again by itself.
+
+## The console stops answering at its public address
+
+With **Only my devices**, the server refuses plain HTTP from the internet. Open the console at the server's home network address, or run `docker compose exec server komika-server setup` and choose a public mode.
 
 ## Cloudflare setup problems
 

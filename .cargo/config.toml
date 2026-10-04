@@ -1,0 +1,4 @@
+[env]
+# SQLite otherwise caps PRAGMA mmap_size near 2 GiB. Keep the bundled engine's
+# ceiling aligned with the main database's fixed 8 GiB virtual mapping budget.
+LIBSQLITE3_FLAGS = { value = "SQLITE_MAX_MMAP_SIZE=8589934592LL", force = true }

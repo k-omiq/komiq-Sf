@@ -181,6 +181,10 @@ export async function installAdminQueueFixtures(page, state = {}) {
 					hasNextPage: false,
 				},
 				scanStatus: { librarySize: 150, overdueCount: 4, lastTickAt: at, nextDueAt: at },
+				// Scanlators › Sites and Settings › Blocked content: empty lists.
+				scanlatorSites: [],
+				siteBlockRules: [],
+				tags: [],
 			};
 			await route.fulfill({ headers: { 'access-control-allow-origin': '*' }, json: { data } });
 		},

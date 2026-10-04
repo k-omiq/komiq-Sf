@@ -47,7 +47,10 @@ export interface CatalogEntry {
 	 * alone. It must never fall back to `ch`.
 	 */
 	latestCh: string;
+	/** Our own readers' rating; 0 when nobody here rated it. */
 	rating: number;
+	/** MangaDex's rating; null when it has none or the server does not show them. */
+	mdRating: number | null;
 	status: Status;
 	/**
 	 * Positional index in the backend-returned order — NOT a recency signal. Kept
@@ -120,7 +123,12 @@ export interface Card {
 	 * than printing "released 4h" next to "4h".
 	 */
 	released?: string;
+	/** Our own readers' rating, formatted; '' (or "0.0") when nobody here rated it. On a
+	 *  feed row from a server that predates the two-rating split this is the server's
+	 *  merged number instead, which is all such a server can say. */
 	rating: string;
+	/** MangaDex's rating; null/absent when it has none or the server does not show them. */
+	mdRating?: number | null;
 	cover?: string;
 	id?: string;
 	/** Format of the series, when the source feed knows it. */

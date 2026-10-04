@@ -112,9 +112,9 @@ modest, and prefer off-peak.
   cache. Point `--target` at `https://api.komiq.cc` to measure the whole delivery path;
   expect lower numbers, because the tunnel becomes the limit.
 - **`mixed` weights are an estimate**, not measured traffic. Refine from access logs.
-- **Anonymous only.** No auth token is sent, so the per-viewer library N+1
-  (`viewer_library_row`, one query per series for signed-in users) never fires. Real
-  logged-in traffic is heavier than these numbers suggest.
+- **Anonymous only by default.** No auth token is sent, so viewer-library batch reads
+  are not exercised. The local SQLite contention harness below adds authenticated
+  library mutations.
 
 ## Keeping it honest
 
@@ -136,3 +136,33 @@ Note the comment on the `search` operation: the harness currently uses the **dep
 Add an entry to `SCENARIOS`: a weighted list of `[weight, () => request]` pairs, where a
 request is `{method, path, headers?, body?}`. Use the `GQL(query, variables)` helper for
 GraphQL. Weights only matter for blends; single-op scenarios use `[[1, ...]]`.
+
+## Local SQLite contention comparison
+
+The ignored Rust harness in `sqlite_contention.rs` opens a disposable database copy,
+applies migrations before measurement, and serves the real GraphQL schema on
+`127.0.0.1:18089`. It runs `loadtest.mjs` mixed reads at 10/s and authenticated
+`setFavorite` writes at 2/s for 20 seconds while rebuilding the full feed, browse and
+FTS projections. A separate connection probes the writer every 5ms. Application
+lock-error logs and probe contention are reported separately.
+
+Use a **consistent backup**, never the live application database. The harness writes
+test users and catalogue projections. Node must be on PATH. From `apps/server`:
+
+```bash
+mkdir -p /tmp/komiq-sqlite-safety
+cp /path/to/consistent-backup.sqlite3 /tmp/komiq-sqlite-safety/comparison.sqlite3
+KOMIQ_BENCH_DB=/tmp/komiq-sqlite-safety/comparison.sqlite3 \
+KOMIQ_HTTP_BENCH_PREFIX=/tmp/komiq-sqlite-safety/comparison \
+cargo test sqlite_writer_hold_benchmark -- --ignored --nocapture --test-threads=1
+```
+
+Run the same harness against the baseline and candidate, each with a fresh copy and
+without competing build/test work. Compare successful request counts as well as p95:
+fast failed writes are not a latency improvement. This router omits production
+middleware; middleware has separate admission/timeout regression tests.
+
+`sqlite_projection.rs` provides another ignored real-size check for atomic merge and
+split projection with 128 sources and 8,192 chapters. Set
+`KOMIQ_PROJECTION_BENCH_DB` to a disposable copy and run
+`cargo test incremental_projection_writer_holds_on_real_size_catalogue -- --ignored --nocapture --test-threads=1`.

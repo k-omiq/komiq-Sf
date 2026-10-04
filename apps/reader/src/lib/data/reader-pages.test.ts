@@ -237,6 +237,33 @@ test('single-source readers also carry publication layout metadata', async () =>
 	assert.equal(got.seriesTitle, 'Single-source comic');
 });
 
+test('every copy names its source, for the AI badge of a tagged source', async () => {
+	fakeBackend({ mdPages: { 'md-5a': ['image'] } });
+	const view = await getReaderChapter(WORK, 'md-5a');
+	assert.deepEqual(
+		view.versions?.map((v) => [v.id, v.sourceId]),
+		[
+			['md-5a', 'mangadex'],
+			['md-5b', 'mangadex'],
+			['9005', '1998944621602463790'],
+		],
+	);
+	assert.equal(view.sourceId, 'mangadex');
+
+	// A numeric series has one source and its chapters name none: the series row does,
+	// also for a copy with no group credit.
+	fakeBackend();
+	testGlobals.backend.series = async () => ({ title: 'Single-source comic', sourceId: '7001' });
+	testGlobals.backend.chapters = async () => [chapter('9005', 5, null)];
+	testGlobals.backend.pages = async () => [{ index: 0, sourceUrl: 'image' }];
+	const single = await getReaderChapter('777', '9005');
+	assert.equal(single.sourceId, '7001');
+	assert.deepEqual(
+		single.versions?.map((v) => [v.id, v.group, v.sourceId]),
+		[['9005', null, '7001']],
+	);
+});
+
 // The reader logs every failed copy on purpose; keep the test output readable.
 console.warn = () => {};
 

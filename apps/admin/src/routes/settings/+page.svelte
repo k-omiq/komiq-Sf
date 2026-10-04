@@ -1,8 +1,25 @@
 <script lang="ts">
+	import { tick } from 'svelte';
 	import { href } from '$lib/paths';
-	import type { ExtensionAutoUpdate, ExtensionInfo, SourceInfo } from '@komika/types';
-	import type { ExtensionRepo, MangadexSetting, SourceRateLimit } from '@komika/api';
+	import type { ExtensionAutoUpdate, ExtensionInfo, SourceInfo, TagInfo } from '@komika/types';
+	import type {
+		BlockRule,
+		ContentRating,
+		ExtensionRepo,
+		MangadexSetting,
+		SourceRateLimit,
+	} from '@komika/api';
 	import { auth, toggleNsfwVisibility } from '$lib/auth.svelte';
+	import {
+		MAX_RULE_TAGS,
+		RATINGS,
+		RATING_LABEL,
+		checkDraft,
+		ruleText,
+		sameRule,
+		tagShelves,
+		tidyRule,
+	} from '$lib/block-rules';
 	import { config, serverAddress, target } from '$lib/config';
 	import { confirm } from '$lib/confirm.svelte';
 	import {
@@ -10,11 +27,15 @@
 		isEngineUnreachable,
 		loadExtensionRepos,
 		loadMangadexSetting,
+		loadSiteBlockRules,
 		loadSourceRateLimits,
 		loadSources,
+		loadTags,
 		removeExtensionRepo,
 		removeSourceRateLimit,
 		setMangadexEnabled,
+		setShowMangadexRatings,
+		setSiteBlockRules,
 		setSourceRateLimit,
 		consolidateDuplicates,
 		loadExtensionAutoUpdate,
@@ -34,9 +55,18 @@
 	import Switch from '$lib/components/Switch.svelte';
 	import AccessSettings from './AccessSettings.svelte';
 
+	/**
+	 * The block rules: `loading` until the first answer. `failed`: that answer was an
+	 * error, and the section offers to ask again. `off`: an older server, so the Blocked
+	 * content section is hidden. Declared here because the section links read it.
+	 */
+	let rulesState = $state<'loading' | 'ready' | 'failed' | 'off'>('loading');
+
 	const sections = $derived([
 		{ id: 'appearance', label: 'Appearance' },
 		{ id: 'content', label: 'Content' },
+		// Not on a server that predates block rules.
+		...(rulesState !== 'off' ? [{ id: 'blocked', label: 'Blocked content' }] : []),
 		// Only on a server that reports its settings (`instance`).
 		...(instance.info
 			? [
@@ -74,6 +104,174 @@
 		} finally {
 			nsfwBusy = false;
 		}
+	}
+
+	// ---- Blocked content: the site-wide block rules -------------------------------
+	// A series that matches a rule is left out of every reader list and cannot be opened,
+	// for every reader. The server keeps one list and takes it whole, so adding or
+	// removing a rule sends the full list, at once. `rulesState` is at the top of the file.
+	let blockRules = $state<BlockRule[]>([]);
+	/** The save in flight: `add`, or the place in the list of the rule being removed. */
+	let savingRule = $state<'add' | number | null>(null);
+	let ruleList = $state<HTMLUListElement | null>(null);
+	let ruleForm = $state<HTMLFormElement | null>(null);
+
+	/**
+	 * Reads and saves share this counter, and only the newest of them writes the list. A
+	 * read that began before a save holds the list from before it: shown, it would drop
+	 * the saved rule from the screen, and the next save, which sends the whole list,
+	 * would delete it on the server.
+	 */
+	let rulesSeq = 0;
+
+	async function refreshBlockRules(): Promise<void> {
+		const seq = ++rulesSeq;
+		try {
+			const rules = await loadSiteBlockRules();
+			if (seq !== rulesSeq) return;
+			// An answer that carries no list comes from a server without block rules.
+			if (!Array.isArray(rules)) {
+				if (rulesState !== 'ready') rulesState = 'off';
+				return;
+			}
+			blockRules = rules;
+			rulesState = 'ready';
+		} catch (err) {
+			if (seq !== rulesSeq) return;
+			// A later load that fails keeps the list on screen: it is the last one the
+			// server gave.
+			if (rulesState === 'ready') return;
+			// Only a server (or backend) without the rules hides the section. Any other
+			// error can pass, so the section stays and offers to ask again.
+			const message = err instanceof Error ? err.message : '';
+			const unsupported =
+				message.includes('Unknown field "siteBlockRules"') ||
+				message.includes('unavailable on this backend');
+			rulesState = unsupported ? 'off' : 'failed';
+		}
+	}
+
+	function retryBlockRules(): void {
+		rulesState = 'loading';
+		void refreshBlockRules();
+	}
+
+	// The tags a rule can name. The list follows the admin's own NSFW setting, so it is
+	// read again when that setting changes. It is not asked for on a server without
+	// block rules.
+	let tagList = $state<TagInfo[]>([]);
+	let tagsState = $state<'loading' | 'ready' | 'failed'>('loading');
+	/** Only the newest request writes: two reads overlap when the setting is switched twice. */
+	let tagsSeq = 0;
+
+	async function refreshTags(): Promise<void> {
+		const seq = ++tagsSeq;
+		try {
+			const tags = await loadTags();
+			if (seq !== tagsSeq) return;
+			tagList = tags;
+			tagsState = 'ready';
+			// A choice the new list does not offer would leave the picker blank.
+			if (tagPick && !tags.some((t) => t.id === tagPick)) tagPick = '';
+		} catch {
+			if (seq !== tagsSeq) return;
+			tagList = [];
+			tagsState = 'failed';
+		}
+	}
+
+	$effect(() => {
+		if (rulesState !== 'ready' || !auth.user) return;
+		void auth.user.showNsfw;
+		void refreshTags();
+	});
+
+	const tagNames = $derived(new Map(tagList.map((t) => [t.id, t.name])));
+	const tagName = (id: string): string | undefined => tagNames.get(id);
+
+	// The rule being put together. It is saved only by "Add rule".
+	let draftTags = $state<string[]>([]);
+	let draftRatings = $state<ContentRating[]>([]);
+	let tagPick = $state('');
+	const shelves = $derived(tagShelves(tagList, draftTags));
+	const tagsFull = $derived(draftTags.length >= MAX_RULE_TAGS);
+	const draftCheck = $derived(checkDraft({ tags: draftTags, ratings: draftRatings }, blockRules));
+
+	function addDraftTag(): void {
+		if (!tagPick || tagsFull || draftTags.includes(tagPick)) return;
+		draftTags = [...draftTags, tagPick];
+		tagPick = '';
+	}
+
+	function removeDraftTag(id: string): void {
+		draftTags = draftTags.filter((t) => t !== id);
+	}
+
+	/** Send the whole list. True when the server stored it. */
+	async function saveBlockRules(next: BlockRule[]): Promise<boolean> {
+		// Outdates a read that is still in flight: see `rulesSeq`.
+		rulesSeq++;
+		try {
+			blockRules = await setSiteBlockRules(next);
+			toast.success('Blocked content saved.');
+			return true;
+		} catch (err) {
+			toast.fromError(err, 'The rules could not be saved.');
+			await refreshBlockRules();
+			return false;
+		}
+	}
+
+	async function onAddRule(ev: SubmitEvent): Promise<void> {
+		ev.preventDefault();
+		if (savingRule !== null || rulesState !== 'ready' || !draftCheck.ok) return;
+		savingRule = 'add';
+		try {
+			const sent = { tags: draftTags, ratings: draftRatings };
+			if (await saveBlockRules([...blockRules, tidyRule(sent)])) {
+				// The form stays usable while the save runs. A draft that was changed in
+				// that time is the start of the next rule, and is kept.
+				if (sameRule(sent, { tags: draftTags, ratings: draftRatings })) {
+					draftTags = [];
+					draftRatings = [];
+					tagPick = '';
+				}
+			}
+		} finally {
+			savingRule = null;
+		}
+	}
+
+	async function onRemoveRule(i: number): Promise<void> {
+		if (savingRule !== null) return;
+		const rule = blockRules[i];
+		const ok = await confirm({
+			title: 'Remove this rule?',
+			message: `${ruleText(rule, tagName)}.\n\nSeries that only this rule hides are shown to every reader again.`,
+			confirmLabel: 'Remove rule',
+			danger: true,
+		});
+		if (!ok || savingRule !== null) return;
+		// Found again by what it says, not by place or identity: the list can have been
+		// read again while the question was open. Gone already means nothing to save.
+		const at = blockRules.findIndex((r) => sameRule(r, rule));
+		if (at < 0) return;
+		savingRule = at;
+		try {
+			if (!(await saveBlockRules(blockRules.filter((_, n) => n !== at)))) return;
+		} finally {
+			savingRule = null;
+		}
+		// The button that was pressed is disabled while it saves, and can be gone after:
+		// focus is then on nothing. Put it on the rule now in that place, else on the last
+		// rule, else on the form, so a keyboard does not start again from the top of the page.
+		await tick();
+		if (document.activeElement !== document.body) return;
+		const buttons = ruleList?.querySelectorAll('button') ?? [];
+		const target =
+			buttons[Math.min(at, buttons.length - 1)] ??
+			ruleForm?.querySelector<HTMLElement>('select:enabled, input:enabled');
+		target?.focus();
 	}
 
 	// ---- Accounts: the sign-up switch -------------------------------------------
@@ -129,6 +327,30 @@
 			await refreshMangadex();
 		} finally {
 			mangadexBusy = false;
+		}
+	}
+
+	// ---- Sources: MangaDex ratings ---------------------------------------------
+	// What readers are shown, not whether the server uses MangaDex: with this off no
+	// response carries a MangaDex rating and a card shows our own readers' rating only.
+	// Read from the public `instance` facts like the sign-up switch; a server that
+	// predates the setting has no such fact and the row is hidden.
+	let ratingsBusy = $state(false);
+	let ratingsPinned = $state<string | null>(null);
+
+	async function onToggleMangadexRatings(next: boolean): Promise<void> {
+		if (!instance.info || ratingsBusy) return;
+		ratingsBusy = true;
+		try {
+			const shown = await setShowMangadexRatings(next);
+			instance.info = { ...instance.info, showMangadexRatings: shown };
+			toast.success(shown ? 'MangaDex ratings are shown.' : 'MangaDex ratings are hidden.');
+		} catch (err) {
+			const message = err instanceof Error ? err.message : '';
+			if (message.includes('KOMIKA_MANGADEX_RATINGS')) ratingsPinned = message;
+			else toast.fromError(err, 'The setting could not be saved.');
+		} finally {
+			ratingsBusy = false;
 		}
 	}
 
@@ -394,6 +616,7 @@
 		void refreshRepos();
 		void refreshMangadex();
 		void refreshLimits();
+		void refreshBlockRules();
 		void refreshAutoUpdate().then(followUpdates);
 	});
 	// Stop following a running update pass, and stop a merge run between batches, when
@@ -614,6 +837,167 @@
 				</div>
 			</section>
 
+			{#if rulesState !== 'off'}
+				<section id="blocked" class="group" aria-labelledby="blocked-h">
+					<div class="group-head">
+						<div>
+							<h2 id="blocked-h" class="group-title">Blocked content</h2>
+							<p class="group-desc">
+								Series that match a rule are hidden from every reader of this server, signed in or
+								not, and cannot be opened. The catalogue pages of this console still show them.
+							</p>
+						</div>
+					</div>
+					<div class="group-body rules">
+						{#if rulesState === 'loading'}
+							<p class="k-hint">Loading rules…</p>
+						{:else if rulesState === 'failed'}
+							<p class="k-hint" role="alert">
+								The rules could not be loaded.
+								<button class="k-link retry" type="button" onclick={retryBlockRules}
+									>Try again</button
+								>
+							</p>
+						{:else if blockRules.length === 0}
+							<p class="k-hint">No rules. Nothing is blocked.</p>
+						{:else}
+							<!-- Keyed by place: after a removal the next rule takes the row, and the
+							     focus on its button with it. -->
+							<ul class="repo-list" aria-label="Block rules" bind:this={ruleList}>
+								{#each blockRules as rule, i (i)}
+									{@const text = ruleText(rule, tagName)}
+									<li>
+										<span class="repo-text"><span class="repo-name">{text}</span></span>
+										<Button
+											variant="ghost"
+											size="sm"
+											icon="trash"
+											iconOnly
+											aria-label="Remove the rule: {text}"
+											busy={savingRule === i}
+											disabled={savingRule !== null && savingRule !== i}
+											onclick={() => onRemoveRule(i)}
+										/>
+									</li>
+								{/each}
+							</ul>
+						{/if}
+
+						<!-- Not while the list could not be read: a save sends the whole list. -->
+						{#if rulesState !== 'failed'}
+							<form
+								class="rule-form"
+								aria-labelledby="rule-form-h"
+								onsubmit={onAddRule}
+								bind:this={ruleForm}
+							>
+								<p id="rule-form-h" class="setting-name">Add a rule</p>
+
+								<div class="k-field">
+									<label class="k-label" for="rule-tag">Tags</label>
+									{#if draftTags.length > 0}
+										<ul class="chips" aria-label="Tags of the new rule">
+											{#each draftTags as id (id)}
+												{@const name = tagName(id) ?? id}
+												<li class="chip">
+													<span>{name}</span>
+													<button
+														type="button"
+														class="chip-x"
+														aria-label="Remove tag {name}"
+														onclick={() => removeDraftTag(id)}><Icon name="x" size={12} /></button
+													>
+												</li>
+											{/each}
+										</ul>
+									{/if}
+									<!-- A button adds the tag, not the choice itself: with a keyboard, moving
+									     through a closed list already changes its value. -->
+									<div class="tag-line">
+										<select
+											id="rule-tag"
+											class="k-select"
+											name="tag"
+											autocomplete="off"
+											bind:value={tagPick}
+											disabled={shelves.length === 0 || tagsFull}
+										>
+											<option value="">
+												{tagsState === 'loading'
+													? 'Loading tags…'
+													: shelves.length === 0
+														? 'No tags to choose'
+														: 'Choose a tag'}
+											</option>
+											{#each shelves as shelf (shelf.label)}
+												<optgroup label={shelf.label}>
+													{#each shelf.tags as t (t.id)}
+														<option value={t.id}>{t.name}</option>
+													{/each}
+												</optgroup>
+											{/each}
+										</select>
+										<Button icon="plus" disabled={!tagPick || tagsFull} onclick={addDraftTag}
+											>Add tag</Button
+										>
+									</div>
+									{#if tagsState === 'failed'}
+										<p class="k-hint">
+											The tags could not be loaded. A rule can still name ratings.
+											<button class="k-link retry" type="button" onclick={refreshTags}
+												>Try again</button
+											>
+										</p>
+									{:else if tagsState === 'ready' && tagList.length === 0}
+										<p class="k-hint">
+											This server has no tags yet. A rule can still name ratings.
+										</p>
+									{:else}
+										<p class="k-hint">
+											A series must have all of these tags.
+											{#if tagsFull}A rule takes at most {MAX_RULE_TAGS} tags.{/if}
+										</p>
+									{/if}
+									{#if auth.user && !auth.user.showNsfw}
+										<p class="k-hint">
+											Tags that only adult series carry are not listed while Show NSFW content is
+											off.
+										</p>
+									{/if}
+								</div>
+
+								<div class="k-field" role="group" aria-labelledby="rule-ratings-h">
+									<span id="rule-ratings-h" class="k-label">Ratings</span>
+									<div class="checks">
+										{#each RATINGS as r (r)}
+											<label class="check">
+												<input type="checkbox" name="rating" value={r} bind:group={draftRatings} />
+												<span>{RATING_LABEL[r]}</span>
+											</label>
+										{/each}
+									</div>
+									<p class="k-hint">Leave empty for any rating.</p>
+								</div>
+
+								<div class="rule-foot">
+									<Button
+										type="submit"
+										variant="primary"
+										icon="plus"
+										aria-describedby="rule-why"
+										busy={savingRule === 'add'}
+										disabled={!draftCheck.ok || rulesState !== 'ready' || savingRule !== null}
+										>Add rule</Button
+									>
+									<!-- Always here, so a reason that appears is announced. -->
+									<p id="rule-why" class="k-hint" role="status">{draftCheck.reason ?? ''}</p>
+								</div>
+							</form>
+						{/if}
+					</div>
+				</section>
+			{/if}
+
 			{#if instance.info}
 				<section id="access" class="group" aria-labelledby="access-h">
 					<div class="group-head">
@@ -693,6 +1077,30 @@
 								checked={mangadex.enabled}
 								disabled={mangadexBusy || mangadex.pinned}
 								onchange={onToggleMangadex}
+							/>
+						</div>
+					{/if}
+
+					{#if instance.info?.showMangadexRatings !== undefined}
+						<div class="setting">
+							<div class="setting-text">
+								<p class="setting-name">Show MangaDex ratings</p>
+								{#if ratingsPinned}
+									<p class="k-hint">{ratingsPinned}</p>
+								{:else}
+									<p class="k-hint">
+										A series can show two ratings: the rating from your readers, and the rating from
+										MangaDex. When this is off, every reader sees the rating from your readers only.
+										When it is on, each reader can still hide MangaDex ratings in their own
+										settings.
+									</p>
+								{/if}
+							</div>
+							<Switch
+								label="Show MangaDex ratings"
+								checked={instance.info.showMangadexRatings}
+								disabled={ratingsBusy || !!ratingsPinned}
+								onchange={onToggleMangadexRatings}
 							/>
 						</div>
 					{/if}
@@ -1192,6 +1600,101 @@
 		font-family: var(--k-font-mono);
 		font-size: 0.92em;
 		overflow-wrap: anywhere;
+	}
+
+	/* Blocked content: the rules, then the form that adds one. */
+	.rules,
+	.rule-form {
+		display: grid;
+		gap: var(--k-space-4);
+	}
+	.rule-form {
+		margin-top: var(--k-space-2);
+	}
+	.tag-line,
+	.rule-foot {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: var(--k-space-2) var(--k-space-3);
+	}
+	.tag-line .k-select {
+		flex: 1 1 220px;
+		max-width: 340px;
+		min-width: 0;
+	}
+	/* The same chips as on a series page, without the outline: a soft fill, like the rows. */
+	.chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+		padding: 0;
+		list-style: none;
+	}
+	.chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 2px;
+		max-width: 100%;
+		min-height: 28px;
+		padding: 2px 3px 2px 10px;
+		border-radius: var(--k-radius);
+		background: var(--k-surface-4);
+		color: var(--k-text-1);
+		font-size: var(--k-text-sm);
+		overflow-wrap: anywhere;
+	}
+	.chip-x {
+		flex: none;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 22px;
+		height: 22px;
+		border: 0;
+		border-radius: var(--k-radius-sm);
+		background: transparent;
+		color: var(--k-text-dim);
+		cursor: pointer;
+		transition:
+			background var(--k-dur) var(--k-ease),
+			color var(--k-dur) var(--k-ease);
+	}
+	.chip-x:hover {
+		background: var(--k-hover-fill);
+		color: var(--k-text-bright);
+	}
+	.checks {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--k-space-1) var(--k-space-5);
+	}
+	.check {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--k-space-2);
+		min-height: 28px;
+		color: var(--k-text-1);
+		font-size: var(--k-text-sm);
+		cursor: pointer;
+	}
+	.check input {
+		flex: none;
+		width: 16px;
+		height: 16px;
+		cursor: pointer;
+	}
+	@media (pointer: coarse) {
+		.chip {
+			min-height: 40px;
+		}
+		.chip-x {
+			width: 36px;
+			height: 36px;
+		}
+		.check {
+			min-height: 44px;
+		}
 	}
 
 	.repos {

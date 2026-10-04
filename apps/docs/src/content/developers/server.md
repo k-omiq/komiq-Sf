@@ -9,14 +9,7 @@ Run it through the desktop admin app, with Docker, or as a standalone binary. Th
 
 ## Framework and architecture
 
-The Rust server uses these crates:
-
-- `axum 0.8`: provides the HTTP routing layer and request handlers.
-- `tokio`: powers the asynchronous multi-threaded runtime.
-- `async-graphql 7`: builds the code-first GraphQL schema matching the project schema contract.
-- `sqlx 0.8`: manages asynchronous SQLite connection pools, transactions and migrations.
-- `reqwest 0.12`: sends outbound HTTP requests to the Suwayomi engine and upstream sources.
-- `tower` and `tower-http`: provide HTTP middleware for request tracing, panic recovery, CORS, security headers and response compression.
+The server uses axum for HTTP routing, Tokio for asynchronous tasks, async-graphql for the schema and sqlx for SQLite. Reqwest handles upstream HTTP; Tower middleware handles tracing, CORS and compression.
 
 ### Middleware stack
 
@@ -35,6 +28,8 @@ Compression -> Route handler: routes the request
 Compression targets text and JSON. WebP covers and avatars skip compression.
 
 The public router admits up to 64 active handlers. Excess requests receive HTTP 503 with `Retry-After: 1` and `Cache-Control: no-store`. Handler execution has a 20-second deadline and returns the same response when it expires.
+
+Search accepts at most 256 characters and 12 distinct terms, with a two-second SQLite deadline. Heavy GraphQL root fields are limited to four per operation. Upstream misses share a 60-per-minute client budget. Library and progress queries return at most 1,000 entries.
 
 Pool saturation also returns a retryable 503. A failed session lookup returns an error rather than treating a signed-in reader as anonymous. GraphQL GET responses containing errors are never publicly cached.
 
@@ -116,7 +111,7 @@ For fast browse responses, the server stores catalogue query results in dedicate
 - `browse_catalogue`: maintains a flat, indexed projection of browsable titles for filtering by genre, demographic, status, year, rating and follow counts.
 - `work_fts`: provides an SQLite FTS5 full-text search index across canonical titles and aliases.
 
-A background task spawned 20 seconds after boot (`catalog::refresh_feed_updates`) rebuilds these tables. It refreshes them periodically after catalog synchronization cycles.
+Catalogue writes update browse and search together. A local reconciliation loop rebuilds these tables daily, even with MangaDex disabled. Rebuilds stage expensive reads separately and publish bounded batches.
 
 ### Cover cache and garbage collection
 
@@ -126,7 +121,7 @@ The garbage collector in `apps/server/src/gc.rs` runs hourly. It deletes orphane
 
 ### Database statistics refresh
 
-The database loop in `apps/server/src/db.rs` refreshes query planner statistics every 6 hours. It handles one table at a time and yields between tables.
+The database loop in `apps/server/src/db.rs` refreshes query planner statistics every 6 hours. It samples one index per writer turn and yields between indexes.
 
 ## Serving web applications
 

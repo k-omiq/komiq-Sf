@@ -1301,7 +1301,7 @@ mod tests {
         // One scan schedule per Suwayomi series — the table that is 74% all.mangadex in
         // production and that the scheduler reads WITHOUT joining `source_series`.
         for key in ["100", "101", "102", "103"] {
-            sqlx::query("INSERT INTO series_scan_state (series_id, updated_at) VALUES (?, 'now')")
+            sqlx::query("INSERT INTO series_scan_state (series_id, updated_at, next_scan_at) VALUES (?, 'now', '1970-01-01T00:00:00+00:00')")
                 .bind(key)
                 .execute(&pool)
                 .await

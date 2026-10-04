@@ -52,7 +52,7 @@ The Sources group manages where comics and manga originate:
 - **Extensions** (`/sources/extensions`): View installed source extensions, check for updates, and install new extensions from configured repositories.
 - **Browse & add** (`/sources/browse`): Explore titles available through installed extensions and import them into your library.
 - **Health** (`/sources/health`): Monitor source scan health. If a source has a detected outage, a red alarm badge appears next to Health in the sidebar.
-- **Scanlators** (`/scanlators`): List the scanlation groups that chapters credit, and tag the groups that translate with AI.
+- **Scanlators** (`/scanlators`): List the scanlation groups that chapters credit and the sources that translate their own series, and tag the ones that translate with AI.
 
 For details on source configuration, see [Sources](/admin/sources).
 
@@ -67,7 +67,7 @@ The Community group manages user accounts and moderation:
 
 The bottom section of the sidebar provides server configuration and session management:
 
-- **Settings** (`/settings`): Configure theme preferences, NSFW content filters, registration toggles, MangaDex access, extension repositories, background auto-updates, network access modes, and bulk maintenance jobs. See [Settings](/admin/settings).
+- **Settings** (`/settings`): Configure theme preferences, NSFW content filters, block rules, registration toggles, MangaDex access, extension repositories, background auto-updates, network access modes, and bulk maintenance jobs. See [Settings](/admin/settings).
 - **Account bar**: Displays your username and role. Includes a theme button that cycles between Dark, Light, and System modes, as well as a sign-out button.
 - **NSFW banner**: If your account has NSFW content disabled, a warning banner appears below the navigation. Turning off NSFW blocks source browsing, extension installation, and adding series from sources.
 

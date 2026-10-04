@@ -52,11 +52,14 @@ import type {
 	InstanceInfo,
 	ExtensionRepo,
 	MangadexSetting,
+	BlockRule,
 	BrowseSource,
 	ScanlatorAi,
 	ScanlatorPage,
 	ScanlatorQuery,
+	ScanlatorSite,
 	ScanlatorTag,
+	SourceAiTag,
 	SourceRateLimit,
 	MyComment,
 	PostCommentInput,
@@ -275,6 +278,9 @@ export class CompositeBackend implements Backend {
 	scanlatorTags(): Promise<ScanlatorTag[]> {
 		return this.opts.hosted.scanlatorTags?.() ?? Promise.resolve([]);
 	}
+	sourceAiTags(): Promise<SourceAiTag[]> {
+		return this.opts.hosted.sourceAiTags?.() ?? Promise.resolve([]);
+	}
 	browseFilterSupported(): boolean {
 		return this.opts.hosted.browseFilterSupported?.() ?? false;
 	}
@@ -414,6 +420,12 @@ export class CompositeBackend implements Backend {
 	// --- viewer preferences ---
 	setShowNsfw(value: boolean): Promise<boolean> {
 		return this.opts.hosted.setShowNsfw!(value);
+	}
+	myBlockRules(): Promise<BlockRule[]> {
+		return this.opts.hosted.myBlockRules!();
+	}
+	setMyBlockRules(rules: BlockRule[]): Promise<BlockRule[]> {
+		return this.opts.hosted.setMyBlockRules!(rules);
 	}
 
 	// --- profile ---
@@ -685,8 +697,23 @@ export class CompositeBackend implements Backend {
 	setScanlatorAi(name: string, ai: ScanlatorAi | null): Promise<boolean> {
 		return this.opts.hosted.setScanlatorAi!(name, ai);
 	}
+	scanlatorSites(): Promise<ScanlatorSite[]> {
+		return this.opts.hosted.scanlatorSites!();
+	}
+	setSourceAi(sourceId: string, ai: ScanlatorAi | null): Promise<boolean> {
+		return this.opts.hosted.setSourceAi!(sourceId, ai);
+	}
+	siteBlockRules(): Promise<BlockRule[]> {
+		return this.opts.hosted.siteBlockRules!();
+	}
+	setSiteBlockRules(rules: BlockRule[]): Promise<BlockRule[]> {
+		return this.opts.hosted.setSiteBlockRules!(rules);
+	}
 	setRegistrationOpen(open: boolean): Promise<boolean> {
 		return this.opts.hosted.setRegistrationOpen!(open);
+	}
+	setShowMangadexRatings(shown: boolean): Promise<boolean> {
+		return this.opts.hosted.setShowMangadexRatings!(shown);
 	}
 
 	// --- admin access + Cloudflare setup (hosted server only) ---

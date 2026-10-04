@@ -197,7 +197,8 @@ pub async fn init(database_url: &str) -> Result<Database> {
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         // Map projected growth up to 8 GiB. This reserves virtual address space;
-        // only pages actually read become resident. Litestream owns checkpoints.
+        // only pages actually read become resident. .cargo/config.toml raises the
+        // bundled SQLite ceiling to match. Litestream owns checkpoints.
         .pragma("mmap_size", "8589934592")
         .pragma("cache_size", "-16000")
         .pragma("temp_store", "MEMORY");
@@ -274,6 +275,15 @@ pub async fn connect_existing_covers(database_url: &str) -> Result<Database> {
         2,
     )
     .await?;
+    let version = sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+        .fetch_one(&pool)
+        .await;
+    if !matches!(version, Ok(1)) {
+        pool.close().await;
+        anyhow::bail!(
+            "cover cache schema is behind or unsupported; start the server to upgrade it first"
+        );
+    }
     if let Err(error) = sqlx::query("SELECT work_id, version FROM work_cover_blob LIMIT 1")
         .fetch_optional(&pool)
         .await
@@ -304,84 +314,100 @@ async fn open_covers(database_url: &str) -> Result<Database> {
         .pragma("temp_store", "MEMORY");
     let pool = Database::connect_with(opts, 4).await?;
     let schema = async {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS work_cover_blob (\
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await?;
+        anyhow::ensure!(
+            version <= 1,
+            "cover cache schema version {version} is newer than this server supports"
+        );
+        if version == 0 {
+            // Version zero is the legacy inline schema. Upgrade it atomically without
+            // discarding cached blobs; future changes get their own version branch.
+            let mut transaction = pool.begin().await?;
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS work_cover_blob (\
              work_id    TEXT PRIMARY KEY,\
              webp       BLOB NOT NULL,\
              version    INTEGER NOT NULL,\
              updated_at TEXT NOT NULL\
          )",
-        )
-        .execute(&pool)
-        .await?;
-        // Resized, origin-cached Suwayomi SOURCE covers, keyed by numeric Suwayomi manga
-        // id. The discovery/browse/search feeds hand back the raw `/api/v1/manga/{id}/
-        // thumbnail` proxy path (full-resolution, up to several MB), so `serve_suwayomi_image`
-        // downscales each cover to a bounded WebP on first request and caches it here.
-        // Same rationale as `work_cover_blob`: large, re-derivable, and deliberately
-        // excluded from Litestream backup.
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS suwayomi_cover_blob (\
+            )
+            .execute(&mut *transaction)
+            .await?;
+            // Resized, origin-cached Suwayomi SOURCE covers, keyed by numeric Suwayomi manga
+            // id. The discovery/browse/search feeds hand back the raw `/api/v1/manga/{id}/
+            // thumbnail` proxy path (full-resolution, up to several MB), so `serve_suwayomi_image`
+            // downscales each cover to a bounded WebP on first request and caches it here.
+            // Same rationale as `work_cover_blob`: large, re-derivable, and deliberately
+            // excluded from Litestream backup.
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS suwayomi_cover_blob (\
              manga_id   INTEGER PRIMARY KEY,\
              webp       BLOB NOT NULL,\
              updated_at TEXT NOT NULL\
          )",
-        )
-        .execute(&pool)
-        .await?;
-        // Card-sized derivatives of the two cover masters above, generated lazily when a
-        // request asks for an allowlisted `?w=` (see `cover::VARIANT_WIDTHS`). `asset_key`
-        // namespaces the families that share this table: `w_…` for a canonical work,
-        // `s:<manga_id>` for a Suwayomi source cover. Purely derived and re-generable from
-        // the master on the next request, so — like the masters — it is deliberately
-        // excluded from Litestream backup, and dropping the table is always safe.
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS cover_variant (\
+            )
+            .execute(&mut *transaction)
+            .await?;
+            // Card-sized derivatives of the two cover masters above, generated lazily when a
+            // request asks for an allowlisted `?w=` (see `cover::VARIANT_WIDTHS`). `asset_key`
+            // namespaces the families that share this table: `w_…` for a canonical work,
+            // `s:<manga_id>` for a Suwayomi source cover. Purely derived and re-generable from
+            // the master on the next request, so — like the masters — it is deliberately
+            // excluded from Litestream backup, and dropping the table is always safe.
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS cover_variant (\
              asset_key  TEXT NOT NULL,\
              width      INTEGER NOT NULL,\
              webp       BLOB NOT NULL,\
              updated_at TEXT NOT NULL,\
              PRIMARY KEY (asset_key, width)\
          )",
-        )
-        .execute(&pool)
-        .await?;
-        // Durable cursors for one-shot maintenance passes over this DB. One row per pass,
-        // holding the highest key it has already handled, so a restart resumes instead of
-        // re-scanning 20 GB of blobs. Lives here (not the main DB) because both the data it
-        // walks and the progress marker are cover-cache state: dropping this file loses the
-        // cursor and the covers together, which is consistent, and neither needs backup.
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS cover_maintenance (\
+            )
+            .execute(&mut *transaction)
+            .await?;
+            // Durable cursors for one-shot maintenance passes over this DB. One row per pass,
+            // holding the highest key it has already handled, so a restart resumes instead of
+            // re-scanning 20 GB of blobs. Lives here (not the main DB) because both the data it
+            // walks and the progress marker are cover-cache state: dropping this file loses the
+            // cursor and the covers together, which is consistent, and neither needs backup.
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS cover_maintenance (\
              key        TEXT PRIMARY KEY,\
              cursor     TEXT NOT NULL,\
              done       INTEGER NOT NULL DEFAULT 0,\
              updated_at TEXT NOT NULL\
          )",
-        )
-        .execute(&pool)
-        .await?;
-        // Extension icons Keiyoushi published AFTER the vendored snapshot in
-        // `assets/ext-icons/` was taken (refreshed by `scripts/fetch-ext-icons.mjs`).
-        // The baked-in set is authoritative and answers essentially every request;
-        // this table only backfills extensions added upstream since, so the icons
-        // don't go stale between snapshot refreshes. Same rationale as the cover
-        // tables for living here: re-derivable from Keiyoushi, so deliberately
-        // excluded from Litestream backup.
-        //
-        // An EMPTY `png` is a tombstone, not an icon: ~41 extensions publish no icon
-        // in either source, and without a recorded miss every request for one would
-        // re-fetch from Keiyoushi. `serve_ext_icon` serves 404 for a tombstone and
-        // only re-checks upstream once it ages past its TTL.
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS extension_icon_blob (\
+            )
+            .execute(&mut *transaction)
+            .await?;
+            // Extension icons Keiyoushi published AFTER the vendored snapshot in
+            // `assets/ext-icons/` was taken (refreshed by `scripts/fetch-ext-icons.mjs`).
+            // The baked-in set is authoritative and answers essentially every request;
+            // this table only backfills extensions added upstream since, so the icons
+            // don't go stale between snapshot refreshes. Same rationale as the cover
+            // tables for living here: re-derivable from Keiyoushi, so deliberately
+            // excluded from Litestream backup.
+            //
+            // An EMPTY `png` is a tombstone, not an icon: ~41 extensions publish no icon
+            // in either source, and without a recorded miss every request for one would
+            // re-fetch from Keiyoushi. `serve_ext_icon` serves 404 for a tombstone and
+            // only re-checks upstream once it ages past its TTL.
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS extension_icon_blob (\
              pkg_name   TEXT PRIMARY KEY,\
              png        BLOB NOT NULL,\
              updated_at TEXT NOT NULL\
          )",
-        )
-        .execute(&pool)
-        .await?;
+            )
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query("PRAGMA user_version = 1")
+                .execute(&mut *transaction)
+                .await?;
+            transaction.commit().await?;
+        }
         // Touch every cache table's key index, without reading the 20 GB of blobs.
         // Open/schema failures and corruption found here take the same recovery path.
         for table in [
@@ -395,12 +421,12 @@ async fn open_covers(database_url: &str) -> Result<Database> {
                 .fetch_one(&pool)
                 .await?;
         }
-        Ok::<(), sqlx::Error>(())
+        Ok::<(), anyhow::Error>(())
     }
     .await;
     if let Err(error) = schema {
         pool.close().await;
-        return Err(error.into());
+        return Err(error);
     }
     Ok(pool)
 }
@@ -586,6 +612,75 @@ async fn refresh_statistics(pool: &Database) {
 #[cfg(test)]
 mod boot_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn main_pool_maps_projected_eight_gib_on_reader_and_writer() {
+        let scratch = Scratch::new();
+        let pool = init(&scratch.url("main.sqlite3")).await.unwrap();
+        for connection_pool in [pool.read(), pool.write()] {
+            let effective: i64 = sqlx::query_scalar("PRAGMA mmap_size")
+                .fetch_one(connection_pool)
+                .await
+                .unwrap();
+            assert!(
+                effective >= 8 * 1024 * 1024 * 1024,
+                "SQLite capped mmap_size at {effective} bytes"
+            );
+        }
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn cover_schema_version_upgrades_legacy_data_and_rejects_future_versions() {
+        let scratch = Scratch::new();
+        let url = scratch.url("covers.sqlite3");
+        let legacy = Database::connect_with(
+            SqliteConnectOptions::from_str(&url)
+                .unwrap()
+                .create_if_missing(true),
+            2,
+        )
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE work_cover_blob(work_id TEXT PRIMARY KEY,webp BLOB NOT NULL,version INTEGER NOT NULL,updated_at TEXT NOT NULL); INSERT INTO work_cover_blob VALUES ('w_test',x'0102',7,'2026-01-01')")
+            .execute(&legacy).await.unwrap();
+        legacy.close().await;
+        let upgraded = init_covers(&url).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                .fetch_one(&upgraded)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Vec<u8>>(
+                "SELECT webp FROM work_cover_blob WHERE work_id='w_test'"
+            )
+            .fetch_one(&upgraded)
+            .await
+            .unwrap(),
+            vec![1, 2]
+        );
+        sqlx::query("PRAGMA user_version=99")
+            .execute(&upgraded)
+            .await
+            .unwrap();
+        upgraded.close().await;
+        assert!(init_covers(&url)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("newer"));
+        assert_eq!(
+            std::fs::read_dir(&scratch.0)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains("quarantined"))
+                .count(),
+            0
+        );
+    }
 
     struct Scratch(PathBuf);
 

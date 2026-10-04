@@ -44,19 +44,11 @@ const WINDOW_OFFSET_CAP: i64 = 9_900;
 /// 5xx that slipped the retry layer, momentary index lag), so we retry rather than
 /// truncate the seed. Retries are naturally paced by the 4/s token bucket.
 const EMPTY_PAGE_RETRIES: u32 = 3;
-/// How many times to retry a single work upsert that failed with a transient SQLite
-/// "database is locked" (BUSY). During a full seed the cover drainer + scan scheduler
-/// also write the main DB, and even with `busy_timeout` a burst can return BUSY; a
-/// dropped work stays missing until the next full seed, so it's worth a few retries.
-
 /// Cap on a cover-thumbnail body read. The 512px thumbnails are tens of KB, so this is
 /// purely a safety bound against an unbounded/hostile body (`Response::bytes` is
 /// otherwise limited only by the 30s client timeout). Matches the 8 MB pre-decode cap
 /// the upload paths use (`media::MAX_UPLOAD_BYTES`, `avatar::MAX_UPLOAD_BYTES`).
 const MAX_COVER_FETCH_BYTES: usize = 8 * 1024 * 1024;
-
-/// Transient SQLite lock/BUSY predicate. Single definition in `db` so the scanner's
-/// retry loop and this one agree on what "transient" means.
 
 /// Which timestamp a sweep windows on. The full seed walks the whole catalogue by
 /// `createdAt`; recurring incremental refreshes walk only recently-changed records by
@@ -3366,7 +3358,7 @@ pub struct GroupFill {
 /// chapters on the work-list. Distinct `w_` work ids, in no particular order.
 ///
 /// COMPUTED ONCE PER DRAIN RUN, NOT PER BATCH. This used to be a CTE inside the batch query,
-/// which meant every 2 s batch re-read all of `user_library`, `canonical_library` and
+/// which meant every 2 s batch re-read all of `user_library` and
 /// `canonical_progress` and re-sorted `series_views` to learn a set that changes on the
 /// scale of minutes. `spawn_group_backfill` now calls this at the start of a run and every
 /// [`GROUP_BACKFILL_HOT_REFRESH_EVERY`] batches, and hands the result to
@@ -3395,7 +3387,6 @@ pub struct GroupFill {
 async fn group_backfill_hot_works(pool: &crate::db::Database) -> Result<Vec<String>> {
     const HOT_WORKS_SQL: &str = "WITH keys(k) AS ( \
              SELECT series_id FROM user_library \
-             UNION SELECT work_id FROM canonical_library \
              UNION SELECT work_id FROM canonical_progress \
              UNION SELECT k FROM (SELECT series_key AS k FROM series_views \
                                    ORDER BY total DESC LIMIT ?) \
@@ -4313,7 +4304,6 @@ pub fn spawn_recurring(
     cover_phash: bool,
     interval_secs: u64,
     chapter_interval_secs: u64,
-    reconcile_interval_secs: u64,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     // Supervisor: run the loop in a child task and, if it panics, restart it after
@@ -4327,7 +4317,6 @@ pub fn spawn_recurring(
                 cover_phash,
                 interval_secs,
                 chapter_interval_secs,
-                reconcile_interval_secs,
                 shutdown.clone(),
             ));
             match handle.await {
@@ -4354,31 +4343,10 @@ async fn run_recurring(
     cover_phash: bool,
     interval_secs: u64,
     chapter_interval_secs: u64,
-    reconcile_interval_secs: u64,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    // Start 60s behind the scanner so the boot burst is spread across the five
-    // background loops rather than landing in one instant — see scanner::run_loop.
-    // THREE CADENCES, NOT ONE (Phases C3 + D). They used to be the same tick, which meant
-    // the cheapest and most time-critical of the three — the chapter firehose — ran at the
-    // pace of the most expensive.
-    //
-    //   catalogue   6 h  — thousands of records; genuinely slow-changing.
-    //   chapters   15 m  — ~75 chapters an incremental pass. This is the freshness knob.
-    //   reconcile  24 h  — the demoted wholesale chain, now a drift REPORT (C3).
-    //
-    // Staggered starts so the boot burst is spread rather than landing in one instant, and
-    // `Delay` on all three so a long pass postpones the next tick instead of queueing a
-    // backlog. They share `CATALOGUE_SYNC_RUNNING`, so two sweeps can never interleave.
-    //
-    // THE SWITCH (module doc). The outer loop parks until MangaDex is on, then runs the
-    // three tickers until it goes off again, and parks again. The tickers are rebuilt on
-    // every resume with the same staggered first ticks, so an admin turning MangaDex on
-    // at runtime gets a catalogue pass a minute later, exactly as a boot with it on
-    // does. A pass in flight when the switch goes off is not cancelled: its next
-    // request fails at the client gate, the cycle ends with its cursor unchanged (the
-    // ordinary failed-cycle path), and the loop then sees the flip and parks. With the
-    // switch pinned on by `CATALOGUE_SYNC=on` this is the old loop, unchanged.
+    // The two upstream sweeps pause with MangaDex. Local catalogue/FTS repair runs
+    // on its own loop, so disabled upstreams cannot strand search updates.
     let mut switch = client.subscribe();
     'resume: loop {
         if client.wait_enabled("catalogue sync", &mut shutdown).await {
@@ -4395,15 +4363,9 @@ async fn run_recurring(
             std::time::Duration::from_secs(chapter_interval_secs),
         );
         chapters.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut reconcile = tokio::time::interval_at(
-            tokio::time::Instant::now() + std::time::Duration::from_secs(300),
-            std::time::Duration::from_secs(reconcile_interval_secs),
-        );
-        reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tracing::info!(
             interval_secs,
             chapter_interval_secs,
-            reconcile_interval_secs,
             cover_phash,
             "mangadex: recurring sync started"
         );
@@ -4419,10 +4381,51 @@ async fn run_recurring(
                     // 15-minute cadence affordable at all.
                     chapter_cycle(&pool, &client).await;
                 }
-                _ = reconcile.tick() => {
-                    // Phase C3: rebuild everything and report what the incremental writers
-                    // missed. `drifted == 0` is the healthy answer, and it is the evidence that
-                    // the incremental path is actually correct rather than merely present.
+                r = switch.changed() => {
+                    if r.is_ok() && !*switch.borrow_and_update() {
+                        tracing::info!("mangadex: switched off — recurring sync paused");
+                        continue 'resume;
+                    }
+                }
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        tracing::info!("mangadex: recurring sync stopping");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn spawn_reconciler(
+    pool: crate::db::Database,
+    interval_secs: u64,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(crate::task::supervise(
+        "catalogue-reconcile",
+        Duration::from_secs(30),
+        shutdown.clone(),
+        move || run_reconcile_loop(pool.clone(), interval_secs, shutdown.clone()),
+    ));
+}
+
+async fn run_reconcile_loop(
+    pool: crate::db::Database,
+    interval_secs: u64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(300),
+        Duration::from_secs(interval_secs.max(1)),
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => return,
+            _ = ticker.tick() => {
                     match crate::catalog::ledger::reconcile_feed(&pool).await {
                         Ok(r) if r.drifted == 0 => tracing::info!(
                             rows = r.rows_after,
@@ -4439,19 +4442,6 @@ async fn run_recurring(
                         ),
                         Err(e) => tracing::warn!(error = %e, "feed reconciler: failed"),
                     }
-                }
-                r = switch.changed() => {
-                    if r.is_ok() && !*switch.borrow_and_update() {
-                        tracing::info!("mangadex: switched off — recurring sync paused");
-                        continue 'resume;
-                    }
-                }
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        tracing::info!("mangadex: recurring sync stopping");
-                        return;
-                    }
-                }
             }
         }
     }
@@ -4471,6 +4461,36 @@ mod tests {
             .await
             .unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn local_reconcile_runs_when_mangadex_is_disabled() {
+        let pool = pool().await;
+        let client = std::sync::Arc::new(MangaDexClient::new("komiq-test", 100.0, 100.0));
+        client.set_enabled(false);
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        spawn_recurring(pool.clone(), client, false, 21600, 900, shutdown.clone());
+        spawn_reconciler(pool.clone(), 86400, shutdown);
+        tokio::task::yield_now().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(301)).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed_reconcile_report")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                if count > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("disabled upstream prevented local reconciliation");
+        stop.send(true).unwrap();
+        pool.close().await;
     }
 
     // --- the MangaDex half's incremental feed writer ---------------------------------
@@ -6035,7 +6055,7 @@ mod tests {
             }
         };
         let in_library = work("lib-uuid", true).await;
-        let in_canon_library = work("canon-lib-uuid", true).await;
+        let in_work_library = work("canon-lib-uuid", true).await;
         let in_progress = work("progress-uuid", true).await;
         let most_viewed = work("viewed-uuid", true).await;
         let drained = work("drained-uuid", false).await;
@@ -6057,8 +6077,8 @@ mod tests {
         )
         .await;
         exec(
-            "INSERT INTO canonical_library (user_id, work_id, created_at) VALUES ('u1', ?, 'now')",
-            in_canon_library.clone(),
+            "INSERT INTO user_library (user_id, series_id, created_at) VALUES ('u1', ?, 'now')",
+            in_work_library.clone(),
         )
         .await;
         exec(
@@ -6074,7 +6094,7 @@ mod tests {
         .await;
         // Hot but fully drained: must not cost a probe per batch.
         exec(
-            "INSERT INTO canonical_library (user_id, work_id, created_at) VALUES ('u1', ?, 'now')",
+            "INSERT INTO user_library (user_id, series_id, created_at) VALUES ('u1', ?, 'now')",
             drained.clone(),
         )
         .await;
@@ -6087,7 +6107,7 @@ mod tests {
 
         let mut got = group_backfill_hot_works(&pool).await.unwrap();
         got.sort_unstable();
-        let mut want = vec![in_library, in_canon_library, in_progress, most_viewed];
+        let mut want = vec![in_library, in_work_library, in_progress, most_viewed];
         want.sort_unstable();
         assert_eq!(got, want);
     }

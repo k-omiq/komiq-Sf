@@ -169,6 +169,27 @@ export function isPrivateAddress(address: string): boolean {
 }
 
 /**
+ * Whether the server takes a client that typed `address` for one on the internet: a
+ * public IP address, or a name no home network hands out (`typed_host` in the server's
+ * direct.rs). With "Only my devices" it refuses such a client over plain HTTP.
+ */
+export function typedFromInternet(address: string): boolean {
+	if (isPrivateAddress(address)) return false;
+	let host = address.trim();
+	try {
+		host = new URL(host.includes('://') ? host : `http://${host}`).hostname;
+	} catch {
+		// A bare IPv6 address is not a URL host: test it as typed.
+	}
+	host = host
+		.replace(/^\[|\]$/g, '')
+		.replace(/\.$/, '')
+		.toLowerCase();
+	if (/^[\d.]+$/.test(host) || host.includes(':')) return true;
+	return host.includes('.') && !/\.(local|lan|home|internal|localdomain|home\.arpa)$/.test(host);
+}
+
+/**
  * The detected public address as the "Server address" field wants it: alone when the
  * server gets a certificate for it, with the plain HTTP port otherwise.
  */

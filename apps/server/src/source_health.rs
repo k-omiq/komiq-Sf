@@ -325,7 +325,7 @@ async fn persist_buffer(pool: &Database, drained: HashMap<Key, Entry>) -> Result
         if let SubjectKey::Manga(id) = subject {
             if !source_of.contains_key(id) {
                 let source: Option<String> = sqlx::query_scalar(
-                    "SELECT source_id FROM source_series \
+                    "SELECT COALESCE(source_id, '') FROM source_series \
                       WHERE source_type = 'suwayomi' AND source_key = ? LIMIT 1",
                 )
                 .bind(id.to_string())

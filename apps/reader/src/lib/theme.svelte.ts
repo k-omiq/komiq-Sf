@@ -8,8 +8,11 @@
  *    preset and a colour the reader picked go through the same rules. The default
  *    palette sets neither and leaves the tokens as they are.
  *  - pure black: `data-black`, a true-black background for the dark theme.
+ *  - MangaDex ratings: `data-md-ratings="off"` hides MangaDex's rating wherever a
+ *    rating is shown ($lib/components/Ratings.svelte owns the rule), so a card says
+ *    the same thing on its first paint as after the app has started.
  *
- * A no-FOUC script (static/theme-init.js) applies the same three before first paint;
+ * A no-FOUC script (static/theme-init.js) applies the same four before first paint;
  * `initTheme()` re-syncs the reactive store on mount and tracks OS changes while the
  * mode is "system". Both read the same two keys: keep them in step.
  */
@@ -45,7 +48,8 @@ export const PALETTES: readonly Palette[] = [
 ];
 
 const MODE_KEY = 'komika-theme';
-/** `{ palette, seed, custom, black }` — `seed` is what theme-init.js applies. */
+/** `{ palette, seed, custom, black, md }` — `seed` is what theme-init.js applies, and
+ * `md` is false only when the reader turned MangaDex ratings off. */
 const LOOK_KEY = 'komiq-look';
 const HEX = /^#[0-9a-f]{6}$/i;
 
@@ -56,7 +60,15 @@ export const theme = $state<{
 	/** The reader's own colour, kept while a preset is in use. */
 	custom: string;
 	pureBlack: boolean;
-}>({ pref: 'system', palette: DEFAULT_PALETTE, custom: '#7c6cf0', pureBlack: false });
+	/** Show MangaDex's rating next to our own readers' rating. */
+	mdRatings: boolean;
+}>({
+	pref: 'system',
+	palette: DEFAULT_PALETTE,
+	custom: '#7c6cf0',
+	pureBlack: false,
+	mdRatings: true,
+});
 
 function systemDark(): boolean {
 	return typeof matchMedia !== 'undefined' && matchMedia('(prefers-color-scheme: dark)').matches;
@@ -89,6 +101,8 @@ function apply(): void {
 	}
 	if (theme.pureBlack) root.dataset.black = '';
 	else delete root.dataset.black;
+	if (theme.mdRatings) delete root.dataset.mdRatings;
+	else root.dataset.mdRatings = 'off';
 	// The browser / OS bar around the page. A palette tints the background by a few
 	// percent only, so the untinted value is close enough here.
 	const bar = mode === 'light' ? '#f4f2ee' : theme.pureBlack ? '#000000' : '#0c0c0d';
@@ -105,6 +119,7 @@ function save(): void {
 				seed: seed(),
 				custom: theme.custom,
 				black: theme.pureBlack,
+				md: theme.mdRatings,
 			}),
 		);
 	} catch {
@@ -123,6 +138,7 @@ export function initTheme(): void {
 			theme.palette = look.palette;
 		}
 		theme.pureBlack = look.black === true;
+		theme.mdRatings = look.md !== false;
 	} catch {
 		/* private mode or a damaged value: keep the defaults */
 	}
@@ -162,7 +178,15 @@ export function setPureBlack(on: boolean): void {
 	apply();
 }
 
-/** Back to the look of a fresh install. */
+/** Show or hide MangaDex's rating next to our own readers' rating, on this device. */
+export function setMdRatings(on: boolean): void {
+	theme.mdRatings = on;
+	save();
+	apply();
+}
+
+/** Back to the look of a fresh install. What is shown (MangaDex ratings) is not a
+ * look and stays as it is. */
 export function resetTheme(): void {
 	theme.pref = 'system';
 	theme.palette = DEFAULT_PALETTE;

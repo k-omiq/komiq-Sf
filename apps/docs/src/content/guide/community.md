@@ -9,6 +9,17 @@ Use the reader app to share ratings, discuss series and chapters, and report cat
 
 Every series in the connected server’s catalogue can receive a community rating on a scale from 1 to 10 stars.
 
+### Two ratings
+
+A series can show two ratings, and each has its own mark:
+
+- **The yellow star** is the average score from readers on the connected server. This is the rating you add to when you rate a series.
+- **The orange star** is the rating from MangaDex. It appears only when MangaDex has a rating for the series.
+
+A cover shows the yellow star first and the orange star under it. A series with one rating shows that one only. A card says `Unrated` when there is no rating to show.
+
+You can hide the MangaDex rating in [Settings](/guide/accounts#mangadex-ratings).
+
 ### Submit a rating
 
 To rate a series, open its series page:

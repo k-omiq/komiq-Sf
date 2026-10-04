@@ -60,6 +60,16 @@ pub const MANGADEX_ENABLED: Setting = Setting {
     default: "true",
 };
 
+/// Whether the API hands out MangaDex's community rating next to our own readers'
+/// rating (`Series.mangadexRating`, `UpdateFeedRow.mangadexRating`). Off: every
+/// surface carries our own rating only. Separate from [`MANGADEX_ENABLED`]: that one
+/// decides whether the server talks to MangaDex, this one what the reader is shown.
+pub const SHOW_MANGADEX_RATINGS: Setting = Setting {
+    key: "show_mangadex_ratings",
+    env: "KOMIKA_MANGADEX_RATINGS",
+    default: "true",
+};
+
 /// The resolved usage switch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MangadexUsage {
@@ -204,8 +214,9 @@ pub const TRUSTED_PROXY_CIDRS: Setting = Setting {
 
 /// The wizard's access choice: `local` (only my devices), `internet` (a domain with
 /// Cloudflare in front) or `direct` (public at the server's own address, nothing in
-/// front). Display only: it decides what Settings › Access shows, not what the server
-/// listens on. Empty until someone chooses.
+/// front). It decides what Settings › Access shows, not what the server listens on.
+/// One choice acts: with `local`, the plain HTTP port refuses clients on the internet
+/// (`cloudflare::plain_http_guard`). Empty until someone chooses.
 pub const ACCESS_MODE: Setting = Setting {
     key: "access_mode",
     env: "",
@@ -295,29 +306,44 @@ pub async fn resolve_with(
     s: &Setting,
     env: impl Fn(&str) -> Option<String>,
 ) -> Resolved {
+    resolve_with_checked(pool, s, env)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(error = %error, key = s.key, "instance_setting read failed");
+            Resolved {
+                value: s.default.to_string(),
+                source: Source::Default,
+            }
+        })
+}
+
+/// Resolve a request-path setting without disguising a failed database read as
+/// its default. Callers that memoize a response must propagate this error.
+pub async fn resolve_checked(pool: &Database, s: &Setting) -> sqlx::Result<Resolved> {
+    resolve_with_checked(pool, s, |name| std::env::var(name).ok()).await
+}
+
+async fn resolve_with_checked(
+    pool: &Database,
+    s: &Setting,
+    env: impl Fn(&str) -> Option<String>,
+) -> sqlx::Result<Resolved> {
     if let Some(v) = Some(s.env)
         .filter(|name| !name.is_empty())
         .and_then(&env)
         .filter(|v| !v.trim().is_empty())
     {
-        return Resolved {
+        return Ok(Resolved {
             value: v,
             source: Source::Env,
-        };
+        });
     }
     let stored: Option<String> =
         sqlx::query_scalar("SELECT value FROM instance_setting WHERE key = ?")
             .bind(s.key)
             .fetch_optional(pool)
-            .await
-            // A read failure must not take the setting down with it: log it and
-            // fall through to the default.
-            .inspect_err(
-                |e| tracing::warn!(error = %e, key = s.key, "instance_setting read failed"),
-            )
-            .ok()
-            .flatten();
-    match stored {
+            .await?;
+    Ok(match stored {
         Some(value) => Resolved {
             value,
             source: Source::Table,
@@ -326,7 +352,7 @@ pub async fn resolve_with(
             value: s.default.to_string(),
             source: Source::Default,
         },
-    }
+    })
 }
 
 /// Store `value` for `s` (upsert). The caller decides whether an env override

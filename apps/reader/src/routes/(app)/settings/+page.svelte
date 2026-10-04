@@ -1,8 +1,10 @@
 <script lang="ts">
 	// The settings screen. Everything about the look and the chapter reader is kept on
-	// this device and works signed out; the content filter is the account's own setting
-	// on the server, so it needs a session.
-	import { isTauri } from '@komika/api';
+	// this device and works signed out; the content filter and the block rules are the
+	// account's own settings on the server, so they need a session.
+	import { tick } from 'svelte';
+	import { isTauri, type BlockRule, type ContentRating } from '@komika/api';
+	import type { TagInfo } from '@komika/types';
 	import Icon from '$lib/components/Icon.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import Dropdown from '$lib/components/Dropdown.svelte';
@@ -16,13 +18,14 @@
 		fetchOnDevice,
 		saveFetchOnDevice,
 	} from '$lib/config';
-	import { fetchLocked, loadInstance } from '$lib/instance.svelte';
+	import { fetchLocked, instance, loadInstance } from '$lib/instance.svelte';
 	import { connectScreen, engineSupported } from '$lib/server-connect.svelte';
 	import {
 		CUSTOM_PALETTE,
 		PALETTES,
 		resetTheme,
 		setCustomColor,
+		setMdRatings,
 		setPalette,
 		setPureBlack,
 		setTheme,
@@ -44,6 +47,20 @@
 		type ReaderPrefs,
 	} from '$lib/reader-prefs';
 	import { clearPreferredTranslators, translatorPrefs } from '$lib/data/translator-pref.svelte';
+	import { getBrowseTags } from '$lib/data/source';
+	import { shelveTags } from '$lib/data/browse-filters';
+	import {
+		RATINGS,
+		RATING_LABEL,
+		RULE_PROBLEM_TEXT,
+		canonicalRule,
+		ruleKey,
+		ruleProblem,
+		ruleText,
+		sameRule,
+		uniqueRules,
+	} from '$lib/data/block-rules';
+	import { blockRulesChanged } from '$lib/block-rules.svelte';
 
 	// --- Appearance -------------------------------------------------------------
 	const THEME_MODES: { value: ThemePref; label: string }[] = [
@@ -96,6 +113,149 @@
 			savingNsfw = false;
 		}
 	}
+
+	// Blocked content: the viewer's own block rules (see $lib/data/block-rules). Kept on
+	// the server like the NSFW setting, so they need a session. A change saves at once:
+	// the whole list goes up and the stored list comes back.
+	const canBlock = !!backend.myBlockRules && !!backend.setMyBlockRules;
+	let rules = $state.raw<BlockRule[]>([]);
+	// 'old' is a server that predates the rules. The block is left out there.
+	let rulesState = $state<'idle' | 'loading' | 'ready' | 'failed' | 'old'>('idle');
+	let rulesAttempt = $state(0);
+	let savingRules = $state(false);
+	let rulesError = $state('');
+	$effect(() => {
+		void rulesAttempt; // "Try again" runs this once more
+		if (!canBlock || !auth.user?.id) {
+			rules = [];
+			rulesState = 'idle';
+			return;
+		}
+		let cancelled = false;
+		rulesState = 'loading';
+		backend.myBlockRules!().then(
+			(list) => {
+				if (cancelled) return;
+				rules = uniqueRules(list);
+				rulesState = 'ready';
+			},
+			(err) => {
+				if (cancelled) return;
+				const msg = err instanceof Error ? err.message : String(err);
+				rulesState = msg.includes('Unknown field "myBlockRules"') ? 'old' : 'failed';
+			},
+		);
+		return () => {
+			cancelled = true;
+		};
+	});
+
+	// The tag vocabulary, for the picker and for the names in a rule's text. Only the
+	// real tag list is offered: the legacy genre fallback has no stable ids. With no
+	// list the form still makes rating-only rules, and a rule shows its tag ids.
+	let tagList = $state.raw<TagInfo[]>([]);
+	let tagsReady = $state(false);
+	let tagsAsked = false;
+	$effect(() => {
+		if (!canBlock || !auth.user?.id || tagsAsked) return;
+		tagsAsked = true;
+		void getBrowseTags().then((r) => {
+			if (r.source === 'tags') tagList = r.tags;
+			tagsReady = true;
+		});
+	});
+	const tagNames = $derived(new Map(tagList.map((t) => [t.id, t.name])));
+	const tagName = (id: string) => tagNames.get(id);
+
+	// The rule being put together.
+	let draftTags = $state<string[]>([]);
+	let draftRatings = $state<ContentRating[]>([]);
+	let tagNeedle = $state('');
+	let showAllTags = $state(false);
+	let ruleAdded = $state(false);
+	const draftProblem = $derived(ruleProblem({ tags: draftTags, ratings: draftRatings }, rules));
+	const draftNote = $derived(
+		draftProblem && draftProblem !== 'empty'
+			? RULE_PROBLEM_TEXT[draftProblem]
+			: ruleAdded
+				? 'Rule added.'
+				: '',
+	);
+	// Grouped and A to Z like Browse's picker. A picked tag stays in the list whatever
+	// the search says, so the draft can always be seen and undone.
+	const tagShelves = $derived(
+		shelveTags(tagList, tagNeedle, { includedTags: draftTags, excludedTags: [] }),
+	);
+	const browsingTags = $derived(showAllTags || tagNeedle.trim() !== '');
+	const pickedTags = $derived(tagList.filter((t) => draftTags.includes(t.id)));
+
+	let rulesEl = $state<HTMLElement | null>(null);
+	let addEl = $state<HTMLElement | null>(null);
+	const focusAddForm = () => addEl?.querySelector<HTMLElement>('input, button')?.focus();
+
+	async function toggleDraftTag(id: string, chip: HTMLElement): Promise<void> {
+		ruleAdded = false;
+		draftTags = draftTags.includes(id) ? draftTags.filter((t) => t !== id) : [...draftTags, id];
+		// A tag taken out of the draft can leave the list, and the focus with it.
+		await tick();
+		if (!chip.isConnected) focusAddForm();
+	}
+	function toggleDraftRating(rating: ContentRating): void {
+		ruleAdded = false;
+		draftRatings = draftRatings.includes(rating)
+			? draftRatings.filter((r) => r !== rating)
+			: [...draftRatings, rating];
+	}
+
+	async function saveRules(next: BlockRule[]): Promise<boolean> {
+		if (savingRules || !backend.setMyBlockRules) return false;
+		savingRules = true;
+		rulesError = '';
+		try {
+			rules = uniqueRules(await backend.setMyBlockRules(next));
+			// Lists fetched under the old rules must not come back.
+			blockRulesChanged();
+			return true;
+		} catch (err) {
+			rulesError = err instanceof Error ? err.message : 'Could not save your rules.';
+			return false;
+		} finally {
+			savingRules = false;
+		}
+	}
+	async function addRule(): Promise<void> {
+		if (draftProblem) return;
+		const sent = { tags: draftTags, ratings: draftRatings };
+		if (!(await saveRules([...rules, canonicalRule(sent)]))) return;
+		// The form stays usable while the save runs. A draft that was changed in that
+		// time is the start of the next rule, and is kept.
+		if (sameRule(sent, { tags: draftTags, ratings: draftRatings })) {
+			draftTags = [];
+			draftRatings = [];
+			tagNeedle = '';
+		}
+		ruleAdded = true;
+		// The button is disabled again with an empty draft; keep the focus in the form.
+		await tick();
+		focusAddForm();
+	}
+	async function removeRule(index: number): Promise<void> {
+		ruleAdded = false;
+		if (!(await saveRules(rules.filter((_, i) => i !== index)))) return;
+		// The pressed button is gone: go to the rule that took its place, else the form.
+		await tick();
+		const left = rulesEl?.querySelectorAll<HTMLElement>('.rule-remove');
+		if (left?.length) left[Math.min(index, left.length - 1)].focus();
+		else focusAddForm();
+	}
+
+	// MangaDex's rating next to our own readers' rating. Kept on this device (it is part
+	// of what a card looks like, see $lib/theme.svelte) and works signed out. A server
+	// whose admin turned them off sends none, so the switch has nothing to change there.
+	$effect(() => {
+		void loadInstance();
+	});
+	const mdRatingsOffHere = $derived(instance.info?.showMangadexRatings === false);
 
 	// --- Server -----------------------------------------------------------------
 	function origin(url: string): string {
@@ -168,6 +328,25 @@
 	>
 		<span class="knob"></span>
 	</button>
+{/snippet}
+
+<!-- A chip always has its icon, a plus or a check: the state does not rest on the
+     colour, and a chip that is pressed keeps its width, so its neighbours stay put. -->
+{#snippet chip(
+	label: string,
+	on: boolean,
+	onclick: (e: MouseEvent & { currentTarget: HTMLButtonElement }) => void,
+)}
+	<button type="button" class="chip k-hit" class:on aria-pressed={on} {onclick}>
+		<Icon name={on ? 'check' : 'plus'} size={13} strokeWidth={2.6} />
+		<span>{label}</span>
+	</button>
+{/snippet}
+
+{#snippet tagChip(tag: TagInfo)}
+	{@render chip(tag.name, draftTags.includes(tag.id), (e) =>
+		toggleDraftTag(tag.id, e.currentTarget),
+	)}
 {/snippet}
 
 <div class="wrap k-gutter">
@@ -386,6 +565,151 @@
 				)}
 			</div>
 			{#if nsfwError}<p class="error" role="alert">{nsfwError}</p>{/if}
+			<div class="row">
+				<label class="text" for="md-ratings-switch">
+					<span class="label">Show MangaDex ratings</span>
+					<span class="desc" id="md-ratings-switch-desc">
+						{#if mdRatingsOffHere}
+							This server does not show MangaDex ratings.
+						{:else}
+							The yellow star is the rating from readers here, and the orange star is the rating
+							from MangaDex. When this is off, you see the yellow star only. This choice is kept on
+							this device.
+						{/if}
+					</span>
+				</label>
+				{@render toggle(
+					'md-ratings-switch',
+					'Show MangaDex ratings',
+					theme.mdRatings && !mdRatingsOffHere,
+					() => setMdRatings(!theme.mdRatings),
+					mdRatingsOffHere,
+				)}
+			</div>
+			{#if canBlock && rulesState !== 'old'}
+				<div class="stack blocked">
+					<div class="text">
+						<span class="label" id="block-label">Blocked content</span>
+						<span class="desc">
+							Hide series by tag, by content rating, or by both. A series is hidden when it matches
+							any rule.
+							{#if auth.ready && !auth.user}Sign in to change this.{/if}
+						</span>
+					</div>
+					{#if rulesState === 'failed'}
+						<div class="row">
+							<p class="error" role="alert">Could not load your rules.</p>
+							<button type="button" class="btn k-hit" onclick={() => (rulesAttempt += 1)}>
+								Try again
+							</button>
+						</div>
+					{:else if rulesState === 'ready' && tagsReady}
+						{#if rules.length}
+							<ul class="rules" aria-labelledby="block-label" bind:this={rulesEl}>
+								{#each rules as rule, i (ruleKey(rule))}
+									{@const text = ruleText(rule, tagName)}
+									<li class="rule">
+										<span class="rule-text">{text}</span>
+										<!-- Not disabled while a save runs: that would drop the focus. A
+										     second press is ignored instead. -->
+										<button
+											type="button"
+											class="rule-remove k-hit"
+											aria-label={`Remove rule: ${text}`}
+											title="Remove rule"
+											onclick={() => removeRule(i)}
+										>
+											<Icon name="x" size={15} />
+										</button>
+									</li>
+								{/each}
+							</ul>
+						{/if}
+						{#if rulesError}<p class="error" role="alert">{rulesError}</p>{/if}
+						<div class="add" role="group" aria-label="Add rule" bind:this={addEl}>
+							{#if tagList.length}
+								<div class="field">
+									<span class="field-label" id="block-tags-label">Tags</span>
+									<input
+										type="search"
+										class="tag-search"
+										placeholder="Search tags"
+										aria-label="Search tags"
+										aria-controls="block-tags"
+										autocomplete="off"
+										bind:value={tagNeedle}
+									/>
+									<div
+										class="tag-list"
+										id="block-tags"
+										role="group"
+										aria-labelledby="block-tags-label"
+										aria-describedby="block-tags-hint"
+									>
+										{#if browsingTags}
+											{#each tagShelves as shelf (shelf.group)}
+												<div class="shelf" role="group" aria-label={shelf.label}>
+													<span class="shelf-label">{shelf.label}</span>
+													<div class="chips">
+														{#each shelf.tags as tag (tag.id)}{@render tagChip(tag)}{/each}
+													</div>
+												</div>
+											{:else}
+												<p class="desc">No tag matches this search.</p>
+											{/each}
+										{:else if pickedTags.length}
+											<div class="chips">
+												{#each pickedTags as tag (tag.id)}{@render tagChip(tag)}{/each}
+											</div>
+										{/if}
+									</div>
+									{#if !tagNeedle.trim()}
+										<button
+											type="button"
+											class="more k-hit"
+											aria-expanded={showAllTags}
+											aria-controls="block-tags"
+											onclick={() => (showAllTags = !showAllTags)}
+										>
+											{showAllTags ? 'Show fewer tags' : `Show all ${tagList.length} tags`}
+											<Icon name="chevron-down" size={13} />
+										</button>
+									{/if}
+									<span class="desc" id="block-tags-hint"
+										>A series must have all of these tags.</span
+									>
+								</div>
+							{/if}
+							<div class="field">
+								<span class="field-label" id="block-ratings-label">Content rating</span>
+								<div
+									class="chips"
+									role="group"
+									aria-labelledby="block-ratings-label"
+									aria-describedby="block-ratings-hint"
+								>
+									{#each RATINGS as rating (rating)}
+										{@render chip(RATING_LABEL[rating], draftRatings.includes(rating), () =>
+											toggleDraftRating(rating),
+										)}
+									{/each}
+								</div>
+								<span class="desc" id="block-ratings-hint">Leave empty for any rating.</span>
+							</div>
+							<div class="add-foot">
+								<button
+									type="button"
+									class="btn k-hit"
+									disabled={!!draftProblem}
+									aria-describedby="block-note"
+									onclick={addRule}>Add rule</button
+								>
+								<span class="desc" id="block-note" role="status">{draftNote}</span>
+							</div>
+						</div>
+					{/if}
+				</div>
+			{/if}
 		</div>
 	</section>
 
@@ -821,6 +1145,173 @@
 		color: var(--k-text-fainter);
 	}
 
+	/* ---- Blocked content ---------------------------------------------------- */
+	/* Soft fills and spacing only, like the rest of the page: no outlines. */
+	.blocked .error {
+		margin: 0;
+	}
+	.rules {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+	}
+	.rule {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 10px;
+		min-height: 44px;
+		padding: 4px 4px 4px 14px;
+		border-radius: 10px;
+		background: var(--k-surface-4);
+	}
+	.rule-text {
+		min-width: 0;
+		font-size: 13.5px;
+		font-weight: 600;
+		line-height: 1.35;
+		color: var(--k-text-1);
+		overflow-wrap: anywhere;
+	}
+	.rule-remove {
+		flex: 0 0 auto;
+		width: 36px;
+		height: 36px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border: none;
+		border-radius: 8px;
+		background: transparent;
+		color: var(--k-text-dim);
+		cursor: pointer;
+		transition:
+			background var(--k-dur) var(--k-ease),
+			color var(--k-dur) var(--k-ease);
+	}
+	.rule-remove:hover {
+		background: var(--k-hover-fill);
+		color: var(--k-text);
+	}
+	.add {
+		display: flex;
+		flex-direction: column;
+		gap: 16px;
+		margin-top: 4px;
+	}
+	.field {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		min-width: 0;
+	}
+	.field-label {
+		font-size: 12.5px;
+		font-weight: 700;
+		color: var(--k-text-2);
+	}
+	.tag-search {
+		width: 100%;
+		min-height: 38px;
+		padding: 0 12px;
+		border: none;
+		border-radius: 10px;
+		background: var(--k-surface-5);
+		color: var(--k-text);
+		font-family: inherit;
+		font-size: 13.5px;
+	}
+	.tag-search::placeholder {
+		color: var(--k-text-dim);
+		opacity: 1;
+	}
+	.tag-list {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+	}
+	.tag-list:empty {
+		display: none;
+	}
+	.shelf {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+	}
+	.shelf-label {
+		font-size: 11.5px;
+		font-weight: 600;
+		color: var(--k-text-faint);
+	}
+	.chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+	}
+	.chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		min-height: 34px;
+		padding: 0 13px 0 10px;
+		border: none;
+		border-radius: 999px;
+		background: var(--k-surface-5);
+		color: var(--k-text-2);
+		font-family: inherit;
+		font-size: 13px;
+		font-weight: 600;
+		text-align: left;
+		cursor: pointer;
+		transition:
+			background var(--k-dur) var(--k-ease),
+			color var(--k-dur) var(--k-ease);
+	}
+	.chip :global(svg) {
+		flex: 0 0 auto;
+	}
+	.chip:hover {
+		background: var(--k-border-4);
+		color: var(--k-text);
+	}
+	.chip.on {
+		background: var(--k-primary);
+		color: var(--k-on-primary);
+	}
+	.chip.on:hover {
+		background: var(--k-primary-hover);
+	}
+	.more {
+		align-self: flex-start;
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		min-height: 28px;
+		padding: 0;
+		border: none;
+		background: transparent;
+		color: var(--k-text-dim);
+		font-family: inherit;
+		font-size: 12.5px;
+		font-weight: 600;
+		cursor: pointer;
+	}
+	.more:hover {
+		color: var(--k-text);
+	}
+	.more[aria-expanded='true'] :global(svg) {
+		transform: rotate(180deg);
+	}
+	.add-foot {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px 12px;
+	}
+
 	@media (max-width: 640px) {
 		.wrap {
 			padding-top: 24px;
@@ -848,6 +1339,14 @@
 		}
 		.palettes {
 			grid-template-columns: repeat(auto-fill, minmax(76px, 1fr));
+		}
+		/* Finger-sized chips, and a search field iOS does not zoom into. */
+		.chip {
+			min-height: 40px;
+		}
+		.tag-search {
+			min-height: 44px;
+			font-size: 16px;
 		}
 	}
 </style>

@@ -42,6 +42,8 @@ struct Mock {
     fail: HashMap<String, u32>,
     /// Operation name → calls let through before `fail` applies.
     fail_skip: HashMap<String, u32>,
+    /// Operation name → its calls are on record (`calls`) and wait here for the test.
+    gate: HashMap<String, Arc<tokio::sync::Notify>>,
     calls: Vec<String>,
     next_id: u32,
     ca: Option<Arc<TestCa>>,
@@ -111,8 +113,15 @@ async fn handle(
         (&Method::DELETE, ["zones", _, "rulesets", _]) => "ruleset_delete",
         _ => return err(StatusCode::NOT_FOUND, 7003, "No route for that URI"),
     };
+    let gate = {
+        let mut m = m.lock().unwrap();
+        m.calls.push(op.to_string());
+        m.gate.get(op).cloned()
+    };
+    if let Some(gate) = gate {
+        gate.notified().await;
+    }
     let mut m = m.lock().unwrap();
-    m.calls.push(op.to_string());
     let skip = m.fail_skip.get_mut(op).filter(|n| **n > 0).map(|n| {
         *n -= 1;
     });
@@ -477,6 +486,30 @@ impl TestCa {
     fn pem(&self) -> String {
         pem("CERTIFICATE", &self.cert_der)
     }
+
+    /// A certificate for the key in `pkcs8` (the one on disk), with the subject
+    /// alternative name and the dates (days from now) a test needs.
+    fn sign_for_key(&self, pkcs8: &[u8], san: &[u8], days: (i64, i64)) -> String {
+        let key =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8, &SystemRandom::new())
+                .unwrap();
+        let leaf = Self::sign_dated(
+            &self.key,
+            &[0x7F],
+            &der_name("komiq test CA"),
+            &seq(&[]),
+            &super::origin_tls::der_spki(key.public_key().as_ref()),
+            san,
+            (&utc_time(days.0), &utc_time(days.1)),
+        );
+        pem("CERTIFICATE", &leaf)
+    }
+}
+
+fn utc_time(days_from_now: i64) -> String {
+    (chrono::Utc::now() + chrono::Duration::days(days_from_now))
+        .format("%y%m%d%H%M%SZ")
+        .to_string()
 }
 
 // ---- harness -----------------------------------------------------------------
@@ -552,12 +585,14 @@ fn options_with_ports(
         data_dir: dir.join("data"),
         origin_service: "http://127.0.0.1:18080".into(),
         listen: SocketAddr::from(([127, 0, 0, 1], 18080)),
+        published_port: 18080,
         https_addr: SocketAddr::from(([127, 0, 0, 1], ports.0)),
         acme_addr: SocketAddr::from(([127, 0, 0, 1], ports.1)),
         // Never Let's Encrypt from a test: a closed port unless a test sets a mock.
         acme_directory: "http://127.0.0.1:9/directory".into(),
         acme_ca_file: None,
         renew_check: Duration::from_millis(50),
+        https_retry: Duration::from_millis(20),
         health_attempts: 2,
         health_delay: Duration::from_millis(10),
         connector_timeout: Duration::from_secs(5),
@@ -1960,4 +1995,256 @@ async fn retry_repairs_changed_public_ips_and_keeps_entered_addresses() {
         all_done(&wait_job(&mgr).await);
         assert_clean(&mock.lock().unwrap(), true);
     }
+}
+
+/// A finished public-IP setup for `read.example.com`, its HTTPS listener stopped: what
+/// a restart finds.
+async fn public_ip_setup(
+    name: &str,
+) -> (
+    Shared,
+    Database,
+    Options,
+    Arc<crate::TrustedProxies>,
+    Arc<TestCa>,
+) {
+    let ca = Arc::new(TestCa::new());
+    let mut m = base_mock();
+    m.ca = Some(ca.clone());
+    let (api, mock) = start_mock(m).await;
+    let pool = pool().await;
+    let trusted = Arc::new(crate::TrustedProxies::for_tests(vec![], false));
+    let opts = options(&api, &temp_dir(name), None);
+    let mgr = manager(&pool, opts.clone(), trusted.clone());
+    mgr.start_setup(input("read.example.com", Connection::PublicIp))
+        .await
+        .unwrap();
+    all_done(&wait_job(&mgr).await);
+    mgr.stop_https().await;
+    (mock, pool, opts, trusted, ca)
+}
+
+async fn wait_https(m: &Manager) -> AccessStatus {
+    for _ in 0..200 {
+        let st = m.status().await;
+        if st.https {
+            return st;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("HTTPS did not come up");
+}
+
+#[tokio::test]
+async fn https_starts_at_boot_despite_a_dead_connector_or_a_busy_port() {
+    let (_mock, pool, mut opts, trusted, _ca) = public_ip_setup("boot-https").await;
+
+    // A tunnel is stored too, and its connector cannot start: HTTPS starts anyway.
+    let mut s = load_stored(&pool).await.unwrap();
+    s.tunnel_id = Some("tunnel-0001".into());
+    save_stored(&pool, Some(&s)).await.unwrap();
+    std::fs::write(opts.data_dir.join(TUNNEL_TOKEN_FILE), RUN_TOKEN).unwrap();
+    opts.cloudflared_bin = Some("/nonexistent/cloudflared".into());
+    let boot = manager(&pool, opts.clone(), trusted.clone());
+    boot.resume().await;
+    let st = boot.status().await;
+    assert_eq!(st.connector, "missing");
+    assert!(st.https && st.https_error.is_none());
+    boot.stop_https().await;
+
+    // Another program holds the HTTPS port at boot: the reason shows, and HTTPS comes
+    // up by itself once the port is free.
+    let other_program = std::net::TcpListener::bind(opts.https_addr).unwrap();
+    let boot = manager(&pool, opts.clone(), trusted.clone());
+    boot.resume().await;
+    let st = boot.status().await;
+    assert!(!st.https);
+    let why = st.https_error.expect("the console can show why");
+    assert!(
+        why.contains(&format!("port {}", opts.https_addr.port())),
+        "{why}"
+    );
+    drop(other_program);
+    let st = wait_https(&boot).await;
+    assert!(st.https_error.is_none());
+
+    // "Only my devices" while the port is still busy: nothing is left to try.
+    boot.stop_https().await;
+    let other_program = std::net::TcpListener::bind(opts.https_addr).unwrap();
+    let boot = manager(&pool, opts.clone(), trusted);
+    boot.resume().await;
+    assert!(boot.status().await.https_error.is_some());
+    boot.set_access("local", None, false).await.unwrap();
+    assert!(boot.status().await.https_error.is_none());
+    drop(other_program);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!boot.status().await.https, "the retry stopped");
+}
+
+#[tokio::test]
+async fn run_setup_again_replaces_an_origin_certificate_that_is_due() {
+    let (mock, pool, opts, trusted, ca) = public_ip_setup("origin-renew").await;
+    let cert_file = opts.data_dir.join(ORIGIN_CERT_FILE);
+    let key_file = opts.data_dir.join(ORIGIN_KEY_FILE);
+    let domain = der_san_extension("read.example.com");
+    let on_disk = |days| {
+        let key = std::fs::read(&key_file).unwrap();
+        std::fs::write(&cert_file, ca.sign_for_key(&key, &domain, days)).unwrap();
+    };
+    let mgr = manager(&pool, opts.clone(), trusted);
+    let first = load_stored(&pool).await.unwrap().certificate_id.unwrap();
+
+    // A certificate with years left: its end date shows, and a re-run keeps it.
+    let st = mgr.status().await;
+    let until = origin_tls::validity(&std::fs::read_to_string(&cert_file).unwrap())
+        .unwrap()
+        .1;
+    assert_eq!(st.certificate_expires, Some(until.to_rfc3339()));
+    assert!(st.certificate_error.is_none());
+    mgr.retry_setup(TOKEN).await.unwrap();
+    all_done(&wait_job(&mgr).await);
+    assert_eq!(
+        load_stored(&pool).await.unwrap().certificate_id,
+        Some(first.clone())
+    );
+    assert!(mock.lock().unwrap().revoked.is_empty());
+
+    // Close to its end, past it, or for another domain: the console says so, and a
+    // re-run gets a new one and revokes the old one.
+    let other = der_san_extension("old.example.com");
+    let cases: [(&dyn Fn(), &str); 3] = [
+        (&|| on_disk((-400, 10)), "ends on"),
+        (&|| on_disk((-400, -1)), "ended on"),
+        (
+            &|| {
+                let key = std::fs::read(&key_file).unwrap();
+                std::fs::write(&cert_file, ca.sign_for_key(&key, &other, (-1, 400))).unwrap();
+            },
+            "is not for read.example.com",
+        ),
+    ];
+    let mut current = first;
+    for (n, (make_due, why)) in cases.iter().enumerate() {
+        make_due();
+        let due = mgr.status().await.certificate_error.unwrap_or_default();
+        assert!(
+            due.contains(why) && due.contains("Run setup again"),
+            "{due}"
+        );
+
+        // A refused request leaves the certificate on disk as it was.
+        let before = std::fs::read(&cert_file).unwrap();
+        let key_before = std::fs::read(&key_file).unwrap();
+        mock.lock().unwrap().fail.insert("cert_create".into(), 1);
+        mgr.retry_setup(TOKEN).await.unwrap();
+        let job = wait_job(&mgr).await;
+        assert!(job.failed);
+        assert_eq!(std::fs::read(&cert_file).unwrap(), before);
+        assert_eq!(std::fs::read(&key_file).unwrap(), key_before);
+
+        mgr.retry_setup(TOKEN).await.unwrap();
+        all_done(&wait_job(&mgr).await);
+        let now = load_stored(&pool).await.unwrap().certificate_id.unwrap();
+        assert_ne!(now, current, "a new certificate");
+        {
+            let m = mock.lock().unwrap();
+            assert_eq!(m.revoked.len(), n + 1);
+            assert_eq!(m.revoked[n], current, "the old one is revoked");
+            assert_eq!(m.certs.keys().collect::<Vec<_>>(), [&now]);
+        }
+        let st = mgr.status().await;
+        assert!(st.https && st.certificate_error.is_none());
+        assert!(origin_tls::is_for(
+            &std::fs::read_to_string(&cert_file).unwrap(),
+            "read.example.com"
+        ));
+        current = now;
+    }
+
+    // The new certificate is the one that serves, not the one of the run before.
+    use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer};
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca.pem().as_bytes()).unwrap())
+        .resolve("read.example.com", opts.https_addr)
+        .no_proxy()
+        .tls_info(true)
+        .build()
+        .unwrap();
+    let url = format!("https://read.example.com:{}/health", opts.https_addr.port());
+    let answer = client.get(url).send().await.unwrap();
+    assert_eq!(answer.status(), 200);
+    let served = answer
+        .extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .and_then(|tls| tls.peer_certificate())
+        .unwrap();
+    let on_disk = CertificateDer::pem_file_iter(&cert_file)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(served, on_disk.as_ref());
+}
+
+#[tokio::test]
+async fn remove_leaves_no_https_listener_when_the_retry_comes_in_the_middle() {
+    let (mock, pool, opts, trusted, _ca) = public_ip_setup("retry-remove").await;
+    // Another program holds the HTTPS port at boot, so the server keeps trying.
+    let other_program = std::net::TcpListener::bind(opts.https_addr).unwrap();
+    let boot = manager(&pool, opts.clone(), trusted);
+    let started = std::time::Instant::now();
+    boot.resume().await;
+    assert!(boot.status().await.https_error.is_some());
+
+    // "Remove" is at Cloudflare, revoking the certificate, when the port gets free.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    mock.lock()
+        .unwrap()
+        .gate
+        .insert("cert_revoke".into(), gate.clone());
+    boot.start_remove(TOKEN).await.unwrap();
+    let revoking = || {
+        mock.lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|c| c == "cert_revoke")
+    };
+    for _ in 0..400 {
+        if revoking() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(revoking());
+    drop(other_program);
+    // Long enough for the next try: each wait is twice the one before.
+    tokio::time::sleep(started.elapsed() * 2 + Duration::from_millis(250)).await;
+    gate.notify_one();
+
+    all_done(&wait_job(&boot).await);
+    assert!(!boot.status().await.https);
+    assert!(
+        std::net::TcpListener::bind(opts.https_addr).is_ok(),
+        "nothing serves the revoked certificate"
+    );
+}
+
+#[tokio::test]
+async fn preflight_reports_the_port_other_machines_use() {
+    let pool = pool().await;
+    let trusted = Arc::new(crate::TrustedProxies::for_tests(vec![], false));
+    // Docker with KOMIQ_PORT=9000: the host publishes 9000, the server listens on 18080.
+    let mut opts = options("http://127.0.0.1:9", &temp_dir("published"), None);
+    opts.published_port = 9000;
+    let mgr = manager(&pool, opts, trusted);
+    assert_eq!(mgr.preflight().await.http_port, 9000);
+
+    // The compose file hands it over in KOMIKA_PUBLISHED_PORT. Without it, the port
+    // is the listener's own.
+    let cfg = crate::config::Config::from_env();
+    std::env::set_var("KOMIKA_PUBLISHED_PORT", "9000");
+    assert_eq!(Options::from_env(&cfg).published_port, 9000);
+    std::env::remove_var("KOMIKA_PUBLISHED_PORT");
+    assert_eq!(Options::from_env(&cfg).published_port, cfg.port);
 }

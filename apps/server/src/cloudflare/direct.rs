@@ -18,6 +18,9 @@
 //! side, so a firewall in front of the server locks nobody out. (An owner whose own
 //! network blocks port 443 still has the terminal setup on the server itself.)
 //!
+//! The same guard keeps the "only my devices" choice: the plain HTTP port then refuses
+//! clients on the internet outright.
+//!
 //! Three 0600 files next to the database: the account key, the certificate's key and
 //! the certificate chain. The name the certificate is for is `instance::DIRECT_TLS_HOST`;
 //! it is empty whenever this is off.
@@ -37,7 +40,7 @@ pub(super) const DIRECT_CERT_FILE: &str = "direct-cert.pem";
 /// setup` waits for an answer.
 const ISSUE_TIMEOUT: Duration = Duration::from_secs(90);
 
-type Dates = (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>);
+pub(super) type Dates = (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>);
 
 /// What the owner typed, as the name the certificate is for: `203.0.113.5:8080` and
 /// `https://203.0.113.5/` both become `203.0.113.5`. A port is dropped: HTTPS has its
@@ -262,14 +265,33 @@ fn typed_public(request: &Request, origin: &str) -> bool {
     }
 }
 
+/// What a client on the internet reads at the plain HTTP port of a server that is for
+/// its owner's devices only. The owner may be that client: say the way back in.
+const LOCAL_ONLY: &str = "This server is set to \"Only my devices\". It does not answer \
+                          from the internet. Use its address on your home network. To open \
+                          it to the internet, run `komika-server setup` on the server.";
+
+/// Refuse a request with a sentence for its user.
+fn refuse(request: &Request, message: &str) -> Response {
+    // A GraphQL client shows `errors[].message`; it would hide the body of a 403.
+    if request.uri().path() == "/graphql" {
+        return axum::Json(json!({ "data": null, "errors": [{ "message": message }] }))
+            .into_response();
+    }
+    (StatusCode::FORBIDDEN, message.to_string()).into_response()
+}
+
 /// Middleware on the public router. While direct mode serves HTTPS, and once a client
 /// on the internet has used it, a request from the internet over plain HTTP is not
 /// handled: a page load is sent to the HTTPS address, anything else is refused with
-/// that address. Home-network clients and this computer are let through. With direct
-/// HTTPS off this does nothing.
+/// that address. Home-network clients and this computer are let through.
 ///
 /// "From the internet" is a public peer, or a public address the client typed
 /// ([`TypedHost`]): behind Docker Desktop or rootless Docker every peer is private.
+///
+/// With the "only my devices" choice, a request from the internet over plain HTTP is
+/// refused (`Manager::plain_from_internet`). While nobody has chosen, and in the other
+/// modes without direct HTTPS, this does nothing.
 pub async fn plain_http_guard(
     State(manager): State<Arc<Manager>>,
     request: Request,
@@ -284,6 +306,19 @@ pub async fn plain_http_guard(
         .unwrap_or_else(|p| p.into_inner())
         .clone();
     let Some(origin) = origin else {
+        if manager.local_only.load(Ordering::Relaxed) {
+            use crate::graphql::PlainFromInternet as Plain;
+            // Read before the lookup: the request cannot wait across it.
+            let plain = manager.plain_from_internet(&request);
+            let internet = match plain {
+                Plain::Yes => true,
+                Plain::Named(name) => manager.named_on_internet(&name).await,
+                Plain::No => false,
+            };
+            if internet {
+                return refuse(&request, LOCAL_ONLY);
+            }
+        }
         return next.run(request).await;
     };
     let internet = request
@@ -320,12 +355,7 @@ pub async fn plain_http_guard(
             .unwrap_or("/");
         return Redirect::permanent(&format!("{origin}{path}")).into_response();
     }
-    // A GraphQL client shows `errors[].message`; it would hide the body of a 403.
-    if request.uri().path() == "/graphql" {
-        return axum::Json(json!({ "data": null, "errors": [{ "message": message }] }))
-            .into_response();
-    }
-    (StatusCode::FORBIDDEN, message).into_response()
+    refuse(&request, &message)
 }
 
 // ---- manager -----------------------------------------------------------------------
@@ -343,17 +373,63 @@ impl Manager {
         // One change at a time, and never in the middle of a certificate request: the
         // last choice made is the one that holds.
         let _one = self.issuing.lock().await;
-        if mode == "direct" && encrypt {
-            return self.enable_direct_tls(address.unwrap_or_default()).await;
+        let changed = async {
+            if mode == "direct" && encrypt {
+                return self.enable_direct_tls(address.unwrap_or_default()).await;
+            }
+            set_access(&self.pool, mode, address).await?;
+            self.disable_direct_tls().await;
+            if matches!(mode, "local" | "direct") {
+                self.pause_cloudflare().await;
+            } else {
+                self.resume_cloudflare().await?;
+            }
+            Ok(())
         }
-        set_access(&self.pool, mode, address).await?;
-        self.disable_direct_tls().await;
-        if matches!(mode, "local" | "direct") {
-            self.pause_cloudflare().await;
-        } else {
-            self.resume_cloudflare().await?;
+        .await;
+        self.note_access_mode().await;
+        changed
+    }
+
+    /// Read the access choice for `plain_http_guard`, after anything that can change it.
+    pub(super) async fn note_access_mode(&self) {
+        let mode = instance::resolve(&self.pool, &instance::ACCESS_MODE)
+            .await
+            .value;
+        self.local_only.store(mode == "local", Ordering::Relaxed);
+    }
+
+    /// Whether a request came in the clear from the internet, as the GraphQL layer
+    /// reads it (`crate::plain_from_internet`): not over HTTPS, not through a trusted
+    /// proxy, and from a public peer or to a public address.
+    fn plain_from_internet(&self, request: &Request) -> crate::graphql::PlainFromInternet {
+        let extensions = request.extensions();
+        let Some(peer) = extensions.get::<ConnectInfo<SocketAddr>>() else {
+            return Default::default();
+        };
+        let tls = extensions
+            .get::<origin_tls::OverTls>()
+            .map(|tls| axum::Extension(*tls));
+        crate::plain_from_internet(tls, peer.0, &self.trusted.current(), request.headers())
+    }
+
+    /// [`name_on_internet`], asked once a minute for the name clients type: the guard
+    /// needs the answer for every request to it.
+    async fn named_on_internet(&self, name: &str) -> bool {
+        const KEEP: Duration = Duration::from_secs(60);
+        let known = self
+            .typed_name
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .filter(|(known, _, at)| known == name && at.elapsed() < KEEP);
+        if let Some((_, public, _)) = known {
+            return public;
         }
-        Ok(())
+        let public = name_on_internet(name).await;
+        *self.typed_name.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((name.to_string(), public, std::time::Instant::now()));
+        public
     }
 
     /// The name the server holds a direct-mode certificate for, when that is on.
@@ -372,17 +448,46 @@ impl Manager {
         origin_tls::validity(&pem)
     }
 
-    /// The certificate on disk fits the key on disk, and less than half of its life is
-    /// gone. A pair that does not fit (a crash between the two writes) counts as due.
-    fn certificate_fresh(&self) -> bool {
+    /// The certificate on disk is for `host`: the address in the settings. It is for
+    /// another one after a crash in the middle of an address change, which writes the
+    /// files first.
+    fn certificate_names(&self, host: &str) -> bool {
+        std::fs::read_to_string(self.opts.data_dir.join(DIRECT_CERT_FILE))
+            .is_ok_and(|cert| origin_tls::is_for(&cert, host))
+    }
+
+    /// The certificate on disk is for `host`, fits the key on disk, and less than half
+    /// of its life is gone. A pair that does not fit (a crash between the two writes)
+    /// counts as due.
+    fn certificate_fresh(&self, host: &str) -> bool {
         let dir = &self.opts.data_dir;
         let fits = std::fs::read_to_string(dir.join(DIRECT_CERT_FILE))
             .ok()
             .zip(std::fs::read(dir.join(DIRECT_KEY_FILE)).ok())
             .is_some_and(|(cert, key)| origin_tls::server_config(&cert, &key).is_ok());
-        fits && self
-            .certificate_dates()
-            .is_some_and(|(from, until)| chrono::Utc::now() < from + (until - from) / 2)
+        fits && self.certificate_names(host)
+            && self
+                .certificate_dates()
+                .is_some_and(|(from, until)| chrono::Utc::now() < from + (until - from) / 2)
+    }
+
+    /// Serve the certificate on disk, when it is for `host`. One for another address
+    /// stays unserved: the renewal replaces it.
+    pub(super) async fn serve_direct(&self, host: &str) -> Result<(), String> {
+        let cert = self.opts.data_dir.join(DIRECT_CERT_FILE);
+        if cert.is_file() && !self.certificate_names(host) {
+            return Err(format!(
+                "The certificate on this server is not for {host}. The server is getting a \
+                 new one."
+            ));
+        }
+        self.start_https(DIRECT_KEY_FILE, DIRECT_CERT_FILE).await
+    }
+
+    /// Where readers go while direct HTTPS is on: the stored host on the HTTPS port of
+    /// this run. `KOMIKA_HTTPS_PORT` can change between runs.
+    pub(super) fn direct_address(&self, host: &str) -> String {
+        https_origin(host, self.opts.https_addr.port())
     }
 
     /// What `plain_http_guard` works from: the HTTPS address while direct HTTPS is on,
@@ -415,7 +520,7 @@ impl Manager {
         let previous = self.direct_tls_host().await;
         self.start_challenge_listener().await?;
         // The same address again, with a certificate that is still good: keep it.
-        let keep = previous.as_deref() == Some(host.as_str()) && self.certificate_fresh();
+        let keep = previous.as_deref() == Some(host.as_str()) && self.certificate_fresh(&host);
         let served = async {
             if !keep {
                 self.issue(&host).await?;
@@ -437,7 +542,7 @@ impl Manager {
             }
             return Err(e);
         }
-        let address = https_origin(&host, self.opts.https_addr.port());
+        let address = self.direct_address(&host);
         // A new address has to prove itself before the plain port closes again.
         let same = previous.as_deref() == Some(host.as_str());
         let seen = same && self.https_seen_stored().await;
@@ -471,22 +576,28 @@ impl Manager {
         self.set_certificate_error(None);
     }
 
-    /// Boot: serve the stored certificate again and keep renewing it.
+    /// Boot: answer the certificate authority again and keep renewing the certificate.
+    /// `resume` serves it (`ensure_https`).
     pub(super) async fn resume_direct_tls(self: &Arc<Self>) {
         let Some(host) = self.direct_tls_host().await else {
             return;
         };
+        // A crash cut a change of mode short, after the new choice was stored. That
+        // choice holds: finish leaving direct HTTPS.
+        let mode = instance::resolve(&self.pool, &instance::ACCESS_MODE)
+            .await
+            .value;
+        if mode != "direct" {
+            self.disable_direct_tls().await;
+            return;
+        }
         if let Err(e) = self.start_challenge_listener().await {
             tracing::warn!("direct HTTPS: {e}");
         }
         self.set_plain_guard(
-            Some(https_origin(&host, self.opts.https_addr.port())),
+            Some(self.direct_address(&host)),
             self.https_seen_stored().await,
         );
-        match self.start_https(DIRECT_KEY_FILE, DIRECT_CERT_FILE).await {
-            Ok(()) => tracing::info!(%host, addr = %self.opts.https_addr, "direct HTTPS listening"),
-            Err(e) => tracing::warn!("direct HTTPS not started: {e}"),
-        }
         self.start_renewals();
     }
 
@@ -558,33 +669,34 @@ impl Manager {
     /// the HTTPS listener back when it is down. A failure is kept for Settings › Access
     /// and tried again at the next look.
     async fn renew_if_due(&self) {
+        // Read the address under the lock: a change of address that this waited for
+        // has stored its own by then.
+        let _one = self.issuing.lock().await;
         let Some(host) = self.direct_tls_host().await else {
             return;
         };
-        let _one = self.issuing.lock().await;
         // Port 80 was taken at boot, perhaps: without it no renewal can pass.
         if let Err(e) = self.start_challenge_listener().await {
             tracing::warn!("direct HTTPS: {e}");
         }
-        let fresh = self.certificate_fresh();
+        let fresh = self.certificate_fresh(&host);
         if fresh && self.https_up() {
             return;
         }
-        let served = async {
-            if !fresh {
-                self.issue(&host).await?;
-            }
-            self.start_https(DIRECT_KEY_FILE, DIRECT_CERT_FILE).await
-        }
-        .await;
-        match served {
-            Ok(()) => {
-                tracing::info!(%host, renewed = !fresh, "direct HTTPS certificate in place");
-                self.set_certificate_error(None);
-            }
-            Err(e) => {
+        if !fresh {
+            if let Err(e) = self.issue(&host).await {
                 tracing::warn!(%host, "direct HTTPS certificate not renewed: {e}");
                 self.set_certificate_error(Some(e));
+                return;
+            }
+        }
+        self.set_certificate_error(None);
+        // A port that cannot be opened says nothing about the certificate.
+        match self.start_https(DIRECT_KEY_FILE, DIRECT_CERT_FILE).await {
+            Ok(()) => tracing::info!(%host, renewed = !fresh, "direct HTTPS certificate in place"),
+            Err(e) => {
+                tracing::warn!(%host, "direct HTTPS not started: {e}");
+                self.set_https_error(Some(e));
             }
         }
     }

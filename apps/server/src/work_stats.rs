@@ -453,11 +453,13 @@ pub fn spawn_stats_backfill(
 /// value (MangaDex reports an unrated title as `average: null, bayesian: 0`), is simply absent:
 /// absent means "MangaDex has no rating for it", never "rated zero".
 ///
-/// Fails OPEN to "no rating" — a query error logs and yields an empty map — because this only
-/// ever decorates a card; it must not take a feed page down with it.
-pub async fn display_rating_batch(pool: &Database, work_ids: &[String]) -> HashMap<String, f64> {
+/// Propagate failed reads so a memoized feed never stores a degraded rating map.
+pub async fn display_rating_batch_checked(
+    pool: &Database,
+    work_ids: &[String],
+) -> Result<HashMap<String, f64>> {
     if work_ids.is_empty() {
-        return HashMap::new();
+        return Ok(HashMap::new());
     }
     let ph = std::iter::repeat_n("?", work_ids.len())
         .collect::<Vec<_>>()
@@ -472,15 +474,11 @@ pub async fn display_rating_batch(pool: &Database, work_ids: &[String]) -> HashM
     for id in work_ids {
         q = q.bind(id);
     }
-    q.fetch_all(pool)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "work_stats: display_rating_batch query failed");
-            Vec::new()
-        })
+    Ok(q.fetch_all(pool)
+        .await?
         .into_iter()
         .filter_map(|(wid, r)| r.filter(|x| x.is_finite()).map(|x| (wid, x)))
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]

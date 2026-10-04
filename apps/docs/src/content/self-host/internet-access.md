@@ -22,21 +22,21 @@ You do three things once at Cloudflare: have a free account, add your domain and
 | Router ports | No incoming ports needed                | Port 443 open and forwarded   |
 | Public IP    | Works with a changing or shared address | A public IPv4 or IPv6 address |
 
-Under the connection choice, the form says what your server found: whether the connector is there or will be downloaded (tunnel), or whether port 443 is free (public IP).
+The form says whether the connector is there or will be downloaded (tunnel), or whether port 443 is free (public IP).
 
 ### Cloudflare Tunnel
 
 A tunnel suits home servers. Your server runs `cloudflared`, Cloudflare's connector program, which connects out to Cloudflare.
 
-You do not install `cloudflared`. The Docker image includes it. Elsewhere, your server looks at `CLOUDFLARED_BIN`, then its `PATH`, then its own tool folder. If it finds none, setup downloads a fixed release, checks its SHA-256 checksum, a fingerprint of the file, and saves it there. Builds exist for Linux and macOS on x86-64 and ARM64, and for Windows on x86-64.
+You do not install `cloudflared`: the Docker image includes it. Elsewhere, your server looks at `CLOUDFLARED_BIN`, then its `PATH`, then its own tool folder. If it finds none, setup downloads a fixed release, checks its SHA-256 checksum, a fingerprint of the file, and saves it there. Builds exist for Linux and macOS on x86-64 and ARM64, and for Windows on x86-64.
 
 With Docker, keep `KOMIQ_BIND=127.0.0.1` so the plain HTTP port is closed to your network. The installer writes that for `tunnel`. Read [Install with Docker](/self-host/docker).
 
 ### Public IP with DNS
 
-Komiq creates a proxied DNS record (A or AAAA) for your server's public IP address. It requests a 15-year Cloudflare Origin Certificate Authority (CA) certificate and serves HTTPS on port 443.
+Komiq creates a proxied DNS record (A or AAAA) for your server's public IP address. It requests a 15-year Cloudflare Origin Certificate Authority (CA) certificate and serves HTTPS on port 443. Nothing renews that certificate by itself. When **Settings › Access** warns that it is due, choose **Run setup again**.
 
-With Docker, port 443 must be published too. Run the installer with `--access public-ip`. Or add this line to `deploy/selfhost/.env` and run `docker compose up -d`:
+With Docker, publish port 443 too. Run the installer with `--access public-ip`, or add this line to `deploy/selfhost/.env` and run `docker compose up -d`:
 
 ```sh
 COMPOSE_FILE=docker-compose.yml:docker-compose.https.yml
@@ -96,7 +96,9 @@ The optional image proxy in `apps/worker` runs on Cloudflare’s network. The bu
 
 If a step fails, click **Retry**. **Run setup again** also repairs the DNS record after your server's address changed.
 
-To pause, choose **Only my devices** in **Settings › Access**. The tunnel, or HTTPS on your server, is turned off. What setup made at Cloudflare stays, and **Turn on** brings it back with no token. To undo setup, click **Remove** and enter your API token again. The server removes what setup created and restores the previous zone settings.
+If port 443 is busy at start, the server tries again by itself and shows the reason in **Settings › Access**.
+
+To pause, choose **Only my devices** in **Settings › Access**. The tunnel, or HTTPS on your server, is turned off, and your server refuses plain HTTP from the internet. A console open at a public address stops answering: use your home network address, or run `komika-server setup` on the server. What setup made at Cloudflare stays, and **Turn on** brings it back with no token. **Remove** asks for your API token again, deletes what setup created and restores the previous zone settings.
 
 If your server fails to connect, read [Fix server problems](/self-host/troubleshooting).
 
@@ -104,7 +106,7 @@ Next: [Settings reference](/self-host/configuration).
 
 ## Without a domain
 
-If your server has a public address, such as a cloud VPS, readers can connect straight to it, with no domain and no Cloudflare account. The connection is HTTPS: komiq gets a free certificate for the IP address from Let's Encrypt, a public certificate authority, and renews it by itself. Using it means you agree to the [Let's Encrypt Subscriber Agreement](https://letsencrypt.org/repository/).
+If your server has a public address, such as a cloud VPS, readers can connect straight to it, without a domain or a Cloudflare account. The connection is HTTPS: komiq gets a free certificate for the IP address from Let's Encrypt, a public certificate authority, and renews it by itself. Using it means you agree to the [Let's Encrypt Subscriber Agreement](https://letsencrypt.org/repository/).
 
 1. Open ports 80 and 443 in your cloud firewall. With Docker, publish them too: run the installer with `--access direct`, or set `COMPOSE_FILE=docker-compose.yml:docker-compose.https.yml:docker-compose.acme.yml` in `.env` and run `docker compose up -d`.
 2. In [First-run setup](/self-host/first-run), choose **Public without a domain** on **Access**. Later, use **Use without a domain** in **Settings › Access**.
@@ -112,9 +114,11 @@ If your server has a public address, such as a cloud VPS, readers can connect st
 
 Keep port 80 open: Let's Encrypt checks it before each certificate. **Settings › Access** shows the certificate's end date and any renewal error.
 
-After the first visit from the internet over HTTPS, komiq stops handling internet requests on its plain HTTP port, `KOMIQ_PORT`. It also does not create the owner account over plain HTTP from the internet: the **Owner** step shows no form there.
+The desktop app, as the console of a remote server, moves to the `https://` address once it answers. Without an answer, it stays on the old address and shows a notice with **Try again**.
+
+After the first visit from the internet over HTTPS, komiq stops handling internet requests on its plain HTTP port, `KOMIQ_PORT`. It also refuses the owner account over plain HTTP from the internet, so the **Owner** step shows no form there.
 
 > [!NOTE]
-> With Docker Desktop or rootless Docker, every connection looks local. There the server goes by the address you typed: a public address counts as the internet.
+> With Docker Desktop or rootless Docker, every connection looks local, so the server goes by the address you typed: a public address counts as the internet.
 
-You can switch **Encrypt the connection** off. Readers then use plain HTTP, such as `http://203.0.113.5:8080`, and people on the network path can see passwords and pages. With Docker, run the installer with `--access direct --encrypt no` so the HTTP port answers every address.
+With **Encrypt the connection** off, readers use plain HTTP, such as `http://203.0.113.5:8080`, and people on the network path can see passwords and pages. With Docker, run the installer with `--access direct --encrypt no` so the HTTP port answers every address.
