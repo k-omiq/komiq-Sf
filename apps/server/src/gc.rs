@@ -19,6 +19,12 @@ use crate::db::Database;
 /// slow multi-step composes without letting abandoned drafts accumulate.
 const STAGED_TTL_HOURS: i64 = 24;
 
+/// Keep unread notifications indefinitely. Read notifications expire by creation
+/// time after 90 days, with bounded writer turns and bounded work per hourly tick.
+const READ_NOTIFICATION_TTL_DAYS: i64 = 90;
+const NOTIFICATION_DELETE_BATCH: u64 = 128;
+const NOTIFICATION_DELETE_BUDGET: u64 = 1024;
+
 /// How often the sweep runs.
 const SWEEP_INTERVAL_SECS: u64 = 3600;
 
@@ -51,7 +57,7 @@ async fn run_loop(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                sweep(&pool).await;
+                sweep(&pool, &shutdown).await;
                 sweep_cover_blobs(&pool, &covers, &shutdown).await;
             }
             _ = shutdown.changed() => {
@@ -67,7 +73,7 @@ async fn run_loop(
 /// Delete staged (`comment_id IS NULL`) comment-media rows older than the TTL.
 /// Best-effort: any error is logged and swallowed so a transient DB blip doesn't
 /// kill the sweep loop.
-async fn sweep(pool: &Database) {
+async fn sweep(pool: &Database, shutdown: &tokio::sync::watch::Receiver<bool>) {
     // created_at is written as `chrono::Utc::now().to_rfc3339()`, so a UTC RFC-3339
     // cutoff compares correctly against it lexically.
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(STAGED_TTL_HOURS)).to_rfc3339();
@@ -99,6 +105,55 @@ async fn sweep(pool: &Database) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "gc: source-health prune failed"),
     }
+    let notification_cutoff =
+        (chrono::Utc::now() - chrono::Duration::days(READ_NOTIFICATION_TTL_DAYS)).to_rfc3339();
+    match prune_read_notifications(pool, &notification_cutoff, shutdown).await {
+        Ok(n) if n > 0 => tracing::info!(deleted = n, "gc: pruned old read notifications"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "gc: notification prune failed"),
+    }
+}
+
+async fn prune_read_notifications(
+    pool: &Database,
+    cutoff: &str,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<u64> {
+    let mut deleted = 0;
+    while deleted < NOTIFICATION_DELETE_BUDGET {
+        if *shutdown.borrow() {
+            break;
+        }
+        let batch = crate::db::retry_transaction(|| async {
+            if *shutdown.borrow() {
+                return Ok(0);
+            }
+            let mut tx = pool.begin().await?;
+            // Shutdown may have started while waiting for the single writer.
+            if *shutdown.borrow() {
+                tx.rollback().await?;
+                return Ok(0);
+            }
+            let result = sqlx::query(
+                "DELETE FROM notifications WHERE id IN \
+                 (SELECT id FROM notifications WHERE read_at IS NOT NULL AND created_at < ? \
+                  ORDER BY created_at, id LIMIT ?)",
+            )
+            .bind(cutoff)
+            .bind(NOTIFICATION_DELETE_BATCH as i64)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(result.rows_affected())
+        })
+        .await?;
+        deleted += batch;
+        if batch < NOTIFICATION_DELETE_BATCH {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(deleted)
 }
 
 // ---------------------------------------------------------------------------------
@@ -501,6 +556,110 @@ async fn sweep_suwayomi_cover_blobs(
 mod tests {
     use super::*;
     use crate::database::TestPoolOptions;
+
+    #[tokio::test]
+    async fn notification_gc_keeps_unread_recent_boundary_and_release_history() {
+        let pool = main_pool().await;
+        sqlx::query("INSERT INTO users(id, username, email, password_hash, created_at) VALUES ('gc-user', 'gc-user', 'gc@example.test', 'unused', '2026-01-01T00:00:00+00:00')")
+            .execute(&pool).await.unwrap();
+        let cutoff = "2026-07-10T12:00:00+00:00";
+        for (id, created_at, read_at) in [
+            (
+                "old-read",
+                "2026-07-09T12:00:00+00:00",
+                Some("2026-10-08T12:00:00+00:00"),
+            ),
+            ("old-unread", "2020-01-01T00:00:00+00:00", None),
+            ("recent-read", "2026-07-11T12:00:00+00:00", Some(cutoff)),
+            ("boundary-read", cutoff, Some(cutoff)),
+        ] {
+            sqlx::query("INSERT INTO notifications(id, user_id, kind, created_at, read_at) VALUES (?, 'gc-user', 'reply', ?, ?)")
+                .bind(id).bind(created_at).bind(read_at).execute(&pool).await.unwrap();
+        }
+        seed_works(&pool, 0, 1).await;
+        sqlx::query("INSERT INTO release_event(work_id, chapter_key, label, first_seen_at) VALUES ('w_00000', '10', '1', 1)")
+            .execute(&pool).await.unwrap();
+        assert_eq!(
+            prune_read_notifications(&pool, cutoff, &never_shutdown().1)
+                .await
+                .unwrap(),
+            1
+        );
+        let kept: Vec<String> = sqlx::query_scalar("SELECT id FROM notifications ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, ["boundary-read", "old-unread", "recent-read"]);
+        let release: (String, String, String, i64) =
+            sqlx::query_as("SELECT work_id, chapter_key, label, first_seen_at FROM release_event")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(release, ("w_00000".into(), "10".into(), "1".into(), 1));
+        assert_eq!(
+            prune_read_notifications(&pool, cutoff, &never_shutdown().1)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_gc_batches_uses_partial_index_and_resumes_backlog() {
+        let pool = main_pool().await;
+        sqlx::query("INSERT INTO users(id, username, email, password_hash, created_at) VALUES ('gc-user', 'gc-user', 'gc@example.test', 'unused', '2026-01-01T00:00:00+00:00')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1400) INSERT INTO notifications(id,user_id,kind,created_at,read_at) SELECT printf('old-%04d',i), 'gc-user', 'reply', '2020-01-01T00:00:00+00:00', '2020-01-02T00:00:00+00:00' FROM n")
+            .execute(&pool).await.unwrap();
+        let plans: Vec<(i64, i64, i64, String)> = sqlx::query_as("EXPLAIN QUERY PLAN SELECT id FROM notifications WHERE read_at IS NOT NULL AND created_at < ? ORDER BY created_at, id LIMIT 128")
+            .bind("2026-07-10T12:00:00+00:00").fetch_all(&pool).await.unwrap();
+        assert!(
+            plans
+                .iter()
+                .any(|row| row.3.contains("idx_notifications_read_created")),
+            "{plans:?}"
+        );
+        assert!(
+            !plans.iter().any(|row| row.3.contains("TEMP B-TREE")),
+            "{plans:?}"
+        );
+        assert_eq!(
+            prune_read_notifications(&pool, "2026-07-10T12:00:00+00:00", &never_shutdown().1)
+                .await
+                .unwrap(),
+            NOTIFICATION_DELETE_BUDGET
+        );
+        assert_eq!(
+            prune_read_notifications(&pool, "2026-07-10T12:00:00+00:00", &never_shutdown().1)
+                .await
+                .unwrap(),
+            376
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_gc_rechecks_shutdown_after_waiting_for_writer() {
+        let pool = main_pool().await;
+        sqlx::query("INSERT INTO users(id, username, email, password_hash, created_at) VALUES ('gc-user', 'gc-user', 'gc@example.test', 'unused', '2020-01-01T00:00:00+00:00')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO notifications(id,user_id,kind,created_at,read_at) VALUES ('old-read','gc-user','reply','2020-01-01T00:00:00+00:00','2020-01-02T00:00:00+00:00')")
+            .execute(&pool).await.unwrap();
+        let writer = pool.begin().await.unwrap();
+        let (signal, shutdown) = never_shutdown();
+        let pruning_pool = pool.clone();
+        let pruning = tokio::spawn(async move {
+            prune_read_notifications(&pruning_pool, "2026-07-10T12:00:00+00:00", &shutdown).await
+        });
+        tokio::task::yield_now().await;
+        signal.send(true).unwrap();
+        writer.rollback().await.unwrap();
+        assert_eq!(pruning.await.unwrap().unwrap(), 0);
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notifications")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 1);
+    }
 
     /// Main DB with the real schema. `max_connections(1)` because a `sqlite::memory:`
     /// pool gives every connection its OWN empty database.

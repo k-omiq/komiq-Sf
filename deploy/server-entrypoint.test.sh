@@ -2,7 +2,7 @@
 # Exercise the entrypoint without a server, replica credentials, or network access.
 set -eu
 
-entrypoint="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/server-entrypoint.sh"
+entrypoint="${ENTRYPOINT_UNDER_TEST:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/server-entrypoint.sh}"
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT HUP INT TERM
 mkdir "$scratch/bin"

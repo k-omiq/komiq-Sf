@@ -38,8 +38,12 @@ RUN KOMIKA_TARGET=embedded pnpm --filter @komika/reader build \
 FROM rust:1-slim-bookworm AS server
 WORKDIR /build
 COPY .cargo/config.toml ./.cargo/config.toml
-COPY apps/server/ ./
-RUN cargo build --release --locked --bin komika-server
+COPY apps/server/ ./apps/server/
+WORKDIR /build/apps/server
+# Match server.Dockerfile's build path and command so both images can reuse the
+# same verified release-builder layer.
+RUN cargo build --release --locked --bin komika-server \
+    && strip target/release/komika-server
 
 # ---- cloudflared ---------------------------------------------------------------
 # Pinned release, verified by checksum. The server starts it as a child process
@@ -79,7 +83,7 @@ RUN apt-get update \
     && mkdir -p /data \
     && chown komika:komika /data
 
-COPY --from=server /build/target/release/komika-server /usr/local/bin/komika-server
+COPY --from=server /build/apps/server/target/release/komika-server /usr/local/bin/komika-server
 COPY --from=cloudflared /cloudflared /usr/local/bin/cloudflared
 COPY --from=web /web /srv/web
 

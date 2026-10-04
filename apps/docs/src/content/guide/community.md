@@ -73,6 +73,10 @@ Readers signed in on the connected server can vote on other readers’ comments 
 
 If you enter text into a comment composer or attach an image without posting, komiq tracks the unsaved draft. If you attempt to leave the page or close the tab, the application displays a confirmation prompt asking whether you want to discard your draft.
 
+## Notifications
+
+Read notifications are removed once they are more than 90 days old. Unread notifications stay until you read them.
+
 ## Report a problem
 
 If you find an error in the catalogue, broken images, or abusive comments, you can send a report to the moderation queue.

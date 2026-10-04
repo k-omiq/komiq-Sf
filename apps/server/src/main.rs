@@ -26,6 +26,7 @@ mod notify;
 mod phase_f;
 mod phash;
 mod rate_limit;
+mod request_budget;
 mod scanlators;
 mod scanner;
 mod series_cache;
@@ -261,6 +262,8 @@ fn resolve_client_ip(headers: &HeaderMap, peer: SocketAddr, trusted: &[Cidr]) ->
 struct RouterState {
     schema: ApiSchema,
     pool: crate::db::Database,
+    ready_pool: ReadyDb,
+    request_budgets: Arc<request_budget::RequestBudgets>,
     /// Un-replicated cover-cache DB (`work_cover_blob`); served by `serve_cover`.
     /// A newtype (`CoverDb`) distinguishes it from the main `pool` in `FromRef`.
     cover_pool: crate::db::Database,
@@ -281,6 +284,30 @@ impl FromRef<RouterState> for ApiSchema {
 impl FromRef<RouterState> for crate::db::Database {
     fn from_ref(s: &RouterState) -> Self {
         s.pool.clone()
+    }
+}
+/// A reserved query-only connection keeps reader-pool contention from turning a
+/// healthy process into an unhealthy readiness probe.
+#[derive(Clone)]
+struct ReadyDb(sqlx::SqlitePool);
+impl ReadyDb {
+    async fn connect(pool: &crate::db::Database) -> Result<Self, sqlx::Error> {
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(3))
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .map(Self)
+    }
+}
+impl FromRef<RouterState> for ReadyDb {
+    fn from_ref(s: &RouterState) -> Self {
+        s.ready_pool.clone()
+    }
+}
+impl FromRef<RouterState> for Arc<request_budget::RequestBudgets> {
+    fn from_ref(s: &RouterState) -> Self {
+        s.request_budgets.clone()
     }
 }
 /// Newtype for the cover-cache pool so a handler can extract it via `State`
@@ -349,36 +376,44 @@ async fn graphql_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     tls: Option<axum::Extension<cloudflare::origin_tls::OverTls>>,
     headers: HeaderMap,
-    req: GraphQLRequest,
+    req: request_budget::AdmittedGraphQLRequest,
 ) -> axum::response::Response {
-    let auth = RequestAuth(bearer(&headers));
-    let plain = plain_from_internet(tls, peer, &trusted.current(), &headers);
-    let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted.current())));
-    // Fresh per-request caches so `current_user` does at most one session lookup, the
-    // viewer's NSFW preference at most one `users` read, and each series' `user_library`
-    // row is read at most once — even when many resolvers ask (one per feed item).
-    let user_cache = RequestUserCache::default();
-    let nsfw_cache = RequestNsfwPref::default();
-    let blocks_cache = RequestBlocks::default();
-    let library_cache = RequestLibraryCache::default();
-    let response = schema
-        .execute(
-            req.into_inner()
-                .data(auth)
-                .data(ip)
-                .data(plain)
-                .data(user_cache)
-                .data(nsfw_cache)
-                .data(blocks_cache)
-                .data(library_cache),
-        )
-        .await;
-    let unavailable = graphql_unavailable(&response);
-    let mut response = GraphQLResponse::from(response).into_response();
-    if unavailable {
-        mark_unavailable(&mut response);
-    }
-    response
+    let request_budget::AdmittedGraphQLRequest {
+        request: req,
+        lease,
+    } = req;
+    lease
+        .run(async move {
+            let auth = RequestAuth(bearer(&headers));
+            let plain = plain_from_internet(tls, peer, &trusted.current(), &headers);
+            let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted.current())));
+            // Fresh per-request caches so `current_user` does at most one session lookup, the
+            // viewer's NSFW preference at most one `users` read, and each series' `user_library`
+            // row is read at most once — even when many resolvers ask (one per feed item).
+            let user_cache = RequestUserCache::default();
+            let nsfw_cache = RequestNsfwPref::default();
+            let blocks_cache = RequestBlocks::default();
+            let library_cache = RequestLibraryCache::default();
+            let response = schema
+                .execute(
+                    req.into_inner()
+                        .data(auth)
+                        .data(ip)
+                        .data(plain)
+                        .data(user_cache)
+                        .data(nsfw_cache)
+                        .data(blocks_cache)
+                        .data(library_cache),
+                )
+                .await;
+            let unavailable = graphql_unavailable(&response);
+            let mut response = GraphQLResponse::from(response).into_response();
+            if unavailable {
+                mark_unavailable(&mut response);
+            }
+            response
+        })
+        .await
 }
 
 fn graphql_unavailable(response: &async_graphql::Response) -> bool {
@@ -426,22 +461,6 @@ fn database_error_response(
     }
 }
 
-/// Fixed admission bound prevents a queue of requests from growing behind the
-/// bounded database pools. Dropping a timed-out request releases its permit.
-async fn limit_requests(
-    State(admission): State<Arc<tokio::sync::Semaphore>>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let Ok(_permit) = admission.try_acquire_owned() else {
-        return busy_response();
-    };
-    match tokio::time::timeout(std::time::Duration::from_secs(20), next.run(request)).await {
-        Ok(response) => response,
-        Err(_) => busy_response(),
-    }
-}
-
 /// Browser cache lifetime for anonymous GET /graphql responses. Matches the lower
 /// bound of the in-process feed memo (30–60 s), so an edge/browser hit is never
 /// staler than what the origin would have served from its own cache anyway.
@@ -469,11 +488,19 @@ async fn graphql_get_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     tls: Option<axum::Extension<cloudflare::origin_tls::OverTls>>,
     headers: HeaderMap,
-    req: GraphQLRequest,
+    req: request_budget::AdmittedGraphQLRequest,
 ) -> axum::response::Response {
+    let request_budget::AdmittedGraphQLRequest {
+        request: req,
+        lease,
+    } = req;
     let anonymous = bearer(&headers).is_none();
     let plain = plain_from_internet(tls, peer, &trusted.current(), &headers);
-    let mut res = graphql_get_response(schema, trusted, peer, plain, headers, req).await;
+    let mut res = lease
+        .run(graphql_get_response(
+            schema, trusted, peer, plain, headers, req,
+        ))
+        .await;
     if anonymous {
         allow_any_origin(res.headers_mut());
     }
@@ -712,8 +739,13 @@ async fn upload_avatar(
     };
 
     // Decoding + resizing + encoding is CPU-bound: keep it off the async runtime.
-    let _decoding = UPLOAD_DECODE_LIMIT.acquire().await;
-    let webp = match tokio::task::spawn_blocking(move || avatar::process_avatar(&bytes)).await {
+    let decoding = UPLOAD_DECODE_LIMIT.acquire().await;
+    let webp = match tokio::task::spawn_blocking(move || {
+        let _decoding = decoding;
+        avatar::process_avatar(&bytes)
+    })
+    .await
+    {
         Ok(Ok(w)) => w,
         Ok(Err(e)) => return avatar_error(StatusCode::BAD_REQUEST, &e.to_string()),
         Err(e) => {
@@ -832,7 +864,13 @@ async fn upload_cover(
         return avatar_error(StatusCode::BAD_REQUEST, "No image file provided");
     };
 
-    let webp = match tokio::task::spawn_blocking(move || cover::process_cover(&bytes)).await {
+    let decoding = UPLOAD_DECODE_LIMIT.acquire().await;
+    let webp = match tokio::task::spawn_blocking(move || {
+        let _decoding = decoding;
+        cover::process_cover(&bytes)
+    })
+    .await
+    {
         Ok(Ok(w)) => w,
         Ok(Err(e)) => return avatar_error(StatusCode::BAD_REQUEST, &e.to_string()),
         Err(e) => {
@@ -1041,6 +1079,7 @@ async fn serve_cover(
         return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response();
     }
     let cdn_fallback = crate::mangadex::cover_thumb_url(&mangadex_id, &file_name);
+    let work = cover::master_cover_work().await;
     let Some(bytes) = app
         .mangadex
         .cover_thumb_bytes(&mangadex_id, &file_name)
@@ -1049,7 +1088,7 @@ async fn serve_cover(
         return axum::response::Redirect::temporary(&cdn_fallback).into_response();
     };
     // Decode + resize + WebP encode is CPU-bound — keep it off the async runtime.
-    let resized = tokio::task::spawn_blocking(move || cover::process_cover(&bytes)).await;
+    let resized = work.process(move || cover::process_cover(&bytes)).await;
     match resized {
         Ok(Ok(webp)) => {
             let work = work_id.to_owned();
@@ -1213,6 +1252,7 @@ async fn serve_suwayomi_cover(
         return cover_response_at_width(covers, &variant_key, width, webp).await;
     }
     let path = format!("/api/v1/manga/{manga_id}/thumbnail");
+    let work = cover::master_cover_work().await;
     // On a MISS the fetch goes through the BOUNDED cover pool (`fetch_cover_now`), which
     // refuses rather than queues when saturated and uses an 8 s timeout instead of the
     // scanner's 30 s. Before this, a cold cover grid opened ~30 unbounded fetches that
@@ -1246,10 +1286,9 @@ async fn serve_suwayomi_cover(
     // (~130ms even at opt-level=3): keep it off the async runtime like the
     // avatar/comment handlers do. On failure the closure hands the original
     // bytes back so the cover still renders raw.
-    let resized = tokio::task::spawn_blocking(move || {
-        cover::process_cover(&bytes).map_err(|e| (e.to_string(), bytes))
-    })
-    .await;
+    let resized = work
+        .process(move || cover::process_cover(&bytes).map_err(|e| (e.to_string(), bytes)))
+        .await;
     match resized {
         Ok(Ok(webp)) => {
             let writer = covers.clone();
@@ -1294,12 +1333,11 @@ fn spawn_suwayomi_cover_materialize(
     tokio::spawn(async move {
         let _slot = slot; // held for the task's lifetime: this is the fan-out bound
         let path = format!("/api/v1/manga/{manga_id}/thumbnail");
+        let work = cover::master_cover_work().await;
         let Ok((bytes, _ct)) = suwayomi.fetch_cover_background(&path).await else {
             return;
         };
-        if let Ok(Ok(webp)) =
-            tokio::task::spawn_blocking(move || cover::process_cover(&bytes)).await
-        {
+        if let Ok(Ok(webp)) = work.process(move || cover::process_cover(&bytes)).await {
             if let Err(e) = cover::put_suwayomi_cover(&covers, manga_id, &webp).await {
                 tracing::warn!(error = %e, manga_id, "background suwayomi cover store failed");
             }
@@ -1388,8 +1426,9 @@ async fn cover_response_at_width(
     }
     // Bounded: unlike every other resize here, this one has no upstream fetch in front of
     // it to cap concurrency, so a cold grid would otherwise start ~30 at once. See
-    // `cover::VARIANT_RESIZE_LIMIT`. Held across the resize, released at end of scope.
-    let _permit = cover::variant_resize_permit().await;
+    // `cover::VARIANT_RESIZE_LIMIT`. The worker retains the permit even if the
+    // HTTP route times out while its non-cancellable resize is still running.
+    let permit = cover::variant_resize_permit().await;
     // Re-check under the permit: while we waited, another request for this same cover may
     // have generated and stored it. Skips a duplicate resize on exactly the stampede this
     // bound exists for.
@@ -1399,7 +1438,7 @@ async fn cover_response_at_width(
     // Decode + Lanczos3 resize + WebP encode is CPU-bound; keep it off the async runtime
     // exactly like `process_cover`'s callers do.
     let source = master.clone();
-    let made = tokio::task::spawn_blocking(move || cover::downscale_variant(&source, w)).await;
+    let made = resize_cover_variant(permit, move || cover::downscale_variant(&source, w)).await;
     match made {
         // The master is already at or under `w` — serve it, store nothing.
         Ok(Ok(None)) => webp_cover_response(master),
@@ -1420,6 +1459,18 @@ async fn cover_response_at_width(
             webp_cover_response(master)
         }
     }
+}
+
+/// Move the resize slot into the blocking worker, whose lifetime can outlast the
+/// HTTP response when the route's deadline or client cancellation drops its join.
+fn resize_cover_variant<T: Send + 'static>(
+    permit: tokio::sync::SemaphorePermit<'static>,
+    resize: impl FnOnce() -> T + Send + 'static,
+) -> tokio::task::JoinHandle<T> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        resize()
+    })
 }
 
 /// Immutable-cached response for a resized WebP cover.
@@ -1547,16 +1598,20 @@ async fn upload_comment_media(
     };
 
     // Decoding + resizing + encoding is CPU-bound: keep it off the async runtime.
-    let _decoding = UPLOAD_DECODE_LIMIT.acquire().await;
-    let processed =
-        match tokio::task::spawn_blocking(move || media::process_comment_image(&bytes)).await {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => return avatar_error(StatusCode::BAD_REQUEST, &e.to_string()),
-            Err(e) => {
-                tracing::error!(error = %e, "comment media processing task panicked");
-                return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Could not process image");
-            }
-        };
+    let decoding = UPLOAD_DECODE_LIMIT.acquire().await;
+    let processed = match tokio::task::spawn_blocking(move || {
+        let _decoding = decoding;
+        media::process_comment_image(&bytes)
+    })
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return avatar_error(StatusCode::BAD_REQUEST, &e.to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, "comment media processing task panicked");
+            return avatar_error(StatusCode::INTERNAL_SERVER_ERROR, "Could not process image");
+        }
+    };
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -1760,7 +1815,7 @@ async fn metrics(State(pool): State<crate::db::Database>) -> impl IntoResponse {
 
 /// Readiness: verifies the process can actually serve — i.e. the DB answers.
 /// For a load balancer / orchestrator readiness gate, not the liveness probe.
-async fn ready(State(pool): State<crate::db::Database>) -> impl IntoResponse {
+async fn ready(State(ReadyDb(pool)): State<ReadyDb>) -> impl IntoResponse {
     match sqlx::query_scalar::<_, i64>("SELECT 1")
         .fetch_one(&pool)
         .await
@@ -1771,6 +1826,213 @@ async fn ready(State(pool): State<crate::db::Database>) -> impl IntoResponse {
             (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
         }
     }
+}
+
+/// Assemble the actual public router in one place so admission regressions test
+/// the same routes and global middleware served by both HTTP and HTTPS.
+fn public_router(
+    cfg: &Config,
+    router_state: RouterState,
+    cloudflare: Arc<cloudflare::Manager>,
+) -> Router {
+    let mangadex = router_state.app_state.mangadex.clone();
+    let request_budgets = router_state.request_budgets.clone();
+    let origins: Vec<_> = cfg
+        .cors_origins
+        .iter()
+        .filter_map(|o| o.parse().ok())
+        .collect();
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+
+    // P3.1: GET /graphql is the CACHEABLE query endpoint (anonymous public reads get
+    // Cache-Control + ETag so Cloudflare and browsers can serve/revalidate them —
+    // POST is uncacheable by every CDN). Mutations over GET are rejected in the
+    // handler. GraphiQL moved to its own GET /graphiql when enabled; introspection
+    // stays disabled in the same off state (see build_schema above).
+    let mut app = Router::new().route(
+        "/graphql",
+        get(graphql_get_handler)
+            .post(graphql_handler)
+            // The GraphQL extractor reads the whole body, and a multipart one into a
+            // temporary file, before any resolver checks who is asking. Nothing the
+            // apps send comes near this size; files have their own upload routes.
+            .layer(RequestBodyLimitLayer::new(GRAPHQL_BODY_LIMIT)),
+    );
+    if cfg.graphiql_enabled {
+        app = app.route("/graphiql", get(graphiql));
+    }
+    let app = app
+        .route("/health", get(health))
+        .route("/health/ready", get(ready))
+        // Operational gauges for scraping are NOT on this router: `/metrics` is
+        // served on a separate 127.0.0.1-bound listener below, so the scrape
+        // endpoint is unreachable from outside the host by construction
+        // (aggregate counts only — no series content, no user data).
+        // Authenticated avatar upload + public serve (VM data volume). The upload
+        // route raises the body limit above the raw-image cap enforced in
+        // `avatar::process_avatar` (axum's default is 2 MB).
+        .route(
+            "/avatar",
+            post(upload_avatar)
+                .layer::<_, std::convert::Infallible>(axum::middleware::from_fn_with_state(
+                    request_budgets.clone(),
+                    request_budget::limit_uploads,
+                ))
+                .layer(DefaultBodyLimit::max(
+                    avatar::MAX_UPLOAD_BYTES + 1024 * 1024,
+                )),
+        )
+        .route("/avatars/{file}", get(serve_avatar))
+        // Public serve of DB-backed work covers (WebP BLOB in `work_cover_blob`).
+        // Lets the web reader load covers from our own origin instead of the CF
+        // image Worker; the bytes are materialized by `cover::crawl_uncached_covers`
+        // (admin `materializeCatalogueCovers`).
+        .route(
+            "/covers/{file}",
+            get(serve_cover).layer(axum::middleware::from_fn_with_state(
+                std::time::Duration::from_secs(120),
+                request_budget::limit_image_time,
+            )),
+        )
+        // Public serve of extension icons from the vendored snapshot baked into
+        // this image, with a lazy fetch from each extension's own repo for the rest.
+        // Hosted here because Keiyoushi's own icon directory was emptied in their
+        // `index.pb` migration (see the `ext_icon` module).
+        .route(
+            "/ext-icons/{file}",
+            get(serve_ext_icon).layer(axum::middleware::from_fn_with_state(
+                std::time::Duration::from_secs(120),
+                request_budget::limit_image_time,
+            )),
+        )
+        // Admin: replace ONE work's cover from an uploaded image (the "Bugs" panel's
+        // manual-upload action for covers the crawl can't process). Same multipart
+        // model as avatars; body limit raised above the raw-image cap.
+        .route(
+            "/admin/cover/{work_id}",
+            post(upload_cover)
+                .layer::<_, std::convert::Infallible>(axum::middleware::from_fn_with_state(
+                    request_budgets.clone(),
+                    request_budget::limit_uploads,
+                ))
+                .layer(DefaultBodyLimit::max(cover::MAX_SOURCE_BYTES + 1024 * 1024)),
+        )
+        // Public proxy for Suwayomi-source cover thumbnails + chapter pages. Suwayomi
+        // is loopback-only, so its image endpoints are unreachable from the browser;
+        // these URLs point HERE (SUWAYOMI_PUBLIC_URL=https://api.komiq.cc) and we fetch
+        // the bytes internally. Restricted to the two numeric image paths
+        // (`is_suwayomi_image_path`) so it is not a general Suwayomi REST proxy.
+        .route(
+            "/api/v1/manga/{*rest}",
+            get(serve_suwayomi_image).layer(axum::middleware::from_fn_with_state(
+                std::time::Duration::from_secs(60),
+                request_budget::limit_image_time,
+            )),
+        )
+        // Authenticated comment-image upload + public serve, same BLOB-in-SQLite
+        // model as avatars. The upload route raises the body limit above the raw
+        // image cap enforced in `media::process_comment_image`.
+        .route(
+            "/comment-media",
+            post(upload_comment_media)
+                .layer::<_, std::convert::Infallible>(axum::middleware::from_fn_with_state(
+                    request_budgets.clone(),
+                    request_budget::limit_uploads,
+                ))
+                .layer(DefaultBodyLimit::max(media::MAX_UPLOAD_BYTES + 1024 * 1024)),
+        )
+        .route("/comment-media/{file}", get(serve_comment_media));
+    // Self-host: the server's own image proxy (`img_proxy`), the stand-in for the
+    // `img.komiq.cc` Worker. Mounted only where it is wanted — a server that serves
+    // the web apps (`KOMIKA_WEB_DIR`) or one told to (`KOMIKA_IMG_PROXY=on`) — so the
+    // hosted API, which has the Worker, exposes no new route.
+    let app = if cfg.img_proxy_enabled {
+        tracing::info!("image proxy enabled at /img");
+        app.route(
+            "/img",
+            get(img_proxy::serve)
+                .with_state(Arc::new(img_proxy::ImgProxy::new(mangadex.clone())))
+                .layer(axum::middleware::from_fn_with_state(
+                    std::time::Duration::from_secs(180),
+                    request_budget::limit_image_time,
+                )),
+        )
+    } else {
+        app
+    };
+    // Self-host: the built reader at `/` and admin at `/admin`, below every API
+    // route above. Unset (the default, and the hosted deployment) serves nothing.
+    let app = match &cfg.web_dir {
+        Some(dir) => {
+            tracing::info!(dir, "serving web apps from KOMIKA_WEB_DIR");
+            web_dir::mount(app, std::path::Path::new(dir))
+        }
+        None => app,
+    };
+    let app = app
+        // Compress compressible responses (JSON payloads — the home feed alone drops
+        // 64 KB → ~22 KB). Innermost of the middleware so the request-id/trace span
+        // and every outer layer observe the final (encoded) body. The default
+        // predicate leaves image/* and already-encoded responses alone.
+        .layer(CompressionLayer::new())
+        // Self-host "public without a domain" with HTTPS: plain HTTP from the internet
+        // is sent to the HTTPS address instead of being handled. A no-op otherwise.
+        .layer(axum::middleware::from_fn_with_state(
+            cloudflare.clone(),
+            cloudflare::plain_http_guard,
+        ))
+        // Request-id + access-log span. SetRequestId runs first (generates an
+        // x-request-id when the client didn't send one), TraceLayer's span picks
+        // it up, and PropagateRequestId echoes it back on the response.
+        .layer(
+            ServiceBuilder::new()
+                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+                .layer(
+                    TraceLayer::new_for_http()
+                        .make_span_with(|request: &axum::http::Request<axum::body::Body>| {
+                            let request_id = request
+                                .headers()
+                                .get("x-request-id")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("-");
+                            tracing::info_span!(
+                                "request",
+                                method = %request.method(),
+                                uri = %request.uri(),
+                                request_id = %request_id,
+                            )
+                        })
+                        .on_response(DefaultOnResponse::new().level(Level::INFO)),
+                )
+                .layer(PropagateRequestIdLayer::x_request_id()),
+        )
+        .layer(cors)
+        .layer(SetResponseHeaderLayer::overriding(
+            header::HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::HeaderName::from_static("x-frame-options"),
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::HeaderName::from_static("permissions-policy"),
+            HeaderValue::from_static(
+                "geolocation=(), camera=(), microphone=(), payment=(), usb=()",
+            ),
+        ))
+        // Outermost: a panicking resolver/handler becomes a 500 (logged) instead
+        // of dropping the connection or killing the worker task.
+        .layer(CatchPanicLayer::custom(handle_panic))
+        .with_state(router_state);
+    app
 }
 
 #[tokio::main]
@@ -1821,6 +2083,7 @@ async fn main() -> anyhow::Result<()> {
 
     let _data_directory_lock = db::DataDirectoryLock::acquire(&cfg.database_url)?;
     let pool = db::init(&cfg.database_url).await?;
+    let ready_pool = ReadyDb::connect(&pool).await?;
     // Separate, un-replicated DB for cover blobs — see `db::init_covers`. Kept out
     // of the main DB so Litestream ships only accounts/social/catalogue to R2, never
     // the large (re-derivable) cover thumbnails.
@@ -2141,178 +2404,20 @@ async fn main() -> anyhow::Result<()> {
         .data(cloudflare.clone())
         .finish();
 
-    let origins: Vec<_> = cfg
-        .cors_origins
-        .iter()
-        .filter_map(|o| o.parse().ok())
-        .collect();
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
-
-    // P3.1: GET /graphql is the CACHEABLE query endpoint (anonymous public reads get
-    // Cache-Control + ETag so Cloudflare and browsers can serve/revalidate them —
-    // POST is uncacheable by every CDN). Mutations over GET are rejected in the
-    // handler. GraphiQL moved to its own GET /graphiql when enabled; introspection
-    // stays disabled in the same off state (see build_schema above).
-    let mut app = Router::new().route(
-        "/graphql",
-        get(graphql_get_handler)
-            .post(graphql_handler)
-            // The GraphQL extractor reads the whole body, and a multipart one into a
-            // temporary file, before any resolver checks who is asking. Nothing the
-            // apps send comes near this size; files have their own upload routes.
-            .layer(RequestBodyLimitLayer::new(GRAPHQL_BODY_LIMIT)),
-    );
-    if cfg.graphiql_enabled {
-        app = app.route("/graphiql", get(graphiql));
-    }
-    let app = app
-        .route("/health", get(health))
-        .route("/health/ready", get(ready))
-        // Operational gauges for scraping are NOT on this router: `/metrics` is
-        // served on a separate 127.0.0.1-bound listener below, so the scrape
-        // endpoint is unreachable from outside the host by construction
-        // (aggregate counts only — no series content, no user data).
-        // Authenticated avatar upload + public serve (VM data volume). The upload
-        // route raises the body limit above the raw-image cap enforced in
-        // `avatar::process_avatar` (axum's default is 2 MB).
-        .route(
-            "/avatar",
-            post(upload_avatar).layer(DefaultBodyLimit::max(
-                avatar::MAX_UPLOAD_BYTES + 1024 * 1024,
-            )),
-        )
-        .route("/avatars/{file}", get(serve_avatar))
-        // Public serve of DB-backed work covers (WebP BLOB in `work_cover_blob`).
-        // Lets the web reader load covers from our own origin instead of the CF
-        // image Worker; the bytes are materialized by `cover::crawl_uncached_covers`
-        // (admin `materializeCatalogueCovers`).
-        .route("/covers/{file}", get(serve_cover))
-        // Public serve of extension icons from the vendored snapshot baked into
-        // this image, with a lazy fetch from each extension's own repo for the rest.
-        // Hosted here because Keiyoushi's own icon directory was emptied in their
-        // `index.pb` migration (see the `ext_icon` module).
-        .route("/ext-icons/{file}", get(serve_ext_icon))
-        // Admin: replace ONE work's cover from an uploaded image (the "Bugs" panel's
-        // manual-upload action for covers the crawl can't process). Same multipart
-        // model as avatars; body limit raised above the raw-image cap.
-        .route(
-            "/admin/cover/{work_id}",
-            post(upload_cover).layer(DefaultBodyLimit::max(cover::MAX_SOURCE_BYTES + 1024 * 1024)),
-        )
-        // Public proxy for Suwayomi-source cover thumbnails + chapter pages. Suwayomi
-        // is loopback-only, so its image endpoints are unreachable from the browser;
-        // these URLs point HERE (SUWAYOMI_PUBLIC_URL=https://api.komiq.cc) and we fetch
-        // the bytes internally. Restricted to the two numeric image paths
-        // (`is_suwayomi_image_path`) so it is not a general Suwayomi REST proxy.
-        .route("/api/v1/manga/{*rest}", get(serve_suwayomi_image))
-        // Authenticated comment-image upload + public serve, same BLOB-in-SQLite
-        // model as avatars. The upload route raises the body limit above the raw
-        // image cap enforced in `media::process_comment_image`.
-        .route(
-            "/comment-media",
-            post(upload_comment_media)
-                .layer(DefaultBodyLimit::max(media::MAX_UPLOAD_BYTES + 1024 * 1024)),
-        )
-        .route("/comment-media/{file}", get(serve_comment_media));
-    // Self-host: the server's own image proxy (`img_proxy`), the stand-in for the
-    // `img.komiq.cc` Worker. Mounted only where it is wanted — a server that serves
-    // the web apps (`KOMIKA_WEB_DIR`) or one told to (`KOMIKA_IMG_PROXY=on`) — so the
-    // hosted API, which has the Worker, exposes no new route.
-    let app = if cfg.img_proxy_enabled {
-        tracing::info!("image proxy enabled at /img");
-        app.route(
-            "/img",
-            get(img_proxy::serve).with_state(Arc::new(img_proxy::ImgProxy::new(mangadex.clone()))),
-        )
-    } else {
-        app
-    };
-    // Self-host: the built reader at `/` and admin at `/admin`, below every API
-    // route above. Unset (the default, and the hosted deployment) serves nothing.
-    let app = match &cfg.web_dir {
-        Some(dir) => {
-            tracing::info!(dir, "serving web apps from KOMIKA_WEB_DIR");
-            web_dir::mount(app, std::path::Path::new(dir))
-        }
-        None => app,
-    };
-    let app = app
-        // Compress compressible responses (JSON payloads — the home feed alone drops
-        // 64 KB → ~22 KB). Innermost of the middleware so the request-id/trace span
-        // and every outer layer observe the final (encoded) body. The default
-        // predicate leaves image/* and already-encoded responses alone.
-        .layer(CompressionLayer::new())
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::new(tokio::sync::Semaphore::new(64)),
-            limit_requests,
-        ))
-        // Self-host "public without a domain" with HTTPS: plain HTTP from the internet
-        // is sent to the HTTPS address instead of being handled. A no-op otherwise.
-        .layer(axum::middleware::from_fn_with_state(
-            cloudflare.clone(),
-            cloudflare::plain_http_guard,
-        ))
-        // Request-id + access-log span. SetRequestId runs first (generates an
-        // x-request-id when the client didn't send one), TraceLayer's span picks
-        // it up, and PropagateRequestId echoes it back on the response.
-        .layer(
-            ServiceBuilder::new()
-                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-                .layer(
-                    TraceLayer::new_for_http()
-                        .make_span_with(|request: &axum::http::Request<axum::body::Body>| {
-                            let request_id = request
-                                .headers()
-                                .get("x-request-id")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("-");
-                            tracing::info_span!(
-                                "request",
-                                method = %request.method(),
-                                uri = %request.uri(),
-                                request_id = %request_id,
-                            )
-                        })
-                        .on_response(DefaultOnResponse::new().level(Level::INFO)),
-                )
-                .layer(PropagateRequestIdLayer::x_request_id()),
-        )
-        .layer(cors)
-        .layer(SetResponseHeaderLayer::overriding(
-            header::HeaderName::from_static("x-content-type-options"),
-            HeaderValue::from_static("nosniff"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            header::HeaderName::from_static("x-frame-options"),
-            HeaderValue::from_static("DENY"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            header::REFERRER_POLICY,
-            HeaderValue::from_static("no-referrer"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            header::HeaderName::from_static("permissions-policy"),
-            HeaderValue::from_static(
-                "geolocation=(), camera=(), microphone=(), payment=(), usb=()",
-            ),
-        ))
-        // Outermost: a panicking resolver/handler becomes a 500 (logged) instead
-        // of dropping the connection or killing the worker task.
-        .layer(CatchPanicLayer::custom(handle_panic))
-        .with_state(RouterState {
+    let app = public_router(
+        &cfg,
+        RouterState {
             schema,
-            // Cloned (pools are cheap Arc handles): `main` still needs `pool` for
-            // the post-shutdown view flush below.
             pool: pool.clone(),
+            ready_pool: ready_pool.clone(),
+            request_budgets: Arc::new(request_budget::RequestBudgets::default()),
             cover_pool,
             trusted_proxies: trusted_proxies.clone(),
-            // ~20 uploads/min per user across the avatar + comment-media routes.
             upload_limiter: Arc::new(RateLimiter::new(20, 60)),
             app_state: state,
-        });
+        },
+        cloudflare.clone(),
+    );
 
     // Loopback-only metrics listener, separate from the public router: binding to
     // 127.0.0.1 makes the scrape endpoint unreachable off-host by construction.
@@ -2362,6 +2467,7 @@ async fn main() -> anyhow::Result<()> {
         if let Err(e) = views::flush(&pool).await {
             tracing::warn!(error = %e, "post-shutdown view flush failed; buffered views lost");
         }
+        ready_pool.0.close().await;
         Ok(())
     })
     .await?;
@@ -2435,6 +2541,40 @@ async fn shutdown_signal(shutdown_tx: tokio::sync::watch::Sender<bool>) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn cancelled_cover_variant_request_retains_resize_slot_until_worker_finishes() {
+        static TEST_RESIZE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let permit = TEST_RESIZE_LIMIT.acquire().await.unwrap();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (finish, finish_wait) = std::sync::mpsc::channel();
+        let request = tokio::spawn(async move {
+            resize_cover_variant(permit, move || {
+                started.send(()).unwrap();
+                finish_wait.recv().unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        waiting.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(TEST_RESIZE_LIMIT.available_permits(), 0);
+        assert!(
+            TEST_RESIZE_LIMIT.try_acquire().is_err(),
+            "cancelled request freed a running worker's slot"
+        );
+        finish.send(()).unwrap();
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            TEST_RESIZE_LIMIT.acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(permit);
+        assert_eq!(TEST_RESIZE_LIMIT.available_permits(), 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn shutdown_deadline_bounds_a_hanging_drain_after_the_signal() {
         let (signal, receiver) = tokio::sync::watch::channel(false);
@@ -2497,60 +2637,150 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saturated_http_admission_returns_retryable_503_without_running_handler() {
-        use tower::ServiceExt;
-        let admission = Arc::new(tokio::sync::Semaphore::new(1));
-        let _held = admission.clone().acquire_owned().await.unwrap();
-        let app = Router::new()
-            .route("/", get(|| async { "should not run" }))
-            .layer(axum::middleware::from_fn_with_state(
-                admission,
-                limit_requests,
-            ));
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
+    async fn readiness_has_a_reserved_query_only_connection_when_readers_are_exhausted() {
+        let pool = crate::db::Database::connect("sqlite::memory:")
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
-        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let reserved = ReadyDb::connect(&pool).await.unwrap();
+        let mut readers = Vec::new();
+        for _ in 0..pool.read().options().get_max_connections() {
+            readers.push(pool.read().acquire().await.unwrap());
+        }
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ready(State(reserved.clone())),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let query_only: i64 = sqlx::query_scalar("PRAGMA query_only")
+            .fetch_one(&reserved.0)
+            .await
+            .unwrap();
+        assert_eq!(query_only, 1);
+        drop(readers);
+        reserved.0.close().await;
+        pool.close().await;
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn hanging_http_request_times_out_and_releases_its_admission_slot() {
+    #[tokio::test]
+    async fn production_router_keeps_health_and_images_outside_graphql_admission() {
         use tower::ServiceExt;
-        let admission = Arc::new(tokio::sync::Semaphore::new(1));
-        let app = Router::new()
-            .route(
-                "/",
-                get(|| async {
-                    std::future::pending::<()>().await;
-                    "done"
-                }),
-            )
-            .layer(axum::middleware::from_fn_with_state(
-                admission.clone(),
-                limit_requests,
-            ));
-        let started = tokio::time::Instant::now();
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
+        let pool = crate::db::Database::connect("sqlite::memory:")
             .await
             .unwrap();
-        assert_eq!(started.elapsed(), std::time::Duration::from_secs(20));
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
-        assert_eq!(admission.available_permits(), 1);
+        sqlx::migrate!("./migrations")
+            .run(pool.write())
+            .await
+            .unwrap();
+        let covers = db::init_covers("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO work_cover_blob(work_id, webp, version, updated_at) VALUES ('cached', X'0102', 1, 't')")
+            .execute(&covers).await.unwrap();
+        let reserved = ReadyDb::connect(&pool).await.unwrap();
+        let budgets = Arc::new(request_budget::RequestBudgets::default());
+        let mangadex = Arc::new(mangadex::MangaDexClient::new("router-test", 50.0, 600.0));
+        mangadex.set_enabled(false);
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            cover_pool: covers.clone(),
+            suwayomi: SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
+            mangadex,
+            admin_users: vec![],
+            scan_health: std::sync::Mutex::new(ScanHealth::default()),
+            auth_limiter: RateLimiter::new(100, 60),
+            comment_limiter: graphql::comment_limiter(),
+            password_work: Arc::new(tokio::sync::Semaphore::new(4)),
+            federated_limiter: RateLimiter::new(100, 60),
+            session_ttl_secs: 3600,
+            series_inflight: KeyedLocks::default(),
+            chapters_inflight: KeyedLocks::default(),
+            cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            catalogue_cover_phash: false,
+            ext_icons_dir: std::path::PathBuf::new(),
+            setup_code: instance::SetupCode::default(),
+        });
+        let trusted = Arc::new(TrustedProxies::for_tests(vec![], false));
+        let mut cfg = Config::from_env();
+        cfg.img_proxy_enabled = true;
+        cfg.graphiql_enabled = true;
+        cfg.web_dir = None;
+        let cloudflare = Arc::new(cloudflare::Manager::new(
+            pool.clone(),
+            cloudflare::Options::from_env(&cfg),
+            trusted.clone(),
+        ));
+        let schema = graphql::schema_builder(state.clone(), true)
+            .data(cloudflare.clone())
+            .finish();
+        let app = public_router(
+            &cfg,
+            RouterState {
+                schema,
+                pool: pool.clone(),
+                ready_pool: reserved.clone(),
+                request_budgets: budgets.clone(),
+                cover_pool: covers.clone(),
+                trusted_proxies: trusted,
+                upload_limiter: Arc::new(RateLimiter::new(20, 60)),
+                app_state: state,
+            },
+            cloudflare,
+        );
+        let request = |path: &str| {
+            let mut request = axum::http::Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
+            request
+        };
+        let held = budgets.exhaust_for_test().await;
+        for (path, expected) in [
+            ("/health", StatusCode::OK),
+            ("/health/ready", StatusCode::OK),
+            ("/graphiql", StatusCode::OK),
+            ("/covers/cached.webp", StatusCode::OK),
+            ("/img", StatusCode::BAD_REQUEST),
+            ("/api/v1/manga/not-numeric", StatusCode::NOT_FOUND),
+            ("/ext-icons/not..valid.png", StatusCode::NOT_FOUND),
+            ("/avatars/missing.webp", StatusCode::NOT_FOUND),
+            ("/comment-media/missing.webp", StatusCode::NOT_FOUND),
+        ] {
+            let response = app.clone().oneshot(request(path)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                expected,
+                "actual production route {path}"
+            );
+        }
+        let graphql_path = "/graphql?query=%7Bsession%7Btoken%7D%7D";
+        assert_eq!(
+            app.clone()
+                .oneshot(request(graphql_path))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(held);
+        let (images, api, health) = tokio::join!(
+            futures::future::join_all(
+                (0..140).map(|_| app.clone().oneshot(request("/covers/cached.webp")))
+            ),
+            app.clone().oneshot(request(graphql_path)),
+            app.clone().oneshot(request("/health/ready")),
+        );
+        assert!(images
+            .into_iter()
+            .all(|response| response.unwrap().status() == StatusCode::OK));
+        assert_eq!(api.unwrap().status(), StatusCode::OK);
+        assert_eq!(health.unwrap().status(), StatusCode::OK);
+        reserved.0.close().await;
+        covers.close().await;
+        pool.close().await;
     }
 
     #[test]

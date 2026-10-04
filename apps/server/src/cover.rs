@@ -30,6 +30,68 @@ use crate::mangadex::MangaDexClient;
 /// pixel-dimension + allocation ceiling, which still applies after this gate.
 pub const MAX_SOURCE_BYTES: usize = 24 * 1024 * 1024;
 
+/// Capacity for uncached master covers, independent of GraphQL and variant work.
+/// Acquire before the download: at most eight source buffers can exist while
+/// waiting for one of two memory-heavy decoders. Cached covers bypass this lane.
+static MASTER_COVER_LIMITS: std::sync::LazyLock<MasterCoverLimits> =
+    std::sync::LazyLock::new(|| MasterCoverLimits::new(8, 2));
+
+struct MasterCoverLimits {
+    sources: Arc<tokio::sync::Semaphore>,
+    decoders: Arc<tokio::sync::Semaphore>,
+}
+
+impl MasterCoverLimits {
+    fn new(sources: usize, decoders: usize) -> Self {
+        Self {
+            sources: Arc::new(tokio::sync::Semaphore::new(sources)),
+            decoders: Arc::new(tokio::sync::Semaphore::new(decoders)),
+        }
+    }
+
+    async fn acquire(&self) -> MasterCoverWork {
+        MasterCoverWork {
+            _source: self
+                .sources
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("master cover source semaphore is never closed"),
+            decoders: self.decoders.clone(),
+        }
+    }
+}
+
+/// Owns capacity from before a source fetch until its decoder really exits.
+/// Dropping the HTTP future cannot release either permit from a blocking worker.
+pub struct MasterCoverWork {
+    _source: tokio::sync::OwnedSemaphorePermit,
+    decoders: Arc<tokio::sync::Semaphore>,
+}
+
+pub async fn master_cover_work() -> MasterCoverWork {
+    MASTER_COVER_LIMITS.acquire().await
+}
+
+impl MasterCoverWork {
+    pub async fn process<T: Send + 'static>(
+        self,
+        process: impl FnOnce() -> T + Send + 'static,
+    ) -> std::result::Result<T, tokio::task::JoinError> {
+        let decoder = self
+            .decoders
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("master cover decoder semaphore is never closed");
+        tokio::task::spawn_blocking(move || {
+            let (_work, _decoder) = (self, decoder);
+            process()
+        })
+        .await
+    }
+}
+
 /// Per-cover size budget for the stored WebP — the "100–150 KB" target. Lossy
 /// encoding (below) keeps detailed art sharp at 512px while landing under this,
 /// so the DB blob store + its Litestream replication stay cheap. Down from the old
@@ -172,12 +234,9 @@ const HIDPI_VARIANT_QUALITY: f32 = 75.0;
 
 /// Concurrency bound on variant generation.
 ///
-/// Every other cover resize on this server is bounded IMPLICITLY, by the fetch that has
-/// to happen first: `process_cover` only ever runs after a permit from
-/// `suwayomi::COVER_FETCH_CONCURRENCY`, so at most 12 can be in flight. A variant breaks
-/// that coupling — its input is the already-stored master, so it needs no fetch and
-/// nothing upstream throttles it. A cold grid asks for ~30 covers at once, which without
-/// this would launch ~30 concurrent Lanczos3 resizes on a 4-core box.
+/// Uncached masters use [`master_cover_work`]. Variants read an already-stored,
+/// small master and retain their separate two-worker lane, so a slow source fetch
+/// cannot delay generation of a cached cover's card-sized derivative.
 ///
 /// Two permits, not more: the resize is short (a card-sized derivative is a fraction of
 /// `process_cover`'s work, which is itself ~130 ms), so a queued request waits
@@ -927,13 +986,14 @@ where
 {
     let mut last_error = None;
     for source in sources {
+        let work = master_cover_work().await;
         let Some(bytes) = fetch(source).await else {
             continue;
         };
         // A download is only usable after it has decoded and processed. A corrupt
         // MangaDex image must not prevent trying Suwayomi, nor may a bad first
         // Suwayomi source prevent trying the remaining linked sources.
-        match tokio::task::spawn_blocking(move || process_cover(&bytes)).await? {
+        match work.process(move || process_cover(&bytes)).await? {
             Ok(webp) => return Ok(Some(webp)),
             Err(error) => last_error = Some(error),
         }
@@ -1082,12 +1142,13 @@ pub async fn crawl_uncached_covers(
     let mut saved = 0usize;
     let mut failed = 0usize;
     for job in jobs {
+        let work = master_cover_work().await;
         match mangadex
             .cover_thumb_bytes(&job.mangadex_id, &job.file_name)
             .await
         {
-            Some(bytes) => match process_cover(&bytes) {
-                Ok(webp) => match put_work_cover(main, covers, &job.work_id, &webp).await {
+            Some(bytes) => match work.process(move || process_cover(&bytes)).await {
+                Ok(Ok(webp)) => match put_work_cover(main, covers, &job.work_id, &webp).await {
                     Ok(()) => {
                         saved += 1;
                         clear_cover_issue(main, &job.work_id).await;
@@ -1102,7 +1163,7 @@ pub async fn crawl_uncached_covers(
                 // this work every tick. A deterministic one gets the long window; a
                 // truncated DOWNLOAD (the image is fine, the transfer was cut short) gets
                 // the transient ladder, so it is retried soon but not 288 times a day.
-                Err(e) => {
+                Ok(Err(e)) => {
                     failed += 1;
                     tracing::warn!(work_id = %job.work_id, error = %e, "cover crawl: encode failed");
                     record_cover_issue_backoff(
@@ -1112,6 +1173,10 @@ pub async fn crawl_uncached_covers(
                         &e.to_string(),
                     )
                     .await;
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(work_id = %job.work_id, error = %e, "cover crawl: encode task panicked");
                 }
             },
             // Upstream fetch failure is TRANSIENT (rate limit / network). It IS recorded
@@ -1202,6 +1267,7 @@ pub async fn crawl_uncached_covers(
     const SUW_CRAWL_CONCURRENCY: usize = crate::suwayomi::WARM_COVER_CONCURRENCY;
     let (suw_saved, suw_failed) = futures::stream::iter(suw_jobs)
         .map(|(work_id, thumb)| async move {
+            let work = master_cover_work().await;
             let bytes = match suwayomi.cover_bytes(Some(&thumb)).await {
                 Some(b) => b,
                 None => {
@@ -1219,7 +1285,7 @@ pub async fn crawl_uncached_covers(
                     return (0usize, 1usize);
                 }
             };
-            match tokio::task::spawn_blocking(move || process_cover(&bytes)).await {
+            match work.process(move || process_cover(&bytes)).await {
                 Ok(Ok(webp)) => match put_work_cover(main, covers, &work_id, &webp).await {
                     Ok(()) => {
                         clear_cover_issue(main, &work_id).await;
@@ -1514,6 +1580,10 @@ pub async fn warm_suwayomi_covers(
             if *shutdown.borrow() {
                 return (source_id, WarmOutcome::Skipped);
             }
+            let work = master_cover_work().await;
+            if *shutdown.borrow() {
+                return (source_id, WarmOutcome::Skipped);
+            }
             let path = format!("/api/v1/manga/{manga_id}/thumbnail");
             let bytes = match suwayomi.fetch_cover_background(&path).await {
                 Ok((b, _ct)) => b,
@@ -1535,7 +1605,7 @@ pub async fn warm_suwayomi_covers(
                     return (source_id, WarmOutcome::from(failure));
                 }
             };
-            match tokio::task::spawn_blocking(move || process_cover(&bytes)).await {
+            match work.process(move || process_cover(&bytes)).await {
                 Ok(Ok(webp)) => match put_suwayomi_cover(covers, manga_id, &webp).await {
                     Ok(()) => {
                         if had_issue {
@@ -1823,6 +1893,93 @@ mod tests {
     use super::*;
     use image::{DynamicImage, RgbImage};
     use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
+
+    #[tokio::test]
+    async fn cancelled_master_cover_keeps_capacity_until_decoder_exits() {
+        let limits = MasterCoverLimits::new(1, 1);
+        let work = limits.acquire().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let waiter = tokio::spawn(async move {
+            work.process(move || {
+                let _ = started_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("test releases the blocking decoder");
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("decoder starts")
+            .expect("start signal");
+        waiter.abort();
+        assert!(waiter
+            .await
+            .expect_err("HTTP waiter cancelled")
+            .is_cancelled());
+
+        // A timed-out HTTP request cannot admit another source image or decoder
+        // while its non-cancellable blocking worker still owns the image.
+        assert!(limits.sources.clone().try_acquire_owned().is_err());
+        assert!(limits.decoders.clone().try_acquire_owned().is_err());
+        release_tx.send(()).expect("release decoder");
+        let next = tokio::time::timeout(Duration::from_secs(5), limits.acquire())
+            .await
+            .expect("capacity returns when the real decoder exits");
+        next.process(|| ()).await.expect("next decoder runs");
+        assert_eq!(limits.sources.available_permits(), 1);
+        assert_eq!(limits.decoders.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn master_cover_pipeline_bounds_source_buffers_and_decoder_workers() {
+        use std::sync::atomic::AtomicUsize;
+
+        let limits = Arc::new(MasterCoverLimits::new(3, 2));
+        let live_sources = Arc::new(AtomicUsize::new(0));
+        let peak_sources = Arc::new(AtomicUsize::new(0));
+        let live_decoders = Arc::new(AtomicUsize::new(0));
+        let peak_decoders = Arc::new(AtomicUsize::new(0));
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let limits = limits.clone();
+            let live_sources = live_sources.clone();
+            let peak_sources = peak_sources.clone();
+            let live_decoders = live_decoders.clone();
+            let peak_decoders = peak_decoders.clone();
+            requests.spawn(async move {
+                // Live routes and background work acquire before downloading,
+                // so each fake fetch below represents a retained source buffer.
+                let work = limits.acquire().await;
+                let sources = live_sources.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                peak_sources.fetch_max(sources, AtomicOrdering::SeqCst);
+                tokio::task::yield_now().await;
+                work.process(move || {
+                    let decoders = live_decoders.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                    peak_decoders.fetch_max(decoders, AtomicOrdering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(10));
+                    live_decoders.fetch_sub(1, AtomicOrdering::SeqCst);
+                    live_sources.fetch_sub(1, AtomicOrdering::SeqCst);
+                })
+                .await
+                .expect("decoder task completes");
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(request) = requests.join_next().await {
+                request.expect("request completes");
+            }
+        })
+        .await
+        .expect("bounded pipeline drains");
+        assert_eq!(peak_sources.load(AtomicOrdering::SeqCst), 3);
+        assert!((1..=2).contains(&peak_decoders.load(AtomicOrdering::SeqCst)));
+        assert_eq!(live_sources.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(live_decoders.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(limits.sources.available_permits(), 3);
+        assert_eq!(limits.decoders.available_permits(), 2);
+    }
 
     #[test]
     fn the_card_variant_width_is_actually_servable() {

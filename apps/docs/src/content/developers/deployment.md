@@ -116,7 +116,7 @@ dbs:
         region: ${LITESTREAM_REGION}
         force-path-style: true
         sync-interval: 10s
-        retention: 24h
+        retention: 36h
         snapshot-interval: 24h
 ```
 
@@ -128,7 +128,7 @@ Litestream runs alongside the server process inside the `server` container. It i
 - Litestream monitors the WAL and streams changes to an S3-compatible bucket, such as Cloudflare R2.
 - The synchronization interval is set to 10 seconds (`sync-interval: 10s`), giving a recovery point objective (RPO) of approximately 10 seconds.
 - A full database snapshot is generated every 24 hours (`snapshot-interval: 24h`).
-- Litestream checks retention hourly. It keeps snapshots inside `retention: 24h` and removes earlier snapshots and WAL segments before the oldest retained snapshot. The restore window therefore depends on when snapshots were taken; a 24-hour setting does not promise 24 hours of usable history.
+- Litestream checks retention hourly. It keeps snapshots inside `retention: 36h` and removes earlier snapshots and WAL segments before the oldest retained snapshot. The usable history varies with snapshot timing. Budget for two daily snapshots plus retained WAL and measure bucket usage to confirm your storage limit.
 
 The separate `/data/covers.sqlite3` cache is excluded from Litestream. The server checks its tables at startup. An open or corruption failure preserves the file and its SQLite sidecars with a `.quarantined-<id>` suffix, then recreates the derived cache. It clears main-database cover pointers whose blobs are missing in batches of 256. A partly missing cache receives the same reconciliation.
 

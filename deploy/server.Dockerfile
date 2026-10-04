@@ -17,7 +17,7 @@ COPY apps/server/ ./apps/server/
 WORKDIR /build/apps/server
 # `panic = "abort"` + LTO are set in the crate's [profile.release].
 RUN cargo build --release --locked --bin komika-server \
-    && strip target/release/komika-server || true
+    && strip target/release/komika-server
 
 # ---- runtime ----------------------------------------------------------------
 # Distroless-style slim base kept simple; only CA certs are pulled in for
@@ -34,8 +34,11 @@ RUN apt-get update \
     # of relying on TARGETARCH, which is only injected under BuildKit/buildx and
     # silently defaulted to amd64 under the legacy builder → wrong-arch binary.
     && arch="$(dpkg --print-architecture)" \
-    && curl -fsSL "https://github.com/benbjohnson/litestream/releases/download/v${LITESTREAM_VERSION}/litestream-v${LITESTREAM_VERSION}-linux-${arch}.tar.gz" \
-       | tar -xz -C /usr/local/bin litestream \
+    && curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 120 \
+       "https://github.com/benbjohnson/litestream/releases/download/v${LITESTREAM_VERSION}/litestream-v${LITESTREAM_VERSION}-linux-${arch}.tar.gz?download=1" \
+       -o /tmp/litestream.tar.gz \
+    && tar -xzf /tmp/litestream.tar.gz -C /usr/local/bin litestream \
+    && rm /tmp/litestream.tar.gz \
     && rm -rf /var/lib/apt/lists/* \
     # Non-root runtime user; owns the data dir where the SQLite file lives.
     && useradd --system --create-home --uid 10001 komika \

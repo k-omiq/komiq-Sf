@@ -462,7 +462,9 @@ pub struct LibraryBatchState {
 #[derive(Clone, Default)]
 pub struct RequestLibraryCache(pub std::sync::Arc<std::sync::Mutex<LibraryBatchState>>);
 
-const MAX_LIBRARY_ROWS: i64 = 1000;
+/// Library responses contain every entry; this bounds each metadata hydration pass,
+/// not the number of series a user may keep. The reader expects the complete list.
+const LIBRARY_HYDRATION_BATCH: usize = 256;
 
 /// Upper bound on password length accepted by `login`/`register`, enforced
 /// before hashing so an over-long password can't amplify Argon2 CPU cost (A7).
@@ -505,7 +507,7 @@ pub fn schema_builder(
         .extension(ErrorLogger)
         // Bound query cost on this public endpoint (H7): cap nesting depth and the
         // Weighted list costs cover ordinary home/library/reader documents. The
-        // parse extension separately caps heavy root aliases, including fragments.
+        // request preflight separately caps heavy root aliases, including fragments.
         .limit_depth(20)
         .limit_complexity(50_000)
         .data(state);
@@ -534,69 +536,61 @@ const MAX_HEAVY_ROOTS: usize = 4;
 fn check_heavy_roots(
     document: &async_graphql::parser::types::ExecutableDocument,
 ) -> async_graphql::ServerResult<()> {
-    use async_graphql::parser::types::{ExecutableDocument, Selection, SelectionSet};
-    fn visit(
-        set: &SelectionSet,
-        document: &ExecutableDocument,
-        active: &mut std::collections::HashSet<String>,
-        keys: &mut std::collections::HashSet<String>,
-    ) -> async_graphql::ServerResult<()> {
-        for selection in &set.items {
-            match &selection.node {
-                Selection::Field(field) => {
-                    if matches!(
-                        field.node.name.node.as_str(),
-                        "discovery"
-                            | "search"
-                            | "updates"
-                            | "updatesFeed"
-                            | "canonicalUpdates"
-                            | "seriesPage"
-                            | "canonicalSeries"
-                            | "aggregatedChapters"
-                            | "workSources"
-                            | "series"
-                            | "chapters"
-                            | "canonicalChapters"
-                            | "pages"
-                            | "canonicalPages"
-                            | "library"
-                            | "libraryProgress"
-                            | "searchAllSources"
-                    ) {
-                        keys.insert(field.node.response_key().node.to_string());
-                        if keys.len() > MAX_HEAVY_ROOTS {
-                            return Err(async_graphql::ServerError::new(
-                                "At most 4 heavy root fields are allowed per operation",
-                                Some(field.pos),
-                            ));
+    use async_graphql::parser::types::Selection;
+    crate::request_budget::validate_fragment_expansion(document)?;
+    for (_, operation) in document.operations.iter() {
+        let mut pending = vec![&operation.node.selection_set.node];
+        let mut active = std::collections::HashSet::new();
+        let mut keys = std::collections::HashSet::new();
+        while let Some(set) = pending.pop() {
+            for selection in &set.items {
+                match &selection.node {
+                    Selection::Field(field) => {
+                        if matches!(
+                            field.node.name.node.as_str(),
+                            "discovery"
+                                | "search"
+                                | "updates"
+                                | "updatesFeed"
+                                | "canonicalUpdates"
+                                | "seriesPage"
+                                | "canonicalSeries"
+                                | "aggregatedChapters"
+                                | "workSources"
+                                | "series"
+                                | "chapters"
+                                | "canonicalChapters"
+                                | "pages"
+                                | "canonicalPages"
+                                | "library"
+                                | "libraryProgress"
+                                | "searchAllSources"
+                        ) {
+                            keys.insert(field.node.response_key().node.to_string());
+                            if keys.len() > MAX_HEAVY_ROOTS {
+                                return Err(async_graphql::ServerError::new(
+                                    "At most 4 heavy root fields are allowed per operation",
+                                    Some(field.pos),
+                                ));
+                            }
                         }
                     }
-                }
-                Selection::InlineFragment(fragment) => {
-                    visit(&fragment.node.selection_set.node, document, active, keys)?
-                }
-                Selection::FragmentSpread(spread) => {
-                    let name = spread.node.fragment_name.node.to_string();
-                    if active.insert(name.clone()) {
-                        if let Some(fragment) = document.fragments.get(name.as_str()) {
-                            visit(&fragment.node.selection_set.node, document, active, keys)?;
+                    Selection::InlineFragment(fragment) => {
+                        pending.push(&fragment.node.selection_set.node)
+                    }
+                    Selection::FragmentSpread(spread) => {
+                        let name = spread.node.fragment_name.node.to_string();
+                        if active.insert(name.clone()) {
+                            if let Some(fragment) = document.fragments.get(name.as_str()) {
+                                pending.push(&fragment.node.selection_set.node);
+                            }
+                            // Repeated fragment spreads merge the same response keys.
+                            // Keep it visited to avoid exponential walks of a fragment DAG.
                         }
-                        // Repeated fragment spreads merge the same response keys.
-                        // Keep it visited to avoid exponential walks of a fragment DAG.
                     }
                 }
             }
         }
-        Ok(())
-    }
-    for (_, operation) in document.operations.iter() {
-        visit(
-            &operation.node.selection_set.node,
-            document,
-            &mut Default::default(),
-            &mut Default::default(),
-        )?;
     }
     Ok(())
 }
@@ -605,16 +599,17 @@ struct ErrorLoggerExtension;
 
 #[async_trait::async_trait]
 impl async_graphql::extensions::Extension for ErrorLoggerExtension {
-    async fn parse_query(
+    async fn prepare_request(
         &self,
         ctx: &async_graphql::extensions::ExtensionContext<'_>,
-        query: &str,
-        variables: &async_graphql::Variables,
-        next: async_graphql::extensions::NextParseQuery<'_>,
-    ) -> async_graphql::ServerResult<async_graphql::parser::types::ExecutableDocument> {
-        let document = next.run(ctx, query, variables).await?;
-        check_heavy_roots(&document)?;
-        Ok(document)
+        mut request: async_graphql::Request,
+        next: async_graphql::extensions::NextPrepareRequest<'_>,
+    ) -> async_graphql::ServerResult<async_graphql::Request> {
+        // NextParseQuery includes the library's recursive fragment-depth walk.
+        // Validate expansion before entering it, and retain the parsed document
+        // on the request so the library does not need to parse the source again.
+        check_heavy_roots(request.parsed_query()?)?;
+        next.run(ctx, request).await
     }
 
     async fn request(
@@ -3452,6 +3447,8 @@ struct BrowseWorkExtras {
     artist: Option<String>,
     description: Option<String>,
     description_override: Option<String>,
+    content_type_override: Option<String>,
+    original_language: Option<String>,
 }
 
 /// Hydrate a page of `browse_catalogue` rows into `Series`, in FIVE grouped queries for
@@ -3516,7 +3513,7 @@ async fn map_browse_rows(
     let nsfw_live = nsfw_work_ids(&st.pool, &work_ids).await?;
     // (3) The `work` columns 0064 does not store.
     let extras_sql = format!(
-        "SELECT id, author, artist, description, description_override \
+        "SELECT id, author, artist, description, description_override, content_type_override, original_language \
          FROM work WHERE id IN ({ph})"
     );
     let mut q = sqlx::query_as::<_, BrowseWorkExtras>(&extras_sql);
@@ -3578,6 +3575,19 @@ async fn map_browse_rows(
         .into_iter()
         .map(|r| {
             let ex = extras.get(&r.work_id).cloned().unwrap_or_default();
+            let genres = genres.get(&r.work_id).cloned().unwrap_or_default();
+            let comic_type = r
+                .comic_type
+                .as_deref()
+                .and_then(comic_type_from_word)
+                .unwrap_or_else(|| {
+                    resolve_comic_type(
+                        ex.content_type_override.as_deref(),
+                        ex.original_language.as_deref(),
+                        &genres,
+                        &r.title,
+                    )
+                });
             // `cover_url` is a ready origin path; the Suwayomi fallback has to be
             // absolutized at READ time because `image_base_url` is runtime config, not data
             // (migration 0064). Same call `map_series` and `updates_feed` make.
@@ -3609,16 +3619,10 @@ async fn map_browse_rows(
                 author: ex.author,
                 artist: ex.artist,
                 description: ex.description_override.or(ex.description),
-                genres: genres.get(&r.work_id).cloned().unwrap_or_default(),
-                // A NULL `comic_type` cannot happen on a committed generation (the rebuild
-                // fills it inside its transaction and the scanner's incremental writer
-                // fills its own rows), but the column is nullable, so default rather than
-                // unwrap.
-                r#type: r
-                    .comic_type
-                    .as_deref()
-                    .and_then(comic_type_from_word)
-                    .unwrap_or(ComicType::Manga),
+                genres,
+                // A library fallback has no materialized type yet; derive it from
+                // the same local metadata and effective genres as the projector.
+                r#type: comic_type,
                 status: r
                     .status
                     .as_deref()
@@ -6880,10 +6884,9 @@ impl QueryRoot {
             "SELECT COALESCE(ss.work_id, ul.series_id), ul.series_id, ul.is_favorite, ul.status \
              FROM user_library ul LEFT JOIN source_series ss \
                ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
-             WHERE ul.user_id = ? ORDER BY ul.created_at DESC, ul.series_id LIMIT ?",
+             WHERE ul.user_id = ? ORDER BY ul.created_at DESC, ul.series_id",
         )
         .bind(&user.id)
-        .bind(MAX_LIBRARY_ROWS)
         .fetch_all(&st.pool)
         .await
         .map_err(gql_err)?;
@@ -6902,80 +6905,106 @@ impl QueryRoot {
                 row.status = status;
             }
         }
-        // Reuse the catalogue's materialized metadata and hydrate the whole library
-        // in grouped queries. Loading chapters + canonical metadata per card was
-        // hundreds of serial DB round trips on an ordinary library.
-        let mut cached_rows = crate::browse::rows_by_work_ids(&st.pool, &ids)
-            .await
-            .map_err(gql_err)?;
-        for row in &mut cached_rows {
-            row.reader_id.clone_from(&row.work_id);
-        }
-        let mut cached: HashMap<String, Series> = map_browse_rows(st, cached_rows)
-            .await?
-            .into_iter()
-            .map(|series| (series.id.0.clone(), series))
-            .collect();
-        // Build the library in the stored (newest-added-first) order. Canonical works
-        // fill their slot immediately; numeric Suwayomi series reserve a slot and are
-        // mapped together in ONE batched pass afterwards (O(1) grouped queries per
-        // lookup instead of ~5 per series), preserving the interleaved order.
-        let numeric_ids: Vec<i64> = ids.iter().filter_map(|id| id.parse().ok()).collect();
-        let mut numeric_cache = crate::series_cache::get_series_fresh_batch(&st.pool, &numeric_ids)
-            .await
-            .map_err(gql_err)?;
-        let client = client_ip(ctx);
-        let mut out: Vec<Option<Series>> = Vec::with_capacity(ids.len());
-        let mut pending: Vec<(usize, SuwayomiManga)> = Vec::new();
-        for sid in ids {
-            if let Some(series) = cached.remove(&sid) {
-                out.push(Some(series));
-                continue;
+        // Return the complete library. Hydrate in bounded groups so large libraries
+        // cannot exceed SQLite's bind limit or turn one card query into a catalogue
+        // sized statement. The response and its ordering stay compatible with the
+        // reader's shelves, sorting, Continue reading and Profile totals.
+        let mut library = Vec::with_capacity(ids.len());
+        for ids in ids.chunks(LIBRARY_HYDRATION_BATCH) {
+            let mut cached_rows = crate::browse::rows_by_work_ids(&st.pool, ids)
+                .await
+                .map_err(gql_err)?;
+            for row in &mut cached_rows {
+                row.reader_id.clone_from(&row.work_id);
             }
-            if sid.starts_with("w_") {
-                // Canonical (MangaDex-mirrored) work.
-                if let Some(work) = catalog::load_canonical_work(&st.pool, &sid)
+            let projected: std::collections::HashSet<&str> =
+                cached_rows.iter().map(|row| row.work_id.as_str()).collect();
+            let missing: Vec<String> = ids
+                .iter()
+                .filter(|id| !projected.contains(id.as_str()))
+                .cloned()
+                .collect();
+            cached_rows.extend(
+                catalog::library_browse_fallback(&st.pool, &missing)
                     .await
-                    .map_err(gql_err)?
-                {
-                    let chapters = catalog::load_canonical_chapters(&st.pool, &sid)
-                        .await
-                        .map_err(gql_err)?;
-                    out.push(Some(
-                        map_canonical_series(
-                            &st.pool,
-                            Some(user.id.as_str()),
-                            work,
-                            catalog::main_chapter_count_str(&chapters) as i32,
-                        )
-                        .await?,
-                    ));
-                }
-            } else if let Ok(n) = sid.parse::<i64>() {
-                // Numeric Suwayomi series — DB cache first, live fetch on a miss.
-                let m = resolve_series_with_cached(st, n, numeric_cache.remove(&n), Some(&client))
+                    .map_err(gql_err)?,
+            );
+            let mut cached: HashMap<String, Series> = map_browse_rows(st, cached_rows)
+                .await?
+                .into_iter()
+                .map(|series| (series.id.0.clone(), series))
+                .collect();
+            // Build the library in the stored (newest-added-first) order. Canonical works
+            // fill their slot immediately; numeric Suwayomi series reserve a slot and are
+            // mapped together in ONE batched pass afterwards (O(1) grouped queries per
+            // lookup instead of ~5 per series), preserving the interleaved order.
+            let numeric_ids: Vec<i64> = ids.iter().filter_map(|id| id.parse().ok()).collect();
+            let mut numeric_cache =
+                crate::series_cache::get_series_fresh_batch(&st.pool, &numeric_ids)
                     .await
                     .map_err(gql_err)?;
-                let m = Some(m);
-                if let Some(m) = m {
-                    pending.push((out.len(), m));
-                    out.push(None); // slot filled by the batched map below
+            let mut out: Vec<Option<Series>> = Vec::with_capacity(ids.len());
+            let mut pending: Vec<(usize, SuwayomiManga)> = Vec::new();
+            let mut placeholders = Vec::new();
+            for sid in ids {
+                if let Some(series) = cached.remove(sid) {
+                    out.push(Some(series));
+                    continue;
                 }
+                if let Some((m, _fresh)) = sid
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|n| numeric_cache.remove(&n))
+                {
+                    // A library card uses the last known local metadata, even if stale.
+                    // Only opening the detail page should fetch/refresh upstream: a
+                    // large library must not create one upstream request per entry.
+                    pending.push((out.len(), m));
+                } else {
+                    // Preserve a genuinely uncached or retired identity in the list so
+                    // it remains visible/removable. The reader renders its ordinary
+                    // cover placeholder and this explicit label; detail opens can
+                    // fetch a numeric series normally.
+                    placeholders.push((
+                        out.len(),
+                        crate::browse::BrowseRow {
+                            work_id: sid.clone(),
+                            reader_id: sid.clone(),
+                            title: format!("Unavailable series ({sid})"),
+                            cover_url: None,
+                            suwayomi_thumbnail: None,
+                            comic_type: None,
+                            status: None,
+                            en_chapter_count: 0,
+                            latest_chapter: None,
+                            released_at: None,
+                            is_nsfw: false,
+                            created_at: String::new(),
+                        },
+                    ));
+                }
+                out.push(None); // slot filled by one of the batched maps below
             }
+            // Map all numeric Suwayomi series at once, then drop each into its slot.
+            let (indices, mangas): (Vec<usize>, Vec<SuwayomiManga>) = pending.into_iter().unzip();
+            for (idx, series) in indices.into_iter().zip(map_series_batch(st, mangas).await?) {
+                out[idx] = Some(series);
+            }
+            let (indices, rows): (Vec<usize>, Vec<crate::browse::BrowseRow>) =
+                placeholders.into_iter().unzip();
+            for (idx, series) in indices.into_iter().zip(map_browse_rows(st, rows).await?) {
+                out[idx] = Some(series);
+            }
+            library.extend(out.into_iter().flatten());
         }
-        // Map all numeric Suwayomi series at once, then drop each into its slot.
-        let (indices, mangas): (Vec<usize>, Vec<SuwayomiManga>) = pending.into_iter().unzip();
-        for (idx, series) in indices.into_iter().zip(map_series_batch(st, mangas).await?) {
-            out[idx] = Some(series);
-        }
-        let mut out: Vec<Series> = out.into_iter().flatten().collect();
+        let mut out = library;
         // Library updates follow the catalogue's announcement/found clock. Release
         // dates stay separate so an old chapter discovered today still moves here.
         let work_recency: HashMap<String, (i64, Option<i64>)> = sqlx::query_as::<_, (String, i64, Option<i64>)>(
             "SELECT f.work_id, f.released_at, f.announced_at FROM feed_series_updates f \
              WHERE f.work_id IN (SELECT COALESCE(ss.work_id, ul.series_id) FROM user_library ul \
                LEFT JOIN source_series ss ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
-               WHERE ul.user_id = ? ORDER BY ul.created_at DESC, ul.series_id LIMIT 1000)",
+               WHERE ul.user_id = ?)",
         )
         .bind(&user.id)
         .fetch_all(&st.pool)
@@ -6998,7 +7027,7 @@ impl QueryRoot {
         filter_blocked(&st.pool, &viewer_blocks(ctx).await?.site, out).await
     }
 
-    /// Per-series read progress for the viewer's library, in two grouped queries. The
+    /// Per-series read progress for the viewer's complete library, in grouped queries. The
     /// Library and Profile screens use this to shelve series by progress (reading /
     /// completed / plan) without fetching each series' chapter list — the N-round-trip
     /// fan-out that hung both pages. Empty for anonymous viewers.
@@ -7042,7 +7071,7 @@ impl QueryRoot {
         let read_rows = sqlx::query_as::<_, (String, i64, Option<String>)>(
             "WITH library AS ( \
                SELECT ul.user_id, COALESCE(ss.work_id, ul.series_id) AS series_id \
-               FROM (SELECT * FROM user_library WHERE user_id = ?1 ORDER BY created_at DESC, series_id LIMIT 1000) ul LEFT JOIN source_series ss \
+               FROM user_library ul LEFT JOIN source_series ss \
                  ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
                WHERE ul.user_id = ?1 GROUP BY ul.user_id, COALESCE(ss.work_id, ul.series_id) \
              ), prog(lib_id, ckey, ts) AS ( \
@@ -7090,7 +7119,7 @@ impl QueryRoot {
         let total_rows = sqlx::query_as::<_, (String, i64)>(
             "WITH library AS ( \
                SELECT ul.user_id, COALESCE(ss.work_id, ul.series_id) AS series_id \
-               FROM (SELECT * FROM user_library WHERE user_id = ?1 ORDER BY created_at DESC, series_id LIMIT 1000) ul LEFT JOIN source_series ss \
+               FROM user_library ul LEFT JOIN source_series ss \
                  ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
                WHERE ul.user_id = ?1 GROUP BY ul.user_id, COALESCE(ss.work_id, ul.series_id) \
              ) SELECT lib_id, COUNT(DISTINCT ckey) FROM ( \
@@ -7123,7 +7152,7 @@ impl QueryRoot {
         let fallback = sqlx::query_as::<_, (String, i64, i64)>(
             "WITH library AS ( \
                SELECT ul.user_id, COALESCE(ss.work_id, ul.series_id) AS series_id \
-               FROM (SELECT * FROM user_library WHERE user_id = ?1 ORDER BY created_at DESC, series_id LIMIT 1000) ul LEFT JOIN source_series ss \
+               FROM user_library ul LEFT JOIN source_series ss \
                  ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
                WHERE ul.user_id = ?1 GROUP BY ul.user_id, COALESCE(ss.work_id, ul.series_id) \
              ) SELECT lib_id, \
@@ -7145,11 +7174,8 @@ impl QueryRoot {
         .fetch_all(&st.pool)
         .await
         .map_err(gql_err)?;
-        // Merge on the library id. A row is emitted when ANY source has something to say:
-        // a series with a known total but no progress reports 0/N (the client used to
-        // have to infer that from a missing row plus `chapterCount`), and a series with
-        // no chapters cached anywhere still reports its read count with `total` 0, which
-        // the client backfills from `chapterCount` exactly as before.
+        // Emit every library identity, including a cold cache with zero known
+        // chapters. The reader backfills a zero total from the card's chapterCount.
         fn entry(map: &mut BTreeMap<String, SeriesProgress>, id: String) -> &mut SeriesProgress {
             map.entry(id.clone()).or_insert_with(|| SeriesProgress {
                 id: ID(id),
@@ -7159,6 +7185,18 @@ impl QueryRoot {
             })
         }
         let mut by_id: BTreeMap<String, SeriesProgress> = BTreeMap::new();
+        let library_ids = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT COALESCE(ss.work_id, ul.series_id) FROM user_library ul \
+             LEFT JOIN source_series ss ON ss.source_type='suwayomi' AND ss.source_key=ul.series_id \
+             WHERE ul.user_id=?",
+        )
+        .bind(&user.id)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(gql_err)?;
+        for id in library_ids {
+            entry(&mut by_id, id);
+        }
         for (id, read, last_read_at) in read_rows {
             let e = entry(&mut by_id, id);
             e.read = read as i32;
@@ -11605,22 +11643,14 @@ impl MutationRoot {
     ) -> Result<DuplicateSweepResult> {
         require_admin(ctx).await?;
         let st = state(ctx);
-        if RECONCILE_RUNNING
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_err()
-        {
+        let Some(_running) = crate::request_budget::RunningGuard::try_acquire(&RECONCILE_RUNNING)
+        else {
             return Err(Error::new(
                 "A catalogue reconcile is already running — try again when it finishes.",
             ));
-        }
+        };
         let limit = limit.max(1) as i64;
         let res = sweep_duplicates_once(&st.pool, Some(&st.cover_pool), limit).await;
-        RECONCILE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
         let out = res.map_err(gql_err)?;
         tracing::info!(
             merged = out.merged,
@@ -12749,24 +12779,18 @@ impl MutationRoot {
         require_admin(ctx).await?;
         let st = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
         // Single-flight: refuse a second concurrent crawl (compare-and-set false→true).
-        if st
-            .cover_crawl_running
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_err()
-        {
+        let Some(running) =
+            crate::request_budget::RunningGuard::try_acquire(st.cover_crawl_running.clone())
+        else {
             return Err(gql_err(
                 "a cover materialization run is already in progress",
             ));
-        }
+        };
         let queued = crate::cover::pending_cover_count(&st.pool)
             .await
             .map_err(gql_err)? as i32;
         tokio::spawn(async move {
+            let _running = running;
             crate::cover::crawl_uncached_covers(
                 &st.pool,
                 &st.cover_pool,
@@ -12775,8 +12799,6 @@ impl MutationRoot {
                 None,
             )
             .await;
-            st.cover_crawl_running
-                .store(false, std::sync::atomic::Ordering::SeqCst);
         });
         tracing::info!(queued, "materializeCatalogueCovers: crawl started");
         Ok(queued)
@@ -12794,26 +12816,19 @@ impl MutationRoot {
     async fn reconcile_catalogue(&self, ctx: &Context<'_>) -> Result<i32> {
         require_admin(ctx).await?;
         let st = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
-        if RECONCILE_RUNNING
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_err()
-        {
+        let Some(running) = crate::request_budget::RunningGuard::try_acquire(&RECONCILE_RUNNING)
+        else {
             return Err(gql_err("a catalogue reconcile is already in progress"));
-        }
+        };
         let pending = pending_reconcile_count(&st.pool).await.map_err(gql_err)? as i32;
         tokio::spawn(async move {
+            let _running = running;
             match reconcile_provisional_works(&st.pool, Some(&st.cover_pool)).await {
                 Ok((merged, queued, skipped)) => {
                     tracing::info!(merged, queued, skipped, "reconcile: complete")
                 }
                 Err(e) => tracing::error!(error = %e, "reconcile: failed"),
             }
-            RECONCILE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
         });
         tracing::info!(pending, "reconcile: started");
         Ok(pending)
@@ -14427,18 +14442,11 @@ async fn sweep_duplicates_once(
 /// cover blobs (see `catalog::merge_works_ex`). Passing `None` leaks them, and is only
 /// correct where no covers pool exists.
 pub(crate) async fn run_post_ingest_dedup_ex(pool: &Database, covers: Option<&Database>) {
-    if RECONCILE_RUNNING
-        .compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        )
-        .is_err()
-    {
+    let Some(_running) = crate::request_budget::RunningGuard::try_acquire(&RECONCILE_RUNNING)
+    else {
         tracing::info!("post-ingest dedup: a reconcile is already running; skipping");
         return;
-    }
+    };
     tracing::info!("post-ingest dedup: starting");
     match reconcile_provisional_works(pool, covers).await {
         Ok((merged, queued, skipped)) => {
@@ -14502,7 +14510,6 @@ pub(crate) async fn run_post_ingest_dedup_ex(pool: &Database, covers: Option<&Da
         stale,
         "post-ingest dedup: complete"
     );
-    RECONCILE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Reconcile one provisional work: build a candidate from its own metadata, match it
@@ -28232,6 +28239,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_limits_fragment_preflight_precedes_recursive_schema_validation() {
+        let schema = setup().await;
+        let chain = |count, duplicate| {
+            let mut query = String::from("query { ...F0 }");
+            for index in 0..count {
+                query.push_str(&format!(" fragment F{index} on QueryRoot {{ "));
+                if index + 1 == count {
+                    query.push_str("session { token }");
+                } else {
+                    query.push_str(&format!("...F{}", index + 1));
+                    if duplicate {
+                        query.push_str(&format!(" ...F{}", index + 1));
+                    }
+                }
+                query.push_str(" }");
+            }
+            query
+        };
+        let valid = schema.execute(chain(8, false)).await;
+        assert!(
+            valid.errors.is_empty(),
+            "valid fragments rejected: {:?}",
+            valid.errors
+        );
+        for (query, expected) in [
+            (chain(5000, false), "32 levels"),
+            (chain(20, true), "50000 selections"),
+            (
+                "query { ...A } fragment A on QueryRoot { ...B } fragment B on QueryRoot { ...A }"
+                    .to_string(),
+                "cycles",
+            ),
+        ] {
+            let response = schema.execute(query).await;
+            assert!(
+                response
+                    .errors
+                    .iter()
+                    .any(|error| error.message.contains(expected)),
+                "wrong preflight result: {:?}",
+                response.errors
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn request_limits_weight_lists_and_accept_shipped_documents() {
         struct ValidateOnly;
         impl async_graphql::extensions::ExtensionFactory for ValidateOnly {
@@ -28480,7 +28533,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_limits_library_and_progress_have_the_same_bounded_population() {
+    async fn library_and_progress_include_all_entries_beyond_one_thousand() {
         let (schema, pool, _) = setup_with_state(100).await;
         sqlx::query("WITH RECURSIVE n(id) AS (VALUES(10000) UNION ALL SELECT id+1 FROM n WHERE id<11004) INSERT INTO suwayomi_series(id,title,status,source_id,updated_at,series_fetched_at) SELECT id,'Bounded','ONGOING','src','t',? FROM n")
             .bind(Utc::now().to_rfc3339()).execute(&pool).await.unwrap();
@@ -28494,7 +28547,9 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(library.len(), MAX_LIBRARY_ROWS as usize);
+        assert_eq!(library.len(), 1005);
+        assert_eq!(library[0]["id"], "10000");
+        assert_eq!(library[1004]["id"], "11004");
         let progress = exec(
             &schema,
             "{libraryProgress{id total}}",
@@ -28507,7 +28562,7 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(progress.len(), MAX_LIBRARY_ROWS as usize);
+        assert_eq!(progress.len(), 1005);
         let ids = |rows: Vec<serde_json::Value>| {
             rows.into_iter()
                 .map(|row| row["id"].as_str().unwrap().to_string())
@@ -28525,7 +28580,109 @@ mod tests {
         assert_eq!(
             older.data.into_json().unwrap()["series"]["isMarked"],
             true,
-            "listing cap hid an older library membership"
+            "older library membership was lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn large_mixed_library_uses_local_batches_including_projection_and_cache_gaps() {
+        let origin =
+            crate::suwayomi::testsrv::spawn_error(503, "upstream must not be called").await;
+        let (schema, pool, _) = setup_with_engine(100, &origin.base_url).await;
+        // 1,005 numeric entries and 512 canonical entries cross six hydration
+        // batches. The canonical half is deliberately older than the numeric half.
+        sqlx::query("WITH RECURSIVE n(id) AS (VALUES(10000) UNION ALL SELECT id+1 FROM n WHERE id<11004) INSERT INTO suwayomi_series(id,title,status,source_id,chapter_count,updated_at,series_fetched_at) SELECT id,'Cached '||id,'ONGOING','src',1,'2020-01-01T00:00:00Z','2020-01-01T00:00:00Z' FROM n")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO user_library(user_id,series_id,created_at) SELECT 'bob-id',CAST(id AS TEXT),'2026-10-01T00:00:00Z' FROM suwayomi_series WHERE id>=10000")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO suwayomi_chapter(id,manga_id,name,chapter_number,updated_at) SELECT id,id,'First',1,'2026-10-01T00:00:00Z' FROM suwayomi_series WHERE id>=10000")
+            .execute(&pool).await.unwrap();
+        sqlx::query("WITH RECURSIVE n(id) AS (VALUES(20000) UNION ALL SELECT id+1 FROM n WHERE id<20511) INSERT INTO work(id,primary_title,status,original_language,created_at,updated_at) SELECT 'w_large_'||id,'Canonical '||id,'ongoing','ko','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z' FROM n")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO source_series(id,work_id,source_type,source_key,created_at) SELECT 'ss_'||id,id,'mangadex','md_'||id,'2020-01-01T00:00:00Z' FROM work WHERE id LIKE 'w_large_%'")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO chapter(id,source_series_id,external_id,chapter_key,number,lang,created_at) SELECT 'ch_'||id,'ss_'||id,'external_'||id,'100','1','en','2020-01-01T00:00:00Z' FROM work WHERE id LIKE 'w_large_%' AND id<>'w_large_20511'")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO user_library(user_id,series_id,created_at,is_favorite,status) SELECT 'bob-id',id,'2020-01-01T00:00:00Z',CASE WHEN id='w_large_20510' THEN 1 ELSE 0 END,CASE WHEN id='w_large_20510' THEN 'reading' END FROM work WHERE id LIKE 'w_large_%'")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO browse_catalogue(work_id,reader_id,title,comic_type,status,en_chapter_count,created_at) SELECT id,id,primary_title,'manhwa','ONGOING',1,created_at FROM work WHERE id LIKE 'w_large_20%' AND id<'w_large_20256'")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO canonical_progress(user_id,work_id,chapter_id,last_page_read,read,updated_at) VALUES('bob-id','w_large_20510','external_w_large_20510',7,1,'2026-10-02T00:00:00Z')")
+            .execute(&pool).await.unwrap();
+        // One numeric card has no local metadata at all. Another has only its
+        // canonical work/source mapping, without a Browse row or cached metadata.
+        sqlx::query("INSERT INTO work(id,primary_title,created_at,updated_at) VALUES('w_numeric_gap','Known local title','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES('ss_numeric_gap','w_numeric_gap','suwayomi','src','10000','2020-01-01T00:00:00Z')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM suwayomi_series WHERE id IN (10000,11004)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = exec(
+            &schema,
+            "{ library { id title type chapterCount isFavorite libraryStatus } libraryProgress { id read total } }",
+            Some("bobtok"),
+            "large-library-local",
+        ).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(
+            origin.hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "library hydration fetched upstream, including stale cache refreshes"
+        );
+        let data = response.data.into_json().unwrap();
+        let library = data["library"].as_array().unwrap();
+        let progress = data["libraryProgress"].as_array().unwrap();
+        assert_eq!(library.len(), 1517, "mixed library was truncated");
+        assert_eq!(progress.len(), 1517, "progress population was truncated");
+        assert_eq!(library.first().unwrap()["id"], "w_numeric_gap");
+        assert_eq!(library.last().unwrap()["id"], "w_large_20511");
+        let card = |id: &str| library.iter().find(|row| row["id"] == id).unwrap();
+        assert_eq!(card("w_numeric_gap")["title"], "Known local title");
+        assert_eq!(card("11004")["title"], "Unavailable series (11004)");
+        assert_eq!(card("w_large_20510")["title"], "Canonical 20510");
+        assert_eq!(card("w_large_20510")["type"], "MANHWA");
+        assert_eq!(card("w_large_20510")["chapterCount"], 1);
+        assert_eq!(card("w_large_20510")["isFavorite"], true);
+        assert_eq!(card("w_large_20510")["libraryStatus"], "reading");
+        assert_eq!(card("w_large_20511")["chapterCount"], 0);
+        let reading = progress
+            .iter()
+            .find(|row| row["id"] == "w_large_20510")
+            .unwrap();
+        assert_eq!(reading["read"], 1);
+        assert_eq!(reading["total"], 1);
+        let empty = progress
+            .iter()
+            .find(|row| row["id"] == "w_large_20511")
+            .unwrap();
+        assert_eq!(empty["read"], 0);
+        assert_eq!(empty["total"], 0);
+        let ids = |rows: &[serde_json::Value]| {
+            rows.iter()
+                .map(|row| row["id"].as_str().unwrap().to_owned())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(ids(library), ids(progress));
+        // Fallback projection is read-only; it did not repair the missing Browse
+        // row or backfill the missing source metadata on the request's writer lane.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM browse_catalogue WHERE work_id='w_large_20510'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM suwayomi_series WHERE id=11004")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
         );
     }
 

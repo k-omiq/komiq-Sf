@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """File-backed SQLite regression and real-copy migration checks. No original DB writes."""
 import argparse
+import itertools
 import json
 import pathlib
 import shutil
@@ -59,20 +60,62 @@ def empty(path, through=120):
             timing[file.name] = apply(conn, file)
     return conn, timing
 
+
+def database_snapshot(conn):
+    """Compare schema definitions/root pages, every stored value, and header state."""
+    schema = conn.execute('SELECT * FROM sqlite_schema ORDER BY type,name').fetchall()
+    data = {}
+    for _, name, _, _, _ in schema:
+        # sqlite_schema also contains indexes, triggers and views.
+        if conn.execute("SELECT type FROM sqlite_schema WHERE name=?", (name,)).fetchone() != ('table',):
+            continue
+        quoted = '"' + name.replace('"', '""') + '"'
+        data[name] = sorted(conn.execute('SELECT * FROM ' + quoted).fetchall(), key=repr)
+    return {
+        'schema': schema,
+        'data': data,
+        'temporary_schema': conn.execute('SELECT * FROM sqlite_temp_schema ORDER BY type,name').fetchall(),
+        'user_version': conn.execute('PRAGMA user_version').fetchone(),
+        'schema_version': conn.execute('PRAGMA schema_version').fetchone(),
+        'application_id': conn.execute('PRAGMA application_id').fetchone(),
+    }
+
+
+def preflight_rows(conn):
+    """Execute the read-only operator script and capture its two result sets."""
+    results = []
+    pending = ''
+    script = ROOT / 'apps/server/scripts/sqlite_0120_preflight.sql'
+    for line in script.read_text().splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            cursor = conn.execute(pending)
+            if cursor.description:
+                names = [column[0] for column in cursor.description]
+                results.append([dict(zip(names, row)) for row in cursor.fetchall()])
+            pending = ''
+    assert not pending.strip()
+    assert len(results) == 2
+    return results
+
+
+def seed_fixture(conn):
+    conn.execute("INSERT INTO users(id,username,email,password_hash,created_at) VALUES('u1','one','Alice@example.test','hash','2026-01-01'),('u2','two','alice@example.test','hash','2026-01-01')")
+    conn.execute("INSERT INTO canonical_library(user_id,work_id,created_at) VALUES('u1','w_legacy','2026-01-01')")
+    conn.execute("INSERT INTO series_scan_state(series_id,updated_at) VALUES('legacy_null','2026-01-01')")
+    conn.execute("INSERT INTO suwayomi_series(id,title,status,source_id,updated_at,created_at) VALUES(7,'Seven','ONGOING','known','2026-10-01','1784280205'),(8,'Eight','ONGOING','known','2026-10-01','1784280205123'),(9,'Nine','ONGOING','known','2026-10-01','2026-07-18T13:13:26.100490+00:00')")
+    conn.execute("INSERT INTO work(id,primary_title,created_at,updated_at) VALUES('w_old','Old rich title','2026-01-01','2026-01-01'),('w_keep','Seven','2026-02-01','2026-02-01'),('w_other','Other','2026-02-01','2026-02-01')")
+    conn.execute("INSERT INTO source_series(id,work_id,source_type,source_id,source_key,is_nsfw,created_at) VALUES('ss_old','w_old','suwayomi','','7',1,'2026-01-01'),('ss_keep','w_keep','suwayomi','known','7',0,'2026-02-01'),('ss_other','w_old','suwayomi','known','17',0,'2026-02-01'),('ss_md','w_keep','mangadex','mangadex','md-seven',0,'2026-02-01'),('ss_unknown','w_other','suwayomi','','99',0,'2026-02-01')")
+    conn.execute("INSERT INTO chapter(id,source_series_id,external_id,number,title,created_at,chapter_key,label) VALUES('ch_old_shared','ss_old','shared','1','old','2026-01-01','100','1'),('ch_keep_shared','ss_keep','shared','1','keeper','2026-02-01','100','1'),('ch_old_unique','ss_old','old-only','2','old unique','2026-01-01','200','2'),('ch_keep_unique','ss_keep','keep-only','3','keep unique','2026-02-01','300','3'),('ch_other','ss_other','other','1','other','2026-02-01','100','1')")
+    conn.execute("INSERT INTO merge_candidate(id,source_series_id,candidate_work_id,score,method,created_at) VALUES('mc_old','ss_old','w_other',0.8,'title_exact','2026-01-01'),('mc_keep','ss_keep','w_other',0.9,'cover','2026-02-01')")
+    conn.execute("INSERT INTO release_event(work_id,chapter_key,first_seen_at,first_source_series_id,label) VALUES('w_old','100',1,'ss_old','1')")
+    conn.execute("INSERT INTO canonical_progress(user_id,chapter_id,work_id,last_page_read,updated_at) VALUES('u1','shared','w_old',15,'2026-01-01')")
+    conn.commit()
+
 class Migrations(unittest.TestCase):
     def setUp(self):
         self.conn, self.before_timing = empty(SCRATCH / 'fixture.sqlite3', through=118)
-        self.conn.execute("INSERT INTO users(id,username,email,password_hash,created_at) VALUES('u1','one','Alice@example.test','hash','2026-01-01'),('u2','two','alice@example.test','hash','2026-01-01')")
-        self.conn.execute("INSERT INTO canonical_library(user_id,work_id,created_at) VALUES('u1','w_legacy','2026-01-01')")
-        self.conn.execute("INSERT INTO series_scan_state(series_id,updated_at) VALUES('legacy_null','2026-01-01')")
-        self.conn.execute("INSERT INTO suwayomi_series(id,title,status,source_id,updated_at,created_at) VALUES(7,'Seven','ONGOING','known','2026-10-01','1784280205'),(8,'Eight','ONGOING','known','2026-10-01','1784280205123'),(9,'Nine','ONGOING','known','2026-10-01','2026-07-18T13:13:26.100490+00:00')")
-        self.conn.execute("INSERT INTO work(id,primary_title,created_at,updated_at) VALUES('w_old','Old rich title','2026-01-01','2026-01-01'),('w_keep','Seven','2026-02-01','2026-02-01'),('w_other','Other','2026-02-01','2026-02-01')")
-        self.conn.execute("INSERT INTO source_series(id,work_id,source_type,source_id,source_key,is_nsfw,created_at) VALUES('ss_old','w_old','suwayomi','','7',1,'2026-01-01'),('ss_keep','w_keep','suwayomi','known','7',0,'2026-02-01'),('ss_other','w_old','suwayomi','known','17',0,'2026-02-01'),('ss_md','w_keep','mangadex','mangadex','md-seven',0,'2026-02-01'),('ss_unknown','w_other','suwayomi','','99',0,'2026-02-01')")
-        self.conn.execute("INSERT INTO chapter(id,source_series_id,external_id,number,title,created_at,chapter_key,label) VALUES('ch_old_shared','ss_old','shared','1','old','2026-01-01','100','1'),('ch_keep_shared','ss_keep','shared','1','keeper','2026-02-01','100','1'),('ch_old_unique','ss_old','old-only','2','old unique','2026-01-01','200','2'),('ch_keep_unique','ss_keep','keep-only','3','keep unique','2026-02-01','300','3'),('ch_other','ss_other','other','1','other','2026-02-01','100','1')")
-        self.conn.execute("INSERT INTO merge_candidate(id,source_series_id,candidate_work_id,score,method,created_at) VALUES('mc_old','ss_old','w_other',0.8,'title_exact','2026-01-01'),('mc_keep','ss_keep','w_other',0.9,'cover','2026-02-01')")
-        self.conn.execute("INSERT INTO release_event(work_id,chapter_key,first_seen_at,first_source_series_id,label) VALUES('w_old','100',1,'ss_old','1')")
-        self.conn.execute("INSERT INTO canonical_progress(user_id,chapter_id,work_id,last_page_read,updated_at) VALUES('u1','shared','w_old',15,'2026-01-01')")
-        self.conn.commit()
+        seed_fixture(self.conn)
         self.assertEqual(self.conn.execute('PRAGMA foreign_key_check').fetchall(), [])
         self.after_timing = {}
         for number, file in migrations():
@@ -167,24 +210,75 @@ class Migrations(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_failed_parent_rebuild_rolls_back_all_children(self):
-        conn, _ = empty(SCRATCH / 'rollback.sqlite3', through=118)
-        conn.execute("INSERT INTO work(id,created_at,updated_at) VALUES('rollback_work','now','now')")
-        conn.execute("INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES('rollback_source','rollback_work','suwayomi','known','1','now')")
-        conn.execute("INSERT INTO chapter(id,source_series_id,external_id,number,created_at) VALUES('rollback_chapter','rollback_source','ch','1','now')")
-        conn.execute("INSERT INTO merge_candidate(id,source_series_id,candidate_work_id,score,method,created_at) VALUES('rollback_candidate','rollback_source','rollback_work',1,'title_exact','now')")
-        conn.commit()
+    def test_failed_rebuild_restores_entire_schema_and_every_row(self):
         file = next(file for number, file in migrations() if number == 120)
         sql = file.read_text()
-        marker = 'DROP TABLE source_series;'
-        self.assertIn(marker, sql)
-        # Keep BEGIN inside executescript, exactly as in apply().
+        # Early fault: children emptied and original parent dropped. Late fault:
+        # parent/children restored, duplicate identities collapsed, history copied.
+        for begin, marker in itertools.product(
+                ('BEGIN', 'BEGIN IMMEDIATE'),
+                ('DROP TABLE source_series;', 'DROP TABLE _ss_identity_release_history;')):
+            with self.subTest(begin=begin, after=marker):
+                conn, _ = empty(SCRATCH / 'rollback.sqlite3', through=118)
+                try:
+                    seed_fixture(conn)
+                    apply(conn, next(file for number, file in migrations() if number == 119))
+                    before = database_snapshot(conn)
+                    self.assertIn(marker, sql)
+                    self.assertEqual(sql.count(marker), 1)
+                    injected = sql.replace(marker, marker + '\nSELECT * FROM deliberately_missing_table;', 1)
+                    # The committed migration file is never modified. BEGIN is
+                    # inside executescript. Cover SQLx's deferred BEGIN as well
+                    # as this standalone runner's immediate write transaction.
+                    with self.assertRaisesRegex(sqlite3.OperationalError, 'deliberately_missing_table'):
+                        conn.executescript(begin + ';\n' + injected + '\nCOMMIT;')
+                    self.assertTrue(conn.in_transaction)
+                    # Prove the injected statement ran after destructive work,
+                    # rather than failing before the migration changed anything.
+                    if marker == 'DROP TABLE source_series;':
+                        self.assertEqual(conn.execute("SELECT name FROM sqlite_schema WHERE name='source_series'").fetchall(), [])
+                        self.assertEqual(conn.execute('SELECT COUNT(*) FROM chapter').fetchone(), (0,))
+                    else:
+                        self.assertEqual(conn.execute("SELECT id FROM source_series WHERE id='ss_old'").fetchall(), [])
+                        self.assertEqual(conn.execute("SELECT COUNT(*) FROM release_event WHERE work_id='w_keep'").fetchone(), (1,))
+                    conn.rollback()
+                    self.assertFalse(conn.in_transaction)
+                    self.assertEqual(database_snapshot(conn), before)
+                    self.assertEqual(conn.execute('PRAGMA foreign_keys').fetchone(), (1,))
+                    self.assertEqual(conn.execute('PRAGMA foreign_key_check').fetchall(), [])
+                    self.assertEqual(conn.execute('PRAGMA integrity_check').fetchall(), [('ok',)])
+                    # The same untouched migration succeeds after the rollback.
+                    apply(conn, file)
+                    self.assertEqual(conn.execute('PRAGMA foreign_key_check').fetchall(), [])
+                finally:
+                    conn.close()
+
+    def test_read_only_preflight_predicts_exact_source_and_chapter_removals(self):
+        conn, _ = empty(SCRATCH / 'preflight.sqlite3', through=118)
         try:
-            with self.assertRaises(sqlite3.OperationalError):
-                conn.executescript('BEGIN IMMEDIATE;\n' + sql.replace(marker, marker + '\nSELECT * FROM deliberately_missing_table;', 1))
-            conn.rollback()
-            for table in ('source_series', 'chapter', 'merge_candidate'):
-                self.assertEqual(conn.execute('SELECT COUNT(*) FROM ' + table).fetchone(), (1,))
+            seed_fixture(conn)
+            # Include several losers without an original keeper chapter: 0120
+            # retains the earliest losing row, then its ID as the restoration
+            # target for any later collision. Preflight must use that ordering.
+            conn.execute("INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES('ss_third','w_old','suwayomi','other','7','2026-03-01')")
+            conn.execute("INSERT INTO chapter(id,source_series_id,external_id,number,created_at) VALUES('ch_third_unique','ss_third','old-only','2','2026-04-01')")
+            conn.commit()
+            before = database_snapshot(conn)
+            sources, chapters = preflight_rows(conn)
+            self.assertEqual(database_snapshot(conn), before)
+            self.assertEqual({row['id'] for row in sources}, {'ss_old', 'ss_third'})
+            self.assertEqual({row['id'] for row in chapters}, {'ch_old_shared', 'ch_third_unique'})
+            self.assertEqual({row['retained_chapter_id'] for row in chapters}, {'ch_keep_shared', 'ch_old_unique'})
+            self.assertTrue(all(row['collapsed_source_rows'] == 2 for row in sources))
+            self.assertTrue(all(row['collapsed_chapter_rows'] == 2 for row in chapters))
+            source_ids = {row[0] for row in conn.execute('SELECT id FROM source_series')}
+            chapter_ids = {row[0] for row in conn.execute('SELECT id FROM chapter')}
+            conn.execute('PRAGMA query_only=OFF')
+            for number, file in migrations():
+                if number > 118:
+                    apply(conn, file)
+            self.assertEqual(source_ids - {row[0] for row in conn.execute('SELECT id FROM source_series')}, {row['id'] for row in sources})
+            self.assertEqual(chapter_ids - {row[0] for row in conn.execute('SELECT id FROM chapter')}, {row['id'] for row in chapters})
             self.assertEqual(conn.execute('PRAGMA foreign_key_check').fetchall(), [])
         finally:
             conn.close()
@@ -217,6 +311,8 @@ def run_checks(args):
     c.close()
     report = {'regression_tests': result.testsRun, 'empty_all_files': len(timing),
               'empty_migration_seconds': timing,
+              'empty_added_migration_seconds': {file.name: timing[file.name]
+                                                for number, file in migrations() if number >= 119},
               'empty_total_seconds': round(sum(timing.values()), 6)}
     if args.real_copy:
         real_path = SCRATCH / 'real-copy.sqlite3'
@@ -228,6 +324,8 @@ def run_checks(args):
         before = {table: c.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0]
                   for table in ('source_series', 'chapter', 'merge_candidate', 'work',
                                 'release_event', 'canonical_progress', 'user_library')}
+        removed_sources, removed_chapters = preflight_rows(c)
+        c.execute('PRAGMA query_only=OFF')
         c.execute('CREATE TEMP TABLE _schema_safety_original_release_event AS SELECT * FROM release_event')
         natural_union = c.execute("SELECT COUNT(*) FROM (SELECT CASE WHEN ss.source_type='suwayomi' THEN 'suwayomi:'||ss.source_key ELSE ss.id END source,c.external_id FROM chapter c JOIN source_series ss ON ss.id=c.source_series_id GROUP BY source,c.external_id)").fetchone()[0]
         real_timing = {}
@@ -239,6 +337,14 @@ def run_checks(args):
         assert c.execute("SELECT source_key FROM source_series WHERE source_type='suwayomi' GROUP BY source_key HAVING COUNT(*)>1").fetchall() == []
         assert c.execute("SELECT COUNT(*) FROM source_series WHERE source_id=''").fetchone() == (0,)
         assert c.execute('SELECT COUNT(*) FROM chapter').fetchone() == (natural_union,)
+        assert before['source_series'] - after['source_series'] == len(removed_sources)
+        assert before['chapter'] - after['chapter'] == len(removed_chapters)
+        for row in removed_sources:
+            assert c.execute('SELECT id FROM source_series WHERE id=?', (row['id'],)).fetchone() is None
+            assert c.execute('SELECT id FROM source_series WHERE id=?', (row['retained_source_series_id'],)).fetchone() is not None
+        for row in removed_chapters:
+            assert c.execute('SELECT id FROM chapter WHERE id=?', (row['id'],)).fetchone() is None
+            assert c.execute('SELECT id FROM chapter WHERE id=?', (row['retained_chapter_id'],)).fetchone() is not None
         assert c.execute("SELECT COUNT(*) FROM suwayomi_series WHERE length(created_at) IN (10,13) AND created_at NOT GLOB '*[^0-9]*'").fetchone() == (0,)
         for table in ('work', 'canonical_progress'):
             assert before[table] == after[table]
@@ -254,6 +360,11 @@ def run_checks(args):
         report.update({'real_migration_seconds': real_timing,
                        'real_total_seconds': round(sum(real_timing.values()), 6),
                        'real_before_counts': before, 'real_after_counts': after,
+                       'real_preflight_source_rows': len(removed_sources),
+                       'real_preflight_chapter_rows': len(removed_chapters),
+                       'real_preflight_source_ids': [row['id'] for row in removed_sources],
+                       'real_release_history_preservation': {
+                           'original_keys_preserved': True, 'clocks_never_advance': True},
                        'expected_unique_chapters': natural_union,
                        'real_foreign_keys_on': c.execute('PRAGMA foreign_keys').fetchone()[0]})
         c.close()

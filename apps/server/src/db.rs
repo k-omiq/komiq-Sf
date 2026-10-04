@@ -12,6 +12,9 @@ static WRITE_QUEUE_WAIT_MICROS: AtomicU64 = AtomicU64::new(0);
 static WRITE_QUEUE_ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
 static LOCK_ERRORS: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+include!("../bench/sqlite_migration.rs");
+
 pub fn write_queue_wait_seconds() -> f64 {
     WRITE_QUEUE_WAIT_MICROS.load(Ordering::Relaxed) as f64 / 1_000_000.0
 }

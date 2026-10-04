@@ -5,7 +5,7 @@ description: Understand the Rust server inside the self-hostable admin app, its 
 
 The server is part of the self-hostable admin app. It serves GraphQL, covers, avatars and configured web apps. SQLite stores accounts, libraries, social data and catalogue state. Suwayomi supplies source content.
 
-Run it through the desktop admin app, with Docker, or as a standalone binary. The reader app connects to your server. See [Internet access](/self-host/internet-access) to make your server reachable outside your network.
+Run it through the desktop admin app, Docker or a standalone binary. See [Internet access](/self-host/internet-access) for remote connections.
 
 ## Framework and architecture
 
@@ -13,25 +13,23 @@ The server uses axum for HTTP routing, Tokio for asynchronous tasks, async-graph
 
 ### Middleware stack
 
-Incoming HTTP requests pass through this middleware:
-
 ```flow
 HTTP request -> Catch panic: turns panics into JSON 500 responses
 Catch panic -> Security headers: sets nosniff, DENY and referrer policy
 Security headers -> CORS: validates allowed origins, headers and methods
 CORS -> Request ID and tracing: assigns x-request-id and logs access spans
-Request ID and tracing -> Admission: limits active handlers and request time
-Admission -> Compression: applies gzip compression
-Compression -> Route handler: routes the request
+Request ID and tracing -> Compression: applies gzip compression
+Compression -> Route budget: admits GraphQL and uploads; images have separate deadlines
+Route budget -> Route handler: routes the request
 ```
 
 Compression targets text and JSON. WebP covers and avatars skip compression.
 
-The public router admits up to 64 active handlers. Excess requests receive HTTP 503 with `Retry-After: 1` and `Cache-Control: no-store`. Handler execution has a 20-second deadline and returns the same response when it expires.
+GraphQL has separate lanes: 64 local requests for 20s, 16 upstream requests for 300s, two federated searches for 1,800s and two maintenance operations for 3,600s. Uploads have four slots and 120s. Images keep their own limits; health bypasses admission. Saturation and deadlines return 503 with `Retry-After: 1` and `Cache-Control: no-store`.
 
-Search accepts at most 256 characters and 12 distinct terms, with a two-second SQLite deadline. Heavy GraphQL root fields are limited to four per operation. Upstream misses share a 60-per-minute client budget. Library and progress queries return at most 1,000 entries.
+Search accepts at most 256 characters and 12 distinct terms, with a two-second SQLite deadline. Heavy GraphQL root fields are limited to four per operation. Upstream misses share a 60-per-minute client budget. Library and progress queries return the complete library, hydrating metadata in batches of 256 identities from local data without upstream requests.
 
-Pool saturation also returns a retryable 503. A failed session lookup returns an error rather than treating a signed-in reader as anonymous. GraphQL GET responses containing errors are never publicly cached.
+A failed session lookup remains an error. GraphQL GET errors are never publicly cached.
 
 ## Core modules
 
@@ -52,10 +50,10 @@ The modules in `apps/server/src/` include:
 | `setup_cli.rs` | `komika-server setup`: first-run setup in a terminal              |
 | `lan.rs`       | Home network addresses of the server, for the console to show     |
 | `cover.rs`     | Cover fetching, WebP encoding, variant resizing and caching       |
-| `gc.rs`        | Garbage collection for unreferenced covers and staged media       |
+| `gc.rs`        | Cleanup of orphaned covers, staged media and old read notifications |
 | `instance.rs`  | Instance settings, setup code generation and access modes         |
 
-`komika-server setup` is a client of the running server. It opens no database. It asks the same owner, access, account and source questions as `/admin/setup`, and refuses plain HTTP over the internet.
+`komika-server setup` calls the running server without opening its database. It matches `/admin/setup` and refuses plain HTTP over the internet.
 
 Access modes are `local`, `internet` and `direct`. The last serves the server's own public address without a domain or Cloudflare. Encryption adds an HTTPS listener. Leaving `internet` stops its connector or origin-certificate listener. Returning to it reuses the stored setup.
 
@@ -117,7 +115,7 @@ Catalogue writes update browse and search together. A local reconciliation loop 
 
 The cover drainer in `apps/server/src/cover.rs` downloads and resizes uncached covers every 5 minutes (`cover_cache_interval_secs = 300`), in batches of 500.
 
-The garbage collector in `apps/server/src/gc.rs` runs hourly. It deletes orphaned cover blobs from the cover database when their owning work record is removed. It also cleans up staged comment media uploads that were never submitted.
+The garbage collector in `apps/server/src/gc.rs` runs hourly. It deletes orphaned cover blobs, abandoned staged comment media, and read notifications created more than 90 days ago. Notifications use batches of 128, up to 1,024 per tick. Unread notifications and release events are kept.
 
 ### Database statistics refresh
 
@@ -169,7 +167,7 @@ curl http://localhost:8080/health
 curl http://localhost:8080/health/ready
 ```
 
-`/health/ready` runs `SELECT 1` on the read pool. It returns HTTP 200 and `ready` on success, or 503 and `not ready` on failure.
+`/health/ready` runs `SELECT 1` on a reserved query-only connection. Regular read-pool exhaustion does not affect it. Database failures return 503; success returns 200 and `ready`.
 
 ### Operational metrics
 

@@ -1741,6 +1741,10 @@ fn browse_catalogue_select_for(scope: &str) -> String {
     } else {
         "AND ss.work_id = ?1"
     };
+    browse_catalogue_select_scoped(scope, source_scope, joined_scope)
+}
+
+fn browse_catalogue_select_scoped(scope: &str, source_scope: &str, joined_scope: &str) -> String {
     format!(
         "SELECT w.id, \
             -- The ANCHOR decides first: a MangaDex-anchored work navigates to its canonical
@@ -1813,6 +1817,47 @@ fn browse_catalogue_select_for(scope: &str) -> String {
                   ELSE COALESCE(w.is_nsfw_override, w.is_nsfw) END",
         ),
     )
+}
+
+/// Local card metadata when the library references a work whose materialized Browse
+/// row is missing. Reuses the projection's expressions, but pushes the requested
+/// IDs into every grouped source/chapter query. This is read-only and never loads
+/// chapter lists or waits on upstream. The caller supplies at most 256 identities.
+pub async fn library_browse_fallback(
+    pool: &Database,
+    ids: &[String],
+) -> Result<Vec<crate::browse::BrowseRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(ids.len() <= 256, "library hydration batch is too large");
+    // Numbered parameters are shared by the four subqueries and the outer scope.
+    let ph = (1..=ids.len())
+        .map(|n| format!("?{n}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let select = browse_catalogue_select_scoped(
+        &format!(" AND w.id IN ({ph})"),
+        &format!("AND work_id IN ({ph})"),
+        &format!("AND ss.work_id IN ({ph})"),
+    );
+    let sql = format!(
+        "WITH projection ({BROWSE_CATALOGUE_COLUMNS}) AS ({select}) \
+         SELECT w.id AS work_id, w.id AS reader_id, \
+                COALESCE(p.title, w.title_override, w.primary_title, 'Unavailable series (' || w.id || ')') AS title, \
+                COALESCE(p.cover_url, CASE WHEN w.cover_cached_version IS NOT NULL \
+                    THEN '/covers/' || w.id || '.webp?v=' || w.cover_cached_version \
+                    WHEN w.cover_file_name IS NOT NULL THEN '/covers/' || w.id || '.webp' END) AS cover_url, \
+                p.suwayomi_thumbnail, NULL AS comic_type, COALESCE(p.status, w.status) AS status, \
+                COALESCE(p.en_chapter_count, 0) AS en_chapter_count, p.latest_chapter, p.released_at, \
+                COALESCE(w.is_nsfw_override, w.is_nsfw) AS is_nsfw, w.created_at \
+           FROM work w LEFT JOIN projection p ON p.work_id = w.id WHERE w.id IN ({ph})"
+    );
+    let mut query = sqlx::query_as::<_, crate::browse::BrowseRow>(&sql);
+    for id in ids {
+        query = query.bind(id);
+    }
+    Ok(query.fetch_all(pool).await?)
 }
 
 /// `browse_catalogue.demographic` (migration 0106) over a `work` row aliased `w`: MangaDex's

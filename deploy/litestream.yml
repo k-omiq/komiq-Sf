@@ -11,7 +11,8 @@
 # force-path-style is required (R2 doesn't do virtual-host-style buckets).
 #
 # The replica's sync-interval/retention/snapshot-interval below bound R2 operation
-# and storage cost to stay within the free tier (1M Class-A ops/mo, 10 GB storage).
+# and storage cost. Measure stored WAL churn to verify the free-tier budget
+# (1M Class-A ops/mo, 10 GB storage); retention alone cannot guarantee it.
 dbs:
   - path: /data/komika.sqlite3
     replicas:
@@ -22,5 +23,5 @@ dbs:
         region: ${LITESTREAM_REGION}
         force-path-style: true
         sync-interval: 10s # fewer WAL PUTs during write bursts; RPO becomes ~10s
-        retention: 24h # bound WAL history kept in R2 (caps storage)
+        retention: 36h # approved history budget; allow room for two daily snapshots
         snapshot-interval: 24h # one base snapshot/day; keeps restore fast
