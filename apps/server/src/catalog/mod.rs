@@ -3525,24 +3525,52 @@ pub async fn source_nsfw_pinned(pool: &Database, source_id: &str) -> Result<bool
     )
 }
 
-/// Set or clear the admin's "this source is adult" pin. Idempotent both ways.
-pub async fn set_source_nsfw_pin(pool: &Database, source_id: &str, pinned: bool) -> Result<()> {
+/// Set or clear the source pin and every linked work override atomically.
+/// Returns the number of affected works. A later ingest sees the same committed
+/// choice as existing works, even if another admin changes the pin concurrently.
+pub async fn set_source_nsfw_pin(pool: &Database, source_id: &str, pinned: bool) -> Result<u64> {
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let changed = set_source_nsfw_pin_in(&mut tx, source_id, pinned).await?;
+        tx.commit().await?;
+        Ok(changed)
+    })
+    .await
+}
+
+async fn set_source_nsfw_pin_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+    pinned: bool,
+) -> Result<u64> {
+    let now = Utc::now().to_rfc3339();
     if pinned {
         sqlx::query(
             "INSERT INTO source_nsfw_pin (source_id, created_at) VALUES (?, ?) \
              ON CONFLICT(source_id) DO NOTHING",
         )
         .bind(source_id)
-        .bind(Utc::now().to_rfc3339())
-        .execute(pool)
+        .bind(&now)
+        .execute(&mut **tx)
         .await?;
     } else {
         sqlx::query("DELETE FROM source_nsfw_pin WHERE source_id = ?")
             .bind(source_id)
-            .execute(pool)
+            .execute(&mut **tx)
             .await?;
     }
-    Ok(())
+    // true pins the override; false returns it to the source-derived value.
+    let changed = sqlx::query(
+        "UPDATE work SET is_nsfw_override = ?, updated_at = ? \
+         WHERE id IN (SELECT work_id FROM source_series \
+                      WHERE source_type = 'suwayomi' AND source_id = ?)",
+    )
+    .bind(pinned.then_some(1_i64))
+    .bind(&now)
+    .bind(source_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(changed.rows_affected())
 }
 
 /// Mark the works behind these MangaDex ids as metadata-attempted (H1), so the
@@ -3693,9 +3721,9 @@ pub struct WorkIdentity {
 /// the precondition aborts with `merge precondition failed` and the caller simply
 /// re-examines the pair on the next pass, when the gate sees the new values.
 ///
-/// `None` keeps the unconditional behaviour, which is correct for a merge a human
-/// explicitly asked for (`mergeWorks`, `resolveMergeCandidate`): the admin IS the
-/// authority whose intent a precondition would be protecting.
+/// `None` keeps the unconditional behavior for `mergeWorks`, where the admin names
+/// both works. A pending review additionally checks its source mapping still belongs
+/// to the captured work, inside the transaction that claims and merges it.
 pub async fn merge_works_checked(
     pool: &Database,
     covers: Option<&Database>,
@@ -4311,6 +4339,16 @@ pub async fn work_source_series_rows(
     pool: &Database,
     work_id: &str,
 ) -> Result<Vec<SourceSeriesRow>> {
+    work_source_series_rows_using(pool, work_id).await
+}
+
+async fn work_source_series_rows_using<'e, E>(
+    executor: E,
+    work_id: &str,
+) -> Result<Vec<SourceSeriesRow>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let rows = sqlx::query_as::<_, SourceSeriesRow>(
         "SELECT ss.id, ss.source_type, ss.source_id, ss.source_key, ss.source_url, ss.is_nsfw, \
                 COALESCE(NULLIF(sy.lang, ''), NULLIF(se.lang, '')) AS lang, \
@@ -4326,7 +4364,7 @@ pub async fn work_source_series_rows(
           ORDER BY (ss.source_type = 'mangadex') DESC, ss.last_seen DESC",
     )
     .bind(work_id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows)
 }
@@ -4396,10 +4434,25 @@ pub async fn split_source_series(
     source_series_ids: &[String],
     actor_user_id: Option<&str>,
 ) -> Result<SplitOutcome> {
+    crate::db::retry_transaction(|| {
+        split_source_series_attempt(pool, work_id, source_series_ids, actor_user_id)
+    })
+    .await
+}
+
+async fn split_source_series_attempt(
+    pool: &Database,
+    work_id: &str,
+    source_series_ids: &[String],
+    actor_user_id: Option<&str>,
+) -> Result<SplitOutcome> {
     if source_series_ids.is_empty() {
         anyhow::bail!("pick at least one source to detach");
     }
-    let all = work_source_series_rows(pool, work_id).await?;
+    // The source set and last-source guard belong to the writer snapshot. Two
+    // disjoint splits must not both treat the other's source as the one kept.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let all = work_source_series_rows_using(&mut *tx, work_id).await?;
     if all.is_empty() {
         anyhow::bail!("no such work, or it has no sources: {work_id}");
     }
@@ -4451,13 +4504,7 @@ pub async fn split_source_series(
     };
 
     let now = Utc::now().to_rfc3339();
-    // IMMEDIATE for the reason every writer in this file takes it: the transaction reads
-    // (the parent work's gating columns, the source's cached metadata) before it writes,
-    // and a DEFERRED read-then-write upgrade fails with SQLITE_BUSY_SNAPSHOT, which
-    // `busy_timeout` structurally cannot retry (`db::is_locked_error`).
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-
-    // Re-read the parent under the write lock: the gating columns are what the new work
+    // Read the parent under the same write lock: the gating columns are what the new work
     // inherits, and `updateSeriesMetadata` is not single-flighted against this.
     let (parent_rating, parent_nsfw): (Option<String>, i64) = sqlx::query_as(
         "SELECT content_rating, COALESCE(is_nsfw_override, is_nsfw) FROM work WHERE id = ?",
@@ -10090,3 +10137,6 @@ mod tests {
 
 #[cfg(test)]
 include!("../../bench/sqlite_contention.rs");
+
+#[cfg(test)]
+mod production_safety_tests;

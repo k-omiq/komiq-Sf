@@ -71,20 +71,33 @@ fn current_hour() -> i64 {
 /// canonical-source-per-work concept; single-source works (the common case) unify
 /// exactly.
 pub async fn view_key(pool: &Database, series_id: &str) -> String {
-    if !series_id.is_empty() && series_id.bytes().all(|b| b.is_ascii_digit()) {
-        return series_id.to_string();
+    match pool.acquire().await {
+        Ok(mut connection) => view_key_in(&mut connection, series_id)
+            .await
+            .unwrap_or_else(|_| series_id.to_string()),
+        Err(_) => series_id.to_string(),
     }
+}
+
+async fn view_key_in(connection: &mut sqlx::SqliteConnection, series_id: &str) -> Result<String> {
+    if !series_id.is_empty() && series_id.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(series_id.to_string());
+    }
+    let survivor: Option<String> =
+        sqlx::query_scalar("SELECT new_id FROM work_redirect WHERE old_id = ?")
+            .bind(series_id)
+            .fetch_optional(&mut *connection)
+            .await?;
+    let work_id = survivor.as_deref().unwrap_or(series_id);
     let numeric: Option<String> = sqlx::query_scalar(
         "SELECT source_key FROM source_series \
          WHERE work_id = ? AND source_type = 'suwayomi' \
          ORDER BY CAST(source_key AS INTEGER) LIMIT 1",
     )
-    .bind(series_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-    numeric.unwrap_or_else(|| series_id.to_string())
+    .bind(work_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    Ok(numeric.unwrap_or_else(|| work_id.to_string()))
 }
 
 /// In-memory view buffer: raw `series_id` views aggregated by the hour they were
@@ -236,11 +249,13 @@ async fn flush_buffer(buf: &ViewBuffer, pool: &Database) -> Result<usize> {
 /// normalise to the same view key (a `w_` work and its numeric Suwayomi source) are
 /// summed before writing so the upsert count matches the old per-view arithmetic.
 async fn write_batch(pool: &Database, views: HashMap<(String, i64), i64>) -> Result<()> {
-    // Resolve raw ids -> normalised keys (reads, outside the write transaction).
+    // Resolve redirects and source keys on the same writer snapshot as the upserts.
+    // A merge committed before this writer is acquired must never recreate old keys.
+    let mut tx = pool.begin().await?;
     let mut key_of: HashMap<String, String> = HashMap::new();
     for (series_id, _) in views.keys() {
         if !key_of.contains_key(series_id) {
-            let key = view_key(pool, series_id).await;
+            let key = view_key_in(&mut tx, series_id).await?;
             key_of.insert(series_id.clone(), key);
         }
     }
@@ -251,7 +266,6 @@ async fn write_batch(pool: &Database, views: HashMap<(String, i64), i64>) -> Res
         *by_key.entry((key, hour)).or_insert(0) += n;
     }
     let now = chrono::Utc::now().to_rfc3339();
-    let mut tx = pool.begin().await?;
     for ((key, hour), n) in &by_key {
         sqlx::query(
             "INSERT INTO series_views (series_key, total, updated_at) VALUES (?, ?, ?) \
@@ -400,6 +414,39 @@ mod tests {
         let buf = ViewBuffer::new();
         record_with(&buf, pool, series_id).await.unwrap();
         flush_buffer(&buf, pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffered_views_follow_a_merge_committed_by_another_connection() {
+        let pool = pool().await;
+        let external = Database::connect_with((*pool.connect_options()).clone(), 2)
+            .await
+            .unwrap();
+        let buf = std::sync::Arc::new(ViewBuffer::new());
+        buf.push_at("w_old", current_hour());
+        let mut merge = external.begin().await.unwrap();
+        sqlx::query("INSERT INTO work_redirect(old_id,new_id,created_at) VALUES ('w_old','w_survivor','2026-01-01')")
+            .execute(&mut *merge).await.unwrap();
+        let writer = pool.clone();
+        let flush_buf = buf.clone();
+        let mut flush = tokio::spawn(async move { flush_buffer(&flush_buf, &writer).await });
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut flush)
+            .await
+            .is_err());
+        merge.commit().await.unwrap();
+        flush.await.unwrap().unwrap();
+        let rows: Vec<(String, i64)> = sqlx::query_as("SELECT series_key,total FROM series_views")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![("w_survivor".into(), 1)]);
+        let keys: Vec<String> = sqlx::query_scalar("SELECT series_key FROM series_view_bucket")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(keys, vec!["w_survivor"]);
+        external.close().await;
+        pool.close().await;
     }
 
     #[tokio::test]

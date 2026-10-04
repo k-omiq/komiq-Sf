@@ -425,12 +425,23 @@ pub struct LibraryRow {
     pub status: Option<String>,
 }
 
-/// One bounded library snapshot per request, shared by every card and flag.
-/// Errors are retained too, so a failed lookup cannot appear as an empty library.
+type LibraryFlag = Result<Option<LibraryRow>>;
+type LibraryReceiver = tokio::sync::watch::Receiver<Option<LibraryFlag>>;
+type LibraryJob = (String, tokio::sync::watch::Sender<Option<LibraryFlag>>);
+
+#[derive(Default)]
+pub struct LibraryBatchState {
+    rows: HashMap<String, LibraryReceiver>,
+    pending: Vec<LibraryJob>,
+    running: bool,
+    #[cfg(test)]
+    batches: usize,
+}
+
+/// Request-scoped flag loader: concurrent cards share alias-aware batches, while
+/// each requested identity retains its result (including errors) for the request.
 #[derive(Clone, Default)]
-pub struct RequestLibraryCache(
-    pub std::sync::Arc<tokio::sync::OnceCell<Result<HashMap<String, LibraryRow>>>>,
-);
+pub struct RequestLibraryCache(pub std::sync::Arc<std::sync::Mutex<LibraryBatchState>>);
 
 const MAX_LIBRARY_ROWS: i64 = 1000;
 
@@ -940,22 +951,38 @@ async fn session_user(ctx: &Context<'_>) -> Result<Option<User>> {
     lookup().await
 }
 
-/// Resolve the viewer's bounded library and all of its source aliases together.
-async fn fetch_library_snapshot(
+/// Read only the identities requested by this page, without truncating older
+/// library memberships. Every batch has at most 256 keys and uses bound parameters.
+async fn fetch_library_rows_batch(
     pool: &Database,
     user_id: &str,
+    ids: &[String],
 ) -> Result<HashMap<String, LibraryRow>> {
-    let rows = sqlx::query_as::<_, (String, String, i64, Option<String>)>(
-        "SELECT COALESCE(ss.work_id, ul.series_id), ul.series_id, ul.is_favorite, ul.status \
-         FROM (SELECT * FROM user_library WHERE user_id = ? \
-               ORDER BY created_at DESC, series_id LIMIT ?) ul \
-         LEFT JOIN source_series ss ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
-         ORDER BY (ul.series_id = COALESCE(ss.work_id, ul.series_id)) DESC, ul.created_at DESC",
-    ).bind(user_id).bind(MAX_LIBRARY_ROWS).fetch_all(pool).await.map_err(gql_err)?;
-    let mut flags: HashMap<String, LibraryRow> = HashMap::new();
-    let mut aliases = Vec::new();
-    for (identity, stored, favorite, status) in rows {
-        let row = flags.entry(identity.clone()).or_insert(LibraryRow {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let values = std::iter::repeat_n("(?)", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "WITH requested(id) AS (VALUES {values}), target AS ( \
+           SELECT id, COALESCE((SELECT work_id FROM source_series \
+              WHERE source_type='suwayomi' AND source_key=requested.id ORDER BY work_id LIMIT 1), id) AS work_id \
+             FROM requested \
+         ) SELECT target.id, ul.is_favorite, ul.status \
+           FROM target JOIN user_library ul ON ul.user_id=? AND (ul.series_id=target.work_id \
+             OR ul.series_id IN (SELECT source_key FROM source_series \
+                   WHERE source_type='suwayomi' AND work_id=target.work_id)) \
+          ORDER BY target.id, (ul.series_id=target.work_id) DESC, ul.created_at DESC",
+    );
+    let mut query = sqlx::query_as::<_, (String, i64, Option<String>)>(&sql);
+    for id in ids {
+        query = query.bind(id);
+    }
+    let rows = query.bind(user_id).fetch_all(pool).await.map_err(gql_err)?;
+    let mut out: HashMap<String, LibraryRow> = HashMap::new();
+    for (id, favorite, status) in rows {
+        let row = out.entry(id).or_insert(LibraryRow {
             is_favorite: false,
             status: None,
         });
@@ -963,37 +990,85 @@ async fn fetch_library_snapshot(
         if row.status.is_none() {
             row.status = status;
         }
-        aliases.push((stored, identity));
     }
-    if !flags.is_empty() {
-        let ids: Vec<String> = flags.keys().cloned().collect();
-        let sql = format!("SELECT source_key, work_id FROM source_series WHERE source_type = 'suwayomi' AND work_id IN ({})", in_placeholders(ids.len()));
-        let mut q = sqlx::query_as::<_, (String, String)>(&sql);
-        for id in &ids {
-            q = q.bind(id);
-        }
-        aliases.extend(q.fetch_all(pool).await.map_err(gql_err)?);
-    }
-    for (alias, identity) in aliases {
-        if let Some(row) = flags.get(&identity).cloned() {
-            flags.insert(alias, row);
-        }
-    }
-    Ok(flags)
+    Ok(out)
 }
 
-async fn viewer_library_row(ctx: &Context<'_>, series_id: &str) -> Result<Option<LibraryRow>> {
+async fn library_row_cached(
+    cache: &RequestLibraryCache,
+    pool: &Database,
+    user_id: &str,
+    series_id: &str,
+) -> LibraryFlag {
+    let (mut receiver, start) = {
+        let mut state = cache.0.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(receiver) = state.rows.get(series_id) {
+            (receiver.clone(), false)
+        } else {
+            let (sender, receiver) = tokio::sync::watch::channel(None);
+            state.rows.insert(series_id.to_string(), receiver.clone());
+            state.pending.push((series_id.to_string(), sender));
+            let start = !state.running;
+            state.running = true;
+            (receiver, start)
+        }
+    };
+    if start {
+        let cache = cache.clone();
+        let pool = pool.clone();
+        let user_id = user_id.to_string();
+        tokio::spawn(async move {
+            // async-graphql polls a page's sibling fields together. Yield once so
+            // their keys enter the same batch before acquiring a reader connection.
+            tokio::task::yield_now().await;
+            loop {
+                let jobs: Vec<LibraryJob> = {
+                    let mut state = cache.0.lock().unwrap_or_else(|error| error.into_inner());
+                    if state.pending.is_empty() {
+                        state.running = false;
+                        return;
+                    }
+                    #[cfg(test)]
+                    {
+                        state.batches += 1;
+                    }
+                    let count = state.pending.len().min(256);
+                    state.pending.drain(..count).collect()
+                };
+                let ids: Vec<String> = jobs.iter().map(|(id, _)| id.clone()).collect();
+                let result = fetch_library_rows_batch(&pool, &user_id, &ids).await;
+                for (id, sender) in jobs {
+                    let row = match &result {
+                        Ok(rows) => Ok(rows.get(&id).cloned()),
+                        Err(error) => Err(error.clone()),
+                    };
+                    // A cancelled request may have dropped its receivers.
+                    let _ = sender.send(Some(row));
+                }
+            }
+        });
+    }
+    loop {
+        if let Some(value) = { receiver.borrow().clone() } {
+            return value;
+        }
+        receiver.changed().await.map_err(gql_err)?;
+    }
+}
+
+async fn viewer_library_row(ctx: &Context<'_>, series_id: &str) -> LibraryFlag {
     let Some(user) = current_user(ctx).await? else {
         return Ok(None);
     };
-    let fetch = || fetch_library_snapshot(&state(ctx).pool, &user.id);
     if let Some(cache) = ctx.data_opt::<RequestLibraryCache>() {
-        return match cache.0.get_or_init(fetch).await {
-            Ok(rows) => Ok(rows.get(series_id).cloned()),
-            Err(error) => Err(error.clone()),
-        };
+        library_row_cached(cache, &state(ctx).pool, &user.id, series_id).await
+    } else {
+        Ok(
+            fetch_library_rows_batch(&state(ctx).pool, &user.id, &[series_id.to_string()])
+                .await?
+                .remove(series_id),
+        )
     }
-    Ok(fetch().await?.get(series_id).cloned())
 }
 
 /// What a signed-in account with a temporary password is told by everything but
@@ -1126,12 +1201,12 @@ fn parse_chapter_number(raw: &str) -> Option<f64> {
 /// `last_page_read` is only ever written on INSERT, so a chapter the viewer had genuinely
 /// stopped partway through keeps the position it stopped at.
 async fn catch_up_canonical(
-    pool: &Database,
+    conn: &mut sqlx::SqliteConnection,
     user_id: &str,
     work_id: &str,
     number: f64,
     now: &str,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     // work_id is '' for a chapter that isn't in the mirror; there is nothing to catch up.
     if work_id.is_empty() {
         return Ok(());
@@ -1152,9 +1227,8 @@ async fn catch_up_canonical(
     .bind(now)
     .bind(work_id)
     .bind(number)
-    .execute(pool)
-    .await
-    .map_err(gql_err)?;
+    .execute(conn)
+    .await?;
     Ok(())
 }
 
@@ -1163,12 +1237,12 @@ async fn catch_up_canonical(
 /// Simpler only because `suwayomi_chapter.chapter_number` is already REAL, so the
 /// numeric-label guard is a plain `IS NOT NULL`.
 async fn catch_up_suwayomi(
-    pool: &Database,
+    conn: &mut sqlx::SqliteConnection,
     user_id: &str,
     series_id: &str,
     number: f64,
     now: &str,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     if series_id.is_empty() {
         return Ok(());
     }
@@ -1188,9 +1262,8 @@ async fn catch_up_suwayomi(
     .bind(now)
     .bind(series_id.parse::<i64>().unwrap_or(-1))
     .bind(number)
-    .execute(pool)
-    .await
-    .map_err(gql_err)?;
+    .execute(conn)
+    .await?;
     Ok(())
 }
 
@@ -8695,32 +8768,86 @@ fn tidy_chapter_number(raw: &str) -> String {
 
 /// Store library membership once per work, folding historical source-scoped rows.
 /// Preserve favorites, the explicit shelf, and original addition date on consolidation.
+#[cfg(test)]
 async fn consolidate_library_identity(
     pool: &Database,
     user_id: &str,
     series_id: &str,
 ) -> Result<String> {
-    crate::db::retry_transaction(|| consolidate_library_identity_once(pool, user_id, series_id))
-        .await
-        .map_err(gql_err)
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        let identity = consolidate_library_identity_on(&mut tx, user_id, series_id).await?;
+        tx.commit().await?;
+        Ok(identity)
+    })
+    .await
+    .map_err(mutation_write_error)
 }
 
-async fn consolidate_library_identity_once(
+#[derive(Clone, Copy)]
+enum LibraryEdit<'a> {
+    Marked(bool),
+    Status(Option<&'a str>),
+    Favorite(bool),
+}
+
+async fn write_library_once(
     pool: &Database,
     user_id: &str,
     series_id: &str,
+    edit: LibraryEdit<'_>,
 ) -> anyhow::Result<String> {
     let mut tx = pool.begin().await?;
+    let identity = consolidate_library_identity_on(&mut tx, user_id, series_id).await?;
+    let now = Utc::now().to_rfc3339();
+    match edit {
+        LibraryEdit::Marked(true) => {
+            sqlx::query("INSERT INTO user_library(user_id,series_id,created_at) VALUES(?,?,?) ON CONFLICT(user_id,series_id) DO NOTHING")
+            .bind(user_id).bind(&identity).bind(&now).execute(&mut *tx).await?;
+        }
+        LibraryEdit::Marked(false) => {
+            sqlx::query("DELETE FROM user_library WHERE user_id=? AND series_id=?")
+                .bind(user_id)
+                .bind(&identity)
+                .execute(&mut *tx)
+                .await?;
+        }
+        LibraryEdit::Status(status) => {
+            sqlx::query("INSERT INTO user_library(user_id,series_id,created_at,status) VALUES(?,?,?,?) ON CONFLICT(user_id,series_id) DO UPDATE SET status=excluded.status")
+            .bind(user_id).bind(&identity).bind(&now).bind(status).execute(&mut *tx).await?;
+        }
+        LibraryEdit::Favorite(favorite) => {
+            sqlx::query("INSERT INTO user_library(user_id,series_id,created_at,is_favorite) VALUES(?,?,?,?) ON CONFLICT(user_id,series_id) DO UPDATE SET is_favorite=excluded.is_favorite")
+            .bind(user_id).bind(&identity).bind(&now).bind(favorite as i64).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(identity)
+}
+
+async fn consolidate_library_identity_on(
+    conn: &mut sqlx::SqliteConnection,
+    user_id: &str,
+    series_id: &str,
+) -> anyhow::Result<String> {
     let identity = if series_id.starts_with("w_") {
-        sqlx::query_scalar::<_, String>("SELECT id FROM work WHERE id = ?")
-            .bind(series_id).fetch_optional(&mut *tx).await?
+        sqlx::query_scalar::<_, String>("SELECT id FROM work WHERE id=?1 UNION ALL SELECT new_id FROM work_redirect WHERE old_id=?1 LIMIT 1")
+            .bind(series_id).fetch_optional(&mut *conn).await?
     } else {
         sqlx::query_scalar::<_, String>(
             "SELECT work_id FROM source_series WHERE source_type = 'suwayomi' AND source_key = ? ORDER BY work_id LIMIT 1",
-        ).bind(series_id).fetch_optional(&mut *tx).await?
+        ).bind(series_id).fetch_optional(&mut *conn).await?
     }.unwrap_or_else(|| series_id.to_string());
+    if identity.starts_with("w_") {
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work WHERE id=?)")
+            .bind(&identity)
+            .fetch_one(&mut *conn)
+            .await?;
+        if !exists {
+            return Err(MutationValidation("No such work").into());
+        }
+    }
     if identity == series_id && !identity.starts_with("w_") {
-        tx.commit().await?;
         return Ok(identity);
     }
     let rows = sqlx::query_as::<_, (String, String, i64, Option<String>)>(
@@ -8731,7 +8858,7 @@ async fn consolidate_library_identity_once(
     )
     .bind(user_id)
     .bind(&identity)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *conn)
     .await?;
     if !rows.is_empty() {
         let created = rows.iter().map(|r| &r.1).min().unwrap();
@@ -8747,7 +8874,7 @@ async fn consolidate_library_identity_once(
         .bind(created)
         .bind(favorite as i64)
         .bind(status)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await
         ?;
         sqlx::query(
@@ -8757,11 +8884,10 @@ async fn consolidate_library_identity_once(
         )
         .bind(user_id)
         .bind(&identity)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await
         ?;
     }
-    tx.commit().await?;
     Ok(identity)
 }
 
@@ -8770,11 +8896,10 @@ async fn consolidate_library_identity_once(
 /// against `user_id`. Shared by the library mutations to echo the updated state.
 async fn reload_series(st: &AppState, user_id: &str, series_id: &str) -> Result<Series> {
     if series_id.starts_with("w_") {
-        let work = catalog::load_canonical_work(&st.pool, series_id)
-            .await
-            .map_err(gql_err)?
+        let work = load_work_following_redirect(&st.pool, series_id)
+            .await?
             .ok_or_else(|| Error::new("No such work"))?;
-        let chapters = catalog::load_canonical_chapters(&st.pool, series_id)
+        let chapters = catalog::load_canonical_chapters(&st.pool, &work.work_id)
             .await
             .map_err(gql_err)?;
         return Ok(map_canonical_series(
@@ -8815,6 +8940,100 @@ fn mutation_write_error(error: anyhow::Error) -> Error {
         return Error::new(validation.0);
     }
     gql_err(error)
+}
+
+async fn set_progress_once(
+    pool: &Database,
+    user_id: &str,
+    chapter_id: &str,
+    last_page_read: i32,
+    read: bool,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    // Canonical chapter ids are MangaDex uuids (not all-digits); persist their
+    // progress in `canonical_progress`. Numeric Suwayomi ids fall through (CR6).
+    let is_numeric = !chapter_id.is_empty() && chapter_id.bytes().all(|b| b.is_ascii_digit());
+    if !is_numeric {
+        // The owning work, for per-series aggregation. If the chapter isn't in the
+        // mirror, store with work_id = '' rather than erroring — it's per-user private.
+        // The chapter's own number comes back with it, for the catch-up cascade below.
+        let owner: Option<(String, Option<String>)> = sqlx::query_as(
+                "SELECT ss.work_id, c.number FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
+                 WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
+            )
+            .bind(&chapter_id)
+            .fetch_optional(&mut *tx)
+            .await
+            ?;
+        let (work_id, number) = owner.unwrap_or_default();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+                "INSERT INTO canonical_progress \
+                   (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
+                   last_page_read = excluded.last_page_read, read = MAX(canonical_progress.read, excluded.read), \
+                   work_id = excluded.work_id, updated_at = excluded.updated_at",
+            )
+            .bind(user_id)
+            .bind(&chapter_id)
+            .bind(&work_id)
+            .bind(last_page_read as i64)
+            .bind(read)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            ?;
+        if read {
+            if let Some(n) = number.as_deref().and_then(parse_chapter_number) {
+                catch_up_canonical(&mut *tx, user_id, &work_id, n, &now).await?;
+            }
+        }
+        tx.commit().await?;
+        return Ok(true);
+    }
+    // Numeric Suwayomi chapter: per-user progress in `suwayomi_progress` (CR6).
+    // Suwayomi is a content source only now — we no longer push read state to it.
+    let n = chapter_id.parse::<i64>()?;
+    // The owning series id, for per-series aggregation in `libraryProgress`. If the
+    // chapter isn't cached yet, store with series_id = '' rather than erroring —
+    // the row is per-user private and the read state still round-trips.
+    // Its number rides along for the catch-up cascade below.
+    let owner: Option<(i64, Option<f64>)> = sqlx::query_as(
+        "SELECT manga_id, chapter_number FROM suwayomi_chapter WHERE id = ? LIMIT 1",
+    )
+    .bind(n)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (series_id, number) = match owner {
+        Some((sid, num)) => (sid.to_string(), num),
+        None => (String::new(), None),
+    };
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+            "INSERT INTO suwayomi_progress \
+               (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
+               last_page_read = excluded.last_page_read, read = MAX(suwayomi_progress.read, excluded.read), \
+               series_id = excluded.series_id, updated_at = excluded.updated_at",
+        )
+        .bind(user_id)
+        .bind(chapter_id)
+        .bind(&series_id)
+        .bind(last_page_read as i64)
+        .bind(read)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        ?;
+    if read {
+        if let Some(num) = number {
+            catch_up_suwayomi(&mut *tx, user_id, &series_id, num, &now).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 async fn set_chapter_read_once(
@@ -9026,19 +9245,17 @@ impl MutationRoot {
         if !series_id.0.starts_with("w_") && series_id.0.parse::<i64>().is_err() {
             return Err(Error::new("Invalid series id"));
         }
-        let library_id = consolidate_library_identity(&st.pool, &user.id, &series_id.0).await?;
-        if marked {
-            let now = Utc::now().to_rfc3339();
-            sqlx::query(
-                "INSERT INTO user_library (user_id, series_id, created_at) VALUES (?, ?, ?) \
-                 ON CONFLICT(user_id, series_id) DO NOTHING",
+        crate::db::retry_transaction(|| {
+            write_library_once(
+                &st.pool,
+                &user.id,
+                &series_id.0,
+                LibraryEdit::Marked(marked),
             )
-            .bind(&user.id)
-            .bind(&library_id)
-            .bind(&now)
-            .execute(&st.pool)
-            .await
-            .map_err(gql_err)?;
+        })
+        .await
+        .map_err(mutation_write_error)?;
+        if marked {
             log_activity(
                 &st.pool,
                 &user.id,
@@ -9047,13 +9264,6 @@ impl MutationRoot {
                 Some(&series_id.0),
             )
             .await;
-        } else {
-            sqlx::query("DELETE FROM user_library WHERE user_id = ? AND series_id = ?")
-                .bind(&user.id)
-                .bind(&library_id)
-                .execute(&st.pool)
-                .await
-                .map_err(gql_err)?;
         }
         reload_series(st, &user.id, &series_id.0).await
     }
@@ -9077,19 +9287,16 @@ impl MutationRoot {
                 ));
             }
         }
-        let library_id = consolidate_library_identity(&st.pool, &user.id, &series_id.0).await?;
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO user_library (user_id, series_id, created_at, status) VALUES (?, ?, ?, ?) \
-             ON CONFLICT(user_id, series_id) DO UPDATE SET status = excluded.status",
-        )
-        .bind(&user.id)
-        .bind(&library_id)
-        .bind(&now)
-        .bind(&status)
-        .execute(&st.pool)
+        crate::db::retry_transaction(|| {
+            write_library_once(
+                &st.pool,
+                &user.id,
+                &series_id.0,
+                LibraryEdit::Status(status.as_deref()),
+            )
+        })
         .await
-        .map_err(gql_err)?;
+        .map_err(mutation_write_error)?;
         reload_series(st, &user.id, &series_id.0).await
     }
 
@@ -9103,19 +9310,16 @@ impl MutationRoot {
     ) -> Result<Series> {
         let st = state(ctx);
         let user = require_user(ctx).await?;
-        let library_id = consolidate_library_identity(&st.pool, &user.id, &series_id.0).await?;
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO user_library (user_id, series_id, created_at, is_favorite) VALUES (?, ?, ?, ?) \
-             ON CONFLICT(user_id, series_id) DO UPDATE SET is_favorite = excluded.is_favorite",
-        )
-        .bind(&user.id)
-        .bind(&library_id)
-        .bind(&now)
-        .bind(favorite as i64)
-        .execute(&st.pool)
+        crate::db::retry_transaction(|| {
+            write_library_once(
+                &st.pool,
+                &user.id,
+                &series_id.0,
+                LibraryEdit::Favorite(favorite),
+            )
+        })
         .await
-        .map_err(gql_err)?;
+        .map_err(mutation_write_error)?;
         reload_series(st, &user.id, &series_id.0).await
     }
 
@@ -9398,93 +9602,18 @@ impl MutationRoot {
         if last_page_read < 0 {
             return Err(Error::new("lastPageRead must be non-negative"));
         }
-        let st = state(ctx);
-        // Canonical chapter ids are MangaDex uuids (not all-digits); persist their
-        // progress in `canonical_progress`. Numeric Suwayomi ids fall through (CR6).
-        let is_numeric =
-            !chapter_id.0.is_empty() && chapter_id.0.bytes().all(|b| b.is_ascii_digit());
-        if !is_numeric {
-            let user = require_user(ctx).await?;
-            // The owning work, for per-series aggregation. If the chapter isn't in the
-            // mirror, store with work_id = '' rather than erroring — it's per-user private.
-            // The chapter's own number comes back with it, for the catch-up cascade below.
-            let owner: Option<(String, Option<String>)> = sqlx::query_as(
-                "SELECT ss.work_id, c.number FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
-                 WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
-            )
-            .bind(&chapter_id.0)
-            .fetch_optional(&st.pool)
-            .await
-            .map_err(gql_err)?;
-            let (work_id, number) = owner.unwrap_or_default();
-            let now = Utc::now().to_rfc3339();
-            sqlx::query(
-                "INSERT INTO canonical_progress \
-                   (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?) \
-                 ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-                   last_page_read = excluded.last_page_read, read = MAX(canonical_progress.read, excluded.read), \
-                   work_id = excluded.work_id, updated_at = excluded.updated_at",
-            )
-            .bind(&user.id)
-            .bind(&chapter_id.0)
-            .bind(&work_id)
-            .bind(last_page_read as i64)
-            .bind(read)
-            .bind(&now)
-            .execute(&st.pool)
-            .await
-            .map_err(gql_err)?;
-            if read {
-                if let Some(n) = number.as_deref().and_then(parse_chapter_number) {
-                    catch_up_canonical(&st.pool, &user.id, &work_id, n, &now).await?;
-                }
-            }
-            return Ok(true);
-        }
-        // Numeric Suwayomi chapter: per-user progress in `suwayomi_progress` (CR6).
-        // Suwayomi is a content source only now — we no longer push read state to it.
-        let n = chapter_id.0.parse::<i64>().map_err(gql_err)?;
         let user = require_user(ctx).await?;
-        // The owning series id, for per-series aggregation in `libraryProgress`. If the
-        // chapter isn't cached yet, store with series_id = '' rather than erroring —
-        // the row is per-user private and the read state still round-trips.
-        // Its number rides along for the catch-up cascade below.
-        let owner: Option<(i64, Option<f64>)> = sqlx::query_as(
-            "SELECT manga_id, chapter_number FROM suwayomi_chapter WHERE id = ? LIMIT 1",
-        )
-        .bind(n)
-        .fetch_optional(&st.pool)
+        crate::db::retry_transaction(|| {
+            set_progress_once(
+                &state(ctx).pool,
+                &user.id,
+                &chapter_id.0,
+                last_page_read,
+                read,
+            )
+        })
         .await
-        .map_err(gql_err)?;
-        let (series_id, number) = match owner {
-            Some((sid, num)) => (sid.to_string(), num),
-            None => (String::new(), None),
-        };
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO suwayomi_progress \
-               (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-               last_page_read = excluded.last_page_read, read = MAX(suwayomi_progress.read, excluded.read), \
-               series_id = excluded.series_id, updated_at = excluded.updated_at",
-        )
-        .bind(&user.id)
-        .bind(chapter_id.0.clone())
-        .bind(&series_id)
-        .bind(last_page_read as i64)
-        .bind(read)
-        .bind(&now)
-        .execute(&st.pool)
-        .await
-        .map_err(gql_err)?;
-        if read {
-            if let Some(num) = number {
-                catch_up_suwayomi(&st.pool, &user.id, &series_id, num, &now).await?;
-            }
-        }
-        Ok(true)
+        .map_err(mutation_write_error)
     }
 
     /// Mark ONE chapter read or unread, exactly — the series list's per-chapter toggle.
@@ -10082,24 +10211,8 @@ impl MutationRoot {
         if user.is_banned != 0 {
             return Err(Error::new("This account has been suspended."));
         }
-        let tok = new_session(&st.pool, &user.id, st.session_ttl_secs).await?;
-        // The password may have changed while this sign-in ran. `changePassword` ends
-        // every other session, but only those that exist when it commits: a session
-        // made from the old password just after would outlive it. So look again.
-        let current: Option<(String,)> =
-            sqlx::query_as("SELECT password_hash FROM users WHERE id = ?")
-                .bind(&user.id)
-                .fetch_optional(&st.pool)
-                .await
-                .map_err(gql_err)?;
-        if current.map(|(hash,)| hash) != Some(checked_hash) {
-            sqlx::query("DELETE FROM sessions WHERE token = ?")
-                .bind(auth::hash_token(&tok))
-                .execute(&st.pool)
-                .await
-                .map_err(gql_err)?;
-            return Err(Error::new("Invalid username or password"));
-        }
+        let tok = new_session_checked(&st.pool, &user.id, st.session_ttl_secs, Some(&checked_hash))
+            .await?;
         let show_nsfw = user_show_nsfw(&st.pool, &user.id).await?;
         Ok(Session {
             token: tok,
@@ -10990,28 +11103,9 @@ impl MutationRoot {
     ) -> Result<i32> {
         require_admin(ctx).await?;
         let st = state(ctx);
-        let now = Utc::now().to_rfc3339();
-        // Remember the decision BEFORE touching the works: if this fails nothing has
-        // changed, and once it is in place an ingest racing the UPDATE below already
-        // pins what it adds. Kept apart from `source_extension`, which the record pass
-        // rewrites from the engine and would overwrite.
-        catalog::set_source_nsfw_pin(&st.pool, &source_id, is_nsfw)
+        let n = catalog::set_source_nsfw_pin(&st.pool, &source_id, is_nsfw)
             .await
-            .map_err(gql_err)?;
-        // true → pin override = 1; false → clear (NULL) so it reverts to derived.
-        let val: Option<i64> = is_nsfw.then_some(1);
-        let res = sqlx::query(
-            "UPDATE work SET is_nsfw_override = ?, updated_at = ? \
-             WHERE id IN (SELECT work_id FROM source_series \
-                          WHERE source_type = 'suwayomi' AND source_id = ?)",
-        )
-        .bind(val)
-        .bind(&now)
-        .bind(&source_id)
-        .execute(&st.pool)
-        .await
-        .map_err(gql_err)?;
-        let n = res.rows_affected() as i32;
+            .map_err(gql_err)? as i32;
         // Push the new effective flag into the two feed tables that store a COPY of it.
         // Same id set as the UPDATE above, read back rather than threaded through: the
         // UPDATE reports a row COUNT, not which rows (see `resync_feed_nsfw`).
@@ -11196,47 +11290,12 @@ impl MutationRoot {
     /// sign in and their active sessions are revoked immediately. Admins can't
     /// ban themselves or another admin.
     async fn ban_user(&self, ctx: &Context<'_>, user_id: ID, banned: bool) -> Result<AdminUser> {
-        let admin = require_admin(ctx).await?;
-        let st = state(ctx);
-        if user_id.0 == admin.id {
-            return Err(Error::new("You cannot ban your own account."));
-        }
-        let target: Option<(String, String, String, Option<String>, i64, String)> = sqlx::query_as(
-            "SELECT id, username, email, avatar_url, is_admin, created_at FROM users WHERE id = ?",
-        )
-        .bind(&user_id.0)
-        .fetch_optional(&st.pool)
-        .await
-        .map_err(gql_err)?;
-        let Some((id, username, email, avatar_url, is_admin, created_at)) = target else {
-            return Err(Error::new("No such user."));
-        };
-        if is_admin != 0 {
-            return Err(Error::new("You cannot ban an admin account."));
-        }
-        sqlx::query("UPDATE users SET is_banned = ? WHERE id = ?")
-            .bind(banned as i64)
-            .bind(&id)
-            .execute(&st.pool)
-            .await
-            .map_err(gql_err)?;
-        if banned {
-            // Revoke active sessions so the ban takes effect at once.
-            sqlx::query("DELETE FROM sessions WHERE user_id = ?")
-                .bind(&id)
-                .execute(&st.pool)
-                .await
-                .map_err(gql_err)?;
-        }
-        Ok(AdminUser {
-            id: ID(id),
-            username,
-            email,
-            avatar_url,
-            is_admin: is_admin != 0,
-            is_banned: banned,
-            created_at,
+        let actor = require_admin(ctx).await?;
+        crate::db::retry_transaction(|| {
+            ban_user_once(&state(ctx).pool, &actor.id, &user_id.0, banned)
         })
+        .await
+        .map_err(mutation_write_error)
     }
 
     /// Admin moderation: delete a comment and its entire reply subtree. Returns
@@ -11287,38 +11346,12 @@ impl MutationRoot {
         user_id: ID,
         is_admin: bool,
     ) -> Result<AdminUser> {
-        let admin = require_admin(ctx).await?;
-        let st = state(ctx);
-        if user_id.0 == admin.id && !is_admin {
-            return Err(Error::new("You cannot remove your own admin access."));
-        }
-        let res = sqlx::query("UPDATE users SET is_admin = ? WHERE id = ?")
-            .bind(is_admin as i64)
-            .bind(&user_id.0)
-            .execute(&st.pool)
-            .await
-            .map_err(gql_err)?;
-        if res.rows_affected() == 0 {
-            return Err(Error::new("No such user."));
-        }
-        if !is_admin {
-            // Revoke active sessions so the demotion takes effect at once —
-            // defense-in-depth, matching the ban path above.
-            sqlx::query("DELETE FROM sessions WHERE user_id = ?")
-                .bind(&user_id.0)
-                .execute(&st.pool)
-                .await
-                .map_err(gql_err)?;
-        }
-        let row: AdminUserRow = sqlx::query_as(
-            "SELECT id, username, email, avatar_url, is_admin, is_banned, created_at \
-             FROM users WHERE id = ?",
-        )
-        .bind(&user_id.0)
-        .fetch_one(&st.pool)
+        let actor = require_admin(ctx).await?;
+        crate::db::retry_transaction(|| {
+            set_user_admin_once(&state(ctx).pool, &actor.id, &user_id.0, is_admin)
+        })
         .await
-        .map_err(gql_err)?;
-        Ok(row.into())
+        .map_err(mutation_write_error)
     }
 
     /// Admin: open or close public sign-up (`registration_open`). Refused when the
@@ -12952,44 +12985,152 @@ async fn verify_password_bounded(st: &AppState, password: &str, phc: &str) -> Re
 
 /// Create a session row and return its opaque token.
 async fn new_session(pool: &Database, user_id: &str, ttl_secs: i64) -> Result<String> {
-    let (is_admin,): (i64,) = sqlx::query_as("SELECT is_admin FROM users WHERE id = ?")
-        .bind(user_id)
-        .fetch_one(pool)
-        .await
-        .map_err(gql_err)?;
-    // Privileged bearer tokens have a shorter exposure window. Existing tokens
-    // are not silently rotated; incident response must revoke them explicitly.
-    let ttl_secs = if is_admin != 0 {
-        ttl_secs.min(8 * 60 * 60)
-    } else {
-        ttl_secs
-    };
-    let tok = auth::generate_token();
-    // Store only sha256(token) at rest (defense-in-depth): a leaked DB snapshot
-    // never yields a replayable bearer token. The plaintext `tok` is returned to
-    // the caller unchanged and is what the client presents on later requests
-    // (`user_for_token` re-hashes before lookup).
-    let token_hash = auth::hash_token(&tok);
-    let now = Utc::now();
-    let created = now.to_rfc3339();
-    let expires = auth::format_ts(now + chrono::Duration::seconds(ttl_secs));
-    sqlx::query(
-        "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-    )
-    .bind(&token_hash)
-    .bind(user_id)
-    .bind(&created)
-    .bind(&expires)
-    .execute(pool)
+    new_session_checked(pool, user_id, ttl_secs, None).await
+}
+
+async fn new_session_checked(
+    pool: &Database,
+    user_id: &str,
+    ttl_secs: i64,
+    expected_hash: Option<&str>,
+) -> Result<String> {
+    let token = auth::generate_token();
+    let token_hash = auth::hash_token(&token);
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        let current: Option<(i64, i64, String)> =
+            sqlx::query_as("SELECT is_admin,is_banned,password_hash FROM users WHERE id=?")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((admin, banned, hash)) = current else {
+            return Err(MutationValidation("Invalid username or password").into());
+        };
+        if banned != 0 {
+            return Err(MutationValidation("This account has been suspended.").into());
+        }
+        if expected_hash.is_some_and(|expected| expected != hash) {
+            return Err(MutationValidation("Invalid username or password").into());
+        }
+        let lifetime = if admin != 0 {
+            ttl_secs.min(8 * 60 * 60)
+        } else {
+            ttl_secs
+        };
+        let now = Utc::now();
+        sqlx::query("INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES(?,?,?,?)")
+            .bind(&token_hash)
+            .bind(user_id)
+            .bind(now.to_rfc3339())
+            .bind(auth::format_ts(now + chrono::Duration::seconds(lifetime)))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM sessions WHERE expires_at<=?")
+            .bind(auth::format_ts(now))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    })
     .await
-    .map_err(gql_err)?;
-    // Opportunistic GC: drop rows that have already expired so the table (and its
-    // index) don't accumulate dead sessions between event-driven deletes.
-    let _ = sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
-        .bind(auth::format_ts(now))
-        .execute(pool)
-        .await;
-    Ok(tok)
+    .map_err(mutation_write_error)?;
+    Ok(token)
+}
+
+async fn require_admin_on(conn: &mut sqlx::SqliteConnection, actor_id: &str) -> anyhow::Result<()> {
+    let permitted: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id=? AND is_admin=1 AND is_banned=0)",
+    )
+    .bind(actor_id)
+    .fetch_one(conn)
+    .await?;
+    if !permitted {
+        return Err(MutationValidation("Admin access required").into());
+    }
+    Ok(())
+}
+
+async fn set_user_admin_once(
+    pool: &Database,
+    actor_id: &str,
+    target_id: &str,
+    is_admin: bool,
+) -> anyhow::Result<AdminUser> {
+    let mut tx = pool.begin().await?;
+    require_admin_on(&mut tx, actor_id).await?;
+    if actor_id == target_id && !is_admin {
+        return Err(MutationValidation("You cannot remove your own admin access.").into());
+    }
+    if !is_admin {
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE is_admin=1 AND is_banned=0 AND id!=?",
+        )
+        .bind(target_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if remaining == 0 {
+            return Err(MutationValidation("At least one admin must remain.").into());
+        }
+    }
+    let changed = sqlx::query("UPDATE users SET is_admin=? WHERE id=?")
+        .bind(is_admin as i64)
+        .bind(target_id)
+        .execute(&mut *tx)
+        .await?;
+    if changed.rows_affected() == 0 {
+        return Err(MutationValidation("No such user.").into());
+    }
+    if !is_admin {
+        sqlx::query("DELETE FROM sessions WHERE user_id=?")
+            .bind(target_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let row: AdminUserRow = sqlx::query_as(
+        "SELECT id,username,email,avatar_url,is_admin,is_banned,created_at FROM users WHERE id=?",
+    )
+    .bind(target_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row.into())
+}
+
+async fn ban_user_once(
+    pool: &Database,
+    actor_id: &str,
+    target_id: &str,
+    banned: bool,
+) -> anyhow::Result<AdminUser> {
+    let mut tx = pool.begin().await?;
+    require_admin_on(&mut tx, actor_id).await?;
+    if actor_id == target_id {
+        return Err(MutationValidation("You cannot ban your own account.").into());
+    }
+    let mut row: AdminUserRow = sqlx::query_as(
+        "SELECT id,username,email,avatar_url,is_admin,is_banned,created_at FROM users WHERE id=?",
+    )
+    .bind(target_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(MutationValidation("No such user."))?;
+    if row.is_admin != 0 {
+        return Err(MutationValidation("You cannot ban an admin account.").into());
+    }
+    sqlx::query("UPDATE users SET is_banned=? WHERE id=?")
+        .bind(banned as i64)
+        .bind(target_id)
+        .execute(&mut *tx)
+        .await?;
+    if banned {
+        sqlx::query("DELETE FROM sessions WHERE user_id=?")
+            .bind(target_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    row.is_banned = banned as i64;
+    tx.commit().await?;
+    Ok(row.into())
 }
 
 /// Single-flight guard for the catalogue reconcile (process-global; single replica).
@@ -27432,10 +27573,18 @@ mod tests {
                 .data(cache),
             )
         };
-        let first = run("42", cache.clone()).await;
-        assert!(first.errors.is_empty(), "{:?}", first.errors);
-        // The first card must have loaded all library flags. A later card must not
-        // issue another library SELECT, even when the backing table becomes unavailable.
+        let (first, other) = futures::join!(
+            library_row_cached(&cache, &pool, "bob-id", "42"),
+            library_row_cached(&cache, &pool, "bob-id", "43"),
+        );
+        assert!(first.unwrap().unwrap().is_favorite);
+        assert_eq!(other.unwrap().unwrap().status.as_deref(), Some("completed"));
+        assert_eq!(
+            cache.0.lock().unwrap().batches,
+            1,
+            "page cards were not batched"
+        );
+        // Repeated selections of the page's cards reuse the loaded batch.
         sqlx::query("DROP TABLE user_library")
             .execute(&pool)
             .await
@@ -27591,6 +27740,19 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>()
         };
         assert_eq!(ids(library), ids(progress));
+        let older = exec(
+            &schema,
+            "{series(id:\"11004\"){isMarked}}",
+            Some("bobtok"),
+            "phase5-older-card",
+        )
+        .await;
+        assert!(older.errors.is_empty(), "{:?}", older.errors);
+        assert_eq!(
+            older.data.into_json().unwrap()["series"]["isMarked"],
+            true,
+            "listing cap hid an older library membership"
+        );
     }
 
     #[tokio::test]
@@ -27792,5 +27954,267 @@ mod tests {
                 .await
                 .unwrap();
         assert!(next < "2999-01-01T00:00:00Z".to_string());
+    }
+
+    #[tokio::test]
+    async fn race_safety_mutual_admin_demotions_leave_an_active_admin() {
+        let (schema, pool, _) = setup_with_state(100).await;
+        sqlx::query("UPDATE users SET is_admin=1 WHERE id='bob-id'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let blocker = pool.begin().await.unwrap();
+        let first_schema = schema.clone();
+        let first = tokio::spawn(async move {
+            exec(
+                &first_schema,
+                "mutation{setUserAdmin(userId:\"bob-id\",isAdmin:false){id}}",
+                Some("admintok"),
+                "phase5-admin-a",
+            )
+            .await
+        });
+        let second_schema = schema.clone();
+        let second = tokio::spawn(async move {
+            exec(
+                &second_schema,
+                "mutation{setUserAdmin(userId:\"admin-id\",isAdmin:false){id}}",
+                Some("bobtok"),
+                "phase5-admin-b",
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        blocker.commit().await.unwrap();
+        let (first, second) = (first.await.unwrap(), second.await.unwrap());
+        assert_ne!(
+            first.errors.is_empty(),
+            second.errors.is_empty(),
+            "exactly one demotion succeeds"
+        );
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin=1 AND is_banned=0")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 1);
+    }
+
+    #[tokio::test]
+    async fn race_safety_ban_wins_over_waiting_session_creation_and_rolls_back_on_failure() {
+        let (_, pool, _) = setup_with_state(100).await;
+        let mut blocker = pool.begin().await.unwrap();
+        let waiting_pool = pool.clone();
+        let login = tokio::spawn(async move { new_session(&waiting_pool, "bob-id", 3600).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sqlx::query("UPDATE users SET is_banned=1 WHERE id='bob-id'")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM sessions WHERE user_id='bob-id'")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        blocker.commit().await.unwrap();
+        assert!(
+            login.await.unwrap().is_err(),
+            "login inserted a session after the ban"
+        );
+        ban_user_once(&pool, "admin-id", "bob-id", false)
+            .await
+            .unwrap();
+        let sessions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id='bob-id'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            sessions, 0,
+            "an unban revived a session created during the ban"
+        );
+        new_session(&pool, "bob-id", 3600).await.unwrap();
+        sqlx::query("CREATE TRIGGER fail_ban_session_delete BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT,'forced session deletion failure'); END").execute(&pool).await.unwrap();
+        assert!(ban_user_once(&pool, "admin-id", "bob-id", true)
+            .await
+            .is_err());
+        let banned: i64 = sqlx::query_scalar("SELECT is_banned FROM users WHERE id='bob-id'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(banned, 0, "ban committed without session revocation");
+    }
+
+    #[tokio::test]
+    async fn race_safety_session_rechecks_the_verified_password_under_the_writer() {
+        let (_, pool, _) = setup_with_state(100).await;
+        let checked: String =
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE id='bob-id'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        let waiting_pool = pool.clone();
+        let login = tokio::spawn(async move {
+            new_session_checked(&waiting_pool, "bob-id", 3600, Some(&checked)).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sqlx::query("UPDATE users SET password_hash='changed' WHERE id='bob-id'")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM sessions WHERE user_id='bob-id'")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        blocker.commit().await.unwrap();
+        assert!(login.await.unwrap().is_err());
+        let sessions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id='bob-id'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn race_safety_library_edit_and_merge_cannot_create_an_orphan() {
+        let (schema, pool, _) = setup_with_state(100).await;
+        let source = catalog::create_work(
+            &pool,
+            &catalog::WorkInput {
+                primary_title: Some("Source".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let target = catalog::create_work(
+            &pool,
+            &catalog::WorkInput {
+                primary_title: Some("Target".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let blocker = pool.begin().await.unwrap();
+        let request_schema = schema.clone();
+        let requested = source.clone();
+        let edit = tokio::spawn(async move {
+            exec(
+                &request_schema,
+                &format!("mutation{{mark(seriesId:\"{requested}\",marked:true){{id}}}}"),
+                Some("bobtok"),
+                "phase5-library",
+            )
+            .await
+        });
+        // Queue the merge behind the library transaction. Before the fix it could
+        // acquire the writer between identity consolidation and the actual insert.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let merge_pool = pool.clone();
+        let old = source.clone();
+        let survivor = target.clone();
+        let merge =
+            tokio::spawn(async move { catalog::merge_works(&merge_pool, &old, &survivor).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        blocker.commit().await.unwrap();
+        let response = edit.await.unwrap();
+        let causes: Vec<String> = response
+            .errors
+            .iter()
+            .map(|e| {
+                e.source
+                    .as_ref()
+                    .map(|s| {
+                        s.downcast_ref::<anyhow::Error>()
+                            .map(|e| format!("{e:?}"))
+                            .or_else(|| s.downcast_ref::<sqlx::Error>().map(|e| format!("{e:?}")))
+                            .unwrap_or_else(|| "unknown concrete source".into())
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert!(
+            response.errors.is_empty(),
+            "{:?}; causes={causes:?}",
+            response.errors
+        );
+        merge.await.unwrap().unwrap();
+        let identities: Vec<String> =
+            sqlx::query_scalar("SELECT series_id FROM user_library WHERE user_id='bob-id'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(identities, [target.clone()]);
+        let redirected = write_library_once(&pool, "bob-id", &source, LibraryEdit::Favorite(true))
+            .await
+            .unwrap();
+        assert_eq!(redirected, target);
+    }
+
+    #[tokio::test]
+    async fn race_safety_progress_resolves_its_owner_after_the_merge_commits() {
+        let (schema, pool, _) = setup_with_state(100).await;
+        let source = catalog::upsert_work_from_mangadex(
+            &pool,
+            "progress-source",
+            &catalog::WorkInput {
+                primary_title: Some("Source".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let target = catalog::create_work(
+            &pool,
+            &catalog::WorkInput {
+                primary_title: Some("Target".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let source_series: String = sqlx::query_scalar(
+            "SELECT id FROM source_series WHERE work_id=? AND source_type='mangadex'",
+        )
+        .bind(&source)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        catalog::replace_source_chapters(
+            &pool,
+            &source_series,
+            &[catalog::ChapterInput {
+                external_id: "canonical-race-chapter".into(),
+                number: Some("1".into()),
+                lang: Some("en".into()),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+        let mut merge = pool.begin().await.unwrap();
+        sqlx::query("UPDATE source_series SET work_id=? WHERE id=?")
+            .bind(&target)
+            .bind(&source_series)
+            .execute(&mut *merge)
+            .await
+            .unwrap();
+        let request_schema = schema.clone();
+        let progress = tokio::spawn(async move {
+            exec(&request_schema,"mutation{setProgress(chapterId:\"canonical-race-chapter\",lastPageRead:7,read:false)}",Some("bobtok"),"phase5-progress").await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        sqlx::query("DELETE FROM work WHERE id=?")
+            .bind(&source)
+            .execute(&mut *merge)
+            .await
+            .unwrap();
+        merge.commit().await.unwrap();
+        let response = progress.await.unwrap();
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let owner: String = sqlx::query_scalar("SELECT work_id FROM canonical_progress WHERE user_id='bob-id' AND chapter_id='canonical-race-chapter'").fetch_one(&pool).await.unwrap();
+        assert_eq!(owner, target, "progress landed under the deleted owner");
     }
 }
