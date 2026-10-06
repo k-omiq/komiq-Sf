@@ -25,7 +25,7 @@ Route budget -> Route handler: routes the request
 
 Compression targets text and JSON. WebP covers and avatars skip compression.
 
-GraphQL has separate lanes: 64 local requests for 20s, 16 upstream requests for 300s, two federated searches for 1,800s and two maintenance operations for 3,600s. Uploads have four slots and 120s. Images keep their own limits; health bypasses admission. Saturation and deadlines return 503 with `Retry-After: 1` and `Cache-Control: no-store`.
+GraphQL admits 64 local/reader requests, two federated searches and two maintenance operations. Deadlines are 20s locally, 300s for reader fields, 1,800s for search and 3,600s for maintenance. Engine/API calls take 16 slots, at most three per client; hits take none. Uploads have four slots/120s. Images keep limits; health bypasses admission. Saturation/deadlines return 503 with `Retry-After: 1` and `Cache-Control: no-store`.
 
 Search accepts at most 256 characters and 12 distinct terms, with a two-second SQLite deadline. Heavy GraphQL root fields are limited to four per operation. Upstream misses share a 60-per-minute client budget. Library and progress queries return the complete library, hydrating metadata in batches of 256 identities from local data without upstream requests.
 

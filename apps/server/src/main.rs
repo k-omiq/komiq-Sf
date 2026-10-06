@@ -36,6 +36,9 @@ mod suwayomi;
 mod sync;
 mod tags;
 mod task;
+#[cfg(test)]
+mod upstream_admission_tests;
+mod upstream_cache;
 mod views;
 mod web_dir;
 mod work_stats;
@@ -381,12 +384,14 @@ async fn graphql_handler(
     let request_budget::AdmittedGraphQLRequest {
         request: req,
         lease,
+        upstream,
     } = req;
+    let client = resolve_client_ip(&headers, peer, &trusted.current());
     lease
-        .run(async move {
+        .run(upstream.scope_upstream(client.clone(), async move {
             let auth = RequestAuth(bearer(&headers));
             let plain = plain_from_internet(tls, peer, &trusted.current(), &headers);
-            let ip = ClientIp(Some(resolve_client_ip(&headers, peer, &trusted.current())));
+            let ip = ClientIp(Some(client));
             // Fresh per-request caches so `current_user` does at most one session lookup, the
             // viewer's NSFW preference at most one `users` read, and each series' `user_library`
             // row is read at most once — even when many resolvers ask (one per feed item).
@@ -412,7 +417,7 @@ async fn graphql_handler(
                 mark_unavailable(&mut response);
             }
             response
-        })
+        }))
         .await
 }
 
@@ -493,12 +498,14 @@ async fn graphql_get_handler(
     let request_budget::AdmittedGraphQLRequest {
         request: req,
         lease,
+        upstream,
     } = req;
     let anonymous = bearer(&headers).is_none();
     let plain = plain_from_internet(tls, peer, &trusted.current(), &headers);
     let mut res = lease
-        .run(graphql_get_response(
-            schema, trusted, peer, plain, headers, req,
+        .run(upstream.scope_upstream(
+            resolve_client_ip(&headers, peer, &trusted.current()),
+            graphql_get_response(schema, trusted, peer, plain, headers, req),
         ))
         .await;
     if anonymous {

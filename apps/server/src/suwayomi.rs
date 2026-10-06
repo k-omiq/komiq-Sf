@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::source_health::{Subject, Surface};
+use crate::upstream_cache::TtlMemo;
 
 /// Max simultaneous upstream COVER fetches (Suwayomi -> source CDN) across the whole
 /// process. Covers are the only Suwayomi call a browser `<img>` blocks on, and the
@@ -83,6 +84,11 @@ const PAGE_ACQUIRE_WAIT_SECS: u64 = 6;
 /// retryably, not freeze a slot for 30 s) but above the 8 s cover timeout — a
 /// full-resolution page over a slow source legitimately takes longer than a thumbnail.
 const PAGE_TIMEOUT_SECS: u64 = 20;
+
+/// Re-opening a chapter should reuse its page list and immutable engine owner
+/// without competing with cold source fetches. Viewer gates remain per request.
+const READER_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const READER_MEMO_CAP: usize = 4096;
 
 /// Hard cap on a single page source body, mirroring the image Worker's `MAX_IMAGE_BYTES`.
 /// Streamed via [`read_capped`] so a hostile/oversized body is refused, not buffered.
@@ -424,6 +430,8 @@ pub struct SuwayomiClient {
     /// Global bound on in-flight upstream PAGE fetches (see [`PAGE_FETCH_CONCURRENCY`]).
     /// Shared by every clone of the client; separate from `cover_sem`.
     page_sem: Arc<Semaphore>,
+    pages_memo: Arc<TtlMemo<Vec<String>>>,
+    chapter_owner_memo: Arc<TtlMemo<i64>>,
 }
 
 impl SuwayomiClient {
@@ -472,6 +480,8 @@ impl SuwayomiClient {
             bg_sem: Arc::new(Semaphore::new(BG_MATERIALIZE_CONCURRENCY)),
             page_http,
             page_sem: Arc::new(Semaphore::new(PAGE_FETCH_CONCURRENCY)),
+            pages_memo: Arc::new(TtlMemo::new(READER_MEMO_TTL, READER_MEMO_CAP)),
+            chapter_owner_memo: Arc::new(TtlMemo::new(READER_MEMO_TTL, READER_MEMO_CAP)),
         }
     }
 
@@ -671,6 +681,9 @@ impl SuwayomiClient {
     }
 
     async fn gql<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<T> {
+        // DB/memo hits never reach this point. Bound actual engine requests, and
+        // retain the permit through JSON decoding rather than just response headers.
+        let _permit = crate::request_budget::upstream_permit()?;
         let res = self
             .http
             .post(self.endpoint())
@@ -797,7 +810,9 @@ impl SuwayomiClient {
             .await;
         // Every listing caller (discovery, source-sync, search, ingest) comes through
         // here, so this one line is the whole of the `browse` health surface.
-        crate::source_health::observe(Subject::Source(source_id), Surface::Browse, &fetched);
+        if !matches!(&fetched, Err(error) if crate::request_budget::is_upstream_busy(error)) {
+            crate::source_health::observe(Subject::Source(source_id), Surface::Browse, &fetched);
+        }
         let data = fetched?;
         Ok((
             data.fetch_source_manga.has_next_page,
@@ -831,6 +846,7 @@ impl SuwayomiClient {
         }
         match self.gql::<DetailData>(&detail, json!({ "id": id })).await {
             Ok(d) => Ok((d.f.manga, Provenance::Upstream)),
+            Err(e) if crate::request_budget::is_upstream_busy(&e) => Err(e),
             Err(e) => {
                 let doc = format!(
                     "{MANGA_FIELDS}\nquery M($id: Int!) {{ manga(id: $id) {{ ...MangaFields }} }}"
@@ -887,6 +903,11 @@ impl SuwayomiClient {
                 ))
             }
             Err(e) => {
+                // Admission refusal says nothing about source health and must not
+                // start fallback calls that compete for the same exhausted pool.
+                if crate::request_budget::is_upstream_busy(&e) {
+                    return Err(e);
+                }
                 // "No chapters" is an upstream ANSWER, not an upstream failure: the
                 // mutation reached the source and it has nothing. Reported as
                 // `Upstream` so a genuinely empty series is not mistaken for a broken
@@ -974,6 +995,7 @@ impl SuwayomiClient {
                     Provenance::Upstream,
                 ))
             }
+            Err(e) if crate::request_budget::is_upstream_busy(&e) => Err(e),
             Err(_) => {
                 // Fallback: two calls (each carries its own older-engine fallback). The
                 // failure is recorded by `chapters_with_provenance`, once, so a scan that
@@ -986,6 +1008,17 @@ impl SuwayomiClient {
     }
 
     pub async fn pages(&self, chapter_id: i64) -> Result<Vec<String>> {
+        self.pages_memo
+            .get_or_try_init(&chapter_id.to_string(), || self.fetch_pages(chapter_id))
+            .await
+    }
+
+    pub(crate) fn reader_pages_cached(&self, chapter_id: i64) -> bool {
+        let key = chapter_id.to_string();
+        self.pages_memo.has_value(&key) && self.chapter_owner_memo.has_value(&key)
+    }
+
+    async fn fetch_pages(&self, chapter_id: i64) -> Result<Vec<String>> {
         let doc =
             "mutation P($id: Int!) { fetchChapterPages(input: { chapterId: $id }) { pages } }";
         #[derive(Deserialize)]
@@ -1011,6 +1044,14 @@ impl SuwayomiClient {
     /// needs the owning series, which isn't mirrored locally for Suwayomi sources.
     /// `None` if the chapter is unknown to the source server.
     pub async fn chapter_manga_id(&self, chapter_id: i64) -> Result<Option<i64>> {
+        self.chapter_owner_memo
+            .get_or_try_init_optional(&chapter_id.to_string(), || {
+                self.fetch_chapter_manga_id(chapter_id)
+            })
+            .await
+    }
+
+    async fn fetch_chapter_manga_id(&self, chapter_id: i64) -> Result<Option<i64>> {
         let doc = "query CM($id: Int!) { chapters(condition: { id: $id }) { nodes { mangaId } } }";
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -1701,6 +1742,40 @@ mod tests {
             Duration::ZERO,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn reader_page_and_positive_owner_memos_are_shared_by_clones() {
+        use std::sync::atomic::Ordering;
+        let engine = engine_answering(
+            r#"{"data":{"fetchChapterPages":{"pages":["/api/v1/manga/42/chapter/1/page/0"]},"chapters":{"nodes":[{"mangaId":42}]}}}"#,
+        )
+        .await;
+        let original = client(&engine.base_url);
+        let clone = original.clone();
+        let (first, same) = tokio::join!(original.pages(1), clone.pages(1));
+        assert_eq!(first.unwrap(), same.unwrap());
+        let (first, same) = tokio::join!(original.chapter_manga_id(1), clone.chapter_manga_id(1));
+        assert_eq!(first.unwrap(), Some(42));
+        assert_eq!(same.unwrap(), Some(42));
+        assert_eq!(engine.hits.load(Ordering::SeqCst), 2);
+        assert_eq!(clone.pages(1).await.unwrap().len(), 1);
+        assert_eq!(clone.chapter_manga_id(1).await.unwrap(), Some(42));
+        assert_eq!(
+            engine.hits.load(Ordering::SeqCst),
+            2,
+            "warm chapter reached engine"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_chapter_owners_are_never_memoized() {
+        use std::sync::atomic::Ordering;
+        let engine = engine_answering(r#"{"data":{"chapters":{"nodes":[]}}}"#).await;
+        let client = client(&engine.base_url);
+        assert_eq!(client.chapter_manga_id(999).await.unwrap(), None);
+        assert_eq!(client.chapter_manga_id(999).await.unwrap(), None);
+        assert_eq!(engine.hits.load(Ordering::SeqCst), 2);
     }
 
     /// The body is what Suwayomi v2.3.2243 really answers for this document (captured by

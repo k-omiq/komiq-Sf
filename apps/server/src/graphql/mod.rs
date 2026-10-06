@@ -21,6 +21,7 @@ use chrono::Utc;
 use crate::auth::{self, User};
 use crate::browse::BROWSE_PAGE_SIZE;
 use crate::catalog;
+use crate::request_budget::{check_upstream_rate as upstream_budget, UpstreamRateLimit};
 use crate::scanner::scan_series;
 use crate::suwayomi::{FetchType, SuwayomiChapter, SuwayomiClient, SuwayomiManga};
 use types::*;
@@ -74,28 +75,6 @@ pub use crate::rate_limit::RateLimiter;
 /// HTTP layer.
 static VIEW_LIMITER: std::sync::LazyLock<RateLimiter> =
     std::sync::LazyLock::new(|| RateLimiter::new(10, 60));
-
-/// Cache hits do not consume this per-client upstream budget.
-static UPSTREAM_LIMITER: std::sync::LazyLock<RateLimiter> =
-    std::sync::LazyLock::new(|| RateLimiter::new(60, 60));
-
-#[derive(Debug)]
-struct UpstreamRateLimit(u64);
-impl std::fmt::Display for UpstreamRateLimit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Too many upstream requests; retry in {}s", self.0)
-    }
-}
-impl std::error::Error for UpstreamRateLimit {}
-
-fn upstream_budget(client: Option<&str>) -> anyhow::Result<()> {
-    if let Some(client) = client {
-        UPSTREAM_LIMITER
-            .check(&format!("upstream:{client}"))
-            .map_err(UpstreamRateLimit)?;
-    }
-    Ok(())
-}
 
 /// How long a memoized `discovery` / `genreFacets` payload stays usable.
 ///
@@ -1137,11 +1116,12 @@ fn gql_err(e: impl std::fmt::Display + Send + Sync + 'static) -> Error {
         .downcast_ref::<sqlx::Error>()
         .is_some_and(|error| matches!(error, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed))
         || source.downcast_ref::<anyhow::Error>().is_some_and(|error| {
-            error.chain().any(|cause| {
-                cause.downcast_ref::<sqlx::Error>().is_some_and(|error| {
-                    matches!(error, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
+            crate::request_budget::is_upstream_busy(error)
+                || error.chain().any(|cause| {
+                    cause.downcast_ref::<sqlx::Error>().is_some_and(|error| {
+                        matches!(error, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
+                    })
                 })
-            })
         });
     let mut error = if unavailable {
         Error::new("Server busy; retry soon").extend_with(|_, extensions| {
@@ -3104,7 +3084,7 @@ async fn resolve_series_with_cached(
 
     // Single-flight: collapse concurrent misses/refreshes for this id.
     let lock = st.series_inflight.lock_handle(id);
-    let _guard = lock.lock().await;
+    let _guard = crate::request_budget::lock_cold_cache(&lock).await?;
 
     // Re-check after acquiring: a task we queued behind may have just refreshed it.
     if let Some((m, true)) = crate::series_cache::get_series_fresh(&st.pool, id).await? {
@@ -3181,7 +3161,7 @@ async fn resolve_chapters_with_cached(
 
     // Single-flight: collapse concurrent misses/refreshes for this manga id.
     let lock = st.chapters_inflight.lock_handle(manga_id);
-    let _guard = lock.lock().await;
+    let _guard = crate::request_budget::lock_cold_cache(&lock).await?;
 
     // Re-check after acquiring: a queued-behind task may have just refreshed.
     let cached = crate::series_cache::get_chapters(&st.pool, manga_id).await?;
@@ -4946,7 +4926,23 @@ impl QueryRoot {
         // Single-flight the refill: every task that missed awaits ONE per-key lock,
         // then re-checks — exactly one recomputation serves the whole burst.
         let lock = DISCOVERY_INFLIGHT.lock_handle(i64::from(show_nsfw));
-        let _guard = lock.lock().await;
+        let _guard = match lock.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // A populated catalogue computes entirely in SQLite. Only the
+                // empty-catalogue source browse needs cold-wait admission.
+                let _waiter = if crate::series_cache::count(&st.pool)
+                    .await
+                    .map_err(gql_err)?
+                    == 0
+                {
+                    crate::request_budget::cache_wait_permit().map_err(gql_err)?
+                } else {
+                    None
+                };
+                lock.lock().await
+            }
+        };
         if let Some(hit) = cached_feed(&DISCOVERY_CACHE, key, FEED_TTL) {
             return discovery_without_blocked(st, &blocks.lists, (*hit).clone()).await;
         }
@@ -5916,7 +5912,6 @@ impl QueryRoot {
             }
         }
         deny_blocked_chapter(ctx, &chapter_id.0, "No such chapter").await?;
-        upstream_budget(Some(&client_ip(ctx))).map_err(gql_err)?;
         let urls = st.mangadex.at_home(&chapter_id.0).await.map_err(gql_err)?;
         Ok(urls
             .into_iter()
@@ -6785,7 +6780,9 @@ impl QueryRoot {
         // chapters aren't mirrored locally — so resolve the manga id from the source and
         // gate the page images exactly like `series`/`chapters` (N2). An unknown chapter
         // is allowed through to the (cleanly-failing) page fetch, mirroring canonicalPages.
-        upstream_budget(Some(&client_ip(ctx))).map_err(gql_err)?;
+        if !st.suwayomi.reader_pages_cached(n) {
+            upstream_budget(Some(&client_ip(ctx))).map_err(gql_err)?;
+        }
         let manga_id = st.suwayomi.chapter_manga_id(n).await.map_err(gql_err)?;
         if let Some(manga_id) = manga_id {
             if canonical_is_nsfw(&st.pool, &manga_id.to_string()).await
@@ -6798,7 +6795,12 @@ impl QueryRoot {
         let urls = st.suwayomi.pages(n).await;
         // A reader opening a chapter is the request that matters most, and the scanner
         // never makes it — so it is counted here, against the owning source.
-        if let Some(manga_id) = manga_id {
+        if let Some(manga_id) = manga_id.filter(|_| {
+            !urls.as_ref().err().is_some_and(|error| {
+                crate::request_budget::is_upstream_busy(error)
+                    || crate::request_budget::is_upstream_rate_limited(error)
+            })
+        }) {
             crate::source_health::observe(
                 crate::source_health::Subject::Manga(manga_id),
                 crate::source_health::Surface::Pages,
@@ -8906,7 +8908,9 @@ async fn browse_sources_memo(st: &AppState, show_nsfw: bool) -> Result<Vec<Brows
         return Ok((*hit).clone());
     }
     let lock = BROWSE_SOURCES_INFLIGHT.lock_handle(i64::from(show_nsfw));
-    let _guard = lock.lock().await;
+    let _guard = crate::request_budget::lock_cold_cache(&lock)
+        .await
+        .map_err(gql_err)?;
     if let Some(hit) = cached_feed(&BROWSE_SOURCES_CACHE, key, BROWSE_SOURCES_TTL) {
         return Ok((*hit).clone());
     }
@@ -9056,21 +9060,16 @@ async fn federated_search(
     let targets = select_federated_sources(all_sources, show_nsfw);
     let sources_queried = targets.len() as i32;
 
-    // Fan out with bounded concurrency + a per-source timeout. A failing or slow
-    // source is skipped (logged), never fatal. Each task carries its source's
-    // selection INDEX so results can be reassembled deterministically regardless of
-    // completion order (X4).
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(FEDERATED_CONCURRENCY));
-    let mut set = tokio::task::JoinSet::new();
-    for (idx, src) in targets.into_iter().enumerate() {
-        let st2 = st.clone();
-        let sem2 = sem.clone();
-        let q = query.to_string();
-        set.spawn(async move {
-            let _permit = sem2.acquire().await.ok()?;
-            let fut = st2
+    // Poll source futures inside the foreground request so task-local client
+    // admission follows every engine call. Each carries its selection index for
+    // deterministic reassembly regardless of completion order (X4).
+    use futures::StreamExt as _;
+    let concurrency = FEDERATED_CONCURRENCY.min(crate::request_budget::UPSTREAM_CLIENT_CONCURRENCY);
+    let mut searches = futures::stream::iter(targets.into_iter().enumerate())
+        .map(|(idx, src)| async move {
+            let fut = st
                 .suwayomi
-                .browse_source(&src.id, FetchType::Search, page, Some(&q));
+                .browse_source(&src.id, FetchType::Search, page, Some(query));
             match tokio::time::timeout(
                 std::time::Duration::from_secs(FEDERATED_SOURCE_TIMEOUT_SECS),
                 fut,
@@ -9087,15 +9086,13 @@ async fn federated_search(
                     None
                 }
             }
-        });
-    }
-    // Gather per-source results, then reassemble in source-index order (X4: NOT
-    // JoinSet completion order, which is nondeterministic and made which hits fell
-    // inside the top-N vary per request).
+        })
+        .buffer_unordered(concurrency);
+    // Completion order varies; source-index order remains the ranking input.
     let mut per_source: Vec<(usize, Vec<crate::suwayomi::SuwayomiManga>)> = Vec::new();
     let mut any_has_next = false;
-    while let Some(joined) = set.join_next().await {
-        if let Ok(Some((idx, has_next, mangas))) = joined {
+    while let Some(result) = searches.next().await {
+        if let Some((idx, has_next, mangas)) = result {
             any_has_next = any_has_next || has_next;
             per_source.push((idx, mangas));
         }
@@ -13360,8 +13357,11 @@ pub(crate) async fn enrich_works(st: &AppState, ids: &[String]) -> Result<i32> {
     // Overlap the per-work /cover fetches: metadata is already batched 100/req, but each
     // work's cover set is a separate round-trip. The shared TokenBucket still caps the
     // MangaDex request rate (5/s), so buffer_unordered only hides RTT — it never raises the
-    // upstream load. Kept modest to stay well under the burst budget.
+    // upstream load. Foreground backfills also stay inside their client's call
+    // cap, rather than rejecting half their own cover lookups. Background drains
+    // retain their existing concurrency.
     const COVER_FETCH_CONCURRENCY: usize = 6;
+    let cover_concurrency = crate::request_budget::upstream_concurrency(COVER_FETCH_CONCURRENCY);
     let mut refreshed = 0i32;
     for chunk in ids.chunks(100) {
         let mangas = st.mangadex.get_manga_by_ids(chunk).await.map_err(gql_err)?;
@@ -13395,7 +13395,7 @@ pub(crate) async fn enrich_works(st: &AppState, ids: &[String]) -> Result<i32> {
                 };
                 (id, input, covers_ok)
             })
-            .buffer_unordered(COVER_FETCH_CONCURRENCY)
+            .buffer_unordered(cover_concurrency)
             .collect()
             .await;
         refreshed += persist_enrichment(&st.pool, &prepared).await?;
@@ -16801,6 +16801,102 @@ mod tests {
             setup_code: crate::instance::SetupCode::default(),
         });
         (build_schema(state.clone(), false), pool, state)
+    }
+
+    #[tokio::test]
+    async fn federated_foreground_fanout_keeps_client_admission_and_releases_on_cancel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cold_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+        let sources: Vec<_> = (1..=9)
+            .map(|id| {
+                serde_json::json!({
+                    "id": id.to_string(), "name": format!("Source {id}"),
+                    "lang": "en", "isNsfw": false,
+                    "extension": {"pkgName": format!("test.fanout.{id}")}
+                })
+            })
+            .collect();
+        let mock = axum::Router::new().route(
+            "/api/graphql",
+            axum::routing::post({
+                let cold_calls = cold_calls.clone();
+                let stop = stop.clone();
+                move |axum::Json(request): axum::Json<serde_json::Value>| {
+                    let cold_calls = cold_calls.clone();
+                    let stop = stop.clone();
+                    let sources = sources.clone();
+                    async move {
+                        if request["query"]
+                            .as_str()
+                            .unwrap()
+                            .contains("fetchSourceManga")
+                        {
+                            cold_calls.fetch_add(1, Ordering::SeqCst);
+                            stop.notified().await;
+                            axum::Json(serde_json::json!({"data": {"fetchSourceManga": {
+                                "hasNextPage": false, "mangas": []
+                            }}}))
+                        } else {
+                            axum::Json(serde_json::json!({"data": {"sources": {"nodes": sources}}}))
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let (_, pool, state) = setup_with_engine(100, &url).await;
+        let budgets = std::sync::Arc::new(crate::request_budget::RequestBudgets::default());
+        let search = {
+            let budgets = budgets.clone();
+            tokio::spawn(async move {
+                budgets
+                    .scope_upstream("federated-client".into(), async move {
+                        federated_search(
+                            &state,
+                            "test",
+                            1,
+                            false,
+                            &crate::block::BlockSet::default(),
+                            None,
+                        )
+                        .await
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cold_calls.load(Ordering::SeqCst)
+                < crate::request_budget::UPSTREAM_CLIENT_CONCURRENCY
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("federated source fetches did not start");
+        assert_eq!(
+            cold_calls.load(Ordering::SeqCst),
+            crate::request_budget::UPSTREAM_CLIENT_CONCURRENCY
+        );
+        assert_eq!(
+            budgets.upstream_available_for_test(),
+            16 - crate::request_budget::UPSTREAM_CLIENT_CONCURRENCY
+        );
+        budgets
+            .scope_upstream("federated-client".into(), async {
+                assert!(crate::request_budget::is_upstream_busy(
+                    &crate::request_budget::upstream_permit().err().unwrap()
+                ));
+            })
+            .await;
+        search.abort();
+        assert!(matches!(search.await, Err(error) if error.is_cancelled()));
+        assert_eq!(budgets.upstream_available_for_test(), 16);
+        stop.notify_waiters();
+        server.abort();
+        pool.close().await;
     }
 
     /// `chapterOrigin` tells a reader app where a chapter lives so it can fetch the pages
@@ -28508,6 +28604,7 @@ mod tests {
             .await
             .unwrap();
         let client = format!("phase3-budget-{}", uuid::Uuid::new_v4());
+        let budgets = std::sync::Arc::new(crate::request_budget::RequestBudgets::default());
         for _ in 0..60 {
             upstream_budget(Some(&client)).unwrap();
         }
@@ -28516,7 +28613,9 @@ mod tests {
             "{canonicalPages(chapterId:\"1\"){index}}",
             "{series(id:\"9999\"){id}}",
         ] {
-            let response = exec(&schema, query, None, &client).await;
+            let response = budgets
+                .scope_upstream(client.clone(), exec(&schema, query, None, &client))
+                .await;
             assert_eq!(
                 response.errors[0].extensions.as_ref().unwrap().get("code"),
                 Some(&async_graphql::Value::String("RATE_LIMITED".into())),

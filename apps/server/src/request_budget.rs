@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
-    sync::Arc,
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -18,6 +18,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+pub(crate) const UPSTREAM_CLIENT_CONCURRENCY: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Class {
@@ -38,12 +40,15 @@ impl Class {
     }
 }
 
-/// Separate slots keep a slow engine or maintenance operation from occupying
-/// every ordinary catalogue/auth request. Admission never creates a waiting queue.
+/// HTTP admission and network work are different resources. Reader operations
+/// share local admission, even when their deadline allows a cold source fetch.
+/// Only actual foreground engine/API calls take an upstream slot.
 pub(crate) struct RequestBudgets {
     ingress: Arc<Semaphore>,
     local: Arc<Semaphore>,
     upstream: Arc<Semaphore>,
+    cache_waiters: Arc<Semaphore>,
+    upstream_clients: Mutex<HashMap<String, Weak<Semaphore>>>,
     federated: Arc<Semaphore>,
     maintenance: Arc<Semaphore>,
     uploads: Arc<Semaphore>,
@@ -55,6 +60,8 @@ impl Default for RequestBudgets {
             ingress: Arc::new(Semaphore::new(64)),
             local: Arc::new(Semaphore::new(64)),
             upstream: Arc::new(Semaphore::new(16)),
+            cache_waiters: Arc::new(Semaphore::new(16)),
+            upstream_clients: Mutex::new(HashMap::new()),
             federated: Arc::new(Semaphore::new(2)),
             maintenance: Arc::new(Semaphore::new(2)),
             uploads: Arc::new(Semaphore::new(4)),
@@ -65,11 +72,75 @@ impl Default for RequestBudgets {
 impl RequestBudgets {
     fn lane(&self, class: Class) -> &Arc<Semaphore> {
         match class {
-            Class::Local => &self.local,
-            Class::Upstream => &self.upstream,
+            Class::Local | Class::Upstream => &self.local,
             Class::Federated => &self.federated,
             Class::Maintenance => &self.maintenance,
         }
+    }
+
+    /// The trusted, resolved client identity follows the request's foreground
+    /// futures. Detached background/image work retains its existing own limits.
+    pub(crate) async fn scope_upstream<F: Future>(
+        self: &Arc<Self>,
+        client: String,
+        work: F,
+    ) -> F::Output {
+        UPSTREAM_REQUEST
+            .scope(
+                UpstreamContext {
+                    budgets: self.clone(),
+                    client,
+                },
+                work,
+            )
+            .await
+    }
+
+    fn try_upstream(&self, client: &str) -> anyhow::Result<UpstreamPermit> {
+        self.try_resource(&self.upstream, client)
+    }
+
+    fn try_resource(
+        &self,
+        resource: &Arc<Semaphore>,
+        client: &str,
+    ) -> anyhow::Result<UpstreamPermit> {
+        let global = resource
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| UpstreamBusy)?;
+        let per_client = {
+            let mut clients = self
+                .upstream_clients
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            // A live permit owns its semaphore, so active client limits cannot
+            // be evicted. At most 16 calls plus 16 cache waiters own live keys.
+            clients.retain(|_, semaphore| semaphore.strong_count() != 0);
+            match clients.get(client).and_then(Weak::upgrade) {
+                Some(semaphore) => semaphore,
+                None => {
+                    let semaphore = Arc::new(Semaphore::new(UPSTREAM_CLIENT_CONCURRENCY));
+                    clients.insert(client.to_owned(), Arc::downgrade(&semaphore));
+                    semaphore
+                }
+            }
+        };
+        let client = per_client.try_acquire_owned().map_err(|_| UpstreamBusy)?;
+        Ok(UpstreamPermit {
+            _global: global,
+            _client: client,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn upstream_available_for_test(&self) -> usize {
+        self.upstream.available_permits()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn upstream_waiters_available_for_test(&self) -> usize {
+        self.cache_waiters.available_permits()
     }
 
     #[cfg(test)]
@@ -94,6 +165,119 @@ impl RequestBudgets {
     }
 }
 
+struct UpstreamContext {
+    budgets: Arc<RequestBudgets>,
+    client: String,
+}
+
+tokio::task_local! {
+    static UPSTREAM_REQUEST: UpstreamContext;
+}
+
+/// Owned through the complete network response/body, with normal drop releasing
+/// both bounds after completion, cancellation or a request deadline.
+pub(crate) struct UpstreamPermit {
+    _global: OwnedSemaphorePermit,
+    _client: OwnedSemaphorePermit,
+}
+
+/// Contended cache initializers have a separate bound. They share the client's
+/// three slots with real calls, and cannot fill all 64 local request permits.
+pub(crate) struct CacheWaitPermit {
+    _held: UpstreamPermit,
+}
+
+#[derive(Debug)]
+struct UpstreamBusy;
+
+impl std::fmt::Display for UpstreamBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Upstream capacity is busy; retry soon")
+    }
+}
+
+impl std::error::Error for UpstreamBusy {}
+
+pub(crate) fn is_upstream_busy(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<UpstreamBusy>().is_some()
+}
+
+/// Called only at a real engine/API fetch, after all cache/single-flight checks.
+/// Background jobs and image transports keep their independent resource bounds.
+pub(crate) fn upstream_permit() -> anyhow::Result<Option<UpstreamPermit>> {
+    UPSTREAM_REQUEST
+        .try_with(|context| context.budgets.try_upstream(&context.client).map(Some))
+        .unwrap_or(Ok(None))
+}
+
+pub(crate) fn cache_wait_permit() -> anyhow::Result<Option<CacheWaitPermit>> {
+    UPSTREAM_REQUEST
+        .try_with(|context| {
+            context
+                .budgets
+                .try_resource(&context.budgets.cache_waiters, &context.client)
+                .map(|held| Some(CacheWaitPermit { _held: held }))
+        })
+        .unwrap_or(Ok(None))
+}
+
+pub(crate) fn upstream_concurrency(preferred: usize) -> usize {
+    UPSTREAM_REQUEST
+        .try_with(|_| preferred.min(UPSTREAM_CLIENT_CONCURRENCY))
+        .unwrap_or(preferred)
+}
+
+pub(crate) async fn lock_cold_cache<T>(
+    lock: &tokio::sync::Mutex<T>,
+) -> anyhow::Result<tokio::sync::MutexGuard<'_, T>> {
+    match lock.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(_) => {
+            let _waiter = cache_wait_permit()?;
+            Ok(lock.lock().await)
+        }
+    }
+}
+
+/// Existing public-reader miss rate limit, separate from concurrent network work.
+/// Admin jobs keep their existing rate policies. Cache hits never spend this budget.
+static UPSTREAM_LIMITER: std::sync::LazyLock<crate::rate_limit::RateLimiter> =
+    std::sync::LazyLock::new(|| crate::rate_limit::RateLimiter::new(60, 60));
+
+#[derive(Debug)]
+pub(crate) struct UpstreamRateLimit(pub(crate) u64);
+
+impl std::fmt::Display for UpstreamRateLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Too many upstream requests; retry in {}s",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UpstreamRateLimit {}
+
+pub(crate) fn check_upstream_rate(client: Option<&str>) -> anyhow::Result<()> {
+    if let Some(client) = client {
+        UPSTREAM_LIMITER
+            .check(&format!("upstream:{client}"))
+            .map_err(UpstreamRateLimit)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn check_current_upstream_rate() -> anyhow::Result<()> {
+    UPSTREAM_REQUEST
+        .try_with(|context| check_upstream_rate(Some(&context.client)))
+        .unwrap_or(Ok(()))
+}
+
+pub(crate) fn is_upstream_rate_limited(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<UpstreamRateLimit>().is_some()
+}
+
 pub(crate) struct Lease {
     _permit: OwnedSemaphorePermit,
     timeout: Duration,
@@ -115,6 +299,7 @@ impl Lease {
 pub(crate) struct AdmittedGraphQLRequest {
     pub(crate) request: GraphQLRequest,
     pub(crate) lease: Lease,
+    pub(crate) upstream: Arc<RequestBudgets>,
 }
 
 impl<S> FromRequest<S> for AdmittedGraphQLRequest
@@ -160,6 +345,7 @@ where
                 _permit: permit,
                 timeout: class.timeout(),
             },
+            upstream: budgets,
         })
     }
 }
@@ -388,6 +574,134 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    #[tokio::test]
+    async fn real_upstream_work_has_global_and_per_client_bounds() {
+        let budgets = Arc::new(RequestBudgets::default());
+        assert!(upstream_permit().unwrap().is_none());
+        assert_eq!(upstream_concurrency(6), 6);
+        let first = budgets
+            .scope_upstream("client-a".into(), async {
+                assert_eq!(upstream_concurrency(6), 3);
+                let held: Vec<_> = (0..3)
+                    .map(|_| upstream_permit().unwrap().unwrap())
+                    .collect();
+                assert!(is_upstream_busy(&upstream_permit().err().unwrap()));
+                held
+            })
+            .await;
+        assert_eq!(budgets.upstream.available_permits(), 13);
+        let other = budgets
+            .scope_upstream("client-b".into(), async {
+                upstream_permit().unwrap().unwrap()
+            })
+            .await;
+        assert_eq!(budgets.upstream.available_permits(), 12);
+        drop((first, other));
+        assert_eq!(budgets.upstream.available_permits(), 16);
+
+        let mut held = Vec::new();
+        for index in 0..16 {
+            held.push(
+                budgets
+                    .scope_upstream(format!("client-{}", index / 3), async {
+                        upstream_permit().unwrap().unwrap()
+                    })
+                    .await,
+            );
+        }
+        budgets
+            .scope_upstream("another-client".into(), async {
+                assert!(is_upstream_busy(&upstream_permit().err().unwrap()));
+            })
+            .await;
+        assert_eq!(budgets.upstream.available_permits(), 0);
+        drop(held);
+        assert_eq!(budgets.upstream.available_permits(), 16);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upstream_cancellation_releases_both_bounds_and_idle_clients_are_reclaimed() {
+        let budgets = Arc::new(RequestBudgets::default());
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            budgets.scope_upstream("unknown".into(), async {
+                let _permit = upstream_permit().unwrap().unwrap();
+                std::future::pending::<()>().await;
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(budgets.upstream.available_permits(), 16);
+        for index in 0..1000 {
+            budgets
+                .scope_upstream(format!("idle-{index}"), async {
+                    let _permit = upstream_permit().unwrap().unwrap();
+                })
+                .await;
+        }
+        assert!(budgets.upstream_clients.lock().unwrap().len() <= 1);
+        assert_eq!(budgets.upstream.available_permits(), 16);
+    }
+
+    #[tokio::test]
+    async fn cache_waiters_are_separately_bounded_and_share_the_client_call_cap() {
+        let budgets = Arc::new(RequestBudgets::default());
+        assert!(cache_wait_permit().unwrap().is_none());
+        let held = budgets
+            .scope_upstream("client".into(), async {
+                let call = upstream_permit().unwrap().unwrap();
+                let waits: Vec<_> = (0..2)
+                    .map(|_| cache_wait_permit().unwrap().unwrap())
+                    .collect();
+                assert!(is_upstream_busy(&cache_wait_permit().err().unwrap()));
+                assert!(is_upstream_busy(&upstream_permit().err().unwrap()));
+                (call, waits)
+            })
+            .await;
+        assert_eq!(budgets.upstream.available_permits(), 15);
+        assert_eq!(budgets.cache_waiters.available_permits(), 14);
+        drop(held);
+        let mut waits = Vec::new();
+        for index in 0..16 {
+            waits.push(
+                budgets
+                    .scope_upstream(format!("waiting-{}", index / 3), async {
+                        cache_wait_permit().unwrap().unwrap()
+                    })
+                    .await,
+            );
+        }
+        budgets
+            .scope_upstream("another".into(), async {
+                assert!(is_upstream_busy(&cache_wait_permit().err().unwrap()));
+                let _call = upstream_permit().unwrap().unwrap();
+            })
+            .await;
+        assert_eq!(budgets.upstream.available_permits(), 16);
+        assert_eq!(budgets.cache_waiters.available_permits(), 0);
+        drop(waits);
+        assert_eq!(budgets.cache_waiters.available_permits(), 16);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_deadline_readers_use_local_admission_without_reserving_upstream() {
+        let budgets = Arc::new(RequestBudgets::default());
+        let _all_network = budgets
+            .upstream
+            .clone()
+            .acquire_many_owned(16)
+            .await
+            .unwrap();
+        let app = router(budgets.clone());
+        let response = app
+            .oneshot(request("{pages(chapterId:\"1\"){sourceUrl}}", 30))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(budgets.local.available_permits(), 64);
+        assert_eq!(budgets.upstream.available_permits(), 0);
+    }
+
     fn classify(query: &str, operation_name: Option<&str>) -> Class {
         super::classify(query, operation_name).unwrap()
     }
@@ -605,7 +919,7 @@ mod tests {
                 ),
                 (Class::Maintenance, "mutation { retryCover(workId:\"w\") }"),
             ] {
-                if other != class {
+                if !Arc::ptr_eq(budgets.lane(other), budgets.lane(class)) {
                     assert_eq!(
                         app.clone()
                             .oneshot(request(other_query, 0))
@@ -713,8 +1027,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(started.elapsed(), Duration::from_secs(timeout));
             let expected = match class {
-                Class::Local => 64,
-                Class::Upstream => 16,
+                Class::Local | Class::Upstream => 64,
                 _ => 2,
             };
             assert_eq!(budgets.lane(class).available_permits(), expected);

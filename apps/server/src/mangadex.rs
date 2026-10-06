@@ -25,9 +25,10 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 
 use crate::catalog::{self, Alias, Cover, WorkInput};
+use crate::upstream_cache::TtlMemo;
 
 const API_BASE: &str = "https://api.mangadex.org";
 const COVERS_BASE: &str = "https://uploads.mangadex.org/covers";
@@ -188,68 +189,6 @@ const ATHOME_MEMO_TTL: Duration = Duration::from_secs(10 * 60);
 /// cap is a few MB — the memo protects the 40 req/min `/at-home` budget, not memory.
 const ATHOME_MEMO_CAP: usize = 4096;
 
-/// A TTL memo with single-flight initialisation: concurrent callers for the same key
-/// share ONE in-flight fetch instead of each spending a request. A slot expires `ttl`
-/// after its fetch was *started*, and the value arrives later than that, so no caller
-/// ever sees a value the upstream issued more than `ttl` ago. A failed init leaves the
-/// slot uninitialised; waiters and later callers retry one at a time.
-///
-/// `tokio::time::Instant` rather than `std`: identical in production, but it obeys
-/// `tokio::time::pause`/`advance`, which is what lets the expiry test be exact.
-struct TtlMemo<V> {
-    ttl: Duration,
-    cap: usize,
-    slots: std::sync::Mutex<HashMap<String, MemoSlot<V>>>,
-}
-
-/// When the slot's fetch was started, and the cell its value lands in (shared by
-/// every caller that joined while the fetch was in flight).
-type MemoSlot<V> = (tokio::time::Instant, Arc<OnceCell<V>>);
-
-impl<V: Clone> TtlMemo<V> {
-    fn new(ttl: Duration, cap: usize) -> Self {
-        Self {
-            ttl,
-            cap,
-            slots: std::sync::Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// The live slot for `key`, replacing an expired one. The lock is never held
-    /// across an await, so a slow upstream fetch blocks only its own key's waiters.
-    fn slot(&self, key: &str) -> Arc<OnceCell<V>> {
-        let now = tokio::time::Instant::now();
-        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((started, cell)) = slots.get(key) {
-            if now.duration_since(*started) < self.ttl {
-                return cell.clone();
-            }
-        }
-        if slots.len() >= self.cap {
-            let ttl = self.ttl;
-            slots.retain(|_, (started, _)| now.duration_since(*started) < ttl);
-            if slots.len() >= self.cap {
-                // Every entry is live and the memo is still full: the working set is
-                // larger than the cap. Start over rather than grow without bound — one
-                // extra upstream round per chapter is the cost, never wrong data.
-                slots.clear();
-            }
-        }
-        let cell = Arc::new(OnceCell::new());
-        slots.insert(key.to_string(), (now, cell.clone()));
-        cell
-    }
-
-    async fn get_or_try_init<F, Fut>(&self, key: &str, init: F) -> Result<V>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<V>>,
-    {
-        let cell = self.slot(key);
-        Ok(cell.get_or_try_init(init).await?.clone())
-    }
-}
-
 /// The error every gated request returns while the MangaDex switch is off. A type
 /// (not just a message) so the background drains can tell "switched off" from
 /// "upstream unhappy" and wait for the switch instead of backing off for an hour.
@@ -406,6 +345,29 @@ impl MangaDexClient {
         params: &[(String, String)],
         athome: bool,
         label: &str,
+    ) -> Result<(
+        reqwest::Response,
+        Option<crate::request_budget::UpstreamPermit>,
+    )> {
+        if !self.is_enabled() {
+            return Err(anyhow::Error::new(MangadexOff));
+        }
+        // This runs only when an API lookup really needs the network, after any
+        // at-home memo hit/single-flight check. Keep the lease through backoff and
+        // hand it to the caller so response-body decoding remains accounted for.
+        let permit = crate::request_budget::upstream_permit()?;
+        let response = self
+            .get_with_retry_inner(url, params, athome, label)
+            .await?;
+        Ok((response, permit))
+    }
+
+    async fn get_with_retry_inner(
+        &self,
+        url: &str,
+        params: &[(String, String)],
+        athome: bool,
+        label: &str,
     ) -> Result<reqwest::Response> {
         const MAX_RETRIES: u32 = 4;
         const MAX_TRANSPORT_RETRIES: u32 = 2;
@@ -499,7 +461,7 @@ impl MangaDexClient {
         if let Some(since) = since {
             params.push((window.since_param().into(), since.to_string()));
         }
-        let res = self
+        let (res, _permit) = self
             .get_with_retry(
                 &format!("{}/manga", self.api_base),
                 &params,
@@ -543,7 +505,7 @@ impl MangaDexClient {
             for id in chunk {
                 params.push(("ids[]".into(), id.clone()));
             }
-            let res = self
+            let (res, _permit) = self
                 .get_with_retry(
                     &format!("{}/manga", self.api_base),
                     &params,
@@ -589,7 +551,7 @@ impl MangaDexClient {
             ("limit".into(), limit.clamp(1, 100).to_string()),
             ("order[volume]".into(), "asc".into()),
         ];
-        let res = self
+        let (res, _permit) = self
             .get_with_retry(
                 &format!("{}/cover", self.api_base),
                 &params,
@@ -638,7 +600,7 @@ impl MangaDexClient {
         offset: i64,
     ) -> Result<ChapterPage> {
         let params = chapter_list_params(window, since, offset);
-        let res = self
+        let (res, _permit) = self
             .get_with_retry(
                 &format!("{}/chapter", self.api_base),
                 &params,
@@ -692,7 +654,7 @@ impl MangaDexClient {
             ));
         }
         let params = chapter_ids_params(ids);
-        let res = self
+        let (res, _permit) = self
             .get_with_retry(
                 &format!("{}/chapter", self.api_base),
                 &params,
@@ -738,7 +700,7 @@ impl MangaDexClient {
             .iter()
             .map(|id| ("manga[]".to_string(), id.clone()))
             .collect();
-        let res = self
+        let (res, _permit) = self
             .get_with_retry(
                 &format!("{}/statistics/manga", self.api_base),
                 &params,
@@ -760,14 +722,15 @@ impl MangaDexClient {
     }
 
     /// Shared 512px cover-thumbnail fetch behind `cover_phash` / `cover_thumb_bytes`.
-    /// Goes through `get_with_retry` like the API calls, so a 429 from the cover CDN
+    /// Uses the same retry ladder as API calls, with its independent cover limits,
+    /// so a 429 from the cover CDN
     /// backs off (honoring `Retry-After`) instead of being silently read as "this work
     /// has no cover" — the old direct `http.get(...).send()` turned every rate-limit
     /// into a permanent miss. The body is read with a hard length cap. `None` on any
     /// failure: a missing cover is one fewer dedup signal, never a failed sync.
     async fn fetch_cover_thumb(&self, manga_id: &str, file_name: &str) -> Option<Vec<u8>> {
         let url = format!("{}/{manga_id}/{file_name}.512.jpg", self.covers_base);
-        let res = match self.get_with_retry(&url, &[], false, "cover").await {
+        let res = match self.get_with_retry_inner(&url, &[], false, "cover").await {
             Ok(res) => res,
             Err(e) => {
                 tracing::debug!(manga = %manga_id, error = %e, "mangadex: cover fetch failed");
@@ -809,7 +772,8 @@ impl MangaDexClient {
     }
 
     async fn fetch_at_home(&self, chapter_id: &str) -> Result<Vec<String>> {
-        let res = self
+        crate::request_budget::check_current_upstream_rate()?;
+        let (res, _permit) = self
             .get_with_retry(
                 &format!("{}/at-home/server/{chapter_id}", self.api_base),
                 &[],
@@ -5115,64 +5079,6 @@ mod tests {
         );
         assert!(!params.iter().any(|(k, _)| k.ends_with("Since")));
         assert!(!params.iter().any(|(k, _)| k == "offset"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn athome_memo_shares_one_fetch_and_expires() {
-        use std::sync::atomic::AtomicUsize;
-        // Paused time: `advance` moves the clock exactly, so the TTL edge is a fact
-        // of the test, not of how loaded the runner is.
-        let ttl = Duration::from_secs(600);
-        let memo = TtlMemo::<Vec<String>>::new(ttl, 2);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let fetch = |calls: Arc<AtomicUsize>| async move {
-            calls.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            Ok(vec!["u".to_string()])
-        };
-
-        // Concurrent openers of one chapter share a single upstream request.
-        let (a, b) = tokio::join!(
-            memo.get_or_try_init("ch", || fetch(calls.clone())),
-            memo.get_or_try_init("ch", || fetch(calls.clone()))
-        );
-        assert_eq!(a.unwrap(), ["u"]);
-        assert_eq!(b.unwrap(), ["u"]);
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "second caller must join the first"
-        );
-
-        // Inside the TTL the answer is served from memory — right up to the edge.
-        tokio::time::advance(ttl - Duration::from_millis(11)).await;
-        memo.get_or_try_init("ch", || fetch(calls.clone()))
-            .await
-            .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        // At the TTL the base URL may be dead, so the next caller refetches.
-        tokio::time::advance(Duration::from_millis(1)).await;
-        memo.get_or_try_init("ch", || fetch(calls.clone()))
-            .await
-            .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-
-        // A failed init leaves nothing behind: the next caller retries, not errors.
-        let failing = memo.get_or_try_init("bad", || async { Err(anyhow!("upstream 5xx")) });
-        assert!(failing.await.is_err());
-        memo.get_or_try_init("bad", || fetch(calls.clone()))
-            .await
-            .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
-
-        // Cap 2, both slots live, a third chapter arrives: the memo resets to hold
-        // only the newcomer rather than grow past its cap.
-        memo.get_or_try_init("third", || fetch(calls.clone()))
-            .await
-            .unwrap();
-        let keys: Vec<String> = memo.slots.lock().unwrap().keys().cloned().collect();
-        assert_eq!(keys, ["third"]);
     }
 
     /// A stand-in for MangaDex: `/statistics/manga`, `/at-home/server/{id}` and a cover,
