@@ -82,7 +82,7 @@ def database_snapshot(conn):
 
 
 def preflight_rows(conn):
-    """Execute the read-only operator script and capture its two result sets."""
+    """Execute the read-only operator script and capture its four result sets."""
     results = []
     pending = ''
     script = ROOT / 'apps/server/scripts/sqlite_0120_preflight.sql'
@@ -95,7 +95,7 @@ def preflight_rows(conn):
                 results.append([dict(zip(names, row)) for row in cursor.fetchall()])
             pending = ''
     assert not pending.strip()
-    assert len(results) == 2
+    assert len(results) == 4
     return results
 
 
@@ -264,8 +264,9 @@ class Migrations(unittest.TestCase):
             conn.execute("INSERT INTO chapter(id,source_series_id,external_id,number,created_at) VALUES('ch_third_unique','ss_third','old-only','2','2026-04-01')")
             conn.commit()
             before = database_snapshot(conn)
-            sources, chapters = preflight_rows(conn)
+            sources, chapters, lost_chapters, lost_candidates = preflight_rows(conn)
             self.assertEqual(database_snapshot(conn), before)
+            self.assertEqual((lost_chapters, lost_candidates), ([], []))
             self.assertEqual({row['id'] for row in sources}, {'ss_old', 'ss_third'})
             self.assertEqual({row['id'] for row in chapters}, {'ch_old_shared', 'ch_third_unique'})
             self.assertEqual({row['retained_chapter_id'] for row in chapters}, {'ch_keep_shared', 'ch_old_unique'})
@@ -279,6 +280,35 @@ class Migrations(unittest.TestCase):
                     apply(conn, file)
             self.assertEqual(source_ids - {row[0] for row in conn.execute('SELECT id FROM source_series')}, {row['id'] for row in sources})
             self.assertEqual(chapter_ids - {row[0] for row in conn.execute('SELECT id FROM chapter')}, {row['id'] for row in chapters})
+            self.assertEqual(conn.execute('PRAGMA foreign_key_check').fetchall(), [])
+        finally:
+            conn.close()
+
+    def test_children_of_an_already_missing_source_are_listed_then_left_behind(self):
+        conn, _ = empty(SCRATCH / 'unreachable.sqlite3', through=118)
+        try:
+            seed_fixture(conn)
+            # Production held such rows: their source mapping was removed while
+            # foreign keys were not enforced. Only an unenforced connection can
+            # recreate them, and 0120 cannot restore them with enforcement on.
+            conn.execute('PRAGMA foreign_keys=OFF')
+            conn.execute("INSERT INTO chapter(id,source_series_id,external_id,number,created_at) VALUES('ch_lost','ss_gone','lost','1','2026-01-01')")
+            conn.execute("INSERT INTO merge_candidate(id,source_series_id,candidate_work_id,score,method,created_at) VALUES('mc_lost','ss_gone','w_other',0.5,'cover','2026-01-01')")
+            conn.commit()
+            conn.execute('PRAGMA foreign_keys=ON')
+            self.assertEqual(conn.execute('PRAGMA foreign_keys').fetchone(), (1,))
+            self.assertEqual(len(conn.execute('PRAGMA foreign_key_check').fetchall()), 2)
+            _, chapters, lost_chapters, lost_candidates = preflight_rows(conn)
+            self.assertEqual([row['id'] for row in lost_chapters], ['ch_lost'])
+            self.assertEqual([row['id'] for row in lost_candidates], ['mc_lost'])
+            chapter_ids = {row[0] for row in conn.execute('SELECT id FROM chapter')}
+            candidate_ids = {row[0] for row in conn.execute('SELECT id FROM merge_candidate')}
+            conn.execute('PRAGMA query_only=OFF')
+            for number, file in migrations():
+                if number > 118:
+                    apply(conn, file)
+            self.assertEqual(chapter_ids - {row[0] for row in conn.execute('SELECT id FROM chapter')}, {'ch_lost'} | {row['id'] for row in chapters})
+            self.assertEqual(candidate_ids - {row[0] for row in conn.execute('SELECT id FROM merge_candidate')}, {'mc_lost'})
             self.assertEqual(conn.execute('PRAGMA foreign_key_check').fetchall(), [])
         finally:
             conn.close()
@@ -324,7 +354,7 @@ def run_checks(args):
         before = {table: c.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0]
                   for table in ('source_series', 'chapter', 'merge_candidate', 'work',
                                 'release_event', 'canonical_progress', 'user_library')}
-        removed_sources, removed_chapters = preflight_rows(c)
+        removed_sources, removed_chapters, lost_chapters, lost_candidates = preflight_rows(c)
         c.execute('PRAGMA query_only=OFF')
         c.execute('CREATE TEMP TABLE _schema_safety_original_release_event AS SELECT * FROM release_event')
         natural_union = c.execute("SELECT COUNT(*) FROM (SELECT CASE WHEN ss.source_type='suwayomi' THEN 'suwayomi:'||ss.source_key ELSE ss.id END source,c.external_id FROM chapter c JOIN source_series ss ON ss.id=c.source_series_id GROUP BY source,c.external_id)").fetchone()[0]
@@ -338,7 +368,8 @@ def run_checks(args):
         assert c.execute("SELECT COUNT(*) FROM source_series WHERE source_id=''").fetchone() == (0,)
         assert c.execute('SELECT COUNT(*) FROM chapter').fetchone() == (natural_union,)
         assert before['source_series'] - after['source_series'] == len(removed_sources)
-        assert before['chapter'] - after['chapter'] == len(removed_chapters)
+        assert before['chapter'] - after['chapter'] == len(removed_chapters) + len(lost_chapters)
+        assert before['merge_candidate'] - after['merge_candidate'] == len(lost_candidates)
         for row in removed_sources:
             assert c.execute('SELECT id FROM source_series WHERE id=?', (row['id'],)).fetchone() is None
             assert c.execute('SELECT id FROM source_series WHERE id=?', (row['retained_source_series_id'],)).fetchone() is not None
@@ -362,6 +393,8 @@ def run_checks(args):
                        'real_before_counts': before, 'real_after_counts': after,
                        'real_preflight_source_rows': len(removed_sources),
                        'real_preflight_chapter_rows': len(removed_chapters),
+                       'real_preflight_unreachable_chapter_rows': len(lost_chapters),
+                       'real_preflight_unreachable_candidate_rows': len(lost_candidates),
                        'real_preflight_source_ids': [row['id'] for row in removed_sources],
                        'real_release_history_preservation': {
                            'original_keys_preserved': True, 'clocks_never_advance': True},

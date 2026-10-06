@@ -30,10 +30,17 @@ CREATE INDEX _ss_identity_map_keep ON _ss_identity_map(keep_id);
 -- Preserve them first, empty them, rebuild the parent, then restore them, all in
 -- sqlx's enclosing migration transaction with foreign_keys ON. Do not disable
 -- foreign keys or ALTER/rename child tables: their own schema/indexes stay intact.
+-- A child whose source mapping is already gone (removed while foreign keys were
+-- not enforced) belongs to no work and cannot be restored under foreign_keys ON:
+-- leave it out. sqlite_0120_preflight.sql lists those rows beforehand.
 CREATE TEMP TABLE _ss_identity_source AS SELECT * FROM source_series;
 CREATE INDEX _ss_identity_source_id ON _ss_identity_source(id);
-CREATE TEMP TABLE _ss_identity_chapter AS SELECT * FROM chapter;
-CREATE TEMP TABLE _ss_identity_candidate AS SELECT * FROM merge_candidate;
+CREATE TEMP TABLE _ss_identity_chapter AS
+SELECT c.* FROM chapter c
+ WHERE EXISTS (SELECT 1 FROM source_series ss WHERE ss.id = c.source_series_id);
+CREATE TEMP TABLE _ss_identity_candidate AS
+SELECT c.* FROM merge_candidate c
+ WHERE EXISTS (SELECT 1 FROM source_series ss WHERE ss.id = c.source_series_id);
 DELETE FROM chapter;
 DELETE FROM merge_candidate;
 DROP TABLE source_series;

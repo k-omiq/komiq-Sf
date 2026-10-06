@@ -1,6 +1,6 @@
 -- Read-only production preflight, BEFORE migration 0120:
 -- sqlite3 -readonly -header -csv /path/to/komika.sqlite3 < sqlite_0120_preflight.sql
--- One read transaction keeps both result sets on the same snapshot. query_only
+-- One read transaction keeps every result set on the same snapshot. query_only
 -- also rejects writes if this file is accidentally extended with a write.
 PRAGMA query_only = ON;
 BEGIN;
@@ -78,5 +78,18 @@ SELECT count(*) OVER () AS collapsed_chapter_rows,
   JOIN source_series keeper ON keeper.id = r.retained_source_series_id
  WHERE r.restore_rank > 1
  ORDER BY original.source_key, c.external_id, c.id;
+
+-- Children of a source mapping that no longer exists: it was removed while
+-- foreign keys were not enforced. The work they belonged to cannot be resolved,
+-- and 0120 cannot restore them under foreign_keys ON. These rows disappear.
+SELECT count(*) OVER () AS unreachable_chapter_rows, c.*
+  FROM chapter c
+ WHERE NOT EXISTS (SELECT 1 FROM source_series ss WHERE ss.id = c.source_series_id)
+ ORDER BY c.source_series_id, c.id;
+
+SELECT count(*) OVER () AS unreachable_candidate_rows, c.*
+  FROM merge_candidate c
+ WHERE NOT EXISTS (SELECT 1 FROM source_series ss WHERE ss.id = c.source_series_id)
+ ORDER BY c.source_series_id, c.id;
 
 ROLLBACK;
