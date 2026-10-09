@@ -45,3 +45,33 @@ merge-suwayomi-duplicates.done.log
 
 # Local agent tooling state (worktrees can hold stale copies of anything).
 .claude/worktrees/
+
+# Planning documents, reviews, gate records and reports on work in progress
+# stay local. The repository holds the source and its documentation
+# (apps/docs, published at docs.komiq.cc).
+docs/plans/
+docs/audits/
+docs/reviews/
+docs/superpowers/
+docs/2026-09-17-credential-storage-security-review.md
+docs/ui-functional-regressions.md
+/NATIVE_ENGINE_STATUS_*.md
+/PERFORMANCE_ROADMAP.md
+/.native-*.json
+/SPEC.md
+/CATALOGUE.md
+/PRODUCTION.md
+deploy/GO-LIVE.md
+deploy/CLOUDFLARE-RUNBOOK.md
+apps/server/tests/postgres_golden/VALIDATION.md
+
+# Tools and experiments of the finished move to PostgreSQL stay local too.
+deploy/spikes/
+scripts/postgres-port-*.py
+scripts/postgres-golden-dates.py
+scripts/postgres-search-parity.py
+scripts/postgres-test-fixtures.py
+scripts/postgres-baseline-check.py
+scripts/tests/test_postgres_port_*.py
+scripts/tests/test_postgres_baseline_check.py
+scripts/tests/test_postgres_search_parity.py
