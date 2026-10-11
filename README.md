@@ -105,11 +105,6 @@ repository: [`docs/self-host.md`](./docs/self-host.md).
 All developer documentation lives at **[docs.komiq.cc/developers](https://docs.komiq.cc/developers)**.
 Start there, not here.
 
-The `codex/postgres-phase3` development branch uses PostgreSQL for the main server
-database and SQLite for covers and import sources. Its migration status and test
-commands are in [the Phase 3 integration record](docs/audits/postgres-phase3-integration.md).
-Production repair, deployment and desktop PostgreSQL packaging remain pending.
-
 | Page                                                                 | What it covers                            |
 | -------------------------------------------------------------------- | ----------------------------------------- |
 | [Architecture](https://docs.komiq.cc/developers/architecture)        | The parts of komiq and how they talk      |
