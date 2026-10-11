@@ -21,11 +21,26 @@
 # --with-reader (or export COMPOSE_PROFILES=selfhost) to run the nginx SPA.
 #
 set -euo pipefail
+set +x
 cd "$(dirname "$0")"
 
 cy='\033[36m'; gn='\033[32m'; yl='\033[33m'; rd='\033[31m'; bd='\033[1m'; z='\033[0m'
 say(){ printf "${cy}▸ %s${z}\n" "$*"; }
 die(){ printf "${rd}✗ %s${z}\n" "$*" >&2; exit 1; }
+
+refuse_rehearsal(){
+  [ -z "$(compgen -A variable KOMIKA_REHEARSAL_)" ] || die "deploy.sh refuses rehearsal variables; use postgres/rehearsal.sh."
+  case "${KOMIKA_COMPOSE_FILE:-}:${COMPOSE_FILE:-}:${KOMIKA_COMPOSE_PROJECT:-}:${COMPOSE_PROJECT_NAME:-}" in
+    *rehearsal*) die "deploy.sh refuses rehearsal Compose selection; use postgres/rehearsal.sh." ;;
+  esac
+  for selection in KOMIKA_COMPOSE_FILE COMPOSE_FILE; do
+    if [ -n "${!selection:-}" ]; then
+      python3 -c 'from pathlib import Path; import sys; sys.exit(Path(sys.argv[1]).resolve() != Path(sys.argv[2]).resolve())' \
+        "${!selection}" "$PWD/docker-compose.yml" || die "deploy.sh supports only the hosted Compose file; use postgres/rehearsal.sh for rehearsals."
+    fi
+  done
+}
+refuse_rehearsal
 
 # ---- prerequisites ------------------------------------------------------------
 command -v docker >/dev/null 2>&1 || die "docker is not installed — install Docker first."
@@ -40,10 +55,11 @@ if [ ! -f .env ]; then
   printf "${yl}! created deploy/.env from the template.${z}\n"
   die "review deploy/.env before deploying — set a real KOMIKA_ADMIN_PASSWORD (the template ships a public placeholder) and PUBLIC_HOST, then re-run ./deploy.sh."
 fi
-# .env holds KOMIKA_ADMIN_PASSWORD and the LITESTREAM_* credentials: enforce
+# .env holds KOMIKA_ADMIN_PASSWORD and the KOMIKA_R2_* and PostgreSQL credentials: enforce
 # owner-only permissions (a template-copied file inherits the repo's mode).
 [ "$(stat -c '%a' .env)" = "600" ] || { chmod 600 .env; printf "${yl}! tightened deploy/.env permissions to 0600.${z}\n"; }
 set -a; . ./.env 2>/dev/null || true; set +a
+refuse_rehearsal
 PUBLIC_HOST="${PUBLIC_HOST:-localhost}"
 READER_PORT="${READER_PORT:-8081}"; SERVER_PORT="${SERVER_PORT:-8080}"; SUWAYOMI_PORT="${SUWAYOMI_PORT:-4567}"
 
@@ -71,6 +87,14 @@ case "$cmd" in
   up|"") : ;;
   *) die "unknown command '$cmd' (use: up | bootstrap | down | destroy | logs)" ;;
 esac
+
+# Main URL is interpolated by Compose: keep the password URI-safe (random hex).
+[[ "${KOMIKA_POSTGRES_PASSWORD:-}" =~ ^[A-Za-z0-9_.~-]{24,}$ ]] || die "set KOMIKA_POSTGRES_PASSWORD to >=24 URI-safe random characters in deploy/.env."
+backup_count=0
+for key in KOMIKA_R2_ENDPOINT KOMIKA_R2_BUCKET KOMIKA_R2_PREFIX KOMIKA_R2_KEY KOMIKA_R2_SECRET; do
+  [ -z "${!key:-}" ] || backup_count=$((backup_count + 1))
+done
+[ "$backup_count" -eq 0 ] || [ "$backup_count" -eq 5 ] || die "partial R2 configuration: all five KOMIKA_R2_* variables are required."
 
 # ---- preflight: TRUSTED_PROXY_CIDRS vs. the live bridge gateway ---------------
 # The auth rate-limiter honours X-Forwarded-For / CF-Connecting-IP only when the
@@ -150,7 +174,7 @@ for _ in $(seq 1 100); do
   sleep 3
 done
 # Timed out with services still not healthy → don't bootstrap a partial stack.
-[ -n "$healthy" ] || die "services did not become healthy: ${unhealthy% }"
+[ -n "$healthy" ] || die "services did not become healthy: ${unhealthy% }. On a new R2 prefix, create the stanza and first full explicitly (postgres/RESTORE.md); inspect postgres-backup status."
 
 # ---- bootstrap ----------------------------------------------------------------
 say "bootstrapping (extensions, Cloudflare bypass, admin, library seed)…"
@@ -175,17 +199,10 @@ printf "\n  Manage:  ./deploy.sh logs   ·   ./deploy.sh down   ·   ./deploy.sh
 printf "  The adaptive scanner auto-updates the seeded library — no manual refresh needed.\n"
 
 # ---- backup status ------------------------------------------------------------
-# Continuous backup is opt-in: server-entrypoint.sh only runs the DB under
-# Litestream when ALL of LITESTREAM_BUCKET / LITESTREAM_ACCESS_KEY_ID /
-# LITESTREAM_SECRET_ACCESS_KEY are set (mirror that exact gate here). If backup
-# is off, the single data volume holds accounts, argon2 hashes, session tokens,
-# reviews, comments and scan-state with NO copy — warn loudly so it isn't a
-# silent data-loss surprise.
-if [ -n "${LITESTREAM_BUCKET:-}" ] && [ -n "${LITESTREAM_ACCESS_KEY_ID:-}" ] && [ -n "${LITESTREAM_SECRET_ACCESS_KEY:-}" ]; then
-  printf "\n${gn}✓ Continuous backup ENABLED${z} — DB replicated to %s via Litestream.\n" "${LITESTREAM_BUCKET}"
+if [ -n "${KOMIKA_R2_BUCKET:-}" ] && [ -n "${KOMIKA_R2_ENDPOINT:-}" ] && [ -n "${KOMIKA_R2_PREFIX:-}" ] && [ -n "${KOMIKA_R2_KEY:-}" ] && [ -n "${KOMIKA_R2_SECRET:-}" ]; then
+  printf "\n${gn}✓ pgBackRest configured${z} — weekly full, daily incremental, continuous WAL.\n"
+  printf "  Check postgres-backup health and pg_stat_archiver; see postgres/RESTORE.md.\n"
 else
-  printf "\n${rd}${bd}⚠ NO BACKUP CONFIGURED${z}${rd} — the database has NO continuous backup.${z}\n"
-  printf "${rd}  A volume loss or ${bd}./deploy.sh destroy${z}${rd} is UNRECOVERABLE: accounts, password\n"
-  printf "  hashes, session tokens, reviews, comments and scan-state would be gone.${z}\n"
-  printf "${rd}  Enable it by setting the ${bd}LITESTREAM_*${z}${rd} vars in ${bd}deploy/.env${z}${rd} (see deploy/.env.example).${z}\n"
+  printf "\n${rd}${bd}⚠ NO BACKUP CONFIGURED${z} — volume loss is unrecoverable.\n"
+  printf "  Set all KOMIKA_R2_* variables in deploy/.env; see postgres/RESTORE.md.\n"
 fi

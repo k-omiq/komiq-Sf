@@ -32,7 +32,7 @@
 //! the hosted instance, because it is local disk and answers its ~1,300 Keiyoushi
 //! icons without a single outbound request; a self-hosted install ships none.
 
-use crate::db::Database;
+use crate::sqlite_database::SqliteDatabase as Database;
 use std::time::Duration;
 
 /// Bound the outbound fetch hard. This runs on a request path, and a stalled
@@ -142,7 +142,7 @@ fn is_png(bytes: &[u8]) -> bool {
 pub async fn cached(pool: &Database, pkg: &str) -> Result<Option<Vec<u8>>, ()> {
     let row: Option<(Vec<u8>, i64)> = sqlx::query_as(
         "SELECT png, CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', updated_at) AS INTEGER) \
-         FROM extension_icon_blob WHERE pkg_name = ?",
+         FROM extension_icon_blob WHERE pkg_name = $1",
     )
     .bind(pkg)
     .fetch_optional(pool)
@@ -319,7 +319,7 @@ pub async fn fetch_and_cache(pool: &Database, pkg: &str, repo: RepoLookup<'_>) -
     pool.defer(async move {
         sqlx::query(
             "INSERT INTO extension_icon_blob (pkg_name, png, updated_at) \
-             VALUES (?, ?, datetime('now')) \
+             VALUES ($1, $2, datetime('now')) \
              ON CONFLICT(pkg_name) DO UPDATE SET png = excluded.png, updated_at = excluded.updated_at",
         )
         .bind(cache_key)
@@ -388,7 +388,7 @@ mod tests {
 
     /// An in-memory clone of the `extension_icon_blob` schema from `db::init_covers`.
     async fn cache_pool() -> Database {
-        let pool = crate::database::TestPoolOptions::new()
+        let pool = crate::sqlite_database::SqliteTestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
@@ -409,7 +409,7 @@ mod tests {
     async fn put(pool: &Database, pkg: &str, png: &[u8], age_secs: i64) {
         sqlx::query(
             "INSERT INTO extension_icon_blob (pkg_name, png, updated_at) \
-             VALUES (?, ?, datetime('now', ?))",
+             VALUES ($1, $2, datetime('now', $3))",
         )
         .bind(pkg)
         .bind(png)
@@ -480,7 +480,7 @@ mod tests {
         );
         pool.flush_deferred().await;
         let tombstoned: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM extension_icon_blob WHERE pkg_name = ?")
+            sqlx::query_scalar("SELECT COUNT(*) FROM extension_icon_blob WHERE pkg_name = $1")
                 .bind(pkg)
                 .fetch_one(&pool)
                 .await

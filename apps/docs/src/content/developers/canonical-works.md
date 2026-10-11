@@ -21,7 +21,7 @@ The server's matching pipeline processes series during ingestion, source synchro
 
 ## The work data model
 
-The canonical catalogue layer uses several related SQLite tables introduced in `apps/server/migrations/0005_canonical_works.sql` and extended by later migrations:
+The canonical catalogue layer uses several related PostgreSQL tables defined in `apps/server/migrations_pg/0001_baseline.sql`. The frozen SQLite history remains for importing old installations:
 
 - `work`: the central record representing one logical comic series. It holds canonical metadata including title, author, artist, year, language, status, content rating, `is_nsfw`, and a 64-bit perceptual cover hash (`cover_phash`).
 - `work_alias`: alternative titles populated from MangaDex and admin edits. It stores `normalized_title` (lowercased text with punctuation folded to spaces, diacritics folded, and trailing noise markers removed) and `match_key` (an article-insensitive key that removes "the", "a", and "an" except in the last position, added by `apps/server/migrations/0111_work_alias_match_key.sql`).
@@ -70,7 +70,7 @@ The assessment enforces specific boundaries:
 
 ## The review queue
 
-Pairs that cannot be decided automatically are stored in `merge_candidate` with `status = 'pending'`. Administrators inspect and resolve these pairs under [Duplicates](/admin/duplicates):
+Pairs that cannot be decided automatically are stored in `merge_candidate` with `status = 'pending'`. Administrators inspect and resolve these pairs under [Duplicates: merge and split](/admin/duplicates):
 
 - **Merge**: confirms the merge, folding the candidate work into the target work and marking the row `confirmed`.
 - **Keep separate**: marks the row `rejected`. This human decision prevents automated sweeps from re-proposing or auto-merging the pair.
@@ -81,7 +81,7 @@ The background worker in `apps/server/src/maintenance.rs` rechecks waiting revie
 
 ### Merge operation
 
-Merging two works executes with `BEGIN IMMEDIATE` in `apps/server/src/catalog/mod.rs` (`merge_works_checked`) to avoid SQLite write lock contention:
+Merging two works uses a PostgreSQL transaction in `apps/server/src/catalog/mod.rs` (`merge_works_checked`). Preconditions and database constraints protect the related records:
 
 1. **Precondition check**: automated callers supply identity snapshots. The server verifies that the checked fields still match and aborts if they changed. Admin-requested merges omit this check.
 2. **Blocked check**: when snapshots are supplied, the server confirms the pair was not rejected or recorded in `work_split`.

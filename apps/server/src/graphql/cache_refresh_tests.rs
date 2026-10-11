@@ -10,7 +10,7 @@ async fn fixture() -> (AppState, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) 
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    sqlx::migrate!("./migrations")
+    sqlx::migrate!("./migrations_pg")
         .run(pool.write())
         .await
         .unwrap();
@@ -41,7 +41,9 @@ async fn fixture() -> (AppState, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) 
     });
     let state = AppState {
         pool: pool.clone(),
-        cover_pool: pool,
+        cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
+            .await
+            .unwrap(),
         suwayomi: SuwayomiClient::new(format!("http://{addr}"), None, None),
         mangadex: Arc::new(crate::mangadex::MangaDexClient::new("test", 5.0, 40.0)),
         admin_users: vec![],
@@ -66,9 +68,9 @@ async fn stale_metadata_and_chapters_return_before_refresh_and_do_not_stampede()
     let (state, requests, server) = fixture().await;
     let state = Arc::new(state);
     let id = 88001;
-    sqlx::query("INSERT INTO suwayomi_series (id, title, status, source_id, updated_at, series_fetched_at) VALUES (?, 'Cached', 'ONGOING', 'src', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')")
+    sqlx::query("INSERT INTO suwayomi_series (id, title, status, source_id, updated_at, series_fetched_at) VALUES ($1, 'Cached', 'ONGOING', 'src', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')")
         .bind(id).execute(&state.pool).await.unwrap();
-    sqlx::query("INSERT INTO suwayomi_chapter (id, manga_id, name, chapter_number, updated_at) VALUES (?, ?, 'Cached chapter', 1, '2020-01-01T00:00:00Z')")
+    sqlx::query("INSERT INTO suwayomi_chapter (id, manga_id, name, chapter_number, updated_at) VALUES ($1, $2, 'Cached chapter', 1, '2020-01-01T00:00:00Z')")
         .bind(id * 10).bind(id).execute(&state.pool).await.unwrap();
     // Each source takes 400ms. Cached reads, including repeated navigations while
     // refreshing, must complete inside 100ms and return the existing data.
@@ -114,13 +116,13 @@ async fn stale_metadata_and_chapters_return_before_refresh_and_do_not_stampede()
     );
     // Fresh viewer state remains independent of the source cache, including after
     // a refresh returned global unread flags from Suwayomi.
-    sqlx::query("INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('u', 'u', 'u@x', 'h', 'now')")
+    sqlx::query(r#"INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('6e325f9f-8b73-46d2-a34d-cfd95e86edc4', 'u', 'u@x', 'h', '2020-01-01T00:00:00Z')"#)
         .execute(&state.pool).await.unwrap();
-    sqlx::query("INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, 'u', '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z')")
+    sqlx::query(r#"INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES ($1, '6e325f9f-8b73-46d2-a34d-cfd95e86edc4', '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z')"#)
         .bind(auth::hash_token("tok")).execute(&state.pool).await.unwrap();
-    sqlx::query("INSERT INTO user_library (user_id, series_id, created_at, is_favorite) VALUES ('u', ?, 'now', 1)")
+    sqlx::query(r#"INSERT INTO user_library (user_id, series_id, created_at, is_favorite) VALUES ('6e325f9f-8b73-46d2-a34d-cfd95e86edc4', $1, '2020-01-01T00:00:00Z', TRUE)"#)
         .bind(id.to_string()).execute(&state.pool).await.unwrap();
-    sqlx::query("INSERT INTO suwayomi_progress (user_id, chapter_id, series_id, last_page_read, read, updated_at) VALUES ('u', ?, ?, 9, 1, 'now')")
+    sqlx::query(r#"INSERT INTO suwayomi_progress (user_id, chapter_id, series_id, last_page_read, read, updated_at) VALUES ('6e325f9f-8b73-46d2-a34d-cfd95e86edc4', $1, $2, 9, TRUE, '2020-01-01T00:00:00Z')"#)
         .bind((id * 10).to_string()).bind(id.to_string()).execute(&state.pool).await.unwrap();
     let schema = build_schema(state.clone(), false);
     let query = format!(
@@ -140,7 +142,7 @@ async fn stale_metadata_and_chapters_return_before_refresh_and_do_not_stampede()
     assert_eq!(data["series"]["isFavorite"], true);
     assert_eq!(data["chapters"][0]["read"], true);
     assert_eq!(data["chapters"][0]["lastPageRead"], 9);
-    sqlx::query("UPDATE user_library SET is_favorite = 0 WHERE user_id = 'u'")
+    sqlx::query(r#"UPDATE user_library SET is_favorite = FALSE WHERE user_id = '6e325f9f-8b73-46d2-a34d-cfd95e86edc4'"#)
         .execute(&state.pool)
         .await
         .unwrap();

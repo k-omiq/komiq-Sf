@@ -1,0 +1,16 @@
+{
+  "data": {
+    "scanlatorTags": [
+      {
+        "ai": "PARTIAL",
+        "name": "Alpha"
+      }
+    ],
+    "sourceAiTags": [
+      {
+        "ai": "AI",
+        "sourceId": "source-710002"
+      }
+    ]
+  }
+}

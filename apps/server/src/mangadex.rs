@@ -579,12 +579,15 @@ impl MangaDexClient {
                 // parse failure for months. WARN rather than ERROR because the blast
                 // radius really is one gallery entry — the work and its primary cover
                 // come from the sweep, not from here — but it is no longer silent.
-                Err(e) => tracing::warn!(
-                    manga = %manga_id,
-                    cover = %cover_id,
-                    error = %e,
-                    "mangadex: DROPPED an unparseable cover record"
-                ),
+                Err(e) => {
+                    let e = crate::db::observed_database_error(e.into());
+                    tracing::warn!(
+                        manga = %manga_id,
+                        cover = %cover_id,
+                        error = %e,
+                        "mangadex: DROPPED an unparseable cover record"
+                    );
+                }
             }
         }
         Ok(out)
@@ -1847,6 +1850,11 @@ pub struct SweepOutcome {
     /// only visible evidence that the mirror half's incremental writer ran at all, which is
     /// how it went a whole phase never creating a row without anyone noticing (§8h).
     pub feed: u64,
+    /// The job was reset (`catalog::reset_sync_state`) while this sweep ran: one of its
+    /// seed checkpoints was dropped because the job is no longer in the generation the
+    /// cycle started in, and the sweep stopped right there. Not a loss: the reset asked
+    /// for a fresh walk, and the next cycle does it. The caller writes no cursor.
+    pub reset: bool,
 }
 
 /// The MangaDex half's incremental feed writer — one pass over the `source_series` this
@@ -1881,6 +1889,7 @@ async fn flush_touched_feed_rows(
         // FROM it, so recording this page's chapters afterwards would publish the row with
         // the previous clock and leave the new one for the next rebuild.
         if let Err(e) = catalog::ledger::record_source_series(pool, &ssid).await {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "mangadex: release-ledger write failed");
             continue;
         }
@@ -1890,10 +1899,16 @@ async fn flush_touched_feed_rows(
                 // Not an error: the work's every English chapter is still unreleased (a
                 // far-future `publishAt`), so it is correctly absent from the feed.
                 Ok(false) => {}
-                Err(e) => tracing::warn!(error = %e, "mangadex: feed publish failed"),
+                Err(e) => {
+                    let e = crate::db::observed_database_error(e);
+                    tracing::warn!(error = %e, "mangadex: feed publish failed");
+                }
             },
             Ok(None) => {}
-            Err(e) => tracing::warn!(error = %e, "mangadex: feed work lookup failed"),
+            Err(e) => {
+                let e = crate::db::observed_database_error(e);
+                tracing::warn!(error = %e, "mangadex: feed work lookup failed");
+            }
         }
     }
     published
@@ -1912,6 +1927,7 @@ pub async fn sync_catalogue(
     initial_since: Option<String>,
     cover_phash: bool,
     job: &str,
+    generation: i64,
 ) -> Result<SweepOutcome> {
     let mut since = initial_since;
     let mut out = SweepOutcome::default();
@@ -1969,13 +1985,10 @@ pub async fn sync_catalogue(
                         input.cover_phash = client.cover_phash(&id, &fname).await;
                     }
                 }
-                // Retry a lock-contended upsert a few times (the cover drainer +
-                // scanner write the main DB during the seed) so transient BUSY doesn't
-                // silently drop a work from the spine.
-                let result = crate::db::retry_transaction(|| {
-                    catalog::upsert_work_from_mangadex(pool, &id, &input)
-                })
-                .await;
+                // No retry here: `upsert_work_from_mangadex` is one whole guarded
+                // transaction that already retries itself (deadlock, serialization
+                // failure, changed owner). A second wrapper would only multiply attempts.
+                let result = catalog::upsert_work_from_mangadex(pool, &id, &input).await;
                 match result {
                     Ok(_) => out.upserted += 1,
                     // COUNTED, not just warned (F9). `out.failed` is what
@@ -1988,6 +2001,7 @@ pub async fn sync_catalogue(
                     // for the same reason; this arm was the remaining asymmetry.
                     Err(e) => {
                         out.failed += 1;
+                        let e = crate::db::observed_database_error(e);
                         tracing::warn!(manga = %id, error = %e, "mangadex: upsert failed");
                     }
                 }
@@ -2011,8 +2025,9 @@ pub async fn sync_catalogue(
             // written once, at cycle end.
             if window == SyncWindow::Created {
                 if let Some(s) = last_created.as_deref().and_then(to_since) {
-                    if let Err(e) = catalog::set_seed_progress(pool, job, &s).await {
-                        tracing::warn!(error = %e, "mangadex: failed to checkpoint catalogue seed");
+                    if !checkpoint_seed(pool, job, &s, generation, "catalogue").await {
+                        out.reset = true;
+                        return Ok(out);
                     }
                 }
             }
@@ -2063,8 +2078,9 @@ pub async fn sync_catalogue(
         // seed; incremental cursors are written once, at cycle end.
         if window == SyncWindow::Created {
             if let Some(ref s) = since {
-                if let Err(e) = catalog::set_seed_progress(pool, job, s).await {
-                    tracing::warn!(error = %e, "mangadex: failed to checkpoint catalogue seed");
+                if !checkpoint_seed(pool, job, s, generation, "catalogue").await {
+                    out.reset = true;
+                    return Ok(out);
                 }
             }
         }
@@ -2271,6 +2287,11 @@ pub struct BackfillOutcome {
     /// A fetched-but-unpersisted record is the same class of loss as `failed`/`truncated`,
     /// so it blocks the marker AND forces the cursor rewind.
     pub dropped: u64,
+    /// The backfill job was reset while this pass ran: a window checkpoint was dropped
+    /// because the job is no longer in the generation the pass started in, and the pass
+    /// stopped there. It blocks the completion marker (the walk the reset asked for has
+    /// not happened) and is not "dirty": nothing was lost, so there is nothing to rewind.
+    pub reset: bool,
 }
 
 impl BackfillOutcome {
@@ -2278,7 +2299,7 @@ impl BackfillOutcome {
     /// the sweep reached the end of the catalogue having lost nothing and skipped
     /// nothing. Anything less resumes on a later pass or a later boot.
     pub fn is_clean_completion(&self) -> bool {
-        self.complete && self.failed == 0 && self.truncated == 0 && self.dropped == 0
+        self.complete && !self.reset && self.failed == 0 && self.truncated == 0 && self.dropped == 0
     }
 
     /// Whether this pass left the catalogue in a state that must not be resumed from —
@@ -2316,11 +2337,15 @@ pub async fn backfill_missing_catalogue(
     budget: Option<Duration>,
 ) -> Result<BackfillOutcome> {
     let started = Instant::now();
-    let mut since: Option<String> = catalog::get_sync_state(pool, BACKFILL_JOB)
+    // Generation first, then the cursor (`read_cycle_start`). Every pass reads its own
+    // generation here, so the pass that follows this job's own rewind
+    // (`run_backfill_pass`, the `reset_sync_state` of a dirty pass) starts in the new
+    // generation and its checkpoints are accepted again. A failed read ends the pass:
+    // without a generation no checkpoint of it could be told from a cancelled one.
+    let (generation, state) = read_cycle_start(pool, BACKFILL_JOB)
         .await
-        .ok()
-        .flatten()
-        .map(|s| s.cursor);
+        .map_err(crate::db::observed_read_database_error)?;
+    let mut since: Option<String> = state.map(|s| s.cursor);
     if let Some(ref s) = since {
         tracing::info!(resume = %s, "backfill: resuming from the stored window cursor");
     }
@@ -2412,9 +2437,9 @@ pub async fn backfill_missing_catalogue(
                 // than aborting the pass: we can't tell whether it needs ingesting.
                 // Selects `work_id`, not a `1` sentinel: a present work still needs its
                 // genres topped up below, and that write is keyed by work id.
-                let present: Option<String> = match sqlx::query_scalar(
+                let present: Option<String> = match crate::db_types::query_scalar(
                     "SELECT work_id FROM source_series \
-                     WHERE source_type = 'mangadex' AND source_key = ? LIMIT 1",
+                     WHERE source_type = 'mangadex' AND source_key = $1 LIMIT 1",
                 )
                 .bind(&id)
                 .fetch_optional(pool)
@@ -2423,6 +2448,7 @@ pub async fn backfill_missing_catalogue(
                     Ok(v) => v,
                     Err(e) => {
                         out.failed += 1;
+                        let e = crate::db::observed_read_database_error(e.into());
                         tracing::warn!(manga = %id, error = %e, "backfill: presence check failed");
                         continue;
                     }
@@ -2432,10 +2458,9 @@ pub async fn backfill_missing_catalogue(
                     // existing works, including removal of now-empty upstream lists.
                     // Curated tags and admin override columns remain untouched.
                     {
-                        let res = crate::db::retry_transaction(|| {
-                            catalog::refresh_mangadex_details(pool, &work_id, &input)
-                        })
-                        .await;
+                        // No retry here: the catalogue function is one whole guarded
+                        // transaction that retries itself.
+                        let res = catalog::refresh_mangadex_details(pool, &work_id, &input).await;
                         match res {
                             Ok(()) => out.tagged += 1,
                             Err(e) => {
@@ -2444,6 +2469,7 @@ pub async fn backfill_missing_catalogue(
                                 // marker, so the record gets another pass rather than
                                 // being silently left genreless forever.
                                 out.failed += 1;
+                                crate::db::observe_database_error(&e);
                                 tracing::warn!(
                                     manga = %id, work = %work_id, error = %e,
                                     "backfill: tag refresh failed"
@@ -2458,10 +2484,8 @@ pub async fn backfill_missing_catalogue(
                         input.cover_phash = client.cover_phash(&id, &fname).await;
                     }
                 }
-                let result = crate::db::retry_transaction(|| {
-                    catalog::upsert_work_from_mangadex(pool, &id, &input)
-                })
-                .await;
+                // As above: `upsert_work_from_mangadex` retries its own transaction.
+                let result = catalog::upsert_work_from_mangadex(pool, &id, &input).await;
                 match result {
                     Ok(_) => out.ingested += 1,
                     Err(e) => {
@@ -2469,6 +2493,7 @@ pub async fn backfill_missing_catalogue(
                         // one-shot completion marker while `failed > 0`, so these ids
                         // get another pass instead of being silently abandoned.
                         out.failed += 1;
+                        let e = crate::db::observed_database_error(e);
                         tracing::warn!(manga = %id, error = %e, "backfill: upsert failed");
                     }
                 }
@@ -2478,8 +2503,16 @@ pub async fn backfill_missing_catalogue(
             // Resuming from an already-processed record's `createdAt` only re-enumerates
             // a little, and present ids are skipped, so the overlap costs nothing.
             if let Some(s) = last_created.as_deref().and_then(to_since) {
-                if let Err(e) = checkpoint_backfill(pool, &s, &out).await {
-                    tracing::warn!(error = %e, "backfill: failed to checkpoint the window cursor");
+                match checkpoint_backfill(pool, &s, &out, generation).await {
+                    Ok(Checkpoint::Reset) => {
+                        out.reset = true;
+                        break;
+                    }
+                    Ok(Checkpoint::Written | Checkpoint::Withheld) => {}
+                    Err(e) => {
+                        let e = crate::db::observed_database_error(e);
+                        tracing::warn!(error = %e, "backfill: failed to checkpoint the window cursor");
+                    }
                 }
             }
             // RAW length, never `mangas.len()` — see `next_offset`.
@@ -2497,6 +2530,9 @@ pub async fn backfill_missing_catalogue(
             if budget.is_some_and(|b| started.elapsed() >= b) {
                 break;
             }
+        }
+        if out.reset {
+            break;
         }
         if done {
             out.complete = true;
@@ -2527,8 +2563,16 @@ pub async fn backfill_missing_catalogue(
         }
         // Checkpoint after every completed window so a crash/failure resumes here.
         if let Some(ref s) = since {
-            if let Err(e) = checkpoint_backfill(pool, s, &out).await {
-                tracing::warn!(error = %e, "backfill: failed to checkpoint the window cursor");
+            match checkpoint_backfill(pool, s, &out, generation).await {
+                Ok(Checkpoint::Reset) => {
+                    out.reset = true;
+                    break;
+                }
+                Ok(Checkpoint::Written | Checkpoint::Withheld) => {}
+                Err(e) => {
+                    let e = crate::db::observed_database_error(e);
+                    tracing::warn!(error = %e, "backfill: failed to checkpoint the window cursor");
+                }
             }
         }
         tracing::info!(
@@ -2556,6 +2600,7 @@ pub async fn backfill_missing_catalogue(
         dropped = out.dropped,
         truncated = out.truncated,
         complete = out.complete,
+        reset = out.reset,
         "backfill: catalogue gap backfill pass finished"
     );
     Ok(out)
@@ -2577,7 +2622,7 @@ enum PassResult {
 /// One bounded backfill pass, under the catalogue single-flight lock.
 async fn run_backfill_pass(
     pool: &crate::db::Database,
-    covers: &crate::db::Database,
+    covers: &crate::database::SqliteDatabase,
     client: &MangaDexClient,
     cover_phash: bool,
 ) -> PassResult {
@@ -2589,6 +2634,7 @@ async fn run_backfill_pass(
         // on a 15s lock timeout, so retry after the gap instead — the flag re-read is
         // free and the pass is a no-op once it really is set.
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "backfill: flag read failed; retrying after the pass gap");
             return PassResult::Retry {
                 scanned: 0,
@@ -2599,6 +2645,7 @@ async fn run_backfill_pass(
     }
     let seeded = catalog::get_sync_state(pool, "catalogue")
         .await
+        .map_err(crate::db::observed_read_database_error)
         .ok()
         .flatten()
         .map(|s| s.seed_done)
@@ -2629,6 +2676,7 @@ async fn run_backfill_pass(
                 "backfill: complete"
             );
             if let Err(e) = catalog::set_maintenance_flag(pool, BACKFILL_FLAG).await {
+                let e = crate::db::observed_database_error(e);
                 tracing::warn!(error = %e, "backfill: failed to persist completion marker");
             }
             // The backfill keys on the MangaDex UUID only, so a backfilled series that
@@ -2664,10 +2712,18 @@ async fn run_backfill_pass(
                     "backfill: pass lost or skipped records — NOT marking done; rewinding \
                      the cursor so the next pass re-walks from the start"
                 );
+                // The rewind moves the job to its next generation. Nothing of this pass
+                // is left to write, and the next pass reads the generation again at its
+                // start (`backfill_missing_catalogue`), so its checkpoints are accepted.
                 if let Err(e) = catalog::reset_sync_state(pool, BACKFILL_JOB).await {
+                    let e = crate::db::observed_database_error(e);
                     tracing::error!(error = %e, "backfill: rewind failed; stopping before another pass can mark completion");
                     return PassResult::Stop;
                 }
+            } else if o.reset {
+                tracing::info!(
+                    "backfill: the job was reset during this pass; the next pass starts over"
+                );
             }
             PassResult::Retry {
                 scanned: o.scanned,
@@ -2675,6 +2731,7 @@ async fn run_backfill_pass(
             }
         }
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::error!(error = %e, "backfill: pass failed; cursor kept for the next pass");
             PassResult::Retry {
                 scanned: 0,
@@ -2703,7 +2760,7 @@ async fn run_backfill_pass(
 /// checkpointed per page, so the next boot resumes within one page).
 pub fn spawn_backfill_if_needed(
     pool: crate::db::Database,
-    covers: crate::db::Database,
+    covers: crate::database::SqliteDatabase,
     client: Arc<MangaDexClient>,
     cover_phash: bool,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -2959,13 +3016,13 @@ async fn chapters_needing_readable_at(
     pool: &crate::db::Database,
     limit: i64,
 ) -> Result<Vec<PendingChapter>> {
-    let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+    let rows: Vec<(String, String, Option<String>, String)> = crate::db_types::query_tuple(
         "SELECT c.id, c.external_id, c.published_at, c.created_at \
            FROM chapter c \
           WHERE c.readable_at IS NULL \
             AND EXISTS (SELECT 1 FROM source_series ss \
                          WHERE ss.id = c.source_series_id AND ss.source_type = 'mangadex') \
-          LIMIT ?",
+          LIMIT $1",
     )
     .bind(limit)
     .fetch_all(pool)
@@ -2987,7 +3044,7 @@ async fn chapters_needing_readable_at(
 /// work-list — a `COUNT` that disagreed with the batch query would report "drained" over
 /// rows the drain can still see, or spin over rows it cannot.
 async fn readable_backfill_remaining(pool: &crate::db::Database) -> Result<i64> {
-    Ok(sqlx::query_scalar(
+    Ok(crate::db_types::query_scalar(
         "SELECT COUNT(*) FROM chapter c \
           WHERE c.readable_at IS NULL \
             AND EXISTS (SELECT 1 FROM source_series ss \
@@ -2996,6 +3053,9 @@ async fn readable_backfill_remaining(pool: &crate::db::Database) -> Result<i64> 
     .fetch_one(pool)
     .await?)
 }
+
+#[cfg(test)]
+tokio::task_local! { static READABLE_WRITE_PAUSE: crate::locks::pause_points::PausePoints; }
 
 /// Write one batch's resolutions, in one transaction.
 ///
@@ -3007,19 +3067,34 @@ async fn write_readable_backfill(
     pending: &[PendingChapter],
     upstream: &[MdChapter],
 ) -> Result<ReadableFill> {
+    crate::db::retry_transaction(|| write_readable_backfill_once(pool, pending, upstream)).await
+}
+
+async fn write_readable_backfill_once(
+    pool: &crate::db::Database,
+    pending: &[PendingChapter],
+    upstream: &[MdChapter],
+) -> Result<ReadableFill> {
     let by_id: HashMap<&str, &MdChapterAttrs> = upstream
         .iter()
         .map(|c| (c.id.as_str(), &c.attributes))
         .collect();
     let mut out = ReadableFill::default();
     let mut tx = pool.begin().await?;
+    #[cfg(test)]
+    if let Ok(points) = READABLE_WRITE_PAUSE.try_with(Clone::clone) {
+        points.hit("readable-before-update").await;
+    }
+    let mut pending: Vec<_> = pending.iter().collect();
+    pending.sort_by(|a, b| a.id.cmp(&b.id));
     for row in pending {
         let resolved = resolve_readable_at(row, by_id.get(row.external_id.as_str()).copied());
         if resolved.answered {
-            sqlx::query("UPDATE chapter SET readable_at = ?, external_url = ? WHERE id = ?")
-                .bind(&resolved.readable_at)
+            sqlx::query("UPDATE chapter SET readable_at = $1, external_url = COALESCE(external_url, $2) WHERE id = $3 AND readable_at IS NULL AND external_id = $4")
+                .bind(crate::db_types::date(&resolved.readable_at)?)
                 .bind(&resolved.external_url)
                 .bind(&row.id)
+                .bind(&row.external_id)
                 .execute(&mut *tx)
                 .await?;
             if by_id[row.external_id.as_str()].readable_at.is_some() {
@@ -3032,9 +3107,10 @@ async fn write_readable_backfill(
             // `external_url` is left ALONE, not set to NULL. Upstream told us nothing about
             // this chapter, and the firehose's self-heal may already have written a real URL
             // onto the row; a blind NULL here would undo it and re-blank the reader.
-            sqlx::query("UPDATE chapter SET readable_at = ? WHERE id = ?")
-                .bind(&resolved.readable_at)
+            sqlx::query("UPDATE chapter SET readable_at = $1 WHERE id = $2 AND readable_at IS NULL AND external_id = $3")
+                .bind(crate::db_types::date(&resolved.readable_at)?)
                 .bind(&row.id)
+                .bind(&row.external_id)
                 .execute(&mut *tx)
                 .await?;
             out.unanswered += 1;
@@ -3157,6 +3233,7 @@ pub fn spawn_readable_backfill(
                                  they are unreachable, not merely pending"
                             ),
                             Err(e) => {
+                                let e = crate::db::observed_database_error(e);
                                 tracing::warn!(error = %e, "readable backfill: remaining check failed")
                             }
                         }
@@ -3198,6 +3275,7 @@ pub fn spawn_readable_backfill(
                     // idle interval rather than the batch gap: an error here is usually
                     // upstream being unhappy, and retrying it every 2s is how a rate-limit
                     // becomes a ban.
+                    let e = crate::db::observed_database_error(e);
                     tracing::warn!(error = %e, batches, "readable backfill: batch failed — retrying later");
                     if nap(READABLE_BACKFILL_IDLE_RECHECK, &mut shutdown).await {
                         return;
@@ -3289,7 +3367,7 @@ const GROUP_BACKFILL_HOT_REFRESH_EVERY: u64 = 50;
 /// uses a partial index when the query repeats its WHERE terms — and the `EXISTS` keeps the
 /// scope honest if a uuid-shaped id ever appeared under a non-MangaDex source (it costs one
 /// primary-key probe per row and is always true today).
-const GROUP_WORKLIST_WHERE: &str = "c.scanlator IS NULL AND c.external_id GLOB '*-*' \
+const GROUP_WORKLIST_WHERE: &str = "c.scanlator IS NULL AND c.external_id LIKE '%-%' \
      AND EXISTS (SELECT 1 FROM source_series ss \
                   WHERE ss.id = c.source_series_id AND ss.source_type = 'mangadex')";
 
@@ -3353,7 +3431,7 @@ async fn group_backfill_hot_works(pool: &crate::db::Database) -> Result<Vec<Stri
              SELECT series_id FROM user_library \
              UNION SELECT work_id FROM canonical_progress \
              UNION SELECT k FROM (SELECT series_key AS k FROM series_views \
-                                   ORDER BY total DESC LIMIT ?) \
+                                   ORDER BY total DESC LIMIT $1) \
          ), \
          hot(work_id) AS ( \
              SELECT DISTINCT COALESCE((SELECT s2.work_id FROM source_series s2 \
@@ -3366,8 +3444,8 @@ async fn group_backfill_hot_works(pool: &crate::db::Database) -> Result<Vec<Stri
             AND EXISTS (SELECT 1 FROM source_series ss \
                           JOIN chapter c ON c.source_series_id = ss.id \
                          WHERE ss.work_id = hot.work_id AND ss.source_type = 'mangadex' \
-                           AND c.scanlator IS NULL AND c.external_id GLOB '*-*')";
-    Ok(sqlx::query_scalar(HOT_WORKS_SQL)
+                           AND c.scanlator IS NULL AND c.external_id LIKE '%-%')";
+    Ok(crate::db_types::query_scalar(HOT_WORKS_SQL)
         .bind(GROUP_BACKFILL_HOT_VIEWED)
         .fetch_all(pool)
         .await?)
@@ -3394,16 +3472,16 @@ async fn chapters_needing_group(
     limit: i64,
 ) -> Result<Vec<PendingGroupChapter>> {
     const HOT_SQL: &str = "SELECT DISTINCT c.id, c.external_id \
-           FROM json_each(?) AS hot \
+           FROM unnest($1::text[]) AS hot(value) \
            JOIN source_series ss ON ss.work_id = hot.value AND ss.source_type = 'mangadex' \
            JOIN chapter c ON c.source_series_id = ss.id \
-          WHERE c.scanlator IS NULL AND c.external_id GLOB '*-*' \
-          LIMIT ?";
+          WHERE c.scanlator IS NULL AND c.external_id LIKE '%-%' \
+          LIMIT $2";
     let mut rows: Vec<(String, String)> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !hot.is_empty() {
-        let prio: Vec<(String, String)> = sqlx::query_as(HOT_SQL)
-            .bind(serde_json::to_string(hot)?)
+        let prio: Vec<(String, String)> = crate::db_types::query_tuple(HOT_SQL)
+            .bind(hot)
             .bind(limit)
             .fetch_all(pool)
             .await?;
@@ -3415,12 +3493,12 @@ async fn chapters_needing_group(
     }
     if (rows.len() as i64) < limit {
         let plain_sql = format!(
-            "SELECT c.id, c.external_id FROM chapter c WHERE {GROUP_WORKLIST_WHERE} LIMIT ?"
+            "SELECT c.id, c.external_id FROM chapter c WHERE {GROUP_WORKLIST_WHERE} LIMIT $1"
         );
         // Asked for `limit` rather than the shortfall: the plain sweep can return rows the
         // priority half already took (they are still NULL until this batch writes them), and
         // the de-dup below must still be able to fill the batch.
-        let plain: Vec<(String, String)> = sqlx::query_as(&plain_sql)
+        let plain: Vec<(String, String)> = crate::db_types::query_tuple(&plain_sql)
             .bind(limit)
             .fetch_all(pool)
             .await?;
@@ -3457,7 +3535,7 @@ fn group_batch_ids(pending: &[PendingGroupChapter]) -> Vec<String> {
 
 /// Rows still to do, for the completion line. Same predicate as the work-list.
 async fn group_backfill_remaining(pool: &crate::db::Database) -> Result<i64> {
-    Ok(sqlx::query_scalar(&format!(
+    Ok(crate::db_types::query_scalar(&format!(
         "SELECT COUNT(*) FROM chapter c WHERE {GROUP_WORKLIST_WHERE}"
     ))
     .fetch_one(pool)
@@ -3476,9 +3554,19 @@ async fn write_group_backfill(
     pending: &[PendingGroupChapter],
     upstream: &[MdChapter],
 ) -> Result<GroupFill> {
+    crate::db::retry_transaction(|| write_group_backfill_once(pool, pending, upstream)).await
+}
+
+async fn write_group_backfill_once(
+    pool: &crate::db::Database,
+    pending: &[PendingGroupChapter],
+    upstream: &[MdChapter],
+) -> Result<GroupFill> {
     let by_id: HashMap<&str, &MdChapter> = upstream.iter().map(|c| (c.id.as_str(), c)).collect();
     let mut out = GroupFill::default();
     let mut tx = pool.begin().await?;
+    let mut pending: Vec<_> = pending.iter().collect();
+    pending.sort_by(|a, b| a.id.cmp(&b.id));
     for row in pending {
         let label = match by_id.get(row.external_id.as_str()) {
             Some(c) => {
@@ -3495,7 +3583,7 @@ async fn write_group_backfill(
                 GROUP_UNKNOWN.to_string()
             }
         };
-        sqlx::query("UPDATE chapter SET scanlator = ? WHERE id = ? AND scanlator IS NULL")
+        sqlx::query("UPDATE chapter SET scanlator = $1 WHERE id = $2 AND scanlator IS NULL")
             .bind(&label)
             .bind(&row.id)
             .execute(&mut *tx)
@@ -3581,10 +3669,13 @@ pub fn spawn_group_backfill(
                 // below fails too and takes the back-off path.
                 match group_backfill_hot_works(&pool).await {
                     Ok(h) => hot = h,
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "group backfill: hot-set refresh failed — keeping the previous one"
-                    ),
+                    Err(e) => {
+                        let e = crate::db::observed_database_error(e);
+                        tracing::warn!(
+                            error = %e,
+                            "group backfill: hot-set refresh failed — keeping the previous one"
+                        );
+                    }
                 }
                 since_hot = 0;
             }
@@ -3613,6 +3704,7 @@ pub fn spawn_group_backfill(
                                  unreachable, not merely pending"
                             ),
                             Err(e) => {
+                                let e = crate::db::observed_database_error(e);
                                 tracing::warn!(error = %e, "group backfill: remaining check failed")
                             }
                         }
@@ -3651,6 +3743,7 @@ pub fn spawn_group_backfill(
                     // Nothing was written; the batch is simply re-offered. Back off to the
                     // idle interval — retrying an unhappy upstream every 2 s is how a
                     // rate-limit becomes a ban.
+                    let e = crate::db::observed_database_error(e);
                     tracing::warn!(error = %e, batches, "group backfill: batch failed — retrying later");
                     if nap_or_shutdown(GROUP_BACKFILL_IDLE_RECHECK, &mut shutdown).await {
                         return;
@@ -3689,15 +3782,23 @@ async fn chapter_row_unchanged(
         Option<String>,
         Option<String>,
         Option<String>,
-        Option<String>,
-        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
         Option<String>,
         Option<String>,
     );
-    let row: Option<MutableCols> = match sqlx::query_as(
+    let published = match crate::db_types::optional_date(ch.published_at.as_deref()) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let readable = match crate::db_types::optional_date(ch.readable_at.as_deref()) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let row: Option<MutableCols> = match crate::db_types::query_tuple(
         "SELECT number, volume, lang, title, published_at, readable_at, external_url, \
                 scanlator \
-         FROM chapter WHERE source_series_id = ? AND external_id = ?",
+         FROM chapter WHERE source_series_id = $1 AND external_id = $2",
     )
     .bind(source_series_id)
     .bind(&ch.external_id)
@@ -3706,27 +3807,28 @@ async fn chapter_row_unchanged(
     {
         Ok(row) => row,
         Err(e) => {
+            crate::db::record_read_database_error(&e);
             tracing::debug!(error = %e, "mangadex: chapter presence check failed; writing anyway");
             return false;
         }
     };
     match row {
         // Exactly the columns `upsert_chapter`'s DO UPDATE SET touches, compared as
-        // `Option<String>` so NULL == absent: if this list ever grows there, it must grow
+        // native timestamp instants and `Option<String>` text so NULL == absent: if this list ever grows there, it must grow
         // here too, or the re-seed will skip a genuine change.
         Some((number, volume, lang, title, published_at, readable_at, external_url, scanlator)) => {
             number == ch.number
                 && volume == ch.volume
                 && lang == ch.lang
                 && title == ch.title
-                && published_at == ch.published_at
+                && published_at == published
                 // Added with migration 0073. Comparing them here is what makes the
                 // firehose SELF-HEAL: every existing row has both NULL, so the first pass
                 // that re-offers a chapter now sees a difference and writes the real
                 // `readableAt`/`externalUrl` instead of skipping it as unchanged. (The
                 // firehose only re-offers UPDATED chapters, so the long tail still needs
                 // `backfill_chapter_external_urls`.)
-                && readable_at == ch.readable_at
+                && readable_at == readable
                 && external_url == ch.external_url
                 // The scanlation group, for the same self-heal reason as the two above:
                 // every row mirrored before `includes[]=scanlation_group` has it NULL, and
@@ -3751,6 +3853,7 @@ pub async fn sync_chapters(
     window: SyncWindow,
     initial_since: Option<String>,
     job: &str,
+    generation: i64,
 ) -> Result<SweepOutcome> {
     let mut since = initial_since;
     let mut out = SweepOutcome::default();
@@ -3850,6 +3953,7 @@ pub async fn sync_chapters(
                         continue;
                     }
                     Err(e) => {
+                        let e = crate::db::observed_database_error(e);
                         tracing::warn!(error = %e, "mangadex: chapter source_series lookup failed");
                         out.failed += 1;
                         continue;
@@ -3903,6 +4007,7 @@ pub async fn sync_chapters(
                     // non-zero, so the seed re-runs instead.
                     Err(e) => {
                         out.failed += 1;
+                        let e = crate::db::observed_database_error(e);
                         tracing::warn!(error = %e, "mangadex: chapter upsert failed");
                     }
                 }
@@ -3959,8 +4064,9 @@ pub async fn sync_chapters(
         // Checkpoint the chapter seed's progress so an abort resumes here (M6).
         if window == SyncWindow::Created {
             if let Some(ref s) = since {
-                if let Err(e) = catalog::set_seed_progress(pool, job, s).await {
-                    tracing::warn!(error = %e, "mangadex: failed to checkpoint chapter seed");
+                if !checkpoint_seed(pool, job, s, generation, "chapter").await {
+                    out.reset = true;
+                    return Ok(out);
                 }
             }
         }
@@ -4039,10 +4145,12 @@ pub fn spawn_resync(
     tokio::spawn(async move {
         let _guard = SyncGuard; // releases the lock on completion or panic
         if let Err(e) = catalog::reset_sync_state(&pool, "catalogue").await {
+            let e = crate::db::observed_database_error(e);
             tracing::error!(error = %e, "resync: failed to reset catalogue sync state; aborting");
             return;
         }
         if let Err(e) = catalog::reset_sync_state(&pool, "chapters").await {
+            let e = crate::db::observed_database_error(e);
             tracing::error!(error = %e, "resync: failed to reset chapter sync state; aborting");
             return;
         }
@@ -4067,9 +4175,12 @@ async fn run_one_cycle(pool: &crate::db::Database, client: &MangaDexClient, cove
     // --- Catalogue -----------------------------------------------------------
     // seed_done == false → (re)run/resume the full createdAt seed from the
     // provisional cursor; true → incremental updatedAtSince refresh.
-    let catalogue_state = match catalog::get_sync_state(pool, "catalogue").await {
+    // The job's reset generation is read BEFORE its state (`read_cycle_start`), and
+    // every checkpoint of this cycle is written against it.
+    let (generation, catalogue_state) = match read_cycle_start(pool, "catalogue").await {
         Ok(s) => s,
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "mangadex: catalogue state read failed; skipping cycle");
             return;
         }
@@ -4083,7 +4194,25 @@ async fn run_one_cycle(pool: &crate::db::Database, client: &MangaDexClient, cove
         Some(s) => (SyncWindow::Created, Some(s.cursor.clone())), // resume seed
         None => (SyncWindow::Created, None),                      // fresh seed
     };
-    match sync_catalogue(pool, client, window, since, cover_phash, "catalogue").await {
+    let swept = sync_catalogue(
+        pool,
+        client,
+        window,
+        since,
+        cover_phash,
+        "catalogue",
+        generation,
+    )
+    .await;
+    match swept {
+        // A seed checkpoint was dropped: the job was reset under this cycle. Write
+        // nothing more; the next cycle starts the walk the reset asked for.
+        Ok(o) if o.reset => {
+            tracing::info!(
+                upserted = o.upserted,
+                "mangadex: catalogue job was reset during the cycle; cycle stopped"
+            );
+        }
         Ok(o) => {
             tracing::info!(
                 upserted = o.upserted,
@@ -4097,13 +4226,22 @@ async fn run_one_cycle(pool: &crate::db::Database, client: &MangaDexClient, cove
                 catalogue_seeded,
                 catalogue_seed_may_latch(&o),
                 &run_start,
+                generation,
             )
             .await;
-            if let Err(e) = res {
-                tracing::warn!(error = %e, "mangadex: failed to persist catalogue cursor");
+            match res {
+                Ok(Checkpoint::Reset) => tracing::info!(
+                    "mangadex: catalogue job was reset during the cycle; cursor not written"
+                ),
+                Ok(Checkpoint::Written | Checkpoint::Withheld) => {}
+                Err(e) => {
+                    let e = crate::db::observed_database_error(e);
+                    tracing::warn!(error = %e, "mangadex: failed to persist catalogue cursor");
+                }
             }
         }
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "mangadex: catalogue cycle failed (cursor unchanged)");
         }
     }
@@ -4113,40 +4251,119 @@ async fn run_one_cycle(pool: &crate::db::Database, client: &MangaDexClient, cove
     let _ = run_start;
 }
 
+/// What became of one checkpoint of a sync job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Checkpoint {
+    /// Stored, in the generation the cycle started in.
+    Written,
+    /// Deliberately not attempted: the sweep lost records, so its cursor must not move.
+    Withheld,
+    /// Dropped by the catalogue: the job was reset since the cycle read its generation.
+    /// The cycle must stop and write nothing further.
+    Reset,
+}
+
+#[cfg(test)]
+tokio::task_local! { static CYCLE_START_PAUSE: crate::locks::pause_points::PausePoints; }
+
+/// The two things a cycle reads before its first upstream request: the job's reset
+/// generation and its stored state, IN THAT ORDER.
+///
+/// The order is the guard. Every checkpoint of the cycle is a compare-and-swap on this
+/// generation (`catalog::*_at`), so a reset that commits after the generation read is
+/// always noticed: either the state read below already sees the cleared row (the cycle
+/// then starts the fresh walk, and its checkpoints are dropped until the next cycle), or
+/// it does not and the checkpoints are dropped all the same. Reading the state FIRST
+/// would let a reset slip in between: the cycle would hold the old cursor together with
+/// the NEW generation, its checkpoints would be accepted, and the re-seed the reset
+/// asked for would resume from a recent cursor and latch without walking the catalogue.
+async fn read_cycle_start(
+    pool: &crate::db::Database,
+    job: &str,
+) -> Result<(i64, Option<catalog::SyncState>)> {
+    let generation = catalog::sync_generation(pool, job).await?;
+    #[cfg(test)]
+    if let Ok(points) = CYCLE_START_PAUSE.try_with(Clone::clone) {
+        points.hit("cycle-start-between-reads").await;
+    }
+    let state = catalog::get_sync_state(pool, job).await?;
+    Ok((generation, state))
+}
+
+/// One in-sweep seed checkpoint. `false` means the job was reset since the cycle read
+/// `generation`: nothing was written and the sweep must stop. A failed write is logged
+/// and the sweep goes on, as before: the next page checkpoints again.
+async fn checkpoint_seed(
+    pool: &crate::db::Database,
+    job: &str,
+    since: &str,
+    generation: i64,
+    what: &str,
+) -> bool {
+    match catalog::set_seed_progress_at(pool, job, since, generation).await {
+        Ok(written) => {
+            if !written {
+                tracing::info!(
+                    job,
+                    "mangadex: {what} job was reset during its seed; stopping this sweep"
+                );
+            }
+            written
+        }
+        Err(e) => {
+            let e = crate::db::observed_database_error(e);
+            tracing::warn!(error = %e, "mangadex: failed to checkpoint {what} seed");
+            true
+        }
+    }
+}
+
 /// Only a clean sweep may advance a forward-only updatedAtSince cursor.
+///
+/// No retry of its own: each catalogue checkpoint is one whole transaction under the
+/// job key and retries itself.
 async fn persist_cycle_outcome(
     pool: &crate::db::Database,
     job: &str,
     seeded: bool,
     clean: bool,
     run_start: &str,
-) -> Result<()> {
+    generation: i64,
+) -> Result<Checkpoint> {
     if !clean {
         tracing::warn!(
             job,
             "mangadex: sweep lost records; retaining the previous cursor"
         );
-        return Ok(());
+        return Ok(Checkpoint::Withheld);
     }
-    crate::db::retry_transaction(|| async {
-        if seeded {
-            catalog::set_sync_cursor(pool, job, run_start).await
-        } else {
-            catalog::mark_seed_done(pool, job, run_start).await
-        }
+    let written = if seeded {
+        catalog::set_sync_cursor_at(pool, job, run_start, generation).await?
+    } else {
+        catalog::mark_seed_done_at(pool, job, run_start, generation).await?
+    };
+    Ok(if written {
+        Checkpoint::Written
+    } else {
+        Checkpoint::Reset
     })
-    .await
 }
 
 async fn checkpoint_backfill(
     pool: &crate::db::Database,
     cursor: &str,
     outcome: &BackfillOutcome,
-) -> Result<()> {
+    generation: i64,
+) -> Result<Checkpoint> {
     if outcome.is_dirty() {
-        return Ok(());
+        return Ok(Checkpoint::Withheld);
     }
-    crate::db::retry_transaction(|| catalog::set_seed_progress(pool, BACKFILL_JOB, cursor)).await
+    let written = catalog::set_seed_progress_at(pool, BACKFILL_JOB, cursor, generation).await?;
+    Ok(if written {
+        Checkpoint::Written
+    } else {
+        Checkpoint::Reset
+    })
 }
 
 /// The chapter half of a cycle, on its own schedule (Phase D). Takes the same single-flight
@@ -4209,6 +4426,7 @@ async fn run_chapter_cycle(pool: &crate::db::Database, client: &MangaDexClient, 
     // completed above is observed this same cycle.
     let catalogue_done = catalog::get_sync_state(pool, "catalogue")
         .await
+        .map_err(crate::db::observed_read_database_error)
         .ok()
         .flatten()
         .map(|s| s.seed_done)
@@ -4218,9 +4436,11 @@ async fn run_chapter_cycle(pool: &crate::db::Database, client: &MangaDexClient, 
         return;
     }
 
-    let chapter_state = match catalog::get_sync_state(pool, "chapters").await {
+    // Generation before state, as in `run_one_cycle` (`read_cycle_start`).
+    let (generation, chapter_state) = match read_cycle_start(pool, "chapters").await {
         Ok(s) => s,
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "mangadex: chapter state read failed; skipping");
             return;
         }
@@ -4231,7 +4451,13 @@ async fn run_chapter_cycle(pool: &crate::db::Database, client: &MangaDexClient, 
         Some(s) => (SyncWindow::Created, Some(s.cursor.clone())),
         None => (SyncWindow::Created, None),
     };
-    match sync_chapters(pool, client, window, since, "chapters").await {
+    match sync_chapters(pool, client, window, since, "chapters", generation).await {
+        Ok(o) if o.reset => {
+            tracing::info!(
+                stored = o.upserted,
+                "mangadex: chapter job was reset during the cycle; cycle stopped"
+            );
+        }
         Ok(o) => {
             tracing::info!(
                 stored = o.upserted,
@@ -4247,13 +4473,22 @@ async fn run_chapter_cycle(pool: &crate::db::Database, client: &MangaDexClient, 
                 chapters_seeded,
                 chapter_seed_may_latch(&o),
                 run_start,
+                generation,
             )
             .await;
-            if let Err(e) = res {
-                tracing::warn!(error = %e, "mangadex: failed to persist chapter cursor");
+            match res {
+                Ok(Checkpoint::Reset) => tracing::info!(
+                    "mangadex: chapter job was reset during the cycle; cursor not written"
+                ),
+                Ok(Checkpoint::Written | Checkpoint::Withheld) => {}
+                Err(e) => {
+                    let e = crate::db::observed_database_error(e);
+                    tracing::warn!(error = %e, "mangadex: failed to persist chapter cursor");
+                }
             }
         }
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "mangadex: chapter cycle failed (cursor unchanged)");
         }
     }
@@ -4404,7 +4639,7 @@ async fn run_reconcile_loop(
                             sample = %r.sample.join(" | "),
                             "feed reconciler: DRIFT — the incremental writers missed rows"
                         ),
-                        Err(e) => tracing::warn!(error = %e, "feed reconciler: failed"),
+                        Err(e) => { let e = crate::db::observed_database_error(e); tracing::warn!(error = %e, "feed reconciler: failed"); },
                     }
             }
         }
@@ -4420,13 +4655,71 @@ mod tests {
         let pool = crate::db::Database::connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
         pool
     }
 
+    /// The backfill selected two chapters, then ingestion answered both before the
+    /// backfill's transaction wrote. One is answered by upstream (the UPDATE with an
+    /// external URL), one is not (the fallback UPDATE): neither may overwrite the
+    /// fresher clock or URL, and the same batch still fills a chapter nobody answered.
+    #[tokio::test]
+    async fn readable_backfill_preserves_a_concurrent_ingestion_answer() {
+        let pool = pool().await.foreground();
+        let (_, ssid) = mirror_work(&pool, "11111111-1111-4111-8111-111111111111", "Series").await;
+        for (id, external) in [
+            ("backfill-answered", "external-answered"),
+            ("backfill-unanswered", "external-unanswered"),
+            ("backfill-untouched", "external-untouched"),
+        ] {
+            sqlx::query("INSERT INTO chapter(id,source_series_id,external_id,created_at) VALUES ($1,$2,$3,'2020-01-01T00:00:00Z')").bind(id).bind(&ssid).bind(external).execute(&pool).await.unwrap();
+        }
+        let pending = chapters_needing_readable_at(&pool, 10).await.unwrap();
+        assert_eq!(pending.len(), 3);
+        let upstream: Vec<MdChapter> = vec![serde_json::from_value(serde_json::json!({
+            "id": "external-answered",
+            "attributes": {
+                "readableAt": "2021-01-01T00:00:00+00:00",
+                "externalUrl": "https://example.test/stale",
+            },
+            "relationships": [],
+        }))
+        .unwrap()];
+        let points = crate::locks::pause_points::PausePoints::default();
+        let armed = points.arm("readable-before-update");
+        let writer = pool.clone();
+        let first = tokio::spawn(READABLE_WRITE_PAUSE.scope(points, async move {
+            write_readable_backfill(&writer, &pending, &upstream).await
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
+            .await
+            .expect("the backfill never opened its transaction");
+        sqlx::query("UPDATE chapter SET readable_at='2026-02-01T00:00:00Z',external_url='https://example.test/fresh' WHERE id IN ('backfill-answered','backfill-unanswered')").execute(&pool).await.unwrap();
+        armed.release();
+        first.await.unwrap().unwrap();
+        let rows: Vec<(String, chrono::DateTime<chrono::Utc>, Option<String>)> =
+            sqlx::query_as("SELECT id,readable_at,external_url FROM chapter ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let fresh = crate::db_types::date("2026-02-01T00:00:00Z").unwrap();
+        let fresh_url = Some("https://example.test/fresh".to_owned());
+        assert_eq!(
+            rows,
+            [
+                ("backfill-answered".to_owned(), fresh, fresh_url.clone()),
+                ("backfill-unanswered".to_owned(), fresh, fresh_url),
+                (
+                    "backfill-untouched".to_owned(),
+                    crate::db_types::date("2020-01-01T00:00:00Z").unwrap(),
+                    None
+                ),
+            ]
+        );
+    }
     #[tokio::test]
     async fn local_reconcile_runs_when_mangadex_is_disabled() {
         let pool = pool().await;
@@ -4441,10 +4734,11 @@ mod tests {
         tokio::time::resume();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed_reconcile_report")
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+                let count: i64 =
+                    crate::db_types::query_scalar("SELECT COUNT(*) FROM feed_reconcile_report")
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
                 if count > 0 {
                     break;
                 }
@@ -4469,17 +4763,17 @@ mod tests {
     /// last is a row that appears, disappears or re-sorts depending on firehose timing.
     /// `~` stands in for NULL so a NULL cannot swallow the concatenation.
     async fn feed_digest(pool: &crate::db::Database, work_id: &str) -> Option<String> {
-        sqlx::query_scalar(
+        crate::db_types::query_scalar(
             "SELECT work_id || '|' || reader_id || '|' || title \
                  || '|' || COALESCE(cover_url, '~') || '|' || COALESCE(suwayomi_thumbnail, '~') \
                  || '|' || COALESCE(comic_type, '~') || '|' || COALESCE(latest_chapter, '~') \
                  || '|' || COALESCE(latest_chapter_title, '~') \
-                 || '|' || COALESCE(chapter_count, '~') \
-                 || '|' || released_at || '|' || typeof(released_at) \
-                 || '|' || COALESCE(detected_at, '~') || '|' || is_nsfw \
+                 || '|' || COALESCE(chapter_count::text, '~') \
+                 || '|' || released_at || '|' || pg_typeof(released_at)::text \
+                 || '|' || COALESCE(detected_at::text, '~') || '|' || is_nsfw \
                  || '|' || COALESCE(status, '~') || '|' || content_rating \
                  || '|' || en_chapter_count \
-             FROM feed_series_updates WHERE work_id = ?",
+             FROM feed_series_updates WHERE work_id = $1",
         )
         .bind(work_id)
         .fetch_optional(pool)
@@ -4490,12 +4784,12 @@ mod tests {
     /// The same for `feed_updates` (migration 0051), which `canonicalUpdates` reads directly
     /// — the OTHER surface this writer has to keep honest.
     async fn canonical_digest(pool: &crate::db::Database, work_id: &str) -> Option<String> {
-        sqlx::query_scalar(
-            "SELECT work_id || '|' || COALESCE(mangadex_id, '~') || '|' || title \
+        crate::db_types::query_scalar(
+            "SELECT work_id || '|' || COALESCE(mangadex_id::text, '~') || '|' || title \
                  || '|' || is_nsfw || '|' || COALESCE(cover_url, '~') \
                  || '|' || COALESCE(latest_chapter, '~') \
                  || '|' || COALESCE(latest_chapter_title, '~') || '|' || latest_at \
-             FROM feed_updates WHERE work_id = ?",
+             FROM feed_updates WHERE work_id = $1",
         )
         .bind(work_id)
         .fetch_optional(pool)
@@ -4560,7 +4854,7 @@ mod tests {
 
     /// THE BUG §8h FOUND, stated as a test: the incremental path must CREATE the feed row.
     ///
-    /// The old inline block ran only `project_feed_from_ledger_for_work`, an `UPDATE … FROM`.
+    /// The old inline block ran only the per-work ledger projection, an `UPDATE … FROM`.
     /// An UPDATE matches nothing when there is no row, so a work whose first English chapter
     /// had just been mirrored stayed invisible on `/updates` until the next 6-hourly rebuild
     /// — precisely the F5 staleness the block was written to remove. It reported success
@@ -4577,9 +4871,9 @@ mod tests {
         );
         assert_eq!(flush(&pool, &ssid).await, 1, "the work must reach the feed");
 
-        let (released_at, typ, label, count): (i64, String, Option<String>, i64) = sqlx::query_as(
-            "SELECT released_at, typeof(released_at), latest_chapter, en_chapter_count \
-             FROM feed_series_updates WHERE work_id = ?",
+        let (released_at, typ, label, count): (i64, String, Option<String>, i64) = crate::db_types::query_tuple(
+            "SELECT released_at, pg_typeof(released_at)::text, latest_chapter, en_chapter_count \
+             FROM feed_series_updates WHERE work_id = $1",
         )
         .bind(&work)
         .fetch_one(&pool)
@@ -4587,7 +4881,10 @@ mod tests {
         .unwrap();
         // The sort key must land as INTEGER epoch-millis. A TEXT key sorts every ISO '2…'
         // row above every millis '1…' row under BINARY collation — migration 0064.
-        assert_eq!(typ, "integer", "released_at must be an INTEGER, not TEXT");
+        assert_eq!(
+            typ, "timestamp with time zone",
+            "released_at must use the audited native timestamp type"
+        );
         assert_eq!(
             released_at,
             chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
@@ -4599,12 +4896,13 @@ mod tests {
         assert_eq!(count, 1);
         // A brand-new row must not land type-less: `comic_type IS NULL` is invisible to the
         // reader's format tabs and to Browse's format chips.
-        let typed: Option<String> =
-            sqlx::query_scalar("SELECT comic_type FROM feed_series_updates WHERE work_id = ?")
-                .bind(&work)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let typed: Option<String> = crate::db_types::query_scalar(
+            "SELECT comic_type FROM feed_series_updates WHERE work_id = $1",
+        )
+        .bind(&work)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(typed.as_deref(), Some("MANGA"));
     }
 
@@ -4669,11 +4967,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO suwayomi_series \
-                 (id, title, thumbnail_url, status, in_library, source_id, chapter_count, \
-                  latest_chapter_at, updated_at) \
-             VALUES (7, 'Suwayomi Title', '/thumb/7', 'ONGOING', 1, '1', 13, '1780000000000', \
-                     '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO suwayomi_series (id, title, thumbnail_url, status, in_library, source_id, chapter_count, latest_chapter_at, updated_at) VALUES (7, 'Suwayomi Title', '/thumb/7', 'ONGOING', TRUE, '1', 13, '1780000000000', '2026-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -4688,8 +4982,8 @@ mod tests {
         .unwrap();
         mirror_chapter(&pool, &both_ssid, "b1", "12", "2026-06-01T00:00:00Z").await;
         catalog::refresh_feed_updates(&pool).await.unwrap();
-        let settled: (Option<i64>, Option<String>) = sqlx::query_as(
-            "SELECT chapter_count, suwayomi_thumbnail FROM feed_series_updates WHERE work_id = ?",
+        let settled: (Option<i64>, Option<String>) = crate::db_types::query_tuple(
+            "SELECT chapter_count, suwayomi_thumbnail FROM feed_series_updates WHERE work_id = $1",
         )
         .bind(&both)
         .fetch_one(&pool)
@@ -4836,9 +5130,13 @@ mod tests {
             catalog::mark_seed_done(&pool, job, "2026-01-01T00:00:00")
                 .await
                 .unwrap();
-            persist_cycle_outcome(&pool, job, true, false, "2026-02-01T00:00:00")
-                .await
-                .unwrap();
+            let generation = catalog::sync_generation(&pool, job).await.unwrap();
+            assert_eq!(
+                persist_cycle_outcome(&pool, job, true, false, "2026-02-01T00:00:00", generation)
+                    .await
+                    .unwrap(),
+                Checkpoint::Withheld
+            );
             assert_eq!(
                 catalog::get_sync_state(&pool, job)
                     .await
@@ -4847,9 +5145,12 @@ mod tests {
                     .cursor,
                 "2026-01-01T00:00:00"
             );
-            persist_cycle_outcome(&pool, job, true, true, "2026-02-01T00:00:00")
-                .await
-                .unwrap();
+            assert_eq!(
+                persist_cycle_outcome(&pool, job, true, true, "2026-02-01T00:00:00", generation)
+                    .await
+                    .unwrap(),
+                Checkpoint::Written
+            );
             assert_eq!(
                 catalog::get_sync_state(&pool, job)
                     .await
@@ -4864,17 +5165,29 @@ mod tests {
     #[tokio::test]
     async fn dirty_backfill_cannot_checkpoint_past_missing_records_even_if_rewind_fails() {
         let pool = pool().await;
-        checkpoint_backfill(&pool, "2026-01-01T00:00:00", &BackfillOutcome::default())
+        let generation = catalog::sync_generation(&pool, BACKFILL_JOB).await.unwrap();
+        assert_eq!(
+            checkpoint_backfill(
+                &pool,
+                "2026-01-01T00:00:00",
+                &BackfillOutcome::default(),
+                generation
+            )
             .await
-            .unwrap();
+            .unwrap(),
+            Checkpoint::Written
+        );
         let dirty = BackfillOutcome {
             failed: 1,
             ..Default::default()
         };
-        checkpoint_backfill(&pool, "2026-02-01T00:00:00", &dirty)
-            .await
-            .unwrap();
-        sqlx::query("CREATE TRIGGER reject_rewind BEFORE DELETE ON catalogue_sync_state BEGIN SELECT RAISE(ABORT, 'rewind unavailable'); END")
+        assert_eq!(
+            checkpoint_backfill(&pool, "2026-02-01T00:00:00", &dirty, generation)
+                .await
+                .unwrap(),
+            Checkpoint::Withheld
+        );
+        sqlx::raw_sql("CREATE FUNCTION reject_rewind_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'rewind unavailable'; END $$; CREATE TRIGGER reject_rewind BEFORE DELETE ON catalogue_sync_state FOR EACH ROW EXECUTE FUNCTION reject_rewind_fn()")
             .execute(&pool).await.unwrap();
         assert!(catalog::reset_sync_state(&pool, BACKFILL_JOB)
             .await
@@ -4886,6 +5199,426 @@ mod tests {
                 .unwrap()
                 .cursor,
             "2026-01-01T00:00:00"
+        );
+    }
+
+    // --- reset generations and the sync cycles (T053/T054/T056, T178/T179) -------------
+
+    /// A stand-in for the two list endpoints a sync cycle walks: `/manga` answers with
+    /// the given page, `/chapter` with an empty window. With `hold`, every `/manga`
+    /// request reports its arrival and then waits for a permit, so a test can act while
+    /// a cycle's upstream request is in flight.
+    struct ListMock {
+        base: String,
+        manga_hits: Arc<AtomicU64>,
+        arrived: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl ListMock {
+        fn client(&self) -> Arc<MangaDexClient> {
+            let client = MangaDexClient::new("cycle-test", 50.0, 600.0)
+                .with_bases(&self.base, &format!("{}/covers", self.base));
+            client.set_enabled(true);
+            Arc::new(client)
+        }
+
+        /// Wait until a `/manga` request of the cycle under test is in flight.
+        async fn request_in_flight(&self) {
+            tokio::time::timeout(Duration::from_secs(30), self.arrived.acquire())
+                .await
+                .expect("the cycle never reached its upstream request")
+                .unwrap()
+                .forget();
+        }
+    }
+
+    async fn mock_lists(manga_page: Value, hold: bool) -> ListMock {
+        use axum::{routing::get, Json, Router};
+        let manga_hits = Arc::new(AtomicU64::new(0));
+        let arrived = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (hits, seen, gate) = (manga_hits.clone(), arrived.clone(), release.clone());
+        let app = Router::new()
+            .route(
+                "/manga",
+                get(move || {
+                    let (hits, seen, gate) = (hits.clone(), seen.clone(), gate.clone());
+                    let page = manga_page.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        if hold {
+                            seen.add_permits(1);
+                            gate.acquire().await.unwrap().forget();
+                        }
+                        Json(page)
+                    }
+                }),
+            )
+            .route(
+                "/chapter",
+                get(|| async { Json(serde_json::json!({"data": [], "total": 0})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        ListMock {
+            base: format!("http://{addr}"),
+            manga_hits,
+            arrived,
+            release,
+        }
+    }
+
+    /// Finding B of the rest check. Another process resets a job between the two reads a
+    /// cycle makes at its start. Had the cycle read the stored cursor first and the
+    /// generation second, it would hold the cursor of before the reset together with the
+    /// generation of after it: its final checkpoint would be accepted and would put the
+    /// deleted row back with a recent cursor, so the full re-seed the reset asked for
+    /// would resume from there and latch without walking the catalogue. The same holds
+    /// for a cycle that writes unconditional checkpoints. The cycle must leave the reset
+    /// standing, and the next cycle must do the walk.
+    #[tokio::test]
+    async fn a_reset_between_a_cycles_two_start_reads_is_not_undone() {
+        let pool = pool().await;
+        let mock = mock_lists(serde_json::json!({"data": [], "total": 0}), false).await;
+        let client = mock.client();
+        for job in ["catalogue", "chapters"] {
+            // An incremental job with a recent cursor: the state a reset wants gone.
+            catalog::mark_seed_done(&pool, job, "2026-09-01T00:00:00")
+                .await
+                .unwrap();
+            assert_eq!(catalog::sync_generation(&pool, job).await.unwrap(), 0);
+            let points = crate::locks::pause_points::PausePoints::default();
+            let armed = points.arm("cycle-start-between-reads");
+            let (cycle_pool, cycle_client) = (pool.clone(), client.clone());
+            let cycle = tokio::spawn(CYCLE_START_PAUSE.scope(points, async move {
+                if job == "catalogue" {
+                    run_one_cycle(&cycle_pool, &cycle_client, false).await;
+                } else {
+                    run_chapter_cycle(&cycle_pool, &cycle_client, "2026-10-01T00:00:00").await;
+                }
+            }));
+            tokio::time::timeout(Duration::from_secs(30), armed.reached())
+                .await
+                .expect("the cycle never read its start state");
+            catalog::reset_sync_state(&pool, job).await.unwrap();
+            armed.release();
+            tokio::time::timeout(Duration::from_secs(30), cycle)
+                .await
+                .expect("the cycle did not finish")
+                .unwrap();
+            assert!(
+                catalog::get_sync_state(&pool, job).await.unwrap().is_none(),
+                "{job}: a cycle that started before the reset re-created the state row"
+            );
+            assert_eq!(catalog::sync_generation(&pool, job).await.unwrap(), 1);
+
+            // The cycle after the reset is the fresh seed, and ITS checkpoints count: with
+            // an empty upstream window it completes and latches.
+            if job == "catalogue" {
+                run_one_cycle(&pool, &client, false).await;
+            } else {
+                run_chapter_cycle(&pool, &client, "2026-10-02T00:00:00").await;
+            }
+            let state = catalog::get_sync_state(&pool, job).await.unwrap();
+            assert!(
+                state.is_some_and(|s| s.seed_done),
+                "{job}: the cycle after the reset must be accepted"
+            );
+        }
+    }
+
+    /// T178: the job is reset while an upstream request of its seed is in flight. The
+    /// page that request returns is still mirrored, but the seed checkpoint after it is
+    /// dropped, the sweep stops there (no second page is requested) and no state row
+    /// reappears.
+    #[tokio::test]
+    async fn a_reset_during_an_upstream_request_stops_the_seed_without_a_checkpoint() {
+        let pool = pool().await;
+        // One record of a window that claims 250: a sweep that goes on asks for more.
+        let mock = mock_lists(
+            serde_json::json!({"data": [manga_json()], "total": 250}),
+            true,
+        )
+        .await;
+        let client = mock.client();
+        let (cycle_pool, cycle_client) = (pool.clone(), client.clone());
+        let cycle =
+            tokio::spawn(async move { run_one_cycle(&cycle_pool, &cycle_client, false).await });
+        mock.request_in_flight().await;
+        catalog::reset_sync_state(&pool, "catalogue").await.unwrap();
+        mock.release.add_permits(1_000);
+        tokio::time::timeout(Duration::from_secs(30), cycle)
+            .await
+            .expect("the cycle did not stop")
+            .unwrap();
+        assert!(
+            catalog::get_sync_state(&pool, "catalogue")
+                .await
+                .unwrap()
+                .is_none(),
+            "a seed checkpoint of the cancelled cycle was written"
+        );
+        assert_eq!(
+            mock.manga_hits.load(Ordering::SeqCst),
+            1,
+            "the sweep must stop at its first dropped checkpoint"
+        );
+        let mirrored: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM source_series \
+             WHERE source_type = 'mangadex' AND source_key = 'md-uuid-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(mirrored, 1, "the fetched page is still mirrored");
+    }
+
+    /// T179: the same for the gap backfill. Its window checkpoint is dropped, the pass
+    /// stops, reports the reset, and can neither latch the one-shot marker nor count as
+    /// a dirty pass (which would rewind the cursor a second time).
+    #[tokio::test]
+    async fn a_backfill_pass_stops_when_its_job_is_reset_under_it() {
+        let pool = pool().await;
+        let mock = mock_lists(
+            serde_json::json!({"data": [manga_json()], "total": 250}),
+            true,
+        )
+        .await;
+        let client = mock.client();
+        let (pass_pool, pass_client) = (pool.clone(), client.clone());
+        let pass = tokio::spawn(async move {
+            backfill_missing_catalogue(&pass_pool, &pass_client, false, None).await
+        });
+        mock.request_in_flight().await;
+        catalog::reset_sync_state(&pool, BACKFILL_JOB)
+            .await
+            .unwrap();
+        mock.release.add_permits(1_000);
+        let out = tokio::time::timeout(Duration::from_secs(30), pass)
+            .await
+            .expect("the pass did not stop")
+            .unwrap()
+            .unwrap();
+        assert!(out.reset, "{out:?}");
+        assert!(!out.complete && !out.is_clean_completion() && !out.is_dirty());
+        assert_eq!((out.scanned, out.ingested), (1, 1));
+        assert_eq!(mock.manga_hits.load(Ordering::SeqCst), 1);
+        assert!(catalog::get_sync_state(&pool, BACKFILL_JOB)
+            .await
+            .unwrap()
+            .is_none());
+        // Reaching the end does not make a reset pass a completion.
+        assert!(!BackfillOutcome {
+            complete: true,
+            reset: true,
+            ..Default::default()
+        }
+        .is_clean_completion());
+
+        // The pass after the reset reads the new generation, and its checkpoint counts.
+        let generation = catalog::sync_generation(&pool, BACKFILL_JOB).await.unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!(
+            checkpoint_backfill(
+                &pool,
+                "2026-03-01T00:00:00",
+                &BackfillOutcome::default(),
+                generation
+            )
+            .await
+            .unwrap(),
+            Checkpoint::Written
+        );
+        assert_eq!(
+            checkpoint_backfill(
+                &pool,
+                "2026-04-01T00:00:00",
+                &BackfillOutcome::default(),
+                generation - 1
+            )
+            .await
+            .unwrap(),
+            Checkpoint::Reset
+        );
+        assert_eq!(
+            catalog::get_sync_state(&pool, BACKFILL_JOB)
+                .await
+                .unwrap()
+                .unwrap()
+                .cursor,
+            "2026-03-01T00:00:00"
+        );
+    }
+
+    // --- the sweeps against a concurrent writer of the same MangaDex id (T173-T175) ----
+
+    /// The works and `mangadex` mappings that carry one MangaDex id.
+    async fn mangadex_owners(pool: &crate::db::Database, id: &str) -> (Vec<String>, i64) {
+        let works: Vec<String> = sqlx::query_scalar(
+            "SELECT work_id FROM work_external_id \
+             WHERE provider = 'mangadex' AND external_id = $1 ORDER BY work_id",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let mappings: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM source_series \
+             WHERE source_type = 'mangadex' AND source_key = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (works, mappings)
+    }
+
+    /// T173 and T175. Another writer is minting the work of a MangaDex id (its
+    /// transaction is open: the row is invisible, only its identity keys are held) when
+    /// the catalogue sweep, and then the gap backfill's missing-work branch, reach the
+    /// same id. Each must wait on the identity guard and then adopt the committed work.
+    /// Without a shared guard both would mint, and one MangaDex id would own two works.
+    #[tokio::test]
+    async fn the_sweeps_wait_for_a_concurrent_mint_of_the_same_mangadex_id() {
+        for sweep in ["catalogue", "backfill"] {
+            let pool = pool().await;
+            let writer = pool.foreground();
+            let mock = mock_lists(
+                serde_json::json!({"data": [manga_json()], "total": 1}),
+                false,
+            )
+            .await;
+            let client = mock.client();
+            let md: MdManga = serde_json::from_value(manga_json()).unwrap();
+            let (id, mut input) = to_work_input(&md);
+            input.primary_title = Some("Minted by the other writer".into());
+
+            let mut peer = writer.begin().await.unwrap();
+            crate::locks::advisory(&mut peer, &catalog::mangadex_upsert_keys(&id, &input))
+                .await
+                .unwrap();
+            let minted = catalog::upsert_work_from_mangadex_on(&mut peer, &id, &input)
+                .await
+                .unwrap();
+
+            let (sweep_pool, sweep_client) = (pool.clone(), client.clone());
+            let running = tokio::spawn(async move {
+                if sweep == "catalogue" {
+                    let generation = catalog::sync_generation(&sweep_pool, "catalogue").await?;
+                    sync_catalogue(
+                        &sweep_pool,
+                        &sweep_client,
+                        SyncWindow::Created,
+                        None,
+                        false,
+                        "catalogue",
+                        generation,
+                    )
+                    .await
+                    .map(|o| (o.upserted, o.failed))
+                } else {
+                    backfill_missing_catalogue(&sweep_pool, &sweep_client, false, None)
+                        .await
+                        .map(|o| (o.ingested, o.failed))
+                }
+            });
+            crate::cover::wait_for_writer_lock(&writer).await;
+            assert!(!running.is_finished(), "{sweep}: the sweep did not wait");
+            peer.commit().await.unwrap();
+            let counted = tokio::time::timeout(Duration::from_secs(30), running)
+                .await
+                .expect("the sweep did not finish")
+                .unwrap()
+                .unwrap();
+            assert_eq!(counted, (1, 0), "{sweep}");
+            assert_eq!(
+                mangadex_owners(&pool, &id).await,
+                (vec![minted.clone()], 1),
+                "{sweep}: one MangaDex id must own one work and one mapping"
+            );
+            let works: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(works, 1, "{sweep}: the sweep minted a second work");
+            let title: Option<String> =
+                sqlx::query_scalar("SELECT primary_title FROM work WHERE id = $1")
+                    .bind(&minted)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                title.as_deref(),
+                Some("Tensei Shitara Slime Datta Ken"),
+                "{sweep}: the sweep wrote the adopted work after waiting"
+            );
+        }
+    }
+
+    /// T174. The gap backfill reaches a work that is already catalogued while another
+    /// writer holds that work (the parent lock every catalogue writer of it takes). Its
+    /// details refresh must wait for the work, then write under it: the tags the other
+    /// writer committed are replaced as one set, not interleaved with them.
+    #[tokio::test]
+    async fn the_backfill_details_refresh_waits_for_the_work_it_refreshes() {
+        let pool = pool().await;
+        let writer = pool.foreground();
+        let mut page = manga_json();
+        page["attributes"]["tags"] = serde_json::json!([
+            { "id": "t-action", "attributes": { "group": "genre", "name": { "en": "Action" } } }
+        ]);
+        let md: MdManga = serde_json::from_value(page.clone()).unwrap();
+        let (id, mut stale) = to_work_input(&md);
+        stale.tags.clear();
+        stale.tag_details.clear();
+        let work_id = catalog::upsert_work_from_mangadex(&pool, &id, &stale)
+            .await
+            .unwrap();
+        let mock = mock_lists(serde_json::json!({"data": [page], "total": 1}), false).await;
+        let client = mock.client();
+
+        let mut peer = writer.begin().await.unwrap();
+        let locked = crate::locks::lock_works(&mut peer, &[&work_id])
+            .await
+            .unwrap();
+        assert_eq!(locked.locked.as_slice(), std::slice::from_ref(&work_id));
+        sqlx::query(
+            "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) \
+             VALUES ($1, 'Peer', 0, 'mangadex', 'peer')",
+        )
+        .bind(&work_id)
+        .execute(&mut *peer)
+        .await
+        .unwrap();
+
+        let (pass_pool, pass_client) = (pool.clone(), client.clone());
+        let pass = tokio::spawn(async move {
+            backfill_missing_catalogue(&pass_pool, &pass_client, false, None).await
+        });
+        crate::cover::wait_for_writer_lock(&writer).await;
+        assert!(!pass.is_finished(), "the refresh did not wait for the work");
+        peer.commit().await.unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(30), pass)
+            .await
+            .expect("the pass did not finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!((out.tagged, out.ingested, out.failed), (1, 0, 0), "{out:?}");
+        let tags: Vec<String> = sqlx::query_scalar(
+            "SELECT tag FROM work_tag WHERE work_id = $1 AND source = 'mangadex' ORDER BY tag",
+        )
+        .bind(&work_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            tags,
+            ["Action"],
+            "the refresh replaces the set it waited for"
         );
     }
 
@@ -4907,6 +5640,7 @@ mod tests {
             // nothing: a feed row is a cache the rebuild reconstructs, whereas every field
             // above describes a chapter that did or did not reach the durable mirror.
             feed: 0,
+            reset: false,
         };
         assert!(chapter_seed_may_latch(&clean));
         assert!(!chapter_seed_may_latch(&SweepOutcome {
@@ -4982,6 +5716,15 @@ mod tests {
         assert!(!chapter_row_unchanged(&pool, &ssid, &ch).await);
         catalog::upsert_chapter(&pool, &ssid, &ch).await.unwrap();
         assert!(chapter_row_unchanged(&pool, &ssid, &ch).await);
+        let equivalent_clock = catalog::ChapterInput {
+            published_at: Some("2026-07-01T05:30:00+05:30".into()),
+            readable_at: Some("2026-06-30T00:00:00Z".into()),
+            ..ch.clone()
+        };
+        assert!(
+            chapter_row_unchanged(&pool, &ssid, &equivalent_clock).await,
+            "equivalent native instants must not force a no-op chapter write"
+        );
 
         // Every mutable column `upsert_chapter`'s DO UPDATE SET touches must defeat the
         // skip — a re-seed that swallowed a retitled or renumbered chapter would be worse
@@ -5334,11 +6077,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let work_id: String = sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
-            .bind(&ssid)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let work_id: String =
+            crate::db_types::query_scalar("SELECT work_id FROM source_series WHERE id = $1")
+                .bind(&ssid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
 
         let unfilled = |external_id: &str, external_url: Option<&str>| catalog::ChapterInput {
             external_id: external_id.into(),
@@ -5408,13 +6152,14 @@ mod tests {
         assert_eq!(fill.unanswered, 1);
         // The 2037 sentinel is gone from the answered row: this is what returns the 46
         // sentinel works to /updates.
-        let (readable, url): (String, Option<String>) =
-            sqlx::query_as("SELECT readable_at, external_url FROM chapter WHERE external_id = ?")
-                .bind(&asked[0])
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(readable, "2023-10-07T00:00:00+00:00");
+        let (readable, url): (String, Option<String>) = crate::db_types::query_tuple(
+            "SELECT readable_at, external_url FROM chapter WHERE external_id = $1",
+        )
+        .bind(&asked[0])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(readable, "2023-10-07T00:00:00.000000+00:00");
         assert_eq!(
             url.as_deref(),
             Some("https://mangaplus.shueisha.co.jp/viewer/1019123")
@@ -5450,8 +6195,8 @@ mod tests {
         // Fallback rows took their own `published_at` — i.e. the backfill materialised the
         // `COALESCE(readable_at, published_at, created_at)` the read path already computes,
         // changing no behaviour and only ending the loop.
-        let sentinels: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM chapter WHERE source_series_id = ? \
+        let sentinels: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM chapter WHERE source_series_id = $1 \
                AND readable_at = '2037-12-31T15:00:00+00:00'",
         )
         .bind(&ssid)
@@ -5461,21 +6206,23 @@ mod tests {
         assert_eq!(sentinels, 3);
         // And an unanswered row keeps the URL the firehose already healed onto it. Writing
         // NULL there would re-blank a chapter we had already fixed.
-        let url: Option<String> =
-            sqlx::query_scalar("SELECT external_url FROM chapter WHERE external_id = 'md-4'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let url: Option<String> = crate::db_types::query_scalar(
+            "SELECT external_url FROM chapter WHERE external_id = 'md-4'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(url.as_deref(), Some("https://comikey.com/x"));
 
         // The Suwayomi row was never offered and is untouched — still NULL, still invisible
         // to a backfill that could not resolve it.
-        let suwa_readable: Option<String> =
-            sqlx::query_scalar("SELECT readable_at FROM chapter WHERE source_series_id = ?")
-                .bind(&suwa)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let suwa_readable: Option<String> = crate::db_types::query_scalar(
+            "SELECT readable_at FROM chapter WHERE source_series_id = $1",
+        )
+        .bind(&suwa)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(suwa_readable, None);
     }
 
@@ -5625,12 +6372,13 @@ mod tests {
             ("md-unknown", GROUP_UNKNOWN),
             ("991", NO_GROUP),
         ] {
-            let actual: Option<String> =
-                sqlx::query_scalar("SELECT scanlator FROM chapter WHERE external_id = ?")
-                    .bind(external_id)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+            let actual: Option<String> = crate::db_types::query_scalar(
+                "SELECT scanlator FROM chapter WHERE external_id = $1",
+            )
+            .bind(external_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             assert_eq!(actual.as_deref(), Some(expected));
         }
         let chapter = md_chapter(
@@ -5643,11 +6391,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(group_backfill_remaining(&pool).await.unwrap(), 0);
-        let actual: String =
-            sqlx::query_scalar("SELECT scanlator FROM chapter WHERE external_id = 'md-solo'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let actual: String = crate::db_types::query_scalar(
+            "SELECT scanlator FROM chapter WHERE external_id = 'md-solo'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(actual, "solo-uploader");
     }
 
@@ -5679,7 +6428,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let cold_work: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
+            crate::db_types::query_scalar("SELECT work_id FROM source_series WHERE id = $1")
                 .bind(&cold)
                 .fetch_one(&pool)
                 .await
@@ -5717,11 +6466,13 @@ mod tests {
         catalog::upsert_chapter(&pool, &suwa, &row("991", "1", None))
             .await
             .unwrap();
-        sqlx::query("INSERT INTO series_views (series_key, total, updated_at) VALUES (?, 50, 'x')")
-            .bind(&hot_work)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO series_views (series_key, total, updated_at) VALUES ($1, 50, '2020-01-01T00:00:00Z')",
+        )
+        .bind(&hot_work)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         assert_eq!(group_backfill_remaining(&pool).await.unwrap(), 3);
         // The drain computes the hot set once and reuses it across batches.
@@ -5785,8 +6536,8 @@ mod tests {
         let group = |ext: &'static str| {
             let pool = pool.clone();
             async move {
-                sqlx::query_scalar::<_, Option<String>>(
-                    "SELECT scanlator FROM chapter WHERE external_id = ?",
+                crate::db_types::query_scalar::<Option<String>>(
+                    "SELECT scanlator FROM chapter WHERE external_id = $1",
                 )
                 .bind(ext)
                 .fetch_one(&pool)
@@ -5810,7 +6561,7 @@ mod tests {
         // A row the firehose filled between the SELECT and the UPDATE keeps the firehose's
         // (fresher) value — and has still left the work-list, so nothing loops.
         let stale = vec![PendingGroupChapter {
-            id: sqlx::query_scalar("SELECT id FROM chapter WHERE external_id = 'md-c3'")
+            id: crate::db_types::query_scalar("SELECT id FROM chapter WHERE external_id = 'md-c3'")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
@@ -5863,7 +6614,7 @@ mod tests {
         // Viewed under BOTH keys, and read under the canonical one.
         for key in ["4242", work.as_str()] {
             sqlx::query(
-                "INSERT INTO series_views (series_key, total, updated_at) VALUES (?, 10, 'x')",
+                "INSERT INTO series_views (series_key, total, updated_at) VALUES ($1, 10, '2020-01-01T00:00:00Z')",
             )
             .bind(key)
             .execute(&pool)
@@ -5871,15 +6622,13 @@ mod tests {
             .unwrap();
         }
         sqlx::query(
-            "INSERT INTO users (id, username, email, password_hash, created_at) \
-             VALUES ('u1','u1','u1@x','h','now')",
+            r#"INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468','u1','u1@x','h','2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO canonical_progress (user_id, chapter_id, work_id, updated_at) \
-             VALUES ('u1', 'md-t1', ?, 'now')",
+            r#"INSERT INTO canonical_progress (user_id, chapter_id, work_id, updated_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468', 'md-t1', $1, '2020-01-01T00:00:00Z')"#,
         )
         .bind(&work)
         .execute(&pool)
@@ -5920,8 +6669,7 @@ mod tests {
     async fn group_backfill_hot_works_reads_every_source_and_skips_drained_works() {
         let pool = pool().await;
         sqlx::query(
-            "INSERT INTO users (id, username, email, password_hash, created_at) \
-             VALUES ('u1','u1','u1@x','h','now')",
+            r#"INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468','u1','u1@x','h','2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -5978,35 +6726,34 @@ mod tests {
             }
         };
         exec(
-            "INSERT INTO user_library (user_id, series_id, created_at) VALUES ('u1', ?, 'now')",
+            r#"INSERT INTO user_library (user_id, series_id, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468', $1, '2020-01-01T00:00:00Z')"#,
             "77".into(),
         )
         .await;
         exec(
-            "INSERT INTO user_library (user_id, series_id, created_at) VALUES ('u1', ?, 'now')",
+            r#"INSERT INTO user_library (user_id, series_id, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468', $1, '2020-01-01T00:00:00Z')"#,
             in_work_library.clone(),
         )
         .await;
         exec(
-            "INSERT INTO canonical_progress (user_id, chapter_id, work_id, updated_at) \
-             VALUES ('u1', 'x', ?, 'now')",
+            r#"INSERT INTO canonical_progress (user_id, chapter_id, work_id, updated_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468', 'x', $1, '2020-01-01T00:00:00Z')"#,
             in_progress.clone(),
         )
         .await;
         exec(
-            "INSERT INTO series_views (series_key, total, updated_at) VALUES (?, 9, 'x')",
+            "INSERT INTO series_views (series_key, total, updated_at) VALUES ($1, 9, '2020-01-01T00:00:00Z')",
             most_viewed.clone(),
         )
         .await;
         // Hot but fully drained: must not cost a probe per batch.
         exec(
-            "INSERT INTO user_library (user_id, series_id, created_at) VALUES ('u1', ?, 'now')",
+            r#"INSERT INTO user_library (user_id, series_id, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468', $1, '2020-01-01T00:00:00Z')"#,
             drained.clone(),
         )
         .await;
         // A viewed key that maps to nothing (an unmirrored Suwayomi id) matches nothing.
         exec(
-            "INSERT INTO series_views (series_key, total, updated_at) VALUES (?, 99, 'x')",
+            "INSERT INTO series_views (series_key, total, updated_at) VALUES ($1, 99, '2020-01-01T00:00:00Z')",
             "9999".into(),
         )
         .await;
@@ -6117,6 +6864,7 @@ mod tests {
             complete: true,
             truncated: 0,
             dropped: 0,
+            reset: false,
         };
         assert!(clean.is_clean_completion());
         assert!(!clean.is_dirty());
@@ -6148,6 +6896,7 @@ mod tests {
             complete: true,
             truncated: 1,
             dropped: 0,
+            reset: false,
         };
         assert!(
             !truncated.is_clean_completion(),
@@ -6175,6 +6924,7 @@ mod tests {
             complete: false, // stopped on the wall-clock budget
             truncated: 0,
             dropped: 0,
+            reset: false,
         };
         assert!(
             dirty_partial.is_dirty(),
@@ -6191,6 +6941,7 @@ mod tests {
             complete: false,
             truncated: 0,
             dropped: 0,
+            reset: false,
         };
         assert!(
             !clean_partial.is_dirty(),
@@ -6216,6 +6967,7 @@ mod tests {
             complete: true,
             truncated: 0,
             dropped: 1,
+            reset: false,
         };
         assert!(
             !dropped.is_clean_completion(),

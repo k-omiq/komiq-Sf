@@ -863,7 +863,13 @@ mod tests {
             ),
             Class::Upstream
         );
-        assert_eq!(classify("mutation { ...A } fragment A on MutationRoot { ...B } fragment B on MutationRoot { innocent: backfillMangadexMetadata }", None), Class::Maintenance);
+        assert_eq!(
+            classify(
+                "mutation { ...A } fragment A on MutationRoot { ...B } fragment B on MutationRoot { innocent: backfillMangadexMetadata }",
+                None
+            ),
+            Class::Maintenance
+        );
         assert_eq!(
             classify(
                 "query { ... on QueryRoot { innocent: searchAllSources(query:\"x\") { page } } }",
@@ -1203,7 +1209,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = format!("--gql\r\nContent-Disposition: form-data; name=\"operations\"\r\n\r\n{}\r\n--gql\r\nContent-Disposition: form-data; name=\"map\"\r\n\r\n{{}}\r\n--gql--\r\n", serde_json::json!({"query": query, "operationName": "Long"}));
+        let body = format!(
+            "--gql\r\nContent-Disposition: form-data; name=\"operations\"\r\n\r\n{}\r\n--gql\r\nContent-Disposition: form-data; name=\"map\"\r\n\r\n{{}}\r\n--gql--\r\n",
+            serde_json::json!({"query": query, "operationName": "Long"})
+        );
         let response = app
             .oneshot(
                 HttpRequest::builder()
@@ -1216,6 +1225,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eight_blocked_upstream_reads_leave_cached_mutation_and_upload_lanes_available() {
+        let budgets = Arc::new(RequestBudgets::default());
+        let app = router(budgets.clone());
+        let (started, mut reached) = tokio::sync::mpsc::channel(8);
+        let mut blocked = Vec::new();
+        for i in 0..8 {
+            let budgets = budgets.clone();
+            let started = started.clone();
+            blocked.push(tokio::spawn(async move {
+                // A cold reader holds ordinary request admission and upstream
+                // capacity through its pending engine read, exactly as production.
+                let _admission = budgets.local.clone().acquire_owned().await.unwrap();
+                let _upstream = budgets.try_upstream(&format!("client-{i}")).unwrap();
+                started.send(()).await.unwrap();
+                std::future::pending::<()>().await;
+            }));
+        }
+        for _ in 0..8 {
+            reached.recv().await.unwrap();
+        }
+        for query in [
+            "{ session { token } }",
+            "mutation { setFavorite(seriesId:\"w\",favorite:true) { id } }",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(query, 0))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        assert_eq!(
+            app.oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/avatar")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::OK
+        );
+        for task in blocked {
+            task.abort();
+            let _ = task.await;
+        }
+        assert_eq!(budgets.upstream.available_permits(), 16);
     }
 
     #[tokio::test(start_paused = true)]

@@ -1,0 +1,650 @@
+{
+  "data": {
+    "search": {
+      "hasNextPage": false,
+      "items": [
+        {
+          "altTitles": [
+            "Only Alias Hero",
+            "Shared Alias",
+            "나 혼자만 레벨업"
+          ],
+          "artist": "Artist 1",
+          "author": "Author 1",
+          "chapterCount": 6,
+          "coverUrl": "/covers/w_00000000000040008000000000000001.webp?v=7",
+          "createdAt": "2020-01-01T01:02:03.000000+00:00",
+          "description": "Description 1: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Action",
+            "Gore"
+          ],
+          "id": "w_00000000000040008000000000000001",
+          "isFavorite": true,
+          "isMarked": true,
+          "isNsfw": false,
+          "latestChapter": "Oneshot",
+          "latestChapterAt": "2020-01-05T01:02:03.000000+00:00",
+          "libraryStatus": "reading",
+          "mangadexRating": 5.1,
+          "rating": {
+            "average": 7.666666666666667,
+            "count": 3,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              1,
+              0,
+              1,
+              1,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "ONGOING",
+          "title": "Solo Leveling",
+          "type": "MANGA",
+          "updatedAt": "2020-01-05T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 9",
+          "author": "Author 9",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000009.webp",
+          "createdAt": "2020-01-01T01:02:03.000000+00:00",
+          "description": "Description 9: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Action"
+          ],
+          "id": "w_00000000000040008000000000000009",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "9",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 5.9,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "CANCELLED",
+          "title": "進撃の巨人",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [
+            "Shared Alias"
+          ],
+          "artist": "Artist 2",
+          "author": "Author 2",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000002.webp",
+          "createdAt": "2020-01-02T01:02:03.000000+00:00",
+          "description": "Description 2: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Romance",
+            "Gore"
+          ],
+          "id": "w_00000000000040008000000000000002",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "2",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 5.2,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "COMPLETED",
+          "title": "Solo Leveling: Side Story",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 10",
+          "author": "Author 10",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000010.webp",
+          "createdAt": "2020-01-02T01:02:03.000000+00:00",
+          "description": "Description 10: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Romance"
+          ],
+          "id": "w_00000000000040008000000000000010",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "10",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 6.0,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "UNKNOWN",
+          "title": "나 혼자만 레벨업",
+          "type": "MANGA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 3",
+          "author": "Author 3",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000003.webp",
+          "createdAt": "2020-01-03T01:02:03.000000+00:00",
+          "description": "Description 3: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Action"
+          ],
+          "id": "w_00000000000040008000000000000003",
+          "isFavorite": false,
+          "isMarked": true,
+          "isNsfw": false,
+          "latestChapter": "3",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 5.3,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "HIATUS",
+          "title": "Café Chronicle",
+          "type": "MANHUA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 11",
+          "author": "Author 11",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000011.webp",
+          "createdAt": "2020-01-03T01:02:03.000000+00:00",
+          "description": "Description 11: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Action"
+          ],
+          "id": "w_00000000000040008000000000000011",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "11",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 6.1,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "ONGOING",
+          "title": "魔道祖师",
+          "type": "MANGA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 4",
+          "author": "Author 4",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000004.webp",
+          "createdAt": "2020-01-04T01:02:03.000000+00:00",
+          "description": "Description 4: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Romance"
+          ],
+          "id": "w_00000000000040008000000000000004",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "4",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": null,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "CANCELLED",
+          "title": "Dr.STONE",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 12",
+          "author": "Author 12",
+          "chapterCount": 0,
+          "coverUrl": "/covers/w_00000000000040008000000000000012.webp",
+          "createdAt": "2020-01-04T01:02:03.000000+00:00",
+          "description": "Description 12: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Romance"
+          ],
+          "id": "w_00000000000040008000000000000012",
+          "isFavorite": false,
+          "isMarked": true,
+          "isNsfw": false,
+          "latestChapter": null,
+          "latestChapterAt": "",
+          "libraryStatus": null,
+          "mangadexRating": null,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "COMPLETED",
+          "title": "Chronicle Zero",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-04T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 5",
+          "author": "Author 5",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000005.webp",
+          "createdAt": "2020-01-05T01:02:03.123000+00:00",
+          "description": "Description 5: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Action"
+          ],
+          "id": "w_00000000000040008000000000000005",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "5",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 5.5,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "UNKNOWN",
+          "title": "SPY×FAMILY",
+          "type": "MANGA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 13",
+          "author": "Author 13",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000013.webp",
+          "createdAt": "2020-01-05T01:02:03.123000+00:00",
+          "description": "Description 13: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Action"
+          ],
+          "id": "w_00000000000040008000000000000013",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "13",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 6.3,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "HIATUS",
+          "title": "Chronicle Moon",
+          "type": "MANHUA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 6",
+          "author": "Author 6",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000006.webp",
+          "createdAt": "2020-01-06T01:02:03.123456+00:00",
+          "description": "Description 6: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Romance"
+          ],
+          "id": "w_00000000000040008000000000000006",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "6",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 5.6,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "ONGOING",
+          "title": "X",
+          "type": "MANGA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 14",
+          "author": "Author 14",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000014.webp",
+          "createdAt": "2020-01-06T01:02:03.123456+00:00",
+          "description": "Description 14: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Romance"
+          ],
+          "id": "w_00000000000040008000000000000014",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "14",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 6.4,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "CANCELLED",
+          "title": "Chronicle Star",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 7",
+          "author": "Author 7",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000007.webp",
+          "createdAt": "2020-01-07T01:02:03.123456+00:00",
+          "description": "Description 7: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Action"
+          ],
+          "id": "w_00000000000040008000000000000007",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "7",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 5.7,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "COMPLETED",
+          "title": "Go",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 15",
+          "author": "Author 15",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000015.webp",
+          "createdAt": "2020-01-07T01:02:03.123456+00:00",
+          "description": "Description 15: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Action",
+            "Gore"
+          ],
+          "id": "w_00000000000040008000000000000015",
+          "isFavorite": false,
+          "isMarked": true,
+          "isNsfw": true,
+          "latestChapter": "15",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 6.5,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "UNKNOWN",
+          "title": "Night Chronicle",
+          "type": "MANGA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 8",
+          "author": "Author 8",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000008.webp",
+          "createdAt": "2020-01-08T01:02:03.000000+00:00",
+          "description": "Description 8: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Romance"
+          ],
+          "id": "w_00000000000040008000000000000008",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "8",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": null,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "HIATUS",
+          "title": "Sun",
+          "type": "MANHUA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        }
+      ],
+      "page": 1,
+      "total": 15
+    }
+  }
+}

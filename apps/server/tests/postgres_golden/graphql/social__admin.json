@@ -1,0 +1,137 @@
+{
+  "data": {
+    "comments": {
+      "hasNextPage": false,
+      "items": [
+        {
+          "author": {
+            "avatarUrl": null,
+            "id": "00000000-0000-4000-8000-000000000900",
+            "username": "owner"
+          },
+          "body": "Root discussion",
+          "createdAt": "2020-01-01T01:02:03.000000+00:00",
+          "deletedBy": null,
+          "dislikes": 1,
+          "hasSpoiler": false,
+          "id": "00000000-0000-4000-8000-000000001100",
+          "likes": 1,
+          "mediaHeight": null,
+          "mediaUrl": null,
+          "mediaWidth": null,
+          "myVote": 0,
+          "parentId": null,
+          "targetId": "w_00000000000040008000000000000001",
+          "targetType": "series"
+        },
+        {
+          "author": {
+            "avatarUrl": null,
+            "id": "00000000-0000-4000-8000-000000000901",
+            "username": "reader"
+          },
+          "body": "Reply — accents",
+          "createdAt": "2020-01-02T01:02:03.000000+00:00",
+          "deletedBy": null,
+          "dislikes": 0,
+          "hasSpoiler": true,
+          "id": "00000000-0000-4000-8000-000000001101",
+          "likes": 0,
+          "mediaHeight": null,
+          "mediaUrl": null,
+          "mediaWidth": null,
+          "myVote": 0,
+          "parentId": "00000000-0000-4000-8000-000000001100",
+          "targetId": "w_00000000000040008000000000000001",
+          "targetType": "series"
+        },
+        {
+          "author": {
+            "avatarUrl": null,
+            "id": "00000000-0000-4000-8000-000000000902",
+            "username": "cjk-reader"
+          },
+          "body": "Another root",
+          "createdAt": "2020-01-03T01:02:03.000000+00:00",
+          "deletedBy": null,
+          "dislikes": 0,
+          "hasSpoiler": false,
+          "id": "00000000-0000-4000-8000-000000001102",
+          "likes": 0,
+          "mediaHeight": null,
+          "mediaUrl": null,
+          "mediaWidth": null,
+          "myVote": 0,
+          "parentId": null,
+          "targetId": "w_00000000000040008000000000000001",
+          "targetType": "series"
+        }
+      ],
+      "page": 1,
+      "total": 2
+    },
+    "myReview": {
+      "author": {
+        "avatarUrl": null,
+        "id": "00000000-0000-4000-8000-000000000900",
+        "username": "owner"
+      },
+      "body": "Nice café",
+      "createdAt": "2020-01-01T01:02:03.000000+00:00",
+      "hasSpoiler": false,
+      "id": "00000000-0000-4000-8000-000000001000",
+      "score": 6,
+      "seriesId": "w_00000000000040008000000000000001",
+      "updatedAt": "2020-01-06T01:02:03.123456+00:00"
+    },
+    "reviews": {
+      "hasNextPage": false,
+      "items": [
+        {
+          "author": {
+            "avatarUrl": null,
+            "id": "00000000-0000-4000-8000-000000000902",
+            "username": "cjk-reader"
+          },
+          "body": "漫画が好き",
+          "createdAt": "2020-01-03T01:02:03.000000+00:00",
+          "hasSpoiler": false,
+          "id": "00000000-0000-4000-8000-000000001002",
+          "score": 8,
+          "seriesId": "w_00000000000040008000000000000001",
+          "updatedAt": "2020-01-08T01:02:03.000000+00:00"
+        },
+        {
+          "author": {
+            "avatarUrl": null,
+            "id": "00000000-0000-4000-8000-000000000901",
+            "username": "reader"
+          },
+          "body": "Legacy source review wins",
+          "createdAt": "2020-01-01T01:02:03.000000+00:00",
+          "hasSpoiler": false,
+          "id": "00000000-0000-4000-8000-000000001010",
+          "score": 9,
+          "seriesId": "710001",
+          "updatedAt": "2020-02-01T00:00:00.000000+00:00"
+        },
+        {
+          "author": {
+            "avatarUrl": null,
+            "id": "00000000-0000-4000-8000-000000000900",
+            "username": "owner"
+          },
+          "body": "Nice café",
+          "createdAt": "2020-01-01T01:02:03.000000+00:00",
+          "hasSpoiler": false,
+          "id": "00000000-0000-4000-8000-000000001000",
+          "score": 6,
+          "seriesId": "w_00000000000040008000000000000001",
+          "updatedAt": "2020-01-06T01:02:03.123456+00:00"
+        }
+      ],
+      "page": 1,
+      "total": 3
+    }
+  }
+}

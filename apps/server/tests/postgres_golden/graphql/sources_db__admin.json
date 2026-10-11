@@ -1,0 +1,109 @@
+{
+  "data": {
+    "workSources": [
+      {
+        "extension": null,
+        "isNsfw": false,
+        "lang": null,
+        "sourceId": "mangadex",
+        "sourceKey": "00000000-0000-4000-8000-000000000001",
+        "sourceType": "mangadex",
+        "sourceUrl": "https://example.invalid/manga/1"
+      },
+      {
+        "extension": {
+          "apkName": "fixture.apk",
+          "lang": "en",
+          "pkgName": "org.example.710001",
+          "repoUrl": "https://example.invalid/repo",
+          "versionCode": 3
+        },
+        "isNsfw": false,
+        "lang": "en",
+        "sourceId": "source-710001",
+        "sourceKey": "710001",
+        "sourceType": "suwayomi",
+        "sourceUrl": "https://example.invalid/710001"
+      },
+      {
+        "extension": {
+          "apkName": "fixture.apk",
+          "lang": "en",
+          "pkgName": "org.example.710002",
+          "repoUrl": "https://example.invalid/repo",
+          "versionCode": 3
+        },
+        "isNsfw": false,
+        "lang": "en",
+        "sourceId": "source-710002",
+        "sourceKey": "710002",
+        "sourceType": "suwayomi",
+        "sourceUrl": "https://example.invalid/710002"
+      }
+    ],
+    "workSourcesBatch": [
+      {
+        "sources": [
+          {
+            "extension": null,
+            "isNsfw": false,
+            "lang": null,
+            "sourceId": "mangadex",
+            "sourceKey": "00000000-0000-4000-8000-000000000001",
+            "sourceType": "mangadex",
+            "sourceUrl": "https://example.invalid/manga/1"
+          },
+          {
+            "extension": {
+              "apkName": "fixture.apk",
+              "lang": "en",
+              "pkgName": "org.example.710001",
+              "repoUrl": "https://example.invalid/repo",
+              "versionCode": 3
+            },
+            "isNsfw": false,
+            "lang": "en",
+            "sourceId": "source-710001",
+            "sourceKey": "710001",
+            "sourceType": "suwayomi",
+            "sourceUrl": "https://example.invalid/710001"
+          },
+          {
+            "extension": {
+              "apkName": "fixture.apk",
+              "lang": "en",
+              "pkgName": "org.example.710002",
+              "repoUrl": "https://example.invalid/repo",
+              "versionCode": 3
+            },
+            "isNsfw": false,
+            "lang": "en",
+            "sourceId": "source-710002",
+            "sourceKey": "710002",
+            "sourceType": "suwayomi",
+            "sourceUrl": "https://example.invalid/710002"
+          }
+        ],
+        "workId": "w_00000000000040008000000000000001"
+      },
+      {
+        "sources": [
+          {
+            "extension": null,
+            "isNsfw": false,
+            "lang": null,
+            "sourceId": "mangadex",
+            "sourceKey": "00000000-0000-4000-8000-000000000012",
+            "sourceType": "mangadex",
+            "sourceUrl": "https://example.invalid/manga/12"
+          }
+        ],
+        "workId": "w_00000000000040008000000000000012"
+      },
+      {
+        "sources": [],
+        "workId": "w_00000000000040008000000000000015"
+      }
+    ]
+  }
+}

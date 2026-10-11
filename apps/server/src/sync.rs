@@ -105,13 +105,14 @@ fn stopping(shutdown: &watch::Receiver<bool>) -> bool {
 /// needs the elapsed time, so it can defer a restart-skipped tick by the REMAINDER of
 /// the interval rather than by a whole fresh one (P1-3).
 async fn seconds_since_last_pass(pool: &crate::db::Database) -> Option<u64> {
-    let last: Option<String> =
-        sqlx::query_scalar("SELECT last_full_pass_at FROM sync_state WHERE id = 1")
+    let last: Option<chrono::DateTime<chrono::Utc>> =
+        crate::db_types::query_scalar("SELECT last_full_pass_at FROM sync_state WHERE id = 1")
             .fetch_optional(pool)
             .await
+            .inspect_err(crate::db::record_read_database_error)
             .ok()
             .flatten();
-    let t = chrono::DateTime::parse_from_rfc3339(&last?).ok()?;
+    let t = last?;
     Some(
         (chrono::Utc::now() - t.with_timezone(&chrono::Utc))
             .num_seconds()
@@ -281,11 +282,22 @@ pub async fn sync_all(
 
     // Give any breaker-disabled subscription a probe pass once its disablement is stale
     // (P1-5) — before enumerating subscriptions, so a re-armed one is walked this pass.
-    rearm_stale_breakers(state).await;
+    match rearm_stale_breakers(&state.pool).await {
+        Ok(packages) => {
+            for pkg in packages {
+                tracing::info!(pkg, "source-sync: re-arming breaker for a probe pass");
+            }
+        }
+        Err(e) => {
+            crate::db::record_database_error(&e);
+            tracing::warn!(error = %e, "source-sync: breaker re-arm failed");
+        }
+    }
 
     let subs = match crate::catalog::subscribed_extensions(&state.pool).await {
         Ok(s) => s,
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "source-sync: failed to list subscriptions");
             // Couldn't even enumerate subscriptions — treat the pass as incomplete so
             // the scheduler retries early rather than waiting a full interval.
@@ -309,6 +321,7 @@ pub async fn sync_all(
     // of waiting a full interval (audit #3 follow-up). Stamped LAST, after the walks.
     if reconciled {
         if let Err(e) = crate::catalog::mark_source_sync_pass(&state.pool).await {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "source-sync: failed to record pass completion");
         }
     } else {
@@ -359,12 +372,16 @@ async fn reconcile_library(state: &AppState, shutdown: &watch::Receiver<bool>) -
                     return false;
                 }
                 if let Err(e) = state.suwayomi.set_in_library(id, false).await {
+                    let e = crate::db::observed_database_error(e);
                     tracing::warn!(series_id = id, error = %e, "source-sync: un-library of purged non-English series failed");
                 }
                 tokio::time::sleep(Duration::from_millis(HEAL_DELAY_MS)).await;
             }
         }
-        Err(e) => tracing::warn!(error = %e, "source-sync: non-English purge failed"),
+        Err(e) => {
+            let e = crate::db::observed_database_error(e);
+            tracing::warn!(error = %e, "source-sync: non-English purge failed");
+        }
     }
 
     // Backfill a "due now" scan-state row for any enrolled series that lacks one (e.g.
@@ -373,12 +390,16 @@ async fn reconcile_library(state: &AppState, shutdown: &watch::Receiver<bool>) -
     match crate::catalog::backfill_pending_scan_states(&state.pool).await {
         Ok(0) => {}
         Ok(n) => tracing::info!(added = n, "source-sync: backfilled scan-state rows"),
-        Err(e) => tracing::warn!(error = %e, "source-sync: scan-state backfill failed"),
+        Err(e) => {
+            let e = crate::db::observed_database_error(e);
+            tracing::warn!(error = %e, "source-sync: scan-state backfill failed");
+        }
     }
 
     let enrolled = match crate::catalog::suwayomi_source_keys(&state.pool).await {
         Ok(k) => k,
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "source-sync: failed to list enrolled series");
             return false;
         }
@@ -391,6 +412,7 @@ async fn reconcile_library(state: &AppState, shutdown: &watch::Receiver<bool>) -
     let in_library: HashSet<String> = match state.suwayomi.library_ids().await {
         Ok(ids) => ids,
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "source-sync: failed to list library for reconcile");
             return false;
         }
@@ -410,6 +432,7 @@ async fn reconcile_library(state: &AppState, shutdown: &watch::Receiver<bool>) -
         match state.suwayomi.set_in_library(id, true).await {
             Ok(()) => healed += 1,
             Err(e) => {
+                let e = crate::db::observed_database_error(e);
                 tracing::warn!(series_id = id, error = %e, "source-sync: reconcile set_in_library failed")
             }
         }
@@ -438,38 +461,10 @@ const BREAKER_REARM_HOURS: i64 = 24 * 7;
 /// Clear `disabled_at` on any subscription whose disablement is older than
 /// `BREAKER_REARM_HOURS`, so it gets a probe pass (P1-5). Best-effort: a failure here
 /// just means the re-arm happens on a later pass.
-async fn rearm_stale_breakers(state: &AppState) {
-    let horizon = (chrono::Utc::now() - chrono::Duration::hours(BREAKER_REARM_HOURS)).to_rfc3339();
-    let stale: Vec<String> = match sqlx::query_scalar(
-        "SELECT pkg_name FROM extension_subscription \
-         WHERE disabled_at IS NOT NULL AND disabled_at < ?",
-    )
-    .bind(&horizon)
-    .fetch_all(&state.pool)
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, "source-sync: breaker re-arm query failed");
-            return;
-        }
-    };
-    for pkg in stale {
-        // Probe re-arm, NOT a full reset: this is an automatic timer re-arm, so a
-        // still-dead source must re-trip on its very next failing walk. A full clear
-        // (`reset_subscription_breaker`) would hand it back the whole
-        // SUBSCRIPTION_FAILURE_LIMIT budget, costing 5 failing walks per cycle instead
-        // of 1. The full clear stays for the admin re-subscribe, where "I've fixed it"
-        // is a human assertion worth trusting.
-        match crate::catalog::rearm_subscription_breaker_probe(&state.pool, &pkg).await {
-            Ok(()) => tracing::info!(
-                pkg = %pkg,
-                rearm_hours = BREAKER_REARM_HOURS,
-                "source-sync: re-arming breaker-disabled subscription for a probe pass"
-            ),
-            Err(e) => tracing::warn!(pkg = %pkg, error = %e, "source-sync: breaker re-arm failed"),
-        }
-    }
+async fn rearm_stale_breakers(pool: &crate::db::Database) -> sqlx::Result<Vec<String>> {
+    let horizon = chrono::Utc::now() - chrono::Duration::hours(BREAKER_REARM_HOURS);
+    sqlx::query_scalar::<_, String>("UPDATE extension_subscription SET disabled_at = NULL, consecutive_failures = GREATEST($2 - 1, 0) WHERE disabled_at < $1 RETURNING pkg_name")
+        .bind(horizon).bind(crate::catalog::SUBSCRIPTION_FAILURE_LIMIT).fetch_all(pool.write()).await
 }
 
 /// Is this failure OURS rather than the source's?
@@ -577,6 +572,7 @@ async fn sync_extension_inner(
     let retired_ids = match crate::phase_f::enrolment_excluded_source_ids(&state.pool).await {
         Ok(ids) => ids,
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "source-sync: could not load Phase F source-id exclusions");
             HashSet::new()
         }
@@ -597,6 +593,7 @@ async fn sync_extension_inner(
             .collect::<Vec<_>>(),
         Err(e) => {
             let msg = format!("list_sources failed: {e}");
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(pkg = pkg_name, error = %e, "source-sync: list_sources failed");
             // Reaching the engine at all is infrastructure; never a strike (P1-5).
             if is_infrastructure_error(&msg) {
@@ -630,6 +627,7 @@ async fn sync_extension_inner(
         match sync_source_latest(state, source_id, max_pages, shutdown).await {
             Ok(n) => added += n,
             Err(e) => {
+                let e = crate::db::observed_database_error(e);
                 tracing::warn!(pkg = pkg_name, source_id, error = %e, "source-sync: source walk failed");
                 let msg = format!("source {source_id}: {e}");
                 if is_infrastructure_error(&msg) {
@@ -665,6 +663,7 @@ async fn sync_extension_inner(
         ),
         Ok(false) => {}
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(pkg = pkg_name, error = %e, "source-sync: failed to record pass outcome")
         }
     }
@@ -745,6 +744,7 @@ async fn sync_source_latest(
             }
             Ok(_) => {}
             Err(e) => {
+                let e = crate::db::observed_database_error(e);
                 tracing::warn!(source_id, error = %e, "source-sync: latest-trigger lookup failed")
             }
         }
@@ -771,6 +771,7 @@ async fn sync_source_latest(
                 match crate::graphql::ingest_source_series(state, &id.to_string()).await {
                     Ok(_) => added += 1,
                     Err(e) => {
+                        let e = crate::db::observed_database_error(e);
                         tracing::warn!(source_id, manga_id = id, error = %e, "source-sync: enrol failed")
                     }
                 }
@@ -819,6 +820,30 @@ const DEFAULT_KICK_MAX_PAGES: i64 = 5;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn breaker_rearm_rechecks_a_concurrent_fresh_disable_after_waiting() {
+        let pool = crate::database::TestPoolOptions::new()
+            .max_connections(8)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+            .foreground();
+        sqlx::migrate!("./migrations_pg")
+            .run(pool.write())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO extension_subscription (pkg_name, created_at, disabled_at, consecutive_failures) VALUES ('rest-breaker', NOW(), NOW() - INTERVAL '10 days', 5)").execute(&pool).await.unwrap();
+        let mut first = pool.begin().await.unwrap();
+        sqlx::query("UPDATE extension_subscription SET disabled_at = NOW(), consecutive_failures = 7 WHERE pkg_name = 'rest-breaker'").execute(&mut *first).await.unwrap();
+        let a = pool.clone();
+        let second = tokio::spawn(async move { rearm_stale_breakers(&a).await });
+        crate::cover::wait_for_writer_lock(&pool).await;
+        first.commit().await.unwrap();
+        assert!(second.await.unwrap().unwrap().is_empty());
+        let (disabled, failures): (bool,i64) = sqlx::query_as("SELECT disabled_at IS NOT NULL, consecutive_failures FROM extension_subscription WHERE pkg_name = 'rest-breaker'").fetch_one(&pool).await.unwrap();
+        assert_eq!((disabled, failures), (true, 7));
+    }
 
     /// P1-5: the breaker must not count our own infrastructure against a source. The
     /// live case was `drakescans` carrying strikes for a DNS failure resolving our own
@@ -905,7 +930,7 @@ mod tests {
         let pool = crate::db::Database::connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -916,8 +941,8 @@ mod tests {
         );
 
         let six_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(6)).to_rfc3339();
-        sqlx::query("INSERT INTO sync_state (id, last_full_pass_at) VALUES (1, ?)")
-            .bind(&six_hours_ago)
+        sqlx::query("INSERT INTO sync_state (id, last_full_pass_at) VALUES (1, $1)")
+            .bind(crate::db_types::date(&six_hours_ago).unwrap())
             .execute(&pool)
             .await
             .unwrap();

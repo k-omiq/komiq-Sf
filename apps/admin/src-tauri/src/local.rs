@@ -1,9 +1,9 @@
 //! The komiq server this app runs on this computer ("Run komiq on this computer").
 //!
-//! One supervision task does the whole start: the source engine first (the reader's
-//! supervisor, see `mod suwayomi` in lib.rs), then the `komika-server` sidecar pointed at
-//! it. Progress, the failure of a step, the server's address and its one-time setup code
-//! are read by the start screen through `local_server_status`; both processes' output is
+//! One supervision task starts the database, source engine (the reader's supervisor,
+//! see `mod suwayomi` in lib.rs), then the `komika-server` sidecar. Progress, the failure
+//! of a step, the server's address and its one-time setup code are read by the start
+//! screen through `local_server_status`; all three stages' output is
 //! kept in memory for `local_server_log` (src/logbuf.rs).
 //!
 //! The server binds loopback unless the owner turned on "Allow other devices"
@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
+use crate::import::{Bounds, Overdue};
 use crate::logbuf::{find_setup_code, LogBuf, MASK};
 
 /// First port tried for a new install. Then the next few, then any free one.
@@ -31,8 +32,22 @@ pub const DEFAULT_PORT: u16 = 7580;
 const PORT_TRIES: u16 = 10;
 /// Boot attempts when the chosen port turns out to be taken after all.
 const PORT_ATTEMPTS: usize = 3;
-/// How long the server may take to answer `/health` (first boot runs migrations).
+/// How long the server may take to answer `/health` on an ordinary start (first boot
+/// runs migrations). Also how long it may check an old SQLite file before it either
+/// starts converting or carries on.
 pub const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(60);
+/// While the server converts an old SQLite database: the longest silence between two of
+/// its progress lines. The server prints a line at least at every stage and table, and
+/// every 5 seconds while a table is copied (apps/server/src/pg_import/copy.rs).
+pub const IMPORT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// The longest a start with a conversion may take in all.
+pub const IMPORT_READY_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
+/// The waits of a real start. Tests pass shorter ones to `boot_server`.
+pub const START_BOUNDS: Bounds = Bounds {
+  normal: SERVER_READY_TIMEOUT,
+  inactivity: IMPORT_INACTIVITY_TIMEOUT,
+  total: IMPORT_READY_TIMEOUT,
+};
 /// How long to wait for the setup-code line once the server says it needs setup.
 const CODE_WAIT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(200);
@@ -46,6 +61,7 @@ const APP_ORIGINS: &str =
 /// The step the start is on. `Ready` once the server answers `/health`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stage {
+  Database,
   Engine,
   Server,
   Ready,
@@ -54,6 +70,7 @@ pub enum Stage {
 impl Stage {
   fn as_str(self) -> &'static str {
     match self {
+      Stage::Database => "database",
       Stage::Engine => "engine",
       Stage::Server => "server",
       Stage::Ready => "ready",
@@ -69,6 +86,13 @@ pub struct Status {
   pub error: Option<String>,
   pub address: Option<String>,
   pub setup_code: Option<String>,
+  /// The server's last line while it checks or converts an old SQLite database.
+  pub progress: Option<String>,
+  /// `idle`, `preparing`, `converting`, `noop`, `failed` or `done` (src/import.rs).
+  pub import: &'static str,
+  /// What the owner should know although the start went on: the server's
+  /// `sqlite import: warning:` lines and processes of an earlier run left running.
+  pub warnings: Vec<String>,
 }
 
 /// `local_network` / `set_local_network`, the `LocalNetwork` of desktop.ts.
@@ -111,6 +135,9 @@ pub trait Engine: Send + Sync {
   /// Start it if it is not running yet. Idempotent.
   fn ensure_started(&self);
   fn state(&self) -> EngineState;
+  fn stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    Box::pin(async {})
+  }
 }
 
 /// What a server start needs, independent of Tauri.
@@ -121,6 +148,35 @@ pub struct Launch {
   pub web_dir: Option<PathBuf>,
   /// Database, covers, `desktop.json`.
   pub data_dir: PathBuf,
+  /// Explicit bundled resource tree; None is reserved for fake-process unit tests.
+  pub postgres_runtime: Option<PathBuf>,
+}
+
+/// Emergency gate cleanup after its worker was hard-killed. Acquires the app lock
+/// before reaping, never initializes a new cluster, and never starts PostgreSQL.
+#[cfg(feature = "desktop-gate")]
+pub async fn cleanup_gate(launch: &Launch) -> Result<String, String> {
+  let root = launch.data_dir.parent().unwrap_or(&launch.data_dir);
+  let _ownership = crate::postgres::Ownership::acquire(root)?;
+  let log = LogBuf::new();
+  for warning in crate::child::init(root) {
+    log.push(&format!("[komiq] warning: {warning}"));
+  }
+  if crate::postgres::cluster_dir(&launch.data_dir)
+    .join("data")
+    .exists()
+  {
+    let runtime = launch
+      .postgres_runtime
+      .as_ref()
+      .ok_or("Missing gate runtime")?;
+    let database =
+      crate::postgres::Database::prepare(runtime, &launch.data_dir, std::slice::from_ref(&log))
+        .await?;
+    database.cleanup_orphan().await?;
+  }
+  crate::child::forget_all();
+  Ok(log.text())
 }
 
 enum Cmd {
@@ -129,6 +185,31 @@ enum Cmd {
   /// Stop the server and start it again (new bind address).
   Restart,
   Stop,
+  #[cfg(feature = "desktop-gate")]
+  Gate(
+    GateAction,
+    tokio::sync::oneshot::Sender<Result<String, String>>,
+  ),
+}
+
+#[cfg(feature = "desktop-gate")]
+#[derive(serde::Deserialize)]
+#[serde(tag = "action", content = "value", rename_all = "snake_case")]
+pub enum GateAction {
+  Sql(String),
+  /// SQL as the application role in another database of the cluster: `[database, sql]`.
+  SqlIn(String, String),
+  Dump,
+  DumpFailure,
+  InspectDump(String),
+  /// `pg_restore` of this dump into a new empty database; answers its name.
+  RestoreDump(String),
+  /// The Database section of the log view.
+  DatabaseLog,
+  /// The program file the supervisor starts as the database.
+  PostgresProgram,
+  /// What the supervisor read from the server's import lines in this start (JSON).
+  ImportReport,
 }
 
 struct State {
@@ -141,6 +222,10 @@ struct State {
   setup_code: Option<String>,
   /// Bumped on every transition to `Ready`.
   ready_gen: u64,
+  /// Bumped every time the supervisor puts off a restart for a changed network choice
+  /// because a conversion runs. `set_network` reads it to learn what became of the
+  /// request it sent.
+  restarts_put_off: u64,
   running: bool,
 }
 
@@ -150,12 +235,24 @@ pub struct LocalServer {
   prefs_path: Option<PathBuf>,
   launch: Launch,
   engine: Arc<dyn Engine>,
+  pub database_log: Arc<LogBuf>,
   pub engine_log: Arc<LogBuf>,
   pub server_log: Arc<LogBuf>,
   /// Filled by the output pump when the server prints its setup code.
   code_slot: Arc<Mutex<Option<String>>>,
+  /// Supervisor warnings of this app run (see `Status::warnings`).
+  warnings: Mutex<Vec<String>>,
   tx: Mutex<Option<mpsc::UnboundedSender<Cmd>>>,
 }
+
+/// Supervisor warnings kept per app run.
+const MAX_WARNINGS: usize = 50;
+
+/// What `set_local_network` answers while the old database is checked or converted.
+pub const NETWORK_AFTER_CONVERSION: &str = "The database is being converted. Your choice is \
+   saved and is applied as soon as the conversion is finished.";
+const RESTART_DEFERRED_LOG: &str = "[komiq] a restart for a changed network choice was put off: \
+   the database conversion is running; the choice is applied when it is finished";
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
   m.lock().unwrap_or_else(|e| e.into_inner())
@@ -177,23 +274,87 @@ impl LocalServer {
       .unwrap_or_default();
     LocalServer {
       state: Mutex::new(State {
-        stage: Stage::Engine,
+        stage: Stage::Database,
         error: None,
         port: None,
         lan: false,
         setup_code: None,
         ready_gen: 0,
+        restarts_put_off: 0,
         running: false,
       }),
       prefs: Mutex::new(prefs),
       prefs_path,
       launch,
       engine,
+      database_log: LogBuf::new(),
       engine_log,
       server_log: LogBuf::new(),
       code_slot: Arc::new(Mutex::new(None)),
+      warnings: Mutex::new(Vec::new()),
       tx: Mutex::new(None),
     }
+  }
+
+  /// Keep a warning for the start status and write it to the log view (Database
+  /// section: it is what the supervisor found before it started anything).
+  pub(crate) fn note_warning(&self, warning: String) {
+    let mut warnings = lock(&self.warnings);
+    if warnings.contains(&warning) {
+      return;
+    }
+    self
+      .database_log
+      .push(&format!("[komiq] warning: {warning}"));
+    if warnings.len() < MAX_WARNINGS {
+      warnings.push(warning);
+    }
+  }
+
+  /// Supervisor warnings, then the server's import warnings of its current start.
+  fn all_warnings(&self) -> Vec<String> {
+    // Children whose identity could not be recorded (src/child.rs) report here. Only the
+    // real app installs the child record; fake-process tests leave the queue alone.
+    if self.launch.postgres_runtime.is_some() {
+      for warning in crate::child::take_warnings() {
+        self.note_warning(warning);
+      }
+    }
+    let mut all = lock(&self.warnings).clone();
+    for warning in self.server_log.import().warnings() {
+      let text = format!("Database conversion: {warning}");
+      if !all.contains(&text) {
+        all.push(text);
+      }
+    }
+    all
+  }
+
+  /// What the supervisor read from the server's import lines in this start.
+  #[cfg(feature = "desktop-gate")]
+  fn import_report(&self) -> String {
+    let import = self.server_log.import();
+    serde_json::json!({
+      "state": import.state().as_str(),
+      "bound": import.bound_kind(),
+      "conversion_lines": import.progress_lines(),
+      "verifier_pass": import.verifier_pass(),
+      "renamed": import.renamed(),
+      "warnings": import.warnings(),
+      "error": import.error(),
+    })
+    .to_string()
+  }
+
+  #[cfg(feature = "desktop-gate")]
+  pub async fn gate(&self, action: GateAction) -> Result<String, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    lock(&self.tx)
+      .as_ref()
+      .ok_or("Supervisor not started")?
+      .send(Cmd::Gate(action, tx))
+      .map_err(|e| e.to_string())?;
+    rx.await.map_err(|e| e.to_string())?
   }
 
   // ---- bridge ----------------------------------------------------------------
@@ -202,6 +363,8 @@ impl LocalServer {
   pub fn start(self: &Arc<Self>) {
     let mut tx = lock(&self.tx);
     if let Some(sender) = tx.as_ref() {
+      // A page that asks again (reload, Back then Run) while the server converts the old
+      // database sends this too; the supervisor ignores it then (`import_running`).
       if sender.send(Cmd::Retry).is_ok() {
         // Cleared here, not only when the task gets to it: the start screen polls right
         // after this returns and must not read the failure it is retrying.
@@ -214,15 +377,33 @@ impl LocalServer {
     {
       let mut st = lock(&self.state);
       st.running = true;
-      st.stage = Stage::Engine;
+      st.stage = Stage::Database;
       st.error = None;
     }
     let this = self.clone();
     tauri::async_runtime::spawn(async move { this.run(receiver).await });
   }
 
+  /// The server step is running, nothing failed, and the server is checking or
+  /// converting an old database. A retry request is ignored for as long as this holds:
+  /// the checking state ends by itself within the normal start bound, a conversion by
+  /// its own bounds, and a failure sets the error that makes Retry valid again.
+  fn import_running(&self) -> bool {
+    let waiting = {
+      let st = lock(&self.state);
+      st.stage == Stage::Server && st.error.is_none()
+    };
+    waiting
+      && matches!(
+        self.server_log.import().state(),
+        crate::import::ImportState::Preparing | crate::import::ImportState::Converting
+      )
+  }
+
   /// `local_server_status`. The setup code is handed out once, with the first `ready`.
   pub fn status(&self) -> Status {
+    let warnings = self.all_warnings();
+    let import = self.server_log.import();
     let mut st = lock(&self.state);
     let ready = st.stage == Stage::Ready;
     Status {
@@ -234,10 +415,17 @@ impl LocalServer {
         None
       },
       setup_code: if ready { st.setup_code.take() } else { None },
+      progress: if st.stage == Stage::Server {
+        import.progress().map(str::to_string)
+      } else {
+        None
+      },
+      import: import.state().as_str(),
+      warnings,
     }
   }
 
-  /// `local_server_log`: both logs, engine first.
+  /// `local_server_log`: database, engine and server logs in startup order.
   pub fn log_text(&self) -> String {
     let section = |title: &str, buf: &LogBuf| {
       let text = buf.text();
@@ -250,11 +438,22 @@ impl LocalServer {
         }
       )
     };
-    format!(
-      "{}\n\n{}",
+    // The logs are rings of the last lines: a warning printed early in a long
+    // conversion would scroll out. Warnings are therefore listed again, in full, on top.
+    let warnings = self.all_warnings();
+    let mut text = String::new();
+    if !warnings.is_empty() {
+      text.push_str("── Warnings ──\n");
+      text.push_str(&warnings.join("\n"));
+      text.push_str("\n\n");
+    }
+    text.push_str(&format!(
+      "{}\n\n{}\n\n{}",
+      section("Database", &self.database_log),
       section("Source engine", &self.engine_log),
       section("Server", &self.server_log)
-    )
+    ));
+    text
   }
 
   /// `local_network`.
@@ -291,26 +490,51 @@ impl LocalServer {
   /// `set_local_network`: remember the choice and, when the server runs, restart it on
   /// the new address. Resolves once it answers again, or with the reason it did not.
   pub async fn set_network(self: &Arc<Self>, enabled: bool) -> Result<Network, String> {
+    self.set_network_with(enabled, || {}).await
+  }
+
+  /// [`LocalServer::set_network`]. `before_request` runs between the look at the
+  /// conversion and the request to the supervisor (a test puts the server's first
+  /// conversion line there).
+  async fn set_network_with(
+    self: &Arc<Self>,
+    enabled: bool,
+    before_request: impl FnOnce(),
+  ) -> Result<Network, String> {
     {
       let mut prefs = lock(&self.prefs);
       prefs.lan = enabled;
       self.save_prefs(&prefs);
     }
-    let gen = {
+    let (gen, put_off) = {
       let st = lock(&self.state);
       if !st.running {
         return Ok(self.network());
       }
-      st.ready_gen
+      (st.ready_gen, st.restarts_put_off)
     };
+    // A restart now would end a running conversion of the old database. The choice is
+    // saved; the supervisor applies it when the conversion is done (`run`). The request
+    // is still sent so that the log says so; the supervisor ignores it for the same reason.
+    let converting = self.import_running();
+    before_request();
     if let Some(tx) = lock(&self.tx).as_ref() {
       let _ = tx.send(Cmd::Restart);
+    }
+    if converting {
+      return Err(NETWORK_AFTER_CONVERSION.into());
     }
     let deadline = Instant::now() + SERVER_READY_TIMEOUT + Duration::from_secs(15);
     loop {
       tokio::time::sleep(POLL).await;
       {
         let st = lock(&self.state);
+        // The conversion began between the look above and the supervisor reading the
+        // request, and the supervisor put the restart off. The answer is the same as when
+        // the conversion was seen here: saved, applied when it is finished.
+        if st.restarts_put_off > put_off {
+          return Err(NETWORK_AFTER_CONVERSION.into());
+        }
         if st.ready_gen > gen && st.stage == Stage::Ready {
           break;
         }
@@ -338,7 +562,7 @@ impl LocalServer {
     if !sent {
       return;
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while lock(&self.state).running && Instant::now() < deadline {
       tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -356,7 +580,11 @@ impl LocalServer {
   }
 
   fn fail(&self, error: String) {
-    self.server_log.push(&format!("[komiq] {error}"));
+    if lock(&self.state).stage == Stage::Database {
+      self.database_log.push(&error);
+    } else {
+      self.server_log.push(&format!("[komiq] {error}"));
+    }
     lock(&self.state).error = Some(error);
   }
 
@@ -388,107 +616,281 @@ impl LocalServer {
   // ---- the start sequence ------------------------------------------------------
 
   async fn run(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<Cmd>) {
+    let root = self
+      .launch
+      .data_dir
+      .parent()
+      .unwrap_or(&self.launch.data_dir);
+    let _ownership = loop {
+      self.set_stage(Stage::Database);
+      match crate::postgres::Ownership::acquire(root) {
+        Ok(guard) => break guard,
+        Err(error) => {
+          self.fail(error);
+          if !wait_for_retry(&mut rx).await {
+            return self.finish(None, None, None).await;
+          }
+        }
+      }
+    };
+    // A second app must acquire the OS lock BEFORE touching the previous run's pids.
+    // Fake-process tests do not install the app-global child registry.
+    if self.launch.postgres_runtime.is_some() {
+      // A record it could not verify is kept on disk; its process was left running.
+      for warning in crate::child::init(root) {
+        self.note_warning(warning);
+      }
+    }
+    let mut db_exits = crate::postgres::RestartBudget::default();
     let mut exits: VecDeque<Instant> = VecDeque::new();
-    'start: loop {
-      // 1. The source engine.
-      self.set_stage(Stage::Engine);
-      self.engine.ensure_started();
-      let link = loop {
-        match self.engine.state() {
-          EngineState::Ready(link) => break link,
-          EngineState::Failed(e) => {
-            let mut st = lock(&self.state);
-            if st.error.is_none() {
-              st.error = Some(format!("The source engine did not start: {e}"));
-            }
+    'database: loop {
+      self.set_stage(Stage::Database);
+      let mut database = if let Some(runtime) = &self.launch.postgres_runtime {
+        // At every start, also a retried one: both folders private to this user. What
+        // cannot be made private (a link, another owner) is said in the start status.
+        for dir in [root, self.launch.data_dir.as_path()] {
+          if let Ok(Some(warning)) = crate::postgres::private_dir(dir) {
+            self.note_warning(warning);
           }
-          EngineState::Starting => {}
         }
-        tokio::select! {
-          cmd = rx.recv() => match cmd {
-            // From the top: an engine that never launched is started again.
-            Some(Cmd::Retry) | Some(Cmd::Restart) => {
-              self.clear_error();
-              continue 'start;
+        let logs = [
+          self.database_log.clone(),
+          self.server_log.clone(),
+          self.engine_log.clone(),
+        ];
+        let prepared = tokio::select! {
+          result = crate::postgres::Database::prepare(runtime, &self.launch.data_dir, &logs) => result,
+          cmd = rx.recv() => {
+            if matches!(cmd, Some(Cmd::Stop) | None) { return self.finish(None, None, None).await; }
+            continue 'database;
+          }
+        };
+        let mut db = match prepared {
+          Ok(db) => db,
+          Err(error) => {
+            self.fail(error);
+            if !wait_for_retry(&mut rx).await {
+              return self.finish(None, None, None).await;
             }
-            Some(Cmd::Stop) | None => return self.finish(None).await,
-          },
-          _ = tokio::time::sleep(POLL) => {}
+            continue 'database;
+          }
+        };
+        let started = tokio::select! {
+          result = db.start(&logs) => result,
+          cmd = rx.recv() => {
+            db.stop().await;
+            if matches!(cmd, Some(Cmd::Stop) | None) { return self.finish(None, None, None).await; }
+            continue 'database;
+          }
+        };
+        if let Err(error) = started {
+          db.stop().await;
+          self.fail(error);
+          if !wait_for_retry(&mut rx).await {
+            return self.finish(None, None, None).await;
+          }
+          continue 'database;
         }
+        Some(db)
+      } else if cfg!(test) {
+        None // Fake engine/server lifecycle tests deliberately do not run PostgreSQL.
+      } else {
+        self.fail(
+          "The bundled PostgreSQL resource path is unavailable. Reinstall, then Retry.".into(),
+        );
+        if !wait_for_retry(&mut rx).await {
+          return self.finish(None, None, None).await;
+        }
+        continue 'database;
       };
-
-      // 2. The server.
-      self.set_stage(Stage::Server);
-      let (mut child, port, lan) = match self.boot(&link).await {
-        Ok(ok) => ok,
-        Err(e) => {
-          self.fail(e);
-          match wait_for_retry(&mut rx).await {
-            true => continue 'start,
-            false => return self.finish(None).await,
+      'server: loop {
+        self.set_stage(Stage::Engine);
+        self.engine.ensure_started();
+        let link = loop {
+          match self.engine.state() {
+            EngineState::Ready(link) => break link,
+            EngineState::Failed(error) => {
+              self.fail(format!("The source engine did not start: {error}"))
+            }
+            EngineState::Starting => {}
           }
+          tokio::select! {
+            cmd = rx.recv() => match cmd {
+              Some(Cmd::Retry) | Some(Cmd::Restart) => continue 'server,
+              Some(Cmd::Stop) | None => return self.finish(None, database.as_mut(), None).await,
+              #[cfg(feature = "desktop-gate")]
+              Some(Cmd::Gate(_, reply)) => { let _ = reply.send(Err("Server is still starting".into())); },
+            },
+            _ = tokio::time::sleep(POLL) => {
+              if database.as_mut().is_some_and(|db| db.exited().unwrap_or(true)) { break 'server; }
+            }
+          }
+        };
+        // Engine startup can be interrupted by database failure too.
+        if database
+          .as_mut()
+          .is_some_and(|db| db.exited().unwrap_or(true))
+        {
+          break 'server;
         }
-      };
-      let code = self.wait_for_code(port).await;
-      self.set_ready(port, lan, code);
-      self
-        .server_log
-        .push(&format!("[komiq] server ready on port {port}"));
-
-      // 3. Keep it running.
-      loop {
-        tokio::select! {
-          status = child.wait() => {
-            let what = status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
-            self.server_log.push(&format!("[komiq] the server stopped unexpectedly ({what})"));
-            let now = Instant::now();
-            exits.push_back(now);
-            while exits.front().is_some_and(|t| now.duration_since(*t) > Duration::from_secs(60)) {
-              exits.pop_front();
+        self.set_stage(Stage::Server);
+        let url = database
+          .as_ref()
+          .map(|db| db.url())
+          .unwrap_or_else(|| "postgres://fake:fake@127.0.0.1:1/komika".into());
+        let boot = {
+          let booting = self.boot(&link, &url);
+          tokio::pin!(booting);
+          loop {
+            tokio::select! {
+              result = &mut booting => break result,
+              cmd = rx.recv() => match cmd {
+                // Dropping `booting` ends the server process. A retry that arrives while
+                // it converts the old database is not a reason to do that, and neither
+                // is a changed network choice: that one is applied when the conversion
+                // is done (below, after the boot).
+                Some(Cmd::Retry) if self.import_running() => {
+                  self.server_log.push("[komiq] a retry request was ignored: the database conversion is running");
+                }
+                Some(Cmd::Restart) if self.import_running() => {
+                  self.server_log.push(RESTART_DEFERRED_LOG);
+                  lock(&self.state).restarts_put_off += 1;
+                }
+                Some(Cmd::Retry) | Some(Cmd::Restart) => continue 'server,
+                Some(Cmd::Stop) | None => return self.finish(None, database.as_mut(), None).await,
+                #[cfg(feature = "desktop-gate")]
+                Some(Cmd::Gate(_, reply)) => { let _ = reply.send(Err("Server is still starting".into())); continue 'server; },
+              },
+              _ = wait_database_exit(&mut database) => { break 'server; }
             }
-            if exits.len() > MAX_RESTARTS_PER_MIN {
-              exits.clear();
-              self.set_stage(Stage::Server);
-              self.fail("The server keeps stopping. The log has the cause.".into());
-              if !wait_for_retry(&mut rx).await {
-                return self.finish(None).await;
-              }
-            } else {
-              tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            continue 'start;
           }
-          cmd = rx.recv() => match cmd {
-            Some(Cmd::Retry) => {}
-            Some(Cmd::Restart) => {
-              self.server_log.push("[komiq] restarting the server");
-              crate::suwayomi::stop_child(&mut child).await;
-              continue 'start;
+        };
+        let (mut child, port, lan) = match boot {
+          Ok(ok) => ok,
+          Err(error) => {
+            self.fail(error);
+            if !wait_for_retry(&mut rx).await {
+              return self.finish(None, database.as_mut(), None).await;
             }
-            Some(Cmd::Stop) | None => return self.finish(Some(child)).await,
-          },
-          _ = tokio::time::sleep(Duration::from_secs(2)) => {
-            // The engine restarted on a new port: the server must follow it.
-            if let EngineState::Ready(now) = self.engine.state() {
-              if now != link {
-                self.server_log.push("[komiq] the source engine moved; restarting the server");
+            continue 'server; // Import/migration errors wait for explicit Retry.
+          }
+        };
+        // The network choice was changed while this boot ran and its restart was put off
+        // (a conversion was running). The conversion is done now: start again on the
+        // address that was chosen. Nothing was reported as ready in between.
+        if lock(&self.prefs).lan != lan {
+          self.server_log.push(
+            "[komiq] the network choice changed while the server started; restarting it on the new address",
+          );
+          crate::suwayomi::stop_child(&mut child).await;
+          continue 'server;
+        }
+        let code = self.wait_for_code(port).await;
+        self.set_ready(port, lan, code);
+        self
+          .server_log
+          .push(&format!("[komiq] server ready on port {port}"));
+        let mut dump = database.as_ref().map(|db| db.dump_task());
+        loop {
+          tokio::select! {
+            status = child.wait() => {
+              stop_dump(dump.take()).await;
+              self.server_log.push(&format!("[komiq] server stopped unexpectedly ({status:?})"));
+              let now = Instant::now();
+              exits.push_back(now);
+              while exits.front().is_some_and(|t| now.duration_since(*t) > Duration::from_secs(60)) { exits.pop_front(); }
+              if exits.len() > MAX_RESTARTS_PER_MIN {
+                exits.clear(); self.set_stage(Stage::Server);
+                self.fail("The server keeps stopping. The log has the cause.".into());
+                if !wait_for_retry(&mut rx).await { return self.finish(None, database.as_mut(), None).await; }
+              } else { tokio::time::sleep(Duration::from_secs(1)).await; }
+              continue 'server;
+            },
+            cmd = rx.recv() => match cmd {
+              #[cfg(feature = "desktop-gate")]
+              Some(Cmd::Gate(action, reply)) => {
+                stop_dump(dump.take()).await;
+                let result = match database.as_mut() {
+                  Some(db) => match action {
+                    GateAction::ImportReport => Ok(self.import_report()),
+                    GateAction::Sql(sql) => db.sql(&sql, false, "komika").await,
+                    GateAction::SqlIn(database, sql) => db.sql(&sql, false, &database).await,
+                    GateAction::RestoreDump(path) => db.restore_dump(Path::new(&path)).await,
+                    GateAction::DatabaseLog => Ok(self.database_log.text()),
+                    GateAction::PostgresProgram => Ok(db.postgres_program().display().to_string()),
+                    GateAction::Dump => db.dump().await.map(|p| p.display().to_string()),
+                    GateAction::DumpFailure => db.simulate_dump_failure().await.map(|p| p.display().to_string()),
+                    GateAction::InspectDump(path) => db.inspect_dump(Path::new(&path)).await,
+                  },
+                  None => Err("Real PostgreSQL required for the gate".into()),
+                };
+                let _ = reply.send(result);
+                dump = database.as_ref().map(|db| db.dump_task());
+              },
+              Some(Cmd::Retry) => {},
+              Some(Cmd::Restart) => {
+                stop_dump(dump.take()).await;
                 crate::suwayomi::stop_child(&mut child).await;
-                continue 'start;
+                continue 'server;
+              },
+              Some(Cmd::Stop) | None => return self.finish(Some(child), database.as_mut(), dump.take()).await,
+            },
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+              if database.as_mut().is_some_and(|db| db.exited().unwrap_or(true)) {
+                stop_dump(dump.take()).await;
+                crate::suwayomi::stop_child(&mut child).await;
+                break 'server;
+              }
+              if let EngineState::Ready(now) = self.engine.state() {
+                if now != link {
+                  stop_dump(dump.take()).await;
+                  crate::suwayomi::stop_child(&mut child).await;
+                  continue 'server;
+                }
               }
             }
           }
         }
       }
+      if let Some(db) = database.as_mut() {
+        db.stop().await;
+      }
+      self.set_stage(Stage::Database);
+      self
+        .database_log
+        .push("Database exited; server stopped before database recovery");
+      if let Some(backoff) = db_exits.record(Instant::now()) {
+        tokio::select! {
+          _ = tokio::time::sleep(backoff) => {},
+          cmd = rx.recv() => if matches!(cmd, Some(Cmd::Stop) | None) { return self.finish(None, None, None).await; }
+        }
+      } else {
+        self.fail("The database keeps stopping (three automatic restarts per minute exhausted). See Database log, correct the cause, then Retry.".into());
+        if !wait_for_retry(&mut rx).await {
+          return self.finish(None, None, None).await;
+        }
+        db_exits = crate::postgres::RestartBudget::default();
+      }
     }
   }
 
-  async fn finish(&self, child: Option<tokio::process::Child>) {
+  async fn finish(
+    &self,
+    child: Option<tokio::process::Child>,
+    database: Option<&mut crate::postgres::Database>,
+    dump: Option<tokio::task::JoinHandle<()>>,
+  ) {
+    stop_dump(dump).await;
     if let Some(mut child) = child {
       crate::suwayomi::stop_child(&mut child).await;
     }
+    self.engine.stop().await;
+    if let Some(db) = database {
+      db.stop().await;
+    }
     let mut st = lock(&self.state);
     st.running = false;
-    st.stage = Stage::Engine;
+    st.stage = Stage::Database;
     st.port = None;
   }
 
@@ -497,6 +899,7 @@ impl LocalServer {
   async fn boot(
     &self,
     link: &EngineLink,
+    database_url: &str,
   ) -> Result<(tokio::process::Child, u16, bool), String> {
     let (lan, preferred) = {
       let prefs = lock(&self.prefs);
@@ -519,13 +922,14 @@ impl LocalServer {
         port,
         metrics_port,
         engine: link.clone(),
+        database_url: database_url.into(),
       };
       match boot_server(
         &self.launch,
         &attempt,
         &self.server_log,
         &self.code_slot,
-        SERVER_READY_TIMEOUT,
+        &START_BOUNDS,
       )
       .await
       {
@@ -584,6 +988,7 @@ pub struct Attempt {
   pub port: u16,
   pub metrics_port: u16,
   pub engine: EngineLink,
+  pub database_url: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -599,7 +1004,15 @@ pub fn server_env(launch: &Launch, attempt: &Attempt) -> Vec<(&'static str, Stri
     ("BIND_ADDR", attempt.bind.to_string()),
     ("PORT", attempt.port.to_string()),
     ("KOMIKA_METRICS_PORT", attempt.metrics_port.to_string()),
-    ("DATABASE_URL", format!("sqlite://{}", db.display())),
+    ("DATABASE_URL", attempt.database_url.clone()),
+    (
+      "COVERS_DATABASE_URL",
+      format!(
+        "sqlite://{}",
+        launch.data_dir.join("covers.sqlite3").display()
+      ),
+    ),
+    ("KOMIKA_SQLITE_IMPORT_PATH", db.display().to_string()),
     ("SUWAYOMI_URL", attempt.engine.url.clone()),
     ("SUWAYOMI_PUBLIC_URL", attempt.engine.public_url.clone()),
     ("CORS_ORIGINS", APP_ORIGINS.to_string()),
@@ -617,16 +1030,25 @@ pub fn server_env(launch: &Launch, attempt: &Attempt) -> Vec<(&'static str, Stri
 }
 
 /// Spawn the server, copy its output into `log` (catching the setup code into
-/// `code_slot`), and wait until it answers `/health`, it exits, or `timeout` passes.
+/// `code_slot`), and wait until it answers `/health`, it exits, or its wait is over.
+///
+/// Which wait applies is decided by the server's own import lines, never by what files
+/// lie in the data folder: see `wait_ready` and src/import.rs.
 pub async fn boot_server(
   launch: &Launch,
   attempt: &Attempt,
   log: &Arc<LogBuf>,
   code_slot: &Arc<Mutex<Option<String>>>,
-  timeout: Duration,
+  bounds: &Bounds,
 ) -> Result<tokio::process::Child, BootError> {
-  std::fs::create_dir_all(&launch.data_dir)
+  // Private to this user: the server refuses to convert an old database in a folder that
+  // others can write to (see `private_dir`).
+  // A folder that cannot be made private is reported by the supervisor's start sequence.
+  crate::postgres::private_dir(&launch.data_dir)
     .map_err(|e| BootError::Failed(format!("Could not create the data folder: {e}")))?;
+  // What the previous server process said about its import says nothing about this one.
+  log.reset_import();
+  log.add_secret(&attempt.database_url);
   log.push(&format!(
     "[komiq] starting the server on {}:{}",
     attempt.bind, attempt.port
@@ -651,7 +1073,11 @@ pub async fn boot_server(
       launch.bin.display()
     ))
   })?;
-  crate::child::after_spawn(&child);
+  let spawned = Instant::now();
+  // Not in the Job Object (Windows): it was ended again, and this start has failed.
+  crate::child::after_spawn_tied(&mut child, "The server", true)
+    .await
+    .map_err(BootError::Failed)?;
 
   let mut pumps = Vec::new();
   if let Some(out) = child.stdout.take() {
@@ -669,7 +1095,11 @@ pub async fn boot_server(
         let _ = tokio::time::timeout(Duration::from_secs(1), p).await;
       }
       let status = status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
-      if port_in_use(log) {
+      let import = log.import();
+      if import.state() == crate::import::ImportState::Failed {
+        // The server said why, in plain words, before it stopped.
+        Err(BootError::Failed(import.failure_text()))
+      } else if port_in_use(log) {
         Err(BootError::PortInUse)
       } else {
         Err(BootError::Failed(format!(
@@ -677,16 +1107,7 @@ pub async fn boot_server(
         )))
       }
     }
-    ok = wait_healthy(attempt.port, timeout) => {
-      if ok {
-        Ok(())
-      } else {
-        Err(BootError::Failed(format!(
-          "The server did not answer within {} seconds.",
-          timeout.as_secs()
-        )))
-      }
-    }
+    waited = wait_ready(attempt.port, bounds, log, spawned) => waited.map_err(BootError::Failed),
   };
   match outcome {
     Ok(()) => Ok(child),
@@ -829,3 +1250,83 @@ pub fn server_bin() -> PathBuf {
 
 #[cfg(test)]
 mod tests;
+
+/// Wait for `/health`. The bound that applies follows the server's import lines:
+///
+/// * no import line, a no-op warning, or a finished conversion: the normal bound (from
+///   spawn, from the warning, from the `complete` line);
+/// * checking the old file (`preparing`): the normal bound, from that line;
+/// * converting: no progress line for `bounds.inactivity`, or `bounds.total` since spawn;
+/// * an error line: over at once.
+async fn wait_ready(
+  port: u16,
+  bounds: &Bounds,
+  log: &LogBuf,
+  spawned: Instant,
+) -> Result<(), String> {
+  loop {
+    if wait_healthy(port, POLL).await {
+      log.import_ready();
+      return Ok(());
+    }
+    let import = log.import();
+    if let Some(overdue) = import.overdue(spawned, Instant::now(), bounds) {
+      return Err(overdue_text(overdue, &import, bounds));
+    }
+  }
+}
+
+fn overdue_text(overdue: Overdue, import: &crate::import::Tracker, bounds: &Bounds) -> String {
+  let normal = bounds.normal.as_secs();
+  match overdue {
+    Overdue::Start | Overdue::AfterNoOp => {
+      format!("The server did not answer within {normal} seconds.")
+    }
+    Overdue::Preparing => {
+      // The server may print its check line on every start, so this is not a
+      // conversion failure: an ordinary start that did not answer.
+      format!(
+        "The server did not answer within {normal} seconds. Its last report: checking the \
+         old database."
+      )
+    }
+    Overdue::AfterDone => format!(
+      "The database was converted, but the server did not answer within {normal} seconds \
+       after that."
+    ),
+    Overdue::Stalled => format!(
+      "The database conversion made no progress for {} minutes and was stopped. Its last \
+       step: {}. Retry continues it.",
+      bounds.inactivity.as_secs().div_ceil(60),
+      import
+        .progress()
+        .map(|line| line[crate::import::PREFIX.len()..].trim())
+        .unwrap_or("unknown")
+    ),
+    Overdue::TooLong => format!(
+      "The database conversion did not finish within {} hours and was stopped. Retry \
+       continues it.",
+      bounds.total.as_secs().div_ceil(3600)
+    ),
+    Overdue::Failed => import.failure_text(),
+  }
+}
+
+async fn wait_database_exit(database: &mut Option<crate::postgres::Database>) {
+  loop {
+    if database
+      .as_mut()
+      .is_some_and(|db| db.exited().unwrap_or(true))
+    {
+      return;
+    }
+    tokio::time::sleep(POLL).await;
+  }
+}
+
+async fn stop_dump(task: Option<tokio::task::JoinHandle<()>>) {
+  if let Some(task) = task {
+    task.abort();
+    let _ = task.await;
+  }
+}

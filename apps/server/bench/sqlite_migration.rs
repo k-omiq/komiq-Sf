@@ -41,7 +41,7 @@ mod sqlite_migration_benchmark {
         // Use the actual production connection options and embedded SQLx
         // migrator, including its enclosing transaction and mmap/temp settings.
         let started = Instant::now();
-        let pool = super::init(&format!("sqlite://{}", path.display()))
+        let pool = super::init_sqlite(&format!("sqlite://{}", path.display()))
             .await
             .unwrap();
         let startup_seconds = started.elapsed().as_secs_f64();
@@ -111,7 +111,7 @@ mod sqlite_migration_rollback {
 
     async fn quoted_rows(conn: &mut SqliteConnection, table: &str) -> Vec<Vec<String>> {
         let columns: Vec<String> =
-            sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+            sqlx::query_scalar("SELECT name FROM pragma_table_info($1) ORDER BY cid")
                 .bind(table)
                 .fetch_all(&mut *conn)
                 .await

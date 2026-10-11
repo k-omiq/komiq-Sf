@@ -199,6 +199,9 @@ pub enum Connection {
 /// What setup created, for "Remove" and re-runs. Never holds a secret.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Stored {
+    /// The access choice this job claimed, distinct from resource checkpoints.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub access_generation: String,
     pub domain: String,
     pub connection: Option<Connection>,
     #[serde(default)]
@@ -273,6 +276,7 @@ async fn save_stored(pool: &Database, s: Option<&Stored>) -> Result<(), String> 
     instance::store(pool, &instance::CLOUDFLARE_STATE, &raw)
         .await
         .map_err(|e| {
+            crate::db::record_database_error(&e);
             tracing::error!(error = %e, "saving cloudflare_state failed");
             "The server could not save its progress. Check its log.".to_string()
         })
@@ -280,25 +284,28 @@ async fn save_stored(pool: &Database, s: Option<&Stored>) -> Result<(), String> 
 
 /// Persist the final local state atomically after external setup/removal steps.
 /// Retain the saved checkpoint when persistence fails so the job can be retried.
-async fn save_completed(pool: &Database, kind: JobKind, state: &Stored) -> Result<(), String> {
-    let values = match kind {
-        JobKind::Setup => vec![(
-            &instance::CLOUDFLARE_STATE,
-            serde_json::to_string(state).map_err(|e| e.to_string())?,
-        )],
-        JobKind::Remove => vec![
-            (&instance::CLOUDFLARE_STATE, String::new()),
-            (&instance::PUBLIC_DOMAIN, String::new()),
-            (&instance::ACCESS_MODE, "local".to_owned()),
-        ],
+async fn save_completed(pool: &Database, kind: JobKind, state: &Stored) -> Result<bool, String> {
+    let raw = match kind {
+        JobKind::Setup => serde_json::to_string(state).map_err(|e| e.to_string())?,
+        JobKind::Remove => String::new(),
     };
     crate::db::retry_transaction(|| async {
-        let mut transaction = pool.begin().await?;
-        for (setting, value) in &values {
-            instance::store(&mut *transaction, setting, value).await?;
+        let mut tx = pool.begin().await?;
+        lock_access(&mut tx).await?;
+        #[cfg(test)]
+        if let Ok(points) = ACCESS_PUBLICATION_PAUSE.try_with(Clone::clone) {
+            points.hit("access-locked").await;
         }
-        transaction.commit().await?;
-        Ok(())
+        let current = access_generation_matches(&mut tx, &state.access_generation).await?;
+        // Resource cleanup/progress remains recoverable even when an owner changed
+        // access during the remote steps. Such a job must leave the new choice intact.
+        instance::store(&mut *tx, &instance::CLOUDFLARE_STATE, &raw).await?;
+        if current && kind == JobKind::Remove {
+            instance::store(&mut *tx, &instance::PUBLIC_DOMAIN, "").await?;
+            instance::store(&mut *tx, &instance::ACCESS_MODE, "local").await?;
+        }
+        tx.commit().await?;
+        Ok(current)
     })
     .await
     .map_err(|error| {
@@ -590,6 +597,7 @@ pub struct Manager {
     /// Direct mode with HTTPS, for `plain_http_guard`: the HTTPS address, and whether
     /// a client on the internet has used it (`instance::DIRECT_HTTPS_SEEN`).
     direct_origin: Arc<RwLock<Option<String>>>,
+    direct_generation: RwLock<String>,
     https_seen: AtomicBool,
     /// The access choice is "only my devices" (`note_access_mode`): `plain_http_guard`
     /// refuses plain HTTP from the internet. With it, the last DNS name a client
@@ -624,6 +632,7 @@ impl Manager {
             issuing: tokio::sync::Mutex::new(()),
             certificate_error: Mutex::new(None),
             direct_origin: Arc::new(RwLock::new(None)),
+            direct_generation: RwLock::new(String::new()),
             https_seen: AtomicBool::new(false),
             local_only: AtomicBool::new(false),
             typed_name: Mutex::new(None),
@@ -837,7 +846,7 @@ impl Manager {
             lan_addresses: crate::lan::addresses(self.opts.listen.ip(), self.opts.listen.port()),
             lan_client_seen_at: match self.lan_client_seen_at.load(Ordering::Relaxed) {
                 0 => None,
-                at => chrono::DateTime::from_timestamp(at, 0).map(|t| t.to_rfc3339()),
+                at => chrono::DateTime::from_timestamp(at, 0).map(crate::db_types::format_date),
             },
             mode,
             domain,
@@ -852,7 +861,8 @@ impl Manager {
             connector_message,
             https,
             https_error,
-            certificate_expires: certificate_dates.map(|(_, until)| until.to_rfc3339()),
+            certificate_expires: certificate_dates
+                .map(|(_, until)| crate::db_types::format_date(until)),
             certificate_error,
             plain_http_closed: direct_tls && self.https_seen.load(Ordering::Relaxed),
             trusted_proxies: self.trusted.raw(),
@@ -984,15 +994,47 @@ impl Manager {
         if let Some(ip) = &public_ip {
             check_public_ip(ip)?;
         }
-        if input.connection == Connection::PublicIp && self.direct_tls_host().await.is_some() {
+        let _one = self.issuing.lock().await;
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            crate::db::record_database_error(&e);
+            "Could not start setup.".to_string()
+        })?;
+        lock_access(&mut tx).await.map_err(|e| {
+            crate::db::record_database_error(&e);
+            "Could not lock setup.".to_string()
+        })?;
+        let tls_host: Option<String> =
+            sqlx::query_scalar("SELECT NULLIF(value, '') FROM instance_setting WHERE key = $1")
+                .bind(instance::DIRECT_TLS_HOST.key)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| {
+                    crate::db::record_database_error(&e);
+                    "Could not check the HTTPS address.".to_string()
+                })?
+                .flatten();
+        if input.connection == Connection::PublicIp && tls_host.is_some() {
             return Err(
                 "This server serves HTTPS at its own address, on the port Cloudflare would \
                  use. Choose \"Only my devices\" first, or use a Tunnel."
                     .into(),
             );
         }
-        let existing = load_stored(&self.pool).await;
-        let stored = match existing {
+        let raw: Option<String> =
+            sqlx::query_scalar("SELECT value FROM instance_setting WHERE key = $1")
+                .bind(instance::CLOUDFLARE_STATE.key)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| {
+                    crate::db::record_database_error(&e);
+                    "Could not read setup progress.".to_string()
+                })?;
+        let existing: Option<Stored> = raw
+            .filter(|raw| !raw.is_empty())
+            .map(|raw| serde_json::from_str(&raw))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let mut stored = match existing {
             Some(s)
                 if s.has_resources()
                     && (s.domain != domain || s.connection != Some(input.connection)) =>
@@ -1017,11 +1059,20 @@ impl Manager {
                 ..Stored::default()
             },
         };
+        stored.access_generation = uuid::Uuid::new_v4().to_string();
         let steps = setup_steps(input.connection);
         self.begin(JobKind::Setup, &steps, &domain)?;
-        if let Err(e) = save_stored(&self.pool, Some(&stored)).await {
+        let saved: sqlx::Result<()> = async {
+            let raw = serde_json::to_string(&stored).expect("serializable Cloudflare checkpoint");
+            instance::store(&mut *tx, &ACCESS_GENERATION, &stored.access_generation).await?;
+            instance::store(&mut *tx, &instance::CLOUDFLARE_STATE, &raw).await?;
+            tx.commit().await
+        }
+        .await;
+        if let Err(e) = saved {
+            crate::db::record_database_error(&e);
             self.finish();
-            return Err(e);
+            return Err("Could not save setup progress.".to_owned());
         }
         let me = self.clone();
         tokio::spawn(async move { me.run(JobKind::Setup, steps, stored, token).await });
@@ -1053,11 +1104,44 @@ impl Manager {
     /// Start "Remove" in the background: delete exactly what setup created.
     pub async fn start_remove(self: &Arc<Self>, token: &str) -> Result<(), String> {
         let token = ApiToken::new(token).ok_or("Paste the API token first.")?;
-        let stored = load_stored(&self.pool)
-            .await
-            .ok_or("Cloudflare is not set up on this server.")?;
-        let steps = remove_steps(&stored);
-        self.begin(JobKind::Remove, &steps, &stored.domain)?;
+        let _one = self.issuing.lock().await;
+        let mut began = false;
+        let claimed: anyhow::Result<(Stored, Vec<Step>)> = async {
+            let mut tx = self.pool.begin().await?;
+            lock_access(&mut tx).await?;
+            let raw: Option<String> =
+                sqlx::query_scalar("SELECT value FROM instance_setting WHERE key = $1")
+                    .bind(instance::CLOUDFLARE_STATE.key)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let mut stored: Stored = serde_json::from_str(
+                raw.as_deref()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Cloudflare is not set up on this server."))?,
+            )?;
+            stored.access_generation = uuid::Uuid::new_v4().to_string();
+            let steps = remove_steps(&stored);
+            self.begin(JobKind::Remove, &steps, &stored.domain)
+                .map_err(anyhow::Error::msg)?;
+            began = true;
+            instance::store(&mut *tx, &ACCESS_GENERATION, &stored.access_generation).await?;
+            instance::store(
+                &mut *tx,
+                &instance::CLOUDFLARE_STATE,
+                &serde_json::to_string(&stored)?,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok((stored, steps))
+        }
+        .await;
+        let (stored, steps) = claimed.map_err(|e| {
+            crate::db::observe_database_error(&e);
+            if began {
+                self.finish();
+            }
+            e.to_string()
+        })?;
         let me = self.clone();
         tokio::spawn(async move { me.run(JobKind::Remove, steps, stored, token).await });
         Ok(())
@@ -1088,21 +1172,47 @@ impl Manager {
         }
         if ok {
             s.complete = true;
-            if let Err(message) = save_completed(&self.pool, kind, &s).await {
-                self.mark(
-                    steps.len().saturating_sub(1),
-                    LineState::Failed,
-                    Some(message),
-                );
-                self.finish();
-                return;
-            }
-            // Either way the server is no longer public at its own address.
             let _one = self.issuing.lock().await;
-            self.disable_direct_tls().await;
+            match save_completed(&self.pool, kind, &s).await {
+                Ok(true) => self.disable_direct_tls().await,
+                Ok(false) => {}
+                Err(message) => {
+                    self.mark(
+                        steps.len().saturating_sub(1),
+                        LineState::Failed,
+                        Some(message),
+                    );
+                    self.finish();
+                    return;
+                }
+            }
         }
         self.note_access_mode().await;
         self.finish();
+    }
+
+    async fn save_job_trusted(&self, state: &Stored, list: &[String]) -> Result<bool, String> {
+        let _one = self.issuing.lock().await;
+        let result: anyhow::Result<bool> = async {
+            let mut tx = self.pool.begin().await?;
+            lock_access(&mut tx).await?;
+            if !access_generation_matches(&mut tx, &state.access_generation).await? {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            instance::store(&mut *tx, &instance::TRUSTED_PROXY_CIDRS, &list.join(",")).await?;
+            tx.commit().await?;
+            Ok(true)
+        }
+        .await;
+        let published = result.map_err(|error| {
+            crate::db::observe_database_error(&error);
+            "The server could not save the trusted proxies.".to_string()
+        })?;
+        if published {
+            self.trusted.replace(list);
+        }
+        Ok(published)
     }
 
     async fn step(&self, step: Step, api: &Client, s: &mut Stored) -> StepResult {
@@ -1182,10 +1292,12 @@ impl Manager {
                 if list.is_empty() {
                     return Err("Cloudflare returned no address ranges.".into());
                 }
-                instance::store(&self.pool, &instance::TRUSTED_PROXY_CIDRS, &list.join(","))
-                    .await
-                    .map_err(|_| "The server could not save the trusted proxies.".to_string())?;
-                self.trusted.replace(&list);
+                if !self.save_job_trusted(s, &list).await? {
+                    return Ok(Some(
+                        "Your access choice changed during setup. Its proxy settings were kept."
+                            .into(),
+                    ));
+                }
                 s.trusted_proxies_set = true;
                 save_stored(&self.pool, Some(s)).await?;
                 Ok(Some(match s.connection {
@@ -1216,12 +1328,14 @@ impl Manager {
             }
             Step::Health => {
                 let message = self.step_health(s).await?;
-                instance::store(&self.pool, &instance::PUBLIC_DOMAIN, &s.domain)
-                    .await
-                    .map_err(|_| "Could not save the domain.".to_string())?;
-                instance::store(&self.pool, &instance::ACCESS_MODE, "internet")
-                    .await
-                    .map_err(|_| "Could not save the access choice.".to_string())?;
+                let _one = self.issuing.lock().await;
+                store_access(
+                    &self.pool,
+                    "internet",
+                    Some(&s.domain),
+                    Some(&s.access_generation),
+                )
+                .await?;
                 Ok(message)
             }
 
@@ -1263,7 +1377,14 @@ impl Manager {
                 // The HTTPS retry waits (`retry_https`): it must not serve this
                 // certificate again while Cloudflare revokes it.
                 let _one = self.issuing.lock().await;
-                self.stop_https().await;
+                if current_access_generation(&self.pool)
+                    .await?
+                    .as_deref()
+                    .unwrap_or("")
+                    == s.access_generation
+                {
+                    self.stop_https().await;
+                }
                 if let Some(id) = s.certificate_id.clone() {
                     gone_ok(api.revoke_origin_certificate(&id).await)?;
                     s.certificate_id = None;
@@ -1310,12 +1431,7 @@ impl Manager {
             Step::ResetClientIp => {
                 if s.trusted_proxies_set {
                     if !self.trusted.is_pinned() {
-                        instance::store(&self.pool, &instance::TRUSTED_PROXY_CIDRS, "")
-                            .await
-                            .map_err(|_| {
-                                "The server could not save the trusted proxies.".to_string()
-                            })?;
-                        self.trusted.replace(&[]);
+                        self.save_job_trusted(s, &[]).await?;
                     }
                     s.trusted_proxies_set = false;
                 }
@@ -1473,6 +1589,13 @@ impl Manager {
             if let Some(old) = old {
                 revoked = gone_ok(api.revoke_origin_certificate(&old).await);
             }
+        }
+        let _one = self.issuing.lock().await;
+        let current = current_access_generation(&self.pool).await?;
+        if current.as_deref().unwrap_or("") != s.access_generation {
+            return Ok(Some(
+                "The certificate is saved for a later return to Cloudflare.".into(),
+            ));
         }
         self.start_https(ORIGIN_KEY_FILE, ORIGIN_CERT_FILE).await?;
         let serving = format!("Serving HTTPS on port {}.", self.opts.https_addr.port());
@@ -1865,38 +1988,114 @@ async fn detect_public_ip(trace_url: &str) -> Result<String, String> {
 /// Record the wizard's access choice (and the domain an owner set up by hand).
 /// Record the access choice. `domain` is the domain for `internet` (optional: set by
 /// Cloudflare setup otherwise) and the server's public address for `direct` (required).
+pub(super) const ACCESS_GENERATION: instance::Setting = instance::Setting {
+    key: "access_generation",
+    env: "",
+    default: "",
+};
+
+async fn current_access_generation(pool: &Database) -> Result<Option<String>, String> {
+    sqlx::query_scalar("SELECT value FROM instance_setting WHERE key=$1")
+        .bind(ACCESS_GENERATION.key)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            crate::db::record_read_database_error(&e);
+            "Could not read the access choice.".into()
+        })
+}
+
+async fn access_generation_matches(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    expected: &str,
+) -> sqlx::Result<bool> {
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT value FROM instance_setting WHERE key=$1")
+            .bind(ACCESS_GENERATION.key)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(current.as_deref().unwrap_or("") == expected)
+}
+
+pub(super) async fn lock_access(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> sqlx::Result<()> {
+    crate::locks::advisory(
+        tx,
+        &[crate::locks::AdvisoryKey::new(
+            crate::locks::KeyClass::InstanceSetting,
+            &["access"],
+        )],
+    )
+    .await
+}
+
 pub async fn set_access(pool: &Database, mode: &str, domain: Option<&str>) -> Result<(), String> {
+    store_access(pool, mode, domain, None).await.map(|_| ())
+}
+
+async fn store_access(
+    pool: &Database,
+    mode: &str,
+    domain: Option<&str>,
+    expected_generation: Option<&str>,
+) -> Result<bool, String> {
     if !matches!(mode, "local" | "internet" | "direct") {
         return Err("Access must be local, internet or direct.".into());
     }
     let given = domain.map(str::trim).filter(|d| !d.is_empty());
-    let store = |s, v: &str| {
-        let v = v.to_string();
-        async move { instance::store(pool, s, &v).await }
+    let values = if mode == "direct" {
+        vec![
+            (
+                &instance::PUBLIC_ADDRESS,
+                normalize_address(given.unwrap_or_default())?,
+            ),
+            (&instance::ACCESS_MODE, mode.to_owned()),
+        ]
+    } else {
+        let mut values = vec![(&instance::ACCESS_MODE, mode.to_owned())];
+        if mode == "internet" {
+            if let Some(domain) = given {
+                values.push((&instance::PUBLIC_DOMAIN, normalize_domain(domain)?));
+            }
+        }
+        values
     };
-    if mode == "direct" {
-        let address = normalize_address(given.unwrap_or_default())?;
-        store(&instance::PUBLIC_ADDRESS, &address)
-            .await
-            .map_err(|_| "Could not save the address.".to_string())?;
-        return store(&instance::ACCESS_MODE, mode)
-            .await
-            .map_err(|_| "Could not save the access choice.".to_string());
+    let result: anyhow::Result<bool> = async {
+        let mut tx = pool.begin().await?;
+        lock_access(&mut tx).await?;
+        #[cfg(test)]
+        if let Ok(points) = ACCESS_PUBLICATION_PAUSE.try_with(Clone::clone) {
+            points.hit("access-locked").await;
+        }
+        if let Some(expected) = expected_generation {
+            if !access_generation_matches(&mut tx, expected).await? {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+        } else {
+            instance::store(
+                &mut *tx,
+                &ACCESS_GENERATION,
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .await?;
+        }
+        for (setting, value) in &values {
+            instance::store(&mut *tx, setting, value).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
     }
-    let domain = match given {
-        Some(d) => normalize_domain(d)?,
-        None => String::new(),
-    };
-    store(&instance::ACCESS_MODE, mode)
-        .await
-        .map_err(|_| "Could not save the access choice.".to_string())?;
-    if mode == "internet" && !domain.is_empty() {
-        store(&instance::PUBLIC_DOMAIN, &domain)
-            .await
-            .map_err(|_| "Could not save the domain.".to_string())?;
-    }
-    Ok(())
+    .await;
+    result.map_err(|e| {
+        crate::db::observe_database_error(&e);
+        "Could not save the access choice.".to_string()
+    })
 }
+
+#[cfg(test)]
+tokio::task_local! { static ACCESS_PUBLICATION_PAUSE: crate::locks::pause_points::PausePoints; }
 
 /// Bind briefly unless our listener already holds the address. Unexpected OS errors
 /// use `unknown`: never claim a busy port or a permission problem without evidence.
@@ -1915,5 +2114,392 @@ fn port_error_state(kind: std::io::ErrorKind) -> &'static str {
         std::io::ErrorKind::AddrInUse => "in_use",
         std::io::ErrorKind::PermissionDenied => "denied",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod rest_phase4_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    async fn pool() -> Database {
+        let pool = crate::database::TestPoolOptions::new()
+            .max_connections(8)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+            .foreground();
+        sqlx::migrate!("./migrations_pg")
+            .run(pool.write())
+            .await
+            .unwrap();
+        pool
+    }
+
+    fn manager(pool: &Database) -> Arc<Manager> {
+        let opts = Options {
+            api_base: "http://127.0.0.1:9".into(),
+            download_base: "http://127.0.0.1:9".into(),
+            trace_url: "http://127.0.0.1:9".into(),
+            health_base: None,
+            cloudflared_bin: None,
+            search_path: Default::default(),
+            data_dir: std::env::temp_dir().join(format!("rest-cf-{}", uuid::Uuid::new_v4())),
+            origin_service: "http://127.0.0.1:9".into(),
+            listen: ([127, 0, 0, 1], 9).into(),
+            published_port: 9,
+            https_addr: ([127, 0, 0, 1], 443).into(),
+            acme_addr: ([127, 0, 0, 1], 9).into(),
+            acme_directory: "http://127.0.0.1:9".into(),
+            acme_ca_file: None,
+            renew_check: Duration::from_secs(3600),
+            https_retry: Duration::from_secs(60),
+            health_attempts: 1,
+            health_delay: Duration::ZERO,
+            connector_timeout: Duration::from_secs(1),
+        };
+        Arc::new(Manager::new(
+            pool.clone(),
+            opts,
+            Arc::new(crate::TrustedProxies::for_tests(vec![], false)),
+        ))
+    }
+
+    #[tokio::test]
+    async fn foreground_access_changes_and_completed_removal_share_one_guard() {
+        for remove in [false, true] {
+            let pool = pool().await;
+            instance::store(&pool, &ACCESS_GENERATION, "claim")
+                .await
+                .unwrap();
+            let points = crate::locks::pause_points::PausePoints::default();
+            let armed = points.arm("access-locked");
+            let a = pool.clone();
+            let first = tokio::spawn(ACCESS_PUBLICATION_PAUSE.scope(points, async move {
+                if remove {
+                    save_completed(
+                        &a,
+                        JobKind::Remove,
+                        &Stored {
+                            access_generation: "claim".into(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    set_access(&a, "internet", Some("first.example")).await
+                }
+            }));
+            tokio::time::timeout(Duration::from_secs(30), armed.reached())
+                .await
+                .unwrap();
+            let a = pool.clone();
+            let second =
+                tokio::spawn(
+                    async move { set_access(&a, "internet", Some("second.example")).await },
+                );
+            crate::cover::wait_for_writer_lock(&pool).await;
+            armed.release();
+            first.await.unwrap().unwrap();
+            second.await.unwrap().unwrap();
+            assert_eq!(
+                instance::resolve(&pool, &instance::ACCESS_MODE).await.value,
+                "internet"
+            );
+            assert_eq!(
+                instance::resolve(&pool, &instance::PUBLIC_DOMAIN)
+                    .await
+                    .value,
+                "second.example"
+            );
+            if remove {
+                assert!(instance::resolve(&pool, &instance::CLOUDFLARE_STATE)
+                    .await
+                    .value
+                    .is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_cloudflare_job_cannot_publish_over_a_new_access_choice() {
+        let pool = pool().await;
+        instance::store(&pool, &ACCESS_GENERATION, "old-job")
+            .await
+            .unwrap();
+        let points = crate::locks::pause_points::PausePoints::default();
+        let armed = points.arm("access-locked");
+        let a = pool.clone();
+        let first = tokio::spawn(ACCESS_PUBLICATION_PAUSE.scope(points, async move {
+            set_access(&a, "direct", Some("203.0.113.5:8080")).await
+        }));
+        tokio::time::timeout(Duration::from_secs(30), armed.reached())
+            .await
+            .unwrap();
+        let a = pool.clone();
+        let second = tokio::spawn(async move {
+            store_access(&a, "internet", Some("old.example"), Some("old-job")).await
+        });
+        crate::cover::wait_for_writer_lock(&pool).await;
+        armed.release();
+        first.await.unwrap().unwrap();
+        assert!(!second.await.unwrap().unwrap());
+        let manager = manager(&pool);
+        assert!(!manager
+            .save_job_trusted(
+                &Stored {
+                    access_generation: "old-job".into(),
+                    ..Default::default()
+                },
+                &["127.0.0.1/32".into()]
+            )
+            .await
+            .unwrap());
+        assert!(manager.trusted.raw().is_empty());
+        assert!(!save_completed(
+            &pool,
+            JobKind::Remove,
+            &Stored {
+                access_generation: "old-job".into(),
+                ..Default::default()
+            }
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            instance::resolve(&pool, &instance::ACCESS_MODE).await.value,
+            "direct"
+        );
+        assert_eq!(
+            instance::resolve(&pool, &instance::PUBLIC_ADDRESS)
+                .await
+                .value,
+            "http://203.0.113.5:8080"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_rechecks_the_tls_conflict_after_waiting_for_access_publication() {
+        let pool = pool().await;
+        let manager = manager(&pool);
+        let mut first = pool.begin().await.unwrap();
+        lock_access(&mut first).await.unwrap();
+        instance::store(&mut *first, &instance::DIRECT_TLS_HOST, "203.0.113.5")
+            .await
+            .unwrap();
+        let second = tokio::spawn(async move {
+            manager
+                .start_setup(CloudflareSetupInput {
+                    token: "test-api-token-0123456789".into(),
+                    domain: "second.example".into(),
+                    connection: Connection::PublicIp,
+                    public_ip: Some("203.0.113.6".into()),
+                })
+                .await
+        });
+        crate::cover::wait_for_writer_lock(&pool).await;
+        first.commit().await.unwrap();
+        let error = second.await.unwrap().unwrap_err();
+        assert!(
+            error.contains("serves HTTPS at its own address"),
+            "unexpected result: {error}"
+        );
+        assert!(load_stored(&pool).await.is_none());
+    }
+
+    fn fresh_test_certificate(host: &str) -> (Vec<u8>, String) {
+        use ring::{
+            rand::SystemRandom,
+            signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING},
+        };
+        fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+            let mut bytes = vec![tag];
+            if content.len() < 128 {
+                bytes.push(content.len() as u8);
+            } else {
+                let length = content.len().to_be_bytes();
+                let first = length.iter().position(|b| *b != 0).unwrap();
+                bytes.push(0x80 | (length.len() - first) as u8);
+                bytes.extend_from_slice(&length[first..]);
+            }
+            bytes.extend_from_slice(content);
+            bytes
+        }
+        fn seq(parts: &[&[u8]]) -> Vec<u8> {
+            tlv(0x30, &parts.concat())
+        }
+        let pkcs8 = origin_tls::generate_key().unwrap();
+        let key = EcdsaKeyPair::from_pkcs8(
+            &ECDSA_P256_SHA256_ASN1_SIGNING,
+            &pkcs8,
+            &SystemRandom::new(),
+        )
+        .unwrap();
+        let now = chrono::Utc::now();
+        let from = (now - chrono::Duration::hours(1))
+            .format("%y%m%d%H%M%SZ")
+            .to_string();
+        let until = (now + chrono::Duration::days(6))
+            .format("%y%m%d%H%M%SZ")
+            .to_string();
+        let name = origin_tls::der_name(host);
+        let validity = seq(&[&tlv(0x17, from.as_bytes()), &tlv(0x17, until.as_bytes())]);
+        let spki = origin_tls::der_spki(key.public_key().as_ref());
+        let san = origin_tls::der_san_ip_extension(host.parse().unwrap());
+        let algorithm = origin_tls::der_ecdsa_sha256();
+        let tbs = seq(&[
+            &tlv(0xA0, &[0x02, 0x01, 0x02]),
+            &[0x02, 0x01, 0x01],
+            &algorithm,
+            &name,
+            &validity,
+            &name,
+            &spki,
+            &tlv(0xA3, &seq(&[&san])),
+        ]);
+        let signature = key.sign(&SystemRandom::new(), &tbs).unwrap();
+        let cert = seq(&[
+            &tbs,
+            &algorithm,
+            &origin_tls::der_bit_string(signature.as_ref()),
+        ]);
+        (pkcs8, origin_tls::pem("CERTIFICATE", &cert))
+    }
+
+    #[tokio::test]
+    async fn direct_tls_enable_rechecks_the_committed_https_proof_under_the_access_guard() {
+        let pool = pool().await;
+        let mut manager = manager(&pool);
+        let options = &mut Arc::get_mut(&mut manager).unwrap().opts;
+        options.https_addr.set_port(0);
+        options.acme_addr.set_port(0);
+        let dir = manager.opts.data_dir.clone();
+        std::fs::create_dir_all(&dir).unwrap();
+        let (key, cert) = fresh_test_certificate("127.0.0.1");
+        std::fs::write(dir.join(direct::DIRECT_KEY_FILE), key).unwrap();
+        std::fs::write(dir.join(direct::DIRECT_CERT_FILE), cert).unwrap();
+        manager.set_router(
+            axum::Router::new().route("/health", axum::routing::get(|| async { "ok" })),
+        );
+        instance::store(&pool, &instance::DIRECT_TLS_HOST, "127.0.0.1")
+            .await
+            .unwrap();
+        instance::store(&pool, &instance::ACCESS_MODE, "direct")
+            .await
+            .unwrap();
+        instance::store(&pool, &instance::DIRECT_HTTPS_SEEN, "")
+            .await
+            .unwrap();
+        let mut first = pool.begin().await.unwrap();
+        lock_access(&mut first).await.unwrap();
+        instance::store(&mut *first, &instance::DIRECT_HTTPS_SEEN, "1")
+            .await
+            .unwrap();
+        let a = manager.clone();
+        let second =
+            tokio::spawn(async move { a.set_access("direct", Some("127.0.0.1"), true).await });
+        crate::cover::wait_for_writer_lock(&pool).await;
+        first.commit().await.unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(
+            instance::resolve(&pool, &instance::DIRECT_HTTPS_SEEN)
+                .await
+                .value,
+            "1"
+        );
+        assert_eq!(
+            instance::resolve(&pool, &instance::DIRECT_TLS_HOST)
+                .await
+                .value,
+            "127.0.0.1"
+        );
+        assert_eq!(
+            instance::resolve(&pool, &instance::ACCESS_MODE).await.value,
+            "direct"
+        );
+        assert!(!instance::resolve(&pool, &direct::DIRECT_TLS_GENERATION)
+            .await
+            .value
+            .is_empty());
+        assert!(manager.https_seen.load(Ordering::Relaxed));
+        manager.stop_direct_tasks().await;
+        manager.stop_https().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_old_https_proof_cannot_survive_a_disable_and_same_address_reset() {
+        let pool = pool().await;
+        let manager = manager(&pool);
+        instance::store(&pool, &instance::DIRECT_TLS_HOST, "203.0.113.5")
+            .await
+            .unwrap();
+        instance::store(&pool, &direct::DIRECT_TLS_GENERATION, "old")
+            .await
+            .unwrap();
+        *manager.direct_generation.write().unwrap() = "old".into();
+        *manager.direct_origin.write().unwrap() = Some("https://203.0.113.5".into());
+        let router = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                manager.clone(),
+                plain_http_guard,
+            ));
+        let points = crate::locks::pause_points::PausePoints::default();
+        let armed = points.arm("tls-seen-before-publish");
+        let (sent, mut results) = tokio::sync::mpsc::unbounded_channel();
+        let mut request = axum::http::Request::builder()
+            .uri("/")
+            .header("host", "203.0.113.5")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(origin_tls::OverTls);
+        let response = direct::TLS_SEEN_RESULTS
+            .scope(
+                sent,
+                direct::TLS_SEEN_PAUSE.scope(points, router.oneshot(request)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(30), armed.reached())
+            .await
+            .unwrap();
+        {
+            let _one = manager.issuing.lock().await;
+            manager.disable_direct_tls().await;
+        }
+        assert!(instance::resolve(&pool, &instance::DIRECT_TLS_HOST)
+            .await
+            .value
+            .is_empty());
+        let new_generation = manager.direct_generation.read().unwrap().clone();
+        assert_ne!(new_generation, "old");
+        // Model a later committed enable at the exact same address. The delayed
+        // request is from the previous generation even though its origin is equal.
+        let mut second = pool.begin().await.unwrap();
+        lock_access(&mut second).await.unwrap();
+        instance::store(&mut *second, &instance::DIRECT_TLS_HOST, "203.0.113.5")
+            .await
+            .unwrap();
+        instance::store(&mut *second, &instance::DIRECT_HTTPS_SEEN, "")
+            .await
+            .unwrap();
+        second.commit().await.unwrap();
+        *manager.direct_origin.write().unwrap() = Some("https://203.0.113.5".into());
+        armed.release();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), results.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            Ok(false)
+        );
+        assert!(instance::resolve(&pool, &instance::DIRECT_HTTPS_SEEN)
+            .await
+            .value
+            .is_empty());
+        assert!(!manager.https_seen.load(Ordering::Relaxed));
     }
 }

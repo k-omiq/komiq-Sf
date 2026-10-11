@@ -58,6 +58,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::database::SqliteDatabase;
 use crate::db::Database;
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -141,8 +142,8 @@ fn is_uuid(s: &str) -> bool {
 /// rather than hardcoded, so a language source added upstream is excluded the day it is
 /// recorded.
 pub async fn all_mangadex_source_ids(pool: &Database) -> Result<Vec<String>> {
-    let ids = sqlx::query_scalar::<_, String>(
-        "SELECT source_id FROM source_extension WHERE pkg_name = ? ORDER BY source_id",
+    let ids = crate::db_types::query_scalar::<String>(
+        "SELECT source_id FROM source_extension WHERE pkg_name = $1 ORDER BY source_id",
     )
     .bind(ALL_MANGADEX_PKG)
     .fetch_all(pool)
@@ -211,9 +212,9 @@ pub async fn record_uuids(
     let sql = format!(
         "SELECT id, work_id, source_key FROM source_series \
          WHERE source_type = 'suwayomi' AND source_id IN ({}) ORDER BY id",
-        placeholders(ids.len())
+        crate::sql_params::placeholders(1, ids.len())
     );
-    let mut q = sqlx::query_as::<_, (String, String, String)>(&sql);
+    let mut q = crate::db_types::query_tuple::<(String, String, String)>(&sql);
     for id in &ids {
         q = q.bind(id);
     }
@@ -224,7 +225,7 @@ pub async fn record_uuids(
         rows: rows.len() as u64,
         ..Default::default()
     };
-    for (ss_id, work_id, key) in rows {
+    for (ss_id, _work_id, key) in rows {
         let Some(uuid) = uuid_by_suwayomi_key
             .get(&key)
             .and_then(|u| uuid_from_manga_url(u))
@@ -232,42 +233,47 @@ pub async fn record_uuids(
             report.unresolved.push(ss_id);
             continue;
         };
-        let existing: Option<String> = sqlx::query_scalar(
-            "SELECT mangadex_uuid FROM all_mangadex_uuid WHERE source_series_id = ?",
-        )
-        .bind(&ss_id)
-        .fetch_optional(pool)
-        .await?;
-        if let Some(prev) = existing {
-            if prev != uuid {
-                report.conflicts.push((ss_id.clone(), prev, uuid.clone()));
-                continue;
-            }
-        }
-        report.resolved += 1;
         if !apply.is_yes() {
+            let previous: Option<String> = crate::db_types::query_scalar(
+                "SELECT mangadex_uuid FROM all_mangadex_uuid WHERE source_series_id = $1",
+            )
+            .bind(&ss_id)
+            .fetch_optional(pool)
+            .await?;
+            if let Some(previous) = previous.filter(|previous| previous != &uuid) {
+                report.conflicts.push((ss_id, previous, uuid));
+            } else {
+                report.resolved += 1;
+            }
             continue;
         }
-        sqlx::query(
-            "INSERT INTO all_mangadex_uuid \
-                 (source_series_id, work_id, suwayomi_key, mangadex_uuid, resolved_at) \
-             VALUES (?, ?, ?, ?, ?) \
-             ON CONFLICT(source_series_id) DO UPDATE SET \
-                 work_id = excluded.work_id, resolved_at = excluded.resolved_at",
-        )
-        .bind(&ss_id)
-        .bind(&work_id)
-        .bind(&key)
-        .bind(&uuid)
-        .bind(&now)
-        .execute(pool)
-        .await?;
-        // The row's own designated column, for as long as the row exists.
-        sqlx::query("UPDATE source_series SET source_url = ? WHERE id = ?")
-            .bind(format!("/manga/{uuid}"))
-            .bind(&ss_id)
-            .execute(pool)
-            .await?;
+        let conflict = crate::db::retry_transaction(|| async {
+            let mut tx = pool.begin().await?;
+            lock_proof_inputs(&mut tx, &ss_id, false).await?;
+            let owner: Option<(String, String)> = sqlx::query_as("SELECT work_id, source_key FROM source_series WHERE id = $1")
+                .bind(&ss_id).fetch_optional(&mut *tx).await?;
+            let Some((work_id, current_key)) = owner else { return Err(crate::locks::RestartTransaction.into()); };
+            if current_key != key { return Err(crate::locks::RestartTransaction.into()); }
+            let previous: Option<String> = crate::db_types::query_scalar("SELECT mangadex_uuid FROM all_mangadex_uuid WHERE source_series_id = $1")
+                .bind(&ss_id).fetch_optional(&mut *tx).await?;
+            if let Some(previous) = previous.filter(|previous| previous != &uuid) {
+                tx.commit().await?;
+                return Ok(Some(previous));
+            }
+            crate::catalog::guards::held().await;
+            sqlx::query("INSERT INTO all_mangadex_uuid (source_series_id, work_id, suwayomi_key, mangadex_uuid, resolved_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(source_series_id) DO UPDATE SET work_id = excluded.work_id, resolved_at = excluded.resolved_at")
+                .bind(&ss_id).bind(&work_id).bind(&key).bind(crate::db_types::uuid(&uuid)?).bind(crate::db_types::date(&now)?)
+                .execute(&mut *tx).await?;
+            sqlx::query("UPDATE source_series SET source_url = $1 WHERE id = $2")
+                .bind(format!("/manga/{uuid}")).bind(&ss_id).execute(&mut *tx).await?;
+            tx.commit().await?;
+            Ok(None)
+        }).await?;
+        if let Some(previous) = conflict {
+            report.conflicts.push((ss_id, previous, uuid));
+        } else {
+            report.resolved += 1;
+        }
     }
     Ok(report)
 }
@@ -416,7 +422,28 @@ impl ClassifiedRow {
 /// must appear as [`Verdict::Unresolved`] rather than vanish from the report. A row that
 /// is missing from the classification is a row nobody proved anything about.
 pub async fn classify(pool: &Database) -> Result<Vec<ClassifiedRow>> {
-    let ids = all_mangadex_source_ids(pool).await?;
+    let mut conn = pool.acquire().await?;
+    classify_on(&mut conn, None).await
+}
+
+async fn classify_on(
+    conn: &mut sqlx::PgConnection,
+    source: Option<&str>,
+) -> Result<Vec<ClassifiedRow>> {
+    classify_scope_on(conn, source, None).await
+}
+
+async fn classify_scope_on(
+    conn: &mut sqlx::PgConnection,
+    source: Option<&str>,
+    work: Option<&str>,
+) -> Result<Vec<ClassifiedRow>> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT source_id FROM source_extension WHERE pkg_name = $1 ORDER BY source_id",
+    )
+    .bind(ALL_MANGADEX_PKG)
+    .fetch_all(&mut *conn)
+    .await?;
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -440,25 +467,32 @@ pub async fn classify(pool: &Database) -> Result<Vec<ClassifiedRow>> {
                   WHERE a.source_type = 'mangadex' AND {same_work}) AS anchors, \
                 EXISTS (SELECT 1 FROM source_series a \
                          WHERE a.source_type = 'mangadex' \
-                           AND a.source_key = u.mangadex_uuid AND {same_work}) AS matches, \
+                           AND a.source_key = u.mangadex_uuid::text AND {same_work}) AS matches, \
                 (SELECT {ro} FROM source_series o \
-                  WHERE o.source_type = 'mangadex' AND o.source_key = u.mangadex_uuid \
+                  WHERE o.source_type = 'mangadex' AND o.source_key = u.mangadex_uuid::text \
                   LIMIT 1) AS uuid_owner, \
                 (SELECT COUNT(*) FROM chapter c WHERE c.source_series_id = s.id) AS chapters, \
                 u.disposition \
            FROM source_series s \
            LEFT JOIN all_mangadex_uuid u ON u.source_series_id = s.id \
           WHERE s.source_type = 'suwayomi' AND s.source_id IN ({}) \
-          ORDER BY s.id",
-        placeholders(ids.len())
+          {} ORDER BY s.id",
+        crate::sql_params::placeholders(1, ids.len()),
+        if source.is_some() {
+            format!("AND s.id = ${}", ids.len() + 1)
+        } else if work.is_some() {
+            format!("AND s.work_id = ${}", ids.len() + 1)
+        } else {
+            String::new()
+        }
     );
     type Row = (
         String,
         String,
         String,
-        Option<String>,
+        Option<uuid::Uuid>,
         i64,
-        i64,
+        bool,
         Option<String>,
         i64,
         Option<String>,
@@ -467,7 +501,10 @@ pub async fn classify(pool: &Database) -> Result<Vec<ClassifiedRow>> {
     for id in &ids {
         q = q.bind(id);
     }
-    let rows = q.fetch_all(pool).await?;
+    if let Some(scope) = source.or(work) {
+        q = q.bind(scope);
+    }
+    let rows = q.fetch_all(&mut *conn).await?;
     Ok(rows
         .into_iter()
         .map(
@@ -476,9 +513,9 @@ pub async fn classify(pool: &Database) -> Result<Vec<ClassifiedRow>> {
                     source_series_id: id,
                     work_id,
                     suwayomi_key: key,
-                    mangadex_uuid: uuid,
+                    mangadex_uuid: uuid.map(|id| id.to_string()),
                     anchor_count: anchors,
-                    uuid_matches_anchor: matches != 0,
+                    uuid_matches_anchor: matches,
                     uuid_owner_work: owner,
                     chapters,
                     disposition,
@@ -570,6 +607,10 @@ impl GateReport {
 /// entry, and deleting them cascades 4,178 chapters.
 pub async fn gate(pool: &Database) -> Result<GateReport> {
     let rows = classify(pool).await?;
+    Ok(gate_rows(rows))
+}
+
+fn gate_rows(rows: Vec<ClassifiedRow>) -> GateReport {
     let mut report = GateReport::default();
     for r in rows {
         let verdict = r.verdict();
@@ -587,7 +628,7 @@ pub async fn gate(pool: &Database) -> Result<GateReport> {
             });
         }
     }
-    Ok(report)
+    report
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +682,7 @@ pub struct StepReport {
 /// steps resolves all 496 without either one having to guess.
 pub async fn merge_anchorless(
     pool: &Database,
-    covers: Option<&Database>,
+    covers: Option<&SqliteDatabase>,
     apply: Apply,
 ) -> Result<StepReport> {
     let rows = classify(pool).await?;
@@ -686,29 +727,60 @@ pub async fn merge_anchorless(
         if !apply.is_yes() {
             continue;
         }
-        crate::catalog::merge_works_ex(pool, covers, &work, &target)
-            .await
-            .with_context(|| format!("merge {work} -> {target}"))?;
-        let now = Utc::now().to_rfc3339();
-        for c in &candidates {
-            sqlx::query(
-                "UPDATE all_mangadex_uuid \
-                    SET disposition = 'merged', disposed_at = ?, prev_work_id = ?, work_id = ? \
-                  WHERE source_series_id = ?",
-            )
-            .bind(&now)
-            .bind(&work)
-            .bind(&target)
-            .bind(&c.source_series_id)
-            .execute(pool)
-            .await?;
+        crate::db::retry_transaction(|| async {
+            let mut tx = pool.begin().await?;
+            crate::catalog::lock_merge_inputs(&mut tx, &work, &target).await?;
+            let current = classify_scope_on(&mut tx, None, Some(&work)).await?;
+            let mut eligible: Vec<_> = current
+                .into_iter()
+                .filter(|row| row.work_id == work)
+                .collect();
+            eligible.sort_by(|a, b| {
+                b.chapters
+                    .cmp(&a.chapters)
+                    .then_with(|| a.source_series_id.cmp(&b.source_series_id))
+            });
+            if eligible.first().is_none_or(|row| {
+                row.verdict() != Verdict::Anchorless
+                    || row.uuid_owner_work.as_deref() != Some(target.as_str())
+                    || row.source_series_id != winner.source_series_id
+            }) {
+                anyhow::bail!(
+                    "source changed under anchorless merge proof — reload classification"
+                );
+            }
+            crate::catalog::merge_works_on(&mut tx, &work, &target, None, None).await?;
+            let now = Utc::now().to_rfc3339();
+            for c in &eligible {
+                sqlx::query(
+                    "UPDATE all_mangadex_uuid \
+                    SET disposition = 'merged', disposed_at = $1, prev_work_id = $2, work_id = $3 \
+                  WHERE source_series_id = $4",
+                )
+                .bind(crate::db_types::date(&now)?)
+                .bind(&work)
+                .bind(&target)
+                .bind(&c.source_series_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        })
+        .await
+        .with_context(|| format!("merge {work} -> {target}"))?;
+        if let Some(covers) = covers {
+            if let Err(error) = crate::catalog::reclaim_cover_blob(covers, &work).await {
+                crate::db::observe_database_error(&error);
+                tracing::warn!(%error, work, "phase-f: cover reclaim failed");
+            }
         }
     }
     // NOT re-projected per merge, deliberately. `feed_series_updates` and
     // `browse_catalogue` are DERIVED caches: the loser's rows cascade off the deleted
     // work and the survivor's are rebuilt by the periodic refresh — which is exactly
     // what the admin `mergeWorks` mutation relies on today (it calls `merge_works_ex`
-    // and re-projects nothing). Calling `project_feed_from_ledger_for_work` per work
+    // and re-projects nothing). Projecting the feed from the ledger for each work
     // instead costs a full `ledger::is_complete` sweep per call, whose production memo
     // is `#[cfg(not(test))]` (§8h caveat (c)). Measured on a 2.3 GB snapshot copy: with
     // the per-work projection this step made no measurable progress in 90 s; without it
@@ -788,8 +860,16 @@ pub async fn split_mismatched(pool: &Database, apply: Apply) -> Result<StepRepor
         if !apply.is_yes() {
             continue;
         }
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("UPDATE source_series SET work_id = ? WHERE id = ?")
+        crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin_with("BEGIN").await?;
+        lock_proof_inputs(&mut tx, &r.source_series_id, false).await?;
+        let current = classify_on(&mut tx, Some(&r.source_series_id)).await?;
+        let current = current.first().ok_or_else(|| anyhow::anyhow!("source disappeared under split proof"))?;
+        if current.verdict() != Verdict::Mismatch || current.work_id != r.work_id || current.uuid_owner_work.as_deref() != Some(target.as_str()) {
+            anyhow::bail!("source changed under split proof — reload classification");
+        }
+        crate::catalog::guards::held().await;
+        sqlx::query("UPDATE source_series SET work_id = $1 WHERE id = $2")
             .bind(&target)
             .bind(&r.source_series_id)
             .execute(&mut *tx)
@@ -798,15 +878,15 @@ pub async fn split_mismatched(pool: &Database, apply: Apply) -> Result<StepRepor
         // then delete: if the target already knows the chapter key, its own (possibly
         // earlier) first_seen_at wins, which is the ledger's rule everywhere else.
         sqlx::query(
-            "INSERT OR IGNORE INTO release_event \
+            "INSERT INTO release_event \
                  (work_id, chapter_key, first_seen_at, first_source_series_id, label, announce_at) \
-             SELECT ?, e.chapter_key, e.first_seen_at, e.first_source_series_id, e.label, \
+             SELECT $1, e.chapter_key, e.first_seen_at, e.first_source_series_id, e.label, \
                     e.announce_at \
                FROM release_event e \
-              WHERE e.work_id = ? AND e.first_source_series_id = ? \
+              WHERE e.work_id = $2 AND e.first_source_series_id = $3 \
                 AND NOT EXISTS (SELECT 1 FROM chapter c \
                                   JOIN source_series s ON s.id = c.source_series_id \
-                                 WHERE s.work_id = ? AND c.chapter_key = e.chapter_key)",
+                                 WHERE s.work_id = $4 AND c.chapter_key = e.chapter_key) ON CONFLICT DO NOTHING",
         )
         .bind(&target)
         .bind(&r.work_id)
@@ -816,10 +896,10 @@ pub async fn split_mismatched(pool: &Database, apply: Apply) -> Result<StepRepor
         .await?;
         sqlx::query(
             "DELETE FROM release_event \
-              WHERE work_id = ? AND first_source_series_id = ? \
+              WHERE work_id = $1 AND first_source_series_id = $2 \
                 AND NOT EXISTS (SELECT 1 FROM chapter c \
                                   JOIN source_series s ON s.id = c.source_series_id \
-                                 WHERE s.work_id = ? AND c.chapter_key = release_event.chapter_key)",
+                                 WHERE s.work_id = $3 AND c.chapter_key = release_event.chapter_key)",
         )
         .bind(&r.work_id)
         .bind(&r.source_series_id)
@@ -828,16 +908,18 @@ pub async fn split_mismatched(pool: &Database, apply: Apply) -> Result<StepRepor
         .await?;
         sqlx::query(
             "UPDATE all_mangadex_uuid \
-                SET disposition = 'split', disposed_at = ?, prev_work_id = ?, work_id = ? \
-              WHERE source_series_id = ?",
+                SET disposition = 'split', disposed_at = $1, prev_work_id = $2, work_id = $3 \
+              WHERE source_series_id = $4",
         )
-        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now())
         .bind(&r.work_id)
         .bind(&target)
         .bind(&r.source_series_id)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        Ok(())
+        }).await?;
     }
     // Same as the merge step: the two derived caches are left to the periodic rebuild
     // rather than re-projected per row. See `merge_anchorless`.
@@ -896,6 +978,65 @@ pub struct DeleteReport {
 /// home/discovery serves `/api/v1/manga/{id}/thumbnail` out of `suwayomi_cover_blob`,
 /// not `/covers/`), and removing the series from Suwayomi's own library is the owner's
 /// separate, engine-side step.
+type ProofInput = (String, String, Option<String>, String, Option<uuid::Uuid>);
+
+async fn proof_input(conn: &mut sqlx::PgConnection, source: &str) -> Result<Option<ProofInput>> {
+    Ok(sqlx::query_as(
+        "SELECT s.work_id, s.source_type, s.source_id, s.source_key, u.mangadex_uuid \
+         FROM source_series s LEFT JOIN all_mangadex_uuid u ON u.source_series_id = s.id WHERE s.id = $1",
+    ).bind(source).fetch_optional(conn).await?)
+}
+
+async fn lock_proof_inputs(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    source: &str,
+    deleting: bool,
+) -> Result<()> {
+    let before = proof_input(tx, source).await?;
+    let Some((owner, kind, sid, key, uuid)) = &before else {
+        anyhow::bail!("source disappeared under proof");
+    };
+    let mut keys = crate::catalog::guards::source_keys(kind, sid.as_deref().unwrap_or(""), key);
+    if let Some(uuid) = uuid {
+        let uuid = uuid.to_string();
+        keys.extend(crate::catalog::guards::source_keys(
+            "mangadex", "mangadex", &uuid,
+        ));
+        keys.push(crate::locks::AdvisoryKey::external_identity(
+            "mangadex", &uuid,
+        ));
+    }
+    crate::locks::advisory(tx, &keys).await?;
+    let anchors: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, work_id FROM source_series WHERE source_type = 'mangadex' AND source_key = $1 ORDER BY id",
+    ).bind(uuid.map(|id| id.to_string())).fetch_all(&mut **tx).await?;
+    let mut works = vec![owner.clone()];
+    works.extend(anchors.iter().map(|(_, work)| work.clone()));
+    crate::locks::lock_works(tx, &works).await?;
+    let mut sources = vec![source.to_owned()];
+    sources.extend(anchors.iter().map(|(id, _)| id.clone()));
+    sources.sort();
+    sources.dedup();
+    for id in sources {
+        let sql = if deleting && id == source {
+            "SELECT id FROM source_series WHERE id = $1 FOR UPDATE"
+        } else {
+            "SELECT id FROM source_series WHERE id = $1 FOR NO KEY UPDATE"
+        };
+        sqlx::query(sql).bind(id).fetch_optional(&mut **tx).await?;
+    }
+    if proof_input(tx, source).await? != before {
+        return Err(crate::locks::RestartTransaction.into());
+    }
+    let current: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, work_id FROM source_series WHERE source_type = 'mangadex' AND source_key = $1 ORDER BY id",
+    ).bind(uuid.map(|id| id.to_string())).fetch_all(&mut **tx).await?;
+    if current != anchors {
+        return Err(crate::locks::RestartTransaction.into());
+    }
+    Ok(())
+}
+
 pub async fn delete_redundant(
     pool: &Database,
     apply: Apply,
@@ -925,9 +1066,10 @@ pub async fn delete_redundant(
     // dry run reports the number that actually matters (74% of the scheduler's table).
     // One query over ~14k rows, intersected in memory, rather than 10k bound parameters.
     let keys: HashSet<&str> = targets.iter().map(|r| r.suwayomi_key.as_str()).collect();
-    let scheduled: Vec<String> = sqlx::query_scalar("SELECT series_id FROM series_scan_state")
-        .fetch_all(pool)
-        .await?;
+    let scheduled: Vec<String> =
+        crate::db_types::query_scalar("SELECT series_id FROM series_scan_state")
+            .fetch_all(pool)
+            .await?;
     report.scan_states = scheduled
         .iter()
         .filter(|s| keys.contains(s.as_str()))
@@ -945,34 +1087,70 @@ pub async fn delete_redundant(
     let now = Utc::now().to_rfc3339();
     report.scan_states = 0; // re-counted from what the writes actually removed
     for r in targets {
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("DELETE FROM source_series WHERE id = ?")
+        #[cfg(test)]
+        crate::catalog::guards::pause("delete-discovered").await;
+        let n = crate::db::retry_transaction(|| async {
+            let mut tx = pool.begin_with("BEGIN").await?;
+            lock_proof_inputs(&mut tx, &r.source_series_id, true).await?;
+            let current = classify_on(&mut tx, Some(&r.source_series_id)).await?;
+            let current = current
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("source disappeared under deletion proof"))?;
+            if current.verdict() != Verdict::Redundant
+                || (current.disposition.as_deref() == Some("split") && !include_split)
+            {
+                anyhow::bail!("source changed under deletion proof — refusing to delete");
+            }
+            // UUID agreement alone cannot justify cascading a uniquely held chapter.
+            let unique: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM chapter c WHERE c.source_series_id = $1 AND \
+             (c.chapter_key IS NULL OR NOT EXISTS(SELECT 1 FROM chapter mirror \
+                JOIN source_series anchor ON anchor.id = mirror.source_series_id \
+                WHERE anchor.source_type = 'mangadex' AND anchor.work_id = $2 \
+                  AND anchor.source_key = $3 AND mirror.chapter_key = c.chapter_key)))",
+            )
+            .bind(&current.source_series_id)
+            .bind(&current.work_id)
+            .bind(&current.mangadex_uuid)
+            .fetch_one(&mut *tx)
+            .await?;
+            if unique {
+                anyhow::bail!(
+                    "chapter parity failed for {} — refusing to delete",
+                    current.source_series_id
+                );
+            }
+            crate::catalog::guards::held().await;
+            sqlx::query("DELETE FROM source_series WHERE id = $1")
+                .bind(&r.source_series_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "UPDATE all_mangadex_uuid SET disposition = 'deleted', disposed_at = $1 \
+              WHERE source_series_id = $2",
+            )
+            .bind(crate::db_types::date(&now)?)
             .bind(&r.source_series_id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query(
-            "UPDATE all_mangadex_uuid SET disposition = 'deleted', disposed_at = ? \
-              WHERE source_series_id = ?",
-        )
-        .bind(&now)
-        .bind(&r.source_series_id)
-        .execute(&mut *tx)
-        .await?;
-        // …and the schedule that would otherwise keep scanning it (see above). The
-        // NOT EXISTS is what makes this safe for a Suwayomi key some other row still
-        // claims — impossible today (a manga id belongs to one source), cheap insurance.
-        let n = sqlx::query(
-            "DELETE FROM series_scan_state \
-              WHERE series_id = ? \
+            // …and the schedule that would otherwise keep scanning it (see above). The
+            // NOT EXISTS is what makes this safe for a Suwayomi key some other row still
+            // claims — impossible today (a manga id belongs to one source), cheap insurance.
+            let n = sqlx::query(
+                "DELETE FROM series_scan_state \
+              WHERE series_id = $1 \
                 AND NOT EXISTS (SELECT 1 FROM source_series s \
-                                 WHERE s.source_type = 'suwayomi' AND s.source_key = ?)",
-        )
-        .bind(&r.suwayomi_key)
-        .bind(&r.suwayomi_key)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        tx.commit().await?;
+                                 WHERE s.source_type = 'suwayomi' AND s.source_key = $2)",
+            )
+            .bind(&r.suwayomi_key)
+            .bind(&r.suwayomi_key)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            tx.commit().await?;
+            Ok(n)
+        })
+        .await?;
         report.deleted += 1;
         report.scan_states += n;
     }
@@ -993,7 +1171,7 @@ pub async fn delete_redundant(
 ///   * `delete`  — the destructive step; needs `--apply --confirm <token>`.
 pub async fn run_cli(
     pool: &Database,
-    covers: Option<&Database>,
+    covers: Option<&SqliteDatabase>,
     suwayomi_url: &str,
     args: &[String],
 ) -> Result<()> {
@@ -1044,9 +1222,9 @@ pub async fn run_cli(
                 "SELECT source_id, COUNT(*) FROM source_series \
                   WHERE source_type = 'suwayomi' AND source_id IN ({}) \
                   GROUP BY source_id ORDER BY 2 DESC",
-                placeholders(source_ids.len())
+                crate::sql_params::placeholders(1, source_ids.len())
             );
-            let mut q = sqlx::query_as::<_, (String, i64)>(&sql);
+            let mut q = crate::db_types::query_tuple::<(String, i64)>(&sql);
             for id in &source_ids {
                 q = q.bind(id);
             }
@@ -1151,11 +1329,6 @@ pub async fn run_cli(
     Ok(())
 }
 
-/// `?, ?, ?` for an `IN (…)` list.
-fn placeholders(n: usize) -> String {
-    vec!["?"; n].join(", ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1166,7 +1339,7 @@ mod tests {
 
     async fn pool() -> Database {
         let pool = Database::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -1218,8 +1391,7 @@ mod tests {
     async fn fixture() -> Database {
         let pool = pool().await;
         sqlx::query(
-            "INSERT INTO source_extension (source_id, pkg_name, repo_url, updated_at) \
-             VALUES ('2499283573021220255', ?, 'r', 'now'), ('999', ?, 'r', 'now')",
+            r#"INSERT INTO source_extension (source_id, pkg_name, repo_url, updated_at) VALUES ('2499283573021220255', $1, 'r', '2020-01-01T00:00:00Z'), ('999', $2, 'r', '2020-01-01T00:00:00Z')"#,
         )
         .bind(ALL_MANGADEX_PKG)
         .bind(ALL_MANGADEX_PKG)
@@ -1233,7 +1405,7 @@ mod tests {
             ("w_colored", "Colored edition"),
         ] {
             sqlx::query(
-                "INSERT INTO work (id, primary_title, created_at, updated_at) VALUES (?, ?, 'now', 'now')",
+                r#"INSERT INTO work (id, primary_title, created_at, updated_at) VALUES ($1, $2, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
             )
             .bind(id)
             .bind(title)
@@ -1292,8 +1464,7 @@ mod tests {
             ),
         ] {
             sqlx::query(
-                "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
-                 VALUES (?, ?, ?, ?, ?, 'now')",
+                r#"INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) VALUES ($1, $2, $3, $4, $5, '2020-01-01T00:00:00Z')"#,
             )
             .bind(id).bind(work).bind(ty).bind(sid).bind(key)
             .execute(&pool).await.unwrap();
@@ -1301,7 +1472,7 @@ mod tests {
         // One scan schedule per Suwayomi series — the table that is 74% all.mangadex in
         // production and that the scheduler reads WITHOUT joining `source_series`.
         for key in ["100", "101", "102", "103"] {
-            sqlx::query("INSERT INTO series_scan_state (series_id, updated_at, next_scan_at) VALUES (?, 'now', '1970-01-01T00:00:00+00:00')")
+            sqlx::query(r#"INSERT INTO series_scan_state (series_id, updated_at, next_scan_at) VALUES ($1, '2020-01-01T00:00:00Z', '1970-01-01T00:00:00+00:00')"#)
                 .bind(key)
                 .execute(&pool)
                 .await
@@ -1336,7 +1507,7 @@ mod tests {
             .unwrap();
         assert_eq!((r.rows, r.resolved, r.unresolved.len()), (4, 3, 1));
         // Dry run wrote nothing.
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM all_mangadex_uuid")
+        let n: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM all_mangadex_uuid")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -1345,17 +1516,18 @@ mod tests {
         record_uuids(&pool, &uuid_map().await, Apply::Yes)
             .await
             .unwrap();
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM all_mangadex_uuid")
+        let n: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM all_mangadex_uuid")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(n, 3);
         // …and on the row itself, for as long as the row exists.
-        let url: Option<String> =
-            sqlx::query_scalar("SELECT source_url FROM source_series WHERE id = 'ss_ok'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let url: Option<String> = crate::db_types::query_scalar(
+            "SELECT source_url FROM source_series WHERE id = 'ss_ok'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             url.as_deref(),
             Some("/manga/11111111-1111-1111-1111-111111111111")
@@ -1369,7 +1541,7 @@ mod tests {
         );
         let r = record_uuids(&pool, &moved, Apply::Yes).await.unwrap();
         assert_eq!(r.conflicts.len(), 1);
-        let stored: String = sqlx::query_scalar(
+        let stored: String = crate::db_types::query_scalar(
             "SELECT mangadex_uuid FROM all_mangadex_uuid WHERE source_series_id = 'ss_ok'",
         )
         .fetch_one(&pool)
@@ -1435,13 +1607,13 @@ mod tests {
             // The dry run still PROJECTS the scan-state half honestly.
             assert_eq!(r.scan_states, 1);
         }
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source_series")
+        let n: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM source_series")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(n, 7);
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM series_scan_state")
+            crate::db_types::query_scalar::<i64>("SELECT COUNT(*) FROM series_scan_state")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
@@ -1453,7 +1625,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.to_string().contains("refusing to delete"), "{e}");
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source_series")
+        let n: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM source_series")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -1489,20 +1661,22 @@ mod tests {
             1
         );
         // The duplicate work is gone, its row moved, and a redirect was left behind.
-        let survivor: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = 'ss_anchorless'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let survivor: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE id = 'ss_anchorless'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(survivor, "w_twin");
-        let redirect: Option<String> =
-            sqlx::query_scalar("SELECT new_id FROM work_redirect WHERE old_id = 'w_dupe'")
-                .fetch_optional(&pool)
-                .await
-                .unwrap();
+        let redirect: Option<String> = crate::db_types::query_scalar(
+            "SELECT new_id FROM work_redirect WHERE old_id = 'w_dupe'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
         assert_eq!(redirect.as_deref(), Some("w_twin"));
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM work WHERE id = 'w_dupe'")
+            crate::db_types::query_scalar::<i64>("SELECT COUNT(*) FROM work WHERE id = 'w_dupe'")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
@@ -1510,14 +1684,15 @@ mod tests {
         );
 
         assert_eq!(split_mismatched(&pool, Apply::Yes).await.unwrap().acted, 1);
-        let moved: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = 'ss_mismatch'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let moved: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE id = 'ss_mismatch'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(moved, "w_colored");
         // …and the move is undoable from the ledger alone.
-        let prev: Option<String> = sqlx::query_scalar(
+        let prev: Option<String> = crate::db_types::query_scalar(
             "SELECT prev_work_id FROM all_mangadex_uuid WHERE source_series_id = 'ss_mismatch'",
         )
         .fetch_one(&pool)
@@ -1536,24 +1711,25 @@ mod tests {
         assert_eq!((r.deletable, r.deleted, r.withheld_split), (3, 3, 1));
         // …and the schedules go with them, or Phase F frees no scan budget at all.
         assert_eq!(r.scan_states, 3);
-        let scheduled: Vec<String> =
-            sqlx::query_scalar("SELECT series_id FROM series_scan_state ORDER BY series_id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let scheduled: Vec<String> = crate::db_types::query_scalar(
+            "SELECT series_id FROM series_scan_state ORDER BY series_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             scheduled,
             vec!["101".to_string()],
             "the split row keeps its schedule"
         );
-        let left: Vec<String> = sqlx::query_scalar(
+        let left: Vec<String> = crate::db_types::query_scalar(
             "SELECT id FROM source_series WHERE source_type = 'suwayomi' ORDER BY id",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
         assert_eq!(left, vec!["ss_mismatch".to_string()]);
-        let disposed: Vec<String> = sqlx::query_scalar(
+        let disposed: Vec<String> = crate::db_types::query_scalar(
             "SELECT disposition FROM all_mangadex_uuid ORDER BY source_series_id",
         )
         .fetch_all(&pool)
@@ -1570,7 +1746,7 @@ mod tests {
                 .map(String::from)
                 .collect::<Vec<_>>()
         );
-        let merged_from: Option<String> = sqlx::query_scalar(
+        let merged_from: Option<String> = crate::db_types::query_scalar(
             "SELECT prev_work_id FROM all_mangadex_uuid WHERE source_series_id = 'ss_anchorless'",
         )
         .fetch_one(&pool)
@@ -1673,7 +1849,7 @@ mod tests {
         );
 
         // Referential hazards, measured before the merge.
-        let stale_redirects_before: i64 = sqlx::query_scalar(
+        let stale_redirects_before: i64 = crate::db_types::query_scalar(
             "SELECT COUNT(*) FROM work_redirect r WHERE NOT EXISTS (SELECT 1 FROM work w WHERE w.id = r.new_id)",
         ).fetch_one(&pool).await.unwrap();
         assert_eq!(stale_redirects_before, 0, "§4.14 baseline");
@@ -1701,7 +1877,7 @@ mod tests {
         assert!(s.blocked.is_empty());
 
         // Hazard checks AFTER the merge.
-        let stale_redirects: i64 = sqlx::query_scalar(
+        let stale_redirects: i64 = crate::db_types::query_scalar(
             "SELECT COUNT(*) FROM work_redirect r WHERE NOT EXISTS (SELECT 1 FROM work w WHERE w.id = r.new_id)",
         ).fetch_one(&pool).await.unwrap();
         assert_eq!(
@@ -1716,7 +1892,7 @@ mod tests {
             ("source_series", "work_id"),
             ("chapter_override", "work_id"),
         ] {
-            let orphans: i64 = sqlx::query_scalar(&format!(
+            let orphans: i64 = crate::db_types::query_scalar(&format!(
                 "SELECT COUNT(*) FROM {table} t \
                   WHERE NOT EXISTS (SELECT 1 FROM work w WHERE w.id = t.{col})"
             ))
@@ -1752,8 +1928,8 @@ mod tests {
         // 74% of the scheduler's table, which §7 step 4 alone would have left scanning.
         assert_eq!(d.scan_states, 10_479 - 64);
         assert_eq!(d.cascading_chapters, 366_340);
-        let still_there: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM source_series WHERE source_type = 'suwayomi' AND source_id = ?",
+        let still_there: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM source_series WHERE source_type = 'suwayomi' AND source_id = $1",
         )
         .bind(PRIMARY_SOURCE_ID)
         .fetch_one(&pool)
@@ -1768,29 +1944,30 @@ mod tests {
             eprintln!("PHASE_F_RUN_DELETE != 1 — stopping before the destructive step");
             return;
         }
-        let chapters_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chapter")
+        let chapters_before: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM chapter")
             .fetch_one(&pool)
             .await
             .unwrap();
-        let scan_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM series_scan_state")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let scan_before: i64 =
+            crate::db_types::query_scalar("SELECT COUNT(*) FROM series_scan_state")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         let d = delete_redundant(&pool, Apply::Yes, Some(DELETE_CONFIRM_TOKEN), false)
             .await
             .unwrap();
         println!("delete applied: {d:?}");
         assert_eq!(d.deleted, 10_479 - 64);
         assert_eq!(d.scan_states, 10_479 - 64);
-        let left: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM source_series WHERE source_type = 'suwayomi' AND source_id = ?",
+        let left: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM source_series WHERE source_type = 'suwayomi' AND source_id = $1",
         )
         .bind(PRIMARY_SOURCE_ID)
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(left, 64, "only the split cohort survives");
-        let chapters_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chapter")
+        let chapters_after: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM chapter")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -1799,17 +1976,18 @@ mod tests {
             366_340,
             "exactly the cascade the gate accounted for — no chapter went unaccounted"
         );
-        let scan_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM series_scan_state")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let scan_after: i64 =
+            crate::db_types::query_scalar("SELECT COUNT(*) FROM series_scan_state")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(scan_before - scan_after, 10_479 - 64);
         // Nothing anywhere points at a `source_series` row that no longer exists.
         for (table, col) in [
             ("chapter", "source_series_id"),
             ("merge_candidate", "source_series_id"),
         ] {
-            let orphans: i64 = sqlx::query_scalar(&format!(
+            let orphans: i64 = crate::db_types::query_scalar(&format!(
                 "SELECT COUNT(*) FROM {table} t \
                   WHERE NOT EXISTS (SELECT 1 FROM source_series s WHERE s.id = t.{col})"
             ))
@@ -1821,7 +1999,7 @@ mod tests {
         // And the ledger survived: `release_event.first_source_series_id` is nullable and
         // NON-ENFORCING by design (§9's mitigation), so a deleted source must not have
         // taken any first-seen history with it.
-        let events_orphaned: i64 = sqlx::query_scalar(
+        let events_orphaned: i64 = crate::db_types::query_scalar(
             "SELECT COUNT(*) FROM release_event e \
               WHERE NOT EXISTS (SELECT 1 FROM work w WHERE w.id = e.work_id)",
         )
@@ -1829,5 +2007,236 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(events_orphaned, 0);
+    }
+    #[tokio::test]
+    async fn uuid_evidence_and_source_url_choose_one_conflicting_writer() {
+        let pool = fixture().await.foreground();
+        let first = uuid_map().await;
+        let mut second = first.clone();
+        second.insert(
+            "102".into(),
+            "/manga/33333333-3333-3333-3333-333333333333".into(),
+        );
+        let (a, b) = crate::catalog::phase4_tests::overlap(
+            &pool,
+            move |pool| async move { record_uuids(&pool, &first, Apply::Yes).await },
+            move |pool| async move { record_uuids(&pool, &second, Apply::Yes).await },
+        )
+        .await;
+        assert!(a.unwrap().conflicts.is_empty());
+        let conflicts = b.unwrap().conflicts;
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].0, "ss_anchorless");
+        let values:(uuid::Uuid,String)=sqlx::query_as("SELECT u.mangadex_uuid,s.source_url FROM all_mangadex_uuid u JOIN source_series s ON s.id=u.source_series_id WHERE s.id='ss_anchorless'").fetch_one(&pool).await.unwrap();
+        assert_eq!(values.1, format!("/manga/{}", values.0));
+        assert_eq!(values.0.to_string(), "22222222-2222-2222-2222-222222222222");
+    }
+
+    #[tokio::test]
+    async fn anchorless_merge_and_uuid_recording_preserve_disposition_in_both_orders() {
+        for merge_first in [false, true] {
+            let pool = fixture().await.foreground();
+            let map = uuid_map().await;
+            record_uuids(&pool, &map, Apply::Yes).await.unwrap();
+            let merge = move |pool: Database| async move {
+                merge_anchorless(&pool, None, Apply::Yes).await.map(|_| ())
+            };
+            let record = move |pool: Database| async move {
+                record_uuids(&pool, &map, Apply::Yes).await.map(|_| ())
+            };
+            let (a, b) = if merge_first {
+                crate::catalog::phase4_tests::overlap(&pool, merge, record).await
+            } else {
+                crate::catalog::phase4_tests::overlap(&pool, record, merge).await
+            };
+            a.unwrap();
+            b.unwrap();
+            let values:(String,String,String)=sqlx::query_as("SELECT s.work_id,u.work_id,u.disposition FROM source_series s JOIN all_mangadex_uuid u ON u.source_series_id=s.id WHERE s.id='ss_anchorless'").fetch_one(&pool).await.unwrap();
+            assert_eq!(values, ("w_twin".into(), "w_twin".into(), "merged".into()));
+            assert_eq!(
+                crate::catalog::redirect_work_id(&pool, "w_dupe")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("w_twin")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mismatch_split_and_chapter_writer_keep_the_new_owner() {
+        let pool = fixture().await.foreground();
+        record_uuids(&pool, &uuid_map().await, Apply::Yes)
+            .await
+            .unwrap();
+        let chapter = crate::catalog::ChapterInput {
+            external_id: "before".into(),
+            number: Some("1".into()),
+            published_at: Some("2020-01-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        crate::catalog::upsert_chapter(&pool, "ss_mismatch", &chapter)
+            .await
+            .unwrap();
+        crate::catalog::ledger::record_source_series(&pool, "ss_mismatch")
+            .await
+            .unwrap();
+        let (a, b) = crate::catalog::phase4_tests::overlap(
+            &pool,
+            move |pool| async move { split_mismatched(&pool, Apply::Yes).await },
+            move |pool| async move {
+                crate::catalog::upsert_chapter(
+                    &pool,
+                    "ss_mismatch",
+                    &crate::catalog::ChapterInput {
+                        external_id: "after".into(),
+                        number: Some("2".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+            },
+        )
+        .await;
+        assert_eq!(a.unwrap().acted, 1);
+        b.unwrap();
+        let values:(String,String,String)=sqlx::query_as("SELECT s.work_id,u.prev_work_id,u.disposition FROM source_series s JOIN all_mangadex_uuid u ON u.source_series_id=s.id WHERE s.id='ss_mismatch'").fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            values,
+            ("w_colored".into(), "w_base".into(), "split".into())
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT work_id FROM release_event WHERE first_source_series_id='ss_mismatch'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "w_colored"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM chapter WHERE source_series_id='ss_mismatch'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            2
+        );
+    }
+
+    async fn clean_delete_fixture() -> Database {
+        let pool = fixture().await.foreground();
+        let mut map = uuid_map().await;
+        map.insert(
+            "103".into(),
+            "/manga/11111111-1111-1111-1111-111111111111".into(),
+        );
+        record_uuids(&pool, &map, Apply::Yes).await.unwrap();
+        merge_anchorless(&pool, None, Apply::Yes).await.unwrap();
+        split_mismatched(&pool, Apply::Yes).await.unwrap();
+        assert!(gate(&pool).await.unwrap().is_clean());
+        pool
+    }
+
+    #[tokio::test]
+    async fn delete_revalidates_chapter_parity_after_discovery() {
+        let pool = clean_delete_fixture().await;
+        let points = crate::locks::pause_points::PausePoints::default();
+        let discovered = points.arm("delete-discovered");
+        let delete_pool = pool.clone();
+        let deleting = tokio::spawn(
+            crate::catalog::guards::TEST_PAUSE.scope(points, async move {
+                delete_redundant(&delete_pool, Apply::Yes, Some(DELETE_CONFIRM_TOKEN), false).await
+            }),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), discovered.reached())
+            .await
+            .unwrap();
+        crate::catalog::upsert_chapter(
+            &pool,
+            "ss_anchorless",
+            &crate::catalog::ChapterInput {
+                external_id: "unique".into(),
+                number: Some("777".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        discovered.release();
+        let error = deleting.await.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("chapter parity failed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM source_series WHERE id='ss_anchorless'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chapter WHERE external_id='unique'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM series_scan_state WHERE series_id='102'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_and_split_keep_a_defined_winner_in_both_orders() {
+        for delete_first in [false, true] {
+            let pool = clean_delete_fixture().await;
+            let delete = move |pool: Database| async move {
+                delete_redundant(&pool, Apply::Yes, Some(DELETE_CONFIRM_TOKEN), false)
+                    .await
+                    .map(|_| ())
+            };
+            let split = move |pool: Database| async move {
+                crate::catalog::split_source_series(
+                    &pool,
+                    "w_twin",
+                    &["ss_anchorless".into()],
+                    None,
+                )
+                .await
+                .map(|_| ())
+            };
+            let (a, b) = if delete_first {
+                crate::catalog::phase4_tests::overlap(&pool, delete, split).await
+            } else {
+                crate::catalog::phase4_tests::overlap(&pool, split, delete).await
+            };
+            a.unwrap();
+            let error = b.unwrap_err();
+            assert!(
+                error.to_string().contains(if delete_first {
+                    "not a source"
+                } else {
+                    "refusing to delete"
+                }),
+                "{error:#}"
+            );
+            let left: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM source_series WHERE id='ss_anchorless'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(left, i64::from(!delete_first));
+        }
     }
 }

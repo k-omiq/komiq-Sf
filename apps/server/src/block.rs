@@ -267,16 +267,16 @@ fn parse_row(tags: &str, ratings: &str) -> Option<BlockRule> {
 pub async fn list(pool: &Database, scope: Scope<'_>) -> Result<Vec<BlockRule>> {
     let rows: Vec<(String, String)> =
         match scope {
-            Scope::Site => sqlx::query_as(
+            Scope::Site => crate::db_types::query_tuple(
                 "SELECT tags, ratings FROM content_block_rule WHERE user_id IS NULL ORDER BY id",
             )
             .fetch_all(pool)
             .await?,
             Scope::User(user_id) => {
-                sqlx::query_as(
-                    "SELECT tags, ratings FROM content_block_rule WHERE user_id = ? ORDER BY id",
+                crate::db_types::query_tuple(
+                    "SELECT tags, ratings FROM content_block_rule WHERE user_id = $1 ORDER BY id",
                 )
-                .bind(user_id)
+                .bind(crate::db_types::uuid(user_id)?)
                 .fetch_all(pool)
                 .await?
             }
@@ -286,6 +286,9 @@ pub async fn list(pool: &Database, scope: Scope<'_>) -> Result<Vec<BlockRule>> {
         .filter_map(|(tags, ratings)| parse_row(tags, ratings))
         .collect())
 }
+
+#[cfg(test)]
+tokio::task_local! { static REPLACE_PAUSE: crate::locks::pause_points::PausePoints; }
 
 /// Replace one scope's rules with `rules` (repeats dropped, order kept). Atomic: a reader
 /// sees the old list or the new one.
@@ -306,20 +309,38 @@ pub async fn replace(pool: &Database, scope: Scope<'_>, rules: &[BlockRule]) -> 
     let now = Utc::now().to_rfc3339();
     crate::db::retry_transaction(|| async {
         let mut tx = pool.begin().await?;
-        // `IS ?` matches NULL to NULL, so one statement serves both scopes.
-        sqlx::query("DELETE FROM content_block_rule WHERE user_id IS ?")
-            .bind(user_id)
+        if let Some(id) = user_id {
+            anyhow::ensure!(
+                crate::locks::lock_user(&mut tx, id).await?,
+                "user no longer exists"
+            );
+        }
+        let canonical = user_id
+            .map(crate::db_types::uuid)
+            .transpose()?
+            .map(|id| id.to_string());
+        crate::locks::advisory(
+            &mut tx,
+            &[crate::locks::AdvisoryKey::block_rule(canonical.as_deref())],
+        )
+        .await?;
+        #[cfg(test)]
+        if let Ok(points) = REPLACE_PAUSE.try_with(Clone::clone) {
+            points.hit("block-locked").await;
+        }
+        sqlx::query("DELETE FROM content_block_rule WHERE user_id IS NOT DISTINCT FROM $1")
+            .bind(crate::db_types::optional_uuid(user_id)?)
             .execute(&mut *tx)
             .await?;
         for rule in &unique {
             sqlx::query(
                 "INSERT INTO content_block_rule (user_id, tags, ratings, created_at) \
-                 VALUES (?, ?, ?, ?)",
+                 VALUES ($1, $2, $3, $4)",
             )
-            .bind(user_id)
+            .bind(crate::db_types::optional_uuid(user_id)?)
             .bind(rule.tags.join(","))
             .bind(rule.ratings.join(","))
-            .bind(&now)
+            .bind(crate::db_types::date(&now)?)
             .execute(&mut *tx)
             .await?;
         }
@@ -336,18 +357,20 @@ pub async fn replace(pool: &Database, scope: Scope<'_>, rules: &[BlockRule]) -> 
 pub async fn load(pool: &Database, user_id: Option<&str>) -> Result<BlockSet> {
     let rows: Vec<(String, String)> = match user_id {
         Some(user_id) => {
-            sqlx::query_as(
+            crate::db_types::query_tuple(
                 "SELECT tags, ratings FROM content_block_rule \
-                  WHERE user_id IS NULL OR user_id = ?",
+                  WHERE user_id IS NULL OR user_id = $1",
             )
-            .bind(user_id)
+            .bind(crate::db_types::uuid(user_id)?)
             .fetch_all(pool)
             .await?
         }
         None => {
-            sqlx::query_as("SELECT tags, ratings FROM content_block_rule WHERE user_id IS NULL")
-                .fetch_all(pool)
-                .await?
+            crate::db_types::query_tuple(
+                "SELECT tags, ratings FROM content_block_rule WHERE user_id IS NULL",
+            )
+            .fetch_all(pool)
+            .await?
         }
     };
     Ok(BlockSet::new(
@@ -372,9 +395,9 @@ pub async fn blocked_ids(
     let mut out = HashSet::new();
     // Under SQLite's bind limit, with room to spare.
     for chunk in work_ids.chunks(500) {
-        let marks = vec!["?"; chunk.len()].join(", ");
+        let marks = crate::sql_params::placeholders(1, chunk.len());
         let sql = format!("SELECT w.id FROM work w WHERE w.id IN ({marks}) AND {blocked}");
-        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        let mut query = crate::db_types::query_scalar::<String>(&sql);
         for id in chunk {
             query = query.bind(id);
         }
@@ -401,12 +424,12 @@ pub async fn blocked_series_ids(
         .partition(|id| id.starts_with("w_"));
     let mut out = blocked_ids(pool, set, &works).await?;
     for chunk in engine.chunks(500) {
-        let marks = vec!["?"; chunk.len()].join(", ");
+        let marks = crate::sql_params::placeholders(1, chunk.len());
         let sql = format!(
             "SELECT DISTINCT ss.source_key FROM source_series ss \
               WHERE ss.source_type = 'suwayomi' AND ss.source_key IN ({marks}) AND {blocked}"
         );
-        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        let mut query = crate::db_types::query_scalar::<String>(&sql);
         for id in chunk {
             query = query.bind(id);
         }
@@ -444,7 +467,7 @@ mod tests {
 
     async fn pool() -> Database {
         let pool = Database::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -532,19 +555,19 @@ mod tests {
             sqlx::query(
                 "INSERT INTO work (id, primary_title, content_rating, is_nsfw, is_nsfw_override, \
                                    created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+                 VALUES ($1, $2, $3, $4, $5, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
             )
             .bind(id)
             .bind(id)
             .bind(rating)
-            .bind(nsfw)
-            .bind(pin)
+            .bind(nsfw != 0)
+            .bind(pin.map(|value| value != 0))
             .execute(pool)
             .await
             .unwrap();
             for tag in tags {
                 sqlx::query(
-                    "INSERT INTO work_tag (work_id, tag, tag_key, source) VALUES (?, ?, ?, 'mangadex')",
+                    "INSERT INTO work_tag (work_id, tag, tag_key, source) VALUES ($1, $2, $3, 'mangadex')",
                 )
                 .bind(id)
                 .bind(tag)
@@ -558,7 +581,7 @@ mod tests {
 
     async fn blocked(pool: &Database, rules: Vec<BlockRule>) -> Vec<String> {
         let set = BlockSet::new(rules);
-        let all: Vec<String> = sqlx::query_scalar("SELECT id FROM work ORDER BY id")
+        let all: Vec<String> = crate::db_types::query_scalar("SELECT id FROM work ORDER BY id")
             .fetch_all(pool)
             .await
             .unwrap();
@@ -568,7 +591,10 @@ mod tests {
             "SELECT w.id FROM work w WHERE 1 = 1{} ORDER BY w.id",
             set.and_not_blocked("w.id", None)
         );
-        let kept: Vec<String> = sqlx::query_scalar(&sql).fetch_all(pool).await.unwrap();
+        let kept: Vec<String> = crate::db_types::query_scalar(&sql)
+            .fetch_all(pool)
+            .await
+            .unwrap();
         let expect_kept: Vec<String> = all
             .iter()
             .filter(|id| !hit.contains(*id))
@@ -580,6 +606,32 @@ mod tests {
         hit
     }
 
+    #[tokio::test]
+    async fn two_foreground_replacements_of_an_empty_scope_do_not_union_rules() {
+        let pool = pool().await.foreground();
+        let points = crate::locks::pause_points::PausePoints::default();
+        let armed = points.arm("block-locked");
+        let writer = pool.clone();
+        let first = tokio::spawn(REPLACE_PAUSE.scope(points, async move {
+            replace(&writer, Scope::Site, &[rule(&["action"], &[])]).await
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
+            .await
+            .unwrap();
+        let writer = pool.clone();
+        let second =
+            tokio::spawn(
+                async move { replace(&writer, Scope::Site, &[rule(&["comedy"], &[])]).await },
+            );
+        crate::cover::wait_for_writer_lock(&pool).await;
+        armed.release();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(
+            list(&pool, Scope::Site).await.unwrap(),
+            vec![rule(&["comedy"], &[])]
+        );
+    }
     #[tokio::test]
     async fn rules_block_by_tag_by_rating_and_by_both() {
         let pool = pool().await;
@@ -640,19 +692,24 @@ mod tests {
             "SELECT w.id FROM work w WHERE {}",
             set.blocked_sql("w.id", Some("w.content_rating")).unwrap()
         );
-        let hit: Vec<String> = sqlx::query_scalar(&sql).fetch_all(&pool).await.unwrap();
+        let hit: Vec<String> = crate::db_types::query_scalar(&sql)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
         assert_eq!(hit, ["w_gore"]);
     }
 
     #[tokio::test]
     async fn a_scope_is_replaced_as_a_whole_and_a_viewer_gets_both_scopes() {
         let pool = pool().await;
+        let u1 = crate::db_types::test_uuid("u1").to_string();
+        let u2 = crate::db_types::test_uuid("u2").to_string();
         for user in ["u1", "u2"] {
             sqlx::query(
                 "INSERT INTO users (id, username, email, password_hash, created_at) \
-                 VALUES (?, ?, ?, 'x', '2020-01-01T00:00:00Z')",
+                 VALUES ($1, $2, $3, 'x', '2020-01-01T00:00:00Z')",
             )
-            .bind(user)
+            .bind(crate::db_types::test_uuid(user))
             .bind(user)
             .bind(format!("{user}@example.test"))
             .execute(&pool)
@@ -666,15 +723,15 @@ mod tests {
             rule(&["harem"], &["erotica"]),
         ];
         replace(&pool, Scope::Site, &site).await.unwrap();
-        replace(&pool, Scope::User("u1"), &mine).await.unwrap();
+        replace(&pool, Scope::User(&u1), &mine).await.unwrap();
 
         // Saved order kept, the repeat dropped.
         assert_eq!(list(&pool, Scope::Site).await.unwrap(), site);
         assert_eq!(
-            list(&pool, Scope::User("u1")).await.unwrap(),
+            list(&pool, Scope::User(&u1)).await.unwrap(),
             vec![rule(&["gore"], &[]), rule(&["harem"], &["erotica"])]
         );
-        assert!(list(&pool, Scope::User("u2")).await.unwrap().is_empty());
+        assert!(list(&pool, Scope::User(&u2)).await.unwrap().is_empty());
 
         // Anonymous and u2: the site rule. u1: all three.
         assert_eq!(
@@ -682,17 +739,17 @@ mod tests {
             BlockSet::new(site.clone())
         );
         assert_eq!(
-            load(&pool, Some("u2")).await.unwrap(),
+            load(&pool, Some(u2.as_str())).await.unwrap(),
             BlockSet::new(site.clone())
         );
         assert_eq!(
-            load(&pool, Some("u1")).await.unwrap().key(),
+            load(&pool, Some(u1.as_str())).await.unwrap().key(),
             "/pornographic;gore/;harem/erotica"
         );
 
         // Replacing one scope leaves the other alone; an empty list clears it.
-        replace(&pool, Scope::User("u1"), &[]).await.unwrap();
-        assert!(list(&pool, Scope::User("u1")).await.unwrap().is_empty());
+        replace(&pool, Scope::User(&u1), &[]).await.unwrap();
+        assert!(list(&pool, Scope::User(&u1)).await.unwrap().is_empty());
         assert_eq!(list(&pool, Scope::Site).await.unwrap(), site);
 
         let too_many: Vec<BlockRule> = (0..=MAX_RULES)
@@ -703,16 +760,19 @@ mod tests {
         assert_eq!(list(&pool, Scope::Site).await.unwrap(), site);
 
         // A user's rules go with the account.
-        replace(&pool, Scope::User("u2"), &mine).await.unwrap();
-        sqlx::query("DELETE FROM users WHERE id = 'u2'")
+        replace(&pool, Scope::User(&u2), &mine).await.unwrap();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(crate::db_types::test_uuid("u2"))
             .execute(&pool)
             .await
             .unwrap();
-        let left: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM content_block_rule WHERE user_id = 'u2'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let left: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM content_block_rule WHERE user_id = $1",
+        )
+        .bind(crate::db_types::test_uuid("u2"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(left, 0);
     }
 }

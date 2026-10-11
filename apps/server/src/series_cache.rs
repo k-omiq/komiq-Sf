@@ -57,7 +57,6 @@ pub async fn put_series(pool: &Database, m: &SuwayomiManga) -> Result<bool> {
         return Ok(false);
     }
     let now = Utc::now().to_rfc3339();
-    let genre = serde_json::to_string(&m.genre).unwrap_or_else(|_| "[]".to_string());
     let count = m.chapters.as_ref().map(|c| c.total_count);
     // `series_fetched_at` records ONLY a metadata fetch (this call) — distinct from
     // `updated_at`, which `put_chapters` also bumps — so the reader's series-metadata
@@ -67,14 +66,14 @@ pub async fn put_series(pool: &Database, m: &SuwayomiManga) -> Result<bool> {
            (id, title, thumbnail_url, author, artist, description, genre, status, \
             in_library, in_library_at, last_fetched_at, source_id, lang, chapter_count, \
             updated_at, created_at, series_fetched_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 0), ?, ?, ?) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, COALESCE($14, 0), $15, $16, $17) \
          ON CONFLICT(id) DO UPDATE SET \
            title = excluded.title, thumbnail_url = excluded.thumbnail_url, \
            author = excluded.author, artist = excluded.artist, description = excluded.description, \
            genre = excluded.genre, status = excluded.status, in_library = excluded.in_library, \
            in_library_at = excluded.in_library_at, last_fetched_at = excluded.last_fetched_at, \
            source_id = excluded.source_id, lang = excluded.lang, \
-           chapter_count = COALESCE(?, suwayomi_series.chapter_count), \
+           chapter_count = COALESCE($18, suwayomi_series.chapter_count), \
            updated_at = excluded.updated_at, \
            created_at = COALESCE(suwayomi_series.created_at, excluded.created_at), \
            series_fetched_at = excluded.series_fetched_at",
@@ -85,17 +84,17 @@ pub async fn put_series(pool: &Database, m: &SuwayomiManga) -> Result<bool> {
     .bind(&m.author)
     .bind(&m.artist)
     .bind(&m.description)
-    .bind(&genre)
+    .bind(sqlx::types::Json(&m.genre))
     .bind(&m.status)
-    .bind(m.in_library as i64)
+    .bind(m.in_library)
     .bind(&m.in_library_at)
     .bind(&m.last_fetched_at)
     .bind(&m.source_id)
     .bind(&lang)
     .bind(count)
-    .bind(&now)
-    .bind(&now)
-    .bind(&now)
+    .bind(crate::db_types::date(&now)?)
+    .bind(crate::db_types::date(&now)?)
+    .bind(crate::db_types::date(&now)?)
     .bind(count)
     .execute(pool)
     .await?;
@@ -107,15 +106,24 @@ pub async fn put_series(pool: &Database, m: &SuwayomiManga) -> Result<bool> {
 /// byte-identical `suwayomi_chapter` table, so the rewrite can be skipped.
 #[derive(sqlx::FromRow, PartialEq)]
 struct ChapterDigestRow {
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     id: i64,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     name: String,
     chapter_number: f64,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     scanlator: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     upload_date: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     is_read: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     is_bookmarked: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     is_downloaded: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     last_page_read: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     page_count: i64,
 }
 
@@ -232,7 +240,7 @@ fn derive_latest_chapter_at(chapters: &[SuwayomiChapter]) -> Option<String> {
         // encodes. `updates` orders on this column AS TEXT — it has to, or
         // `idx_suwayomi_series_latest_chapter` (migration 0050) stops serving the ORDER
         // BY and the feed grows a temp B-tree — while `feed_series_updates.released_at`
-        // stores `MAX(CAST(… AS INTEGER))` and orders numerically. The two agree only
+        // stores `MAX(CAST(… AS BIGINT))` and orders numerically. The two agree only
         // while every value is the same width. `normalize_epoch_millis` accepts anything
         // in [1000, 4_102_444_800_000], so a pre-2001-09-09 chapter yields 4–12 digits,
         // and under BINARY collation any such string starting '2'..='9' sorts ABOVE every
@@ -259,16 +267,20 @@ pub async fn hydrate_latest_chapter_at(pool: &Database, m: &mut SuwayomiManga) {
     if m.latest_chapter_at.is_some() {
         return;
     }
-    m.latest_chapter_at = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT latest_chapter_at FROM suwayomi_series WHERE id = ?",
+    m.latest_chapter_at = crate::db_types::query_scalar::<Option<i64>>(
+        "SELECT latest_chapter_at FROM suwayomi_series WHERE id = $1",
     )
     .bind(m.id)
     .fetch_optional(pool)
     .await
-    .inspect_err(|e| tracing::warn!(error = %e, id = m.id, "hydrate_latest_chapter_at failed"))
+    .inspect_err(|e| {
+        crate::db::record_read_database_error(e);
+        tracing::warn!(error = %e, id = m.id, "hydrate_latest_chapter_at failed");
+    })
     .ok()
     .flatten()
-    .flatten();
+    .flatten()
+    .map(|ms| format!("{ms:013}"));
 }
 
 /// Replace the cached chapter list for a manga (delete + insert in one tx), and
@@ -278,101 +290,200 @@ pub async fn hydrate_latest_chapter_at(pool: &Database, m: &mut SuwayomiManga) {
 /// to what is already cached, and the series' derived columns (`chapter_count`,
 /// `latest_chapter_at`) already match. `scanner::persist_scan` calls this on every
 /// scan tick — ~24k/day, of which ≥95% find no new chapter — and each rewrite was a
-/// DELETE plus one INSERT per chapter (48 on average) inside its own transaction,
-/// i.e. ~20 KiB of Litestream-shipped WAL for a byte-identical result. Reading the
-/// existing rows back and comparing costs 0.08 ms and zero writes.
+/// DELETE plus one INSERT per chapter (48 on average) inside its own transaction.
+///
+/// That comparison runs FIRST, on the reader lane, with no transaction and no lock
+/// ([`chapters_cached_unchanged`]): two indexed reads and zero writes. An unchanged scan
+/// therefore never opens a writer transaction, takes no advisory key and no row lock,
+/// and cannot make a foreground writer of the work wait. Only a list that differs goes
+/// on to the guarded unit, which compares AGAIN under its locks: the lock-free answer
+/// is a reason to skip, never a reason to write.
+///
+/// Skipping on the lock-free read is safe. The read saw a committed cache equal to what
+/// this call would write, so skipping is the same outcome as writing it at that
+/// instant; a writer that commits a different list later would have replaced ours too.
 ///
 /// When the list HAS changed, the per-row INSERT loop is replaced by chunked multi-row
-/// INSERTs (measured 24.0 ms → 2.6 ms per 48-chapter series).
+/// INSERTs (measured 24.0 ms → 2.6 ms per 48-chapter series). Cache, spine and release
+/// ledger commit together (T194, T210): the ledger rows are written through
+/// `catalog::ledger::record_source_series_on` under the same work and source locks, so a
+/// failed ledger write rolls the cache back too and the next scan, which then still
+/// sees a different list, writes all three again.
 pub async fn put_chapters(
     pool: &Database,
     manga_id: i64,
     chapters: &[SuwayomiChapter],
 ) -> Result<()> {
-    let (cached, source_series_id) =
-        crate::db::retry_transaction(|| put_chapters_attempt(pool, manga_id, chapters)).await?;
+    let wanted = WantedChapters::of(chapters);
+    if chapters_cached_unchanged(pool, manga_id, &wanted).await {
+        // The unchanged path records a successful fetch without a database write.
+        note_chapters_fetched(manga_id, Utc::now());
+        return Ok(());
+    }
+    // Read before BEGIN: the unit below holds the leased background writer and its
+    // locks, and must not wait for a reader connection while it does.
+    let record_ledger = release_ledger_ready(pool, manga_id).await;
+    let cached = crate::db::retry_transaction(|| {
+        put_chapters_attempt(pool, manga_id, chapters, &wanted, record_ledger)
+    })
+    .await?;
     if cached {
         // A failed write must not make an older chapter cache look freshly fetched.
-        // The unchanged path still records a successful fetch without a database write.
         note_chapters_fetched(manga_id, Utc::now());
-    }
-    if let Some(ssid) = source_series_id {
-        record_chapters_in_ledger(pool, manga_id, &ssid).await;
     }
     Ok(())
 }
 
+/// What one chapter replacement wants the cache to hold: the digest rows in id order
+/// and the two derived series columns.
+struct WantedChapters {
+    rows: Vec<ChapterDigestRow>,
+    count: i64,
+    latest: Option<String>,
+}
+
+impl WantedChapters {
+    fn of(chapters: &[SuwayomiChapter]) -> Self {
+        let mut rows: Vec<ChapterDigestRow> = chapters.iter().map(ChapterDigestRow::of).collect();
+        rows.sort_by_key(|r| r.id);
+        Self {
+            rows,
+            count: crate::catalog::main_chapter_count(chapters.iter().map(|c| c.chapter_number)),
+            latest: derive_latest_chapter_at(chapters),
+        }
+    }
+}
+
+/// The lock-free pre-check of [`put_chapters`]: is the committed cache already what
+/// this replacement would write? Reader lane, no transaction, no lock. A failed read
+/// answers "not known", which sends the caller to the guarded unit (it reads again
+/// under its locks), so a busy reader pool can cost a transaction but never a result.
+async fn chapters_cached_unchanged(
+    pool: &Database,
+    manga_id: i64,
+    wanted: &WantedChapters,
+) -> bool {
+    let read = async {
+        let derived: Option<(i64, Option<i64>)> = crate::db_types::query_tuple(
+            "SELECT chapter_count, latest_chapter_at FROM suwayomi_series WHERE id = $1",
+        )
+        .bind(manga_id)
+        .fetch_optional(pool)
+        .await?;
+        let Some(derived) = derived else {
+            return Ok(false);
+        };
+        if !chapter_derived_matches(&derived, wanted.count, &wanted.latest) {
+            return Ok(false);
+        }
+        let existing = sqlx::query_as::<_, ChapterDigestRow>(CHAPTER_DIGEST_SELECT)
+            .bind(manga_id)
+            .fetch_all(pool)
+            .await?;
+        Ok::<_, sqlx::Error>(existing == wanted.rows)
+    };
+    match read.await {
+        Ok(unchanged) => unchanged,
+        Err(e) => {
+            crate::db::record_read_database_error(&e);
+            tracing::debug!(manga_id, error = %e, "series cache: unchanged pre-check failed");
+            false
+        }
+    }
+}
+
 const CHAPTER_DIGEST_SELECT: &str = "SELECT id, name, chapter_number, scanlator, upload_date, \
             is_read, is_bookmarked, is_downloaded, last_page_read, page_count \
-     FROM suwayomi_chapter WHERE manga_id = ? ORDER BY id";
+     FROM suwayomi_chapter WHERE manga_id = $1 ORDER BY id";
 
 fn chapter_derived_matches(
-    stored: &(i64, Option<String>),
+    stored: &(i64, Option<i64>),
     count: i64,
     latest: &Option<String>,
 ) -> bool {
-    stored.0 == count && (latest.is_none() || latest == &stored.1)
+    stored.0 == count
+        && (latest.is_none() || latest.as_deref().and_then(|v| v.parse::<i64>().ok()) == stored.1)
 }
+
+/// The advisory keys of a unit that publishes rows derived from the source mappings of
+/// one Suwayomi series, for its single `locks::advisory` call. `Series` is the key of
+/// the scan and admin writers of the series. The Suwayomi source identity key is the
+/// one a writer holds while it creates a `source_series` row for this series
+/// (`catalog::source_claim_keys`): a mapping that is absent when the unit looks for it
+/// has no row to lock, so only this key keeps it from appearing while the unit runs.
+pub(crate) fn series_publication_keys(series_id: &str) -> [crate::locks::AdvisoryKey; 2] {
+    [
+        crate::locks::AdvisoryKey::new(crate::locks::KeyClass::Series, &[series_id]),
+        crate::locks::AdvisoryKey::source_identity("suwayomi", series_id),
+    ]
+}
+
+#[cfg(test)]
+tokio::task_local! { static CHAPTER_PUBLICATION_PAUSE: crate::locks::pause_points::PausePoints; }
 
 async fn put_chapters_attempt(
     pool: &Database,
     manga_id: i64,
     chapters: &[SuwayomiChapter],
-) -> Result<(bool, Option<String>)> {
-    // An uncached (including non-English) series must not resurrect satellite rows.
-    let derived: Option<(i64, Option<String>)> =
-        sqlx::query_as("SELECT chapter_count, latest_chapter_at FROM suwayomi_series WHERE id = ?")
-            .bind(manga_id)
-            .fetch_optional(pool)
-            .await?;
-    let Some(derived) = derived else {
-        return Ok((false, None));
-    };
-    let count = crate::catalog::main_chapter_count(chapters.iter().map(|c| c.chapter_number));
-    let latest = derive_latest_chapter_at(chapters);
-    let mut incoming: Vec<ChapterDigestRow> = chapters.iter().map(ChapterDigestRow::of).collect();
-    incoming.sort_by_key(|r| r.id);
-    let existing = sqlx::query_as::<_, ChapterDigestRow>(CHAPTER_DIGEST_SELECT)
-        .bind(manga_id)
-        .fetch_all(pool)
-        .await?;
-    if existing == incoming && chapter_derived_matches(&derived, count, &latest) {
-        return Ok((true, None));
+    wanted: &WantedChapters,
+    record_ledger: bool,
+) -> Result<bool> {
+    let (count, latest, incoming) = (wanted.count, &wanted.latest, &wanted.rows);
+    let mut tx = pool.begin().await?;
+    crate::locks::advisory(&mut tx, &series_publication_keys(&manga_id.to_string())).await?;
+    let sources: Vec<String> = sqlx::query_scalar("SELECT id FROM source_series WHERE source_type = 'suwayomi' AND source_key = $1 ORDER BY id")
+        .bind(manga_id.to_string()).fetch_all(&mut *tx).await?;
+    crate::locks::lock_source_series(&mut tx, &sources).await?;
+    let current: Vec<String> = sqlx::query_scalar("SELECT id FROM source_series WHERE source_type = 'suwayomi' AND source_key = $1 ORDER BY id").bind(manga_id.to_string()).fetch_all(&mut *tx).await?;
+    if current != sources {
+        return Err(crate::locks::RestartTransaction.into());
     }
 
-    // Re-read after acquiring the writer so the rewrite/prune decisions share the
-    // transaction with both caches. A busy retry starts this entire operation again.
-    let mut tx = pool.begin().await?;
-    let derived: Option<(i64, Option<String>)> =
-        sqlx::query_as("SELECT chapter_count, latest_chapter_at FROM suwayomi_series WHERE id = ?")
-            .bind(manga_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    sqlx::query("SELECT id FROM suwayomi_series WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(manga_id)
+        .execute(&mut *tx)
+        .await?;
+    #[cfg(test)]
+    if let Ok(points) = CHAPTER_PUBLICATION_PAUSE.try_with(Clone::clone) {
+        points.hit("chapters-locked").await;
+    }
+    let derived: Option<(i64, Option<i64>)> = crate::db_types::query_tuple(
+        "SELECT chapter_count, latest_chapter_at FROM suwayomi_series WHERE id = $1",
+    )
+    .bind(manga_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     let Some(derived) = derived else {
         tx.rollback().await?;
-        return Ok((false, None));
+        return Ok(false);
     };
+    // The recheck under the locks. The lock-free pre-check only ever skips; whether to
+    // WRITE is decided here, against rows nobody can change while the unit runs.
     let existing = sqlx::query_as::<_, ChapterDigestRow>(CHAPTER_DIGEST_SELECT)
         .bind(manga_id)
         .fetch_all(&mut *tx)
         .await?;
-    let changed = existing != incoming;
-    if !changed && chapter_derived_matches(&derived, count, &latest) {
+    let changed = &existing != incoming;
+    if !changed && chapter_derived_matches(&derived, count, latest) {
         tx.rollback().await?;
-        return Ok((true, None));
+        return Ok(true);
     }
 
     let now = Utc::now().to_rfc3339();
-    let source_series_id = if changed {
-        sqlx::query("DELETE FROM suwayomi_chapter WHERE manga_id = ?")
+    if changed {
+        sqlx::query("DELETE FROM suwayomi_chapter WHERE manga_id = $1")
             .bind(manga_id)
             .execute(&mut *tx)
             .await?;
         // Twelve binds per row; keep well below SQLite's variable limit.
         for chunk in chapters.chunks(CHAPTER_INSERT_CHUNK) {
-            let values = std::iter::repeat_n("(?,?,?,?,?,?,?,?,?,?,?,?)", chunk.len())
+            let values = crate::sql_params::placeholders(1, chunk.len() * 12)
+                .split(", ")
                 .collect::<Vec<_>>()
-                .join(",");
+                .chunks(12)
+                .map(|row| format!("({})", row.join(", ")))
+                .collect::<Vec<_>>()
+                .join(", ");
             let sql = format!(
                 "INSERT INTO suwayomi_chapter \
                    (id, manga_id, name, chapter_number, scanlator, upload_date, \
@@ -388,49 +499,52 @@ async fn put_chapters_attempt(
                     .bind(c.chapter_number)
                     .bind(&c.scanlator)
                     .bind(&c.upload_date)
-                    .bind(c.is_read as i64)
-                    .bind(c.is_bookmarked as i64)
-                    .bind(c.is_downloaded as i64)
+                    .bind(c.is_read)
+                    .bind(c.is_bookmarked)
+                    .bind(c.is_downloaded)
                     .bind(c.last_page_read)
                     .bind(c.page_count)
-                    .bind(&now);
+                    .bind(crate::db_types::date(&now)?);
             }
             q.execute(&mut *tx).await?;
         }
         // A spine error rolls back the chapter cache too. The identical upstream
         // list remains different from the old cache on the next scan and retries.
-        write_chapters_to_spine_on(&mut tx, manga_id, chapters).await?
-    } else {
-        None
-    };
+        let mapping = write_chapters_to_spine_on(&mut tx, manga_id, chapters).await?;
+        // The release ledger in the same commit, under the locks taken above: `mapping`
+        // is one of `sources`, so `lock_source_series` holds it and its work.
+        if let (Some(ssid), true) = (mapping, record_ledger) {
+            crate::catalog::ledger::record_source_series_on(&mut tx, &ssid).await?;
+        }
+    }
     // Preserve a previously good upstream time if this batch has no datable rows.
     sqlx::query(
         "UPDATE suwayomi_series \
-         SET chapter_count = ?, latest_chapter_at = COALESCE(?, latest_chapter_at), \
-             updated_at = ? WHERE id = ?",
+         SET chapter_count = $1, latest_chapter_at = COALESCE($2, latest_chapter_at), \
+             updated_at = $3 WHERE id = $4",
     )
     .bind(count)
-    .bind(&latest)
-    .bind(&now)
+    .bind(latest.as_deref().map(str::parse::<i64>).transpose()?)
+    .bind(crate::db_types::date(&now)?)
     .bind(manga_id)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok((true, source_series_id))
+    Ok(true)
 }
 
 /// Mirror chapters on the caller's writer connection. An unmapped series is picked
 /// up by the spine backfill once its source mapping exists.
 async fn write_chapters_to_spine_on(
-    conn: &mut sqlx::SqliteConnection,
+    conn: &mut sqlx::PgConnection,
     manga_id: i64,
     chapters: &[SuwayomiChapter],
 ) -> Result<Option<String>> {
     // Keep the indexed source_key as text; casting that column would force a scan.
-    let ssid: Option<String> = sqlx::query_scalar(
+    let ssid: Option<String> = crate::db_types::query_scalar(
         "SELECT id FROM source_series \
-         WHERE source_type = 'suwayomi' AND source_key = ? \
-         ORDER BY last_seen DESC, id ASC LIMIT 1",
+         WHERE source_type = 'suwayomi' AND source_key = $1 \
+         ORDER BY last_seen DESC NULLS LAST, id ASC LIMIT 1",
     )
     .bind(manga_id.to_string())
     .fetch_optional(&mut *conn)
@@ -446,18 +560,20 @@ async fn write_chapters_to_spine_on(
     Ok(Some(ssid))
 }
 
-/// Record release history after the cache and spine have committed. During spine
-/// backfill the ledger seed considers every source together, preserving first credit.
-async fn record_chapters_in_ledger(pool: &Database, manga_id: i64, ssid: &str) {
+/// Whether a chapter replacement may record release history: only once the spine
+/// backfill has drained. During the backfill the ledger seed considers every source
+/// together, which preserves first credit; recording one source early would not.
+///
+/// Best-effort and read before the unit begins. A failed read answers "no": the
+/// replacement goes ahead without ledger rows, and the ledger seed or the next changed
+/// scan records them.
+async fn release_ledger_ready(pool: &Database, manga_id: i64) -> bool {
     match crate::catalog::spine::remaining(pool).await {
-        Ok((0, 0)) => {
-            if let Err(e) = crate::catalog::ledger::record_source_series(pool, ssid).await {
-                tracing::warn!(manga_id, error = %e, "series cache: release ledger write failed");
-            }
-        }
-        Ok(_) => {}
+        Ok(remaining) => remaining == (0, 0),
         Err(e) => {
-            tracing::warn!(manga_id, error = %e, "series cache: spine readiness check failed")
+            let e = crate::db::observed_read_database_error(e);
+            tracing::warn!(manga_id, error = %e, "series cache: spine readiness check failed");
+            false
         }
     }
 }
@@ -465,20 +581,34 @@ async fn record_chapters_in_ledger(pool: &Database, manga_id: i64, ssid: &str) {
 /// A cached-series row shape (reconstructed into a `SuwayomiManga`).
 #[derive(sqlx::FromRow)]
 struct SeriesRow {
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     id: i64,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     title: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     thumbnail_url: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     author: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     artist: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     description: Option<String>,
-    genre: Option<String>,
+    genre: Option<serde_json::Value>,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     status: String,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     in_library: i64,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     in_library_at: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     last_fetched_at: Option<String>,
-    latest_chapter_at: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
+    latest_chapter_at: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     source_id: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     lang: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     chapter_count: i64,
 }
 
@@ -486,8 +616,7 @@ impl From<SeriesRow> for SuwayomiManga {
     fn from(r: SeriesRow) -> Self {
         let genre: Vec<String> = r
             .genre
-            .as_deref()
-            .and_then(|g| serde_json::from_str(g).ok())
+            .and_then(|g| serde_json::from_value(g).ok())
             .unwrap_or_default();
         SuwayomiManga {
             id: r.id,
@@ -503,7 +632,7 @@ impl From<SeriesRow> for SuwayomiManga {
             in_library: r.in_library != 0,
             in_library_at: r.in_library_at,
             last_fetched_at: r.last_fetched_at,
-            latest_chapter_at: r.latest_chapter_at,
+            latest_chapter_at: r.latest_chapter_at.map(|ms| format!("{ms:013}")),
             source_id: r.source_id,
             source: Some(SuwayomiSourceLang { lang: r.lang }),
             chapters: Some(ChapterCount {
@@ -552,7 +681,7 @@ const SERIES_SELECT: &str = "SELECT id, title, thumbnail_url, author, artist, de
 
 /// Load one cached series, or `None` on a cache miss.
 pub async fn get_series(pool: &Database, id: i64) -> Result<Option<SuwayomiManga>> {
-    let row = sqlx::query_as::<_, SeriesRow>(&format!("{SERIES_SELECT} WHERE id = ?"))
+    let row = sqlx::query_as::<_, SeriesRow>(&format!("{SERIES_SELECT} WHERE id = $1"))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -575,13 +704,12 @@ pub async fn get_series_fresh_batch(
     struct FreshRow {
         #[sqlx(flatten)]
         series: SeriesRow,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         series_fetched_at: Option<String>,
     }
     let mut out = std::collections::HashMap::new();
     for chunk in ids.chunks(256) {
-        let ph = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let ph = crate::sql_params::placeholders(1, chunk.len());
         let sql = format!(
             "{} WHERE id IN ({ph})",
             SERIES_SELECT.replace("chapter_count ", "chapter_count, series_fetched_at ")
@@ -607,14 +735,13 @@ pub async fn get_chapters_fresh_batch(
     struct FreshRow {
         #[sqlx(flatten)]
         chapter: ChapterRow,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         last_fetched_at: Option<String>,
     }
     let mut out: std::collections::HashMap<i64, (Vec<SuwayomiChapter>, bool)> =
         std::collections::HashMap::new();
     for chunk in ids.chunks(256) {
-        let ph = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let ph = crate::sql_params::placeholders(1, chunk.len());
         let sql = format!(
             "SELECT id, manga_id, name, chapter_number, scanlator, upload_date, \
              is_read, is_bookmarked, is_downloaded, last_page_read, page_count, \
@@ -651,8 +778,8 @@ pub async fn get_chapters_fresh_batch(
 /// `put_series` never touches either, so this still cleanly tracks chapter fetches
 /// rather than metadata fetches.
 pub async fn chapters_last_fetched(pool: &Database, manga_id: i64) -> Result<Option<String>> {
-    let stored: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT MAX(updated_at) FROM suwayomi_chapter WHERE manga_id = ?",
+    let stored: Option<String> = crate::db_types::query_scalar::<Option<String>>(
+        "SELECT MAX(updated_at) FROM suwayomi_chapter WHERE manga_id = $1",
     )
     .bind(manga_id)
     .fetch_optional(pool)
@@ -679,7 +806,7 @@ pub async fn get_chapters(pool: &Database, manga_id: i64) -> Result<Vec<Suwayomi
     let rows = sqlx::query_as::<_, ChapterRow>(
         "SELECT id, manga_id, name, chapter_number, scanlator, upload_date, \
                 is_read, is_bookmarked, is_downloaded, last_page_read, page_count \
-         FROM suwayomi_chapter WHERE manga_id = ? ORDER BY chapter_number DESC, id DESC",
+         FROM suwayomi_chapter WHERE manga_id = $1 ORDER BY chapter_number DESC, id DESC",
     )
     .bind(manga_id)
     .fetch_all(pool)
@@ -689,16 +816,26 @@ pub async fn get_chapters(pool: &Database, manga_id: i64) -> Result<Vec<Suwayomi
 
 #[derive(sqlx::FromRow)]
 struct ChapterRow {
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     id: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     manga_id: i64,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     name: String,
     chapter_number: f64,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     scanlator: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     upload_date: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     is_read: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     is_bookmarked: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     is_downloaded: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     last_page_read: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     page_count: i64,
 }
 
@@ -739,10 +876,10 @@ impl From<ChapterRow> for SuwayomiChapter {
 /// hot path. The `(? = 1 OR …)` shape survives here only because these two callers have a
 /// small fixed `LIMIT` and no ORDER BY the OR can spoil; it is exactly the shape
 /// `browse::build_where` documents as forbidden for a paged query.
-const NSFW_GATE_SQL: &str = "(? = 1 OR NOT EXISTS ( \
+const NSFW_GATE_SQL: &str = "($1 OR NOT EXISTS ( \
         SELECT 1 FROM source_series ss JOIN work w ON w.id = ss.work_id \
         WHERE ss.source_type = 'suwayomi' AND ss.source_key = CAST(suwayomi_series.id AS TEXT) \
-          AND COALESCE(w.is_nsfw_override, w.is_nsfw) = 1))";
+          AND COALESCE(w.is_nsfw_override, w.is_nsfw)))";
 
 /// Cached in-library series, most-recently-updated first — serves `discovery`
 /// without a live source browse. `limit` caps the result.
@@ -759,10 +896,10 @@ pub async fn library(pool: &Database, limit: i64, show_nsfw: bool) -> Result<Vec
     // this reads in order without a temp sort. This is the "recently updated" feed the
     // name implies.
     let rows = sqlx::query_as::<_, SeriesRow>(&format!(
-        "{SERIES_SELECT} WHERE in_library = 1 AND {NSFW_GATE_SQL} \
-         ORDER BY latest_chapter_at DESC, id DESC LIMIT ?"
+        "{SERIES_SELECT} WHERE in_library = TRUE AND {NSFW_GATE_SQL} \
+         ORDER BY latest_chapter_at DESC NULLS LAST, id DESC LIMIT $2"
     ))
-    .bind(show_nsfw as i64)
+    .bind(show_nsfw)
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -779,11 +916,16 @@ pub async fn recently_added(
     limit: i64,
     show_nsfw: bool,
 ) -> Result<Vec<SuwayomiManga>> {
+    // Keep the shared Phase-3 query unchanged; this path can use boolean SQL now.
+    const RECENT_NSFW_GATE: &str = "($1 OR NOT EXISTS ( \
+         SELECT 1 FROM source_series ss JOIN work w ON w.id = ss.work_id \
+         WHERE ss.source_type = 'suwayomi' AND ss.source_key = CAST(suwayomi_series.id AS TEXT) \
+           AND COALESCE(w.is_nsfw_override, w.is_nsfw) = TRUE))";
     let rows = sqlx::query_as::<_, SeriesRow>(&format!(
-        "{SERIES_SELECT} WHERE in_library = 1 AND {NSFW_GATE_SQL} \
-         ORDER BY COALESCE(created_at, updated_at) DESC, id DESC LIMIT ?"
+        "{SERIES_SELECT} WHERE in_library = TRUE AND {RECENT_NSFW_GATE} \
+         ORDER BY COALESCE(created_at, updated_at) DESC, id DESC LIMIT $2"
     ))
-    .bind(show_nsfw as i64)
+    .bind(show_nsfw)
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -792,9 +934,11 @@ pub async fn recently_added(
 
 /// How many series are cached (any). Lets `discovery` decide DB-vs-live.
 pub async fn count(pool: &Database) -> Result<i64> {
-    Ok(sqlx::query_scalar("SELECT COUNT(*) FROM suwayomi_series")
-        .fetch_one(pool)
-        .await?)
+    Ok(
+        crate::db_types::query_scalar("SELECT COUNT(*) FROM suwayomi_series")
+            .fetch_one(pool)
+            .await?,
+    )
 }
 
 #[cfg(test)]
@@ -808,7 +952,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -855,6 +999,343 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_foreground_chapter_replacements_leave_one_complete_cache_and_spine() {
+        let pool = pool().await.foreground();
+        put_series(&pool, &manga(1, "Series")).await.unwrap();
+        sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES ('w_chapters',now(),now()); INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES ('ss_chapters','w_chapters','suwayomi','src-1','1',now())").execute(&pool).await.unwrap();
+        let points = crate::locks::pause_points::PausePoints::default();
+        let armed = points.arm("chapters-locked");
+        let writer = pool.clone();
+        let first = tokio::spawn(CHAPTER_PUBLICATION_PAUSE.scope(points, async move {
+            put_chapters(&writer, 1, &[chapter(11, 1, 1.0)]).await
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
+            .await
+            .unwrap();
+        let writer = pool.clone();
+        let second = tokio::spawn(async move {
+            put_chapters(&writer, 1, &[chapter(22, 1, 2.0), chapter(33, 1, 3.0)]).await
+        });
+        crate::cover::wait_for_writer_lock(&pool).await;
+        armed.release();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        let cached: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM suwayomi_chapter WHERE manga_id=1 ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let spine: Vec<String> = sqlx::query_scalar("SELECT external_id FROM chapter WHERE source_series_id='ss_chapters' ORDER BY external_id").fetch_all(&pool).await.unwrap();
+        assert_eq!(cached, vec![22, 33]);
+        assert_eq!(spine, vec!["22", "33"]);
+        let count: i64 = sqlx::query_scalar("SELECT chapter_count FROM suwayomi_series WHERE id=1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // The shared Series key alone holds a replacement back, before it reads any row
+        // of the series. That key is all a writer of an absent admin row or of a new
+        // source mapping can hold, so the row locks above cannot stand in for it.
+        let mut holder = pool.begin().await.unwrap();
+        crate::locks::advisory(
+            &mut holder,
+            &[crate::locks::AdvisoryKey::new(
+                crate::locks::KeyClass::Series,
+                &["1"],
+            )],
+        )
+        .await
+        .unwrap();
+        let writer = pool.clone();
+        let third =
+            tokio::spawn(async move { put_chapters(&writer, 1, &[chapter(44, 1, 4.0)]).await });
+        crate::cover::wait_for_writer_lock(&pool).await;
+        let cached: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM suwayomi_chapter WHERE manga_id=1 ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            cached,
+            vec![22, 33],
+            "replaced while the Series key was held"
+        );
+        holder.commit().await.unwrap();
+        third.await.unwrap().unwrap();
+        let cached: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM suwayomi_chapter WHERE manga_id=1 ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let spine: Vec<String> = sqlx::query_scalar("SELECT external_id FROM chapter WHERE source_series_id='ss_chapters' ORDER BY external_id").fetch_all(&pool).await.unwrap();
+        assert_eq!(cached, vec![44]);
+        assert_eq!(spine, vec!["44"]);
+    }
+
+    /// A mapping of the series that does not exist yet has no row to lock. Its creator
+    /// holds the Suwayomi source identity key, and the replacement must wait for that
+    /// key: otherwise it finds no mapping, writes no spine and commits, and the new
+    /// mapping keeps an empty spine until the next scan.
+    #[tokio::test]
+    async fn a_chapter_replacement_waits_for_a_source_mapping_that_is_being_created() {
+        let pool = pool().await.foreground();
+        put_series(&pool, &manga(1, "Series")).await.unwrap();
+        sqlx::query("INSERT INTO work(id,created_at,updated_at) VALUES ('w_new',now(),now())")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The real catalogue writer, stopped inside its transaction after it took its
+        // guards and before it inserted the mapping.
+        let points = crate::locks::pause_points::PausePoints::default();
+        let held = points.arm("guard-held");
+        let creator_pool = pool.clone();
+        let creator = tokio::spawn(
+            crate::catalog::guards::TEST_PAUSE.scope(points, async move {
+                crate::catalog::upsert_source_series(
+                    &creator_pool,
+                    "w_new",
+                    "suwayomi",
+                    "src-1",
+                    "1",
+                    None,
+                    false,
+                )
+                .await
+            }),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(30), held.reached())
+            .await
+            .expect("the catalogue writer did not reach its guards");
+        let writer = pool.clone();
+        let mut replacement =
+            tokio::spawn(async move { put_chapters(&writer, 1, &[chapter(11, 1, 1.0)]).await });
+        tokio::select! {
+            _ = crate::cover::wait_for_writer_lock(&pool) => {}
+            done = &mut replacement => panic!("the replacement did not wait for the mapping creator: {done:?}"),
+        }
+        let cached: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM suwayomi_chapter")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cached, 0, "replaced while the mapping was being created");
+        held.release();
+        let mapping = creator.await.unwrap().unwrap();
+        replacement.await.unwrap().unwrap();
+        let spine: Vec<String> = sqlx::query_scalar(
+            "SELECT external_id FROM chapter WHERE source_series_id = $1 ORDER BY external_id",
+        )
+        .bind(&mapping)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(spine, vec!["11"]);
+    }
+
+    /// Whether another session can take the series row right now. A unit that waits
+    /// for a parent (a work or a source mapping) must not hold this lower-tier row.
+    async fn series_row_is_free(pool: &Database, manga_id: i64) -> bool {
+        let mut probe = pool.begin().await.unwrap();
+        let free =
+            sqlx::query("SELECT id FROM suwayomi_series WHERE id = $1 FOR NO KEY UPDATE NOWAIT")
+                .bind(manga_id)
+                .execute(&mut *probe)
+                .await
+                .is_ok();
+        probe.rollback().await.unwrap();
+        free
+    }
+
+    async fn mapped_series(pool: &Database) {
+        put_series(pool, &manga(1, "Series")).await.unwrap();
+        sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES ('w_chapters',now(),now()); INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES ('ss_chapters','w_chapters','suwayomi','src-1','1',now())").execute(pool).await.unwrap();
+    }
+
+    /// An unchanged chapter list is decided on the reader lane, before any guard: it
+    /// must return while another transaction holds the unit's advisory keys and the
+    /// work and mapping rows. (A replacement that always opened its guarded unit
+    /// would wait for the keys and time out.)
+    #[tokio::test]
+    async fn an_unchanged_chapter_list_takes_no_guard() {
+        let pool = pool().await.foreground();
+        mapped_series(&pool).await;
+        let list = [chapter(11, 1, 1.0), chapter(22, 1, 2.0)];
+        put_chapters(&pool, 1, &list).await.unwrap();
+        let mut holder = pool.begin().await.unwrap();
+        crate::locks::advisory(&mut holder, &series_publication_keys("1"))
+            .await
+            .unwrap();
+        crate::locks::lock_source_series(&mut holder, &["ss_chapters"])
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            put_chapters(&pool, 1, &list),
+        )
+        .await
+        .expect("an unchanged list waited for the guards of the series")
+        .expect("an unchanged list waited for the guards of the series");
+        // A changed list still waits for them.
+        let writer = pool.clone();
+        let mut changed =
+            tokio::spawn(async move { put_chapters(&writer, 1, &[chapter(33, 1, 3.0)]).await });
+        tokio::select! {
+            _ = crate::cover::wait_for_writer_lock(&pool) => {}
+            done = &mut changed => panic!("a changed list did not wait for the guards: {done:?}"),
+        }
+        holder.rollback().await.unwrap();
+        changed.await.unwrap().unwrap();
+        let cached: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM suwayomi_chapter WHERE manga_id=1 ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cached, vec![33]);
+    }
+
+    /// A changed list locks the work and the mapping of its series BEFORE the series
+    /// row and before it writes anything. Another transaction holds only the work row,
+    /// or only the mapping row: the replacement must wait, and while it waits the
+    /// series row must still be free. (The spine write locks both parents as well, but
+    /// only after the series row and the cache rows: the wrong order.)
+    #[tokio::test]
+    async fn a_chapter_replacement_takes_its_work_and_mapping_before_the_series_row() {
+        for held in ["work", "mapping"] {
+            let pool = pool().await.foreground();
+            mapped_series(&pool).await;
+            let mut holder = pool.begin().await.unwrap();
+            if held == "work" {
+                crate::locks::lock_works(&mut holder, &["w_chapters"])
+                    .await
+                    .unwrap();
+            } else {
+                sqlx::query(
+                    "SELECT id FROM source_series WHERE id = 'ss_chapters' FOR NO KEY UPDATE",
+                )
+                .execute(&mut *holder)
+                .await
+                .unwrap();
+            }
+            let writer = pool.clone();
+            let mut replacement =
+                tokio::spawn(async move { put_chapters(&writer, 1, &[chapter(11, 1, 1.0)]).await });
+            tokio::select! {
+                _ = crate::cover::wait_for_writer_lock(&pool) => {}
+                done = &mut replacement => panic!("{held}: the replacement did not wait: {done:?}"),
+            }
+            assert!(
+                series_row_is_free(&pool, 1).await,
+                "{held}: the replacement holds the series row while it waits for a parent"
+            );
+            holder.rollback().await.unwrap();
+            replacement.await.unwrap().unwrap();
+            let spine: Vec<String> = sqlx::query_scalar("SELECT external_id FROM chapter WHERE source_series_id='ss_chapters' ORDER BY external_id").fetch_all(&pool).await.unwrap();
+            assert_eq!(spine, vec!["11"], "{held}");
+        }
+    }
+
+    /// The mapping set is read, locked, and read again. A mapping that a writer
+    /// outside the key protocol commits between the first read and the locks is not
+    /// locked: the unit must restart and lock it (and its work) at the parent tier.
+    /// Here the work of that late mapping is held by another transaction, so the
+    /// restarted unit waits for it, holding nothing below. A unit that went on with
+    /// its first read would reach that work from the spine write, with the series row
+    /// and the rewritten cache already locked.
+    #[tokio::test]
+    async fn a_mapping_that_appears_during_discovery_restarts_the_replacement() {
+        let pool = pool().await.foreground();
+        put_series(&pool, &manga(1, "Series")).await.unwrap();
+        sqlx::query("INSERT INTO work(id,created_at,updated_at) VALUES ('w_late',now(),now())")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let points = crate::locks::pause_points::PausePoints::default();
+        let discovered = points.arm("source-discovered");
+        let writer = pool.clone();
+        let mut replacement = tokio::spawn(
+            crate::locks::SOURCE_DISCOVERY_PAUSE.scope(points, async move {
+                put_chapters(&writer, 1, &[chapter(11, 1, 1.0)]).await
+            }),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(30), discovered.reached())
+            .await
+            .expect("the replacement did not reach its mapping discovery");
+        sqlx::query("INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES ('ss_late','w_late','suwayomi','src-1','1',now())")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut holder = pool.begin().await.unwrap();
+        crate::locks::lock_works(&mut holder, &["w_late"])
+            .await
+            .unwrap();
+        discovered.release();
+        tokio::select! {
+            _ = crate::cover::wait_for_writer_lock(&pool) => {}
+            done = &mut replacement => panic!("the replacement did not wait for the late mapping's work: {done:?}"),
+        }
+        assert!(
+            series_row_is_free(&pool, 1).await,
+            "the replacement went on with a stale mapping set and holds the series row"
+        );
+        holder.rollback().await.unwrap();
+        replacement.await.unwrap().unwrap();
+        let spine: Vec<String> = sqlx::query_scalar(
+            "SELECT external_id FROM chapter WHERE source_series_id='ss_late' ORDER BY external_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(spine, vec!["11"]);
+    }
+
+    /// Cache, spine and release ledger are one commit. The ledger rows exist as soon
+    /// as the replacement returns, and a failed ledger write rolls the cache and the
+    /// spine back with it, so the next scan (which then still sees a different list)
+    /// writes all three again.
+    #[tokio::test]
+    async fn a_chapter_replacement_commits_its_ledger_rows_with_the_cache() {
+        let pool = pool().await.foreground();
+        mapped_series(&pool).await;
+        let counts = || async {
+            sqlx::query_as::<_, (i64, i64, i64)>(
+                "SELECT (SELECT count(*) FROM suwayomi_chapter WHERE manga_id = 1), \
+                        (SELECT count(*) FROM chapter WHERE source_series_id = 'ss_chapters'), \
+                        (SELECT count(*) FROM release_event WHERE work_id = 'w_chapters')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        sqlx::raw_sql(
+            "CREATE FUNCTION reject_release_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+               RAISE EXCEPTION 'injected ledger failure'; END $$; \
+             CREATE TRIGGER reject_release BEFORE INSERT ON release_event \
+               FOR EACH ROW EXECUTE FUNCTION reject_release_fn()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let error = put_chapters(&pool, 1, &[chapter(11, 1, 1.0)])
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected ledger failure"));
+        assert_eq!(
+            counts().await,
+            (0, 0, 0),
+            "the cache committed without its ledger rows"
+        );
+
+        sqlx::query("DROP TRIGGER reject_release ON release_event")
+            .execute(&pool)
+            .await
+            .unwrap();
+        put_chapters(&pool, 1, &[chapter(11, 1, 1.0)])
+            .await
+            .unwrap();
+        assert_eq!(counts().await, (1, 1, 1));
+    }
+
+    #[tokio::test]
     async fn round_trips_series_and_chapters() {
         let pool = pool().await;
         put_series(&pool, &manga(1, "Solo Leveling")).await.unwrap();
@@ -880,10 +1361,11 @@ mod tests {
         let chs = get_chapters(&pool, 1).await.unwrap();
         assert_eq!(chs.len(), 3);
         assert_eq!(chs[0].chapter_number, 3.0, "newest first");
-        let cnt: i64 = sqlx::query_scalar("SELECT chapter_count FROM suwayomi_series WHERE id = 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let cnt: i64 =
+            crate::db_types::query_scalar("SELECT chapter_count FROM suwayomi_series WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(cnt, 3, "count synced to stored chapters");
 
         // Re-put fewer chapters replaces (no accumulation).
@@ -965,8 +1447,8 @@ mod tests {
             (2, "2026-02-01T00:00:00Z"),
             (3, "2026-03-01T00:00:00Z"),
         ] {
-            sqlx::query("UPDATE suwayomi_series SET created_at = ? WHERE id = ?")
-                .bind(ts)
+            sqlx::query("UPDATE suwayomi_series SET created_at = $1 WHERE id = $2")
+                .bind(crate::db_types::date(ts).unwrap())
                 .bind(id)
                 .execute(&pool)
                 .await
@@ -985,13 +1467,13 @@ mod tests {
         // Re-upserting an existing series must NOT reset its first-add time.
         put_series(&pool, &manga(1, "S1 refreshed")).await.unwrap();
         let kept: Option<String> =
-            sqlx::query_scalar("SELECT created_at FROM suwayomi_series WHERE id = 1")
+            crate::db_types::query_scalar("SELECT created_at FROM suwayomi_series WHERE id = 1")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
         assert_eq!(
             kept.as_deref(),
-            Some("2026-01-01T00:00:00Z"),
+            Some("2026-01-01T00:00:00.000000+00:00"),
             "created_at preserved on upsert"
         );
     }
@@ -1020,8 +1502,7 @@ mod tests {
             put_series(&pool, &manga(id, "T")).await.unwrap();
         }
         sqlx::query(
-            "INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) \
-             VALUES ('w_x', 'X', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) VALUES ('w_x', 'X', TRUE, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -1135,8 +1616,8 @@ mod tests {
         let pool = pool().await;
         let mid = 777_101_i64;
         let stored = |pool: Database| async move {
-            sqlx::query_scalar::<_, Option<String>>(
-                "SELECT latest_chapter_at FROM suwayomi_series WHERE id = ?",
+            crate::db_types::query_scalar::<Option<String>>(
+                "SELECT latest_chapter_at FROM suwayomi_series WHERE id = $1",
             )
             .bind(mid)
             .fetch_one(&pool)
@@ -1248,8 +1729,8 @@ mod tests {
         put_chapters(&pool, mid, &chs).await.unwrap();
 
         let series_row = |pool: Database| async move {
-            sqlx::query_as::<_, (Option<String>, String)>(
-                "SELECT latest_chapter_at, updated_at FROM suwayomi_series WHERE id = ?",
+            crate::db_types::query_tuple::<(Option<String>, String)>(
+                "SELECT latest_chapter_at, updated_at FROM suwayomi_series WHERE id = $1",
             )
             .bind(mid)
             .fetch_one(&pool)
@@ -1257,8 +1738,8 @@ mod tests {
             .unwrap()
         };
         let chapter_stamp = |pool: Database| async move {
-            sqlx::query_scalar::<_, String>(
-                "SELECT MAX(updated_at) FROM suwayomi_chapter WHERE manga_id = ?",
+            crate::db_types::query_scalar::<String>(
+                "SELECT MAX(updated_at) FROM suwayomi_chapter WHERE manga_id = $1",
             )
             .bind(mid)
             .fetch_one(&pool)
@@ -1269,8 +1750,8 @@ mod tests {
 
         // Simulate a row left behind by an older binary / migration 0050's backfill:
         // the chapter set has moved on, the derived column has not.
-        sqlx::query("UPDATE suwayomi_series SET latest_chapter_at = ? WHERE id = ?")
-            .bind("1600000000000")
+        sqlx::query("UPDATE suwayomi_series SET latest_chapter_at = $1 WHERE id = $2")
+            .bind(1_600_000_000_000_i64)
             .bind(mid)
             .execute(&pool)
             .await
@@ -1320,19 +1801,20 @@ mod tests {
         put_chapters(&pool, mid, &chs).await.unwrap();
 
         let stamp = |pool: Database| async move {
-            let ch: Option<String> = sqlx::query_scalar(
-                "SELECT MAX(updated_at) FROM suwayomi_chapter WHERE manga_id = ?",
+            let ch: Option<String> = crate::db_types::query_scalar(
+                "SELECT MAX(updated_at) FROM suwayomi_chapter WHERE manga_id = $1",
             )
             .bind(mid)
             .fetch_one(&pool)
             .await
             .unwrap();
-            let se: String =
-                sqlx::query_scalar("SELECT updated_at FROM suwayomi_series WHERE id = ?")
-                    .bind(mid)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+            let se: String = crate::db_types::query_scalar(
+                "SELECT updated_at FROM suwayomi_series WHERE id = $1",
+            )
+            .bind(mid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             (ch.unwrap(), se)
         };
         let (ch_before, series_before) = stamp(pool.clone()).await;
@@ -1361,11 +1843,13 @@ mod tests {
         inflated.chapters = Some(ChapterCount { total_count: 99 });
         put_series(&pool, &inflated).await.unwrap();
         put_chapters(&pool, mid, &chs).await.unwrap();
-        let cnt: i64 = sqlx::query_scalar("SELECT chapter_count FROM suwayomi_series WHERE id = ?")
-            .bind(mid)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let cnt: i64 = crate::db_types::query_scalar(
+            "SELECT chapter_count FROM suwayomi_series WHERE id = $1",
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             cnt, 3,
             "deduped count re-asserted without touching chapters"
@@ -1398,24 +1882,26 @@ mod tests {
         put_chapters(&pool, mid, &[chapter(10, mid, 1.0)])
             .await
             .unwrap();
-        let old_series: (i64, Option<String>, String) = sqlx::query_as(
-            "SELECT chapter_count, latest_chapter_at, updated_at FROM suwayomi_series WHERE id = ?",
+        let old_series: (i64, Option<i64>, String) = crate::db_types::query_tuple(
+            "SELECT chapter_count, latest_chapter_at, updated_at FROM suwayomi_series WHERE id = $1",
         )
         .bind(mid)
         .fetch_one(&pool)
         .await
         .unwrap();
-        let old_spine: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT external_id, id, created_at FROM chapter WHERE source_series_id = ? ORDER BY external_id",
+        let old_spine: Vec<(String, String, String)> = crate::db_types::query_tuple(
+            "SELECT external_id, id, created_at FROM chapter WHERE source_series_id = $1 ORDER BY external_id",
         )
         .bind(&ssid)
         .fetch_all(&pool)
         .await
         .unwrap();
         let old_fetch = chapters_last_fetched(&pool, mid).await.unwrap();
-        sqlx::query(
-            "CREATE TRIGGER fail_new_spine_chapter BEFORE INSERT ON chapter \
-             WHEN NEW.external_id = '11' BEGIN SELECT RAISE(ABORT, 'forced spine failure'); END",
+        sqlx::raw_sql(
+            "CREATE FUNCTION fail_new_spine_chapter_fn() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF NEW.external_id = '11' THEN RAISE EXCEPTION 'forced spine failure'; END IF; \
+             RETURN NEW; END $$; CREATE TRIGGER fail_new_spine_chapter BEFORE INSERT ON chapter \
+             FOR EACH ROW EXECUTE FUNCTION fail_new_spine_chapter_fn()",
         )
         .execute(&pool)
         .await
@@ -1427,16 +1913,16 @@ mod tests {
         assert!(error.to_string().contains("forced spine failure"));
         let cached = get_chapters(&pool, mid).await.unwrap();
         assert_eq!(cached.iter().map(|ch| ch.id).collect::<Vec<_>>(), vec![10]);
-        let series_after: (i64, Option<String>, String) = sqlx::query_as(
-            "SELECT chapter_count, latest_chapter_at, updated_at FROM suwayomi_series WHERE id = ?",
+        let series_after: (i64, Option<i64>, String) = crate::db_types::query_tuple(
+            "SELECT chapter_count, latest_chapter_at, updated_at FROM suwayomi_series WHERE id = $1",
         )
         .bind(mid)
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(series_after, old_series);
-        let spine_after: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT external_id, id, created_at FROM chapter WHERE source_series_id = ? ORDER BY external_id",
+        let spine_after: Vec<(String, String, String)> = crate::db_types::query_tuple(
+            "SELECT external_id, id, created_at FROM chapter WHERE source_series_id = $1 ORDER BY external_id",
         )
         .bind(&ssid)
         .fetch_all(&pool)
@@ -1445,15 +1931,15 @@ mod tests {
         assert_eq!(spine_after, old_spine);
         assert_eq!(chapters_last_fetched(&pool, mid).await.unwrap(), old_fetch);
 
-        sqlx::query("DROP TRIGGER fail_new_spine_chapter")
+        sqlx::query("DROP TRIGGER fail_new_spine_chapter ON chapter")
             .execute(&pool)
             .await
             .unwrap();
         // Exactly the same upstream list must heal both structures after the failure.
         put_chapters(&pool, mid, &incoming).await.unwrap();
         assert_eq!(get_chapters(&pool, mid).await.unwrap().len(), 2);
-        let spine: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT external_id, id, created_at FROM chapter WHERE source_series_id = ? ORDER BY external_id",
+        let spine: Vec<(String, String, String)> = crate::db_types::query_tuple(
+            "SELECT external_id, id, created_at FROM chapter WHERE source_series_id = $1 ORDER BY external_id",
         )
         .bind(&ssid)
         .fetch_all(&pool)
@@ -1540,17 +2026,17 @@ mod tests {
         for (wid, sid, raw, over) in [("w_a", "2", 0, 1), ("w_b", "3", 1, 0)] {
             sqlx::query(
                 "INSERT INTO work (id, primary_title, is_nsfw, is_nsfw_override, created_at, updated_at) \
-                 VALUES (?, 'X', ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                 VALUES ($1, 'X', $2, $3, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
             )
             .bind(wid)
-            .bind(raw)
-            .bind(over)
+            .bind(raw != 0)
+            .bind(over != 0)
             .execute(&pool)
             .await
             .unwrap();
             sqlx::query(
                 "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
-                 VALUES (?, ?, 'suwayomi', ?, '2026-01-01T00:00:00Z')",
+                 VALUES ($1, $2, 'suwayomi', $3, '2026-01-01T00:00:00Z')",
             )
             .bind(format!("ss_{wid}"))
             .bind(wid)

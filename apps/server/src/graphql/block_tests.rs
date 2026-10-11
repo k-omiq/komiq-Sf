@@ -35,7 +35,7 @@ async fn seed_work(pool: &Database, key: &str, title: &str, rating: &str, tags: 
             external_id: format!("{key}-c1"),
             number: Some("1".into()),
             lang: Some("en".into()),
-            published_at: Some("2026-07-01T00:00:00Z".into()),
+            published_at: Some("2026-07-01T00:00:00.000000+00:00".into()),
             ..Default::default()
         },
     )
@@ -260,7 +260,7 @@ async fn a_site_rule_hides_a_work_from_every_list_and_closes_its_doors() {
     // The reader has the Gore work in their library from before the rule.
     sqlx::query(
         "INSERT INTO user_library (user_id, series_id, created_at) \
-         VALUES ('bob-id', ?, '2026-01-01T00:00:00Z'), ('bob-id', ?, '2026-01-02T00:00:00Z')",
+         VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', $1, '2026-01-01T00:00:00Z'), ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', $2, '2026-01-02T00:00:00Z')",
     )
     .bind(&works.gore)
     .bind(&works.plain)
@@ -413,8 +413,8 @@ async fn a_site_rule_hides_a_work_from_every_list_and_closes_its_doors() {
             "{q}"
         );
     }
-    let kept: (Option<String>, i64) = sqlx::query_as(
-        "SELECT status, is_favorite FROM user_library WHERE user_id = 'bob-id' AND series_id = ?",
+    let kept: (Option<String>, i64) = crate::db_types::query_tuple(
+        "SELECT status, is_favorite FROM user_library WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c' AND series_id = $1",
     )
     .bind(gore)
     .fetch_one(&st.pool)
@@ -465,7 +465,7 @@ async fn a_users_own_rule_hides_from_their_lists_and_from_nothing_else() {
     let works = seed(&st.pool).await;
     sqlx::query(
         "INSERT INTO user_library (user_id, series_id, created_at) \
-         VALUES ('bob-id', ?, '2026-01-01T00:00:00Z')",
+         VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', $1, '2026-01-01T00:00:00Z')",
     )
     .bind(&works.gore)
     .execute(&st.pool)
@@ -546,10 +546,12 @@ async fn an_admin_edit_that_changes_the_rating_reaches_a_rule_at_once() {
     let (s, st) = fixture(&engine).await;
     let works = seed(&st.pool).await;
     // A reader who sees adult works, so only a rule can hide one.
-    sqlx::query("UPDATE users SET show_nsfw = 1 WHERE id = 'bob-id'")
-        .execute(&st.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        r#"UPDATE users SET show_nsfw = TRUE WHERE id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'"#,
+    )
+    .execute(&st.pool)
+    .await
+    .unwrap();
     set_site(&s, "[{ ratings: [EROTICA] }]").await;
     for (path, query) in LISTS {
         assert_eq!(
@@ -597,7 +599,7 @@ async fn seed_engine_series(pool: &Database, id: i64, title: &str, tags: &[&str]
     let work_id = format!("w_engine{id}");
     sqlx::query(
         "INSERT INTO work (id, primary_title, created_at, updated_at) \
-         VALUES (?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+         VALUES ($1, $2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
     )
     .bind(&work_id)
     .bind(title)
@@ -606,7 +608,7 @@ async fn seed_engine_series(pool: &Database, id: i64, title: &str, tags: &[&str]
     .unwrap();
     sqlx::query(
         "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
-         VALUES (?, ?, 'suwayomi', '77', ?, '2026-01-01T00:00:00Z')",
+         VALUES ($1, $2, 'suwayomi', '77', $3, '2026-01-01T00:00:00Z')",
     )
     .bind(format!("ss{id}"))
     .bind(&work_id)
@@ -616,7 +618,7 @@ async fn seed_engine_series(pool: &Database, id: i64, title: &str, tags: &[&str]
     .unwrap();
     for tag in tags {
         sqlx::query(
-            "INSERT INTO work_tag (work_id, tag, tag_key, source) VALUES (?, ?, ?, 'suwayomi')",
+            "INSERT INTO work_tag (work_id, tag, tag_key, source) VALUES ($1, $2, $3, 'suwayomi')",
         )
         .bind(&work_id)
         .bind(tag)
@@ -626,9 +628,7 @@ async fn seed_engine_series(pool: &Database, id: i64, title: &str, tags: &[&str]
         .unwrap();
     }
     sqlx::query(
-        "INSERT INTO suwayomi_series \
-           (id, title, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) \
-         VALUES (?, ?, 'ONGOING', '77', 5, 1, '1750000000000', '2026-07-15T00:00:00+00:00')",
+        r#"INSERT INTO suwayomi_series (id, title, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) VALUES ($1, $2, 'ONGOING', '77', 5, TRUE, '1750000000000', '2026-07-15T00:00:00+00:00')"#,
     )
     .bind(id)
     .bind(title)
@@ -638,7 +638,7 @@ async fn seed_engine_series(pool: &Database, id: i64, title: &str, tags: &[&str]
     sqlx::query(
         "INSERT INTO series_scan_state \
            (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at, next_scan_at) \
-         VALUES (?, 0, 5, '2026-07-15T00:00:00+00:00', '2026-07-15T00:00:00+00:00', '1970-01-01T00:00:00+00:00')",
+         VALUES ($1, 0, 5, '2026-07-15T00:00:00+00:00', '2026-07-15T00:00:00+00:00', '1970-01-01T00:00:00+00:00')",
     )
     .bind(id.to_string())
     .execute(pool)
@@ -721,8 +721,7 @@ async fn a_rule_reaches_a_series_the_moment_it_is_added() {
     let (s, st) = fixture(&engine).await;
     // The source is on record, so the enrol does not have to ask the engine about it.
     sqlx::query(
-        "INSERT INTO source_extension (source_id, pkg_name, repo_url, is_nsfw, updated_at) \
-         VALUES ('77', 'pkg', 'repo', 0, '2026-01-01T00:00:00Z')",
+        r#"INSERT INTO source_extension (source_id, pkg_name, repo_url, is_nsfw, updated_at) VALUES ('77', 'pkg', 'repo', FALSE, '2026-01-01T00:00:00Z')"#,
     )
     .execute(&st.pool)
     .await
@@ -766,7 +765,7 @@ async fn a_rule_reaches_a_series_the_moment_it_is_added() {
     // The rule read the tags the enrol derived, not a later refresh.
     for (work, tag) in [(&gore.work_id, "gore"), (&plain.work_id, "action")] {
         let keys: Vec<String> = sqlx::query_scalar(
-            "SELECT tag_key FROM work_tag WHERE work_id = ? AND source = 'suwayomi'",
+            "SELECT tag_key FROM work_tag WHERE work_id = $1 AND source = 'suwayomi'",
         )
         .bind(work)
         .fetch_all(&st.pool)
@@ -783,8 +782,7 @@ async fn a_source_ai_tag_is_admin_written_and_public_to_read() {
     seed_engine_series(&st.pool, 901, "Engine Plain", &["Action"]).await;
     // `scanlatorSites` lists the sources Browse knows, so the series must be in it.
     sqlx::query(
-        "INSERT INTO browse_catalogue (work_id, reader_id, title, is_nsfw, en_chapter_count, created_at) \
-         VALUES ('w_engine901', '901', 'Engine Plain', 0, 5, '2026-01-01T00:00:00Z')",
+        r#"INSERT INTO browse_catalogue (work_id, reader_id, title, is_nsfw, en_chapter_count, created_at) VALUES ('w_engine901', '901', 'Engine Plain', FALSE, 5, '2026-01-01T00:00:00Z')"#,
     )
     .execute(&st.pool)
     .await

@@ -55,7 +55,7 @@ const RELEASED_AT_SQL: &str = "COALESCE(c.readable_at, c.published_at)";
 /// the statements below rely on having exactly ONE min/max aggregate so that their bare
 /// columns (`label`, `source_series_id`) come from the winning row, and a second aggregate
 /// would silently make those bare columns arbitrary.
-const ANNOUNCE_AT_SQL: &str = "CASE      WHEN ss.created_at < COALESCE(c.readable_at, c.published_at)      THEN MAX(CAST(strftime('%s', COALESCE(c.readable_at, c.published_at)) AS INTEGER) * 1000, ?)      ELSE CAST(strftime('%s', COALESCE(c.readable_at, c.published_at)) AS INTEGER) * 1000      END";
+const ANNOUNCE_AT_SQL: &str = "CASE WHEN ss.created_at < COALESCE(c.readable_at, c.published_at) THEN GREATEST(date_trunc('second', COALESCE(c.readable_at, c.published_at) + INTERVAL '500 microseconds'), $1) ELSE date_trunc('second', COALESCE(c.readable_at, c.published_at) + INTERVAL '500 microseconds') END";
 
 /// WHAT COUNTS AS A SEEDABLE CHAPTER — the one definition, shared by the work-list, the
 /// insert and the progress count. `?` binds "now", in millis.
@@ -68,23 +68,9 @@ const ANNOUNCE_AT_SQL: &str = "CASE      WHEN ss.created_at < COALESCE(c.readabl
 /// query every second for the life of the process. A test caught it; a divergence in the
 /// other direction (work-list narrower than the insert) would instead have left chapters
 /// silently unrecorded, which is quieter and worse.
-fn seedable_where() -> String {
-    format!(
-        "c.chapter_key IS NOT NULL \
-     AND {RELEASED_AT_SQL} IS NOT NULL \
-     -- `strftime` returns NULL on anything it cannot parse. Dropping those rows is the
-     -- only safe response: the column is NOT NULL, and the alternative to skipping an
-     -- undatable chapter is inventing a date for it.
-     AND strftime('%s', {RELEASED_AT_SQL}) IS NOT NULL \
-     -- NOT YET RELEASED IS NOT FIRST-SEEN. MangaDex schedules chapters, and stamps
-     -- external ones with a 2037 sentinel `publishAt` (236 rows today, every one of them a
-     -- work missing from /updates entirely). Admitting them would put events in the
-     -- ledger's future — the exact condition `assert_no_future_events` refuses to let a
-     -- deploy finish with. They enter the ledger when they are actually readable: either
-     -- the firehose re-offers them with a real `readableAt`, or the A1b backfill supplies
-     -- one.
-     AND CAST(strftime('%s', {RELEASED_AT_SQL}) AS INTEGER) * 1000 <= ?"
-    )
+fn seedable_where(now_index: usize) -> String {
+    let now_arg = crate::sql_params::placeholders(now_index, 1);
+    format!("c.chapter_key IS NOT NULL AND {RELEASED_AT_SQL} IS NOT NULL AND date_trunc('second', {RELEASED_AT_SQL} + INTERVAL '500 microseconds') <= {now_arg}")
 }
 
 /// Seed the ledger for one batch of works. Returns how many works were seeded; `0` means
@@ -104,7 +90,7 @@ fn seedable_where() -> String {
 /// seconds an hour, which is a fair price for having no second piece of state to get wrong.
 pub async fn seed_batch(pool: &Database) -> Result<u64> {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let works: Vec<String> = sqlx::query_scalar(&format!(
+    let works: Vec<String> = crate::db_types::query_scalar(&format!(
         "SELECT DISTINCT ss.work_id \
            FROM source_series ss \
            JOIN chapter c ON c.source_series_id = ss.id \
@@ -112,10 +98,10 @@ pub async fn seed_batch(pool: &Database) -> Result<u64> {
             AND NOT EXISTS (SELECT 1 FROM release_event re \
                              WHERE re.work_id = ss.work_id \
                                AND re.chapter_key = c.chapter_key) \
-          LIMIT ?",
-        seedable_where()
+          LIMIT $2",
+        seedable_where(1)
     ))
-    .bind(now_ms)
+    .bind(crate::db_types::epoch_millis(now_ms)?)
     .bind(SEED_BATCH)
     .fetch_all(pool)
     .await?;
@@ -141,31 +127,38 @@ pub async fn seed_batch(pool: &Database) -> Result<u64> {
 /// min/max aggregate, every bare column is taken from the row that produced it — so they
 /// come from the EARLIEST-released row, i.e. from the source that actually won the race.
 /// The same rule is what `refresh_feed_series_updates` already relies on.
-async fn seed_work(pool: &Database, work_id: &str, now_ms: i64) -> Result<u64> {
+pub(crate) async fn seed_work(pool: &Database, work_id: &str, now_ms: i64) -> Result<u64> {
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        let Some(work_id) = super::guards::resolve_work_optional(&mut tx, work_id).await? else {
+            return Ok(0);
+        };
     let n = sqlx::query(&format!(
-        "INSERT OR IGNORE INTO release_event \
+        "INSERT INTO release_event \
              (work_id, chapter_key, first_seen_at, first_source_series_id, label, announce_at) \
-         SELECT ss.work_id, c.chapter_key, \
-                MIN(CAST(strftime('%s', {RELEASED_AT_SQL}) AS INTEGER) * 1000), \
+         SELECT DISTINCT ON (c.chapter_key) ss.work_id, c.chapter_key, \
+                date_trunc('second', {RELEASED_AT_SQL} + INTERVAL '500 microseconds'), \
                 c.source_series_id, \
                 COALESCE(c.label, c.number, 'Oneshot'), \
                 {ANNOUNCE_AT_SQL} \
            FROM source_series ss \
            JOIN chapter c ON c.source_series_id = ss.id \
-          WHERE ss.work_id = ? AND {} \
-          GROUP BY c.chapter_key",
-        seedable_where()
+          WHERE ss.work_id = $2 AND {} \
+          ORDER BY c.chapter_key, date_trunc('second', {RELEASED_AT_SQL} + INTERVAL '500 microseconds') ASC, c.id ASC ON CONFLICT DO NOTHING",
+        seedable_where(3)
     ))
     // THREE BINDS, AND THE ORDER IS THE SQL TEXT ORDER, NOT THE ARGUMENT ORDER. The
     // `ANNOUNCE_AT_SQL` placeholder sits in the SELECT list, so it is the FIRST `?` in the
-    // statement; `seedable_where()`'s bound is the last. Both are `now_ms`.
-    .bind(now_ms)
-    .bind(work_id)
-    .bind(now_ms)
-    .execute(pool)
+    // statement; `seedable_where(3)`'s bound is the last. Both are `now_ms`.
+    .bind(crate::db_types::epoch_millis(now_ms)?)
+    .bind(&work_id)
+    .bind(crate::db_types::epoch_millis(now_ms)?)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
+    tx.commit().await?;
     Ok(n)
+    }).await
 }
 
 /// Record release events for everything one source_series currently carries.
@@ -175,26 +168,50 @@ async fn seed_work(pool: &Database, work_id: &str, now_ms: i64) -> Result<u64> {
 /// the seed, narrowed to one series, so the two writers cannot disagree about what a
 /// release event looks like.
 pub async fn record_source_series(pool: &Database, source_series_id: &str) -> Result<u64> {
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        crate::locks::lock_source_series(&mut tx, &[source_series_id]).await?;
+        super::guards::held().await;
+        let n = record_source_series_on(&mut tx, source_series_id).await?;
+        tx.commit().await?;
+        Ok(n)
+    })
+    .await
+}
+
+/// [`record_source_series`] inside the caller's transaction (T194, T210). Neither
+/// begins nor commits, and never retries: the caller owns BEGIN through COMMIT and wraps
+/// that whole unit in `db::retry_transaction`.
+///
+/// Guards the CALLER must already hold: `locks::lock_source_series` for this mapping
+/// (which locks its work parent first). The events are then recorded for the owner the
+/// caller locked, in the same commit as the chapters they describe, so a merge or a
+/// split of that mapping can neither run between the two nor see one without the other.
+pub async fn record_source_series_on(
+    conn: &mut sqlx::PgConnection,
+    source_series_id: &str,
+) -> Result<u64> {
+    super::guards::assert_in_transaction(conn, "ledger::record_source_series_on");
     let now_ms = chrono::Utc::now().timestamp_millis();
     let n = sqlx::query(&format!(
-        "INSERT OR IGNORE INTO release_event \
+        "INSERT INTO release_event \
              (work_id, chapter_key, first_seen_at, first_source_series_id, label, announce_at) \
-         SELECT ss.work_id, c.chapter_key, \
-                MIN(CAST(strftime('%s', {RELEASED_AT_SQL}) AS INTEGER) * 1000), \
+         SELECT DISTINCT ON (c.chapter_key) ss.work_id, c.chapter_key, \
+                date_trunc('second', {RELEASED_AT_SQL} + INTERVAL '500 microseconds'), \
                 c.source_series_id, \
                 COALESCE(c.label, c.number, 'Oneshot'), \
                 {ANNOUNCE_AT_SQL} \
            FROM source_series ss \
            JOIN chapter c ON c.source_series_id = ss.id \
-          WHERE ss.id = ? AND {} \
-          GROUP BY c.chapter_key",
-        seedable_where()
+          WHERE ss.id = $2 AND {} \
+          ORDER BY c.chapter_key, date_trunc('second', {RELEASED_AT_SQL} + INTERVAL '500 microseconds') ASC, c.id ASC ON CONFLICT DO NOTHING",
+        seedable_where(3)
     ))
     // Bind order is SQL TEXT order — see `seed_work`.
-    .bind(now_ms)
+    .bind(crate::db_types::epoch_millis(now_ms)?)
     .bind(source_series_id)
-    .bind(now_ms)
-    .execute(pool)
+    .bind(crate::db_types::epoch_millis(now_ms)?)
+    .execute(&mut *conn)
     .await?
     .rows_affected();
     Ok(n)
@@ -211,15 +228,15 @@ pub async fn record_source_series(pool: &Database, source_series_id: &str) -> Re
 /// every dedup merge would re-float the merged-in work's whole back catalogue to the top of
 /// /updates — the F7 symptom, reintroduced by the fix for it.
 pub async fn merge_release_events(
-    tx: &mut sqlx::SqliteConnection,
+    tx: &mut sqlx::PgConnection,
     source_work: &str,
     target_work: &str,
 ) -> Result<u64> {
     let n = sqlx::query(
         "INSERT INTO release_event \
              (work_id, chapter_key, first_seen_at, first_source_series_id, label, announce_at) \
-         SELECT ?, chapter_key, first_seen_at, first_source_series_id, label, announce_at \
-           FROM release_event WHERE work_id = ? \
+         SELECT $1, chapter_key, first_seen_at, first_source_series_id, label, announce_at \
+           FROM release_event WHERE work_id = $2 \
          ON CONFLICT(work_id, chapter_key) DO UPDATE SET \
              first_source_series_id = CASE \
                  WHEN excluded.first_seen_at < release_event.first_seen_at \
@@ -233,12 +250,12 @@ pub async fn merge_release_events(
              -- merged-in work's whole back catalogue. COALESCEd on both sides so a row that
              -- predates migration 0099 (NULL) contributes its release clock rather than
              -- losing to a NULL, which is the identity this column is deployed with.
-             announce_at = MIN(COALESCE(release_event.announce_at, release_event.first_seen_at), \
+             announce_at = LEAST(COALESCE(release_event.announce_at, release_event.first_seen_at), \
                                COALESCE(excluded.announce_at, excluded.first_seen_at)), \
              -- Safe to assign alongside the CASEs that read it: every right-hand side in a
              -- SET list is evaluated against the PRE-UPDATE row, so `release_event
              -- .first_seen_at` above is the stored value regardless of assignment order.
-             first_seen_at = MIN(release_event.first_seen_at, excluded.first_seen_at)",
+             first_seen_at = LEAST(release_event.first_seen_at, excluded.first_seen_at)",
     )
     .bind(target_work)
     .bind(source_work)
@@ -253,10 +270,10 @@ pub async fn merge_release_events(
 /// `now()`, and page 1 of /updates is about to be wrong.
 pub async fn assert_no_future_events(pool: &Database) -> Result<()> {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let (future, max): (i64, Option<i64>) = sqlx::query_as(
-        "SELECT COUNT(*), MAX(first_seen_at) FROM release_event WHERE first_seen_at > ?",
+    let (future, max): (i64, Option<chrono::DateTime<chrono::Utc>>) = crate::db_types::query_tuple(
+        "SELECT COUNT(*), MAX(first_seen_at) FROM release_event WHERE first_seen_at > $1",
     )
-    .bind(now_ms)
+    .bind(crate::db_types::epoch_millis(now_ms)?)
     .fetch_one(pool)
     .await?;
     if future > 0 {
@@ -307,8 +324,9 @@ pub async fn is_complete(pool: &Database) -> Result<bool> {
 ///
 /// MEMOISED, BECAUSE THE HOT PATH CANNOT AFFORD THE QUERY. The honest check below scans
 /// 1.44 M `chapter` rows with a primary-key probe each — a few seconds. That is fine once a
-/// day. It is NOT fine on the callers that matter: `project_feed_from_ledger_for_work` runs
-/// once per touched series per firehose PAGE and once per scanner detection, so an
+/// day. It is NOT fine on the callers that matter: the per-work projection runs once per
+/// touched series per firehose PAGE (`catalog::publish_mirror_feed_row`) and once per
+/// scanner detection (`scanner::upsert_feed_series_update`), so an
 /// un-memoised check would put a multi-second scan inside the 15-minute chapter cycle, which
 /// is precisely the kind of cost Phase D exists to remove.
 ///
@@ -444,7 +462,7 @@ pub async fn reconcile_feed(pool: &Database) -> Result<DriftReport> {
     let started = std::time::Instant::now();
 
     let snapshot: HashMap<String, (i64, Option<String>)> =
-        sqlx::query_as::<_, (String, i64, Option<String>)>(DRIFT_COLUMNS)
+        crate::db_types::query_tuple::<(String, i64, Option<String>)>(DRIFT_COLUMNS)
             .fetch_all(pool)
             .await?
             .into_iter()
@@ -453,8 +471,9 @@ pub async fn reconcile_feed(pool: &Database) -> Result<DriftReport> {
 
     crate::catalog::refresh_feed_updates(pool).await?;
 
-    let after: Vec<(String, i64, Option<String>)> =
-        sqlx::query_as(DRIFT_COLUMNS).fetch_all(pool).await?;
+    let after: Vec<(String, i64, Option<String>)> = crate::db_types::query_tuple(DRIFT_COLUMNS)
+        .fetch_all(pool)
+        .await?;
 
     let mut drifted = 0i64;
     let mut sample = Vec::new();
@@ -491,13 +510,13 @@ pub async fn reconcile_feed(pool: &Database) -> Result<DriftReport> {
     sqlx::query(
         "INSERT INTO feed_reconcile_report \
              (id, ran_at, duration_ms, rows_before, rows_after, drifted, sample) \
-         VALUES (1, ?, ?, ?, ?, ?, ?) \
+         VALUES (1, $1, $2, $3, $4, $5, $6) \
          ON CONFLICT(id) DO UPDATE SET \
              ran_at = excluded.ran_at, duration_ms = excluded.duration_ms, \
              rows_before = excluded.rows_before, rows_after = excluded.rows_after, \
              drifted = excluded.drifted, sample = excluded.sample",
     )
-    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(chrono::Utc::now())
     .bind(report.duration_ms)
     .bind(report.rows_before)
     .bind(report.rows_after)
@@ -510,19 +529,19 @@ pub async fn reconcile_feed(pool: &Database) -> Result<DriftReport> {
 
 /// How many ledger rows exist, and how many spine chapters still have none.
 pub async fn remaining(pool: &Database) -> Result<(i64, i64)> {
-    let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_event")
+    let events: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM release_event")
         .fetch_one(pool)
         .await?;
-    let pending: i64 = sqlx::query_scalar(&format!(
+    let pending: i64 = crate::db_types::query_scalar(&format!(
         "SELECT COUNT(*) FROM source_series ss \
            JOIN chapter c ON c.source_series_id = ss.id \
           WHERE {} \
             AND NOT EXISTS (SELECT 1 FROM release_event re \
                              WHERE re.work_id = ss.work_id \
                                AND re.chapter_key = c.chapter_key)",
-        seedable_where()
+        seedable_where(1)
     ))
-    .bind(chrono::Utc::now().timestamp_millis())
+    .bind(chrono::Utc::now())
     .fetch_one(pool)
     .await?;
     Ok((events, pending))
@@ -540,12 +559,8 @@ mod tests {
     /// load-bearing here — it is exactly what `merge_release_events` has to get ahead of.
     async fn pool() -> Database {
         let pool = Database::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
-            .await
-            .unwrap();
-        sqlx::query("PRAGMA foreign_keys = ON")
-            .execute(&pool)
             .await
             .unwrap();
         pool
@@ -628,9 +643,9 @@ mod tests {
 
         while seed_batch(&pool).await.unwrap() > 0 {}
 
-        let rows: Vec<(String, i64, Option<String>)> = sqlx::query_as(
+        let rows: Vec<(String, i64, Option<String>)> = crate::db_types::query_tuple(
             "SELECT chapter_key, first_seen_at, first_source_series_id FROM release_event \
-             WHERE work_id = ?",
+             WHERE work_id = $1",
         )
         .bind(&work)
         .fetch_all(&pool)
@@ -653,12 +668,13 @@ mod tests {
         // `released_at = MAX(...)` could never be made safe against.
         record_source_series(&pool, &md).await.unwrap();
         while seed_batch(&pool).await.unwrap() > 0 {}
-        let after: i64 =
-            sqlx::query_scalar("SELECT first_seen_at FROM release_event WHERE work_id = ?")
-                .bind(&work)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let after: i64 = crate::db_types::query_scalar(
+            "SELECT first_seen_at FROM release_event WHERE work_id = $1",
+        )
+        .bind(&work)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             after,
             ms("2026-06-01T00:00:00Z"),
@@ -707,8 +723,8 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            sqlx::query("UPDATE source_series SET created_at = ? WHERE id = ?")
-                .bind("2026-06-01T00:00:00+00:00")
+            sqlx::query("UPDATE source_series SET created_at = $1 WHERE id = $2")
+                .bind(crate::db_types::date("2026-06-01T00:00:00+00:00").unwrap())
                 .bind(&ss)
                 .execute(&pool)
                 .await
@@ -755,8 +771,8 @@ mod tests {
         let row = |work: String| {
             let pool = pool.clone();
             async move {
-                sqlx::query_as::<_, (i64, Option<i64>)>(
-                    "SELECT first_seen_at, announce_at FROM release_event WHERE work_id = ?",
+                crate::db_types::query_tuple::<(i64, Option<i64>)>(
+                    "SELECT first_seen_at, announce_at FROM release_event WHERE work_id = $1",
                 )
                 .bind(&work)
                 .fetch_one(&pool)
@@ -826,11 +842,12 @@ mod tests {
         }
         while seed_batch(&pool).await.unwrap() > 0 {}
 
-        let times: Vec<i64> =
-            sqlx::query_scalar("SELECT first_seen_at FROM release_event ORDER BY first_seen_at")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let times: Vec<i64> = crate::db_types::query_scalar(
+            "SELECT first_seen_at FROM release_event ORDER BY first_seen_at",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             times,
             vec![
@@ -868,7 +885,7 @@ mod tests {
         .unwrap();
         while seed_batch(&pool).await.unwrap() > 0 {}
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM release_event")
+            crate::db_types::query_scalar::<i64>("SELECT COUNT(*) FROM release_event")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
@@ -883,7 +900,7 @@ mod tests {
             .await
             .unwrap();
         while seed_batch(&pool).await.unwrap() > 0 {}
-        let t: i64 = sqlx::query_scalar("SELECT first_seen_at FROM release_event")
+        let t: i64 = crate::db_types::query_scalar("SELECT first_seen_at FROM release_event")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -936,8 +953,8 @@ mod tests {
         merge_release_events(&mut tx, &b, &a).await.unwrap();
         tx.commit().await.unwrap();
 
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT chapter_key, first_seen_at FROM release_event WHERE work_id = ? \
+        let rows: Vec<(String, i64)> = crate::db_types::query_tuple(
+            "SELECT chapter_key, first_seen_at FROM release_event WHERE work_id = $1 \
              ORDER BY chapter_key",
         )
         .bind(&a)
@@ -954,17 +971,19 @@ mod tests {
         );
 
         // And the cascade the merge relies on still fires for the losing work.
-        sqlx::query("DELETE FROM work WHERE id = ?")
+        sqlx::query("DELETE FROM work WHERE id = $1")
             .bind(&b)
             .execute(&pool)
             .await
             .unwrap();
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM release_event WHERE work_id = ?")
-                .bind(&b)
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
+            crate::db_types::query_scalar::<i64>(
+                "SELECT COUNT(*) FROM release_event WHERE work_id = $1"
+            )
+            .bind(&b)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
             0
         );
     }
@@ -1006,17 +1025,18 @@ mod tests {
         assert_eq!(second.rows_before, second.rows_after);
 
         // And the report is persisted for the console to read days later.
-        let (drifted, rows): (i64, i64) =
-            sqlx::query_as("SELECT drifted, rows_after FROM feed_reconcile_report WHERE id = 1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (drifted, rows): (i64, i64) = crate::db_types::query_tuple(
+            "SELECT drifted, rows_after FROM feed_reconcile_report WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(drifted, 0);
         assert_eq!(rows, second.rows_after);
 
         // Now corrupt the feed behind the incremental writers' backs and prove the
         // reconciler NOTICES. Without this the zero above could just mean it is blind.
-        sqlx::query("UPDATE feed_series_updates SET released_at = 1, latest_chapter = 'x'")
+        sqlx::query("UPDATE feed_series_updates SET released_at = TIMESTAMPTZ '1970-01-01 00:00:00.001+00', latest_chapter = 'x'")
             .execute(&pool)
             .await
             .unwrap();
@@ -1057,7 +1077,7 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO feed_series_updates (work_id, reader_id, title, released_at) \
-             VALUES (?, ?, 'Both Halves', 0)",
+             VALUES ($1, $2, 'Both Halves', TIMESTAMPTZ '1970-01-01 00:00:00+00')",
         )
         .bind(&work)
         .bind(&work)
@@ -1070,8 +1090,8 @@ mod tests {
             .await
             .unwrap();
         drop(conn);
-        let (before, label): (i64, Option<String>) = sqlx::query_as(
-            "SELECT released_at, latest_chapter FROM feed_series_updates WHERE work_id = ?",
+        let (before, label): (i64, Option<String>) = crate::db_types::query_tuple(
+            "SELECT released_at, latest_chapter FROM feed_series_updates WHERE work_id = $1",
         )
         .bind(&work)
         .fetch_one(&pool)
@@ -1102,12 +1122,13 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        let after: i64 =
-            sqlx::query_scalar("SELECT released_at FROM feed_series_updates WHERE work_id = ?")
-                .bind(&work)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let after: i64 = crate::db_types::query_scalar(
+            "SELECT released_at FROM feed_series_updates WHERE work_id = $1",
+        )
+        .bind(&work)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             after,
             ms("2026-06-01T00:00:00Z"),
@@ -1134,8 +1155,8 @@ mod tests {
             .await
             .unwrap();
         drop(conn);
-        let (moved, label2): (i64, Option<String>) = sqlx::query_as(
-            "SELECT released_at, latest_chapter FROM feed_series_updates WHERE work_id = ?",
+        let (moved, label2): (i64, Option<String>) = crate::db_types::query_tuple(
+            "SELECT released_at, latest_chapter FROM feed_series_updates WHERE work_id = $1",
         )
         .bind(&work)
         .fetch_one(&pool)
@@ -1310,7 +1331,7 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO feed_series_updates (work_id, reader_id, title, released_at) \
-             VALUES (?, ?, 'T', 99999)",
+             VALUES ($1, $2, 'T', TIMESTAMPTZ '1970-01-01 00:01:39.999+00')",
         )
         .bind(&work)
         .bind(&work)
@@ -1327,8 +1348,8 @@ mod tests {
             0
         );
         assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT released_at FROM feed_series_updates WHERE work_id = ?"
+            crate::db_types::query_scalar::<i64>(
+                "SELECT released_at FROM feed_series_updates WHERE work_id = $1"
             )
             .bind(&work)
             .fetch_one(&pool)
@@ -1348,8 +1369,8 @@ mod tests {
             1
         );
         assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT released_at FROM feed_series_updates WHERE work_id = ?"
+            crate::db_types::query_scalar::<i64>(
+                "SELECT released_at FROM feed_series_updates WHERE work_id = $1"
             )
             .bind(&work)
             .fetch_one(&pool)
@@ -1397,7 +1418,7 @@ mod tests {
             "the seed must hold off while the spine is still filling"
         );
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM release_event")
+            crate::db_types::query_scalar::<i64>("SELECT COUNT(*) FROM release_event")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),

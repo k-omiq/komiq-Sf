@@ -200,7 +200,26 @@ unset COMPOSE_FILE COMPOSE_PATH_SEPARATOR KOMIQ_PORT KOMIQ_BIND
 # Existing ports published by this stack are safe on a re-run. Only accept a
 # running server's actual host bindings, not arbitrary Docker listeners.
 owned_bindings=
-server_id=$(docker compose ps -q server 2>/dev/null) || server_id=
+project=${COMPOSE_PROJECT_NAME:-$(env_value COMPOSE_PROJECT_NAME)}
+project=${project:-komiq}
+case "$project" in
+    [a-z0-9]* ) ;;
+    *) problem "Compose project name must start with a lowercase letter or digit." ;;
+esac
+case "$project" in *[!a-z0-9_-]*) problem "Invalid Compose project name." ;; esac
+rollback_state=.sqlite-image-${project}
+[ ! -f "$rollback_state" ] || chmod 600 "$rollback_state"
+# Inspect only DATABASE_URL entries without printing the image/container env.
+# The old self-host image baked in this SQLite default; the new image has none.
+sqlite_env() {
+    awk '/^sqlite$/ { found=1 } END { exit !found }'
+}
+image_is_sqlite() {
+    docker image inspect --format '{{range .Config.Env}}{{if ge (len .) 22}}{{if eq (slice . 0 22) "DATABASE_URL=sqlite://"}}{{println "sqlite"}}{{end}}{{end}}{{end}}' "$1" | sqlite_env
+}
+immutable_image() { [[ "$1" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; }
+export COMPOSE_PROJECT_NAME="$project"
+server_id=$(docker ps -aq --filter "label=com.docker.compose.project=$project" --filter label=com.docker.compose.service=server) || server_id=
 if [ -n "$server_id" ]; then
     owned_bindings=$(docker inspect --format '{{if .State.Running}}{{range .NetworkSettings.Ports}}{{range .}}{{println .HostIp .HostPort}}{{end}}{{end}}{{end}}' "$server_id" 2>/dev/null) || owned_bindings=
 fi
@@ -268,6 +287,21 @@ if [ -f .env ]; then
 else
     cp .env.example .env
 fi
+chmod 600 .env
+[ ! -f .env.bak ] || chmod 600 .env.bak
+# Append a password only when missing or empty. Never print it or execute .env.
+db_password=$(env_value KOMIQ_DB_PASSWORD)
+if [ -z "$db_password" ]; then
+    db_password=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+    [ "${#db_password}" -eq 64 ] || problem "Could not generate a database password."
+    password_tmp=$(mktemp .env.password.XXXXXX)
+    chmod 600 "$password_tmp"
+    awk '!/^[[:space:]]*(export[[:space:]]+)?KOMIQ_DB_PASSWORD[[:space:]]*=/' .env > "$password_tmp"
+    printf 'KOMIQ_DB_PASSWORD=%s\n' "$db_password" >> "$password_tmp"
+    mv "$password_tmp" .env
+fi
+case "$db_password" in *[!A-Za-z0-9_.-]*) problem "KOMIQ_DB_PASSWORD must use letters, digits, _, . or -. Keep the existing password on an initialized PostgreSQL volume." ;; esac
+unset db_password KOMIQ_DB_PASSWORD
 env_tmp=$(mktemp .env.install.XXXXXX)
 trap 'rm -f "$env_tmp"' EXIT
 cp -p .env "$env_tmp"
@@ -285,6 +319,7 @@ awk -v port="$port" -v bind="$bind" -v files="$env_compose" '
     }
 ' .env > "$env_tmp"
 mv "$env_tmp" .env
+chmod 600 .env
 ok "Saved .env (port $port, bind $bind, access $access)."
 export COMPOSE_FILE="$compose_files" COMPOSE_PATH_SEPARATOR=:
 export KOMIQ_PORT="$port" KOMIQ_BIND="$bind"
@@ -340,20 +375,157 @@ else
 fi
 printf '%s\n' "If this is a cloud server, also open the same ports in your provider's firewall (security group / security list)."
 
-printf '%s\n' 'Starting komiq. The first build takes 15 to 30 minutes.'
-docker compose up -d --build || problem "Build or start failed. Check: docker compose logs server (from $PWD)."
-printf '%s\n' 'Waiting for the server to be ready (up to 5 minutes).'
-healthy=no
-for ((attempt=0; attempt<60; attempt++)); do
+# Start the database first. Its health check authenticates as the application role.
+printf '%s\n' 'Starting PostgreSQL.'
+docker compose up -d --wait --wait-timeout 300 postgres || problem "PostgreSQL did not become ready. Run: docker compose logs postgres"
+# Inspect the existing named volume read-only using the now-cached postgres image.
+# Labels also support COMPOSE_PROJECT_NAME; no old server needs to be started.
+legacy_bytes=0 legacy_found=no
+volume=$(docker volume ls -q --filter "label=com.docker.compose.project=$project" --filter label=com.docker.compose.volume=server-data) || problem "Could not inspect the server volume."
+if [ -n "$volume" ]; then
+    pg_image=$(docker compose images -q postgres) || problem "Could not find the PostgreSQL image."
+    legacy_bytes=$(docker run --rm --network none --pull never --entrypoint sh -v "$volume:/legacy:ro" "$pg_image" -c 'if [ -f /legacy/komika.sqlite3 ]; then stat -c %s /legacy/komika.sqlite3; else echo missing; fi') || problem "Could not check the old SQLite database."
+    case "$legacy_bytes" in
+        missing) legacy_bytes=0 ;;
+        ''|*[!0-9]*) problem "Could not measure the old SQLite database." ;;
+        *) legacy_found=yes ;;
+    esac
+fi
+if [ "$legacy_found" = yes ]; then
+    printf '%s\n' 'The first start converts your SQLite database to PostgreSQL and verifies it before serving.' \
+        'Your SQLite file stays untouched until verification succeeds, then it is renamed and kept.' \
+        'Watch conversion: docker compose logs -f server'
+    rollback_tag=komiq-selfhost:${project}-pre-postgres
+    rollback_state=.sqlite-image-${project}
+    rollback_image=
+    if [ -f "$rollback_state" ]; then
+        rollback_image=$(< "$rollback_state") || problem "Could not read saved SQLite image."
+        immutable_image "$rollback_image" || problem "Invalid saved SQLite image ID."
+        image_is_sqlite "$rollback_image" || problem "Saved image is missing or is not a SQLite-era image. Restore the previous SQLite image from your archive."
+        # Recreate our tag from the recorded identity, never from a retry container.
+        docker image tag "$rollback_image" "$rollback_tag" || problem "Saved SQLite image is missing. Restore it from your image archive."
+    elif [ -n "$server_id" ]; then
+        # Require both a SQLite container URL (queries/relative paths accepted)
+        # and the image's baked-in SQLite default. The overlay proves only the URL.
+        old_database=$(docker inspect --format '{{range .Config.Env}}{{if ge (len .) 22}}{{if eq (slice . 0 22) "DATABASE_URL=sqlite://"}}{{println "sqlite"}}{{end}}{{end}}{{end}}' "$server_id" | sqlite_env && printf sqlite) || old_database=
+        if [ "$old_database" = sqlite ]; then
+            candidate_image=$(docker inspect --format '{{.Image}}' "$server_id") || problem "Could not preserve the previous image."
+            immutable_image "$candidate_image" || problem "Invalid previous image ID."
+            if image_is_sqlite "$candidate_image"; then
+                rollback_image=$candidate_image
+                docker image tag "$rollback_image" "$rollback_tag" || problem "Could not preserve the previous image."
+                # Noclobber protects an existing record, even if two installers race.
+                (umask 077; set -o noclobber; printf '%s\n' "$rollback_image" > "$rollback_state") || problem "Could not record the SQLite image; retry the installer."
+            fi
+        fi
+    fi
+    if [ -z "$rollback_image" ]; then
+        warn "No SQLite image was saved: no previous SQLite server container was available."
+    fi
+fi
+import_seconds() {
+    local bytes=$1
+    # Docker stat uses decimal bytes. Reject values outside Bash's signed range.
+    while [ "${#bytes}" -gt 1 ] && [ "${bytes:0:1}" = 0 ]; do bytes=${bytes:1}; done
+    if [ "${#bytes}" -gt 19 ] || { [ "${#bytes}" -eq 19 ] && [[ "$bytes" > 9223372036854775807 ]]; }; then
+        problem "SQLite source size exceeds the supported integer range."
+    fi
+    bytes=$((10#$bytes))
+    # Divide first; remainder * 3600 is bounded below 9.9e12.
+    printf '%s\n' "$((bytes / 2750000000 * 3600 + (bytes % 2750000000 * 3600 + 2749999999) / 2750000000))"
+}
+# Compose defaults to a day; increase it for larger measured sources.
+import_grace=$(import_seconds "$legacy_bytes")
+[ "$import_grace" -ge 86400 ] || import_grace=86400
+export KOMIQ_IMPORT_START_PERIOD=${import_grace}s
+grace_tmp=$(mktemp .env.grace.XXXXXX)
+chmod 600 "$grace_tmp"
+awk '!/^[[:space:]]*(export[[:space:]]+)?KOMIQ_IMPORT_START_PERIOD[[:space:]]*=/' .env > "$grace_tmp"
+printf 'KOMIQ_IMPORT_START_PERIOD=%s\n' "$KOMIQ_IMPORT_START_PERIOD" >> "$grace_tmp"
+mv "$grace_tmp" .env
+printf '%s\n' 'Starting komiq. The first build can take a while.'
+# Do not let restart policy hide a conversion failure in a restart loop.
+rollback_command() {
+    local file
+    local selected_files
+    IFS=: read -r -a selected_files <<< "$compose_files"
+    printf 'KOMIQ_IMAGE=%s docker compose' "$1" >&2
+    for file in "${selected_files[@]}"; do printf ' -f %s' "$file" >&2; done
+    printf ' -f docker-compose.rollback.yml up -d --no-build --no-deps server\n' >&2
+}
+startup_failed() {
+    docker compose stop server >/dev/null 2>&1 || true
+    printf '%s\n' 'Startup failed. Inspect: docker compose logs server' >&2
+    if [ "$legacy_found" = yes ]; then
+        printf '%s\n' 'Before a successful import, use the rollback Compose file with DATABASE_URL=sqlite:///data/komika.sqlite3.' >&2
+        if [ -n "$rollback_image" ]; then
+            rollback_command "$rollback_tag"
+        else
+            printf '%s\n' 'No SQLite image was saved. Use the published SQLite image tag for the release you previously installed, or load its saved image archive.' \
+                'This repository defines no published SQLite image tag; do not use the current PostgreSQL image for rollback.' >&2
+            rollback_command '<previous-SQLite-release-tag>'
+        fi
+        printf '%s\n' 'After successful conversion and new writes, the kept SQLite file is behind; restore a current backup instead.' >&2
+    fi
+    exit 1
+}
+startup_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+previous_server_id=$(docker compose ps -aq server) || previous_server_id=
+previous_restarts=0
+if [ -n "$previous_server_id" ]; then
+    previous_restarts=$(docker inspect --format '{{.RestartCount}}' "$previous_server_id" 2>/dev/null) || previous_restarts=0
+fi
+docker compose up -d --build || startup_failed
+# Timing rule: docs/audits/postgres-phase5b-selfhost.md, Upgrade and readiness.
+idle_seconds=300
+if [ "$legacy_found" = yes ]; then
+    idle_seconds=$(import_seconds "$legacy_bytes")
+    [ "$idle_seconds" -ge 3600 ] || idle_seconds=3600
+fi
+idle_limit=$(((idle_seconds + 4) / 5))
+printf '%s\n' 'Waiting for readiness. Import progress extends the wait.'
+healthy=no idle=0 shown=0 previous_progress= progress_marks=
+while [ "$idle" -lt "$idle_limit" ]; do
     server_id=$(docker compose ps -q server) || server_id=
-    health=
+    health= state= restarts=0
     if [ -n "$server_id" ]; then
         health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$server_id" 2>/dev/null) || health=
+        state=$(docker inspect --format '{{.State.Status}}' "$server_id" 2>/dev/null) || state=
+        restarts=$(docker inspect --format '{{.RestartCount}}' "$server_id" 2>/dev/null) || restarts=0
     fi
+    logs=$(docker compose logs --no-color --since "$startup_since" server) || problem "Could not read the server log."
+    progress=$(printf '%s\n' "$logs" | sed -n 's/^.*\(sqlite import:.*\)$/\1/p')
+    count=$(printf '%s\n' "$progress" | awk 'NF { n++ } END { print n+0 }')
+    if [ "$count" -le "$shown" ] && [ "$progress" != "$previous_progress" ]; then
+        # Bounded Docker logs can rotate during a large import.
+        shown=0
+    fi
+    if [ "$count" -gt "$shown" ]; then
+        printf '%s\n' "$progress" | tail -n +"$((shown + 1))"
+        shown=$count
+    fi
+    # Display cursor is independent from progress high-water marks: duplicates
+    # and log rotation cannot renew the allowance.
+    progress_result=$(printf '%s\n' "$progress" | awk -v marks="$progress_marks" -f "$PWD/install-progress.awk")
+    advanced=${progress_result%%$'\n'*}
+    progress_marks=${progress_result#*$'\n'}
+    [ "$advanced" != 1 ] || idle=0
+    previous_progress=$progress
+    failure=$(printf '%s\n' "$logs" | awk 'tolower($0) ~ /sqlite import:/ && tolower($0) ~ /fail|error/ { last=$0 } END { print last }')
+    if [ -n "$failure" ]; then printf '%s\n' "$failure" >&2; startup_failed; fi
+    case "$state" in exited|dead|restarting) printf '%s\n' "$logs" >&2; startup_failed ;; esac
+    restart_baseline=0
+    [ "$server_id" != "$previous_server_id" ] || restart_baseline=$previous_restarts
+    if [ "$restarts" -gt "$restart_baseline" ]; then printf '%s\n' "$logs" >&2; startup_failed; fi
     if [ "$health" = healthy ]; then healthy=yes; break; fi
     sleep 5
+    idle=$((idle + 1))
 done
-[ "$healthy" = yes ] || problem "Server did not become healthy. Run: cd '$PWD' && docker compose logs server"
+if [ "$healthy" != yes ]; then
+    printf '%s\n' "$logs" >&2
+    printf '%s\n' 'Server did not become healthy. No new import progress arrived within the startup allowance.' >&2
+    startup_failed
+fi
 ok "Server is healthy."
 
 # The choices made here, so setup does not ask them again (or get another answer).
@@ -396,4 +568,4 @@ case "$access:$encrypt" in
 esac
 printf 'Change a choice later: cd %q && docker compose exec server komika-server setup\n' "$PWD"
 printf '%s\n' 'Update: git pull, then re-run this install.sh.'
-printf '%s\n' 'Data stays in Docker volumes: komiq_server-data and komiq_engine-data.'
+printf '%s\n' 'Data stays in Docker volumes: komiq_postgres-data, komiq_server-data and komiq_engine-data.'

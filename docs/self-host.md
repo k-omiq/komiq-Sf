@@ -466,7 +466,8 @@ docker compose up -d
 ```
 
 Stop komiq before copying: the database is written all the time, and a copy taken while
-it runs may not open. Timed backups are planned for a later release.
+it runs may not open. `deploy/selfhost/backup.sh` writes a PostgreSQL dump and keeps the
+newest seven. Run it from the host's cron.
 
 ## Remove
 

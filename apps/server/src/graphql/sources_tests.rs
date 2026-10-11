@@ -54,43 +54,62 @@ pub(super) async fn mock_engine() -> (String, Removed) {
 /// client starts OFF (as on a fresh install) and points at a dead port, so even a
 /// switched-on call can never leave the machine.
 pub(super) async fn fixture(engine: &str) -> (ApiSchema, Arc<AppState>) {
+    fixture_with_users(
+        engine,
+        &[
+            (
+                "964771b0-a2fb-4849-857a-6198947115ec",
+                "admin",
+                1,
+                "admintok",
+            ),
+            ("ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c", "bob", 0, "bobtok"),
+        ],
+    )
+    .await
+}
+
+/// Same in-process harness, with caller-chosen fixed identities.
+pub(super) async fn fixture_with_users(
+    engine: &str,
+    users: &[(&str, &str, i64, &str)],
+) -> (ApiSchema, Arc<AppState>) {
     let pool = crate::database::TestPoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    sqlx::migrate!("./migrations")
+    sqlx::migrate!("./migrations_pg")
         .run(pool.write())
         .await
         .unwrap();
-    for (id, name, admin, tok) in [
-        ("admin-id", "admin", 1, "admintok"),
-        ("bob-id", "bob", 0, "bobtok"),
-    ] {
+    for &(id, name, admin, tok) in users {
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, is_admin, created_at) \
-             VALUES (?, ?, ?, 'x', ?, '2020-01-01T00:00:00Z')",
+             VALUES ($1, $2, $3, 'x', $4, '2020-01-01T00:00:00Z')",
         )
-        .bind(id)
+        .bind(crate::db_types::uuid(id).unwrap())
         .bind(name)
         .bind(format!("{name}@e.com"))
-        .bind(admin)
+        .bind(admin != 0)
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
             "INSERT INTO sessions (token, user_id, created_at, expires_at) \
-             VALUES (?, ?, '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
+             VALUES ($1, $2, '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
         )
         .bind(auth::hash_token(tok))
-        .bind(id)
+        .bind(crate::db_types::uuid(id).unwrap())
         .execute(&pool)
         .await
         .unwrap();
     }
     let state = Arc::new(AppState {
         pool: pool.clone(),
-        cover_pool: pool,
+        cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
+            .await
+            .unwrap(),
         suwayomi: SuwayomiClient::new(engine.to_string(), None, None),
         mangadex: Arc::new(
             crate::mangadex::MangaDexClient::new("sources-test", 50.0, 600.0)
@@ -502,15 +521,14 @@ async fn scanlator_tags_are_admin_written_public_to_read_and_sources_are_listed(
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO browse_catalogue (work_id, reader_id, title, is_nsfw, en_chapter_count, created_at) \
-         VALUES ('w1', 'w1', 'One', 0, 3, '2026-01-01T00:00:00Z')",
+        r#"INSERT INTO browse_catalogue (work_id, reader_id, title, is_nsfw, en_chapter_count, created_at) VALUES ('w1', 'w1', 'One', FALSE, 3, '2026-01-01T00:00:00Z')"#,
     )
     .execute(&st.pool)
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
-         VALUES ('md1', 'w1', 'mangadex', 'mangadex', 'u1', '2026-01-01T00:00:00Z'), \
+         VALUES ('md1', 'w1', 'mangadex', 'mangadex', '11ac9418-0c9e-4237-9e42-3ace93d7c468', '2026-01-01T00:00:00Z'), \
                 ('sy1', 'w1', 'suwayomi', '77', '1', '2026-01-01T00:00:00Z')",
     )
     .execute(&st.pool)

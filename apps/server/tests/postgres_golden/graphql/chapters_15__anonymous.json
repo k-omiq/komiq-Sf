@@ -1,0 +1,17 @@
+{
+  "data": null,
+  "errors": [
+    {
+      "locations": [
+        {
+          "column": 3,
+          "line": 1
+        }
+      ],
+      "message": "No such work",
+      "path": [
+        "canonicalChapters"
+      ]
+    }
+  ]
+}

@@ -3,11 +3,11 @@ title: Catalogue sync
 description: Understand how the server inside the admin app fills its catalogue, mirrors MangaDex and schedules source scans.
 ---
 
-Komiq is self-hostable: the admin app runs the server and gives you its management portal, and the reader app connects to a server. The server maintains its catalogue from two data streams: a direct MangaDex mirror and sources tracked through [Suwayomi](/developers/suwayomi) extensions. This page explains how its background workers ingest titles, poll for chapter releases and adapt scan schedules.
+Komiq is self-hostable: the admin app runs the server and gives you its management portal, and the reader app connects to a server. The server maintains its catalogue from two data streams: a direct MangaDex mirror and sources tracked through [Suwayomi, the source engine](/developers/suwayomi) extensions. This page explains how its background workers ingest titles, poll for chapter releases and adapt scan schedules.
 
 ## Overview
 
-The catalogue architecture separates metadata storage from image delivery. The server stores series records, chapter lists and author credits in its SQLite database. When you read a chapter, page images stream live through the image proxy rather than taking up disk space on the server.
+The catalogue architecture separates metadata storage from image delivery. The server stores series records, chapter lists and author credits in PostgreSQL. When you read a chapter, page images stream live through the image proxy rather than taking up disk space on the server.
 
 ```flow
 MangaDex API -> Catalogue sync: fetches metadata and chapter feed
@@ -42,7 +42,7 @@ The usage switch (`mangadex_enabled`) decides whether the server may contact Man
 
 1. The `KOMIKA_MANGADEX` environment variable. If set to `on` or `off`, it locks the switch.
 2. The `CATALOGUE_SYNC` environment variable. If set to `on`, it forces MangaDex usage on.
-3. The stored setting in the `instance_setting` table, toggled from the admin console under [Settings](/admin/settings).
+3. The stored setting in the `instance_setting` table, toggled from the admin console under [Settings and maintenance](/admin/settings).
 4. The built-in default: `off` when `KOMIKA_WEB_DIR` is set to a non-empty value, and `on` otherwise. The Docker image and desktop admin app set this variable to serve the web apps.
 
 When the usage switch is off, all MangaDex API calls fail immediately inside the client without opening a network connection.
@@ -87,7 +87,7 @@ Komiq's Suwayomi integration does not use a global chapter firehose. It discover
 The source sync supervisor in `apps/server/src/sync.rs` runs every 24 hours by default (`SOURCE_SYNC_INTERVAL_SECONDS`). It reconciles enrolled series, then discovers titles through extensions enabled in `extension_subscription`:
 
 - **Reconcile**: It ensures every enrolled series has a tracking row in `series_scan_state`, and verifies that Suwayomi marks the series as part of its library.
-- **Discover**: It walks the latest updates list (`FetchType::Latest`) for each subscribed English source. It ingests newly found series sequentially with [canonical work](/developers/canonical-works) deduplication.
+- **Discover**: It walks the latest updates list (`FetchType::Latest`) for each subscribed English source. It ingests newly found series sequentially with [One entry per series](/developers/canonical-works) deduplication.
 
 The walk pauses 750 milliseconds between browse pages (`PAGE_DELAY_MS`). The crawler stops after 2 consecutive fully known pages (`STOP_AFTER_KNOWN_PAGES`) once it has seen at least 30 distinct series (`LATEST_TRIGGER_WINDOW`), when the source has no next page, or at a maximum of 10 pages by default (`SOURCE_SYNC_MAX_PAGES`).
 

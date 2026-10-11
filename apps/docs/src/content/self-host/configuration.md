@@ -17,10 +17,11 @@ On a self-hosted installation where `KOMIKA_WEB_DIR` is set (Docker Compose or t
 
 ## Docker Compose settings
 
-The Compose file in `deploy/selfhost/docker-compose.yml` reads optional variables from `.env`. Copy `deploy/selfhost/.env.example` to `.env` to customize them.
+The Compose file in `deploy/selfhost/docker-compose.yml` requires `KOMIQ_DB_PASSWORD` in `.env`. Run `deploy/selfhost/install.sh` to generate it and preserve existing settings. Other variables are optional. Keep the file private with `chmod 600 deploy/selfhost/.env`.
 
 | Setting                | Default   | Description                                                                                                                            |
 | ---------------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `KOMIQ_DB_PASSWORD`    | required  | Random URL-safe database password. Generated once by the installer. Keep it unchanged on an initialized cluster.                       |
 | `KOMIQ_PORT`           | `8080`    | Host port on which komiq listens.                                                                                                      |
 | `KOMIQ_BIND`           | `0.0.0.0` | Host address to bind (`0.0.0.0` for local network access, `127.0.0.1` for this machine only).                                          |
 | `COMPOSE_FILE`         | unset     | Extra Compose files that publish port 443 (`docker-compose.https.yml`) and port 80 (`docker-compose.acme.yml`). The installer sets it. |
@@ -47,11 +48,14 @@ These variables configure network listeners, web applications, and proxy endpoin
 
 These variables configure database connections and file storage paths.
 
-| Variable              | Default                   | Description                                                       |
-| --------------------- | ------------------------- | ----------------------------------------------------------------- |
-| `DATABASE_URL`        | `sqlite://komika.sqlite3` | SQLite URL for accounts, library data, and settings.              |
-| `COVERS_DATABASE_URL` | sibling `covers.sqlite3`  | SQLite URL for cached cover storage, separate from main database. |
-| `EXT_ICONS_DIR`       | `/srv/ext-icons`          | Directory on disk where source extension icons are cached.        |
+| Variable                    | Default                       | Description                                                                                                                |
+| --------------------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`              | `postgres://localhost/komika` | PostgreSQL URL for accounts, libraries and settings. Compose supplies the private `postgres` service and application role. |
+| `COVERS_DATABASE_URL`       | `sqlite://covers.sqlite3`     | SQLite URL for cached cover storage, separate from main database.                                                          |
+| `KOMIKA_SQLITE_IMPORT_PATH` | `komika.sqlite3` beside the covers file | Absolute path of the old main SQLite file to convert; the server refuses a relative path. Compose sets `/data/komika.sqlite3`. |
+| `EXT_ICONS_DIR`             | `/srv/ext-icons`              | Directory on disk where source extension icons are cached.                                                                 |
+
+The main database lives in `postgres-data`; covers and other server files live in `server-data`. Use a PostgreSQL dump for account and library backups. Copying the cover file does not back up those records. See [Update and back up](/self-host/update-and-backup).
 
 ## Source engine settings
 
@@ -63,37 +67,11 @@ These variables configure connections to the Suwayomi source engine.
 | `SUWAYOMI_PUBLIC_URL` | unset                   | Public base URL for Suwayomi for direct client fetching. |
 | `SUWAYOMI_SOURCE_ID`  | unset                   | Pins requests to a specific Suwayomi source identifier.  |
 
-## Accounts and authentication
+## Accounts and instance settings
 
-These variables control administrator bootstrapping and authentication limits.
+Create the owner in [First-run setup](/self-host/first-run), then manage registration, sources and user accounts in the admin console. Environment overrides take precedence over those choices. For example, `KOMIKA_REGISTRATION_OPEN` pins registration and `KOMIKA_MANGADEX` pins MangaDex access.
 
-| Variable                           | Default   | Description                                                                                                |
-| ---------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------- |
-| `KOMIKA_ADMIN_USERS`               | empty     | Comma-separated admin usernames to bootstrap at boot.                                                      |
-| `KOMIKA_ADMIN_PASSWORD`            | empty     | Password for bootstrap admin creation or promotion.                                                        |
-| `KOMIKA_ADMIN_EMAIL`               | empty     | Email address assigned to bootstrapped administrators.                                                     |
-| `KOMIKA_SETUP_CODE`                | unset     | Read by the `komika-server setup` command instead of its `--setup-code` option.                            |
-| `SESSION_TTL_SECS`                 | `2592000` | User session lifetime in seconds (30 days). Admin sessions cap at 8 hours.                                 |
-| `AUTH_RATE_LIMIT_MAX`              | `10`      | Maximum login attempts per address per window. One account takes 3 times this from all addresses together. |
-| `AUTH_RATE_LIMIT_WINDOW_SECS`      | `300`     | Window in seconds for login rate limiting (5 minutes).                                                     |
-| `FEDERATED_RATE_LIMIT_MAX`         | `20`      | Maximum requests per window for federated engine operations.                                               |
-| `FEDERATED_RATE_LIMIT_WINDOW_SECS` | `60`      | Window in seconds for federated rate limits (1 minute).                                                    |
-
-## Instance configuration
-
-These variables override settings normally managed in the admin console.
-
-| Variable                       | Default             | Description                                                          |
-| ------------------------------ | ------------------- | -------------------------------------------------------------------- |
-| `KOMIKA_INSTANCE_NAME`         | `komiq`             | Server name shown on page headers and reader screens.                |
-| `KOMIKA_REGISTRATION_OPEN`     | `false` (self-host) | Controls user registration. Pins the setting on or off.              |
-| `KOMIKA_MANGADEX`              | `false` (self-host) | Controls MangaDex integration. Pins the setting on or off.           |
-| `KOMIKA_MANGADEX_RATINGS`      | `true`              | Shows MangaDex ratings to readers. Pins the setting on or off.       |
-| `CATALOGUE_SYNC`               | unset               | Set to `on` to force MangaDex usage on and run catalogue crawl.      |
-| `KOMIKA_APPS_FETCH_THEMSELVES` | `false`             | Tells reader apps that have their own engine to fetch chapter pages. |
-
-> [!NOTE]
-> With `KOMIKA_APPS_FETCH_THEMSELVES=on`, a reader app that has its own source engine (the desktop app, or an Android app built with the engine) greys out "The server" on its "Who gets the chapters?" screen and fetches chapter pages itself. The server still answers page requests. The web reader and phone apps without an engine read through the server, and an app with an engine falls back to the server when its own fetch fails.
+`KOMIKA_APPS_FETCH_THEMSELVES=on` asks a reader with its own engine to fetch chapters on that device. The web reader and apps without an engine still use the server. The server continues answering page requests.
 
 ## Cloudflare and proxy settings
 
@@ -112,23 +90,9 @@ These variables configure Cloudflare and reverse proxies, services that forward 
 
 ## Scanner and maintenance tasks
 
-These variables control background scanning, extension updates, and cache maintenance.
+Use the admin console's source settings for scan limits and extension subscriptions. Environment settings can also set source rate caps with `SCAN_SOURCE_RATE_LIMITS`, discovery page limits with `SOURCE_SYNC_MAX_PAGES` and update cadence with `EXTENSION_AUTO_UPDATE_INTERVAL_SECONDS`.
 
-| Variable                                 | Default | Description                                                                                                                                                                                  |
-| ---------------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SCAN_GLOBAL_CONCURRENCY`                | `12`    | Maximum concurrent chapter scans across all sources. Minimum is 1.                                                                                                                           |
-| `SCAN_SOURCE_RATE_LIMITS`                | empty   | Per-source scan limits (`source_id=requests/window_seconds[@cost]`). You can also set limits in the admin app, in Settings. A limit set there replaces the one set here for the same source. |
-| `SCAN_TICK_SECONDS`                      | `3600`  | Cadence in seconds between scanner scheduler sweeps (1 hour).                                                                                                                                |
-| `SOURCE_SYNC_INTERVAL_SECONDS`           | `86400` | Cadence in seconds between source discovery scans (24 hours).                                                                                                                                |
-| `SOURCE_SYNC_MAX_PAGES`                  | `10`    | Maximum pages browsed per source during discovery passes.                                                                                                                                    |
-| `EXTENSION_AUTO_UPDATE_INTERVAL_SECONDS` | `21600` | Cadence in seconds between extension update checks (6 hours). 0 disables.                                                                                                                    |
-| `COVER_CACHE`                            | `true`  | Enables the background cover thumbnail cache drainer.                                                                                                                                        |
-| `COVER_CACHE_INTERVAL_SECS`              | `300`   | Interval in seconds between cover cache passes (5 minutes).                                                                                                                                  |
-| `COVER_CACHE_BATCH`                      | `500`   | Maximum cover images downloaded per cache pass.                                                                                                                                              |
-| `COVER_RECOMPRESS`                       | `true`  | Enables automatic recompression of stored cover images.                                                                                                                                      |
-| `COVER_RECOMPRESS_INTERVAL_SECS`         | `60`    | Interval in seconds between cover recompression passes (1 minute).                                                                                                                           |
-| `COVER_RECOMPRESS_BATCH`                 | `200`   | Maximum cover images evaluated per recompression pass.                                                                                                                                       |
-| `COVER_PHASH`                            | `false` | Computes perceptual hashes for covers to assist deduplication.                                                                                                                               |
+The cover cache has separate download, recompression and perceptual-hash controls. Those settings affect the refetchable SQLite cache, not the PostgreSQL backup. For the full environment list, inspect `apps/server/src/config.rs` in the version you run.
 
 For detailed instructions on Docker installation, read [Install with Docker](/self-host/docker). For source setup, read [Add sources](/self-host/sources). For internet connectivity options, read [Reach it from the internet](/self-host/internet-access).
 

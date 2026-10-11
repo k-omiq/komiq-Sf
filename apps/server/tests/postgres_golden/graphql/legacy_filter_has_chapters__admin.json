@@ -1,0 +1,375 @@
+{
+  "data": {
+    "search": {
+      "hasNextPage": false,
+      "items": [
+        {
+          "chapterCount": 6,
+          "createdAt": "2020-01-01T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000001",
+          "isNsfw": false,
+          "latestChapter": "Oneshot",
+          "latestChapterAt": "2020-01-05T01:02:03.000000+00:00",
+          "rating": {
+            "average": 7.666666666666667,
+            "count": 3,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              1,
+              0,
+              1,
+              1,
+              0
+            ]
+          },
+          "status": "ONGOING",
+          "title": "Solo Leveling",
+          "type": "MANGA",
+          "updatedAt": "2020-01-05T01:02:03.000000+00:00"
+        },
+        {
+          "chapterCount": 1,
+          "createdAt": "2020-01-06T01:02:03.123456+00:00",
+          "id": "w_00000000000040008000000000000014",
+          "isNsfw": false,
+          "latestChapter": "14",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "status": "CANCELLED",
+          "title": "Chronicle Star",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "chapterCount": 1,
+          "createdAt": "2020-01-05T01:02:03.123000+00:00",
+          "id": "w_00000000000040008000000000000013",
+          "isNsfw": false,
+          "latestChapter": "13",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "status": "HIATUS",
+          "title": "Chronicle Moon",
+          "type": "MANHUA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "chapterCount": 1,
+          "createdAt": "2020-01-03T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000011",
+          "isNsfw": false,
+          "latestChapter": "11",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "status": "ONGOING",
+          "title": "魔道祖师",
+          "type": "MANGA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "chapterCount": 1,
+          "createdAt": "2020-01-02T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000010",
+          "isNsfw": false,
+          "latestChapter": "10",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "status": "UNKNOWN",
+          "title": "나 혼자만 레벨업",
+          "type": "MANGA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "chapterCount": 1,
+          "createdAt": "2020-01-01T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000009",
+          "isNsfw": false,
+          "latestChapter": "9",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "status": "CANCELLED",
+          "title": "進撃の巨人",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "chapterCount": 1,
+          "createdAt": "2020-01-08T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000008",
+          "isNsfw": false,
+          "latestChapter": "8",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "status": "HIATUS",
+          "title": "Sun",
+          "type": "MANHUA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "chapterCount": 1,
+          "createdAt": "2020-01-07T01:02:03.123456+00:00",
+          "id": "w_00000000000040008000000000000007",
+          "isNsfw": false,
+          "latestChapter": "7",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "status": "COMPLETED",
+          "title": "Go",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "chapterCount": 1,
+          "createdAt": "2020-01-06T01:02:03.123456+00:00",
+          "id": "w_00000000000040008000000000000006",
+          "isNsfw": false,
+          "latestChapter": "6",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "status": "ONGOING",
+          "title": "X",
+          "type": "MANGA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "chapterCount": 1,
+          "createdAt": "2020-01-05T01:02:03.123000+00:00",
+          "id": "w_00000000000040008000000000000005",
+          "isNsfw": false,
+          "latestChapter": "5",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "status": "UNKNOWN",
+          "title": "SPY×FAMILY",
+          "type": "MANGA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "chapterCount": 1,
+          "createdAt": "2020-01-04T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000004",
+          "isNsfw": false,
+          "latestChapter": "4",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "status": "CANCELLED",
+          "title": "Dr.STONE",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "chapterCount": 1,
+          "createdAt": "2020-01-03T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000003",
+          "isNsfw": false,
+          "latestChapter": "3",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "status": "HIATUS",
+          "title": "Café Chronicle",
+          "type": "MANHUA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "chapterCount": 1,
+          "createdAt": "2020-01-02T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000002",
+          "isNsfw": false,
+          "latestChapter": "2",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "status": "COMPLETED",
+          "title": "Solo Leveling: Side Story",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        }
+      ],
+      "page": 1,
+      "total": 13
+    }
+  }
+}

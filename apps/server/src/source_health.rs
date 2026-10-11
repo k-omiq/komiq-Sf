@@ -324,9 +324,9 @@ async fn persist_buffer(pool: &Database, drained: HashMap<Key, Entry>) -> Result
     for (subject, ..) in drained.keys() {
         if let SubjectKey::Manga(id) = subject {
             if !source_of.contains_key(id) {
-                let source: Option<String> = sqlx::query_scalar(
+                let source: Option<String> = crate::db_types::query_scalar(
                     "SELECT COALESCE(source_id, '') FROM source_series \
-                      WHERE source_type = 'suwayomi' AND source_key = ? LIMIT 1",
+                      WHERE source_type = 'suwayomi' AND source_key = $1 LIMIT 1",
                 )
                 .bind(id.to_string())
                 .fetch_optional(pool)
@@ -348,7 +348,7 @@ async fn persist_buffer(pool: &Database, drained: HashMap<Key, Entry>) -> Result
         match rows.get_mut(&(source.clone(), surface, hour, reason)) {
             Some(e) => {
                 e.count += entry.count;
-                if entry.last_at > e.last_at {
+                if crate::db_types::date(&entry.last_at)? > crate::db_types::date(&e.last_at)? {
                     e.last_at = entry.last_at;
                     if entry.last_message.is_some() {
                         e.last_message = entry.last_message;
@@ -362,15 +362,24 @@ async fn persist_buffer(pool: &Database, drained: HashMap<Key, Entry>) -> Result
     }
     let n = rows.len();
     let mut tx = pool.begin().await?;
+    let mut rows: Vec<_> = rows.into_iter().collect();
+    rows.sort_by(|a, b| {
+        (a.0 .0.as_str(), a.0 .1.as_str(), a.0 .2, a.0 .3).cmp(&(
+            b.0 .0.as_str(),
+            b.0 .1.as_str(),
+            b.0 .2,
+            b.0 .3,
+        ))
+    });
     for ((source, surface, hour, reason), e) in &rows {
         sqlx::query(
             "INSERT INTO source_health_bucket \
                (source_id, surface, hour_ts, reason, count, last_message, last_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT(source_id, surface, hour_ts, reason) DO UPDATE SET \
-               count = count + excluded.count, \
-               last_message = COALESCE(excluded.last_message, last_message), \
-               last_at = MAX(last_at, excluded.last_at)",
+               count = source_health_bucket.count + excluded.count, \
+               last_message = COALESCE(excluded.last_message, source_health_bucket.last_message), \
+               last_at = GREATEST(source_health_bucket.last_at, excluded.last_at)",
         )
         .bind(source)
         .bind(surface.as_str())
@@ -378,7 +387,7 @@ async fn persist_buffer(pool: &Database, drained: HashMap<Key, Entry>) -> Result
         .bind(reason)
         .bind(e.count)
         .bind(&e.last_message)
-        .bind(&e.last_at)
+        .bind(crate::db_types::date(&e.last_at)?)
         .execute(&mut *tx)
         .await?;
     }
@@ -412,6 +421,7 @@ async fn run_flush_loop(pool: Database, mut shutdown: tokio::sync::watch::Receiv
         // A failed flush loses that interval's counts on purpose: these are diagnostics,
         // and re-queueing them would grow the buffer for as long as the DB is unhappy.
         if let Err(e) = flush(&pool).await {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "source health flush failed; dropped one interval");
         }
         if stopping {
@@ -423,7 +433,7 @@ async fn run_flush_loop(pool: Database, mut shutdown: tokio::sync::watch::Receiv
 /// Delete buckets past [`BUCKET_RETENTION_HOURS`]. Called by the GC sweep.
 pub async fn prune_buckets(pool: &Database) -> Result<u64> {
     let cutoff = chrono::Utc::now().timestamp() / 3600 - BUCKET_RETENTION_HOURS;
-    let r = sqlx::query("DELETE FROM source_health_bucket WHERE hour_ts <= ?")
+    let r = sqlx::query("DELETE FROM source_health_bucket WHERE hour_ts <= $1")
         .bind(cutoff)
         .execute(pool)
         .await?;
@@ -431,7 +441,7 @@ pub async fn prune_buckets(pool: &Database) -> Result<u64> {
 }
 
 /// One (source, surface, reason) total over a window.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct Stat {
     pub source_id: String,
     pub surface: String,
@@ -443,18 +453,35 @@ pub struct Stat {
     pub last_at: String,
 }
 
+impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for Stat {
+    fn from_row(row: &sqlx::postgres::PgRow) -> sqlx::Result<Self> {
+        use crate::db_types::Row;
+        Ok(Self {
+            source_id: row.try_get("source_id")?,
+            surface: row.try_get("surface")?,
+            reason: row.try_get("reason")?,
+            count: row.try_get("count")?,
+            last_message: row.try_get("last_message")?,
+            last_at: row.try_get("last_at")?,
+        })
+    }
+}
+
 /// Totals for the last `hours` hours, one row per (source, surface, reason).
 ///
-/// `last_message` rides on the single `MAX(last_at)`: with exactly one min/max aggregate
-/// SQLite takes the bare columns from the row that holds it, i.e. the newest bucket.
+/// Select the newest bucket's message together with its timestamp. Equal clocks
+/// use the earliest hourly bucket; totals include every bucket in the window.
 pub async fn stats(pool: &Database, hours: i64) -> Result<Vec<Stat>> {
     let since = chrono::Utc::now().timestamp() / 3600 - hours.clamp(1, BUCKET_RETENTION_HOURS);
     Ok(sqlx::query_as::<_, Stat>(
-        "SELECT source_id, surface, reason, SUM(count) AS count, \
-                last_message, MAX(last_at) AS last_at \
-           FROM source_health_bucket \
-          WHERE hour_ts > ? \
-          GROUP BY source_id, surface, reason",
+        "SELECT source_id, surface, reason, count, last_message, last_at FROM ( \
+            SELECT source_id, surface, reason, \
+                   SUM(count) OVER (PARTITION BY source_id, surface, reason)::bigint AS count, \
+                   last_message, last_at, \
+                   ROW_NUMBER() OVER (PARTITION BY source_id, surface, reason \
+                                      ORDER BY last_at DESC NULLS LAST, hour_ts ASC) AS rank \
+              FROM source_health_bucket WHERE hour_ts > $1 \
+         ) ranked WHERE rank = 1 ORDER BY source_id, surface, reason",
     )
     .bind(since)
     .fetch_all(pool)
@@ -507,14 +534,15 @@ mod tests {
     #[tokio::test]
     async fn source_health_flush_retries_an_external_writer() {
         let pool = Database::connect("sqlite::memory:").await.unwrap();
-        sqlx::raw_sql(include_str!("../migrations/0110_source_health.sql"))
-            .execute(&pool)
-            .await
-            .unwrap();
+
         let external = Database::connect_with((*pool.connect_options()).clone(), 2)
             .await
             .unwrap();
-        let held = external.begin().await.unwrap();
+        let mut held = external.begin().await.unwrap();
+        sqlx::query("LOCK TABLE source_health_bucket IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *held)
+            .await
+            .unwrap();
         let buf = std::sync::Arc::new(Buffer::new());
         buf.push(Subject::Source("src-a"), Surface::Pages, REASON_OK, None);
         let writer = pool.clone();
@@ -531,17 +559,8 @@ mod tests {
     #[tokio::test]
     async fn flush_charges_a_manga_to_its_source_and_stats_sum_the_window() {
         let pool = Database::connect("sqlite::memory:").await.unwrap();
-        sqlx::query(
-            "CREATE TABLE source_series (source_type TEXT, source_key TEXT, source_id TEXT)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::raw_sql(include_str!("../migrations/0110_source_health.sql"))
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO source_series VALUES ('suwayomi', '7', 'src-a')")
+
+        sqlx::raw_sql("INSERT INTO work(id,primary_title,created_at,updated_at) VALUES ('w_health','Health','2020-01-01','2020-01-01'); INSERT INTO source_series(id,work_id,source_type,source_key,source_id,created_at) VALUES ('ss_health','w_health','suwayomi','7','src-a','2020-01-01')")
             .execute(&pool)
             .await
             .unwrap();

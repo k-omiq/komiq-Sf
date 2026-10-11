@@ -1,4 +1,4 @@
-//! Regression tests use two independent writer pools on one file-backed WAL DB.
+//! Regression tests use two independent writer pools on one disposable PostgreSQL database.
 use super::*;
 use std::sync::Arc;
 use tokio::sync::Barrier;
@@ -6,16 +6,16 @@ use tokio::sync::Barrier;
 async fn database_pair() -> (Database, Database) {
     // Database's test memory URL allocates a temporary file, held by `first`.
     let first = Database::connect("sqlite::memory:").await.unwrap();
-    sqlx::migrate!("./migrations")
+    sqlx::migrate!("./migrations_pg")
         .run(first.write())
         .await
         .unwrap();
     let options = (*first.write().connect_options()).clone();
-    assert_ne!(options.get_filename(), std::path::Path::new(":memory:"));
+    assert_ne!(options.get_database(), Some("postgres"));
     let second = Database::connect_with(options, 2).await.unwrap();
     assert_eq!(
-        first.write().connect_options().get_filename(),
-        second.write().connect_options().get_filename()
+        first.write().connect_options().get_database(),
+        second.write().connect_options().get_database()
     );
     (first, second)
 }
@@ -46,7 +46,7 @@ async fn disjoint_concurrent_splits_keep_one_original_source() {
     // Occupy the writer while both requests begin. The former implementation read
     // the same two-source set before it queued for this lock, so both splits passed
     // the last-source check. The corrected implementation reads only after BEGIN.
-    let writer = second.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let writer = second.begin_with("BEGIN").await.unwrap();
     let ready = Arc::new(Barrier::new(3));
     let a = {
         let db = first.clone();
@@ -75,13 +75,14 @@ async fn disjoint_concurrent_splits_keep_one_original_source() {
     assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
     let rejected = a.err().or_else(|| b.err()).unwrap();
     assert!(rejected.to_string().contains("at least one source"));
-    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source_series WHERE work_id = ?")
-        .bind(&original)
-        .fetch_one(&first)
-        .await
-        .unwrap();
+    let remaining: i64 =
+        crate::db_types::query_scalar("SELECT COUNT(*) FROM source_series WHERE work_id = $1")
+            .bind(&original)
+            .fetch_one(&first)
+            .await
+            .unwrap();
     assert_eq!(remaining, 1);
-    let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+    let works: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
         .fetch_one(&second)
         .await
         .unwrap();
@@ -102,7 +103,7 @@ async fn pending_review_refuses_source_moved_since_owner_snapshot() {
     sqlx::query(
         "INSERT INTO merge_candidate \
              (id, source_series_id, candidate_work_id, score, method, created_at) \
-         VALUES ('stale-owner-review', ?, ?, 1.0, 'title_exact', '2026-01-01')",
+         VALUES ('stale-owner-review', $1, $2, 1.0, 'title_exact', '2026-01-01')",
     )
     .bind(&source)
     .bind(&target)
@@ -121,7 +122,7 @@ async fn pending_review_refuses_source_moved_since_owner_snapshot() {
         .identity(None);
     // A second database handle moves only the source mapping. Metadata identities
     // still match, so only the source-owner clause can prevent merging the old work.
-    sqlx::query("UPDATE source_series SET work_id = ? WHERE id = ?")
+    sqlx::query("UPDATE source_series SET work_id = $1 WHERE id = $2")
         .bind(&other)
         .bind(&source)
         .execute(&second)
@@ -138,19 +139,21 @@ async fn pending_review_refuses_source_moved_since_owner_snapshot() {
     .await
     .expect_err("a changed source owner must invalidate the review acceptance");
     assert!(error.to_string().starts_with("merge precondition failed"));
-    let status: String =
-        sqlx::query_scalar("SELECT status FROM merge_candidate WHERE id = 'stale-owner-review'")
+    let status: String = crate::db_types::query_scalar(
+        "SELECT status FROM merge_candidate WHERE id = 'stale-owner-review'",
+    )
+    .fetch_one(&second)
+    .await
+    .unwrap();
+    assert_eq!(status, "pending");
+    let current: String =
+        crate::db_types::query_scalar("SELECT work_id FROM source_series WHERE id = $1")
+            .bind(&source)
             .fetch_one(&second)
             .await
             .unwrap();
-    assert_eq!(status, "pending");
-    let current: String = sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
-        .bind(&source)
-        .fetch_one(&second)
-        .await
-        .unwrap();
     assert_eq!(current, other);
-    let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+    let works: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
         .fetch_one(&second)
         .await
         .unwrap();
@@ -174,9 +177,9 @@ async fn source_nsfw_pin_rolls_back_when_work_override_fails() {
     )
     .await
     .unwrap();
-    sqlx::query(
-        "CREATE TRIGGER reject_nsfw_override BEFORE UPDATE OF is_nsfw_override ON work \
-         BEGIN SELECT RAISE(ABORT, 'injected work override failure'); END",
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_nsfw_override_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected work override failure'; END $$; \
+         CREATE TRIGGER reject_nsfw_override BEFORE UPDATE OF is_nsfw_override ON work FOR EACH ROW EXECUTE FUNCTION reject_nsfw_override_fn()",
     )
     .execute(&second)
     .await
@@ -188,11 +191,12 @@ async fn source_nsfw_pin_rolls_back_when_work_override_fails() {
     assert!(!source_nsfw_pinned(&second, "rollback-source")
         .await
         .unwrap());
-    let flag: Option<i64> = sqlx::query_scalar("SELECT is_nsfw_override FROM work WHERE id = ?")
-        .bind(&id)
-        .fetch_one(&second)
-        .await
-        .unwrap();
+    let flag: Option<i64> =
+        crate::db_types::query_scalar("SELECT is_nsfw_override FROM work WHERE id = $1")
+            .bind(&id)
+            .fetch_one(&second)
+            .await
+            .unwrap();
     assert_eq!(flag, None);
     second.close().await;
     first.close().await;
@@ -215,7 +219,7 @@ async fn concurrent_source_nsfw_choices_keep_pin_and_work_flags_together() {
         pin.unwrap();
         unpin.unwrap();
         let pinned = source_nsfw_pinned(&second, "race-source").await.unwrap();
-        let flags: Vec<Option<i64>> = sqlx::query_scalar(
+        let flags: Vec<Option<i64>> = crate::db_types::query_scalar(
             "SELECT is_nsfw_override FROM work \
              WHERE id IN (SELECT work_id FROM source_series WHERE source_id = 'race-source')",
         )
@@ -228,10 +232,11 @@ async fn concurrent_source_nsfw_choices_keep_pin_and_work_flags_together() {
     set_source_nsfw_pin(&first, "race-source", true)
         .await
         .unwrap();
-    let adult: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE is_nsfw_override = 1")
-        .fetch_one(&second)
-        .await
-        .unwrap();
+    let adult: i64 =
+        crate::db_types::query_scalar("SELECT COUNT(*) FROM work WHERE is_nsfw_override = TRUE")
+            .fetch_one(&second)
+            .await
+            .unwrap();
     assert_eq!(adult, 2);
     second.close().await;
     first.close().await;

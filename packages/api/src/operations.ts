@@ -657,6 +657,7 @@ export const COMMENTS = /* GraphQL */ `
 				targetType
 				targetId
 				parentId
+				deletedBy
 				author {
 					...UserRefFields
 				}

@@ -11,7 +11,7 @@ This page explains how accounts and sessions work, how clients store bearer toke
 
 User identity is defined by the `User` struct in `apps/server/src/auth.rs`. Each account record contains an identifier, username, email, password hash, avatar reference, and flags for admin status, ban state, and password change requirements.
 
-Usernames are validated during registration. They may contain letters, digits, underscores, hyphens, and periods. A database trigger and case-insensitive uniqueness check (`COLLATE NOCASE`) ensure that two users cannot register variations of the same name with different casing.
+Usernames are validated during registration. They may contain letters, digits, underscores, hyphens, and periods. Unique indexes on the ASCII-lowercased username and email (`users_username_ascii_unique`, `users_email_ascii_unique`) ensure that two users cannot register variations of the same name with different casing.
 
 Admin status is granted through environment configuration (`KOMIKA_ADMIN_USERS`) or through the initial setup code. Regular user registration cannot self-elevate to admin status.
 

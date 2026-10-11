@@ -5,6 +5,8 @@ mod block_tests;
 #[cfg(test)]
 mod cache_refresh_tests;
 #[cfg(test)]
+mod postgres_golden_tests;
+#[cfg(test)]
 mod sources_tests;
 
 use std::collections::{BTreeMap, HashMap};
@@ -306,7 +308,7 @@ pub struct AppState {
     pub pool: Database,
     /// Separate, un-replicated DB for cover blobs (`work_cover_blob`). Kept out of
     /// `pool` so Litestream/R2 backs up only the main DB; see `db::init_covers`.
-    pub cover_pool: Database,
+    pub cover_pool: crate::database::SqliteDatabase,
     pub suwayomi: SuwayomiClient,
     /// Direct MangaDex client — page resolution for canonical (MangaDex-mirrored)
     /// works via MangaDex@Home (CATALOGUE.md §5). Shared with the catalogue sync.
@@ -596,8 +598,9 @@ impl async_graphql::extensions::Extension for ErrorLoggerExtension {
         ctx: &async_graphql::extensions::ExtensionContext<'_>,
         next: async_graphql::extensions::NextRequest<'_>,
     ) -> async_graphql::Response {
-        let resp = next.run(ctx).await;
+        let resp = Database::foreground_scope(next.run(ctx)).await;
         for err in &resp.errors {
+            observe_graphql_error_source(&err.source);
             tracing::warn!(
                 error = %err.message,
                 path = ?err.path,
@@ -608,34 +611,21 @@ impl async_graphql::extensions::Extension for ErrorLoggerExtension {
     }
 }
 
-/// Guarantee an ISO-8601 date-time carries a UTC offset, appending `Z` when it does not.
-///
-/// `Date.parse` in the browser applies a documented split: a date-ONLY string is read as
-/// UTC, but an offset-less date-TIME string is read as LOCAL time. So a bare
-/// `"2026-07-26T13:58:51.705034"` renders in the reader shifted by the viewer's own UTC
-/// offset — up to half a day out, and far enough to produce a detection timestamp in the
-/// future ("in 9h"). Everything this server stores in these columns is UTC.
-///
-/// Deliberately NOT `types::to_iso`: that helper parses an epoch INTEGER string and
-/// returns `None` on anything else, so routing an already-ISO column through it would
-/// have silently blanked the field rather than fixing its offset.
-///
-/// Audited on a production snapshot: all 1,316 dated `series_scan_state` rows already
-/// end in `+00:00`, because `scanner::scan_series` writes `to_rfc3339()`. So this is a
-/// guard against a future writer, not a repair of existing rows — a bare
-/// `strftime('%Y-%m-%dT%H:%M:%S')` (the shape used elsewhere in `scanner.rs`, which
-/// appends `'+00:00'` by hand) is one forgotten concatenation away from the offset-less
-/// case. Values that already carry `Z` or a `±HH:MM` offset pass through untouched.
+/// Format stored API dates through C10, preserving an empty legacy value.
 fn ensure_utc_offset(s: &str) -> String {
-    let t = s.trim();
-    // Look for the offset only in the TIME part: the date part's own `-` separators
-    // (`2026-07-26`) must not be mistaken for a negative UTC offset.
-    let time = t.split_once('T').map_or("", |(_, time)| time);
-    if time.ends_with('Z') || time.contains('+') || time.contains('-') {
-        t.to_string()
-    } else {
-        format!("{t}Z")
-    }
+    crate::db_types::date(s)
+        .or_else(|_| {
+            // Legacy API text also held zoneless fractional timestamps. The
+            // importer census grammar deliberately excludes this shape; its API
+            // meaning was UTC, and C10 normalizes it through the same formatter.
+            let trimmed = s.trim();
+            chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f"))
+                .map(|dt| dt.and_utc())
+                .map_err(anyhow::Error::from)
+        })
+        .map(crate::db_types::format_date)
+        .unwrap_or_else(|_| s.trim().to_string())
 }
 
 fn state<'a>(ctx: &Context<'a>) -> &'a AppState {
@@ -654,7 +644,7 @@ async fn extension_auto_update_status(st: &AppState) -> Result<ExtensionAutoUpda
     let s = crate::maintenance::update_status();
     let recent = crate::maintenance::recent_updates(&st.pool, 30)
         .await
-        .map_err(gql_err)?
+        .map_err(gql_read_err)?
         .into_iter()
         .map(|e| ExtensionUpdateEvent {
             at: e.at,
@@ -764,13 +754,13 @@ impl Series {
     /// newest-language-agnostic, ordered by language tag. Empty for a work with no
     /// enrichment yet (run `backfillMangadexMetadata`) or a non-canonical series.
     async fn localized_descriptions(&self, ctx: &Context<'_>) -> Result<Vec<LocalizedDescription>> {
-        let rows = sqlx::query_as::<_, (String, String)>(
-            "SELECT lang, description FROM work_description WHERE work_id = ? ORDER BY lang",
+        let rows = crate::db_types::query_tuple::<(String, String)>(
+            "SELECT lang, description FROM work_description WHERE work_id = $1 ORDER BY lang",
         )
         .bind(&self.id.0)
         .fetch_all(&state(ctx).pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         Ok(rows
             .into_iter()
             .map(|(lang, description)| LocalizedDescription { lang, description })
@@ -782,19 +772,19 @@ impl Series {
     async fn credits(&self, ctx: &Context<'_>) -> Result<Vec<Credit>> {
         // An admin-pinned author or artist replaces the source's credits for that role,
         // or the series page would keep listing the names the admin corrected.
-        let rows = sqlx::query_as::<_, (String, String)>(
-            "SELECT role, name FROM work_credit c WHERE work_id = ?1 \
+        let rows = crate::db_types::query_tuple::<(String, String)>(
+            "SELECT role, name FROM work_credit c WHERE work_id = $1 \
                AND NOT EXISTS (SELECT 1 FROM work_field_pin p \
                                WHERE p.work_id = c.work_id AND p.field = c.role) \
              UNION ALL \
              SELECT field, value FROM work_field_pin \
-             WHERE work_id = ?1 AND field IN ('author', 'artist') AND value IS NOT NULL \
+             WHERE work_id = $1 AND field IN ('author', 'artist') AND value IS NOT NULL \
              ORDER BY 1, 2",
         )
         .bind(&self.id.0)
         .fetch_all(&state(ctx).pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         Ok(rows
             .into_iter()
             .flat_map(|(role, names)| {
@@ -817,37 +807,39 @@ impl Series {
         let Some(work_id) = resolve_work_id(pool, &self.id.0).await else {
             return Ok(None);
         };
-        let facts = sqlx::query_as::<
-            _,
-            (Option<i64>, Option<String>, Option<String>, Option<String>),
-        >(
-            "SELECT year, original_language, demographic, content_rating FROM work WHERE id = ?",
+        let facts = crate::db_types::query_tuple::<(
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>(
+            "SELECT year, original_language, demographic, content_rating FROM work WHERE id = $1",
         )
         .bind(&work_id)
         .fetch_optional(pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         let Some((year, original_language, demographic, content_rating)) = facts else {
             return Ok(None);
         };
-        let curated: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM work_tag WHERE work_id = ? AND source = 'admin')",
+        let curated: bool = crate::db_types::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM work_tag WHERE work_id = $1 AND source = 'admin')",
         )
         .bind(&work_id)
         .fetch_one(pool)
         .await
-        .map_err(gql_err)?;
-        let tags = sqlx::query_as::<_, (Option<String>, String, Option<String>)>(
-            "SELECT tag_id, tag, tag_group FROM work_tag WHERE work_id = ? AND source = ? ORDER BY ord, tag"
+        .map_err(gql_read_err)?;
+        let tags = crate::db_types::query_tuple::<(Option<String>, String, Option<String>)>(
+            "SELECT tag_id, tag, tag_group FROM work_tag WHERE work_id = $1 AND source = $2 ORDER BY ord, tag"
         ).bind(&work_id).bind(if curated { "admin" } else { "mangadex" })
-            .fetch_all(pool).await.map_err(gql_err)?.into_iter()
+            .fetch_all(pool).await.map_err(gql_read_err)?.into_iter()
             .map(|(id, name, group)| MetadataTag { id: if curated { None } else { id }, name,
                 group: if curated { "custom".into() } else { group.unwrap_or_else(|| "other".into()) } }).collect();
-        let mut rows = sqlx::query_as::<_, (String, String)>(
-            "SELECT provider, external_id FROM work_tracker_link WHERE work_id = ? ORDER BY provider"
-        ).bind(&work_id).fetch_all(pool).await.map_err(gql_err)?;
-        if let Some(id) = sqlx::query_scalar::<_, String>("SELECT source_key FROM source_series WHERE work_id = ? AND source_type = 'mangadex' ORDER BY source_key LIMIT 1")
-            .bind(&work_id).fetch_optional(pool).await.map_err(gql_err)? {
+        let mut rows = crate::db_types::query_tuple::<(String, String)>(
+            "SELECT provider, external_id FROM work_tracker_link WHERE work_id = $1 ORDER BY provider"
+        ).bind(&work_id).fetch_all(pool).await.map_err(gql_read_err)?;
+        if let Some(id) = crate::db_types::query_scalar::<String>("SELECT source_key FROM source_series WHERE work_id = $1 AND source_type = 'mangadex' ORDER BY source_key LIMIT 1")
+            .bind(&work_id).fetch_optional(pool).await.map_err(gql_read_err)? {
             rows.insert(0, ("mangadex".into(), id));
         }
         let trackers = rows
@@ -876,20 +868,20 @@ impl Series {
     async fn covers(&self, ctx: &Context<'_>) -> Result<Vec<Cover>> {
         let pool = &state(ctx).pool;
         // Cover URLs are `covers/{mangadex_id}/{fileName}` — resolve the anchor.
-        let mangadex_id: Option<String> = sqlx::query_scalar(
+        let mangadex_id: Option<String> = crate::db_types::query_scalar(
             "SELECT source_key FROM source_series \
-             WHERE work_id = ? AND source_type = 'mangadex' LIMIT 1",
+             WHERE work_id = $1 AND source_type = 'mangadex' LIMIT 1",
         )
         .bind(&self.id.0)
         .fetch_optional(pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         let Some(mid) = mangadex_id else {
             return Ok(Vec::new());
         };
         let covers = catalog::load_work_covers(pool, &self.id.0)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         Ok(covers
             .into_iter()
             .map(|c| Cover {
@@ -934,7 +926,7 @@ async fn session_user(ctx: &Context<'_>) -> Result<Option<User>> {
         match token(ctx) {
             Some(tok) => auth::session_user_for_token(&state(ctx).pool, &tok)
                 .await
-                .map_err(gql_err),
+                .map_err(gql_read_err),
             None => Ok(None),
         }
     };
@@ -954,25 +946,24 @@ async fn fetch_library_rows_batch(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let values = std::iter::repeat_n("(?)", ids.len())
+    let values = crate::sql_params::placeholders(1, ids.len())
+        .split(", ")
+        .map(|id| format!("({id})"))
         .collect::<Vec<_>>()
-        .join(",");
+        .join(", ");
+    let user_arg = crate::sql_params::placeholders(ids.len() + 1, 1);
     let sql = format!(
-        "WITH requested(id) AS (VALUES {values}), target AS ( \
-           SELECT id, COALESCE((SELECT work_id FROM source_series \
-              WHERE source_type='suwayomi' AND source_key=requested.id ORDER BY work_id LIMIT 1), id) AS work_id \
-             FROM requested \
-         ) SELECT target.id, ul.is_favorite, ul.status \
-           FROM target JOIN user_library ul ON ul.user_id=? AND (ul.series_id=target.work_id \
-             OR ul.series_id IN (SELECT source_key FROM source_series \
-                   WHERE source_type='suwayomi' AND work_id=target.work_id)) \
-          ORDER BY target.id, (ul.series_id=target.work_id) DESC, ul.created_at DESC",
+        r#"WITH requested(id) AS (VALUES {values}), target AS ( SELECT id, COALESCE((SELECT work_id FROM source_series WHERE source_type='suwayomi' AND source_key=requested.id ORDER BY work_id LIMIT 1), id) AS work_id FROM requested ) SELECT target.id, ul.is_favorite, ul.status FROM target JOIN user_library ul ON ul.user_id={user_arg} AND (ul.series_id=target.work_id OR ul.series_id IN (SELECT source_key FROM source_series WHERE source_type='suwayomi' AND work_id=target.work_id)) ORDER BY target.id, (ul.series_id=target.work_id) DESC NULLS LAST, ul.created_at DESC NULLS LAST"#,
     );
-    let mut query = sqlx::query_as::<_, (String, i64, Option<String>)>(&sql);
+    let mut query = crate::db_types::query_tuple::<(String, i64, Option<String>)>(&sql);
     for id in ids {
         query = query.bind(id);
     }
-    let rows = query.bind(user_id).fetch_all(pool).await.map_err(gql_err)?;
+    let rows = query
+        .bind(crate::db_types::uuid(user_id)?)
+        .fetch_all(pool)
+        .await
+        .map_err(gql_read_err)?;
     let mut out: HashMap<String, LibraryRow> = HashMap::new();
     for (id, favorite, status) in rows {
         let row = out.entry(id).or_insert(LibraryRow {
@@ -1008,7 +999,7 @@ async fn library_row_cached(
     };
     if start {
         let cache = cache.clone();
-        let pool = pool.clone();
+        let pool = pool.foreground();
         let user_id = user_id.to_string();
         tokio::spawn(async move {
             // async-graphql polls a page's sibling fields together. Yield once so
@@ -1093,7 +1084,18 @@ async fn require_admin(ctx: &Context<'_>) -> Result<User> {
 /// directly and never routed through here, so they're preserved.
 fn gql_err(e: impl std::fmt::Display + Send + Sync + 'static) -> Error {
     tracing::error!(error = %e, "internal error");
-    let source: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(e);
+    let source: Box<dyn std::any::Any + Send + Sync> = Box::new(e);
+    // Keep the typed marker in GraphQL's source so its response/job boundary
+    // can observe equivalent conversion paths without recounting this one.
+    let source: std::sync::Arc<dyn std::any::Any + Send + Sync> = match source
+        .downcast::<anyhow::Error>()
+    {
+        Ok(error) => std::sync::Arc::new(crate::db::observed_database_error(*error)),
+        Err(source) => match source.downcast::<sqlx::Error>() {
+            Ok(error) => std::sync::Arc::new(crate::db::observed_database_error((*error).into())),
+            Err(source) => source.into(),
+        },
+    };
     let retry = source
         .downcast_ref::<UpstreamRateLimit>()
         .map(|error| error.0)
@@ -1134,6 +1136,22 @@ fn gql_err(e: impl std::fmt::Display + Send + Sync + 'static) -> Error {
     error
 }
 
+fn gql_read_err(error: impl Into<anyhow::Error>) -> Error {
+    gql_err(crate::db::observed_read_database_error(error.into()))
+}
+
+// Equivalent GraphQL conversion paths may carry a raw SQLx/anyhow source.
+// gql_err and retries attach Observed, so outer response/job logging skips them.
+fn observe_graphql_error_source(source: &Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>) {
+    if let Some(source) = source {
+        if let Some(error) = source.downcast_ref::<anyhow::Error>() {
+            crate::db::observe_database_error(error);
+        } else if let Some(error) = source.downcast_ref::<sqlx::Error>() {
+            crate::db::record_database_error(error);
+        }
+    }
+}
+
 /// A `scanner::EffectiveRateLimit` as the admin console reads it.
 fn source_rate_limit(l: crate::scanner::EffectiveRateLimit) -> SourceRateLimit {
     use crate::scanner::LimitOrigin;
@@ -1168,7 +1186,7 @@ fn engine_err(e: anyhow::Error) -> Error {
 
 /// Parse a `chapter.number` for ordering. `None` when the label isn't a number.
 ///
-/// `chapter.number` is free-form TEXT, so a bare `CAST(number AS REAL)` in SQL would read
+/// `chapter.number` is free-form TEXT, so a bare `CAST(number AS DOUBLE PRECISION)` in SQL would read
 /// every non-numeric label as 0.0 — and 0 is a legitimate chapter (prologues), so the two
 /// cannot be told apart downstream. Parsing here keeps the SQL comparison honest, and a
 /// chapter with an unparseable number simply doesn't trigger a cascade.
@@ -1188,14 +1206,14 @@ fn parse_chapter_number(raw: &str) -> Option<f64> {
 ///    would fold every non-numeric label to 0.0 and sweep it in (see `parse_chapter_number`).
 ///  - strict `<` — the chapter just read is already upserted by the caller with its real
 ///    `last_page_read`, and must not be overwritten by this statement's 0.
-///  - `WHERE canonical_progress.read = 0` on the conflict — a chapter already marked read
+///  - `WHERE canonical_progress.read = FALSE` on the conflict — a chapter already marked read
 ///    keeps its stored `updated_at`, so replaying a finish doesn't restamp a whole series
 ///    and shove it to the top of the "Recently read" sort.
 ///
 /// `last_page_read` is only ever written on INSERT, so a chapter the viewer had genuinely
 /// stopped partway through keeps the position it stopped at.
 async fn catch_up_canonical(
-    conn: &mut sqlx::SqliteConnection,
+    conn: &mut sqlx::PgConnection,
     user_id: &str,
     work_id: &str,
     number: f64,
@@ -1205,25 +1223,54 @@ async fn catch_up_canonical(
     if work_id.is_empty() {
         return Ok(());
     }
+    let candidates: Vec<(String, Option<String>)> = crate::db_types::query_tuple(
+        "SELECT c.external_id, c.number FROM chapter c JOIN source_series ss ON ss.id=c.source_series_id \
+         WHERE ss.work_id=$1 AND ss.source_type='mangadex' AND c.lang='en'",
+    ).bind(work_id).fetch_all(&mut *conn).await?;
+    // SQLite's original digit-prefix guard and REAL conversion accept numeric
+    // prefixes, overflow to Infinity and underflow to zero. PostgreSQL casts throw
+    // for those inputs, so compare the same float64 values before binding the set.
+    let earlier: Vec<String> = candidates
+        .into_iter()
+        .filter_map(|(id, label)| {
+            let label = label?;
+            let starts_with_digit = label.as_bytes().first().is_some_and(u8::is_ascii_digit);
+            (starts_with_digit && catalog::sqlite_real_prefix(Some(&label)) < number).then_some(id)
+        })
+        .collect();
     sqlx::query(
         "INSERT INTO canonical_progress \
            (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
-         SELECT ?, c.external_id, ?, 0, 1, ? \
+         SELECT DISTINCT $1::uuid, c.external_id, $2::text, 0, TRUE, $3::timestamptz \
            FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
-          WHERE ss.work_id = ? AND ss.source_type = 'mangadex' AND c.lang = 'en' \
-            AND c.number GLOB '[0-9]*' AND CAST(c.number AS REAL) < ? \
+          WHERE ss.work_id = $4 AND ss.source_type = 'mangadex' AND c.lang = 'en' \
+            AND c.external_id = ANY($5::text[]) \
          ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-           read = 1, updated_at = excluded.updated_at \
-          WHERE canonical_progress.read = 0",
+           read = TRUE, updated_at = excluded.updated_at \
+          WHERE canonical_progress.read = FALSE",
     )
-    .bind(user_id)
+    .bind(crate::db_types::uuid(user_id)?)
     .bind(work_id)
-    .bind(now)
+    .bind(crate::db_types::date(now)?)
     .bind(work_id)
-    .bind(number)
+    .bind(earlier)
     .execute(conn)
     .await?;
     Ok(())
+}
+
+/// SQLite ROUND(float*100) uses its zero-decimal, half-away primitive, then
+/// CAST to INTEGER saturates. PG float8 round is ties-to-even and bigint casts
+/// can throw; retain the old grouping key with explicit guards. `number` is an
+/// internal column/expression only, never client SQL.
+fn sqlite_progress_key_sql(number: &str) -> String {
+    let n = format!("({number} * 100.0::double precision)");
+    format!(
+        "CAST(CASE WHEN {n} >= 9223372036854775808.0::double precision THEN 9223372036854775807::bigint \
+      WHEN {n} <= -9223372036854775808.0::double precision THEN (-9223372036854775807::bigint - 1) \
+      ELSE CAST(CASE WHEN abs({n}) > 4503599627370496.0::double precision THEN {n} \
+        ELSE trunc({n} + CASE WHEN {n}<0 THEN -0.5::double precision ELSE 0.5::double precision END) END AS bigint) END AS text)"
+    )
 }
 
 /// The Suwayomi half of [`catch_up_canonical`] — same contract, same guards.
@@ -1231,7 +1278,7 @@ async fn catch_up_canonical(
 /// Simpler only because `suwayomi_chapter.chapter_number` is already REAL, so the
 /// numeric-label guard is a plain `IS NOT NULL`.
 async fn catch_up_suwayomi(
-    conn: &mut sqlx::SqliteConnection,
+    conn: &mut sqlx::PgConnection,
     user_id: &str,
     series_id: &str,
     number: f64,
@@ -1243,17 +1290,17 @@ async fn catch_up_suwayomi(
     sqlx::query(
         "INSERT INTO suwayomi_progress \
            (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
-         SELECT ?, CAST(sc.id AS TEXT), ?, 0, 1, ? \
+         SELECT $1, CAST(sc.id AS TEXT), $2, 0, TRUE, $3 \
            FROM suwayomi_chapter sc \
-          WHERE sc.manga_id = ? AND sc.chapter_number IS NOT NULL \
-            AND sc.chapter_number < ? \
+          WHERE sc.manga_id = $4 AND sc.chapter_number IS NOT NULL \
+            AND sc.chapter_number < $5 \
          ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-           read = 1, updated_at = excluded.updated_at \
-          WHERE suwayomi_progress.read = 0",
+           read = TRUE, updated_at = excluded.updated_at \
+          WHERE suwayomi_progress.read = FALSE",
     )
-    .bind(user_id)
+    .bind(crate::db_types::uuid(user_id)?)
     .bind(series_id)
-    .bind(now)
+    .bind(crate::db_types::date(now)?)
     .bind(series_id.parse::<i64>().unwrap_or(-1))
     .bind(number)
     .execute(conn)
@@ -1270,8 +1317,11 @@ async fn catch_up_suwayomi(
 #[derive(Clone, Default, sqlx::FromRow)]
 struct AdminOverrides {
     override_interval_hours: Option<f64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     poll_every_minutes: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     paused_override: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     status_override: Option<String>,
 }
 
@@ -1279,10 +1329,10 @@ struct AdminOverrides {
 /// §2). True once it's linked to a `work` flagged NSFW; false when uncatalogued (we
 /// only hide what we positively know is NSFW).
 async fn canonical_is_nsfw(pool: &Database, suwayomi_id: &str) -> bool {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT COALESCE(MAX(COALESCE(w.is_nsfw_override, w.is_nsfw)), 0) FROM source_series ss \
+    crate::db_types::query_scalar::<i64>(
+        "SELECT COALESCE(bool_or(COALESCE(w.is_nsfw_override, w.is_nsfw)), FALSE) FROM source_series ss \
          JOIN work w ON w.id = ss.work_id \
-         WHERE ss.source_type = 'suwayomi' AND ss.source_key = ?",
+         WHERE ss.source_type = 'suwayomi' AND ss.source_key = $1",
     )
     .bind(suwayomi_id)
     .fetch_optional(pool)
@@ -1303,8 +1353,8 @@ async fn canonical_is_nsfw(pool: &Database, suwayomi_id: &str) -> bool {
 /// NOT NSFW — an unknown work has nothing to hide, and the caller's own lookup will
 /// come back empty anyway.
 async fn work_is_nsfw(pool: &Database, work_id: &str) -> bool {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT COALESCE(is_nsfw_override, is_nsfw) FROM work WHERE id = ?",
+    crate::db_types::query_scalar::<i64>(
+        "SELECT COALESCE(is_nsfw_override, is_nsfw) FROM work WHERE id = $1",
     )
     .bind(work_id)
     .fetch_optional(pool)
@@ -1323,14 +1373,14 @@ async fn nsfw_work_ids(
         return Ok(std::collections::HashSet::new());
     }
     let sql = format!(
-        "SELECT id FROM work WHERE COALESCE(is_nsfw_override, is_nsfw) = 1 AND id IN ({})",
-        in_placeholders(work_ids.len())
+        "SELECT id FROM work WHERE COALESCE(is_nsfw_override, is_nsfw) = TRUE AND id IN ({})",
+        crate::sql_params::placeholders(1, work_ids.len())
     );
-    let mut q = sqlx::query_scalar::<_, String>(&sql);
+    let mut q = crate::db_types::query_scalar::<String>(&sql);
     for id in work_ids {
         q = q.bind(id);
     }
-    let rows = q.fetch_all(pool).await.map_err(gql_err)?;
+    let rows = q.fetch_all(pool).await.map_err(gql_read_err)?;
     Ok(rows.into_iter().collect())
 }
 
@@ -1338,7 +1388,7 @@ async fn nsfw_work_ids(
 ///
 /// `feed_updates` (migration 0051), `feed_series_updates` (0064) and `browse_catalogue`
 /// (0069) each store a COPY of `COALESCE(work.is_nsfw_override, work.is_nsfw)` so their
-/// resolvers can pin `is_nsfw = 0` as an index prefix instead of joining `work` per row. That
+/// resolvers can pin `is_nsfw = FALSE` as an index prefix instead of joining `work` per row. That
 /// copy is only rewritten by `catalog::refresh_feed_updates`, i.e. at boot and once per
 /// catalogue-sync cycle — so between refreshes an admin who marks a work NSFW keeps SERVING
 /// it to opted-out viewers on `updatesFeed` / `canonicalUpdates` / Browse, for hours.
@@ -1370,13 +1420,34 @@ async fn nsfw_work_ids(
 /// already been committed to `work` (the authoritative column every non-feed surface
 /// reads).
 async fn resync_feed_nsfw(pool: &Database, work_ids: &[String]) {
-    if work_ids.is_empty() {
-        return;
+    for chunk in work_ids.chunks(500) {
+        let result = crate::db::retry_transaction(|| async {
+            let mut tx = pool.begin().await?;
+            crate::locks::lock_works(&mut tx, chunk).await?;
+            #[cfg(test)]
+            guard_pause("nsfw-locked").await;
+            resync_feed_nsfw_on(&mut tx, chunk).await?;
+            tx.commit().await?;
+            #[cfg(test)]
+            guard_pause("nsfw-committed").await;
+            Ok(())
+        })
+        .await;
+        if let Err(error) = result {
+            crate::db::observe_database_error(&error);
+            tracing::warn!(%error, "resync_feed_nsfw failed; retained for the next refresh");
+        }
     }
+}
+
+async fn resync_feed_nsfw_on(
+    conn: &mut sqlx::PgConnection,
+    work_ids: &[String],
+) -> anyhow::Result<()> {
     // 500 ids per statement, matching the other bulk admin paths — well inside SQLite's
     // 32,766 bound-parameter limit.
     for chunk in work_ids.chunks(500) {
-        let ph = in_placeholders(chunk.len());
+        let ph = crate::sql_params::placeholders(1, chunk.len());
         for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
             // The outer COALESCE keeps the current value if the work row is somehow
             // missing. It cannot be, on any of the three — `work_id` is a
@@ -1412,11 +1483,10 @@ async fn resync_feed_nsfw(pool: &Database, work_ids: &[String]) {
             for id in chunk {
                 q = q.bind(id);
             }
-            if let Err(e) = q.execute(pool).await {
-                tracing::warn!(error = %e, table, "resync_feed_nsfw failed; flag stays stale until the next feed refresh");
-            }
+            q.execute(&mut *conn).await?;
         }
     }
+    Ok(())
 }
 
 /// The canonical type inputs (admin override + original language) for a federated
@@ -1467,7 +1537,7 @@ async fn resolve_viewer_show_nsfw(ctx: &Context<'_>) -> Result<bool> {
 /// updates views — and they are ALSO the reader's. An opted-out admin therefore could
 /// not see a single NSFW-flagged work in the console, which is precisely the set the
 /// console exists to fix: ~2,500 mainstream titles (Naruto, One Piece, …) are currently
-/// mis-flagged `is_nsfw = 1`, and they were invisible to the only person able to
+/// mis-flagged `is_nsfw = TRUE`, and they were invisible to the only person able to
 /// unflag them.
 ///
 /// `extensions`/`sources` solve the same problem by hardcoding `show_nsfw = true` for
@@ -1592,7 +1662,7 @@ async fn search_v2(
     } else {
         crate::browse::search_text(&st.pool, trimmed, &bq).await
     }
-    .map_err(gql_err)?;
+    .map_err(gql_read_err)?;
     let items = filter_nsfw(show_nsfw, map_browse_rows(st, rows).await?);
     let has_next = i64::from(page) * BROWSE_PAGE_SIZE < total;
     Ok(SeriesPage {
@@ -1632,11 +1702,11 @@ async fn viewer_show_nsfw_or_admin(ctx: &Context<'_>, include_nsfw: Option<bool>
 /// A failed preference read is an error, so it cannot seed a degraded feed cache.
 async fn user_show_nsfw(pool: &Database, user_id: &str) -> Result<bool> {
     Ok(
-        sqlx::query_scalar::<_, i64>("SELECT show_nsfw FROM users WHERE id = ?")
-            .bind(user_id)
+        crate::db_types::query_scalar::<i64>("SELECT show_nsfw FROM users WHERE id = $1")
+            .bind(crate::db_types::uuid(user_id)?)
             .fetch_optional(pool)
             .await
-            .map_err(gql_err)?
+            .map_err(gql_read_err)?
             .unwrap_or(0)
             != 0,
     )
@@ -1670,11 +1740,11 @@ async fn viewer_blocks(ctx: &Context<'_>) -> Result<std::sync::Arc<ViewerBlocks>
 /// The unmemoized body of [`viewer_blocks`].
 async fn resolve_viewer_blocks(ctx: &Context<'_>) -> Result<std::sync::Arc<ViewerBlocks>> {
     let pool = &state(ctx).pool;
-    let site = crate::block::load(pool, None).await.map_err(gql_err)?;
+    let site = crate::block::load(pool, None).await.map_err(gql_read_err)?;
     let lists = match current_user(ctx).await? {
         Some(user) => crate::block::load(pool, Some(&user.id))
             .await
-            .map_err(gql_err)?,
+            .map_err(gql_read_err)?,
         None => site.clone(),
     };
     Ok(std::sync::Arc::new(ViewerBlocks { site, lists }))
@@ -1694,7 +1764,7 @@ async fn filter_blocked(
     let ids: Vec<String> = items.iter().map(|s| s.id.0.clone()).collect();
     let blocked = crate::block::blocked_series_ids(pool, set, &ids)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
     Ok(items
         .into_iter()
         .filter(|s| !blocked.contains(&s.id.0))
@@ -1716,7 +1786,7 @@ async fn discovery_without_blocked(
         .collect();
     let blocked = crate::block::blocked_series_ids(&st.pool, set, &ids)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
     if !blocked.is_empty() {
         for feed in &mut feeds {
             feed.items.retain(|s| !blocked.contains(&s.id.0));
@@ -1754,7 +1824,7 @@ async fn store_block_rules(
     block::replace(&st.pool, scope, &parsed)
         .await
         .map_err(gql_err)?;
-    let stored = block::list(&st.pool, scope).await.map_err(gql_err)?;
+    let stored = block::list(&st.pool, scope).await.map_err(gql_read_err)?;
     Ok(stored.iter().map(Into::into).collect())
 }
 
@@ -1765,7 +1835,7 @@ async fn deny_blocked_work(ctx: &Context<'_>, work_id: &str, not_found: &str) ->
     let blocks = viewer_blocks(ctx).await?;
     if crate::block::is_blocked(&state(ctx).pool, &blocks.site, work_id)
         .await
-        .map_err(gql_err)?
+        .map_err(gql_read_err)?
     {
         return Err(Error::new(not_found));
     }
@@ -1778,7 +1848,7 @@ async fn site_blocks_work(ctx: &Context<'_>, work_id: &str) -> Result<bool> {
     let blocks = viewer_blocks(ctx).await?;
     crate::block::is_blocked(&state(ctx).pool, &blocks.site, work_id)
         .await
-        .map_err(gql_err)
+        .map_err(gql_read_err)
 }
 
 /// [`deny_blocked_work`] for a mirrored MangaDex chapter, by chapter uuid: blocked when
@@ -1795,21 +1865,21 @@ async fn deny_blocked_chapter(ctx: &Context<'_>, external_id: &str, not_found: &
         return Ok(());
     }
     let pool = &state(ctx).pool;
-    let owner: Option<String> = sqlx::query_scalar(
+    let owner: Option<String> = crate::db_types::query_scalar(
         "SELECT ss.work_id FROM chapter c \
          JOIN source_series ss ON ss.id = c.source_series_id \
-         WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
+         WHERE c.external_id = $1 AND ss.source_type = 'mangadex' LIMIT 1",
     )
     .bind(external_id)
     .fetch_optional(pool)
     .await
-    .map_err(gql_err)?;
+    .map_err(gql_read_err)?;
     let Some(work_id) = owner else {
         return Err(Error::new(not_found));
     };
     if crate::block::is_blocked(pool, &blocks.site, &work_id)
         .await
-        .map_err(gql_err)?
+        .map_err(gql_read_err)?
     {
         return Err(Error::new(not_found));
     }
@@ -1838,7 +1908,7 @@ async fn deny_blocked_series(ctx: &Context<'_>, series_id: &str, not_found: &str
     };
     let hit = crate::block::blocked_series_ids(&state(ctx).pool, &blocks.site, &[key])
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
     if hit.is_empty() {
         Ok(())
     } else {
@@ -2051,7 +2121,7 @@ async fn map_series_batch(st: &AppState, list: Vec<SuwayomiManga>) -> Result<Vec
     };
     let genres_by_work = catalog::work_effective_genres_batch_checked(&st.pool, &genre_work_ids)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
     // MangaDex's rating for the same catalogued works: the second number on the card.
     let md_ratings = mangadex_rating_batch(&st.pool, &genre_work_ids).await?;
     // The REAL newest-chapter time for the whole page in one query. A live-fetched manga
@@ -2127,12 +2197,6 @@ async fn map_series_batch(st: &AppState, list: Vec<SuwayomiManga>) -> Result<Vec
     Ok(out)
 }
 
-/// Build the `?,?,…` placeholder list for an `IN (…)` clause of `n` values. Values
-/// are always bound (never interpolated), so this only ever emits placeholders.
-fn in_placeholders(n: usize) -> String {
-    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
-}
-
 /// Batched `rating_summary`: one grouped query for all series → per-series summary.
 /// Missing ids (no reviews) are simply absent; the caller defaults them to empty.
 async fn rating_summary_batch(
@@ -2145,13 +2209,13 @@ async fn rating_summary_batch(
     let sql = format!(
         "SELECT series_id, score, COUNT(*) FROM reviews WHERE series_id IN ({}) \
          GROUP BY series_id, score",
-        in_placeholders(ids.len())
+        crate::sql_params::placeholders(1, ids.len())
     );
-    let mut q = sqlx::query_as::<_, (String, i64, i64)>(&sql);
+    let mut q = crate::db_types::query_tuple::<(String, i64, i64)>(&sql);
     for id in ids {
         q = q.bind(id);
     }
-    let rows = q.fetch_all(pool).await.map_err(gql_err)?;
+    let rows = q.fetch_all(pool).await.map_err(gql_read_err)?;
     Ok(fold_rating_rows(rows))
 }
 
@@ -2213,7 +2277,7 @@ async fn rating_summary_by_work_batch(
     if work_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let ph = in_placeholders(work_ids.len());
+    let ph = crate::sql_params::placeholders(1, work_ids.len());
     // The SAME text `browse::RATED_PER_WORK_CTE` sorts by, spliced in rather than retyped —
     // including its one-vote-per-(work, user) window, without which a user holding both a
     // `w_…` row and a numeric row for one work would be counted twice.
@@ -2221,11 +2285,11 @@ async fn rating_summary_by_work_batch(
     let sql = format!(
         "SELECT wid, score, COUNT(*) FROM ({votes}) WHERE wid IN ({ph}) GROUP BY wid, score"
     );
-    let mut q = sqlx::query_as::<_, (String, i64, i64)>(&sql);
+    let mut q = crate::db_types::query_tuple::<(String, i64, i64)>(&sql);
     for id in work_ids {
         q = q.bind(id);
     }
-    let rows = q.fetch_all(pool).await.map_err(gql_err)?;
+    let rows = q.fetch_all(pool).await.map_err(gql_read_err)?;
     Ok(fold_rating_rows(rows))
 }
 
@@ -2244,14 +2308,14 @@ async fn mangadex_rating_batch(
     if work_ids.is_empty()
         || !inst::resolve_checked(pool, &inst::SHOW_MANGADEX_RATINGS)
             .await
-            .map_err(gql_err)?
+            .map_err(gql_read_err)?
             .as_bool()
     {
         return Ok(HashMap::new());
     }
     crate::work_stats::display_rating_batch_checked(pool, work_ids)
         .await
-        .map_err(gql_err)
+        .map_err(gql_read_err)
 }
 
 /// Map each id in `ids` (ANY shape — a `w_…` work id or a numeric Suwayomi source key) to
@@ -2266,7 +2330,8 @@ async fn work_ids_for_series_ids(
     if ids.is_empty() {
         return Ok(out);
     }
-    let ph = in_placeholders(ids.len());
+    let ph = crate::sql_params::placeholders(1, ids.len());
+    let second_ph = crate::sql_params::placeholders(ids.len() + 1, ids.len());
     // A `w_…` id IS a work id, but only if the row still exists; the numeric ones resolve
     // through `source_series`. `MIN(work_id)` matches `resolve_work_id`'s deterministic
     // `ORDER BY work_id LIMIT 1` for the (pathological) key mapped to two works.
@@ -2283,14 +2348,14 @@ async fn work_ids_for_series_ids(
         "SELECT id AS sid, id AS wid, 0 AS arm FROM work WHERE id IN ({ph}) \
          UNION ALL \
          SELECT source_key, MIN(work_id), 1 FROM source_series \
-           WHERE source_type = 'suwayomi' AND source_key IN ({ph}) GROUP BY source_key \
+           WHERE source_type = 'suwayomi' AND source_key IN ({second_ph}) GROUP BY source_key \
          ORDER BY arm"
     );
-    let mut q = sqlx::query_as::<_, (String, String, i64)>(&sql);
+    let mut q = crate::db_types::query_tuple::<(String, String, i64)>(&sql);
     for id in ids.iter().chain(ids.iter()) {
         q = q.bind(id);
     }
-    let rows = q.fetch_all(pool).await.map_err(gql_err)?;
+    let rows = q.fetch_all(pool).await.map_err(gql_read_err)?;
     for (sid, wid, _arm) in rows {
         // Ordered by `arm` above, so the first row for a key is the work arm's when it has
         // one. Belt and braces with the ORDER BY: neither alone is load-bearing.
@@ -2358,23 +2423,24 @@ async fn suwayomi_latest_chapter_at_batch(
     pool: &Database,
     ids: &[String],
 ) -> Result<HashMap<String, String>> {
+    let ids: Vec<i64> = ids.iter().filter_map(|id| id.parse().ok()).collect();
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
     let sql = format!(
-        "SELECT CAST(id AS TEXT), latest_chapter_at FROM suwayomi_series \
+        "SELECT id, latest_chapter_at FROM suwayomi_series \
          WHERE latest_chapter_at IS NOT NULL AND id IN ({})",
-        in_placeholders(ids.len())
+        crate::sql_params::placeholders(1, ids.len())
     );
-    let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+    let mut q = crate::db_types::query_tuple::<(i64, i64)>(&sql);
     for id in ids {
         q = q.bind(id);
     }
     Ok(q.fetch_all(pool)
         .await
-        .map_err(gql_err)?
+        .map_err(gql_read_err)?
         .into_iter()
-        .filter_map(|(id, ts)| to_iso(Some(&ts)).map(|iso| (id, iso)))
+        .filter_map(|(id, ts)| to_iso(Some(&ts.to_string())).map(|iso| (id.to_string(), iso)))
         .collect())
 }
 
@@ -2414,15 +2480,15 @@ async fn suwayomi_latest_chapter_label_batch(
           WHERE ss.source_type = 'suwayomi' \
             AND bc.latest_chapter IS NOT NULL AND bc.latest_chapter <> '' \
             AND ss.source_key IN ({})",
-        in_placeholders(ids.len())
+        crate::sql_params::placeholders(1, ids.len())
     );
-    let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+    let mut q = crate::db_types::query_tuple::<(String, String)>(&sql);
     for id in ids {
         q = q.bind(id);
     }
     Ok(q.fetch_all(pool)
         .await
-        .map_err(gql_err)?
+        .map_err(gql_read_err)?
         .into_iter()
         .collect())
 }
@@ -2437,6 +2503,7 @@ async fn admin_overrides_batch(
     }
     #[derive(sqlx::FromRow)]
     struct Row {
+        #[sqlx(try_from = "crate::db_types::DbString")]
         series_id: String,
         #[sqlx(flatten)]
         ov: AdminOverrides,
@@ -2444,7 +2511,7 @@ async fn admin_overrides_batch(
     let sql = format!(
         "SELECT series_id, override_interval_hours, poll_every_minutes, paused_override, \
          status_override FROM series_admin WHERE series_id IN ({})",
-        in_placeholders(ids.len())
+        crate::sql_params::placeholders(1, ids.len())
     );
     let mut q = sqlx::query_as::<_, Row>(&sql);
     for id in ids {
@@ -2452,7 +2519,7 @@ async fn admin_overrides_batch(
     }
     Ok(q.fetch_all(pool)
         .await
-        .map_err(gql_err)?
+        .map_err(gql_read_err)?
         .into_iter()
         .map(|r| (r.series_id, r.ov))
         .collect())
@@ -2468,6 +2535,7 @@ async fn scan_state_batch(
     }
     #[derive(sqlx::FromRow)]
     struct Row {
+        #[sqlx(try_from = "crate::db_types::DbString")]
         series_id: String,
         #[sqlx(flatten)]
         state: crate::scanner::ScanState,
@@ -2477,7 +2545,7 @@ async fn scan_state_batch(
         "SELECT series_id, avg_interval_hours, known_chapter_count, known_max_chapter, \
          last_scanned_at, next_scan_at, last_new_chapter_at, awaiting_since, known_chapter_ids \
          FROM series_scan_state WHERE series_id IN ({})",
-        in_placeholders(ids.len())
+        crate::sql_params::placeholders(1, ids.len())
     );
     let mut q = sqlx::query_as::<_, Row>(&sql);
     for id in ids {
@@ -2485,7 +2553,7 @@ async fn scan_state_batch(
     }
     Ok(q.fetch_all(pool)
         .await
-        .map_err(gql_err)?
+        .map_err(gql_read_err)?
         .into_iter()
         .map(|r| (r.series_id, r.state))
         .collect())
@@ -2506,13 +2574,13 @@ async fn canonical_alt_titles_batch(
          JOIN work_alias wa ON wa.work_id = ss.work_id \
          WHERE ss.source_type = 'suwayomi' AND ss.source_key IN ({}) \
          ORDER BY ss.source_key, wa.raw_title",
-        in_placeholders(keys.len())
+        crate::sql_params::placeholders(1, keys.len())
     );
-    let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+    let mut q = crate::db_types::query_tuple::<(String, String)>(&sql);
     for k in keys {
         q = q.bind(k);
     }
-    let rows = q.fetch_all(pool).await.map_err(gql_err)?;
+    let rows = q.fetch_all(pool).await.map_err(gql_read_err)?;
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for (key, raw_title) in rows {
         map.entry(key).or_default().push(raw_title);
@@ -2531,18 +2599,18 @@ async fn canonical_is_nsfw_batch(
         return Ok(HashMap::new());
     }
     let sql = format!(
-        "SELECT ss.source_key, COALESCE(MAX(COALESCE(w.is_nsfw_override, w.is_nsfw)), 0) \
+        "SELECT ss.source_key, COALESCE(bool_or(COALESCE(w.is_nsfw_override, w.is_nsfw)), FALSE) \
          FROM source_series ss \
          JOIN work w ON w.id = ss.work_id \
          WHERE ss.source_type = 'suwayomi' AND ss.source_key IN ({}) \
          GROUP BY ss.source_key",
-        in_placeholders(keys.len())
+        crate::sql_params::placeholders(1, keys.len())
     );
-    let mut q = sqlx::query_as::<_, (String, i64)>(&sql);
+    let mut q = crate::db_types::query_tuple::<(String, i64)>(&sql);
     for k in keys {
         q = q.bind(k);
     }
-    let rows = q.fetch_all(pool).await.map_err(gql_err)?;
+    let rows = q.fetch_all(pool).await.map_err(gql_read_err)?;
     Ok(rows.into_iter().map(|(k, v)| (k, v != 0)).collect())
 }
 
@@ -2557,12 +2625,19 @@ async fn canonical_overrides_batch(
     }
     #[derive(sqlx::FromRow)]
     struct Row {
+        #[sqlx(try_from = "crate::db_types::DbString")]
         source_key: String,
+        #[sqlx(try_from = "crate::db_types::DbString")]
         work_id: String,
+        #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
         cover_cached_version: Option<i64>,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         content_type_override: Option<String>,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         original_language: Option<String>,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         title_override: Option<String>,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         description_override: Option<String>,
     }
     let sql = format!(
@@ -2572,13 +2647,13 @@ async fn canonical_overrides_batch(
          JOIN work w ON w.id = ss.work_id \
          WHERE ss.source_type = 'suwayomi' AND ss.source_key IN ({}) \
          ORDER BY ss.source_key, w.id",
-        in_placeholders(keys.len())
+        crate::sql_params::placeholders(1, keys.len())
     );
     let mut q = sqlx::query_as::<_, Row>(&sql);
     for k in keys {
         q = q.bind(k);
     }
-    let rows = q.fetch_all(pool).await.map_err(gql_err)?;
+    let rows = q.fetch_all(pool).await.map_err(gql_read_err)?;
     let mut map: HashMap<String, SuwayomiWorkOverrides> = HashMap::new();
     for r in rows {
         let Row {
@@ -2827,8 +2902,8 @@ async fn updates_total(
     if let Some(total) = crate::browse::cached_count_with(&key, ttl) {
         return Ok(total);
     }
-    let total: i64 = sqlx::query_scalar(count_sql)
-        .bind(show_nsfw as i64)
+    let total: i64 = crate::db_types::query_scalar(count_sql)
+        .bind(show_nsfw)
         .fetch_one(pool)
         .await?;
     crate::browse::store_count_with(key, total, ttl);
@@ -2861,12 +2936,15 @@ async fn chapter_overrides(
 ) -> std::collections::HashMap<String, (bool, Option<String>)> {
     #[derive(sqlx::FromRow)]
     struct Row {
+        #[sqlx(try_from = "crate::db_types::DbString")]
         chapter_key: String,
+        #[sqlx(try_from = "crate::db_types::DbI64")]
         hidden: i64,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         title_override: Option<String>,
     }
     sqlx::query_as::<_, Row>(
-        "SELECT chapter_key, hidden, title_override FROM chapter_override WHERE work_id = ?",
+        "SELECT chapter_key, hidden, title_override FROM chapter_override WHERE work_id = $1",
     )
     .bind(work_id)
     .fetch_all(pool)
@@ -2882,16 +2960,16 @@ async fn chapter_overrides(
 /// catalogued (numeric id with no `source_series` row, or an unknown `w_` id).
 async fn resolve_work_id(pool: &Database, series_id: &str) -> Option<String> {
     if series_id.starts_with("w_") {
-        return sqlx::query_scalar::<_, String>("SELECT id FROM work WHERE id = ?")
+        return crate::db_types::query_scalar::<String>("SELECT id FROM work WHERE id = $1")
             .bind(series_id)
             .fetch_optional(pool)
             .await
             .ok()
             .flatten();
     }
-    sqlx::query_scalar::<_, String>(
+    crate::db_types::query_scalar::<String>(
         "SELECT work_id FROM source_series \
-         WHERE source_type = 'suwayomi' AND source_key = ? ORDER BY work_id LIMIT 1",
+         WHERE source_type = 'suwayomi' AND source_key = $1 ORDER BY work_id LIMIT 1",
     )
     .bind(series_id)
     .fetch_optional(pool)
@@ -2914,8 +2992,8 @@ async fn review_key_set(pool: &Database, series_id: &str) -> Vec<String> {
     let Some(work_id) = resolve_work_id(pool, series_id).await else {
         return vec![series_id.to_string()];
     };
-    let mut keys: Vec<String> = sqlx::query_scalar::<_, String>(
-        "SELECT source_key FROM source_series WHERE work_id = ? AND source_type = 'suwayomi'",
+    let mut keys: Vec<String> = crate::db_types::query_scalar::<String>(
+        "SELECT source_key FROM source_series WHERE work_id = $1 AND source_type = 'suwayomi'",
     )
     .bind(&work_id)
     .fetch_all(pool)
@@ -2943,28 +3021,8 @@ async fn known_series_id(pool: &Database, series_id: &str) -> bool {
     let Ok(n) = series_id.parse::<i64>() else {
         return false;
     };
-    sqlx::query_scalar::<_, i64>("SELECT 1 FROM suwayomi_series WHERE id = ?")
+    crate::db_types::query_scalar::<i64>("SELECT 1 FROM suwayomi_series WHERE id = $1")
         .bind(n)
-        .fetch_optional(pool)
-        .await
-        .map(|r| r.is_some())
-        .unwrap_or(false)
-}
-
-/// Whether `chapter_id` names a chapter we know: a mirrored MangaDex chapter
-/// (`chapter.external_id`, a uuid) or a cached Suwayomi chapter (numeric id). Used to
-/// stop comment threads being opened on arbitrary ids. Fails CLOSED on a DB error.
-async fn known_chapter_id(pool: &Database, chapter_id: &str) -> bool {
-    if let Ok(n) = chapter_id.parse::<i64>() {
-        return sqlx::query_scalar::<_, i64>("SELECT 1 FROM suwayomi_chapter WHERE id = ?")
-            .bind(n)
-            .fetch_optional(pool)
-            .await
-            .map(|r| r.is_some())
-            .unwrap_or(false);
-    }
-    sqlx::query_scalar::<_, i64>("SELECT 1 FROM chapter WHERE external_id = ? LIMIT 1")
-        .bind(chapter_id)
         .fetch_optional(pool)
         .await
         .map(|r| r.is_some())
@@ -2993,13 +3051,14 @@ async fn load_work_following_redirect(
 ) -> Result<Option<catalog::CanonicalWork>> {
     if let Some(w) = catalog::load_canonical_work(pool, work_id)
         .await
-        .map_err(gql_err)?
+        .map_err(gql_read_err)?
     {
         return Ok(Some(w));
     }
     let redirected = match catalog::redirect_work_id(pool, work_id).await {
         Ok(v) => v,
         Err(e) => {
+            crate::db::observe_database_error(&e);
             tracing::warn!(work_id, error = %e, "work_redirect lookup failed");
             None
         }
@@ -3010,7 +3069,7 @@ async fn load_work_following_redirect(
     tracing::debug!(from = work_id, to = %new_id, "followed work_redirect");
     catalog::load_canonical_work(pool, &new_id)
         .await
-        .map_err(gql_err)
+        .map_err(gql_read_err)
 }
 
 /// Reload a work as a `Series` in the CALLER's id shape (`w_` canonical vs a numeric
@@ -3031,7 +3090,7 @@ async fn reload_series_in_shape(
             .ok_or_else(|| Error::new("No such work"))?;
         let chapters = catalog::load_canonical_chapters(&st.pool, &work.work_id)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let user = current_user(ctx).await?;
         map_canonical_series(
             &st.pool,
@@ -3212,11 +3271,11 @@ async fn series_by_keys(st: &AppState, keys: &[String]) -> Result<Vec<Series>> {
         if key.starts_with("w_") {
             if let Some(work) = catalog::load_canonical_work(&st.pool, key)
                 .await
-                .map_err(gql_err)?
+                .map_err(gql_read_err)?
             {
                 let chapters = catalog::load_canonical_chapters(&st.pool, key)
                     .await
-                    .map_err(gql_err)?;
+                    .map_err(gql_read_err)?;
                 out.push(Some(
                     map_canonical_series(
                         &st.pool,
@@ -3318,7 +3377,7 @@ async fn map_canonical_series(
     let chapter_count = chapter_count.max(
         catalog::suwayomi_chapter_count(pool, &work.work_id)
             .await
-            .map_err(gql_err)?
+            .map_err(gql_read_err)?
             .max(0) as i32,
     );
     let chapter_count = if chapter_count > 0 {
@@ -3326,7 +3385,7 @@ async fn map_canonical_series(
     } else {
         catalog::aggregate_chapter_count(pool, &work.work_id)
             .await
-            .map_err(gql_err)?
+            .map_err(gql_read_err)?
             .max(0) as i32
     };
     // Publish time of the newest English chapter across every source — the real
@@ -3345,12 +3404,12 @@ async fn map_canonical_series(
     // fabricated clock sorted first.
     let latest_chapter_at = catalog::latest_english_chapter_at(pool, &work.work_id)
         .await
-        .map_err(gql_err)?
+        .map_err(gql_read_err)?
         .unwrap_or_default();
     let genres =
         catalog::work_effective_genres_batch_checked(pool, std::slice::from_ref(&work.work_id))
             .await
-            .map_err(gql_err)?
+            .map_err(gql_read_err)?
             .remove(&work.work_id)
             .unwrap_or_default();
     let comic_type = resolve_comic_type(
@@ -3422,12 +3481,19 @@ async fn map_canonical_series(
 /// looked up again — `created_at` moved onto that row in 0069, so it is no longer here.
 #[derive(sqlx::FromRow, Default, Clone)]
 struct BrowseWorkExtras {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     id: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     author: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     artist: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     description: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     description_override: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     content_type_override: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     original_language: Option<String>,
 }
 
@@ -3458,7 +3524,7 @@ async fn map_browse_rows(
         return Ok(Vec::new());
     }
     let work_ids: Vec<String> = rows.iter().map(|r| r.work_id.clone()).collect();
-    let ph = in_placeholders(work_ids.len());
+    let ph = crate::sql_params::placeholders(1, work_ids.len());
 
     // (1) Genres, with the admin > MangaDex > Suwayomi tier precedence already applied —
     //     three grouped queries inside, and the only thing here that is not a single
@@ -3466,7 +3532,7 @@ async fn map_browse_rows(
     //     match the same work's chips on the home rows.
     let genres = catalog::work_effective_genres_batch_checked(&st.pool, &work_ids)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
     // (2) Ratings, keyed by work id across both `reviews.series_id` shapes.
     let ratings = rating_summary_by_work_batch(&st.pool, &work_ids).await?;
     let md_ratings = mangadex_rating_batch(&st.pool, &work_ids).await?;
@@ -3503,21 +3569,22 @@ async fn map_browse_rows(
     let extras: HashMap<String, BrowseWorkExtras> = q
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?
+        .map_err(gql_read_err)?
         .into_iter()
         .map(|e| (e.id.clone(), e))
         .collect();
     // (4) Alt titles. The reader's `SeriesFields` fragment selects `altTitles`, so dropping
     //     them here would be a silent regression against the feed this replaces (which got
     //     them from `map_series_batch`'s own alias batch).
-    let alias_sql =
-        format!("SELECT work_id, raw_title FROM work_alias WHERE work_id IN ({ph}) ORDER BY work_id, raw_title");
-    let mut qa = sqlx::query_as::<_, (String, String)>(&alias_sql);
+    let alias_sql = format!(
+        "SELECT work_id, raw_title FROM work_alias WHERE work_id IN ({ph}) ORDER BY work_id, raw_title"
+    );
+    let mut qa = crate::db_types::query_tuple::<(String, String)>(&alias_sql);
     for id in &work_ids {
         qa = qa.bind(id);
     }
     let mut alts: HashMap<String, Vec<String>> = HashMap::new();
-    for (wid, raw) in qa.fetch_all(&st.pool).await.map_err(gql_err)? {
+    for (wid, raw) in qa.fetch_all(&st.pool).await.map_err(gql_read_err)? {
         alts.entry(wid).or_default().push(raw);
     }
     // (5) The scanner's detection time for the numeric cards. `series_scan_state` is
@@ -3537,15 +3604,15 @@ async fn map_browse_rows(
             let sql = format!(
                 "SELECT series_id, last_new_chapter_at FROM series_scan_state \
                  WHERE last_new_chapter_at IS NOT NULL AND series_id IN ({})",
-                in_placeholders(scan_ids.len())
+                crate::sql_params::placeholders(1, scan_ids.len())
             );
-            let mut qs = sqlx::query_as::<_, (String, String)>(&sql);
+            let mut qs = crate::db_types::query_tuple::<(String, String)>(&sql);
             for id in &scan_ids {
                 qs = qs.bind(id);
             }
             qs.fetch_all(&st.pool)
                 .await
-                .map_err(gql_err)?
+                .map_err(gql_read_err)?
                 .into_iter()
                 .collect()
         }
@@ -3725,8 +3792,8 @@ fn map_canonical_chapter(
 /// Absent keys are absent, not defaulted: see `Chapter::found_at` on why a missing announce
 /// clock must reach the UI as a null.
 async fn announce_map_for_work(pool: &Database, work_id: &str) -> HashMap<String, String> {
-    let rows = sqlx::query_as::<_, (String, Option<i64>)>(
-        "SELECT chapter_key, announce_at FROM release_event WHERE work_id = ?",
+    let rows = crate::db_types::query_tuple::<(String, Option<i64>)>(
+        "SELECT chapter_key, announce_at FROM release_event WHERE work_id = $1",
     )
     .bind(work_id)
     .fetch_all(pool)
@@ -3751,9 +3818,12 @@ async fn canonical_progress_map(
     let Some(uid) = user_id else {
         return HashMap::new();
     };
-    let rows = sqlx::query_as::<_, (String, i64, i64)>(
+    let Ok(uid) = crate::db_types::uuid(uid) else {
+        return HashMap::new();
+    };
+    let rows = crate::db_types::query_tuple::<(String, i64, i64)>(
         "SELECT chapter_id, last_page_read, read FROM canonical_progress \
-         WHERE user_id = ? AND work_id = ?",
+         WHERE user_id = $1 AND work_id = $2",
     )
     .bind(uid)
     .bind(work_id)
@@ -3778,9 +3848,12 @@ async fn suwayomi_progress_map(
     let Some(uid) = user_id else {
         return HashMap::new();
     };
-    let rows = sqlx::query_as::<_, (String, i64, i64)>(
+    let Ok(uid) = crate::db_types::uuid(uid) else {
+        return HashMap::new();
+    };
+    let rows = crate::db_types::query_tuple::<(String, i64, i64)>(
         "SELECT chapter_id, last_page_read, read FROM suwayomi_progress \
-         WHERE user_id = ? AND series_id = ?",
+         WHERE user_id = $1 AND series_id = $2",
     )
     .bind(uid)
     .bind(series_id.to_string())
@@ -3809,13 +3882,17 @@ async fn suwayomi_progress_batch(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let sql = format!("SELECT series_id, chapter_id, last_page_read, read FROM suwayomi_progress WHERE user_id = ? AND series_id IN ({})", in_placeholders(ids.len()));
-    let mut q = sqlx::query_as::<_, (String, String, i64, i64)>(&sql).bind(user_id);
+    let sql = format!(
+        "SELECT series_id, chapter_id, last_page_read, read FROM suwayomi_progress WHERE user_id = $1 AND series_id IN ({})",
+        crate::sql_params::placeholders(2, ids.len())
+    );
+    let mut q = crate::db_types::query_tuple::<(String, String, i64, i64)>(&sql)
+        .bind(crate::db_types::uuid(user_id)?);
     for id in ids {
         q = q.bind(id.to_string());
     }
     let mut out: HashMap<i64, HashMap<i64, (i32, bool)>> = HashMap::new();
-    for (sid, cid, page, read) in q.fetch_all(pool).await.map_err(gql_err)? {
+    for (sid, cid, page, read) in q.fetch_all(pool).await.map_err(gql_read_err)? {
         if let (Ok(sid), Ok(cid)) = (sid.parse::<i64>(), cid.parse::<i64>()) {
             out.entry(sid)
                 .or_default()
@@ -3828,7 +3905,7 @@ async fn suwayomi_progress_batch(
 /// The spine key (`chapter.chapter_key`) of one mirrored MangaDex chapter, computed by
 /// the SAME call the spine writer uses so the two can never disagree.
 ///
-/// Not `round(number * 100)` inlined in SQL: `CAST('Extra' AS REAL)` is `0.0`, which
+/// Not `round(number * 100)` inlined in SQL: `CAST('Extra' AS DOUBLE PRECISION)` is `0.0`, which
 /// collides with a real chapter 0 — the `x:<external_id>` namespace in
 /// [`crate::chapter_label`] is what stops that, and it only exists in Rust.
 fn canonical_chapter_key(c: &catalog::CanonicalChapter) -> String {
@@ -3876,25 +3953,28 @@ async fn work_read_keys(
     let Some(uid) = user_id else {
         return std::collections::HashSet::new();
     };
+    let Ok(uid) = crate::db_types::uuid(uid) else {
+        return std::collections::HashSet::new();
+    };
     if work_id.is_empty() {
         return std::collections::HashSet::new();
     }
-    let rows = sqlx::query_scalar::<_, String>(
+    let rows = crate::db_types::query_scalar::<String>(
         // `lang = 'en'` on the MangaDex arm, as everywhere else: `chapter` holds every
         // language and komika serves English only.
         "SELECT c.chapter_key \
            FROM canonical_progress cp \
            JOIN source_series ss ON ss.work_id = cp.work_id AND ss.source_type = 'mangadex' \
            JOIN chapter c ON c.source_series_id = ss.id AND c.external_id = cp.chapter_id \
-          WHERE cp.user_id = ?1 AND cp.work_id = ?2 AND cp.read = 1 \
+          WHERE cp.user_id = $1 AND cp.work_id = $2 AND cp.read = TRUE \
             AND c.lang = 'en' AND c.chapter_key IS NOT NULL \
           UNION \
          SELECT c.chapter_key \
            FROM suwayomi_progress sp \
            JOIN source_series ss ON ss.source_type = 'suwayomi' \
-                AND ss.source_key = sp.series_id AND ss.work_id = ?2 \
+                AND ss.source_key = sp.series_id AND ss.work_id = $2 \
            JOIN chapter c ON c.source_series_id = ss.id AND c.external_id = sp.chapter_id \
-          WHERE sp.user_id = ?1 AND sp.read = 1 AND c.chapter_key IS NOT NULL",
+          WHERE sp.user_id = $1 AND sp.read = TRUE AND c.chapter_key IS NOT NULL",
     )
     .bind(uid)
     .bind(work_id)
@@ -3911,10 +3991,8 @@ async fn work_read_keys(
 /// series has no `source_series` mapping yet, and the caller falls back to per-source read
 /// state — there is no work to gather sibling sources from.
 async fn suwayomi_series_work_id(pool: &Database, series_id: i64) -> Option<String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT work_id FROM source_series \
-         WHERE source_type = 'suwayomi' AND source_key = ? \
-         ORDER BY last_seen DESC, id ASC LIMIT 1",
+    crate::db_types::query_scalar::<String>(
+        r#"SELECT work_id FROM source_series WHERE source_type = 'suwayomi' AND source_key = $1 ORDER BY last_seen DESC NULLS LAST, id ASC NULLS FIRST LIMIT 1"#,
     )
     .bind(series_id.to_string())
     .fetch_optional(pool)
@@ -3928,15 +4006,25 @@ async fn suwayomi_series_work_id(pool: &Database, series_id: i64) -> Option<Stri
 
 #[derive(sqlx::FromRow)]
 struct ReviewJoin {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     series_id: String,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     score: i64,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     body: String,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     has_spoiler: i64,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     created_at: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     updated_at: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     author_id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     author_username: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     author_avatar: Option<String>,
 }
 
@@ -3973,57 +4061,99 @@ fn validate_comment_target(target_type: &str) -> Result<&'static str> {
 
 #[derive(sqlx::FromRow)]
 struct CommentJoin {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     target_type: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     target_id: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     parent_id: Option<String>,
+    deleted_by: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     body: String,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     has_spoiler: i64,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     created_at: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     author_id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     author_username: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     author_avatar: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     media_id: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     media_width: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     media_height: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     likes: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     dislikes: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     my_vote: i64,
 }
 
 impl From<CommentJoin> for Comment {
     fn from(c: CommentJoin) -> Self {
+        let deleted = c.deleted_by.is_some();
         Comment {
             id: ID(c.id),
             target_type: c.target_type,
             target_id: ID(c.target_id),
             parent_id: c.parent_id.map(ID),
             author: UserRef {
-                id: ID(c.author_id),
-                username: c.author_username,
-                avatar_url: c.author_avatar,
+                id: ID(if deleted { String::new() } else { c.author_id }),
+                username: if deleted {
+                    "Deleted user".into()
+                } else {
+                    c.author_username
+                },
+                avatar_url: if deleted { None } else { c.author_avatar },
             },
-            body: c.body,
-            has_spoiler: c.has_spoiler != 0,
-            media_url: c.media_id.as_deref().map(crate::media::comment_media_url),
-            media_width: c.media_width.map(|n| n as i32),
-            media_height: c.media_height.map(|n| n as i32),
+            body: if deleted { String::new() } else { c.body },
+            has_spoiler: !deleted && c.has_spoiler != 0,
+            deleted_by: c.deleted_by,
+            media_url: if deleted {
+                None
+            } else {
+                c.media_id.as_deref().map(crate::media::comment_media_url)
+            },
+            media_width: if deleted {
+                None
+            } else {
+                c.media_width.map(|n| n as i32)
+            },
+            media_height: if deleted {
+                None
+            } else {
+                c.media_height.map(|n| n as i32)
+            },
             created_at: c.created_at,
-            likes: c.likes as i32,
-            dislikes: c.dislikes as i32,
-            my_vote: c.my_vote as i32,
+            likes: if deleted { 0 } else { c.likes as i32 },
+            dislikes: if deleted { 0 } else { c.dislikes as i32 },
+            my_vote: if deleted { 0 } else { c.my_vote as i32 },
         }
     }
 }
 
 #[derive(sqlx::FromRow)]
 struct AdminUserRow {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     username: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     email: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     avatar_url: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     is_admin: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     is_banned: i64,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     created_at: String,
 }
 
@@ -4048,14 +4178,19 @@ async fn user_profile_fields(
     pool: &Database,
     user_id: &str,
 ) -> (Option<String>, Option<String>, String, bool) {
-    sqlx::query_as::<_, (Option<String>, Option<String>, String, bool)>(
-        "SELECT display_name, bio, created_at, must_change_password FROM users WHERE id = ?",
+    let Ok(user_id) = crate::db_types::uuid(user_id) else {
+        return (None, None, String::new(), false);
+    };
+    crate::db_types::query_tuple::<(Option<String>, Option<String>, String, bool)>(
+        "SELECT display_name, bio, created_at, must_change_password FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_optional(pool)
     .await
     // Log (don't swallow) DB errors; still fall back to empties gracefully.
-    .inspect_err(|e| tracing::warn!(error = %e, user_id, "user_profile_fields query failed"))
+    .inspect_err(
+        |e| tracing::warn!(error = %e, user_id = %user_id, "user_profile_fields query failed"),
+    )
     .ok()
     .flatten()
     .unwrap_or((None, None, String::new(), false))
@@ -4090,19 +4225,23 @@ async fn log_activity(
     target_type: Option<&str>,
     target_id: Option<&str>,
 ) {
+    let Ok(user_id) = crate::db_types::uuid(user_id) else {
+        return;
+    };
     let res = sqlx::query(
         "INSERT INTO user_activity (id, user_id, kind, target_type, target_id, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
-    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(uuid::Uuid::new_v4())
     .bind(user_id)
     .bind(kind)
     .bind(target_type)
     .bind(target_id)
-    .bind(Utc::now().to_rfc3339())
+    .bind(Utc::now())
     .execute(pool)
     .await;
     if let Err(e) = res {
+        crate::db::record_database_error(&e);
         tracing::warn!(error = %e, kind, "failed to record user activity");
     }
 }
@@ -4133,17 +4272,24 @@ pub struct CanonicalUpdate {
     pub average_rating: Option<f64>,
     #[sqlx(skip)]
     pub rating_count: i32,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub work_id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub mangadex_id: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub title: Option<String>,
     pub is_nsfw: bool,
     /// Proxy-ready cover thumbnail URL (`uploads.mangadex.org`), or null if the cover
     /// fileName hasn't been synced yet. The client resolves it through the Worker.
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub cover_url: Option<String>,
     /// Latest stored chapter number (string — chapters can be "10.5").
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub latest_chapter: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub latest_chapter_title: Option<String>,
     /// Publish time of the latest stored chapter (falls back to ingest time).
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub latest_at: Option<String>,
 }
 
@@ -4233,21 +4379,34 @@ pub struct UpdateFeedPage {
 /// Suwayomi config) and converting `released_at` back to ISO-8601.
 #[derive(sqlx::FromRow)]
 struct FeedSeriesUpdateRow {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     work_id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     reader_id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     title: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     cover_url: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     suwayomi_thumbnail: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     comic_type: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     status: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     latest_chapter: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     latest_chapter_title: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     chapter_count: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     released_at: i64,
     /// Nullable in the struct though migration 0099 leaves no NULLs behind, because a row
     /// INSERTed by a rebuild between the `DELETE` and `default_announced_at` is momentarily
     /// NULL and this type must be able to read it rather than fail the whole page.
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     announced_at: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     detected_at: Option<String>,
     is_nsfw: bool,
 }
@@ -4258,9 +4417,11 @@ struct FeedSeriesUpdateRow {
 /// An out-of-range value yields the epoch rather than panicking: this is a display
 /// timestamp on a cache row, and a corrupt one must not take down the whole feed.
 fn epoch_ms_to_iso(ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(ms)
-        .unwrap_or_else(|| chrono::DateTime::from_timestamp_millis(0).expect("epoch is in range"))
-        .to_rfc3339()
+    crate::db_types::format_date(
+        chrono::DateTime::from_timestamp_millis(ms).unwrap_or_else(|| {
+            chrono::DateTime::from_timestamp_millis(0).expect("epoch is in range")
+        }),
+    )
 }
 
 /// A pending mid-confidence match awaiting manual admin review.
@@ -4292,21 +4453,36 @@ pub struct MergeCandidate {
 /// type).
 #[derive(sqlx::FromRow)]
 struct MergeCandidateRow {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     source_series_id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     source_work_id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     candidate_work_id: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     candidate_title: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     source_title: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     source_cover_version: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     source_cover_file_name: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     source_mangadex_id: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     candidate_cover_version: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     candidate_cover_file_name: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     candidate_mangadex_id: Option<String>,
     score: f64,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     method: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     status: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     created_at: String,
 }
 
@@ -4343,17 +4519,29 @@ pub struct WorkReviewDetail {
 /// assembled by the resolver).
 #[derive(sqlx::FromRow)]
 struct WorkReviewDetailRow {
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     title: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     author: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     artist: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     year: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     status: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     content_rating: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     original_language: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     is_nsfw: i64,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     description: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     cover_cached_version: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     cover_file_name: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     mangadex_id: Option<String>,
 }
 
@@ -4419,15 +4607,25 @@ pub struct CoverSourceBackoff {
 
 #[derive(sqlx::FromRow)]
 struct CoverSourceBackoffRow {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     source_id: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     source_name: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     reason: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     detail: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     failures: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     failed_covers: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     deferred_covers: i64,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     first_seen: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     last_seen: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     retry_after: String,
     active: bool,
 }
@@ -4435,15 +4633,25 @@ struct CoverSourceBackoffRow {
 /// Row shape for the cover-issue listing join (DB columns; `cover_url` is derived).
 #[derive(sqlx::FromRow)]
 struct CoverIssueRow {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     work_id: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     title: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     reason: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     detail: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     attempts: i64,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     first_seen: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     last_seen: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     cover_cached_version: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     mangadex_id: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     cover_file_name: Option<String>,
 }
 
@@ -4576,20 +4784,35 @@ pub struct ReportPage {
 /// Raw `report` row + the joined reporter username.
 #[derive(sqlx::FromRow)]
 struct ReportRow {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     kind: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     status: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     reporter: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     subject_id: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     subject_id_secondary: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     subject_title: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     comment_id: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     reported_username: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     comment_excerpt: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     source_url: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     detail: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     admin_note: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     created_at: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     resolved_at: Option<String>,
 }
 
@@ -4687,15 +4910,15 @@ async fn compute_discovery(st: &AppState, show_nsfw: bool) -> Result<Vec<Discove
     // LIMIT, rather than trimming an already-truncated page (see series_cache).
     let (popular, latest, recent) = if crate::series_cache::count(&st.pool)
         .await
-        .map_err(gql_err)?
+        .map_err(gql_read_err)?
         > 0
     {
         let lib = crate::series_cache::library(&st.pool, PAGE_SIZE, show_nsfw)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let recent = crate::series_cache::recently_added(&st.pool, PAGE_SIZE, show_nsfw)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         (lib, Vec::new(), recent)
     } else {
         // Cold path (pre-cache, fresh install only): overlap the two independent
@@ -4738,7 +4961,7 @@ async fn compute_discovery(st: &AppState, show_nsfw: bool) -> Result<Vec<Discove
     };
     let (_, recent_rows) = crate::browse::browse_catalogue(&st.pool, &latest_added)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
     let recent = if recent_rows.is_empty() {
         filter_nsfw(show_nsfw, map_series_list(st, recent).await?)
     } else {
@@ -4758,7 +4981,7 @@ async fn compute_discovery(st: &AppState, show_nsfw: bool) -> Result<Vec<Discove
     let trending = {
         let keys: Vec<String> = crate::views::trending_keys(&st.pool, 10)
             .await
-            .map_err(gql_err)?
+            .map_err(gql_read_err)?
             .into_iter()
             .map(|(k, _)| k)
             .collect();
@@ -4878,7 +5101,7 @@ impl SeriesPageBundle {
         let st = state(ctx);
         let rows = catalog::work_source_chapters(&st.pool, &self.work_id.0)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let mut chapters = group_aggregated_chapters(rows);
         let ov = chapter_overrides(&st.pool, &self.work_id.0).await;
         if !ov.is_empty() {
@@ -4933,7 +5156,7 @@ impl QueryRoot {
                 // empty-catalogue source browse needs cold-wait admission.
                 let _waiter = if crate::series_cache::count(&st.pool)
                     .await
-                    .map_err(gql_err)?
+                    .map_err(gql_read_err)?
                     == 0
                 {
                     crate::request_budget::cache_wait_permit().map_err(gql_err)?
@@ -4986,10 +5209,10 @@ impl QueryRoot {
         // token-for-token (only the continuation indentation differs). Both take one bind
         // (`show_nsfw as i64`) and gate the same table for different modules; there is no
         // compile-time link between them, so if you change one, change the other.
-        const NSFW_FILTER: &str = "(? = 1 OR NOT EXISTS ( \
+        const NSFW_FILTER: &str = "($1 OR NOT EXISTS ( \
              SELECT 1 FROM source_series ss JOIN work w ON w.id = ss.work_id \
              WHERE ss.source_type = 'suwayomi' AND ss.source_key = CAST(suwayomi_series.id AS TEXT) \
-               AND COALESCE(w.is_nsfw_override, w.is_nsfw) = 1))";
+               AND COALESCE(w.is_nsfw_override, w.is_nsfw) = TRUE))";
         // Membership: the series is ENROLLED with our scanner. It used to be the DRIVING
         // table and the ORDER BY key; it is now only a predicate, because ordering by it was
         // the bug (see below).
@@ -5060,7 +5283,7 @@ impl QueryRoot {
         // the encoding mismatch above). 0 of the 1,316 current members are affected;
         // 2,312 of the 13,847 in-library series have a NULL here, none of them detected.
         //
-        // `in_library = 1` matches the index's leading column and is also the honest
+        // `in_library = TRUE` matches the index's leading column and is also the honest
         // membership test — the feed is the reader's library. Fetch one extra row to
         // compute has_next without a second round-trip.
         //
@@ -5070,19 +5293,17 @@ impl QueryRoot {
         let blocks = viewer_blocks(ctx).await?;
         let not_blocked =
             crate::block::and_series_not_blocked(&blocks.lists, "CAST(suwayomi_series.id AS TEXT)");
-        let ids: Vec<String> = sqlx::query_scalar(&format!(
-            "SELECT CAST(id AS TEXT) FROM suwayomi_series \
-             WHERE in_library = 1 AND {DETECTED} AND {NSFW_FILTER}{not_blocked} \
-             ORDER BY latest_chapter_at DESC NULLS LAST, id DESC LIMIT ? OFFSET ?"
+        let ids: Vec<String> = crate::db_types::query_scalar(&format!(
+            r#"SELECT CAST(id AS TEXT) FROM suwayomi_series WHERE in_library = TRUE AND {DETECTED} AND {NSFW_FILTER}{not_blocked} ORDER BY latest_chapter_at DESC NULLS LAST, suwayomi_series.id DESC NULLS LAST LIMIT $2 OFFSET $3"#
         ))
-        .bind(show_nsfw as i64)
+        .bind(show_nsfw)
         .bind(PAGE_SIZE + 1)
         .bind(offset)
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         // Counts EXACTLY the row set the ids query pages over — same three predicates,
-        // `in_library = 1` included. It previously counted every dated `series_scan_state`
+        // `in_library = TRUE` included. It previously counted every dated `series_scan_state`
         // row, so a scan-state row for a series no longer in the library inflated `total`
         // and `has_next` above what the pages could ever return.
         //
@@ -5097,7 +5318,7 @@ impl QueryRoot {
             &st.pool,
             &format!(
                 "SELECT COUNT(*) FROM suwayomi_series \
-                 WHERE in_library = 1 AND {DETECTED} AND {NSFW_FILTER}{not_blocked}"
+                 WHERE in_library = TRUE AND {DETECTED} AND {NSFW_FILTER}{not_blocked}"
             ),
             show_nsfw,
             &blocks.lists.key(),
@@ -5119,7 +5340,7 @@ impl QueryRoot {
             .collect();
         let mut cached = crate::series_cache::get_series_fresh_batch(&st.pool, &ids)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let mut resolved = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(row) = cached.remove(&id) {
@@ -5174,9 +5395,9 @@ impl QueryRoot {
         // the per-group newest-chapter selection are baked into the refresh.
         //
         // The query is BRANCHED on the NSFW preference rather than `WHERE (? = 1 OR
-        // is_nsfw = 0)`: that OR is opaque to the planner, so it can't tell `is_nsfw`
+        // is_nsfw = FALSE)`: that OR is opaque to the planner, so it can't tell `is_nsfw`
         // is constant and falls back to a temp B-tree sort over the whole table. The
-        // anonymous branch pins `is_nsfw = 0`, which lets the composite index
+        // anonymous branch pins `is_nsfw = FALSE`, which lets the composite index
         // (is_nsfw, latest_at DESC, work_id DESC) serve BOTH the filter and the order
         // with no sort — and the anonymous path is the hot, edge-cacheable one.
         let base = "SELECT work_id, mangadex_id, title, is_nsfw, cover_url, \
@@ -5187,7 +5408,7 @@ impl QueryRoot {
         let blocks = list_blocks_or_admin(ctx, include_nsfw).await?;
         let mut conds: Vec<String> = Vec::new();
         if !show_nsfw {
-            conds.push("is_nsfw = 0".into());
+            conds.push("is_nsfw = FALSE".into());
         }
         if let Some(blocked) = blocks.blocked_sql("feed_updates.work_id", None) {
             conds.push(format!("NOT {blocked}"));
@@ -5197,14 +5418,15 @@ impl QueryRoot {
         } else {
             format!(" WHERE {}", conds.join(" AND "))
         };
-        let sql =
-            format!("{base}{where_sql} ORDER BY latest_at DESC, work_id DESC LIMIT ? OFFSET ?");
+        let sql = format!(
+            r#"{base}{where_sql} ORDER BY latest_at DESC NULLS LAST, work_id DESC NULLS LAST LIMIT $1 OFFSET $2"#
+        );
         let mut rows = sqlx::query_as::<_, CanonicalUpdate>(&sql)
             .bind(PAGE_SIZE)
             .bind(offset)
             .fetch_all(&st.pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let ids: Vec<String> = rows.iter().map(|r| r.work_id.clone()).collect();
         let ratings = rating_summary_by_work_batch(&st.pool, &ids).await?;
         for row in &mut rows {
@@ -5257,7 +5479,7 @@ impl QueryRoot {
             ComicType::Manhua => "MANHUA",
             ComicType::Manga | ComicType::Comic => "MANGA",
         });
-        // FOUR SQL SHAPES, not one parameterized one. `WHERE (? = 1 OR is_nsfw = 0)` is
+        // FOUR SQL SHAPES, not one parameterized one. `WHERE (? = 1 OR is_nsfw = FALSE)` is
         // opaque to the planner — it cannot tell `is_nsfw` is constant, so it sorts the
         // whole 48k-row table through a temp B-tree to satisfy the ORDER BY.
         // `canonical_updates` documents the same thing and branches for the same reason.
@@ -5281,10 +5503,10 @@ impl QueryRoot {
         let blocks = viewer_blocks(ctx).await?;
         let mut conds: Vec<String> = Vec::new();
         if !show_nsfw {
-            conds.push("is_nsfw = 0".into());
+            conds.push("is_nsfw = FALSE".into());
         }
         if type_word.is_some() {
-            conds.push("comic_type = ?".into());
+            conds.push("comic_type = $1".into());
         }
         if let Some(blocked) = blocks
             .lists
@@ -5312,12 +5534,12 @@ impl QueryRoot {
         // `MAX(COALESCE(announce_at, first_seen_at))`, which is the identity on every event
         // recorded before 0099 — so this ORDER BY is byte-identical to the old one until
         // real announce clocks start landing.
+        let page_args = crate::sql_params::placeholders(usize::from(type_word.is_some()) + 1, 2);
+        let mut page_args = page_args.split(", ");
+        let limit_arg = page_args.next().unwrap();
+        let offset_arg = page_args.next().unwrap();
         let sql = format!(
-            "SELECT work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, status, \
-                    latest_chapter, latest_chapter_title, chapter_count, released_at, \
-                    announced_at, detected_at, is_nsfw \
-             FROM feed_series_updates {where_sql} \
-             ORDER BY announced_at DESC, work_id DESC LIMIT ? OFFSET ?"
+            r#"SELECT work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, status, latest_chapter, latest_chapter_title, chapter_count, released_at, announced_at, detected_at, is_nsfw FROM feed_series_updates {where_sql} ORDER BY announced_at DESC NULLS LAST, work_id DESC NULLS LAST LIMIT {limit_arg} OFFSET {offset_arg}"#
         );
         let mut q = sqlx::query_as::<_, FeedSeriesUpdateRow>(&sql);
         if let Some(w) = type_word {
@@ -5328,17 +5550,17 @@ impl QueryRoot {
             .bind(offset)
             .fetch_all(&st.pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         // Counts exactly the row set the page query walks — same WHERE, so a filtered
         // feed reports its own total and the pager's "showing 41-60 of N" is honest.
         // Index-only on all four shapes (`… USING COVERING INDEX …`), 0.15-3.5 ms warm,
         // so it is NOT memoized the way `series_cache`'s catalogue count had to be.
         let count_sql = format!("SELECT COUNT(*) FROM feed_series_updates {where_sql}");
-        let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+        let mut cq = crate::db_types::query_scalar::<i64>(&count_sql);
         if let Some(w) = type_word {
             cq = cq.bind(w);
         }
-        let total: i64 = cq.fetch_one(&st.pool).await.map_err(gql_err)?;
+        let total: i64 = cq.fetch_one(&st.pool).await.map_err(gql_read_err)?;
 
         // The card's star: the work's aggregate rating, resolved for the <=20 rows of this
         // page in TWO batched queries (never one per row), both keyed by the row's WORK id.
@@ -5463,7 +5685,7 @@ impl QueryRoot {
         deny_blocked_work(ctx, &work.work_id, "No such work").await?;
         let chapters = catalog::load_canonical_chapters(&st.pool, &work_id.0)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let user = current_user(ctx).await?;
         map_canonical_series(
             &st.pool,
@@ -5500,7 +5722,7 @@ impl QueryRoot {
         deny_blocked_work(ctx, &work.work_id, "No such work").await?;
         let chapters = catalog::load_canonical_chapters(&st.pool, &work_id.0)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let user = current_user(ctx).await?;
         let uid = user.as_ref().map(|u| u.id.as_str());
         // Two lookups, two different jobs. `progress` is this SOURCE's own rows and is what
@@ -5550,7 +5772,7 @@ impl QueryRoot {
         deny_blocked_work(ctx, &work.work_id, "No such work").await?;
         let rows = catalog::work_source_chapters(&st.pool, &work_id.0)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         // (the NSFW gate above uses the effective flag incl. admin override)
         let mut chapters = group_aggregated_chapters(rows);
         // Apply admin chapter overrides: drop soft-hidden chapters and apply renames
@@ -5621,7 +5843,7 @@ impl QueryRoot {
         let (series, spine_chapters) = if work.mangadex_id.is_some() {
             let chapters = catalog::load_canonical_chapters(&st.pool, &effective_id)
                 .await
-                .map_err(gql_err)?;
+                .map_err(gql_read_err)?;
             let count = catalog::main_chapter_count_str(&chapters) as i32;
             let progress = canonical_progress_map(&st.pool, user_id, &effective_id).await;
             let mapped: Vec<Chapter> = chapters
@@ -5654,11 +5876,11 @@ impl QueryRoot {
             .collect();
         let mut cached_series = crate::series_cache::get_series_fresh_batch(&st.pool, &source_ids)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let mut cached_chapters =
             crate::series_cache::get_chapters_fresh_batch(&st.pool, &source_ids)
                 .await
-                .map_err(gql_err)?;
+                .map_err(gql_read_err)?;
         let mut source_progress = suwayomi_progress_batch(&st.pool, user_id, &source_ids).await?;
         let client = client_ip(ctx);
         // First pass: per-source chapters + the raw cached series row. The series
@@ -5782,33 +6004,45 @@ impl QueryRoot {
         };
         #[derive(sqlx::FromRow)]
         struct Row {
+            #[sqlx(try_from = "crate::db_types::DbOptionalString")]
             title_override: Option<String>,
+            #[sqlx(try_from = "crate::db_types::DbOptionalString")]
             description_override: Option<String>,
+            #[sqlx(try_from = "crate::db_types::DbOptionalString")]
             content_type_override: Option<String>,
+            #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
             is_nsfw_override: Option<i64>,
+            #[sqlx(try_from = "crate::db_types::DbOptionalString")]
             author: Option<String>,
+            #[sqlx(try_from = "crate::db_types::DbOptionalString")]
             artist: Option<String>,
+            #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
             year: Option<i64>,
+            #[sqlx(try_from = "crate::db_types::DbOptionalString")]
             original_language: Option<String>,
+            #[sqlx(try_from = "crate::db_types::DbOptionalString")]
             status: Option<String>,
+            #[sqlx(try_from = "crate::db_types::DbOptionalString")]
             demographic: Option<String>,
+            #[sqlx(try_from = "crate::db_types::DbOptionalString")]
             content_rating: Option<String>,
         }
         let row = sqlx::query_as::<_, Row>(
             "SELECT title_override, description_override, content_type_override, is_nsfw_override, \
                     author, artist, year, original_language, status, demographic, content_rating \
-             FROM work WHERE id = ?",
+             FROM work WHERE id = $1",
         )
         .bind(&work_id)
         .fetch_one(&st.pool)
         .await
-        .map_err(gql_err)?;
-        let curated: Vec<String> =
-            sqlx::query_scalar("SELECT tag FROM work_tag WHERE work_id = ? ORDER BY ord, tag")
-                .bind(&work_id)
-                .fetch_all(&st.pool)
-                .await
-                .unwrap_or_default();
+        .map_err(gql_read_err)?;
+        let curated: Vec<String> = crate::db_types::query_scalar(
+            "SELECT tag FROM work_tag WHERE work_id = $1 ORDER BY ord, tag",
+        )
+        .bind(&work_id)
+        .fetch_all(&st.pool)
+        .await
+        .unwrap_or_default();
         let has_curated_tags = !curated.is_empty();
         let tags = if has_curated_tags {
             curated
@@ -5818,7 +6052,7 @@ impl QueryRoot {
         // Column names to the field names of `SeriesAdminMeta`.
         let pinned_fields = catalog::pinned_work_fields(&st.pool, &work_id)
             .await
-            .map_err(gql_err)?
+            .map_err(gql_read_err)?
             .into_iter()
             .map(|column| match column.as_str() {
                 "original_language" => "originalLanguage".to_string(),
@@ -5867,7 +6101,7 @@ impl QueryRoot {
         let st = state(ctx);
         let rows = catalog::work_source_chapters(&st.pool, &work_id.0)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let aggregated = group_aggregated_chapters(rows);
         let ov = chapter_overrides(&st.pool, &work_id.0).await;
         Ok(aggregated
@@ -5905,7 +6139,7 @@ impl QueryRoot {
         // fails cleanly if the id is bogus.
         if let Some(true) = catalog::chapter_owner_is_nsfw(&st.pool, &chapter_id.0)
             .await
-            .map_err(gql_err)?
+            .map_err(gql_read_err)?
         {
             if !viewer_show_nsfw(ctx).await? {
                 return Err(Error::new("No such chapter"));
@@ -5961,6 +6195,7 @@ impl QueryRoot {
         let redirected = match catalog::redirect_work_id(&st.pool, &work_id.0).await {
             Ok(v) => v,
             Err(e) => {
+                crate::db::observe_database_error(&e);
                 tracing::warn!(work_id = %work_id.0, error = %e, "workSources: redirect lookup failed");
                 None
             }
@@ -5996,7 +6231,7 @@ impl QueryRoot {
         let st = state(ctx);
         let rows = catalog::work_source_series_rows(&st.pool, &work_id.0)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         // Display names come from the ENGINE's installed-source list, which is the only
         // place they exist — nothing caches them (see `Translator::source_name`, nullable
         // for exactly this reason). Best-effort: an engine that is down or slow must not
@@ -6089,7 +6324,7 @@ impl QueryRoot {
         let blocked_works =
             crate::block::blocked_ids(&st.pool, &viewer_blocks(ctx).await?.site, &ids)
                 .await
-                .map_err(gql_err)?;
+                .map_err(gql_read_err)?;
         let mut by_work = load_work_sources_batch(&st.pool, &ids, show_nsfw).await?;
         let groups = work_ids
             .into_iter()
@@ -6111,7 +6346,7 @@ impl QueryRoot {
     /// An EMPTY query browses the whole BROWSABLE canonical catalogue — 115,567 works, from
     /// the materialized `browse_catalogue` (migration 0069) — with every filter and sort
     /// applied IN SQL, so `total` and `hasNextPage` describe the filtered set rather than a
-    /// slice of it. It used to read `suwayomi_series WHERE in_library = 1`, which was 13,847
+    /// slice of it. It used to read `suwayomi_series WHERE in_library = TRUE`, which was 13,847
     /// works, keyed by numeric Suwayomi id, with one fixed ORDER BY and no format/status/
     /// rating filter possible at all; then `feed_series_updates`, which was 48,567 — the
     /// works with a chapter we can DATE.
@@ -6248,8 +6483,8 @@ impl QueryRoot {
             };
             let (total, rows) = crate::browse::browse_catalogue(&st.pool, &bq)
                 .await
-                .map_err(gql_err)?;
-            // Rust-side backstop mirroring `discovery`. The SQL gate is `is_nsfw = 0` on a
+                .map_err(gql_read_err)?;
+            // Rust-side backstop mirroring `discovery`. The SQL gate is `is_nsfw = FALSE` on a
             // MATERIALIZED copy of `COALESCE(is_nsfw_override, is_nsfw)`; this re-filters
             // on `Series.is_nsfw`, which `map_browse_rows` resolves from the LIVE `work`
             // row (`nsfw_work_ids`) precisely so that this is a real check and not a
@@ -6341,7 +6576,7 @@ impl QueryRoot {
         // is `search_works_fts`' tier/chapters/bm25 order.
         let rows = crate::browse::rows_by_work_ids(&st.pool, &ids)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         if rows.len() != ids.len() {
             // A ranked id with no catalogue row — the work lost its last source or its
             // title between the two rebuilds. Dropped, never silent (the old per-row
@@ -6401,7 +6636,7 @@ impl QueryRoot {
             } else {
                 let facets = crate::browse::genre_facets(&st.pool, show_nsfw)
                     .await
-                    .map_err(gql_err)?;
+                    .map_err(gql_read_err)?;
                 store_feed(&GENRE_FACETS_CACHE, key, facets.clone());
                 facets
             }
@@ -6438,7 +6673,7 @@ impl QueryRoot {
             } else {
                 let rows = crate::tags::list_tags(&st.pool, show_nsfw)
                     .await
-                    .map_err(gql_err)?;
+                    .map_err(gql_read_err)?;
                 store_feed(&TAGS_CACHE, key, rows.clone());
                 rows
             }
@@ -6483,7 +6718,7 @@ impl QueryRoot {
     async fn source_ai_tags(&self, ctx: &Context<'_>) -> Result<Vec<SourceAiTag>> {
         let tags = crate::scanlators::list_source_tags(&state(ctx).pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let mut tags: Vec<SourceAiTag> = tags
             .into_iter()
             .map(|(source_id, level)| SourceAiTag {
@@ -6508,7 +6743,7 @@ impl QueryRoot {
         let st = state(ctx);
         let mut tags = crate::scanlators::list_source_tags(&st.pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let mut sites: Vec<ScanlatorSite> = browse_sources_memo(st, true)
             .await?
             .into_iter()
@@ -6543,7 +6778,7 @@ impl QueryRoot {
         require_admin(ctx).await?;
         let rules = crate::block::list(&state(ctx).pool, crate::block::Scope::Site)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         Ok(rules.iter().map(Into::into).collect())
     }
 
@@ -6555,7 +6790,7 @@ impl QueryRoot {
         let user = require_user(ctx).await?;
         let rules = crate::block::list(&state(ctx).pool, crate::block::Scope::User(&user.id))
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         Ok(rules.iter().map(Into::into).collect())
     }
 
@@ -6565,7 +6800,7 @@ impl QueryRoot {
     async fn scanlator_tags(&self, ctx: &Context<'_>) -> Result<Vec<ScanlatorTag>> {
         let tags = crate::scanlators::list_tags(&state(ctx).pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         Ok(tags
             .into_iter()
             .map(|t| ScanlatorTag {
@@ -6595,8 +6830,8 @@ impl QueryRoot {
         use crate::scanlators::{self as sc, AiFilter};
         require_admin(ctx).await?;
         let st = state(ctx);
-        let stats = sc::group_stats(&st.pool).await.map_err(gql_err)?;
-        let tags = sc::list_tags(&st.pool).await.map_err(gql_err)?;
+        let stats = sc::group_stats(&st.pool).await.map_err(gql_read_err)?;
+        let tags = sc::list_tags(&st.pool).await.map_err(gql_read_err)?;
         let page = page.max(1);
         let query = sc::ListQuery {
             search: search.map(|s| s.chars().take(sc::MAX_NAME_LEN).collect()),
@@ -6696,7 +6931,7 @@ impl QueryRoot {
         // S1: serve from the DB cache; only live-fetch (and cache) on a miss.
         let cached = crate::series_cache::get_series_fresh(&st.pool, n)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let client = client_ip(ctx);
         let m = resolve_series_with_cached(st, n, cached, Some(&client))
             .await
@@ -6729,7 +6964,7 @@ impl QueryRoot {
         // S1: serve from the DB cache; only live-fetch (and cache) on a miss.
         let cached = crate::series_cache::get_chapters_fresh_batch(&st.pool, &[n])
             .await
-            .map_err(gql_err)?
+            .map_err(gql_read_err)?
             .remove(&n);
         let client = client_ip(ctx);
         let list = resolve_chapters_with_cached(st, n, cached, Some(&client))
@@ -6842,24 +7077,29 @@ impl QueryRoot {
             return Err(Error::new("No such chapter"));
         }
         deny_blocked_series(ctx, &origin.manga_id.to_string(), "No such chapter").await?;
-        let extension =
-            sqlx::query_as::<_, (String, String, Option<String>, Option<i64>, Option<String>)>(
-                "SELECT pkg_name, repo_url, apk_name, version_code, lang \
-             FROM source_extension WHERE source_id = ?",
-            )
-            .bind(&origin.source_id)
-            .fetch_optional(&st.pool)
-            .await
-            .map_err(gql_err)?
-            .map(
-                |(pkg_name, repo_url, apk_name, version_code, lang)| SourceExtension {
-                    pkg_name,
-                    repo_url,
-                    apk_name,
-                    version_code: version_code.map(|v| v as i32),
-                    lang,
-                },
-            );
+        let extension = crate::db_types::query_tuple::<(
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+        )>(
+            "SELECT pkg_name, repo_url, apk_name, version_code, lang \
+             FROM source_extension WHERE source_id = $1",
+        )
+        .bind(&origin.source_id)
+        .fetch_optional(&st.pool)
+        .await
+        .map_err(gql_read_err)?
+        .map(
+            |(pkg_name, repo_url, apk_name, version_code, lang)| SourceExtension {
+                pkg_name,
+                repo_url,
+                apk_name,
+                version_code: version_code.map(|v| v as i32),
+                lang,
+            },
+        );
         Ok(Some(ChapterOrigin {
             source_id: origin.source_id,
             manga_url: origin.manga_url,
@@ -6882,16 +7122,13 @@ impl QueryRoot {
         let Some(user) = current_user(ctx).await? else {
             return Ok(Vec::new());
         };
-        let stored_rows = sqlx::query_as::<_, (String, String, i64, Option<String>)>(
-            "SELECT COALESCE(ss.work_id, ul.series_id), ul.series_id, ul.is_favorite, ul.status \
-             FROM user_library ul LEFT JOIN source_series ss \
-               ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
-             WHERE ul.user_id = ? ORDER BY ul.created_at DESC, ul.series_id",
+        let stored_rows = crate::db_types::query_tuple::<(String, String, i64, Option<String>)>(
+            r#"SELECT COALESCE(ss.work_id, ul.series_id), ul.series_id, ul.is_favorite, ul.status FROM user_library ul LEFT JOIN source_series ss ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id WHERE ul.user_id = $1 ORDER BY ul.created_at DESC NULLS LAST, ul.series_id"#,
         )
-        .bind(&user.id)
+        .bind(crate::db_types::uuid(&user.id )?)
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         let mut ids = Vec::new();
         let mut flags: HashMap<String, LibraryRow> = HashMap::new();
         for (identity, stored_id, favorite, status) in stored_rows {
@@ -6915,7 +7152,7 @@ impl QueryRoot {
         for ids in ids.chunks(LIBRARY_HYDRATION_BATCH) {
             let mut cached_rows = crate::browse::rows_by_work_ids(&st.pool, ids)
                 .await
-                .map_err(gql_err)?;
+                .map_err(gql_read_err)?;
             for row in &mut cached_rows {
                 row.reader_id.clone_from(&row.work_id);
             }
@@ -6929,7 +7166,7 @@ impl QueryRoot {
             cached_rows.extend(
                 catalog::library_browse_fallback(&st.pool, &missing)
                     .await
-                    .map_err(gql_err)?,
+                    .map_err(gql_read_err)?,
             );
             let mut cached: HashMap<String, Series> = map_browse_rows(st, cached_rows)
                 .await?
@@ -6944,7 +7181,7 @@ impl QueryRoot {
             let mut numeric_cache =
                 crate::series_cache::get_series_fresh_batch(&st.pool, &numeric_ids)
                     .await
-                    .map_err(gql_err)?;
+                    .map_err(gql_read_err)?;
             let mut out: Vec<Option<Series>> = Vec::with_capacity(ids.len());
             let mut pending: Vec<(usize, SuwayomiManga)> = Vec::new();
             let mut placeholders = Vec::new();
@@ -7002,16 +7239,16 @@ impl QueryRoot {
         let mut out = library;
         // Library updates follow the catalogue's announcement/found clock. Release
         // dates stay separate so an old chapter discovered today still moves here.
-        let work_recency: HashMap<String, (i64, Option<i64>)> = sqlx::query_as::<_, (String, i64, Option<i64>)>(
+        let work_recency: HashMap<String, (i64, Option<i64>)> = crate::db_types::query_tuple::<(String, i64, Option<i64>)>(
             "SELECT f.work_id, f.released_at, f.announced_at FROM feed_series_updates f \
              WHERE f.work_id IN (SELECT COALESCE(ss.work_id, ul.series_id) FROM user_library ul \
                LEFT JOIN source_series ss ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
-               WHERE ul.user_id = ?)",
+               WHERE ul.user_id = $1)",
         )
-        .bind(&user.id)
+        .bind(crate::db_types::uuid(&user.id )?)
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?
+        .map_err(gql_read_err)?
         .into_iter()
         .map(|(id, released, found)| (id, (released, found)))
         .collect();
@@ -7052,7 +7289,7 @@ impl QueryRoot {
     ///    Suwayomi translation of the same work. The old query joined
     ///    `user_library.series_id = suwayomi_progress.series_id`, which a `w_` library
     ///    row can never match, so those reads vanished and every such series reported
-    ///    read=0 and shelved itself as "Plan to Read" — with 208 chapters read. The
+    ///    read = FALSE and shelved itself as "Plan to Read" — with 208 chapters read. The
     ///    third UNION branch below routes them back through
     ///    `source_series.source_key -> work_id`.
     ///
@@ -7070,12 +7307,12 @@ impl QueryRoot {
         // Read side. Each branch maps one progress row to the spine key it read, via a
         // scalar sub-select so a row that doesn't resolve (spine not drained for that
         // source yet) still contributes its timestamp — COUNT(DISTINCT) skips the NULL.
-        let read_rows = sqlx::query_as::<_, (String, i64, Option<String>)>(
+        let read_rows = crate::db_types::query_tuple::<(String, i64, Option<String>)>(
             "WITH library AS ( \
                SELECT ul.user_id, COALESCE(ss.work_id, ul.series_id) AS series_id \
                FROM user_library ul LEFT JOIN source_series ss \
                  ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
-               WHERE ul.user_id = ?1 GROUP BY ul.user_id, COALESCE(ss.work_id, ul.series_id) \
+               WHERE ul.user_id = $1 GROUP BY ul.user_id, COALESCE(ss.work_id, ul.series_id) \
              ), prog(lib_id, ckey, ts) AS ( \
                SELECT ul.series_id, \
                       (SELECT c.chapter_key FROM chapter c \
@@ -7085,7 +7322,7 @@ impl QueryRoot {
                       cp.updated_at \
                  FROM canonical_progress cp \
                  JOIN library ul ON ul.user_id = cp.user_id AND ul.series_id = cp.work_id \
-                WHERE cp.user_id = ?1 AND cp.read = 1 \
+                WHERE cp.user_id = $1 AND cp.read = TRUE \
                UNION ALL \
                SELECT ul.series_id, \
                       (SELECT c.chapter_key FROM chapter c \
@@ -7095,7 +7332,7 @@ impl QueryRoot {
                       sp.updated_at \
                  FROM suwayomi_progress sp \
                  JOIN library ul ON ul.user_id = sp.user_id AND ul.series_id = sp.series_id \
-                WHERE sp.user_id = ?1 AND sp.read = 1 \
+                WHERE sp.user_id = $1 AND sp.read = TRUE \
                UNION ALL \
                SELECT ul.series_id, \
                       (SELECT c.chapter_key FROM chapter c \
@@ -7106,43 +7343,43 @@ impl QueryRoot {
                  JOIN source_series ss ON ss.source_type = 'suwayomi' \
                       AND ss.source_key = sp.series_id \
                  JOIN library ul ON ul.user_id = sp.user_id AND ul.series_id = ss.work_id \
-                WHERE sp.user_id = ?1 AND sp.read = 1 \
+                WHERE sp.user_id = $1 AND sp.read = TRUE \
              ) \
              SELECT lib_id, COUNT(DISTINCT ckey), MAX(ts) FROM prog GROUP BY lib_id",
         )
-        .bind(&user.id)
+        .bind(crate::db_types::uuid(&user.id)?)
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         // Total side — the same spine, reached from the library row rather than from a
         // progress row. The first branch matches `w_` works (all their sources), the
         // second numeric Suwayomi rows (that one source); the two id shapes are disjoint,
         // and the outer GROUP BY would fold them anyway.
-        let total_rows = sqlx::query_as::<_, (String, i64)>(
+        let total_rows = crate::db_types::query_tuple::<(String, i64)>(
             "WITH library AS ( \
                SELECT ul.user_id, COALESCE(ss.work_id, ul.series_id) AS series_id \
                FROM user_library ul LEFT JOIN source_series ss \
                  ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
-               WHERE ul.user_id = ?1 GROUP BY ul.user_id, COALESCE(ss.work_id, ul.series_id) \
+               WHERE ul.user_id = $1 GROUP BY ul.user_id, COALESCE(ss.work_id, ul.series_id) \
              ) SELECT lib_id, COUNT(DISTINCT ckey) FROM ( \
                SELECT ul.series_id AS lib_id, c.chapter_key AS ckey \
                  FROM library ul \
                  JOIN source_series ss ON ss.work_id = ul.series_id \
                  JOIN chapter c ON c.source_series_id = ss.id \
-                WHERE ul.user_id = ?1 \
+                WHERE ul.user_id = $1 \
                UNION ALL \
                SELECT ul.series_id, c.chapter_key \
                  FROM library ul \
                  JOIN source_series ss ON ss.source_type = 'suwayomi' \
                       AND ss.source_key = ul.series_id \
                  JOIN chapter c ON c.source_series_id = ss.id \
-                WHERE ul.user_id = ?1 \
+                WHERE ul.user_id = $1 \
              ) GROUP BY lib_id",
         )
-        .bind(&user.id)
+        .bind(crate::db_types::uuid(&user.id)?)
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         // Pre-spine fallback for NUMERIC library rows, counted off `suwayomi_chapter`
         // directly. A series added moments ago has its chapter list cached but has not
         // been drained into the spine yet, and in that window both queries above return
@@ -7151,31 +7388,33 @@ impl QueryRoot {
         // `suwayomi_chapter` rows keeps `read <= total` here too. This is only consulted
         // when the spine has nothing for the row (below); on production data the two
         // agree exactly on every numeric library series.
-        let fallback = sqlx::query_as::<_, (String, i64, i64)>(
+        let fallback_key = sqlite_progress_key_sql("sc.chapter_number");
+        let fallback_sql = format!(
             "WITH library AS ( \
                SELECT ul.user_id, COALESCE(ss.work_id, ul.series_id) AS series_id \
                FROM user_library ul LEFT JOIN source_series ss \
                  ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
-               WHERE ul.user_id = ?1 GROUP BY ul.user_id, COALESCE(ss.work_id, ul.series_id) \
+               WHERE ul.user_id = $1 GROUP BY ul.user_id, COALESCE(ss.work_id, ul.series_id) \
              ) SELECT lib_id, \
-                    COUNT(DISTINCT CASE WHEN rd = 1 THEN k END), \
+                    COUNT(DISTINCT CASE WHEN rd = TRUE THEN k END), \
                     COUNT(DISTINCT k) \
                FROM ( \
                  SELECT ul.series_id AS lib_id, \
-                        CAST(CAST(ROUND(sc.chapter_number * 100) AS INTEGER) AS TEXT) AS k, \
-                        COALESCE(sp.read, 0) AS rd \
+                        {fallback_key} AS k, \
+                        COALESCE(sp.read, FALSE) AS rd \
                    FROM library ul \
                    LEFT JOIN source_series ss ON ss.source_type = 'suwayomi' AND ss.work_id = ul.series_id \
-                   JOIN suwayomi_chapter sc ON sc.manga_id = CAST(COALESCE(ss.source_key, ul.series_id) AS INTEGER) \
+                   JOIN suwayomi_chapter sc ON sc.manga_id = sqlite_integer_pin(COALESCE(ss.source_key, ul.series_id)) \
                    LEFT JOIN suwayomi_progress sp ON sp.user_id = ul.user_id \
                         AND sp.chapter_id = CAST(sc.id AS TEXT) \
-                  WHERE ul.user_id = ?1 \
+                  WHERE ul.user_id = $1 \
                ) GROUP BY lib_id",
-        )
-        .bind(&user.id)
-        .fetch_all(&st.pool)
-        .await
-        .map_err(gql_err)?;
+        );
+        let fallback = crate::db_types::query_tuple::<(String, i64, i64)>(&fallback_sql)
+            .bind(crate::db_types::uuid(&user.id)?)
+            .fetch_all(&st.pool)
+            .await
+            .map_err(gql_read_err)?;
         // Emit every library identity, including a cold cache with zero known
         // chapters. The reader backfills a zero total from the card's chapterCount.
         fn entry(map: &mut BTreeMap<String, SeriesProgress>, id: String) -> &mut SeriesProgress {
@@ -7187,15 +7426,15 @@ impl QueryRoot {
             })
         }
         let mut by_id: BTreeMap<String, SeriesProgress> = BTreeMap::new();
-        let library_ids = sqlx::query_scalar::<_, String>(
+        let library_ids = crate::db_types::query_scalar::<String>(
             "SELECT DISTINCT COALESCE(ss.work_id, ul.series_id) FROM user_library ul \
              LEFT JOIN source_series ss ON ss.source_type='suwayomi' AND ss.source_key=ul.series_id \
-             WHERE ul.user_id=?",
+             WHERE ul.user_id=$1",
         )
-        .bind(&user.id)
+        .bind(crate::db_types::uuid(&user.id )?)
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         for id in library_ids {
             entry(&mut by_id, id);
         }
@@ -7234,18 +7473,17 @@ impl QueryRoot {
         // one under each key shape (historical rows are not rewritten), so a person can
         // never appear in the list twice.
         let keys = review_key_set(&st.pool, &series_id.0).await;
-        let ph = in_placeholders(keys.len());
+        let ph = crate::sql_params::placeholders(1, keys.len());
+        let inner_ph = crate::sql_params::placeholders(keys.len() + 1, keys.len());
+        let page_args = crate::sql_params::placeholders(keys.len() * 2 + 1, 2);
+        let mut page_args = page_args.split(", ");
+        let limit_arg = page_args.next().unwrap();
+        let offset_arg = page_args.next().unwrap();
         let newest_per_author = format!(
-            "r.id = (SELECT r2.id FROM reviews r2 \
-                       WHERE r2.user_id = r.user_id AND r2.series_id IN ({ph}) \
-                       ORDER BY r2.updated_at DESC, r2.id DESC LIMIT 1)"
+            r#"r.id = (SELECT r2.id FROM reviews r2 WHERE r2.user_id = r.user_id AND r2.series_id IN ({inner_ph}) ORDER BY r2.updated_at DESC NULLS LAST, r2.id DESC NULLS LAST LIMIT 1)"#
         );
         let list_sql = format!(
-            "SELECT r.id, r.series_id, r.score, r.body, r.has_spoiler, r.created_at, r.updated_at, \
-             u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar \
-             FROM reviews r JOIN users u ON u.id = r.user_id \
-             WHERE r.series_id IN ({ph}) AND u.is_banned = 0 AND {newest_per_author} \
-             ORDER BY r.created_at DESC, r.id DESC LIMIT ? OFFSET ?"
+            r#"SELECT r.id, r.series_id, r.score, r.body, r.has_spoiler, r.created_at, r.updated_at, u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar FROM reviews r JOIN users u ON u.id = r.user_id WHERE r.series_id IN ({ph}) AND u.is_banned = FALSE AND {newest_per_author} ORDER BY r.created_at DESC NULLS LAST, r.id DESC NULLS LAST LIMIT {limit_arg} OFFSET {offset_arg}"#
         );
         let mut lq = sqlx::query_as::<_, ReviewJoin>(&list_sql);
         for k in keys.iter().chain(keys.iter()) {
@@ -7256,16 +7494,16 @@ impl QueryRoot {
             .bind(offset)
             .fetch_all(&st.pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let count_sql = format!(
             "SELECT COUNT(*) FROM reviews r JOIN users u ON u.id = r.user_id \
-             WHERE r.series_id IN ({ph}) AND u.is_banned = 0 AND {newest_per_author}"
+             WHERE r.series_id IN ({ph}) AND u.is_banned = FALSE AND {newest_per_author}"
         );
-        let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+        let mut cq = crate::db_types::query_scalar::<i64>(&count_sql);
         for k in keys.iter().chain(keys.iter()) {
             cq = cq.bind(k);
         }
-        let total: i64 = cq.fetch_one(&st.pool).await.map_err(gql_err)?;
+        let total: i64 = cq.fetch_one(&st.pool).await.map_err(gql_read_err)?;
         let has_next = rows.len() as i64 > PAGE_SIZE;
         let items = rows
             .into_iter()
@@ -7299,23 +7537,20 @@ impl QueryRoot {
         // necessarily the id the rating was posted under (both shapes exist in production),
         // and answering `null` there shows a viewer who HAS rated an empty star row.
         let keys = review_key_set(&st.pool, &series_id.0).await;
-        let ph = in_placeholders(keys.len());
+        let ph = crate::sql_params::placeholders(1, keys.len());
+        let user_arg = crate::sql_params::placeholders(keys.len() + 1, 1);
         let sql = format!(
-            "SELECT r.id, r.series_id, r.score, r.body, r.has_spoiler, r.created_at, r.updated_at, \
-             u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar \
-             FROM reviews r JOIN users u ON u.id = r.user_id \
-             WHERE r.series_id IN ({ph}) AND r.user_id = ? \
-             ORDER BY r.updated_at DESC, r.id DESC LIMIT 1"
+            r#"SELECT r.id, r.series_id, r.score, r.body, r.has_spoiler, r.created_at, r.updated_at, u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar FROM reviews r JOIN users u ON u.id = r.user_id WHERE r.series_id IN ({ph}) AND r.user_id = {user_arg} ORDER BY r.updated_at DESC NULLS LAST, r.id DESC NULLS LAST LIMIT 1"#
         );
         let mut q = sqlx::query_as::<_, ReviewJoin>(&sql);
         for k in &keys {
             q = q.bind(k);
         }
         let row: Option<ReviewJoin> = q
-            .bind(&user.id)
+            .bind(crate::db_types::uuid(&user.id)?)
             .fetch_optional(&st.pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         Ok(row.map(Review::from))
     }
 
@@ -7342,58 +7577,34 @@ impl QueryRoot {
         // assemble the full reply tree without extra round-trips. Banned authors'
         // subtrees are pruned at every depth (the recursion re-checks `is_banned`),
         // so a banned reply never orphans the branch beneath it in the response.
+        // Tombstones carry no author content and remain visible even after a ban.
         // Like/dislike tallies and the viewer's vote are correlated subqueries so the
         // whole thread's votes come back in this one query (no per-comment fan-out).
         let rows: Vec<CommentJoin> = sqlx::query_as(
-            "WITH RECURSIVE roots AS ( \
-                 SELECT c.id, c.created_at FROM comments c JOIN users u ON u.id = c.user_id \
-                 WHERE c.target_type = ? AND c.target_id = ? AND c.parent_id IS NULL \
-                   AND u.is_banned = 0 \
-                 ORDER BY c.created_at ASC, c.id ASC LIMIT ? OFFSET ? \
-             ), \
-             thread(id) AS ( \
-                 SELECT id FROM roots \
-                 UNION ALL \
-                 SELECT c.id FROM comments c JOIN thread t ON c.parent_id = t.id \
-                     JOIN users u ON u.id = c.user_id WHERE u.is_banned = 0 \
-             ) \
-             SELECT c.id, c.target_type, c.target_id, c.parent_id, c.body, c.has_spoiler, \
-                    c.created_at, u.id AS author_id, u.username AS author_username, \
-                    u.avatar_url AS author_avatar, \
-                    m.id AS media_id, m.width AS media_width, m.height AS media_height, \
-                    COALESCE((SELECT COUNT(*) FROM comment_votes v \
-                              WHERE v.comment_id = c.id AND v.value = 1), 0) AS likes, \
-                    COALESCE((SELECT COUNT(*) FROM comment_votes v \
-                              WHERE v.comment_id = c.id AND v.value = -1), 0) AS dislikes, \
-                    COALESCE((SELECT v.value FROM comment_votes v \
-                              WHERE v.comment_id = c.id AND v.user_id = ?), 0) AS my_vote \
-             FROM comments c JOIN users u ON u.id = c.user_id \
-             LEFT JOIN comment_media m ON m.comment_id = c.id \
-             WHERE c.id IN (SELECT id FROM thread) \
-             ORDER BY c.created_at ASC LIMIT ?",
+            r#"WITH RECURSIVE roots AS ( SELECT c.id, c.created_at FROM comments c JOIN users u ON u.id = c.user_id WHERE c.target_type = $1 AND c.target_id = $2 AND c.parent_id IS NULL AND (c.deleted_by IS NOT NULL OR u.is_banned = FALSE) ORDER BY c.created_at ASC NULLS FIRST, c.id ASC NULLS FIRST LIMIT $3 OFFSET $4 ), thread(id) AS ( SELECT id FROM roots UNION ALL SELECT c.id FROM comments c JOIN thread t ON c.parent_id = t.id JOIN users u ON u.id = c.user_id WHERE c.deleted_by IS NOT NULL OR u.is_banned = FALSE ) SELECT c.id, c.target_type, c.target_id, c.parent_id, c.deleted_by, c.body, c.has_spoiler, c.created_at, u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar, m.id AS media_id, m.width AS media_width, m.height AS media_height, COALESCE((SELECT COUNT(*) FROM comment_votes v WHERE v.comment_id = c.id AND v.value = 1), 0) AS likes, COALESCE((SELECT COUNT(*) FROM comment_votes v WHERE v.comment_id = c.id AND v.value = -1), 0) AS dislikes, COALESCE((SELECT v.value FROM comment_votes v WHERE v.comment_id = c.id AND v.user_id = $5), 0) AS my_vote FROM comments c JOIN users u ON u.id = c.user_id LEFT JOIN comment_media m ON m.comment_id = c.id WHERE c.id IN (SELECT id FROM thread) ORDER BY c.created_at ASC NULLS FIRST LIMIT $6"#,
         )
         .bind(target_type)
         .bind(target_id.0.clone())
         .bind(PAGE_SIZE)
         .bind(offset)
-        .bind(&viewer_id)
+        .bind(uuid::Uuid::parse_str(&viewer_id).ok())
         // What full threads add up to. It cuts only threads from before the reply
         // limit, and oldest first keeps every reply's parent in the answer.
         .bind(PAGE_SIZE * (MAX_THREAD_REPLIES + 1))
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         // `total` and `has_next_page` count root threads (the paginated unit).
-        let total_roots: i64 = sqlx::query_scalar(
+        let total_roots: i64 = crate::db_types::query_scalar(
             "SELECT COUNT(*) FROM comments c JOIN users u ON u.id = c.user_id \
-             WHERE c.target_type = ? AND c.target_id = ? AND c.parent_id IS NULL \
-               AND u.is_banned = 0",
+             WHERE c.target_type = $1 AND c.target_id = $2 AND c.parent_id IS NULL \
+               AND (c.deleted_by IS NOT NULL OR u.is_banned = FALSE)",
         )
         .bind(target_type)
         .bind(target_id.0.clone())
         .fetch_one(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         let has_next = offset + PAGE_SIZE < total_roots;
         let items = rows.into_iter().map(Comment::from).collect();
         Ok(CommentPage {
@@ -7432,10 +7643,12 @@ impl QueryRoot {
         // Earliest FUTURE next_scan_at across all tracked series. Restricting to `> now`
         // excludes already-due rows (the far-past DUE_NOW_SENTINEL and any overdue), so
         // this reports the next *upcoming* scan rather than the 1970 sentinel.
-        let next_due_at: Option<String> = sqlx::query_scalar(
-            "SELECT MIN(next_scan_at) FROM series_scan_state WHERE next_scan_at > ?",
+        let next_due_at: Option<String> = crate::db_types::query_scalar(
+            "SELECT MIN(next_scan_at) FROM series_scan_state WHERE next_scan_at > $1",
         )
-        .bind(Utc::now().to_rfc3339())
+        .bind(crate::db_types::date(
+            &(crate::db_types::format_date(Utc::now())),
+        )?)
         .fetch_optional(&st.pool)
         .await
         .ok()
@@ -7462,18 +7675,17 @@ impl QueryRoot {
         let st = state(ctx);
         let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
         let rows: Vec<AdminUserRow> = sqlx::query_as(
-            "SELECT id, username, email, avatar_url, is_admin, is_banned, created_at \
-             FROM users ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            r#"SELECT id, username, email, avatar_url, is_admin, is_banned, created_at FROM users ORDER BY created_at DESC NULLS LAST, id DESC NULLS LAST LIMIT $1 OFFSET $2"#,
         )
         .bind(PAGE_SIZE + 1)
         .bind(offset)
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?;
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .map_err(gql_read_err)?;
+        let total: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM users")
             .fetch_one(&st.pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let has_next = rows.len() as i64 > PAGE_SIZE;
         let items = rows
             .into_iter()
@@ -7524,10 +7736,10 @@ impl QueryRoot {
              JOIN work sw ON sw.id = ss.work_id \
              WHERE mc.status = 'pending' AND mc.candidate_work_id <> ss.work_id";
 
-        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) {FROM_WHERE}"))
+        let total: i64 = crate::db_types::query_scalar(&format!("SELECT COUNT(*) {FROM_WHERE}"))
             .fetch_one(&st.pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         // `mc.id` breaks ties so paging is stable: score+created_at alone are not
         // unique across ~10k rows, and an unstable order duplicates/skips rows at page
         // boundaries.
@@ -7536,28 +7748,13 @@ impl QueryRoot {
         // `work_cover_url` needs for the lazy-fetch fallback on an uncached work. They
         // run at most 2×50 times per page — an admin panel, not a hot path.
         let rows = sqlx::query_as::<_, MergeCandidateRow>(&format!(
-            "SELECT mc.id, mc.source_series_id, sw.id AS source_work_id, mc.candidate_work_id, \
-                    cw.primary_title AS candidate_title, sw.primary_title AS source_title, \
-                    sw.cover_cached_version AS source_cover_version, \
-                    sw.cover_file_name AS source_cover_file_name, \
-                    (SELECT s2.source_key FROM source_series s2 \
-                     WHERE s2.work_id = sw.id AND s2.source_type = 'mangadex' \
-                     ORDER BY s2.created_at ASC, s2.id ASC LIMIT 1) AS source_mangadex_id, \
-                    cw.cover_cached_version AS candidate_cover_version, \
-                    cw.cover_file_name AS candidate_cover_file_name, \
-                    (SELECT c2.source_key FROM source_series c2 \
-                     WHERE c2.work_id = cw.id AND c2.source_type = 'mangadex' \
-                     ORDER BY c2.created_at ASC, c2.id ASC LIMIT 1) AS candidate_mangadex_id, \
-                    mc.score, mc.method, mc.status, mc.created_at \
-             {FROM_WHERE} \
-             ORDER BY mc.score DESC, mc.created_at DESC, mc.id ASC \
-             LIMIT ? OFFSET ?"
+            r#"SELECT mc.id, mc.source_series_id, sw.id AS source_work_id, mc.candidate_work_id, cw.primary_title AS candidate_title, sw.primary_title AS source_title, sw.cover_cached_version AS source_cover_version, sw.cover_file_name AS source_cover_file_name, (SELECT s2.source_key FROM source_series s2 WHERE s2.work_id = sw.id AND s2.source_type = 'mangadex' ORDER BY s2.created_at ASC NULLS FIRST, s2.id ASC NULLS FIRST LIMIT 1) AS source_mangadex_id, cw.cover_cached_version AS candidate_cover_version, cw.cover_file_name AS candidate_cover_file_name, (SELECT c2.source_key FROM source_series c2 WHERE c2.work_id = cw.id AND c2.source_type = 'mangadex' ORDER BY c2.created_at ASC NULLS FIRST, c2.id ASC NULLS FIRST LIMIT 1) AS candidate_mangadex_id, mc.score, mc.method, mc.status, mc.created_at {FROM_WHERE} ORDER BY mc.score DESC NULLS LAST, mc.created_at DESC NULLS LAST, mc.id ASC NULLS FIRST LIMIT $1 OFFSET $2"#
         ))
         .bind(per + 1) // one extra row to compute has_next_page
         .bind(offset)
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
 
         let has_next_page = rows.len() as i64 > per;
         let items = rows
@@ -7612,39 +7809,30 @@ impl QueryRoot {
     async fn work_review_detail(&self, ctx: &Context<'_>, work_id: ID) -> Result<WorkReviewDetail> {
         require_admin(ctx).await?;
         let st = state(ctx);
-        const SELECT: &str = "SELECT COALESCE(w.title_override, w.primary_title) AS title, \
-                    w.author, w.artist, w.year, w.status, w.content_rating, \
-                    w.original_language, \
-                    COALESCE(w.is_nsfw_override, w.is_nsfw) AS is_nsfw, \
-                    COALESCE(w.description_override, w.description) AS description, \
-                    w.cover_cached_version, w.cover_file_name, \
-                    (SELECT ss.source_key FROM source_series ss \
-                     WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' \
-                     ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS mangadex_id \
-             FROM work w WHERE w.id = ?";
+        const SELECT: &str = r#"SELECT COALESCE(w.title_override, w.primary_title) AS title, w.author, w.artist, w.year, w.status, w.content_rating, w.original_language, COALESCE(w.is_nsfw_override, w.is_nsfw) AS is_nsfw, COALESCE(w.description_override, w.description) AS description, w.cover_cached_version, w.cover_file_name, (SELECT ss.source_key FROM source_series ss WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' ORDER BY ss.created_at ASC NULLS FIRST, ss.id ASC NULLS FIRST LIMIT 1) AS mangadex_id FROM work w WHERE w.id = $1"#;
 
         let mut id = work_id.0.clone();
         let mut row = sqlx::query_as::<_, WorkReviewDetailRow>(SELECT)
             .bind(&id)
             .fetch_optional(&st.pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         if row.is_none() {
             if let Ok(Some(new_id)) = catalog::redirect_work_id(&st.pool, &id).await {
                 row = sqlx::query_as::<_, WorkReviewDetailRow>(SELECT)
                     .bind(&new_id)
                     .fetch_optional(&st.pool)
                     .await
-                    .map_err(gql_err)?;
+                    .map_err(gql_read_err)?;
                 id = new_id;
             }
         }
         let row = row.ok_or_else(|| Error::new("No such work."))?;
 
         const MAX_ALT_TITLES: i64 = 24;
-        let alt_titles: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT raw_title FROM work_alias WHERE work_id = ? \
-             ORDER BY raw_title LIMIT ?",
+        let alt_titles: Vec<String> = crate::db_types::query_scalar(
+            "SELECT DISTINCT raw_title FROM work_alias WHERE work_id = $1 \
+             ORDER BY raw_title LIMIT $2",
         )
         .bind(&id)
         .bind(MAX_ALT_TITLES)
@@ -7654,10 +7842,10 @@ impl QueryRoot {
 
         // DISTINCT number: the same chapter mirrored from three sources is one
         // chapter to a reviewer comparing how complete two entries are.
-        let chapter_count: i64 = sqlx::query_scalar(
+        let chapter_count: i64 = crate::db_types::query_scalar(
             "SELECT COUNT(DISTINCT c.number) FROM chapter c \
              JOIN source_series ss ON ss.id = c.source_series_id \
-             WHERE ss.work_id = ?",
+             WHERE ss.work_id = $1",
         )
         .bind(&id)
         .fetch_one(&st.pool)
@@ -7703,30 +7891,21 @@ impl QueryRoot {
         const PER: i64 = 50;
         let offset = (page as i64 - 1) * PER;
 
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_issue")
+        let total: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work_cover_issue")
             .fetch_one(&st.pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
 
         // Join the work for its title + the MangaDex anchor needed to build the
         // fallback cover URL (one extra fetch per page is fine for an admin panel).
         let rows = sqlx::query_as::<_, CoverIssueRow>(
-            "SELECT i.work_id, w.primary_title AS title, i.reason, i.detail, \
-                    i.attempts, i.first_seen, i.last_seen, w.cover_cached_version, \
-                    (SELECT ss.source_key FROM source_series ss \
-                     WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' \
-                     ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS mangadex_id, \
-                    w.cover_file_name \
-             FROM work_cover_issue i \
-             JOIN work w ON w.id = i.work_id \
-             ORDER BY i.last_seen DESC \
-             LIMIT ? OFFSET ?",
+            r#"SELECT i.work_id, w.primary_title AS title, i.reason, i.detail, i.attempts, i.first_seen, i.last_seen, w.cover_cached_version, (SELECT ss.source_key FROM source_series ss WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' ORDER BY ss.created_at ASC NULLS FIRST, ss.id ASC NULLS FIRST LIMIT 1) AS mangadex_id, w.cover_file_name FROM work_cover_issue i JOIN work w ON w.id = i.work_id ORDER BY i.last_seen DESC NULLS LAST LIMIT $1 OFFSET $2"#,
         )
         .bind(PER + 1) // fetch one extra to compute has_next_page
         .bind(offset)
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
 
         let has_next_page = rows.len() as i64 > PER;
         let items = rows
@@ -7763,23 +7942,15 @@ impl QueryRoot {
     async fn cover_source_backoffs(&self, ctx: &Context<'_>) -> Result<Vec<CoverSourceBackoff>> {
         require_admin(ctx).await?;
         let st = state(ctx);
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = crate::db_types::format_date(Utc::now());
         let rows = sqlx::query_as::<_, CoverSourceBackoffRow>(
-            "SELECT b.source_id, e.pkg_name AS source_name, b.reason, b.detail, \
-                    b.failures, b.failed_covers, \
-                    (SELECT COUNT(*) FROM suwayomi_cover_issue i \
-                      WHERE i.source_id = b.source_id AND i.retry_after > ?) AS deferred_covers, \
-                    b.first_seen, b.last_seen, b.retry_after, \
-                    (b.retry_after > ?) AS active \
-               FROM cover_source_backoff b \
-               LEFT JOIN source_extension e ON e.source_id = b.source_id \
-              ORDER BY b.last_seen DESC",
+            r#"SELECT b.source_id, e.pkg_name AS source_name, b.reason, b.detail, b.failures, b.failed_covers, (SELECT COUNT(*) FROM suwayomi_cover_issue i WHERE i.source_id = b.source_id AND i.retry_after > $1) AS deferred_covers, b.first_seen, b.last_seen, b.retry_after, (b.retry_after > $2) AS active FROM cover_source_backoff b LEFT JOIN source_extension e ON e.source_id = b.source_id ORDER BY b.last_seen DESC NULLS LAST"#,
         )
-        .bind(&now)
-        .bind(&now)
+        .bind(crate::db_types::date(&now )?)
+        .bind(crate::db_types::date(&now )?)
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         Ok(rows
             .into_iter()
             .map(|r| CoverSourceBackoff {
@@ -7826,12 +7997,15 @@ impl QueryRoot {
         // the prepared-statement cache still covers the entire query surface.
         let status_s = status.map(|s| s.as_str());
         let kind_s = kind.map(|k| k.as_str());
-        let mut clauses: Vec<&str> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
         if status_s.is_some() {
-            clauses.push("r.status = ?");
+            clauses.push("r.status = $1".into());
         }
         if kind_s.is_some() {
-            clauses.push("r.kind = ?");
+            clauses.push(format!(
+                "r.kind = {}",
+                crate::sql_params::placeholders(clauses.len() + 1, 1)
+            ));
         }
         let filter = if clauses.is_empty() {
             String::new()
@@ -7843,27 +8017,24 @@ impl QueryRoot {
         let binds: Vec<&str> = [status_s, kind_s].into_iter().flatten().collect();
 
         let count_sql = format!("SELECT COUNT(*) FROM report r {filter}");
-        let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+        let mut count_q = crate::db_types::query_scalar::<i64>(&count_sql);
         for b in &binds {
             count_q = count_q.bind(*b);
         }
-        let total: i64 = count_q.fetch_one(&st.pool).await.map_err(gql_err)?;
+        let total: i64 = count_q.fetch_one(&st.pool).await.map_err(gql_read_err)?;
 
         let open_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM report WHERE status = 'open'")
+            crate::db_types::query_scalar("SELECT COUNT(*) FROM report WHERE status = 'open'")
                 .fetch_one(&st.pool)
                 .await
-                .map_err(gql_err)?;
+                .map_err(gql_read_err)?;
 
+        let page_args = crate::sql_params::placeholders(binds.len() + 1, 2);
+        let mut page_args = page_args.split(", ");
+        let limit_arg = page_args.next().unwrap();
+        let offset_arg = page_args.next().unwrap();
         let page_sql = format!(
-            "SELECT r.id, r.kind, r.status, u.username AS reporter, r.subject_id, \
-                    r.subject_id_secondary, r.subject_title, r.comment_id, \
-                    r.reported_username, r.comment_excerpt, r.source_url, r.detail, \
-                    r.admin_note, r.created_at, r.resolved_at \
-             FROM report r LEFT JOIN users u ON u.id = r.user_id \
-             {filter} \
-             ORDER BY r.created_at DESC, r.id DESC \
-             LIMIT ? OFFSET ?"
+            r#"SELECT r.id, r.kind, r.status, u.username AS reporter, r.subject_id, r.subject_id_secondary, r.subject_title, r.comment_id, r.reported_username, r.comment_excerpt, r.source_url, r.detail, r.admin_note, r.created_at, r.resolved_at FROM report r LEFT JOIN users u ON u.id = r.user_id {filter} ORDER BY r.created_at DESC NULLS LAST, r.id DESC NULLS LAST LIMIT {limit_arg} OFFSET {offset_arg}"#
         );
         let mut page_q = sqlx::query_as::<_, ReportRow>(&page_sql);
         for b in &binds {
@@ -7874,7 +8045,7 @@ impl QueryRoot {
             .bind(offset)
             .fetch_all(&st.pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
 
         let has_next_page = rows.len() as i64 > PER;
         Ok(ReportPage {
@@ -7897,7 +8068,7 @@ impl QueryRoot {
     async fn instance(&self, ctx: &Context<'_>) -> Result<Instance> {
         use crate::instance as inst;
         let pool = &state(ctx).pool;
-        let setup_required = !inst::admin_exists(pool).await.map_err(gql_err)?;
+        let setup_required = !inst::admin_exists(pool).await.map_err(gql_read_err)?;
         Ok(Instance {
             setup_required,
             name: inst::resolve(pool, &inst::INSTANCE_NAME).await.value,
@@ -7938,7 +8109,7 @@ impl QueryRoot {
         require_admin(ctx).await?;
         let limits = crate::scanner::effective_source_rate_limits(&state(ctx).pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         Ok(limits.into_iter().map(source_rate_limit).collect())
     }
 
@@ -7990,15 +8161,13 @@ impl QueryRoot {
         };
         let limit = limit.clamp(1, 50) as i64;
         let rows = sqlx::query_as::<_, ActivityRow>(
-            "SELECT id, kind, target_type, target_id, created_at \
-             FROM user_activity WHERE user_id = ? \
-             ORDER BY created_at DESC LIMIT ?",
+            r#"SELECT id, kind, target_type, target_id, created_at FROM user_activity WHERE user_id = $1 ORDER BY created_at DESC NULLS LAST LIMIT $2"#,
         )
-        .bind(&user.id)
+        .bind(crate::db_types::uuid(&user.id )?)
         .bind(limit)
         .fetch_all(&state(ctx).pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
@@ -8033,68 +8202,21 @@ impl QueryRoot {
         // canonical work — its title falls back to a Suwayomi mapping's title while the
         // work is unenriched — and a numeric one is a Suwayomi series.
         let rows: Vec<MyCommentRow> = sqlx::query_as(
-            "WITH mine AS ( \
-                 SELECT c.id, c.target_type, c.target_id, c.parent_id, c.body, \
-                        c.has_spoiler, c.created_at \
-                 FROM comments c WHERE c.user_id = ? \
-                 ORDER BY c.created_at DESC, c.id DESC LIMIT ? OFFSET ? \
-             ), \
-             resolved AS ( \
-                 SELECT m.*, \
-                    CASE WHEN m.target_type = 'series' THEN m.target_id ELSE COALESCE( \
-                        (SELECT CAST(sc.manga_id AS TEXT) FROM suwayomi_chapter sc \
-                         WHERE m.target_id <> '' AND m.target_id NOT GLOB '*[^0-9]*' \
-                           AND sc.id = CAST(m.target_id AS INTEGER)), \
-                        (SELECT ss.work_id FROM chapter ch \
-                         JOIN source_series ss ON ss.id = ch.source_series_id \
-                         WHERE ch.external_id = m.target_id AND ss.source_type = 'mangadex' \
-                         LIMIT 1) \
-                    ) END AS series_id, \
-                    CASE WHEN m.target_type = 'chapter' THEN COALESCE( \
-                        (SELECT CAST(sc.chapter_number AS TEXT) FROM suwayomi_chapter sc \
-                         WHERE m.target_id <> '' AND m.target_id NOT GLOB '*[^0-9]*' \
-                           AND sc.id = CAST(m.target_id AS INTEGER)), \
-                        (SELECT ch.number FROM chapter ch \
-                         JOIN source_series ss ON ss.id = ch.source_series_id \
-                         WHERE ch.external_id = m.target_id AND ss.source_type = 'mangadex' \
-                         LIMIT 1) \
-                    ) END AS chapter_number \
-                 FROM mine m \
-             ) \
-             SELECT r.id, r.target_type, r.target_id, r.parent_id, r.body, r.has_spoiler, \
-                    r.created_at, r.series_id, r.chapter_number, \
-                    CASE \
-                        WHEN substr(r.series_id, 1, 2) = 'w_' THEN COALESCE( \
-                            (SELECT COALESCE(w.title_override, w.primary_title) FROM work w \
-                             WHERE w.id = r.series_id), \
-                            (SELECT s.title FROM source_series ss \
-                             JOIN suwayomi_series s ON s.id = CAST(ss.source_key AS INTEGER) \
-                             WHERE ss.work_id = r.series_id AND ss.source_type = 'suwayomi' \
-                             ORDER BY ss.created_at ASC LIMIT 1)) \
-                        WHEN r.series_id <> '' AND r.series_id NOT GLOB '*[^0-9]*' THEN \
-                            (SELECT s.title FROM suwayomi_series s \
-                             WHERE s.id = CAST(r.series_id AS INTEGER)) \
-                    END AS series_title, \
-                    COALESCE((SELECT COUNT(*) FROM comment_votes v \
-                              WHERE v.comment_id = r.id AND v.value = 1), 0) AS likes, \
-                    COALESCE((SELECT COUNT(*) FROM comment_votes v \
-                              WHERE v.comment_id = r.id AND v.value = -1), 0) AS dislikes, \
-                    (SELECT COUNT(*) FROM comments k JOIN users u ON u.id = k.user_id \
-                     WHERE k.parent_id = r.id AND u.is_banned = 0) AS reply_count \
-             FROM resolved r \
-             ORDER BY r.created_at DESC, r.id DESC",
+            r#"WITH mine AS ( SELECT c.id, c.target_type, c.target_id, c.parent_id, c.body, c.has_spoiler, c.created_at FROM comments c WHERE c.user_id = $1 AND c.deleted_by IS NULL ORDER BY c.created_at DESC NULLS LAST, c.id DESC NULLS LAST LIMIT $2 OFFSET $3 ), resolved AS ( SELECT m.*, CASE WHEN m.target_type = 'series' THEN m.target_id ELSE COALESCE( (SELECT CAST(sc.manga_id AS TEXT) FROM suwayomi_chapter sc WHERE m.target_id ~ '^[0-9]+$' AND sc.id = sqlite_integer_pin(m.target_id)), (SELECT ss.work_id FROM chapter ch JOIN source_series ss ON ss.id = ch.source_series_id WHERE ch.external_id = m.target_id AND ss.source_type = 'mangadex' LIMIT 1) ) END AS series_id, CASE WHEN m.target_type = 'chapter' THEN COALESCE( (SELECT CAST(sc.chapter_number AS TEXT) FROM suwayomi_chapter sc WHERE m.target_id ~ '^[0-9]+$' AND sc.id = sqlite_integer_pin(m.target_id)), (SELECT ch.number FROM chapter ch JOIN source_series ss ON ss.id = ch.source_series_id WHERE ch.external_id = m.target_id AND ss.source_type = 'mangadex' LIMIT 1) ) END AS chapter_number FROM mine m ) SELECT r.id, r.target_type, r.target_id, r.parent_id, r.body, r.has_spoiler, r.created_at, r.series_id, r.chapter_number, CASE WHEN substr(r.series_id, 1, 2) = 'w_' THEN COALESCE( (SELECT COALESCE(w.title_override, w.primary_title) FROM work w WHERE w.id = r.series_id), (SELECT s.title FROM source_series ss JOIN suwayomi_series s ON s.id = sqlite_integer_pin(ss.source_key) WHERE ss.work_id = r.series_id AND ss.source_type = 'suwayomi' ORDER BY ss.created_at ASC NULLS FIRST LIMIT 1)) WHEN r.series_id ~ '^[0-9]+$' THEN (SELECT s.title FROM suwayomi_series s WHERE s.id = sqlite_integer_pin(r.series_id)) END AS series_title, COALESCE((SELECT COUNT(*) FROM comment_votes v WHERE v.comment_id = r.id AND v.value = 1), 0) AS likes, COALESCE((SELECT COUNT(*) FROM comment_votes v WHERE v.comment_id = r.id AND v.value = -1), 0) AS dislikes, (SELECT COUNT(*) FROM comments k JOIN users u ON u.id = k.user_id WHERE k.parent_id = r.id AND k.deleted_by IS NULL AND u.is_banned = FALSE) AS reply_count FROM resolved r ORDER BY r.created_at DESC NULLS LAST, r.id DESC NULLS LAST"#,
         )
-        .bind(&user.id)
+        .bind(crate::db_types::uuid(&user.id )?)
         .bind(PAGE_SIZE)
         .bind(offset)
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?;
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM comments WHERE user_id = ?")
-            .bind(&user.id)
-            .fetch_one(&st.pool)
-            .await
-            .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
+        let total: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM comments WHERE user_id = $1 AND deleted_by IS NULL",
+        )
+        .bind(crate::db_types::uuid(&user.id)?)
+        .fetch_one(&st.pool)
+        .await
+        .map_err(gql_read_err)?;
         Ok(MyCommentPage {
             items: rows.into_iter().map(MyComment::from).collect(),
             page,
@@ -8123,30 +8245,14 @@ impl QueryRoot {
         // happens to start with a digit out of the numeric branch. Null for `series`
         // targets (targetId already is the series) and unresolvable chapters.
         let rows: Vec<NotificationRow> = sqlx::query_as(
-            "SELECT n.id, n.kind, n.count, n.created_at, n.read_at, n.target_type, \
-                    n.target_id, \
-                    CASE WHEN n.target_type = 'chapter' THEN COALESCE( \
-                        (SELECT CAST(sc.manga_id AS TEXT) FROM suwayomi_chapter sc \
-                         WHERE n.target_id <> '' AND n.target_id NOT GLOB '*[^0-9]*' \
-                           AND sc.id = CAST(n.target_id AS INTEGER)), \
-                        (SELECT ss.work_id FROM chapter ch \
-                         JOIN source_series ss ON ss.id = ch.source_series_id \
-                         WHERE ch.external_id = n.target_id AND ss.source_type = 'mangadex') \
-                    ) END AS series_id, \
-                    n.comment_id, a.id AS actor_id, a.username AS actor_username, \
-                    a.avatar_url AS actor_avatar, substr(c.body, 1, 140) AS comment_excerpt \
-             FROM notifications n \
-             LEFT JOIN users a ON a.id = n.actor_id \
-             LEFT JOIN comments c ON c.id = n.comment_id \
-             WHERE n.user_id = ? \
-             ORDER BY n.created_at DESC, n.id DESC LIMIT ? OFFSET ?",
+            r#"SELECT n.id, n.kind, n.count, n.created_at, n.read_at, n.target_type, n.target_id, CASE WHEN n.target_type = 'chapter' THEN COALESCE( (SELECT CAST(sc.manga_id AS TEXT) FROM suwayomi_chapter sc WHERE n.target_id ~ '^[0-9]+$' AND sc.id = sqlite_integer_pin(n.target_id)), (SELECT ss.work_id FROM chapter ch JOIN source_series ss ON ss.id = ch.source_series_id WHERE ch.external_id = n.target_id AND ss.source_type = 'mangadex') ) END AS series_id, n.comment_id, a.id AS actor_id, a.username AS actor_username, a.avatar_url AS actor_avatar, substr(c.body, 1, 140) AS comment_excerpt FROM notifications n LEFT JOIN users a ON a.id = n.actor_id LEFT JOIN comments c ON c.id = n.comment_id WHERE n.user_id = $1 AND (n.comment_id IS NULL OR (c.id IS NOT NULL AND c.deleted_by IS NULL)) ORDER BY n.created_at DESC NULLS LAST, n.id DESC NULLS LAST LIMIT $2 OFFSET $3"#,
         )
-        .bind(&user.id)
+        .bind(crate::db_types::uuid(&user.id )?)
         .bind(PAGE_SIZE)
         .bind(offset)
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         Ok(rows.into_iter().map(Notification::from).collect())
     }
 
@@ -8156,13 +8262,13 @@ impl QueryRoot {
         let Some(user) = current_user(ctx).await? else {
             return Ok(0);
         };
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at IS NULL",
+        let n: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM notifications n LEFT JOIN comments c ON c.id = n.comment_id WHERE n.user_id = $1 AND n.read_at IS NULL AND (n.comment_id IS NULL OR (c.id IS NOT NULL AND c.deleted_by IS NULL))",
         )
-        .bind(&user.id)
+        .bind(crate::db_types::uuid(&user.id)?)
         .fetch_one(&state(ctx).pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         Ok(n as i32)
     }
 
@@ -8229,7 +8335,7 @@ impl QueryRoot {
         // per-extension lookup and keeps the map pure.
         let subscribed = catalog::subscribed_extension_set(&st.pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         Ok(
             filter_extensions(list, installed_only, lang.as_deref(), nsfw, true)
                 .into_iter()
@@ -8300,7 +8406,7 @@ impl QueryRoot {
         let mut activity: HashMap<String, Vec<SourceHealthStat>> = HashMap::new();
         for s in crate::source_health::stats(&st.pool, hours as i64)
             .await
-            .map_err(gql_err)?
+            .map_err(gql_read_err)?
         {
             activity
                 .entry(s.source_id)
@@ -8315,29 +8421,29 @@ impl QueryRoot {
         }
         let health = catalog::source_scan_health(&st.pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let exclusive = catalog::source_exclusive_work_counts(&st.pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let outages: std::collections::HashMap<String, catalog::SourceOutage> =
             catalog::source_outages(&st.pool)
                 .await
-                .map_err(gql_err)?
+                .map_err(gql_read_err)?
                 .into_iter()
                 .map(|o| (o.source_id.clone(), o))
                 .collect();
         let subscribed = catalog::subscribed_extension_set(&st.pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         // Subscription rows that exist but are breaker-disabled: `subscribed_extension_set`
         // deliberately excludes them (it is the sync work-list), and "disabled" is exactly
         // what this panel needs to show.
-        let disabled: std::collections::HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
+        let disabled: std::collections::HashMap<String, String> = crate::db_types::query_tuple::<(String, String)>(
             "SELECT pkg_name, disabled_at FROM extension_subscription WHERE disabled_at IS NOT NULL",
         )
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?
+        .map_err(gql_read_err)?
         .into_iter()
         .collect();
         // Best-effort: names are a nicety, and a Suwayomi hiccup must not blank the health
@@ -8443,7 +8549,7 @@ impl QueryRoot {
         let st = state(ctx);
         Ok(crate::ingest::list_jobs(&st.pool, active)
             .await
-            .map_err(gql_err)?
+            .map_err(gql_read_err)?
             .into_iter()
             .map(Into::into)
             .collect())
@@ -8477,23 +8583,21 @@ impl QueryRoot {
         // the same key under its real source id. Fetch all rows and pick, per key,
         // the real mapping (then most-recent) so provenance never surfaces the shell.
         let keys: Vec<String> = series_ids.iter().map(|id| id.0.clone()).collect();
-        let placeholders = std::iter::repeat_n("?", keys.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = crate::sql_params::placeholders(1, keys.len());
         let sql = format!(
-            "SELECT source_key, work_id, (NULLIF(source_id, '') IS NOT NULL) AS is_real, COALESCE(last_seen, '') AS last_seen \
+            "SELECT source_key, work_id, (NULLIF(source_id, '') IS NOT NULL) AS is_real, last_seen \
              FROM source_series \
              WHERE source_type = 'suwayomi' AND source_key IN ({placeholders})"
         );
-        let mut q = sqlx::query_as::<_, (String, String, i64, String)>(&sql);
+        let mut q = crate::db_types::query_tuple::<(String, String, i64, Option<String>)>(&sql);
         for k in &keys {
             q = q.bind(k);
         }
-        let rows = q.fetch_all(&st.pool).await.map_err(gql_err)?;
+        let rows = q.fetch_all(&st.pool).await.map_err(gql_read_err)?;
         // Best work_id per key: real mapping first, then latest last_seen.
         let mut best: HashMap<String, (i64, String, String)> = HashMap::new();
         for (key, wid, is_real, last_seen) in rows {
-            let cand = (is_real, last_seen, wid);
+            let cand = (is_real, last_seen.unwrap_or_default(), wid);
             match best.get(&key) {
                 Some((r, ls, _)) if (*r, ls.as_str()) >= (cand.0, cand.1.as_str()) => {}
                 _ => {
@@ -8701,16 +8805,27 @@ fn summarize_bulk(entries: Vec<BulkAddEntry>) -> BulkAddResult {
 /// a native client how to FETCH a source.
 #[derive(sqlx::FromRow)]
 struct WorkSourceJoinRow {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     work_id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     source_type: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     source_id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     source_key: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     source_url: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     is_nsfw: i64,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pkg_name: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     repo_url: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     apk_name: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     version_code: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     ext_lang: Option<String>,
 }
 
@@ -8742,8 +8857,7 @@ fn work_source_from_row(r: WorkSourceJoinRow, show_nsfw: bool) -> Option<WorkSou
     })
 }
 
-const WORK_SOURCE_SELECT: &str =
-    "SELECT ss.work_id, ss.source_type, COALESCE(ss.source_id, '') AS source_id, ss.source_key, ss.source_url, ss.is_nsfw, \
+const WORK_SOURCE_SELECT: &str = "SELECT ss.work_id, ss.source_type, COALESCE(ss.source_id, '') AS source_id, ss.source_key, ss.source_url, ss.is_nsfw, \
             se.pkg_name, se.repo_url, se.apk_name, se.version_code, se.lang AS ext_lang \
      FROM source_series ss \
      LEFT JOIN source_extension se ON se.source_id = ss.source_id";
@@ -8757,7 +8871,7 @@ async fn authoritative_key_set(
 ) -> Result<std::collections::HashSet<String>> {
     Ok(catalog::authoritative_suwayomi_mappings(pool, work_id)
         .await
-        .map_err(gql_err)?
+        .map_err(gql_read_err)?
         .into_iter()
         .map(|m| m.source_key)
         .collect())
@@ -8787,13 +8901,12 @@ async fn load_work_sources(
     show_nsfw: bool,
 ) -> Result<Vec<WorkSource>> {
     let rows = sqlx::query_as::<_, WorkSourceJoinRow>(&format!(
-        "{WORK_SOURCE_SELECT} WHERE ss.work_id = ? \
-         ORDER BY (ss.source_type = 'mangadex') DESC, ss.last_seen DESC"
+        r#"{WORK_SOURCE_SELECT} WHERE ss.work_id = $1 ORDER BY (ss.source_type = 'mangadex') DESC NULLS LAST, ss.last_seen DESC NULLS LAST"#
     ))
     .bind(work_id)
     .fetch_all(pool)
     .await
-    .map_err(gql_err)?;
+    .map_err(gql_read_err)?;
     let mapped: Vec<WorkSource> = rows
         .into_iter()
         .filter_map(|r| work_source_from_row(r, show_nsfw))
@@ -8813,18 +8926,15 @@ async fn load_work_sources_batch(
     if work_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let placeholders = std::iter::repeat_n("?", work_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let placeholders = crate::sql_params::placeholders(1, work_ids.len());
     let sql = format!(
-        "{WORK_SOURCE_SELECT} WHERE ss.work_id IN ({placeholders}) \
-         ORDER BY (ss.source_type = 'mangadex') DESC, ss.last_seen DESC"
+        r#"{WORK_SOURCE_SELECT} WHERE ss.work_id IN ({placeholders}) ORDER BY (ss.source_type = 'mangadex') DESC NULLS LAST, ss.last_seen DESC NULLS LAST"#
     );
     let mut q = sqlx::query_as::<_, WorkSourceJoinRow>(&sql);
     for wid in work_ids {
         q = q.bind(wid);
     }
-    let rows = q.fetch_all(pool).await.map_err(gql_err)?;
+    let rows = q.fetch_all(pool).await.map_err(gql_read_err)?;
     let mut map: HashMap<String, Vec<WorkSource>> = HashMap::new();
     for r in rows {
         let wid = r.work_id.clone();
@@ -9130,7 +9240,7 @@ async fn federated_search(
         };
         let probe = crate::dedup::resolve(&st.pool, &cand)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let matched_work = match &probe {
             crate::dedup::Decision::AutoMerge { work_id, .. }
             | crate::dedup::Decision::Review { work_id, .. } => Some(work_id.clone()),
@@ -9141,11 +9251,11 @@ async fn federated_search(
         if !show_nsfw {
             let matched_nsfw = match &matched_work {
                 Some(wid) => {
-                    sqlx::query_scalar::<_, i64>("SELECT is_nsfw FROM work WHERE id = ?")
+                    crate::db_types::query_scalar::<i64>("SELECT is_nsfw FROM work WHERE id = $1")
                         .bind(wid)
                         .fetch_optional(&st.pool)
                         .await
-                        .map_err(gql_err)?
+                        .map_err(gql_read_err)?
                         .unwrap_or(0)
                         != 0
                 }
@@ -9166,7 +9276,10 @@ async fn federated_search(
                     work_order.push(res.work_id);
                 }
             }
-            Err(e) => tracing::warn!(manga_id = m.id, error = %e, "federated: persist failed"),
+            Err(e) => {
+                crate::db::observe_database_error(&e);
+                tracing::warn!(manga_id = m.id, error = %e, "federated: persist failed");
+            }
         }
     }
 
@@ -9178,7 +9291,7 @@ async fn federated_search(
     // (`add_source_series_checked` derives them), so a rule reaches it too.
     let blocked = crate::block::blocked_ids(&st.pool, blocks, &work_order)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
     let mut items = Vec::new();
     for wid in work_order {
         if blocked.contains(&wid) {
@@ -9186,7 +9299,7 @@ async fn federated_search(
         }
         let Some(work) = catalog::load_canonical_work(&st.pool, &wid)
             .await
-            .map_err(gql_err)?
+            .map_err(gql_read_err)?
         else {
             continue;
         };
@@ -9196,7 +9309,7 @@ async fn federated_search(
         }
         let chapters = catalog::load_canonical_chapters(&st.pool, &wid)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         let series = map_canonical_series(
             &st.pool,
             uid,
@@ -9232,10 +9345,15 @@ async fn federated_search(
 /// Row loader for `user_activity`, mapped to the `Activity` GraphQL type.
 #[derive(sqlx::FromRow)]
 struct ActivityRow {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     kind: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     target_type: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     target_id: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     created_at: String,
 }
 
@@ -9255,18 +9373,31 @@ impl From<ActivityRow> for Activity {
 /// mapped to the `Notification` GraphQL type.
 #[derive(sqlx::FromRow)]
 struct NotificationRow {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     kind: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     count: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     created_at: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     read_at: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     target_type: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     target_id: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     series_id: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     comment_id: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     actor_id: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     actor_username: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     actor_avatar: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     comment_excerpt: Option<String>,
 }
 
@@ -9294,18 +9425,31 @@ impl From<NotificationRow> for Notification {
 
 #[derive(sqlx::FromRow)]
 struct MyCommentRow {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     target_type: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     target_id: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     parent_id: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     body: String,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     has_spoiler: i64,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     created_at: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     series_id: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     chapter_number: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     series_title: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     likes: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     dislikes: i64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     reply_count: i64,
 }
 
@@ -9338,6 +9482,114 @@ fn tidy_chapter_number(raw: &str) -> String {
     } else {
         t.to_string()
     }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static GUARD_PAUSE: crate::locks::pause_points::PausePoints;
+}
+
+#[cfg(test)]
+async fn guard_pause(name: &str) {
+    if let Ok(points) = GUARD_PAUSE.try_with(Clone::clone) {
+        points.hit(name).await;
+    }
+}
+
+async fn lock_work_identity(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    series_id: &str,
+    missing_message: Option<&'static str>,
+) -> anyhow::Result<String> {
+    let identity = resolve_library_identity_on(tx, series_id).await?;
+    #[cfg(test)]
+    guard_pause("work-discovered").await;
+    if identity.starts_with("w_") {
+        crate::locks::lock_works(tx, &[&identity]).await?;
+        if resolve_library_identity_on(tx, series_id).await? != identity {
+            return Err(crate::locks::RestartTransaction.into());
+        }
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work WHERE id=$1)")
+            .bind(&identity)
+            .fetch_one(&mut **tx)
+            .await?;
+        if !exists {
+            if let Some(message) = missing_message {
+                return Err(MutationValidation(message).into());
+            }
+        }
+    }
+    Ok(identity)
+}
+
+async fn resolve_library_identity_on(
+    conn: &mut sqlx::PgConnection,
+    series_id: &str,
+) -> anyhow::Result<String> {
+    let identity = if series_id.starts_with("w_") {
+        crate::db_types::query_scalar::<String>("SELECT id FROM work WHERE id=$1 UNION ALL SELECT new_id FROM work_redirect WHERE old_id=$1 LIMIT 1")
+            .bind(series_id).fetch_optional(&mut *conn).await?
+    } else {
+        crate::db_types::query_scalar::<String>("SELECT work_id FROM source_series WHERE source_type='suwayomi' AND source_key=$1 ORDER BY work_id LIMIT 1")
+            .bind(series_id).fetch_optional(&mut *conn).await?
+    };
+    Ok(identity.unwrap_or_else(|| series_id.to_owned()))
+}
+
+/// Every source that owns `chapter_id`: the spine rows of its store, plus, for a
+/// numeric id, the Suwayomi source of the engine's cached chapter. Both branches
+/// start from one indexed chapter key. This runs twice inside every progress
+/// transaction while the user row is locked, so it must never scan a chapter table:
+/// compare `suwayomi_chapter.id` as the integer it is ($3), not as text.
+const PROGRESS_SOURCES_SQL: &str = "SELECT ss.id FROM chapter c \
+       JOIN source_series ss ON ss.id = c.source_series_id \
+      WHERE c.external_id = $1 AND ss.source_type = $2 \
+     UNION \
+     SELECT ss.id FROM suwayomi_chapter sc \
+       JOIN source_series ss ON ss.source_type = 'suwayomi' AND ss.source_key = sc.manga_id::text \
+      WHERE $2 = 'suwayomi' AND sc.id = $3 \
+     ORDER BY 1";
+
+/// A numeric Suwayomi series the engine cache knows, by its integer key ($1).
+const KNOWN_SUWAYOMI_SERIES_SQL: &str =
+    "SELECT EXISTS(SELECT 1 FROM suwayomi_series WHERE id = $1)";
+
+/// A chapter either store knows: the spine by external id ($1), the engine cache by
+/// its integer key ($2).
+const KNOWN_CHAPTER_SQL: &str = "SELECT EXISTS(SELECT 1 FROM chapter WHERE external_id = $1) \
+     OR EXISTS(SELECT 1 FROM suwayomi_chapter WHERE id = $2)";
+
+async fn progress_sources_on(
+    conn: &mut sqlx::PgConnection,
+    chapter_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let numeric = chapter_id.bytes().all(|b| b.is_ascii_digit());
+    Ok(sqlx::query_scalar(PROGRESS_SOURCES_SQL)
+        .bind(chapter_id)
+        .bind(if numeric { "suwayomi" } else { "mangadex" })
+        .bind(chapter_id.parse::<i64>().ok())
+        .fetch_all(conn)
+        .await?)
+}
+
+async fn lock_progress_owner(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: &str,
+    chapter_id: &str,
+) -> anyhow::Result<()> {
+    crate::locks::lock_user(tx, user_id).await?;
+    let sources = progress_sources_on(tx, chapter_id).await?;
+    #[cfg(test)]
+    guard_pause("progress-discovered").await;
+    // The user parent serializes all of this user's progress/catch-up/clear sets,
+    // including chapters not yet in the spine. Sources protect owner changes.
+    crate::locks::lock_source_series(tx, &sources).await?;
+    if progress_sources_on(tx, chapter_id).await? != sources {
+        return Err(crate::locks::RestartTransaction.into());
+    }
+    #[cfg(test)]
+    guard_pause("progress-locked").await;
+    Ok(())
 }
 
 /// Store library membership once per work, folding historical source-scoped rows.
@@ -9373,26 +9625,26 @@ async fn write_library_once(
 ) -> anyhow::Result<String> {
     let mut tx = pool.begin().await?;
     let identity = consolidate_library_identity_on(&mut tx, user_id, series_id).await?;
-    let now = Utc::now().to_rfc3339();
+    let now = crate::db_types::format_date(Utc::now());
     match edit {
         LibraryEdit::Marked(true) => {
-            sqlx::query("INSERT INTO user_library(user_id,series_id,created_at) VALUES(?,?,?) ON CONFLICT(user_id,series_id) DO NOTHING")
-            .bind(user_id).bind(&identity).bind(&now).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO user_library(user_id,series_id,created_at) VALUES($1,$2,$3) ON CONFLICT(user_id,series_id) DO NOTHING")
+            .bind(crate::db_types::uuid(user_id )?).bind(&identity).bind(crate::db_types::date(&now )?).execute(&mut *tx).await?;
         }
         LibraryEdit::Marked(false) => {
-            sqlx::query("DELETE FROM user_library WHERE user_id=? AND series_id=?")
-                .bind(user_id)
+            sqlx::query("DELETE FROM user_library WHERE user_id=$1 AND series_id=$2")
+                .bind(crate::db_types::uuid(user_id)?)
                 .bind(&identity)
                 .execute(&mut *tx)
                 .await?;
         }
         LibraryEdit::Status(status) => {
-            sqlx::query("INSERT INTO user_library(user_id,series_id,created_at,status) VALUES(?,?,?,?) ON CONFLICT(user_id,series_id) DO UPDATE SET status=excluded.status")
-            .bind(user_id).bind(&identity).bind(&now).bind(status).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO user_library(user_id,series_id,created_at,status) VALUES($1,$2,$3,$4) ON CONFLICT(user_id,series_id) DO UPDATE SET status=excluded.status")
+            .bind(crate::db_types::uuid(user_id )?).bind(&identity).bind(crate::db_types::date(&now )?).bind(status).execute(&mut *tx).await?;
         }
         LibraryEdit::Favorite(favorite) => {
-            sqlx::query("INSERT INTO user_library(user_id,series_id,created_at,is_favorite) VALUES(?,?,?,?) ON CONFLICT(user_id,series_id) DO UPDATE SET is_favorite=excluded.is_favorite")
-            .bind(user_id).bind(&identity).bind(&now).bind(favorite as i64).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO user_library(user_id,series_id,created_at,is_favorite) VALUES($1,$2,$3,$4) ON CONFLICT(user_id,series_id) DO UPDATE SET is_favorite=excluded.is_favorite")
+            .bind(crate::db_types::uuid(user_id )?).bind(&identity).bind(crate::db_types::date(&now )?).bind(favorite).execute(&mut *tx).await?;
         }
     }
     tx.commit().await?;
@@ -9400,23 +9652,36 @@ async fn write_library_once(
 }
 
 async fn consolidate_library_identity_on(
-    conn: &mut sqlx::SqliteConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user_id: &str,
     series_id: &str,
 ) -> anyhow::Result<String> {
-    let identity = if series_id.starts_with("w_") {
-        sqlx::query_scalar::<_, String>("SELECT id FROM work WHERE id=?1 UNION ALL SELECT new_id FROM work_redirect WHERE old_id=?1 LIMIT 1")
-            .bind(series_id).fetch_optional(&mut *conn).await?
-    } else {
-        sqlx::query_scalar::<_, String>(
-            "SELECT work_id FROM source_series WHERE source_type = 'suwayomi' AND source_key = ? ORDER BY work_id LIMIT 1",
-        ).bind(series_id).fetch_optional(&mut *conn).await?
-    }.unwrap_or_else(|| series_id.to_string());
+    crate::locks::lock_user(tx, user_id).await?;
+    let identity = resolve_library_identity_on(tx, series_id).await?;
+    crate::locks::advisory(
+        tx,
+        &[crate::locks::AdvisoryKey::library_progress(
+            user_id, &identity,
+        )],
+    )
+    .await?;
+    #[cfg(test)]
+    guard_pause("library-discovered").await;
     if identity.starts_with("w_") {
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work WHERE id=?)")
-            .bind(&identity)
-            .fetch_one(&mut *conn)
-            .await?;
+        crate::locks::lock_works(tx, &[&identity]).await?;
+        let current = resolve_library_identity_on(tx, series_id).await?;
+        if current != identity {
+            return Err(crate::locks::RestartTransaction.into());
+        }
+    }
+    #[cfg(test)]
+    guard_pause("library-locked").await;
+    if identity.starts_with("w_") {
+        let exists: bool =
+            crate::db_types::query_scalar("SELECT EXISTS(SELECT 1 FROM work WHERE id=$1)")
+                .bind(&identity)
+                .fetch_one(&mut **tx)
+                .await?;
         if !exists {
             return Err(MutationValidation("No such work").into());
         }
@@ -9424,15 +9689,12 @@ async fn consolidate_library_identity_on(
     if identity == series_id && !identity.starts_with("w_") {
         return Ok(identity);
     }
-    let rows = sqlx::query_as::<_, (String, String, i64, Option<String>)>(
-        "SELECT series_id, created_at, is_favorite, status FROM user_library \
-         WHERE user_id = ?1 AND (series_id = ?2 OR series_id IN ( \
-           SELECT source_key FROM source_series WHERE work_id = ?2 AND source_type = 'suwayomi' \
-         )) ORDER BY (series_id = ?2) DESC, created_at DESC",
+    let rows = crate::db_types::query_tuple::<(String, String, i64, Option<String>)>(
+        r#"SELECT series_id, created_at, is_favorite, status FROM user_library WHERE user_id = $1 AND (series_id = $2 OR series_id IN ( SELECT source_key FROM source_series WHERE work_id = $2 AND source_type = 'suwayomi' )) ORDER BY (series_id = $2) DESC NULLS LAST, created_at DESC NULLS LAST"#,
     )
-    .bind(user_id)
+    .bind(crate::db_types::uuid(user_id )?)
     .bind(&identity)
-    .fetch_all(&mut *conn)
+    .fetch_all(&mut **tx)
     .await?;
     if !rows.is_empty() {
         let created = rows.iter().map(|r| &r.1).min().unwrap();
@@ -9440,25 +9702,25 @@ async fn consolidate_library_identity_on(
         let status = rows.iter().find_map(|r| r.3.as_deref());
         sqlx::query(
             "INSERT INTO user_library (user_id, series_id, created_at, is_favorite, status) \
-             VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, series_id) DO UPDATE SET \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT(user_id, series_id) DO UPDATE SET \
              created_at = excluded.created_at, is_favorite = excluded.is_favorite, status = excluded.status",
         )
-        .bind(user_id)
+        .bind(crate::db_types::uuid(user_id )?)
         .bind(&identity)
-        .bind(created)
-        .bind(favorite as i64)
+        .bind(crate::db_types::date(created )?)
+        .bind(favorite)
         .bind(status)
-        .execute(&mut *conn)
+        .execute(&mut **tx)
         .await
         ?;
         sqlx::query(
-            "DELETE FROM user_library WHERE user_id = ?1 AND series_id != ?2 AND series_id IN ( \
-               SELECT source_key FROM source_series WHERE work_id = ?2 AND source_type = 'suwayomi' \
+            "DELETE FROM user_library WHERE user_id = $1 AND series_id != $2 AND series_id IN ( \
+               SELECT source_key FROM source_series WHERE work_id = $2 AND source_type = 'suwayomi' \
              )",
         )
-        .bind(user_id)
+        .bind(crate::db_types::uuid(user_id )?)
         .bind(&identity)
-        .execute(&mut *conn)
+        .execute(&mut **tx)
         .await
         ?;
     }
@@ -9475,7 +9737,7 @@ async fn reload_series(st: &AppState, user_id: &str, series_id: &str) -> Result<
             .ok_or_else(|| Error::new("No such work"))?;
         let chapters = catalog::load_canonical_chapters(&st.pool, &work.work_id)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
         return map_canonical_series(
             &st.pool,
             Some(user_id),
@@ -9490,7 +9752,7 @@ async fn reload_series(st: &AppState, user_id: &str, series_id: &str) -> Result<
     // (the write has already landed; this only echoes the series back).
     let m = match crate::series_cache::get_series(&st.pool, n)
         .await
-        .map_err(gql_err)?
+        .map_err(gql_read_err)?
     {
         Some(m) => m,
         None => st.suwayomi.series(n).await.map_err(gql_err)?,
@@ -9516,6 +9778,412 @@ fn mutation_write_error(error: anyhow::Error) -> Error {
     gql_err(error)
 }
 
+async fn lock_comment_thread(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> anyhow::Result<()> {
+    let id = uuid::Uuid::parse_str(id).ok();
+    let root: Option<uuid::Uuid> = sqlx::query_scalar(
+        "WITH RECURSIVE up(id,parent_id) AS (SELECT id,parent_id FROM comments WHERE id=$1 \
+         UNION ALL SELECT c.id,c.parent_id FROM comments c JOIN up ON c.id=up.parent_id) \
+         SELECT id FROM up WHERE parent_id IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    // Parent links are immutable. All operations on the root, its replies and
+    // tombstone pruning take this key before any comment/vote/media row lock.
+    if let Some(root) = root.or(id) {
+        crate::locks::advisory(
+            tx,
+            &[crate::locks::AdvisoryKey::new(
+                crate::locks::KeyClass::Thread,
+                &[&root.to_string()],
+            )],
+        )
+        .await?;
+    }
+    #[cfg(test)]
+    guard_pause("thread-locked").await;
+    Ok(())
+}
+
+/// What an admin mutation writes to one `series_admin` row.
+#[derive(Clone, Copy)]
+enum SeriesAdminWrite<'a> {
+    /// `updateSeriesAdmin`: the whole override state. A `None` field clears that
+    /// override; it does not keep the stored value.
+    Replace {
+        override_interval_hours: Option<f64>,
+        poll_every_minutes: Option<i32>,
+        paused: Option<bool>,
+        status: Option<&'a str>,
+    },
+    /// `setSeriesPaused`: the forced pause only; the other overrides are kept.
+    Paused(bool),
+}
+
+/// One complete admin write of a series' scan overrides (T134, and the caller side of
+/// the REST wave's T199/T200): BEGIN, the `Series` key of the numeric series id, the
+/// upsert, COMMIT. The scanner records a scan outcome under the same key and reads the
+/// overrides after it has waited for it, so a scan never computes a schedule from an
+/// override row that is being replaced, and two admin writes are applied one after the
+/// other. No user or work lock belongs to this unit. The schedule helpers that follow
+/// (`scan_series`, `mark_scan_due_now`) run after COMMIT.
+///
+/// `series_id` is the stored key as the client sent it; `numeric` is the same id
+/// parsed, and its `to_string()` is the spelling of the key the scanner takes.
+async fn write_series_admin_once(
+    pool: &Database,
+    numeric: i64,
+    series_id: &str,
+    write: SeriesAdminWrite<'_>,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    crate::locks::advisory(
+        &mut tx,
+        &[crate::locks::AdvisoryKey::new(
+            crate::locks::KeyClass::Series,
+            &[&numeric.to_string()],
+        )],
+    )
+    .await?;
+    #[cfg(test)]
+    guard_pause("series-admin-locked").await;
+    match write {
+        SeriesAdminWrite::Replace {
+            override_interval_hours,
+            poll_every_minutes,
+            paused,
+            status,
+        } => {
+            sqlx::query(
+                "INSERT INTO series_admin \
+                   (series_id, override_interval_hours, poll_every_minutes, paused_override, status_override, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT(series_id) DO UPDATE SET \
+                   override_interval_hours = excluded.override_interval_hours, \
+                   poll_every_minutes = excluded.poll_every_minutes, \
+                   paused_override = excluded.paused_override, \
+                   status_override = excluded.status_override, \
+                   updated_at = excluded.updated_at",
+            )
+            .bind(series_id)
+            .bind(override_interval_hours)
+            .bind(poll_every_minutes)
+            .bind(paused)
+            .bind(status)
+            .bind(crate::db_types::date(&crate::db_types::format_date(now))?)
+            .execute(&mut *tx)
+            .await?;
+        }
+        SeriesAdminWrite::Paused(paused) => {
+            sqlx::query(
+                "INSERT INTO series_admin (series_id, paused_override, updated_at) VALUES ($1, $2, $3) \
+                 ON CONFLICT(series_id) DO UPDATE SET \
+                   paused_override = excluded.paused_override, \
+                   updated_at = excluded.updated_at",
+            )
+            .bind(series_id)
+            .bind(paused)
+            .bind(crate::db_types::truncate_date(now))
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// One complete `voteComment` transaction (BEGIN to COMMIT), retried as a whole by its
+/// caller. Returns the fresh `(likes, dislikes)`.
+///
+/// The milestone notifications are inserted HERE, before COMMIT (T125): a vote and the
+/// notification it earns are published together or not at all. They used to be written
+/// after the commit by a fire-and-forget helper, so a crash, a full pool or a comment
+/// deleted in between lost the notification of a like that had been counted, and a
+/// failure there was invisible to the voter's request.
+async fn vote_comment_once(
+    pool: &Database,
+    user_id: &str,
+    comment_id: &str,
+    value: i32,
+) -> anyhow::Result<(i64, i64)> {
+    let comment = uuid::Uuid::parse_str(comment_id).ok();
+    let voter = crate::db_types::uuid(user_id)?;
+    let mut tx = pool.begin().await?;
+    lock_comment_thread(&mut tx, comment_id).await?;
+    // Resolve the comment's author + thread (for the notification and self-check).
+    let row: Option<(String, String, String, Option<String>)> = crate::db_types::query_tuple(
+        "SELECT user_id, target_type, target_id, deleted_by FROM comments WHERE id = $1 FOR UPDATE",
+    )
+    .bind(comment)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((author_id, target_type, target_id, deleted_by)) = row else {
+        return Err(MutationValidation("comment not found").into());
+    };
+    if deleted_by.is_some() {
+        return Err(MutationValidation("You cannot vote on a deleted comment.").into());
+    }
+    // You can't vote on your own comment — that would let an author inflate their
+    // own like tally (which feeds everyone's milestones and any like-ranking).
+    if author_id == user_id {
+        return Err(MutationValidation("you can't vote on your own comment").into());
+    }
+    let prior_likes: i64 = crate::db_types::query_scalar(
+        "SELECT COUNT(*) FROM comment_votes WHERE comment_id = $1 AND value = 1",
+    )
+    .bind(comment)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if value == 0 {
+        sqlx::query("DELETE FROM comment_votes WHERE comment_id = $1 AND user_id = $2")
+            .bind(comment)
+            .bind(voter)
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        sqlx::query(
+            "INSERT INTO comment_votes (comment_id, user_id, value, created_at) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT(comment_id, user_id) DO UPDATE SET \
+               value = excluded.value, created_at = excluded.created_at",
+        )
+        .bind(comment)
+        .bind(voter)
+        .bind(value)
+        .bind(crate::db_types::date(
+            &(crate::db_types::format_date(Utc::now())),
+        )?)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let (likes, dislikes): (i64, i64) = crate::db_types::query_tuple(
+        "SELECT \
+           COALESCE(SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END), 0), \
+           COALESCE(SUM(CASE WHEN value = -1 THEN 1 ELSE 0 END), 0) \
+         FROM comment_votes WHERE comment_id = $1",
+    )
+    .bind(comment)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    // Notify the author for EVERY milestone this like crossed (prior_likes, likes],
+    // not just an exact landing. The insert is idempotent per (comment, count), so
+    // re-crossing after an unlike notifies once. The Thread key and the comment row
+    // lock above are the guards `record_like_milestone_on` asks for, and both counts
+    // were read under them. (Self-votes are rejected above, so this is always someone
+    // else's like.)
+    if value == 1 && likes > prior_likes {
+        for &milestone in crate::notify::LIKE_MILESTONES {
+            if milestone > prior_likes && milestone <= likes {
+                crate::notify::record_like_milestone_on(
+                    &mut tx,
+                    &author_id,
+                    comment_id,
+                    &target_type,
+                    &target_id,
+                    milestone,
+                )
+                .await?;
+            }
+        }
+    }
+    #[cfg(test)]
+    guard_pause("vote-recorded").await;
+    tx.commit().await?;
+    Ok((likes, dislikes))
+}
+
+/// One complete `deleteComment` transaction (BEGIN to COMMIT), retried as a whole by
+/// its caller. Lock order: the acting user, the thread key, every ancestor comment in
+/// id order, every notification of those comments in id order, then the child rows.
+async fn delete_comment_once(
+    pool: &Database,
+    user_id: &str,
+    id: uuid::Uuid,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    crate::locks::lock_user(&mut tx, user_id).await?;
+    lock_comment_thread(&mut tx, &id.to_string()).await?;
+    // Tombstone pruning may visit several ancestors. Discover and lock the
+    // complete comment set, then all their notification UUIDs in one order
+    // shared with markNotificationsRead, before deleting any child rows.
+    let ancestors: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "WITH RECURSIVE up(id,parent_id) AS (SELECT id,parent_id FROM comments WHERE id=$1 \
+         UNION ALL SELECT c.id,c.parent_id FROM comments c JOIN up ON c.id=up.parent_id) SELECT id FROM up ORDER BY id",
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+    #[cfg(test)]
+    guard_pause("comment-delete-discovered").await;
+    sqlx::query("SELECT id FROM comments WHERE id=ANY($1) ORDER BY id FOR UPDATE")
+        .bind(&ancestors)
+        .fetch_all(&mut *tx)
+        .await?;
+    sqlx::query("SELECT id FROM notifications WHERE comment_id=ANY($1) ORDER BY id FOR UPDATE")
+        .bind(&ancestors)
+        .fetch_all(&mut *tx)
+        .await?;
+    #[cfg(test)]
+    guard_pause("comment-delete-locked").await;
+    let row: Option<(uuid::Uuid, Option<uuid::Uuid>, Option<String>)> = sqlx::query_as(
+        "SELECT user_id, parent_id, deleted_by FROM comments WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((author_id, mut parent_id, deleted_by)) = row else {
+        return Ok(false);
+    };
+    let is_author = author_id == crate::db_types::uuid(user_id)?;
+    if !is_author {
+        require_admin_on(&mut tx, user_id).await?;
+    }
+    if deleted_by.is_some() {
+        return Ok(false);
+    }
+    let has_children: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM comments WHERE parent_id = $1)")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+    let mut current = id;
+    loop {
+        // Media bytes live in this row, with no external file to remove. Reply
+        // notifications reference the reply itself, so only this comment's
+        // notifications are removed; surviving replies retain their notifications.
+        for sql in [
+            "DELETE FROM comment_media WHERE comment_id = $1",
+            "DELETE FROM comment_votes WHERE comment_id = $1",
+            "DELETE FROM notifications WHERE comment_id = $1",
+        ] {
+            sqlx::query(sql).bind(current).execute(&mut *tx).await?;
+        }
+        if current == id && has_children {
+            sqlx::query(
+                "UPDATE comments SET body = '', has_spoiler = FALSE, deleted_by = $2 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(if is_author { "author" } else { "moderator" })
+            .execute(&mut *tx)
+            .await?;
+            break;
+        }
+        sqlx::query("DELETE FROM comments WHERE id = $1")
+            .bind(current)
+            .execute(&mut *tx)
+            .await?;
+        let Some(parent) = parent_id else { break };
+        // Lock before checking for children: posting replies locks the same row.
+        let ancestor: Option<(Option<uuid::Uuid>, Option<String>)> =
+            sqlx::query_as("SELECT parent_id, deleted_by FROM comments WHERE id = $1 FOR UPDATE")
+                .bind(parent)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((next_parent, Some(_))) = ancestor else {
+            break;
+        };
+        let occupied: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM comments WHERE parent_id = $1)")
+                .bind(parent)
+                .fetch_one(&mut *tx)
+                .await?;
+        if occupied {
+            break;
+        }
+        current = parent;
+        parent_id = next_parent;
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+async fn create_owner_once(
+    pool: &Database,
+    id: &str,
+    username: &str,
+    email: &str,
+    hash: &str,
+    now: &str,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    crate::locks::advisory(&mut tx, &[crate::locks::AdvisoryKey::membership()]).await?;
+    #[cfg(test)]
+    guard_pause("owner-locked").await;
+    let inserted = sqlx::query(
+        "INSERT INTO users (id, username, email, password_hash, avatar_url, is_admin, created_at) \
+             SELECT $1, $2, $3, $4, NULL, TRUE, $5 \
+             WHERE NOT EXISTS (SELECT 1 FROM users WHERE is_admin = TRUE)",
+    )
+    .bind(crate::db_types::uuid(id)?)
+    .bind(username)
+    .bind(email)
+    .bind(hash)
+    .bind(crate::db_types::date(now)?)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(inserted.rows_affected() == 1)
+}
+
+/// The viewer's unread notifications, locked in primary-key order by ONE statement:
+/// the `LockRows` node sits above the sort on `id`, so the rows are locked in the
+/// order `deleteComment` and the notification prune lock theirs. `$1` is the user.
+const LOCK_UNREAD_NOTIFICATIONS_SQL: &str =
+    "SELECT id FROM notifications WHERE user_id=$1 AND read_at IS NULL ORDER BY id FOR UPDATE";
+
+/// The same for an explicit id list (`$2`), read or unread, scoped to the viewer.
+const LOCK_LISTED_NOTIFICATIONS_SQL: &str =
+    "SELECT id FROM notifications WHERE user_id=$1 AND id = ANY($2) ORDER BY id FOR UPDATE";
+
+/// One statement locks the complete set in id order, one statement marks it. A user
+/// with ten thousand unread notifications used to cost twenty thousand statements in
+/// this transaction (a lock and an update per row); it is two now.
+async fn mark_notifications_read_once(
+    pool: &Database,
+    user_id: &str,
+    ids: Option<&[uuid::Uuid]>,
+    now: &str,
+) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+    let user = crate::db_types::uuid(user_id)?;
+    let locked: Vec<uuid::Uuid> = match ids {
+        Some(ids) => {
+            sqlx::query_scalar(LOCK_LISTED_NOTIFICATIONS_SQL)
+                .bind(user)
+                .bind(ids)
+                .fetch_all(&mut *tx)
+                .await?
+        }
+        None => {
+            sqlx::query_scalar(LOCK_UNREAD_NOTIFICATIONS_SQL)
+                .bind(user)
+                .fetch_all(&mut *tx)
+                .await?
+        }
+    };
+    #[cfg(test)]
+    guard_pause("notification-locked").await;
+    let count = sqlx::query(
+        "UPDATE notifications SET read_at=$1 WHERE id = ANY($2) AND user_id=$3 AND read_at IS NULL",
+    )
+    .bind(crate::db_types::date(now)?)
+    .bind(&locked)
+    .bind(user)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(count)
+}
+
 async fn set_progress_once(
     pool: &Database,
     user_id: &str,
@@ -9524,6 +10192,7 @@ async fn set_progress_once(
     read: bool,
 ) -> anyhow::Result<bool> {
     let mut tx = pool.begin().await?;
+    lock_progress_owner(&mut tx, user_id, chapter_id).await?;
     // Canonical chapter ids are MangaDex uuids (not all-digits); persist their
     // progress in `canonical_progress`. Numeric Suwayomi ids fall through (CR6).
     let is_numeric = !chapter_id.is_empty() && chapter_id.bytes().all(|b| b.is_ascii_digit());
@@ -9531,30 +10200,30 @@ async fn set_progress_once(
         // The owning work, for per-series aggregation. If the chapter isn't in the
         // mirror, store with work_id = '' rather than erroring — it's per-user private.
         // The chapter's own number comes back with it, for the catch-up cascade below.
-        let owner: Option<(String, Option<String>)> = sqlx::query_as(
+        let owner: Option<(String, Option<String>)> = crate::db_types::query_tuple(
                 "SELECT ss.work_id, c.number FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
-                 WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
+                 WHERE c.external_id = $1 AND ss.source_type = 'mangadex' LIMIT 1",
             )
             .bind(chapter_id)
             .fetch_optional(&mut *tx)
             .await
             ?;
         let (work_id, number) = owner.unwrap_or_default();
-        let now = Utc::now().to_rfc3339();
+        let now = crate::db_types::format_date(Utc::now());
         sqlx::query(
                 "INSERT INTO canonical_progress \
                    (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
                  ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-                   last_page_read = excluded.last_page_read, read = MAX(canonical_progress.read, excluded.read), \
+                   last_page_read = excluded.last_page_read, read = (canonical_progress.read OR excluded.read), \
                    work_id = excluded.work_id, updated_at = excluded.updated_at",
             )
-            .bind(user_id)
+            .bind(crate::db_types::uuid(user_id )?)
             .bind(chapter_id)
             .bind(&work_id)
             .bind(last_page_read as i64)
             .bind(read)
-            .bind(&now)
+            .bind(crate::db_types::date(&now )?)
             .execute(&mut *tx)
             .await
             ?;
@@ -9573,8 +10242,8 @@ async fn set_progress_once(
     // chapter isn't cached yet, store with series_id = '' rather than erroring —
     // the row is per-user private and the read state still round-trips.
     // Its number rides along for the catch-up cascade below.
-    let owner: Option<(i64, Option<f64>)> = sqlx::query_as(
-        "SELECT manga_id, chapter_number FROM suwayomi_chapter WHERE id = ? LIMIT 1",
+    let owner: Option<(i64, Option<f64>)> = crate::db_types::query_tuple(
+        "SELECT manga_id, chapter_number FROM suwayomi_chapter WHERE id = $1 LIMIT 1",
     )
     .bind(n)
     .fetch_optional(&mut *tx)
@@ -9583,21 +10252,21 @@ async fn set_progress_once(
         Some((sid, num)) => (sid.to_string(), num),
         None => (String::new(), None),
     };
-    let now = Utc::now().to_rfc3339();
+    let now = crate::db_types::format_date(Utc::now());
     sqlx::query(
             "INSERT INTO suwayomi_progress \
                (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-               last_page_read = excluded.last_page_read, read = MAX(suwayomi_progress.read, excluded.read), \
+               last_page_read = excluded.last_page_read, read = (suwayomi_progress.read OR excluded.read), \
                series_id = excluded.series_id, updated_at = excluded.updated_at",
         )
-        .bind(user_id)
+        .bind(crate::db_types::uuid(user_id )?)
         .bind(chapter_id)
         .bind(&series_id)
         .bind(last_page_read as i64)
         .bind(read)
-        .bind(&now)
+        .bind(crate::db_types::date(&now )?)
         .execute(&mut *tx)
         .await
         ?;
@@ -9618,20 +10287,21 @@ async fn set_chapter_read_once(
 ) -> anyhow::Result<bool> {
     // Same id-shape routing as `set_progress` (CR6): numeric = Suwayomi, else MangaDex.
     let numeric = id.bytes().all(|b| b.is_ascii_digit());
-    let now = Utc::now().to_rfc3339();
+    let now = crate::db_types::format_date(Utc::now());
     let mut tx = pool.begin().await?;
+    lock_progress_owner(&mut tx, user_id, id).await?;
     if read {
         if numeric {
             // The owning Suwayomi series: from the engine's chapter cache, or — when that
             // cache never held the chapter (the engine is down, or the row came in through
             // the spine drain) — from the spine mapping, whose `source_key` IS the series
             // id `suwayomi_progress.series_id` stores.
-            let series_id: String = sqlx::query_scalar::<_, String>(
-                "SELECT CAST(manga_id AS TEXT) FROM suwayomi_chapter WHERE id = ?1 \
+            let series_id: String = crate::db_types::query_scalar::<String>(
+                "SELECT CAST(manga_id AS TEXT) FROM suwayomi_chapter WHERE id = $1 \
                  UNION ALL \
                  SELECT ss.source_key FROM chapter c \
                    JOIN source_series ss ON ss.id = c.source_series_id \
-                  WHERE c.external_id = ?2 AND ss.source_type = 'suwayomi' \
+                  WHERE c.external_id = $2 AND ss.source_type = 'suwayomi' \
                  LIMIT 1",
             )
             .bind(id.parse::<i64>()?)
@@ -9642,21 +10312,21 @@ async fn set_chapter_read_once(
             sqlx::query(
                 "INSERT INTO suwayomi_progress \
                    (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
-                 VALUES (?, ?, ?, 0, 1, ?) \
+                 VALUES ($1, $2, $3, 0, TRUE, $4) \
                  ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-                   read = 1, updated_at = excluded.updated_at",
+                   read = TRUE, updated_at = excluded.updated_at",
             )
-            .bind(user_id)
+            .bind(crate::db_types::uuid(user_id)?)
             .bind(id)
             .bind(&series_id)
-            .bind(&now)
+            .bind(crate::db_types::date(&now)?)
             .execute(&mut *tx)
             .await?;
         } else {
-            let work_id: String = sqlx::query_scalar::<_, String>(
+            let work_id: String = crate::db_types::query_scalar::<String>(
                 "SELECT ss.work_id FROM chapter c \
                    JOIN source_series ss ON ss.id = c.source_series_id \
-                  WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
+                  WHERE c.external_id = $1 AND ss.source_type = 'mangadex' LIMIT 1",
             )
             .bind(id)
             .fetch_optional(&mut *tx)
@@ -9665,14 +10335,14 @@ async fn set_chapter_read_once(
             sqlx::query(
                 "INSERT INTO canonical_progress \
                    (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
-                 VALUES (?, ?, ?, 0, 1, ?) \
+                 VALUES ($1, $2, $3, 0, TRUE, $4) \
                  ON CONFLICT(user_id, chapter_id) DO UPDATE SET \
-                   read = 1, updated_at = excluded.updated_at",
+                   read = TRUE, updated_at = excluded.updated_at",
             )
-            .bind(user_id)
+            .bind(crate::db_types::uuid(user_id)?)
             .bind(id)
             .bind(&work_id)
-            .bind(&now)
+            .bind(crate::db_types::date(&now)?)
             .execute(&mut *tx)
             .await?;
         }
@@ -9682,23 +10352,23 @@ async fn set_chapter_read_once(
     // Unread. The clicked copy first, by id — this alone is the whole answer for a
     // chapter the spine does not know (no key to fold on).
     let own = if numeric {
-        "UPDATE suwayomi_progress SET read = 0, updated_at = ? \
-          WHERE user_id = ? AND chapter_id = ? AND read = 1"
+        "UPDATE suwayomi_progress SET read = FALSE, updated_at = $1 \
+          WHERE user_id = $2 AND chapter_id = $3 AND read = TRUE"
     } else {
-        "UPDATE canonical_progress SET read = 0, updated_at = ? \
-          WHERE user_id = ? AND chapter_id = ? AND read = 1"
+        "UPDATE canonical_progress SET read = FALSE, updated_at = $1 \
+          WHERE user_id = $2 AND chapter_id = $3 AND read = TRUE"
     };
     sqlx::query(own)
-        .bind(&now)
-        .bind(user_id)
+        .bind(crate::db_types::date(&now)?)
+        .bind(crate::db_types::uuid(user_id)?)
         .bind(id)
         .execute(&mut *tx)
         .await?;
     // Then every sibling copy of the same chapter in the same work, on both stores.
-    let ident: Option<(String, String)> = sqlx::query_as(
+    let ident: Option<(String, String)> = crate::db_types::query_tuple(
         "SELECT ss.work_id, c.chapter_key FROM chapter c \
            JOIN source_series ss ON ss.id = c.source_series_id \
-          WHERE c.external_id = ? AND ss.source_type = ? AND c.chapter_key IS NOT NULL \
+          WHERE c.external_id = $1 AND ss.source_type = $2 AND c.chapter_key IS NOT NULL \
           LIMIT 1",
     )
     .bind(id)
@@ -9708,22 +10378,23 @@ async fn set_chapter_read_once(
     if let Some((work_id, key)) = ident {
         // Two static statements rather than one formatted over the table name: identical
         // but for the store, and kept literal so no SQL text is ever assembled at runtime.
-        const CLEAR_CANONICAL: &str = "UPDATE canonical_progress SET read = 0, updated_at = ?1 \
-              WHERE user_id = ?2 AND read = 1 AND chapter_id IN ( \
+        const CLEAR_CANONICAL: &str =
+            "UPDATE canonical_progress SET read = FALSE, updated_at = $1 \
+              WHERE user_id = $2 AND read = TRUE AND chapter_id IN ( \
                 SELECT c.external_id FROM chapter c \
                   JOIN source_series ss ON ss.id = c.source_series_id \
-                 WHERE ss.work_id = ?3 AND ss.source_type = 'mangadex' \
-                   AND c.chapter_key = ?4)";
-        const CLEAR_SUWAYOMI: &str = "UPDATE suwayomi_progress SET read = 0, updated_at = ?1 \
-              WHERE user_id = ?2 AND read = 1 AND chapter_id IN ( \
+                 WHERE ss.work_id = $3 AND ss.source_type = 'mangadex' \
+                   AND c.chapter_key = $4)";
+        const CLEAR_SUWAYOMI: &str = "UPDATE suwayomi_progress SET read = FALSE, updated_at = $1 \
+              WHERE user_id = $2 AND read = TRUE AND chapter_id IN ( \
                 SELECT c.external_id FROM chapter c \
                   JOIN source_series ss ON ss.id = c.source_series_id \
-                 WHERE ss.work_id = ?3 AND ss.source_type = 'suwayomi' \
-                   AND c.chapter_key = ?4)";
+                 WHERE ss.work_id = $3 AND ss.source_type = 'suwayomi' \
+                   AND c.chapter_key = $4)";
         for sql in [CLEAR_CANONICAL, CLEAR_SUWAYOMI] {
             sqlx::query(sql)
-                .bind(&now)
-                .bind(user_id)
+                .bind(crate::db_types::date(&now)?)
+                .bind(crate::db_types::uuid(user_id)?)
                 .bind(&work_id)
                 .bind(&key)
                 .execute(&mut *tx)
@@ -9734,13 +10405,338 @@ async fn set_chapter_read_once(
     Ok(true)
 }
 
+async fn update_series_metadata_once(
+    pool: &Database,
+    input: &SeriesMetadataInput,
+) -> anyhow::Result<String> {
+    use async_graphql::MaybeUndefined::{Null, Undefined, Value};
+    let mut tx = pool.begin().await?;
+    let work_id = lock_work_identity(
+        &mut tx,
+        &input.series_id.0,
+        Some("Series is not catalogued — add it to the catalogue before editing its metadata."),
+    )
+    .await?;
+    if !work_id.starts_with("w_") {
+        return Err(MutationValidation(
+            "Series is not catalogued — add it to the catalogue before editing its metadata.",
+        )
+        .into());
+    }
+    #[cfg(test)]
+    guard_pause("metadata-locked").await;
+    let now = crate::db_types::format_date(Utc::now());
+    match &input.title {
+        Undefined => {}
+        Null | Value(_) => {
+            let v = match &input.title {
+                Value(v) => Some(v.as_str()),
+                _ => None,
+            };
+            sqlx::query("UPDATE work SET title_override = $1, updated_at = $2 WHERE id = $3")
+                .bind(v)
+                .bind(crate::db_types::date(&now)?)
+                .bind(&work_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    match &input.description {
+        Undefined => {}
+        Null | Value(_) => {
+            let v = match &input.description {
+                Value(v) => Some(v.as_str()),
+                _ => None,
+            };
+            sqlx::query("UPDATE work SET description_override = $1, updated_at = $2 WHERE id = $3")
+                .bind(v)
+                .bind(crate::db_types::date(&now)?)
+                .bind(&work_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    match input.r#type {
+        Undefined => {}
+        Null | Value(_) => {
+            let word = match input.r#type {
+                Value(t) => Some(content_type_word(t)),
+                _ => None,
+            };
+            sqlx::query(
+                "UPDATE work SET content_type_override = $1, updated_at = $2 WHERE id = $3",
+            )
+            .bind(word)
+            .bind(crate::db_types::date(&now)?)
+            .bind(&work_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    match input.is_nsfw {
+        Undefined => {}
+        Null | Value(_) => {
+            let val = match input.is_nsfw {
+                Value(b) => Some(b),
+                _ => None,
+            };
+            sqlx::query("UPDATE work SET is_nsfw_override = $1, updated_at = $2 WHERE id = $3")
+                .bind(val)
+                .bind(crate::db_types::date(&now)?)
+                .bind(&work_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    // Tags: `tags: []` and `tags: null` both leave zero curated rows → the work
+    // reverts to source-derived genres (curated-empty is intentionally not
+    // expressible; the console only sends `tags` when the admin edits them).
+    match &input.tags {
+        Undefined => {}
+        Null | Value(_) => {
+            sqlx::query("DELETE FROM work_tag WHERE work_id = $1")
+                .bind(&work_id)
+                .execute(&mut *tx)
+                .await?;
+            if let Value(list) = &input.tags {
+                for (i, tag) in list.iter().enumerate() {
+                    let t = tag.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    // `tag_key` (migration 0106) so the curated tag is filterable
+                    // immediately; `tags::fill_tag_keys` would otherwise only reach it
+                    // at the next Browse rebuild.
+                    sqlx::query(
+                        "INSERT INTO work_tag (work_id, tag, ord, tag_key) \
+                             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                    )
+                    .bind(&work_id)
+                    .bind(t)
+                    .bind(i as i64)
+                    .bind(crate::tags::slug(t))
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+        }
+    }
+    // Source-owned fields. A value pins the column; null hands it back to the source.
+    use catalog::PinnedField;
+    let text = |v: &str, max: usize| -> Option<String> {
+        let v: String = v.trim().chars().take(max).collect();
+        (!v.is_empty()).then_some(v)
+    };
+    let mut pins: Vec<(PinnedField, Option<Option<String>>)> = Vec::new();
+    let mut pin = |field, value: Option<Option<String>>| pins.push((field, value));
+    match &input.author {
+        Undefined => {}
+        Null => pin(PinnedField::Author, None),
+        Value(v) => pin(PinnedField::Author, Some(text(v, 300))),
+    }
+    match &input.artist {
+        Undefined => {}
+        Null => pin(PinnedField::Artist, None),
+        Value(v) => pin(PinnedField::Artist, Some(text(v, 300))),
+    }
+    match input.year {
+        Undefined => {}
+        Null => pin(PinnedField::Year, None),
+        Value(y) if (1800..=2100).contains(&y) => pin(PinnedField::Year, Some(Some(y.to_string()))),
+        Value(_) => return Err(MutationValidation("Year must be between 1800 and 2100.").into()),
+    }
+    match &input.original_language {
+        Undefined => {}
+        Null => pin(PinnedField::OriginalLanguage, None),
+        Value(v) => {
+            let code = v.trim().to_lowercase();
+            let valid = code.is_empty()
+                || (code.len() <= 8
+                    && code.split('-').all(|part| {
+                        (2..=4).contains(&part.len())
+                            && part.chars().all(|c| c.is_ascii_alphanumeric())
+                    }));
+            if !valid {
+                return Err(MutationValidation(
+                    "Original language must be a language code such as ja, ko, zh or zh-hk.",
+                )
+                .into());
+            }
+            pin(PinnedField::OriginalLanguage, Some(text(&code, 8)))
+        }
+    }
+    match input.status {
+        Undefined => {}
+        Null => pin(PinnedField::Status, None),
+        Value(st) => pin(PinnedField::Status, Some(Some(status_word(st).to_string()))),
+    }
+    match input.demographic {
+        Undefined => {}
+        Null => pin(PinnedField::Demographic, None),
+        // "No demographic" is stored as NULL.
+        Value(Demographic::None) => pin(PinnedField::Demographic, Some(None)),
+        Value(d) => pin(
+            PinnedField::Demographic,
+            Some(Some(demographic_word(d).to_string())),
+        ),
+    }
+    match input.content_rating {
+        Undefined => {}
+        Null => pin(PinnedField::ContentRating, None),
+        Value(r) => pin(
+            PinnedField::ContentRating,
+            Some(Some(content_rating_word(r).to_string())),
+        ),
+    }
+    for (field, value) in pins {
+        match value {
+            Some(value) => {
+                catalog::pin_work_field(&mut tx, &work_id, field, value.as_deref()).await
+            }
+            None => catalog::unpin_work_field(&mut tx, &work_id, field).await,
+        }?;
+    }
+    // Project the title, aliases, tags and visibility under the metadata
+    // transaction, so a committed edit is immediately browsable and searchable.
+    catalog::upsert_browse_work(&mut tx, &work_id).await?;
+    resync_feed_nsfw_on(&mut tx, std::slice::from_ref(&work_id)).await?;
+    tx.commit().await?;
+    Ok(work_id)
+}
+
+async fn post_review_once(
+    pool: &Database,
+    user_id: &str,
+    input: &PostReviewInput,
+) -> anyhow::Result<ReviewJoin> {
+    let mut tx = pool.begin().await?;
+    crate::locks::lock_user(&mut tx, user_id).await?;
+    let stored_id = lock_work_identity(&mut tx, &input.series_id.0, Some("No such series")).await?;
+    if !stored_id.starts_with("w_") {
+        let known: bool = sqlx::query_scalar(KNOWN_SUWAYOMI_SERIES_SQL)
+            .bind(stored_id.parse::<i64>().ok())
+            .fetch_one(&mut *tx)
+            .await?;
+        if !known {
+            return Err(MutationValidation("No such series").into());
+        }
+    }
+    #[cfg(test)]
+    guard_pause("review-locked").await;
+    let now = crate::db_types::format_date(Utc::now());
+    let id = uuid::Uuid::new_v4().to_string();
+    // One review per (series, user): upsert, keeping the original id/created_at.
+    sqlx::query(
+            "INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT(series_id, user_id) DO UPDATE SET \
+               score = excluded.score, body = excluded.body, \
+               has_spoiler = excluded.has_spoiler, updated_at = excluded.updated_at",
+        )
+        .bind(crate::db_types::uuid(&id )?)
+        .bind(stored_id.clone())
+        .bind(crate::db_types::uuid(user_id )?)
+        .bind(input.score as i64)
+        .bind(input.body.trim())
+        .bind(input.has_spoiler)
+        .bind(crate::db_types::date(&now )?)
+        .bind(crate::db_types::date(&now )?)
+        .execute(&mut *tx)
+        .await
+        ?;
+
+    let row: ReviewJoin = sqlx::query_as(
+        "SELECT r.id, r.series_id, r.score, r.body, r.has_spoiler, r.created_at, r.updated_at, \
+             u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar \
+             FROM reviews r JOIN users u ON u.id = r.user_id \
+             WHERE r.series_id = $1 AND r.user_id = $2",
+    )
+    .bind(stored_id.clone())
+    .bind(crate::db_types::uuid(user_id)?)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query("INSERT INTO user_activity(id,user_id,kind,target_type,target_id,created_at) VALUES($1,$2,'review','series',$3,$4)")
+        .bind(uuid::Uuid::new_v4()).bind(crate::db_types::uuid(user_id)?).bind(&stored_id)
+        .bind(crate::db_types::date(&now)?).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+async fn delete_review_once(
+    pool: &Database,
+    user_id: &str,
+    series_id: &str,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    crate::locks::lock_user(&mut tx, user_id).await?;
+    let identity = lock_work_identity(&mut tx, series_id, None).await?;
+    let mut keys: Vec<String> = sqlx::query_scalar("SELECT source_key FROM source_series WHERE work_id=$1 AND source_type='suwayomi' ORDER BY source_key")
+        .bind(&identity).fetch_all(&mut *tx).await?;
+    keys.extend([identity, series_id.to_owned()]);
+    keys.sort();
+    keys.dedup();
+    #[cfg(test)]
+    guard_pause("review-locked").await;
+    let removed = sqlx::query("DELETE FROM reviews WHERE user_id=$1 AND series_id=ANY($2)")
+        .bind(crate::db_types::uuid(user_id)?)
+        .bind(&keys)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if removed > 0 {
+        sqlx::query(
+            "DELETE FROM user_activity WHERE user_id=$1 AND kind='review' AND target_id=ANY($2)",
+        )
+        .bind(crate::db_types::uuid(user_id)?)
+        .bind(&keys)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(removed > 0)
+}
+
+async fn rederive_nsfw_once(pool: &Database, work_id: &str) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    crate::locks::lock_works(&mut tx, &[work_id]).await?;
+    #[cfg(test)]
+    guard_pause("rederive-locked").await;
+    let rows: Vec<(Option<String>, bool)> = crate::db_types::query_tuple(
+        "SELECT s.genre, COALESCE(se.is_nsfw,FALSE) FROM source_series ss \
+         JOIN work w ON w.id=ss.work_id LEFT JOIN suwayomi_series s ON s.id=sqlite_integer_pin(ss.source_key) \
+         LEFT JOIN source_extension se ON se.source_id=ss.source_id \
+         WHERE w.id=$1 AND ss.source_type='suwayomi' AND w.is_nsfw=FALSE \
+         AND (w.content_rating IS NULL OR w.content_rating NOT IN ('safe','suggestive'))",
+    ).bind(work_id).fetch_all(&mut *tx).await?;
+    let adult = rows.iter().any(|(genre, source)| {
+        let genres: Vec<String> = genre
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default();
+        *source || genre_is_nsfw(&genres)
+    });
+    if adult {
+        sqlx::query("UPDATE work SET is_nsfw=TRUE,updated_at=$1 WHERE id=$2")
+            .bind(Utc::now())
+            .bind(work_id)
+            .execute(&mut *tx)
+            .await?;
+        resync_feed_nsfw_on(&mut tx, &[work_id.to_owned()]).await?;
+    }
+    tx.commit().await?;
+    Ok(adult)
+}
+
 async fn set_chapter_override_once(
     pool: &Database,
     input: &ChapterOverrideInput,
 ) -> anyhow::Result<bool> {
     use async_graphql::MaybeUndefined::{Null, Undefined, Value};
     let mut tx = pool.begin().await?;
-    let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM work WHERE id = ?")
+    crate::locks::lock_works(&mut tx, &[&input.work_id.0]).await?;
+    #[cfg(test)]
+    guard_pause("override-locked").await;
+    let exists = crate::db_types::query_scalar::<i64>("SELECT 1 FROM work WHERE id = $1")
         .bind(&input.work_id.0)
         .fetch_optional(&mut *tx)
         .await?;
@@ -9749,8 +10745,8 @@ async fn set_chapter_override_once(
     }
     // Read-modify-write under ONE transaction so two concurrent partial edits (one
     // toggling `hidden`, one renaming) can't clobber each other's field.
-    let existing = sqlx::query_as::<_, (i64, Option<String>)>(
-        "SELECT hidden, title_override FROM chapter_override WHERE work_id = ? AND chapter_key = ?",
+    let existing = crate::db_types::query_tuple::<(i64, Option<String>)>(
+        "SELECT hidden, title_override FROM chapter_override WHERE work_id = $1 AND chapter_key = $2",
     )
     .bind(&input.work_id.0)
     .bind(&input.chapter_key)
@@ -9772,7 +10768,7 @@ async fn set_chapter_override_once(
     }
     // A no-op override (visible + no rename) is stored as the absence of a row.
     if !hidden && title.is_none() {
-        sqlx::query("DELETE FROM chapter_override WHERE work_id = ? AND chapter_key = ?")
+        sqlx::query("DELETE FROM chapter_override WHERE work_id = $1 AND chapter_key = $2")
             .bind(&input.work_id.0)
             .bind(&input.chapter_key)
             .execute(&mut *tx)
@@ -9780,10 +10776,10 @@ async fn set_chapter_override_once(
         tx.commit().await?;
         return Ok(true);
     }
-    let now = Utc::now().to_rfc3339();
+    let now = crate::db_types::format_date(Utc::now());
     sqlx::query(
         "INSERT INTO chapter_override (work_id, chapter_key, hidden, title_override, updated_at) \
-         VALUES (?, ?, ?, ?, ?) \
+         VALUES ($1, $2, $3, $4, $5) \
          ON CONFLICT(work_id, chapter_key) DO UPDATE SET \
            hidden = excluded.hidden, \
            title_override = excluded.title_override, \
@@ -9791,9 +10787,9 @@ async fn set_chapter_override_once(
     )
     .bind(&input.work_id.0)
     .bind(&input.chapter_key)
-    .bind(hidden as i64)
+    .bind(hidden)
     .bind(&title)
-    .bind(&now)
+    .bind(crate::db_types::date(&now)?)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -9950,6 +10946,7 @@ impl MutationRoot {
         let is_admin_viewer = current_user(ctx).await?.is_some_and(|u| u.is_admin != 0);
         if !is_admin_viewer {
             if let Err(e) = crate::views::record(&st.pool, sid).await {
+                crate::db::observe_database_error(&e);
                 tracing::warn!(series_id = %sid, error = %e, "recordView failed");
             }
         }
@@ -10055,16 +11052,19 @@ impl MutationRoot {
             }
         }
 
+        let user = current_user(ctx).await?;
+        let mut tx = st.pool.begin().await.map_err(gql_err)?;
+        // Snapshot and insert under the same lock as deletion.
         // Snapshot the reported comment. A missing id is an error rather than a silent
         // null: it means the reader's link is stale and the report would be untriageable.
         let mut comment_excerpt = None;
         if let Some(cid) = comment_id.as_deref() {
-            let found: Option<(String, String)> = sqlx::query_as(
+            let found: Option<(String, String)> = crate::db_types::query_tuple(
                 "SELECT c.body, u.username FROM comments c \
-                 JOIN users u ON u.id = c.user_id WHERE c.id = ?",
+                 JOIN users u ON u.id = c.user_id WHERE c.id = $1 AND c.deleted_by IS NULL FOR UPDATE OF c",
             )
-            .bind(cid)
-            .fetch_optional(&st.pool)
+            .bind(uuid::Uuid::parse_str(cid).ok())
+            .fetch_optional(&mut *tx)
             .await
             .map_err(gql_err)?;
             let Some((body, author)) = found else {
@@ -10076,30 +11076,31 @@ impl MutationRoot {
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
-        let user = current_user(ctx).await?;
-
+        let now = crate::db_types::format_date(Utc::now());
         sqlx::query(
             "INSERT INTO report (id, kind, status, user_id, subject_id, subject_id_secondary, \
                                  subject_title, comment_id, reported_username, comment_excerpt, \
                                  source_url, detail, created_at) \
-             VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, 'open', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
-        .bind(&id)
+        .bind(crate::db_types::uuid(&id)?)
         .bind(input.kind.as_str())
-        .bind(user.as_ref().map(|u| u.id.as_str()))
+        .bind(crate::db_types::optional_uuid(
+            user.as_ref().map(|u| u.id.as_str()),
+        )?)
         .bind(&subject_id)
         .bind(&subject_id_secondary)
         .bind(&subject_title)
-        .bind(&comment_id)
+        .bind(crate::db_types::optional_uuid((comment_id).as_deref())?)
         .bind(&reported_username)
         .bind(&comment_excerpt)
         .bind(&source_url)
         .bind(&detail)
-        .bind(&now)
-        .execute(&st.pool)
+        .bind(crate::db_types::date(&now)?)
+        .execute(&mut *tx)
         .await
         .map_err(gql_err)?;
+        tx.commit().await.map_err(gql_err)?;
 
         tracing::info!(report_id = %id, kind = %input.kind.as_str(), "reader report filed");
 
@@ -10138,18 +11139,21 @@ impl MutationRoot {
         // from a fresh one in the queue rather than showing a stale "resolved 3 days ago".
         let (resolved_at, resolved_by) = match status {
             ReportStatus::Open => (None, None),
-            _ => (Some(Utc::now().to_rfc3339()), Some(admin.id.clone())),
+            _ => (
+                Some(crate::db_types::format_date(Utc::now())),
+                Some(admin.id.clone()),
+            ),
         };
 
         let affected = sqlx::query(
-            "UPDATE report SET status = ?, admin_note = COALESCE(?, admin_note), \
-                    resolved_at = ?, resolved_by = ? WHERE id = ?",
+            "UPDATE report SET status = $1, admin_note = COALESCE($2, admin_note), \
+                    resolved_at = $3, resolved_by = $4 WHERE id = $5",
         )
         .bind(status.as_str())
         .bind(&note)
-        .bind(&resolved_at)
-        .bind(&resolved_by)
-        .bind(&report_id.0)
+        .bind(crate::db_types::optional_date(resolved_at.as_deref())?)
+        .bind(crate::db_types::optional_uuid((resolved_by).as_deref())?)
+        .bind(uuid::Uuid::parse_str(&report_id.0).ok())
         .execute(&st.pool)
         .await
         .map_err(gql_err)?
@@ -10163,12 +11167,12 @@ impl MutationRoot {
                     r.subject_id_secondary, r.subject_title, r.comment_id, \
                     r.reported_username, r.comment_excerpt, r.source_url, r.detail, \
                     r.admin_note, r.created_at, r.resolved_at \
-             FROM report r LEFT JOIN users u ON u.id = r.user_id WHERE r.id = ?",
+             FROM report r LEFT JOIN users u ON u.id = r.user_id WHERE r.id = $1",
         )
-        .bind(&report_id.0)
+        .bind(uuid::Uuid::parse_str(&report_id.0).ok())
         .fetch_one(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         Ok(row.into())
     }
 
@@ -10248,66 +11252,9 @@ impl MutationRoot {
         // what the client shows as the comment thread.
         let user = require_user(ctx).await?;
         let st = state(ctx);
-        // The target must exist. `reviews.series_id` is a free-form TEXT key (it carries
-        // both `w_` work ids and numeric Suwayomi ids), so nothing in the schema stops a
-        // signed-in user from creating rows against arbitrary ids — and those rows feed
-        // the public rating aggregate.
-        if !known_series_id(&st.pool, &input.series_id.0).await {
-            return Err(Error::new("No such series"));
-        }
-        let now = Utc::now().to_rfc3339();
-        let id = uuid::Uuid::new_v4().to_string();
-        // WRITE UNDER THE WORK, not under whichever id the reader happened to be addressing.
-        //
-        // A rating is about the WORK; the id the series page holds is an accident of the
-        // route the reader took (a `w_…` on the canonical page, the numeric id of a source on
-        // a Browse link — and a work can have several sources). Writing the literal id is
-        // what let one user file two rows for one work and see "0 users rated" on both.
-        // Historical rows are deliberately NOT rewritten (the UNIQUE(series_id, user_id)
-        // collisions make that a destructive migration), so the read-side aggregates resolve
-        // every shape onto the work and keep one vote per (work, user).
-        let stored_id = resolve_work_id(&st.pool, &input.series_id.0)
+        let row = crate::db::retry_transaction(|| post_review_once(&st.pool, &user.id, &input))
             .await
-            .unwrap_or_else(|| input.series_id.0.clone());
-        // One review per (series, user): upsert, keeping the original id/created_at.
-        sqlx::query(
-            "INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(series_id, user_id) DO UPDATE SET \
-               score = excluded.score, body = excluded.body, \
-               has_spoiler = excluded.has_spoiler, updated_at = excluded.updated_at",
-        )
-        .bind(&id)
-        .bind(stored_id.clone())
-        .bind(&user.id)
-        .bind(input.score as i64)
-        .bind(input.body.trim())
-        .bind(input.has_spoiler)
-        .bind(&now)
-        .bind(&now)
-        .execute(&st.pool)
-        .await
-        .map_err(gql_err)?;
-
-        let row: ReviewJoin = sqlx::query_as(
-            "SELECT r.id, r.series_id, r.score, r.body, r.has_spoiler, r.created_at, r.updated_at, \
-             u.id AS author_id, u.username AS author_username, u.avatar_url AS author_avatar \
-             FROM reviews r JOIN users u ON u.id = r.user_id \
-             WHERE r.series_id = ? AND r.user_id = ?",
-        )
-        .bind(stored_id.clone())
-        .bind(&user.id)
-        .fetch_one(&st.pool)
-        .await
-        .map_err(gql_err)?;
-        log_activity(
-            &st.pool,
-            &user.id,
-            "review",
-            Some("series"),
-            Some(&input.series_id.0),
-        )
-        .await;
+            .map_err(mutation_write_error)?;
         Ok(row.into())
     }
 
@@ -10338,33 +11285,9 @@ impl MutationRoot {
     async fn delete_review(&self, ctx: &Context<'_>, series_id: ID) -> Result<bool> {
         let user = require_user(ctx).await?;
         let st = state(ctx);
-        let keys = review_key_set(&st.pool, &series_id.0).await;
-        let ph = in_placeholders(keys.len());
-        let sql = format!("DELETE FROM reviews WHERE user_id = ? AND series_id IN ({ph})");
-        let mut q = sqlx::query(&sql).bind(&user.id);
-        for k in &keys {
-            q = q.bind(k);
-        }
-        let removed = q.execute(&st.pool).await.map_err(gql_err)?.rows_affected();
-        if removed == 0 {
-            return Ok(false);
-        }
-        // The activity feed said "reviewed X" on the strength of a row that no longer
-        // exists; a withdrawn rating that still advertises itself on your profile is the
-        // same lie in a different place. Same key set, same user scoping.
-        let sql = format!(
-            "DELETE FROM user_activity \
-             WHERE user_id = ? AND kind = 'review' AND target_id IN ({ph})"
-        );
-        let mut q = sqlx::query(&sql).bind(&user.id);
-        for k in &keys {
-            q = q.bind(k);
-        }
-        if let Err(e) = q.execute(&st.pool).await {
-            // Best-effort: the vote is already gone, which is what the caller asked for.
-            tracing::warn!(error = %e, "failed to clear review activity");
-        }
-        Ok(true)
+        crate::db::retry_transaction(|| delete_review_once(&st.pool, &user.id, &series_id.0))
+            .await
+            .map_err(mutation_write_error)
     }
 
     async fn post_comment(&self, ctx: &Context<'_>, input: PostCommentInput) -> Result<Comment> {
@@ -10387,128 +11310,145 @@ impl MutationRoot {
             )));
         }
 
-        // The thread's target must exist. `comments.target_id` is a free-form TEXT key
-        // with no FK, so without this a signed-in user can open threads on arbitrary
-        // series/chapter ids.
-        let target_exists = match target_type {
-            "series" => known_series_id(&st.pool, &input.target_id.0).await,
-            _ => known_chapter_id(&st.pool, &input.target_id.0).await,
-        };
-        if !target_exists {
-            return Err(Error::new(format!("No such {target_type}")));
-        }
-
-        // A reply must point at an existing comment on the SAME target — this keeps
-        // a thread's tree self-consistent and blocks cross-thread / cross-series
-        // parent ids. The root of the tree is a NULL parent.
-        if let Some(parent) = input.parent_id.as_ref() {
-            let ok: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM comments WHERE id = ? AND target_type = ? AND target_id = ?",
-            )
-            .bind(&parent.0)
-            .bind(target_type)
-            .bind(input.target_id.0.clone())
-            .fetch_optional(&st.pool)
-            .await
-            .map_err(gql_err)?;
-            if ok.is_none() {
-                return Err(Error::new("reply target not found on this thread"));
-            }
-            // One thread (a top comment and everything under it) holds a bounded
-            // number of replies: `comments` returns whole threads, so without this
-            // one thread could make every read of its page as large as someone
-            // cares to post. Walk up to the top comment, then count what is under it.
-            let replies: i64 = sqlx::query_scalar(
-                "WITH RECURSIVE up(id, parent_id) AS ( \
-                     SELECT id, parent_id FROM comments WHERE id = ? \
-                     UNION ALL \
-                     SELECT c.id, c.parent_id FROM comments c JOIN up ON c.id = up.parent_id \
-                 ), \
-                 thread(id) AS ( \
-                     SELECT id FROM up WHERE parent_id IS NULL \
-                     UNION ALL \
-                     SELECT c.id FROM comments c JOIN thread t ON c.parent_id = t.id \
-                 ) \
-                 SELECT COUNT(*) - 1 FROM thread",
-            )
-            .bind(&parent.0)
-            .fetch_one(&st.pool)
-            .await
-            .map_err(gql_err)?;
-            if replies >= MAX_THREAD_REPLIES {
-                return Err(Error::new(
-                    "This thread is full. Post a new comment instead of a reply.",
-                ));
-            }
-        }
-
-        let now = Utc::now().to_rfc3339();
+        let now = crate::db_types::format_date(Utc::now());
         let id = uuid::Uuid::new_v4().to_string();
         let parent_id = input.parent_id.as_ref().map(|p| p.0.clone());
 
         // Insert the comment and (optionally) claim the staged image in one
         // transaction, so a comment never ends up referencing media it failed to
         // link (or media stays orphaned after the comment committed).
-        let media: Option<(i64, i64)> = {
-            let mut tx = st.pool.begin().await.map_err(gql_err)?;
+        let (media, stored_target) = crate::db::retry_transaction(|| async {
+            let mut tx = st.pool.begin().await?;
+            crate::locks::lock_user(&mut tx, &user.id).await?;
+            let sources = if target_type == "chapter" {
+                progress_sources_on(&mut tx, &input.target_id.0).await?
+            } else { Vec::new() };
+            if let Some(parent) = input.parent_id.as_ref() {
+                lock_comment_thread(&mut tx, &parent.0).await?;
+            }
+            let stored_target = if target_type == "series" {
+                let identity = lock_work_identity(&mut tx, &input.target_id.0, Some("No such series")).await?;
+                if !identity.starts_with("w_") {
+                    let exists: bool = sqlx::query_scalar(KNOWN_SUWAYOMI_SERIES_SQL)
+                        .bind(identity.parse::<i64>().ok()).fetch_one(&mut *tx).await?;
+                    if !exists { return Err(MutationValidation("No such series").into()); }
+                }
+                // Preserve numeric/source-shaped threads; canonical redirects use
+                // the surviving work. The work lock protects both shapes.
+                if input.target_id.0.starts_with("w_") { identity } else { input.target_id.0.clone() }
+            } else {
+                crate::locks::lock_source_series(&mut tx, &sources).await?;
+                if progress_sources_on(&mut tx, &input.target_id.0).await? != sources {
+                    return Err(crate::locks::RestartTransaction.into());
+                }
+                let exists: bool = sqlx::query_scalar(KNOWN_CHAPTER_SQL)
+                    .bind(&input.target_id.0).bind(input.target_id.0.parse::<i64>().ok()).fetch_one(&mut *tx).await?;
+                if !exists { return Err(MutationValidation("No such chapter").into()); }
+                input.target_id.0.clone()
+            };
+            // A reply must point at an existing comment on the SAME target — this keeps
+            // a thread's tree self-consistent and blocks cross-thread / cross-series
+            // parent ids. The root of the tree is a NULL parent.
+            if let Some(parent) = input.parent_id.as_ref() {
+                let parent_deleted: Option<Option<String>> = crate::db_types::query_scalar(
+                    "SELECT deleted_by FROM comments WHERE id = $1 AND target_type = $2 AND target_id = $3 FOR UPDATE",
+                )
+                .bind(uuid::Uuid::parse_str(&parent.0).ok())
+                .bind(target_type)
+                .bind(&stored_target)
+                .fetch_optional(&mut *tx)
+                .await
+                ?;
+                if parent_deleted.is_none() {
+                    return Err(MutationValidation("reply target not found on this thread").into());
+                }
+                if parent_deleted.flatten().is_some() {
+                    return Err(MutationValidation("You cannot reply to a deleted comment.").into());
+                }
+                // One thread (a top comment and everything under it) holds a bounded
+                // number of replies: `comments` returns whole threads, so without this
+                // one thread could make every read of its page as large as someone
+                // cares to post. Walk up to the top comment, then count what is under it.
+                let replies: i64 = crate::db_types::query_scalar(
+                    "WITH RECURSIVE up(id, parent_id) AS ( \
+                         SELECT id, parent_id FROM comments WHERE id = $1 \
+                         UNION ALL \
+                         SELECT c.id, c.parent_id FROM comments c JOIN up ON c.id = up.parent_id \
+                     ), \
+                     thread(id) AS ( \
+                         SELECT id FROM up WHERE parent_id IS NULL \
+                         UNION ALL \
+                         SELECT c.id FROM comments c JOIN thread t ON c.parent_id = t.id \
+                     ) \
+                     SELECT COUNT(*) - 1 FROM thread",
+                )
+                .bind(uuid::Uuid::parse_str(&parent.0).ok())
+                .fetch_one(&mut *tx)
+                .await
+                ?;
+                if replies >= MAX_THREAD_REPLIES {
+                    return Err(MutationValidation("This thread is full. Post a new comment instead of a reply.").into());
+                }
+            }
+
             sqlx::query(
                 "INSERT INTO comments \
                    (id, target_type, target_id, parent_id, user_id, body, has_spoiler, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
-            .bind(&id)
+            .bind(crate::db_types::uuid(&id)?)
             .bind(target_type)
-            .bind(input.target_id.0.clone())
-            .bind(&parent_id)
-            .bind(&user.id)
+            .bind(&stored_target)
+            .bind(crate::db_types::optional_uuid((parent_id).as_deref())?)
+            .bind(crate::db_types::uuid(&user.id)?)
             .bind(&body)
             .bind(input.has_spoiler)
-            .bind(&now)
+            .bind(crate::db_types::date(&now)?)
             .execute(&mut *tx)
             .await
-            .map_err(gql_err)?;
+            ?;
 
             let dims = if let Some(media_id) = input.media_id.as_ref() {
                 // Claim the caller's own, not-yet-linked upload. RETURNING gives us
                 // the stored dimensions for the response in the same statement.
-                let row: Option<(i64, i64)> = sqlx::query_as(
-                    "UPDATE comment_media SET comment_id = ? \
-                     WHERE id = ? AND user_id = ? AND comment_id IS NULL \
+                let row: Option<(i64, i64)> = crate::db_types::query_tuple(
+                    "UPDATE comment_media SET comment_id = $1 \
+                     WHERE id = $2 AND user_id = $3 AND comment_id IS NULL \
                      RETURNING width, height",
                 )
-                .bind(&id)
-                .bind(&media_id.0)
-                .bind(&user.id)
+                .bind(crate::db_types::uuid(&id)?)
+                .bind(uuid::Uuid::parse_str(&media_id.0).ok())
+                .bind(crate::db_types::uuid(&user.id)?)
                 .fetch_optional(&mut *tx)
                 .await
-                .map_err(gql_err)?;
+                ?;
                 if row.is_none() {
                     // Bad/foreign/already-used media id: abort so the comment isn't
                     // committed with a phantom attachment.
-                    return Err(Error::new("attached image not found"));
+                    return Err(MutationValidation("attached image not found").into());
                 }
                 row
             } else {
                 None
             };
-            tx.commit().await.map_err(gql_err)?;
-            dims
-        };
+            tx.commit().await?;
+            Ok((dims, stored_target))
+        }).await.map_err(mutation_write_error)?;
 
         log_activity(
             &st.pool,
             &user.id,
             "comment",
             Some(target_type),
-            Some(&input.target_id.0),
+            Some(&stored_target),
         )
         .await;
         // Notify the parent comment's author that someone replied — one notification
         // per reply, never to yourself. Fire-and-forget (must not fail the post).
         if let Some(pid) = parent_id.as_ref() {
             let parent_author: Option<String> =
-                sqlx::query_scalar("SELECT user_id FROM comments WHERE id = ?")
-                    .bind(pid)
+                crate::db_types::query_scalar("SELECT user_id FROM comments WHERE id = $1")
+                    .bind(uuid::Uuid::parse_str(pid).ok())
                     .fetch_optional(&st.pool)
                     .await
                     .ok()
@@ -10524,7 +11464,7 @@ impl MutationRoot {
                         Some(&user.id),
                         Some(&id),
                         Some(target_type),
-                        Some(&input.target_id.0),
+                        Some(&stored_target),
                         None,
                     )
                     .await;
@@ -10538,13 +11478,14 @@ impl MutationRoot {
         Ok(Comment {
             id: ID(id),
             target_type: target_type.to_string(),
-            target_id: input.target_id,
+            target_id: ID(stored_target),
             parent_id: input.parent_id,
             author: UserRef {
                 id: ID(user.id),
                 username: user.username,
                 avatar_url: user.avatar_url,
             },
+            deleted_by: None,
             body,
             has_spoiler: input.has_spoiler,
             media_url,
@@ -10572,84 +11513,15 @@ impl MutationRoot {
         }
         let user = require_user(ctx).await?;
         let st = state(ctx);
-        // Resolve the comment's author + thread (for the notification and self-check).
-        let row: Option<(String, String, String)> =
-            sqlx::query_as("SELECT user_id, target_type, target_id FROM comments WHERE id = ?")
-                .bind(&comment_id.0)
-                .fetch_optional(&st.pool)
-                .await
-                .map_err(gql_err)?;
-        let Some((author_id, target_type, target_id)) = row else {
-            return Err(Error::new("comment not found"));
-        };
-        // You can't vote on your own comment — that would let an author inflate their
-        // own like tally (which feeds everyone's milestones and any like-ranking).
-        if author_id == user.id {
-            return Err(Error::new("you can't vote on your own comment"));
-        }
-        let prior_likes: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM comment_votes WHERE comment_id = ? AND value = 1",
-        )
-        .bind(&comment_id.0)
-        .fetch_one(&st.pool)
+        // One retried unit: vote, tallies and the milestone notifications it crossed.
+        // The notification insert takes a key-share lock on the author's user row while
+        // this transaction holds the comment row, the reverse of what an account
+        // deletion does, so the unit can be a deadlock victim and is retried whole.
+        let (likes, dislikes) = crate::db::retry_transaction(|| {
+            vote_comment_once(&st.pool, &user.id, &comment_id.0, value)
+        })
         .await
-        .map_err(gql_err)?;
-
-        if value == 0 {
-            sqlx::query("DELETE FROM comment_votes WHERE comment_id = ? AND user_id = ?")
-                .bind(&comment_id.0)
-                .bind(&user.id)
-                .execute(&st.pool)
-                .await
-                .map_err(gql_err)?;
-        } else {
-            sqlx::query(
-                "INSERT INTO comment_votes (comment_id, user_id, value, created_at) \
-                 VALUES (?, ?, ?, ?) \
-                 ON CONFLICT(comment_id, user_id) DO UPDATE SET \
-                   value = excluded.value, created_at = excluded.created_at",
-            )
-            .bind(&comment_id.0)
-            .bind(&user.id)
-            .bind(value)
-            .bind(Utc::now().to_rfc3339())
-            .execute(&st.pool)
-            .await
-            .map_err(gql_err)?;
-        }
-
-        let (likes, dislikes): (i64, i64) = sqlx::query_as(
-            "SELECT \
-               COALESCE(SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END), 0), \
-               COALESCE(SUM(CASE WHEN value = -1 THEN 1 ELSE 0 END), 0) \
-             FROM comment_votes WHERE comment_id = ?",
-        )
-        .bind(&comment_id.0)
-        .fetch_one(&st.pool)
-        .await
-        .map_err(gql_err)?;
-
-        // Notify the author for EVERY milestone this like crossed (prior_likes, likes],
-        // not just an exact landing — so a like that jumps 4→6 (concurrent likes) still
-        // fires milestone 5. `record_like_milestone` is idempotent per (comment, count),
-        // so re-crossing after an unlike, or a concurrent double-send, notifies once.
-        // (Self-votes are already rejected above, so this is always someone else's like.)
-        if value == 1 && likes > prior_likes {
-            for &m in crate::notify::LIKE_MILESTONES {
-                if m > prior_likes && m <= likes {
-                    crate::notify::record_like_milestone(
-                        &st.pool,
-                        &author_id,
-                        &comment_id.0,
-                        &target_type,
-                        &target_id,
-                        m,
-                    )
-                    .await;
-                }
-            }
-        }
-
+        .map_err(mutation_write_error)?;
         Ok(CommentVote {
             likes: likes as i32,
             dislikes: dislikes as i32,
@@ -10667,47 +11539,28 @@ impl MutationRoot {
     ) -> Result<i32> {
         let user = require_user(ctx).await?;
         let st = state(ctx);
-        let now = Utc::now().to_rfc3339();
-        // Cap the explicit list: this issues one UPDATE per id inside a single
-        // transaction, so an unbounded list holds the single SQLite writer for as long as
-        // the caller cares to make it. "Mark all read" (omit `ids`) is the one-statement
-        // path for bulk, so no legitimate client needs more than this.
+        let now = crate::db_types::format_date(Utc::now());
+        // Bound explicit lists. Both paths lock rows in sorted native UUID order
+        // before their conditional transitions; malformed IDs never become mark-all.
         const MAX_NOTIFICATION_IDS: usize = 200;
         if ids.as_ref().is_some_and(|v| v.len() > MAX_NOTIFICATION_IDS) {
             return Err(Error::new(format!(
                 "Too many notification ids (max {MAX_NOTIFICATION_IDS}) — omit `ids` to mark all read"
             )));
         }
-        let affected = match ids {
-            Some(ids) if !ids.is_empty() => {
-                let mut n: u64 = 0;
-                let mut tx = st.pool.begin().await.map_err(gql_err)?;
-                for id in ids {
-                    let r = sqlx::query(
-                        "UPDATE notifications SET read_at = ? \
-                         WHERE id = ? AND user_id = ? AND read_at IS NULL",
-                    )
-                    .bind(&now)
-                    .bind(&id.0)
-                    .bind(&user.id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(gql_err)?;
-                    n += r.rows_affected();
-                }
-                tx.commit().await.map_err(gql_err)?;
-                n
-            }
-            _ => sqlx::query(
-                "UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL",
-            )
-            .bind(&now)
-            .bind(&user.id)
-            .execute(&st.pool)
-            .await
-            .map_err(gql_err)?
-            .rows_affected(),
+        let ids = match ids {
+            Some(ids) if !ids.is_empty() => Some(
+                ids.into_iter()
+                    .filter_map(|id| uuid::Uuid::parse_str(&id.0).ok())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
         };
+        let affected = crate::db::retry_transaction(|| {
+            mark_notifications_read_once(&st.pool, &user.id, ids.as_deref(), &now)
+        })
+        .await
+        .map_err(mutation_write_error)?;
         Ok(affected as i32)
     }
 
@@ -10747,12 +11600,12 @@ impl MutationRoot {
             )));
         }
         let row = sqlx::query_as::<_, User>(
-            "SELECT id, username, email, password_hash, avatar_url, is_admin, is_banned, must_change_password FROM users WHERE username = ?",
+            "SELECT id, username, email, password_hash, avatar_url, is_admin, is_banned, must_change_password FROM users WHERE username = $1",
         )
         .bind(&username)
         .fetch_optional(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         // Always run an Argon2 verify — against the real hash if the user exists,
         // else a fixed dummy hash — so login time doesn't reveal whether the
         // username exists (A3). Argon2 is ~10-50ms of pure CPU; run it off the async
@@ -10838,22 +11691,22 @@ impl MutationRoot {
         ensure_username_free(&st.pool, username).await?;
         let hash = hash_password_bounded(st, &input.password).await?;
         let id = uuid::Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
+        let now = crate::db_types::format_date(Utc::now());
         let is_admin = false;
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, avatar_url, is_admin, created_at) \
-             VALUES (?, ?, ?, ?, NULL, ?, ?)",
+             VALUES ($1, $2, $3, $4, NULL, $5, $6)",
         )
-        .bind(&id)
+        .bind(crate::db_types::uuid(&id )?)
         .bind(username)
         .bind(email)
         .bind(&hash)
-        .bind(is_admin as i64)
-        .bind(&now)
+        .bind(is_admin)
+        .bind(crate::db_types::date(&now )?)
         .execute(&st.pool)
         .await
         .map_err(|e| {
-            if e.to_string().contains("UNIQUE") {
+            if e.as_database_error().and_then(|e| e.code()).as_deref() == Some("23505") {
                 Error::new("username or email already taken")
             } else {
                 gql_err(e)
@@ -10880,7 +11733,7 @@ impl MutationRoot {
         let st = state(ctx);
         if let Some(tok) = token(ctx) {
             // Stored column is sha256(token) — hash the presented token to match.
-            sqlx::query("DELETE FROM sessions WHERE token = ?")
+            sqlx::query("DELETE FROM sessions WHERE token = $1")
                 .bind(auth::hash_token(&tok))
                 .execute(&st.pool)
                 .await
@@ -10916,7 +11769,7 @@ impl MutationRoot {
         }
         if crate::instance::admin_exists(&st.pool)
             .await
-            .map_err(gql_err)?
+            .map_err(gql_read_err)?
         {
             return Err(Error::new("This server is already set up."));
         }
@@ -10930,22 +11783,13 @@ impl MutationRoot {
         ensure_username_free(&st.pool, username).await?;
         let hash = hash_password_bounded(st, &password).await?;
         let id = uuid::Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
-        // One statement, so two racing setups cannot both create an admin.
-        let inserted = sqlx::query(
-            "INSERT INTO users (id, username, email, password_hash, avatar_url, is_admin, created_at) \
-             SELECT ?, ?, ?, ?, NULL, 1, ? \
-             WHERE NOT EXISTS (SELECT 1 FROM users WHERE is_admin = 1)",
-        )
-        .bind(&id)
-        .bind(username)
-        .bind(email)
-        .bind(&hash)
-        .bind(&now)
-        .execute(&st.pool)
+        let now = crate::db_types::format_date(Utc::now());
+        let inserted = crate::db::retry_transaction(|| {
+            create_owner_once(&st.pool, &id, username, email, &hash, &now)
+        })
         .await
-        .map_err(user_insert_err)?;
-        if inserted.rows_affected() == 0 {
+        .map_err(account_write_error)?;
+        if !inserted {
             return Err(Error::new("This server is already set up."));
         }
         st.setup_code.clear();
@@ -11002,13 +11846,18 @@ impl MutationRoot {
         }
         let hash = hash_password_bounded(st, &new_password).await?;
         let mut tx = st.pool.begin().await.map_err(gql_err)?;
+        crate::locks::lock_user(&mut tx, &user.id)
+            .await
+            .map_err(gql_err)?;
+        #[cfg(test)]
+        guard_pause("password-locked").await;
         // Guarded on the hash we verified against, so a concurrent reset wins.
         let updated = sqlx::query(
-            "UPDATE users SET password_hash = ?, must_change_password = 0 \
-             WHERE id = ? AND password_hash = ?",
+            "UPDATE users SET password_hash = $1, must_change_password = FALSE \
+             WHERE id = $2 AND password_hash = $3 AND is_banned = FALSE",
         )
         .bind(&hash)
-        .bind(&user.id)
+        .bind(crate::db_types::uuid(&user.id)?)
         .bind(&user.password_hash)
         .execute(&mut *tx)
         .await
@@ -11017,8 +11866,8 @@ impl MutationRoot {
             return Err(Error::new("Password changed elsewhere — sign in again"));
         }
         let keep = token(ctx).map(|t| auth::hash_token(&t)).unwrap_or_default();
-        sqlx::query("DELETE FROM sessions WHERE user_id = ? AND token != ?")
-            .bind(&user.id)
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1 AND token != $2")
+            .bind(crate::db_types::uuid(&user.id)?)
             .bind(&keep)
             .execute(&mut *tx)
             .await
@@ -11036,14 +11885,22 @@ impl MutationRoot {
         let st = state(ctx);
         // Stored column is sha256(token) — hash the presented token to exempt it.
         let sql = match token(ctx) {
-            Some(tok) => sqlx::query("DELETE FROM sessions WHERE user_id = ? AND token != ?")
-                .bind(&user.id)
+            Some(tok) => sqlx::query("DELETE FROM sessions WHERE user_id = $1 AND token != $2")
+                .bind(crate::db_types::uuid(&user.id)?)
                 .bind(auth::hash_token(&tok)),
             // Token resolved the user but isn't in ctx form (defensive) — nothing
             // to exempt, so revoke all of the user's rows.
-            None => sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(&user.id),
+            None => sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+                .bind(crate::db_types::uuid(&user.id)?),
         };
-        sql.execute(&st.pool).await.map_err(gql_err)?;
+        let mut tx = st.pool.begin().await.map_err(gql_err)?;
+        crate::locks::lock_user(&mut tx, &user.id)
+            .await
+            .map_err(gql_err)?;
+        #[cfg(test)]
+        guard_pause("revoke-locked").await;
+        sql.execute(&mut *tx).await.map_err(gql_err)?;
+        tx.commit().await.map_err(gql_err)?;
         Ok(true)
     }
 
@@ -11076,10 +11933,10 @@ impl MutationRoot {
             }
         }
         let st = state(ctx);
-        sqlx::query("UPDATE users SET display_name = ?, bio = ? WHERE id = ?")
+        sqlx::query("UPDATE users SET display_name = $1, bio = $2 WHERE id = $3")
             .bind(&display_name)
             .bind(&bio)
-            .bind(&user.id)
+            .bind(crate::db_types::uuid(&user.id)?)
             .execute(&st.pool)
             .await
             .map_err(gql_err)?;
@@ -11091,9 +11948,9 @@ impl MutationRoot {
     /// Returns the new value.
     async fn set_show_nsfw(&self, ctx: &Context<'_>, value: bool) -> Result<bool> {
         let user = require_user(ctx).await?;
-        sqlx::query("UPDATE users SET show_nsfw = ? WHERE id = ?")
-            .bind(value as i64)
-            .bind(&user.id)
+        sqlx::query("UPDATE users SET show_nsfw = $1 WHERE id = $2")
+            .bind(value)
+            .bind(crate::db_types::uuid(&user.id)?)
             .execute(&state(ctx).pool)
             .await
             .map_err(gql_err)?;
@@ -11132,27 +11989,16 @@ impl MutationRoot {
         })?;
         let m = st.suwayomi.series(n).await.map_err(gql_err)?;
 
-        let now = Utc::now().to_rfc3339();
         let status = input.status.map(status_word);
-        let paused = input.paused.map(|p| p as i64);
-        sqlx::query(
-            "INSERT INTO series_admin \
-               (series_id, override_interval_hours, poll_every_minutes, paused_override, status_override, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(series_id) DO UPDATE SET \
-               override_interval_hours = excluded.override_interval_hours, \
-               poll_every_minutes = excluded.poll_every_minutes, \
-               paused_override = excluded.paused_override, \
-               status_override = excluded.status_override, \
-               updated_at = excluded.updated_at",
-        )
-        .bind(input.series_id.0.clone())
-        .bind(input.override_interval_hours)
-        .bind(input.poll_every_minutes)
-        .bind(paused)
-        .bind(status)
-        .bind(&now)
-        .execute(&st.pool)
+        let write = SeriesAdminWrite::Replace {
+            override_interval_hours: input.override_interval_hours,
+            poll_every_minutes: input.poll_every_minutes,
+            paused: input.paused,
+            status,
+        };
+        crate::db::retry_transaction(|| {
+            write_series_admin_once(&st.pool, n, &input.series_id.0, write, Utc::now())
+        })
         .await
         .map_err(gql_err)?;
         // Make the change take effect promptly WITHOUT stranding or thrashing the series.
@@ -11165,6 +12011,7 @@ impl MutationRoot {
         // hiccups, fall back to due-now so a parked series still can't be stranded by a
         // cleared/loosened override.
         if let Err(e) = scan_series(st, &m, Utc::now()).await {
+            crate::db::observe_database_error(&e);
             tracing::warn!(series_id = n, error = %e, "updateSeriesAdmin: re-scan failed; marking due-now");
             mark_scan_due_now(&st.pool, &input.series_id.0)
                 .await
@@ -11192,16 +12039,15 @@ impl MutationRoot {
         // Resolve the series first so a bogus id fails before any write.
         let m = st.suwayomi.series(n).await.map_err(gql_err)?;
         let now = Utc::now();
-        sqlx::query(
-            "INSERT INTO series_admin (series_id, paused_override, updated_at) VALUES (?, ?, ?) \
-             ON CONFLICT(series_id) DO UPDATE SET \
-               paused_override = excluded.paused_override, \
-               updated_at = excluded.updated_at",
-        )
-        .bind(&series_id.0)
-        .bind(paused as i64)
-        .bind(now.to_rfc3339())
-        .execute(&st.pool)
+        crate::db::retry_transaction(|| {
+            write_series_admin_once(
+                &st.pool,
+                n,
+                &series_id.0,
+                SeriesAdminWrite::Paused(paused),
+                now,
+            )
+        })
         .await
         .map_err(gql_err)?;
         if !paused {
@@ -11235,212 +12081,12 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: SeriesMetadataInput,
     ) -> Result<Series> {
-        use async_graphql::MaybeUndefined::{Null, Undefined, Value};
         require_admin(ctx).await?;
         let st = state(ctx);
-        let work_id = resolve_work_id(&st.pool, &input.series_id.0)
-            .await
-            .ok_or_else(|| {
-                Error::new(
-                    "Series is not catalogued — add it to the catalogue before editing its metadata.",
-                )
-            })?;
-        let now = Utc::now().to_rfc3339();
-
-        // All override writes in ONE transaction so a partial failure can't leave a
-        // half-applied edit. Each singular column follows the three-valued input:
-        // Undefined => leave; Null => clear (NULL); Value => set.
-        let mut tx = st.pool.begin().await.map_err(gql_err)?;
-        match &input.title {
-            Undefined => {}
-            Null | Value(_) => {
-                let v = match &input.title {
-                    Value(v) => Some(v.as_str()),
-                    _ => None,
-                };
-                sqlx::query("UPDATE work SET title_override = ?, updated_at = ? WHERE id = ?")
-                    .bind(v)
-                    .bind(&now)
-                    .bind(&work_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(gql_err)?;
-            }
-        }
-        match &input.description {
-            Undefined => {}
-            Null | Value(_) => {
-                let v = match &input.description {
-                    Value(v) => Some(v.as_str()),
-                    _ => None,
-                };
-                sqlx::query(
-                    "UPDATE work SET description_override = ?, updated_at = ? WHERE id = ?",
-                )
-                .bind(v)
-                .bind(&now)
-                .bind(&work_id)
-                .execute(&mut *tx)
+        let work_id =
+            crate::db::retry_transaction(|| update_series_metadata_once(&st.pool, &input))
                 .await
-                .map_err(gql_err)?;
-            }
-        }
-        match input.r#type {
-            Undefined => {}
-            Null | Value(_) => {
-                let word = match input.r#type {
-                    Value(t) => Some(content_type_word(t)),
-                    _ => None,
-                };
-                sqlx::query(
-                    "UPDATE work SET content_type_override = ?, updated_at = ? WHERE id = ?",
-                )
-                .bind(word)
-                .bind(&now)
-                .bind(&work_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(gql_err)?;
-            }
-        }
-        match input.is_nsfw {
-            Undefined => {}
-            Null | Value(_) => {
-                let val = match input.is_nsfw {
-                    Value(b) => Some(b as i64),
-                    _ => None,
-                };
-                sqlx::query("UPDATE work SET is_nsfw_override = ?, updated_at = ? WHERE id = ?")
-                    .bind(val)
-                    .bind(&now)
-                    .bind(&work_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(gql_err)?;
-            }
-        }
-        // Tags: `tags: []` and `tags: null` both leave zero curated rows → the work
-        // reverts to source-derived genres (curated-empty is intentionally not
-        // expressible; the console only sends `tags` when the admin edits them).
-        match &input.tags {
-            Undefined => {}
-            Null | Value(_) => {
-                sqlx::query("DELETE FROM work_tag WHERE work_id = ?")
-                    .bind(&work_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(gql_err)?;
-                if let Value(list) = &input.tags {
-                    for (i, tag) in list.iter().enumerate() {
-                        let t = tag.trim();
-                        if t.is_empty() {
-                            continue;
-                        }
-                        // `tag_key` (migration 0106) so the curated tag is filterable
-                        // immediately; `tags::fill_tag_keys` would otherwise only reach it
-                        // at the next Browse rebuild.
-                        sqlx::query(
-                            "INSERT OR IGNORE INTO work_tag (work_id, tag, ord, tag_key) \
-                             VALUES (?, ?, ?, ?)",
-                        )
-                        .bind(&work_id)
-                        .bind(t)
-                        .bind(i as i64)
-                        .bind(crate::tags::slug(t))
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(gql_err)?;
-                    }
-                }
-            }
-        }
-        // Source-owned fields. A value pins the column; null hands it back to the source.
-        use catalog::PinnedField;
-        let text = |v: &str, max: usize| -> Option<String> {
-            let v: String = v.trim().chars().take(max).collect();
-            (!v.is_empty()).then_some(v)
-        };
-        let mut pins: Vec<(PinnedField, Option<Option<String>>)> = Vec::new();
-        let mut pin = |field, value: Option<Option<String>>| pins.push((field, value));
-        match &input.author {
-            Undefined => {}
-            Null => pin(PinnedField::Author, None),
-            Value(v) => pin(PinnedField::Author, Some(text(v, 300))),
-        }
-        match &input.artist {
-            Undefined => {}
-            Null => pin(PinnedField::Artist, None),
-            Value(v) => pin(PinnedField::Artist, Some(text(v, 300))),
-        }
-        match input.year {
-            Undefined => {}
-            Null => pin(PinnedField::Year, None),
-            Value(y) if (1800..=2100).contains(&y) => {
-                pin(PinnedField::Year, Some(Some(y.to_string())))
-            }
-            Value(_) => return Err(Error::new("Year must be between 1800 and 2100.")),
-        }
-        match &input.original_language {
-            Undefined => {}
-            Null => pin(PinnedField::OriginalLanguage, None),
-            Value(v) => {
-                let code = v.trim().to_lowercase();
-                let valid = code.is_empty()
-                    || (code.len() <= 8
-                        && code.split('-').all(|part| {
-                            (2..=4).contains(&part.len())
-                                && part.chars().all(|c| c.is_ascii_alphanumeric())
-                        }));
-                if !valid {
-                    return Err(Error::new(
-                        "Original language must be a language code such as ja, ko, zh or zh-hk.",
-                    ));
-                }
-                pin(PinnedField::OriginalLanguage, Some(text(&code, 8)))
-            }
-        }
-        match input.status {
-            Undefined => {}
-            Null => pin(PinnedField::Status, None),
-            Value(st) => pin(PinnedField::Status, Some(Some(status_word(st).to_string()))),
-        }
-        match input.demographic {
-            Undefined => {}
-            Null => pin(PinnedField::Demographic, None),
-            // "No demographic" is stored as NULL.
-            Value(Demographic::None) => pin(PinnedField::Demographic, Some(None)),
-            Value(d) => pin(
-                PinnedField::Demographic,
-                Some(Some(demographic_word(d).to_string())),
-            ),
-        }
-        match input.content_rating {
-            Undefined => {}
-            Null => pin(PinnedField::ContentRating, None),
-            Value(r) => pin(
-                PinnedField::ContentRating,
-                Some(Some(content_rating_word(r).to_string())),
-            ),
-        }
-        for (field, value) in pins {
-            match value {
-                Some(value) => {
-                    catalog::pin_work_field(&mut tx, &work_id, field, value.as_deref()).await
-                }
-                None => catalog::unpin_work_field(&mut tx, &work_id, field).await,
-            }
-            .map_err(gql_err)?;
-        }
-        // Project the title, aliases, tags and visibility under the metadata
-        // transaction, so a committed edit is immediately browsable and searchable.
-        catalog::upsert_browse_work(&mut tx, &work_id)
-            .await
-            .map_err(gql_err)?;
-        tx.commit().await.map_err(gql_err)?;
-        // `is_nsfw` above may have just changed the effective flag; push it into the two
-        // feed tables that store a COPY of it, or `updatesFeed` keeps serving this work to
-        // opted-out viewers until the next feed rebuild. See `resync_feed_nsfw`.
-        resync_feed_nsfw(&st.pool, std::slice::from_ref(&work_id)).await;
+                .map_err(mutation_write_error)?;
         // The home rails and Browse's genre chips memoize their payloads for
         // `FEED_TTL`, and this edit can change title, type, tags OR the NSFW gate that
         // keys them. Without this the admin's correction is invisible for up to a
@@ -11451,11 +12097,11 @@ impl MutationRoot {
         if input.series_id.0.starts_with("w_") {
             let work = catalog::load_canonical_work(&st.pool, &work_id)
                 .await
-                .map_err(gql_err)?
+                .map_err(gql_read_err)?
                 .ok_or_else(|| Error::new("No such work"))?;
             let chapters = catalog::load_canonical_chapters(&st.pool, &work_id)
                 .await
-                .map_err(gql_err)?;
+                .map_err(gql_read_err)?;
             let user = current_user(ctx).await?;
             map_canonical_series(
                 &st.pool,
@@ -11505,13 +12151,13 @@ impl MutationRoot {
         if !norm.is_empty() {
             let mut involved: Vec<String> = catalog::find_works_by_alias(&st.pool, &norm)
                 .await
-                .map_err(gql_err)?;
+                .map_err(gql_read_err)?;
             if !involved.contains(&work_id) {
                 involved.push(work_id.clone());
             }
             let match_data = catalog::load_match_data_batch(&st.pool, &involved)
                 .await
-                .map_err(gql_err)?;
+                .map_err(gql_read_err)?;
             let edited_author = match_data.get(&work_id).and_then(|m| m.author.as_deref());
             involved.retain(|wid| {
                 wid == &work_id
@@ -11523,7 +12169,7 @@ impl MutationRoot {
             if involved.len() >= 2 && involved.len() <= MAX_AUTO_MERGE {
                 survivor = catalog::pick_survivor(&st.pool, &involved)
                     .await
-                    .map_err(gql_err)?;
+                    .map_err(gql_read_err)?;
                 for other in involved.iter().filter(|w| *w != &survivor) {
                     // Never re-fold a pair an admin SPLIT apart (migration 0098). This
                     // path is the easiest way to undo a split by accident: the two halves
@@ -11559,30 +12205,37 @@ impl MutationRoot {
                     ) {
                         continue;
                     }
-                    match catalog::merge_works_checked(
+                    // Everything above was read without a lock. The pair is merged as
+                    // one guarded transaction that repeats the decision on the locked
+                    // works: both must still carry this alias (an alias removed in
+                    // between leaves the pair alone), their authors must still match,
+                    // and neither identity may have been edited (T137).
+                    let alias_key = crate::catalog::normalize::match_key(&norm);
+                    merge_pair_guarded(
                         &st.pool,
                         Some(&st.cover_pool),
                         other,
                         &survivor,
-                        Some((&source.identity(None), &target.identity(None))),
+                        Some((
+                            &source.identity(Some(&alias_key)),
+                            &target.identity(Some(&alias_key)),
+                        )),
+                        None,
+                        MergeGate::SharedAlias(&norm),
                     )
                     .await
-                    {
-                        Ok(_) => {}
-                        Err(e) if is_precondition_failure(&e) => continue,
-                        Err(e) => return Err(gql_err(e)),
-                    }
+                    .map_err(gql_err)?;
                 }
             }
         }
         // A blocked pair may leave the edited work intact even if another survivor
         // was selected. Keep the editor on that work until it actually merges away.
         let edited_exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work WHERE id = ?)")
+            crate::db_types::query_scalar("SELECT EXISTS(SELECT 1 FROM work WHERE id = $1)")
                 .bind(&work_id)
                 .fetch_one(&st.pool)
                 .await
-                .map_err(gql_err)?;
+                .map_err(gql_read_err)?;
         if edited_exists {
             survivor = work_id.clone();
         }
@@ -11647,7 +12300,12 @@ impl MutationRoot {
             ));
         };
         let limit = limit.max(1) as i64;
-        let res = sweep_duplicates_once(&st.pool, Some(&st.cover_pool), limit).await;
+        let res = Database::background_scope(sweep_duplicates_once(
+            &st.pool,
+            Some(&st.cover_pool),
+            limit,
+        ))
+        .await;
         let out = res.map_err(gql_err)?;
         tracing::info!(
             merged = out.merged,
@@ -11686,9 +12344,9 @@ impl MutationRoot {
         // Push the new effective flag into the two feed tables that store a COPY of it.
         // Same id set as the UPDATE above, read back rather than threaded through: the
         // UPDATE reports a row COUNT, not which rows (see `resync_feed_nsfw`).
-        let touched: Vec<String> = sqlx::query_scalar(
+        let touched: Vec<String> = crate::db_types::query_scalar(
             "SELECT work_id FROM source_series \
-             WHERE source_type = 'suwayomi' AND source_id = ?",
+             WHERE source_type = 'suwayomi' AND source_id = $1",
         )
         .bind(&source_id)
         .fetch_all(&st.pool)
@@ -11717,18 +12375,18 @@ impl MutationRoot {
         // source_series rows — measured at 10,264 ms for this one query. Casting the
         // other side turns `SCAN s LEFT-JOIN` into
         // `SEARCH s USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN`.
-        let rows = sqlx::query_as::<_, (String, String, Option<String>, i64, i64, Option<String>)>(
-            "SELECT ss.work_id, COALESCE(ss.source_id, '') AS source_id, s.genre, w.is_nsfw, COALESCE(se.is_nsfw, 0), \
+        let rows = crate::db_types::query_tuple::<(String, String, Option<String>, i64, i64, Option<String>)>(
+            "SELECT ss.work_id, COALESCE(ss.source_id, '') AS source_id, s.genre, w.is_nsfw, COALESCE(se.is_nsfw, FALSE), \
                     w.content_rating \
              FROM source_series ss \
              JOIN work w ON w.id = ss.work_id \
-             LEFT JOIN suwayomi_series s ON s.id = CAST(ss.source_key AS INTEGER) \
+             LEFT JOIN suwayomi_series s ON s.id = sqlite_integer_pin(ss.source_key) \
              LEFT JOIN source_extension se ON se.source_id = ss.source_id \
              WHERE ss.source_type = 'suwayomi'",
         )
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
 
         // A work is NSFW if ANY of its Suwayomi sources is adult (genre or source
         // flag) — UNLESS MangaDex authoritatively rated it safe/suggestive, which wins
@@ -11764,31 +12422,25 @@ impl MutationRoot {
                 *per_source.entry(src.clone()).or_default() += 1;
             }
         }
-        let now = Utc::now().to_rfc3339();
-        for chunk in to_flip.chunks(500) {
-            let sql = format!(
-                "UPDATE work SET is_nsfw = 1, updated_at = ? WHERE id IN ({})",
-                in_placeholders(chunk.len())
-            );
-            let mut q = sqlx::query(&sql).bind(&now);
-            for wid in chunk {
-                q = q.bind(wid);
+        let mut flipped = Vec::new();
+        for wid in &to_flip {
+            if crate::db::retry_transaction(|| rederive_nsfw_once(&st.pool, wid))
+                .await
+                .map_err(mutation_write_error)?
+            {
+                flipped.push(wid.clone());
             }
-            q.execute(&st.pool).await.map_err(gql_err)?;
         }
-        // Push the newly-derived flags into the two feed tables that store a COPY of them
-        // (see `resync_feed_nsfw`). Only the flipped works can have changed.
-        resync_feed_nsfw(&st.pool, &to_flip).await;
         clear_feed_caches();
         for (src, n) in &per_source {
             tracing::info!(source_id = %src, flipped = n, "rederiveSuwayomiNsfw: source flagged");
         }
         tracing::info!(
-            total = to_flip.len(),
+            total = flipped.len(),
             sources = per_source.len(),
             "rederiveSuwayomiNsfw complete"
         );
-        Ok(to_flip.len() as i32)
+        Ok(flipped.len() as i32)
     }
 
     /// Admin: force an immediate re-scan of every installed Suwayomi source of a
@@ -11797,24 +12449,25 @@ impl MutationRoot {
     async fn rescan_work(&self, ctx: &Context<'_>, work_id: ID) -> Result<i32> {
         require_admin(ctx).await?;
         let st = state(ctx);
-        let keys: Vec<String> = sqlx::query_scalar(
+        let keys: Vec<String> = crate::db_types::query_scalar(
             "SELECT source_key FROM source_series \
-             WHERE work_id = ? AND source_type = 'suwayomi'",
+             WHERE work_id = $1 AND source_type = 'suwayomi'",
         )
         .bind(&work_id.0)
         .fetch_all(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         let now = Utc::now();
         let mut scanned = 0;
         for key in keys {
             let Ok(n) = key.parse::<i64>() else { continue };
             match st.suwayomi.series(n).await {
-                Ok(m) => {
-                    if scan_series(st, &m, now).await.is_ok() {
-                        scanned += 1;
+                Ok(m) => match scan_series(st, &m, now).await {
+                    Ok(_) => scanned += 1,
+                    Err(error) => {
+                        crate::db::observe_database_error(&error);
                     }
-                }
+                },
                 Err(e) => {
                     tracing::warn!(source_key = key, error = %e, "rescanWork: skipping unresolvable source")
                 }
@@ -11875,42 +12528,23 @@ impl MutationRoot {
         .map_err(mutation_write_error)
     }
 
-    /// Admin moderation: delete a comment and its entire reply subtree. Returns
-    /// false if it was already gone. (Authors don't self-delete here — this is the
-    /// mod action.) The subtree and its attached images are removed explicitly
-    /// (via a recursive CTE) rather than relying on `ON DELETE CASCADE`, so it
-    /// behaves the same on connections without the foreign_keys pragma.
+    /// Remove a comment as its author or an admin, preserving every reply. A comment
+    /// with children becomes a content-free tombstone; a leaf is deleted, along with
+    /// any now-empty tombstone ancestors. Missing or already-deleted comments return false.
     async fn delete_comment(&self, ctx: &Context<'_>, comment_id: ID) -> Result<bool> {
-        require_admin(ctx).await?;
+        let user = require_user(ctx).await?;
+        let Ok(id) = uuid::Uuid::parse_str(&comment_id.0) else {
+            return Ok(false);
+        };
         let st = state(ctx);
-        let mut tx = st.pool.begin().await.map_err(gql_err)?;
-        // Drop the attached images of the whole subtree first (FK-safe ordering).
-        sqlx::query(
-            "WITH RECURSIVE subtree(id) AS ( \
-                 SELECT id FROM comments WHERE id = ? \
-                 UNION ALL \
-                 SELECT c.id FROM comments c JOIN subtree s ON c.parent_id = s.id \
-             ) \
-             DELETE FROM comment_media WHERE comment_id IN (SELECT id FROM subtree)",
-        )
-        .bind(&comment_id.0)
-        .execute(&mut *tx)
-        .await
-        .map_err(gql_err)?;
-        let res = sqlx::query(
-            "WITH RECURSIVE subtree(id) AS ( \
-                 SELECT id FROM comments WHERE id = ? \
-                 UNION ALL \
-                 SELECT c.id FROM comments c JOIN subtree s ON c.parent_id = s.id \
-             ) \
-             DELETE FROM comments WHERE id IN (SELECT id FROM subtree)",
-        )
-        .bind(&comment_id.0)
-        .execute(&mut *tx)
-        .await
-        .map_err(gql_err)?;
-        tx.commit().await.map_err(gql_err)?;
-        Ok(res.rows_affected() > 0)
+        // The unit locks several comment rows and deletes parent rows of votes, media
+        // and notifications. A writer that holds one of those rows and wants another
+        // (a catalogue merge re-pointing the thread, a notification insert that needs
+        // the author's user row) can close a cycle with it, so the whole unit is
+        // retried when it is the deadlock victim.
+        crate::db::retry_transaction(|| delete_comment_once(&st.pool, &user.id, id))
+            .await
+            .map_err(mutation_write_error)
     }
 
     /// Admin user-management: grant or revoke a user's admin flag. An admin can't
@@ -11991,18 +12625,45 @@ impl MutationRoot {
         let admin = require_admin(ctx).await?;
         use crate::instance as inst;
         let st = state(ctx);
+        static PUBLICATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        #[cfg(test)]
+        let _publication = {
+            let mut waiting = Box::pin(PUBLICATION.lock());
+            match futures::poll!(waiting.as_mut()) {
+                std::task::Poll::Ready(guard) => guard,
+                std::task::Poll::Pending => {
+                    guard_pause("mangadex-waiting").await;
+                    waiting.await
+                }
+            }
+        };
+        #[cfg(not(test))]
+        let _publication = PUBLICATION.lock().await;
         if let Some(var) = inst::resolve_mangadex(&st.pool).await.pinned_by {
             return Err(Error::new(format!(
                 "MangaDex is set by {var} on this server and cannot be changed here."
             )));
         }
+        let mut tx = st.pool.begin().await.map_err(gql_err)?;
+        crate::locks::advisory(
+            &mut tx,
+            &[crate::locks::AdvisoryKey::new(
+                crate::locks::KeyClass::InstanceSetting,
+                &["mangadex_enabled"],
+            )],
+        )
+        .await
+        .map_err(gql_err)?;
         inst::store(
-            &st.pool,
+            &mut *tx,
             &inst::MANGADEX_ENABLED,
             if enabled { "true" } else { "false" },
         )
         .await
         .map_err(gql_err)?;
+        tx.commit().await.map_err(gql_err)?;
+        #[cfg(test)]
+        guard_pause("mangadex-persisted").await;
         // Store first, then flip: a failed write leaves the live switch where it was,
         // so memory never claims a value the next boot would not restore.
         if st.mangadex.set_enabled(enabled) {
@@ -12234,7 +12895,7 @@ impl MutationRoot {
     /// asked to pick their own password at first sign-in unless
     /// `mustChangePassword: false`. Reserved admin usernames stay reserved.
     async fn create_user(&self, ctx: &Context<'_>, input: CreateUserInput) -> Result<AdminUser> {
-        require_admin(ctx).await?;
+        let actor = require_admin(ctx).await?;
         let st = state(ctx);
         let username = input.username.trim();
         let email = input.email.trim();
@@ -12249,30 +12910,50 @@ impl MutationRoot {
         ensure_username_free(&st.pool, username).await?;
         let hash = hash_password_bounded(st, &input.password).await?;
         let id = uuid::Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
+        let now = crate::db_types::format_date(Utc::now());
+        let mut tx = st.pool.begin().await.map_err(gql_err)?;
+        crate::locks::advisory(&mut tx, &[crate::locks::AdvisoryKey::membership()])
+            .await
+            .map_err(gql_err)?;
+        crate::locks::lock_user(&mut tx, &actor.id)
+            .await
+            .map_err(gql_err)?;
+        require_admin_on(&mut tx, &actor.id)
+            .await
+            .map_err(mutation_write_error)?;
+        crate::locks::advisory(
+            &mut tx,
+            &[
+                crate::locks::AdvisoryKey::username(username),
+                crate::locks::AdvisoryKey::email(email),
+            ],
+        )
+        .await
+        .map_err(gql_err)?;
         sqlx::query(
             "INSERT INTO users \
                (id, username, email, password_hash, avatar_url, is_admin, must_change_password, created_at) \
-             VALUES (?, ?, ?, ?, NULL, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, NULL, $5, $6, $7)",
         )
-        .bind(&id)
+        .bind(crate::db_types::uuid(&id )?)
         .bind(username)
         .bind(email)
         .bind(&hash)
-        .bind(input.is_admin.unwrap_or(false) as i64)
-        .bind(input.must_change_password.unwrap_or(true) as i64)
-        .bind(&now)
-        .execute(&st.pool)
+        .bind(input.is_admin.unwrap_or(false))
+        .bind(input.must_change_password.unwrap_or(true))
+        .bind(crate::db_types::date(&now )?)
+        .execute(&mut *tx)
         .await
         .map_err(user_insert_err)?;
+        tx.commit().await.map_err(gql_err)?;
         let row: AdminUserRow = sqlx::query_as(
             "SELECT id, username, email, avatar_url, is_admin, is_banned, created_at \
-             FROM users WHERE id = ?",
+             FROM users WHERE id = $1",
         )
-        .bind(&id)
+        .bind(crate::db_types::uuid(&id)?)
         .fetch_one(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         Ok(row.into())
     }
 
@@ -12295,19 +12976,32 @@ impl MutationRoot {
         validate_new_password(&password)?;
         let hash = hash_password_bounded(st, &password).await?;
         let mut tx = st.pool.begin().await.map_err(gql_err)?;
+        crate::locks::advisory(&mut tx, &[crate::locks::AdvisoryKey::membership()])
+            .await
+            .map_err(gql_err)?;
+        let users: Vec<&str> = [admin.id.as_str(), user_id.0.as_str()]
+            .into_iter()
+            .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+            .collect();
+        crate::locks::lock_users(&mut tx, &users)
+            .await
+            .map_err(gql_err)?;
+        require_admin_on(&mut tx, &admin.id)
+            .await
+            .map_err(mutation_write_error)?;
         let updated = sqlx::query(
-            "UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?",
+            "UPDATE users SET password_hash = $1, must_change_password = TRUE WHERE id = $2",
         )
         .bind(&hash)
-        .bind(&user_id.0)
+        .bind(uuid::Uuid::parse_str(&user_id.0).ok())
         .execute(&mut *tx)
         .await
         .map_err(gql_err)?;
         if updated.rows_affected() == 0 {
             return Err(Error::new("No such user."));
         }
-        sqlx::query("DELETE FROM sessions WHERE user_id = ?")
-            .bind(&user_id.0)
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+            .bind(uuid::Uuid::parse_str(&user_id.0).ok())
             .execute(&mut *tx)
             .await
             .map_err(gql_err)?;
@@ -12361,6 +13055,7 @@ impl MutationRoot {
         // `ensure_pending` is an idempotent `ON CONFLICT DO NOTHING`, so a successful scan
         // right after cleanly overwrites the schedule (mirrors `federated_ingest`).
         if let Err(e) = crate::scanner::ensure_pending(&st.pool, &mid.to_string()).await {
+            crate::db::observe_database_error(&e);
             tracing::warn!(
                 series_id = m.id,
                 error = %e,
@@ -12387,6 +13082,7 @@ impl MutationRoot {
         // Idempotent (record_scan is a read-modify-write keyed on the series) and
         // rate-limit-safe (a single chapters fetch for this one series).
         if let Err(e) = scan_series(st, &m, Utc::now()).await {
+            crate::db::observe_database_error(&e);
             tracing::warn!(
                 series_id = m.id,
                 error = %e,
@@ -12488,13 +13184,13 @@ impl MutationRoot {
     ) -> Result<bool> {
         require_admin(ctx).await?;
         let st = state(ctx);
-        let row: Option<(String, String, String)> = sqlx::query_as(
-            "SELECT source_series_id, candidate_work_id, status FROM merge_candidate WHERE id = ?",
+        let row: Option<(String, String, String)> = crate::db_types::query_tuple(
+            "SELECT source_series_id, candidate_work_id, status FROM merge_candidate WHERE id = $1",
         )
         .bind(&id.0)
         .fetch_optional(&st.pool)
         .await
-        .map_err(gql_err)?;
+        .map_err(gql_read_err)?;
         let Some((source_series_id, target_work, status)) = row else {
             return Err(Error::new("No such merge candidate."));
         };
@@ -12504,22 +13200,20 @@ impl MutationRoot {
         // Preserve the owner the admin approved throughout retries. A concurrent split
         // must not make a retried request approve a different source work.
         let source_work: Option<String> =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
+            crate::db_types::query_scalar("SELECT work_id FROM source_series WHERE id = $1")
                 .bind(&source_series_id)
                 .fetch_optional(&st.pool)
                 .await
-                .map_err(gql_err)?;
-        crate::db::retry_transaction(|| {
-            resolve_merge_review_once(
-                &st.pool,
-                &st.cover_pool,
-                &id.0,
-                &source_series_id,
-                source_work.as_deref(),
-                &target_work,
-                accept,
-            )
-        })
+                .map_err(gql_read_err)?;
+        resolve_merge_review_once(
+            &st.pool,
+            &st.cover_pool,
+            &id.0,
+            &source_series_id,
+            source_work.as_deref(),
+            &target_work,
+            accept,
+        )
         .await
         .map_err(mutation_write_error)?;
         clear_feed_caches();
@@ -12625,6 +13319,7 @@ impl MutationRoot {
         // invisible state (the Sync toggle only renders for installed extensions) and
         // silently resume syncing on a later reinstall (audit LOW). Best-effort.
         if let Err(err) = catalog::set_extension_subscription(&st.pool, &pkg_name, false).await {
+            crate::db::observe_database_error(&err);
             tracing::warn!(pkg = %pkg_name, error = %err, "failed to clear subscription on uninstall");
         }
         Ok(map_extension_info(st, e))
@@ -12729,6 +13424,7 @@ impl MutationRoot {
                 }
                 Ok(false) => refused += 1,
                 Err(e) => {
+                    crate::db::observe_database_error(&e);
                     tracing::warn!(series_id = m.id, error = %e, "persistCatalogue: series write failed")
                 }
             }
@@ -12740,7 +13436,12 @@ impl MutationRoot {
             for id in ids {
                 match st_bg.suwayomi.chapters(id).await {
                     Ok(chapters) => {
-                        let _ = crate::series_cache::put_chapters(&st_bg.pool, id, &chapters).await;
+                        if let Err(error) =
+                            crate::series_cache::put_chapters(&st_bg.pool, id, &chapters).await
+                        {
+                            crate::db::observe_database_error(&error);
+                            tracing::warn!(series_id=id, %error, "persistCatalogue(bg): chapter write failed");
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(series_id = id, error = %e, "persistCatalogue(bg): chapter fetch failed")
@@ -12785,7 +13486,7 @@ impl MutationRoot {
         };
         let queued = crate::cover::pending_cover_count(&st.pool)
             .await
-            .map_err(gql_err)? as i32;
+            .map_err(gql_read_err)? as i32;
         tokio::spawn(async move {
             let _running = running;
             crate::cover::crawl_uncached_covers(
@@ -12824,7 +13525,10 @@ impl MutationRoot {
                 Ok((merged, queued, skipped)) => {
                     tracing::info!(merged, queued, skipped, "reconcile: complete")
                 }
-                Err(e) => tracing::error!(error = %e, "reconcile: failed"),
+                Err(e) => {
+                    crate::db::observe_database_error(&e);
+                    tracing::error!(error = %e, "reconcile: failed");
+                }
             }
         });
         tracing::info!(pending, "reconcile: started");
@@ -12959,7 +13663,7 @@ impl MutationRoot {
                 None => {
                     if let Some(existing) = crate::ingest::load_running_job(&st_arc.pool, &src.id)
                         .await
-                        .map_err(gql_err)?
+                        .map_err(gql_read_err)?
                     {
                         jobs.push(existing.into());
                     }
@@ -13053,11 +13757,14 @@ impl MutationRoot {
                     result: Some(r),
                     error: None,
                 },
-                Err(e) => BulkAddEntry {
-                    suwayomi_manga_id: id,
-                    result: None,
-                    error: Some(e.to_string()),
-                },
+                Err(e) => {
+                    crate::db::observe_database_error(&e);
+                    BulkAddEntry {
+                        suwayomi_manga_id: id,
+                        result: None,
+                        error: Some(e.to_string()),
+                    }
+                }
             };
             entries.push(entry);
         }
@@ -13140,12 +13847,16 @@ pub(crate) async fn ingest_source_series(
     // (`addSourceSeries`) — one extra chapters fetch per item. Best-effort: a scan
     // hiccup only logs and leaves the scheduler to retry; it never fails the enrol.
     if let Err(e) = scan_series(st, &m, Utc::now()).await {
+        crate::db::observe_database_error(&e);
         // `scan_series` only caches series metadata AFTER its (fallible) chapter fetch,
         // so on a scan hiccup the `suwayomi_series` row (thumbnail_url etc.) never got
         // written — leaving the cover crawl with no thumbnail to materialize until the
         // next scheduler tick. Persist the metadata here as a best-effort fallback so
         // that window is closed (no double on the success path, which OPT-6 dropped).
-        let _ = crate::series_cache::put_series(&st.pool, &m).await;
+        if let Err(error) = crate::series_cache::put_series(&st.pool, &m).await {
+            crate::db::observe_database_error(&error);
+            tracing::warn!(%error, "ingest metadata cache write failed");
+        }
         tracing::warn!(
             series_id = m.id,
             error = %e,
@@ -13253,17 +13964,13 @@ fn genre_is_nsfw(genre: &[String]) -> bool {
 /// re-enrich every already-enriched work. Narrowing it is a behaviour change, not a perf
 /// fix, so it is deliberately NOT done here.
 async fn works_needing_enrichment(pool: &Database, batch: i64) -> Result<Vec<String>> {
-    sqlx::query_scalar(
-        "SELECT ss.source_key FROM source_series ss \
-         WHERE ss.source_type = 'mangadex' \
-           AND EXISTS (SELECT 1 FROM work w WHERE w.id = ss.work_id \
-                       AND (w.metadata_synced_at IS NULL OR w.covers_synced_at IS NULL OR w.mangadex_details_synced_at IS NULL)) \
-         ORDER BY ss.created_at ASC LIMIT ?",
+    crate::db_types::query_scalar(
+        r#"SELECT ss.source_key FROM source_series ss WHERE ss.source_type = 'mangadex' AND EXISTS (SELECT 1 FROM work w WHERE w.id = ss.work_id AND (w.metadata_synced_at IS NULL OR w.covers_synced_at IS NULL OR w.mangadex_details_synced_at IS NULL)) ORDER BY ss.created_at ASC NULLS FIRST LIMIT $1"#,
     )
     .bind(batch)
     .fetch_all(pool)
     .await
-    .map_err(gql_err)
+    .map_err(gql_read_err)
 }
 
 /// X1: recurring auto-enrichment. Every `interval_secs` it drains a small batch of
@@ -13313,7 +14020,7 @@ async fn metadata_backfill_loop(
                 }
                 let ids = match works_needing_enrichment(&state.pool, batch).await {
                     Ok(ids) => ids,
-                    Err(e) => { tracing::warn!(error = %e.message, "enrich tick: selection failed"); continue; }
+                    Err(e) => { observe_graphql_error_source(&e.source); tracing::warn!(error = %e.message, "enrich tick: selection failed"); continue; }
                 };
                 if ids.is_empty() {
                     tracing::debug!("enrich tick: nothing to enrich");
@@ -13321,7 +14028,7 @@ async fn metadata_backfill_loop(
                 }
                 match enrich_works(&state, &ids).await {
                     Ok(n) => tracing::info!(selected = ids.len(), refreshed = n, "enrich tick: done"),
-                    Err(e) => tracing::warn!(error = %e.message, "enrich tick: enrich_works failed"),
+                    Err(e) => { observe_graphql_error_source(&e.source); tracing::warn!(error = %e.message, "enrich tick: enrich_works failed"); }
                 }
             }
             _ = shutdown.changed() => {
@@ -13405,55 +14112,155 @@ pub(crate) async fn enrich_works(st: &AppState, ids: &[String]) -> Result<i32> {
 
 /// Only successfully persisted records receive completion markers. Missing upstream
 /// rows and failed upserts remain selectable on the next enrichment pass.
+///
+/// Each record is ONE retried transaction (T147): its content and its completion
+/// markers commit together. There is no retry around a catalogue function that already
+/// retries, and no marker is written for a work in a later transaction than its
+/// content: a crash between the two used to leave either enriched works that the
+/// backfill fetched again, or (worse, with the batch-end markers) nothing wrong at all
+/// but one failed marker statement discarding the whole batch's progress.
 async fn persist_enrichment(
     pool: &Database,
     prepared: &[(String, catalog::WorkInput, bool)],
 ) -> Result<i32> {
-    let mut metadata_ok = Vec::new();
-    let mut covers_ok = Vec::new();
+    let mut persisted = 0i32;
     for (id, input, fetched_covers) in prepared {
-        match crate::db::retry_transaction(|| catalog::upsert_work_from_mangadex(pool, id, input))
-            .await
+        match crate::db::retry_transaction(|| {
+            persist_enriched_work_once(pool, id, input, *fetched_covers)
+        })
+        .await
         {
-            Ok(_) => {
-                metadata_ok.push(id.clone());
-                if *fetched_covers {
-                    covers_ok.push(id.clone());
-                }
-            }
+            Ok(()) => persisted += 1,
             Err(error) => {
+                crate::db::observe_database_error(&error);
                 tracing::warn!(manga = %id, error = %error, "enrich: upsert failed; retained for retry")
             }
         }
     }
-    catalog::mark_metadata_synced(pool, &metadata_ok)
-        .await
-        .map_err(gql_err)?;
-    catalog::mark_covers_synced(pool, &covers_ok)
-        .await
-        .map_err(gql_err)?;
-    Ok(metadata_ok.len() as i32)
+    Ok(persisted)
+}
+
+/// One enriched MangaDex record: BEGIN, the identity keys of the upsert in one advisory
+/// call, the upsert (which locks the owning work and restarts if the owner changed),
+/// the completion markers of that same work, COMMIT.
+async fn persist_enriched_work_once(
+    pool: &Database,
+    mangadex_id: &str,
+    input: &catalog::WorkInput,
+    fetched_covers: bool,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    crate::locks::advisory(&mut tx, &catalog::mangadex_upsert_keys(mangadex_id, input)).await?;
+    catalog::upsert_work_from_mangadex_on(&mut tx, mangadex_id, input).await?;
+    #[cfg(test)]
+    guard_pause("enrich-upserted").await;
+    let ids = [mangadex_id.to_string()];
+    catalog::mark_metadata_synced_on(&mut tx, &ids).await?;
+    if fetched_covers {
+        catalog::mark_covers_synced_on(&mut tx, &ids).await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Resolve one review from the original owner snapshot. The actual fold and claim
 /// are atomic; rejection or a no-op approval also rechecks the pair under the writer.
 async fn resolve_merge_review_once(
     pool: &Database,
-    covers: &Database,
+    covers: &crate::database::SqliteDatabase,
     id: &str,
     source_series_id: &str,
     source_work: Option<&str>,
     target_work: &str,
     accept: bool,
 ) -> anyhow::Result<()> {
-    if accept && source_work.is_some_and(|source| source != target_work) {
-        catalog::merge_pending_candidate(pool, Some(covers), source_work.unwrap(), target_work, id)
-            .await?;
-        return Ok(());
+    if let Some(source) = source_work.filter(|source| accept && *source != target_work) {
+        // An accepted review of two different works: ONE guarded transaction claims
+        // the pending row and folds its owner (T146, T148). The merge guard set is the
+        // first lock acquisition of that transaction and contains the pair's
+        // `ReviewPair` key, the key a rejection of the same row takes first, so the
+        // two decisions are made one after the other and the second one finds the row
+        // resolved.
+        let merged = merge_pair_guarded(
+            pool,
+            Some(covers),
+            source,
+            target_work,
+            None,
+            Some(id),
+            MergeGate::Named,
+        )
+        .await?;
+        if merged.is_some() {
+            return Ok(());
+        }
+        // The claim failed: the row was resolved first, or its mapping left the work
+        // the admin approved. Say which, from the row as it is now.
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM merge_candidate WHERE id = $1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|error| crate::db::observed_read_database_error(error.into()))?;
+        return Err(MutationValidation(if status.as_deref() == Some("pending") {
+            "This merge candidate changed; reload and try again."
+        } else {
+            "This merge candidate is already resolved."
+        })
+        .into());
     }
+    crate::db::retry_transaction(|| {
+        resolve_merge_review_state_once(
+            pool,
+            id,
+            source_series_id,
+            source_work,
+            target_work,
+            accept,
+        )
+    })
+    .await
+}
+
+async fn resolve_merge_review_state_once(
+    pool: &Database,
+    id: &str,
+    source_series_id: &str,
+    source_work: Option<&str>,
+    target_work: &str,
+    accept: bool,
+) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
-    let current: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT source_series_id, candidate_work_id, status FROM merge_candidate WHERE id = ?",
+    let discovered: Option<String> =
+        sqlx::query_scalar("SELECT work_id FROM source_series WHERE id=$1")
+            .bind(source_series_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some(owner) = &discovered {
+        crate::locks::advisory(
+            &mut tx,
+            &[crate::locks::AdvisoryKey::review_pair(owner, target_work)],
+        )
+        .await?;
+        crate::locks::lock_works(&mut tx, &[owner.as_str(), target_work]).await?;
+    } else {
+        crate::locks::lock_works(&mut tx, &[target_work]).await?;
+    }
+    sqlx::query("SELECT id FROM source_series WHERE id=$1 FOR NO KEY UPDATE")
+        .bind(source_series_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let owner: Option<String> = sqlx::query_scalar("SELECT work_id FROM source_series WHERE id=$1")
+        .bind(source_series_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if owner != discovered {
+        return Err(crate::locks::RestartTransaction.into());
+    }
+    #[cfg(test)]
+    guard_pause("candidate-locked").await;
+    let current: Option<(String, String, String)> = crate::db_types::query_tuple(
+        "SELECT source_series_id, candidate_work_id, status FROM merge_candidate WHERE id = $1 FOR UPDATE",
     )
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -13469,7 +14276,7 @@ async fn resolve_merge_review_once(
     }
     if accept {
         let owner: Option<String> =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
+            crate::db_types::query_scalar("SELECT work_id FROM source_series WHERE id = $1")
                 .bind(source_series_id)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -13479,9 +14286,12 @@ async fn resolve_merge_review_once(
             );
         }
     }
-    sqlx::query("UPDATE merge_candidate SET status = ?, resolved_at = ? WHERE id = ? AND status = 'pending'")
-        .bind(if accept { "confirmed" } else { "rejected" }).bind(Utc::now().to_rfc3339()).bind(id)
+    let changed = sqlx::query("UPDATE merge_candidate SET status = $1, resolved_at = $2 WHERE id = $3 AND status = 'pending'")
+        .bind(if accept { "confirmed" } else { "rejected" }).bind(crate::db_types::date(&(crate::db_types::format_date(Utc::now())))?).bind(id)
         .execute(&mut *tx).await?;
+    if changed.rows_affected() != 1 {
+        return Err(MutationValidation("This merge candidate is already resolved.").into());
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -13489,8 +14299,10 @@ async fn resolve_merge_review_once(
 /// An upstream scan failure must not hide a failed attempt to reschedule the series.
 async fn mark_scan_due_now(pool: &Database, series_id: &str) -> anyhow::Result<()> {
     crate::db::retry_transaction(|| async {
-        sqlx::query("UPDATE series_scan_state SET next_scan_at = ? WHERE series_id = ?")
-            .bind(Utc::now().to_rfc3339())
+        sqlx::query("UPDATE series_scan_state SET next_scan_at = $1 WHERE series_id = $2")
+            .bind(crate::db_types::date(
+                &(crate::db_types::format_date(Utc::now())),
+            )?)
             .bind(series_id)
             .execute(pool)
             .await?;
@@ -13510,11 +14322,17 @@ async fn federated_ingest(st: &AppState, raw_id: &str) -> anyhow::Result<MatchRe
     st.suwayomi.set_in_library(mid, true).await?;
     m.in_library = true;
     // S1: cache series METADATA (chapters fill on scan / first read — not per item).
-    let _ = crate::series_cache::put_series(&st.pool, &m).await;
+    if let Err(error) = crate::series_cache::put_series(&st.pool, &m).await {
+        crate::db::observe_database_error(&error);
+        tracing::warn!(%error, "federated metadata cache write failed");
+    }
     // This path deliberately does NOT scan-on-enrol (chapters fill lazily), so register
     // a "due now" scan-state row explicitly — otherwise the DB-driven scanner, which
     // selects work from `series_scan_state`, would never pick this series up.
-    let _ = crate::scanner::ensure_pending(&st.pool, &mid.to_string()).await;
+    if let Err(error) = crate::scanner::ensure_pending(&st.pool, &mid.to_string()).await {
+        crate::db::observe_database_error(&error);
+        tracing::warn!(%error, "federated pending scan write failed");
+    }
     // WAITS on the shared bounded cover-fetch pool, eating into the reader's on-demand
     // headroom. Called once per id from a SEQUENTIAL loop in `federated_search`, so one
     // permit per in-flight federated search — and that loop is the one most exposed to
@@ -13577,11 +14395,11 @@ fn validate_new_password(password: &str) -> Result<()> {
 /// while preserving legacy identities that already have case collisions.
 async fn ensure_username_free(pool: &Database, username: &str) -> Result<()> {
     let taken: Option<i64> =
-        sqlx::query_scalar("SELECT 1 FROM users WHERE username = ? COLLATE NOCASE")
+        crate::db_types::query_scalar("SELECT 1 FROM users WHERE translate(username, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') = translate($1, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')")
             .bind(username)
             .fetch_optional(pool)
             .await
-            .map_err(gql_err)?;
+            .map_err(gql_read_err)?;
     if taken.is_some() {
         return Err(Error::new("username or email already taken"));
     }
@@ -13589,8 +14407,20 @@ async fn ensure_username_free(pool: &Database, username: &str) -> Result<()> {
 }
 
 /// Map an INSERT into `users` failing on a unique key to the user-facing message.
+fn account_write_error(error: anyhow::Error) -> Error {
+    if error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        .any(|cause| cause.as_database_error().and_then(|e| e.code()).as_deref() == Some("23505"))
+    {
+        Error::new("username or email already taken")
+    } else {
+        mutation_write_error(error)
+    }
+}
+
 fn user_insert_err(e: sqlx::Error) -> Error {
-    if e.to_string().contains("UNIQUE") {
+    if e.as_database_error().and_then(|e| e.code()).as_deref() == Some("23505") {
         Error::new("username or email already taken")
     } else {
         gql_err(e)
@@ -13607,13 +14437,19 @@ async fn hash_password_bounded(st: &AppState, password: &str) -> Result<String> 
         .try_acquire_owned()
         .map_err(|_| Error::new("Sign-in is busy — please try again shortly"))?;
     let pw = password.to_string();
-    tokio::task::spawn_blocking(move || {
+    let hash = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         auth::hash_password(&pw)
     })
     .await
     .map_err(gql_err)?
-    .map_err(gql_err)
+    .map_err(gql_err)?;
+    // A two-writer test parks the hashing writer here, where it holds no transaction,
+    // so the seconds one Argon2id hash takes in a test build are never spent while the
+    // other writer sits idle inside its transaction.
+    #[cfg(test)]
+    guard_pause("hashed").await;
+    Ok(hash)
 }
 
 /// Verify a password against a stored hash under the same semaphore.
@@ -13647,11 +14483,15 @@ async fn new_session_checked(
     let token_hash = auth::hash_token(&token);
     crate::db::retry_transaction(|| async {
         let mut tx = pool.begin().await?;
-        let current: Option<(i64, i64, String)> =
-            sqlx::query_as("SELECT is_admin,is_banned,password_hash FROM users WHERE id=?")
-                .bind(user_id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        crate::locks::lock_user(&mut tx, user_id).await?;
+        #[cfg(test)]
+        guard_pause("session-locked").await;
+        let current: Option<(i64, i64, String)> = crate::db_types::query_tuple(
+            "SELECT is_admin,is_banned,password_hash FROM users WHERE id=$1",
+        )
+        .bind(crate::db_types::uuid(user_id)?)
+        .fetch_optional(&mut *tx)
+        .await?;
         let Some((admin, banned, hash)) = current else {
             return Err(MutationValidation("Invalid username or password").into());
         };
@@ -13667,30 +14507,66 @@ async fn new_session_checked(
             ttl_secs
         };
         let now = Utc::now();
-        sqlx::query("INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES(?,?,?,?)")
-            .bind(&token_hash)
-            .bind(user_id)
-            .bind(now.to_rfc3339())
-            .bind(auth::format_ts(now + chrono::Duration::seconds(lifetime)))
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM sessions WHERE expires_at<=?")
-            .bind(auth::format_ts(now))
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES($1,$2,$3,$4)",
+        )
+        .bind(&token_hash)
+        .bind(crate::db_types::uuid(user_id)?)
+        .bind(crate::db_types::truncate_date(now))
+        .bind(crate::db_types::date(
+            &(auth::format_ts(now + chrono::Duration::seconds(lifetime))),
+        )?)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     })
     .await
     .map_err(mutation_write_error)?;
+    // The session exists now. Housekeeping runs after COMMIT, as its own statement.
+    sweep_expired_sessions(pool).await;
     Ok(token)
 }
 
-async fn require_admin_on(conn: &mut sqlx::SqliteConnection, actor_id: &str) -> anyhow::Result<()> {
-    let permitted: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM users WHERE id=? AND is_admin=1 AND is_banned=0)",
+/// Expired sessions that no other transaction holds, deleted in primary-key order.
+/// `$1` is the current time.
+const EXPIRED_SESSION_SWEEP_SQL: &str = "DELETE FROM sessions WHERE token IN \
+     (SELECT token FROM sessions WHERE expires_at <= $1 \
+      ORDER BY token FOR UPDATE SKIP LOCKED)";
+
+/// Remove expired sessions after a login has committed. Best-effort housekeeping: the
+/// login it follows has already succeeded, so a failure is counted, logged and dropped.
+///
+/// This used to be `DELETE FROM sessions WHERE expires_at <= now` INSIDE the login
+/// transaction. That statement locks expired rows of EVERY user, in whatever order the
+/// scan meets them, while the login holds its own user row. `revokeAllSessions`,
+/// `changePassword` and a password reset lock their user and then delete that user's
+/// session rows, in another order, and none of those three units is retried: one of
+/// them could be the victim of the cycle. A row that is held now is skipped and swept
+/// by a later login; nothing here ever waits for a row lock.
+async fn sweep_expired_sessions(pool: &Database) {
+    let now = match crate::db_types::date(&auth::format_ts(Utc::now())) {
+        Ok(now) => now,
+        Err(error) => {
+            tracing::warn!(%error, "expired-session sweep skipped: clock value did not parse");
+            return;
+        }
+    };
+    if let Err(error) = sqlx::query(EXPIRED_SESSION_SWEEP_SQL)
+        .bind(now)
+        .execute(pool)
+        .await
+    {
+        crate::db::record_database_error(&error);
+        tracing::warn!(%error, "expired-session sweep failed; the next login retries it");
+    }
+}
+
+async fn require_admin_on(conn: &mut sqlx::PgConnection, actor_id: &str) -> anyhow::Result<()> {
+    let permitted: bool = crate::db_types::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND is_admin = TRUE AND is_banned = FALSE)",
     )
-    .bind(actor_id)
+    .bind(crate::db_types::uuid(actor_id)?)
     .fetch_one(conn)
     .await?;
     if !permitted {
@@ -13706,39 +14582,56 @@ async fn set_user_admin_once(
     is_admin: bool,
 ) -> anyhow::Result<AdminUser> {
     let mut tx = pool.begin().await?;
+    crate::locks::advisory(&mut tx, &[crate::locks::AdvisoryKey::membership()]).await?;
+    let users: Vec<&str> = [actor_id, target_id]
+        .into_iter()
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .collect();
+    crate::locks::lock_users(&mut tx, &users).await?;
+    #[cfg(test)]
+    guard_pause("membership-locked").await;
     require_admin_on(&mut tx, actor_id).await?;
     if actor_id == target_id && !is_admin {
         return Err(MutationValidation("You cannot remove your own admin access.").into());
     }
+    if is_admin {
+        let banned: Option<bool> = sqlx::query_scalar("SELECT is_banned FROM users WHERE id=$1")
+            .bind(uuid::Uuid::parse_str(target_id).ok())
+            .fetch_optional(&mut *tx)
+            .await?;
+        if banned == Some(true) {
+            return Err(MutationValidation("You cannot promote a suspended account.").into());
+        }
+    }
     if !is_admin {
-        let remaining: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM users WHERE is_admin=1 AND is_banned=0 AND id!=?",
+        let remaining: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE is_admin = TRUE AND is_banned = FALSE AND ($1::uuid IS NULL OR id!=$1)",
         )
-        .bind(target_id)
+        .bind(uuid::Uuid::parse_str(target_id ).ok())
         .fetch_one(&mut *tx)
         .await?;
         if remaining == 0 {
             return Err(MutationValidation("At least one admin must remain.").into());
         }
     }
-    let changed = sqlx::query("UPDATE users SET is_admin=? WHERE id=?")
-        .bind(is_admin as i64)
-        .bind(target_id)
+    let changed = sqlx::query("UPDATE users SET is_admin=$1 WHERE id=$2")
+        .bind(is_admin)
+        .bind(uuid::Uuid::parse_str(target_id).ok())
         .execute(&mut *tx)
         .await?;
     if changed.rows_affected() == 0 {
         return Err(MutationValidation("No such user.").into());
     }
     if !is_admin {
-        sqlx::query("DELETE FROM sessions WHERE user_id=?")
-            .bind(target_id)
+        sqlx::query("DELETE FROM sessions WHERE user_id=$1")
+            .bind(uuid::Uuid::parse_str(target_id).ok())
             .execute(&mut *tx)
             .await?;
     }
     let row: AdminUserRow = sqlx::query_as(
-        "SELECT id,username,email,avatar_url,is_admin,is_banned,created_at FROM users WHERE id=?",
+        "SELECT id,username,email,avatar_url,is_admin,is_banned,created_at FROM users WHERE id=$1",
     )
-    .bind(target_id)
+    .bind(uuid::Uuid::parse_str(target_id).ok())
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -13752,28 +14645,36 @@ async fn ban_user_once(
     banned: bool,
 ) -> anyhow::Result<AdminUser> {
     let mut tx = pool.begin().await?;
+    crate::locks::advisory(&mut tx, &[crate::locks::AdvisoryKey::membership()]).await?;
+    let users: Vec<&str> = [actor_id, target_id]
+        .into_iter()
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .collect();
+    crate::locks::lock_users(&mut tx, &users).await?;
+    #[cfg(test)]
+    guard_pause("membership-locked").await;
     require_admin_on(&mut tx, actor_id).await?;
     if actor_id == target_id {
         return Err(MutationValidation("You cannot ban your own account.").into());
     }
     let mut row: AdminUserRow = sqlx::query_as(
-        "SELECT id,username,email,avatar_url,is_admin,is_banned,created_at FROM users WHERE id=?",
+        "SELECT id,username,email,avatar_url,is_admin,is_banned,created_at FROM users WHERE id=$1",
     )
-    .bind(target_id)
+    .bind(uuid::Uuid::parse_str(target_id).ok())
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(MutationValidation("No such user."))?;
     if row.is_admin != 0 {
         return Err(MutationValidation("You cannot ban an admin account.").into());
     }
-    sqlx::query("UPDATE users SET is_banned=? WHERE id=?")
-        .bind(banned as i64)
-        .bind(target_id)
+    sqlx::query("UPDATE users SET is_banned=$1 WHERE id=$2")
+        .bind(banned)
+        .bind(uuid::Uuid::parse_str(target_id).ok())
         .execute(&mut *tx)
         .await?;
     if banned {
-        sqlx::query("DELETE FROM sessions WHERE user_id=?")
-            .bind(target_id)
+        sqlx::query("DELETE FROM sessions WHERE user_id=$1")
+            .bind(uuid::Uuid::parse_str(target_id).ok())
             .execute(&mut *tx)
             .await?;
     }
@@ -13828,7 +14729,7 @@ const RECONCILE_PENDING_WHERE: &str = "EXISTS (SELECT 1 FROM source_series ss \
 
 /// How many provisional (Suwayomi-only) works still need reconciling against the spine.
 async fn pending_reconcile_count(pool: &Database) -> anyhow::Result<i64> {
-    let n: i64 = sqlx::query_scalar(&format!(
+    let n: i64 = crate::db_types::query_scalar(&format!(
         "SELECT COUNT(*) FROM work w WHERE {RECONCILE_PENDING_WHERE}"
     ))
     .fetch_one(pool)
@@ -13848,15 +14749,14 @@ enum ReconcileAction {
 /// `(merged, queued, skipped)`.
 pub(crate) async fn reconcile_provisional_works(
     pool: &Database,
-    covers: Option<&Database>,
+    covers: Option<&crate::database::SqliteDatabase>,
 ) -> anyhow::Result<(i64, i64, i64)> {
     const BATCH: i64 = 200;
     let mut cursor = String::new();
     let (mut merged, mut queued, mut skipped) = (0i64, 0i64, 0i64);
     loop {
-        let batch: Vec<String> = sqlx::query_scalar(&format!(
-            "SELECT w.id FROM work w WHERE {RECONCILE_PENDING_WHERE} AND w.id > ? \
-             ORDER BY w.id ASC LIMIT ?"
+        let batch: Vec<String> = crate::db_types::query_scalar(&format!(
+            r#"SELECT w.id FROM work w WHERE {RECONCILE_PENDING_WHERE} AND w.id > $1 ORDER BY w.id ASC NULLS FIRST LIMIT $2"#
         ))
         .bind(&cursor)
         .bind(BATCH)
@@ -13873,6 +14773,7 @@ pub(crate) async fn reconcile_provisional_works(
                 Ok(ReconcileAction::Skipped) => skipped += 1,
                 Err(e) => {
                     skipped += 1;
+                    crate::db::observe_database_error(&e);
                     tracing::warn!(work_id = %work_id, error = %e, "reconcile: work failed");
                 }
             }
@@ -13882,6 +14783,376 @@ pub(crate) async fn reconcile_provisional_works(
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
     Ok((merged, queued, skipped))
+}
+
+/// What a guarded pair merge re-reads once it holds the complete merge guard set
+/// (`catalog::lock_merge_inputs`: users, identity and review keys, both work rows, every
+/// source mapping). The caller decided on rows it read without a lock; the gate repeats
+/// that decision on the locked rows, and a decision that no longer holds leaves both
+/// works untouched.
+#[derive(Clone, Copy, Debug)]
+enum MergeGate<'a> {
+    /// A person named both works (`mergeWorks`, an accepted review). Nothing to
+    /// re-decide: the guarded merge re-checks the works and claims the review itself.
+    Named,
+    /// `addSeriesAltTitle`: both works must still carry this exact normalized alias,
+    /// their authors must still match, and they must not be a novel and its comic or
+    /// the two halves of a split.
+    SharedAlias(&'a str),
+    /// The duplicate sweep: `pair::assess(target, source)` must still say "merge" on
+    /// the same kind of title link. `pair_only` is the size-two-group condition the
+    /// sweep applied to a year-only corroboration.
+    Sweep {
+        link: catalog::pair::Link,
+        pair_only: bool,
+    },
+    /// The review sort: the rules must still call the pair one series, must still pick
+    /// the same direction (`flipped`: the review's candidate work is the loser), and
+    /// the loser must still have no rival target.
+    ReviewSort { flipped: bool },
+    /// The reconcile: the matcher, run again for the source work, must still
+    /// auto-merge it into this target.
+    Matcher,
+}
+
+/// The matcher input the reconcile builds from a provisional work's own metadata.
+/// `None` when the work has no title to match on.
+fn reconcile_candidate(md: &catalog::WorkMatchData) -> Option<crate::dedup::Candidate> {
+    let title = md
+        .primary_title
+        .clone()
+        .or_else(|| md.aliases_norm.first().cloned())
+        .unwrap_or_default();
+    if title.is_empty() && md.aliases_norm.is_empty() {
+        return None;
+    }
+    Some(crate::dedup::Candidate {
+        title,
+        alt_titles: md.aliases_norm.clone(),
+        description: md.description.clone(),
+        author: md.author.clone(),
+        year: md.year,
+        cover_phash: md.cover_phash.clone(),
+        external_ids: Vec::new(),
+    })
+}
+
+/// Re-read one merge decision on the caller's transaction, which holds the merge guard
+/// set of `(source, target)`. Read only.
+async fn merge_gate_holds(
+    conn: &mut sqlx::PgConnection,
+    source: &str,
+    target: &str,
+    gate: MergeGate<'_>,
+) -> anyhow::Result<bool> {
+    use catalog::pair::{assess, Verdict};
+    if let MergeGate::Named = gate {
+        return Ok(true);
+    }
+    let data =
+        catalog::load_match_data_batch_on(&mut *conn, &[source.to_string(), target.to_string()])
+            .await?;
+    let (Some(loser), Some(survivor)) = (data.get(source), data.get(target)) else {
+        return Ok(false);
+    };
+    match gate {
+        MergeGate::Named => Ok(true),
+        MergeGate::SharedAlias(alias) => {
+            let sharers = catalog::find_works_by_alias_on(&mut *conn, alias).await?;
+            Ok(sharers.iter().any(|id| id == source)
+                && sharers.iter().any(|id| id == target)
+                && crate::catalog::similarity::authors_match(
+                    loser.author.as_deref(),
+                    survivor.author.as_deref(),
+                )
+                && !crate::catalog::normalize::novel_mismatch(
+                    loser.primary_title.as_deref(),
+                    survivor.primary_title.as_deref(),
+                )
+                && !catalog::is_split_pair_on(&mut *conn, source, target).await?)
+        }
+        MergeGate::Sweep { link, pair_only } => {
+            let verdict = assess(survivor, loser);
+            Ok(verdict.verdict == Verdict::Merge
+                && verdict.link == link
+                && (pair_only || verdict.reason != "same_title_and_year")
+                && !catalog::is_split_pair_on(&mut *conn, source, target).await?)
+        }
+        MergeGate::ReviewSort { flipped } => {
+            // The review row reads "owner of the source mapping" against "candidate
+            // work"; a flipped merge folds the candidate work into the owner.
+            let (owner, candidate) = if flipped {
+                (survivor, loser)
+            } else {
+                (loser, survivor)
+            };
+            Ok(assess(owner, candidate).verdict == Verdict::Merge
+                && (owner.mangadex_anchored && !candidate.mangadex_anchored) == flipped
+                && !catalog::is_split_pair_on(&mut *conn, source, target).await?
+                && !has_rival_target_on(&mut *conn, loser, survivor).await?)
+        }
+        MergeGate::Matcher => {
+            let Some(candidate) = reconcile_candidate(loser) else {
+                return Ok(false);
+            };
+            Ok(matches!(
+                crate::dedup::resolve_on(&mut *conn, &candidate, Some(source)).await?,
+                crate::dedup::Decision::AutoMerge { work_id, .. } if work_id == target
+            ))
+        }
+    }
+}
+
+/// One merge decision as ONE transaction, BEGIN to COMMIT (T137, T146, T148, T153,
+/// T155, T157). `Ok(None)` means the decision no longer held under the locks, or the
+/// merge's own precondition failed: nothing was changed.
+///
+/// The merge guard set is the FIRST lock acquisition of the transaction, as
+/// `catalog::merge_works_guarded_on` requires: it starts at the users tier. A named
+/// merge calls that function. A decided merge needs its decision re-read between the
+/// locks and the merge, so it calls the two halves of that same function in the same
+/// order (`lock_merge_inputs`, then `merge_works_on`) with the gate in between.
+async fn merge_pair_once(
+    pool: &Database,
+    source: &str,
+    target: &str,
+    expected: Option<(&catalog::WorkIdentity, &catalog::WorkIdentity)>,
+    candidate_id: Option<&str>,
+    gate: MergeGate<'_>,
+) -> anyhow::Result<Option<catalog::MergeOutcome>> {
+    let mut tx = pool.begin().await?;
+    let merged = if let MergeGate::Named = gate {
+        catalog::merge_works_guarded_on(&mut tx, source, target, expected, candidate_id).await
+    } else {
+        if source == target {
+            anyhow::bail!("cannot merge a work into itself");
+        }
+        catalog::lock_merge_inputs(&mut tx, source, target).await?;
+        #[cfg(test)]
+        guard_pause("merge-gate-locked").await;
+        if !merge_gate_holds(&mut tx, source, target, gate).await? {
+            return Ok(None);
+        }
+        catalog::merge_works_on(&mut tx, source, target, expected, candidate_id).await
+    };
+    let outcome = match merged {
+        Ok(outcome) => outcome,
+        Err(error) if is_precondition_failure(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    #[cfg(test)]
+    guard_pause("merge-pair-merged").await;
+    tx.commit().await?;
+    Ok(Some(outcome))
+}
+
+/// [`merge_pair_once`] with its retry and its side effect: the whole transaction is
+/// retried as one unit (never a batch of pairs), and the losing work's cached cover,
+/// which lives in another database, is reclaimed only after the COMMIT, outside the
+/// retry.
+async fn merge_pair_guarded(
+    pool: &Database,
+    covers: Option<&crate::database::SqliteDatabase>,
+    source: &str,
+    target: &str,
+    expected: Option<(&catalog::WorkIdentity, &catalog::WorkIdentity)>,
+    candidate_id: Option<&str>,
+    gate: MergeGate<'_>,
+) -> anyhow::Result<Option<catalog::MergeOutcome>> {
+    let outcome = crate::db::retry_transaction(|| {
+        merge_pair_once(pool, source, target, expected, candidate_id, gate)
+    })
+    .await?;
+    if let (Some(_), Some(covers)) = (&outcome, covers) {
+        if let Err(error) = catalog::reclaim_cover_blob(covers, source).await {
+            crate::db::observe_database_error(&error);
+            tracing::warn!(work_id = %source, %error, "merge: cover blob reclaim failed (leaked)");
+        }
+    }
+    Ok(outcome)
+}
+
+/// What one attempt to put a pair in the review queue did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuedReview {
+    /// A new pending row.
+    Inserted,
+    /// The pair already has a row in some status (or both sides are one work now), or
+    /// the matcher no longer asks this question.
+    Suppressed,
+    /// The owning work has no source mapping to hang a review off.
+    NoSource,
+}
+
+/// The source mapping a review of `owner` hangs off: its oldest mapping, or its oldest
+/// Suwayomi mapping for the reconcile.
+async fn review_source_on(
+    conn: &mut sqlx::PgConnection,
+    owner: &str,
+    suwayomi_only: bool,
+) -> anyhow::Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT id FROM source_series WHERE work_id = $1 AND ($2 = FALSE OR source_type = 'suwayomi') \
+         ORDER BY created_at ASC NULLS FIRST, id ASC NULLS FIRST LIMIT 1",
+    )
+    .bind(owner)
+    .bind(suwayomi_only)
+    .fetch_optional(&mut *conn)
+    .await?)
+}
+
+/// Queue the pair `(owner, target)` for review as ONE transaction (T154, and the review
+/// branch of T157): choose the source mapping, take the pair's `ReviewPair` key in the
+/// unit's single advisory call, let `catalog::insert_merge_candidate_on` lock both
+/// works and re-read the pair, then re-read the choice of the source mapping under
+/// those locks. A mapping that moved or a different oldest mapping restarts the unit,
+/// so the row is never written for a pair other than the one that was judged.
+///
+/// `matcher` is the reconcile's extra condition: its matcher, run again under the work
+/// locks, must still ask for a review against this target.
+async fn queue_review_once(
+    pool: &Database,
+    owner: &str,
+    target: &str,
+    score: f64,
+    method: &str,
+    suwayomi_only: bool,
+    matcher: bool,
+) -> anyhow::Result<QueuedReview> {
+    let mut tx = pool.begin().await?;
+    let Some(source_series_id) = review_source_on(&mut tx, owner, suwayomi_only).await? else {
+        return Ok(QueuedReview::NoSource);
+    };
+    let pair = match catalog::review_pair_on(&mut tx, &source_series_id, target).await? {
+        Some(pair) if pair.owner == owner => pair,
+        // The mapping moved or vanished between two statements: discover again.
+        _ => return Err(crate::locks::RestartTransaction.into()),
+    };
+    crate::locks::advisory(&mut tx, &[pair.key()]).await?;
+    #[cfg(test)]
+    guard_pause("review-queue-keyed").await;
+    let inserted =
+        catalog::insert_merge_candidate_on(&mut tx, &source_series_id, &pair, score, method)
+            .await?;
+    if review_source_on(&mut tx, owner, suwayomi_only)
+        .await?
+        .as_deref()
+        != Some(source_series_id.as_str())
+    {
+        return Err(crate::locks::RestartTransaction.into());
+    }
+    if matcher {
+        let still_asked = match catalog::load_match_data_on(&mut tx, owner)
+            .await?
+            .as_ref()
+            .and_then(reconcile_candidate)
+        {
+            Some(candidate) => matches!(
+                crate::dedup::resolve_on(&mut tx, &candidate, Some(owner)).await?,
+                crate::dedup::Decision::Review { work_id, .. } if work_id == pair.target
+            ),
+            None => false,
+        };
+        if !still_asked {
+            return Ok(QueuedReview::Suppressed);
+        }
+    }
+    tx.commit().await?;
+    Ok(if inserted.is_some() {
+        QueuedReview::Inserted
+    } else {
+        QueuedReview::Suppressed
+    })
+}
+
+/// Close one waiting review as `dismissed` in ONE transaction (the "two different
+/// works" branch of T155). Lock order as a person's rejection of the same row
+/// (`resolve_merge_review_state_once`): the pair's `ReviewPair` key, both works, the
+/// source mapping, the review row. The rules are applied again to the locked works; a
+/// review whose pair or whose answer changed stays pending for the next pass.
+/// Returns whether this call closed it.
+async fn dismiss_review_once(
+    pool: &Database,
+    id: &str,
+    source_work: &str,
+    target_work: &str,
+) -> anyhow::Result<bool> {
+    use catalog::pair::{assess, Verdict};
+    const REVIEW_ROW: &str = "SELECT mc.source_series_id, ss.work_id, mc.candidate_work_id, mc.status \
+         FROM merge_candidate mc JOIN source_series ss ON ss.id = mc.source_series_id WHERE mc.id = $1";
+    let mut tx = pool.begin().await?;
+    let seen: Option<(String, String, String, String)> = sqlx::query_as(REVIEW_ROW)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some((source_series_id, owner, target, status)) = seen.clone() else {
+        return Ok(false);
+    };
+    if status != "pending" || owner != source_work || target != target_work {
+        return Ok(false);
+    }
+    crate::locks::advisory(
+        &mut tx,
+        &[crate::locks::AdvisoryKey::review_pair(&owner, &target)],
+    )
+    .await?;
+    if !crate::locks::lock_works(&mut tx, &[owner.as_str(), target.as_str()])
+        .await?
+        .missing
+        .is_empty()
+    {
+        return Ok(false);
+    }
+    sqlx::query("SELECT id FROM source_series WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(&source_series_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let locked: Option<(String, String, String, String)> =
+        sqlx::query_as(&format!("{REVIEW_ROW} FOR UPDATE OF mc"))
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if locked != seen {
+        // Resolved, or its mapping moved, while this unit waited: the keys it holds
+        // may no longer be the pair's. Discover again.
+        return Err(crate::locks::RestartTransaction.into());
+    }
+    #[cfg(test)]
+    guard_pause("review-dismiss-locked").await;
+    let data = catalog::load_match_data_batch_on(&mut tx, &[owner.clone(), target.clone()]).await?;
+    let (Some(a), Some(b)) = (data.get(&owner), data.get(&target)) else {
+        return Ok(false);
+    };
+    let verdict = assess(a, b);
+    let split = catalog::is_split_pair_on(&mut tx, &owner, &target).await?;
+    let repeated: bool = crate::db_types::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM merge_candidate mc \
+         JOIN source_series ss ON ss.id = mc.source_series_id \
+         WHERE mc.id < $1 AND mc.status IN ('pending', 'rejected') \
+           AND (ss.work_id = $2 AND mc.candidate_work_id = $3 \
+             OR ss.work_id = $3 AND mc.candidate_work_id = $2))",
+    )
+    .bind(id)
+    .bind(&owner)
+    .bind(&target)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !(verdict.verdict == Verdict::Distinct || split || repeated) {
+        return Ok(false);
+    }
+    let closed = sqlx::query(
+        "UPDATE merge_candidate SET status = 'dismissed', score = $1, resolved_at = $2 \
+         WHERE id = $3 AND status = 'pending'",
+    )
+    .bind(verdict.score)
+    .bind(crate::db_types::date(
+        &(crate::db_types::format_date(Utc::now())),
+    )?)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(closed.rows_affected() == 1)
 }
 
 /// Did this error come from `merge_works_checked`'s optimistic-concurrency precondition?
@@ -13939,15 +15210,13 @@ struct ConsolidateOutcome {
 /// re-examining the same first `limit` groups forever.
 async fn consolidate_exact_duplicates_from(
     pool: &Database,
-    covers: Option<&Database>,
+    covers: Option<&crate::database::SqliteDatabase>,
     limit: i64,
     cursor: &str,
 ) -> anyhow::Result<ConsolidateOutcome> {
     use catalog::pair::{assess, Assessment, Link, Verdict};
-    let groups: Vec<String> = sqlx::query_scalar(
-        "SELECT match_key FROM work_alias WHERE match_key > ? \
-         GROUP BY match_key HAVING COUNT(DISTINCT work_id) > 1 \
-         ORDER BY match_key ASC LIMIT ?",
+    let groups: Vec<String> = crate::db_types::query_scalar(
+        r#"SELECT match_key FROM work_alias WHERE match_key > $1 GROUP BY match_key HAVING COUNT(DISTINCT work_id) > 1 ORDER BY match_key ASC NULLS FIRST LIMIT $2"#,
     )
     .bind(cursor)
     .bind(limit.max(1))
@@ -13962,14 +15231,8 @@ async fn consolidate_exact_duplicates_from(
         out.cursor.clone_from(&key);
         // Re-query the group's works fresh (a prior group may already have folded
         // some), best survivor first.
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT w.id FROM work w \
-             JOIN work_alias a ON a.work_id = w.id AND a.match_key = ? \
-             GROUP BY w.id \
-             ORDER BY EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id \
-                              AND ss.source_type = 'mangadex') DESC, \
-                      (SELECT COUNT(*) FROM source_series ss WHERE ss.work_id = w.id) DESC, \
-                      w.id ASC",
+        let ids: Vec<String> = crate::db_types::query_scalar(
+            r#"SELECT w.id FROM work w JOIN work_alias a ON a.work_id = w.id AND a.match_key = $1 GROUP BY w.id ORDER BY EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id AND ss.source_type = 'mangadex') DESC NULLS LAST, (SELECT COUNT(*) FROM source_series ss WHERE ss.work_id = w.id) DESC NULLS LAST, w.id ASC NULLS FIRST"#,
         )
         .bind(&key)
         .fetch_all(pool)
@@ -14067,17 +15330,26 @@ async fn consolidate_exact_duplicates_from(
                 // was the sole corroboration) in that window aborts the merge instead of
                 // silently destroying a work on stale grounds. The pair is simply
                 // re-examined next pass, against the new values.
+                // The pair is one guarded, retried transaction (T153): the rules are
+                // applied again to the locked works before anything is folded, and a
+                // deadlock or a changed discovery replays this pair only, never the
+                // pairs this pass has already committed.
                 let link_key = verdict.key.as_deref();
-                match catalog::merge_works_checked(
+                match merge_pair_guarded(
                     pool,
                     covers,
                     &other.work_id,
                     &against.work_id,
                     Some((&other.identity(link_key), &against.identity(link_key))),
+                    None,
+                    MergeGate::Sweep {
+                        link: verdict.link,
+                        pair_only,
+                    },
                 )
                 .await
                 {
-                    Ok(_) => {
+                    Ok(Some(_)) => {
                         tracing::info!(
                             loser = %other.work_id, survivor = %against.work_id, alias = %key,
                             reason = verdict.reason, "consolidate: merged"
@@ -14085,7 +15357,7 @@ async fn consolidate_exact_duplicates_from(
                         out.merged
                             .push((other.work_id.clone(), against.work_id.clone()));
                     }
-                    Err(e) if is_precondition_failure(&e) => {
+                    Ok(None) => {
                         out.stale += 1;
                         tracing::info!(
                             loser = %other.work_id, survivor = %against.work_id, alias = %key,
@@ -14134,19 +15406,16 @@ async fn queue_consolidate_review(
     survivor: &str,
     score: f64,
 ) -> anyhow::Result<bool> {
-    let ssid: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM source_series WHERE work_id = ? ORDER BY created_at ASC, id ASC LIMIT 1",
-    )
-    .bind(loser)
-    .fetch_optional(pool)
-    .await?;
-    let Some(ssid) = ssid else {
-        return Ok(false);
-    };
-    // A `None` return means the pair is already in the queue or already resolved; either
+    // The source mapping is chosen INSIDE the transaction that inserts the row and is
+    // read again under the work locks (T154). Chosen outside, a mapping that moved to
+    // another work in between made the row ask about a pair nobody had judged.
+    // `Suppressed` means the pair is already in the queue or already resolved; either
     // way a row exists.
-    catalog::insert_merge_candidate(pool, &ssid, survivor, score, "title_exact").await?;
-    Ok(true)
+    let queued = crate::db::retry_transaction(|| {
+        queue_review_once(pool, loser, survivor, score, "title_exact", false, false)
+    })
+    .await?;
+    Ok(queued != QueuedReview::NoSource)
 }
 
 /// What one pass over the review queue did.
@@ -14170,6 +15439,18 @@ async fn has_rival_target(
     loser: &catalog::WorkMatchData,
     survivor: &catalog::WorkMatchData,
 ) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    has_rival_target_on(&mut conn, loser, survivor).await
+}
+
+/// [`has_rival_target`] on the caller's connection. Read only. The rivals are other
+/// works, which a pair merge does not lock: the answer is evidence about them, read
+/// as of now.
+async fn has_rival_target_on(
+    conn: &mut sqlx::PgConnection,
+    loser: &catalog::WorkMatchData,
+    survivor: &catalog::WorkMatchData,
+) -> anyhow::Result<bool> {
     use crate::catalog::normalize::{match_key, normalize_title};
     use catalog::pair::{assess, Verdict};
     let mut rivals: Vec<String> = Vec::new();
@@ -14178,7 +15459,8 @@ async fn has_rival_target(
             continue;
         };
         rivals.extend(
-            catalog::find_works_by_match_key(pool, &match_key(&normalize_title(title))).await?,
+            catalog::find_works_by_match_key_on(&mut *conn, &match_key(&normalize_title(title)))
+                .await?,
         );
     }
     rivals.retain(|id| *id != loser.work_id && *id != survivor.work_id);
@@ -14189,7 +15471,7 @@ async fn has_rival_target(
     if rivals.len() > MAX_RIVALS {
         return Ok(true);
     }
-    let data = catalog::load_match_data_batch(pool, &rivals).await?;
+    let data = catalog::load_match_data_batch_on(&mut *conn, &rivals).await?;
     Ok(data.values().any(|rival| {
         assess(loser, rival).verdict == Verdict::Merge
             && assess(survivor, rival).verdict != Verdict::Merge
@@ -14209,15 +15491,15 @@ async fn has_rival_target(
 /// a later automatic merge, should the works' metadata change.
 async fn sort_pending_reviews(
     pool: &Database,
-    covers: Option<&Database>,
+    covers: Option<&crate::database::SqliteDatabase>,
     after: &str,
     limit: i64,
 ) -> anyhow::Result<ReviewOutcome> {
     use catalog::pair::{assess, Verdict};
-    let rows: Vec<(String, String, String, f64)> = sqlx::query_as(
+    let rows: Vec<(String, String, String, f64)> = crate::db_types::query_tuple(
         "SELECT mc.id, ss.work_id, mc.candidate_work_id, mc.score FROM merge_candidate mc \
          JOIN source_series ss ON ss.id = mc.source_series_id \
-         WHERE mc.status = 'pending' AND mc.id > ? ORDER BY mc.id LIMIT ?",
+         WHERE mc.status = 'pending' AND mc.id > $1 ORDER BY mc.id LIMIT $2",
     )
     .bind(after)
     .bind(limit.max(1))
@@ -14243,12 +15525,12 @@ async fn sort_pending_reviews(
             .unwrap_or(false);
         // The same two works, asked about or refused in an earlier row (the sweep used
         // to queue a pair once per direction): one question is enough.
-        let repeated: bool = sqlx::query_scalar(
+        let repeated: bool = crate::db_types::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM merge_candidate mc \
              JOIN source_series ss ON ss.id = mc.source_series_id \
-             WHERE mc.id < ?1 AND mc.status IN ('pending', 'rejected') \
-               AND (ss.work_id = ?2 AND mc.candidate_work_id = ?3 \
-                 OR ss.work_id = ?3 AND mc.candidate_work_id = ?2))",
+             WHERE mc.id < $1 AND mc.status IN ('pending', 'rejected') \
+               AND (ss.work_id = $2 AND mc.candidate_work_id = $3 \
+                 OR ss.work_id = $3 AND mc.candidate_work_id = $2))",
         )
         .bind(&id)
         .bind(&source)
@@ -14256,16 +15538,13 @@ async fn sort_pending_reviews(
         .fetch_one(pool)
         .await?;
         if verdict.verdict == Verdict::Distinct || split || repeated {
-            let closed = sqlx::query(
-                "UPDATE merge_candidate SET status = 'dismissed', score = ?, resolved_at = ? \
-                 WHERE id = ? AND status = 'pending'",
-            )
-            .bind(verdict.score)
-            .bind(Utc::now().to_rfc3339())
-            .bind(&id)
-            .execute(pool)
-            .await?;
-            if closed.rows_affected() == 1 {
+            // One guarded, retried transaction for this row (T155): the answer is
+            // read again under the pair key and the work locks a person's rejection
+            // of the same row takes, so the two cannot both decide it.
+            let closed =
+                crate::db::retry_transaction(|| dismiss_review_once(pool, &id, &source, &target))
+                    .await?;
+            if closed {
                 out.dismissed += 1;
                 tracing::debug!(
                     candidate_id = %id, a = %source, b = %target, reason = verdict.reason,
@@ -14278,48 +15557,40 @@ async fn sort_pending_reviews(
         let flipped = a.mangadex_anchored && !b.mangadex_anchored;
         let (loser, survivor) = if flipped { (b, a) } else { (a, b) };
         if verdict.verdict == Verdict::Merge && !has_rival_target(pool, loser, survivor).await? {
+            // One guarded, retried transaction for this pair (T155, T156): the
+            // verdict, the direction and the rival check are repeated on the locked
+            // works, and an unflipped merge claims this review row in that same
+            // transaction. A retry replays this pair only.
             let key = verdict.key.as_deref();
             let expected = (&loser.identity(key), &survivor.identity(key));
-            let result = if flipped {
-                catalog::merge_works_checked(
-                    pool,
-                    covers,
-                    &loser.work_id,
-                    &survivor.work_id,
-                    Some(expected),
-                )
-                .await
-            } else {
-                catalog::merge_pending_candidate_checked(
-                    pool,
-                    covers,
-                    &loser.work_id,
-                    &survivor.work_id,
-                    expected,
-                    &id,
-                )
-                .await
-            };
-            match result {
-                Ok(_) => {
-                    tracing::info!(
-                        candidate_id = %id, loser = %loser.work_id, survivor = %survivor.work_id,
-                        reason = verdict.reason, "review sorted: merged"
-                    );
-                    out.merged
-                        .push((loser.work_id.clone(), survivor.work_id.clone()));
-                    continue;
-                }
-                Err(e) if is_precondition_failure(&e) => {}
-                Err(error) => return Err(error),
+            let merged = merge_pair_guarded(
+                pool,
+                covers,
+                &loser.work_id,
+                &survivor.work_id,
+                Some(expected),
+                (!flipped).then_some(id.as_str()),
+                MergeGate::ReviewSort { flipped },
+            )
+            .await?;
+            if merged.is_some() {
+                tracing::info!(
+                    candidate_id = %id, loser = %loser.work_id, survivor = %survivor.work_id,
+                    reason = verdict.reason, "review sorted: merged"
+                );
+                out.merged
+                    .push((loser.work_id.clone(), survivor.work_id.clone()));
+                continue;
             }
         }
         if (verdict.score - old_score).abs() > f64::EPSILON {
-            sqlx::query("UPDATE merge_candidate SET score = ? WHERE id = ? AND status = 'pending'")
-                .bind(verdict.score)
-                .bind(&id)
-                .execute(pool)
-                .await?;
+            sqlx::query(
+                "UPDATE merge_candidate SET score = $1 WHERE id = $2 AND status = 'pending'",
+            )
+            .bind(verdict.score)
+            .bind(&id)
+            .execute(pool)
+            .await?;
         }
     }
     if !out.merged.is_empty() {
@@ -14331,20 +15602,17 @@ async fn sort_pending_reviews(
 /// Sort the whole review queue (see `sort_pending_reviews`), yielding between batches so
 /// the live sync and the cover drainer keep getting the single SQLite writer.
 ///
-/// A batch that loses the writer to another job uses the shared bounded retry helper
-/// from the same cursor: a row it already settled is no longer waiting, so the repeat
-/// only does the rest.
+/// Each merge owns its transaction and retry boundary. Never retry the batch:
+/// earlier pairs may already be committed and their cover cleanup completed.
 pub(crate) async fn auto_merge_pending_reviews(
     pool: &Database,
-    covers: Option<&Database>,
+    covers: Option<&crate::database::SqliteDatabase>,
 ) -> anyhow::Result<u64> {
     const BATCH: i64 = 200;
     let mut cursor = String::new();
     let (mut merged, mut dismissed) = (0u64, 0i64);
     loop {
-        let out =
-            crate::db::retry_transaction(|| sort_pending_reviews(pool, covers, &cursor, BATCH))
-                .await?;
+        let out = sort_pending_reviews(pool, covers, &cursor, BATCH).await?;
         merged += out.merged.len() as u64;
         dismissed += out.dismissed;
         if out.seen < BATCH {
@@ -14377,7 +15645,7 @@ pub struct DuplicateSweepResult {
 /// and advances `CONSOLIDATE_CURSOR`; the caller holds `RECONCILE_RUNNING`.
 async fn sweep_duplicates_once(
     pool: &Database,
-    covers: Option<&Database>,
+    covers: Option<&crate::database::SqliteDatabase>,
     limit: i64,
 ) -> anyhow::Result<DuplicateSweepResult> {
     let mut cursor = CONSOLIDATE_CURSOR
@@ -14418,7 +15686,7 @@ async fn sweep_duplicates_once(
         };
     }
     *CONSOLIDATE_CURSOR.lock().unwrap_or_else(|e| e.into_inner()) = cursor;
-    result.pending = sqlx::query_scalar::<_, i64>(
+    result.pending = crate::db_types::query_scalar::<i64>(
         "SELECT COUNT(*) FROM merge_candidate mc          JOIN source_series ss ON ss.id = mc.source_series_id          WHERE mc.status = 'pending' AND mc.candidate_work_id <> ss.work_id",
     )
     .fetch_one(pool)
@@ -14441,7 +15709,10 @@ async fn sweep_duplicates_once(
 /// COVER BLOBS: pass `Some(covers)` so the merges reclaim the losing works' cached
 /// cover blobs (see `catalog::merge_works_ex`). Passing `None` leaks them, and is only
 /// correct where no covers pool exists.
-pub(crate) async fn run_post_ingest_dedup_ex(pool: &Database, covers: Option<&Database>) {
+pub(crate) async fn run_post_ingest_dedup_ex(
+    pool: &Database,
+    covers: Option<&crate::database::SqliteDatabase>,
+) {
     let Some(_running) = crate::request_budget::RunningGuard::try_acquire(&RECONCILE_RUNNING)
     else {
         tracing::info!("post-ingest dedup: a reconcile is already running; skipping");
@@ -14452,10 +15723,14 @@ pub(crate) async fn run_post_ingest_dedup_ex(pool: &Database, covers: Option<&Da
         Ok((merged, queued, skipped)) => {
             tracing::info!(merged, queued, skipped, "post-ingest dedup: reconcile done")
         }
-        Err(e) => tracing::error!(error = %e, "post-ingest dedup: reconcile failed"),
+        Err(e) => {
+            crate::db::observe_database_error(&e);
+            tracing::error!(error = %e, "post-ingest dedup: reconcile failed");
+        }
     }
     // After the reconcile, so the reviews it just queued are sorted in this same run.
     if let Err(e) = auto_merge_pending_reviews(pool, covers).await {
+        crate::db::observe_database_error(&e);
         tracing::warn!(error = %e, "post-ingest dedup: pending review sweep failed");
     }
     // BOUNDED. This used to be `loop { … }` until nothing merged, which — with the old
@@ -14490,6 +15765,7 @@ pub(crate) async fn run_post_ingest_dedup_ex(pool: &Database, covers: Option<&Da
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             }
             Err(e) => {
+                crate::db::observe_database_error(&e);
                 tracing::error!(error = %e, "post-ingest dedup: consolidate failed");
                 break;
             }
@@ -14516,67 +15792,62 @@ pub(crate) async fn run_post_ingest_dedup_ex(pool: &Database, covers: Option<&Da
 /// against the spine (excluding itself), then merge / queue / skip.
 async fn reconcile_one(
     pool: &Database,
-    covers: Option<&Database>,
+    covers: Option<&crate::database::SqliteDatabase>,
     work_id: &str,
 ) -> anyhow::Result<ReconcileAction> {
+    // A lock-free probe: it only says which unit to run. Each unit repeats the
+    // matcher on the locked works before it changes anything (T157).
     let Some(md) = catalog::load_match_data(pool, work_id).await? else {
         return Ok(ReconcileAction::Skipped); // vanished (e.g. merged by a prior item)
     };
-    let title = md
-        .primary_title
-        .clone()
-        .or_else(|| md.aliases_norm.first().cloned())
-        .unwrap_or_default();
-    if title.is_empty() && md.aliases_norm.is_empty() {
+    let Some(cand) = reconcile_candidate(&md) else {
         return Ok(ReconcileAction::Skipped);
-    }
-    let cand = crate::dedup::Candidate {
-        title,
-        alt_titles: md.aliases_norm.clone(),
-        description: md.description.clone(),
-        author: md.author.clone(),
-        year: md.year,
-        cover_phash: md.cover_phash.clone(),
-        external_ids: Vec::new(),
     };
     match crate::dedup::resolve_ex(pool, &cand, Some(work_id)).await? {
         crate::dedup::Decision::AutoMerge {
             work_id: target, ..
         } => {
-            catalog::merge_works_ex(pool, covers, work_id, &target).await?;
-            Ok(ReconcileAction::Merged)
+            // `None`: under the locks the matcher no longer auto-merges this pair (a
+            // split, a rejection or an edit landed first). The work stays provisional
+            // and the next reconcile looks at it again.
+            let merged = merge_pair_guarded(
+                pool,
+                covers,
+                work_id,
+                &target,
+                None,
+                None,
+                MergeGate::Matcher,
+            )
+            .await?;
+            Ok(if merged.is_some() {
+                ReconcileAction::Merged
+            } else {
+                ReconcileAction::Skipped
+            })
         }
         crate::dedup::Decision::Review {
             work_id: target,
             score,
             method,
         } => {
-            let ssid: Option<String> = sqlx::query_scalar(
-                "SELECT id FROM source_series WHERE work_id = ? AND source_type = 'suwayomi' \
-                 ORDER BY created_at ASC, id ASC LIMIT 1",
-            )
-            .bind(work_id)
-            .fetch_optional(pool)
-            .await?;
-            match ssid {
-                // A `None` from the insert is a pair an admin already ruled on (or one
-                // already queued): counting it as `Queued` would report review work that
-                // does not exist. `Skipped` is the honest bucket.
-                Some(ssid) => {
-                    match catalog::insert_merge_candidate(pool, &ssid, &target, score, &method)
-                        .await?
-                    {
-                        Some(_) => Ok(ReconcileAction::Queued),
-                        None => {
-                            tracing::debug!(
-                                work_id, %target,
-                                "reconcile: pair already queued or already resolved — not re-proposed"
-                            );
-                            Ok(ReconcileAction::Skipped)
-                        }
-                    }
+            // `Suppressed` is a pair an admin already ruled on (or one already queued):
+            // counting it as `Queued` would report review work that does not exist.
+            // `Skipped` is the honest bucket.
+            match crate::db::retry_transaction(|| {
+                queue_review_once(pool, work_id, &target, score, &method, true, true)
+            })
+            .await?
+            {
+                QueuedReview::Inserted => Ok(ReconcileAction::Queued),
+                QueuedReview::Suppressed => {
+                    tracing::debug!(
+                        work_id, %target,
+                        "reconcile: pair already queued or already resolved — not re-proposed"
+                    );
+                    Ok(ReconcileAction::Skipped)
                 }
-                None => Ok(ReconcileAction::Skipped),
+                QueuedReview::NoSource => Ok(ReconcileAction::Skipped),
             }
         }
         crate::dedup::Decision::New => Ok(ReconcileAction::Skipped),
@@ -14689,27 +15960,108 @@ async fn add_source_series_checked(
     // derives the tags then.
     if let Err(e) = crate::tags::sync_work_suwayomi_tags(&st.pool, &result.work_id, &m.genre).await
     {
+        crate::db::observe_database_error(&e);
         tracing::warn!(work_id = %result.work_id, error = %e, "enrol: tag derivation failed; the next catalogue refresh retries");
     }
     Ok(result)
 }
 
-/// Give a work linked to an admin-pinned source the same `is_nsfw_override = 1` that
+/// Give a work linked to an admin-pinned source the same `is_nsfw_override = TRUE` that
 /// `markSourceNsfw` gave the works the source already had when it ran, so a series
 /// added later is pinned exactly like one added earlier. Needed on top of
 /// `mark_work_nsfw`, which yields to a MangaDex `safe`/`suggestive` rating — the admin's
 /// pin does not. A work whose override an admin already set by hand (either way) is
 /// left alone: that per-work decision is more specific than the per-source one.
-async fn pin_work_nsfw(pool: &Database, work_id: &str) -> anyhow::Result<()> {
+///
+/// Runs on the enrolment transaction, which holds the work's row lock.
+async fn pin_work_nsfw_on(conn: &mut sqlx::PgConnection, work_id: &str) -> anyhow::Result<()> {
     sqlx::query(
-        "UPDATE work SET is_nsfw_override = 1, updated_at = ? \
-         WHERE id = ? AND is_nsfw_override IS NULL",
+        "UPDATE work SET is_nsfw_override = TRUE, updated_at = $1 \
+         WHERE id = $2 AND is_nsfw_override IS NULL",
     )
-    .bind(Utc::now().to_rfc3339())
+    .bind(crate::db_types::date(
+        &(crate::db_types::format_date(Utc::now())),
+    )?)
     .bind(work_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+/// Where an enrolment decided its series belongs. Read by `enrol_route_on`.
+#[derive(Debug, Clone, PartialEq)]
+enum EnrolRoute {
+    /// The series' url names a MangaDex id that a catalogue work is anchored to.
+    MangadexId(String),
+    /// The matcher's answer for the series' own title and metadata.
+    Matched(crate::dedup::Decision),
+}
+
+impl EnrolRoute {
+    /// The existing work this route would link to or ask a review against.
+    fn work(&self) -> Option<&str> {
+        match self {
+            EnrolRoute::MangadexId(work_id)
+            | EnrolRoute::Matched(crate::dedup::Decision::AutoMerge { work_id, .. })
+            | EnrolRoute::Matched(crate::dedup::Decision::Review { work_id, .. }) => Some(work_id),
+            EnrolRoute::Matched(crate::dedup::Decision::New) => None,
+        }
+    }
+
+    /// The same decision: the same kind, the same work, the same method. The score is
+    /// left out on purpose. It moves with every edit of any work the fuzzy block
+    /// happens to list, and a moved score that still gives the same answer is no reason
+    /// to run the unit again.
+    fn agrees_with(&self, other: &EnrolRoute) -> bool {
+        use crate::dedup::Decision::{AutoMerge, New, Review};
+        match (self, other) {
+            (EnrolRoute::MangadexId(a), EnrolRoute::MangadexId(b)) => a == b,
+            (EnrolRoute::Matched(New), EnrolRoute::Matched(New)) => true,
+            (
+                EnrolRoute::Matched(AutoMerge {
+                    work_id: a,
+                    method: am,
+                    ..
+                }),
+                EnrolRoute::Matched(AutoMerge {
+                    work_id: b,
+                    method: bm,
+                    ..
+                }),
+            )
+            | (
+                EnrolRoute::Matched(Review {
+                    work_id: a,
+                    method: am,
+                    ..
+                }),
+                EnrolRoute::Matched(Review {
+                    work_id: b,
+                    method: bm,
+                    ..
+                }),
+            ) => a == b && am == bm,
+            _ => false,
+        }
+    }
+}
+
+/// Decide the route of an enrolment on the caller's transaction. Read only.
+async fn enrol_route_on(
+    conn: &mut sqlx::PgConnection,
+    mangadex_uuid: Option<&str>,
+    candidate: &crate::dedup::Candidate,
+) -> anyhow::Result<EnrolRoute> {
+    if let Some(uuid) = mangadex_uuid {
+        if let Some((_, work_id)) =
+            catalog::find_source_series_on(&mut *conn, "mangadex", "mangadex", uuid).await?
+        {
+            return Ok(EnrolRoute::MangadexId(work_id));
+        }
+    }
+    Ok(EnrolRoute::Matched(
+        crate::dedup::resolve_on(&mut *conn, candidate, None).await?,
+    ))
 }
 
 /// As `add_source_series_core`, but `consolidate` controls the mid-confidence
@@ -14720,6 +16072,10 @@ async fn pin_work_nsfw(pool: &Database, work_id: &str) -> anyhow::Result<()> {
 /// canonical entry in search results, as the reader UX requires. Federated
 /// consolidation is optimistic and does NOT enqueue a review row (that would
 /// re-split the very entry the feature is meant to unify).
+///
+/// The enrolment is ONE retried transaction ([`enrol_source_series_once`], T159 with the
+/// catalogue's T024 and T093). Everything slow (the Suwayomi request, the cover hash,
+/// the source's adult posture) is prepared by the caller before this is called.
 async fn add_source_series_core_ex(
     pool: &Database,
     m: &crate::suwayomi::SuwayomiManga,
@@ -14729,9 +16085,10 @@ async fn add_source_series_core_ex(
 ) -> anyhow::Result<MatchResult> {
     let source_key = m.id.to_string();
 
-    // DD2 idempotency: if this source series is already linked to a work, return
-    // that linkage untouched instead of re-running the matcher (which would mint an
-    // orphan work and, for a review, a duplicate merge_candidate row).
+    // DD2 idempotency, as a lock-free pre-check: a series that is already linked (the
+    // usual case of a repeated bulk ingest) is answered from a reader connection, with
+    // no writer transaction and no advisory key. The unit repeats this check under the
+    // source's claim keys, so the pre-check decides nothing by itself.
     if let Some((ssid, existing_work_id)) =
         crate::catalog::find_source_series(pool, "suwayomi", &m.source_id, &source_key).await?
     {
@@ -14757,123 +16114,179 @@ async fn add_source_series_core_ex(
     // installed since the last record pass. An admin's pin on the source counts too.
     let source_nsfw = genre_is_nsfw(&m.genre) || source.adult || source.pinned;
 
-    // Exact MangaDex-identity consolidation. The MangaDex Suwayomi extension carries
-    // the canonical MangaDex UUID in `MangaType.url` (e.g. `/manga/<uuid>`). When that
-    // UUID resolves to an existing `mangadex`-anchored catalogue work, this mirror IS
-    // that same work — link it DIRECTLY by exact id instead of leaning on fuzzy
-    // title/cover dedup, which was leaving ~1 in 5 MangaDex-extension series as
-    // un-catalogued standalone works (present in Browse but invisible to search / home
-    // / canonical surfaces, which are built only from `mangadex`-anchored works). The
-    // existence of a canonical work for that exact UUID IS the gate — no dependency on
-    // `source_extension` being populated yet (it isn't at first boot), and no risk of a
-    // false link: a non-MangaDex source's url practically never contains a UUID, and a
-    // UUID that matches one of our ~109k MangaDex ids can only be that MangaDex series.
-    // A UUID hit is authoritative, so no merge_candidate review is enqueued.
-    if let Some(uuid) = m.url.as_deref().and_then(mangadex_uuid) {
-        if let Some((_, work_id)) =
-            crate::catalog::find_source_series(pool, "mangadex", "mangadex", &uuid).await?
-        {
-            let ssid = crate::catalog::upsert_source_series(
-                pool,
-                &work_id,
-                "suwayomi",
-                &m.source_id,
-                &source_key,
-                None,
-                source_nsfw,
-            )
-            .await?;
-            if source_nsfw {
-                crate::catalog::mark_work_nsfw(pool, &work_id).await?;
-                if source.pinned {
-                    pin_work_nsfw(pool, &work_id).await?;
-                }
-                // Push the escalation into the materialized feed copies immediately.
-                // Without this the flag reaches `work` but not `browse_catalogue`, and
-                // Browse gates on the copy — so an opted-out viewer keeps being served
-                // this work until the next rebuild (one catalogue-sync interval, 6h by
-                // default; boot-only if the sync is disabled). The admin mark paths have
-                // always done this; the ingest/link path did not.
-                resync_feed_nsfw(pool, std::slice::from_ref(&work_id)).await;
-            }
-            // Adopt the AUTHORITATIVE stored linkage (H6): if a concurrent add via the
-            // fuzzy path won the natural-key claim and linked this series to a different
-            // work, `upsert_source_series`'s `ON CONFLICT` kept that work_id — return it
-            // rather than our own, so the reported linkage never disagrees with the DB.
-            let linked =
-                crate::catalog::find_source_series(pool, "suwayomi", &m.source_id, &source_key)
-                    .await?
-                    .map(|(_, w)| w)
-                    .unwrap_or(work_id);
-            return Ok(MatchResult {
-                decision: "mangadex_id".into(),
-                work_id: linked,
-                matched_work_id: None,
-                score: None,
-                method: Some("mangadex_id".into()),
-                source_series_id: ssid,
-            });
-        }
-    }
-
     // Suwayomi carries no external tracker IDs (no AniList/MAL on MangaType), so
     // `external_ids` stays empty — the external-ID dedup rung is a no-op here.
-    let cand = crate::dedup::Candidate {
-        title: m.title.clone(),
-        alt_titles: Vec::new(),
-        description: m.description.clone(),
-        author: m.author.clone(),
-        year: None,
-        cover_phash: cover_phash.clone(),
-        external_ids: Vec::new(),
+    let enrolment = Enrolment {
+        source_id: &m.source_id,
+        source_key: &source_key,
+        // The MangaDex Suwayomi extension carries the canonical MangaDex UUID in
+        // `MangaType.url` (e.g. `/manga/<uuid>`); see `enrol_source_series_once`.
+        mangadex_uuid: m.url.as_deref().and_then(mangadex_uuid),
+        candidate: crate::dedup::Candidate {
+            title: m.title.clone(),
+            alt_titles: Vec::new(),
+            description: m.description.clone(),
+            author: m.author.clone(),
+            year: None,
+            cover_phash: cover_phash.clone(),
+            external_ids: Vec::new(),
+        },
+        // The work minted for `new` and for a provisional `review`.
+        work: crate::catalog::WorkInput {
+            primary_title: Some(m.title.clone()),
+            description: m.description.clone(),
+            author: m.author.clone(),
+            artist: m.artist.clone(),
+            status: Some(m.status.clone()),
+            is_nsfw: source_nsfw,
+            cover_phash,
+            aliases: vec![crate::catalog::Alias {
+                raw: m.title.clone(),
+                lang: None,
+            }],
+            ..Default::default()
+        },
+        title: &m.title,
+        consolidate,
+        source_nsfw,
+        pinned: source.pinned,
     };
-    let decision = crate::dedup::resolve(pool, &cand).await?;
+    crate::db::retry_transaction(|| enrol_source_series_once(pool, &enrolment)).await
+}
 
-    // The work this source series is (provisionally) linked to. For `new` and
-    // `review` we mint a first-class work from the Suwayomi metadata.
-    let make_work = || crate::catalog::WorkInput {
-        primary_title: Some(m.title.clone()),
-        description: m.description.clone(),
-        author: m.author.clone(),
-        artist: m.artist.clone(),
-        status: Some(m.status.clone()),
-        is_nsfw: source_nsfw,
-        cover_phash: cover_phash.clone(),
-        aliases: vec![crate::catalog::Alias {
-            raw: m.title.clone(),
-            lang: None,
-        }],
-        ..Default::default()
-    };
+/// Everything one enrolment needs, prepared before its transaction begins.
+struct Enrolment<'a> {
+    source_id: &'a str,
+    source_key: &'a str,
+    mangadex_uuid: Option<String>,
+    candidate: crate::dedup::Candidate,
+    work: crate::catalog::WorkInput,
+    title: &'a str,
+    consolidate: bool,
+    source_nsfw: bool,
+    pinned: bool,
+}
 
+/// One enrolment of a Suwayomi series, BEGIN to COMMIT, retried as a whole by its
+/// caller (T159; closes the catalogue's T024 and T093 for this caller).
+///
+/// 1. ONE advisory call: the source's claim keys (its natural key, Suwayomi's global
+///    key, the source policy key an admin pin of the source takes), the match domain of
+///    the candidate (one key per article-insensitive title), the identity keys of the
+///    work that may be minted, and the MangaDex identity of the uuid in the series' url.
+///    Two enrolments of one series, and two enrolments of two series with one title,
+///    therefore run one after the other.
+/// 2. Under those keys: is the series linked already? Then that link is the answer.
+/// 3. The route (`enrol_route_on`): the MangaDex id, or the matcher.
+/// 4. If the route names an existing work, lock it (sorted, with the works the claim
+///    will lock) and read the route AGAIN. A different answer restarts the unit: the
+///    work was merged away, split, retitled or rated while this unit waited.
+/// 5. Mint the work, or reuse the locked one. Link the series. Escalate the adult flag
+///    and push it into the feed copies. Queue the review. All in this transaction.
+///
+/// Before this, each of those steps committed by itself: two enrolments of one new
+/// title both saw "no such work" and minted two works; a minted work whose claim was
+/// lost had to be deleted again afterwards; a crash between the link and the adult flag
+/// left an adult series served as safe until the next rebuild.
+async fn enrol_source_series_once(
+    pool: &Database,
+    enrolment: &Enrolment<'_>,
+) -> anyhow::Result<MatchResult> {
     use crate::dedup::Decision;
-    // `minted_work` is the work we FRESHLY created in this call (New / provisional
-    // Review). It's the orphan-cleanup target if we lose the concurrent claim below
-    // — AutoMerge / review_consolidated reuse an existing work and must never be
-    // deleted here.
-    let mut minted_work: Option<String> = None;
-    let (mut decision_str, matched_work_id, score, method, mut work_id) = match &decision {
-        Decision::AutoMerge {
+    let Enrolment {
+        source_id,
+        source_key,
+        mangadex_uuid,
+        candidate,
+        work,
+        title,
+        consolidate,
+        source_nsfw,
+        pinned,
+    } = enrolment;
+    let mangadex_uuid = mangadex_uuid.as_deref();
+    let mut tx = pool.begin().await?;
+    let mut keys = catalog::source_claim_keys("suwayomi", source_id, source_key);
+    keys.extend(crate::dedup::match_domain_keys(candidate));
+    keys.extend(catalog::create_work_keys(work));
+    // The key `catalog::upsert_work_from_mangadex` holds while it creates the work of
+    // this uuid: its anchor either exists when the route is read, or does not yet.
+    keys.extend(
+        mangadex_uuid.map(|uuid| crate::locks::AdvisoryKey::external_identity("mangadex", uuid)),
+    );
+    crate::locks::advisory(&mut tx, &keys).await?;
+    #[cfg(test)]
+    guard_pause("enrol-keys-held").await;
+
+    // DD2 under the claim keys: nobody can link this series while they are held.
+    if let Some((ssid, existing_work_id)) =
+        catalog::find_source_series_on(&mut tx, "suwayomi", source_id, source_key).await?
+    {
+        return Ok(MatchResult {
+            decision: "existing".into(),
+            work_id: existing_work_id,
+            matched_work_id: None,
+            score: None,
+            method: None,
+            source_series_id: ssid,
+        });
+    }
+
+    let mut route = enrol_route_on(&mut tx, mangadex_uuid, candidate).await?;
+    if let Some(existing) = route.work().map(str::to_owned) {
+        // The complete work set of the unit, before any work lock: the route's work
+        // and the works the claim will lock (the same work after its redirect; the
+        // stored owner of the key, which step 2 has just shown not to exist).
+        let mut works =
+            catalog::source_claim_works_on(&mut tx, &existing, "suwayomi", source_id, source_key)
+                .await?;
+        works.push(existing);
+        let locked = crate::locks::lock_works(&mut tx, &works).await?;
+        let again = enrol_route_on(&mut tx, mangadex_uuid, candidate).await?;
+        if !locked.missing.is_empty() || !again.agrees_with(&route) {
+            return Err(crate::locks::RestartTransaction.into());
+        }
+        // The values read under the lock are the ones that are reported and stored.
+        route = again;
+    }
+    #[cfg(test)]
+    guard_pause("enrol-locked").await;
+
+    // (decision, matched work, score, method, the work to link, review to queue)
+    let (decision, matched_work_id, score, method, work_id, review) = match &route {
+        // Exact MangaDex-identity consolidation: a work anchored to that exact uuid IS
+        // this series, so it is linked directly instead of leaning on fuzzy title/cover
+        // dedup. A uuid hit is authoritative, so no review is queued.
+        EnrolRoute::MangadexId(work_id) => (
+            "mangadex_id",
+            None,
+            None,
+            Some("mangadex_id".to_string()),
+            work_id.clone(),
+            None,
+        ),
+        EnrolRoute::Matched(Decision::AutoMerge {
             work_id,
             score,
             method,
-        } => (
+        }) => (
             "auto_merge",
             Some(work_id.clone()),
             Some(*score),
             Some(method.clone()),
             work_id.clone(),
+            None,
         ),
         // Federated (S3/C2): consolidate onto the matched work ONLY when the match
         // is corroborated beyond the bare title and the title is non-trivial —
         // otherwise this falls through to the cautious provisional arm below.
-        Decision::Review {
+        EnrolRoute::Matched(Decision::Review {
             work_id,
             score,
             method,
-        } if consolidate
+        }) if *consolidate
             && method != "title_exact"
-            && federated_consolidate_ok(*score, &m.title) =>
+            && federated_consolidate_ok(*score, title) =>
         {
             (
                 "review_consolidated",
@@ -14881,103 +16294,92 @@ async fn add_source_series_core_ex(
                 Some(*score),
                 Some(method.clone()),
                 work_id.clone(),
+                None,
             )
         }
-        Decision::Review {
+        // Cautious path: a provisional work and a review for a human. Reached by the
+        // admin add flow AND by federated matches that failed the C2
+        // corroboration/length guard — never a silent merge.
+        EnrolRoute::Matched(Decision::Review {
             work_id,
             score,
             method,
-        } => {
-            // Cautious path: a provisional work + (below) a merge_candidate for a
-            // human. Reached by the admin add flow AND by federated matches that
-            // failed the C2 corroboration/length guard — never a silent merge.
-            let provisional = crate::catalog::create_work(pool, &make_work()).await?;
-            minted_work = Some(provisional.clone());
-            (
-                "review",
-                Some(work_id.clone()),
-                Some(*score),
-                Some(method.clone()),
-                provisional,
-            )
-        }
-        Decision::New => {
-            let created = crate::catalog::create_work(pool, &make_work()).await?;
-            minted_work = Some(created.clone());
-            ("new", None, None, None, created)
-        }
+        }) => (
+            "review",
+            Some(work_id.clone()),
+            Some(*score),
+            Some(method.clone()),
+            catalog::create_work_on(&mut tx, work).await?,
+            Some((work_id.clone(), *score, method.clone())),
+        ),
+        EnrolRoute::Matched(Decision::New) => (
+            "new",
+            None,
+            None,
+            None,
+            catalog::create_work_on(&mut tx, work).await?,
+            None,
+        ),
     };
 
-    let ssid = crate::catalog::upsert_source_series(
-        pool,
+    let ssid = catalog::upsert_source_series_on(
+        &mut tx,
         &work_id,
         "suwayomi",
-        &m.source_id,
-        &source_key,
+        source_id,
+        source_key,
         None,
-        source_nsfw,
+        *source_nsfw,
     )
     .await?;
-
-    // H6 — post-claim re-check. The natural-key `ON CONFLICT` in
-    // `upsert_source_series` is the atomic claim: exactly one work_id ends up
-    // stored for this (source_type, source_id, source_key). If a concurrent add of
-    // the SAME series won the claim, the stored work_id differs from the one we
-    // just linked. Adopt the authoritative stored linkage and, if WE minted a fresh
-    // work, delete it so it isn't orphaned. This closes the false-split / orphan
-    // race without a cross-helper transaction refactor.
-    // Residual risk: two concurrent *New* decisions for what is genuinely the same
-    // series (both saw no existing work) still mint two works; the claim serializes
-    // them so only one is linked and the loser's work is reclaimed here — but a
-    // concurrent add matching a DIFFERENT existing work than the winner would keep
-    // its own (non-minted) work. That window is narrow and human-reviewable.
-    if let Some((_, stored_work_id)) =
-        crate::catalog::find_source_series(pool, "suwayomi", &m.source_id, &source_key).await?
-    {
-        if stored_work_id != work_id {
-            if minted_work.as_deref() == Some(work_id.as_str()) {
-                crate::catalog::delete_work_cascade(pool, &work_id).await?;
-            }
-            // The concurrent winner already established (and, if applicable, queued
-            // a review for) the canonical linkage — treat this add as idempotent.
-            work_id = stored_work_id;
-            decision_str = "existing";
-        }
+    // The claim keeps a stored owner, and there was none under the keys (step 2), so
+    // the mapping must be this unit's. Anything else means the keys did not cover the
+    // claim; run again rather than report a link the database does not hold.
+    let linked: String = sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = $1")
+        .bind(&ssid)
+        .fetch_one(&mut *tx)
+        .await?;
+    if linked != work_id {
+        return Err(crate::locks::RestartTransaction.into());
     }
 
     // N4: the source-level NSFW signal must reach `work.is_nsfw` — the only column the
-    // gating reads consult. `new`/`review` already mint the work with it via make_work;
-    // an `auto_merge` reuses an existing (possibly SFW) work, so OR the flag in there.
-    if source_nsfw {
-        crate::catalog::mark_work_nsfw(pool, &work_id).await?;
-        if source.pinned {
-            pin_work_nsfw(pool, &work_id).await?;
+    // gating reads consult. A minted work carries it already; a reused (possibly SFW)
+    // work gets it here. `work` is the authoritative column, but Browse and the feeds
+    // gate on a materialized copy, so the escalation is pushed there in this same
+    // transaction: the link and the flag are visible together or not at all.
+    if *source_nsfw {
+        catalog::mark_work_nsfw_on(&mut tx, &work_id).await?;
+        if *pinned {
+            pin_work_nsfw_on(&mut tx, &work_id).await?;
         }
-        // Same reason as the other `mark_work_nsfw` site: `work` is the authoritative
-        // column, but Browse and the feeds gate on a materialized copy, so the escalation
-        // has to be pushed there in the same breath or it is invisible to the gate for up
-        // to a full sync interval.
-        resync_feed_nsfw(pool, std::slice::from_ref(&work_id)).await;
+        resync_feed_nsfw_on(&mut tx, std::slice::from_ref(&work_id)).await?;
     }
 
-    // Enqueue a review row whenever we took the PROVISIONAL review path (decision
-    // "review") — the admin add flow, and the federated fallback for an
-    // uncorroborated match. A directly-consolidated federated match
-    // ("review_consolidated") already linked to the matched work, so a candidate
-    // would ask a human to re-split the very entry we consolidated.
-    if decision_str == "review" {
-        if let Decision::Review {
-            work_id: cand_work,
-            score,
-            method,
-        } = &decision
-        {
-            crate::catalog::insert_merge_candidate(pool, &ssid, cand_work, *score, method).await?;
+    // A review row whenever the PROVISIONAL review path was taken. A directly
+    // consolidated federated match already linked to the matched work, so a candidate
+    // would ask a human to re-split the very entry that was consolidated.
+    if let Some((candidate_work, score, method)) = &review {
+        // The pair is (the work minted above, the matched work). Its `ReviewPair` key
+        // is not in the advisory call of step 1 because the minted id did not exist
+        // then, and it is not taken now because the advisory tier is behind us. It
+        // guards nothing here: the key serialises writers that can name both works,
+        // and no other transaction can name a work that is not committed. The matched
+        // work is locked (step 4); `insert_merge_candidate_on` re-reads the pair.
+        let pair = catalog::review_pair_on(&mut tx, &ssid, candidate_work)
+            .await?
+            .ok_or(crate::locks::RestartTransaction)?;
+        if pair.owner != work_id {
+            return Err(crate::locks::RestartTransaction.into());
         }
+        catalog::insert_merge_candidate_on(&mut tx, &ssid, &pair, *score, method).await?;
     }
+    #[cfg(test)]
+    guard_pause("enrol-written").await;
+    tx.commit().await?;
 
     Ok(MatchResult {
-        decision: decision_str.to_string(),
+        decision: decision.to_string(),
         work_id,
         matched_work_id,
         score,
@@ -14996,8 +16398,8 @@ pub async fn provision_admins(
     admin_email: Option<&str>,
 ) -> anyhow::Result<()> {
     for (idx, username) in admin_users.iter().enumerate() {
-        let existing: Vec<(String, String, i64, i64)> = sqlx::query_as(
-            "SELECT id, password_hash, is_admin, is_banned FROM users WHERE username = ? COLLATE NOCASE",
+        let existing: Vec<(String, String, i64, i64)> = crate::db_types::query_tuple(
+            "SELECT id, password_hash, is_admin, is_banned FROM users WHERE translate(username, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') = translate($1, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')",
         )
         .bind(username)
         .fetch_all(pool)
@@ -15016,22 +16418,29 @@ pub async fn provision_admins(
             if *is_banned != 0
                 || !admin_password.is_some_and(|password| auth::verify_password(password, hash))
             {
-                tracing::warn!(username, "admin promotion refused: current account password proof required and account must not be suspended");
+                tracing::warn!(
+                    username,
+                    "admin promotion refused: current account password proof required and account must not be suspended"
+                );
                 continue;
             }
             let mut tx = pool.begin().await?;
+            crate::locks::advisory(&mut tx, &[crate::locks::AdvisoryKey::membership()]).await?;
+            crate::locks::lock_user(&mut tx, id).await?;
+            #[cfg(test)]
+            guard_pause("provision-locked").await;
             // Guard against a password/ban change between proof and promotion.
             let promoted = sqlx::query(
-                "UPDATE users SET is_admin = 1 WHERE id = ? AND password_hash = ? AND is_admin = 0 AND is_banned = 0",
+                "UPDATE users SET is_admin = TRUE WHERE id = $1 AND password_hash = $2 AND is_admin = FALSE AND is_banned = FALSE",
             )
-            .bind(id)
+            .bind(crate::db_types::uuid(id )?)
             .bind(hash)
             .execute(&mut *tx)
             .await?;
             if promoted.rows_affected() != 0 {
                 // Old regular-user bearer sessions must not gain admin powers.
-                sqlx::query("DELETE FROM sessions WHERE user_id = ?")
-                    .bind(id)
+                sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+                    .bind(crate::db_types::uuid(id)?)
                     .execute(&mut *tx)
                     .await?;
                 tracing::info!(
@@ -15051,25 +16460,47 @@ pub async fn provision_admins(
             continue;
         };
         let hash = auth::hash_password(pw)?;
+        // See `hash_password_bounded`: no transaction is open here.
+        #[cfg(test)]
+        guard_pause("hashed").await;
         let id = uuid::Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
+        let now = crate::db_types::format_date(Utc::now());
         // The primary admin gets the configured email; any others get a
         // collision-free synthetic address (email is UNIQUE).
         let email = match (idx, admin_email) {
             (0, Some(e)) => e.to_string(),
             _ => format!("{username}@admin.local"),
         };
+        let mut tx = pool.begin().await?;
+        crate::locks::advisory(&mut tx, &[crate::locks::AdvisoryKey::membership()]).await?;
+        crate::locks::advisory(
+            &mut tx,
+            &[
+                crate::locks::AdvisoryKey::username(username),
+                crate::locks::AdvisoryKey::email(&email),
+            ],
+        )
+        .await?;
+        #[cfg(test)]
+        guard_pause("provision-new-locked").await;
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE translate(username,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')=translate($1,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'))")
+            .bind(username).fetch_one(&mut *tx).await?;
+        if exists {
+            tx.commit().await?;
+            continue;
+        }
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, avatar_url, is_admin, created_at) \
-             VALUES (?, ?, ?, ?, NULL, 1, ?)",
+             VALUES ($1, $2, $3, $4, NULL, TRUE, $5)",
         )
-        .bind(&id)
+        .bind(crate::db_types::uuid(&id )?)
         .bind(username)
         .bind(&email)
         .bind(&hash)
-        .bind(&now)
-        .execute(pool)
+        .bind(crate::db_types::date(&now )?)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         tracing::info!(
             username,
             "provisioned admin account from KOMIKA_ADMIN_PASSWORD"
@@ -15080,6 +16511,16 @@ pub async fn provision_admins(
 
 #[cfg(test)]
 mod tests {
+    mod phase4_tests {
+        use super::*;
+        include!("phase4_tests.rs");
+    }
+
+    mod comment_deletion_tests {
+        use super::*;
+        include!("comment_deletion_tests.rs");
+    }
+
     use super::*;
     use crate::database::TestPoolOptions;
 
@@ -15241,7 +16682,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -15251,18 +16692,18 @@ mod tests {
     #[tokio::test]
     async fn add_source_series_new_sets_nsfw_and_is_idempotent() {
         let pool = migrated_pool().await;
-        // A unique-title, NSFW-genre series → decision "new", work.is_nsfw = 1 (N1).
+        // A unique-title, NSFW-genre series → decision "new", work.is_nsfw = TRUE (N1).
         let m = suwayomi_manga(42, "A Very Spicy One-Off", &["Action", "Hentai"], "src1");
         let r1 = add_source_series_core(&pool, &m, None).await.unwrap();
         assert_eq!(r1.decision, "new");
-        let nsfw: i64 = sqlx::query_scalar("SELECT is_nsfw FROM work WHERE id = ?")
+        let nsfw: i64 = crate::db_types::query_scalar("SELECT is_nsfw FROM work WHERE id = $1")
             .bind(&r1.work_id)
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(nsfw, 1, "N1: an NSFW genre sets work.is_nsfw");
 
-        let works_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+        let works_before: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -15272,7 +16713,7 @@ mod tests {
         assert_eq!(r2.decision, "existing");
         assert_eq!(r2.work_id, r1.work_id);
         assert_eq!(r2.source_series_id, r1.source_series_id);
-        let works_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+        let works_after: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -15344,11 +16785,11 @@ mod tests {
         assert_eq!(r1.decision, "review", "missing author requires review");
         assert_eq!(r1.matched_work_id.as_deref(), Some(existing.as_str()));
 
-        let works_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+        let works_before: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
             .await
             .unwrap();
-        let mc_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
+        let mc_before: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM merge_candidate")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -15358,11 +16799,11 @@ mod tests {
         // created.
         let r2 = add_source_series_core(&pool, &m, None).await.unwrap();
         assert_eq!(r2.decision, "existing");
-        let works_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+        let works_after: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
             .await
             .unwrap();
-        let mc_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
+        let mc_after: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM merge_candidate")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -15410,12 +16851,12 @@ mod tests {
             .unwrap();
         assert_eq!(r.decision, "review");
         assert_eq!(r.matched_work_id, Some(existing));
-        let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+        let works: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(works, 2, "keeps a provisional work pending review");
-        let mc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
+        let mc: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM merge_candidate")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -15451,13 +16892,13 @@ mod tests {
         }
         let ssid = format!("ss_{}", uuid::Uuid::new_v4());
         sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
-            VALUES (?, ?, 'suwayomi', 'src', ?, '2020-01-01T00:00:00Z')")
+            VALUES ($1, $2, 'suwayomi', 'src', $3, '2020-01-01T00:00:00Z')")
             .bind(&ssid).bind(&ids[0]).bind(&ssid).execute(pool).await.unwrap();
         let review = catalog::insert_merge_candidate(pool, &ssid, &ids[1], 0.6, "title_exact")
             .await
             .unwrap()
             .unwrap();
-        sqlx::query("UPDATE merge_candidate SET status = ? WHERE id = ?")
+        sqlx::query("UPDATE merge_candidate SET status = $1 WHERE id = $2")
             .bind(status)
             .bind(&review)
             .execute(pool)
@@ -15513,7 +16954,7 @@ mod tests {
             "pending",
         )
         .await;
-        sqlx::query("INSERT INTO work_split (work_a, work_b, split_at) VALUES (MIN(?, ?), MAX(?, ?), '2026-10-03')")
+        sqlx::query("INSERT INTO work_split (work_a, work_b, split_at) VALUES (LEAST($1, $2), GREATEST($3, $4), '2026-10-03')")
             .bind(&split.0).bind(&split.1).bind(&split.0).bind(&split.1).execute(&pool).await.unwrap();
         untouched.push(split);
         assert_eq!(auto_merge_pending_reviews(&pool, None).await.unwrap(), 1);
@@ -15521,19 +16962,21 @@ mod tests {
             catalog::redirect_work_id(&pool, &source).await.unwrap(),
             Some(target)
         );
-        let status: String = sqlx::query_scalar("SELECT status FROM merge_candidate WHERE id = ?")
-            .bind(&review)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(status, "confirmed");
-        for (a, b, _) in untouched {
-            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id IN (?, ?)")
-                .bind(a)
-                .bind(b)
+        let status: String =
+            crate::db_types::query_scalar("SELECT status FROM merge_candidate WHERE id = $1")
+                .bind(&review)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
+        assert_eq!(status, "confirmed");
+        for (a, b, _) in untouched {
+            let count: i64 =
+                crate::db_types::query_scalar("SELECT COUNT(*) FROM work WHERE id IN ($1, $2)")
+                    .bind(a)
+                    .bind(b)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
             assert_eq!(count, 2);
         }
         assert_eq!(auto_merge_pending_reviews(&pool, None).await.unwrap(), 0);
@@ -15556,7 +16999,7 @@ mod tests {
             author: Some("Masashi Kishimoto".into()),
             ..Default::default()
         };
-        sqlx::query("UPDATE work SET author = 'Another Person' WHERE id = ?")
+        sqlx::query("UPDATE work SET author = 'Another Person' WHERE id = $1")
             .bind(&source)
             .execute(&pool)
             .await
@@ -15571,18 +17014,19 @@ mod tests {
         )
         .await;
         assert!(is_precondition_failure(&result.unwrap_err()));
-        let status: String = sqlx::query_scalar("SELECT status FROM merge_candidate WHERE id = ?")
-            .bind(&review)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let status: String =
+            crate::db_types::query_scalar("SELECT status FROM merge_candidate WHERE id = $1")
+                .bind(&review)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(status, "pending");
-        sqlx::query("UPDATE work SET author = 'Masashi Kishimoto' WHERE id = ?")
+        sqlx::query("UPDATE work SET author = 'Masashi Kishimoto' WHERE id = $1")
             .bind(&source)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE merge_candidate SET status = 'rejected' WHERE id = ?")
+        sqlx::query("UPDATE merge_candidate SET status = 'rejected' WHERE id = $1")
             .bind(&review)
             .execute(&pool)
             .await
@@ -15597,12 +17041,13 @@ mod tests {
         )
         .await;
         assert!(is_precondition_failure(&result.unwrap_err()));
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id IN (?, ?)")
-            .bind(source)
-            .bind(target)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let count: i64 =
+            crate::db_types::query_scalar("SELECT COUNT(*) FROM work WHERE id IN ($1, $2)")
+                .bind(source)
+                .bind(target)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count, 2);
     }
 
@@ -15638,7 +17083,7 @@ mod tests {
     }
 
     async fn work_exists(pool: &Database, id: &str) -> bool {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work WHERE id = ?)")
+        crate::db_types::query_scalar("SELECT EXISTS(SELECT 1 FROM work WHERE id = $1)")
             .bind(id)
             .fetch_one(pool)
             .await
@@ -15664,12 +17109,13 @@ mod tests {
             "A",
         ];
         let id = sweep_work(&pool, "suwayomi", &titles, None).await;
-        let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT normalized_title, match_key FROM work_alias WHERE work_id = ?")
-                .bind(&id)
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let rows: Vec<(String, String)> = crate::db_types::query_tuple(
+            "SELECT normalized_title, match_key FROM work_alias WHERE work_id = $1",
+        )
+        .bind(&id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(rows.len(), titles.len());
         for (normalized, key) in rows {
             assert_eq!(key, match_key(&normalized), "for {normalized:?}");
@@ -15809,7 +17255,7 @@ mod tests {
         let b = sweep_work(&pool, "mangadex", &["Series Beta", "Shared Name"], author).await;
         let (lo, hi) = if a < b { (&a, &b) } else { (&b, &a) };
         sqlx::query(
-            "INSERT INTO work_split (work_a, work_b, split_at) VALUES (?, ?, '2026-01-01')",
+            "INSERT INTO work_split (work_a, work_b, split_at) VALUES ($1, $2, '2026-01-01')",
         )
         .bind(lo)
         .bind(hi)
@@ -15905,19 +17351,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.merged.len(), 1);
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id IN (?, ?)")
-            .bind(&canonical)
-            .bind(&duplicate)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let count: i64 =
+            crate::db_types::query_scalar("SELECT COUNT(*) FROM work WHERE id IN ($1, $2)")
+                .bind(&canonical)
+                .bind(&duplicate)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count, 1, "same author copies collapse");
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id IN (?, ?)")
-            .bind(other_author)
-            .bind(extra)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let count: i64 =
+            crate::db_types::query_scalar("SELECT COUNT(*) FROM work WHERE id IN ($1, $2)")
+                .bind(other_author)
+                .bind(extra)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count, 2, "unrelated namesakes survive");
     }
 
@@ -15957,7 +17405,7 @@ mod tests {
             // Give each a source_series so a refusal is queueable rather than dropped.
             sqlx::query(
                 "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
-                 VALUES (?, ?, 'mangadex', 'mangadex', ?, '2020-01-01T00:00:00Z')",
+                 VALUES ($1, $2, 'mangadex', 'mangadex', $3, '2020-01-01T00:00:00Z')",
             )
             .bind(format!("ss{i}"))
             .bind(&id)
@@ -15980,21 +17428,21 @@ mod tests {
             out.queued, 0,
             "separate MangaDex entries are not a review question"
         );
-        let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+        let works: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(works, 3, "no work may be deleted");
 
         // Re-running must not grow the queue (idempotent across ANY status).
-        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
+        let before: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM merge_candidate")
             .fetch_one(&pool)
             .await
             .unwrap();
         let _ = consolidate_exact_duplicates_from(&pool, None, 100, "")
             .await
             .unwrap();
-        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
+        let after: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM merge_candidate")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -16025,7 +17473,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.merged.len(), 1, "the corroborated pair folds");
-        let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+        let works: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -16062,13 +17510,13 @@ mod tests {
                 .unwrap(),
             "a loser with no source_series is reported unqueueable, not queued"
         );
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
+        let n: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM merge_candidate")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(n, 0);
         // …and it is certainly not merged away.
-        let alive: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+        let alive: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -16077,7 +17525,7 @@ mod tests {
         // Give it a source series → now it queues exactly one row.
         sqlx::query(
             "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
-             VALUES ('ss1', ?, 'suwayomi', 'src', 'k1', '2020-01-01T00:00:00Z')",
+             VALUES ('ss1', $1, 'suwayomi', 'src', 'k1', '2020-01-01T00:00:00Z')",
         )
         .bind(&loser)
         .execute(&pool)
@@ -16086,7 +17534,7 @@ mod tests {
         assert!(queue_consolidate_review(&pool, &loser, &survivor, 0.6)
             .await
             .unwrap());
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
+        let n: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM merge_candidate")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -16103,7 +17551,7 @@ mod tests {
                 .unwrap());
         }
         let rows: Vec<(i64, String)> =
-            sqlx::query_as("SELECT COUNT(*), MAX(status) FROM merge_candidate")
+            crate::db_types::query_tuple("SELECT COUNT(*), MAX(status) FROM merge_candidate")
                 .fetch_all(&pool)
                 .await
                 .unwrap();
@@ -16183,11 +17631,13 @@ mod tests {
         let count = |title: &'static str| {
             let pool = pool.clone();
             async move {
-                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM work WHERE primary_title = ?")
-                    .bind(title)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap()
+                crate::db_types::query_scalar::<i64>(
+                    "SELECT COUNT(*) FROM work WHERE primary_title = $1",
+                )
+                .bind(title)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
             }
         };
         assert_eq!(count("Alpha Dog").await, 2, "the weak pair is never merged");
@@ -16232,7 +17682,7 @@ mod tests {
             .unwrap();
         assert!(out.merged.is_empty(), "{:?}", out.merged);
         assert_eq!(out.queued, 1, "only the real question is queued");
-        let queued: Vec<(String, f64)> = sqlx::query_as(
+        let queued: Vec<(String, f64)> = crate::db_types::query_tuple(
             "SELECT w.primary_title, mc.score FROM merge_candidate mc              JOIN work w ON w.id = mc.candidate_work_id",
         )
         .fetch_all(&pool)
@@ -16290,7 +17740,7 @@ mod tests {
         for id in [&grave, &haka, &one, &two] {
             assert!(work_exists(&pool, id).await, "only the site copy is folded");
         }
-        let statuses: Vec<(String, i64)> = sqlx::query_as(
+        let statuses: Vec<(String, i64)> = crate::db_types::query_tuple(
             "SELECT status, COUNT(*) FROM merge_candidate GROUP BY status ORDER BY status",
         )
         .fetch_all(&pool)
@@ -16307,11 +17757,12 @@ mod tests {
         consolidate_exact_duplicates_from(&pool, None, 100, "")
             .await
             .unwrap();
-        let pending: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate WHERE status = 'pending'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let pending: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM merge_candidate WHERE status = 'pending'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(pending, 1);
     }
 
@@ -16383,7 +17834,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.decision, "auto_merge", "exact title auto-merges");
         assert_eq!(r.work_id, existing, "merged into the existing work");
-        let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+        let works: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -16391,17 +17842,18 @@ mod tests {
             works, 1,
             "no provisional minted — merged into the existing work"
         );
-        let mc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM merge_candidate")
+        let mc: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM merge_candidate")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(mc, 0, "no review row — the exact-title match auto-merged");
         // The new source mapping points at the existing (merged-into) work.
-        let linked: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_id = 'src-ext2'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let linked: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_id = 'src-ext2'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(linked, r.work_id);
         assert_eq!(
             linked, existing,
@@ -16449,13 +17901,13 @@ mod tests {
         assert_eq!((merged, queued, skipped), (1, 0, 0));
 
         // The provisional work is gone; the Suwayomi mapping now points at the spine.
-        let gone: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id = ?")
+        let gone: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work WHERE id = $1")
             .bind(&provisional)
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(gone, 0, "provisional work merged away");
-        let linked: String = sqlx::query_scalar(
+        let linked: String = crate::db_types::query_scalar(
             "SELECT work_id FROM source_series WHERE source_type = 'suwayomi' AND source_key = '42'",
         )
         .fetch_one(&pool)
@@ -16511,14 +17963,14 @@ mod tests {
             (0, 1),
             "a short generic title must be reviewed, not merged"
         );
-        let mc_id: String = sqlx::query_scalar("SELECT id FROM merge_candidate")
+        let mc_id: String = crate::db_types::query_scalar("SELECT id FROM merge_candidate")
             .fetch_one(&pool)
             .await
             .unwrap();
 
         // The admin says NO.
         sqlx::query(
-            "UPDATE merge_candidate SET status='rejected', resolved_at='2026-01-01' WHERE id=?",
+            "UPDATE merge_candidate SET status='rejected', resolved_at='2026-01-01' WHERE id=$1",
         )
         .bind(&mc_id)
         .execute(&pool)
@@ -16536,7 +17988,7 @@ mod tests {
             );
         }
         let rows: (i64, String) =
-            sqlx::query_as("SELECT COUNT(*), MAX(status) FROM merge_candidate")
+            crate::db_types::query_tuple("SELECT COUNT(*), MAX(status) FROM merge_candidate")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -16572,7 +18024,7 @@ mod tests {
             "src1",
         );
         let r = add_source_series_core(&pool, &m, None).await.unwrap();
-        let nsfw: i64 = sqlx::query_scalar("SELECT is_nsfw FROM work WHERE id = ?")
+        let nsfw: i64 = crate::db_types::query_scalar("SELECT is_nsfw FROM work WHERE id = $1")
             .bind(&r.work_id)
             .fetch_one(&pool)
             .await
@@ -16586,14 +18038,14 @@ mod tests {
         let hash = auth::hash_password("password123").unwrap();
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, avatar_url, is_admin, is_banned, created_at) \
-             VALUES (?, ?, ?, ?, NULL, ?, ?, '2020-01-01T00:00:00Z')",
+             VALUES ($1, $2, $3, $4, NULL, $5, $6, '2020-01-01T00:00:00Z')",
         )
-        .bind(id)
+        .bind(crate::db_types::test_uuid(id))
         .bind(username)
         .bind(format!("{username}@example.com"))
         .bind(&hash)
-        .bind(is_admin)
-        .bind(is_banned)
+        .bind(is_admin != 0)
+        .bind(is_banned != 0)
         .execute(pool)
         .await
         .unwrap();
@@ -16615,8 +18067,7 @@ mod tests {
     async fn seed_target_series(pool: &Database, key: &str) {
         let work_id = format!("w_{key}");
         sqlx::query(
-            "INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) \
-             VALUES (?, ?, 0, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+            r#"INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) VALUES ($1, $2, FALSE, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
         )
         .bind(&work_id)
         .bind(format!("Fixture {key}"))
@@ -16626,7 +18077,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO source_series \
                (id, work_id, source_type, source_id, source_key, created_at, last_seen) \
-             VALUES (?, ?, 'suwayomi', 'src', ?, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+             VALUES ($1, $2, 'suwayomi', 'src', $3, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
         )
         .bind(format!("ss_{key}"))
         .bind(&work_id)
@@ -16639,6 +18090,82 @@ mod tests {
     async fn setup_full(max: u32) -> (ApiSchema, Database) {
         let (schema, pool, _) = setup_with_state(max).await;
         (schema, pool)
+    }
+
+    #[tokio::test]
+    async fn foundation_graphql_locked_user_error_is_observed_once() {
+        let (schema, pool) = setup_full(100).await;
+        let foreground = pool.foreground();
+        // Configure every possible checkout to keep this real resolver failure short.
+        let mut connections = Vec::new();
+        for _ in 0..foreground.write().options().get_max_connections() {
+            let mut connection = foreground.write().acquire().await.unwrap();
+            sqlx::query("SET lock_timeout='50ms'")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            connections.push(connection);
+        }
+        drop(connections);
+        let mut held = foreground.begin().await.unwrap();
+        sqlx::query("SELECT id FROM users WHERE username='bob' FOR UPDATE")
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        // Scoped to this task: the process-global counters move under other tests.
+        let (response, seen) = crate::db::test_counters::scope(exec(
+            &schema,
+            "mutation { setShowNsfw(value:true) }",
+            Some("bobtok"),
+            "1.1.1.1",
+        ))
+        .await;
+        assert!(!response.errors.is_empty());
+        assert_eq!(
+            seen.database,
+            crate::db::DatabaseCounters {
+                lock_timeouts: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!((seen.lock_errors, seen.write_lane_events), (1, 1));
+        held.rollback().await.unwrap();
+        pool.close().await;
+    }
+
+    // Session resolution is a read: when the reader pool cannot hand out a
+    // connection, the write gate must not move.
+    #[tokio::test]
+    async fn foundation_graphql_session_read_pool_timeout_leaves_write_gate_unchanged() {
+        let (schema, pool) = setup_full(100).await;
+        assert_eq!(pool.read().options().get_max_connections(), 1);
+        // The only reader is taken: the session lookup's acquisition times out.
+        let reader = pool.read().acquire().await.unwrap();
+        let (response, seen) = crate::db::test_counters::scope(exec(
+            &schema,
+            "{ session { token } }",
+            Some("bobtok"),
+            "1.1.1.1",
+        ))
+        .await;
+        drop(reader);
+        assert_eq!(response.errors.len(), 1, "{:?}", response.errors);
+        assert_eq!(response.errors[0].message, "Server busy; retry soon");
+        assert_eq!(
+            seen,
+            crate::db::test_counters::Counters {
+                database: crate::db::DatabaseCounters {
+                    pool_timeouts: 1,
+                    ..Default::default()
+                },
+                // lock_error_count(), write pool timeouts and write-lane
+                // connection loss are the write gate: none of them moved.
+                lock_errors: 0,
+                write_lane_events: 0,
+                read_lane_events: 1,
+            }
+        );
+        pool.close().await;
     }
 
     #[tokio::test]
@@ -16668,27 +18195,29 @@ mod tests {
     #[tokio::test]
     async fn library_identity_retries_a_fresh_transaction_after_an_external_writer() {
         let (_, pool) = setup_full(100).await;
-        sqlx::query("INSERT INTO user_library (user_id, series_id, created_at) VALUES ('bob-id', 's1', 't')")
+        sqlx::query(r#"INSERT INTO user_library (user_id, series_id, created_at) VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', 's1', '2020-01-01T00:00:00Z')"#)
             .execute(&pool).await.unwrap();
-        let external = sqlx::sqlite::SqlitePoolOptions::new()
+        let external = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
-            .connect_with(
-                (*pool.connect_options())
-                    .clone()
-                    .pragma("query_only", "OFF"),
-            )
+            .connect_with((*pool.connect_options()).clone())
             .await
             .unwrap();
-        let writer = external.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let mut writer = external.begin().await.unwrap();
+        sqlx::query("UPDATE user_library SET series_id=series_id WHERE user_id=$1")
+            .bind(crate::db_types::test_uuid("bob-id"))
+            .execute(&mut *writer)
+            .await
+            .unwrap();
         let task_pool = pool.clone();
         let task = tokio::spawn(async move {
-            consolidate_library_identity(&task_pool, "bob-id", "w_s1").await
+            consolidate_library_identity(&task_pool, "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c", "w_s1")
+                .await
         });
         tokio::time::sleep(Duration::from_millis(350)).await;
         writer.commit().await.unwrap();
         assert_eq!(task.await.unwrap().unwrap(), "w_s1");
         let identities: Vec<String> =
-            sqlx::query_scalar("SELECT series_id FROM user_library WHERE user_id = 'bob-id'")
+            crate::db_types::query_scalar("SELECT series_id FROM user_library WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'")
                 .fetch_all(&pool)
                 .await
                 .unwrap();
@@ -16715,7 +18244,7 @@ mod tests {
         let (hide, rename) = tokio::join!(hide, rename);
         assert!(hide.errors.is_empty(), "{:?}", hide.errors);
         assert!(rename.errors.is_empty(), "{:?}", rename.errors);
-        let row: (i64, Option<String>) = sqlx::query_as(
+        let row: (i64, Option<String>) = crate::db_types::query_tuple(
             "SELECT hidden, title_override FROM chapter_override WHERE work_id = 'w_s1' AND chapter_key = '1'",
         ).fetch_one(&pool).await.unwrap();
         assert_eq!(row, (1, Some("Renamed".into())));
@@ -16737,23 +18266,26 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
-        seed_user(&pool, "admin-id", "admin", 1, 0).await;
-        seed_user(&pool, "bob-id", "bob", 0, 0).await;
-        seed_user(&pool, "banned-id", "carol", 0, 1).await;
+        seed_user(&pool, "964771b0-a2fb-4849-857a-6198947115ec", "admin", 1, 0).await;
+        seed_user(&pool, "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c", "bob", 0, 0).await;
+        seed_user(&pool, "42e4db22-01a5-4e54-bae1-f8a4adfb653b", "carol", 0, 1).await;
         // Sessions store sha256(token); clients still present the raw token
         // ("admintok"/"bobtok") in the Authorization header, which `user_for_token`
         // re-hashes before lookup — so seed the hashed value here.
-        for (tok, uid) in [("admintok", "admin-id"), ("bobtok", "bob-id")] {
+        for (tok, uid) in [
+            ("admintok", "964771b0-a2fb-4849-857a-6198947115ec"),
+            ("bobtok", "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c"),
+        ] {
             sqlx::query(
                 "INSERT INTO sessions (token, user_id, created_at, expires_at) \
-                 VALUES (?, ?, '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
+                 VALUES ($1, $2, '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
             )
             .bind(auth::hash_token(tok))
-            .bind(uid)
+            .bind(crate::db_types::uuid(uid).unwrap())
             .execute(&pool)
             .await
             .unwrap();
@@ -16761,7 +18293,7 @@ mod tests {
         // An already-expired session — its token must not resolve (A1).
         sqlx::query(
             "INSERT INTO sessions (token, user_id, created_at, expires_at) \
-             VALUES (?, 'bob-id', '2020-01-01T00:00:00Z', '2020-02-01T00:00:00Z')",
+             VALUES ($1, 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', '2020-01-01T00:00:00Z', '2020-02-01T00:00:00Z')",
         )
         .bind(auth::hash_token("expiredtok"))
         .execute(&pool)
@@ -16781,7 +18313,9 @@ mod tests {
         .unwrap();
         let state = std::sync::Arc::new(AppState {
             pool: pool.clone(),
-            cover_pool: pool.clone(),
+            cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
+                .await
+                .unwrap(),
             suwayomi: crate::suwayomi::SuwayomiClient::new(engine_url.into(), None, None),
             mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
                 "test-ua", 5.0, 40.0,
@@ -16918,8 +18452,7 @@ mod tests {
         .await;
         let (s, pool, _) = setup_with_engine(100, &engine.base_url).await;
         sqlx::query(
-            "INSERT INTO source_extension (source_id, pkg_name, repo_url, is_nsfw, updated_at) \
-             VALUES ('src-9', 'org.example.ext', 'https://example/index.pb', 0, '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO source_extension (source_id, pkg_name, repo_url, is_nsfw, updated_at) VALUES ('src-9', 'org.example.ext', 'https://example/index.pb', FALSE, '2026-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -16952,8 +18485,7 @@ mod tests {
 
         // The owning manga (engine id 77) belongs to an NSFW work.
         sqlx::query(
-            "INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) \
-             VALUES ('w_adult', 'Adult', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) VALUES ('w_adult', 'Adult', TRUE, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -16976,7 +18508,7 @@ mod tests {
             );
         }
         // Opted in: served.
-        sqlx::query("UPDATE users SET show_nsfw = 1 WHERE id = 'bob-id'")
+        sqlx::query(r#"UPDATE users SET show_nsfw = TRUE WHERE id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'"#)
             .execute(&pool)
             .await
             .unwrap();
@@ -17027,7 +18559,7 @@ mod tests {
     }
 
     async fn recorded_source_nsfw(pool: &Database, source_id: &str) -> Option<i64> {
-        sqlx::query_scalar("SELECT is_nsfw FROM source_extension WHERE source_id = ?")
+        crate::db_types::query_scalar("SELECT is_nsfw FROM source_extension WHERE source_id = $1")
             .bind(source_id)
             .fetch_optional(pool)
             .await
@@ -17070,16 +18602,16 @@ mod tests {
             data_json(&r)
         );
 
-        let work_id: String = sqlx::query_scalar(
+        let work_id: String = crate::db_types::query_scalar(
             "SELECT work_id FROM source_series \
              WHERE source_type = 'suwayomi' AND source_id = '1534' AND source_key = '501'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        let (work_nsfw, series_nsfw): (i64, i64) = sqlx::query_as(
+        let (work_nsfw, series_nsfw): (i64, i64) = crate::db_types::query_tuple(
             "SELECT w.is_nsfw, ss.is_nsfw FROM work w \
-             JOIN source_series ss ON ss.work_id = w.id WHERE w.id = ?",
+             JOIN source_series ss ON ss.work_id = w.id WHERE w.id = $1",
         )
         .bind(&work_id)
         .fetch_one(&pool)
@@ -17103,7 +18635,7 @@ mod tests {
                 "adult work served to {token:?}"
             );
         }
-        sqlx::query("UPDATE users SET show_nsfw = 1 WHERE id = 'bob-id'")
+        sqlx::query(r#"UPDATE users SET show_nsfw = TRUE WHERE id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'"#)
             .execute(&pool)
             .await
             .unwrap();
@@ -17148,7 +18680,7 @@ mod tests {
             .err()
             .expect("an unclassifiable source must not be added as safe");
         assert!(err.to_string().contains("adult source"), "{err}");
-        let works: i64 = sqlx::query_scalar(
+        let works: i64 = crate::db_types::query_scalar(
             "SELECT COUNT(*) FROM source_series WHERE source_type = 'suwayomi' AND source_id = 'ghost'",
         )
         .fetch_one(&pool)
@@ -17157,8 +18689,7 @@ mod tests {
         assert_eq!(works, 0, "nothing was linked");
         // With the row there, the engine is not needed at all.
         sqlx::query(
-            "INSERT INTO source_extension (source_id, pkg_name, repo_url, is_nsfw, updated_at) \
-             VALUES ('ghost', 'pkg', 'repo', 1, '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO source_extension (source_id, pkg_name, repo_url, is_nsfw, updated_at) VALUES ('ghost', 'pkg', 'repo', TRUE, '2026-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -17166,7 +18697,7 @@ mod tests {
         let r = add_source_series_checked(&st, &m, None, false)
             .await
             .unwrap();
-        let nsfw: i64 = sqlx::query_scalar("SELECT is_nsfw FROM work WHERE id = ?")
+        let nsfw: i64 = crate::db_types::query_scalar("SELECT is_nsfw FROM work WHERE id = $1")
             .bind(&r.work_id)
             .fetch_one(&pool)
             .await
@@ -17188,7 +18719,7 @@ mod tests {
         .await;
         let (s, pool, _) = setup_with_engine(100, &engine.base_url).await;
         // The extension is NSFW; the admin has to have opted in to install it.
-        sqlx::query("UPDATE users SET show_nsfw = 1 WHERE id = 'admin-id'")
+        sqlx::query(r#"UPDATE users SET show_nsfw = TRUE WHERE id = '964771b0-a2fb-4849-857a-6198947115ec'"#)
             .execute(&pool)
             .await
             .unwrap();
@@ -17248,7 +18779,7 @@ mod tests {
         )
         .await;
         let (s, pool, _) = setup_with_engine(100, &engine.base_url).await;
-        sqlx::query("UPDATE users SET show_nsfw = 1 WHERE id = 'admin-id'")
+        sqlx::query(r#"UPDATE users SET show_nsfw = TRUE WHERE id = '964771b0-a2fb-4849-857a-6198947115ec'"#)
             .execute(&pool)
             .await
             .unwrap();
@@ -17334,7 +18865,7 @@ mod tests {
         .unwrap();
 
         async fn flags(pool: &Database, id: &str) -> (i64, Option<i64>) {
-            sqlx::query_as("SELECT is_nsfw, is_nsfw_override FROM work WHERE id = ?")
+            crate::db_types::query_tuple("SELECT is_nsfw, is_nsfw_override FROM work WHERE id = $1")
                 .bind(id)
                 .fetch_one(pool)
                 .await
@@ -17392,39 +18923,30 @@ mod tests {
         schema.execute(req).await
     }
 
-    /// `ensure_utc_offset` must be a NO-OP on anything already carrying an offset — and
-    /// in particular must not be fooled by the `-` separators in the DATE part into
-    /// thinking a naive value already has a negative UTC offset. Every dated
-    /// `series_scan_state` row in production is the `+00:00` case, so the pass-through
-    /// arm is the one that actually runs; the appending arm guards future writers.
     #[test]
-    fn ensure_utc_offset_appends_only_when_missing() {
-        for already in [
-            "2026-07-26T13:48:54.108583013+00:00",
-            "2026-07-26T13:48:54Z",
-            "2026-07-26T08:48:54-05:00",
+    fn api_date_format_uses_utc_six_digits_and_truncates() {
+        for (input, expected) in [
+            (
+                "2026-07-26T13:48:54.108583+00:00",
+                "2026-07-26T13:48:54.108583+00:00",
+            ),
+            ("2026-07-26T13:48:54Z", "2026-07-26T13:48:54.000000+00:00"),
+            (
+                "2026-07-26T09:48:54.108583999-04:00",
+                "2026-07-26T13:48:54.108583+00:00",
+            ),
+            (
+                "2026-07-26T13:58:51.705034",
+                "2026-07-26T13:58:51.705034+00:00",
+            ),
+            (
+                "  2026-07-26T13:58:51  ",
+                "2026-07-26T13:58:51.000000+00:00",
+            ),
+            ("", ""),
         ] {
-            assert_eq!(ensure_utc_offset(already), already, "must pass through");
+            assert_eq!(ensure_utc_offset(input), expected, "{input}");
         }
-        // Naive: the date's own hyphens must not be read as an offset.
-        assert_eq!(
-            ensure_utc_offset("2026-07-26T13:58:51.705034"),
-            "2026-07-26T13:58:51.705034Z"
-        );
-        assert_eq!(
-            ensure_utc_offset("2026-07-26T13:58:51"),
-            "2026-07-26T13:58:51Z"
-        );
-        // Surrounding whitespace is trimmed rather than baked into the output.
-        assert_eq!(
-            ensure_utc_offset("  2026-07-26T13:58:51  "),
-            "2026-07-26T13:58:51Z"
-        );
-        // Parseable by the same reader-side path that was reading these as local time.
-        assert!(
-            chrono::DateTime::parse_from_rfc3339(&ensure_utc_offset("2026-07-26T13:58:51")).is_ok(),
-            "output must be valid RFC 3339"
-        );
     }
 
     fn first_error(resp: &async_graphql::Response) -> String {
@@ -17454,35 +18976,33 @@ mod tests {
                 10_i64,
                 // detected EARLIER, released LATER -> must sort FIRST.
                 "Older Detection Newer Release",
-                "2026-07-01T00:00:00+00:00",
+                "2026-07-01T00:00:00.000000+00:00",
                 "1751328000000",
             ),
             (
                 20,
                 // detected LATER, released EARLIER -> must sort SECOND.
                 "Newer Detection Older Release",
-                "2026-07-10T00:00:00+00:00",
+                "2026-07-10T00:00:00.000000+00:00",
                 "1748736000000",
             ),
         ] {
             sqlx::query(
-                "INSERT INTO suwayomi_series \
-                   (id, title, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) \
-                 VALUES (?, ?, 'ONGOING', 'src', 5, 1, ?, '2026-07-15T00:00:00+00:00')",
+                r#"INSERT INTO suwayomi_series (id, title, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) VALUES ($1, $2, 'ONGOING', 'src', 5, TRUE, $3, '2026-07-15T00:00:00+00:00')"#,
             )
             .bind(id)
             .bind(title)
-            .bind(latest_ms)
+            .bind(latest_ms.parse::<i64>().unwrap())
             .execute(&pool)
             .await
             .unwrap();
             sqlx::query(
                 "INSERT INTO series_scan_state \
                    (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at, next_scan_at) \
-                 VALUES (?, 0, 5, ?, '2026-07-15T00:00:00+00:00', '1970-01-01T00:00:00+00:00')",
+                 VALUES ($1, 0, 5, $2, '2026-07-15T00:00:00+00:00', '1970-01-01T00:00:00+00:00')",
             )
             .bind(id.to_string())
-            .bind(new_at)
+            .bind(crate::db_types::date(new_at).unwrap())
             .execute(&pool)
             .await
             .unwrap();
@@ -17513,17 +19033,17 @@ mod tests {
         // sort key: it ascends down the page while the feed descends by release time.
         assert_eq!(
             items[0]["detectedAt"],
-            serde_json::json!("2026-07-01T00:00:00+00:00")
+            serde_json::json!("2026-07-01T00:00:00.000000+00:00")
         );
         assert_eq!(
             items[1]["detectedAt"],
-            serde_json::json!("2026-07-10T00:00:00+00:00")
+            serde_json::json!("2026-07-10T00:00:00.000000+00:00")
         );
         // ...and `updatedAt` stays HONEST (the source's own last-touch stamp), no
         // longer overwritten with our detection time.
         assert_ne!(
             items[0]["updatedAt"],
-            serde_json::json!("2026-07-01T00:00:00+00:00"),
+            serde_json::json!("2026-07-01T00:00:00.000000+00:00"),
             "updatedAt must not be overwritten with the detection time"
         );
         // `latestChapterAt` is the stored upstream newest-chapter time, not the poll —
@@ -17556,22 +19076,22 @@ mod tests {
         sqlx::query(
             "INSERT INTO suwayomi_series \
                (id, title, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) \
-             VALUES (?, ?, 'ONGOING', 'src', 5, ?, ?, '2026-07-15T00:00:00+00:00')",
+             VALUES ($1, $2, 'ONGOING', 'src', 5, $3, $4, '2026-07-15T00:00:00+00:00')",
         )
         .bind(id)
         .bind(title)
-        .bind(in_library)
-        .bind(latest_ms)
+        .bind(in_library != 0)
+        .bind(latest_ms.map(|v| v.parse::<i64>().unwrap()))
         .execute(pool)
         .await
         .unwrap();
         sqlx::query(
             "INSERT INTO series_scan_state \
                (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at, next_scan_at) \
-             VALUES (?, 0, 5, ?, '2026-07-15T00:00:00+00:00', '1970-01-01T00:00:00+00:00')",
+             VALUES ($1, 0, 5, $2, '2026-07-15T00:00:00+00:00', '1970-01-01T00:00:00+00:00')",
         )
         .bind(id.to_string())
-        .bind(detected_at)
+        .bind(crate::db_types::date(detected_at).unwrap())
         .execute(pool)
         .await
         .unwrap();
@@ -17598,7 +19118,7 @@ mod tests {
             1,
             "Safe",
             Some("1752969600000"),
-            "2026-07-26T11:00:00+00:00",
+            "2026-07-26T11:00:00.000000+00:00",
             1,
         )
         .await;
@@ -17607,7 +19127,7 @@ mod tests {
             2,
             "Adult",
             Some("1752105600000"),
-            "2026-07-26T11:00:00+00:00",
+            "2026-07-26T11:00:00.000000+00:00",
             1,
         )
         .await;
@@ -17631,21 +19151,21 @@ mod tests {
         const DETECTED: &str = "EXISTS ( \
              SELECT 1 FROM series_scan_state sss \
              WHERE sss.series_id = CAST(suwayomi_series.id AS TEXT))";
-        const NSFW_FILTER: &str = "(? = 1 OR NOT EXISTS ( \
+        const NSFW_FILTER: &str = "($1 OR NOT EXISTS ( \
              SELECT 1 FROM source_series ss JOIN work w ON w.id = ss.work_id \
              WHERE ss.source_type = 'suwayomi' AND ss.source_key = CAST(suwayomi_series.id AS TEXT) \
-               AND COALESCE(w.is_nsfw_override, w.is_nsfw) = 1))";
+               AND COALESCE(w.is_nsfw_override, w.is_nsfw) = TRUE))";
         let count_sql = format!(
             "SELECT COUNT(*) FROM suwayomi_series \
-             WHERE in_library = 1 AND {DETECTED} AND {NSFW_FILTER}"
+             WHERE in_library = TRUE AND {DETECTED} AND {NSFW_FILTER}"
         );
         let ttl = std::time::Duration::from_secs(60);
         let uncached = |show_nsfw: bool| {
             let sql = count_sql.clone();
             let pool = pool.clone();
             async move {
-                sqlx::query_scalar::<_, i64>(&sql)
-                    .bind(show_nsfw as i64)
+                crate::db_types::query_scalar::<i64>(&sql)
+                    .bind(show_nsfw)
                     .fetch_one(&pool)
                     .await
                     .unwrap()
@@ -17692,7 +19212,7 @@ mod tests {
 
         // The memo really is serving: change the data underneath it and watch it NOT move.
         // (Staleness is the accepted trade — see `updates_total`.)
-        sqlx::query("UPDATE suwayomi_series SET in_library = 0 WHERE id = 1")
+        sqlx::query("UPDATE suwayomi_series SET in_library = FALSE WHERE id = 1")
             .execute(&pool)
             .await
             .unwrap();
@@ -17762,9 +19282,7 @@ mod tests {
     async fn discovery_rows_carry_the_latest_chapter_label_not_the_count() {
         let (_s, pool) = setup_full(100).await;
         sqlx::query(
-            "INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) \
-             VALUES ('w_home', 'Partial Mirror', 0, '2020-01-01T00:00:00Z', \
-                     '2020-01-01T00:00:00Z')",
+            r#"INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) VALUES ('w_home', 'Partial Mirror', FALSE, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -17772,17 +19290,14 @@ mod tests {
         sqlx::query(
             "INSERT INTO source_series \
                (id, work_id, source_type, source_id, source_key, created_at) \
-             VALUES ('ss_home', 'w_home', 'suwayomi', 'src', '77', 0)",
+             VALUES ('ss_home', 'w_home', 'suwayomi', 'src', '77', '1970-01-01T00:00:00Z')",
         )
         .execute(&pool)
         .await
         .unwrap();
         // count 7 vs newest label "90" — a partial mirror, the case the card exists for.
         sqlx::query(
-            "INSERT INTO browse_catalogue \
-               (work_id, reader_id, title, content_rating, is_nsfw, en_chapter_count, \
-                latest_chapter, created_at) \
-             VALUES ('w_home', '77', 'Partial Mirror', 'safe', 0, 7, '90', 0)",
+            r#"INSERT INTO browse_catalogue (work_id, reader_id, title, content_rating, is_nsfw, en_chapter_count, latest_chapter, created_at) VALUES ('w_home', '77', 'Partial Mirror', 'safe', FALSE, 7, '90', '1970-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -17822,17 +19337,14 @@ mod tests {
             1,
             "Detected",
             Some("1752969600000"),
-            "2026-07-26T11:00:00+00:00",
+            "2026-07-26T11:00:00.000000+00:00",
             1,
         )
         .await;
         // Enrolled, in library, dated — but never seen to CHANGE. This is the ~9,851-series
         // cohort the gate excluded.
         sqlx::query(
-            "INSERT INTO suwayomi_series \
-               (id, title, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) \
-             VALUES (2, 'Never Detected', 'ONGOING', 'src', 5, 1, '1752105600000', \
-                     '2026-07-15T00:00:00+00:00')",
+            r#"INSERT INTO suwayomi_series (id, title, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) VALUES (2, 'Never Detected', 'ONGOING', 'src', 5, TRUE, '1752105600000', '2026-07-15T00:00:00+00:00')"#,
         )
         .execute(&pool)
         .await
@@ -17851,7 +19363,7 @@ mod tests {
             3,
             "Out Of Library",
             Some("1753969600000"),
-            "2026-07-26T11:00:00+00:00",
+            "2026-07-26T11:00:00.000000+00:00",
             0,
         )
         .await;
@@ -17860,10 +19372,7 @@ mod tests {
         // change KEEPS, and the reason the `INDEXED BY` hint could be dropped rather than
         // re-pointed: what is left is a pure equality on the table's primary key.
         sqlx::query(
-            "INSERT INTO suwayomi_series \
-               (id, title, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) \
-             VALUES (4, 'Never Enrolled', 'ONGOING', 'src', 5, 1, '1753969600000', \
-                     '2026-07-15T00:00:00+00:00')",
+            r#"INSERT INTO suwayomi_series (id, title, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) VALUES (4, 'Never Enrolled', 'ONGOING', 'src', 5, TRUE, '1753969600000', '2026-07-15T00:00:00+00:00')"#,
         )
         .execute(&pool)
         .await
@@ -17919,19 +19428,19 @@ mod tests {
                 1_i64,
                 "Middle Release",
                 "1752105600000", // 2025-07-10
-                "2026-07-26T12:00:00+00:00",
+                "2026-07-26T12:00:00.000000+00:00",
             ),
             (
                 2,
                 "Newest Release",
                 "1752969600000", // 2025-07-20
-                "2026-07-26T11:00:00+00:00",
+                "2026-07-26T11:00:00.000000+00:00",
             ),
             (
                 3,
                 "Oldest Release",
                 "1751328000000", // 2025-07-01
-                "2026-07-26T13:00:00+00:00",
+                "2026-07-26T13:00:00.000000+00:00",
             ),
         ] {
             seed_feed_member(&pool, id, title, Some(latest_ms), detected, 1).await;
@@ -18004,7 +19513,7 @@ mod tests {
             1,
             "Has Release Time",
             Some("1751328000000"), // 2025-07-01
-            "2026-07-01T00:00:00+00:00",
+            "2026-07-01T00:00:00.000000+00:00",
             1,
         )
         .await;
@@ -18014,7 +19523,7 @@ mod tests {
             "No Release Time",
             None,
             // The most recent detection in the fixture — the COALESCE trap.
-            "2026-07-26T23:59:59+00:00",
+            "2026-07-26T23:59:59.000000+00:00",
             1,
         )
         .await;
@@ -18056,7 +19565,7 @@ mod tests {
         // Membership data survives: this is a sort change, not a data removal.
         assert_eq!(
             items[1]["detectedAt"],
-            serde_json::json!("2026-07-26T23:59:59+00:00")
+            serde_json::json!("2026-07-26T23:59:59.000000+00:00")
         );
     }
 
@@ -18080,7 +19589,7 @@ mod tests {
                 id,
                 &format!("Tied Series {id:02}"),
                 Some("1751328000000"), // every row: the SAME release time
-                "2026-07-20T00:00:00+00:00",
+                "2026-07-20T00:00:00.000000+00:00",
                 1,
             )
             .await;
@@ -18136,7 +19645,7 @@ mod tests {
     /// `total` must count EXACTLY the rows the pages can return.
     ///
     /// `total` used to count every dated `series_scan_state` row while the page query is
-    /// now driven from `suwayomi_series WHERE in_library = 1`. Scan state outlives
+    /// now driven from `suwayomi_series WHERE in_library = TRUE`. Scan state outlives
     /// library membership (removing a series from the library does not delete its scan
     /// row), so a stale row inflated `total` and with it `hasNextPage` and the reader's
     /// page count — offering a page that comes back empty.
@@ -18148,7 +19657,7 @@ mod tests {
             1,
             "In Library",
             Some("1751328000000"),
-            "2026-07-20T00:00:00+00:00",
+            "2026-07-20T00:00:00.000000+00:00",
             1,
         )
         .await;
@@ -18158,7 +19667,7 @@ mod tests {
             2,
             "Dropped From Library",
             Some("1752969600000"), // NEWER release: would be first if it counted at all
-            "2026-07-21T00:00:00+00:00",
+            "2026-07-21T00:00:00.000000+00:00",
             0,
         )
         .await;
@@ -18490,12 +19999,12 @@ mod tests {
         }
         // Pin distinct timestamps so newest-first is deterministic.
         for (id, at) in [
-            (&ids[0], "2026-01-01T00:00:00Z"),
-            (&ids[1], "2026-01-02T00:00:00Z"),
+            (&ids[0], "2026-01-01T00:00:00.000000+00:00"),
+            (&ids[1], "2026-01-02T00:00:00.000000+00:00"),
         ] {
-            sqlx::query("UPDATE comments SET created_at = ? WHERE id = ?")
-                .bind(at)
-                .bind(id)
+            sqlx::query("UPDATE comments SET created_at = $1 WHERE id = $2")
+                .bind(crate::db_types::date(at).unwrap())
+                .bind(crate::db_types::test_uuid(id))
                 .execute(&pool)
                 .await
                 .unwrap();
@@ -18622,13 +20131,14 @@ mod tests {
         .unwrap();
 
         async fn total_and_bucket(pool: &Database) -> (i64, i64) {
-            let total: Option<i64> =
-                sqlx::query_scalar("SELECT total FROM series_views WHERE series_key = '778'")
-                    .fetch_optional(pool)
-                    .await
-                    .unwrap();
-            let bucket: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(SUM(views), 0) FROM series_view_bucket WHERE series_key = '778'",
+            let total: Option<i64> = crate::db_types::query_scalar(
+                "SELECT total FROM series_views WHERE series_key = '778'",
+            )
+            .fetch_optional(pool)
+            .await
+            .unwrap();
+            let bucket: i64 = crate::db_types::query_scalar(
+                "SELECT COALESCE(SUM(views), 0)::bigint FROM series_view_bucket WHERE series_key = '778'",
             )
             .fetch_one(pool)
             .await
@@ -18680,7 +20190,7 @@ mod tests {
             "anonymous read must increment series_view_bucket"
         );
 
-        // Ordinary signed-in read (bob, is_admin=0): also increments.
+        // Ordinary signed-in read (bob, is_admin = FALSE): also increments.
         let r = exec(
             &s,
             r#"mutation { recordView(seriesId: "778") }"#,
@@ -18858,14 +20368,16 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
-        let mk_state = || {
+        let mk_state = || async {
             std::sync::Arc::new(AppState {
                 pool: pool.clone(),
-                cover_pool: pool.clone(),
+                cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
+                    .await
+                    .unwrap(),
                 suwayomi: crate::suwayomi::SuwayomiClient::new(
                     "http://127.0.0.1:1".into(),
                     None,
@@ -18892,7 +20404,7 @@ mod tests {
         const Q: &str = "{ __schema { queryType { name } } }";
         // Disabled (production default): `__schema` resolves to null, so the API
         // surface is not enumerable.
-        let disabled = build_schema(mk_state(), true);
+        let disabled = build_schema(mk_state().await, true);
         let r = disabled.execute(Q).await;
         assert_eq!(
             serde_json::to_string(&r.data).unwrap(),
@@ -18901,7 +20413,7 @@ mod tests {
             r.errors
         );
         // Enabled (dev): introspection returns the real schema.
-        let enabled = build_schema(mk_state(), false);
+        let enabled = build_schema(mk_state().await, false);
         let r = enabled.execute(Q).await;
         let json = serde_json::to_string(&r.data).unwrap();
         assert!(
@@ -18918,7 +20430,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -18927,7 +20439,7 @@ mod tests {
         provision_admins(&pool, &["admin".into()], Some("s3cret-pw"), Some("a@b.com"))
             .await
             .unwrap();
-        let (is_admin, email, hash): (i64, String, String) = sqlx::query_as(
+        let (is_admin, email, hash): (i64, String, String) = crate::db_types::query_tuple(
             "SELECT is_admin, email, password_hash FROM users WHERE username='admin'",
         )
         .fetch_one(&pool)
@@ -18947,13 +20459,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE username='admin'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let (count,): (i64,) =
+            crate::db_types::query_tuple("SELECT COUNT(*) FROM users WHERE username='admin'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count, 1, "no duplicate admin row");
         let (hash2,): (String,) =
-            sqlx::query_as("SELECT password_hash FROM users WHERE username='admin'")
+            crate::db_types::query_tuple("SELECT password_hash FROM users WHERE username='admin'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -18963,12 +20476,12 @@ mod tests {
         );
 
         // Existing non-admin requires proof of its current password.
-        seed_user(&pool, "bob-id", "bob", 0, 0).await;
+        seed_user(&pool, "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c", "bob", 0, 0).await;
         provision_admins(&pool, &["bob".into()], None, None)
             .await
             .unwrap();
         let (bob_admin,): (i64,) =
-            sqlx::query_as("SELECT is_admin FROM users WHERE username='bob'")
+            crate::db_types::query_tuple("SELECT is_admin FROM users WHERE username='bob'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -18979,54 +20492,68 @@ mod tests {
         provision_admins(&pool, &["BOB".into()], Some("wrong-password"), None)
             .await
             .unwrap();
-        let (before_proof,): (i64,) =
-            sqlx::query_as("SELECT is_admin FROM users WHERE id = 'bob-id'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (before_proof,): (i64,) = crate::db_types::query_tuple(
+            "SELECT is_admin FROM users WHERE id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(before_proof, 0, "wrong password cannot promote");
-        let token = new_session(&pool, "bob-id", 30 * 24 * 60 * 60)
-            .await
-            .unwrap();
+        let token = new_session(
+            &pool,
+            "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c",
+            30 * 24 * 60 * 60,
+        )
+        .await
+        .unwrap();
         provision_admins(&pool, &["BOB".into()], Some("password123"), None)
             .await
             .unwrap();
         let (bob_admin, hash): (i64, String) =
-            sqlx::query_as("SELECT is_admin, password_hash FROM users WHERE id = 'bob-id'")
+            crate::db_types::query_tuple("SELECT is_admin, password_hash FROM users WHERE id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
         assert_eq!(bob_admin, 1, "current password proves account ownership");
         assert!(auth::verify_password("password123", &hash));
-        let (sessions,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sessions WHERE token = ?")
-            .bind(auth::hash_token(&token))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let (sessions,): (i64,) =
+            crate::db_types::query_tuple("SELECT COUNT(*) FROM sessions WHERE token = $1")
+                .bind(auth::hash_token(&token))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(sessions, 0, "pre-promotion sessions are revoked atomically");
     }
 
     #[tokio::test]
     async fn provisioning_refuses_suspended_and_ambiguous_accounts() {
         let (_, pool) = setup_full(100).await;
-        seed_user(&pool, "suspended-admin", "suspended", 0, 1).await;
+        seed_user(
+            &pool,
+            "6e9ed78f-5182-408b-a07d-51c90dc2f031",
+            "suspended",
+            0,
+            1,
+        )
+        .await;
         provision_admins(&pool, &["suspended".into()], Some("password123"), None)
             .await
             .unwrap();
-        let (privileged,): (i64,) =
-            sqlx::query_as("SELECT is_admin FROM users WHERE id = 'suspended-admin'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (privileged,): (i64,) = crate::db_types::query_tuple(
+            "SELECT is_admin FROM users WHERE id = '6e9ed78f-5182-408b-a07d-51c90dc2f031'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(privileged, 0);
         // Model a collision predating the guard migration, without merging IDs.
-        sqlx::query("DROP TRIGGER users_username_nocase_insert")
+        sqlx::query("DROP INDEX users_username_ascii_unique")
             .execute(&pool)
             .await
             .unwrap();
         seed_user(&pool, "legacy-a", "legacy", 0, 0).await;
         // Only usernames are ambiguous; the email guard remains in force.
-        sqlx::query("UPDATE users SET email='legacy-a@example.com' WHERE id='legacy-a'")
+        sqlx::query(r#"UPDATE users SET email='legacy-a@example.com' WHERE id='a7e2d6fe-4528-488c-8878-6710cfda56b2'"#)
             .execute(&pool)
             .await
             .unwrap();
@@ -19034,8 +20561,8 @@ mod tests {
         provision_admins(&pool, &["legacy".into()], Some("password123"), None)
             .await
             .unwrap();
-        let (privileged,): (i64,) = sqlx::query_as(
-            "SELECT SUM(is_admin) FROM users WHERE username = 'legacy' COLLATE NOCASE",
+        let (privileged,): (i64,) = crate::db_types::query_tuple(
+            "SELECT SUM(CASE WHEN is_admin THEN 1 ELSE 0 END) FROM users WHERE translate(username, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') = 'legacy'",
         )
         .fetch_one(&pool)
         .await
@@ -19053,13 +20580,20 @@ mod tests {
             ("session-admin", 120, 120),
             ("session-reader", 30 * 24 * 60 * 60, 30 * 24 * 60 * 60),
         ] {
-            let token = new_session(&pool, id, configured).await.unwrap();
-            let (created, expires): (String, String) =
-                sqlx::query_as("SELECT created_at, expires_at FROM sessions WHERE token = ?")
-                    .bind(auth::hash_token(&token))
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+            let token = new_session(
+                &pool,
+                &crate::db_types::test_uuid(id).to_string(),
+                configured,
+            )
+            .await
+            .unwrap();
+            let (created, expires): (String, String) = crate::db_types::query_tuple(
+                "SELECT created_at, expires_at FROM sessions WHERE token = $1",
+            )
+            .bind(auth::hash_token(&token))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             let elapsed = chrono::DateTime::parse_from_rfc3339(&expires).unwrap()
                 - chrono::DateTime::parse_from_rfc3339(&created).unwrap();
             // Expiry serialization truncates fractional seconds; the duration
@@ -19076,13 +20610,15 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
         let state = std::sync::Arc::new(AppState {
             pool: pool.clone(),
-            cover_pool: pool.clone(),
+            cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
+                .await
+                .unwrap(),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
             mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
                 "test-ua", 5.0, 40.0,
@@ -19199,8 +20735,8 @@ mod tests {
         let id_of = |key: &'static str| {
             let pool = pool.clone();
             async move {
-                sqlx::query_scalar::<_, String>(
-                    "SELECT work_id FROM source_series WHERE source_key = ?",
+                crate::db_types::query_scalar::<String>(
+                    "SELECT work_id FROM source_series WHERE source_key = $1",
                 )
                 .bind(key)
                 .fetch_one(&pool)
@@ -19214,11 +20750,12 @@ mod tests {
             .await
             .unwrap();
         // Precondition: the id really is gone from `work`, and the redirect exists.
-        let gone: Option<String> = sqlx::query_scalar("SELECT id FROM work WHERE id = ?")
-            .bind(&retired)
-            .fetch_optional(&pool)
-            .await
-            .unwrap();
+        let gone: Option<String> =
+            crate::db_types::query_scalar("SELECT id FROM work WHERE id = $1")
+                .bind(&retired)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
         assert!(gone.is_none(), "merge must delete the losing work row");
 
         // canonicalSeries already did this — it is asserted here as the baseline the
@@ -19484,7 +21021,7 @@ mod tests {
                 external_id: "md-future-1".into(),
                 number: Some("1".into()),
                 lang: Some("en".into()),
-                published_at: Some("2037-12-31T15:00:00+00:00".into()),
+                published_at: Some("2037-12-31T15:00:00.000000+00:00".into()),
                 ..Default::default()
             },
         )
@@ -19530,14 +21067,11 @@ mod tests {
         detected_at: Option<&str>,
     ) {
         sqlx::query(
-            "INSERT INTO suwayomi_series \
-               (id, title, thumbnail_url, status, source_id, chapter_count, in_library, \
-                latest_chapter_at, updated_at) \
-             VALUES (?, ?, '/thumb.png', 'ONGOING', 'src', 42, 1, ?, '2026-07-15T00:00:00+00:00')",
+            r#"INSERT INTO suwayomi_series (id, title, thumbnail_url, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) VALUES ($1, $2, '/thumb.png', 'ONGOING', 'src', 42, TRUE, $3, '2026-07-15T00:00:00+00:00')"#,
         )
         .bind(id)
         .bind(title)
-        .bind(latest_ms)
+        .bind(latest_ms.map(|v| v.parse::<i64>().unwrap()))
         .execute(pool)
         .await
         .unwrap();
@@ -19545,10 +21079,10 @@ mod tests {
             sqlx::query(
                 "INSERT INTO series_scan_state \
                    (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at, next_scan_at) \
-                 VALUES (?, 0, 5, ?, '2026-07-15T00:00:00+00:00', '1970-01-01T00:00:00+00:00')",
+                 VALUES ($1, 0, 5, $2, '2026-07-15T00:00:00+00:00', '1970-01-01T00:00:00+00:00')",
             )
             .bind(id.to_string())
-            .bind(d)
+            .bind(crate::db_types::date(d).unwrap())
             .execute(pool)
             .await
             .unwrap();
@@ -19568,8 +21102,8 @@ mod tests {
 
     /// The `w_` id of the work anchored to a MangaDex key.
     async fn work_id_of(pool: &Database, md_id: &str) -> String {
-        sqlx::query_scalar::<_, String>(
-            "SELECT work_id FROM source_series WHERE source_type = 'mangadex' AND source_key = ?",
+        crate::db_types::query_scalar::<String>(
+            "SELECT work_id FROM source_series WHERE source_type = 'mangadex' AND source_key = $1",
         )
         .bind(md_id)
         .fetch_one(pool)
@@ -19593,11 +21127,21 @@ mod tests {
         let wid = work_id_of(&pool, "md-feed-rating").await;
         seed_suwayomi_half(&pool, &wid, 778, "Rated work", Some("1784937600000"), None).await;
         for (id, sid, user, score) in [
-            ("rate-work", wid.as_str(), "bob-id", 6),
-            ("rate-source", "778", "admin-id", 8),
+            (
+                "rate-work",
+                wid.as_str(),
+                "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c",
+                6,
+            ),
+            (
+                "rate-source",
+                "778",
+                "964771b0-a2fb-4849-857a-6198947115ec",
+                8,
+            ),
         ] {
-            sqlx::query("INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) VALUES (?, ?, ?, ?, '', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
-                .bind(id).bind(sid).bind(user).bind(score).execute(&pool).await.unwrap();
+            sqlx::query(r#"INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) VALUES ($1, $2, $3, $4, '', FALSE, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#)
+                .bind(crate::db_types::test_uuid(id)).bind(sid).bind(crate::db_types::test_uuid(user)).bind(score).execute(&pool).await.unwrap();
         }
         crate::catalog::refresh_feed_updates(&pool).await.unwrap();
         let response = exec(&s, "{ updatesFeed { items { title rating } } canonicalUpdates { title averageRating ratingCount } }", None, "1.1.1.1").await;
@@ -19649,7 +21193,7 @@ mod tests {
             let wid = work_id_of(&pool, md).await;
             sqlx::query(
                 "INSERT INTO work_stats (work_id, follows, rating, rating_avg, fetched_at) \
-                 VALUES (?, 10, ?, ?, '2026-10-01T00:00:00Z')",
+                 VALUES ($1, 10, $2, $3, '2026-10-01T00:00:00Z')",
             )
             .bind(&wid)
             .bind(bayes)
@@ -19659,7 +21203,7 @@ mod tests {
             .unwrap();
         }
         let local = work_id_of(&pool, "md-r-local-wins").await;
-        sqlx::query("INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) VALUES ('r-local', ?, 'bob-id', 6, '', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+        sqlx::query(r#"INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) VALUES ('5b3fc563-cd8e-4ab0-9b63-8a3512355e61', $1, 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', 6, '', FALSE, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#)
             .bind(&local)
             .execute(&pool)
             .await
@@ -19720,7 +21264,7 @@ mod tests {
             let wid = work_id_of(&pool, md).await;
             sqlx::query(
                 "INSERT INTO work_stats (work_id, follows, rating, rating_avg, fetched_at) \
-                 VALUES (?, 10, ?, ?, '2026-10-01T00:00:00Z')",
+                 VALUES ($1, 10, $2, $3, '2026-10-01T00:00:00Z')",
             )
             .bind(&wid)
             .bind(avg)
@@ -19730,7 +21274,7 @@ mod tests {
             .unwrap();
         }
         let both = work_id_of(&pool, "md-two-both").await;
-        sqlx::query("INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) VALUES ('r-two', ?, 'bob-id', 6, '', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+        sqlx::query(r#"INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) VALUES ('4a178c83-8fe5-4be8-8c16-54afb6036a5b', $1, 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', 6, '', FALSE, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#)
             .bind(&both)
             .execute(&pool)
             .await
@@ -19831,7 +21375,7 @@ mod tests {
             77,
             "Two Identities",
             Some("1784937600000"), // 2026-07-25T00:00:00Z
-            Some("2026-07-25T09:00:00+00:00"),
+            Some("2026-07-25T09:00:00.000000+00:00"),
         )
         .await;
         crate::catalog::refresh_feed_updates(&pool).await.unwrap();
@@ -19915,7 +21459,7 @@ mod tests {
             11,
             "Suwayomi Only",
             Some("1784937600000"),
-            Some("2026-07-25T09:00:00+00:00"),
+            Some("2026-07-25T09:00:00.000000+00:00"),
         )
         .await;
         // Detected, in library — but no upstream release time we can place it by.
@@ -19934,7 +21478,7 @@ mod tests {
             12,
             "Undated Series",
             None,
-            Some("2026-07-26T09:00:00+00:00"),
+            Some("2026-07-26T09:00:00.000000+00:00"),
         )
         .await;
         // Dated and in library, but our scanner has never detected a new chapter. Before
@@ -20032,8 +21576,8 @@ mod tests {
             )
             .await;
             // Push each mirror row to a distinct release time.
-            sqlx::query("UPDATE chapter SET published_at = ? WHERE external_id = ?")
-                .bind(format!("2026-07-{:02}T00:00:00+00:00", i))
+            sqlx::query("UPDATE chapter SET published_at = $1 WHERE external_id = $2")
+                .bind(crate::db_types::date(&(format!("2026-07-{:02}T00:00:00+00:00", i))).unwrap())
                 .bind(format!("md-{i}-1"))
                 .execute(&pool)
                 .await
@@ -20057,7 +21601,7 @@ mod tests {
                 100 + i as i64,
                 &format!("Scanner {i}"),
                 Some(&ms.to_string()),
-                Some("2026-07-26T00:00:00+00:00"),
+                Some("2026-07-26T00:00:00.000000+00:00"),
             )
             .await;
         }
@@ -20147,7 +21691,7 @@ mod tests {
                 200 + i as i64,
                 &format!("Tied {i}"),
                 Some("1784937600000"),
-                Some("2026-07-26T00:00:00+00:00"),
+                Some("2026-07-26T00:00:00.000000+00:00"),
             )
             .await;
         }
@@ -20262,7 +21806,7 @@ mod tests {
                     external_id: format!("{md}-1"),
                     number: Some("1".into()),
                     lang: Some("en".into()),
-                    published_at: Some("2026-07-01T00:00:00Z".into()),
+                    published_at: Some("2026-07-01T00:00:00.000000+00:00".into()),
                     ..Default::default()
                 },
             )
@@ -20379,7 +21923,7 @@ mod tests {
             301,
             "Scanner Row",
             Some("1784937600000"), // 2026-07-25
-            Some("2026-07-25T00:00:00+00:00"),
+            Some("2026-07-25T00:00:00.000000+00:00"),
         )
         .await;
         crate::catalog::refresh_feed_updates(&pool).await.unwrap();
@@ -20430,7 +21974,7 @@ mod tests {
         let (_s, pool) = setup_full(100).await;
         seed_canonical(&pool, "md-gen1", "Generation One", false, "1").await;
         crate::catalog::refresh_feed_updates(&pool).await.unwrap();
-        let gen1 = sqlx::query_as::<_, (String, Option<String>)>(
+        let gen1 = crate::db_types::query_tuple::<(String, Option<String>)>(
             "SELECT title, comic_type FROM feed_series_updates ORDER BY title",
         )
         .fetch_all(&pool)
@@ -20443,9 +21987,7 @@ mod tests {
         // change to make — and then a fill that cannot run.
         seed_canonical(&pool, "md-gen2", "Generation Two", false, "2").await;
         sqlx::query(
-            "INSERT INTO feed_updates (work_id, mangadex_id, title, is_nsfw, latest_at) \
-             VALUES ((SELECT work_id FROM source_series WHERE source_key = 'md-gen2'), \
-                     'md-gen2', 'Generation Two', 0, '2026-07-02T00:00:00+00:00')",
+            r#"INSERT INTO feed_updates (work_id, mangadex_id, title, is_nsfw, latest_at) VALUES ((SELECT work_id FROM source_series WHERE source_key = 'md-gen2'), 'md-gen2', 'Generation Two', FALSE, '2026-07-02T00:00:00+00:00')"#,
         )
         .execute(&pool)
         .await
@@ -20460,7 +22002,7 @@ mod tests {
             err.is_err(),
             "a fill that cannot run must fail the rebuild, not be skipped"
         );
-        let after = sqlx::query_as::<_, (String, Option<String>)>(
+        let after = crate::db_types::query_tuple::<(String, Option<String>)>(
             "SELECT title, comic_type FROM feed_series_updates ORDER BY title",
         )
         .fetch_all(&pool)
@@ -20490,11 +22032,12 @@ mod tests {
             seed_canonical(&pool, md, title, false, "1").await;
         }
         crate::catalog::refresh_feed_updates(&pool).await.unwrap();
-        let untyped: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM feed_series_updates WHERE comic_type IS NULL")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let untyped: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM feed_series_updates WHERE comic_type IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             untyped, 0,
             "a committed feed row must always carry a format"
@@ -20523,7 +22066,7 @@ mod tests {
     }
 
     /// The feed stores a COPY of the effective NSFW flag so the resolver can pin
-    /// `is_nsfw = 0` as an index prefix. That copy is only rewritten by the periodic
+    /// `is_nsfw = FALSE` as an index prefix. That copy is only rewritten by the periodic
     /// rebuild, so without an explicit resync an admin's "mark NSFW" left the work
     /// visible to opted-out viewers on `updatesFeed` for HOURS — a gap `graphql::updates`
     /// never had, because it evaluates the same COALESCE live. `updatesFeed` supersedes
@@ -20576,13 +22119,13 @@ mod tests {
         let (s, pool) = setup_full(100).await;
         seed_canonical(&pool, "md-edit", "Editable Work", false, "1").await;
         let wid = work_id_of(&pool, "md-edit").await;
-        sqlx::query("UPDATE work SET author = 'Source Author', year = 2001 WHERE id = ?")
+        sqlx::query("UPDATE work SET author = 'Source Author', year = 2001 WHERE id = $1")
             .bind(&wid)
             .execute(&pool)
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO work_credit (work_id, role, name) VALUES (?, 'author', 'Source Author')",
+            "INSERT INTO work_credit (work_id, role, name) VALUES ($1, 'author', 'Source Author')",
         )
         .bind(&wid)
         .execute(&pool)
@@ -20675,7 +22218,7 @@ mod tests {
 
     // ---- Browse / search(query: "") over the canonical catalogue (migration 0068) -----
     //
-    // Browse used to read `suwayomi_series WHERE in_library = 1` (13,847 of 48,526
+    // Browse used to read `suwayomi_series WHERE in_library = TRUE` (13,847 of 48,526
     // readable works) with a fixed ORDER BY and no format/status/rating filter. It now
     // pages `feed_series_updates`. Every test below builds the table through the real
     // `refresh_feed_updates`, so the SQL that ships is the SQL under test.
@@ -20850,7 +22393,7 @@ mod tests {
             4242,
             "Suwayomi Only",
             Some("1784937600000"),
-            Some("2026-07-25T00:00:00+00:00"),
+            Some("2026-07-25T00:00:00.000000+00:00"),
         )
         .await;
         crate::catalog::refresh_feed_updates(&pool).await.unwrap();
@@ -20928,7 +22471,7 @@ mod tests {
         let count = |sql: &'static str| {
             let pool = pool.clone();
             async move {
-                sqlx::query_scalar::<_, i64>(sql)
+                crate::db_types::query_scalar::<i64>(sql)
                     .fetch_one(&pool)
                     .await
                     .unwrap()
@@ -20946,12 +22489,13 @@ mod tests {
              fewer (the chapter join came back)"
         );
         // And the excluded work really is the sourceless one.
-        let has_orphan: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM browse_catalogue WHERE work_id = ?")
-                .bind(&orphan)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let has_orphan: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM browse_catalogue WHERE work_id = $1",
+        )
+        .bind(&orphan)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             has_orphan, 0,
             "a work with nothing to open must not be a card"
@@ -20988,14 +22532,14 @@ mod tests {
             991,
             "Source intake",
             Some("1752969600000"),
-            "2026-07-26T00:00:00Z",
+            "2026-07-26T00:00:00.000000+00:00",
             1,
         )
         .await;
         seed_canonical(&pool, "md-home-a", "Older work", false, "1").await;
         seed_canonical(&pool, "md-home-b", "Newest work", false, "1").await;
         crate::catalog::refresh_feed_updates(&pool).await.unwrap();
-        sqlx::query("UPDATE browse_catalogue SET created_at = CASE title WHEN 'Newest work' THEN '2026-10-03T00:00:00Z' ELSE '2020-01-01T00:00:00Z' END")
+        sqlx::query("UPDATE browse_catalogue SET created_at = CASE title WHEN 'Newest work' THEN TIMESTAMPTZ '2026-10-03T00:00:00Z' ELSE TIMESTAMPTZ '2020-01-01T00:00:00Z' END")
             .execute(&pool).await.unwrap();
         let home = exec(
             &s,
@@ -21024,19 +22568,21 @@ mod tests {
         assert_eq!(added["items"], browse["search"]["items"]);
         assert_eq!(added["items"][0]["title"], "Newest work");
 
-        let work_id: String =
-            sqlx::query_scalar("SELECT id FROM work WHERE primary_title = 'Newest work'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT id FROM work WHERE primary_title = 'Newest work'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         crate::catalog::upsert_source_series(
             &pool, &work_id, "suwayomi", "src", "991", None, false,
         )
         .await
         .unwrap();
-        sqlx::query("INSERT INTO user_library (user_id, series_id, created_at) VALUES ('bob-id', '991', '2026-10-03T00:00:00Z')")
+        sqlx::query("INSERT INTO user_library (user_id, series_id, created_at) VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', '991', '2026-10-03T00:00:00Z')")
             .execute(&pool).await.unwrap();
-        sqlx::query("UPDATE feed_series_updates SET released_at = 1790985600000 WHERE work_id = ?")
+        sqlx::query("UPDATE feed_series_updates SET released_at = $1 WHERE work_id = $2")
+            .bind(crate::db_types::epoch_millis(1790985600000).unwrap())
             .bind(&work_id)
             .execute(&pool)
             .await
@@ -21198,11 +22744,12 @@ mod tests {
             serde_json::json!(""),
             "`latestChapterAt` is documented as EMPTY when nothing is dated — never the epoch"
         );
-        let entered: String = sqlx::query_scalar("SELECT created_at FROM work WHERE id = ?")
-            .bind(&wid)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let entered: String =
+            crate::db_types::query_scalar("SELECT created_at FROM work WHERE id = $1")
+                .bind(&wid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(
             card["updatedAt"],
             serde_json::json!(entered),
@@ -21251,7 +22798,7 @@ mod tests {
         let one = |sql: &'static str| {
             let pool = pool.clone();
             async move {
-                sqlx::query_scalar::<_, i64>(sql)
+                crate::db_types::query_scalar::<i64>(sql)
                     .fetch_one(&pool)
                     .await
                     .unwrap()
@@ -21356,14 +22903,14 @@ mod tests {
             &["Action", "Romance"],
         )
         .await;
-        sqlx::query("UPDATE work SET demographic = 'seinen', year = 2015 WHERE id = ?")
+        sqlx::query("UPDATE work SET demographic = 'seinen', year = 2015 WHERE id = $1")
             .bind(&beta)
             .execute(&pool)
             .await
             .unwrap();
         sqlx::query(
             "INSERT INTO work_stats (work_id, follows, rating, rating_avg, fetched_at) \
-             VALUES (?, 1234, 8.5, 8.7, '2026-01-01T00:00:00Z')",
+             VALUES ($1, 1234, 8.5, 8.7, '2026-01-01T00:00:00Z')",
         )
         .bind(&beta)
         .execute(&pool)
@@ -21641,11 +23188,12 @@ mod tests {
                 .1,
             ["Alpha"]
         );
-        let hiatus_rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM feed_series_updates WHERE status = 'HIATUS'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let hiatus_rows: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM feed_series_updates WHERE status = 'HIATUS'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(hiatus_rows, 1, "ON_HIATUS must be stored as HIATUS");
         // Content-rating tiers are cumulative, and cannot widen past the NSFW gate: the
         // erotica work stays hidden from this opted-out viewer at EVERY tier.
@@ -21734,7 +23282,7 @@ mod tests {
         );
     }
 
-    /// The feed stores a COPY of the effective NSFW flag so Browse can pin `is_nsfw = 0` as
+    /// The feed stores a COPY of the effective NSFW flag so Browse can pin `is_nsfw = FALSE` as
     /// an index prefix. `resync_feed_nsfw` rewrites that copy on every admin mark; without
     /// it, an admin's "mark NSFW" would leave the work on Browse — and counted in `total` —
     /// for up to a full sync cycle. This is the Browse half of the guarantee
@@ -21817,17 +23365,18 @@ mod tests {
 
         // The authoritative column says NSFW; the materialized copy still says SFW. This is
         // precisely the state `mark_work_nsfw` used to leave behind.
-        sqlx::query("UPDATE work SET is_nsfw = 1 WHERE id = ?")
+        sqlx::query("UPDATE work SET is_nsfw = TRUE WHERE id = $1")
             .bind(&wid)
             .execute(&pool)
             .await
             .unwrap();
-        let stale: i64 =
-            sqlx::query_scalar("SELECT is_nsfw FROM browse_catalogue WHERE work_id = ?")
-                .bind(&wid)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let stale: i64 = crate::db_types::query_scalar(
+            "SELECT is_nsfw FROM browse_catalogue WHERE work_id = $1",
+        )
+        .bind(&wid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             stale, 0,
             "the copy must still be stale for this test to mean anything"
@@ -21982,18 +23531,24 @@ mod tests {
         // (`strftime('%s', …) * 1000`, so always whole seconds) — UTC, no local offset.
         assert_eq!(
             epoch_ms_to_iso(1_785_073_611_000),
-            "2026-07-26T13:46:51+00:00"
+            "2026-07-26T13:46:51.000000+00:00"
         );
         // Sub-second millis survive as a fraction rather than being truncated or lost.
         assert_eq!(
             epoch_ms_to_iso(1_785_073_611_123),
-            "2026-07-26T13:46:51.123+00:00"
+            "2026-07-26T13:46:51.123000+00:00"
         );
-        assert_eq!(epoch_ms_to_iso(0), "1970-01-01T00:00:00+00:00");
+        assert_eq!(epoch_ms_to_iso(0), "1970-01-01T00:00:00.000000+00:00");
         // Pre-epoch and absurd values: an answer, never a panic.
-        assert_eq!(epoch_ms_to_iso(-1000), "1969-12-31T23:59:59+00:00");
-        assert_eq!(epoch_ms_to_iso(i64::MAX), "1970-01-01T00:00:00+00:00");
-        assert_eq!(epoch_ms_to_iso(i64::MIN), "1970-01-01T00:00:00+00:00");
+        assert_eq!(epoch_ms_to_iso(-1000), "1969-12-31T23:59:59.000000+00:00");
+        assert_eq!(
+            epoch_ms_to_iso(i64::MAX),
+            "1970-01-01T00:00:00.000000+00:00"
+        );
+        assert_eq!(
+            epoch_ms_to_iso(i64::MIN),
+            "1970-01-01T00:00:00.000000+00:00"
+        );
     }
 
     #[tokio::test]
@@ -22034,11 +23589,12 @@ mod tests {
             .await
             .unwrap();
         }
-        let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-safe'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-safe'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         // canonicalSeries maps the work; an uncached cover now resolves to our own
         // lazy /covers/ route (serve_cover fetches + caches the MangaDex cover on first
@@ -22076,11 +23632,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let nsfw_work: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-nsfw'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let nsfw_work: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-nsfw'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let q = format!(r#"{{ canonicalSeries(workId: "{nsfw_work}") {{ title }} }}"#);
         let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
         assert_eq!(first_error(&r), "No such work");
@@ -22135,11 +23692,12 @@ mod tests {
             .await
             .unwrap();
         }
-        let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-bundle'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-bundle'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         // A Suwayomi mirror with a cached series row + cached chapters, so the bundle
         // can carry the per-source data without a live Suwayomi round trip.
         sqlx::query(
@@ -22283,11 +23841,12 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-toggle'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-toggle'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let suw_ssid = crate::catalog::upsert_source_series(
             &pool, &work_id, "suwayomi", "suwayomi", "779", None, false,
         )
@@ -22314,16 +23873,14 @@ mod tests {
         }
         // Ch. 1 read on BOTH copies, the MangaDex one stopped at page 7.
         sqlx::query(
-            "INSERT INTO canonical_progress (user_id, work_id, chapter_id, last_page_read, read, updated_at) \
-             VALUES ('bob-id', ?, 'tg-1', 7, 1, '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO canonical_progress (user_id, work_id, chapter_id, last_page_read, read, updated_at) VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', $1, 'tg-1', 7, TRUE, '2026-01-01T00:00:00Z')"#,
         )
         .bind(&work_id)
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO suwayomi_progress (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
-             VALUES ('bob-id', '9101', '779', 0, 1, '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO suwayomi_progress (user_id, chapter_id, series_id, last_page_read, read, updated_at) VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', '9101', '779', 0, TRUE, '2026-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -22331,8 +23888,8 @@ mod tests {
         let read_of = |table: &'static str, id: &'static str| {
             let pool = pool.clone();
             async move {
-                sqlx::query_as::<_, (i64, i64)>(&format!(
-                    "SELECT read, last_page_read FROM {table} WHERE user_id = 'bob-id' AND chapter_id = ?"
+                crate::db_types::query_tuple::<(i64, i64)>(&format!(
+                    "SELECT read, last_page_read FROM {table} WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c' AND chapter_id = $1"
                 ))
                 .bind(id)
                 .fetch_optional(&pool)
@@ -22367,9 +23924,13 @@ mod tests {
             Some((0, 0)),
             "the sibling copy must clear too, or the fold still reads it as read"
         );
-        assert!(work_read_keys(&pool, Some("bob-id"), &work_id)
-            .await
-            .is_empty());
+        assert!(work_read_keys(
+            &pool,
+            Some("ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c"),
+            &work_id
+        )
+        .await
+        .is_empty());
 
         // Read marks exactly one chapter: ch. 3 read, 1 and 2 untouched (no catch-up).
         let r = exec(
@@ -22422,7 +23983,7 @@ mod tests {
                 r.errors
             );
         }
-        let stray: i64 = sqlx::query_scalar(
+        let stray: i64 = crate::db_types::query_scalar(
             "SELECT (SELECT COUNT(*) FROM canonical_progress WHERE chapter_id = 'not-a-chapter') \
                   + (SELECT COUNT(*) FROM suwayomi_progress WHERE chapter_id = '999999')",
         )
@@ -22464,11 +24025,12 @@ mod tests {
             .await
             .unwrap();
         }
-        let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-found'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-found'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         // A Suwayomi mirror of the SAME two chapters: same numbers, different ids. Cached
         // (so the bundle needs no live Suwayomi round trip) AND mirrored into `chapter`
@@ -22529,13 +24091,13 @@ mod tests {
             sqlx::query(
                 "INSERT INTO release_event \
                    (work_id, chapter_key, first_seen_at, first_source_series_id, label, announce_at) \
-                 VALUES (?, ?, ?, NULL, ?, ?)",
+                 VALUES ($1, $2, $3, NULL, $4, $5)",
             )
             .bind(&work_id)
             .bind(key)
-            .bind(ms)
+            .bind(crate::db_types::epoch_millis(ms).unwrap())
             .bind(key)
-            .bind(ms)
+            .bind(crate::db_types::epoch_millis(ms).unwrap())
             .execute(&pool)
             .await
             .unwrap();
@@ -22543,9 +24105,7 @@ mod tests {
         // Chapter 1 read on the MANGADEX spine only — the Suwayomi copy has no progress
         // row of its own, so its `read` can only come from the cross-source fold.
         sqlx::query(
-            "INSERT INTO canonical_progress \
-               (user_id, work_id, chapter_id, last_page_read, read, updated_at) \
-             VALUES ('bob-id', ?, 'fc-ch-1', 0, 1, '2026-01-02T00:00:00Z')",
+            r#"INSERT INTO canonical_progress (user_id, work_id, chapter_id, last_page_read, read, updated_at) VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', $1, 'fc-ch-1', 0, TRUE, '2026-01-02T00:00:00Z')"#,
         )
         .bind(&work_id)
         .execute(&pool)
@@ -22569,12 +24129,12 @@ mod tests {
         assert_eq!(spine.len(), 2);
         assert_eq!(
             spine[0]["foundAt"],
-            serde_json::json!("2026-07-26T13:46:51+00:00"),
+            serde_json::json!("2026-07-26T13:46:51.000000+00:00"),
             "spine ch 1 found date: {spine:?}"
         );
         assert_eq!(
             spine[1]["foundAt"],
-            serde_json::json!("2026-07-27T13:46:51+00:00"),
+            serde_json::json!("2026-07-27T13:46:51.000000+00:00"),
             "spine ch 2 found date: {spine:?}"
         );
         assert_eq!(spine[0]["read"], serde_json::json!(true));
@@ -22598,12 +24158,12 @@ mod tests {
         };
         assert_eq!(
             by_number(1.0)["foundAt"],
-            serde_json::json!("2026-07-26T13:46:51+00:00"),
+            serde_json::json!("2026-07-26T13:46:51.000000+00:00"),
             "the found date belongs to the CHAPTER, not to the source it is read from"
         );
         assert_eq!(
             by_number(2.0)["foundAt"],
-            serde_json::json!("2026-07-27T13:46:51+00:00")
+            serde_json::json!("2026-07-27T13:46:51.000000+00:00")
         );
         assert_eq!(
             by_number(1.0)["read"],
@@ -22620,7 +24180,7 @@ mod tests {
         let spine = page["spineChapters"].as_array().unwrap();
         assert_eq!(
             spine[0]["foundAt"],
-            serde_json::json!("2026-07-26T13:46:51+00:00")
+            serde_json::json!("2026-07-26T13:46:51.000000+00:00")
         );
         assert!(
             spine.iter().all(|c| c["read"] == serde_json::json!(false)),
@@ -22638,11 +24198,12 @@ mod tests {
 
         // NSFW gate: hidden until the viewer opts in.
         seed_canonical(&pool, "md-sp-nsfw", "Spicy Bundle", true, "1").await;
-        let nsfw_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-sp-nsfw'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let nsfw_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-sp-nsfw'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let q = format!(r#"{{ seriesPage(workId: "{nsfw_id}") {{ workId }} }}"#);
         let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
         assert_eq!(first_error(&r), "No such work");
@@ -22650,16 +24211,18 @@ mod tests {
         // Redirect: a merged-away id answers with the SURVIVOR's bundle and id.
         seed_canonical(&pool, "md-sp-keep", "Surviving Bundle", false, "1").await;
         seed_canonical(&pool, "md-sp-gone", "Folded Bundle", false, "2").await;
-        let survivor: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-sp-keep'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        let retired: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-sp-gone'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let survivor: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-sp-keep'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let retired: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-sp-gone'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         catalog::merge_works_ex(&pool, None, &retired, &survivor)
             .await
             .unwrap();
@@ -22678,7 +24241,7 @@ mod tests {
         );
 
         // Federation-only: no MangaDex anchor → series null, sources still served.
-        sqlx::query("INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) VALUES ('w_fed', 'Fed Only', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+        sqlx::query(r#"INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) VALUES ('w_fed', 'Fed Only', FALSE, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#)
             .execute(&pool)
             .await
             .unwrap();
@@ -22724,13 +24287,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let forced_nsfw: String = sqlx::query_scalar(
+        let forced_nsfw: String = crate::db_types::query_scalar(
             "SELECT work_id FROM source_series WHERE source_key = 'md-forcensfw'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        sqlx::query("UPDATE work SET is_nsfw_override = 1 WHERE id = ?")
+        sqlx::query("UPDATE work SET is_nsfw_override = TRUE WHERE id = $1")
             .bind(&forced_nsfw)
             .execute(&pool)
             .await
@@ -22760,13 +24323,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let forced_sfw: String = sqlx::query_scalar(
+        let forced_sfw: String = crate::db_types::query_scalar(
             "SELECT work_id FROM source_series WHERE source_key = 'md-forcesfw'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        sqlx::query("UPDATE work SET is_nsfw_override = 0 WHERE id = ?")
+        sqlx::query("UPDATE work SET is_nsfw_override = FALSE WHERE id = $1")
             .bind(&forced_sfw)
             .execute(&pool)
             .await
@@ -22805,11 +24368,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-enr'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-enr'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let q = format!(
             r#"{{ canonicalSeries(workId: "{work_id}") {{ localizedDescriptions {{ lang description }} credits {{ role name }} }} }}"#
         );
@@ -22846,11 +24410,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-x'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-x'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         crate::catalog::upsert_source_series(
             &pool, &work_id, "suwayomi", "1024", "slug-1", None, false,
         )
@@ -22956,12 +24521,12 @@ mod tests {
             .unwrap()
             .iter()
             .all(|t| t["url"].as_str().unwrap().starts_with("https://")));
-        sqlx::query("UPDATE work SET title_override = 'Curated title' WHERE id = ?")
+        sqlx::query("UPDATE work SET title_override = 'Curated title' WHERE id = $1")
             .bind(&work)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO work_tag (work_id, tag, ord, source) VALUES (?, 'My custom tag', 0, 'admin')").bind(&work).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO work_tag (work_id, tag, ord, source) VALUES ($1, 'My custom tag', 0, 'admin')").bind(&work).execute(&pool).await.unwrap();
         input.external_ids = vec![("al".into(), "456".into())];
         input.official_links.clear();
         input.tags.clear();
@@ -22987,8 +24552,8 @@ mod tests {
         assert!(trackers
             .iter()
             .any(|t| t["provider"] == "al" && t["externalId"] == "456"));
-        let historical: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM work_external_id WHERE work_id = ? AND provider = 'al'",
+        let historical: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM work_external_id WHERE work_id = $1 AND provider = 'al'",
         )
         .bind(&work)
         .fetch_one(&pool)
@@ -22998,7 +24563,7 @@ mod tests {
             historical, 2,
             "display refresh must preserve historical identity keys"
         );
-        sqlx::query("UPDATE work SET metadata_synced_at = 'done', covers_synced_at = 'done', mangadex_details_synced_at = NULL WHERE id = ?").bind(&work).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE work SET metadata_synced_at = TIMESTAMPTZ '2020-01-01T00:00:00Z', covers_synced_at = TIMESTAMPTZ '2020-01-01T00:00:00Z', mangadex_details_synced_at = NULL WHERE id = $1").bind(&work).execute(&pool).await.unwrap();
         assert!(works_needing_enrichment(&pool, 100)
             .await
             .unwrap()
@@ -23034,11 +24599,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-multi'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-multi'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         // Two Suwayomi mirrors of the one work; `777` is the id the reader arrives with.
         for (source_id, source_key) in [("src-a", "777"), ("src-b", "888")] {
             crate::catalog::upsert_source_series(
@@ -23124,11 +24690,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-y'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-y'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         crate::catalog::upsert_source_series(
             &pool,
             &work_id,
@@ -23189,14 +24756,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let work_id: String = sqlx::query_scalar(
+        let work_id: String = crate::db_types::query_scalar(
             "SELECT work_id FROM source_series WHERE source_key = 'md-nsfw-work'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         // …and the admin pins the OVERRIDE, which is all `markSourceNsfw` writes.
-        sqlx::query("UPDATE work SET is_nsfw_override = 1 WHERE id = ?")
+        sqlx::query("UPDATE work SET is_nsfw_override = TRUE WHERE id = $1")
             .bind(&work_id)
             .execute(&pool)
             .await
@@ -23363,7 +24930,7 @@ mod tests {
         // `isCanonicalId` would still route it here, and the resolver must return
         // "No such work" rather than a titleless/coverless/chapterless shell (CR3).
         let (s, pool) = setup_full(100).await;
-        sqlx::query("INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) VALUES ('w_42', 'Backfilled Shell', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+        sqlx::query(r#"INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) VALUES ('w_42', 'Backfilled Shell', FALSE, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#)
             .execute(&pool)
             .await
             .unwrap();
@@ -23392,7 +24959,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let anchored: String = sqlx::query_scalar(
+        let anchored: String = crate::db_types::query_scalar(
             "SELECT work_id FROM source_series WHERE source_key = 'md-anchored'",
         )
         .fetch_one(&pool)
@@ -23434,7 +25001,7 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("/api/v1/manga/323/thumbnail"));
-        sqlx::query("UPDATE work SET cover_cached_version = 1791051562000 WHERE id = ?")
+        sqlx::query("UPDATE work SET cover_cached_version = 1791051562000 WHERE id = $1")
             .bind(&work_id)
             .execute(&pool)
             .await
@@ -23464,7 +25031,7 @@ mod tests {
         .await
         .unwrap();
         for (series_id, numbers) in [(323, vec![1, 2]), (324, vec![1, 2, 3])] {
-            sqlx::query("INSERT INTO suwayomi_series (id, title, thumbnail_url, status, source_id, lang, chapter_count, updated_at) VALUES (?, 'A Painter Who Draws Dungeons', '/cover.png', 'ONGOING', 'src', 'en', ?, '2026-10-03T00:00:00Z')")
+            sqlx::query("INSERT INTO suwayomi_series (id, title, thumbnail_url, status, source_id, lang, chapter_count, updated_at) VALUES ($1, 'A Painter Who Draws Dungeons', '/cover.png', 'ONGOING', 'src', 'en', $2, '2026-10-03T00:00:00Z')")
                 .bind(series_id).bind(numbers.len() as i64).execute(&pool).await.unwrap();
             let ssid = catalog::upsert_source_series(
                 &pool,
@@ -23493,9 +25060,9 @@ mod tests {
             }
         }
         // Historical source and canonical rows for the same work.
-        sqlx::query("INSERT INTO user_library (user_id, series_id, created_at, is_favorite, status) VALUES ('bob-id', '323', '2020-01-01T00:00:00Z', 1, 'reading'), ('bob-id', ?, '2026-10-01T00:00:00Z', 0, NULL)")
+        sqlx::query(r#"INSERT INTO user_library (user_id, series_id, created_at, is_favorite, status) VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', '323', '2020-01-01T00:00:00Z', TRUE, 'reading'), ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', $1, '2026-10-01T00:00:00Z', FALSE, NULL)"#)
             .bind(&work_id).execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO suwayomi_progress (user_id, chapter_id, series_id, read, updated_at) VALUES ('bob-id', '3231', '323', 1, '2026-10-02T00:00:00Z'), ('bob-id', '3242', '324', 1, '2026-10-03T00:00:00Z')")
+        sqlx::query(r#"INSERT INTO suwayomi_progress (user_id, chapter_id, series_id, read, updated_at) VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', '3231', '323', TRUE, '2026-10-02T00:00:00Z'), ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', '3242', '324', TRUE, '2026-10-03T00:00:00Z')"#)
             .execute(&pool).await.unwrap();
         catalog::refresh_feed_updates(&pool).await.unwrap();
         let query = format!(
@@ -23523,14 +25090,14 @@ mod tests {
             response.data.into_json().unwrap()["setFavorite"]["isFavorite"],
             false
         );
-        let rows: Vec<(String, i64, Option<String>, String)> = sqlx::query_as("SELECT series_id, is_favorite, status, created_at FROM user_library WHERE user_id = 'bob-id'").fetch_all(&pool).await.unwrap();
+        let rows: Vec<(String, i64, Option<String>, String)> = crate::db_types::query_tuple("SELECT series_id, is_favorite, status, created_at FROM user_library WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'").fetch_all(&pool).await.unwrap();
         assert_eq!(
             rows,
             vec![(
                 work_id.clone(),
                 0,
                 Some("reading".into()),
-                "2020-01-01T00:00:00Z".into()
+                "2020-01-01T00:00:00.000000+00:00".into()
             )]
         );
         let response = exec(&schema, &query, Some("bobtok"), "1.1.1.1").await;
@@ -23581,15 +25148,23 @@ mod tests {
             "1",
         )
         .await;
-        let work_id: String = sqlx::query_scalar(
+        let work_id: String = crate::db_types::query_scalar(
             "SELECT work_id FROM source_series WHERE source_key = 'md-library-found'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO user_library (user_id, series_id, created_at) VALUES ('bob-id', ?, '2026-10-03T00:00:00Z')").bind(&work_id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO user_library (user_id, series_id, created_at) VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', $1, '2026-10-03T00:00:00Z')").bind(&work_id).execute(&pool).await.unwrap();
         catalog::refresh_feed_updates(&pool).await.unwrap();
-        sqlx::query("UPDATE feed_series_updates SET released_at = 1577836800000, announced_at = 1791028800000 WHERE work_id = ?").bind(&work_id).execute(&pool).await.unwrap();
+        sqlx::query(
+            "UPDATE feed_series_updates SET released_at = $1, announced_at = $2 WHERE work_id = $3",
+        )
+        .bind(crate::db_types::epoch_millis(1577836800000).unwrap())
+        .bind(crate::db_types::epoch_millis(1791028800000).unwrap())
+        .bind(&work_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         let response = exec(
             &schema,
             "{ library { id latestChapterAt detectedAt } }",
@@ -23626,11 +25201,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-flags'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-flags'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         // Favourite + shelf the work as bob (favouriting implies membership).
         let fav = format!(
@@ -23702,11 +25278,12 @@ mod tests {
             .await
             .unwrap();
         }
-        let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-cr6'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-cr6'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         // ---- Library: mark persists + reflects, unmark removes ----
         let mark_q = |m: bool| {
@@ -23719,8 +25296,8 @@ mod tests {
         let r = exec(&s, &mark_q(true), Some("bobtok"), "1.1.1.1").await;
         assert!(r.errors.is_empty(), "mark failed: {:?}", r.errors);
         assert!(data_json(&r).contains("\"isMarked\":true"));
-        let rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM user_library WHERE user_id = 'bob-id' AND series_id = ?",
+        let rows: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM user_library WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c' AND series_id = $1",
         )
         .bind(&work_id)
         .fetch_one(&pool)
@@ -23737,7 +25314,7 @@ mod tests {
         let r = exec(&s, &mark_q(false), Some("bobtok"), "1.1.1.1").await;
         assert!(data_json(&r).contains("\"isMarked\":false"));
         let rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM user_library WHERE user_id = 'bob-id'")
+            crate::db_types::query_scalar("SELECT COUNT(*) FROM user_library WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -23762,8 +25339,8 @@ mod tests {
         assert_eq!(a["read"], serde_json::json!(true));
         assert_eq!(a["lastPageRead"], serde_json::json!(12));
         // The owning work_id was resolved from the chapter uuid.
-        let stored_work: String = sqlx::query_scalar(
-            "SELECT work_id FROM canonical_progress WHERE user_id = 'bob-id' AND chapter_id = 'uuid-a'",
+        let stored_work: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM canonical_progress WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c' AND chapter_id = 'uuid-a'",
         )
         .fetch_one(&pool)
         .await
@@ -23778,9 +25355,9 @@ mod tests {
         )
         .await;
         assert!(r.errors.is_empty(), "{:?}", r.errors);
-        let (cnt, lpr, rd): (i64, i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*), MAX(last_page_read), MAX(read) FROM canonical_progress \
-             WHERE user_id = 'bob-id' AND chapter_id = 'uuid-a'",
+        let (cnt, lpr, rd): (i64, i64, i64) = crate::db_types::query_tuple(
+            "SELECT COUNT(*), MAX(last_page_read), BOOL_OR(read) FROM canonical_progress \
+             WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c' AND chapter_id = 'uuid-a'",
         )
         .fetch_one(&pool)
         .await
@@ -23861,15 +25438,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-rate'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-rate'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         // The same work also mirrored by a numeric Suwayomi source — the id Browse links.
         sqlx::query(
             "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
-             VALUES ('ss-rate-suwa', ?, 'suwayomi', 'src1', '4242', '2020-01-01T00:00:00Z')",
+             VALUES ('ss-rate-suwa', $1, 'suwayomi', 'src1', '4242', '2020-01-01T00:00:00Z')",
         )
         .bind(&work_id)
         .execute(&pool)
@@ -23885,11 +25463,12 @@ mod tests {
         let r = exec(&s, &post("4242", 6), Some("bobtok"), "1.1.1.1").await;
         assert!(r.errors.is_empty(), "postReview failed: {:?}", r.errors);
         // It is STORED under the work, not under the numeric id it was posted with.
-        let stored: Vec<String> =
-            sqlx::query_scalar("SELECT series_id FROM reviews WHERE user_id = 'bob-id'")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let stored: Vec<String> = crate::db_types::query_scalar(
+            "SELECT series_id FROM reviews WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             stored,
             vec![work_id.clone()],
@@ -23900,16 +25479,14 @@ mod tests {
         // shape this fix refuses to migrate away. It is OLDER, so it must lose, and it must
         // not add a second vote.
         sqlx::query(
-            "INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) \
-             VALUES ('legacy-bob', '4242', 'bob-id', 2, '', 0, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+            r#"INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) VALUES ('46348716-7ed7-45eb-9c41-a16c89324a62', '4242', 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', 2, '', FALSE, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
         .unwrap();
         // A DIFFERENT user rating under the numeric key is a genuine second vote.
         sqlx::query(
-            "INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) \
-             VALUES ('legacy-admin', '4242', 'admin-id', 8, '', 0, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+            r#"INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) VALUES ('3b6a27b4-778b-4e9d-8593-91b51619e9e3', '4242', '964771b0-a2fb-4849-857a-6198947115ec', 8, '', FALSE, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -23990,14 +25567,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-clear'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-clear'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
-             VALUES ('ss-clear-suwa', ?, 'suwayomi', 'src1', '7777', '2020-01-01T00:00:00Z')",
+             VALUES ('ss-clear-suwa', $1, 'suwayomi', 'src1', '7777', '2020-01-01T00:00:00Z')",
         )
         .bind(&work_id)
         .execute(&pool)
@@ -24025,8 +25603,7 @@ mod tests {
         .await;
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         sqlx::query(
-            "INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) \
-             VALUES ('legacy-bob-clear', '7777', 'bob-id', 3, '', 0, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+            r#"INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) VALUES ('91caef25-6df4-4dc4-9772-d2629a00a857', '7777', 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', 3, '', FALSE, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -24064,10 +25641,12 @@ mod tests {
             serde_json::json!(true)
         );
         // BOTH of bob's rows are gone — the `w_…` one and the numeric one.
-        let bobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE user_id = 'bob-id'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let bobs: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM reviews WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             bobs, 0,
             "withdrawal covers every id the vote was filed under"
@@ -24075,11 +25654,12 @@ mod tests {
         // Admin's vote is untouched: the count drops by exactly one voter, not to zero.
         let r = exec(&s, &rating_q, None, "1.1.1.1").await;
         assert_eq!(count(r), 1, "only the caller's own vote is withdrawn");
-        let admins: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE user_id = 'admin-id'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let admins: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM reviews WHERE user_id = '964771b0-a2fb-4849-857a-6198947115ec'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(admins, 1);
         // The viewer's own widget agrees, and the profile no longer claims the review.
         let r = exec(
@@ -24090,8 +25670,8 @@ mod tests {
         )
         .await;
         assert!(r.data.into_json().unwrap()["myReview"].is_null());
-        let acts: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM user_activity WHERE user_id = 'bob-id' AND kind = 'review'",
+        let acts: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM user_activity WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c' AND kind = 'review'",
         )
         .fetch_one(&pool)
         .await
@@ -24124,9 +25704,7 @@ mod tests {
         // from the cache (no live source fetch) and `setProgress` can resolve series_id.
         for (cid, num) in [(9001_i64, 1.0_f64), (9002, 2.0)] {
             sqlx::query(
-                "INSERT INTO suwayomi_chapter \
-                   (id, manga_id, name, chapter_number, is_read, last_page_read, page_count, updated_at) \
-                 VALUES (?, 500, ?, ?, 1, 99, 20, '2020-01-01T00:00:00Z')",
+                r#"INSERT INTO suwayomi_chapter (id, manga_id, name, chapter_number, is_read, last_page_read, page_count, updated_at) VALUES ($1, 500, $2, $3, TRUE, 99, 20, '2020-01-01T00:00:00Z')"#,
             )
             .bind(cid)
             .bind(format!("Chapter {num}"))
@@ -24136,12 +25714,15 @@ mod tests {
             .unwrap();
         }
         // Both users add series 500 to their library.
-        for uid in ["bob-id", "admin-id"] {
+        for uid in [
+            "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c",
+            "964771b0-a2fb-4849-857a-6198947115ec",
+        ] {
             sqlx::query(
                 "INSERT INTO user_library (user_id, series_id, created_at) \
-                 VALUES (?, '500', '2020-01-01T00:00:00Z')",
+                 VALUES ($1, '500', '2020-01-01T00:00:00Z')",
             )
-            .bind(uid)
+            .bind(crate::db_types::uuid(uid).unwrap())
             .execute(&pool)
             .await
             .unwrap();
@@ -24156,9 +25737,9 @@ mod tests {
         let r = exec(&s, prog_q, Some("bobtok"), "1.1.1.1").await;
         assert!(r.errors.is_empty(), "setProgress failed: {:?}", r.errors);
         // series_id was resolved from the chapter's cached manga_id.
-        let stored: (String, i64, i64) = sqlx::query_as(
+        let stored: (String, i64, i64) = crate::db_types::query_tuple(
             "SELECT series_id, last_page_read, read FROM suwayomi_progress \
-             WHERE user_id = 'bob-id' AND chapter_id = '9001'",
+             WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c' AND chapter_id = '9001'",
         )
         .fetch_one(&pool)
         .await
@@ -24166,7 +25747,7 @@ mod tests {
         assert_eq!(stored, ("500".into(), 12, 1));
 
         // chapters() overlays only the VIEWER's state — despite the cached global
-        // is_read=1/last_page_read=99, bob sees his own values and admin sees unread.
+        // is_read = TRUE/last_page_read=99, bob sees his own values and admin sees unread.
         let chapters_q = r#"{ chapters(seriesId: "500") { id read lastPageRead } }"#;
         let read_state = |r: async_graphql::Response, id: &str| {
             r.data.into_json().unwrap()["chapters"]
@@ -24231,9 +25812,9 @@ mod tests {
         )
         .await;
         assert!(r.errors.is_empty(), "{:?}", r.errors);
-        let (cnt, lpr, rd): (i64, i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*), MAX(last_page_read), MAX(read) FROM suwayomi_progress \
-             WHERE user_id = 'bob-id' AND chapter_id = '9001'",
+        let (cnt, lpr, rd): (i64, i64, i64) = crate::db_types::query_tuple(
+            "SELECT COUNT(*), MAX(last_page_read), BOOL_OR(read) FROM suwayomi_progress \
+             WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c' AND chapter_id = '9001'",
         )
         .fetch_one(&pool)
         .await
@@ -24304,15 +25885,14 @@ mod tests {
                 .unwrap();
             }
         }
-        sqlx::query("INSERT INTO user_library (user_id, series_id, created_at) VALUES ('bob-id', ?, '2020-01-01T00:00:00Z')")
+        sqlx::query("INSERT INTO user_library (user_id, series_id, created_at) VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', $1, '2020-01-01T00:00:00Z')")
             .bind(&work_id)
             .execute(&pool)
             .await
             .unwrap();
         // Chapter 1 read on the MangaDex spine…
         sqlx::query(
-            "INSERT INTO canonical_progress (user_id, work_id, chapter_id, last_page_read, read, updated_at) \
-             VALUES ('bob-id', ?, 'md-c1', 0, 1, '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO canonical_progress (user_id, work_id, chapter_id, last_page_read, read, updated_at) VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', $1, 'md-c1', 0, TRUE, '2026-01-01T00:00:00Z')"#,
         )
         .bind(&work_id)
         .execute(&pool)
@@ -24321,8 +25901,7 @@ mod tests {
         // …then chapters 1 and 2 read through the Suwayomi translation of the same work.
         for cid in ["7001", "7002"] {
             sqlx::query(
-                "INSERT INTO suwayomi_progress (user_id, series_id, chapter_id, last_page_read, read, updated_at) \
-                 VALUES ('bob-id', '700', ?, 0, 1, '2026-01-02T00:00:00Z')",
+                r#"INSERT INTO suwayomi_progress (user_id, series_id, chapter_id, last_page_read, read, updated_at) VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', '700', $1, 0, TRUE, '2026-01-02T00:00:00Z')"#,
             )
             .bind(cid)
             .execute(&pool)
@@ -24349,7 +25928,10 @@ mod tests {
         assert_eq!(p["total"], serde_json::json!(3), "3 chapters, not 6");
         // The Suwayomi read is the most recent, so it has to win `lastReadAt` too —
         // that is what orders the Continue-reading shelf.
-        assert_eq!(p["lastReadAt"], serde_json::json!("2026-01-02T00:00:00Z"));
+        assert_eq!(
+            p["lastReadAt"],
+            serde_json::json!("2026-01-02T00:00:00.000000+00:00")
+        );
     }
 
     /// REGRESSION: read markers vanished when the viewer switched SOURCE.
@@ -24410,8 +25992,7 @@ mod tests {
         // the assertions below can prove it is NOT inherited by the other source's copy.
         for (cid, page) in [("7001", 0), ("7002", 12)] {
             sqlx::query(
-                "INSERT INTO suwayomi_progress (user_id, series_id, chapter_id, last_page_read, read, updated_at) \
-                 VALUES ('bob-id', '700', ?, ?, 1, '2026-01-02T00:00:00Z')",
+                r#"INSERT INTO suwayomi_progress (user_id, series_id, chapter_id, last_page_read, read, updated_at) VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', '700', $1, $2, TRUE, '2026-01-02T00:00:00Z')"#,
             )
             .bind(cid)
             .bind(page)
@@ -24504,18 +26085,16 @@ mod tests {
             // sort key), so a scan-state row alone is no longer enough to be counted —
             // the series must also be a library member. See `updates_total_matches_paged_row_count`.
             sqlx::query(
-                "INSERT INTO suwayomi_series \
-                   (id, title, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) \
-                 VALUES (?, ?, 'ONGOING', 'src', 5, 1, '1751328000000', '2026-07-10T00:00:00Z')",
+                r#"INSERT INTO suwayomi_series (id, title, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) VALUES ($1, $2, 'ONGOING', 'src', 5, TRUE, '1751328000000', '2026-07-10T00:00:00Z')"#,
             )
-            .bind(sid)
+            .bind(sid.parse::<i64>().unwrap())
             .bind(title)
             .execute(&pool)
             .await
             .unwrap();
             sqlx::query(
                 "INSERT INTO series_scan_state (series_id, last_new_chapter_at, updated_at, next_scan_at) \
-                 VALUES (?, '2026-07-10T00:00:00Z', '2026-07-10T00:00:00Z', '1970-01-01T00:00:00+00:00')",
+                 VALUES ($1, '2026-07-10T00:00:00Z', '2026-07-10T00:00:00Z', '1970-01-01T00:00:00+00:00')",
             )
             .bind(sid)
             .execute(&pool)
@@ -24587,7 +26166,7 @@ mod tests {
             r.decision
         );
         assert_eq!(r.work_id, existing);
-        let nsfw: i64 = sqlx::query_scalar("SELECT is_nsfw FROM work WHERE id = ?")
+        let nsfw: i64 = crate::db_types::query_scalar("SELECT is_nsfw FROM work WHERE id = $1")
             .bind(&existing)
             .fetch_one(&pool)
             .await
@@ -24686,7 +26265,7 @@ mod tests {
     /// A fresh server: the shared fixture with nobody holding admin.
     async fn setup_without_admin() -> (ApiSchema, Database, std::sync::Arc<AppState>) {
         let (s, pool, st) = setup_with_state(100).await;
-        sqlx::query("UPDATE users SET is_admin = 0")
+        sqlx::query("UPDATE users SET is_admin = FALSE")
             .execute(&pool)
             .await
             .unwrap();
@@ -24850,7 +26429,7 @@ mod tests {
     #[tokio::test]
     async fn create_owner_is_rate_limited_per_ip() {
         let (s, _, st) = setup_with_state(2).await;
-        sqlx::query("UPDATE users SET is_admin = 0")
+        sqlx::query("UPDATE users SET is_admin = FALSE")
             .execute(&st.pool)
             .await
             .unwrap();
@@ -24920,11 +26499,12 @@ mod tests {
         let d = data(exec(&s, q, Some("admintok"), "1.1.1.1").await);
         assert_eq!(d["createUser"]["username"], "dave");
         assert_eq!(d["createUser"]["isAdmin"], false);
-        let must: i64 =
-            sqlx::query_scalar("SELECT must_change_password FROM users WHERE username = 'dave'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let must: i64 = crate::db_types::query_scalar(
+            "SELECT must_change_password FROM users WHERE username = 'dave'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(must, 1, "defaults to asking for a new password");
 
         // Works even with sign-up closed, and the user can sign in.
@@ -24957,23 +26537,24 @@ mod tests {
         )
         .await);
         assert_eq!(d["createUser"]["isAdmin"], true);
-        let must: i64 =
-            sqlx::query_scalar("SELECT must_change_password FROM users WHERE username = 'erin'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let must: i64 = crate::db_types::query_scalar(
+            "SELECT must_change_password FROM users WHERE username = 'erin'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(must, 0);
     }
 
     #[tokio::test]
     async fn admin_reset_password_revokes_sessions_and_flags_a_change() {
         let (s, pool, _) = setup_with_state(100).await;
-        let q = r#"mutation { resetUserPassword(userId:"bob-id", password:"reset-pass-1") }"#;
+        let q = r#"mutation { resetUserPassword(userId:"ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c", password:"reset-pass-1") }"#;
         let r = exec(&s, q, Some("bobtok"), "1.1.1.1").await;
         assert_eq!(first_error(&r), "Admin access required");
         let r = exec(
             &s,
-            r#"mutation { resetUserPassword(userId:"admin-id", password:"reset-pass-1") }"#,
+            r#"mutation { resetUserPassword(userId:"964771b0-a2fb-4849-857a-6198947115ec", password:"reset-pass-1") }"#,
             Some("admintok"),
             "1.1.1.1",
         )
@@ -25009,25 +26590,26 @@ mod tests {
         )
         .await);
         assert_eq!(d["login"]["user"]["mustChangePassword"], true);
-        let sessions: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = 'bob-id'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let sessions: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM sessions WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(sessions, 1, "only the new sign-in");
     }
 
     #[tokio::test]
     async fn change_password_checks_current_and_clears_the_flag() {
         let (s, pool, _) = setup_with_state(100).await;
-        sqlx::query("UPDATE users SET must_change_password = 1 WHERE id = 'bob-id'")
+        sqlx::query("UPDATE users SET must_change_password = TRUE WHERE id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'")
             .execute(&pool)
             .await
             .unwrap();
         // A second session for bob, which the change must sign out.
         sqlx::query(
             "INSERT INTO sessions (token, user_id, created_at, expires_at) \
-             VALUES (?, 'bob-id', '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
+             VALUES ($1, 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
         )
         .bind(auth::hash_token("bobtok2"))
         .execute(&pool)
@@ -25111,7 +26693,7 @@ mod tests {
     #[tokio::test]
     async fn a_temporary_password_session_can_only_change_its_password() {
         let (s, pool, _) = setup_with_state(100).await;
-        sqlx::query("UPDATE users SET must_change_password = 1")
+        sqlx::query("UPDATE users SET must_change_password = TRUE")
             .execute(&pool)
             .await
             .unwrap();
@@ -25146,10 +26728,12 @@ mod tests {
         )
         .await;
         assert_eq!(first_error(&r), MUST_CHANGE_PASSWORD);
-        let stored: i64 = sqlx::query_scalar("SELECT show_nsfw FROM users WHERE id = 'bob-id'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let stored: i64 = crate::db_types::query_scalar(
+            "SELECT show_nsfw FROM users WHERE id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(stored, 0, "the refused mutation wrote nothing");
         // The REST uploads resolve the same way.
         assert!(auth::user_for_token(&pool, "bobtok")
@@ -25370,20 +26954,171 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_comment_requires_admin() {
+    async fn postgres_malformed_client_uuid_ids_keep_not_found_semantics() {
+        let (schema, _pool) = setup_full(100).await;
+        for (query, role, expected) in [
+            (
+                r#"mutation { submitReport(input:{kind:COMMENT_ABUSE,commentId:"not-a-uuid",detail:"A stale comment link should retain its previous error."}) { id } }"#,
+                None,
+                "That comment no longer exists.",
+            ),
+            (
+                r#"mutation { resolveReport(reportId:"not-a-uuid",status:RESOLVED) { id } }"#,
+                Some("admintok"),
+                "No such report",
+            ),
+            (
+                r#"mutation { postComment(input:{targetType:"series",targetId:"s1",body:"reply",hasSpoiler:false,parentId:"not-a-uuid"}) { id } }"#,
+                Some("bobtok"),
+                "reply target not found on this thread",
+            ),
+            (
+                r#"mutation { postComment(input:{targetType:"series",targetId:"s1",body:"image",hasSpoiler:false,mediaId:"not-a-uuid"}) { id } }"#,
+                Some("bobtok"),
+                "attached image not found",
+            ),
+            (
+                r#"mutation { voteComment(commentId:"not-a-uuid",value:1) { likes } }"#,
+                Some("bobtok"),
+                "comment not found",
+            ),
+            (
+                r#"mutation { banUser(userId:"not-a-uuid",banned:true) { id } }"#,
+                Some("admintok"),
+                "No such user.",
+            ),
+            (
+                r#"mutation { setUserAdmin(userId:"not-a-uuid",isAdmin:false) { id } }"#,
+                Some("admintok"),
+                "No such user.",
+            ),
+        ] {
+            let response = exec(&schema, query, role, "phase3-malformed-uuid").await;
+            assert_eq!(
+                first_error(&response),
+                expected,
+                "{query}: {:?}",
+                response.errors
+            );
+        }
+        let response = exec(
+            &schema,
+            r#"mutation { deleteComment(commentId:"not-a-uuid") }"#,
+            Some("admintok"),
+            "phase3-malformed-uuid",
+        )
+        .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(response.data.into_json().unwrap()["deleteComment"], false);
+    }
+
+    #[tokio::test]
+    async fn postgres_library_fallback_keys_keep_sqlite_half_and_saturation_semantics() {
+        let pg = migrated_pool().await;
+        let sqlite = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let key_sql = sqlite_progress_key_sql("sc.chapter_number");
+        let sql =
+            format!("SELECT {key_sql} FROM (SELECT $1::double precision AS chapter_number) sc");
+        for number in [
+            Some(0.125),
+            Some(-0.125),
+            Some(0.12499999999999999),
+            Some(1e200),
+            Some(-1e200),
+            Some(1.23456789),
+            Some(9_223_372_036_854_774.0),
+            None,
+        ] {
+            let expected: Option<String> =
+                sqlx::query_scalar("SELECT CAST(CAST(ROUND($1*100) AS INTEGER) AS TEXT)")
+                    .bind(number)
+                    .fetch_one(&sqlite)
+                    .await
+                    .unwrap();
+            let actual: Option<String> = sqlx::query_scalar(&sql)
+                .bind(number)
+                .fetch_one(&pg)
+                .await
+                .unwrap();
+            assert_eq!(actual, expected, "library fallback numeric key: {number:?}");
+        }
+        sqlite.close().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_canonical_catch_up_keeps_sqlite_numeric_prefix_and_extreme_semantics() {
+        let (_schema, pool) = setup_full(100).await;
+        sqlx::query("INSERT INTO work(id,primary_title,created_at,updated_at) VALUES('phase3-catchup','Numeric Catch-up','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')").execute(&pool).await.unwrap();
+        for source in ["phase3-catchup-a", "phase3-catchup-b"] {
+            sqlx::query("INSERT INTO source_series(id,work_id,source_type,source_key,created_at) VALUES($1,'phase3-catchup','mangadex',$1,'2020-01-01T00:00:00Z')").bind(source).execute(&pool).await.unwrap();
+        }
+        let sqlite = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE labels(id TEXT,number TEXT)")
+            .execute(&sqlite)
+            .await
+            .unwrap();
+        for (index, label) in [
+            Some("1e999"),
+            Some("1e-999"),
+            Some("3suffix"),
+            Some("8.5tail"),
+            Some("-1"),
+            Some("+1"),
+            Some("bad"),
+            Some("9"),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("phase3-number-{index}");
+            sqlx::query("INSERT INTO labels VALUES($1,$2)")
+                .bind(&id)
+                .bind(label)
+                .execute(&sqlite)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO chapter(id,source_series_id,external_id,number,lang,created_at) VALUES($1,'phase3-catchup-a',$1,$2,'en','2020-01-01T00:00:00Z')").bind(&id).bind(label).execute(&pool).await.unwrap();
+        }
+        // Duplicate external identities on distinct sources were harmless under
+        // SQLite's per-row upsert and must remain a single progress identity.
+        sqlx::query("INSERT INTO chapter(id,source_series_id,external_id,number,lang,created_at) VALUES('phase3-number-copy','phase3-catchup-b','phase3-number-2','3suffix','en','2020-01-01T00:00:00Z')").execute(&pool).await.unwrap();
+        let expected:Vec<String>=sqlx::query_scalar("SELECT DISTINCT id FROM labels WHERE number GLOB '[0-9]*' AND CAST(number AS REAL)<9 ORDER BY id").fetch_all(&sqlite).await.unwrap();
+        assert_eq!(
+            expected,
+            vec!["phase3-number-1", "phase3-number-2", "phase3-number-3"]
+        );
+        let mut tx = pool.begin().await.unwrap();
+        catch_up_canonical(
+            &mut tx,
+            "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c",
+            "phase3-catchup",
+            9.0,
+            "2020-01-02T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let actual:Vec<String>=sqlx::query_scalar("SELECT chapter_id FROM canonical_progress WHERE work_id='phase3-catchup' AND read=TRUE ORDER BY chapter_id").fetch_all(&pool).await.unwrap();
+        assert_eq!(actual, expected);
+        sqlite.close().await;
+    }
+
+    #[tokio::test]
+    async fn delete_comment_missing_returns_false_for_authenticated_users() {
         let s = setup().await;
-        let q = r#"mutation { deleteComment(commentId:"nope") }"#;
-        assert_eq!(
-            first_error(&exec(&s, q, Some("bobtok"), "1.1.1.1").await),
-            "Admin access required"
-        );
-        // admin: no such comment => false, no error
-        let r = exec(&s, q, Some("admintok"), "1.1.1.1").await;
-        assert!(r.errors.is_empty());
-        assert_eq!(
-            r.data.into_json().unwrap()["deleteComment"],
-            serde_json::json!(false)
-        );
+        for id in ["nope", "00000000-0000-4000-8000-000000009999"] {
+            let q = format!(r#"mutation {{ deleteComment(commentId:"{id}") }}"#);
+            for token in ["bobtok", "admintok"] {
+                let r = exec(&s, &q, Some(token), "1.1.1.1").await;
+                assert!(r.errors.is_empty(), "{:?}", r.errors);
+                assert_eq!(r.data.into_json().unwrap()["deleteComment"], false);
+            }
+            assert_eq!(
+                first_error(&exec(&s, &q, None, "1.1.1.1").await),
+                "Not authenticated"
+            );
+        }
     }
 
     #[tokio::test]
@@ -25394,7 +27129,7 @@ mod tests {
             first_error(
                 &exec(
                     &s,
-                    r#"mutation { banUser(userId:"bob-id", banned:true) { id } }"#,
+                    r#"mutation { banUser(userId:"ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c", banned:true) { id } }"#,
                     Some("bobtok"),
                     "1.1.1.1"
                 )
@@ -25407,7 +27142,7 @@ mod tests {
             first_error(
                 &exec(
                     &s,
-                    r#"mutation { banUser(userId:"admin-id", banned:true) { id } }"#,
+                    r#"mutation { banUser(userId:"964771b0-a2fb-4849-857a-6198947115ec", banned:true) { id } }"#,
                     Some("admintok"),
                     "1.1.1.1"
                 )
@@ -25432,7 +27167,7 @@ mod tests {
         // the full AdminUser, so `isBanned` is selectable and reflects the write.
         let ban = exec(
             &s,
-            r#"mutation { banUser(userId:"bob-id", banned:true) { isBanned username } }"#,
+            r#"mutation { banUser(userId:"ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c", banned:true) { isBanned username } }"#,
             Some("admintok"),
             "1.1.1.1",
         )
@@ -25498,7 +27233,7 @@ mod tests {
         // Admin bans bob.
         let ban = exec(
             &s,
-            r#"mutation { banUser(userId:"bob-id", banned:true) { id } }"#,
+            r#"mutation { banUser(userId:"ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c", banned:true) { id } }"#,
             Some("admintok"),
             "1.1.1.1",
         )
@@ -25552,13 +27287,11 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         for i in 0..=MAX_THREAD_REPLIES {
             sqlx::query(
-                "INSERT INTO comments \
-                   (id, target_type, target_id, parent_id, user_id, body, has_spoiler, created_at) \
-                 VALUES (?, 'series', 's1', ?, 'bob-id', 'x', 0, ?)",
+                r#"INSERT INTO comments (id, target_type, target_id, parent_id, user_id, body, has_spoiler, created_at) VALUES ($1, 'series', 's1', $2, 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', 'x', FALSE, $3)"#,
             )
-            .bind(format!("full-{i}"))
-            .bind((i > 0).then(|| format!("full-{}", i - 1)))
-            .bind(format!("2024-01-01T00:00:00.{i:03}Z"))
+            .bind(crate::db_types::test_uuid(&(format!("full-{i}"))))
+            .bind((i > 0).then(|| crate::db_types::test_uuid(&format!("full-{}", i - 1))))
+            .bind(crate::db_types::date(&(format!("2024-01-01T00:00:00.{i:03}Z"))).unwrap())
             .execute(&mut *tx)
             .await
             .unwrap();
@@ -25571,7 +27304,10 @@ mod tests {
             )
         };
 
-        for parent in ["full-0".to_string(), format!("full-{MAX_THREAD_REPLIES}")] {
+        for parent in [
+            crate::db_types::test_uuid("full-0").to_string(),
+            crate::db_types::test_uuid(&format!("full-{MAX_THREAD_REPLIES}")).to_string(),
+        ] {
             let r = exec(&s, &post(Some(parent)), Some("bobtok"), "1.1.1.1").await;
             assert!(first_error(&r).contains("thread is full"), "{:?}", r.errors);
         }
@@ -25686,7 +27422,7 @@ mod tests {
         .await;
         assert_eq!(first_error(&cross), "reply target not found on this thread");
 
-        // Deleting the root removes the whole subtree (admin moderation).
+        // Deleting the root preserves the replies beneath its tombstone.
         let del = exec(
             &s,
             &format!(r#"mutation {{ deleteComment(commentId:"{root_id}") }}"#),
@@ -25701,17 +27437,18 @@ mod tests {
         );
         let after = exec(
             &s,
-            r#"{ comments(targetType:"series", targetId:"s1") { items { id } total } }"#,
+            r#"{ comments(targetType:"series", targetId:"s1") { items { id body deletedBy } total } }"#,
             Some("bobtok"),
             "1.1.1.1",
         )
         .await;
         let aj = after.data.into_json().unwrap();
-        assert!(
-            aj["comments"]["items"].as_array().unwrap().is_empty(),
-            "subtree gone"
-        );
-        assert_eq!(aj["comments"]["total"], serde_json::json!(0));
+        let items = aj["comments"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3, "all replies survive");
+        let root = items.iter().find(|c| c["id"] == root_id).unwrap();
+        assert_eq!(root["body"], "");
+        assert_eq!(root["deletedBy"], "moderator");
+        assert_eq!(aj["comments"]["total"], serde_json::json!(1));
     }
 
     #[tokio::test]
@@ -25719,8 +27456,7 @@ mod tests {
         let (s, pool) = setup_full(100).await;
         // Stage an uploaded image row for bob (as POST /comment-media would).
         sqlx::query(
-            "INSERT INTO comment_media (id, comment_id, user_id, webp, width, height, created_at) \
-             VALUES ('m1', NULL, 'bob-id', X'00', 800, 600, '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO comment_media (id, comment_id, user_id, webp, width, height, created_at) VALUES ('050fb1d0-6dcf-47c4-9c58-85593d33d3c0', NULL, 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', decode('00','hex'), 800, 600, '2026-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -25739,7 +27475,7 @@ mod tests {
         // Someone else's / unlinked media id owned by bob: another user can't claim it.
         let steal = exec(
             &s,
-            r#"mutation { postComment(input:{ targetType:"series", targetId:"s1", body:"mine now", hasSpoiler:false, mediaId:"m1" }) { id } }"#,
+            r#"mutation { postComment(input:{ targetType:"series", targetId:"s1", body:"mine now", hasSpoiler:false, mediaId:"050fb1d0-6dcf-47c4-9c58-85593d33d3c0" }) { id } }"#,
             Some("admintok"),
             "1.1.1.1",
         )
@@ -25749,7 +27485,7 @@ mod tests {
         // Bob attaches his image (image-only comment, empty body allowed).
         let posted = exec(
             &s,
-            r#"mutation { postComment(input:{ targetType:"series", targetId:"s1", body:"", hasSpoiler:false, mediaId:"m1" }) { id mediaUrl mediaWidth mediaHeight } }"#,
+            r#"mutation { postComment(input:{ targetType:"series", targetId:"s1", body:"", hasSpoiler:false, mediaId:"050fb1d0-6dcf-47c4-9c58-85593d33d3c0" }) { id mediaUrl mediaWidth mediaHeight } }"#,
             Some("bobtok"),
             "1.1.1.1",
         )
@@ -25762,7 +27498,7 @@ mod tests {
         let pj = posted.data.into_json().unwrap();
         assert_eq!(
             pj["postComment"]["mediaUrl"],
-            serde_json::json!("/comment-media/m1.webp")
+            serde_json::json!("/comment-media/050fb1d0-6dcf-47c4-9c58-85593d33d3c0.webp")
         );
         assert_eq!(pj["postComment"]["mediaWidth"], serde_json::json!(800));
         assert_eq!(pj["postComment"]["mediaHeight"], serde_json::json!(600));
@@ -25770,7 +27506,7 @@ mod tests {
         // The image is now linked, so it can't be attached again.
         let reuse = exec(
             &s,
-            r#"mutation { postComment(input:{ targetType:"series", targetId:"s1", body:"again", hasSpoiler:false, mediaId:"m1" }) { id } }"#,
+            r#"mutation { postComment(input:{ targetType:"series", targetId:"s1", body:"again", hasSpoiler:false, mediaId:"050fb1d0-6dcf-47c4-9c58-85593d33d3c0" }) { id } }"#,
             Some("bobtok"),
             "1.1.1.1",
         )
@@ -25788,7 +27524,7 @@ mod tests {
         let lj = list.data.into_json().unwrap();
         assert_eq!(
             lj["comments"]["items"][0]["mediaUrl"],
-            serde_json::json!("/comment-media/m1.webp")
+            serde_json::json!("/comment-media/050fb1d0-6dcf-47c4-9c58-85593d33d3c0.webp")
         );
         assert_eq!(
             lj["comments"]["items"][0]["mediaWidth"],
@@ -25823,13 +27559,12 @@ mod tests {
             let uid = format!("filler-{i}");
             seed_user(&pool, &uid, &format!("filler{i}"), 0, 0).await;
             sqlx::query(
-                "INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) \
-                 VALUES (?, 's1', ?, 8, 'filler', 0, ?, ?)",
+                r#"INSERT INTO reviews (id, series_id, user_id, score, body, has_spoiler, created_at, updated_at) VALUES ($1, 's1', $2, 8, 'filler', FALSE, $3, $4)"#,
             )
-            .bind(format!("rev-{i}"))
-            .bind(&uid)
-            .bind(format!("2099-01-01T00:00:{i:02}Z"))
-            .bind(format!("2099-01-01T00:00:{i:02}Z"))
+            .bind(crate::db_types::test_uuid(&(format!("rev-{i}"))))
+            .bind(crate::db_types::test_uuid(&uid))
+            .bind(crate::db_types::date(&(format!("2099-01-01T00:00:{i:02}Z"))).unwrap())
+            .bind(crate::db_types::date(&(format!("2099-01-01T00:00:{i:02}Z"))).unwrap())
             .execute(&pool)
             .await
             .unwrap();
@@ -25903,7 +27638,7 @@ mod tests {
             first_error(
                 &exec(
                     &s,
-                    r#"mutation { setUserAdmin(userId:"admin-id", isAdmin:false) { isAdmin } }"#,
+                    r#"mutation { setUserAdmin(userId:"964771b0-a2fb-4849-857a-6198947115ec", isAdmin:false) { isAdmin } }"#,
                     Some("admintok"),
                     "1.1.1.1"
                 )
@@ -25914,7 +27649,7 @@ mod tests {
         // promoting bob works
         let r = exec(
             &s,
-            r#"mutation { setUserAdmin(userId:"bob-id", isAdmin:true) { isAdmin } }"#,
+            r#"mutation { setUserAdmin(userId:"ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c", isAdmin:true) { isAdmin } }"#,
             Some("admintok"),
             "1.1.1.1",
         )
@@ -25934,23 +27669,26 @@ mod tests {
         // demotion).
         let r = exec(
             &s,
-            r#"mutation { setUserAdmin(userId:"bob-id", isAdmin:false) { isAdmin } }"#,
+            r#"mutation { setUserAdmin(userId:"ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c", isAdmin:false) { isAdmin } }"#,
             Some("admintok"),
             "1.1.1.1",
         )
         .await;
         assert!(r.errors.is_empty(), "demote failed: {:?}", r.errors);
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = 'bob-id'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let n: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM sessions WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(n, 0, "demotion purged bob's sessions");
         // admin's own sessions are untouched.
-        let admin_n: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = 'admin-id'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let admin_n: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM sessions WHERE user_id = '964771b0-a2fb-4849-857a-6198947115ec'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(admin_n, 1);
     }
 
@@ -25967,7 +27705,7 @@ mod tests {
         // Bob holds a SECOND live session besides the presented "bobtok".
         sqlx::query(
             "INSERT INTO sessions (token, user_id, created_at, expires_at) \
-             VALUES (?, 'bob-id', '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
+             VALUES ($1, 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
         )
         .bind(auth::hash_token("bobtok2"))
         .execute(&pool)
@@ -25989,10 +27727,12 @@ mod tests {
         // every other session of bob's is gone.
         let tok = auth::user_for_token(&pool, "bobtok").await.unwrap();
         assert!(tok.is_some(), "the current session must stay valid");
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = 'bob-id'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let n: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM sessions WHERE user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(n, 1, "other sessions purged");
     }
 
@@ -26015,24 +27755,22 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
         for (sid, ts) in [
-            ("10", Some("2026-02-01T00:00:00Z")),
-            ("11", Some("2026-03-01T00:00:00Z")),
+            ("10", Some("2026-02-01T00:00:00.000000+00:00")),
+            ("11", Some("2026-03-01T00:00:00.000000+00:00")),
             ("12", None),
         ] {
             // Every scan-state row needs its library `suwayomi_series` counterpart: the
-            // feed reads the release-time sort key from there, so `in_library = 1` is
+            // feed reads the release-time sort key from there, so `in_library = TRUE` is
             // now part of what `total` counts.
             sqlx::query(
-                "INSERT INTO suwayomi_series \
-                   (id, title, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) \
-                 VALUES (?, ?, 'ONGOING', 'src', 0, 1, '1751328000000', '2026-01-01T00:00:00Z')",
+                r#"INSERT INTO suwayomi_series (id, title, status, source_id, chapter_count, in_library, latest_chapter_at, updated_at) VALUES ($1, $2, 'ONGOING', 'src', 0, TRUE, '1751328000000', '2026-01-01T00:00:00Z')"#,
             )
-            .bind(sid)
+            .bind(sid.parse::<i64>().unwrap())
             .bind(format!("Series {sid}"))
             .execute(&pool)
             .await
@@ -26040,17 +27778,19 @@ mod tests {
             sqlx::query(
                 "INSERT INTO series_scan_state \
                    (series_id, avg_interval_hours, known_chapter_count, last_new_chapter_at, updated_at, next_scan_at) \
-                 VALUES (?, 0, 0, ?, '2026-01-01T00:00:00Z', '1970-01-01T00:00:00+00:00')",
+                 VALUES ($1, 0, 0, $2, '2026-01-01T00:00:00Z', '1970-01-01T00:00:00+00:00')",
             )
             .bind(sid)
-            .bind(ts)
+            .bind(crate::db_types::optional_date(ts).unwrap())
             .execute(&pool)
             .await
             .unwrap();
         }
         let state = std::sync::Arc::new(AppState {
             pool: pool.clone(),
-            cover_pool: pool.clone(),
+            cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
+                .await
+                .unwrap(),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
             mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
                 "test-ua", 5.0, 40.0,
@@ -26152,15 +27892,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-stub'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-stub'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         // A Suwayomi source for the same work, carrying 526.
         sqlx::query(
-            "INSERT INTO suwayomi_series (id, title, lang, status, source_id, in_library, chapter_count, created_at, updated_at) \
-             VALUES (4242, 'Stubbed Spine', 'en', 'UNKNOWN', 'src', 0, 526, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO suwayomi_series (id, title, lang, status, source_id, in_library, chapter_count, created_at, updated_at) VALUES (4242, 'Stubbed Spine', 'en', 'UNKNOWN', 'src', FALSE, 526, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -26168,7 +27908,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO source_series \
                (id, work_id, source_type, source_id, source_key, created_at, last_seen) \
-             VALUES ('ss_stub_sw', ?, 'suwayomi', 'src', '4242', \
+             VALUES ('ss_stub_sw', $1, 'suwayomi', 'src', '4242', \
                      '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
         )
         .bind(&work_id)
@@ -26220,14 +27960,14 @@ mod tests {
             .await
             .unwrap();
         }
-        let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-full'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-full'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         sqlx::query(
-            "INSERT INTO suwayomi_series (id, title, lang, status, source_id, in_library, chapter_count, created_at, updated_at) \
-             VALUES (4343, 'Full Spine', 'en', 'UNKNOWN', 'src', 0, 2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO suwayomi_series (id, title, lang, status, source_id, in_library, chapter_count, created_at, updated_at) VALUES (4343, 'Full Spine', 'en', 'UNKNOWN', 'src', FALSE, 2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -26235,7 +27975,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO source_series \
                (id, work_id, source_type, source_id, source_key, created_at, last_seen) \
-             VALUES ('ss_full_sw', ?, 'suwayomi', 'src', '4343', \
+             VALUES ('ss_full_sw', $1, 'suwayomi', 'src', '4343', \
                      '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
         )
         .bind(&work_id)
@@ -26258,7 +27998,7 @@ mod tests {
             sqlx::query(
                 "INSERT INTO suwayomi_chapter \
                    (id, manga_id, name, chapter_number, page_count, updated_at) \
-                 VALUES (?, ?, ?, ?, 10, '2026-01-01T00:00:00Z')",
+                 VALUES ($1, $2, $3, $4, 10, '2026-01-01T00:00:00Z')",
             )
             .bind(manga_id * 1000 + i)
             .bind(manga_id)
@@ -26274,11 +28014,11 @@ mod tests {
     /// `chapter_number` is REAL in the schema, so it decodes as f64 and is rounded here —
     /// the fixtures are whole chapters and comparing floats in assertions is noise.
     async fn read_rows(pool: &Database, manga_id: i64) -> Vec<(i64, i64, i64)> {
-        sqlx::query_as::<_, (f64, i64, i64)>(
+        crate::db_types::query_tuple::<(f64, i64, i64)>(
             "SELECT sc.chapter_number, p.read, p.last_page_read \
                FROM suwayomi_progress p JOIN suwayomi_chapter sc \
                  ON CAST(sc.id AS TEXT) = p.chapter_id \
-              WHERE p.user_id = 'bob-id' AND sc.manga_id = ? \
+              WHERE p.user_id = 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c' AND sc.manga_id = $1 \
               ORDER BY sc.chapter_number",
         )
         .bind(manga_id)
@@ -26399,8 +28139,7 @@ mod tests {
             ("w_other", "ssx", "9999"),
         ] {
             sqlx::query(
-                "INSERT INTO work (id, is_nsfw, created_at, updated_at) \
-                 VALUES (?, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                r#"INSERT INTO work (id, is_nsfw, created_at, updated_at) VALUES ($1, FALSE, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#,
             )
             .bind(wid)
             .execute(&pool)
@@ -26408,7 +28147,7 @@ mod tests {
             .unwrap();
             sqlx::query(
                 "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
-                 VALUES (?, ?, 'suwayomi', ?, ?, '2026-01-01T00:00:00Z')",
+                 VALUES ($1, $2, 'suwayomi', $3, $4, '2026-01-01T00:00:00Z')",
             )
             .bind(ssid)
             .bind(wid)
@@ -26442,11 +28181,13 @@ mod tests {
             data_json(&r)
         );
         async fn override_of(pool: &Database, id: &str) -> Option<i64> {
-            sqlx::query_scalar::<_, Option<i64>>("SELECT is_nsfw_override FROM work WHERE id = ?")
-                .bind(id)
-                .fetch_one(pool)
-                .await
-                .unwrap()
+            crate::db_types::query_scalar::<Option<i64>>(
+                "SELECT is_nsfw_override FROM work WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
         }
         assert_eq!(override_of(&pool, "w_omega1").await, Some(1));
         assert_eq!(override_of(&pool, "w_omega2").await, Some(1));
@@ -26476,8 +28217,7 @@ mod tests {
         // Three suwayomi works, all stored SFW (the leak state).
         for wid in ["w_genre", "w_srcflag", "w_sfw"] {
             sqlx::query(
-                "INSERT INTO work (id, is_nsfw, created_at, updated_at) \
-                 VALUES (?, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                r#"INSERT INTO work (id, is_nsfw, created_at, updated_at) VALUES ($1, FALSE, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#,
             )
             .bind(wid)
             .execute(&pool)
@@ -26492,7 +28232,7 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
-                 VALUES (?, ?, 'suwayomi', ?, ?, '2026-01-01T00:00:00Z')",
+                 VALUES ($1, $2, 'suwayomi', $3, $4, '2026-01-01T00:00:00Z')",
             )
             .bind(format!("ss_{key}"))
             .bind(wid)
@@ -26510,18 +28250,19 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO suwayomi_series (id, title, status, source_id, updated_at, genre) \
-                 VALUES (?, 'T', 'ONGOING', 'x', '2026-01-01T00:00:00Z', ?)",
+                 VALUES ($1, 'T', 'ONGOING', 'x', '2026-01-01T00:00:00Z', $2)",
             )
             .bind(key.parse::<i64>().unwrap())
-            .bind(genre)
+            .bind(sqlx::types::Json(
+                serde_json::from_str::<serde_json::Value>(genre).unwrap(),
+            ))
             .execute(&pool)
             .await
             .unwrap();
         }
         // srcB is an adult SOURCE (its per-series genres don't say so → the leak vector).
         sqlx::query(
-            "INSERT INTO source_extension (source_id, pkg_name, repo_url, is_nsfw, updated_at) \
-             VALUES ('srcB', 'pkg', 'repo', 1, '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO source_extension (source_id, pkg_name, repo_url, is_nsfw, updated_at) VALUES ('srcB', 'pkg', 'repo', TRUE, '2026-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -26541,7 +28282,7 @@ mod tests {
             data_json(&r)
         );
         async fn nsfw_of(pool: &Database, id: &str) -> i64 {
-            sqlx::query_scalar("SELECT is_nsfw FROM work WHERE id = ?")
+            crate::db_types::query_scalar("SELECT is_nsfw FROM work WHERE id = $1")
                 .bind(id)
                 .fetch_one(pool)
                 .await
@@ -26564,10 +28305,12 @@ mod tests {
 
     /// Build a minimal `AppState` around a migrated pool (Suwayomi points at a
     /// dead port; `map_series` never dials it, so read-shape tests stay offline).
-    fn state_with_pool(pool: Database) -> std::sync::Arc<AppState> {
+    async fn state_with_pool(pool: Database) -> std::sync::Arc<AppState> {
         std::sync::Arc::new(AppState {
             pool: pool.clone(),
-            cover_pool: pool.clone(),
+            cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
+                .await
+                .unwrap(),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
             mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
                 "test-ua", 5.0, 40.0,
@@ -26599,7 +28342,7 @@ mod tests {
     #[tokio::test]
     async fn latest_chapter_at_never_falls_back_to_the_poll_clock() {
         let pool = migrated_pool().await;
-        let st = state_with_pool(pool.clone());
+        let st = state_with_pool(pool.clone()).await;
         let now_secs = chrono::Utc::now().timestamp();
 
         // A live-fetched manga: no latestChapterAt, lastFetchedAt = the poll we just made.
@@ -26620,11 +28363,9 @@ mod tests {
         // and it is the CHAPTER's time, days old, not the poll time.
         let three_days_ago_ms = (now_secs - 3 * 86_400) * 1000;
         sqlx::query(
-            "INSERT INTO suwayomi_series (id, title, status, source_id, lang, in_library, \
-               latest_chapter_at, updated_at) \
-             VALUES (500, 'Poll Clock Fixture', 'ONGOING', 'src1', 'en', 1, ?, '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO suwayomi_series (id, title, status, source_id, lang, in_library, latest_chapter_at, updated_at) VALUES (500, 'Poll Clock Fixture', 'ONGOING', 'src1', 'en', TRUE, $1, '2026-01-01T00:00:00Z')"#,
         )
-        .bind(three_days_ago_ms.to_string())
+        .bind(three_days_ago_ms)
         .execute(&pool)
         .await
         .unwrap();
@@ -26654,7 +28395,7 @@ mod tests {
     #[tokio::test]
     async fn scan_policy_exposes_raw_poll_override_nullable() {
         let pool = migrated_pool().await;
-        let st = state_with_pool(pool.clone());
+        let st = state_with_pool(pool.clone()).await;
         let m = suwayomi_manga(3, "AD1 Fixture", &["Action"], "src1");
 
         // No admin row: override is null, effective folds to the default.
@@ -26736,7 +28477,7 @@ mod tests {
             "1.1.1.1",
         )
         .await;
-        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM series_admin")
+        let rows: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM series_admin")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -26760,8 +28501,7 @@ mod tests {
         // canonical target the candidate proposes merging onto.
         for wid in ["w_prov", "w_canon"] {
             sqlx::query(
-                "INSERT INTO work (id, is_nsfw, created_at, updated_at) \
-                 VALUES (?, 0, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+                r#"INSERT INTO work (id, is_nsfw, created_at, updated_at) VALUES ($1, FALSE, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
             )
             .bind(wid)
             .execute(&pool)
@@ -26797,7 +28537,7 @@ mod tests {
         assert!(data_json(&r).contains("\"resolveMergeCandidate\":true"));
 
         let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = 'ss1'")
+            crate::db_types::query_scalar("SELECT work_id FROM source_series WHERE id = 'ss1'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -26805,16 +28545,18 @@ mod tests {
             work_id, "w_canon",
             "accept repoints the source onto the canonical work"
         );
-        let prov_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id = 'w_prov'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(prov_count, 0, "the orphaned provisional work is deleted");
-        let (status, resolved_at): (String, Option<String>) =
-            sqlx::query_as("SELECT status, resolved_at FROM merge_candidate WHERE id = 'mc1'")
+        let prov_count: i64 =
+            crate::db_types::query_scalar("SELECT COUNT(*) FROM work WHERE id = 'w_prov'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
+        assert_eq!(prov_count, 0, "the orphaned provisional work is deleted");
+        let (status, resolved_at): (String, Option<String>) = crate::db_types::query_tuple(
+            "SELECT status, resolved_at FROM merge_candidate WHERE id = 'mc1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(status, "confirmed");
         let resolved_at = resolved_at.expect("resolved_at set on first resolve");
 
@@ -26837,7 +28579,7 @@ mod tests {
         // work still gone, and resolved_at identical to the winning call (a blind
         // re-UPDATE would have stamped a fresh timestamp here).
         let work_id2: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = 'ss1'")
+            crate::db_types::query_scalar("SELECT work_id FROM source_series WHERE id = 'ss1'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -26845,11 +28587,12 @@ mod tests {
             work_id2, "w_canon",
             "second resolve does not re-repoint the source"
         );
-        let resolved_at2: Option<String> =
-            sqlx::query_scalar("SELECT resolved_at FROM merge_candidate WHERE id = 'mc1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let resolved_at2: Option<String> = crate::db_types::query_scalar(
+            "SELECT resolved_at FROM merge_candidate WHERE id = 'mc1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             resolved_at2.as_deref(),
             Some(resolved_at.as_str()),
@@ -26869,18 +28612,14 @@ mod tests {
         // The source side: Suwayomi-only, no cached cover and no MangaDex anchor, so
         // there is nothing to point a cover URL at.
         sqlx::query(
-            "INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) \
-             VALUES ('w_prov', 'Provisional Title', 0, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+            r#"INSERT INTO work (id, primary_title, is_nsfw, created_at, updated_at) VALUES ('w_prov', 'Provisional Title', FALSE, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
         .unwrap();
         // The candidate side: a cached cover, so it resolves to the versioned path.
         sqlx::query(
-            "INSERT INTO work (id, primary_title, author, is_nsfw, cover_cached_version, \
-                               created_at, updated_at) \
-             VALUES ('w_canon', 'Canonical Title', 'Some Author', 0, 3, \
-                     '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+            r#"INSERT INTO work (id, primary_title, author, is_nsfw, cover_cached_version, created_at, updated_at) VALUES ('w_canon', 'Canonical Title', 'Some Author', FALSE, 3, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -27285,7 +29024,7 @@ mod tests {
                 "mangadex",
                 None,
                 "md-1",
-                Some("2026-06-08T00:00:00+00:00"),
+                Some("2026-06-08T00:00:00.000000+00:00"),
             ),
             agg_row(
                 1.0,
@@ -27293,7 +29032,7 @@ mod tests {
                 "asura",
                 Some("333"),
                 "s-1",
-                Some("2026-06-01T00:00:00+00:00"),
+                Some("2026-06-01T00:00:00.000000+00:00"),
             ),
             // A chapter only one source has, and only that source dated.
             agg_row(
@@ -27302,7 +29041,7 @@ mod tests {
                 "asura",
                 Some("333"),
                 "s-2",
-                Some("2026-06-15T00:00:00+00:00"),
+                Some("2026-06-15T00:00:00.000000+00:00"),
             ),
             // A chapter NO source dated: null, not a fabricated time.
             agg_row(3.0, "suwayomi", "asura", Some("333"), "s-3", None),
@@ -27315,17 +29054,17 @@ mod tests {
                 "mangadex",
                 None,
                 "md-4",
-                Some("2026-06-20T00:00:00+00:00"),
+                Some("2026-06-20T00:00:00.000000+00:00"),
             ),
         ]);
         let dates: Vec<Option<&str>> = out.iter().map(|c| c.first_released_at.as_deref()).collect();
         assert_eq!(
             dates,
             vec![
-                Some("2026-06-01T00:00:00+00:00"),
-                Some("2026-06-15T00:00:00+00:00"),
+                Some("2026-06-01T00:00:00.000000+00:00"),
+                Some("2026-06-15T00:00:00.000000+00:00"),
                 None,
-                Some("2026-06-20T00:00:00+00:00"),
+                Some("2026-06-20T00:00:00.000000+00:00"),
             ],
             "the earliest source release wins, an absent date never does, and no chapter \
              invents one"
@@ -27421,11 +29160,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let work_id: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = 'md-y'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = 'md-y'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         crate::catalog::upsert_source_series(
             &pool, &work_id, "suwayomi", "2048", "42", None, false,
         )
@@ -27544,16 +29284,18 @@ mod tests {
         sqlx::query(
             "INSERT INTO source_health_bucket \
                (source_id, surface, hour_ts, reason, count, last_message, last_at) \
-             VALUES ('src-x', 'pages', ?, 'blocked', 4, 'HTTP error 403', ?), \
-                    ('src-x', 'pages', ?, 'ok', 6, NULL, ?), \
-                    ('src-x', 'pages', ?, 'blocked', 9, 'too old to count', ?)",
+             VALUES ('src-x', 'pages', $1, 'blocked', 4, 'HTTP error 403', $2), \
+                    ('src-x', 'pages', $3, 'ok', 6, NULL, $4), \
+                    ('src-x', 'pages', $5, 'blocked', 9, 'too old to count', $6)",
         )
         .bind(hour)
-        .bind(Utc::now().to_rfc3339())
+        .bind(crate::db_types::date(&(crate::db_types::format_date(Utc::now()))).unwrap())
         .bind(hour)
-        .bind(Utc::now().to_rfc3339())
+        .bind(crate::db_types::date(&(crate::db_types::format_date(Utc::now()))).unwrap())
         .bind(hour - 48)
-        .bind((Utc::now() - chrono::Duration::hours(48)).to_rfc3339())
+        .bind(crate::db_types::truncate_date(
+            Utc::now() - chrono::Duration::hours(48),
+        ))
         .execute(pool)
         .await
         .unwrap();
@@ -27752,7 +29494,7 @@ mod tests {
 
     #[tokio::test]
     async fn comment_report_snapshots_author_and_survives_deletion() {
-        // Acting on an abuse report DELETES the comment (hard delete, no tombstone). The
+        // Acting on an abuse report deletes this leaf. The existing moderation
         // report has to still be readable afterwards, or the audit trail evaporates
         // exactly when it starts to matter.
         let (s, _pool) = setup_full(100).await;
@@ -28129,10 +29871,10 @@ mod tests {
         for i in 0..51 {
             sqlx::query(
                 "INSERT INTO report (id, kind, status, detail, created_at) \
-                 VALUES (?, 'other', 'open', 'seeded', ?)",
+                 VALUES ($1, 'other', 'open', 'seeded', $2)",
             )
-            .bind(format!("r{i:03}"))
-            .bind(format!("2026-07-30T00:00:{i:02}Z"))
+            .bind(crate::db_types::test_uuid(&(format!("r{i:03}"))))
+            .bind(crate::db_types::date(&(format!("2026-07-30T00:00:{i:02}Z"))).unwrap())
             .execute(&pool)
             .await
             .unwrap();
@@ -28152,7 +29894,10 @@ mod tests {
         assert_eq!(d["reports"]["total"], serde_json::json!(51));
         assert_eq!(d["reports"]["hasNextPage"], serde_json::json!(true));
         assert_eq!(d["reports"]["items"].as_array().unwrap().len(), 50);
-        assert_eq!(d["reports"]["items"][0]["id"], serde_json::json!("r050"));
+        assert_eq!(
+            d["reports"]["items"][0]["id"],
+            serde_json::json!(crate::db_types::test_uuid("r050").to_string())
+        );
 
         // Page 2: the remainder, and no third page claimed.
         let r = exec(
@@ -28165,7 +29910,10 @@ mod tests {
         let d = r.data.into_json().unwrap();
         assert_eq!(d["reports"]["hasNextPage"], serde_json::json!(false));
         assert_eq!(d["reports"]["items"].as_array().unwrap().len(), 1);
-        assert_eq!(d["reports"]["items"][0]["id"], serde_json::json!("r000"));
+        assert_eq!(
+            d["reports"]["items"][0]["id"],
+            serde_json::json!(crate::db_types::test_uuid("r000").to_string())
+        );
 
         // Past the end is empty, not an error, and `total` still describes the whole set.
         let r = exec(
@@ -28190,7 +29938,10 @@ mod tests {
         .await;
         let d = r.data.into_json().unwrap();
         assert_eq!(d["reports"]["page"], serde_json::json!(1));
-        assert_eq!(d["reports"]["items"][0]["id"], serde_json::json!("r050"));
+        assert_eq!(
+            d["reports"]["items"][0]["id"],
+            serde_json::json!(crate::db_types::test_uuid("r050").to_string())
+        );
     }
 
     #[tokio::test]
@@ -28265,9 +30016,7 @@ mod tests {
         // fallback does NOT make such a row reachable through them.
         let (s, pool) = setup_full(100).await;
         sqlx::query(
-            "INSERT INTO report (id, kind, status, detail, created_at) \
-             VALUES ('from-the-future', 'licence_dispute', 'escalated', 'newer deploy', \
-                     '2026-07-30T00:00:00Z')",
+            r#"INSERT INTO report (id, kind, status, detail, created_at) VALUES ('fb6e84f4-b2c8-474f-b895-7b40f918cbd7', 'licence_dispute', 'escalated', 'newer deploy', '2026-07-30T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -28481,9 +30230,9 @@ mod tests {
     async fn request_limits_library_snapshot_batches_cards_and_propagates_failure() {
         let (schema, pool, _) = setup_with_state(100).await;
         seed_target_series(&pool, "43").await;
-        sqlx::query("INSERT INTO suwayomi_series(id,title,status,source_id,updated_at,series_fetched_at) VALUES (43,'Other','ONGOING','src','t',?)")
-            .bind(Utc::now().to_rfc3339()).execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO user_library(user_id,series_id,created_at,is_favorite,status) VALUES ('bob-id','42','t',1,'reading'),('bob-id','w_43','t',1,'completed')")
+        sqlx::query(r#"INSERT INTO suwayomi_series(id,title,status,source_id,updated_at,series_fetched_at) VALUES (43,'Other','ONGOING','src','2020-01-01T00:00:00Z',$1)"#)
+            .bind(crate::db_types::date(&(crate::db_types::format_date(Utc::now()))).unwrap()).execute(&pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO user_library(user_id,series_id,created_at,is_favorite,status) VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c','42','2020-01-01T00:00:00Z',TRUE,'reading'),('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c','w_43','2020-01-01T00:00:00Z',TRUE,'completed')"#)
             .execute(&pool).await.unwrap();
         let cache = RequestLibraryCache::default();
         let run = |id: &str, cache: RequestLibraryCache| {
@@ -28497,8 +30246,8 @@ mod tests {
             )
         };
         let (first, other) = futures::join!(
-            library_row_cached(&cache, &pool, "bob-id", "42"),
-            library_row_cached(&cache, &pool, "bob-id", "43"),
+            library_row_cached(&cache, &pool, "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c", "42"),
+            library_row_cached(&cache, &pool, "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c", "43"),
         );
         assert!(first.unwrap().unwrap().is_favorite);
         assert_eq!(other.unwrap().unwrap().status.as_deref(), Some("completed"));
@@ -28527,11 +30276,11 @@ mod tests {
     #[tokio::test]
     async fn request_limits_batch_cache_reads_work_with_writer_held() {
         let (_, pool, state) = setup_with_state(100).await;
-        sqlx::query("INSERT INTO suwayomi_series(id,title,status,source_id,updated_at,series_fetched_at) VALUES(43,'Other','ONGOING','src','t',?)")
-            .bind(Utc::now().to_rfc3339()).execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO suwayomi_chapter(id,manga_id,name,chapter_number,updated_at) VALUES(420,42,'First',1,?), (430,43,'Second',2,?)")
-            .bind(Utc::now().to_rfc3339()).bind(Utc::now().to_rfc3339()).execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO suwayomi_progress(user_id,chapter_id,series_id,last_page_read,read,updated_at) VALUES('bob-id','420','42',8,1,'t'), ('bob-id','430','43',3,0,'t')")
+        sqlx::query(r#"INSERT INTO suwayomi_series(id,title,status,source_id,updated_at,series_fetched_at) VALUES(43,'Other','ONGOING','src','2020-01-01T00:00:00Z',$1)"#)
+            .bind(crate::db_types::date(&(crate::db_types::format_date(Utc::now()))).unwrap()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO suwayomi_chapter(id,manga_id,name,chapter_number,updated_at) VALUES(420,42,'First',1,$1), (430,43,'Second',2,$2)")
+            .bind(crate::db_types::date(&(crate::db_types::format_date(Utc::now()))).unwrap()).bind(crate::db_types::date(&(crate::db_types::format_date(Utc::now()))).unwrap()).execute(&pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO suwayomi_progress(user_id,chapter_id,series_id,last_page_read,read,updated_at) VALUES('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c','420','42',8,TRUE,'2020-01-01T00:00:00Z'), ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c','430','43',3,FALSE,'2020-01-01T00:00:00Z')"#)
             .execute(&pool).await.unwrap();
         let writer = pool.begin().await.unwrap();
         let (metadata, chapters, progress) = tokio::time::timeout(Duration::from_secs(1), async {
@@ -28541,9 +30290,13 @@ mod tests {
             let chapters = crate::series_cache::get_chapters_fresh_batch(&pool, &[42, 43, 44])
                 .await
                 .unwrap();
-            let progress = suwayomi_progress_batch(&pool, Some("bob-id"), &[42, 43, 44])
-                .await
-                .unwrap();
+            let progress = suwayomi_progress_batch(
+                &pool,
+                Some("ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c"),
+                &[42, 43, 44],
+            )
+            .await
+            .unwrap();
             (metadata, chapters, progress)
         })
         .await
@@ -28568,7 +30321,7 @@ mod tests {
     async fn request_limits_discovery_and_nsfw_errors_never_become_partial_successes() {
         let (schema, pool, _) = setup_with_state(100).await;
         seed_target_series(&pool, "42").await;
-        sqlx::query("UPDATE suwayomi_series SET in_library=1 WHERE id=42")
+        sqlx::query("UPDATE suwayomi_series SET in_library = TRUE WHERE id=42")
             .execute(&pool)
             .await
             .unwrap();
@@ -28598,8 +30351,8 @@ mod tests {
     async fn request_limits_upstream_budget_is_shared_but_cache_hits_remain_available() {
         let (schema, pool, state) = setup_with_state(100).await;
         state.mangadex.set_enabled(true);
-        sqlx::query("UPDATE suwayomi_series SET series_fetched_at=? WHERE id=42")
-            .bind(Utc::now().to_rfc3339())
+        sqlx::query("UPDATE suwayomi_series SET series_fetched_at=$1 WHERE id=42")
+            .bind(crate::db_types::date(&(crate::db_types::format_date(Utc::now()))).unwrap())
             .execute(&pool)
             .await
             .unwrap();
@@ -28634,11 +30387,11 @@ mod tests {
     #[tokio::test]
     async fn library_and_progress_include_all_entries_beyond_one_thousand() {
         let (schema, pool, _) = setup_with_state(100).await;
-        sqlx::query("WITH RECURSIVE n(id) AS (VALUES(10000) UNION ALL SELECT id+1 FROM n WHERE id<11004) INSERT INTO suwayomi_series(id,title,status,source_id,updated_at,series_fetched_at) SELECT id,'Bounded','ONGOING','src','t',? FROM n")
-            .bind(Utc::now().to_rfc3339()).execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO user_library(user_id,series_id,created_at) SELECT 'bob-id',CAST(id AS TEXT),'t' FROM suwayomi_series WHERE id>=10000")
+        sqlx::query("WITH RECURSIVE n(id) AS (VALUES(10000) UNION ALL SELECT id+1 FROM n WHERE id<11004) INSERT INTO suwayomi_series(id,title,status,source_id,updated_at,series_fetched_at) SELECT id,'Bounded','ONGOING','src','2020-01-01T00:00:00Z'::timestamptz,$1 FROM n")
+            .bind(crate::db_types::date(&(crate::db_types::format_date(Utc::now()))).unwrap()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO user_library(user_id,series_id,created_at) SELECT 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c',CAST(id AS TEXT),'2020-01-01T00:00:00Z'::timestamptz FROM suwayomi_series WHERE id>=10000")
             .execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO suwayomi_chapter(id,manga_id,name,chapter_number,updated_at) SELECT id,id,'First',1,'t' FROM suwayomi_series WHERE id>=10000")
+        sqlx::query("INSERT INTO suwayomi_chapter(id,manga_id,name,chapter_number,updated_at) SELECT id,id,'First',1,'2020-01-01T00:00:00Z'::timestamptz FROM suwayomi_series WHERE id>=10000")
             .execute(&pool).await.unwrap();
         let library = exec(&schema, "{library{id}}", Some("bobtok"), "phase3-bounds").await;
         assert!(library.errors.is_empty(), "{:?}", library.errors);
@@ -28692,7 +30445,7 @@ mod tests {
         // batches. The canonical half is deliberately older than the numeric half.
         sqlx::query("WITH RECURSIVE n(id) AS (VALUES(10000) UNION ALL SELECT id+1 FROM n WHERE id<11004) INSERT INTO suwayomi_series(id,title,status,source_id,chapter_count,updated_at,series_fetched_at) SELECT id,'Cached '||id,'ONGOING','src',1,'2020-01-01T00:00:00Z','2020-01-01T00:00:00Z' FROM n")
             .execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO user_library(user_id,series_id,created_at) SELECT 'bob-id',CAST(id AS TEXT),'2026-10-01T00:00:00Z' FROM suwayomi_series WHERE id>=10000")
+        sqlx::query("INSERT INTO user_library(user_id,series_id,created_at) SELECT 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c',CAST(id AS TEXT),'2026-10-01T00:00:00Z' FROM suwayomi_series WHERE id>=10000")
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO suwayomi_chapter(id,manga_id,name,chapter_number,updated_at) SELECT id,id,'First',1,'2026-10-01T00:00:00Z' FROM suwayomi_series WHERE id>=10000")
             .execute(&pool).await.unwrap();
@@ -28702,11 +30455,11 @@ mod tests {
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO chapter(id,source_series_id,external_id,chapter_key,number,lang,created_at) SELECT 'ch_'||id,'ss_'||id,'external_'||id,'100','1','en','2020-01-01T00:00:00Z' FROM work WHERE id LIKE 'w_large_%' AND id<>'w_large_20511'")
             .execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO user_library(user_id,series_id,created_at,is_favorite,status) SELECT 'bob-id',id,'2020-01-01T00:00:00Z',CASE WHEN id='w_large_20510' THEN 1 ELSE 0 END,CASE WHEN id='w_large_20510' THEN 'reading' END FROM work WHERE id LIKE 'w_large_%'")
+        sqlx::query("INSERT INTO user_library(user_id,series_id,created_at,is_favorite,status) SELECT 'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c',id,'2020-01-01T00:00:00Z',CASE WHEN id='w_large_20510' THEN TRUE ELSE FALSE END,CASE WHEN id='w_large_20510' THEN 'reading' END FROM work WHERE id LIKE 'w_large_%'")
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO browse_catalogue(work_id,reader_id,title,comic_type,status,en_chapter_count,created_at) SELECT id,id,primary_title,'manhwa','ONGOING',1,created_at FROM work WHERE id LIKE 'w_large_20%' AND id<'w_large_20256'")
             .execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO canonical_progress(user_id,work_id,chapter_id,last_page_read,read,updated_at) VALUES('bob-id','w_large_20510','external_w_large_20510',7,1,'2026-10-02T00:00:00Z')")
+        sqlx::query(r#"INSERT INTO canonical_progress(user_id,work_id,chapter_id,last_page_read,read,updated_at) VALUES('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c','w_large_20510','external_w_large_20510',7,TRUE,'2026-10-02T00:00:00Z')"#)
             .execute(&pool).await.unwrap();
         // One numeric card has no local metadata at all. Another has only its
         // canonical work/source mapping, without a Browse row or cached metadata.
@@ -28768,7 +30521,7 @@ mod tests {
         // Fallback projection is read-only; it did not repair the missing Browse
         // row or backfill the missing source metadata on the request's writer lane.
         assert_eq!(
-            sqlx::query_scalar::<_, i64>(
+            crate::db_types::query_scalar::<i64>(
                 "SELECT COUNT(*) FROM browse_catalogue WHERE work_id='w_large_20510'"
             )
             .fetch_one(&pool)
@@ -28777,10 +30530,12 @@ mod tests {
             0
         );
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM suwayomi_series WHERE id=11004")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
+            crate::db_types::query_scalar::<i64>(
+                "SELECT COUNT(*) FROM suwayomi_series WHERE id=11004"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
             0
         );
     }
@@ -28797,24 +30552,25 @@ mod tests {
             "pending",
         )
         .await;
-        sqlx::query(&format!("CREATE TRIGGER fail_review_merge BEFORE DELETE ON work WHEN OLD.id='{source}' BEGIN SELECT RAISE(ABORT,'forced merge failure'); END"))
+        sqlx::raw_sql(&format!(r#"CREATE FUNCTION pg_temp.fail_review_merge() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.id='{source}' THEN RAISE EXCEPTION 'forced merge failure'; END IF; RETURN OLD; END $$; CREATE TRIGGER fail_review_merge BEFORE DELETE ON work FOR EACH ROW EXECUTE FUNCTION pg_temp.fail_review_merge()"#))
             .execute(&pool).await.unwrap();
         // This defeats the former compensating write, proving that the status flip
         // has to roll back with the merge rather than be repaired afterwards.
-        sqlx::query("CREATE TRIGGER fail_review_compensation BEFORE UPDATE OF status ON merge_candidate WHEN NEW.status='pending' BEGIN SELECT RAISE(ABORT,'forced compensation failure'); END")
+        sqlx::raw_sql(r#"CREATE FUNCTION pg_temp.fail_review_compensation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.status='pending' THEN RAISE EXCEPTION 'forced compensation failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_review_compensation BEFORE UPDATE OF status ON merge_candidate FOR EACH ROW EXECUTE FUNCTION pg_temp.fail_review_compensation()"#)
             .execute(&pool).await.unwrap();
         let query = format!("mutation{{resolveMergeCandidate(id:\"{review}\",accept:true)}}");
         let response = exec(&schema, &query, Some("admintok"), "durable-review").await;
         assert!(!response.errors.is_empty());
-        let status: String = sqlx::query_scalar("SELECT status FROM merge_candidate WHERE id=?")
-            .bind(&review)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let status: String =
+            crate::db_types::query_scalar("SELECT status FROM merge_candidate WHERE id=$1")
+                .bind(&review)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(status, "pending", "failed merge left a confirmed review");
         assert!(work_exists(&pool, &source).await);
         assert!(work_exists(&pool, &target).await);
-        sqlx::query("DROP TRIGGER fail_review_merge")
+        sqlx::query("DROP TRIGGER fail_review_merge ON work")
             .execute(&pool)
             .await
             .unwrap();
@@ -28822,11 +30578,12 @@ mod tests {
         assert!(response.errors.is_empty(), "{:?}", response.errors);
         assert!(!work_exists(&pool, &source).await);
         assert!(work_exists(&pool, &target).await);
-        let status: String = sqlx::query_scalar("SELECT status FROM merge_candidate WHERE id=?")
-            .bind(&review)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let status: String =
+            crate::db_types::query_scalar("SELECT status FROM merge_candidate WHERE id=$1")
+                .bind(&review)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(status, "confirmed");
     }
 
@@ -28842,19 +30599,20 @@ mod tests {
             "pending",
         )
         .await;
-        sqlx::query(&format!("CREATE TRIGGER fail_sorted_merge BEFORE DELETE ON work WHEN OLD.id='{source}' BEGIN SELECT RAISE(ABORT,'forced merge failure'); END"))
+        sqlx::raw_sql(&format!(r#"CREATE FUNCTION pg_temp.fail_sorted_merge() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.id='{source}' THEN RAISE EXCEPTION 'forced merge failure'; END IF; RETURN OLD; END $$; CREATE TRIGGER fail_sorted_merge BEFORE DELETE ON work FOR EACH ROW EXECUTE FUNCTION pg_temp.fail_sorted_merge()"#))
             .execute(&pool).await.unwrap();
         assert!(
             auto_merge_pending_reviews(&pool, None).await.is_err(),
             "review sort hid a database failure from its retry caller"
         );
-        let status: String = sqlx::query_scalar("SELECT status FROM merge_candidate WHERE id=?")
-            .bind(&review)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let status: String =
+            crate::db_types::query_scalar("SELECT status FROM merge_candidate WHERE id=$1")
+                .bind(&review)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(status, "pending");
-        sqlx::query("DROP TRIGGER fail_sorted_merge")
+        sqlx::query("DROP TRIGGER fail_sorted_merge ON work")
             .execute(&pool)
             .await
             .unwrap();
@@ -28866,12 +30624,13 @@ mod tests {
         let (_, pool, state) = setup_with_state(100).await;
         let (source, target, review) =
             waiting_pair(&pool, "Ao", "AO!", None, None, "pending").await;
-        let source_series: String =
-            sqlx::query_scalar("SELECT source_series_id FROM merge_candidate WHERE id=?")
-                .bind(&review)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let source_series: String = crate::db_types::query_scalar(
+            "SELECT source_series_id FROM merge_candidate WHERE id=$1",
+        )
+        .bind(&review)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let detached = catalog::create_work(
             &pool,
             &catalog::WorkInput {
@@ -28881,7 +30640,7 @@ mod tests {
         )
         .await
         .unwrap();
-        sqlx::query("UPDATE source_series SET work_id=? WHERE id=?")
+        sqlx::query("UPDATE source_series SET work_id=$1 WHERE id=$2")
             .bind(&detached)
             .bind(&source_series)
             .execute(&pool)
@@ -28901,11 +30660,12 @@ mod tests {
         for id in [&source, &target, &detached] {
             assert!(work_exists(&pool, id).await);
         }
-        let status: String = sqlx::query_scalar("SELECT status FROM merge_candidate WHERE id=?")
-            .bind(&review)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let status: String =
+            crate::db_types::query_scalar("SELECT status FROM merge_candidate WHERE id=$1")
+                .bind(&review)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(status, "pending");
     }
 
@@ -28924,11 +30684,11 @@ mod tests {
             )
             .await
             .unwrap();
-            sqlx::query("UPDATE work SET metadata_synced_at=NULL,mangadex_details_synced_at=NULL,covers_synced_at=NULL WHERE id=?")
+            sqlx::query("UPDATE work SET metadata_synced_at=NULL,mangadex_details_synced_at=NULL,covers_synced_at=NULL WHERE id=$1")
                 .bind(&work).execute(&pool).await.unwrap();
             works.insert(mid, work);
         }
-        sqlx::query(&format!("CREATE TRIGGER fail_enrichment BEFORE UPDATE ON work WHEN OLD.id='{}' BEGIN SELECT RAISE(ABORT,'forced enrichment failure'); END", works["failed"]))
+        sqlx::raw_sql(&format!(r#"CREATE FUNCTION pg_temp.fail_enrichment() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.id='{}' THEN RAISE EXCEPTION 'forced enrichment failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_enrichment BEFORE UPDATE ON work FOR EACH ROW EXECUTE FUNCTION pg_temp.fail_enrichment()"#, works["failed"]))
             .execute(&pool).await.unwrap();
         let prepared = ["good", "failed", "cover-failed"].map(|mid| {
             (
@@ -28943,11 +30703,13 @@ mod tests {
         assert_eq!(persist_enrichment(&pool, &prepared).await.unwrap(), 2);
         for mid in ["good", "failed", "cover-failed", "missing"] {
             let (metadata, covers): (Option<String>, Option<String>) =
-                sqlx::query_as("SELECT metadata_synced_at,covers_synced_at FROM work WHERE id=?")
-                    .bind(&works[mid])
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+                crate::db_types::query_tuple(
+                    "SELECT metadata_synced_at,covers_synced_at FROM work WHERE id=$1",
+                )
+                .bind(&works[mid])
+                .fetch_one(&pool)
+                .await
+                .unwrap();
             assert_eq!(
                 metadata.is_some(),
                 matches!(mid, "good" | "cover-failed"),
@@ -28964,41 +30726,45 @@ mod tests {
     #[tokio::test]
     async fn durable_writes_due_now_fallback_propagates_write_failures() {
         let pool = migrated_pool().await;
-        sqlx::query("INSERT INTO series_scan_state(series_id,next_scan_at,updated_at) VALUES('42','2999-01-01T00:00:00Z','t')").execute(&pool).await.unwrap();
-        sqlx::query("CREATE TRIGGER fail_due_now BEFORE UPDATE OF next_scan_at ON series_scan_state BEGIN SELECT RAISE(ABORT,'forced due-now failure'); END").execute(&pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO series_scan_state(series_id,next_scan_at,updated_at) VALUES('42','2999-01-01T00:00:00Z','2020-01-01T00:00:00Z')"#).execute(&pool).await.unwrap();
+        sqlx::raw_sql(r#"CREATE FUNCTION pg_temp.fail_due_now() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced due-now failure'; RETURN NEW; END $$; CREATE TRIGGER fail_due_now BEFORE UPDATE OF next_scan_at ON series_scan_state FOR EACH ROW EXECUTE FUNCTION pg_temp.fail_due_now()"#).execute(&pool).await.unwrap();
         assert!(mark_scan_due_now(&pool, "42").await.is_err());
-        let next: String =
-            sqlx::query_scalar("SELECT next_scan_at FROM series_scan_state WHERE series_id='42'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(next, "2999-01-01T00:00:00Z");
-        sqlx::query("DROP TRIGGER fail_due_now")
+        let next: String = crate::db_types::query_scalar(
+            "SELECT next_scan_at FROM series_scan_state WHERE series_id='42'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(next, "2999-01-01T00:00:00.000000+00:00");
+        sqlx::query("DROP TRIGGER fail_due_now ON series_scan_state")
             .execute(&pool)
             .await
             .unwrap();
         mark_scan_due_now(&pool, "42").await.unwrap();
-        let next: String =
-            sqlx::query_scalar("SELECT next_scan_at FROM series_scan_state WHERE series_id='42'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(next.as_str() < "2999-01-01T00:00:00Z");
+        let next: String = crate::db_types::query_scalar(
+            "SELECT next_scan_at FROM series_scan_state WHERE series_id='42'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(next.as_str() < "2999-01-01T00:00:00.000000+00:00");
     }
 
     #[tokio::test]
     async fn race_safety_mutual_admin_demotions_leave_an_active_admin() {
         let (schema, pool, _) = setup_with_state(100).await;
-        sqlx::query("UPDATE users SET is_admin=1 WHERE id='bob-id'")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE users SET is_admin = TRUE WHERE id='ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let blocker = pool.begin().await.unwrap();
         let first_schema = schema.clone();
         let first = tokio::spawn(async move {
             exec(
                 &first_schema,
-                "mutation{setUserAdmin(userId:\"bob-id\",isAdmin:false){id}}",
+                "mutation{setUserAdmin(userId:\"ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c\",isAdmin:false){id}}",
                 Some("admintok"),
                 "phase5-admin-a",
             )
@@ -29008,7 +30774,7 @@ mod tests {
         let second = tokio::spawn(async move {
             exec(
                 &second_schema,
-                "mutation{setUserAdmin(userId:\"admin-id\",isAdmin:false){id}}",
+                "mutation{setUserAdmin(userId:\"964771b0-a2fb-4849-857a-6198947115ec\",isAdmin:false){id}}",
                 Some("bobtok"),
                 "phase5-admin-b",
             )
@@ -29022,11 +30788,12 @@ mod tests {
             second.errors.is_empty(),
             "exactly one demotion succeeds"
         );
-        let remaining: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin=1 AND is_banned=0")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let remaining: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE is_admin = TRUE AND is_banned = FALSE",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(remaining, 1);
     }
 
@@ -29035,13 +30802,17 @@ mod tests {
         let (_, pool, _) = setup_with_state(100).await;
         let mut blocker = pool.begin().await.unwrap();
         let waiting_pool = pool.clone();
-        let login = tokio::spawn(async move { new_session(&waiting_pool, "bob-id", 3600).await });
+        let login = tokio::spawn(async move {
+            new_session(&waiting_pool, "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c", 3600).await
+        });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        sqlx::query("UPDATE users SET is_banned=1 WHERE id='bob-id'")
-            .execute(&mut *blocker)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM sessions WHERE user_id='bob-id'")
+        sqlx::query(
+            "UPDATE users SET is_banned = TRUE WHERE id='ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'",
+        )
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM sessions WHERE user_id='ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'")
             .execute(&mut *blocker)
             .await
             .unwrap();
@@ -29050,59 +30821,82 @@ mod tests {
             login.await.unwrap().is_err(),
             "login inserted a session after the ban"
         );
-        ban_user_once(&pool, "admin-id", "bob-id", false)
-            .await
-            .unwrap();
-        let sessions: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id='bob-id'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        ban_user_once(
+            &pool,
+            "964771b0-a2fb-4849-857a-6198947115ec",
+            "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c",
+            false,
+        )
+        .await
+        .unwrap();
+        let sessions: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM sessions WHERE user_id='ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             sessions, 0,
             "an unban revived a session created during the ban"
         );
-        new_session(&pool, "bob-id", 3600).await.unwrap();
-        sqlx::query("CREATE TRIGGER fail_ban_session_delete BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT,'forced session deletion failure'); END").execute(&pool).await.unwrap();
-        assert!(ban_user_once(&pool, "admin-id", "bob-id", true)
-            .await
-            .is_err());
-        let banned: i64 = sqlx::query_scalar("SELECT is_banned FROM users WHERE id='bob-id'")
-            .fetch_one(&pool)
+        new_session(&pool, "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c", 3600)
             .await
             .unwrap();
+        sqlx::raw_sql(r#"CREATE FUNCTION pg_temp.fail_ban_session_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced session deletion failure'; RETURN OLD; END $$; CREATE TRIGGER fail_ban_session_delete BEFORE DELETE ON sessions FOR EACH ROW EXECUTE FUNCTION pg_temp.fail_ban_session_delete()"#).execute(&pool).await.unwrap();
+        assert!(ban_user_once(
+            &pool,
+            "964771b0-a2fb-4849-857a-6198947115ec",
+            "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c",
+            true
+        )
+        .await
+        .is_err());
+        let banned: i64 = crate::db_types::query_scalar(
+            "SELECT is_banned FROM users WHERE id='ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(banned, 0, "ban committed without session revocation");
     }
 
     #[tokio::test]
     async fn race_safety_session_rechecks_the_verified_password_under_the_writer() {
         let (_, pool, _) = setup_with_state(100).await;
-        let checked: String =
-            sqlx::query_scalar("SELECT password_hash FROM users WHERE id='bob-id'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let checked: String = crate::db_types::query_scalar(
+            "SELECT password_hash FROM users WHERE id='ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let mut blocker = pool.begin().await.unwrap();
         let waiting_pool = pool.clone();
         let login = tokio::spawn(async move {
-            new_session_checked(&waiting_pool, "bob-id", 3600, Some(&checked)).await
+            new_session_checked(
+                &waiting_pool,
+                "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c",
+                3600,
+                Some(&checked),
+            )
+            .await
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        sqlx::query("UPDATE users SET password_hash='changed' WHERE id='bob-id'")
+        sqlx::query("UPDATE users SET password_hash='changed' WHERE id='ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'")
             .execute(&mut *blocker)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM sessions WHERE user_id='bob-id'")
+        sqlx::query("DELETE FROM sessions WHERE user_id='ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'")
             .execute(&mut *blocker)
             .await
             .unwrap();
         blocker.commit().await.unwrap();
         assert!(login.await.unwrap().is_err());
-        let sessions: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id='bob-id'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let sessions: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM sessions WHERE user_id='ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(sessions, 0);
     }
 
@@ -29172,14 +30966,19 @@ mod tests {
         );
         merge.await.unwrap().unwrap();
         let identities: Vec<String> =
-            sqlx::query_scalar("SELECT series_id FROM user_library WHERE user_id='bob-id'")
+            crate::db_types::query_scalar("SELECT series_id FROM user_library WHERE user_id='ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c'")
                 .fetch_all(&pool)
                 .await
                 .unwrap();
         assert_eq!(identities.as_slice(), std::slice::from_ref(&target));
-        let redirected = write_library_once(&pool, "bob-id", &source, LibraryEdit::Favorite(true))
-            .await
-            .unwrap();
+        let redirected = write_library_once(
+            &pool,
+            "ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c",
+            &source,
+            LibraryEdit::Favorite(true),
+        )
+        .await
+        .unwrap();
         assert_eq!(redirected, target);
     }
 
@@ -29205,8 +31004,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let source_series: String = sqlx::query_scalar(
-            "SELECT id FROM source_series WHERE work_id=? AND source_type='mangadex'",
+        let source_series: String = crate::db_types::query_scalar(
+            "SELECT id FROM source_series WHERE work_id=$1 AND source_type='mangadex'",
         )
         .bind(&source)
         .fetch_one(&pool)
@@ -29225,7 +31024,12 @@ mod tests {
         .await
         .unwrap();
         let mut merge = pool.begin().await.unwrap();
-        sqlx::query("UPDATE source_series SET work_id=? WHERE id=?")
+        // The competing mover follows the shared parent-before-source order.
+        // Its original assertions still require progress to use the new owner.
+        crate::locks::lock_works_for_delete(&mut merge, &[&source, &target])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE source_series SET work_id=$1 WHERE id=$2")
             .bind(&target)
             .bind(&source_series)
             .execute(&mut *merge)
@@ -29235,8 +31039,8 @@ mod tests {
         let progress = tokio::spawn(async move {
             exec(&request_schema,"mutation{setProgress(chapterId:\"canonical-race-chapter\",lastPageRead:7,read:false)}",Some("bobtok"),"phase5-progress").await
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        sqlx::query("DELETE FROM work WHERE id=?")
+        phase4_tests::lock_wait(&pool).await;
+        sqlx::query("DELETE FROM work WHERE id=$1")
             .bind(&source)
             .execute(&mut *merge)
             .await
@@ -29244,7 +31048,7 @@ mod tests {
         merge.commit().await.unwrap();
         let response = progress.await.unwrap();
         assert!(response.errors.is_empty(), "{:?}", response.errors);
-        let owner: String = sqlx::query_scalar("SELECT work_id FROM canonical_progress WHERE user_id='bob-id' AND chapter_id='canonical-race-chapter'").fetch_one(&pool).await.unwrap();
+        let owner: String = crate::db_types::query_scalar("SELECT work_id FROM canonical_progress WHERE user_id='ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c' AND chapter_id='canonical-race-chapter'").fetch_one(&pool).await.unwrap();
         assert_eq!(owner, target, "progress landed under the deleted owner");
     }
     #[tokio::test]
@@ -29257,29 +31061,30 @@ mod tests {
         );
         let response = exec(&schema, &edit, Some("admintok"), "phase6-search-edit").await;
         assert!(response.errors.is_empty(), "{:?}", response.errors);
-        let indexed: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM work_fts WHERE work_fts MATCH 'Projected*' AND work_id=?",
+        let indexed: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(DISTINCT work_id) FROM work_search_alias WHERE normalized_title LIKE 'projected%' AND work_id=$1",
         )
         .bind(&work)
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(indexed, 1, "committed metadata edit remained unsearchable");
-        sqlx::query("CREATE TRIGGER fail_metadata_projection BEFORE UPDATE ON browse_catalogue BEGIN SELECT RAISE(ABORT,'forced metadata projection failure'); END")
+        sqlx::raw_sql(r#"CREATE FUNCTION pg_temp.fail_metadata_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced metadata projection failure'; RETURN NEW; END $$; CREATE TRIGGER fail_metadata_projection BEFORE UPDATE ON browse_catalogue FOR EACH ROW EXECUTE FUNCTION pg_temp.fail_metadata_projection()"#)
             .execute(&pool).await.unwrap();
         let edit = format!(
             r#"mutation{{updateSeriesMetadata(input:{{seriesId:"{work}",title:"Must Roll Back"}}){{id}}}}"#
         );
         let response = exec(&schema, &edit, Some("admintok"), "phase6-search-edit").await;
         assert!(!response.errors.is_empty(), "projection failure was hidden");
-        let title: String = sqlx::query_scalar("SELECT title_override FROM work WHERE id=?")
-            .bind(&work)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let title: String =
+            crate::db_types::query_scalar("SELECT title_override FROM work WHERE id=$1")
+                .bind(&work)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(title, "Projected Search Needle");
-        let indexed: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM work_fts WHERE work_fts MATCH 'Projected*' AND work_id=?",
+        let indexed: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(DISTINCT work_id) FROM work_search_alias WHERE normalized_title LIKE 'projected%' AND work_id=$1",
         )
         .bind(&work)
         .fetch_one(&pool)

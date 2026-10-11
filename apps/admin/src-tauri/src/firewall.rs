@@ -147,14 +147,16 @@ pub async fn open(port: u16) -> Result<String, String> {
       .output()
       .await
       .map_err(|e| format!("Could not request firewall permission: {e}"))?;
-    return match out.status.code() {
+    // The last expression of the function on Windows (the other systems' blocks are not
+    // compiled there).
+    match out.status.code() {
       Some(0) => Ok(format!(
         "Windows now lets devices on your network reach komiq on port {port}."
       )),
       // Refused or cancelled at the Windows prompt: nothing was changed.
       Some(3) => Err("Windows did not give permission to change the firewall.".into()),
       _ => Err("Windows could not add the firewall rule.".into()),
-    };
+    }
   }
   #[cfg(target_os = "linux")]
   {
@@ -184,7 +186,9 @@ pub async fn open(port: u16) -> Result<String, String> {
         }
       ));
     }
-    return Err(match out.status.code() {
+    // The last expression of the function on Linux (the other systems' blocks are not
+    // compiled there).
+    Err(match out.status.code() {
       Some(126) => "The firewall permission prompt was cancelled.".into(),
       Some(127) => "Permission to change the firewall was not granted.".into(),
       _ => {
@@ -196,7 +200,7 @@ pub async fn open(port: u16) -> Result<String, String> {
           .trim();
         format!("The firewall rule could not be added: {reason}")
       }
-    });
+    })
   }
   #[cfg(not(any(target_os = "windows", target_os = "linux")))]
   {
@@ -213,7 +217,13 @@ mod tests {
   fn inner_script(args: &[String]) -> String {
     assert_eq!(
       &args[..5],
-      ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command"]
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-Command"
+      ]
     );
     let command = &args[5];
     let start = command.find("GetBytes('").unwrap() + "GetBytes('".len();

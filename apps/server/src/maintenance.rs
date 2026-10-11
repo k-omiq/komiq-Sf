@@ -52,25 +52,42 @@ pub fn update_status() -> UpdateStatus {
 /// One row of `extension_update_log`, newest first.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UpdateLogEntry {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub at: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub pkg_name: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub from_version: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub to_version: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub origin: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub error: Option<String>,
 }
 
 pub async fn recent_updates(pool: &Database, limit: i64) -> anyhow::Result<Vec<UpdateLogEntry>> {
     Ok(sqlx::query_as::<_, UpdateLogEntry>(
         "SELECT at, pkg_name, from_version, to_version, origin, error \
-           FROM extension_update_log ORDER BY id DESC LIMIT ?",
+           FROM extension_update_log ORDER BY id DESC LIMIT $1",
     )
     .bind(limit)
     .fetch_all(pool)
     .await?)
 }
 
+#[cfg(test)]
+tokio::task_local! { static UPDATE_LOG_PAUSE: crate::locks::pause_points::PausePoints; }
+
 async fn log_attempts(
+    pool: &Database,
+    attempts: &[UpdateAttempt],
+    origin: &str,
+) -> anyhow::Result<()> {
+    crate::db::retry_transaction(|| log_attempts_once(pool, attempts, origin)).await
+}
+
+async fn log_attempts_once(
     pool: &Database,
     attempts: &[UpdateAttempt],
     origin: &str,
@@ -78,14 +95,14 @@ async fn log_attempts(
     if attempts.is_empty() {
         return Ok(());
     }
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = chrono::Utc::now();
     let mut tx = pool.begin().await?;
     for a in attempts {
         sqlx::query(
             "INSERT INTO extension_update_log (at, pkg_name, from_version, to_version, origin, error) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
-        .bind(&now)
+        .bind(now)
         .bind(&a.pkg_name)
         .bind(&a.from_version)
         .bind(&a.to_version)
@@ -94,9 +111,13 @@ async fn log_attempts(
         .execute(&mut *tx)
         .await?;
     }
+    #[cfg(test)]
+    if let Ok(points) = UPDATE_LOG_PAUSE.try_with(Clone::clone) {
+        points.hit("update-log-appended").await;
+    }
     sqlx::query(
         "DELETE FROM extension_update_log \
-          WHERE id <= (SELECT MAX(id) FROM extension_update_log) - ?",
+          WHERE id IN (SELECT id FROM extension_update_log ORDER BY at DESC, id DESC OFFSET $1)",
     )
     .bind(UPDATE_LOG_KEEP)
     .execute(&mut *tx)
@@ -125,6 +146,7 @@ pub async fn run_update_pass(state: &AppState, origin: &'static str) {
         Ok(attempts) => {
             tracing::info!(updated, failed, origin, "extension update pass complete");
             if let Err(e) = log_attempts(&state.pool, attempts, origin).await {
+                let e = crate::db::observed_database_error(e);
                 tracing::warn!(error = %e, "extension update log write failed");
             }
             if updated > 0 {
@@ -135,7 +157,7 @@ pub async fn run_update_pass(state: &AppState, origin: &'static str) {
     }
     let mut s = status();
     s.running = false;
-    s.last_run_at = Some(chrono::Utc::now().to_rfc3339());
+    s.last_run_at = Some(crate::db_types::format_date(chrono::Utc::now()));
     s.last_error = error;
     s.last_updated = updated;
     s.last_failed = failed;
@@ -164,6 +186,7 @@ pub fn spawn(state: Arc<AppState>, update_interval_secs: u64, shutdown: watch::R
                                     3600
                                 }
                                 Err(e) => {
+                                    let e = crate::db::observed_database_error(e);
                                     tracing::warn!(error = %e, "waiting merge reviews failed; will retry");
                                     300
                                 }
@@ -250,6 +273,7 @@ async fn update_extensions(client: &SuwayomiClient) -> anyhow::Result<Vec<Update
                 (None, Some("still has an update after updating".to_string()))
             }
             Err(e) => {
+                let e = crate::db::observed_database_error(e);
                 tracing::warn!(pkg_name = %ext.pkg_name, error = %e, "extension update failed; will retry");
                 (None, Some(e.to_string()))
             }
@@ -270,6 +294,61 @@ mod tests {
     use axum::{routing::post, Json, Router};
     use serde_json::{json, Value};
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn overlapping_extension_log_retention_keeps_ranked_rows_across_sequence_gaps() {
+        let pool = crate::database::TestPoolOptions::new()
+            .max_connections(8)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+            .foreground();
+        sqlx::migrate!("./migrations_pg")
+            .run(pool.write())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO extension_update_log (at, pkg_name, origin) SELECT '2020-01-01'::timestamptz, 'old-' || n, 'auto' FROM generate_series(1, 500) n").execute(&pool).await.unwrap();
+        sqlx::query("SELECT setval(pg_get_serial_sequence('extension_update_log','id'),50000)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let points = crate::locks::pause_points::PausePoints::default();
+        let armed = points.arm("update-log-appended");
+        let a = pool.clone();
+        let pause = points.clone();
+        let first = tokio::spawn(UPDATE_LOG_PAUSE.scope(pause, async move {
+            log_attempts(
+                &a,
+                &[UpdateAttempt {
+                    pkg_name: "first".into(),
+                    from_version: "1".into(),
+                    to_version: Some("2".into()),
+                    error: None,
+                }],
+                "manual",
+            )
+            .await
+        }));
+        tokio::time::timeout(Duration::from_secs(30), armed.reached())
+            .await
+            .unwrap();
+        log_attempts(
+            &pool,
+            &[UpdateAttempt {
+                pkg_name: "second".into(),
+                from_version: "1".into(),
+                to_version: Some("2".into()),
+                error: None,
+            }],
+            "auto",
+        )
+        .await
+        .unwrap();
+        armed.release();
+        first.await.unwrap().unwrap();
+        let (all, fresh): (i64, i64) = sqlx::query_as("SELECT COUNT(*), COUNT(*) FILTER (WHERE pkg_name IN ('first','second')) FROM extension_update_log").fetch_one(&pool).await.unwrap();
+        assert_eq!((all, fresh), (500, 2));
+    }
 
     fn extension(pkg: &str, installed: bool, update: bool) -> Value {
         json!({"pkgName": pkg, "name": pkg, "lang": "en", "versionName": "1.2",

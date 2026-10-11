@@ -1,0 +1,185 @@
+{
+  "data": {
+    "seriesAdminMeta": {
+      "artist": "Artist 1",
+      "author": "Author 1",
+      "contentRating": "SAFE",
+      "contentTypeOverride": "MANGA",
+      "demographic": null,
+      "descriptionOverride": null,
+      "hasCuratedTags": true,
+      "isNsfwOverride": null,
+      "originalLanguage": "ja",
+      "pinnedFields": [],
+      "status": "ONGOING",
+      "tags": [
+        "Action",
+        "Gore"
+      ],
+      "titleOverride": null,
+      "workId": "w_00000000000040008000000000000001",
+      "year": 1991
+    },
+    "siteBlockRules": [
+      {
+        "ratings": [
+          "PORNOGRAPHIC"
+        ],
+        "tags": [
+          "romance"
+        ]
+      }
+    ],
+    "users": {
+      "hasNextPage": false,
+      "items": [
+        {
+          "avatarUrl": null,
+          "createdAt": "2020-01-03T01:02:03.000000+00:00",
+          "email": "cjk-reader@e.com",
+          "id": "00000000-0000-4000-8000-000000000902",
+          "isAdmin": false,
+          "isBanned": false,
+          "username": "cjk-reader"
+        },
+        {
+          "avatarUrl": null,
+          "createdAt": "2020-01-02T01:02:03.000000+00:00",
+          "email": "reader@e.com",
+          "id": "00000000-0000-4000-8000-000000000901",
+          "isAdmin": false,
+          "isBanned": false,
+          "username": "reader"
+        },
+        {
+          "avatarUrl": null,
+          "createdAt": "2020-01-01T01:02:03.000000+00:00",
+          "email": "owner@e.com",
+          "id": "00000000-0000-4000-8000-000000000900",
+          "isAdmin": true,
+          "isBanned": false,
+          "username": "owner"
+        }
+      ],
+      "page": 1,
+      "total": 3
+    },
+    "workChaptersAdmin": [
+      {
+        "effectiveTitle": "Chapter 0",
+        "hidden": false,
+        "key": "0",
+        "number": 0.0,
+        "sourceCount": 1,
+        "sourceTitle": "Chapter 0",
+        "titleOverride": null
+      },
+      {
+        "effectiveTitle": "Chapter 1",
+        "hidden": false,
+        "key": "100",
+        "number": 1.0,
+        "sourceCount": 2,
+        "sourceTitle": "Chapter 1",
+        "titleOverride": null
+      },
+      {
+        "effectiveTitle": "Curated half chapter",
+        "hidden": false,
+        "key": "1050",
+        "number": 10.5,
+        "sourceCount": 3,
+        "sourceTitle": "Chapter 10.5",
+        "titleOverride": "Curated half chapter"
+      },
+      {
+        "effectiveTitle": "Undated chapter",
+        "hidden": false,
+        "key": "1100",
+        "number": 11.0,
+        "sourceCount": 1,
+        "sourceTitle": "Undated chapter",
+        "titleOverride": null
+      },
+      {
+        "effectiveTitle": "Oneshot",
+        "hidden": false,
+        "key": "0",
+        "number": 0.0,
+        "sourceCount": 1,
+        "sourceTitle": "Oneshot",
+        "titleOverride": null
+      },
+      {
+        "effectiveTitle": "Special extra",
+        "hidden": false,
+        "key": "0",
+        "number": 0.0,
+        "sourceCount": 1,
+        "sourceTitle": "Special extra",
+        "titleOverride": null
+      }
+    ],
+    "workReviewDetail": {
+      "altTitles": [
+        "Only Alias Hero",
+        "Shared Alias",
+        "Solo Leveling",
+        "나 혼자만 레벨업"
+      ],
+      "artist": "Artist 1",
+      "author": "Author 1",
+      "chapterCount": 6,
+      "contentRating": "safe",
+      "coverUrl": "/covers/w_00000000000040008000000000000001.webp?v=7",
+      "description": "Description 1: café / 漫画",
+      "isNsfw": false,
+      "originalLanguage": "ja",
+      "sources": [
+        {
+          "extension": null,
+          "isNsfw": false,
+          "lang": null,
+          "sourceId": "mangadex",
+          "sourceKey": "00000000-0000-4000-8000-000000000001",
+          "sourceType": "mangadex",
+          "sourceUrl": "https://example.invalid/manga/1"
+        },
+        {
+          "extension": {
+            "apkName": "fixture.apk",
+            "lang": "en",
+            "pkgName": "org.example.710001",
+            "repoUrl": "https://example.invalid/repo",
+            "versionCode": 3
+          },
+          "isNsfw": false,
+          "lang": "en",
+          "sourceId": "source-710001",
+          "sourceKey": "710001",
+          "sourceType": "suwayomi",
+          "sourceUrl": "https://example.invalid/710001"
+        },
+        {
+          "extension": {
+            "apkName": "fixture.apk",
+            "lang": "en",
+            "pkgName": "org.example.710002",
+            "repoUrl": "https://example.invalid/repo",
+            "versionCode": 3
+          },
+          "isNsfw": false,
+          "lang": "en",
+          "sourceId": "source-710002",
+          "sourceKey": "710002",
+          "sourceType": "suwayomi",
+          "sourceUrl": "https://example.invalid/710002"
+        }
+      ],
+      "status": "ONGOING",
+      "title": "Solo Leveling",
+      "workId": "w_00000000000040008000000000000001",
+      "year": 1991
+    }
+  }
+}

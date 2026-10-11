@@ -75,7 +75,7 @@ pub const STATE_CANCELLED: &str = "cancelled";
 pub const STATE_FAILED: &str = "failed";
 
 /// One persisted ingest job row (mirrors `source_ingest_job`).
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct IngestJob {
     pub id: String,
     pub source_id: String,
@@ -91,6 +91,28 @@ pub struct IngestJob {
     pub error: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+}
+
+impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for IngestJob {
+    fn from_row(row: &sqlx::postgres::PgRow) -> sqlx::Result<Self> {
+        use crate::db_types::Row;
+        Ok(Self {
+            id: row.try_get("id")?,
+            source_id: row.try_get("source_id")?,
+            state: row.try_get("state")?,
+            pages_done: row.try_get("pages_done")?,
+            items_seen: row.try_get("items_seen")?,
+            succeeded: row.try_get("succeeded")?,
+            failed: row.try_get("failed")?,
+            new_works: row.try_get("new_works")?,
+            auto_merged: row.try_get("auto_merged")?,
+            queued_for_review: row.try_get("queued_for_review")?,
+            already_existing: row.try_get("already_existing")?,
+            error: row.try_get("error")?,
+            started_at: row.try_get("started_at")?,
+            finished_at: row.try_get("finished_at")?,
+        })
+    }
 }
 
 /// In-memory progress counters, flushed to the row after every page (and at the
@@ -136,19 +158,19 @@ impl Progress {
 /// losing concurrent INSERT violates `uq_source_ingest_running`).
 pub async fn try_start_job(pool: &Database, source_id: &str) -> Result<Option<IngestJob>> {
     let id = format!("ing_{}", uuid::Uuid::new_v4().simple());
-    let now = Utc::now().to_rfc3339();
+    let now = Utc::now();
     let res = sqlx::query(
-        "INSERT INTO source_ingest_job (id, source_id, state, started_at) VALUES (?, ?, 'running', ?)",
+        "INSERT INTO source_ingest_job (id, source_id, state, started_at) VALUES ($1, $2, 'running', $3)",
     )
     .bind(&id)
     .bind(source_id)
-    .bind(&now)
+    .bind(now)
     .execute(pool)
     .await;
     match res {
         Ok(_) => Ok(load_job(pool, &id).await?),
-        // X3: detect the lost one-running-job-per-source race by the SQLite
-        // extended result code (SQLITE_CONSTRAINT_UNIQUE = 2067), not a brittle
+        // X3: detect the lost one-running-job-per-source race by the PostgreSQL
+        // SQLSTATE 23505, not a brittle
         // message-substring match.
         Err(sqlx::Error::Database(e)) if is_unique_violation(e.as_ref()) => Ok(None),
         Err(e) => Err(e.into()),
@@ -156,17 +178,17 @@ pub async fn try_start_job(pool: &Database, source_id: &str) -> Result<Option<In
 }
 
 /// True when a database error is a UNIQUE-constraint violation, matched by the
-/// SQLite extended result code `SQLITE_CONSTRAINT_UNIQUE` (2067) rather than the
+/// PostgreSQL SQLSTATE `23505` rather than the
 /// human-readable message (X3).
 fn is_unique_violation(e: &dyn sqlx::error::DatabaseError) -> bool {
-    e.code().as_deref() == Some("2067")
+    e.code().as_deref() == Some("23505")
 }
 
 /// Load the currently-running job for a source, if any (F1: so an extension-level
 /// start can report the already-running source alongside the newly-started ones).
 pub async fn load_running_job(pool: &Database, source_id: &str) -> Result<Option<IngestJob>> {
     Ok(sqlx::query_as::<_, IngestJob>(
-        "SELECT * FROM source_ingest_job WHERE source_id = ? AND state = 'running' LIMIT 1",
+        "SELECT * FROM source_ingest_job WHERE source_id = $1 AND state = 'running' LIMIT 1",
     )
     .bind(source_id)
     .fetch_optional(pool)
@@ -196,10 +218,10 @@ pub async fn cancel_running_for_sources(
 /// unchanged (cancel is then a no-op, not an error).
 pub async fn cancel_job(pool: &Database, job_id: &str) -> Result<Option<IngestJob>> {
     sqlx::query(
-        "UPDATE source_ingest_job SET state = ?, finished_at = ? WHERE id = ? AND state = ?",
+        "UPDATE source_ingest_job SET state = $1, finished_at = $2 WHERE id = $3 AND state = $4",
     )
     .bind(STATE_CANCELLED)
-    .bind(Utc::now().to_rfc3339())
+    .bind(Utc::now())
     .bind(job_id)
     .bind(STATE_RUNNING)
     .execute(pool)
@@ -210,7 +232,7 @@ pub async fn cancel_job(pool: &Database, job_id: &str) -> Result<Option<IngestJo
 /// The job's current state string (the runner's cancellation check).
 async fn job_state(pool: &Database, job_id: &str) -> Result<Option<String>> {
     Ok(
-        sqlx::query_scalar("SELECT state FROM source_ingest_job WHERE id = ?")
+        crate::db_types::query_scalar("SELECT state FROM source_ingest_job WHERE id = $1")
             .bind(job_id)
             .fetch_optional(pool)
             .await?,
@@ -219,7 +241,7 @@ async fn job_state(pool: &Database, job_id: &str) -> Result<Option<String>> {
 
 pub async fn load_job(pool: &Database, job_id: &str) -> Result<Option<IngestJob>> {
     Ok(
-        sqlx::query_as::<_, IngestJob>("SELECT * FROM source_ingest_job WHERE id = ?")
+        sqlx::query_as::<_, IngestJob>("SELECT * FROM source_ingest_job WHERE id = $1")
             .bind(job_id)
             .fetch_optional(pool)
             .await?,
@@ -240,9 +262,9 @@ pub async fn list_jobs(pool: &Database, active_only: bool) -> Result<Vec<IngestJ
 /// touches `state`, so it can't resurrect a row the admin just cancelled.
 async fn write_progress(pool: &Database, job_id: &str, p: &Progress) -> Result<()> {
     sqlx::query(
-        "UPDATE source_ingest_job SET pages_done = ?, items_seen = ?, succeeded = ?, \
-         failed = ?, new_works = ?, auto_merged = ?, queued_for_review = ?, \
-         already_existing = ? WHERE id = ?",
+        "UPDATE source_ingest_job SET pages_done = $1, items_seen = $2, succeeded = $3, \
+         failed = $4, new_works = $5, auto_merged = $6, queued_for_review = $7, \
+         already_existing = $8 WHERE id = $9",
     )
     .bind(p.pages_done)
     .bind(p.items_seen)
@@ -262,12 +284,12 @@ async fn write_progress(pool: &Database, job_id: &str, p: &Progress) -> Result<(
 /// first wins (the runner's completed/failed write then becomes a no-op).
 async fn finish_job(pool: &Database, job_id: &str, state: &str, error: Option<&str>) -> Result<()> {
     sqlx::query(
-        "UPDATE source_ingest_job SET state = ?, error = ?, finished_at = ? \
-         WHERE id = ? AND state = 'running'",
+        "UPDATE source_ingest_job SET state = $1, error = $2, finished_at = $3 \
+         WHERE id = $4 AND state = 'running'",
     )
     .bind(state)
     .bind(error)
-    .bind(Utc::now().to_rfc3339())
+    .bind(Utc::now())
     .bind(job_id)
     .execute(pool)
     .await?;
@@ -280,9 +302,9 @@ async fn finish_job(pool: &Database, job_id: &str, state: &str, error: Option<&s
 pub async fn mark_interrupted_jobs(pool: &Database) -> Result<u64> {
     let res = sqlx::query(
         "UPDATE source_ingest_job SET state = 'failed', \
-         error = 'interrupted by server restart', finished_at = ? WHERE state = 'running'",
+         error = 'interrupted by server restart', finished_at = $1 WHERE state = 'running'",
     )
-    .bind(Utc::now().to_rfc3339())
+    .bind(Utc::now())
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
@@ -302,6 +324,7 @@ pub fn spawn_runner(state: Arc<AppState>, job_id: String, source_id: String) {
                 if let Err(e) =
                     finish_job(&pool, &job_id, STATE_COMPLETED, warning.as_deref()).await
                 {
+                    let e = crate::db::observed_database_error(e);
                     tracing::warn!(job_id, error = %e, "ingest: failed to mark job completed");
                 }
                 tracing::info!(job_id, source_id, warning, "ingest: job completed");
@@ -311,8 +334,10 @@ pub fn spawn_runner(state: Arc<AppState>, job_id: String, source_id: String) {
                 tracing::info!(job_id, source_id, "ingest: job cancelled");
             }
             Err(e) => {
+                crate::db::observe_database_error(&e);
                 let msg = e.to_string();
                 if let Err(e2) = finish_job(&pool, &job_id, STATE_FAILED, Some(&msg)).await {
+                    crate::db::observe_database_error(&e2);
                     tracing::warn!(job_id, error = %e2, "ingest: failed to mark job failed");
                 }
                 tracing::warn!(job_id, source_id, error = %msg, "ingest: job failed");
@@ -357,6 +382,7 @@ async fn run_job(state: Arc<AppState>, job_id: &str, source_id: &str) -> Result<
             Ok(ListingOutcome::Cancelled) => return Ok(RunOutcome::Cancelled),
             Ok(ListingOutcome::Done) => walked += 1,
             Err(e) => {
+                let e = crate::db::observed_database_error(e);
                 tracing::warn!(job_id, source_id, listing = label, error = %e, "ingest: listing failed");
                 warning = Some(match warning {
                     Some(prev) => format!("{prev}; {label} listing failed: {e}"),
@@ -472,10 +498,12 @@ async fn walk_listing(
                 Ok((_, Ok(r))) => progress.record_decision(&r.decision),
                 Ok((mid, Err(e))) => {
                     progress.record_failure();
+                    let e = crate::db::observed_database_error(e);
                     tracing::warn!(job_id, manga_id = mid, error = %e, "ingest: item failed");
                 }
                 Err(e) => {
                     progress.record_failure();
+                    let e = crate::db::observed_database_error(e.into());
                     tracing::warn!(job_id, error = %e, "ingest: item task panicked");
                 }
             }
@@ -522,7 +550,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -530,16 +558,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unique_violation_is_matched_by_extended_code_not_message() {
-        // X3: the one-running-job-per-source race is detected by the SQLite
-        // extended result code (2067), returning None rather than an error.
+    async fn unique_violation_is_matched_by_sqlstate_not_message() {
+        // X3: the one-running-job-per-source race is detected by PostgreSQL
+        // SQLSTATE (23505), returning None rather than an error.
         let pool = pool().await;
         assert!(try_start_job(&pool, "src-x").await.unwrap().is_some());
-        // Second concurrent start hits uq_source_ingest_running → 2067 → None.
+        // Second concurrent start hits uq_source_ingest_running → 23505 → None.
         let dup = try_start_job(&pool, "src-x").await;
         assert!(
             matches!(dup, Ok(None)),
-            "duplicate running job must map the 2067 unique violation to Ok(None), got {dup:?}"
+            "duplicate running job must map the 23505 unique violation to Ok(None), got {dup:?}"
         );
     }
 

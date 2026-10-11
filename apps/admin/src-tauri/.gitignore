@@ -9,3 +9,6 @@
 /binaries/
 /web/*
 !/web/.gitkeep
+
+# Verified, trimmed target runtime and generated target-only bundle mapping.
+/postgres/

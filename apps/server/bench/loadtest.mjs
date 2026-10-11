@@ -44,7 +44,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { URL } from 'node:url';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 // ---------------------------------------------------------------------------
 // Scenarios
@@ -179,6 +179,7 @@ function parseArgs(argv) {
 		maxP95: 750,
 		json: null,
 		think: 5,
+		stopFile: null,
 		list: false,
 	};
 	for (let i = 0; i < argv.length; i++) {
@@ -214,6 +215,9 @@ function parseArgs(argv) {
 			case '--think':
 				out.think = parseFloat(next());
 				break;
+			case '--stop-file':
+				out.stopFile = next();
+				break;
 			case '--queries':
 				Q = { ...Q, ...JSON.parse(readFileSync(next(), 'utf8')) };
 				break;
@@ -245,6 +249,9 @@ function usage() {
   --think <sec>        seconds between requests per real user, for the
                        req/s -> concurrent-users conversion (default 5)
   --queries <file>     JSON overriding the GraphQL operation text
+  --stop-file <file>   stop sending as soon as this file exists (in-flight
+                       requests are still awaited and counted); --duration
+                       stays the upper bound
   --json <file>        write full results as JSON
   --list               print scenarios and exit`);
 }
@@ -267,6 +274,23 @@ const mod = isTls ? https : http;
 // and we would be measuring our own generator, not the server.
 const agent = new mod.Agent({ keepAlive: true, maxSockets: Infinity, maxFreeSockets: 4096 });
 
+const ERRORS_KEY = Buffer.from('"errors"');
+
+// --stop-file: a controlling process creates the file to end the load early (the
+// PostgreSQL overlap benchmark does, when its measurement window ends). Checked at
+// most every 50 ms, so the check costs nothing next to a request.
+let stopSeen = false;
+let stopCheckedAt = 0;
+function stopRequested() {
+	if (!args.stopFile || stopSeen) return stopSeen;
+	const now = Date.now();
+	if (now - stopCheckedAt >= 50) {
+		stopCheckedAt = now;
+		stopSeen = existsSync(args.stopFile);
+	}
+	return stopSeen;
+}
+
 function once(req) {
 	return new Promise((resolve) => {
 		const t0 = process.hrtime.bigint();
@@ -282,13 +306,29 @@ function once(req) {
 		const r = mod.request(opts, (res) => {
 			let n = 0;
 			let bad = false;
+			let tail = null;
 			res.on('data', (c) => {
 				n += c.length;
 				// A GraphQL error is HTTP 200 with an `errors` key. Counting those as
 				// successes would make a broken query look like great throughput, so
-				// sniff the body. Only the first chunk is inspected — enough, because
-				// async-graphql serializes `errors` before `data`.
-				if (!bad && n <= c.length && c.includes('"errors"')) bad = true;
+				// sniff the body. The WHOLE body: async-graphql serializes `data`
+				// before `errors`, so on any answer longer than one chunk the key is
+				// not in the first chunk. A chunk boundary can also fall inside the
+				// key, so the last few bytes of each chunk are kept and looked at
+				// together with the start of the next one. No JSON parsing: the
+				// generator must stay cheaper than the server it measures. A selected
+				// field that is itself named `errors` would be counted as an error;
+				// no operation here selects one.
+				if (bad) return;
+				if (c.includes(ERRORS_KEY)) bad = true;
+				else if (
+					tail &&
+					Buffer.concat([tail, c.subarray(0, ERRORS_KEY.length - 1)]).includes(ERRORS_KEY)
+				)
+					bad = true;
+				const joined = tail ? Buffer.concat([tail, c]) : c;
+				const keep = ERRORS_KEY.length - 1;
+				tail = Buffer.from(joined.subarray(Math.max(0, joined.length - keep)));
 			});
 			res.on('end', () => {
 				const us = Number(process.hrtime.bigint() - t0) / 1000;
@@ -350,7 +390,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function closedLoop(makeReq, vus, seconds, collect) {
 	const until = Date.now() + seconds * 1000;
 	const worker = async () => {
-		while (Date.now() < until) {
+		while (Date.now() < until && !stopRequested()) {
 			const r = await once(makeReq());
 			collect(r);
 		}
@@ -365,10 +405,11 @@ async function openLoop(makeReq, rps, seconds, collect) {
 	const gapMs = 1000 / rps;
 	const start = Date.now();
 	let sent = 0;
-	while (Date.now() - start < seconds * 1000) {
+	while (Date.now() - start < seconds * 1000 && !stopRequested()) {
 		const due = start + sent * gapMs;
 		const wait = due - Date.now();
 		if (wait > 1) await sleep(wait);
+		if (stopRequested()) break;
 		const p = once(makeReq()).then(collect);
 		inflight.push(p);
 		if (inflight.length > 50000) inflight.splice(0, 25000); // bound memory on long runs

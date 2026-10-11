@@ -3,7 +3,13 @@
 	import { href } from '$lib/paths';
 	import { goto } from '$app/navigation';
 	import { runsLocalServer, saveLocalServer, saveServer, target } from '$lib/config';
-	import { bridgeError, desktop, handOffSetupCode, type LocalStage } from '$lib/desktop';
+	import {
+		bridgeError,
+		desktop,
+		handOffSetupCode,
+		type LocalImport,
+		type LocalStage,
+	} from '$lib/desktop';
 	import Button from '$lib/components/Button.svelte';
 	import Choice from '$lib/components/Choice.svelte';
 	import Icon from '$lib/components/Icon.svelte';
@@ -31,16 +37,32 @@
 
 	type StepState = 'waiting' | 'running' | 'done' | 'failed';
 	const localSteps: { stage: Exclude<LocalStage, 'ready'>; label: string }[] = [
+		{ stage: 'database', label: 'Database' },
 		{ stage: 'engine', label: 'Source engine' },
 		{ stage: 'server', label: 'Server' },
 	];
-	let stage = $state<LocalStage>('engine');
+	let stage = $state<LocalStage>('database');
 	let localError = $state<string | null>(null);
 	let log = $state<string | null>(null);
+	let progress = $state<string | null>(null);
+	let importState = $state<LocalImport>('idle');
+	let warnings = $state<string[]>([]);
+	// A start that finished with warnings waits here until the owner has read them.
+	let started = $state<{ address: string; setupCode?: string | null } | null>(null);
 	let poll: ReturnType<typeof setTimeout> | null = null;
+	// One status loop at a time: Back and then Run starts a new one and ends the old.
+	let watch = 0;
+
+	/** What the server step is doing, in a few plain words. */
+	function serverText(): string {
+		if (importState === 'preparing') return 'Checking the old database…';
+		if (importState === 'converting') return 'Converting the database…';
+		if (importState === 'done') return 'Database converted. Starting…';
+		return 'Starting…';
+	}
 
 	function stepState(s: Exclude<LocalStage, 'ready'>): StepState {
-		const order = ['engine', 'server', 'ready'];
+		const order = ['database', 'engine', 'server', 'ready'];
 		const at = order.indexOf(stage);
 		const mine = order.indexOf(s);
 		if (mine < at) return 'done';
@@ -49,37 +71,62 @@
 	}
 
 	async function startLocal(): Promise<void> {
+		const mine = ++watch;
+		if (poll) clearTimeout(poll);
 		view = 'local';
-		stage = 'engine';
+		stage = 'database';
 		localError = null;
 		log = null;
+		progress = null;
+		importState = 'idle';
+		warnings = [];
+		started = null;
 		try {
-			await desktop.start();
-			void tick();
+			// A reload, or Back and then Run, comes here while the app may already be
+			// checking or converting the old database. Starting again would be a retry of a
+			// step that is running, so the page only shows it. (The app ignores such a retry
+			// too; a start that has failed, or has not begun, is started as before.)
+			const now = await desktop.status().catch(() => null);
+			const converting =
+				!!now &&
+				!now.error &&
+				now.stage === 'server' &&
+				(now.import === 'preparing' || now.import === 'converting');
+			if (!converting) await desktop.start();
+			if (mine === watch) void tick(mine);
 		} catch (err) {
-			localError = bridgeError(err, 'Could not start.');
+			if (mine === watch) localError = bridgeError(err, 'Could not start.');
 		}
 	}
 
 	if (desktop.available && runsLocalServer) void startLocal();
 
-	async function tick(): Promise<void> {
+	async function tick(mine: number): Promise<void> {
 		try {
 			const status = await desktop.status();
+			if (mine !== watch) return;
 			stage = status.stage;
+			progress = status.progress ?? null;
+			importState = status.import ?? 'idle';
+			warnings = status.warnings ?? [];
 			if (status.error) {
 				localError = status.error;
 				return;
 			}
 			if (status.stage === 'ready' && status.address) {
+				// The setup code is handed out once: keep it while the warnings are read.
+				if (warnings.length > 0) {
+					started = { address: status.address, setupCode: status.setupCode };
+					return;
+				}
 				finish(status.address, true, status.setupCode);
 				return;
 			}
 		} catch (err) {
-			localError = bridgeError(err, 'Lost contact with the server process.');
+			if (mine === watch) localError = bridgeError(err, 'Lost contact with the server process.');
 			return;
 		}
-		poll = setTimeout(tick, 700);
+		poll = setTimeout(() => void tick(mine), 700);
 	}
 
 	async function showLog(): Promise<void> {
@@ -91,6 +138,7 @@
 	}
 
 	onDestroy(() => {
+		watch++;
 		if (poll) clearTimeout(poll);
 	});
 
@@ -194,10 +242,18 @@
 	</Onboarding>
 {:else if view === 'local'}
 	<Onboarding
-		title={localError ? 'komiq could not start' : 'Starting komiq'}
+		title={localError
+			? 'komiq could not start'
+			: started
+				? 'komiq started, with a note'
+				: 'Starting komiq'}
 		lead={localError
 			? 'One step failed. Retry, or read the log for the cause.'
-			: 'This takes a few seconds the first time.'}
+			: started
+				? 'komiq is running. Read this before you continue.'
+				: importState === 'converting'
+					? 'Your library is being moved to the new database. This can take a while. Keep the app open.'
+					: 'This takes a few seconds the first time.'}
 	>
 		<ul class="steps">
 			{#each localSteps as s (s.stage)}
@@ -217,7 +273,9 @@
 						{state === 'done'
 							? 'Running'
 							: state === 'running'
-								? 'Starting…'
+								? s.stage === 'server'
+									? serverText()
+									: 'Starting…'
 								: state === 'failed'
 									? 'Failed'
 									: 'Waiting'}
@@ -225,16 +283,35 @@
 				</li>
 			{/each}
 		</ul>
-		{#if localError}
-			<p class="k-error" role="alert">{localError}</p>
-			{#if log}<pre class="log">{log}</pre>{/if}
+		{#if progress && importState === 'converting' && !localError}
+			<p class="k-hint" role="status">{progress}</p>
 		{/if}
+		{#if warnings.length > 0}
+			<ul class="notes" role="status">
+				{#each warnings as warning (warning)}
+					<li>{warning}</li>
+				{/each}
+			</ul>
+		{/if}
+		{#if localError}
+			<p class="k-error cause" role="alert">{localError}</p>
+		{/if}
+		{#if log}<pre class="log">{log}</pre>{/if}
 		{#snippet footer()}
 			<Button variant="ghost" icon="arrow-left" onclick={() => (view = 'choose')}>Back</Button>
 			{#if localError}
 				<div class="row">
 					{#if !log}<Button variant="ghost" onclick={showLog}>Show log</Button>{/if}
 					<Button variant="primary" icon="refresh" onclick={startLocal}>Retry</Button>
+				</div>
+			{:else if started}
+				<div class="row">
+					{#if !log}<Button variant="ghost" onclick={showLog}>Show log</Button>{/if}
+					<Button
+						variant="primary"
+						onclick={() => started && finish(started.address, true, started.setupCode)}
+						>Continue</Button
+					>
 				</div>
 			{/if}
 		{/snippet}
@@ -361,6 +438,28 @@
 		font-size: var(--k-text-xs);
 		line-height: 1.6;
 		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+	}
+	/* Warnings of a start that went on: soft fill, no outline, like the steps. */
+	.notes {
+		display: grid;
+		gap: 2px;
+		margin: 0;
+		padding: 0;
+		list-style: none;
+	}
+	.notes li {
+		padding: 12px 14px;
+		border-radius: var(--k-radius);
+		background: var(--k-surface-2);
+		color: var(--k-text-2);
+		font-size: var(--k-text-sm);
+		line-height: 1.5;
+		overflow-wrap: anywhere;
+	}
+	/* A failed conversion lists the server's repair output on lines of its own. */
+	.cause {
+		white-space: pre-line;
 		overflow-wrap: anywhere;
 	}
 	.row {

@@ -1,13 +1,137 @@
+<div align="center">
+
+<img src="./assets/brand/mark.png" alt="komiq" height="96">
+
 # komiq
 
-Komiq is an AGPL-licensed manga and comics reader built from one codebase for the
-web, desktop, iOS, and Android. It uses Suwayomi as its content engine and adds a
-social layer. [`komiq.cc`](https://komiq.cc) is a free, work-in-progress demo of
-the apps; it is not an official publisher or content service.
+**A self-hostable, open-source reader for manga and comics.**<br>
+One codebase for the web, desktop, iOS and Android.
 
-See [`SPEC.md`](./SPEC.md) for the full architecture.
+[![Docs](https://img.shields.io/badge/docs-docs.komiq.cc-e0836a)](https://docs.komiq.cc)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--only-e0836a)](./LICENSE)
+[![Status](https://img.shields.io/badge/status-work%20in%20progress-0c0c0d)](#status)
 
-## How content works
+![SvelteKit](https://img.shields.io/badge/SvelteKit-0c0c0d?logo=svelte&logoColor=ff3e00)
+![Tauri](https://img.shields.io/badge/Tauri-0c0c0d?logo=tauri&logoColor=ffc131)
+![Rust](https://img.shields.io/badge/Rust-0c0c0d?logo=rust&logoColor=white)
+![GraphQL](https://img.shields.io/badge/GraphQL-0c0c0d?logo=graphql&logoColor=e10098)
+![SQLite](https://img.shields.io/badge/SQLite-0c0c0d?logo=sqlite&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-0c0c0d?logo=docker&logoColor=2496ed)
+
+[Docs](https://docs.komiq.cc) · [Try the demo](https://komiq.cc) ·
+[Host a server](https://docs.komiq.cc/self-host) ·
+[Developers](https://docs.komiq.cc/developers)
+
+</div>
+
+## What komiq is
+
+Komiq gives you one place to browse, read and organize manga and comics from the sources you
+add. You host it yourself. It has two apps:
+
+| App            | What it does                                                                                                                                   |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Admin app**  | The server and its management console in one. You run it on your computer with the desktop app, or with Docker on a home server or a VPS.      |
+| **Reader app** | What you read with. It runs in a browser, on desktop, on iOS and on Android. It connects to a komiq server on your network or on the internet. |
+
+With the reader app you can:
+
+- search and browse a catalog of series,
+- read chapters in a paged or long-strip reader,
+- keep a personal library and your reading progress,
+- write reviews and comment on chapters.
+
+Komiq is reading software. It is not a publisher or a content service, and it does not come
+with content. You add your own sources.
+
+[`komiq.cc`](https://komiq.cc) is the project's free, work-in-progress demo. You read on it in a
+browser. For now, the desktop and mobile apps connect to self-hosted servers only.
+
+## How it works
+
+```mermaid
+flowchart LR
+    reader["Reader app<br>web, desktop, iOS, Android"]
+
+    subgraph admin["Admin app (you host this)"]
+        direction TB
+        console["Admin console<br>/admin"]
+        server["komiq server<br>accounts, catalog, library, comments"]
+        engine["Suwayomi engine<br>source extensions"]
+        console --> server
+        server --> engine
+    end
+
+    sources[("Third-party<br>sources")]
+
+    reader -- "GraphQL" --> server
+    engine -- "series and chapter lists" --> sources
+    reader -. "page images, on demand" .-> sources
+```
+
+1. **You run the admin app.** It starts the komiq server and the source engine. The engine is
+   [Suwayomi-Server](https://github.com/Suwayomi/Suwayomi-Server), which talks to sources through
+   extensions.
+2. **You add sources in the admin console.** The server builds a catalog from them: series,
+   authors, tags and chapter lists. It merges the same series from different sources into one
+   entry.
+3. **You connect the reader app to your server.** The app takes an IP address and port, a domain
+   or a pasted link. A phone can also scan a QR code. The app asks the server for data over
+   GraphQL.
+4. **You open a chapter.** The pages are fetched from the source at that moment. A browser
+   usually gets them through an image proxy. The desktop and mobile apps can fetch them directly.
+
+The self-host server keeps accounts, libraries, reviews, comments and the catalog in PostgreSQL. It keeps
+small cover thumbnails. It does not keep a permanent archive of chapter pages.
+
+Read more: [What komiq is](https://docs.komiq.cc/start/what-is-komiq) ·
+[How it works](https://docs.komiq.cc/start/how-it-works)
+
+## Get started
+
+| You want to                             | Go to                                                                                                        |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Try komiq in a browser                  | [komiq.cc](https://komiq.cc)                                                                                 |
+| Pick the setup that suits you           | [Choose your setup](https://docs.komiq.cc/start/choose-your-setup)                                           |
+| Host a server on your computer          | [Run the desktop app](https://docs.komiq.cc/self-host/desktop-app)                                           |
+| Host a server on a home server or a VPS | [Install with Docker](https://docs.komiq.cc/self-host/docker)                                                |
+| Read on your own server                 | [Get the reader app](https://docs.komiq.cc/guide/apps) and [connect it](https://docs.komiq.cc/guide/connect) |
+
+A fresh install opens the setup screens in the browser. The Docker steps are also in this
+repository: [`docs/self-host.md`](./docs/self-host.md).
+
+## Developers
+
+All developer documentation lives at **[docs.komiq.cc/developers](https://docs.komiq.cc/developers)**.
+Start there, not here.
+
+The `codex/postgres-phase3` development branch uses PostgreSQL for the main server
+database and SQLite for covers and import sources. Its migration status and test
+commands are in [the Phase 3 integration record](docs/audits/postgres-phase3-integration.md).
+Production repair, deployment and desktop PostgreSQL packaging remain pending.
+
+| Page                                                                 | What it covers                            |
+| -------------------------------------------------------------------- | ----------------------------------------- |
+| [Architecture](https://docs.komiq.cc/developers/architecture)        | The parts of komiq and how they talk      |
+| [Repository layout](https://docs.komiq.cc/developers/repository)     | Where each app and package lives          |
+| [Run it locally](https://docs.komiq.cc/developers/local-development) | Tools, install steps and the dev commands |
+| [Testing](https://docs.komiq.cc/developers/testing)                  | How to check your change                  |
+| [Contributing](https://docs.komiq.cc/developers/contributing)        | How to send a change                      |
+
+The repository in one look:
+
+| Path             | What                                                             |
+| ---------------- | ---------------------------------------------------------------- |
+| `apps/reader`    | The reader app (SvelteKit, with a Tauri shell for native builds) |
+| `apps/admin`     | The admin console and the desktop app that starts the server     |
+| `apps/server`    | The komiq server (Rust, GraphQL, PostgreSQL; SQLite covers)       |
+| `apps/worker`    | The optional image proxy (Cloudflare Worker)                     |
+| `apps/docs`      | The docs site, docs.komiq.cc                                     |
+| `packages/api`   | The data layer the apps share                                    |
+| `packages/types` | Shared domain types                                              |
+| `packages/ui`    | Design tokens and shared components                              |
+
+## How content is handled
 
 - Eligible community members can add third-party sources. A source added through
   that process becomes available globally without the Komiq operator selecting it
@@ -50,57 +174,11 @@ These policies describe services operated by the Komiq project, including the WI
 demo. A person who redistributes or self-hosts the software must provide policies and
 processes appropriate to their own deployment.
 
-## Self-host
-
-Run your own komiq server with Docker: [`docs/self-host.md`](./docs/self-host.md).
-A fresh install opens the setup screens in the browser.
-
-## Prerequisites
-
-- Node ≥ 20, **pnpm** (`corepack enable`)
-- Rust (stable) — for the desktop/mobile shell
-- Xcode (iOS), Android SDK/NDK (Android)
-
-## Setup
-
-```sh
-pnpm install
-```
-
-## Develop
-
-```sh
-pnpm dev:reader          # reader app (web) at http://localhost:5173
-pnpm dev:admin           # admin console at http://localhost:5273
-pnpm dev:docs            # docs site at http://localhost:5410
-
-# desktop app (Rust + webview)
-pnpm --filter @komika/reader desktop:dev
-```
-
-## Build
-
-```sh
-pnpm build               # all packages + apps (static SPAs)
-pnpm --filter @komika/reader desktop:build   # desktop binaries
-```
-
-## Workspace
-
-| Package          | What                                             |
-| ---------------- | ------------------------------------------------ |
-| `@komika/reader` | user app (SvelteKit SPA + `src-tauri` Rust core) |
-| `@komika/admin`  | admin "manga DB" console (web-only SPA)          |
-| `@komika/docs`   | docs site, docs.komiq.cc (prerendered)           |
-| `@komika/types`  | shared domain types                              |
-| `@komika/api`    | data layer — `Backend` + `ImageProvider`         |
-| `@komika/ui`     | design tokens + shared components                |
-
 ## Status
 
 Work in progress. The hosted web build is a demo of the desktop and mobile apps;
 features, data flows, and deployment details may change before a production release.
-See [`SPEC.md`](./SPEC.md) for current implementation notes and known limitations.
+See the [docs](https://docs.komiq.cc) for the current behaviour of each part.
 
 ## License
 

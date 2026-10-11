@@ -1,0 +1,158 @@
+{
+  "data": {
+    "search": {
+      "items": [
+        {
+          "altTitles": [],
+          "artist": "Artist 13",
+          "author": "Author 13",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000013.webp",
+          "createdAt": "2020-01-05T01:02:03.123000+00:00",
+          "description": "Description 13: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Action"
+          ],
+          "id": "w_00000000000040008000000000000013",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "13",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 6.3,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "HIATUS",
+          "title": "Chronicle Moon",
+          "type": "MANHUA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 8",
+          "author": "Author 8",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000008.webp",
+          "createdAt": "2020-01-08T01:02:03.000000+00:00",
+          "description": "Description 8: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Romance"
+          ],
+          "id": "w_00000000000040008000000000000008",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "8",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": null,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "HIATUS",
+          "title": "Sun",
+          "type": "MANHUA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 3",
+          "author": "Author 3",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000003.webp",
+          "createdAt": "2020-01-03T01:02:03.000000+00:00",
+          "description": "Description 3: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Action"
+          ],
+          "id": "w_00000000000040008000000000000003",
+          "isFavorite": false,
+          "isMarked": true,
+          "isNsfw": false,
+          "latestChapter": "3",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 5.3,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "HIATUS",
+          "title": "Café Chronicle",
+          "type": "MANHUA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        }
+      ],
+      "total": 3
+    },
+    "updatesFeed": {
+      "items": [
+        {
+          "announcedAt": "2020-01-01T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000013",
+          "releasedAt": "2020-01-01T01:02:03.000000+00:00",
+          "workId": "w_00000000000040008000000000000013"
+        },
+        {
+          "announcedAt": "2020-01-01T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000008",
+          "releasedAt": "2020-01-01T01:02:03.000000+00:00",
+          "workId": "w_00000000000040008000000000000008"
+        },
+        {
+          "announcedAt": "2020-01-01T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000003",
+          "releasedAt": "2020-01-01T01:02:03.000000+00:00",
+          "workId": "w_00000000000040008000000000000003"
+        }
+      ],
+      "total": 3
+    }
+  }
+}

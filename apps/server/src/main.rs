@@ -10,6 +10,7 @@ mod cover;
 mod cover_recompress;
 mod database;
 mod db;
+mod db_types;
 mod dedup;
 mod discovery;
 mod ext_icon;
@@ -19,23 +20,36 @@ mod img_proxy;
 mod ingest;
 mod instance;
 mod lan;
+mod locks;
 mod maintenance;
 mod mangadex;
 mod media;
 mod notify;
+mod pg_export;
+mod pg_import;
 mod phase_f;
 mod phash;
+#[cfg(test)]
+#[path = "../bench/postgres_contention.rs"]
+mod postgres_contention;
 mod rate_limit;
 mod request_budget;
 mod scanlators;
 mod scanner;
+mod search;
 mod series_cache;
 mod setup_cli;
 mod source_health;
+mod sql_params;
+mod sqlite_database;
+#[cfg(test)]
+mod sqlite_placeholder_tests;
 mod suwayomi;
 mod sync;
 mod tags;
 mod task;
+#[cfg(test)]
+mod test_postgres;
 #[cfg(test)]
 mod upstream_admission_tests;
 mod upstream_cache;
@@ -269,7 +283,7 @@ struct RouterState {
     request_budgets: Arc<request_budget::RequestBudgets>,
     /// Un-replicated cover-cache DB (`work_cover_blob`); served by `serve_cover`.
     /// A newtype (`CoverDb`) distinguishes it from the main `pool` in `FromRef`.
-    cover_pool: crate::db::Database,
+    cover_pool: crate::db::SqliteDatabase,
     trusted_proxies: Arc<TrustedProxies>,
     /// Per-user sliding-window limiter for the CPU-bound upload routes
     /// (`/avatar`, `/comment-media`), so a single account can't flood the
@@ -292,12 +306,24 @@ impl FromRef<RouterState> for crate::db::Database {
 /// A reserved query-only connection keeps reader-pool contention from turning a
 /// healthy process into an unhealthy readiness probe.
 #[derive(Clone)]
-struct ReadyDb(sqlx::SqlitePool);
+struct ReadyDb(sqlx::PgPool);
 impl ReadyDb {
     async fn connect(pool: &crate::db::Database) -> Result<Self, sqlx::Error> {
-        sqlx::sqlite::SqlitePoolOptions::new()
+        sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(std::time::Duration::from_secs(3))
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    db::apply_session_limits(connection, db::Lane::Readers).await?;
+                    sqlx::query("SET default_transaction_read_only = on")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("SET TIME ZONE 'UTC'")
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect_with(pool.connect_options().as_ref().clone())
             .await
             .map(Self)
@@ -316,7 +342,7 @@ impl FromRef<RouterState> for Arc<request_budget::RequestBudgets> {
 /// Newtype for the cover-cache pool so a handler can extract it via `State`
 /// without colliding with the main-pool `FromRef<RouterState> for Database`.
 #[derive(Clone)]
-struct CoverDb(crate::db::Database);
+struct CoverDb(crate::db::SqliteDatabase);
 impl FromRef<RouterState> for CoverDb {
     fn from_ref(s: &RouterState) -> Self {
         CoverDb(s.cover_pool.clone())
@@ -455,6 +481,7 @@ fn database_error_response(
     message: &str,
 ) -> axum::response::Response {
     let error = error.into();
+    db::observe_database_error(&error);
     if error.chain().any(|cause| {
         cause.downcast_ref::<sqlx::Error>().is_some_and(|cause| {
             matches!(cause, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
@@ -706,7 +733,7 @@ async fn upload_avatar(
         Ok(None) => return avatar_error(StatusCode::UNAUTHORIZED, "Not authenticated"),
         Err(e) => {
             tracing::warn!(error = %e, "avatar upload: token lookup failed");
-            return database_error_response(e, "Internal error");
+            return database_error_response(db::observed_read_database_error(e), "Internal error");
         }
     };
     if limiter.check(&format!("upload:{}", user.id)).is_err() {
@@ -732,7 +759,7 @@ async fn upload_avatar(
                             return avatar_error(
                                 StatusCode::BAD_REQUEST,
                                 "Upload too large or could not be read",
-                            )
+                            );
                         }
                     }
                 }
@@ -764,29 +791,34 @@ async fn upload_avatar(
     // Millisecond granularity so two uploads within the same second still produce
     // distinct `?v=` values (the served avatar is immutable/1-year-cached).
     let version = chrono::Utc::now().timestamp_millis();
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::db_types::truncate_date(chrono::Utc::now());
     let url = avatar::avatar_url(&user.id, version);
     // Upsert the BLOB and repoint the user row in one transaction so the stored
     // `avatar_url` version can never disagree with the bytes on record.
     let stored = async {
         let mut tx = pool.begin().await?;
+        anyhow::ensure!(
+            crate::locks::lock_user(&mut tx, &user.id).await?,
+            "user no longer exists"
+        );
         sqlx::query(
-            "INSERT INTO user_avatars (user_id, webp, version, updated_at) VALUES (?, ?, ?, ?) \
+            "INSERT INTO user_avatars (user_id, webp, version, updated_at) VALUES ($1, $2, $3, $4) \
              ON CONFLICT(user_id) DO UPDATE SET \
                webp = excluded.webp, version = excluded.version, updated_at = excluded.updated_at",
         )
-        .bind(&user.id)
+        .bind(uuid::Uuid::parse_str(&user.id).expect("stored user UUID"))
         .bind(&webp)
         .bind(version)
-        .bind(&now)
+        .bind(now)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("UPDATE users SET avatar_url = ? WHERE id = ?")
+        sqlx::query("UPDATE users SET avatar_url = $1 WHERE id = $2")
             .bind(&url)
-            .bind(&user.id)
+            .bind(uuid::Uuid::parse_str(&user.id).expect("stored user UUID"))
             .execute(&mut *tx)
             .await?;
-        tx.commit().await
+        tx.commit().await?;
+        Ok::<_, anyhow::Error>(())
     }
     .await;
     if let Err(e) = stored {
@@ -816,7 +848,7 @@ async fn upload_cover(
         Ok(None) => return avatar_error(StatusCode::UNAUTHORIZED, "Not authenticated"),
         Err(e) => {
             tracing::warn!(error = %e, "cover upload: token lookup failed");
-            return database_error_response(e, "Internal error");
+            return database_error_response(db::observed_read_database_error(e), "Internal error");
         }
     };
     if user.is_admin == 0 {
@@ -830,7 +862,7 @@ async fn upload_cover(
     }
     // Guard against an unknown work id (the FK would also reject, but a clear 404 is
     // friendlier and avoids processing an image we can't attach).
-    match sqlx::query_scalar::<_, i64>("SELECT 1 FROM work WHERE id = ?")
+    match sqlx::query_scalar::<_, i64>("SELECT 1::bigint FROM work WHERE id = $1")
         .bind(&work_id)
         .fetch_optional(&app.pool)
         .await
@@ -839,7 +871,10 @@ async fn upload_cover(
         Ok(None) => return avatar_error(StatusCode::NOT_FOUND, "No such work"),
         Err(e) => {
             tracing::warn!(error = %e, "cover upload: work lookup failed");
-            return database_error_response(e, "Internal error");
+            return database_error_response(
+                db::observed_read_database_error(e.into()),
+                "Internal error",
+            );
         }
     }
 
@@ -858,7 +893,7 @@ async fn upload_cover(
                             return avatar_error(
                                 StatusCode::BAD_REQUEST,
                                 "Upload too large or could not be read",
-                            )
+                            );
                         }
                     }
                 }
@@ -896,10 +931,11 @@ async fn upload_cover(
     // Report the freshly-versioned URL so the admin UI can show the new cover
     // immediately (cache-busted by the stored version).
     let version =
-        sqlx::query_scalar::<_, Option<i64>>("SELECT cover_cached_version FROM work WHERE id = ?")
+        sqlx::query_scalar::<_, Option<i64>>("SELECT cover_cached_version FROM work WHERE id = $1")
             .bind(&work_id)
             .fetch_optional(&app.pool)
             .await
+            .inspect_err(db::record_read_database_error)
             .ok()
             .flatten()
             .flatten();
@@ -950,10 +986,11 @@ async fn serve_ext_icon(
     // after. The repo is the one the engine reports for the package — first from the
     // catalogue's record of installed extensions, then the engine's store listing.
     let recorded: Option<String> =
-        sqlx::query_scalar("SELECT repo_url FROM source_extension WHERE pkg_name = ? LIMIT 1")
+        sqlx::query_scalar("SELECT repo_url FROM source_extension WHERE pkg_name = $1 LIMIT 1")
             .bind(pkg)
             .fetch_optional(&app.pool)
             .await
+            .inspect_err(db::record_read_database_error)
             .ok()
             .flatten();
     let engine = match recorded {
@@ -1014,8 +1051,11 @@ async fn serve_avatar(
     let Some(user_id) = file.strip_suffix(".webp") else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let Ok(user_id) = crate::db_types::uuid(user_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let webp: Option<Vec<u8>> =
-        match sqlx::query_scalar("SELECT webp FROM user_avatars WHERE user_id = ?")
+        match sqlx::query_scalar("SELECT webp FROM user_avatars WHERE user_id = $1")
             .bind(user_id)
             .fetch_optional(&pool)
             .await
@@ -1023,7 +1063,10 @@ async fn serve_avatar(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "avatar read failed");
-                return database_error_response(e, "Internal error");
+                return database_error_response(
+                    db::observed_read_database_error(e.into()),
+                    "Internal error",
+                );
             }
         };
     match webp {
@@ -1058,13 +1101,13 @@ async fn serve_cover(
     // `?v=` (cache bust) is ignored here; only `?w=` changes what we serve.
     let width = cover::variant_width(query_param(&query, "w"));
     // Fast path: already-cached blob.
-    match sqlx::query_scalar::<_, Vec<u8>>("SELECT webp FROM work_cover_blob WHERE work_id = ?")
+    match sqlx::query_scalar::<_, Vec<u8>>("SELECT webp FROM work_cover_blob WHERE work_id = $1")
         .bind(work_id)
         .fetch_optional(&pool)
         .await
     {
         Ok(Some(bytes)) => {
-            return cover_response_at_width(&pool, work_id, width, bytes).await;
+            return cover_response_at_width(&app.pool, &pool, work_id, width, bytes).await;
         }
         Ok(None) => {} // fall through to lazy fetch
         Err(e) => {
@@ -1103,11 +1146,21 @@ async fn serve_cover(
             let main = app.pool.clone();
             let covers = pool.clone();
             app.pool.defer(async move {
-                cover::put_work_cover(&main, &covers, &work, &bytes).await?;
-                cover::clear_cover_issue(&main, &work).await;
+                if cover::put_work_cover_for_missing_anchor(
+                    &main,
+                    &covers,
+                    &work,
+                    &bytes,
+                    &mangadex_id,
+                    &file_name,
+                )
+                .await?
+                {
+                    cover::clear_cover_issue(&main, &work).await;
+                }
                 Ok(())
             });
-            cover_response_at_width(&pool, work_id, width, webp).await
+            cover_response_at_width(&app.pool, &pool, work_id, width, webp).await
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, work_id, "lazy cover resize failed; redirecting to CDN");
@@ -1175,7 +1228,10 @@ async fn serve_suwayomi_image(
             Ok(true) => return StatusCode::NOT_FOUND.into_response(),
             Err(e) => {
                 tracing::warn!(error = %e, "suwayomi page: block rules unreadable");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                return database_error_response(
+                    db::observed_read_database_error(e),
+                    "Internal error",
+                );
             }
         }
     }
@@ -1250,13 +1306,13 @@ fn thumbnail_manga_id(rest: &str) -> Option<i64> {
 /// resize is retried on a later request.
 async fn serve_suwayomi_cover(
     app: &graphql::AppState,
-    covers: &crate::db::Database,
+    covers: &crate::db::SqliteDatabase,
     manga_id: i64,
     width: Option<u32>,
 ) -> axum::response::Response {
     let variant_key = cover::suwayomi_variant_key(manga_id);
     if let Some(webp) = cover::get_suwayomi_cover(covers, manga_id).await {
-        return cover_response_at_width(covers, &variant_key, width, webp).await;
+        return cover_response_at_width(&app.pool, covers, &variant_key, width, webp).await;
     }
     let path = format!("/api/v1/manga/{manga_id}/thumbnail");
     let work = cover::master_cover_work().await;
@@ -1300,8 +1356,12 @@ async fn serve_suwayomi_cover(
         Ok(Ok(webp)) => {
             let writer = covers.clone();
             let bytes = webp.clone();
-            covers.defer(async move { cover::put_suwayomi_cover(&writer, manga_id, &bytes).await });
-            cover_response_at_width(covers, &variant_key, width, webp).await
+            let main = app.pool.background();
+            app.pool.defer(async move {
+                cover::publish_suwayomi_cover_if_missing(&main, &writer, manga_id, &bytes).await?;
+                Ok(())
+            });
+            cover_response_at_width(&app.pool, covers, &variant_key, width, webp).await
         }
         Ok(Err((err, bytes))) => {
             tracing::warn!(error = %err, manga_id, "suwayomi cover resize failed; serving raw");
@@ -1325,19 +1385,32 @@ async fn serve_suwayomi_cover(
 ///
 /// Deliberately un-deduplicated: N concurrent misses for the SAME cover can each spawn a
 /// task and fetch the same bytes. With the pool at 4 the waste is bounded and a
-/// single-flight map would need its own eviction; the second writer simply overwrites an
-/// identical blob.
+/// single-flight map would need its own eviction.
+///
+/// The store is `cover::publish_suwayomi_cover_if_missing` on the background lane: it
+/// takes the asset guard (PostgreSQL Cover key plus the process-local asset mutex) and
+/// looks for the blob again under it. So the second of two tasks stores nothing, and a
+/// fetch that was slow cannot replace a master that the miss path, the warmer or a
+/// re-save published while it was in flight (T080/T169). The old covers-only writer
+/// overwrote whatever was there and dropped that master's derivatives. Fetch and encode
+/// happen before the call, with no database connection held.
+///
+/// Returns the task so a test can await it; the request path drops the handle.
 fn spawn_suwayomi_cover_materialize(
     app: &graphql::AppState,
-    covers: &crate::db::Database,
+    covers: &crate::db::SqliteDatabase,
     manga_id: i64,
-) {
-    let Some(slot) = app.suwayomi.try_background_slot() else {
-        return; // background pool full — the drainer's warmer will get to it
-    };
+) -> Option<tokio::task::JoinHandle<()>> {
+    // Background pool full: the drainer's warmer will get to it.
+    let slot = app.suwayomi.try_background_slot()?;
     let suwayomi = app.suwayomi.clone();
     let covers = covers.clone();
-    tokio::spawn(async move {
+    // Captured here, not read in the task: the task is detached, so it must not depend
+    // on the request's lane scope, and it outlives the borrow of `app`.
+    let main = app.pool.background();
+    #[cfg(test)]
+    let pause = COVER_RESPONSE_PAUSE.try_with(Clone::clone).ok();
+    Some(tokio::spawn(async move {
         let _slot = slot; // held for the task's lifetime: this is the fan-out bound
         let path = format!("/api/v1/manga/{manga_id}/thumbnail");
         let work = cover::master_cover_work().await;
@@ -1345,11 +1418,19 @@ fn spawn_suwayomi_cover_materialize(
             return;
         };
         if let Ok(Ok(webp)) = work.process(move || cover::process_cover(&bytes)).await {
-            if let Err(e) = cover::put_suwayomi_cover(&covers, manga_id, &webp).await {
+            #[cfg(test)]
+            if let Some(points) = pause {
+                points.hit("materialize-fetched").await;
+            }
+            let stored =
+                cover::publish_suwayomi_cover_if_missing(&main, &covers, manga_id, &webp).await;
+            if let Err(e) = stored {
+                // Terminal boundary of a detached task: count the database cause once.
+                db::observe_database_error(&e);
                 tracing::warn!(error = %e, manga_id, "background suwayomi cover store failed");
             }
         }
-    });
+    }))
 }
 
 /// Response for a cover that isn't materialized yet and can't be fetched right now
@@ -1420,7 +1501,8 @@ fn query_param<'a>(raw: &'a Option<String>, key: &str) -> Option<&'a str> {
 /// Every failure mode falls back to the master: a cover that renders slightly too large
 /// is strictly better than a hole in the grid.
 async fn cover_response_at_width(
-    covers: &crate::db::Database,
+    main: &crate::db::Database,
+    covers: &crate::db::SqliteDatabase,
     asset_key: &str,
     width: Option<u32>,
     master: Vec<u8>,
@@ -1444,6 +1526,10 @@ async fn cover_response_at_width(
     }
     // Decode + Lanczos3 resize + WebP encode is CPU-bound; keep it off the async runtime
     // exactly like `process_cover`'s callers do.
+    #[cfg(test)]
+    if let Ok(points) = COVER_RESPONSE_PAUSE.try_with(Clone::clone) {
+        points.hit("derivative-master-read").await;
+    }
     let source = master.clone();
     let made = resize_cover_variant(permit, move || cover::downscale_variant(&source, w)).await;
     match made {
@@ -1453,8 +1539,10 @@ async fn cover_response_at_width(
             let writer = covers.clone();
             let asset = asset_key.to_owned();
             let cached = bytes.clone();
-            covers
-                .defer(async move { cover::put_cover_variant(&writer, &asset, w, &cached).await });
+            let database = main.background();
+            main.defer(async move {
+                cover::put_current_variant(&database, &writer, &asset, w, &master, &cached).await
+            });
             webp_cover_response(bytes)
         }
         Ok(Err(e)) => {
@@ -1549,7 +1637,7 @@ async fn upload_comment_media(
         Ok(None) => return avatar_error(StatusCode::UNAUTHORIZED, "Not authenticated"),
         Err(e) => {
             tracing::warn!(error = %e, "comment media upload: token lookup failed");
-            return database_error_response(e, "Internal error");
+            return database_error_response(db::observed_read_database_error(e), "Internal error");
         }
     };
     if limiter.check(&format!("upload:{}", user.id)).is_err() {
@@ -1558,23 +1646,6 @@ async fn upload_comment_media(
             "Too many uploads — please slow down",
         );
     }
-    // Cap the number of staged (unattached) uploads a user can accumulate, so the
-    // GC-eligible backlog can't be inflated faster than it's swept. 20 pending
-    // drafts is far more than any real compose flow needs.
-    let staged: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM comment_media WHERE user_id = ? AND comment_id IS NULL",
-    )
-    .bind(&user.id)
-    .fetch_one(&pool)
-    .await
-    .unwrap_or(0);
-    if staged >= 20 {
-        return avatar_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many pending image uploads — post or discard some first",
-        );
-    }
-
     // Take the first file part (the reader sends a single `image` field).
     let mut data: Option<Vec<u8>> = None;
     loop {
@@ -1591,7 +1662,7 @@ async fn upload_comment_media(
                             return avatar_error(
                                 StatusCode::BAD_REQUEST,
                                 "Upload too large or could not be read",
-                            )
+                            );
                         }
                     }
                 }
@@ -1621,19 +1692,49 @@ async fn upload_comment_media(
     };
 
     let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let stored = sqlx::query(
-        "INSERT INTO comment_media (id, comment_id, user_id, webp, width, height, created_at) \
-         VALUES (?, NULL, ?, ?, ?, ?, ?)",
-    )
-    .bind(&id)
-    .bind(&user.id)
-    .bind(&processed.webp)
-    .bind(processed.width as i64)
-    .bind(processed.height as i64)
-    .bind(&now)
-    .execute(&pool)
+    let now = crate::db_types::truncate_date(chrono::Utc::now());
+    let stored: anyhow::Result<bool> = async {
+        let mut tx = pool.begin().await?;
+        anyhow::ensure!(
+            crate::locks::lock_user(&mut tx, &user.id).await?,
+            "user no longer exists"
+        );
+        #[cfg(test)]
+        if let Ok(points) = UPLOAD_MEDIA_PAUSE.try_with(Clone::clone) {
+            points.hit("media-user-locked").await;
+        }
+        let staged: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM comment_media WHERE user_id = $1 AND comment_id IS NULL",
+        )
+        .bind(crate::db_types::uuid(&user.id)?)
+        .fetch_one(&mut *tx)
+        .await?;
+        if staged >= 20 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO comment_media (id, comment_id, user_id, webp, width, height, created_at) \
+         VALUES ($1, NULL, $2, $3, $4, $5, $6)",
+        )
+        .bind(uuid::Uuid::parse_str(&id).expect("generated media UUID"))
+        .bind(uuid::Uuid::parse_str(&user.id).expect("stored user UUID"))
+        .bind(&processed.webp)
+        .bind(processed.width as i64)
+        .bind(processed.height as i64)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
     .await;
+    if matches!(stored, Ok(false)) {
+        return avatar_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many pending image uploads — post or discard some first",
+        );
+    }
     if let Err(e) = stored {
         tracing::error!(error = %e, "comment media save failed");
         return database_error_response(e, "Could not save image");
@@ -1658,8 +1759,11 @@ async fn serve_comment_media(
     let Some(id) = file.strip_suffix(".webp") else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let Ok(id) = crate::db_types::uuid(id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let webp: Option<Vec<u8>> =
-        match sqlx::query_scalar("SELECT webp FROM comment_media WHERE id = ?")
+        match sqlx::query_scalar("SELECT webp FROM comment_media WHERE id = $1")
             .bind(id)
             .fetch_optional(&pool)
             .await
@@ -1667,7 +1771,10 @@ async fn serve_comment_media(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "comment media read failed");
-                return database_error_response(e, "Internal error");
+                return database_error_response(
+                    db::observed_read_database_error(e.into()),
+                    "Internal error",
+                );
             }
         };
     match webp {
@@ -1704,30 +1811,34 @@ async fn metrics(State(pool): State<crate::db::Database>) -> impl IntoResponse {
         sqlx::query_scalar::<_, i64>(sql)
             .fetch_one(pool)
             .await
-            .unwrap_or(-1)
+            .unwrap_or_else(|error| {
+                db::record_read_database_error(&error);
+                -1
+            })
     }
 
-    let mut wal_path = pool.connect_options().get_filename().as_os_str().to_owned();
-    wal_path.push("-wal");
-    let wal_bytes = match std::fs::metadata(std::path::Path::new(&wal_path)) {
-        Ok(metadata) => metadata.len() as i64,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(_) => -1,
-    };
+    let wal_bytes = scalar(
+        &pool,
+        "SELECT COALESCE(SUM(size), 0)::bigint FROM pg_ls_waldir()",
+    )
+    .await;
     let pool_size = pool.size();
     let pool_idle = pool.num_idle();
     let write_queue_wait = db::write_queue_wait_seconds();
     let write_queue_acquisitions = db::write_queue_acquisitions();
     let lock_errors = db::lock_error_count();
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::db_types::truncate_date(chrono::Utc::now());
     let scan_total = scalar(&pool, "SELECT COUNT(*) FROM series_scan_state").await;
     let scan_due = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM series_scan_state WHERE next_scan_at <= ?",
+        "SELECT COUNT(*) FROM series_scan_state WHERE next_scan_at <= $1",
     )
-    .bind(&now)
+    .bind(now)
     .fetch_one(&pool)
     .await
-    .unwrap_or(-1);
+    .unwrap_or_else(|error| {
+        db::record_read_database_error(&error);
+        -1
+    });
     let scan_failing = scalar(
         &pool,
         "SELECT COUNT(*) FROM series_scan_state WHERE consecutive_failures > 0",
@@ -1743,7 +1854,7 @@ async fn metrics(State(pool): State<crate::db::Database>) -> impl IntoResponse {
     let scan_max_minute_cluster = scalar(
         &pool,
         "SELECT COALESCE(MAX(c), 0) FROM (SELECT COUNT(*) c FROM series_scan_state \
-         WHERE next_scan_at IS NOT NULL GROUP BY substr(next_scan_at, 1, 16))",
+         WHERE next_scan_at IS NOT NULL GROUP BY date_trunc('minute', next_scan_at)) AS counts",
     )
     .await;
     let subs_total = scalar(&pool, "SELECT COUNT(*) FROM extension_subscription").await;
@@ -1754,17 +1865,17 @@ async fn metrics(State(pool): State<crate::db::Database>) -> impl IntoResponse {
     .await;
     let feed_rows = scalar(&pool, "SELECT COUNT(*) FROM feed_updates").await;
     let feed_age_secs = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT CAST((julianday('now') - julianday(MAX(latest_at))) * 86400 AS INTEGER) \
-         FROM feed_updates",
+        "SELECT FLOOR(EXTRACT(EPOCH FROM (now() - MAX(latest_at))))::bigint FROM feed_updates",
     )
     .fetch_one(&pool)
     .await
+    .inspect_err(db::record_read_database_error)
     .ok()
     .flatten()
     .unwrap_or(-1);
 
-    let body = format!(
-        "# HELP komika_sqlite_wal_bytes Main database WAL file size\n\
+    let mut body = format!(
+        "# HELP komika_sqlite_wal_bytes Current PostgreSQL WAL segment bytes\n\
          # TYPE komika_sqlite_wal_bytes gauge\n\
          komika_sqlite_wal_bytes {wal_bytes}\n\
          # HELP komika_sqlite_pool_connections Main database read pool connections\n\
@@ -1779,7 +1890,7 @@ async fn metrics(State(pool): State<crate::db::Database>) -> impl IntoResponse {
          # HELP komika_sqlite_write_queue_acquisitions_total Writer acquisitions\n\
          # TYPE komika_sqlite_write_queue_acquisitions_total counter\n\
          komika_sqlite_write_queue_acquisitions_total {write_queue_acquisitions}\n\
-         # HELP komika_sqlite_lock_errors_total Observed SQLite lock errors\n\
+         # HELP komika_sqlite_lock_errors_total Observed write lock errors and exhausted retries\n\
          # TYPE komika_sqlite_lock_errors_total counter\n\
          komika_sqlite_lock_errors_total {lock_errors}\n\
          # HELP komika_scan_state_total Series tracked by the scan scheduler\n\
@@ -1810,6 +1921,7 @@ async fn metrics(State(pool): State<crate::db::Database>) -> impl IntoResponse {
          # TYPE komika_feed_updates_newest_age_seconds gauge\n\
          komika_feed_updates_newest_age_seconds {feed_age_secs}\n"
     );
+    body.push_str(&db::database_counters().prometheus());
     (
         axum::http::StatusCode::OK,
         [(
@@ -1823,12 +1935,13 @@ async fn metrics(State(pool): State<crate::db::Database>) -> impl IntoResponse {
 /// Readiness: verifies the process can actually serve — i.e. the DB answers.
 /// For a load balancer / orchestrator readiness gate, not the liveness probe.
 async fn ready(State(ReadyDb(pool)): State<ReadyDb>) -> impl IntoResponse {
-    match sqlx::query_scalar::<_, i64>("SELECT 1")
+    match sqlx::query_scalar::<_, i64>("SELECT 1::bigint")
         .fetch_one(&pool)
         .await
     {
         Ok(_) => (axum::http::StatusCode::OK, "ready"),
         Err(e) => {
+            db::record_read_database_error(&e);
             tracing::warn!(error = %e, "readiness check failed");
             (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready")
         }
@@ -2039,7 +2152,11 @@ fn public_router(
         // of dropping the connection or killing the worker task.
         .layer(CatchPanicLayer::custom(handle_panic))
         .with_state(router_state);
-    app
+    app.layer(axum::middleware::from_fn(
+        |request: axum::extract::Request, next: axum::middleware::Next| async move {
+            crate::db::Database::foreground_scope(next.run(request)).await
+        },
+    ))
 }
 
 #[tokio::main]
@@ -2074,6 +2191,18 @@ async fn main() -> anyhow::Result<()> {
     if argv.first().map(String::as_str) == Some("setup") {
         return setup_cli::run(cfg.port, &argv[1..]).await;
     }
+    if matches!(
+        argv.first().map(String::as_str),
+        Some("import-sqlite-to-postgres" | "verify-sqlite-postgres")
+    ) {
+        return pg_import::run_cli(&argv).await;
+    }
+    if argv.first().map(String::as_str) == Some("export-postgres-to-sqlite") {
+        return pg_export::run_cli(&argv).await;
+    }
+    if argv.first().map(String::as_str) == Some("repair-upload-dates") {
+        return catalog::date_repair::run_cli(&argv[1..]).await;
+    }
     if argv.first().map(String::as_str) == Some("phase-f") {
         let pool = db::connect_existing(&cfg.database_url).await?;
         let cover_pool = db::connect_existing_covers(&cfg.covers_database_url).await?;
@@ -2088,7 +2217,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(?cfg, "starting komika-server");
 
-    let _data_directory_lock = db::DataDirectoryLock::acquire(&cfg.database_url)?;
+    // Keep the process-lifetime exclusion through the retained covers data
+    // directory. The PostgreSQL writer lease does not exclude a second server's
+    // background loops, and Phase 3 does not expand server concurrency.
+    let _data_directory_lock = db::DataDirectoryLock::acquire(&cfg.covers_database_url)?;
+    pg_import::startup::run(&cfg.database_url, &cfg.covers_database_url).await?;
     let pool = db::init(&cfg.database_url).await?;
     let ready_pool = ReadyDb::connect(&pool).await?;
     // Separate, un-replicated DB for cover blobs — see `db::init_covers`. Kept out
@@ -2175,7 +2308,10 @@ async fn main() -> anyhow::Result<()> {
     match ingest::mark_interrupted_jobs(&pool).await {
         Ok(0) => {}
         Ok(n) => tracing::warn!(n, "marked interrupted source-ingest jobs as failed"),
-        Err(e) => tracing::warn!(error = %e, "failed to sweep interrupted ingest jobs"),
+        Err(e) => {
+            db::observe_database_error(&e);
+            tracing::warn!(error = %e, "failed to sweep interrupted ingest jobs");
+        }
     }
 
     // Populate the materialized updates feed at boot (migration 0051), off the request
@@ -2196,7 +2332,10 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(20)).await;
             match crate::catalog::refresh_feed_updates(&pool).await {
                 Ok(n) => tracing::info!(works = n, "feed_updates: initial build complete"),
-                Err(e) => tracing::warn!(error = %e, "feed_updates: initial build failed"),
+                Err(e) => {
+                    db::observe_database_error(&e);
+                    tracing::warn!(error = %e, "feed_updates: initial build failed");
+                }
             }
             // AD-5's `refresh_work_fts` used to be a second call here. It is now the last
             // link of the `refresh_feed_updates` chain (with `feed_series_updates` and
@@ -2252,7 +2391,7 @@ async fn main() -> anyhow::Result<()> {
     // Same idea for the per-source request health counters (`source_health`).
     let health_flusher = source_health::spawn_flusher(pool.clone(), shutdown_tx.subscribe());
 
-    // Keep `sqlite_stat1` current so the planner keeps choosing migration 0058's
+    // Keep PostgreSQL statistics current so the planner can choose the baseline's
     // indexes. Refresh each sampled index in a separate writer turn.
     db::spawn_analyze(pool.clone(), shutdown_tx.subscribe());
     // Local catalogue/search repair must run even with CATALOGUE_SYNC=off.
@@ -2415,7 +2554,7 @@ async fn main() -> anyhow::Result<()> {
         &cfg,
         RouterState {
             schema,
-            pool: pool.clone(),
+            pool: pool.foreground(),
             ready_pool: ready_pool.clone(),
             request_budgets: Arc::new(request_budget::RequestBudgets::default()),
             cover_pool,
@@ -2472,6 +2611,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = views_flusher.await;
         let _ = health_flusher.await;
         if let Err(e) = views::flush(&pool).await {
+            db::observe_database_error(&e);
             tracing::warn!(error = %e, "post-shutdown view flush failed; buffered views lost");
         }
         ready_pool.0.close().await;
@@ -2545,9 +2685,342 @@ async fn shutdown_signal(shutdown_tx: tokio::sync::watch::Sender<bool>) {
 }
 
 #[cfg(test)]
+tokio::task_local! { static UPLOAD_MEDIA_PAUSE: crate::locks::pause_points::PausePoints; static COVER_RESPONSE_PAUSE: crate::locks::pause_points::PausePoints; }
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    async fn rest_media_multipart() -> Multipart {
+        use axum::extract::FromRequest;
+        let image = crate::suwayomi::testsrv::jpeg(32, 32);
+        let mut body = b"--rest-upload\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".to_vec();
+        body.extend(image);
+        body.extend(b"\r\n--rest-upload--\r\n");
+        Multipart::from_request(
+            axum::http::Request::builder()
+                .header(
+                    header::CONTENT_TYPE,
+                    "multipart/form-data; boundary=rest-upload",
+                )
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+            &(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn avatar_handler_takes_the_user_guard_before_the_avatar_child() {
+        let pool = crate::db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap()
+            .foreground();
+        let user = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO users(id,username,email,password_hash,created_at) VALUES ($1,'avatar-owner','avatar@example.test','unused',NOW())").bind(user).execute(&pool).await.unwrap();
+        let token = auth::generate_token();
+        sqlx::query("INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES ($1,$2,NOW(),NOW()+INTERVAL '1 hour')").bind(auth::hash_token(&token)).bind(user).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO user_avatars(user_id,webp,version,updated_at) VALUES ($1,$2,1,NOW())",
+        )
+        .bind(user)
+        .bind(b"original".as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut first = pool.begin().await.unwrap();
+        crate::locks::lock_user(&mut first, &user.to_string())
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let writer = pool.clone();
+        let second = tokio::spawn(async move {
+            upload_avatar(
+                State(writer),
+                State(Arc::new(RateLimiter::new(100, 60))),
+                headers,
+                rest_media_multipart().await,
+            )
+            .await
+        });
+        cover::wait_for_writer_lock(&pool).await;
+        // A protocol writer is allowed to touch the child after its user lock. The
+        // old avatar path took that child first and formed a cycle at this point.
+        sqlx::query("UPDATE user_avatars SET webp=$1,version=2 WHERE user_id=$2")
+            .bind(b"first".as_slice())
+            .bind(user)
+            .execute(&mut *first)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET avatar_url=$1 WHERE id=$2")
+            .bind(avatar::avatar_url(&user.to_string(), 2))
+            .bind(user)
+            .execute(&mut *first)
+            .await
+            .unwrap();
+        first.commit().await.unwrap();
+        let response = second.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let (bytes,version,url):(Vec<u8>,i64,Option<String>)=sqlx::query_as("SELECT a.webp,a.version,u.avatar_url FROM user_avatars a JOIN users u ON u.id=a.user_id WHERE u.id=$1").bind(user).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            bytes,
+            avatar::process_avatar(&crate::suwayomi::testsrv::jpeg(32, 32)).unwrap()
+        );
+        let expected = avatar::avatar_url(&user.to_string(), version);
+        assert_eq!(url.as_deref(), Some(expected.as_str()));
+        assert_eq!(value["avatarUrl"], expected);
+    }
+
+    #[tokio::test]
+    async fn both_cover_handlers_reject_a_derivative_of_a_replaced_master() {
+        for source in [false, true] {
+            let main = crate::db::Database::connect("sqlite::memory:")
+                .await
+                .unwrap()
+                .foreground();
+            let covers = crate::database::SqliteTestPoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            for ddl in ["CREATE TABLE work_cover_blob(work_id TEXT PRIMARY KEY,webp BLOB NOT NULL,version INTEGER NOT NULL,updated_at TEXT NOT NULL)", "CREATE TABLE suwayomi_cover_blob(manga_id INTEGER PRIMARY KEY,webp BLOB NOT NULL,updated_at TEXT NOT NULL)", "CREATE TABLE cover_variant(asset_key TEXT NOT NULL,width INTEGER NOT NULL,webp BLOB NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(asset_key,width))"] { sqlx::query(ddl).execute(&covers).await.unwrap(); }
+            sqlx::query(
+                "INSERT INTO work(id,created_at,updated_at) VALUES ('w_handler',now(),now())",
+            )
+            .execute(&main)
+            .await
+            .unwrap();
+            let old = cover::process_cover(&crate::suwayomi::testsrv::jpeg(512, 768)).unwrap();
+            let asset = if source { "s:7" } else { "w_handler" };
+            if source {
+                cover::publish_suwayomi_cover(&main, &covers, 7, &old)
+                    .await
+                    .unwrap();
+            } else {
+                cover::put_work_cover(&main, &covers, asset, &old)
+                    .await
+                    .unwrap();
+            }
+            let app = Arc::new(AppState {
+                pool: main.clone(),
+                cover_pool: covers.clone(),
+                suwayomi: SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
+                mangadex: Arc::new(mangadex::MangaDexClient::new("rest-test", 100.0, 100.0)),
+                admin_users: vec![],
+                scan_health: std::sync::Mutex::new(ScanHealth::default()),
+                auth_limiter: RateLimiter::new(100, 60),
+                comment_limiter: graphql::comment_limiter(),
+                password_work: Arc::new(tokio::sync::Semaphore::new(4)),
+                federated_limiter: RateLimiter::new(100, 60),
+                session_ttl_secs: 3600,
+                series_inflight: KeyedLocks::default(),
+                chapters_inflight: KeyedLocks::default(),
+                cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                catalogue_cover_phash: false,
+                ext_icons_dir: std::path::PathBuf::new(),
+                setup_code: instance::SetupCode::default(),
+            });
+            let points = crate::locks::pause_points::PausePoints::default();
+            let armed = points.arm("derivative-master-read");
+            let cache = covers.clone();
+            let first = tokio::spawn(COVER_RESPONSE_PAUSE.scope(points, async move {
+                if source {
+                    serve_suwayomi_cover(&app, &cache, 7, Some(192)).await
+                } else {
+                    serve_cover(
+                        State(app),
+                        State(CoverDb(cache)),
+                        UrlPath("w_handler.webp".to_owned()),
+                        RawQuery(Some("w=192".to_owned())),
+                    )
+                    .await
+                }
+            }));
+            tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
+                .await
+                .unwrap();
+            if source {
+                cover::publish_suwayomi_cover(&main, &covers, 7, b"new")
+                    .await
+                    .unwrap();
+            } else {
+                cover::put_work_cover(&main, &covers, asset, b"new")
+                    .await
+                    .unwrap();
+            }
+            armed.release();
+            assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+            main.flush_deferred().await;
+            assert!(
+                cover::get_cover_variant(&covers, asset, 192)
+                    .await
+                    .is_none(),
+                "a derivative of the retired master was published"
+            );
+        }
+    }
+    /// T080/T169, the busy-miss branch of `serve_suwayomi_cover`. The detached
+    /// materialization fetched its bytes while another path (the successful miss branch,
+    /// the warmer, a re-save) published a master for the same cover. It must look again
+    /// under the asset guard and store nothing. The covers-only writer it used before
+    /// replaced the newer master and dropped its derivatives.
+    #[tokio::test]
+    async fn a_background_cover_materialization_never_replaces_a_published_master() {
+        let main = crate::db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let covers = crate::database::SqliteTestPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        for ddl in ["CREATE TABLE suwayomi_cover_blob(manga_id INTEGER PRIMARY KEY,webp BLOB NOT NULL,updated_at TEXT NOT NULL)", "CREATE TABLE cover_variant(asset_key TEXT NOT NULL,width INTEGER NOT NULL,webp BLOB NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(asset_key,width))"] { sqlx::query(ddl).execute(&covers).await.unwrap(); }
+        let origin = crate::suwayomi::testsrv::spawn(
+            crate::suwayomi::testsrv::jpeg(512, 768),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let app = Arc::new(AppState {
+            pool: main.clone(),
+            cover_pool: covers.clone(),
+            suwayomi: SuwayomiClient::new(origin.base_url.clone(), None, None),
+            mangadex: Arc::new(mangadex::MangaDexClient::new("rest-test", 100.0, 100.0)),
+            admin_users: vec![],
+            scan_health: std::sync::Mutex::new(ScanHealth::default()),
+            auth_limiter: RateLimiter::new(100, 60),
+            comment_limiter: graphql::comment_limiter(),
+            password_work: Arc::new(tokio::sync::Semaphore::new(4)),
+            federated_limiter: RateLimiter::new(100, 60),
+            session_ttl_secs: 3600,
+            series_inflight: KeyedLocks::default(),
+            chapters_inflight: KeyedLocks::default(),
+            cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            catalogue_cover_phash: false,
+            ext_icons_dir: std::path::PathBuf::new(),
+            setup_code: instance::SetupCode::default(),
+        });
+
+        // A master is published while the materialization holds its fetched bytes.
+        let points = crate::locks::pause_points::PausePoints::default();
+        let armed = points.arm("materialize-fetched");
+        let (state, cache) = (app.clone(), covers.clone());
+        let task = COVER_RESPONSE_PAUSE
+            .scope(points, async move {
+                spawn_suwayomi_cover_materialize(&state, &cache, 7)
+            })
+            .await
+            .expect("a background slot is free");
+        tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
+            .await
+            .expect("the materialization never fetched its cover");
+        cover::publish_suwayomi_cover(&main, &covers, 7, b"published-meanwhile")
+            .await
+            .unwrap();
+        cover::put_cover_variant(&covers, "s:7", 192, b"its-derivative")
+            .await
+            .unwrap();
+        armed.release();
+        tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .expect("the materialization did not finish")
+            .unwrap();
+        assert_eq!(
+            cover::get_suwayomi_cover(&covers, 7).await.as_deref(),
+            Some(b"published-meanwhile".as_slice()),
+            "a late background fetch replaced a master published in the meantime"
+        );
+        assert_eq!(
+            cover::get_cover_variant(&covers, "s:7", 192)
+                .await
+                .as_deref(),
+            Some(b"its-derivative".as_slice()),
+            "the derivative of the surviving master was dropped"
+        );
+
+        // With no master the same path stores the fetched cover.
+        let task =
+            spawn_suwayomi_cover_materialize(&app, &covers, 8).expect("a background slot is free");
+        tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .expect("the materialization did not finish")
+            .unwrap();
+        assert!(cover::get_suwayomi_cover(&covers, 8).await.is_some());
+        assert_eq!(origin.hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_comment_media_handlers_enforce_the_twenty_draft_cap() {
+        let pool = crate::db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap()
+            .foreground();
+        let user = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO users(id,username,email,password_hash,created_at) VALUES ($1,'media-owner','media@example.test','unused',now())").bind(user).execute(&pool).await.unwrap();
+        let token = auth::generate_token();
+        sqlx::query("INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES ($1,$2,now(),now()+INTERVAL '1 hour')").bind(auth::hash_token(&token)).bind(user).execute(&pool).await.unwrap();
+        for _ in 0..19 {
+            sqlx::query("INSERT INTO comment_media(id,user_id,webp,width,height,created_at) VALUES ($1,$2,$3,1,1,now())").bind(uuid::Uuid::new_v4()).bind(user).bind(b"staged".as_slice()).execute(&pool).await.unwrap();
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let points = crate::locks::pause_points::PausePoints::default();
+        let armed = points.arm("media-user-locked");
+        let writer = pool.clone();
+        let first_headers = headers.clone();
+        let limiter = Arc::new(RateLimiter::new(100, 60));
+        let first_limiter = limiter.clone();
+        let first = tokio::spawn(UPLOAD_MEDIA_PAUSE.scope(points, async move {
+            upload_comment_media(
+                State(writer),
+                State(first_limiter),
+                first_headers,
+                rest_media_multipart().await,
+            )
+            .await
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
+            .await
+            .unwrap();
+        let writer = pool.clone();
+        let second = tokio::spawn(async move {
+            upload_comment_media(
+                State(writer),
+                State(limiter),
+                headers,
+                rest_media_multipart().await,
+            )
+            .await
+        });
+        cover::wait_for_writer_lock(&pool).await;
+        armed.release();
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            second.await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM comment_media WHERE user_id=$1 AND comment_id IS NULL",
+        )
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 20);
+    }
     #[tokio::test]
     async fn cancelled_cover_variant_request_retains_resize_slot_until_worker_finishes() {
         static TEST_RESIZE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
@@ -2610,12 +3083,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_metrics_include_wal_pool_and_contention_counters() {
-        let directory =
-            std::env::temp_dir().join(format!("komiq-metrics-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&directory).unwrap();
-        let database = directory.join("main.sqlite3");
-        let pool = db::init(&format!("sqlite://{}", database.display()))
+    async fn database_metrics_include_postgres_wal_pool_and_contention_counters() {
+        let pool = crate::db::Database::connect("sqlite::memory:")
             .await
             .unwrap();
         let response = metrics(State(pool.clone())).await.into_response();
@@ -2623,11 +3092,8 @@ mod tests {
             .await
             .unwrap();
         let body = std::str::from_utf8(&body).unwrap();
-        let wal_bytes = std::fs::metadata(directory.join("main.sqlite3-wal"))
-            .unwrap()
-            .len();
-        assert!(body.contains(&format!("komika_sqlite_wal_bytes {wal_bytes}\n")));
         for metric in [
+            "komika_sqlite_wal_bytes ",
             "komika_sqlite_pool_connections ",
             "komika_sqlite_pool_idle ",
             "komika_sqlite_write_queue_wait_seconds_total ",
@@ -2640,7 +3106,6 @@ mod tests {
             );
         }
         pool.close().await;
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -2661,11 +3126,27 @@ mod tests {
         .unwrap()
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
-        let query_only: i64 = sqlx::query_scalar("PRAGMA query_only")
+        let query_only: String = sqlx::query_scalar("SHOW default_transaction_read_only")
             .fetch_one(&reserved.0)
             .await
             .unwrap();
-        assert_eq!(query_only, 1);
+        assert_eq!(query_only, "on");
+        let statement: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&reserved.0)
+            .await
+            .unwrap();
+        let lock: String = sqlx::query_scalar("SHOW lock_timeout")
+            .fetch_one(&reserved.0)
+            .await
+            .unwrap();
+        let idle: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
+            .fetch_one(&reserved.0)
+            .await
+            .unwrap();
+        assert_eq!(
+            (statement, lock, idle),
+            ("30s".into(), "5s".into(), "1min".into())
+        );
         drop(readers);
         reserved.0.close().await;
         pool.close().await;
@@ -2677,7 +3158,7 @@ mod tests {
         let pool = crate::db::Database::connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -2754,7 +3235,15 @@ mod tests {
             ("/api/v1/manga/not-numeric", StatusCode::NOT_FOUND),
             ("/ext-icons/not..valid.png", StatusCode::NOT_FOUND),
             ("/avatars/missing.webp", StatusCode::NOT_FOUND),
+            (
+                "/avatars/00000000-0000-4000-8000-000000000999.webp",
+                StatusCode::NOT_FOUND,
+            ),
             ("/comment-media/missing.webp", StatusCode::NOT_FOUND),
+            (
+                "/comment-media/00000000-0000-4000-8000-000000000999.webp",
+                StatusCode::NOT_FOUND,
+            ),
         ] {
             let response = app.clone().oneshot(request(path)).await.unwrap();
             assert_eq!(
@@ -2934,11 +3423,11 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(main.write())
             .await
             .unwrap();
-        let covers = TestPoolOptions::new()
+        let covers = crate::database::SqliteTestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
@@ -2949,9 +3438,9 @@ mod tests {
         ] {
             sqlx::query(ddl).execute(&covers).await.unwrap();
         }
-        sqlx::query("INSERT INTO work (id, cover_file_name, created_at, updated_at) VALUES ('w1', 'c.jpg', 't', 't')")
+        sqlx::query("INSERT INTO work (id, cover_file_name, created_at, updated_at) VALUES ('w1', 'c.jpg', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
             .execute(&main).await.unwrap();
-        sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_key, created_at) VALUES ('ss1', 'w1', 'mangadex', 'md-1', 't')")
+        sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_key, created_at) VALUES ('ss1', 'w1', 'mangadex', 'md-1', '2026-01-01T00:00:00Z')")
             .execute(&main).await.unwrap();
         // Stands in for the MangaDex cover CDN.
         let cdn = crate::suwayomi::testsrv::spawn(

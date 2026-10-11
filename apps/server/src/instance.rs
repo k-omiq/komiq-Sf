@@ -309,6 +309,7 @@ pub async fn resolve_with(
     resolve_with_checked(pool, s, env)
         .await
         .unwrap_or_else(|error| {
+            crate::db::record_read_database_error(&error);
             tracing::warn!(error = %error, key = s.key, "instance_setting read failed");
             Resolved {
                 value: s.default.to_string(),
@@ -339,7 +340,7 @@ async fn resolve_with_checked(
         });
     }
     let stored: Option<String> =
-        sqlx::query_scalar("SELECT value FROM instance_setting WHERE key = ?")
+        crate::db_types::query_scalar("SELECT value FROM instance_setting WHERE key = $1")
             .bind(s.key)
             .fetch_optional(pool)
             .await?;
@@ -359,15 +360,15 @@ async fn resolve_with_checked(
 /// makes the write pointless; this only touches the table.
 pub async fn store<'e, E>(executor: E, s: &Setting, value: &str) -> sqlx::Result<()>
 where
-    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
     sqlx::query(
-        "INSERT INTO instance_setting (key, value, updated_at) VALUES (?, ?, ?) \
+        "INSERT INTO instance_setting (key, value, updated_at) VALUES ($1, $2, $3) \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
     )
     .bind(s.key)
     .bind(value)
-    .bind(Utc::now().to_rfc3339())
+    .bind(Utc::now())
     .execute(executor)
     .await?;
     Ok(())
@@ -375,10 +376,11 @@ where
 
 /// True once any admin account exists — the definition of "set up".
 pub async fn admin_exists(pool: &Database) -> sqlx::Result<bool> {
-    let exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE is_admin = 1)")
-        .fetch_one(pool)
-        .await?;
-    Ok(exists != 0)
+    let exists: bool =
+        crate::db_types::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE is_admin = TRUE)")
+            .fetch_one(pool)
+            .await?;
+    Ok(exists)
 }
 
 /// Crockford base32 (no I, L, O, U): easy to read off a log and type back in.
@@ -455,7 +457,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -495,7 +497,7 @@ mod tests {
         store(&pool, &TEST, "again").await.unwrap();
         let r = resolve_with(&pool, &TEST, no_env).await;
         assert_eq!(r.value, "again");
-        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM instance_setting")
+        let rows: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM instance_setting")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -652,7 +654,7 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, is_admin, created_at) \
-             VALUES ('a', 'admin', 'a@e', 'h', 1, 't')",
+             VALUES ('00000000-0000-4000-8000-000000000001', 'admin', 'a@e', 'h', TRUE, '2020-01-01')",
         )
         .execute(&pool)
         .await

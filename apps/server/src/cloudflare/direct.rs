@@ -32,6 +32,15 @@ use axum::response::{IntoResponse, Redirect, Response};
 
 use super::*;
 
+pub(super) const DIRECT_TLS_GENERATION: instance::Setting = instance::Setting {
+    key: "direct_tls_generation",
+    env: "",
+    default: "",
+};
+
+#[cfg(test)]
+tokio::task_local! { pub(super) static TLS_SEEN_PAUSE: crate::locks::pause_points::PausePoints; pub(super) static TLS_SEEN_RESULTS: tokio::sync::mpsc::UnboundedSender<Result<bool, String>>; }
+
 const ACCOUNT_KEY_FILE: &str = "acme-account.der";
 pub(super) const DIRECT_KEY_FILE: &str = "direct-key.der";
 pub(super) const DIRECT_CERT_FILE: &str = "direct-cert.pem";
@@ -329,13 +338,62 @@ pub async fn plain_http_guard(
     if request.extensions().get::<origin_tls::OverTls>().is_some() {
         if internet && !manager.https_seen.swap(true, Ordering::Relaxed) {
             let manager = manager.clone();
+            let generation = manager
+                .direct_generation
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            #[cfg(test)]
+            let points = TLS_SEEN_PAUSE.try_with(Clone::clone).ok();
+            #[cfg(test)]
+            let results = TLS_SEEN_RESULTS.try_with(Clone::clone).ok();
             tokio::spawn(async move {
-                let stored =
-                    instance::store(&manager.pool, &instance::DIRECT_HTTPS_SEEN, "1").await;
+                #[cfg(test)]
+                if let Some(points) = &points {
+                    points.hit("tls-seen-before-publish").await;
+                }
+                let _one = manager.issuing.lock().await;
+                let stored: anyhow::Result<bool> = async {
+                    let mut tx = manager.pool.begin().await?;
+                    lock_access(&mut tx).await?;
+                    let current = manager
+                        .direct_origin
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    let current_generation: Option<String> =
+                        sqlx::query_scalar("SELECT value FROM instance_setting WHERE key = $1")
+                            .bind(DIRECT_TLS_GENERATION.key)
+                            .fetch_optional(&mut *tx)
+                            .await?;
+                    let publish = current.as_deref() == Some(&origin)
+                        && !generation.is_empty()
+                        && current_generation.as_deref() == Some(&generation);
+                    if publish {
+                        instance::store(&mut *tx, &instance::DIRECT_HTTPS_SEEN, "1").await?;
+                    }
+                    tx.commit().await?;
+                    Ok(publish)
+                }
+                .await;
+                if let Err(e) = &stored {
+                    crate::db::observe_database_error(e);
+                    tracing::warn!(error = %e, "HTTPS marker save failed");
+                }
                 // Not written: a restart would open the plain port again. Let the next
                 // visit over HTTPS try once more.
-                if stored.is_err() {
+                if !matches!(stored, Ok(true))
+                    && *manager
+                        .direct_generation
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        == generation
+                {
                     manager.https_seen.store(false, Ordering::Relaxed);
+                }
+                #[cfg(test)]
+                if let Some(results) = results {
+                    let _ = results.send(stored.map_err(|e| e.to_string()));
                 }
             });
         }
@@ -544,18 +602,58 @@ impl Manager {
         }
         let address = self.direct_address(&host);
         // A new address has to prove itself before the plain port closes again.
-        let same = previous.as_deref() == Some(host.as_str());
-        let seen = same && self.https_seen_stored().await;
+        let generation = uuid::Uuid::new_v4().to_string();
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            crate::db::record_database_error(&e);
+            "Could not save the address.".to_string()
+        })?;
+        lock_access(&mut tx).await.map_err(|e| {
+            crate::db::record_database_error(&e);
+            "Could not lock the access choice.".to_string()
+        })?;
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT value FROM instance_setting WHERE key = $1")
+                .bind(instance::DIRECT_TLS_HOST.key)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| {
+                    crate::db::record_database_error(&e);
+                    "Could not read the HTTPS address.".to_string()
+                })?;
+        let current_seen: Option<String> =
+            sqlx::query_scalar("SELECT value FROM instance_setting WHERE key = $1")
+                .bind(instance::DIRECT_HTTPS_SEEN.key)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| {
+                    crate::db::record_database_error(&e);
+                    "Could not read the HTTPS proof.".to_string()
+                })?;
+        let seen =
+            current.as_deref() == Some(host.as_str()) && current_seen.as_deref() == Some("1");
         for (setting, value) in [
+            (&ACCESS_GENERATION, generation.as_str()),
+            (&DIRECT_TLS_GENERATION, generation.as_str()),
             (&instance::DIRECT_HTTPS_SEEN, if seen { "1" } else { "" }),
             (&instance::DIRECT_TLS_HOST, host.as_str()),
             (&instance::PUBLIC_ADDRESS, address.as_str()),
             (&instance::ACCESS_MODE, "direct"),
         ] {
-            instance::store(&self.pool, setting, value)
+            instance::store(&mut *tx, setting, value)
                 .await
-                .map_err(|_| "Could not save the address.".to_string())?;
+                .map_err(|e| {
+                    crate::db::record_database_error(&e);
+                    "Could not save the address.".to_string()
+                })?;
         }
+        tx.commit().await.map_err(|e| {
+            crate::db::record_database_error(&e);
+            "Could not save the address.".to_string()
+        })?;
+        *self
+            .direct_generation
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = generation;
         self.set_plain_guard(Some(address), seen);
         self.set_certificate_error(None);
         self.start_renewals();
@@ -568,9 +666,27 @@ impl Manager {
         if self.direct_tls_host().await.is_none() {
             return;
         }
+        let generation = uuid::Uuid::new_v4().to_string();
+        let result: anyhow::Result<()> = async {
+            let mut tx = self.pool.begin().await?;
+            lock_access(&mut tx).await?;
+            instance::store(&mut *tx, &DIRECT_TLS_GENERATION, &generation).await?;
+            instance::store(&mut *tx, &instance::DIRECT_TLS_HOST, "").await?;
+            instance::store(&mut *tx, &instance::DIRECT_HTTPS_SEEN, "").await?;
+            tx.commit().await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            crate::db::observe_database_error(&e);
+            tracing::warn!(error = %e, "disabling direct TLS failed");
+            return;
+        }
+        *self
+            .direct_generation
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = generation;
         self.set_plain_guard(None, false);
-        let _ = instance::store(&self.pool, &instance::DIRECT_TLS_HOST, "").await;
-        let _ = instance::store(&self.pool, &instance::DIRECT_HTTPS_SEEN, "").await;
         self.stop_direct_tasks().await;
         self.stop_https().await;
         self.set_certificate_error(None);
@@ -579,6 +695,36 @@ impl Manager {
     /// Boot: answer the certificate authority again and keep renewing the certificate.
     /// `resume` serves it (`ensure_https`).
     pub(super) async fn resume_direct_tls(self: &Arc<Self>) {
+        // Upgrade an existing direct-TLS configuration under the same guard as new
+        // configurations, so an in-flight proof can also distinguish a later ABA reset.
+        let generation: anyhow::Result<String> = async {
+            let mut tx = self.pool.begin().await?;
+            lock_access(&mut tx).await?;
+            let stored: Option<String> =
+                sqlx::query_scalar("SELECT NULLIF(value, '') FROM instance_setting WHERE key = $1")
+                    .bind(DIRECT_TLS_GENERATION.key)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .flatten();
+            let generation = stored.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            instance::store(&mut *tx, &DIRECT_TLS_GENERATION, &generation).await?;
+            tx.commit().await?;
+            Ok(generation)
+        }
+        .await;
+        match generation {
+            Ok(generation) => {
+                *self
+                    .direct_generation
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = generation
+            }
+            Err(error) => {
+                crate::db::observe_database_error(&error);
+                tracing::warn!(%error, "direct TLS generation could not be loaded");
+                return;
+            }
+        }
         let Some(host) = self.direct_tls_host().await else {
             return;
         };

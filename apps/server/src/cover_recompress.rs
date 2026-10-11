@@ -49,6 +49,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::database::SqliteDatabase;
 use crate::db::Database;
 use anyhow::Result;
 use chrono::Utc;
@@ -82,9 +83,9 @@ pub struct Progress {
 
 /// Read the stored cursor. A missing row means "never run" — start from before every
 /// possible `work_id`, i.e. the empty string.
-async fn load_cursor(covers: &Database) -> Result<Option<String>> {
+async fn load_cursor(covers: &SqliteDatabase) -> Result<Option<String>> {
     let row: Option<(String, i64)> =
-        sqlx::query_as("SELECT cursor, done FROM cover_maintenance WHERE key = ?")
+        sqlx::query_as("SELECT cursor, done FROM cover_maintenance WHERE key = $1")
             .bind(CURSOR_KEY)
             .fetch_optional(covers)
             .await?;
@@ -97,9 +98,9 @@ async fn load_cursor(covers: &Database) -> Result<Option<String>> {
 }
 
 /// Persist the cursor (and, at the end of the walk, the terminal `done` flag).
-async fn save_cursor(covers: &Database, cursor: &str, done: bool) -> Result<()> {
+async fn save_cursor(covers: &SqliteDatabase, cursor: &str, done: bool) -> Result<()> {
     sqlx::query(
-        "INSERT INTO cover_maintenance (key, cursor, done, updated_at) VALUES (?, ?, ?, ?) \
+        "INSERT INTO cover_maintenance (key, cursor, done, updated_at) VALUES ($1, $2, $3, $4) \
          ON CONFLICT(key) DO UPDATE SET cursor = excluded.cursor, done = excluded.done, \
          updated_at = excluded.updated_at",
     )
@@ -118,7 +119,7 @@ async fn save_cursor(covers: &Database, cursor: &str, done: bool) -> Result<()> 
 /// Never returns an error for a single bad row — a master that will not decode is left
 /// alone and the cursor moves past it, because a cover we cannot re-encode is still a
 /// cover we can serve.
-pub async fn run_batch(main: &Database, covers: &Database, batch: i64) -> Result<Progress> {
+pub async fn run_batch(main: &Database, covers: &SqliteDatabase, batch: i64) -> Result<Progress> {
     let Some(start) = load_cursor(covers).await? else {
         return Ok(Progress {
             finished: true,
@@ -132,7 +133,7 @@ pub async fn run_batch(main: &Database, covers: &Database, batch: i64) -> Result
     // and a re-run of a finished region nearly free.
     let headers: Vec<(String, Vec<u8>)> = sqlx::query_as(
         "SELECT work_id, substr(webp, 1, 16) FROM work_cover_blob \
-         WHERE work_id > ? ORDER BY work_id LIMIT ?",
+         WHERE work_id > $1 ORDER BY work_id LIMIT $2",
     )
     .bind(&start)
     .bind(batch)
@@ -160,7 +161,7 @@ pub async fn run_batch(main: &Database, covers: &Database, batch: i64) -> Result
         // Only now is the full master worth reading. A row that vanished since the header
         // scan (the GC reclaiming an orphan) simply yields nothing and is stepped over.
         let Some(master): Option<Vec<u8>> =
-            sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id = ?")
+            sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id = $1")
                 .bind(&work_id)
                 .fetch_optional(covers)
                 .await?
@@ -171,16 +172,19 @@ pub async fn run_batch(main: &Database, covers: &Database, batch: i64) -> Result
         // Decode + re-encode is CPU-bound; keep it off the async runtime exactly like
         // every other cover resize. The ladder's top edge (512) is >= the stored master's
         // longest edge, so the scale clamps to 1.0 and this only re-encodes.
+        let expected = master.clone();
         let encoded = match tokio::task::spawn_blocking(move || cover::process_cover(&master)).await
         {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(e)) => {
                 // Leave the row alone and move on. Most likely a master this build's
                 // decoder cannot read; it still serves fine as stored bytes.
+                let e = crate::db::observed_database_error(e);
                 tracing::warn!(error = %e, work_id, "cover recompress: re-encode failed");
                 continue;
             }
             Err(e) => {
+                let e = crate::db::observed_database_error(e.into());
                 tracing::error!(error = %e, work_id, "cover recompress: re-encode task panicked");
                 continue;
             }
@@ -191,9 +195,16 @@ pub async fn run_batch(main: &Database, covers: &Database, batch: i64) -> Result
         if !enough {
             continue;
         }
-        if let Err(e) = cover::put_work_cover(main, covers, &work_id, &encoded).await {
-            tracing::warn!(error = %e, work_id, "cover recompress: store failed");
-            continue;
+        match cover::put_work_cover_if_current(main, covers, &work_id, &encoded, Some(&expected))
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                crate::db::observe_database_error(&e);
+                tracing::warn!(error = %e, work_id, "cover recompress: store failed");
+                continue;
+            }
         }
         progress.rewritten += 1;
         progress.bytes_saved += shrink as u64;
@@ -222,7 +233,7 @@ pub async fn run_batch(main: &Database, covers: &Database, batch: i64) -> Result
 /// "some fresh version" is all the correctness the `?v=` bust needs.
 pub fn spawn(
     main: Database,
-    covers: Database,
+    covers: SqliteDatabase,
     interval_secs: u64,
     batch: i64,
     shutdown: tokio::sync::watch::Receiver<bool>,
@@ -245,7 +256,7 @@ pub fn spawn(
 
 async fn run_loop(
     main: Database,
-    covers: Database,
+    covers: SqliteDatabase,
     interval_secs: u64,
     batch: i64,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -279,7 +290,7 @@ async fn run_loop(
                         mib_saved = p.bytes_saved / (1024 * 1024),
                         "cover recompress tick"
                     ),
-                    Err(e) => tracing::warn!(error = %e, "cover recompress tick failed"),
+                    Err(e) => { let e = crate::db::observed_database_error(e); tracing::warn!(error = %e, "cover recompress tick failed"); },
                 }
             }
             _ = shutdown.changed() => {
@@ -335,8 +346,8 @@ mod tests {
 
     /// Main DB with the version pointer and materialized URLs `put_work_cover` publishes.
     async fn main_db() -> Database {
-        let pool = Database::connect("sqlite::memory:").await.unwrap();
-        sqlx::query("CREATE TABLE work (id TEXT PRIMARY KEY, cover_cached_version INTEGER)")
+        let pool = Database::empty_for_test(2).await.unwrap();
+        sqlx::query("CREATE TABLE work (id TEXT PRIMARY KEY, cover_cached_version BIGINT)")
             .execute(&pool)
             .await
             .unwrap();
@@ -352,8 +363,8 @@ mod tests {
     }
 
     /// Covers DB with the two tables this pass reads and writes.
-    async fn covers_db() -> Database {
-        let pool = Database::connect("sqlite::memory:").await.unwrap();
+    async fn covers_db() -> SqliteDatabase {
+        let pool = SqliteDatabase::connect("sqlite::memory:").await.unwrap();
         for ddl in [
             "CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, \
              version INTEGER NOT NULL, updated_at TEXT NOT NULL)",
@@ -367,15 +378,15 @@ mod tests {
         pool
     }
 
-    async fn insert_master(main: &Database, covers: &Database, id: &str, webp: &[u8]) {
-        sqlx::query("INSERT INTO work (id, cover_cached_version) VALUES (?, 1)")
+    async fn insert_master(main: &Database, covers: &SqliteDatabase, id: &str, webp: &[u8]) {
+        sqlx::query("INSERT INTO work (id, cover_cached_version) VALUES ($1, 1)")
             .bind(id)
             .execute(main)
             .await
             .unwrap();
         sqlx::query(
             "INSERT INTO work_cover_blob (work_id, webp, version, updated_at) \
-             VALUES (?, ?, 1, '2026-01-01T00:00:00Z')",
+             VALUES ($1, $2, 1, '2026-01-01T00:00:00Z')",
         )
         .bind(id)
         .bind(webp)
@@ -384,8 +395,8 @@ mod tests {
         .unwrap();
     }
 
-    async fn stored(covers: &Database, id: &str) -> Vec<u8> {
-        sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id = ?")
+    async fn stored(covers: &SqliteDatabase, id: &str) -> Vec<u8> {
+        sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id = $1")
             .bind(id)
             .fetch_one(covers)
             .await
@@ -428,7 +439,7 @@ mod tests {
         // The `?v=` bust is the whole point: without it the year-long immutable edge entry
         // keeps serving the old fat bytes.
         let version: i64 =
-            sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id = 'w_a'")
+            crate::db_types::query_scalar("SELECT cover_cached_version FROM work WHERE id = 'w_a'")
                 .fetch_one(&main)
                 .await
                 .unwrap();
@@ -453,7 +464,7 @@ mod tests {
         assert_eq!(p.rewritten, 0, "a lossy master needs no work");
         assert_eq!(stored(&covers, "w_a").await, modern, "bytes untouched");
         let version: i64 =
-            sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id = 'w_a'")
+            crate::db_types::query_scalar("SELECT cover_cached_version FROM work WHERE id = 'w_a'")
                 .fetch_one(&main)
                 .await
                 .unwrap();
@@ -476,7 +487,7 @@ mod tests {
             assert_eq!(p.rewritten, 1);
             assert!(!p.finished);
             let cursor: String =
-                sqlx::query_scalar("SELECT cursor FROM cover_maintenance WHERE key = ?")
+                sqlx::query_scalar("SELECT cursor FROM cover_maintenance WHERE key = $1")
                     .bind(CURSOR_KEY)
                     .fetch_one(&covers)
                     .await

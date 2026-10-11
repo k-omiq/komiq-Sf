@@ -33,12 +33,12 @@ Key parts of `apps/admin`:
 
 - `apps/admin/src/routes/`: Console pages for catalog browsing, duplicate review, source management, user management, and settings.
 - `apps/admin/src/lib/`: API clients, state stores, navigation helpers, and Svelte components.
-- `apps/admin/src-tauri/`: Tauri 2 desktop shell for the admin app, a native wrapper for its web interface. Bundles `komika-server` as a sidecar process and hosts the administration interface.
+- `apps/admin/src-tauri/`: Tauri 2 desktop shell for the admin app, a native wrapper for its web interface. Bundles PostgreSQL and `komika-server` as child processes and hosts the administration interface.
 
 The console supports three build targets controlled by `ADMIN_TARGET`:
 
 - `embedded`: Primary browser build, served directly by `komika-server` from `KOMIKA_WEB_DIR` under `/admin`. It uses the same origin as the server.
-- `desktop`: Primary desktop build, runs inside Tauri and starts or picks a server. When running locally, it starts both `komika-server` and Suwayomi.
+- `desktop`: Primary desktop build, runs inside Tauri and starts or picks a server. When running locally, it starts PostgreSQL, `komika-server` and Suwayomi.
 - `hosted`: Secondary build for a separate origin. It connects to your server over HTTPS through `PUBLIC_KOMIKA_API`, for example `https://komiq.example.com/graphql`.
 
 ### apps/server
@@ -49,10 +49,12 @@ Key parts of `apps/server`:
 
 - `apps/server/src/main.rs`: Axum web server configuration, route mounting, CORS middleware, and GraphiQL handler.
 - `apps/server/src/graphql/`: Async-graphql schema definitions and resolver functions.
-- `apps/server/src/db.rs`: SQLite database connection pool and migration runner using sqlx.
+- `apps/server/src/db.rs`: PostgreSQL initialization, SQLite cover recovery and migration runners using sqlx.
 - `apps/server/src/auth.rs`: User password hashing with argon2id and session token verification.
 - `apps/server/src/suwayomi.rs`: HTTP client federating requests to the Suwayomi source engine.
-- `apps/server/migrations/`: SQL migration files defining tables for users, sessions, reviews, comments, works, and catalog state.
+- `apps/server/migrations_pg/`: PostgreSQL schema and migrations for the main database.
+- `apps/server/migrations/`: frozen SQLite migration history used to prepare old import sources.
+- `apps/server/src/pg_import/`: SQLite importer and verifier, and the startup decision in `startup.rs`.
 - `apps/server/bench/`: Load testing scripts and baseline performance benchmarks.
 
 ### apps/reader

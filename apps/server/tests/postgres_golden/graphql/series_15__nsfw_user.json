@@ -1,0 +1,101 @@
+{
+  "data": {
+    "canonicalSeries": {
+      "altTitles": [],
+      "artist": "Artist 15",
+      "author": "Author 15",
+      "chapterCount": 1,
+      "coverUrl": "/covers/w_00000000000040008000000000000015.webp",
+      "covers": [
+        {
+          "fileName": "cover-15.jpg",
+          "isPrimary": true,
+          "lang": "ja",
+          "thumbnailUrl": "https://uploads.mangadex.org/covers/00000000-0000-4000-8000-000000000015/cover-15.jpg.512.jpg",
+          "url": "https://uploads.mangadex.org/covers/00000000-0000-4000-8000-000000000015/cover-15.jpg",
+          "volume": "1"
+        }
+      ],
+      "createdAt": "2020-01-07T01:02:03.123456+00:00",
+      "credits": [],
+      "description": "Description 15: café / 漫画",
+      "detectedAt": null,
+      "genres": [
+        "Action",
+        "Gore"
+      ],
+      "id": "w_00000000000040008000000000000015",
+      "isFavorite": false,
+      "isMarked": true,
+      "isNsfw": true,
+      "latestChapter": null,
+      "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+      "libraryStatus": null,
+      "localizedDescriptions": [],
+      "mangadexRating": 6.5,
+      "metadata": {
+        "contentRating": "erotica",
+        "demographic": "josei",
+        "originalLanguage": "ja",
+        "tags": [
+          {
+            "group": "genre",
+            "id": "00000000-0000-4000-8000-000000000301",
+            "name": "Action"
+          },
+          {
+            "group": "content",
+            "id": "00000000-0000-4000-8000-000000000310",
+            "name": "Gore"
+          }
+        ],
+        "trackers": [
+          {
+            "externalId": "00000000-0000-4000-8000-000000000015",
+            "provider": "mangadex",
+            "url": "https://mangadex.org/title/00000000-0000-4000-8000-000000000015"
+          }
+        ],
+        "year": 2005
+      },
+      "rating": {
+        "average": 0.0,
+        "count": 0,
+        "distribution": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "scan": {
+        "avgIntervalHours": 0.0,
+        "lastScannedAt": null,
+        "nextScanAt": null,
+        "overrideIntervalHours": null,
+        "paused": false,
+        "pausedOverride": null,
+        "pollEveryMinutes": 30,
+        "pollEveryMinutesOverride": null,
+        "statusOverride": null
+      },
+      "sourceId": "mangadex",
+      "status": "UNKNOWN",
+      "title": "Night Chronicle",
+      "type": "COMIC",
+      "updatedAt": "2020-01-01T01:02:03.000000+00:00",
+      "views": {
+        "last24h": 0,
+        "last7d": 0,
+        "total": 0
+      },
+      "workId": "w_00000000000040008000000000000015"
+    }
+  }
+}

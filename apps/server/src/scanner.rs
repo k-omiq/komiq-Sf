@@ -476,22 +476,28 @@ fn resolve_poll_minutes(poll_every_minutes: Option<i64>, steady_interval_hours: 
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
 pub struct ScanState {
     pub avg_interval_hours: f64,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     pub known_chapter_count: i64,
     /// Highest chapter number seen at the last scan. `None` = not yet observed
     /// (pre-`0012` rows), which suppresses number-based new-chapter detection
     /// until a baseline is recorded (SC4).
     pub known_max_chapter: Option<f64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub last_scanned_at: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub next_scan_at: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub last_new_chapter_at: Option<String>,
     /// When the current overdue-awaiting streak began (SC1). `None` = not awaiting
     /// (a chapter is on schedule). Bounds how long the accelerated poll runs.
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub awaiting_since: Option<String>,
     /// Snapshot of the chapter identity set at the last scan (sorted, comma-joined
     /// chapter ids). Drives set-difference new-chapter detection so a removal that
     /// offsets an insertion at/below the current max is still flagged. `None` =
     /// not yet captured (pre-migration row / first observation), which seeds a
     /// baseline without flagging.
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub known_chapter_ids: Option<String>,
 }
 
@@ -501,7 +507,7 @@ pub struct ScanState {
 const SCAN_STATE_SELECT: &str =
     "SELECT avg_interval_hours, known_chapter_count, known_max_chapter, \
      last_scanned_at, next_scan_at, last_new_chapter_at, awaiting_since, known_chapter_ids \
-     FROM series_scan_state WHERE series_id = ?";
+     FROM series_scan_state WHERE series_id = $1";
 
 /// Read the persisted scan state for a series, if any. The DB-driven scheduler selects
 /// due ids directly and `record_scan` re-reads state in its own transaction, so this
@@ -512,30 +518,35 @@ pub async fn scan_state(pool: &Database, series_id: &str) -> Option<ScanState> {
         .bind(series_id)
         .fetch_optional(pool)
         .await
+        .inspect_err(crate::db::record_read_database_error)
         .ok()
         .flatten()
 }
 
 /// Admin overrides the scanner cares about (interval + poll cadence + pause),
 /// read from `series_admin`.
-#[derive(Default, sqlx::FromRow)]
+#[derive(Clone, Default, sqlx::FromRow)]
 struct ScanAdmin {
     override_interval_hours: Option<f64>,
     /// Accelerated re-poll cadence (minutes) used once a series is overdue for a
     /// new chapter that hasn't landed yet (SC1). `None` -> `DEFAULT_POLL_MINUTES`.
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     poll_every_minutes: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     paused_override: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     status_override: Option<String>,
 }
 
 async fn scan_admin(pool: &Database, series_id: &str) -> ScanAdmin {
     sqlx::query_as::<_, ScanAdmin>(
         "SELECT override_interval_hours, poll_every_minutes, paused_override, status_override \
-         FROM series_admin WHERE series_id = ?",
+         FROM series_admin WHERE series_id = $1",
     )
     .bind(series_id)
     .fetch_optional(pool)
     .await
+    .inspect_err(crate::db::record_read_database_error)
     .ok()
     .flatten()
     .unwrap_or_default()
@@ -732,6 +743,7 @@ pub(crate) async fn record_source_extensions(state: &AppState) {
     let extensions = match state.suwayomi.fetch_extensions().await {
         Ok(e) => e,
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "scan tick: failed to fetch Suwayomi extensions");
             return;
         }
@@ -757,6 +769,7 @@ async fn record_extension(pool: &Database, ext: &crate::suwayomi::SuwayomiExtens
     };
     for source_id in &ext.source_ids {
         if let Err(e) = crate::catalog::upsert_source_extension(pool, source_id, &input).await {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(source_id, error = %e, "scan tick: failed to record source extension");
         }
     }
@@ -961,19 +974,141 @@ struct TickOutcome {
 /// `due_series_ids_for_source` in Phase E3.
 #[cfg(test)]
 async fn due_series_ids(pool: &Database, now_iso: &str, limit: i64) -> Vec<String> {
-    sqlx::query_scalar::<_, String>(
+    crate::db_types::query_scalar::<String>(
         "SELECT series_id FROM series_scan_state \
-         WHERE next_scan_at <= ? \
-         ORDER BY next_scan_at ASC LIMIT ?",
+         WHERE next_scan_at <= $1 \
+         ORDER BY next_scan_at ASC NULLS FIRST LIMIT $2",
     )
-    .bind(now_iso)
+    .bind(crate::db_types::date(now_iso).expect("internally generated UTC timestamp"))
     .bind(limit)
     .fetch_all(pool)
     .await
     .unwrap_or_else(|e| {
+        crate::db::record_read_database_error(&e);
         tracing::warn!(error = %e, "scan: due-series query failed");
         Vec::new()
     })
+}
+
+/// SQLite's scheduling time spelling: UTC whole seconds with an explicit offset.
+/// Do not use to_rfc3339(), which keeps the clock's fractional seconds.
+fn schedule_timestamp(now: DateTime<Utc>, minutes: i64) -> String {
+    (now + chrono::Duration::minutes(minutes))
+        .format("%Y-%m-%dT%H:%M:%S+00:00")
+        .to_string()
+}
+
+/// One clock for the entire former UPDATE; independent integer jitter for each row.
+/// The caller holds the writer transaction from selection through commit, preserving
+/// the old statement's atomic cohort and failure rollback. Read the clock after selection,
+/// immediately before the first write, so time spent waiting for the writer is excluded.
+#[cfg(test)]
+async fn write_jittered_schedules(
+    conn: &mut sqlx::PgConnection,
+    ids: &[String],
+    base_minutes: i64,
+    spread_minutes: i64,
+) -> sqlx::Result<u64> {
+    write_jittered_schedules_observed(conn, ids, base_minutes, spread_minutes, || {}).await
+}
+
+// 257 parameters at most, even below SQLite's historical 999-variable limit.
+// Keep each write small while amortizing the async statement round trip.
+const SCHEDULE_WRITE_CHUNK: usize = 128;
+
+#[cfg(test)]
+async fn write_jittered_schedules_observed(
+    conn: &mut sqlx::PgConnection,
+    ids: &[String],
+    base_minutes: i64,
+    spread_minutes: i64,
+    mut on_statement: impl FnMut(),
+) -> sqlx::Result<u64> {
+    write_eligible_schedules(
+        conn,
+        ids,
+        base_minutes,
+        spread_minutes,
+        None,
+        &mut on_statement,
+    )
+    .await
+}
+
+#[cfg(test)]
+tokio::task_local! { static SCHEDULE_DISCOVERY_PAUSE: crate::locks::pause_points::PausePoints; }
+
+async fn write_eligible_schedules(
+    conn: &mut sqlx::PgConnection,
+    ids: &[String],
+    base_minutes: i64,
+    spread_minutes: i64,
+    eligibility: Option<(&str, bool, Option<&str>)>,
+    mut on_statement: impl FnMut(),
+) -> sqlx::Result<u64> {
+    #[cfg(test)]
+    if eligibility.is_some() {
+        if let Ok(points) = SCHEDULE_DISCOVERY_PAUSE.try_with(Clone::clone) {
+            points.hit("schedule-discovered").await;
+        }
+    }
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let now = Utc::now();
+    let updated_at = crate::db_types::date(&schedule_timestamp(now, 0))
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+    let mut changed = 0;
+    for chunk in ids.chunks(SCHEDULE_WRITE_CHUNK) {
+        let mut sql = String::from("WITH v(series_id, next_scan_at) AS (VALUES ");
+        let mut args = sqlx::postgres::PgArguments::default();
+        for (i, id) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!(
+                "(${}::text, ${}::timestamptz)",
+                sqlx::Arguments::len(&args) + 1,
+                sqlx::Arguments::len(&args) + 2
+            ));
+            // SQLite randomFunc masks the sign bit before negating negative draws;
+            // ABS(RANDOM()) therefore has exactly this 63-bit nonnegative distribution.
+            let jitter = (rand_core::OsRng.next_u64() & i64::MAX as u64) % spread_minutes as u64;
+            let next_scan_at =
+                crate::db_types::date(&schedule_timestamp(now, base_minutes + jitter as i64))
+                    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+            sqlx::Arguments::add(&mut args, id).map_err(sqlx::Error::Encode)?;
+            sqlx::Arguments::add(&mut args, next_scan_at).map_err(sqlx::Error::Encode)?;
+        }
+        let updated_arg = crate::sql_params::placeholders(sqlx::Arguments::len(&args) + 1, 1);
+        sql.push_str(&format!(") UPDATE series_scan_state SET next_scan_at = v.next_scan_at, \
+                      updated_at = {updated_arg} FROM v WHERE series_scan_state.series_id = v.series_id"));
+        sqlx::Arguments::add(&mut args, &updated_at).map_err(sqlx::Error::Encode)?;
+        if let Some((horizon, later, source_id)) = eligibility {
+            let arg = sqlx::Arguments::len(&args) + 1;
+            sql.push_str(&format!(
+                " AND series_scan_state.next_scan_at {} ${arg}",
+                if later { ">" } else { "<" }
+            ));
+            sqlx::Arguments::add(
+                &mut args,
+                crate::db_types::date(horizon)
+                    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?,
+            )
+            .map_err(sqlx::Error::Encode)?;
+            if let Some(source_id) = source_id {
+                let arg = sqlx::Arguments::len(&args) + 1;
+                sql.push_str(&format!(" AND EXISTS (SELECT 1 FROM source_series ss WHERE ss.source_type = 'suwayomi' AND ss.source_id = ${arg} AND ss.source_key = series_scan_state.series_id)"));
+                sqlx::Arguments::add(&mut args, source_id).map_err(sqlx::Error::Encode)?;
+            }
+        }
+        on_statement();
+        changed += sqlx::query_with(&sql, args)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+    }
+    Ok(changed)
 }
 
 /// Pull a few rows scheduled past `ABSURD_HORIZON_HOURS` back into the next hour.
@@ -988,21 +1123,28 @@ async fn due_series_ids(pool: &Database, now_iso: &str, limit: i64) -> Vec<Strin
 async fn reclaim_absurd_schedules(pool: &Database, now: DateTime<Utc>) -> u64 {
     let horizon = (now + chrono::Duration::hours(ABSURD_HORIZON_HOURS)).to_rfc3339();
     // Spread over the next hour so a reclaimed cohort doesn't arrive as one herd.
-    let res = sqlx::query(
-        "UPDATE series_scan_state \
-            SET next_scan_at = strftime('%Y-%m-%dT%H:%M:%S', 'now', '+' || (ABS(RANDOM()) % 60) || ' minutes') || '+00:00', \
-                updated_at   = strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' \
-          WHERE series_id IN ( \
-            SELECT series_id FROM series_scan_state \
-             WHERE next_scan_at > ? ORDER BY next_scan_at DESC LIMIT ?)",
-    )
-    .bind(&horizon)
-    .bind(ABSURD_RECLAIM_PER_TICK)
-    .execute(pool)
+    let res = crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        let ids: Vec<String> = crate::db_types::query_scalar(
+            "SELECT series_id FROM series_scan_state \
+             WHERE next_scan_at > $1 ORDER BY next_scan_at DESC NULLS LAST LIMIT $2",
+        )
+        .bind(
+            crate::db_types::date(&horizon)
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?,
+        )
+        .bind(ABSURD_RECLAIM_PER_TICK)
+        .fetch_all(&mut *tx)
+        .await?;
+        let changed =
+            write_eligible_schedules(&mut tx, &ids, 0, 60, Some((&horizon, true, None)), || {})
+                .await?;
+        tx.commit().await?;
+        Ok(changed)
+    })
     .await;
     match res {
-        Ok(r) => {
-            let n = r.rows_affected();
+        Ok(n) => {
             if n > 0 {
                 tracing::info!(
                     reclaimed = n,
@@ -1013,6 +1155,7 @@ async fn reclaim_absurd_schedules(pool: &Database, now: DateTime<Utc>) -> u64 {
             n
         }
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "scan: absurd-schedule reclaim failed");
             0
         }
@@ -1021,10 +1164,13 @@ async fn reclaim_absurd_schedules(pool: &Database, now: DateTime<Utc>) -> u64 {
 
 /// Count of tracked series — the health snapshot's "library size".
 async fn scan_state_count(pool: &Database) -> usize {
-    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM series_scan_state")
+    crate::db_types::query_scalar::<i64>("SELECT COUNT(*) FROM series_scan_state")
         .fetch_one(pool)
         .await
-        .unwrap_or(0) as usize
+        .unwrap_or_else(|e| {
+            crate::db::record_read_database_error(&e);
+            0
+        }) as usize
 }
 
 /// Scheduler entry point: scan ONE due series by id.
@@ -1058,6 +1204,7 @@ async fn scan_due(state: &AppState, series_id: &str, now: DateTime<Utc>) -> anyh
                 if let Err(be) =
                     record_scan_failure(&state.pool, series_id, now, FailureKind::FetchError).await
                 {
+                    let be = crate::db::observed_database_error(be);
                     tracing::warn!(series_id, error = %be, "scan: failed to record backoff");
                 }
                 return Err(e);
@@ -1081,6 +1228,7 @@ async fn scan_due(state: &AppState, series_id: &str, now: DateTime<Utc>) -> anyh
         if let Err(be) =
             record_scan_failure(&state.pool, series_id, now, FailureKind::CachedFallback).await
         {
+            let be = crate::db::observed_database_error(be);
             tracing::warn!(series_id, error = %be, "scan: failed to record backoff");
         }
         return Err(anyhow::anyhow!(
@@ -1109,6 +1257,7 @@ async fn scan_due(state: &AppState, series_id: &str, now: DateTime<Utc>) -> anyh
             if let Err(be) =
                 record_scan_failure(&state.pool, series_id, now, FailureKind::PersistError).await
             {
+                let be = crate::db::observed_database_error(be);
                 tracing::warn!(series_id, error = %be, "scan: failed to record backoff");
             }
             return Err(e);
@@ -1164,7 +1313,7 @@ impl FailureKind {
 /// `kind` is persisted alongside the counter (migration 0072) so the per-source health view
 /// can tell a source that ERRORS from one that silently serves cache — see [`FailureKind`].
 ///
-/// Read-modify-write, so it runs inside `BEGIN IMMEDIATE` with the same whole-transaction
+/// Read-modify-write, so it runs inside `BEGIN` with the same whole-transaction
 /// retry as `record_scan` (P2-1). It was the one scan-state writer left on a bare pooled
 /// read + upsert: harmless in practice (an interleaved writer could only lose a failure
 /// increment), but there is no reason for it to be the odd one out, and the IMMEDIATE
@@ -1178,6 +1327,9 @@ async fn record_scan_failure(
     crate::db::retry_transaction(|| record_scan_failure_once(pool, series_id, now, kind)).await
 }
 
+#[cfg(test)]
+tokio::task_local! { static SCAN_STATE_PAUSE: crate::locks::pause_points::PausePoints; }
+
 /// One attempt at the failure-backoff read-modify-write. See `record_scan_failure`.
 async fn record_scan_failure_once(
     pool: &Database,
@@ -1185,9 +1337,22 @@ async fn record_scan_failure_once(
     now: DateTime<Utc>,
     kind: FailureKind,
 ) -> anyhow::Result<()> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let prior: i64 = sqlx::query_scalar(
-        "SELECT consecutive_failures FROM series_scan_state WHERE series_id = ?",
+    let mut tx = pool.begin_with("BEGIN").await?;
+    crate::locks::advisory(
+        &mut tx,
+        &[crate::locks::AdvisoryKey::new(
+            crate::locks::KeyClass::Series,
+            &[series_id],
+        )],
+    )
+    .await?;
+    #[cfg(test)]
+    if let Ok(points) = SCAN_STATE_PAUSE.try_with(Clone::clone) {
+        points.hit("scan-locked").await;
+    }
+
+    let prior: i64 = crate::db_types::query_scalar(
+        "SELECT consecutive_failures FROM series_scan_state WHERE series_id = $1",
     )
     .bind(series_id)
     .fetch_optional(&mut *tx)
@@ -1206,7 +1371,7 @@ async fn record_scan_failure_once(
         "INSERT INTO series_scan_state \
            (series_id, next_scan_at, consecutive_failures, last_failure_kind, last_failure_at, \
             updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
          ON CONFLICT(series_id) DO UPDATE SET \
            next_scan_at = excluded.next_scan_at, \
            consecutive_failures = excluded.consecutive_failures, \
@@ -1215,11 +1380,11 @@ async fn record_scan_failure_once(
            updated_at = excluded.updated_at",
     )
     .bind(series_id)
-    .bind(&next)
+    .bind(crate::db_types::date(&next).expect("internally generated UTC timestamp"))
     .bind(failures)
     .bind(kind.as_str())
-    .bind(&now_iso)
-    .bind(&now_iso)
+    .bind(crate::db_types::date(&now_iso).expect("internally generated UTC timestamp"))
+    .bind(crate::db_types::date(&now_iso).expect("internally generated UTC timestamp"))
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1254,7 +1419,7 @@ async fn park_paused(pool: &Database, series_id: &str, now: DateTime<Utc>) -> an
         "INSERT INTO series_scan_state \
            (series_id, next_scan_at, awaiting_since, consecutive_failures, last_failure_kind, \
             last_failure_at, updated_at) \
-         VALUES (?, ?, NULL, 0, NULL, NULL, ?) \
+         VALUES ($1, $2, NULL, 0, NULL, NULL, $3) \
          ON CONFLICT(series_id) DO UPDATE SET \
            next_scan_at = excluded.next_scan_at, \
            awaiting_since = NULL, \
@@ -1264,8 +1429,8 @@ async fn park_paused(pool: &Database, series_id: &str, now: DateTime<Utc>) -> an
            updated_at = excluded.updated_at",
     )
     .bind(series_id)
-    .bind(&next)
-    .bind(&now_iso)
+    .bind(crate::db_types::date(&next).expect("internally generated UTC timestamp"))
+    .bind(crate::db_types::date(&now_iso).expect("internally generated UTC timestamp"))
     .execute(pool)
     .await?;
     Ok(())
@@ -1301,16 +1466,19 @@ pub async fn trigger_due_now(pool: &Database, series_ids: &[String]) -> u64 {
     let now_iso = Utc::now().to_rfc3339();
     for id in series_ids {
         let res = sqlx::query(
-            "UPDATE series_scan_state SET next_scan_at = ?, updated_at = ? WHERE series_id = ?",
+            "UPDATE series_scan_state SET next_scan_at = $1, updated_at = $2 WHERE series_id = $3",
         )
-        .bind(DUE_NOW_SENTINEL)
-        .bind(&now_iso)
+        .bind(crate::db_types::date(DUE_NOW_SENTINEL).expect("internally generated UTC timestamp"))
+        .bind(crate::db_types::date(&now_iso).expect("internally generated UTC timestamp"))
         .bind(id)
         .execute(pool)
         .await;
         match res {
             Ok(r) => woken += r.rows_affected(),
-            Err(e) => tracing::warn!(series_id = %id, error = %e, "latest-trigger: wake failed"),
+            Err(e) => {
+                let e = crate::db::observed_database_error(e.into());
+                tracing::warn!(series_id = %id, error = %e, "latest-trigger: wake failed");
+            }
         }
     }
     woken
@@ -1323,12 +1491,12 @@ pub async fn trigger_due_now(pool: &Database, series_ids: &[String]) -> u64 {
 /// sentinel (not NULL) is required by the due-query's `<= ?` completeness invariant.
 pub async fn ensure_pending(pool: &Database, series_id: &str) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO series_scan_state (series_id, next_scan_at, updated_at) VALUES (?, ?, ?) \
+        "INSERT INTO series_scan_state (series_id, next_scan_at, updated_at) VALUES ($1, $2, $3) \
          ON CONFLICT(series_id) DO NOTHING",
     )
     .bind(series_id)
-    .bind(DUE_NOW_SENTINEL)
-    .bind(Utc::now().to_rfc3339())
+    .bind(crate::db_types::date(DUE_NOW_SENTINEL).expect("internally generated UTC timestamp"))
+    .bind(Utc::now())
     .execute(pool)
     .await?;
     Ok(())
@@ -1361,6 +1529,7 @@ pub async fn scan_series(
         if let Err(be) =
             record_scan_failure(&state.pool, &series_id, now, FailureKind::CachedFallback).await
         {
+            let be = crate::db::observed_database_error(be);
             tracing::warn!(series_id, error = %be, "scan: failed to record backoff");
         }
         return Err(anyhow::anyhow!(
@@ -1394,12 +1563,12 @@ pub async fn scan_series(
 /// An unmapped series, or one whose feed row has not been typed yet, falls back to Manga —
 /// the slow, safe tier, and self-healing once the rebuild types it.
 async fn scan_comic_type(pool: &Database, series_id: &str) -> ComicType {
-    let word = sqlx::query_scalar::<_, Option<String>>(
+    let word = crate::db_types::query_scalar::<Option<String>>(
         "SELECT COALESCE(f.comic_type, b.comic_type) \
            FROM source_series ss \
            LEFT JOIN feed_series_updates f ON f.work_id = ss.work_id \
            LEFT JOIN browse_catalogue b ON b.work_id = ss.work_id \
-          WHERE ss.source_type = 'suwayomi' AND ss.source_key = ? LIMIT 1",
+          WHERE ss.source_type = 'suwayomi' AND ss.source_key = $1 LIMIT 1",
     )
     .bind(series_id)
     .fetch_optional(pool)
@@ -1411,6 +1580,7 @@ async fn scan_comic_type(pool: &Database, series_id: &str) -> ComicType {
             .unwrap_or(ComicType::Manga),
         Err(e) => {
             // Loudly, unlike the `.ok()?` that hid the dead column for a whole phase.
+            let e = crate::db::observed_read_database_error(e.into());
             tracing::warn!(series_id, error = %e, "scan: comic-type lookup failed; tiering as Manga");
             ComicType::Manga
         }
@@ -1432,9 +1602,11 @@ async fn persist_scan(
     if let Err(e) =
         crate::db::retry_transaction(|| crate::series_cache::put_series(&state.pool, m)).await
     {
+        let e = crate::db::observed_database_error(e);
         tracing::warn!(series_id, error = %e, "scan: series cache write failed");
     }
     if let Err(e) = crate::series_cache::put_chapters(&state.pool, m.id, chapters).await {
+        let e = crate::db::observed_database_error(e);
         tracing::warn!(series_id, error = %e, "scan: chapter cache write failed");
     }
     // Phase E: resolve the work's format for the cadence tier. Missing (unmapped series or
@@ -1506,6 +1678,7 @@ async fn touch_feed_series_update(pool: &Database, series_id: &str, new_found: b
         return;
     }
     if let Err(e) = upsert_feed_series_update(pool, series_id).await {
+        let e = crate::db::observed_database_error(e);
         tracing::warn!(series_id, error = %e, "scan: updates-feed row upsert failed");
     }
 }
@@ -1583,61 +1756,118 @@ async fn touch_feed_series_update(pool: &Database, series_id: &str, new_found: b
 /// Finally, [`mirror_feed_row_into_browse_catalogue`] copies the finished row onto Browse's
 /// own table (migration 0069). Browse stopped reading THIS table, so without that copy the
 /// detection would be invisible on the surface that pages the whole catalogue.
+async fn lock_feed_sources(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    series_id: &str,
+) -> anyhow::Result<()> {
+    // Series, and the key the creator of a mapping for this series holds: a mapping
+    // that is absent here has no row to lock (`series_cache::series_publication_keys`).
+    crate::locks::advisory(tx, &crate::series_cache::series_publication_keys(series_id)).await?;
+    let sources: Vec<String> = sqlx::query_scalar("SELECT id FROM source_series WHERE source_type = 'suwayomi' AND source_key = $1 ORDER BY id").bind(series_id).fetch_all(&mut **tx).await?;
+    crate::locks::lock_source_series(tx, &sources).await?;
+    let current: Vec<String> = sqlx::query_scalar("SELECT id FROM source_series WHERE source_type = 'suwayomi' AND source_key = $1 ORDER BY id").bind(series_id).fetch_all(&mut **tx).await?;
+    if current != sources {
+        return Err(crate::locks::RestartTransaction.into());
+    }
+    if let Ok(id) = series_id.parse::<i64>() {
+        sqlx::query("SELECT id FROM suwayomi_series WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn upsert_feed_series_update(pool: &Database, series_id: &str) -> anyhow::Result<u64> {
+    // Read on the reader pool BEFORE the unit begins. Inside it, this read would wait
+    // for a reader connection while the unit holds its keys and row locks, and a failed
+    // read would fail the whole feed write. It is best-effort: "not ready" only leaves
+    // the release clock to the rebuild's ledger pass.
+    let ledger_ready = match crate::catalog::ledger::is_complete(pool).await {
+        Ok(ready) => ready,
+        Err(e) => {
+            let e = crate::db::observed_read_database_error(e);
+            tracing::warn!(series_id, error = %e, "scanner: ledger readiness check failed");
+            false
+        }
+    };
+    crate::db::retry_transaction(|| upsert_feed_series_update_once(pool, series_id, ledger_ready))
+        .await
+}
+
+/// The latest chapter of the one series `sy`, for the feed upsert below.
+///
+/// A LATERAL probe of `idx_suwayomi_chapter_manga`, so it reads the chapters of that
+/// series only. The statement used to join a window-function subquery over the whole
+/// `suwayomi_chapter` table, which PostgreSQL cannot restrict to one series: a full
+/// scan and sort of every cached chapter, under this unit's keys and row locks.
+const FEED_LATEST_CHAPTER_SQL: &str = "LEFT JOIN LATERAL ( \
+         SELECT c.chapter_number, c.name FROM suwayomi_chapter c \
+          WHERE c.manga_id = sy.id \
+            AND c.chapter_number >= 0 AND c.chapter_number <= 5000 \
+          ORDER BY sqlite_integer_pin(c.upload_date) DESC NULLS LAST, c.chapter_number DESC \
+          LIMIT 1) lc ON TRUE";
+
+/// The feed upsert of one Suwayomi series (`$1` is its id as text).
+fn feed_series_upsert_sql() -> String {
     let status_sql = crate::catalog::FSU_STATUS_SQL;
-    let n = sqlx::query(&format!(
+    format!(
         "INSERT INTO feed_series_updates \
-             (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, \
-              latest_chapter, latest_chapter_title, chapter_count, released_at, \
-              detected_at, is_nsfw, status, content_rating) \
-         SELECT ss.work_id, \
-                CASE WHEN EXISTS (SELECT 1 FROM source_series md \
-                                   WHERE md.work_id = ss.work_id \
-                                     AND md.source_type = 'mangadex') \
-                     THEN ss.work_id ELSE CAST(sy.id AS TEXT) END, \
-                COALESCE(w.title_override, w.primary_title, sy.title), \
-                CASE WHEN w.cover_cached_version IS NOT NULL \
-                     THEN '/covers/' || w.id || '.webp?v=' || w.cover_cached_version \
-                     END, \
-                sy.thumbnail_url, NULL, \
-                printf('%g', lc.chapter_number), lc.name, sy.chapter_count, \
-                MAX(CAST(sy.latest_chapter_at AS INTEGER)), \
-                sss.last_new_chapter_at, \
-                COALESCE(w.is_nsfw_override, w.is_nsfw), \
-                {status_sql}, COALESCE(w.content_rating, 'safe') \
-         FROM source_series ss \
-         JOIN work w ON w.id = ss.work_id \
-         JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
-         LEFT JOIN series_scan_state sss ON sss.series_id = ss.source_key \
-         LEFT JOIN (SELECT manga_id, chapter_number, name, \
-                            ROW_NUMBER() OVER (PARTITION BY manga_id \
-                                ORDER BY CAST(upload_date AS INTEGER) DESC, \
-                                         chapter_number DESC) AS rn \
-                       FROM suwayomi_chapter \
-                      WHERE chapter_number >= 0 AND chapter_number <= 5000) lc \
-                ON lc.manga_id = sy.id AND lc.rn = 1 \
-         WHERE ss.source_type = 'suwayomi' AND sy.in_library = 1 \
-           AND sy.latest_chapter_at IS NOT NULL \
-           AND ss.work_id IN (SELECT work_id FROM source_series \
-                              WHERE source_type = 'suwayomi' AND source_key = ?) \
-         GROUP BY ss.work_id \
-         ON CONFLICT(work_id) DO UPDATE SET \
-             released_at = MAX(feed_series_updates.released_at, excluded.released_at), \
-             detected_at = COALESCE(excluded.detected_at, feed_series_updates.detected_at), \
-             chapter_count = COALESCE(excluded.chapter_count, feed_series_updates.chapter_count), \
-             cover_url = COALESCE(NULLIF(feed_series_updates.cover_url, ''), excluded.cover_url), \
-             suwayomi_thumbnail = COALESCE(feed_series_updates.suwayomi_thumbnail, excluded.suwayomi_thumbnail), \
-             is_nsfw = MAX(feed_series_updates.is_nsfw, excluded.is_nsfw), \
-             status = excluded.status, \
-             content_rating = excluded.content_rating"
-    ))
-    .bind(series_id)
-    .execute(pool)
-    .await?
-    .rows_affected();
+         (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, \
+          latest_chapter, latest_chapter_title, chapter_count, released_at, \
+          detected_at, is_nsfw, status, content_rating) \
+     SELECT DISTINCT ON (ss.work_id) ss.work_id, \
+            CASE WHEN EXISTS (SELECT 1 FROM source_series md \
+                               WHERE md.work_id = ss.work_id \
+                                 AND md.source_type = 'mangadex') \
+                 THEN ss.work_id ELSE CAST(sy.id AS TEXT) END, \
+            COALESCE(w.title_override, w.primary_title, sy.title), \
+            CASE WHEN w.cover_cached_version IS NOT NULL \
+                 THEN '/covers/' || w.id || '.webp?v=' || w.cover_cached_version \
+                 END, \
+            sy.thumbnail_url, NULL, \
+            sqlite_general_number(lc.chapter_number), lc.name, sy.chapter_count, \
+            TIMESTAMPTZ '1970-01-01 00:00:00+00' + sy.latest_chapter_at * INTERVAL '1 millisecond', \
+            sss.last_new_chapter_at, \
+            COALESCE(w.is_nsfw_override, w.is_nsfw), \
+            {status_sql}, COALESCE(w.content_rating, 'safe') \
+     FROM source_series ss \
+     JOIN work w ON w.id = ss.work_id \
+     JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
+     LEFT JOIN series_scan_state sss ON sss.series_id = ss.source_key \
+     {FEED_LATEST_CHAPTER_SQL} \
+     WHERE ss.source_type = 'suwayomi' AND sy.in_library = TRUE \
+       AND sy.latest_chapter_at IS NOT NULL \
+       AND ss.work_id IN (SELECT work_id FROM source_series \
+                          WHERE source_type = 'suwayomi' AND source_key = $1) \
+     ORDER BY ss.work_id, sy.latest_chapter_at DESC, sy.id ASC \
+     ON CONFLICT(work_id) DO UPDATE SET \
+         released_at = GREATEST(feed_series_updates.released_at, excluded.released_at), \
+         detected_at = COALESCE(excluded.detected_at, feed_series_updates.detected_at), \
+         chapter_count = COALESCE(excluded.chapter_count, feed_series_updates.chapter_count), \
+         cover_url = COALESCE(NULLIF(feed_series_updates.cover_url, ''), excluded.cover_url), \
+         suwayomi_thumbnail = COALESCE(feed_series_updates.suwayomi_thumbnail, excluded.suwayomi_thumbnail), \
+         is_nsfw = (feed_series_updates.is_nsfw OR excluded.is_nsfw), \
+         status = excluded.status, \
+         content_rating = excluded.content_rating"
+    )
+}
+
+async fn upsert_feed_series_update_once(
+    pool: &Database,
+    series_id: &str,
+    ledger_ready: bool,
+) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+    lock_feed_sources(&mut tx, series_id).await?;
+    let n = sqlx::query(&feed_series_upsert_sql())
+        .bind(series_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
     if n > 0 {
-        fill_missing_feed_comic_type(pool, series_id).await?;
-        fill_feed_en_chapter_count(pool, series_id).await?;
+        fill_missing_feed_comic_type_on(&mut tx, series_id).await?;
+        fill_feed_en_chapter_count_on(&mut tx, series_id).await?;
         // The release clock, from the ledger (Phase C2) — the same statement the rebuild's
         // pass (5) runs, so the two cannot disagree. BEFORE the Browse mirror below, which
         // copies this row's columns verbatim: projecting afterwards would leave Browse
@@ -1650,18 +1880,22 @@ async fn upsert_feed_series_update(pool: &Database, series_id: &str) -> anyhow::
         // left in place rather than deleted so this function still converges with the
         // rebuild's scanner half while the ledger is still filling and the projection is
         // inert.
-        let work_id: Option<String> = sqlx::query_scalar(
+        let work_id: Option<String> = crate::db_types::query_scalar(
             "SELECT work_id FROM source_series \
-             WHERE source_type = 'suwayomi' AND source_key = ? LIMIT 1",
+             WHERE source_type = 'suwayomi' AND source_key = $1 LIMIT 1",
         )
         .bind(series_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
         if let Some(w) = work_id {
-            crate::catalog::project_feed_from_ledger_for_work(pool, &w).await?;
+            if ledger_ready {
+                crate::catalog::project_feed_from_ledger(&mut tx, Some(&w)).await?;
+            }
+            crate::catalog::default_announced_at(&mut tx, Some(&w)).await?;
         }
-        mirror_feed_row_into_browse_catalogue(pool, series_id).await?;
+        mirror_feed_row_into_browse_catalogue_on(&mut tx, series_id).await?;
     }
+    tx.commit().await?;
     Ok(n)
 }
 
@@ -1710,8 +1944,23 @@ use crate::catalog::BROWSE_CATALOGUE_MUTABLE as BROWSE_MIRROR_MUTABLE;
 ///
 /// The mutable-column set lives in [`BROWSE_MIRROR_MUTABLE`], which is pinned equal to
 /// `catalog::BROWSE_CATALOGUE_MUTABLE`.
+#[cfg(test)]
 async fn mirror_feed_row_into_browse_catalogue(
     pool: &Database,
+    series_id: &str,
+) -> anyhow::Result<()> {
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        lock_feed_sources(&mut tx, series_id).await?;
+        mirror_feed_row_into_browse_catalogue_on(&mut tx, series_id).await?;
+        tx.commit().await?;
+        Ok(())
+    })
+    .await
+}
+
+async fn mirror_feed_row_into_browse_catalogue_on(
+    pool: &mut sqlx::PgConnection,
     series_id: &str,
 ) -> anyhow::Result<()> {
     // Same mutable columns, same "write only when something differs" guard as
@@ -1739,7 +1988,7 @@ async fn mirror_feed_row_into_browse_catalogue(
         .join(", ");
     let changed = MUT
         .iter()
-        .map(|c| format!("browse_catalogue.{c} IS NOT excluded.{c}"))
+        .map(|c| format!("browse_catalogue.{c} IS DISTINCT FROM excluded.{c}"))
         .collect::<Vec<_>>()
         .join(" OR ");
     // Migration 0106's columns come from `work` / `work_stats` (the feed row carries none of
@@ -1751,7 +2000,7 @@ async fn mirror_feed_row_into_browse_catalogue(
         effective_content_rating_sql, BROWSE_DEMOGRAPHIC_SQL, BROWSE_LANGUAGE_SQL, BROWSE_YEAR_SQL,
     };
     let rating = effective_content_rating_sql("f.content_rating", "f.is_nsfw");
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
     sqlx::query(&format!(
         "INSERT INTO browse_catalogue \
              (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, status, \
@@ -1767,23 +2016,23 @@ async fn mirror_feed_row_into_browse_catalogue(
            JOIN work w ON w.id = f.work_id \
            LEFT JOIN work_stats st ON st.work_id = f.work_id \
           WHERE f.work_id IN (SELECT work_id FROM source_series \
-                              WHERE source_type = 'suwayomi' AND source_key = ?) \
+                              WHERE source_type = 'suwayomi' AND source_key = $1) \
          ON CONFLICT(work_id) DO UPDATE SET {set} WHERE {changed}"
     ))
     .bind(series_id)
-    .execute(&mut *tx)
+    .execute(&mut *pool)
     .await?;
-    let works: Vec<String> = sqlx::query_scalar(
+    let works: Vec<String> = crate::db_types::query_scalar(
         "SELECT DISTINCT work_id FROM source_series \
-        WHERE source_type = 'suwayomi' AND source_key = ?",
+        WHERE source_type = 'suwayomi' AND source_key = $1",
     )
     .bind(series_id)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *pool)
     .await?;
     for work in works {
-        crate::catalog::refresh_work_fts_in(&mut tx, &work).await?;
+        crate::catalog::refresh_work_fts_in(pool, &work).await?;
     }
-    tx.commit().await?;
+
     Ok(())
 }
 
@@ -1803,9 +2052,24 @@ async fn mirror_feed_row_into_browse_catalogue(
 /// indexed single-work lookups and this only runs on a scan that actually DETECTED something
 /// (~5% of ~475 scans/hr), so the cost is negligible; correctness here is the point, because
 /// the two writers are proven byte-identical by that same test.
+#[cfg(test)]
 async fn fill_feed_en_chapter_count(pool: &Database, series_id: &str) -> anyhow::Result<()> {
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        lock_feed_sources(&mut tx, series_id).await?;
+        fill_feed_en_chapter_count_on(&mut tx, series_id).await?;
+        tx.commit().await?;
+        Ok(())
+    })
+    .await
+}
+
+async fn fill_feed_en_chapter_count_on(
+    pool: &mut sqlx::PgConnection,
+    series_id: &str,
+) -> anyhow::Result<()> {
     let scope = "work_id IN (SELECT work_id FROM source_series \
-                             WHERE source_type = 'suwayomi' AND source_key = ?)";
+                             WHERE source_type = 'suwayomi' AND source_key = $1)";
     // The English mirror count. `COALESCE(…, 0)` and not a `WHERE EXISTS` guard: a work whose
     // English chapters were all UNLINKED must fall back to 0 and then to the Suwayomi count
     // below, exactly as a full rebuild would compute it from scratch.
@@ -1818,23 +2082,23 @@ async fn fill_feed_en_chapter_count(pool: &Database, series_id: &str) -> anyhow:
          WHERE {scope}"
     ))
     .bind(series_id)
-    .execute(pool)
+    .execute(&mut *pool)
     .await?;
     // Then the Suwayomi fallback, which may only ever RAISE a zero.
     sqlx::query(&format!(
         "UPDATE feed_series_updates SET en_chapter_count = \
              (SELECT MAX(sy.chapter_count) FROM source_series ss \
-                JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
+                JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
                WHERE ss.work_id = feed_series_updates.work_id \
                  AND ss.source_type = 'suwayomi') \
          WHERE {scope} AND en_chapter_count = 0 \
            AND COALESCE((SELECT MAX(sy.chapter_count) FROM source_series ss \
-                           JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
+                           JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
                           WHERE ss.work_id = feed_series_updates.work_id \
                             AND ss.source_type = 'suwayomi'), 0) > 0"
     ))
     .bind(series_id)
-    .execute(pool)
+    .execute(&mut *pool)
     .await?;
     Ok(())
 }
@@ -1852,27 +2116,42 @@ async fn fill_feed_en_chapter_count(pool: &Database, series_id: &str) -> anyhow:
 /// type the rebuild computed. The rebuild derives the type from the FEED row's title,
 /// which on conflict stays the mirror half's; leaving an existing type alone keeps this
 /// path from disagreeing with it.
+#[cfg(test)]
 async fn fill_missing_feed_comic_type(pool: &Database, series_id: &str) -> anyhow::Result<()> {
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        lock_feed_sources(&mut tx, series_id).await?;
+        fill_missing_feed_comic_type_on(&mut tx, series_id).await?;
+        tx.commit().await?;
+        Ok(())
+    })
+    .await
+}
+
+async fn fill_missing_feed_comic_type_on(
+    pool: &mut sqlx::PgConnection,
+    series_id: &str,
+) -> anyhow::Result<()> {
     let Some((work_id, title, override_word, original_language)) =
-        sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
+        crate::db_types::query_tuple::<(String, String, Option<String>, Option<String>)>(
             "SELECT f.work_id, f.title, w.content_type_override, w.original_language \
              FROM feed_series_updates f JOIN work w ON w.id = f.work_id \
              WHERE f.comic_type IS NULL \
                AND f.work_id IN (SELECT work_id FROM source_series \
-                                 WHERE source_type = 'suwayomi' AND source_key = ?)",
+                                 WHERE source_type = 'suwayomi' AND source_key = $1)",
         )
         .bind(series_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *pool)
         .await?
     else {
         return Ok(());
     };
 
-    let curated = sqlx::query_scalar::<_, String>(
-        "SELECT tag FROM work_tag WHERE work_id = ? ORDER BY ord, tag",
+    let curated = crate::db_types::query_scalar::<String>(
+        "SELECT tag FROM work_tag WHERE work_id = $1 ORDER BY ord, tag",
     )
     .bind(&work_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *pool)
     .await?;
     let genres = if curated.is_empty() {
         // Source genres, deduped in source order. The CAST is on `ss.source_key`
@@ -1880,14 +2159,14 @@ async fn fill_missing_feed_comic_type(pool: &Database, series_id: &str) -> anyho
         // opaque to the planner (see `work_effective_genres`).
         let mut seen = std::collections::BTreeSet::new();
         let mut out = Vec::new();
-        for json in sqlx::query_scalar::<_, String>(
+        for json in crate::db_types::query_scalar::<String>(
             "SELECT sw.genre FROM source_series ss \
-             JOIN suwayomi_series sw ON sw.id = CAST(ss.source_key AS INTEGER) \
-             WHERE ss.source_type = 'suwayomi' AND ss.work_id = ? AND sw.genre IS NOT NULL \
+             JOIN suwayomi_series sw ON sw.id = sqlite_integer_pin(ss.source_key) \
+             WHERE ss.source_type = 'suwayomi' AND ss.work_id = $1 AND sw.genre IS NOT NULL \
              ORDER BY ss.id",
         )
         .bind(&work_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *pool)
         .await?
         {
             let Ok(list) = serde_json::from_str::<Vec<String>>(&json) else {
@@ -1914,11 +2193,11 @@ async fn fill_missing_feed_comic_type(pool: &Database, series_id: &str) -> anyho
         ),
     );
     sqlx::query(
-        "UPDATE feed_series_updates SET comic_type = ? WHERE work_id = ? AND comic_type IS NULL",
+        "UPDATE feed_series_updates SET comic_type = $1 WHERE work_id = $2 AND comic_type IS NULL",
     )
     .bind(word)
     .bind(&work_id)
-    .execute(pool)
+    .execute(&mut *pool)
     .await?;
     Ok(())
 }
@@ -1936,7 +2215,7 @@ async fn fill_missing_feed_comic_type(pool: &Database, series_id: &str) -> anyho
 /// `triggerScan` overlapping a scheduler tick can no longer interleave their
 /// read-modify-write and double-count or clobber `known_chapter_count`.
 ///
-/// The transaction is `BEGIN IMMEDIATE`, not the default DEFERRED, and the whole
+/// The transaction is `BEGIN`, not the default DEFERRED, and the whole
 /// thing is retried on a lock error — see `record_scan` below for why.
 /// Legacy record path (no Phase E policy): the interval comes from `resolve_interval` over
 /// the inferred cadence, and the `awaiting` accelerated poll is live. This is the entry the
@@ -1951,7 +2230,18 @@ async fn record_scan(
     chapters: &[SuwayomiChapter],
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    record_scan_policy(pool, series_id, title, admin, chapters, None, now).await
+    crate::db::retry_transaction(|| {
+        record_scan_with_admin_once(
+            pool,
+            series_id,
+            title,
+            ScanAdminInput::Supplied(admin),
+            chapters,
+            None,
+            now,
+        )
+    })
+    .await
 }
 
 /// Phase E record path. When `comic_type` is `Some`, the steady interval is the format/
@@ -1966,14 +2256,7 @@ async fn record_scan_policy(
     comic_type: Option<ComicType>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    // Retry the ENTIRE transaction on a transient lock. A DEFERRED transaction that
-    // read first and then upgraded to a write was returning SQLITE_BUSY_SNAPSHOT
-    // (code 517) whenever another writer committed in between — 25 times in a 11.5h
-    // window in production. `busy_timeout` cannot help there: the read snapshot is
-    // already stale, so waiting changes nothing and only re-running the read can
-    // recover. `BEGIN IMMEDIATE` (below) takes the write lock up front, which lets
-    // `busy_timeout` do its job and makes 517 rare; this loop covers the remainder
-    // plus plain BUSY (code 5) when the 15s timeout is exhausted.
+    // Every retry starts a fresh transaction and rereads the guarded state.
     crate::db::retry_transaction(|| {
         record_scan_once(pool, series_id, title, admin, chapters, comic_type, now)
     })
@@ -1985,16 +2268,61 @@ async fn record_scan_once(
     pool: &Database,
     series_id: &str,
     title: &str,
-    admin: &ScanAdmin,
+    _admin: &ScanAdmin,
     chapters: &[SuwayomiChapter],
     comic_type: Option<ComicType>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    // BEGIN IMMEDIATE, not the default DEFERRED: take the write lock at the start of
-    // the transaction rather than upgrading to it after the read. That converts the
-    // unretryable-by-timeout SQLITE_BUSY_SNAPSHOT into ordinary BUSY, which
-    // `busy_timeout` (15s, see db::init) absorbs.
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    record_scan_with_admin_once(
+        pool,
+        series_id,
+        title,
+        ScanAdminInput::Stored,
+        chapters,
+        comic_type,
+        now,
+    )
+    .await
+}
+
+enum ScanAdminInput<'a> {
+    Stored,
+    #[allow(dead_code)]
+    Supplied(&'a ScanAdmin),
+}
+
+async fn record_scan_with_admin_once(
+    pool: &Database,
+    series_id: &str,
+    title: &str,
+    policy: ScanAdminInput<'_>,
+    chapters: &[SuwayomiChapter],
+    comic_type: Option<ComicType>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    // Serialize scan outcomes even when the state row does not exist yet. Admin
+    // writers must share this Series key; current overrides are read after waiting.
+    let mut tx = pool.begin_with("BEGIN").await?;
+    crate::locks::advisory(
+        &mut tx,
+        &[crate::locks::AdvisoryKey::new(
+            crate::locks::KeyClass::Series,
+            &[series_id],
+        )],
+    )
+    .await?;
+    #[cfg(test)]
+    if let Ok(points) = SCAN_STATE_PAUSE.try_with(Clone::clone) {
+        points.hit("scan-locked").await;
+    }
+
+    let admin = match policy {
+        ScanAdminInput::Stored => sqlx::query_as::<_, ScanAdmin>(
+            "SELECT override_interval_hours, poll_every_minutes, paused_override, status_override FROM series_admin WHERE series_id = $1 FOR NO KEY UPDATE"
+        ).bind(series_id).fetch_optional(&mut *tx).await?.unwrap_or_default(),
+        ScanAdminInput::Supplied(admin) => admin.clone(),
+    };
+
     let prior_opt = sqlx::query_as::<_, ScanState>(SCAN_STATE_SELECT)
         .bind(series_id)
         .fetch_optional(&mut *tx)
@@ -2160,7 +2488,16 @@ async fn record_scan_once(
     // only when a previous scan exists to measure from, and only when the previous schedule
     // was a real timestamp — a due-now sentinel means E2/E5 TRIGGERED this scan, so it
     // legitimately arrived early and is not evidence about the tier's cadence.
-    if policy_mode && prior.next_scan_at.as_deref() != Some(DUE_NOW_SENTINEL) {
+    if policy_mode
+        && prior
+            .next_scan_at
+            .as_deref()
+            .and_then(|value| crate::db_types::date(value).ok())
+            != Some(
+                crate::db_types::date(DUE_NOW_SENTINEL)
+                    .expect("internally generated UTC timestamp"),
+            )
+    {
         if let Some(prev) = parse_iso(prior.last_scanned_at.as_deref()) {
             record_tier_achieved(steady_interval, (now - prev).num_seconds() as f64 / 3600.0);
         }
@@ -2193,7 +2530,7 @@ async fn record_scan_once(
             last_scanned_at, next_scan_at, last_new_chapter_at, awaiting_since, \
             known_chapter_ids, consecutive_failures, last_failure_kind, last_failure_at, \
             updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, NULL, NULL, $10) \
          ON CONFLICT(series_id) DO UPDATE SET \
            avg_interval_hours = excluded.avg_interval_hours, \
            known_chapter_count = excluded.known_chapter_count, \
@@ -2212,12 +2549,14 @@ async fn record_scan_once(
     .bind(computed_avg)
     .bind(count)
     .bind(known_max)
-    .bind(&now_iso)
-    .bind(&next_scan_at)
-    .bind(&last_new_chapter_at)
-    .bind(&awaiting_since)
+    .bind(crate::db_types::date(&now_iso).expect("internally generated UTC timestamp"))
+    .bind(crate::db_types::date(&next_scan_at).expect("internally generated UTC timestamp"))
+    .bind(crate::db_types::optional_date(
+        last_new_chapter_at.as_deref(),
+    )?)
+    .bind(crate::db_types::optional_date(awaiting_since.as_deref())?)
     .bind(&known_chapter_ids)
-    .bind(&now_iso)
+    .bind(crate::db_types::date(&now_iso).expect("internally generated UTC timestamp"))
     .execute(&mut *tx)
     .await?;
 
@@ -2280,6 +2619,7 @@ async fn check_source_health(state: &AppState) {
     let health = match crate::catalog::source_scan_health(&state.pool).await {
         Ok(h) => h,
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "scan: per-source health aggregation failed");
             return;
         }
@@ -2301,6 +2641,7 @@ async fn check_source_health(state: &AppState) {
                 }
                 Ok(false) => {}
                 Err(e) => {
+                    let e = crate::db::observed_database_error(e);
                     tracing::warn!(source_id = %h.source_id, error = %e, "scan: clearing source outage failed")
                 }
             }
@@ -2340,6 +2681,7 @@ async fn check_source_health(state: &AppState) {
             ),
             Ok(false) => {}
             Err(e) => {
+                let e = crate::db::observed_database_error(e);
                 tracing::warn!(source_id = %h.source_id, error = %e, "scan: recording source outage failed")
             }
         }
@@ -2361,6 +2703,7 @@ async fn check_source_health(state: &AppState) {
                 ),
                 Ok(false) => {}
                 Err(e) => {
+                    let e = crate::db::observed_database_error(e);
                     tracing::warn!(pkg_name = pkg, error = %e, "scan: tripping the subscription breaker failed")
                 }
             }
@@ -2379,27 +2722,40 @@ async fn park_source_series(pool: &Database, source_id: &str) -> Option<String> 
     let spread_minutes = (base_minutes / 5).max(1); // ±10%
     let horizon = Utc::now() + chrono::Duration::minutes(base_minutes);
     let half_horizon = (Utc::now() + chrono::Duration::minutes(base_minutes / 2)).to_rfc3339();
-    let res = sqlx::query(
-        "UPDATE series_scan_state \
-            SET next_scan_at = strftime('%Y-%m-%dT%H:%M:%S', 'now', \
-                  '+' || (? + ABS(RANDOM()) % ?) || ' minutes') || '+00:00', \
-                updated_at   = strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' \
-          WHERE series_id IN (SELECT source_key FROM source_series \
-                               WHERE source_type = 'suwayomi' AND source_id = ?) \
-            AND next_scan_at < ?",
-    )
-    .bind(base_minutes - spread_minutes / 2)
-    .bind(spread_minutes)
-    .bind(source_id)
-    .bind(&half_horizon)
-    .execute(pool)
+    let res = crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        let ids: Vec<String> = crate::db_types::query_scalar(
+            "SELECT series_id FROM series_scan_state \
+             WHERE series_id IN (SELECT source_key FROM source_series \
+                                  WHERE source_type = 'suwayomi' AND source_id = $1) \
+               AND next_scan_at < $2",
+        )
+        .bind(source_id)
+        .bind(
+            crate::db_types::date(&half_horizon)
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let changed = write_eligible_schedules(
+            &mut tx,
+            &ids,
+            base_minutes - spread_minutes / 2,
+            spread_minutes,
+            Some((&half_horizon, false, Some(source_id))),
+            || {},
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(changed)
+    })
     .await;
     match res {
-        Ok(r) => {
-            if r.rows_affected() > 0 {
+        Ok(changed) => {
+            if changed > 0 {
                 tracing::warn!(
                     source_id,
-                    parked = r.rows_affected(),
+                    parked = changed,
                     park_hours = SOURCE_OUTAGE_PARK_HOURS,
                     "scan: parked an out-of-service source's series"
                 );
@@ -2407,6 +2763,7 @@ async fn park_source_series(pool: &Database, source_id: &str) -> Option<String> 
             Some(horizon.to_rfc3339())
         }
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(source_id, error = %e, "scan: parking the source's series failed");
             None
         }
@@ -2425,21 +2782,39 @@ async fn park_source_series(pool: &Database, source_id: &str) -> Option<String> 
 /// self-correcting cost.
 async fn unpark_source_series(pool: &Database, source_id: &str) -> u64 {
     let soon = (Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
-    sqlx::query(
-        "UPDATE series_scan_state \
-            SET next_scan_at = strftime('%Y-%m-%dT%H:%M:%S', 'now', \
-                  '+' || (ABS(RANDOM()) % 60) || ' minutes') || '+00:00', \
-                updated_at   = strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' \
-          WHERE series_id IN (SELECT source_key FROM source_series \
-                               WHERE source_type = 'suwayomi' AND source_id = ?) \
-            AND next_scan_at > ?",
-    )
-    .bind(source_id)
-    .bind(&soon)
-    .execute(pool)
-    .await
-    .map(|r| r.rows_affected())
-    .unwrap_or(0)
+    let res = crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        let ids: Vec<String> = crate::db_types::query_scalar(
+            "SELECT series_id FROM series_scan_state \
+             WHERE series_id IN (SELECT source_key FROM source_series \
+                                  WHERE source_type = 'suwayomi' AND source_id = $1) \
+               AND next_scan_at > $2",
+        )
+        .bind(source_id)
+        .bind(
+            crate::db_types::date(&soon)
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let changed = write_eligible_schedules(
+            &mut tx,
+            &ids,
+            0,
+            60,
+            Some((&soon, true, Some(source_id))),
+            || {},
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(changed)
+    })
+    .await;
+    res.unwrap_or_else(|e| {
+        crate::db::observe_database_error(&e);
+        tracing::warn!(source_id, error = %e, "scan: unparking source failed");
+        0
+    })
 }
 
 // ── Phase E3: per-source scanners with dynamic supervision ────────────────────────
@@ -2588,7 +2963,7 @@ pub enum LimitOrigin {
 pub async fn stored_source_rate_limits(
     pool: &Database,
 ) -> sqlx::Result<Vec<crate::config::SourceRateLimit>> {
-    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+    let rows: Vec<(String, i64, i64)> = crate::db_types::query_tuple(
         "SELECT source_id, requests, window_secs FROM source_rate_limit ORDER BY source_id",
     )
     .fetch_all(pool)
@@ -2615,14 +2990,14 @@ pub async fn store_source_rate_limit(
 ) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO source_rate_limit (source_id, requests, window_secs, updated_at) \
-         VALUES (?, ?, ?, ?) \
+         VALUES ($1, $2, $3, $4) \
          ON CONFLICT(source_id) DO UPDATE SET requests = excluded.requests, \
              window_secs = excluded.window_secs, updated_at = excluded.updated_at",
     )
     .bind(source_id)
     .bind(requests as i64)
     .bind(window_secs as i64)
-    .bind(Utc::now().to_rfc3339())
+    .bind(Utc::now())
     .execute(pool)
     .await?;
     Ok(())
@@ -2630,7 +3005,7 @@ pub async fn store_source_rate_limit(
 
 /// Forget an admin's limit. `false` when the source had none.
 pub async fn delete_source_rate_limit(pool: &Database, source_id: &str) -> sqlx::Result<bool> {
-    let res = sqlx::query("DELETE FROM source_rate_limit WHERE source_id = ?")
+    let res = sqlx::query("DELETE FROM source_rate_limit WHERE source_id = $1")
         .bind(source_id)
         .execute(pool)
         .await?;
@@ -2893,21 +3268,21 @@ async fn due_series_ids_for_source(
     let sql = match sel {
         SourceSel::Id(_) => {
             "SELECT series_id FROM series_scan_state \
-             WHERE source_id = ? AND next_scan_at <= ? \
-             ORDER BY next_scan_at ASC LIMIT ?"
+             WHERE source_id = $1 AND next_scan_at <= $2 \
+             ORDER BY next_scan_at ASC NULLS FIRST LIMIT $3"
         }
         SourceSel::Unassigned { above: None } => {
             "SELECT series_id FROM series_scan_state \
-             WHERE source_id IS NULL AND next_scan_at <= ? \
-             ORDER BY next_scan_at ASC LIMIT ?"
+             WHERE source_id IS NULL AND next_scan_at <= $1 \
+             ORDER BY next_scan_at ASC NULLS FIRST LIMIT $2"
         }
         SourceSel::Unassigned { above: Some(_) } => {
             "SELECT series_id FROM series_scan_state \
-             WHERE (source_id IS NULL OR source_id > ?) AND next_scan_at <= ? \
-             ORDER BY next_scan_at ASC LIMIT ?"
+             WHERE (source_id IS NULL OR source_id > $1) AND next_scan_at <= $2 \
+             ORDER BY next_scan_at ASC NULLS FIRST LIMIT $3"
         }
     };
-    let mut q = sqlx::query_scalar::<_, String>(sql);
+    let mut q = crate::db_types::query_scalar::<String>(sql);
     match sel {
         SourceSel::Id(id) => q = q.bind(id),
         SourceSel::Unassigned {
@@ -2915,11 +3290,12 @@ async fn due_series_ids_for_source(
         } => q = q.bind(cutoff),
         SourceSel::Unassigned { above: None } => {}
     }
-    q.bind(now_iso)
+    q.bind(crate::db_types::date(now_iso).expect("internally generated UTC timestamp"))
         .bind(limit)
         .fetch_all(pool)
         .await
         .unwrap_or_else(|e| {
+            crate::db::record_read_database_error(&e);
             tracing::warn!(error = %e, "scan: per-source due-query failed");
             Vec::new()
         })
@@ -2993,8 +3369,10 @@ async fn tick_source(
                         // A lock error is NOT backed off (our own write contention, not an
                         // upstream failure); the schedule is intact and the next tick retries.
                         if crate::db::is_locked_error(&e) {
+                            let e = crate::db::observed_database_error(e);
                             tracing::warn!(series_id, error = %e, "scan: skipped this tick on write contention (not backed off)");
                         } else {
+                            let e = crate::db::observed_database_error(e);
                             tracing::warn!(series_id, error = %e, "scan: series scan failed; backed off");
                         }
                     }
@@ -3059,7 +3437,7 @@ async fn run_source_loop(
                         // the most recent activity.
                         let mut h = state.scan_health.lock().unwrap_or_else(|e| e.into_inner());
                         // Liveness is always refreshed — "is the scanner running at all?".
-                        h.last_tick_at = Some(Utc::now().to_rfc3339());
+                        h.last_tick_at = Some(crate::db_types::format_date(Utc::now()));
                         // But the ACTIVITY fields are only written by a tick that actually had
                         // work. With N loops on a 60 s beat, the overwhelming majority of ticks
                         // find nothing due (~17 due rows/min library-wide against 16 loops), so
@@ -3072,7 +3450,7 @@ async fn run_source_loop(
                             h.scanned_ok = out.ok;
                             h.scanned_failed = out.failed;
                             if out.ok > 0 {
-                                h.last_success_at = Some(Utc::now().to_rfc3339());
+                                h.last_success_at = Some(crate::db_types::format_date(Utc::now()));
                             }
                             if out.failed > 0 && out.ok == 0 {
                                 h.consecutive_stuck_ticks =
@@ -3192,6 +3570,7 @@ async fn heal_null_source_ids(pool: &Database) -> u64 {
     .await
     .map(|r| r.rows_affected())
     .unwrap_or_else(|e| {
+        crate::db::record_database_error(&e);
         tracing::warn!(error = %e, "scan: source_id heal failed");
         0
     })
@@ -3205,14 +3584,15 @@ async fn heal_null_source_ids(pool: &Database) -> u64 {
 /// [`sweeper_cutoff`] hands to the sweeper. An unordered `LIMIT` would leave an arbitrary,
 /// reconcile-to-reconcile-varying hole that no range can describe.
 async fn distinct_scan_source_ids(pool: &Database, limit: usize) -> Vec<String> {
-    sqlx::query_scalar::<_, String>(
+    crate::db_types::query_scalar::<String>(
         "SELECT DISTINCT source_id FROM series_scan_state WHERE source_id IS NOT NULL \
-         ORDER BY source_id ASC LIMIT ?",
+         ORDER BY source_id ASC NULLS FIRST LIMIT $1",
     )
     .bind(limit as i64)
     .fetch_all(pool)
     .await
     .unwrap_or_else(|e| {
+        crate::db::record_read_database_error(&e);
         tracing::warn!(error = %e, "scan: distinct-source query failed");
         Vec::new()
     })
@@ -3308,6 +3688,7 @@ async fn supervisor(state: Arc<AppState>, mut shutdown: tokio::sync::watch::Rece
         match stored_source_rate_limits(&state.pool).await {
             Ok(stored) => coord.apply_limits(&merge_source_rate_limits(limits.clone(), stored)),
             Err(e) => {
+                let e = crate::db::observed_read_database_error(e.into());
                 tracing::warn!(error = %e, "scan supervisor: could not read source_rate_limit — keeping the current limits")
             }
         }
@@ -3378,12 +3759,13 @@ async fn supervisor(state: Arc<AppState>, mut shutdown: tokio::sync::watch::Rece
         // Admin health snapshot: the library-wide totals, once per reconcile.
         {
             let total = scan_state_count(&state.pool).await;
-            let due: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM series_scan_state WHERE next_scan_at <= ?",
+            let due: i64 = crate::db_types::query_scalar(
+                "SELECT COUNT(*) FROM series_scan_state WHERE next_scan_at <= $1",
             )
-            .bind(now.to_rfc3339())
+            .bind(now)
             .fetch_one(&state.pool)
             .await
+            .inspect_err(crate::db::record_read_database_error)
             .unwrap_or(0);
             let mut h = state.scan_health.lock().unwrap_or_else(|e| e.into_inner());
             h.library_size = total;
@@ -3405,6 +3787,7 @@ async fn supervisor(state: Arc<AppState>, mut shutdown: tokio::sync::watch::Rece
             let failed = coord.failures_since_health.load(Ordering::Relaxed);
             let outage_open = crate::catalog::any_source_outage(&state.pool)
                 .await
+                .map_err(crate::db::observed_read_database_error)
                 .unwrap_or(false);
             if failed > 0 || outage_open {
                 coord
@@ -3450,6 +3833,470 @@ async fn supervisor(state: Arc<AppState>, mut shutdown: tokio::sync::watch::Rece
 mod tests {
     use super::*;
     use crate::database::TestPoolOptions;
+
+    async fn schedule_overlap(mode: u8, move_source: bool) {
+        let pool = migrated_pool().await.foreground();
+        let original = if mode == 1 {
+            DUE_NOW_SENTINEL.to_owned()
+        } else {
+            "2099-01-01T00:00:00Z".to_owned()
+        };
+        put_state(&pool, "1", Some(&original)).await;
+        sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES ('w_schedule',now(),now()); INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES ('ss_schedule','w_schedule','suwayomi','source-a','1',now())")
+            .execute(&pool).await.unwrap();
+        let points = crate::locks::pause_points::PausePoints::default();
+        let armed = points.arm("schedule-discovered");
+        let writer = pool.clone();
+        let first = tokio::spawn(SCHEDULE_DISCOVERY_PAUSE.scope(points, async move {
+            match mode {
+                0 => reclaim_absurd_schedules(&writer, Utc::now()).await,
+                1 => {
+                    assert!(park_source_series(&writer, "source-a").await.is_some());
+                    0
+                }
+                _ => unpark_source_series(&writer, "source-a").await,
+            }
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
+            .await
+            .unwrap();
+        let expected = if move_source {
+            sqlx::query("UPDATE source_series SET source_id = 'source-b' WHERE id = 'ss_schedule'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            crate::db_types::date(&original).unwrap()
+        } else {
+            let next = if mode == 1 {
+                "2098-01-01T00:00:00Z"
+            } else {
+                "2026-01-01T00:00:00Z"
+            };
+            sqlx::query("UPDATE series_scan_state SET next_scan_at = $1 WHERE series_id = '1'")
+                .bind(crate::db_types::date(next).unwrap())
+                .execute(&pool)
+                .await
+                .unwrap();
+            crate::db_types::date(next).unwrap()
+        };
+        armed.release();
+        assert_eq!(first.await.unwrap(), 0);
+        let stored: DateTime<Utc> =
+            sqlx::query_scalar("SELECT next_scan_at FROM series_scan_state WHERE series_id = '1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored, expected,
+            "stale selected ID overwrote concurrent writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn feed_publication_rechecks_locked_work_inputs_in_every_projection() {
+        for operation in 0..4 {
+            let pool = migrated_pool().await.foreground();
+            seed_feed_fixture(&pool, Some("1767225600000")).await;
+            if operation != 0 {
+                upsert_feed_series_update(&pool, "7").await.unwrap();
+            }
+            if operation == 3 {
+                sqlx::query("UPDATE feed_series_updates SET comic_type=NULL")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            let points = crate::locks::pause_points::PausePoints::default();
+            let armed = points.arm("work-edited");
+            let writer = pool.clone();
+            let first = tokio::spawn(async move {
+                let mut tx = writer.begin().await?;
+                crate::locks::lock_works(&mut tx, &["w1"]).await?;
+                match operation {
+                    0 => {
+                        sqlx::query("UPDATE work SET title_override='Fresh Title' WHERE id='w1'")
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                    1 => {
+                        sqlx::query(
+                            "UPDATE feed_series_updates SET title='Fresh Title' WHERE work_id='w1'",
+                        )
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    2 => {
+                        sqlx::query("UPDATE suwayomi_series SET chapter_count=29 WHERE id=7")
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                    _ => {
+                        sqlx::query("UPDATE work SET content_type_override='MANHUA' WHERE id='w1'")
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                }
+                points.hit("work-edited").await;
+                tx.commit().await?;
+                Ok::<_, anyhow::Error>(())
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
+                .await
+                .unwrap();
+            let writer = pool.clone();
+            let second = tokio::spawn(async move {
+                match operation {
+                    0 => upsert_feed_series_update(&writer, "7").await.map(|_| ()),
+                    1 => mirror_feed_row_into_browse_catalogue(&writer, "7").await,
+                    2 => fill_feed_en_chapter_count(&writer, "7").await,
+                    _ => fill_missing_feed_comic_type(&writer, "7").await,
+                }
+            });
+            crate::cover::wait_for_writer_lock(&pool).await;
+            armed.release();
+            first.await.unwrap().unwrap();
+            second.await.unwrap().unwrap();
+            match operation {
+                0 | 1 => {
+                    let title: String =
+                        sqlx::query_scalar("SELECT title FROM browse_catalogue WHERE work_id='w1'")
+                            .fetch_one(&pool)
+                            .await
+                            .unwrap();
+                    assert_eq!(title, "Fresh Title");
+                }
+                2 => {
+                    let count: i64 = sqlx::query_scalar(
+                        "SELECT en_chapter_count FROM feed_series_updates WHERE work_id='w1'",
+                    )
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    assert_eq!(count, 29);
+                }
+                _ => {
+                    let kind: String = sqlx::query_scalar(
+                        "SELECT comic_type FROM feed_series_updates WHERE work_id='w1'",
+                    )
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    assert_eq!(kind, "MANHUA");
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn reclaim_absurd_schedules_preserves_concurrent_schedule_edit() {
+        schedule_overlap(0, false).await;
+    }
+    #[tokio::test]
+    async fn park_source_series_preserves_concurrent_schedule_edit() {
+        schedule_overlap(1, false).await;
+    }
+    #[tokio::test]
+    async fn park_source_series_rechecks_concurrent_source_move() {
+        schedule_overlap(1, true).await;
+    }
+    #[tokio::test]
+    async fn unpark_source_series_preserves_concurrent_schedule_edit() {
+        schedule_overlap(2, false).await;
+    }
+    #[tokio::test]
+    async fn unpark_source_series_rechecks_concurrent_source_move() {
+        schedule_overlap(2, true).await;
+    }
+
+    /// The feed projection of a series whose mapping is being created must wait for
+    /// the creator (it holds the Suwayomi source identity key). Without that key the
+    /// projection finds no mapping, publishes nothing, and the series stays out of
+    /// the feed until its next scan.
+    #[tokio::test]
+    async fn feed_publication_waits_for_a_source_mapping_that_is_being_created() {
+        let pool = migrated_pool().await.foreground();
+        seed_feed_fixture(&pool, Some("1767225600000")).await;
+        sqlx::query("DELETE FROM source_series WHERE id = 'ss1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The real catalogue writer, stopped inside its transaction after it took its
+        // guards and before it inserted the mapping.
+        let points = crate::locks::pause_points::PausePoints::default();
+        let held = points.arm("guard-held");
+        let creator_pool = pool.clone();
+        let creator = tokio::spawn(
+            crate::catalog::guards::TEST_PAUSE.scope(points, async move {
+                crate::catalog::upsert_source_series(
+                    &creator_pool,
+                    "w1",
+                    "suwayomi",
+                    "1",
+                    "7",
+                    None,
+                    false,
+                )
+                .await
+            }),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(30), held.reached())
+            .await
+            .expect("the catalogue writer did not reach its guards");
+        let writer = pool.clone();
+        let mut projection =
+            tokio::spawn(async move { upsert_feed_series_update(&writer, "7").await });
+        tokio::select! {
+            _ = crate::cover::wait_for_writer_lock(&pool) => {}
+            done = &mut projection => panic!("the projection did not wait for the mapping creator: {done:?}"),
+        }
+        held.release();
+        creator.await.unwrap().unwrap();
+        assert_eq!(projection.await.unwrap().unwrap(), 1);
+        let feed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feed_series_updates WHERE work_id = 'w1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(feed, 1);
+    }
+
+    #[tokio::test]
+    async fn scan_policy_reads_the_admin_override_after_waiting_for_the_series_guard() {
+        let pool = migrated_pool().await.foreground();
+        let now = at("2026-01-01T00:00:00Z");
+        let mut first = pool.begin().await.unwrap();
+        crate::locks::advisory(
+            &mut first,
+            &[crate::locks::AdvisoryKey::new(
+                crate::locks::KeyClass::Series,
+                &["1"],
+            )],
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO series_admin(series_id,override_interval_hours,updated_at) VALUES ('1', 48, NOW())").execute(&mut *first).await.unwrap();
+        let writer = pool.clone();
+        let second = tokio::spawn(async move {
+            record_scan_policy(
+                &writer,
+                "1",
+                "Series",
+                &ScanAdmin::default(),
+                &chaps(1),
+                None,
+                now,
+            )
+            .await
+        });
+        crate::cover::wait_for_writer_lock(&pool).await;
+        first.commit().await.unwrap();
+        assert!(!second.await.unwrap().unwrap());
+        let state = scan_state(&pool, "1").await.unwrap();
+        assert_eq!(state.avg_interval_hours, 0.0);
+        assert!((hours_until_next_scan(&pool, "1", now).await - 48.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn two_foreground_scan_failures_increment_and_back_off_twice() {
+        let pool = migrated_pool().await.foreground();
+        let points = crate::locks::pause_points::PausePoints::default();
+        let armed = points.arm("scan-locked");
+        let now = at("2026-01-01T00:00:00Z");
+        let writer = pool.clone();
+        let first = tokio::spawn(SCAN_STATE_PAUSE.scope(points, async move {
+            record_scan_failure(&writer, "1", now, FailureKind::FetchError).await
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
+            .await
+            .unwrap();
+        let writer = pool.clone();
+        let second = tokio::spawn(async move {
+            record_scan_failure(&writer, "1", now, FailureKind::FetchError).await
+        });
+        crate::cover::wait_for_writer_lock(&pool).await;
+        armed.release();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        let (count, next): (i64, DateTime<Utc>) = sqlx::query_as("SELECT consecutive_failures, next_scan_at FROM series_scan_state WHERE series_id = '1'").fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            next,
+            now + chrono::Duration::minutes(ERROR_BACKOFF_BASE_MINUTES * 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn two_foreground_scans_detect_a_new_chapter_once() {
+        let pool = migrated_pool().await.foreground();
+        let now = at("2026-01-01T00:00:00Z");
+        record_scan(&pool, "1", "Series", &ScanAdmin::default(), &chaps(1), now)
+            .await
+            .unwrap();
+        let points = crate::locks::pause_points::PausePoints::default();
+        let armed = points.arm("scan-locked");
+        let writer = pool.clone();
+        let first = tokio::spawn(SCAN_STATE_PAUSE.scope(points, async move {
+            record_scan(
+                &writer,
+                "1",
+                "Series",
+                &ScanAdmin::default(),
+                &chaps(2),
+                now,
+            )
+            .await
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
+            .await
+            .unwrap();
+        let writer = pool.clone();
+        let second = tokio::spawn(async move {
+            record_scan_policy(
+                &writer,
+                "1",
+                "Series",
+                &ScanAdmin::default(),
+                &chaps(2),
+                None,
+                now,
+            )
+            .await
+        });
+        crate::cover::wait_for_writer_lock(&pool).await;
+        armed.release();
+        assert!(first.await.unwrap().unwrap());
+        assert!(!second.await.unwrap().unwrap());
+        assert_eq!(scan_state(&pool, "1").await.unwrap().known_chapter_count, 2);
+    }
+    #[tokio::test]
+    async fn native_schedule_clock_preserves_whole_second_rollovers() {
+        let pool = migrated_pool().await;
+        for (input, minutes, expected) in [
+            (
+                "2024-02-29T23:59:59.999123456+00:00",
+                0_i64,
+                "2024-02-29T23:59:59+00:00",
+            ),
+            (
+                "2024-02-29T23:59:59.999123456+00:00",
+                59,
+                "2024-03-01T00:58:59+00:00",
+            ),
+            (
+                "2026-01-01T00:00:00.123456789+00:00",
+                10080,
+                "2026-01-08T00:00:00+00:00",
+            ),
+        ] {
+            let now = DateTime::parse_from_rfc3339(input)
+                .unwrap()
+                .with_timezone(&Utc);
+            assert_eq!(schedule_timestamp(now, minutes), expected);
+            let actual: DateTime<Utc> = crate::db_types::query_scalar(
+                "SELECT date_trunc('second', $1::timestamptz) + $2::bigint * INTERVAL '1 minute'",
+            )
+            .bind(crate::db_types::date(input).unwrap())
+            .bind(minutes)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(actual, crate::db_types::date(expected).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn portable_schedule_cohort_uses_one_clock_and_rolls_back_on_failure() {
+        let pool = migrated_pool().await;
+        let ids: Vec<String> = (0..SCHEDULE_WRITE_CHUNK + 1)
+            .map(|i| format!("cohort-{i:04}"))
+            .collect();
+        for id in &ids {
+            put_state(&pool, id, Some("2033-01-01T00:00:00+00:00")).await;
+        }
+        let mut tx = pool.begin().await.unwrap();
+        assert_eq!(
+            write_jittered_schedules(&mut tx, &ids, 10, 60)
+                .await
+                .unwrap(),
+            ids.len() as u64
+        );
+        tx.commit().await.unwrap();
+        let rows: Vec<(String, String)> = crate::db_types::query_tuple(
+            "SELECT next_scan_at, updated_at FROM series_scan_state ORDER BY series_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        for (next, updated) in &rows {
+            assert_eq!(updated, &rows[0].1);
+            assert_eq!(updated.len(), 32);
+            assert_eq!(next.len(), 32);
+            let delay = DateTime::parse_from_rfc3339(next).unwrap()
+                - DateTime::parse_from_rfc3339(updated).unwrap();
+            assert!((10..70).contains(&delay.num_minutes()));
+        }
+        sqlx::raw_sql(
+            "CREATE FUNCTION fail_second_schedule_fn() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF NEW.series_id = 'cohort-0128' THEN RAISE EXCEPTION 'schedule failed'; END IF; \
+             RETURN NEW; END $$; CREATE TRIGGER fail_second_schedule BEFORE UPDATE ON series_scan_state \
+             FOR EACH ROW EXECUTE FUNCTION fail_second_schedule_fn()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        assert!(write_jittered_schedules(&mut tx, &ids, 100, 60)
+            .await
+            .is_err());
+        tx.rollback().await.unwrap();
+        let after: Vec<(String, String)> = crate::db_types::query_tuple(
+            "SELECT next_scan_at, updated_at FROM series_scan_state ORDER BY series_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(after, rows);
+    }
+
+    #[tokio::test]
+    async fn portable_schedule_writes_are_bounded_and_empty_is_free() {
+        let pool = migrated_pool().await;
+        for count in [0, SCHEDULE_WRITE_CHUNK * 2, 2000] {
+            let ids: Vec<String> = (0..count).map(|i| format!("bounded-{count}-{i}")).collect();
+            for id in &ids {
+                put_state(&pool, id, Some("2033-01-01T00:00:00+00:00")).await;
+            }
+            let mut statements = 0;
+            let mut tx = pool.begin().await.unwrap();
+            let started = std::time::Instant::now();
+            let mut previous = started;
+            let mut chunk_times = Vec::new();
+            let changed = write_jittered_schedules_observed(&mut tx, &ids, 10, 60, || {
+                let now = std::time::Instant::now();
+                if statements > 0 {
+                    chunk_times.push(now.duration_since(previous));
+                }
+                previous = now;
+                statements += 1;
+            })
+            .await
+            .unwrap();
+            if statements > 0 {
+                chunk_times.push(previous.elapsed());
+            }
+            chunk_times.sort();
+            eprintln!("schedule cohort {count}: {statements} writes, {:?} total; median chunk {:?}, max {:?}", started.elapsed(), chunk_times.get(chunk_times.len() / 2), chunk_times.last());
+            assert_eq!(changed, count as u64);
+            assert_eq!(statements, count.div_ceil(SCHEDULE_WRITE_CHUNK));
+            tx.commit().await.unwrap();
+        }
+        // Exercise the real migration's NULL-rejecting schedule trigger too.
+        assert!(
+            sqlx::query("UPDATE series_scan_state SET next_scan_at = NULL")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
 
     thread_local! {
         /// Schedule jitter is OFF by default in tests — see `jitter_interval_hours`.
@@ -3757,7 +4604,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -4017,11 +4864,43 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
         pool
+    }
+
+    // Historical source migrations stay executable on SQLite for importer coverage.
+    // They are not PostgreSQL runtime migrations; the PG engine uses the baseline.
+    async fn source_migration_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn source_put_state(pool: &sqlx::SqlitePool, id: &str, next_scan_at: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO series_scan_state(series_id,next_scan_at,updated_at) VALUES($1,$2,$3)",
+        )
+        .bind(id)
+        .bind(next_scan_at.unwrap_or(DUE_NOW_SENTINEL))
+        .bind("2024-01-01T00:00:00Z")
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn source_next_scan_of(pool: &sqlx::SqlitePool, id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT next_scan_at FROM series_scan_state WHERE series_id=$1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -4206,7 +5085,7 @@ mod tests {
         assert_eq!(row.known_chapter_count, 13);
         assert_eq!(
             row.last_new_chapter_at.as_deref(),
-            Some(then.to_rfc3339()).as_deref()
+            Some(crate::db_types::format_date(then)).as_deref()
         );
     }
 
@@ -4512,7 +5391,7 @@ mod tests {
         assert_eq!(scan_comic_type(&pool, "7").await, ComicType::Manhua);
         sqlx::query(
             "INSERT INTO feed_series_updates (work_id, reader_id, title, comic_type, released_at) \
-             VALUES ('w1', 'w1', 'T', 'MANHWA', 1700000000)",
+             VALUES ('w1', 'w1', 'T', 'MANHWA', TIMESTAMPTZ '1970-01-20 16:13:20+00')",
         )
         .execute(&pool)
         .await
@@ -4811,7 +5690,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             persisted(&pool, "1").await.awaiting_since.as_deref(),
-            Some(t1.to_rfc3339()).as_deref(),
+            Some(crate::db_types::format_date(t1)).as_deref(),
             "the awaiting streak starts at the first genuinely-late scan"
         );
         assert!((hours_until_next_scan(&pool, "1", t1).await - 0.5).abs() < 0.01);
@@ -4828,7 +5707,7 @@ mod tests {
         );
         assert_eq!(
             persisted(&pool, "1").await.awaiting_since.as_deref(),
-            Some(t1.to_rfc3339()).as_deref(),
+            Some(crate::db_types::format_date(t1)).as_deref(),
             "the streak start is held as the cool-down marker, not re-stamped every scan"
         );
 
@@ -4840,7 +5719,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             persisted(&pool, "1").await.awaiting_since.as_deref(),
-            Some(t3.to_rfc3339()).as_deref(),
+            Some(crate::db_types::format_date(t3)).as_deref(),
             "the streak re-arms once the cool-down has elapsed"
         );
         assert!(
@@ -4857,7 +5736,7 @@ mod tests {
         let pool = migrated_pool().await;
         let now = Utc::now();
         let far = (now + chrono::Duration::days(2500)).to_rfc3339();
-        let ok = (now + chrono::Duration::hours(6)).to_rfc3339();
+        let ok = crate::db_types::format_date(now + chrono::Duration::hours(6));
         put_state(&pool, "parked_in_2033", Some(&far)).await;
         put_state(&pool, "normal", Some(&ok)).await;
 
@@ -5005,7 +5884,7 @@ mod tests {
         top.id = i64::MAX;
         top.chapter_number = real_max + 1.0;
         plus.push(top);
-        sqlx::query("UPDATE series_scan_state SET next_scan_at = '1970-01-01T00:00:00+00:00' WHERE series_id = ?")
+        sqlx::query("UPDATE series_scan_state SET next_scan_at = '1970-01-01T00:00:00+00:00' WHERE series_id = $1")
             .bind(&sid)
             .execute(&pool)
             .await
@@ -5037,22 +5916,24 @@ mod tests {
     /// bounded `next_scan_at <= ?` due-query like a real freshly-enrolled row.
     async fn put_state(pool: &Database, id: &str, next_scan_at: Option<&str>) {
         sqlx::query(
-            "INSERT INTO series_scan_state (series_id, next_scan_at, updated_at) VALUES (?, ?, ?)",
+            "INSERT INTO series_scan_state (series_id, next_scan_at, updated_at) VALUES ($1, $2, $3)",
         )
         .bind(id)
-        .bind(next_scan_at.unwrap_or(DUE_NOW_SENTINEL))
-        .bind("2024-01-01T00:00:00Z")
+        .bind(crate::db_types::date(next_scan_at.unwrap_or(DUE_NOW_SENTINEL)).unwrap())
+        .bind(at("2024-01-01T00:00:00Z"))
         .execute(pool)
         .await
         .unwrap();
     }
 
     async fn next_scan_of(pool: &Database, id: &str) -> Option<String> {
-        sqlx::query_scalar("SELECT next_scan_at FROM series_scan_state WHERE series_id = ?")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .unwrap()
+        crate::db_types::query_scalar(
+            "SELECT next_scan_at FROM series_scan_state WHERE series_id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -5084,7 +5965,7 @@ mod tests {
         ensure_pending(&pool, "42").await.unwrap();
         assert_eq!(
             next_scan_of(&pool, "42").await.as_deref(),
-            Some(DUE_NOW_SENTINEL)
+            Some("1970-01-01T00:00:00.000000+00:00")
         );
         assert!(
             due_series_ids(&pool, &now.to_rfc3339(), 10)
@@ -5130,11 +6011,13 @@ mod tests {
     }
 
     async fn failures_of(pool: &Database, id: &str) -> i64 {
-        sqlx::query_scalar("SELECT consecutive_failures FROM series_scan_state WHERE series_id = ?")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .unwrap()
+        crate::db_types::query_scalar(
+            "SELECT consecutive_failures FROM series_scan_state WHERE series_id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -5213,7 +6096,7 @@ mod tests {
         record_scan_failure(&pool, "quietly_broken", now, FailureKind::CachedFallback)
             .await
             .unwrap();
-        let (kind, at_iso): (Option<String>, Option<String>) = sqlx::query_as(
+        let (kind, at_iso): (Option<String>, Option<String>) = crate::db_types::query_tuple(
             "SELECT last_failure_kind, last_failure_at FROM series_scan_state \
              WHERE series_id = 'quietly_broken'",
         )
@@ -5225,7 +6108,10 @@ mod tests {
             Some("cached_fallback"),
             "a scan served from Suwayomi's cache must be distinguishable from a clean error"
         );
-        assert_eq!(at_iso.as_deref(), Some(now.to_rfc3339().as_str()));
+        assert_eq!(
+            at_iso.as_deref(),
+            Some(crate::db_types::format_date(now).as_str())
+        );
         assert_eq!(failures_of(&pool, "quietly_broken").await, 1);
 
         record_scan(
@@ -5238,7 +6124,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (kind, at_iso): (Option<String>, Option<String>) = sqlx::query_as(
+        let (kind, at_iso): (Option<String>, Option<String>) = crate::db_types::query_tuple(
             "SELECT last_failure_kind, last_failure_at FROM series_scan_state \
              WHERE series_id = 'quietly_broken'",
         )
@@ -5286,7 +6172,7 @@ mod tests {
             sqlx::query(
                 "INSERT INTO source_series \
                    (id, work_id, source_type, source_id, source_key, created_at) \
-                 VALUES (?, 'w', 'suwayomi', 'dead_src', ?, '2024-01-01T00:00:00Z')",
+                 VALUES ($1, 'w', 'suwayomi', 'dead_src', $2, '2024-01-01T00:00:00Z')",
             )
             .bind(format!("ss_{key}"))
             .bind(key)
@@ -5316,7 +6202,7 @@ mod tests {
         );
         assert_eq!(
             next_scan_of(&pool, "20").await.as_deref(),
-            Some(DUE_NOW_SENTINEL),
+            Some("1970-01-01T00:00:00.000000+00:00"),
             "a healthy source's series is untouched"
         );
 
@@ -5359,11 +6245,11 @@ mod tests {
             async move {
                 sqlx::query(
                     "INSERT INTO series_scan_state (series_id, next_scan_at, last_scanned_at, updated_at) \
-                     VALUES (?, ?, ?, '2026-01-01T00:00:00Z')",
+                     VALUES ($1, $2, $3, '2026-01-01T00:00:00Z')",
                 )
                 .bind(id)
-                .bind(next)
-                .bind(last)
+                .bind(crate::db_types::date(&next).unwrap())
+                .bind(crate::db_types::optional_date(last.as_deref()).unwrap())
                 .execute(&pool)
                 .await
                 .unwrap();
@@ -5413,7 +6299,7 @@ mod tests {
         assert_eq!(trigger_due_now(&pool, &due).await, 1);
         assert_eq!(
             next_scan_of(&pool, "parked").await.as_deref(),
-            Some(DUE_NOW_SENTINEL),
+            Some("1970-01-01T00:00:00.000000+00:00"),
             "woken series are ENQUEUED at the due-now sentinel, never scanned inline"
         );
         // The scheduler picks it up on its very next tick, which is the whole mechanism.
@@ -5421,8 +6307,14 @@ mod tests {
             .await
             .contains(&"parked".to_string()));
         // …and nothing else moved.
-        assert!(next_scan_of(&pool, "active").await.as_deref() != Some(DUE_NOW_SENTINEL));
-        assert!(next_scan_of(&pool, "recent").await.as_deref() != Some(DUE_NOW_SENTINEL));
+        assert!(
+            next_scan_of(&pool, "active").await.as_deref()
+                != Some("1970-01-01T00:00:00.000000+00:00")
+        );
+        assert!(
+            next_scan_of(&pool, "recent").await.as_deref()
+                != Some("1970-01-01T00:00:00.000000+00:00")
+        );
     }
 
     #[tokio::test]
@@ -5465,7 +6357,7 @@ mod tests {
             async move {
                 sqlx::query(
                     "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
-                     VALUES (?, 'w', ?, ?, '2024-01-01T00:00:00Z')",
+                     VALUES ($1, 'w', $2, $3, '2024-01-01T00:00:00Z')",
                 )
                 .bind(format!("ss_{ty}_{key}"))
                 .bind(&ty)
@@ -5489,7 +6381,7 @@ mod tests {
         assert_eq!(added, 1, "only the untracked suwayomi series is backfilled");
         assert_eq!(
             next_scan_of(&pool, "100").await.as_deref(),
-            Some(DUE_NOW_SENTINEL),
+            Some("1970-01-01T00:00:00.000000+00:00"),
             "backfilled row is due now (sentinel, never NULL)"
         );
         assert_eq!(
@@ -5498,7 +6390,7 @@ mod tests {
             "already-tracked series is untouched"
         );
         assert!(
-            sqlx::query_scalar::<_, i64>(
+            crate::db_types::query_scalar::<i64>(
                 "SELECT COUNT(*) FROM series_scan_state WHERE series_id = '300'"
             )
             .fetch_one(&pool)
@@ -5518,11 +6410,12 @@ mod tests {
         let now = at("2024-01-01T00:00:00Z");
         ensure_pending(&pool, "1").await.unwrap();
         ensure_pending(&pool, "2").await.unwrap();
-        let nulls: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM series_scan_state WHERE next_scan_at IS NULL")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let nulls: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM series_scan_state WHERE next_scan_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(nulls, 0, "no enrolled row may have a NULL next_scan_at");
         let due = due_series_ids(&pool, &now.to_rfc3339(), 10).await;
         assert!(
@@ -5538,35 +6431,29 @@ mod tests {
     // first future row, so future-dated rows are never visited (audit #6).
     #[tokio::test]
     async fn due_query_is_index_backed_bounded_and_unsorted() {
-        use sqlx::Row as _;
         let pool = migrated_pool().await;
-        let plan: Vec<String> = sqlx::query(
-            "EXPLAIN QUERY PLAN SELECT series_id FROM series_scan_state \
-             WHERE next_scan_at <= ? ORDER BY next_scan_at ASC LIMIT ?",
+        seed_query_plan_cohort(&pool).await;
+        let plan: Vec<String> = crate::db_types::query_scalar(
+            "EXPLAIN SELECT series_id FROM series_scan_state \
+             WHERE next_scan_at <= $1 ORDER BY next_scan_at ASC NULLS FIRST LIMIT $2",
         )
-        .bind("2024-01-01T00:00:00Z")
+        .bind(at("2024-01-01T00:00:00Z"))
         .bind(DUE_BATCH_LIMIT)
         .fetch_all(&pool)
         .await
-        .unwrap()
-        .iter()
-        .map(|r| r.get::<String, _>("detail"))
-        .collect();
+        .unwrap();
         let joined = plan.join(" | ");
         assert!(
             joined.contains("idx_scan_state_next_scan"),
-            "due-query must use the next_scan_at index, got: {joined}"
+            "due-query lost its index: {joined}"
         );
         assert!(
-            !joined.to_uppercase().contains("TEMP B-TREE"),
-            "due-query ordering must come from the index, not a sort, got: {joined}"
+            !joined.contains("Sort"),
+            "the index must supply the ordering: {joined}"
         );
-        // A bounded range seek reports as SEARCH … (next_scan_at<?); a full walk reports as
-        // SCAN. The `<= ?` sentinel design must yield the former (early-terminating).
-        let upper = joined.to_uppercase();
         assert!(
-            upper.contains("SEARCH") && !upper.contains("SCAN SERIES_SCAN_STATE"),
-            "due-query must be a bounded SEARCH (range seek), not a full SCAN, got: {joined}"
+            joined.contains("Index Cond:") && joined.contains("next_scan_at <="),
+            "due-query must use a bounded timestamp range: {joined}"
         );
     }
 
@@ -5604,7 +6491,7 @@ mod tests {
     /// row, against the Rust predicate — so the two cannot drift without a red test.
     #[tokio::test]
     async fn migration_0057_pause_predicate_matches_rust() {
-        let pool = migrated_pool().await;
+        let pool = source_migration_pool().await;
         let now = Utc::now();
         // Far enough out that statement 1 matches it (> now + 14h), but inside the
         // absurd horizon so statement 2 leaves it alone — the row therefore moves if
@@ -5644,12 +6531,12 @@ mod tests {
                     let sid = id.to_string();
                     sqlx::query(
                         "INSERT INTO suwayomi_series (id, title, status, source_id, updated_at) \
-                         VALUES (?, ?, ?, '1', ?)",
+                         VALUES ($1, $2, $3, '1', $4)",
                     )
                     .bind(id)
                     .bind(format!("S{id}"))
                     .bind(status)
-                    .bind(now.to_rfc3339())
+                    .bind(now)
                     .execute(&pool)
                     .await
                     .unwrap();
@@ -5657,17 +6544,17 @@ mod tests {
                         sqlx::query(
                             "INSERT INTO series_admin \
                                (series_id, paused_override, status_override, updated_at) \
-                             VALUES (?, ?, ?, ?)",
+                             VALUES ($1, $2, $3, $4)",
                         )
                         .bind(&sid)
                         .bind(paused_override)
                         .bind(status_override)
-                        .bind(now.to_rfc3339())
+                        .bind(now)
                         .execute(&pool)
                         .await
                         .unwrap();
                     }
-                    put_state(&pool, &sid, Some(&parked)).await;
+                    source_put_state(&pool, &sid, Some(&parked)).await;
 
                     let admin = ScanAdmin {
                         paused_override,
@@ -5691,7 +6578,7 @@ mod tests {
 
         let cutoff = (now + chrono::Duration::hours(14)).to_rfc3339();
         for (sid, rust_paused) in &expected {
-            let stored = next_scan_of(&pool, sid).await.unwrap();
+            let stored = source_next_scan_of(&pool, sid).await.unwrap();
             let moved = stored < cutoff;
             assert_eq!(
                 moved, !rust_paused,
@@ -5707,39 +6594,39 @@ mod tests {
     /// placed inside the 12h window nor pick up a paused row it deliberately skipped.
     #[tokio::test]
     async fn migration_0057_is_idempotent() {
-        let pool = migrated_pool().await;
+        let pool = source_migration_pool().await;
         let now = Utc::now();
         let sql = include_str!("../migrations/0057_clamp_legacy_next_scan_at.sql");
         // One active row parked in 2033, one paused row on a legal 300h park.
         for (id, status) in [(1i64, "ONGOING"), (2, "COMPLETED")] {
             sqlx::query(
                 "INSERT INTO suwayomi_series (id, title, status, source_id, updated_at) \
-                 VALUES (?, ?, ?, '1', ?)",
+                 VALUES ($1, $2, $3, '1', $4)",
             )
             .bind(id)
             .bind(format!("S{id}"))
             .bind(status)
-            .bind(now.to_rfc3339())
+            .bind(now)
             .execute(&pool)
             .await
             .unwrap();
         }
-        put_state(&pool, "1", Some("2033-03-14T03:12:41+00:00")).await;
+        source_put_state(&pool, "1", Some("2033-03-14T03:12:41+00:00")).await;
         let paused_at = (now + chrono::Duration::hours(300)).to_rfc3339();
-        put_state(&pool, "2", Some(&paused_at)).await;
+        source_put_state(&pool, "2", Some(&paused_at)).await;
         sqlx::query("UPDATE series_scan_state SET avg_interval_hours = 58309.0")
             .execute(&pool)
             .await
             .unwrap();
 
         sqlx::raw_sql(sql).execute(&pool).await.unwrap();
-        let after_first = next_scan_of(&pool, "1").await.unwrap();
+        let after_first = source_next_scan_of(&pool, "1").await.unwrap();
         assert!(
             after_first < (now + chrono::Duration::hours(13)).to_rfc3339(),
             "the active row lands inside the 12h window, got {after_first}"
         );
         assert_eq!(
-            next_scan_of(&pool, "2").await.as_deref(),
+            source_next_scan_of(&pool, "2").await.as_deref(),
             Some(paused_at.as_str()),
             "a paused row on a legal park is left alone"
         );
@@ -5754,12 +6641,12 @@ mod tests {
 
         sqlx::raw_sql(sql).execute(&pool).await.unwrap();
         assert_eq!(
-            next_scan_of(&pool, "1").await.as_deref(),
+            source_next_scan_of(&pool, "1").await.as_deref(),
             Some(after_first.as_str()),
             "a second run must not re-roll a row it already placed"
         );
         assert_eq!(
-            next_scan_of(&pool, "2").await.as_deref(),
+            source_next_scan_of(&pool, "2").await.as_deref(),
             Some(paused_at.as_str()),
             "a second run must not pick up the paused row either"
         );
@@ -5932,13 +6819,9 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO suwayomi_series \
-                 (id, title, thumbnail_url, status, in_library, source_id, chapter_count, \
-                  latest_chapter_at, updated_at) \
-             VALUES (7, 'Suwayomi Title', '/thumb/7', 'ONGOING', 1, '1', 13, ?, \
-                     '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO suwayomi_series (id, title, thumbnail_url, status, in_library, source_id, chapter_count, latest_chapter_at, updated_at) VALUES (7, 'Suwayomi Title', '/thumb/7', 'ONGOING', TRUE, '1', 13, $1, '2026-01-01T00:00:00Z')"#,
         )
-        .bind(latest_chapter_at)
+        .bind(latest_chapter_at.map(str::parse::<i64>).transpose().unwrap())
         .execute(pool)
         .await
         .unwrap();
@@ -5970,7 +6853,7 @@ mod tests {
             sqlx::query(
                 "INSERT INTO suwayomi_chapter \
                    (id, manga_id, name, chapter_number, page_count, upload_date, updated_at) \
-                 VALUES (?, 7, ?, ?, 0, ?, '2026-01-01T00:00:00Z')",
+                 VALUES ($1, 7, $2, $3, 0, $4, '2026-01-01T00:00:00Z')",
             )
             .bind(id)
             .bind(name)
@@ -6008,11 +6891,12 @@ mod tests {
         assert!(found, "the second scan is a real detection");
         touch_feed_series_update(&pool, "7", found).await;
 
-        let label: Option<String> =
-            sqlx::query_scalar("SELECT latest_chapter FROM feed_series_updates WHERE work_id='w1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let label: Option<String> = crate::db_types::query_scalar(
+            "SELECT latest_chapter FROM feed_series_updates WHERE work_id='w1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             label.as_deref(),
             Some("10.5"),
@@ -6025,11 +6909,12 @@ mod tests {
         crate::catalog::refresh_feed_series_updates(&pool)
             .await
             .unwrap();
-        let rebuilt: Option<String> =
-            sqlx::query_scalar("SELECT latest_chapter FROM feed_series_updates WHERE work_id='w1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let rebuilt: Option<String> = crate::db_types::query_scalar(
+            "SELECT latest_chapter FROM feed_series_updates WHERE work_id='w1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(rebuilt.as_deref(), Some("10.5"), "rebuild agrees");
     }
 
@@ -6047,8 +6932,8 @@ mod tests {
         Option<i64>,
         Option<String>,
     )> {
-        sqlx::query_as(
-            "SELECT reader_id, released_at, typeof(released_at), title, comic_type, \
+        crate::db_types::query_tuple(
+            "SELECT reader_id, released_at, pg_typeof(released_at)::text, title, comic_type, \
                     chapter_count, detected_at \
              FROM feed_series_updates WHERE work_id = 'w1'",
         )
@@ -6068,14 +6953,14 @@ mod tests {
     /// value depends on which writer touched it last is a row that appears or disappears
     /// from Browse depending on scan timing.
     async fn feed_digest(pool: &Database) -> Option<String> {
-        sqlx::query_scalar(
+        crate::db_types::query_scalar(
             "SELECT work_id || '|' || reader_id || '|' || title \
                  || '|' || COALESCE(cover_url, '~') || '|' || COALESCE(suwayomi_thumbnail, '~') \
                  || '|' || COALESCE(comic_type, '~') || '|' || COALESCE(latest_chapter, '~') \
                  || '|' || COALESCE(latest_chapter_title, '~') \
-                 || '|' || COALESCE(chapter_count, '~') \
-                 || '|' || released_at || '|' || typeof(released_at) \
-                 || '|' || COALESCE(detected_at, '~') || '|' || is_nsfw \
+                 || '|' || COALESCE(chapter_count::text, '~') \
+                 || '|' || released_at || '|' || pg_typeof(released_at)::text \
+                 || '|' || COALESCE(detected_at::text, '~') || '|' || is_nsfw \
                  || '|' || COALESCE(status, '~') || '|' || content_rating \
                  || '|' || en_chapter_count \
              FROM feed_series_updates WHERE work_id = 'w1'",
@@ -6088,7 +6973,7 @@ mod tests {
     /// The same digest over Browse's own table (migration 0069), which
     /// `mirror_feed_row_into_browse_catalogue` writes incrementally and
     /// `catalog::refresh_browse_catalogue` rebuilds. `comic_type` is included because a NULL
-    /// there is invisible to Browse's format tabs, and `typeof(released_at)` because a TEXT
+    /// there is invisible to Browse's format tabs, and `pg_typeof(released_at)::text` because a TEXT
     /// sort key would sort the whole undated tail above every dated work.
     ///
     /// `latest_chapter` (migration 0095) is included for the same reason `en_chapter_count`
@@ -6098,17 +6983,17 @@ mod tests {
     /// in fact missing from the mirror's `MUT` list when 0095 landed (§8h); this digest is
     /// what stops that recurring.
     async fn browse_digest(pool: &Database) -> Option<String> {
-        sqlx::query_scalar(
+        crate::db_types::query_scalar(
             "SELECT work_id || '|' || reader_id || '|' || title \
                  || '|' || COALESCE(cover_url, '~') || '|' || COALESCE(suwayomi_thumbnail, '~') \
                  || '|' || COALESCE(comic_type, '~') || '|' || COALESCE(status, '~') \
                  || '|' || content_rating || '|' || is_nsfw || '|' || en_chapter_count \
                  || '|' || COALESCE(latest_chapter, '~') \
-                 || '|' || COALESCE(released_at, -1) || '|' || typeof(released_at) \
+                 || '|' || COALESCE((EXTRACT(EPOCH FROM released_at) * 1000)::bigint, -1) || '|' || pg_typeof(released_at)::text \
                  || '|' || created_at \
                  || '|' || COALESCE(demographic, '~') || '|' || COALESCE(original_language, '~') \
-                 || '|' || COALESCE(year, '~') || '|' || COALESCE(follows, '~') \
-                 || '|' || COALESCE(rating, '~') \
+                 || '|' || COALESCE(year::text, '~') || '|' || COALESCE(follows::text, '~') \
+                 || '|' || COALESCE(rating::text, '~') \
              FROM browse_catalogue WHERE work_id = 'w1'",
         )
         .fetch_optional(pool)
@@ -6216,8 +7101,8 @@ mod tests {
         // `detected_chapter_upserts_the_updates_feed_row` only covers the INSERT branch,
         // and a TEXT sort key sorts the whole mirror half above the whole scanner half.
         assert_eq!(
-            typ, "integer",
-            "the conflict branch must keep released_at INTEGER"
+            typ, "timestamp with time zone",
+            "the conflict branch must keep released_at native"
         );
         assert_eq!(released_at, 1_785_671_625_000, "and must move forward");
 
@@ -6336,14 +7221,20 @@ mod tests {
         // THE load-bearing assertion: the sort key is stored as INTEGER epoch-millis, not
         // as text. A TEXT key sorts every ISO '2…' mirror row above every millis '1…'
         // scanner row under BINARY collation — see migration 0064.
-        assert_eq!(typ, "integer", "released_at must be an INTEGER, not TEXT");
+        assert_eq!(
+            typ, "timestamp with time zone",
+            "released_at must use the audited native timestamp type"
+        );
         assert_eq!(released_at, 1_785_071_625_000);
         // A Suwayomi-only work has no MangaDex anchor, so the card must navigate by the
         // numeric Suwayomi id, not by `w_…`.
         assert_eq!(reader_id, "7");
         assert_eq!(title, "Canonical Title");
         assert_eq!(chapter_count, Some(13));
-        assert_eq!(detected_at.as_deref(), Some(then.to_rfc3339()).as_deref());
+        assert_eq!(
+            detected_at.as_deref(),
+            Some(crate::db_types::format_date(then)).as_deref()
+        );
         // A brand-new row must not land type-less: `comic_type IS NULL` is invisible to
         // the reader's format tabs. 'ko' -> MANHWA, via the real `resolve_comic_type`.
         assert_eq!(comic_type.as_deref(), Some("MANHWA"));
@@ -6357,9 +7248,7 @@ mod tests {
         // The Suwayomi source is OLDER than what the mirror half already published.
         seed_feed_fixture(&pool, Some("1700000000000")).await;
         sqlx::query(
-            "INSERT INTO feed_series_updates \
-                 (work_id, reader_id, title, comic_type, latest_chapter, released_at, is_nsfw) \
-             VALUES ('w1', 'w1', 'Mirror Title', 'MANGA', '99', 1785071625000, 0)",
+            r#"INSERT INTO feed_series_updates (work_id, reader_id, title, comic_type, latest_chapter, released_at, is_nsfw) VALUES ('w1', 'w1', 'Mirror Title', 'MANGA', '99', TIMESTAMPTZ '1970-01-01T00:00:00Z' + 1785071625000 * INTERVAL '1 millisecond', FALSE)"#,
         )
         .execute(&pool)
         .await
@@ -6474,11 +7363,12 @@ mod tests {
 
         // (3) Browse's table (rebuilt by the call above) carries the canonical id — the card's
         // link — so a Browse card and the same work's Updates card agree.
-        let browse_reader_id: String =
-            sqlx::query_scalar("SELECT reader_id FROM browse_catalogue WHERE work_id = 'w1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let browse_reader_id: String = crate::db_types::query_scalar(
+            "SELECT reader_id FROM browse_catalogue WHERE work_id = 'w1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             browse_reader_id, "w1",
             "Browse must navigate to the canonical page too"
@@ -6575,7 +7465,7 @@ mod tests {
         touch_feed_series_update(&pool, "7", new_found).await;
 
         assert!(feed_row(&pool).await.is_none());
-        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed_series_updates")
+        let rows: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM feed_series_updates")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -6623,11 +7513,11 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO series_scan_state (series_id, source_id, next_scan_at, updated_at) \
-                 VALUES (?, ?, ?, '2026-01-01T00:00:00Z')",
+                 VALUES ($1, $2, $3, '2026-01-01T00:00:00Z')",
             )
             .bind(sid)
             .bind(src)
-            .bind(DUE_NOW_SENTINEL)
+            .bind(crate::db_types::date(DUE_NOW_SENTINEL).unwrap())
             .execute(&pool)
             .await
             .unwrap();
@@ -6671,10 +7561,10 @@ mod tests {
         for sid in ["500", "999"] {
             sqlx::query(
                 "INSERT INTO series_scan_state (series_id, next_scan_at, updated_at) \
-                 VALUES (?, ?, '2026-01-01T00:00:00Z')",
+                 VALUES ($1, $2, '2026-01-01T00:00:00Z')",
             )
             .bind(sid)
-            .bind(DUE_NOW_SENTINEL)
+            .bind(crate::db_types::date(DUE_NOW_SENTINEL).unwrap())
             .execute(&pool)
             .await
             .unwrap();
@@ -6684,17 +7574,19 @@ mod tests {
             1,
             "only the mappable row is healed"
         );
-        let mapped: Option<String> =
-            sqlx::query_scalar("SELECT source_id FROM series_scan_state WHERE series_id = '500'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let mapped: Option<String> = crate::db_types::query_scalar(
+            "SELECT source_id FROM series_scan_state WHERE series_id = '500'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(mapped.as_deref(), Some("srcX"));
-        let unmapped: Option<String> =
-            sqlx::query_scalar("SELECT source_id FROM series_scan_state WHERE series_id = '999'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let unmapped: Option<String> = crate::db_types::query_scalar(
+            "SELECT source_id FROM series_scan_state WHERE series_id = '999'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             unmapped, None,
             "the unmappable row stays NULL for the sweeper"
@@ -6725,7 +7617,7 @@ mod tests {
         for (ss_id, src, key) in [("ss_1", "srcA", "1"), ("ss_2", "", "2")] {
             sqlx::query(
                 "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
-                 VALUES (?, 'w', 'suwayomi', ?, ?, '2024-01-01T00:00:00Z')",
+                 VALUES ($1, 'w', 'suwayomi', $2, $3, '2024-01-01T00:00:00Z')",
             )
             .bind(ss_id)
             .bind(src)
@@ -6737,16 +7629,16 @@ mod tests {
         for sid in ["1", "2", "3"] {
             sqlx::query(
                 "INSERT INTO series_scan_state (series_id, next_scan_at, updated_at) \
-                 VALUES (?, ?, '2026-01-01T00:00:00Z')",
+                 VALUES ($1, $2, '2026-01-01T00:00:00Z')",
             )
             .bind(sid)
-            .bind(DUE_NOW_SENTINEL)
+            .bind(crate::db_types::date(DUE_NOW_SENTINEL).unwrap())
             .execute(&pool)
             .await
             .unwrap();
         }
         let unknown_source: Option<String> =
-            sqlx::query_scalar("SELECT source_id FROM source_series WHERE id = 'ss_2'")
+            crate::db_types::query_scalar("SELECT source_id FROM source_series WHERE id = 'ss_2'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -6764,11 +7656,12 @@ mod tests {
             0,
             "a second pass rewrites nothing — the heal converges instead of spinning"
         );
-        let scan_sources: Vec<(String, Option<String>)> =
-            sqlx::query_as("SELECT series_id, source_id FROM series_scan_state ORDER BY series_id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let scan_sources: Vec<(String, Option<String>)> = crate::db_types::query_tuple(
+            "SELECT series_id, source_id FROM series_scan_state ORDER BY series_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             scan_sources,
             vec![
@@ -6798,17 +7691,119 @@ mod tests {
         );
     }
 
-    /// `EXPLAIN QUERY PLAN` lines for a statement, joined — the substrate for the
-    /// sargability assertions below.
+    /// PostgreSQL chooses plans from current relation statistics. Give the probe a
+    /// representative selective due set among many future schedules, then ANALYZE it.
+    async fn seed_query_plan_cohort(pool: &Database) {
+        sqlx::raw_sql(
+            "INSERT INTO work(id, created_at, updated_at) VALUES ('plan-work', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z'); \
+             INSERT INTO source_series(id, work_id, source_type, source_id, source_key, created_at) \
+             SELECT 'plan-source-' || i, 'plan-work', 'suwayomi', 'x', i::text, '2020-01-01T00:00:00Z' \
+             FROM generate_series(1, 10000) i; \
+             INSERT INTO series_scan_state(series_id, source_id, next_scan_at, updated_at) \
+             SELECT i::text, CASE WHEN i = 1 THEN NULL WHEN i <= 4 OR i % 100 = 0 THEN 'x' ELSE 'y' END, \
+                    CASE WHEN i <= 1000 THEN TIMESTAMPTZ '2020-01-01T00:00:00Z' ELSE TIMESTAMPTZ '2030-01-01T00:00:00Z' END, \
+                    TIMESTAMPTZ '2020-01-01T00:00:00Z' FROM generate_series(1, 10000) i; \
+             ANALYZE series_scan_state; ANALYZE source_series",
+        ).execute(pool).await.unwrap();
+    }
+
+    /// Native EXPLAIN lines joined for the sargability assertions below.
     async fn query_plan(pool: &Database, sql: &str) -> String {
-        sqlx::query_as::<_, (i64, i64, i64, String)>(&format!("EXPLAIN QUERY PLAN {sql}"))
+        crate::db_types::query_scalar::<String>(&format!("EXPLAIN {sql}"))
             .fetch_all(pool)
             .await
             .unwrap()
-            .into_iter()
-            .map(|(_, _, _, detail)| detail)
-            .collect::<Vec<_>>()
             .join(" | ")
+    }
+
+    /// The feed upsert runs under the Series and source identity keys and the work,
+    /// mapping and series row locks, on every new-chapter detection. It must read the
+    /// chapters of its ONE series: the previous form joined a window-function subquery
+    /// over the whole `suwayomi_chapter` table (1071 ms for one series at 552,000
+    /// cached chapters), and every writer of that work waited for it.
+    #[tokio::test]
+    async fn the_feed_upsert_reads_the_chapters_of_one_series_only() {
+        const OLD_LATEST_CHAPTER_SQL: &str = "LEFT JOIN (SELECT manga_id, chapter_number, name, \
+                ROW_NUMBER() OVER (PARTITION BY manga_id \
+                    ORDER BY sqlite_integer_pin(upload_date) DESC NULLS LAST, \
+                             chapter_number DESC) AS rn \
+           FROM suwayomi_chapter \
+          WHERE chapter_number >= 0 AND chapter_number <= 5000) lc \
+            ON lc.manga_id = sy.id AND lc.rn = 1";
+        let pool = migrated_pool().await;
+        seed_feed_fixture(&pool, Some("1785071625000")).await;
+        sqlx::raw_sql(
+            "INSERT INTO suwayomi_series (id, title, status, in_library, source_id, updated_at) \
+               SELECT s, 'Series ' || s, 'ONGOING', TRUE, '1', now() \
+                 FROM generate_series(1000, 1999) s; \
+             INSERT INTO suwayomi_chapter \
+                 (id, manga_id, name, chapter_number, page_count, upload_date, updated_at) \
+               SELECT s * 100 + c, s, 'Ch ' || c, c, 0, 1785000000000 + c, now() \
+                 FROM generate_series(1000, 1999) s, generate_series(1, 40) c; \
+             INSERT INTO suwayomi_chapter \
+                 (id, manga_id, name, chapter_number, page_count, upload_date, updated_at) \
+               SELECT c, 7, 'Ch ' || c, c, 0, 1785000000000 + c, now() \
+                 FROM generate_series(1, 40) c; \
+             ANALYZE suwayomi_chapter; ANALYZE suwayomi_series; ANALYZE source_series",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let sql = feed_series_upsert_sql();
+        assert!(sql.contains(FEED_LATEST_CHAPTER_SQL));
+        let plan = query_plan(&pool, &sql.replace("$1", "'7'")).await;
+        assert!(
+            plan.contains("idx_suwayomi_chapter_manga")
+                && plan.contains("Index Cond: (manga_id = sy.id)"),
+            "the latest chapter must be an index probe of the one series: {plan}"
+        );
+        assert!(
+            !plan.contains("Seq Scan on suwayomi_chapter") && !plan.contains("WindowAgg"),
+            "the feed upsert scans every cached chapter: {plan}"
+        );
+        // The assertions above tell the two forms apart: the previous join cannot be
+        // restricted to one series.
+        let old = sql.replace(FEED_LATEST_CHAPTER_SQL, OLD_LATEST_CHAPTER_SQL);
+        let old_plan = query_plan(&pool, &old.replace("$1", "'7'")).await;
+        assert!(
+            old_plan.contains("WindowAgg") && !old_plan.contains("Index Cond: (manga_id = sy.id)"),
+            "{old_plan}"
+        );
+
+        // Same answer as before: the newest release of the series.
+        assert_eq!(upsert_feed_series_update(&pool, "7").await.unwrap(), 1);
+        let (number, title): (Option<f64>, Option<String>) = sqlx::query_as(
+            "SELECT latest_chapter::float8, latest_chapter_title FROM feed_series_updates \
+              WHERE work_id = 'w1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((number, title.as_deref()), (Some(40.0), Some("Ch 40")));
+    }
+
+    /// The ledger readiness read is best-effort and happens before the unit begins. A
+    /// reader pool that cannot serve it (here: every reader connection is taken) must
+    /// not fail the feed write, and the unit must not wait for a reader connection
+    /// while it holds its locks.
+    #[tokio::test]
+    async fn a_failed_ledger_readiness_read_does_not_fail_the_feed_write() {
+        let pool = migrated_pool().await.foreground();
+        seed_feed_fixture(&pool, Some("1785071625000")).await;
+        let mut readers = Vec::new();
+        for _ in 0..pool.read().options().get_max_connections() {
+            readers.push(pool.acquire().await.unwrap());
+        }
+        let written = upsert_feed_series_update(&pool, "7").await;
+        drop(readers);
+        assert_eq!(written.unwrap(), 1);
+        let feed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feed_series_updates WHERE work_id = 'w1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(feed, 1);
     }
 
     #[tokio::test]
@@ -6817,11 +7812,13 @@ mod tests {
         // 12 minutes at 99.8% CPU. These run every 60 s per loop, so pin the plans.
         let pool = migrated_pool().await;
 
+        seed_query_plan_cohort(&pool).await;
+
         // Per-source due-set — must ride migration 0094's (source_id, next_scan_at).
         let by_source = query_plan(
             &pool,
             "SELECT series_id FROM series_scan_state WHERE source_id = 'x' \
-               AND next_scan_at <= '2026-01-01' ORDER BY next_scan_at ASC LIMIT 10",
+               AND next_scan_at <= '2026-01-01' ORDER BY next_scan_at ASC NULLS FIRST LIMIT 10",
         )
         .await;
         assert!(
@@ -6829,7 +7826,7 @@ mod tests {
             "per-source due-query lost its index: {by_source}"
         );
         assert!(
-            !by_source.contains("TEMP B-TREE"),
+            !by_source.contains("Sort"),
             "the index must supply the ORDER BY too: {by_source}"
         );
 
@@ -6837,7 +7834,7 @@ mod tests {
         let sweeper = query_plan(
             &pool,
             "SELECT series_id FROM series_scan_state WHERE source_id IS NULL \
-               AND next_scan_at <= '2026-01-01' ORDER BY next_scan_at ASC LIMIT 10",
+               AND next_scan_at <= '2026-01-01' ORDER BY next_scan_at ASC NULLS FIRST LIMIT 10",
         )
         .await;
         assert!(
@@ -6863,8 +7860,10 @@ mod tests {
         )
         .await;
         assert!(
-            heal.contains("SEARCH ss"),
-            "the heal must SEARCH source_series, not SCAN it per row: {heal}"
+            heal.contains("uq_source_series_suwayomi_key")
+                && heal.contains("Index Cond: (source_key = series_scan_state.series_id)")
+                && !heal.contains("Seq Scan on source_series"),
+            "the heal must seek source_series by its source key: {heal}"
         );
     }
 
@@ -6898,11 +7897,11 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO series_scan_state (series_id, source_id, next_scan_at, updated_at) \
-                 VALUES (?, ?, ?, '2026-01-01T00:00:00Z')",
+                 VALUES ($1, $2, $3, '2026-01-01T00:00:00Z')",
             )
             .bind(sid)
             .bind(src)
-            .bind(DUE_NOW_SENTINEL)
+            .bind(crate::db_types::date(DUE_NOW_SENTINEL).unwrap())
             .execute(&pool)
             .await
             .unwrap();

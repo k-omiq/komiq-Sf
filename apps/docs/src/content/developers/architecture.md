@@ -19,7 +19,7 @@ The admin app combines `apps/server`, `apps/admin` and the Suwayomi source engin
 
 ### Admin console
 
-The administration console lives in `apps/admin`. It is a SvelteKit application for server owners and administrators. The console provides tools to:
+The administration console lives in `apps/admin`. The SvelteKit console lets owners:
 
 - Inspect and curate the manga catalog.
 - Review duplicate candidates and merge or separate works.
@@ -35,7 +35,9 @@ The secondary `hosted` target builds the console for a separate origin. Set `PUB
 
 The API server lives in `apps/server` and compiles to a native binary named `komika-server`. It is written in Rust using the axum web framework and async-graphql.
 
-The server provides a unified GraphQL API implemented in `apps/server/src/graphql/`, with the client schema contract in `packages/api/src/schema/komika.graphql`. It stores user accounts, password hashes, sessions, reviews, comments, and catalog state in a local SQLite database using sqlx, a Rust database library. It federates calls to Suwayomi over HTTP to resolve upstream sources and chapters. When configured with a static web directory, the server serves the reader and admin web applications directly.
+The server provides a unified GraphQL API implemented in `apps/server/src/graphql/`, with the client schema contract in `packages/api/src/schema/komika.graphql`. It stores user accounts, password hashes, sessions, reviews, comments, and catalog state in PostgreSQL 18 using sqlx, a Rust database library. It federates calls to Suwayomi over HTTP to resolve upstream sources and chapters. When configured with a static web directory, the server serves the reader and admin web applications directly.
+
+Covers remain a separate SQLite cache. Docker runs PostgreSQL privately beside the server; the desktop admin app bundles it. Old main SQLite databases convert at first start and are kept, renamed, after verification. For backups, self-host Docker uses PostgreSQL dumps, the desktop app saves a local dump when the newest is at least 20 hours old, and the global deployment packages pgBackRest backups to object storage.
 
 ### Source engine
 
@@ -59,11 +61,11 @@ The image proxy fetches images on behalf of the web reader and caches them at th
 
 ## Documentation site
 
-The documentation site lives in `apps/docs`. It is a static website built with SvelteKit that generates the public documentation at docs.komiq.cc.
+`apps/docs` is the SvelteKit static documentation site.
 
 ## Shared packages
 
-The repository contains three shared packages in the `packages/` directory.
+The `packages/` directory holds shared libraries.
 
 ### Types package
 
@@ -97,7 +99,7 @@ A web reader configured to use the optional image proxy talks to `komika-server`
 
 ```flow
 Reader app -> API server: requests series and chapter metadata
-API server -> SQLite catalog: reads stored series and chapter metadata
+API server -> PostgreSQL catalog: reads stored series and chapter metadata
 API server -> Reader app: returns GraphQL response
 Reader app -> Image proxy: requests external page image with upstream URL
 Image proxy -> Source site: fetches image bytes
@@ -105,7 +107,7 @@ Image proxy -> Reader app: returns image bytes with cache headers
 ```
 
 1. The reader requests series information from `komika-server` over GraphQL.
-2. The server reads stored series and chapter metadata from SQLite.
+2. The server reads stored series and chapter metadata from PostgreSQL.
 3. The server returns GraphQL data to the browser. Chapter page URLs come from MangaDex's at-home API.
 4. When you open a chapter, the reader requests external page images through the image proxy worker. API-origin images load directly.
 5. The worker checks its edge cache. On a cache miss, it downloads the image from the source host.
@@ -133,13 +135,13 @@ Local engine -> Reader app: returns the page image
 To explore individual subsystems in detail, continue to these pages:
 
 - [Repository layout](/developers/repository): Monorepo directories, configuration files, and build scripts.
-- [Local development](/developers/local-development): Setup steps and commands for running services locally.
-- [Server](/developers/server): Internal design, database migrations, and caching in `komika-server`.
-- [Reader app](/developers/reader-app): Architecture of the reader web client and native shells.
-- [Admin app](/developers/admin-app): Architecture of the admin console and desktop packaging.
-- [Image proxy](/developers/image-proxy): Cloudflare Worker image proxy implementation and rate limits.
-- [GraphQL](/developers/graphql): GraphQL schema, queries, mutations, and resolver architecture.
-- [Suwayomi](/developers/suwayomi): Content engine federation and extension updates.
+- [Run it locally](/developers/local-development): Setup steps and commands for running services locally.
+- [The API server](/developers/server): Internal design, database migrations, and caching in `komika-server`.
+- [The reader app](/developers/reader-app): Architecture of the reader web client and native shells.
+- [The admin app](/developers/admin-app): Architecture of the admin console and desktop packaging.
+- [The image proxy Worker](/developers/image-proxy): Cloudflare Worker image proxy implementation and rate limits.
+- [GraphQL API](/developers/graphql): GraphQL schema, queries, mutations, and resolver architecture.
+- [Suwayomi, the source engine](/developers/suwayomi): Content engine federation and extension updates.
 - [The on-device engine](/developers/native-engine): Embedded Suwayomi and JRE packaging on desktop and mobile.
 - [Testing](/developers/testing): Unit tests, integration harnesses, and end-to-end tests.
 

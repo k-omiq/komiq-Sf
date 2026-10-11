@@ -126,7 +126,7 @@ mod incremental_projection_benchmark {
         sqlx::query(
             "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<127) \
              INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) \
-             SELECT ?1 || i, ?2, 'suwayomi', 'projection-benchmark', CAST(?3+i AS TEXT), ?4 FROM n",
+             SELECT $1 || i, $2, 'suwayomi', 'projection-benchmark', CAST($3+i AS TEXT), $4 FROM n",
         )
         .bind(&prefix)
         .bind(&source)
@@ -138,14 +138,14 @@ mod incremental_projection_benchmark {
         sqlx::query(
             "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<127) \
              INSERT INTO suwayomi_series(id,title,status,source_id,lang,chapter_count,updated_at,created_at) \
-             SELECT ?1+i, 'Projection source ' || i, 'ONGOING', 'projection-benchmark', 'en', 64, ?2, ?2 FROM n",
+             SELECT $1+i, 'Projection source ' || i, 'ONGOING', 'projection-benchmark', 'en', 64, $2, $2 FROM n",
         ).bind(first_manga).bind(&now).execute(&mut *setup).await.unwrap();
         sqlx::query(
             "WITH RECURSIVE s(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM s WHERE i<127), \
              n(ch) AS (VALUES(1) UNION ALL SELECT ch+1 FROM n WHERE ch<64) \
              INSERT INTO chapter(id,source_series_id,external_id,number,lang,title,readable_at,chapter_key,label,created_at) \
-             SELECT ?1 || i || '-' || ch, ?1 || i, CAST(ch AS TEXT), CAST(ch AS TEXT), 'en', \
-                    'Chapter ' || ch, '2026-01-01T00:00:00Z', CAST(ch*10 AS TEXT), CAST(ch AS TEXT), ?2 \
+             SELECT $1 || i || '-' || ch, $1 || i, CAST(ch AS TEXT), CAST(ch AS TEXT), 'en', \
+                    'Chapter ' || ch, '2026-01-01T00:00:00Z', CAST(ch*10 AS TEXT), CAST(ch AS TEXT), $2 \
                FROM s CROSS JOIN n",
         ).bind(&prefix).bind(&now).execute(&mut *setup).await.unwrap();
         upsert_browse_work(&mut setup, &source).await.unwrap();
@@ -163,7 +163,7 @@ mod incremental_projection_benchmark {
         assert_eq!(split.moved_sources, 64);
         for work in [&target, &split.new_work_id] {
             let count: i64 = sqlx::query_scalar(
-                "SELECT CAST(chapters AS INTEGER) FROM work_fts WHERE work_id = ?",
+                "SELECT CAST(chapters AS INTEGER) FROM work_fts WHERE work_id = $1",
             )
             .bind(work)
             .fetch_one(&pool)

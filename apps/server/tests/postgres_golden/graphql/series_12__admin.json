@@ -1,0 +1,95 @@
+{
+  "data": {
+    "canonicalSeries": {
+      "altTitles": [],
+      "artist": "Artist 12",
+      "author": "Author 12",
+      "chapterCount": 0,
+      "coverUrl": "/covers/w_00000000000040008000000000000012.webp",
+      "covers": [
+        {
+          "fileName": "cover-12.jpg",
+          "isPrimary": true,
+          "lang": "ja",
+          "thumbnailUrl": "https://uploads.mangadex.org/covers/00000000-0000-4000-8000-000000000012/cover-12.jpg.512.jpg",
+          "url": "https://uploads.mangadex.org/covers/00000000-0000-4000-8000-000000000012/cover-12.jpg",
+          "volume": "1"
+        }
+      ],
+      "createdAt": "2020-01-04T01:02:03.000000+00:00",
+      "credits": [],
+      "description": "Description 12: café / 漫画",
+      "detectedAt": null,
+      "genres": [
+        "Romance"
+      ],
+      "id": "w_00000000000040008000000000000012",
+      "isFavorite": false,
+      "isMarked": true,
+      "isNsfw": false,
+      "latestChapter": null,
+      "latestChapterAt": "",
+      "libraryStatus": null,
+      "localizedDescriptions": [],
+      "mangadexRating": null,
+      "metadata": {
+        "contentRating": "suggestive",
+        "demographic": "shounen",
+        "originalLanguage": "ko",
+        "tags": [
+          {
+            "group": "genre",
+            "id": "00000000-0000-4000-8000-000000000300",
+            "name": "Romance"
+          }
+        ],
+        "trackers": [
+          {
+            "externalId": "00000000-0000-4000-8000-000000000012",
+            "provider": "mangadex",
+            "url": "https://mangadex.org/title/00000000-0000-4000-8000-000000000012"
+          }
+        ],
+        "year": 2002
+      },
+      "rating": {
+        "average": 0.0,
+        "count": 0,
+        "distribution": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "scan": {
+        "avgIntervalHours": 0.0,
+        "lastScannedAt": null,
+        "nextScanAt": null,
+        "overrideIntervalHours": null,
+        "paused": false,
+        "pausedOverride": null,
+        "pollEveryMinutes": 30,
+        "pollEveryMinutesOverride": null,
+        "statusOverride": null
+      },
+      "sourceId": "mangadex",
+      "status": "COMPLETED",
+      "title": "Chronicle Zero",
+      "type": "MANHWA",
+      "updatedAt": "2020-01-05T01:02:03.123000+00:00",
+      "views": {
+        "last24h": 0,
+        "last7d": 0,
+        "total": 0
+      },
+      "workId": "w_00000000000040008000000000000012"
+    }
+  }
+}

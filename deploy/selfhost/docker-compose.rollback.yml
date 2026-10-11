@@ -1,0 +1,6 @@
+# Only before successful SQLite conversion. Select explicitly, never by default.
+# Preserve HTTPS/ACME override files too when your installation uses them.
+services:
+  server:
+    environment:
+      DATABASE_URL: sqlite:///data/komika.sqlite3

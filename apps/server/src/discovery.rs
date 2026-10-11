@@ -585,11 +585,11 @@ mod tests {
     const EN_SOURCE: &str = "9001";
     /// A next-scan far enough out that a flip to the due-now sentinel can only have come
     /// from `trigger_due_now`.
-    const FUTURE: &str = "2999-01-01T00:00:00+00:00";
+    const FUTURE: &str = "2999-01-01T00:00:00.000000+00:00";
 
     async fn migrated_pool() -> Database {
         let pool = Database::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -598,10 +598,10 @@ mod tests {
 
     /// A minimal `AppState` around a migrated pool and a fake Suwayomi origin. Discovery
     /// touches only `pool` and `suwayomi`; the rest are defaults so the struct is whole.
-    fn state(pool: Database, suwayomi_base: &str) -> AppState {
+    async fn state(pool: Database, suwayomi_base: &str) -> AppState {
         AppState {
             pool: pool.clone(),
-            cover_pool: pool,
+            cover_pool: crate::db::init_covers("sqlite::memory:").await.unwrap(),
             suwayomi: crate::suwayomi::SuwayomiClient::new(suwayomi_base.to_string(), None, None),
             mangadex: Arc::new(crate::mangadex::MangaDexClient::new("test-ua", 5.0, 40.0)),
             admin_users: vec![],
@@ -621,9 +621,9 @@ mod tests {
     }
 
     async fn subscribe(pool: &Database, pkg: &str) {
-        sqlx::query("INSERT INTO extension_subscription (pkg_name, created_at) VALUES (?, ?)")
+        sqlx::query("INSERT INTO extension_subscription (pkg_name, created_at) VALUES ($1, $2)")
             .bind(pkg)
-            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(chrono::Utc::now())
             .execute(pool)
             .await
             .unwrap();
@@ -632,22 +632,25 @@ mod tests {
     async fn enrol(pool: &Database, id: i64) {
         sqlx::query(
             "INSERT INTO series_scan_state (series_id, next_scan_at, updated_at) \
-             VALUES (?, ?, ?)",
+             VALUES ($1, $2, $3)",
         )
         .bind(id.to_string())
-        .bind(FUTURE)
-        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(crate::db_types::date(FUTURE).unwrap())
+        .bind(chrono::Utc::now())
         .execute(pool)
         .await
         .unwrap();
     }
 
     async fn next_scan_at(pool: &Database, id: i64) -> String {
-        sqlx::query_scalar("SELECT next_scan_at FROM series_scan_state WHERE series_id = ?")
-            .bind(id.to_string())
-            .fetch_one(pool)
-            .await
-            .unwrap()
+        let value = crate::db_types::query_scalar::<chrono::DateTime<chrono::Utc>>(
+            "SELECT next_scan_at FROM series_scan_state WHERE series_id = $1",
+        )
+        .bind(id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        crate::db_types::format_date(value)
     }
 
     /// The source list the fake engine reports: one subscribed English source (the only one
@@ -676,7 +679,7 @@ mod tests {
         }
         let engine =
             fake_suwayomi::spawn(source_nodes(), vec![vec![10, 20, 30], vec![30, 10, 20]]).await;
-        let st = state(pool.clone(), &engine.base_url);
+        let st = state(pool.clone(), &engine.base_url).await;
         let (_tx, shutdown) = watch::channel(false);
 
         // ---- THE ASSERTION THAT CATCHES AN INERT E5 -------------------------------------
@@ -723,7 +726,9 @@ mod tests {
         assert_eq!(engine.latest_calls(), 2);
         assert_eq!(
             next_scan_at(&pool, 30).await,
-            crate::scanner::DUE_NOW_SENTINEL,
+            crate::db_types::format_date(
+                crate::db_types::date(crate::scanner::DUE_NOW_SENTINEL).unwrap()
+            ),
             "series 30 jumped rank 2 → 0, which only a new chapter does: it must be due now"
         );
         for id in [10, 20] {
@@ -749,7 +754,7 @@ mod tests {
         // (a) Nothing subscribed at all — the engine is never even asked.
         let pool = migrated_pool().await;
         let engine = fake_suwayomi::spawn(source_nodes(), vec![]).await;
-        let st = state(pool.clone(), &engine.base_url);
+        let st = state(pool.clone(), &engine.base_url).await;
         assert!(subscribed_source_ids(&st).await.unwrap().is_empty());
 
         // A pass over an empty list must not reach upstream, and must not overwrite or
@@ -767,7 +772,7 @@ mod tests {
         // indistinguishable from health without the warning this returns.
         let pool = migrated_pool().await;
         subscribe(&pool, "com.nonexistent.extension").await;
-        let st = state(pool, &engine.base_url);
+        let st = state(pool, &engine.base_url).await;
         assert!(
             subscribed_source_ids(&st).await.unwrap().is_empty(),
             "a subscription with no matching installed source resolves nothing"
@@ -787,7 +792,7 @@ mod tests {
             vec![vec![10, 20, 30]],
         )
         .await;
-        let st = state(pool, &engine.base_url);
+        let st = state(pool, &engine.base_url).await;
         assert!(
             subscribed_source_ids(&st).await.unwrap().is_empty(),
             "`en-us` is not `en` — documenting the sharp edge, not endorsing it"
@@ -833,10 +838,11 @@ mod tests {
                 .unwrap(),
             Some(vec![1, 2])
         );
-        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source_latest_snapshot")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let rows: i64 =
+            crate::db_types::query_scalar("SELECT COUNT(*) FROM source_latest_snapshot")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(
             rows, 1,
             "ON CONFLICT must update in place, not insert a twin"
@@ -856,7 +862,8 @@ mod tests {
     }
 
     /// The documented degradation: `source_latest_snapshot` ends in `.ok()`, so a malformed
-    /// `ordered_ids` reads back as `None` rather than erroring.
+    /// `ordered_ids` reads back as `None` rather than erroring. Native JSONB rejects
+    /// invalid JSON at storage; JSON strings retain the malformed-shape probes.
     ///
     /// THIS IS THE §8i FAILURE MODE, and it is worth naming precisely: `None` is
     /// indistinguishable from "never seen", so a source whose row is corrupt re-baselines on
@@ -870,10 +877,13 @@ mod tests {
         for junk in ["not json", "{}", "[1, \"two\"]", ""] {
             sqlx::query(
                 "INSERT INTO source_latest_snapshot (source_id, ordered_ids, captured_at) \
-                 VALUES ('junk', ?, '2026-01-01T00:00:00+00:00') \
+                 VALUES ('junk', $1, '2026-01-01T00:00:00+00:00') \
                  ON CONFLICT(source_id) DO UPDATE SET ordered_ids = excluded.ordered_ids",
             )
-            .bind(junk)
+            .bind(sqlx::types::Json(
+                serde_json::from_str::<serde_json::Value>(junk)
+                    .unwrap_or_else(|_| serde_json::Value::String(junk.to_string())),
+            ))
             .execute(&pool)
             .await
             .unwrap();
@@ -904,7 +914,7 @@ mod tests {
             vec![vec![10, 20, 30], vec![], vec![10, 20, 30]],
         )
         .await;
-        let st = state(pool.clone(), &engine.base_url);
+        let st = state(pool.clone(), &engine.base_url).await;
         let (_tx, shutdown) = watch::channel(false);
 
         discovery_pass(&st, &shutdown).await;

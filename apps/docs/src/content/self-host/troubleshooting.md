@@ -3,7 +3,7 @@ title: Fix server problems
 description: Fix setup, container and source problems on the komiq server you host with Docker.
 ---
 
-Use this page to fix setup, container or source problems with your Docker installation. Check your server's logs for the symptoms below. For reader app problems, read [Reader troubleshooting](/guide/troubleshooting).
+Fix Docker setup, container and source problems by checking your server logs. For reader app problems, read [Fix reader problems](/guide/troubleshooting).
 
 ## The installer stops with "problem:"
 
@@ -12,21 +12,11 @@ Use this page to fix setup, container or source problems with your Docker instal
 - "Port 8080 is in use. Try --port 8081.": another program has the HTTP port. Run the installer again with the port it names.
 - "Port 443 is in use. Free it before continuing.": another program, often a web server, holds a port komiq needs. Stop it, or choose `tunnel`.
 - "Could not check ports.": install `ss`, `lsof` or `netstat`.
-- "Server did not become healthy.": the installer waited 5 minutes. Read the server log, as described below.
+- "Server did not become healthy.": startup stopped making progress. Read the server log, as described below. Import progress extends the wait.
 
 ## No setup code in the server log
 
-The server issues a setup code only while no administrator account exists. It prints none after setup or if startup fails.
-
-If you already created an owner account, open `http://192.168.1.20:8080/admin` and sign in.
-
-For a fresh installation, inspect the log:
-
-```sh
-docker compose logs server
-```
-
-Check directory permissions and environment variables if initialization fails.
+The server issues a setup code only while no administrator account exists. If you already created an owner account, open `http://192.168.1.20:8080/admin` and sign in. On a fresh installation, read the log with `docker compose logs server`, and check directory permissions and environment variables if initialization fails.
 
 ## Setup displays "Invalid setup code"
 
@@ -38,35 +28,54 @@ docker compose logs server | grep "setup code" | tail -n 1
 
 Type the code shown in the last log line. The server ignores spaces, dashes and letter case.
 
-## Setup displays "Too many setup attempts"
+## Setup cannot continue
 
-Wait for the time the message names, check the setup code in the server log, and try again.
-
-## The Owner step cannot check the connection
-
-The step shows "komiq could not check this connection." when your server did not say whether the connection is safe for a password. Click **Try again**. The form appears only after the check answers.
+For "Too many setup attempts", wait for the time shown before retrying. If the Owner step cannot check the connection, click **Try again**.
 
 ## Server container is not healthy
 
-The health check queries `http://localhost:8080/health/ready` every 30 seconds to check the server and database.
+The health check queries `/health/ready` to check the server and database. Read the logs with `docker compose logs server`.
 
-Read the logs:
+For a published-port conflict, set `KOMIQ_PORT` to a free port in `.env` and run `docker compose up -d`.
 
-```sh
-docker compose logs server
+For file permission errors, ensure `komiq_server-data` permits writes by server user ID `10001`.
+
+If the data directory is locked, stop the duplicate container or desktop server: `.komiq-server.lock` keeps two servers off the same files and releases when the process exits. Do not delete it while a server runs.
+
+For a PostgreSQL connection error, inspect `docker compose logs postgres`. Keep the original `KOMIQ_DB_PASSWORD` in `.env`; editing it does not change an existing cluster's password.
+
+If Compose says `Run install.sh to generate KOMIQ_DB_PASSWORD`, run `bash deploy/selfhost/install.sh` from the repository root. It adds the password without removing old settings.
+
+### SQLite conversion stops or is refused
+
+On an update from SQLite, the server converts `/data/komika.sqlite3` into an empty PostgreSQL database: read [Update and back up](/self-host/update-and-backup). A failed or refused start prints `sqlite import: error: <stage> stage: ...` and exits. The installer stops the server.
+
+A refusal usually says `Nothing was changed`, names the files involved and gives the exact renames and deletions for each way out. When it offers a kept copy, it gives that copy's row counts (or `empty`), so you can pick the copy that holds your data. This is the end of one such line, when only the work copy is left:
+
+```text
+To import it, rename /data/komika.sqlite3.import-work-source to /data/komika.sqlite3 and start again. Or, to start with an empty database, move the listed files out of the data directory and start again
 ```
 
-If the log shows an address binding error, another service on your host is using port 8080. Open `.env`, set `KOMIQ_PORT` to an unused port number (such as `8081`), and restart with `docker compose up -d`.
+In Docker those paths are inside the `komiq_server-data` volume (the prefix follows your Compose project name). Stop the server with `docker compose stop server` (in `deploy/selfhost`), make each rename in a temporary container, then run `docker compose up -d`:
 
-If the log shows database permission errors, check file ownership in the data directory. The server container runs as user ID `10001`. Ensure the `komiq_server-data` volume permits write access to that user.
+```sh
+docker run --rm -v komiq_server-data:/data busybox \
+  mv /data/komika.sqlite3.import-work-source /data/komika.sqlite3
+```
 
-If the data directory is locked, stop the duplicate container or desktop server. `.komiq-server.lock` prevents two servers using the same files. The lock releases when the process exits. Do not delete it while a server is running.
-
-For a Litestream restore error, fix backup credentials, network access or the replica before restarting. Startup stops on restore failures to protect the backup. An existing local database or a bucket without a replica is a normal skip.
+| The line says                                                                       | What to do                                                                                                           |
+| ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `is missing`, `cannot be used`                                                      | Put the SQLite file back, or rename the saved copy as the line says.                                                 |
+| `from a newer release`, `belongs to a newer release`, `differs from the migration`  | A newer komiq wrote the SQLite file or the PostgreSQL database. Start that release. |
+| `already holds other data, while`                                                   | Wrong database: correct `DATABASE_URL`. Right one: delete the record and work files the line names.                  |
+| `changed after PostgreSQL received its data`                                        | To keep PostgreSQL's data, move the SQLite file elsewhere and delete the record and work files.                      |
+| `started with the import-sqlite-to-postgres command`                                | The server never resets that import. Finish it with the command, or follow the line's other way if PostgreSQL holds nothing you need. |
+| `must be owned by the user that runs the server`                                    | Run the `chmod 700` it names, and `chown` the folder to the server user (ID `10001` in Docker).                      |
+| `not enough free disk space`                                                        | Free 8 times the SQLite files' size plus 256 MiB in the folder the line names.                                       |
 
 ## Port 443 or 80 does not answer
 
-With Docker, your server answers on these ports inside the container, and Docker publishes them only when `COMPOSE_FILE` in `.env` names the extra Compose files. Run the installer with `--access public-ip` or `--access direct`, or read [Reach it from the internet](/self-host/internet-access). Then check the firewall on the machine and at your cloud provider.
+Docker publishes these ports only when `COMPOSE_FILE` in `.env` names the extra Compose files. Run the installer with `--access public-ip` or `--access direct`, or read [Reach it from the internet](/self-host/internet-access). Then check the firewall on the machine and at your cloud provider.
 
 If **Settings › Access** shows HTTPS as "Not running", it names the reason, and the server tries again by itself.
 
@@ -76,78 +85,40 @@ With **Only my devices**, the server refuses plain HTTP from the internet. Open 
 
 ## Cloudflare setup problems
 
-If the checklist fails at "Get the connector (cloudflared)", your server could not download `cloudflared`, the tunnel's connector program. Check that your server can reach GitHub, then click **Retry**. Or install `cloudflared` yourself and set `CLOUDFLARED_BIN` to its path.
-
-"This token may lack: …" after **Check token** is advice. You can still run setup. If a step fails, add the named permission to the token in Cloudflare and retry.
+If setup cannot get `cloudflared`, check outbound access to GitHub and retry, or install the connector yourself and set `CLOUDFLARED_BIN`. If a step fails, add the token permission it names and retry.
 
 ## Source engine container fails or stays in starting
 
-On first start, Suwayomi unpacks assets and creates its database. Allow one to two minutes.
-
-Inspect the engine logs:
-
-```sh
-docker compose logs suwayomi
-```
-
-Wait two minutes for the initial launch to finish. If the container stops repeatedly, check that the host has enough memory.
+On first start, Suwayomi unpacks assets and creates its database. Let that finish and read `docker compose logs suwayomi`. If the container stops repeatedly, check the host's memory.
 
 ## The catalogue is empty
 
-A fresh installation has no sources. Add an extension repo and install extensions to fill your catalogue.
-
-To add sources:
-
-1. Open `http://192.168.1.20:8080/admin` and log in as the owner.
-2. To add an extension repository, open **Settings › Sources**, scroll to **Extension repos**, enter the repository index address, and click **Add repo**.
-3. Navigate to **Sources › Extensions** to install extensions from your added repository. Read [Add sources](/self-host/sources) for details.
-4. If you read from MangaDex, open **Settings › Sources** and toggle the **MangaDex** switch.
+A fresh installation has no sources. Open **Settings › Sources** to add an extension repository, then use **Sources › Extensions** to install extensions. Read [Add sources](/self-host/sources). MangaDex has its own switch in source settings.
 
 If adding a repository fails, check `docker compose ps`. The server cannot install extensions while the engine is booting.
 
 ## Covers or chapter pages do not load
 
-If the log says the cover cache was recreated, komiq preserved an unavailable or corrupt cache beside `covers.sqlite3` with a `.quarantined-<id>` suffix. Accounts and libraries live in a separate database. Covers fill again after missing pointers are cleared at startup. Check disk space while both cache files exist.
+If the log says the cover cache was recreated, komiq preserved an unavailable or corrupt cache beside `covers.sqlite3` with a `.quarantined-<id>` suffix. Check disk space while both cache files exist.
 
-This issue occurs if the source engine is stopped, an extension is down, or the upstream source website uses Cloudflare bot protection.
+This happens if the source engine is stopped, an extension is down, or the source website uses Cloudflare bot protection. Check `docker compose ps`, then open **Sources › Health** in the admin console.
 
-First, check that both containers are running:
-
-```sh
-docker compose ps
-```
-
-In the admin console, navigate to **Sources › Health** and inspect the status of the affected extension.
-
-If the upstream source website requires solving a Cloudflare "checking your browser" challenge, enable FlareSolverr. In `.env`, set:
+If the upstream source website requires solving a Cloudflare "checking your browser" challenge, enable FlareSolverr, a headless browser that solves challenge pages for the engine. In `.env`, set:
 
 ```sh
 COMPOSE_PROFILES=flaresolverr
 FLARESOLVERR_ENABLED=true
 ```
 
-Apply the changes by running `docker compose up -d`. FlareSolverr runs a headless browser that solves challenge pages for the engine.
+Apply the changes by running `docker compose up -d`.
 
 ## Build fails or the machine runs out of memory
 
-Compiling the server requires approximately 4 GB of RAM. The installer warns below that. On a small virtual private server, Linux stops the compiler when memory runs out.
-
-Choose one fix:
-
-- Configure a swap file on your server to provide additional temporary memory. A 2 GB to 4 GB swap file allows low-memory servers to finish compiling.
-- Build the image on another computer with sufficient RAM, then transfer the image to your server:
-
-```sh
-docker save komiq-selfhost:local | ssh <server> docker load
-```
-
-After loading the image onto the server, run `docker compose up -d` without the `--build` flag.
+If the compiler stops for lack of memory, add memory or swap, or build the image on another computer, load it here and run `docker compose up -d` without `--build`.
 
 ## Disk space runs low after updates
 
-Docker preserves earlier container images, intermediate build steps, and compiler caches on disk.
-
-Remove unused images and build caches:
+Docker keeps earlier container images, build steps and compiler caches. Remove unused ones:
 
 ```sh
 docker image prune

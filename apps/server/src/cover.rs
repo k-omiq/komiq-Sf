@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::database::SqliteDatabase;
 use crate::db::Database;
 use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
@@ -298,26 +299,34 @@ pub fn downscale_variant(master: &[u8], width: u32) -> Result<Option<Vec<u8>>> {
 /// `asset_key` namespaces the two cover families that share this table — canonical
 /// works (`w_…`) and Suwayomi source covers (`s:<manga_id>`) — so one lazy-generate
 /// path serves both.
-pub async fn get_cover_variant(covers: &Database, asset_key: &str, width: u32) -> Option<Vec<u8>> {
-    sqlx::query_scalar("SELECT webp FROM cover_variant WHERE asset_key = ? AND width = ?")
+pub async fn get_cover_variant(
+    covers: &SqliteDatabase,
+    asset_key: &str,
+    width: u32,
+) -> Option<Vec<u8>> {
+    sqlx::query_scalar("SELECT webp FROM cover_variant WHERE asset_key = $1 AND width = $2")
         .bind(asset_key)
         .bind(width)
         .fetch_optional(covers)
         .await
+        .inspect_err(crate::db::record_read_database_error)
         .ok()
         .flatten()
 }
 
 /// Store (or replace) a cover derivative in the un-replicated covers DB.
-pub async fn put_cover_variant(
-    covers: &Database,
+pub async fn put_cover_variant<'e, E>(
+    covers: E,
     asset_key: &str,
     width: u32,
     webp: &[u8],
-) -> Result<()> {
+) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let ts = Utc::now().to_rfc3339();
     sqlx::query(
-        "INSERT INTO cover_variant (asset_key, width, webp, updated_at) VALUES (?, ?, ?, ?) \
+        "INSERT INTO cover_variant (asset_key, width, webp, updated_at) VALUES ($1, $2, $3, $4) \
          ON CONFLICT(asset_key, width) DO UPDATE SET webp = excluded.webp, \
          updated_at = excluded.updated_at",
     )
@@ -334,12 +343,14 @@ pub async fn put_cover_variant(
 /// re-saved cover cannot keep serving a derivative of the OLD art. The public URL is
 /// `?v=`-busted for works, but the Suwayomi cover path has no version token at all —
 /// there, this delete is the only thing keeping the two in step.
-pub async fn clear_cover_variants(covers: &Database, asset_key: &str) {
-    if let Err(e) = sqlx::query("DELETE FROM cover_variant WHERE asset_key = ?")
+#[allow(dead_code)]
+pub async fn clear_cover_variants(covers: &SqliteDatabase, asset_key: &str) {
+    if let Err(e) = sqlx::query("DELETE FROM cover_variant WHERE asset_key = $1")
         .bind(asset_key)
         .execute(covers)
         .await
     {
+        let e = crate::db::observed_database_error(e.into());
         tracing::warn!(error = %e, asset_key, "cover variant invalidation failed");
     }
 }
@@ -352,30 +363,56 @@ pub fn suwayomi_variant_key(manga_id: i64) -> String {
 /// Read a resized, origin-cached Suwayomi source cover (keyed by numeric manga id),
 /// or `None` if it hasn't been materialized yet. Errors are swallowed to `None` so a
 /// transient DB hiccup falls back to a live resize rather than failing the request.
-pub async fn get_suwayomi_cover(covers: &Database, manga_id: i64) -> Option<Vec<u8>> {
-    sqlx::query_scalar("SELECT webp FROM suwayomi_cover_blob WHERE manga_id = ?")
+pub async fn get_suwayomi_cover(covers: &SqliteDatabase, manga_id: i64) -> Option<Vec<u8>> {
+    sqlx::query_scalar("SELECT webp FROM suwayomi_cover_blob WHERE manga_id = $1")
         .bind(manga_id)
         .fetch_optional(covers)
         .await
+        .inspect_err(crate::db::record_read_database_error)
         .ok()
         .flatten()
 }
 
 /// Store (or replace) a resized Suwayomi source cover in the un-replicated covers DB.
-pub async fn put_suwayomi_cover(covers: &Database, manga_id: i64, webp: &[u8]) -> Result<()> {
+///
+/// Test fixtures only. It takes the process-local asset mutex but not the PostgreSQL
+/// Cover key and overwrites whatever master is there, so no production path may use it:
+/// they publish through [`publish_suwayomi_cover`] or
+/// [`publish_suwayomi_cover_if_missing`] (T080).
+#[cfg(test)]
+pub async fn put_suwayomi_cover(covers: &SqliteDatabase, manga_id: i64, webp: &[u8]) -> Result<()> {
+    let _asset = asset_mutex(&suwayomi_variant_key(manga_id)).await;
+    put_suwayomi_cover_on(covers, manga_id, webp).await
+}
+
+async fn put_suwayomi_cover_on(covers: &SqliteDatabase, manga_id: i64, webp: &[u8]) -> Result<()> {
+    let mut cache = covers.begin().await?;
+    write_suwayomi_cover_on(&mut cache, manga_id, webp).await?;
+    cache.commit().await?;
+    Ok(())
+}
+
+async fn write_suwayomi_cover_on(
+    cache: &mut sqlx::SqliteConnection,
+    manga_id: i64,
+    webp: &[u8],
+) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
     sqlx::query(
-        "INSERT INTO suwayomi_cover_blob (manga_id, webp, updated_at) VALUES (?, ?, ?) \
+        "INSERT INTO suwayomi_cover_blob (manga_id, webp, updated_at) VALUES ($1, $2, $3) \
          ON CONFLICT(manga_id) DO UPDATE SET webp = excluded.webp, updated_at = excluded.updated_at",
     )
     .bind(manga_id)
     .bind(webp)
     .bind(&ts)
-    .execute(covers)
+    .execute(&mut *cache)
     .await?;
     // This path has no `?v=` token in its public URL, so a stale derivative would
     // outlive its master indefinitely. Dropping them here is the only invalidation.
-    clear_cover_variants(covers, &suwayomi_variant_key(manga_id)).await;
+    sqlx::query("DELETE FROM cover_variant WHERE asset_key = $1")
+        .bind(suwayomi_variant_key(manga_id))
+        .execute(&mut *cache)
+        .await?;
     Ok(())
 }
 
@@ -415,16 +452,17 @@ pub fn work_cover_url(
 /// cover file name. `None` if the work has no MangaDex source or no cover file name, in
 /// which case there's nothing to lazily fetch. Used by `serve_cover`'s lazy cache.
 pub async fn mangadex_cover_anchor(main: &Database, work_id: &str) -> Option<(String, String)> {
-    let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+    let row = crate::db_types::query_tuple::<(Option<String>, Option<String>)>(
         "SELECT ss.source_key, w.cover_file_name \
          FROM work w \
          JOIN source_series ss ON ss.work_id = w.id AND ss.source_type = 'mangadex' \
-         WHERE w.id = ? \
+         WHERE w.id = $1 \
          ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1",
     )
     .bind(work_id)
     .fetch_optional(main)
     .await
+    .inspect_err(crate::db::record_read_database_error)
     .ok()
     .flatten()?;
     match row {
@@ -444,19 +482,239 @@ pub async fn mangadex_cover_anchor(main: &Database, work_id: &str) -> Option<(St
 /// leaves a blob with no pointer — harmless: the resolver falls back to the proxy
 /// URL, and the drainer re-runs (it selects `cover_cached_version IS NULL`) and
 /// re-sets the pointer. The reverse order could point at a missing blob → 404.
+pub async fn asset_mutex(asset: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    type Assets = std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>;
+    static ASSETS: std::sync::LazyLock<std::sync::Mutex<Assets>> =
+        std::sync::LazyLock::new(Default::default);
+    let mutex = {
+        let mut assets = ASSETS.lock().unwrap_or_else(|p| p.into_inner());
+        assets.retain(|_, mutex| mutex.strong_count() > 0);
+        match assets.get(asset).and_then(std::sync::Weak::upgrade) {
+            Some(mutex) => mutex,
+            None => {
+                let mutex = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                assets.insert(asset.to_owned(), std::sync::Arc::downgrade(&mutex));
+                mutex
+            }
+        }
+    };
+    mutex.lock_owned().await
+}
+
+pub async fn lock_asset(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    asset: &str,
+) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+    crate::locks::advisory(
+        tx,
+        &[crate::locks::AdvisoryKey::new(
+            crate::locks::KeyClass::Cover,
+            &[asset],
+        )],
+    )
+    .await?;
+    Ok(asset_mutex(asset).await)
+}
+
+/// [`lock_asset`] for several assets of one transaction: every Cover key in ONE sorted
+/// advisory call, then the in-process guards in sorted order.
+///
+/// A single-asset holder takes its advisory key before its in-process guard as well, so
+/// a holder of one in-process guard never waits for a key this call already holds.
+pub async fn lock_assets(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    assets: &[&str],
+) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
+    let mut assets = assets.to_vec();
+    assets.sort_unstable();
+    assets.dedup();
+    let keys: Vec<_> = assets
+        .iter()
+        .map(|asset| crate::locks::AdvisoryKey::new(crate::locks::KeyClass::Cover, &[*asset]))
+        .collect();
+    crate::locks::advisory(tx, &keys).await?;
+    let mut guards = Vec::with_capacity(assets.len());
+    for asset in assets {
+        guards.push(asset_mutex(asset).await);
+    }
+    Ok(guards)
+}
+
+pub async fn put_current_variant(
+    main: &Database,
+    covers: &SqliteDatabase,
+    asset: &str,
+    width: u32,
+    master: &[u8],
+    derivative: &[u8],
+) -> Result<()> {
+    let mut tx = main.begin().await?;
+    let _asset = lock_asset(&mut tx, asset).await?;
+    let mut cache = covers.begin().await?;
+    let current: Option<Vec<u8>> = if let Some(id) = asset.strip_prefix("s:") {
+        sqlx::query_scalar("SELECT webp FROM suwayomi_cover_blob WHERE manga_id = $1")
+            .bind(id.parse::<i64>()?)
+            .fetch_optional(&mut *cache)
+            .await?
+    } else {
+        sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id = $1")
+            .bind(asset)
+            .fetch_optional(&mut *cache)
+            .await?
+    };
+    if current.as_deref() == Some(master) {
+        put_cover_variant(&mut *cache, asset, width, derivative).await?;
+    }
+    cache.commit().await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn publish_suwayomi_cover(
+    main: &Database,
+    covers: &SqliteDatabase,
+    manga_id: i64,
+    webp: &[u8],
+) -> Result<()> {
+    let mut tx = main.begin().await?;
+    let _asset = lock_asset(&mut tx, &suwayomi_variant_key(manga_id)).await?;
+    put_suwayomi_cover_on(covers, manga_id, webp).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn publish_suwayomi_cover_if_missing(
+    main: &Database,
+    covers: &SqliteDatabase,
+    manga_id: i64,
+    webp: &[u8],
+) -> Result<bool> {
+    let mut tx = main.begin().await?;
+    let _asset = lock_asset(&mut tx, &suwayomi_variant_key(manga_id)).await?;
+    let mut cache = covers.begin().await?;
+    let present: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM suwayomi_cover_blob WHERE manga_id = $1)")
+            .bind(manga_id)
+            .fetch_one(&mut *cache)
+            .await?;
+    if present {
+        cache.rollback().await?;
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    write_suwayomi_cover_on(&mut cache, manga_id, webp).await?;
+    cache.commit().await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+#[cfg(test)]
+tokio::task_local! { pub(crate) static COVER_PUBLICATION_PAUSE: crate::locks::pause_points::PausePoints; }
+
 pub async fn put_work_cover(
     main: &Database,
-    covers: &Database,
+    covers: &SqliteDatabase,
     work_id: &str,
     webp: &[u8],
 ) -> Result<()> {
+    publish_work_cover(main, covers, work_id, webp, None, None).await?;
+    Ok(())
+}
+
+pub async fn put_work_cover_if_current(
+    main: &Database,
+    covers: &SqliteDatabase,
+    work_id: &str,
+    webp: &[u8],
+    expected: Option<&[u8]>,
+) -> Result<bool> {
+    publish_work_cover(main, covers, work_id, webp, Some(expected), None).await
+}
+
+pub async fn put_work_cover_for_missing_anchor(
+    main: &Database,
+    covers: &SqliteDatabase,
+    work_id: &str,
+    webp: &[u8],
+    mangadex_id: &str,
+    file_name: &str,
+) -> Result<bool> {
+    publish_work_cover(
+        main,
+        covers,
+        work_id,
+        webp,
+        Some(None),
+        Some((mangadex_id, file_name)),
+    )
+    .await
+}
+
+async fn publish_work_cover(
+    main: &Database,
+    covers: &SqliteDatabase,
+    work_id: &str,
+    webp: &[u8],
+    expected: Option<Option<&[u8]>>,
+    expected_anchor: Option<(&str, &str)>,
+) -> Result<bool> {
     let now = Utc::now();
-    let version = now.timestamp_millis();
+
     let ts = now.to_rfc3339();
+    let mut tx = main.begin().await?;
+    let _asset = lock_asset(&mut tx, work_id).await?;
+    if !crate::locks::lock_works(&mut tx, &[work_id])
+        .await?
+        .missing
+        .is_empty()
+    {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    if let Some((mangadex_id, file_name)) = expected_anchor {
+        let current: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT ss.source_key, w.cover_file_name FROM work w JOIN source_series ss ON ss.work_id = w.id AND ss.source_type = 'mangadex' WHERE w.id = $1 ORDER BY ss.created_at, ss.id LIMIT 1"
+        ).bind(work_id).fetch_optional(&mut *tx).await?;
+        if current
+            .as_ref()
+            .map(|(id, file)| (id.as_str(), file.as_deref()))
+            != Some((mangadex_id, Some(file_name)))
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+    }
+    if let Some(expected) = expected {
+        let current: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id = $1")
+                .bind(work_id)
+                .fetch_optional(covers)
+                .await?;
+        if current.as_deref() != expected {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+    }
+    let previous: Option<i64> =
+        sqlx::query_scalar("SELECT version FROM work_cover_blob WHERE work_id = $1")
+            .bind(work_id)
+            .fetch_optional(covers)
+            .await?;
+    let version = now.timestamp_millis().max(
+        previous
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("cover version exhausted"))?,
+    );
+    #[cfg(test)]
+    if let Ok(points) = COVER_PUBLICATION_PAUSE.try_with(Clone::clone) {
+        points.hit("cover-locked").await;
+    }
+    let mut cache = covers.begin().await?;
     // 1) Blob first, into the un-replicated covers DB.
     sqlx::query(
         "INSERT INTO work_cover_blob (work_id, webp, version, updated_at) \
-         VALUES (?, ?, ?, ?) \
+         VALUES ($1, $2, $3, $4) \
          ON CONFLICT(work_id) DO UPDATE SET \
            webp = excluded.webp, version = excluded.version, updated_at = excluded.updated_at",
     )
@@ -464,17 +722,20 @@ pub async fn put_work_cover(
     .bind(webp)
     .bind(version)
     .bind(&ts)
-    .execute(covers)
+    .execute(&mut *cache)
     .await?;
     // Derivatives of the PREVIOUS master are now wrong art. Drop them here rather than
     // relying on the `?v=` bust: that only stops browsers and the edge from reusing the
     // old bytes, it does not touch what we would hand the next cold request.
-    clear_cover_variants(covers, work_id).await;
+    sqlx::query("DELETE FROM cover_variant WHERE asset_key = $1")
+        .bind(work_id)
+        .execute(&mut *cache)
+        .await?;
+    cache.commit().await?;
     // 2) Publish the version and every materialized card URL atomically. Updating
     // only work left library/browse cards pointing at immutable damaged thumbnails
     // even after an admin had successfully fetched a replacement.
-    let mut tx = main.begin().await?;
-    sqlx::query("UPDATE work SET cover_cached_version = ? WHERE id = ?")
+    sqlx::query("UPDATE work SET cover_cached_version = $1 WHERE id = $2")
         .bind(version)
         .bind(work_id)
         .execute(&mut *tx)
@@ -482,7 +743,7 @@ pub async fn put_work_cover(
     let url = cover_path(work_id, version);
     for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
         sqlx::query(&format!(
-            "UPDATE {table} SET cover_url = ? WHERE work_id = ?"
+            "UPDATE {table} SET cover_url = $1 WHERE work_id = $2"
         ))
         .bind(&url)
         .bind(work_id)
@@ -490,7 +751,7 @@ pub async fn put_work_cover(
         .await?;
     }
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 /// A work still missing a cached cover, with the MangaDex anchor needed to fetch
@@ -514,18 +775,18 @@ pub async fn pending_cover_count(pool: &Database) -> Result<i64> {
     // because 26 works carry a recorded issue. That made the drainer's `Ok(0) => nothing
     // to do` short-circuit unreachable — it launched a full crawl pass every 300 s to
     // process a single row — and overstated the operator-facing backlog by 27x.
-    let n: i64 = sqlx::query_scalar(
+    let n: i64 = crate::db_types::query_scalar(
         "SELECT COUNT(*) FROM work w \
          WHERE w.cover_cached_version IS NULL \
            AND NOT EXISTS (SELECT 1 FROM work_cover_issue i WHERE i.work_id = w.id \
-                           AND (i.retry_after IS NULL OR i.retry_after > ?)) AND ( \
+                           AND (i.retry_after IS NULL OR i.retry_after > $1)) AND ( \
              (w.cover_file_name IS NOT NULL \
               AND EXISTS (SELECT 1 FROM source_series ss \
                           WHERE ss.work_id = w.id AND ss.source_type = 'mangadex')) \
              OR EXISTS (SELECT 1 FROM source_series ss \
                         WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi'))",
     )
-    .bind(Utc::now().to_rfc3339())
+    .bind(Utc::now())
     .fetch_one(pool)
     .await?;
     Ok(n)
@@ -576,6 +837,12 @@ pub async fn record_cover_issue(
     record_cover_issue_backoff(pool, work_id, CoverFailure::Permanent(reason), detail).await;
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static COVER_BACKOFF_PAUSE: crate::locks::pause_points::PausePoints;
+    static COVER_BACKOFF_RESULTS: tokio::sync::mpsc::UnboundedSender<std::result::Result<(), String>>;
+}
+
 /// Record (or refresh) a work cover failure with a `retry_after` computed from the
 /// failure class and the attempt count — the backoff half of the 0043 skip-marker.
 ///
@@ -588,48 +855,64 @@ pub async fn record_cover_issue_backoff(
     failure: CoverFailure,
     detail: &str,
 ) {
-    let now = Utc::now();
-    let ts = now.to_rfc3339();
-    // Truncate an over-long error so a pathological message can't bloat the row.
-    let detail: String = detail.chars().take(500).collect();
-    let prev: i64 = sqlx::query_scalar("SELECT attempts FROM work_cover_issue WHERE work_id = ?")
+    let result: Result<()> = async {
+        let mut tx = pool.begin().await?;
+        let _asset = lock_asset(&mut tx, work_id).await?;
+        #[cfg(test)]
+        if let Ok(points) = COVER_BACKOFF_PAUSE.try_with(Clone::clone) {
+            points.hit("backoff-locked").await;
+        }
+        let now = Utc::now();
+        // Truncate an over-long error so a pathological message can't bloat the row.
+        let detail: String = detail.chars().take(500).collect();
+        let prev: i64 = crate::db_types::query_scalar(
+            "SELECT attempts FROM work_cover_issue WHERE work_id = $1",
+        )
         .bind(work_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
+        .fetch_optional(&mut *tx)
+        .await?
         .unwrap_or(0);
-    let retry_after = failure.retry_after(now, prev + 1);
-    if let Err(e) = sqlx::query(
-        "INSERT INTO work_cover_issue \
+        let retry_after = failure.retry_after(now, prev + 1);
+        sqlx::query(
+            "INSERT INTO work_cover_issue \
            (work_id, reason, detail, attempts, first_seen, last_seen, retry_after) \
-         VALUES (?, ?, ?, 1, ?, ?, ?) \
+         VALUES ($1, $2, $3, 1, $4, $5, $6) \
          ON CONFLICT(work_id) DO UPDATE SET \
            reason = excluded.reason, detail = excluded.detail, \
            attempts = work_cover_issue.attempts + 1, last_seen = excluded.last_seen, \
            retry_after = excluded.retry_after",
-    )
-    .bind(work_id)
-    .bind(failure.reason())
-    .bind(&detail)
-    .bind(&ts)
-    .bind(&ts)
-    .bind(&retry_after)
-    .execute(pool)
-    .await
-    {
-        tracing::warn!(work_id, error = %e, "cover issue: failed to record");
+        )
+        .bind(work_id)
+        .bind(failure.reason())
+        .bind(&detail)
+        .bind(now)
+        .bind(now)
+        .bind(crate::db_types::date(&retry_after).expect("internally generated UTC timestamp"))
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    #[cfg(test)]
+    let _ = COVER_BACKOFF_RESULTS
+        .try_with(|results| results.send(result.as_ref().map(|_| ()).map_err(ToString::to_string)));
+    if let Err(e) = result {
+        crate::db::observe_database_error(&e);
+        tracing::warn!(error = %e, "cover backoff write failed");
     }
 }
 
 /// Clear a work's recorded cover issue (a later attempt — auto or manual — succeeded,
 /// so it should re-enter the normal cached/uncached flow). Best-effort.
 pub async fn clear_cover_issue(pool: &Database, work_id: &str) {
-    if let Err(e) = sqlx::query("DELETE FROM work_cover_issue WHERE work_id = ?")
+    if let Err(e) = sqlx::query("DELETE FROM work_cover_issue WHERE work_id = $1")
         .bind(work_id)
         .execute(pool)
         .await
     {
+        let e = crate::db::observed_database_error(e.into());
         tracing::warn!(work_id, error = %e, "cover issue: failed to clear");
     }
 }
@@ -791,61 +1074,75 @@ pub async fn record_suwayomi_cover_issue(
     failure: CoverFailure,
     detail: &str,
 ) {
-    let now = Utc::now();
-    let detail: String = detail.chars().take(500).collect();
-    let prev: Option<(i64, Option<String>)> = sqlx::query_as(
-        "SELECT attempts, source_fetched_at FROM suwayomi_cover_issue WHERE manga_id = ?",
-    )
-    .bind(manga_id)
-    .fetch_optional(main)
-    .await
-    .ok()
-    .flatten();
-    // A manga the extension has re-fetched since the last failure is a NEW input: start
-    // the ladder again rather than inheriting a 24h step earned by the old thumbnail.
-    let attempts = match &prev {
-        Some((n, seen)) if seen.as_deref() == fetched_at => n + 1,
-        _ => 1,
-    };
-    let ts = now.to_rfc3339();
-    let retry_after = failure.retry_after(now, attempts);
-    if let Err(e) = sqlx::query(
-        "INSERT INTO suwayomi_cover_issue \
+    let result: Result<()> = async {
+        let mut tx = main.begin().await?;
+        let _asset = lock_asset(&mut tx, &suwayomi_variant_key(manga_id)).await?;
+        #[cfg(test)]
+        if let Ok(points) = COVER_BACKOFF_PAUSE.try_with(Clone::clone) {
+            points.hit("backoff-locked").await;
+        }
+        let now = Utc::now();
+        let detail: String = detail.chars().take(500).collect();
+        let prev: Option<(i64, Option<String>)> = crate::db_types::query_tuple(
+            "SELECT attempts, source_fetched_at FROM suwayomi_cover_issue WHERE manga_id = $1",
+        )
+        .bind(manga_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        // A manga the extension has re-fetched since the last failure is a NEW input: start
+        // the ladder again rather than inheriting a 24h step earned by the old thumbnail.
+        let attempts = match &prev {
+            Some((n, seen)) if seen.as_deref() == fetched_at => n + 1,
+            _ => 1,
+        };
+        let retry_after = failure.retry_after(now, attempts);
+        sqlx::query(
+            "INSERT INTO suwayomi_cover_issue \
            (manga_id, source_id, reason, detail, permanent, attempts, first_seen, \
             last_seen, retry_after, source_fetched_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
          ON CONFLICT(manga_id) DO UPDATE SET \
            source_id = excluded.source_id, reason = excluded.reason, \
            detail = excluded.detail, permanent = excluded.permanent, \
            attempts = excluded.attempts, last_seen = excluded.last_seen, \
            retry_after = excluded.retry_after, \
            source_fetched_at = excluded.source_fetched_at",
-    )
-    .bind(manga_id)
-    .bind(source_id)
-    .bind(failure.reason())
-    .bind(&detail)
-    .bind(failure.is_permanent() as i64)
-    .bind(attempts)
-    .bind(&ts)
-    .bind(&ts)
-    .bind(&retry_after)
-    .bind(fetched_at)
-    .execute(main)
-    .await
-    {
-        tracing::warn!(manga_id, error = %e, "suwayomi cover issue: failed to record");
+        )
+        .bind(manga_id)
+        .bind(source_id)
+        .bind(failure.reason())
+        .bind(&detail)
+        .bind(failure.is_permanent())
+        .bind(attempts)
+        .bind(now)
+        .bind(now)
+        .bind(crate::db_types::date(&retry_after).expect("internally generated UTC timestamp"))
+        .bind(fetched_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    #[cfg(test)]
+    let _ = COVER_BACKOFF_RESULTS
+        .try_with(|results| results.send(result.as_ref().map(|_| ()).map_err(ToString::to_string)));
+    if let Err(e) = result {
+        crate::db::observe_database_error(&e);
+        tracing::warn!(error = %e, "cover backoff write failed");
     }
 }
 
 /// Clear a Suwayomi cover marker — a fetch succeeded, so the cover is back in the normal
 /// cached/uncached flow. Best-effort.
 pub async fn clear_suwayomi_cover_issue(main: &Database, manga_id: i64) {
-    if let Err(e) = sqlx::query("DELETE FROM suwayomi_cover_issue WHERE manga_id = ?")
+    if let Err(e) = sqlx::query("DELETE FROM suwayomi_cover_issue WHERE manga_id = $1")
         .bind(manga_id)
         .execute(main)
         .await
     {
+        let e = crate::db::observed_database_error(e.into());
         tracing::warn!(manga_id, error = %e, "suwayomi cover issue: failed to clear");
     }
 }
@@ -865,26 +1162,29 @@ pub async fn record_source_cover_backoff(
     failed_covers: usize,
     detail: &str,
 ) {
+    let result: Result<()> = async {
+    let mut tx = main.begin().await?;
+    let _asset = lock_asset(&mut tx, source_id).await?;
+    #[cfg(test)]
+    if let Ok(points) = COVER_BACKOFF_PAUSE.try_with(Clone::clone) { points.hit("backoff-locked").await; }
     let now = Utc::now();
     let detail: String = detail.chars().take(500).collect();
-    let prev: i64 =
-        sqlx::query_scalar("SELECT failures FROM cover_source_backoff WHERE source_id = ?")
-            .bind(source_id)
-            .fetch_optional(main)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(0);
+    let prev: i64 = crate::db_types::query_scalar(
+        "SELECT failures FROM cover_source_backoff WHERE source_id = $1",
+    )
+    .bind(source_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(0);
     let failures = prev + 1;
     let secs = SOURCE_BACKOFF_BASE_SECS
         .saturating_mul(1i64 << (failures.clamp(1, 20) - 1).min(20))
         .min(SOURCE_BACKOFF_MAX_SECS);
     let retry_after = (now + chrono::Duration::seconds(secs)).to_rfc3339();
-    let ts = now.to_rfc3339();
-    if let Err(e) = sqlx::query(
+    sqlx::query(
         "INSERT INTO cover_source_backoff \
            (source_id, reason, detail, failures, failed_covers, first_seen, last_seen, retry_after) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          ON CONFLICT(source_id) DO UPDATE SET \
            reason = excluded.reason, detail = excluded.detail, failures = excluded.failures, \
            failed_covers = excluded.failed_covers, last_seen = excluded.last_seen, \
@@ -895,15 +1195,12 @@ pub async fn record_source_cover_backoff(
     .bind(&detail)
     .bind(failures)
     .bind(failed_covers as i64)
-    .bind(&ts)
-    .bind(&ts)
-    .bind(&retry_after)
-    .execute(main)
-    .await
-    {
-        tracing::warn!(source_id, error = %e, "cover source backoff: failed to record");
-        return;
-    }
+    .bind(now)
+    .bind(now)
+    .bind(crate::db_types::date(&retry_after).expect("internally generated UTC timestamp"))
+    .execute(&mut *tx)
+    .await?;
+
     tracing::warn!(
         source_id,
         reason = failure.reason(),
@@ -912,16 +1209,27 @@ pub async fn record_source_cover_backoff(
         retry_after = %retry_after,
         "cover warmer: parking a whole source (every cover attempted this tick failed)"
     );
+    tx.commit().await?;
+    Ok(())
+    }.await;
+    #[cfg(test)]
+    let _ = COVER_BACKOFF_RESULTS
+        .try_with(|results| results.send(result.as_ref().map(|_| ()).map_err(ToString::to_string)));
+    if let Err(e) = result {
+        crate::db::observe_database_error(&e);
+        tracing::warn!(error = %e, "cover backoff write failed");
+    }
 }
 
 /// Un-park a source: one of its covers succeeded, so whatever blocked it has lifted.
 /// Also resets the escalation counter, so the next park starts at the base window again.
 pub async fn clear_source_cover_backoff(main: &Database, source_id: &str) {
-    if let Err(e) = sqlx::query("DELETE FROM cover_source_backoff WHERE source_id = ?")
+    if let Err(e) = sqlx::query("DELETE FROM cover_source_backoff WHERE source_id = $1")
         .bind(source_id)
         .execute(main)
         .await
     {
+        let e = crate::db::observed_database_error(e.into());
         tracing::warn!(source_id, error = %e, "cover source backoff: failed to clear");
     }
 }
@@ -933,11 +1241,11 @@ enum RepairCoverSource {
 }
 
 async fn repair_cover_sources(main: &Database, work_id: &str) -> Result<Vec<RepairCoverSource>> {
-    let md = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+    let md = crate::db_types::query_tuple::<(Option<String>, Option<String>)>(
         "SELECT (SELECT ss.source_key FROM source_series ss \
                  WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' \
                  ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1), \
-                w.cover_file_name FROM work w WHERE w.id = ?",
+                w.cover_file_name FROM work w WHERE w.id = $1",
     )
     .bind(work_id)
     .fetch_optional(main)
@@ -954,8 +1262,8 @@ async fn repair_cover_sources(main: &Database, work_id: &str) -> Result<Vec<Repa
     // Every linked engine manga can supply a cover, even before its metadata is
     // mirrored locally. Use the internal thumbnail endpoint rather than requiring
     // a cached thumbnail_url or following a stale public/CDN URL.
-    let keys: Vec<String> = sqlx::query_scalar(
-        "SELECT source_key FROM source_series WHERE work_id = ? \
+    let keys: Vec<String> = crate::db_types::query_scalar(
+        "SELECT source_key FROM source_series WHERE work_id = $1 \
          AND source_type = 'suwayomi' ORDER BY created_at ASC, id ASC",
     )
     .bind(work_id)
@@ -1010,7 +1318,7 @@ where
 /// if every source fails.
 pub async fn retry_one_cover(
     main: &Database,
-    covers: &Database,
+    covers: &SqliteDatabase,
     mangadex: &MangaDexClient,
     suwayomi: &crate::suwayomi::SuwayomiClient,
     work_id: &str,
@@ -1066,7 +1374,7 @@ pub async fn retry_one_cover(
 /// time). Best-effort per work — one failure never aborts the crawl.
 pub async fn crawl_uncached_covers(
     main: &Database,
-    covers: &Database,
+    covers: &SqliteDatabase,
     mangadex: &MangaDexClient,
     suwayomi: &crate::suwayomi::SuwayomiClient,
     limit: Option<i64>,
@@ -1083,23 +1391,23 @@ pub async fn crawl_uncached_covers(
          FROM work w \
          WHERE w.cover_cached_version IS NULL AND w.cover_file_name IS NOT NULL \
            AND NOT EXISTS (SELECT 1 FROM work_cover_issue i WHERE i.work_id = w.id \
-                           AND (i.retry_after IS NULL OR i.retry_after > ?))";
+                           AND (i.retry_after IS NULL OR i.retry_after > $1))";
     // A marker only hides a work while its backoff is unexpired (0100), so `now` is
     // bound into every crawl SELECT rather than the marker being an absolute exclusion.
     let now = Utc::now().to_rfc3339();
     let loaded = match limit {
         Some(n) => {
-            sqlx::query_as::<_, (String, Option<String>, Option<String>)>(&format!(
-                "{BASE} LIMIT ?"
+            crate::db_types::query_tuple::<(String, Option<String>, Option<String>)>(&format!(
+                "{BASE} LIMIT $2"
             ))
-            .bind(&now)
+            .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
             .bind(n)
             .fetch_all(main)
             .await
         }
         None => {
-            sqlx::query_as::<_, (String, Option<String>, Option<String>)>(BASE)
-                .bind(&now)
+            crate::db_types::query_tuple::<(String, Option<String>, Option<String>)>(BASE)
+                .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
                 .fetch_all(main)
                 .await
         }
@@ -1107,6 +1415,7 @@ pub async fn crawl_uncached_covers(
     let pending = match loaded {
         Ok(rows) => rows,
         Err(e) => {
+            let e = crate::db::observed_database_error(e.into());
             tracing::warn!(error = %e, "cover crawl: failed to load pending works");
             return;
         }
@@ -1155,6 +1464,7 @@ pub async fn crawl_uncached_covers(
                     }
                     Err(e) => {
                         failed += 1;
+                        let e = crate::db::observed_database_error(e);
                         tracing::warn!(work_id = %job.work_id, error = %e, "cover crawl: store failed");
                         record_cover_issue(main, &job.work_id, "store", &e.to_string()).await;
                     }
@@ -1165,6 +1475,7 @@ pub async fn crawl_uncached_covers(
                 // the transient ladder, so it is retried soon but not 288 times a day.
                 Ok(Err(e)) => {
                     failed += 1;
+                    let e = crate::db::observed_database_error(e);
                     tracing::warn!(work_id = %job.work_id, error = %e, "cover crawl: encode failed");
                     record_cover_issue_backoff(
                         main,
@@ -1176,6 +1487,7 @@ pub async fn crawl_uncached_covers(
                 }
                 Err(e) => {
                     failed += 1;
+                    let e = crate::db::observed_database_error(e.into());
                     tracing::warn!(work_id = %job.work_id, error = %e, "cover crawl: encode task panicked");
                 }
             },
@@ -1222,20 +1534,22 @@ pub async fn crawl_uncached_covers(
          FROM work w \
          WHERE w.cover_cached_version IS NULL \
            AND NOT EXISTS (SELECT 1 FROM work_cover_issue i WHERE i.work_id = w.id \
-                           AND (i.retry_after IS NULL OR i.retry_after > ?)) \
+                           AND (i.retry_after IS NULL OR i.retry_after > $1)) \
            AND EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id \
                        AND ss.source_type = 'suwayomi')";
     let suw_loaded = match limit {
         Some(n) => {
-            sqlx::query_as::<_, (String, Option<String>)>(&format!("{SUW_BASE} LIMIT ?"))
-                .bind(&now)
-                .bind(n)
-                .fetch_all(main)
-                .await
+            crate::db_types::query_tuple::<(String, Option<String>)>(&format!(
+                "{SUW_BASE} LIMIT $2"
+            ))
+            .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
+            .bind(n)
+            .fetch_all(main)
+            .await
         }
         None => {
-            sqlx::query_as::<_, (String, Option<String>)>(SUW_BASE)
-                .bind(&now)
+            crate::db_types::query_tuple::<(String, Option<String>)>(SUW_BASE)
+                .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
                 .fetch_all(main)
                 .await
         }
@@ -1246,6 +1560,7 @@ pub async fn crawl_uncached_covers(
             .filter_map(|(work_id, thumb)| thumb.filter(|t| !t.is_empty()).map(|t| (work_id, t)))
             .collect(),
         Err(e) => {
+            let e = crate::db::observed_database_error(e.into());
             tracing::warn!(error = %e, "cover crawl (suwayomi): failed to load pending works");
             return;
         }
@@ -1292,6 +1607,7 @@ pub async fn crawl_uncached_covers(
                         (1, 0)
                     }
                     Err(e) => {
+                        let e = crate::db::observed_database_error(e);
                         tracing::warn!(work_id = %work_id, error = %e, "cover crawl (suwayomi): store failed");
                         record_cover_issue(main, &work_id, "store", &e.to_string()).await;
                         (0, 1)
@@ -1300,6 +1616,7 @@ pub async fn crawl_uncached_covers(
                 // Record so we stop re-attempting an unprocessable source every tick;
                 // the failure CLASS picks the window (see `CoverFailure`).
                 Ok(Err(e)) => {
+                    let e = crate::db::observed_database_error(e);
                     tracing::warn!(work_id = %work_id, error = %e, "cover crawl (suwayomi): encode failed");
                     record_cover_issue_backoff(main, &work_id, classify_process_failure(&e), &e.to_string()).await;
                     (0, 1)
@@ -1307,6 +1624,7 @@ pub async fn crawl_uncached_covers(
                 Err(e) => {
                     // A spawn_blocking JoinError (panic) is not necessarily deterministic;
                     // don't permanently skip on it — let a later tick retry.
+                    let e = crate::db::observed_database_error(e.into());
                     tracing::warn!(work_id = %work_id, error = %e, "cover crawl (suwayomi): encode task panicked");
                     (0, 1)
                 }
@@ -1330,16 +1648,18 @@ pub async fn crawl_uncached_covers(
 /// operator-facing signal for "an entire source is failing" would be a silent zero.
 pub async fn suwayomi_cover_backoff_stats(main: &Database) -> Result<(i64, i64)> {
     let now = Utc::now().to_rfc3339();
-    let covers: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM suwayomi_cover_issue WHERE retry_after > ?")
-            .bind(&now)
-            .fetch_one(main)
-            .await?;
-    let sources: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM cover_source_backoff WHERE retry_after > ?")
-            .bind(&now)
-            .fetch_one(main)
-            .await?;
+    let covers: i64 = crate::db_types::query_scalar(
+        "SELECT COUNT(*) FROM suwayomi_cover_issue WHERE retry_after > $1",
+    )
+    .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
+    .fetch_one(main)
+    .await?;
+    let sources: i64 = crate::db_types::query_scalar(
+        "SELECT COUNT(*) FROM cover_source_backoff WHERE retry_after > $1",
+    )
+    .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
+    .fetch_one(main)
+    .await?;
     Ok((covers, sources))
 }
 
@@ -1352,7 +1672,9 @@ pub const WARM_CURSOR_START: i64 = i64::MAX;
 /// blob for ANY manga id the browser asks for, including Browse results that were never
 /// enrolled into `suwayomi_series`. So the table is a superset of the candidate set and
 /// `COUNT(*)` on it is not a coverage figure — see [`pending_suwayomi_cover_count`].
-async fn cached_suwayomi_cover_ids(covers: &Database) -> Result<std::collections::HashSet<i64>> {
+async fn cached_suwayomi_cover_ids(
+    covers: &SqliteDatabase,
+) -> Result<std::collections::HashSet<i64>> {
     Ok(
         sqlx::query_scalar::<_, i64>("SELECT manga_id FROM suwayomi_cover_blob")
             .fetch_all(covers)
@@ -1377,8 +1699,11 @@ async fn thumbnailed_series_ids(main: &Database, before_id: i64) -> Result<Vec<i
 /// against (self-healing).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct WarmCandidate {
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     pub manga_id: i64,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub source_id: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub fetched_at: Option<String>,
     /// A marker row exists (expired or voided — it is not blocking this candidate, or it
     /// would not be one). Lets a success pay for a DELETE only when there is a row.
@@ -1404,17 +1729,17 @@ async fn warm_candidates(main: &Database, before_id: i64) -> Result<Vec<WarmCand
                 s.last_fetched_at AS fetched_at, \
                 EXISTS (SELECT 1 FROM suwayomi_cover_issue i WHERE i.manga_id = s.id) AS had_issue \
            FROM suwayomi_series s \
-          WHERE s.thumbnail_url IS NOT NULL AND s.thumbnail_url <> '' AND s.id < ? \
+          WHERE s.thumbnail_url IS NOT NULL AND s.thumbnail_url <> '' AND s.id < $1 \
             AND NOT EXISTS (SELECT 1 FROM suwayomi_cover_issue i \
-                             WHERE i.manga_id = s.id AND i.retry_after > ? \
-                               AND i.source_fetched_at IS s.last_fetched_at) \
+                             WHERE i.manga_id = s.id AND i.retry_after > $2 \
+                               AND i.source_fetched_at IS NOT DISTINCT FROM s.last_fetched_at) \
             AND NOT EXISTS (SELECT 1 FROM cover_source_backoff b \
-                             WHERE b.source_id = s.source_id AND b.retry_after > ?) \
+                             WHERE b.source_id = s.source_id AND b.retry_after > $3) \
           ORDER BY s.id DESC",
     )
     .bind(before_id)
-    .bind(&now)
-    .bind(&now)
+    .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
+    .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
     .fetch_all(main)
     .await?)
 }
@@ -1434,7 +1759,7 @@ async fn warm_candidates(main: &Database, before_id: i64) -> Result<Vec<WarmCand
 #[cfg(test)]
 async fn uncached_suwayomi_cover_ids(
     main: &Database,
-    covers: &Database,
+    covers: &SqliteDatabase,
     limit: i64,
     before_id: i64,
 ) -> Result<Vec<i64>> {
@@ -1451,7 +1776,7 @@ async fn uncached_suwayomi_cover_ids(
 /// needs (source id, fetched-at fingerprint, "has a marker row").
 async fn uncached_suwayomi_cover_candidates(
     main: &Database,
-    covers: &Database,
+    covers: &SqliteDatabase,
     limit: i64,
     before_id: i64,
 ) -> Result<Vec<WarmCandidate>> {
@@ -1474,7 +1799,7 @@ async fn uncached_suwayomi_cover_candidates(
 /// cached count, understate the gap, and once they outnumber the real gap this reports 0
 /// and the drainer concludes "fully warm" while genuine candidates remain — the warmer
 /// would then never run again.
-pub async fn pending_suwayomi_cover_count(main: &Database, covers: &Database) -> Result<i64> {
+pub async fn pending_suwayomi_cover_count(main: &Database, covers: &SqliteDatabase) -> Result<i64> {
     let cached = cached_suwayomi_cover_ids(covers).await?;
     Ok(thumbnailed_series_ids(main, WARM_CURSOR_START)
         .await?
@@ -1518,7 +1843,7 @@ pub async fn pending_suwayomi_cover_count(main: &Database, covers: &Database) ->
 /// `work_cover_blob` is the single cache, this warmer disappears, and the
 /// `cover_cached_version` pointer covers every surface.
 pub async fn warm_suwayomi_covers(
-    covers: &Database,
+    covers: &SqliteDatabase,
     main: &Database,
     suwayomi: &crate::suwayomi::SuwayomiClient,
     limit: i64,
@@ -1535,6 +1860,7 @@ pub async fn warm_suwayomi_covers(
             match load(WARM_CURSOR_START).await {
                 Ok(ids) => ids,
                 Err(e) => {
+                    let e = crate::db::observed_database_error(e);
                     tracing::warn!(error = %e, "suwayomi cover warmer: failed to load candidates");
                     return (0, 0);
                 }
@@ -1542,6 +1868,7 @@ pub async fn warm_suwayomi_covers(
         }
         Ok(ids) => ids,
         Err(e) => {
+            let e = crate::db::observed_database_error(e);
             tracing::warn!(error = %e, "suwayomi cover warmer: failed to load candidates");
             return (0, 0);
         }
@@ -1606,7 +1933,7 @@ pub async fn warm_suwayomi_covers(
                 }
             };
             match work.process(move || process_cover(&bytes)).await {
-                Ok(Ok(webp)) => match put_suwayomi_cover(covers, manga_id, &webp).await {
+                Ok(Ok(webp)) => match publish_suwayomi_cover(main, covers, manga_id, &webp).await {
                     Ok(()) => {
                         if had_issue {
                             clear_suwayomi_cover_issue(main, manga_id).await;
@@ -1616,6 +1943,7 @@ pub async fn warm_suwayomi_covers(
                     Err(e) => {
                         // A local write failure says nothing about the source, so it is
                         // transient — backed off, never permanent.
+                        let e = crate::db::observed_database_error(e);
                         tracing::warn!(manga_id, error = %e, "suwayomi cover warmer: store failed");
                         record_suwayomi_cover_issue(
                             main,
@@ -1650,6 +1978,7 @@ pub async fn warm_suwayomi_covers(
                 Err(e) => {
                     // A panic in the blocking pool is not attributable to the cover; no
                     // marker, let a later tick retry.
+                    let e = crate::db::observed_database_error(e.into());
                     tracing::warn!(manga_id, error = %e, "suwayomi cover warmer: encode task panicked");
                     (source_id, WarmOutcome::Transient)
                 }
@@ -1719,9 +2048,10 @@ async fn update_source_backoffs(
     // Which sources actually have a row, so a healthy tick doesn't fire a no-op DELETE
     // (and a write lock) per source. Tiny table — 22 sources in production.
     let parked: std::collections::HashSet<String> =
-        sqlx::query_scalar::<_, String>("SELECT source_id FROM cover_source_backoff")
+        crate::db_types::query_scalar::<String>("SELECT source_id FROM cover_source_backoff")
             .fetch_all(main)
             .await
+            .inspect_err(crate::db::record_read_database_error)
             .unwrap_or_default()
             .into_iter()
             .collect();
@@ -1761,7 +2091,7 @@ async fn update_source_backoffs(
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     main: Database,
-    covers: Database,
+    covers: SqliteDatabase,
     mangadex: Arc<MangaDexClient>,
     suwayomi: crate::suwayomi::SuwayomiClient,
     inflight: Arc<AtomicBool>,
@@ -1795,7 +2125,7 @@ pub fn spawn(
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     main: Database,
-    covers: Database,
+    covers: SqliteDatabase,
     mangadex: Arc<MangaDexClient>,
     suwayomi: crate::suwayomi::SuwayomiClient,
     inflight: Arc<AtomicBool>,
@@ -1835,7 +2165,7 @@ async fn run_loop(
                 match pending_cover_count(&main).await {
                     Ok(0) => { /* nothing to do this tick */ }
                     Ok(_) => crawl_uncached_covers(&main, &covers, &mangadex, &suwayomi, Some(batch)).await,
-                    Err(e) => tracing::warn!(error = %e, "cover drainer: count failed"),
+                    Err(e) => { let e = crate::db::observed_read_database_error(e); tracing::warn!(error = %e, "cover drainer: count failed"); },
                 }
                 // Second cache, second pass. `work_cover_blob` (above) is what
                 // `/covers/{work_id}.webp` serves; `suwayomi_cover_blob` (here) is what
@@ -1858,7 +2188,7 @@ async fn run_loop(
                                     parked_sources = parked,
                                     "suwayomi cover warmer: nothing runnable — covers/sources are backed off"
                                 ),
-                                Err(e) => tracing::warn!(error = %e, "suwayomi cover warmer: backoff stats failed"),
+                                Err(e) => { let e = crate::db::observed_read_database_error(e); tracing::warn!(error = %e, "suwayomi cover warmer: backoff stats failed"); },
                             }
                         }
                         Ok(pending) => {
@@ -1873,7 +2203,7 @@ async fn run_loop(
                             )
                             .await;
                         }
-                        Err(e) => tracing::warn!(error = %e, "suwayomi cover warmer: count failed"),
+                        Err(e) => { let e = crate::db::observed_read_database_error(e); tracing::warn!(error = %e, "suwayomi cover warmer: count failed"); },
                     }
                 }
                 inflight.store(false, Ordering::SeqCst);
@@ -1889,11 +2219,309 @@ async fn run_loop(
 }
 
 #[cfg(test)]
+pub(crate) async fn wait_for_writer_lock(pool: &Database) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock')")
+                .fetch_one(pool).await.expect("observe overlapping writer lock wait");
+            if waiting { break; }
+            // A poll interval, not synchronisation: the loop ends on the observed wait.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }).await.expect("second foreground writer never waited on the guard");
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use image::{DynamicImage, RgbImage};
     use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 
+    async fn publication_pools() -> (Database, SqliteDatabase) {
+        let (main, covers) = warm_test_pools().await;
+        sqlx::query("CREATE TABLE work_cover_blob(work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL)").execute(&covers).await.unwrap();
+        sqlx::query(
+            "INSERT INTO work(id,created_at,updated_at) VALUES ('w_publication',now(),now())",
+        )
+        .execute(&main)
+        .await
+        .unwrap();
+        (main.foreground(), covers)
+    }
+
+    #[tokio::test]
+    async fn delayed_cover_misses_recheck_the_current_asset_and_work_anchor() {
+        let (main, covers) = publication_pools().await;
+        sqlx::query("INSERT INTO source_series(id,work_id,source_type,source_key,created_at,last_seen) VALUES ('rest-anchor','w_publication','mangadex','md-old',NOW(),NOW())").execute(&main).await.unwrap();
+        sqlx::query("UPDATE work SET cover_file_name='old.jpg' WHERE id='w_publication'")
+            .execute(&main)
+            .await
+            .unwrap();
+        let mut first = main.begin().await.unwrap();
+        crate::locks::lock_works(&mut first, &["w_publication"])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE work SET cover_file_name='new.jpg' WHERE id='w_publication'")
+            .execute(&mut *first)
+            .await
+            .unwrap();
+        let writer = main.clone();
+        let cache = covers.clone();
+        let second = tokio::spawn(async move {
+            put_work_cover_for_missing_anchor(
+                &writer,
+                &cache,
+                "w_publication",
+                b"old-fetch",
+                "md-old",
+                "old.jpg",
+            )
+            .await
+        });
+        wait_for_writer_lock(&main).await;
+        first.commit().await.unwrap();
+        assert!(!second.await.unwrap().unwrap());
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM work_cover_blob WHERE work_id='w_publication')",
+        )
+        .fetch_one(&covers)
+        .await
+        .unwrap();
+        assert!(!exists);
+        let mut first = main.begin().await.unwrap();
+        let _asset = lock_asset(&mut first, "s:7").await.unwrap();
+        put_suwayomi_cover_on(&covers, 7, b"fresh-source")
+            .await
+            .unwrap();
+        let writer = main.clone();
+        let cache = covers.clone();
+        let second = tokio::spawn(async move {
+            publish_suwayomi_cover_if_missing(&writer, &cache, 7, b"old-fetch").await
+        });
+        wait_for_writer_lock(&main).await;
+        first.commit().await.unwrap();
+        drop(_asset);
+        assert!(!second.await.unwrap().unwrap());
+        assert_eq!(
+            get_suwayomi_cover(&covers, 7).await.unwrap(),
+            b"fresh-source"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_cover_backoffs_recompute_all_three_ladders_under_the_guard() {
+        for kind in 0..3 {
+            let (main, _) = publication_pools().await;
+            insert_series(&main, 7, None).await;
+            let points = crate::locks::pause_points::PausePoints::default();
+            let armed = points.arm("backoff-locked");
+            let (results, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let writer = main.clone();
+            let first_results = results.clone();
+            let operation = |writer: Database| async move {
+                match kind {
+                    0 => {
+                        record_cover_issue_backoff(
+                            &writer,
+                            "w_publication",
+                            CoverFailure::Transient("http_502"),
+                            "failed",
+                        )
+                        .await
+                    }
+                    1 => {
+                        record_suwayomi_cover_issue(
+                            &writer,
+                            7,
+                            Some("1"),
+                            Some("2026-01-01T00:00:00Z"),
+                            CoverFailure::Transient("http_502"),
+                            "failed",
+                        )
+                        .await
+                    }
+                    _ => {
+                        record_source_cover_backoff(
+                            &writer,
+                            "1",
+                            CoverFailure::Transient("http_502"),
+                            3,
+                            "failed",
+                        )
+                        .await
+                    }
+                }
+            };
+            let first = tokio::spawn(COVER_BACKOFF_RESULTS.scope(
+                first_results,
+                COVER_BACKOFF_PAUSE.scope(points, operation(writer)),
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
+                .await
+                .unwrap();
+            let second =
+                tokio::spawn(COVER_BACKOFF_RESULTS.scope(results, operation(main.clone())));
+            wait_for_writer_lock(&main).await;
+            armed.release();
+            first.await.unwrap();
+            second.await.unwrap();
+            received.recv().await.unwrap().unwrap();
+            received.recv().await.unwrap().unwrap();
+            let sql = match kind {
+                0 => "SELECT attempts, EXTRACT(EPOCH FROM (retry_after-last_seen))::bigint FROM work_cover_issue WHERE work_id='w_publication'",
+                1 => "SELECT attempts, EXTRACT(EPOCH FROM (retry_after-last_seen))::bigint FROM suwayomi_cover_issue WHERE manga_id=7",
+                _ => "SELECT failures, EXTRACT(EPOCH FROM (retry_after-last_seen))::bigint FROM cover_source_backoff WHERE source_id='1'",
+            };
+            let (count, seconds): (i64, i64) = sqlx::query_as(sql).fetch_one(&main).await.unwrap();
+            assert_eq!(count, 2);
+            assert_eq!(
+                seconds,
+                if kind == 2 {
+                    SOURCE_BACKOFF_BASE_SECS * 2
+                } else {
+                    TRANSIENT_BACKOFF_BASE_SECS * 2
+                }
+            );
+        }
+    }
+    #[tokio::test]
+    async fn two_foreground_cover_saves_publish_matching_monotonic_versions() {
+        let (main, covers) = publication_pools().await;
+        sqlx::query("INSERT INTO work_cover_blob VALUES ('w_publication', x'00', 4102444800000, '2026-01-01')").execute(&covers).await.unwrap();
+        let points = crate::locks::pause_points::PausePoints::default();
+        let armed = points.arm("cover-locked");
+        let writer = main.clone();
+        let cache = covers.clone();
+        let first = tokio::spawn(COVER_PUBLICATION_PAUSE.scope(points, async move {
+            put_work_cover(&writer, &cache, "w_publication", b"first").await
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
+            .await
+            .unwrap();
+        let writer = main.clone();
+        let cache = covers.clone();
+        let second = tokio::spawn(async move {
+            put_work_cover(&writer, &cache, "w_publication", b"second").await
+        });
+        wait_for_writer_lock(&main).await;
+        armed.release();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        let (bytes, version): (Vec<u8>, i64) = sqlx::query_as(
+            "SELECT webp,version FROM work_cover_blob WHERE work_id='w_publication'",
+        )
+        .fetch_one(&covers)
+        .await
+        .unwrap();
+        let pointer: i64 =
+            sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id='w_publication'")
+                .fetch_one(&main)
+                .await
+                .unwrap();
+        assert_eq!(bytes, b"second");
+        assert_eq!(version, 4102444800002);
+        assert_eq!(pointer, version);
+    }
+
+    #[tokio::test]
+    async fn a_delayed_derivative_cannot_publish_after_master_replacement() {
+        let (main, covers) = publication_pools().await;
+        put_work_cover(&main, &covers, "w_publication", b"old")
+            .await
+            .unwrap();
+        let points = crate::locks::pause_points::PausePoints::default();
+        let armed = points.arm("cover-locked");
+        let writer = main.clone();
+        let cache = covers.clone();
+        let first = tokio::spawn(COVER_PUBLICATION_PAUSE.scope(points, async move {
+            put_work_cover(&writer, &cache, "w_publication", b"new").await
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
+            .await
+            .unwrap();
+        let writer = main.clone();
+        let cache = covers.clone();
+        let second = tokio::spawn(async move {
+            put_current_variant(
+                &writer,
+                &cache,
+                "w_publication",
+                CARD_VARIANT_WIDTH,
+                b"old",
+                b"old-small",
+            )
+            .await
+        });
+        wait_for_writer_lock(&main).await;
+        armed.release();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert!(
+            get_cover_variant(&covers, "w_publication", CARD_VARIANT_WIDTH)
+                .await
+                .is_none()
+        );
+    }
+
+    /// The conditional master writers publish only over the master they captured:
+    /// a lazy miss expects no master, recompression expects the bytes it re-encoded.
+    #[tokio::test]
+    async fn a_stale_fetch_or_recompression_cannot_replace_a_newer_master() {
+        let (main, covers) = publication_pools().await;
+        assert!(
+            put_work_cover_if_current(&main, &covers, "w_publication", b"old", None)
+                .await
+                .unwrap(),
+            "a miss with no master yet publishes"
+        );
+        put_work_cover(&main, &covers, "w_publication", b"new")
+            .await
+            .unwrap();
+        let published = || async {
+            let blob: (Vec<u8>, i64) = sqlx::query_as(
+                "SELECT webp,version FROM work_cover_blob WHERE work_id='w_publication'",
+            )
+            .fetch_one(&covers)
+            .await
+            .unwrap();
+            let pointer: i64 = sqlx::query_scalar(
+                "SELECT cover_cached_version FROM work WHERE id='w_publication'",
+            )
+            .fetch_one(&main)
+            .await
+            .unwrap();
+            assert_eq!(pointer, blob.1, "pointer and blob version differ");
+            blob
+        };
+        let (_, version) = published().await;
+        assert!(
+            !put_work_cover_if_current(&main, &covers, "w_publication", b"stale-fetch", None)
+                .await
+                .unwrap()
+        );
+        assert!(!put_work_cover_if_current(
+            &main,
+            &covers,
+            "w_publication",
+            b"stale-recompression",
+            Some(b"old")
+        )
+        .await
+        .unwrap());
+        assert_eq!(published().await, (b"new".to_vec(), version));
+        assert!(put_work_cover_if_current(
+            &main,
+            &covers,
+            "w_publication",
+            b"recompressed",
+            Some(b"new")
+        )
+        .await
+        .unwrap());
+        let (bytes, newer) = published().await;
+        assert_eq!(bytes, b"recompressed");
+        assert!(newer > version);
+    }
     #[tokio::test]
     async fn cancelled_master_cover_keeps_capacity_until_decoder_exits() {
         let limits = MasterCoverLimits::new(1, 1);
@@ -2297,7 +2925,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(main.write())
             .await
             .unwrap();
@@ -2311,21 +2939,24 @@ mod tests {
 
         record_cover_issue(&main, "w_iss", "unsupported", "boom").await;
         record_cover_issue(&main, "w_iss", "too_large", "again").await;
-        let (reason, attempts): (String, i64) =
-            sqlx::query_as("SELECT reason, attempts FROM work_cover_issue WHERE work_id = ?")
-                .bind("w_iss")
-                .fetch_one(&main)
-                .await
-                .unwrap();
+        let (reason, attempts): (String, i64) = crate::db_types::query_tuple(
+            "SELECT reason, attempts FROM work_cover_issue WHERE work_id = $1",
+        )
+        .bind("w_iss")
+        .fetch_one(&main)
+        .await
+        .unwrap();
         assert_eq!(attempts, 2, "second record increments attempts");
         assert_eq!(reason, "too_large", "reason refreshed to the latest");
 
         clear_cover_issue(&main, "w_iss").await;
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_issue WHERE work_id = ?")
-            .bind("w_iss")
-            .fetch_one(&main)
-            .await
-            .unwrap();
+        let n: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM work_cover_issue WHERE work_id = $1",
+        )
+        .bind("w_iss")
+        .fetch_one(&main)
+        .await
+        .unwrap();
         assert_eq!(n, 0, "clear removes the issue row");
     }
 
@@ -2342,11 +2973,11 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(main.write())
             .await
             .unwrap();
-        let covers = TestPoolOptions::new()
+        let covers = crate::sqlite_database::SqliteTestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
@@ -2435,12 +3066,12 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(main.write())
             .await
             .unwrap();
         // Covers (un-replicated) DB: just the blob table, as `db::init_covers` builds.
-        let covers = TestPoolOptions::new()
+        let covers = crate::sqlite_database::SqliteTestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
@@ -2468,16 +3099,17 @@ mod tests {
         .unwrap();
 
         // No cache yet → resolver falls back to the MangaDex thumbnail URL.
-        let ver0: Option<i64> =
-            sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id = 'w_test'")
-                .fetch_one(&main)
-                .await
-                .unwrap();
+        let ver0: Option<i64> = crate::db_types::query_scalar(
+            "SELECT cover_cached_version FROM work WHERE id = 'w_test'",
+        )
+        .fetch_one(&main)
+        .await
+        .unwrap();
         assert!(ver0.is_none());
 
         sqlx::query("INSERT INTO feed_updates (work_id, title, latest_at, cover_url) VALUES ('w_test', 'Cover fixture', '2026-01-01', '/old.webp')")
             .execute(&main).await.unwrap();
-        sqlx::query("INSERT INTO feed_series_updates (work_id, reader_id, title, released_at, cover_url) VALUES ('w_test', '7', 'Cover fixture', 1, '/old.webp')")
+        sqlx::query("INSERT INTO feed_series_updates (work_id, reader_id, title, released_at, cover_url) VALUES ('w_test', '7', 'Cover fixture', TIMESTAMPTZ '1970-01-01 00:00:00.001+00', '/old.webp')")
             .execute(&main).await.unwrap();
         sqlx::query("INSERT INTO browse_catalogue (work_id, reader_id, title, created_at, cover_url) VALUES ('w_test', '7', 'Cover fixture', '2026-01-01', '/old.webp')")
             .execute(&main).await.unwrap();
@@ -2494,11 +3126,12 @@ mod tests {
                 .fetch_one(&covers)
                 .await
                 .unwrap();
-        let work_ver: Option<i64> =
-            sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id = 'w_test'")
-                .fetch_one(&main)
-                .await
-                .unwrap();
+        let work_ver: Option<i64> = crate::db_types::query_scalar(
+            "SELECT cover_cached_version FROM work WHERE id = 'w_test'",
+        )
+        .fetch_one(&main)
+        .await
+        .unwrap();
         assert_eq!(blob, webp, "stored bytes round-trip");
         assert_eq!(
             Some(blob_ver),
@@ -2512,7 +3145,10 @@ mod tests {
         );
         for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
             let query = format!("SELECT cover_url FROM {table} WHERE work_id = 'w_test'");
-            let url: String = sqlx::query_scalar(&query).fetch_one(&main).await.unwrap();
+            let url: String = crate::db_types::query_scalar(&query)
+                .fetch_one(&main)
+                .await
+                .unwrap();
             assert_eq!(
                 url,
                 cover_path("w_test", blob_ver),
@@ -2526,12 +3162,15 @@ mod tests {
             .unwrap();
         }
         // Existing repairs also need their stale materialized URLs corrected once.
-        sqlx::raw_sql(include_str!("../migrations/0109_cover_card_versions.sql"))
-            .execute(&main)
-            .await
-            .unwrap();
+        sqlx::raw_sql(
+            &include_str!("../migrations/0109_cover_card_versions.sql")
+                .replace("cover_url IS NOT (", "cover_url IS DISTINCT FROM ("),
+        )
+        .execute(&main)
+        .await
+        .unwrap();
         for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
-            let url: String = sqlx::query_scalar(&format!(
+            let url: String = crate::db_types::query_scalar(&format!(
                 "SELECT cover_url FROM {table} WHERE work_id = 'w_test'"
             ))
             .fetch_one(&main)
@@ -2561,14 +3200,14 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(main.write())
             .await
             .unwrap();
         for id in ["w_ok", "w_broken"] {
             sqlx::query(
                 "INSERT INTO work (id, cover_file_name, created_at, updated_at) \
-                 VALUES (?, 'c.jpg', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                 VALUES ($1, 'c.jpg', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
             )
             .bind(id)
             .execute(&main)
@@ -2576,7 +3215,7 @@ mod tests {
             .unwrap();
             sqlx::query(
                 "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
-                 VALUES (?, ?, 'mangadex', ?, '2026-01-01T00:00:00Z')",
+                 VALUES ($1, $2, 'mangadex', $3, '2026-01-01T00:00:00Z')",
             )
             .bind(format!("ss_{id}"))
             .bind(id)
@@ -2667,11 +3306,12 @@ mod tests {
             image::load_from_memory(&before.0).unwrap().dimensions(),
             (300, 450)
         );
-        let issues: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM work_cover_issue WHERE work_id = 'w_repair'")
-                .fetch_one(&main)
-                .await
-                .unwrap();
+        let issues: i64 = crate::db_types::query_scalar(
+            "SELECT count(*) FROM work_cover_issue WHERE work_id = 'w_repair'",
+        )
+        .fetch_one(&main)
+        .await
+        .unwrap();
         assert_eq!(issues, 0);
         assert_eq!(origin.hits.load(Ordering::SeqCst), 1);
         let bad_origin =
@@ -2699,7 +3339,7 @@ mod tests {
         let (main, covers) = warm_test_pools().await;
         sqlx::query("CREATE TABLE work_cover_blob (work_id TEXT PRIMARY KEY, webp BLOB NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL)")
             .execute(&covers).await.unwrap();
-        sqlx::query("INSERT INTO work (id, cover_file_name, created_at, updated_at) VALUES ('w_both', 'c.jpg', 't', 't')")
+        sqlx::query(r#"INSERT INTO work (id, cover_file_name, created_at, updated_at) VALUES ('w_both', 'c.jpg', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#)
             .execute(&main).await.unwrap();
         sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_key, created_at) VALUES ('a', 'w_both', 'mangadex', 'md-uuid', '2026-01-01'), ('b', 'w_both', 'suwayomi', '9', '2026-01-02')")
             .execute(&main).await.unwrap();
@@ -2772,7 +3412,7 @@ mod tests {
         );
         // The MangaDex work was not attempted: no failure marker that would bury it
         // behind a backoff once MangaDex is turned back on.
-        let issues: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_issue")
+        let issues: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work_cover_issue")
             .fetch_one(&main)
             .await
             .unwrap();
@@ -2881,18 +3521,18 @@ mod tests {
     /// Build the two-DB pair the warmer works across: main (migrated, holds
     /// `suwayomi_series`) and covers (holds `suwayomi_cover_blob`), exactly as
     /// `db::init_covers` shapes it.
-    async fn warm_test_pools() -> (Database, Database) {
+    async fn warm_test_pools() -> (Database, SqliteDatabase) {
         use crate::database::TestPoolOptions;
         let main = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(main.write())
             .await
             .unwrap();
-        let covers = TestPoolOptions::new()
+        let covers = crate::sqlite_database::SqliteTestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
@@ -2931,9 +3571,7 @@ mod tests {
         fetched_at: Option<&str>,
     ) {
         sqlx::query(
-            "INSERT INTO suwayomi_series (id, title, status, source_id, in_library, \
-             thumbnail_url, last_fetched_at, updated_at) \
-             VALUES (?, ?, 'ONGOING', ?, 1, ?, ?, '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO suwayomi_series (id, title, status, source_id, in_library, thumbnail_url, last_fetched_at, updated_at) VALUES ($1, $2, 'ONGOING', $3, TRUE, $4, $5, '2026-01-01T00:00:00Z')"#,
         )
         .bind(id)
         .bind(format!("s{id}"))
@@ -2950,9 +3588,9 @@ mod tests {
     }
 
     async fn issue_row(main: &Database, manga_id: i64) -> Option<(String, i64, i64, String)> {
-        sqlx::query_as(
+        crate::db_types::query_tuple(
             "SELECT reason, permanent, attempts, retry_after FROM suwayomi_cover_issue \
-             WHERE manga_id = ?",
+             WHERE manga_id = $1",
         )
         .bind(manga_id)
         .fetch_optional(main)
@@ -3575,7 +4213,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(main.write())
             .await
             .unwrap();

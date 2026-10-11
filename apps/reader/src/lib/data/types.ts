@@ -283,8 +283,21 @@ export interface SeriesComment {
 
 // Shape of a locally-persisted chapter comment in the offline/backend-off fallback.
 // No seeded data — the fallback starts empty (see CATALOGUE.md §7).
+export type CommentDeletion = 'author' | 'moderator';
+
 export interface ReaderComment {
 	id: string;
+	/** Optional for comments saved before threaded discussions were supported. */
+	authorId?: string;
+	parentId?: string | null;
+	deleted?: CommentDeletion | null;
+	mine?: boolean;
+	avatarUrl?: string | null;
+	mediaUrl?: string | null;
+	mediaWidth?: number | null;
+	mediaHeight?: number | null;
+	dislikes?: number;
+	myVote?: number;
 	name: string;
 	initial: string;
 	bg: string;

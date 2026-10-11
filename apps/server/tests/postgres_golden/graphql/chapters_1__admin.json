@@ -1,0 +1,102 @@
+{
+  "data": {
+    "canonicalChapters": [
+      {
+        "bookmarked": false,
+        "externalUrl": null,
+        "foundAt": "2020-01-01T01:02:03.000000+00:00",
+        "id": "00000000-0000-4000-8000-000000000101",
+        "isDownloaded": false,
+        "label": "0",
+        "lastPageRead": 8,
+        "number": 0.0,
+        "pageCount": 0,
+        "read": false,
+        "scanlator": "Group Café",
+        "seriesId": "w_00000000000040008000000000000001",
+        "title": "Chapter 0",
+        "uploadedAt": "2020-01-01T01:02:03.000000+00:00"
+      },
+      {
+        "bookmarked": false,
+        "externalUrl": null,
+        "foundAt": "2020-01-10T01:02:03.456000+00:00",
+        "id": "00000000-0000-4000-8000-000000000106",
+        "isDownloaded": false,
+        "label": "1",
+        "lastPageRead": 0,
+        "number": 1.0,
+        "pageCount": 0,
+        "read": false,
+        "scanlator": "Alpha & Beta",
+        "seriesId": "w_00000000000040008000000000000001",
+        "title": "Chapter 001.00",
+        "uploadedAt": "2020-01-07T01:02:03.123456+00:00"
+      },
+      {
+        "bookmarked": false,
+        "externalUrl": null,
+        "foundAt": "2020-01-10T01:02:03.456000+00:00",
+        "id": "00000000-0000-4000-8000-000000000103",
+        "isDownloaded": false,
+        "label": "10.5",
+        "lastPageRead": 0,
+        "number": 10.5,
+        "pageCount": 0,
+        "read": true,
+        "scanlator": "Alpha & Beta",
+        "seriesId": "w_00000000000040008000000000000001",
+        "title": "Chapter 10.5",
+        "uploadedAt": "2020-01-03T01:02:03.000000+00:00"
+      },
+      {
+        "bookmarked": false,
+        "externalUrl": null,
+        "foundAt": null,
+        "id": "00000000-0000-4000-8000-000000000107",
+        "isDownloaded": false,
+        "label": "11",
+        "lastPageRead": 0,
+        "number": 11.0,
+        "pageCount": 0,
+        "read": false,
+        "scanlator": null,
+        "seriesId": "w_00000000000040008000000000000001",
+        "title": "Undated chapter",
+        "uploadedAt": null
+      },
+      {
+        "bookmarked": false,
+        "externalUrl": null,
+        "foundAt": "2020-01-10T01:02:03.456000+00:00",
+        "id": "00000000-0000-4000-8000-000000000104",
+        "isDownloaded": false,
+        "label": "Oneshot",
+        "lastPageRead": 0,
+        "number": 0.0,
+        "pageCount": 0,
+        "read": false,
+        "scanlator": "Group Café",
+        "seriesId": "w_00000000000040008000000000000001",
+        "title": "Oneshot",
+        "uploadedAt": "2020-01-05T01:02:03.123000+00:00"
+      },
+      {
+        "bookmarked": false,
+        "externalUrl": "https://example.invalid/chapter",
+        "foundAt": "2020-01-10T01:02:03.456000+00:00",
+        "id": "00000000-0000-4000-8000-000000000105",
+        "isDownloaded": false,
+        "label": "Extra",
+        "lastPageRead": 0,
+        "number": 0.0,
+        "pageCount": 0,
+        "read": false,
+        "scanlator": null,
+        "seriesId": "w_00000000000040008000000000000001",
+        "title": "Special extra",
+        "uploadedAt": "2020-01-05T01:02:03.123000+00:00"
+      }
+    ]
+  }
+}

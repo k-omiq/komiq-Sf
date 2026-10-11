@@ -1,0 +1,1339 @@
+-- PostgreSQL 18 baseline; derived by replaying all 107 frozen SQLite migrations.
+-- REQUIRE UTF8, LOCALE_PROVIDER builtin, BUILTIN_LOCALE C.UTF-8, LC_COLLATE C,
+-- LC_CTYPE C on every platform. Unicode word folding uses the builtin provider;
+-- pg_trgm receives an ASCII key independent of libc classification. See audit notes.
+-- Transaction-safe, one-shot DDL: use psql -X -v ON_ERROR_STOP=1 --single-transaction.
+-- No BEGIN/COMMIT here: the caller owns the transaction (including extension creation).
+-- Identity columns preserve supplied ids; importer must reset ALL listed sequences:
+-- content_block_rule.id, extension_update_log.id, feed_reconcile_report.id,
+-- suwayomi_chapter.id, suwayomi_cover_issue.manga_id, suwayomi_series.id, sync_state.id.
+-- work_alias.match_key is generated TEXT omitted by the map; preserved in place.
+-- NOCASE = ASCII translate(), never locale-sensitive lower(). Queries must use the same
+-- expression. SQLite index NULL ordering is explicit: ASC NULLS FIRST, DESC NULLS LAST.
+SET LOCAL search_path = public, pg_catalog;
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_database WHERE datname = current_database()
+        AND (encoding <> pg_char_to_encoding('UTF8') OR datlocprovider <> 'b'
+            OR datlocale IS DISTINCT FROM 'C.UTF-8' OR datcollate <> 'C')) THEN
+        RAISE EXCEPTION 'baseline requires UTF8 builtin C.UTF-8 and LC_COLLATE C';
+    END IF;
+END;
+$$;
+
+CREATE TABLE "all_mangadex_uuid" (
+    "source_series_id" text NOT NULL,
+    "work_id" text NOT NULL,
+    "suwayomi_key" text NOT NULL,
+    "mangadex_uuid" uuid NOT NULL,
+    "resolved_at" timestamptz NOT NULL,
+    "disposition" text,
+    "disposed_at" timestamptz,
+    "prev_work_id" text,
+    CONSTRAINT "all_mangadex_uuid_pkey" PRIMARY KEY ("source_series_id")
+);
+
+CREATE TABLE "browse_catalogue" (
+    "work_id" text NOT NULL,
+    "reader_id" text NOT NULL,
+    "title" text NOT NULL,
+    "cover_url" text,
+    "suwayomi_thumbnail" text,
+    "comic_type" text,
+    "status" text,
+    "content_rating" text NOT NULL DEFAULT 'safe',
+    "is_nsfw" boolean NOT NULL DEFAULT false,
+    "en_chapter_count" bigint NOT NULL DEFAULT 0,
+    "released_at" timestamptz,
+    "created_at" timestamptz NOT NULL,
+    "latest_chapter" text,
+    "announced_at" timestamptz,
+    "demographic" text,
+    "original_language" text,
+    "year" bigint,
+    "follows" bigint,
+    "rating" double precision,
+    CONSTRAINT "browse_catalogue_pkey" PRIMARY KEY ("work_id")
+);
+
+CREATE TABLE "canonical_progress" (
+    "user_id" uuid NOT NULL,
+    "chapter_id" text NOT NULL,
+    "work_id" text NOT NULL,
+    "last_page_read" bigint NOT NULL DEFAULT 0,
+    "read" boolean NOT NULL DEFAULT false,
+    "updated_at" timestamptz NOT NULL,
+    CONSTRAINT "canonical_progress_pkey" PRIMARY KEY ("user_id", "chapter_id")
+);
+
+CREATE TABLE "catalogue_sync_state" (
+    "job" text NOT NULL,
+    "last_synced_at" timestamptz NOT NULL,
+    "updated_at" timestamptz NOT NULL,
+    "seed_done" boolean NOT NULL DEFAULT false,
+    CONSTRAINT "catalogue_sync_state_pkey" PRIMARY KEY ("job")
+);
+
+CREATE TABLE "chapter" (
+    "id" text NOT NULL,
+    "source_series_id" text NOT NULL,
+    "external_id" text NOT NULL,
+    "number" text,
+    "volume" text,
+    "lang" text,
+    "title" text,
+    "published_at" timestamptz,
+    "created_at" timestamptz NOT NULL,
+    "readable_at" timestamptz,
+    "external_url" text,
+    "chapter_key" text,
+    "label" text,
+    "scanlator" text,
+    CONSTRAINT "chapter_pkey" PRIMARY KEY ("id"),
+    CONSTRAINT "chapter_uq_1" UNIQUE ("source_series_id", "external_id")
+);
+
+CREATE TABLE "chapter_override" (
+    "work_id" text NOT NULL,
+    "chapter_key" text NOT NULL,
+    "hidden" boolean NOT NULL DEFAULT false,
+    "title_override" text,
+    "updated_at" timestamptz NOT NULL,
+    CONSTRAINT "chapter_override_pkey" PRIMARY KEY ("work_id", "chapter_key")
+);
+
+CREATE TABLE "comment_media" (
+    "id" uuid NOT NULL,
+    "comment_id" uuid,
+    "user_id" uuid NOT NULL,
+    "webp" bytea NOT NULL,
+    "width" bigint NOT NULL,
+    "height" bigint NOT NULL,
+    "created_at" timestamptz NOT NULL,
+    CONSTRAINT "comment_media_pkey" PRIMARY KEY ("id")
+);
+
+CREATE TABLE "comment_votes" (
+    "comment_id" uuid NOT NULL,
+    "user_id" uuid NOT NULL,
+    "value" integer NOT NULL,
+    "created_at" timestamptz NOT NULL,
+    CONSTRAINT "comment_votes_pkey" PRIMARY KEY ("comment_id", "user_id")
+);
+
+CREATE TABLE "comments" (
+    "id" uuid NOT NULL,
+    "target_type" text NOT NULL,
+    "target_id" text NOT NULL,
+    "user_id" uuid NOT NULL,
+    "body" text NOT NULL,
+    "has_spoiler" boolean NOT NULL DEFAULT false,
+    "created_at" timestamptz NOT NULL,
+    "parent_id" uuid,
+    CONSTRAINT "comments_pkey" PRIMARY KEY ("id")
+);
+
+CREATE TABLE "content_block_rule" (
+    "id" bigint GENERATED BY DEFAULT AS IDENTITY NOT NULL,
+    "user_id" uuid,
+    "tags" text NOT NULL DEFAULT '',
+    "ratings" text NOT NULL DEFAULT '',
+    "created_at" timestamptz NOT NULL,
+    CONSTRAINT "content_block_rule_pkey" PRIMARY KEY ("id"),
+    CONSTRAINT "content_block_rule_ck_1" CHECK (tags != '' OR ratings != '')
+);
+
+CREATE TABLE "cover_source_backoff" (
+    "source_id" text NOT NULL,
+    "reason" text NOT NULL,
+    "detail" text,
+    "failures" bigint NOT NULL DEFAULT 1,
+    "failed_covers" bigint NOT NULL DEFAULT 0,
+    "first_seen" timestamptz NOT NULL,
+    "last_seen" timestamptz NOT NULL,
+    "retry_after" timestamptz NOT NULL,
+    CONSTRAINT "cover_source_backoff_pkey" PRIMARY KEY ("source_id")
+);
+
+CREATE TABLE "extension_subscription" (
+    "pkg_name" text NOT NULL,
+    "created_at" timestamptz NOT NULL,
+    "last_synced_at" timestamptz,
+    "last_added" bigint NOT NULL DEFAULT 0,
+    "last_error" text,
+    "consecutive_failures" bigint NOT NULL DEFAULT 0,
+    "disabled_at" timestamptz,
+    CONSTRAINT "extension_subscription_pkey" PRIMARY KEY ("pkg_name")
+);
+
+CREATE TABLE "extension_update_log" (
+    "id" bigint GENERATED BY DEFAULT AS IDENTITY NOT NULL,
+    "at" timestamptz NOT NULL,
+    "pkg_name" text NOT NULL,
+    "from_version" text,
+    "to_version" text,
+    "origin" text NOT NULL,
+    "error" text,
+    CONSTRAINT "extension_update_log_pkey" PRIMARY KEY ("id")
+);
+
+CREATE TABLE "feed_genre_facet" (
+    "tag" text NOT NULL,
+    "safe_count" bigint NOT NULL,
+    "all_count" bigint NOT NULL,
+    CONSTRAINT "feed_genre_facet_pkey" PRIMARY KEY ("tag")
+);
+
+CREATE TABLE "feed_reconcile_report" (
+    "id" bigint GENERATED BY DEFAULT AS IDENTITY NOT NULL,
+    "ran_at" timestamptz NOT NULL,
+    "duration_ms" bigint NOT NULL,
+    "rows_before" bigint NOT NULL,
+    "rows_after" bigint NOT NULL,
+    "drifted" bigint NOT NULL,
+    "sample" text,
+    CONSTRAINT "feed_reconcile_report_pkey" PRIMARY KEY ("id"),
+    CONSTRAINT "feed_reconcile_report_ck_1" CHECK (id = 1)
+);
+
+CREATE TABLE "feed_series_updates" (
+    "work_id" text NOT NULL,
+    "reader_id" text NOT NULL,
+    "title" text NOT NULL,
+    "cover_url" text,
+    "suwayomi_thumbnail" text,
+    "comic_type" text,
+    "latest_chapter" text,
+    "latest_chapter_title" text,
+    "chapter_count" bigint,
+    "released_at" timestamptz NOT NULL,
+    "detected_at" timestamptz,
+    "is_nsfw" boolean NOT NULL DEFAULT false,
+    "status" text,
+    "content_rating" text NOT NULL DEFAULT 'safe',
+    "en_chapter_count" bigint NOT NULL DEFAULT 0,
+    "announced_at" timestamptz,
+    CONSTRAINT "feed_series_updates_pkey" PRIMARY KEY ("work_id")
+);
+
+CREATE TABLE "feed_updates" (
+    "work_id" text NOT NULL,
+    "mangadex_id" text,
+    "title" text NOT NULL,
+    "is_nsfw" boolean NOT NULL DEFAULT false,
+    "cover_url" text,
+    "latest_chapter" text,
+    "latest_chapter_title" text,
+    "latest_at" timestamptz NOT NULL,
+    CONSTRAINT "feed_updates_pkey" PRIMARY KEY ("work_id")
+);
+
+CREATE TABLE "instance_setting" (
+    "key" text NOT NULL,
+    "value" text NOT NULL,
+    "updated_at" timestamptz NOT NULL,
+    CONSTRAINT "instance_setting_pkey" PRIMARY KEY ("key")
+);
+
+CREATE TABLE "maintenance_flag" (
+    "key" text NOT NULL,
+    "done_at" timestamptz NOT NULL,
+    CONSTRAINT "maintenance_flag_pkey" PRIMARY KEY ("key")
+);
+
+CREATE TABLE "merge_candidate" (
+    "id" text NOT NULL,
+    "source_series_id" text NOT NULL,
+    "candidate_work_id" text NOT NULL,
+    "score" double precision NOT NULL,
+    "method" text NOT NULL,
+    "status" text NOT NULL DEFAULT 'pending',
+    "created_at" timestamptz NOT NULL,
+    "resolved_at" timestamptz,
+    CONSTRAINT "merge_candidate_pkey" PRIMARY KEY ("id")
+);
+
+CREATE TABLE "notifications" (
+    "id" uuid NOT NULL,
+    "user_id" uuid NOT NULL,
+    "kind" text NOT NULL,
+    "actor_id" uuid,
+    "comment_id" uuid,
+    "target_type" text,
+    "target_id" text,
+    "count" bigint,
+    "created_at" timestamptz NOT NULL,
+    "read_at" timestamptz,
+    CONSTRAINT "notifications_pkey" PRIMARY KEY ("id")
+);
+
+CREATE TABLE "release_event" (
+    "work_id" text NOT NULL,
+    "chapter_key" text NOT NULL,
+    "first_seen_at" timestamptz NOT NULL,
+    "first_source_series_id" text,
+    "label" text NOT NULL,
+    "announce_at" timestamptz,
+    CONSTRAINT "release_event_pkey" PRIMARY KEY ("work_id", "chapter_key")
+);
+
+CREATE TABLE "report" (
+    "id" uuid NOT NULL,
+    "kind" text NOT NULL,
+    "status" text NOT NULL DEFAULT 'open',
+    "user_id" uuid,
+    "subject_id" text,
+    "subject_id_secondary" text,
+    "subject_title" text,
+    "comment_id" uuid,
+    "reported_username" text,
+    "comment_excerpt" text,
+    "source_url" text,
+    "detail" text NOT NULL,
+    "admin_note" text,
+    "resolved_at" timestamptz,
+    "resolved_by" uuid,
+    "created_at" timestamptz NOT NULL,
+    CONSTRAINT "report_pkey" PRIMARY KEY ("id")
+);
+
+CREATE TABLE "reviews" (
+    "id" uuid NOT NULL,
+    "series_id" text NOT NULL,
+    "user_id" uuid NOT NULL,
+    "score" bigint NOT NULL,
+    "body" text NOT NULL,
+    "has_spoiler" boolean NOT NULL DEFAULT false,
+    "created_at" timestamptz NOT NULL,
+    "updated_at" timestamptz NOT NULL,
+    CONSTRAINT "reviews_pkey" PRIMARY KEY ("id"),
+    CONSTRAINT "reviews_uq_1" UNIQUE ("series_id", "user_id")
+);
+
+CREATE TABLE "scanlator_tag" (
+    "name_key" text NOT NULL,
+    "name" text NOT NULL,
+    "ai_level" text NOT NULL,
+    "updated_at" timestamptz NOT NULL,
+    CONSTRAINT "scanlator_tag_pkey" PRIMARY KEY ("name_key"),
+    CONSTRAINT "scanlator_tag_ck_1" CHECK (ai_level IN ('ai', 'partial'))
+);
+
+CREATE TABLE "series_admin" (
+    "series_id" text NOT NULL,
+    "override_interval_hours" double precision,
+    "poll_every_minutes" integer,
+    "paused_override" boolean,
+    "status_override" text,
+    "updated_at" timestamptz NOT NULL,
+    CONSTRAINT "series_admin_pkey" PRIMARY KEY ("series_id")
+);
+
+CREATE TABLE "series_scan_state" (
+    "series_id" text NOT NULL,
+    "avg_interval_hours" double precision NOT NULL DEFAULT 0,
+    "known_chapter_count" bigint NOT NULL DEFAULT 0,
+    "last_scanned_at" timestamptz,
+    "next_scan_at" timestamptz NOT NULL,
+    "last_new_chapter_at" timestamptz,
+    "updated_at" timestamptz NOT NULL,
+    "known_max_chapter" double precision,
+    "awaiting_since" timestamptz,
+    "known_chapter_ids" text,
+    "consecutive_failures" bigint NOT NULL DEFAULT 0,
+    "last_failure_kind" text,
+    "last_failure_at" timestamptz,
+    "source_id" text,
+    CONSTRAINT "series_scan_state_pkey" PRIMARY KEY ("series_id")
+);
+
+CREATE TABLE "series_view_bucket" (
+    "series_key" text NOT NULL,
+    "hour_ts" bigint NOT NULL,
+    "views" bigint NOT NULL DEFAULT 0,
+    CONSTRAINT "series_view_bucket_pkey" PRIMARY KEY ("series_key", "hour_ts")
+);
+
+CREATE TABLE "series_views" (
+    "series_key" text NOT NULL,
+    "total" bigint NOT NULL DEFAULT 0,
+    "updated_at" timestamptz NOT NULL,
+    CONSTRAINT "series_views_pkey" PRIMARY KEY ("series_key")
+);
+
+CREATE TABLE "sessions" (
+    "token" text NOT NULL,
+    "user_id" uuid NOT NULL,
+    "created_at" timestamptz NOT NULL,
+    "expires_at" timestamptz,
+    CONSTRAINT "sessions_pkey" PRIMARY KEY ("token")
+);
+
+CREATE TABLE "source_ai_tag" (
+    "source_id" text NOT NULL,
+    "ai_level" text NOT NULL,
+    "updated_at" timestamptz NOT NULL,
+    CONSTRAINT "source_ai_tag_pkey" PRIMARY KEY ("source_id"),
+    CONSTRAINT "source_ai_tag_ck_1" CHECK (ai_level IN ('ai', 'partial'))
+);
+
+CREATE TABLE "source_extension" (
+    "source_id" text NOT NULL,
+    "pkg_name" text NOT NULL,
+    "repo_url" text NOT NULL,
+    "apk_name" text,
+    "version_code" bigint,
+    "lang" text,
+    "is_nsfw" boolean NOT NULL DEFAULT false,
+    "updated_at" timestamptz NOT NULL,
+    CONSTRAINT "source_extension_pkey" PRIMARY KEY ("source_id")
+);
+
+CREATE TABLE "source_health_bucket" (
+    "source_id" text NOT NULL,
+    "surface" text NOT NULL,
+    "hour_ts" bigint NOT NULL,
+    "reason" text NOT NULL,
+    "count" bigint NOT NULL DEFAULT 0,
+    "last_message" text,
+    "last_at" timestamptz NOT NULL,
+    CONSTRAINT "source_health_bucket_pkey" PRIMARY KEY ("source_id", "surface", "hour_ts", "reason")
+);
+
+CREATE TABLE "source_ingest_job" (
+    "id" text NOT NULL,
+    "source_id" text NOT NULL,
+    "state" text NOT NULL,
+    "pages_done" bigint NOT NULL DEFAULT 0,
+    "items_seen" bigint NOT NULL DEFAULT 0,
+    "succeeded" bigint NOT NULL DEFAULT 0,
+    "failed" bigint NOT NULL DEFAULT 0,
+    "new_works" bigint NOT NULL DEFAULT 0,
+    "auto_merged" bigint NOT NULL DEFAULT 0,
+    "queued_for_review" bigint NOT NULL DEFAULT 0,
+    "already_existing" bigint NOT NULL DEFAULT 0,
+    "error" text,
+    "started_at" timestamptz NOT NULL,
+    "finished_at" timestamptz,
+    CONSTRAINT "source_ingest_job_pkey" PRIMARY KEY ("id")
+);
+
+CREATE TABLE "source_latest_snapshot" (
+    "source_id" text NOT NULL,
+    "ordered_ids" jsonb NOT NULL,
+    "captured_at" timestamptz NOT NULL,
+    CONSTRAINT "source_latest_snapshot_pkey" PRIMARY KEY ("source_id")
+);
+
+CREATE TABLE "source_nsfw_pin" (
+    "source_id" text NOT NULL,
+    "created_at" timestamptz NOT NULL,
+    CONSTRAINT "source_nsfw_pin_pkey" PRIMARY KEY ("source_id")
+);
+
+CREATE TABLE "source_rate_limit" (
+    "source_id" text NOT NULL,
+    "requests" bigint NOT NULL,
+    "window_secs" bigint NOT NULL,
+    "updated_at" timestamptz NOT NULL,
+    CONSTRAINT "source_rate_limit_pkey" PRIMARY KEY ("source_id"),
+    CONSTRAINT "source_rate_limit_ck_1" CHECK (requests > 0),
+    CONSTRAINT "source_rate_limit_ck_2" CHECK (window_secs > 0)
+);
+
+CREATE TABLE "source_scan_outage" (
+    "source_id" text NOT NULL,
+    "pkg_name" text,
+    "detected_at" timestamptz NOT NULL,
+    "last_alert_at" timestamptz NOT NULL,
+    "series" bigint NOT NULL DEFAULT 0,
+    "failing" bigint NOT NULL DEFAULT 0,
+    "kind" text,
+    "parked_until" timestamptz,
+    CONSTRAINT "source_scan_outage_pkey" PRIMARY KEY ("source_id")
+);
+
+CREATE TABLE "source_series" (
+    "id" text NOT NULL,
+    "work_id" text NOT NULL,
+    "source_type" text NOT NULL,
+    "source_id" text DEFAULT NULL,
+    "source_key" text NOT NULL,
+    "source_url" text,
+    "is_nsfw" boolean NOT NULL DEFAULT false,
+    "last_seen" timestamptz,
+    "created_at" timestamptz NOT NULL,
+    CONSTRAINT "source_series_pkey" PRIMARY KEY ("id"),
+    CONSTRAINT "source_series_uq_1" UNIQUE ("source_type", "source_id", "source_key")
+);
+
+CREATE TABLE "suwayomi_chapter" (
+    "id" bigint GENERATED BY DEFAULT AS IDENTITY NOT NULL,
+    "manga_id" bigint NOT NULL,
+    "name" text NOT NULL,
+    "chapter_number" double precision NOT NULL,
+    "scanlator" text,
+    "upload_date" text,
+    "is_read" boolean NOT NULL DEFAULT false,
+    "is_bookmarked" boolean NOT NULL DEFAULT false,
+    "is_downloaded" boolean NOT NULL DEFAULT false,
+    "last_page_read" bigint NOT NULL DEFAULT 0,
+    "page_count" bigint NOT NULL DEFAULT 0,
+    "updated_at" timestamptz NOT NULL,
+    CONSTRAINT "suwayomi_chapter_pkey" PRIMARY KEY ("id")
+);
+
+CREATE TABLE "suwayomi_cover_issue" (
+    "manga_id" bigint GENERATED BY DEFAULT AS IDENTITY NOT NULL,
+    "source_id" text,
+    "reason" text NOT NULL,
+    "detail" text,
+    "permanent" boolean NOT NULL DEFAULT false,
+    "attempts" bigint NOT NULL DEFAULT 1,
+    "first_seen" timestamptz NOT NULL,
+    "last_seen" timestamptz NOT NULL,
+    "retry_after" timestamptz NOT NULL,
+    "source_fetched_at" text,
+    CONSTRAINT "suwayomi_cover_issue_pkey" PRIMARY KEY ("manga_id")
+);
+
+CREATE TABLE "suwayomi_progress" (
+    "user_id" uuid NOT NULL,
+    "chapter_id" text NOT NULL,
+    "series_id" text NOT NULL,
+    "last_page_read" bigint NOT NULL DEFAULT 0,
+    "read" boolean NOT NULL DEFAULT false,
+    "updated_at" timestamptz NOT NULL,
+    CONSTRAINT "suwayomi_progress_pkey" PRIMARY KEY ("user_id", "chapter_id")
+);
+
+CREATE TABLE "suwayomi_series" (
+    "id" bigint GENERATED BY DEFAULT AS IDENTITY NOT NULL,
+    "title" text NOT NULL,
+    "thumbnail_url" text,
+    "author" text,
+    "artist" text,
+    "description" text,
+    "genre" jsonb,
+    "status" text NOT NULL,
+    "in_library" boolean NOT NULL DEFAULT false,
+    "in_library_at" text,
+    "last_fetched_at" text,
+    "source_id" text NOT NULL,
+    "lang" text,
+    "chapter_count" bigint NOT NULL DEFAULT 0,
+    "updated_at" timestamptz NOT NULL,
+    "created_at" timestamptz,
+    "series_fetched_at" timestamptz,
+    "latest_chapter_at" bigint,
+    CONSTRAINT "suwayomi_series_pkey" PRIMARY KEY ("id")
+);
+
+CREATE TABLE "sync_state" (
+    "id" bigint GENERATED BY DEFAULT AS IDENTITY NOT NULL,
+    "last_full_pass_at" timestamptz,
+    CONSTRAINT "sync_state_pkey" PRIMARY KEY ("id"),
+    CONSTRAINT "sync_state_ck_1" CHECK (id = 1)
+);
+
+CREATE TABLE "tag" (
+    "id" text NOT NULL,
+    "name" text NOT NULL,
+    "tag_group" text NOT NULL DEFAULT 'genre',
+    "mangadex_id" text,
+    "work_count" bigint NOT NULL DEFAULT 0,
+    "safe_work_count" bigint NOT NULL DEFAULT 0,
+    CONSTRAINT "tag_pkey" PRIMARY KEY ("id")
+);
+
+CREATE TABLE "user_activity" (
+    "id" uuid NOT NULL,
+    "user_id" uuid NOT NULL,
+    "kind" text NOT NULL,
+    "target_type" text,
+    "target_id" text,
+    "created_at" timestamptz NOT NULL,
+    CONSTRAINT "user_activity_pkey" PRIMARY KEY ("id")
+);
+
+CREATE TABLE "user_avatars" (
+    "user_id" uuid NOT NULL,
+    "webp" bytea NOT NULL,
+    "version" bigint NOT NULL,
+    "updated_at" timestamptz NOT NULL,
+    CONSTRAINT "user_avatars_pkey" PRIMARY KEY ("user_id")
+);
+
+CREATE TABLE "user_library" (
+    "user_id" uuid NOT NULL,
+    "series_id" text NOT NULL,
+    "created_at" timestamptz NOT NULL,
+    "status" text,
+    "is_favorite" boolean NOT NULL DEFAULT false,
+    CONSTRAINT "user_library_pkey" PRIMARY KEY ("user_id", "series_id")
+);
+
+CREATE TABLE "users" (
+    "id" uuid NOT NULL,
+    "username" text NOT NULL,
+    "email" text NOT NULL,
+    "password_hash" text NOT NULL,
+    "avatar_url" text,
+    "is_admin" boolean NOT NULL DEFAULT false,
+    "created_at" timestamptz NOT NULL,
+    "is_banned" boolean NOT NULL DEFAULT false,
+    "show_nsfw" boolean NOT NULL DEFAULT false,
+    "display_name" text,
+    "bio" text,
+    "must_change_password" boolean NOT NULL DEFAULT false,
+    CONSTRAINT "users_pkey" PRIMARY KEY ("id"),
+    CONSTRAINT "users_uq_1" UNIQUE ("username"),
+    CONSTRAINT "users_uq_2" UNIQUE ("email")
+);
+
+CREATE TABLE "work" (
+    "id" text NOT NULL,
+    "primary_title" text,
+    "primary_lang" text,
+    "description" text,
+    "year" bigint,
+    "original_language" text,
+    "status" text,
+    "demographic" text,
+    "content_rating" text,
+    "is_nsfw" boolean NOT NULL DEFAULT false,
+    "author" text,
+    "artist" text,
+    "cover_phash" text,
+    "created_at" timestamptz NOT NULL,
+    "updated_at" timestamptz NOT NULL,
+    "cover_file_name" text,
+    "metadata_synced_at" timestamptz,
+    "covers_synced_at" timestamptz,
+    "content_type_override" text,
+    "title_override" text,
+    "description_override" text,
+    "is_nsfw_override" boolean,
+    "cover_cached_version" bigint,
+    "mangadex_details_synced_at" timestamptz,
+    CONSTRAINT "work_pkey" PRIMARY KEY ("id")
+);
+
+CREATE TABLE "work_alias" (
+    "id" text NOT NULL,
+    "work_id" text NOT NULL,
+    "normalized_title" text NOT NULL,
+    "raw_title" text NOT NULL,
+    "lang" text,
+    "match_key" text GENERATED ALWAYS AS (trim(replace(replace(replace(replace(replace(replace(' ' || normalized_title, ' the ', ' '), ' the ', ' '), ' an ', ' '), ' an ', ' '), ' a ', ' '), ' a ', ' '))) STORED,
+    CONSTRAINT "work_alias_pkey" PRIMARY KEY ("id"),
+    CONSTRAINT "work_alias_uq_1" UNIQUE ("work_id", "normalized_title", "lang")
+);
+
+CREATE TABLE "work_alias_token" (
+    "work_id" text NOT NULL,
+    "token" text NOT NULL,
+    CONSTRAINT "work_alias_token_uq_1" UNIQUE ("work_id", "token")
+);
+
+CREATE TABLE "work_cover" (
+    "work_id" text NOT NULL,
+    "cover_file_name" text NOT NULL,
+    "lang" text,
+    "volume" text,
+    "is_primary" boolean NOT NULL DEFAULT false,
+    CONSTRAINT "work_cover_pkey" PRIMARY KEY ("work_id", "cover_file_name")
+);
+
+CREATE TABLE "work_cover_issue" (
+    "work_id" text NOT NULL,
+    "reason" text NOT NULL,
+    "detail" text,
+    "attempts" bigint NOT NULL DEFAULT 1,
+    "first_seen" timestamptz NOT NULL,
+    "last_seen" timestamptz NOT NULL,
+    "retry_after" timestamptz,
+    CONSTRAINT "work_cover_issue_pkey" PRIMARY KEY ("work_id")
+);
+
+CREATE TABLE "work_credit" (
+    "work_id" text NOT NULL,
+    "role" text NOT NULL,
+    "name" text NOT NULL,
+    CONSTRAINT "work_credit_pkey" PRIMARY KEY ("work_id", "role", "name")
+);
+
+CREATE TABLE "work_description" (
+    "work_id" text NOT NULL,
+    "lang" text NOT NULL,
+    "description" text NOT NULL,
+    CONSTRAINT "work_description_pkey" PRIMARY KEY ("work_id", "lang")
+);
+
+CREATE TABLE "work_external_id" (
+    "work_id" text NOT NULL,
+    "provider" text NOT NULL,
+    "external_id" text NOT NULL,
+    CONSTRAINT "work_external_id_pkey" PRIMARY KEY ("provider", "external_id")
+);
+
+CREATE TABLE "work_field_pin" (
+    "work_id" text NOT NULL,
+    "field" text NOT NULL,
+    "value" text,
+    "source_value" text,
+    "pinned_at" timestamptz NOT NULL,
+    CONSTRAINT "work_field_pin_pkey" PRIMARY KEY ("work_id", "field")
+);
+
+CREATE TABLE "work_redirect" (
+    "old_id" text NOT NULL,
+    "new_id" text NOT NULL,
+    "created_at" timestamptz NOT NULL,
+    CONSTRAINT "work_redirect_pkey" PRIMARY KEY ("old_id"),
+    CONSTRAINT "work_redirect_ck_1" CHECK (old_id <> new_id)
+);
+
+CREATE TABLE "work_split" (
+    "work_a" text NOT NULL,
+    "work_b" text NOT NULL,
+    "split_at" timestamptz NOT NULL,
+    "split_by" uuid,
+    CONSTRAINT "work_split_pkey" PRIMARY KEY ("work_a", "work_b")
+);
+
+CREATE TABLE "work_stats" (
+    "work_id" text NOT NULL,
+    "follows" bigint,
+    "rating" double precision,
+    "rating_avg" double precision,
+    "fetched_at" timestamptz NOT NULL,
+    CONSTRAINT "work_stats_pkey" PRIMARY KEY ("work_id")
+);
+
+CREATE TABLE "work_tag" (
+    "work_id" text NOT NULL,
+    "tag" text NOT NULL,
+    "ord" bigint NOT NULL DEFAULT 0,
+    "source" text NOT NULL DEFAULT 'admin',
+    "tag_id" text,
+    "tag_group" text,
+    "tag_key" text,
+    CONSTRAINT "work_tag_pkey" PRIMARY KEY ("work_id", "tag")
+);
+
+CREATE TABLE "work_tracker_link" (
+    "work_id" text NOT NULL,
+    "provider" text NOT NULL,
+    "external_id" text NOT NULL,
+    CONSTRAINT "work_tracker_link_pkey" PRIMARY KEY ("work_id", "provider")
+);
+
+ALTER TABLE "browse_catalogue" ADD CONSTRAINT "browse_catalogue_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "canonical_progress" ADD CONSTRAINT "canonical_progress_fk_0" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "chapter" ADD CONSTRAINT "chapter_fk_0" FOREIGN KEY ("source_series_id") REFERENCES "source_series" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "chapter_override" ADD CONSTRAINT "chapter_override_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "comment_media" ADD CONSTRAINT "comment_media_fk_0" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "comment_media" ADD CONSTRAINT "comment_media_fk_1" FOREIGN KEY ("comment_id") REFERENCES "comments" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "comment_votes" ADD CONSTRAINT "comment_votes_fk_0" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "comment_votes" ADD CONSTRAINT "comment_votes_fk_1" FOREIGN KEY ("comment_id") REFERENCES "comments" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "comments" ADD CONSTRAINT "comments_fk_0" FOREIGN KEY ("parent_id") REFERENCES "comments" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "comments" ADD CONSTRAINT "comments_fk_1" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "content_block_rule" ADD CONSTRAINT "content_block_rule_fk_0" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "feed_series_updates" ADD CONSTRAINT "feed_series_updates_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "feed_updates" ADD CONSTRAINT "feed_updates_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "merge_candidate" ADD CONSTRAINT "merge_candidate_fk_0" FOREIGN KEY ("candidate_work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "merge_candidate" ADD CONSTRAINT "merge_candidate_fk_1" FOREIGN KEY ("source_series_id") REFERENCES "source_series" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "notifications" ADD CONSTRAINT "notifications_fk_0" FOREIGN KEY ("comment_id") REFERENCES "comments" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "notifications" ADD CONSTRAINT "notifications_fk_1" FOREIGN KEY ("actor_id") REFERENCES "users" ("id") ON DELETE SET NULL ON UPDATE NO ACTION;
+ALTER TABLE "notifications" ADD CONSTRAINT "notifications_fk_2" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "release_event" ADD CONSTRAINT "release_event_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "report" ADD CONSTRAINT "report_fk_0" FOREIGN KEY ("resolved_by") REFERENCES "users" ("id") ON DELETE SET NULL ON UPDATE NO ACTION;
+ALTER TABLE "report" ADD CONSTRAINT "report_fk_1" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE SET NULL ON UPDATE NO ACTION;
+ALTER TABLE "reviews" ADD CONSTRAINT "reviews_fk_0" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "sessions" ADD CONSTRAINT "sessions_fk_0" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "source_series" ADD CONSTRAINT "source_series_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "suwayomi_cover_issue" ADD CONSTRAINT "suwayomi_cover_issue_fk_0" FOREIGN KEY ("manga_id") REFERENCES "suwayomi_series" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "suwayomi_progress" ADD CONSTRAINT "suwayomi_progress_fk_0" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "user_activity" ADD CONSTRAINT "user_activity_fk_0" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "user_avatars" ADD CONSTRAINT "user_avatars_fk_0" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "user_library" ADD CONSTRAINT "user_library_fk_0" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "work_alias" ADD CONSTRAINT "work_alias_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "work_alias_token" ADD CONSTRAINT "work_alias_token_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "work_cover" ADD CONSTRAINT "work_cover_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "work_cover_issue" ADD CONSTRAINT "work_cover_issue_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "work_credit" ADD CONSTRAINT "work_credit_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "work_description" ADD CONSTRAINT "work_description_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "work_external_id" ADD CONSTRAINT "work_external_id_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "work_field_pin" ADD CONSTRAINT "work_field_pin_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "work_stats" ADD CONSTRAINT "work_stats_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "work_tag" ADD CONSTRAINT "work_tag_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "work_tracker_link" ADD CONSTRAINT "work_tracker_link_fk_0" FOREIGN KEY ("work_id") REFERENCES "work" ("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+
+-- All 95 surviving explicit SQLite indexes, with their original names.
+
+CREATE INDEX idx_all_mangadex_uuid_disposition
+    ON all_mangadex_uuid (disposition NULLS FIRST);
+CREATE INDEX idx_all_mangadex_uuid_uuid
+    ON all_mangadex_uuid (mangadex_uuid NULLS FIRST);
+CREATE INDEX idx_bc_added
+    ON browse_catalogue(is_nsfw NULLS FIRST, created_at DESC NULLS LAST, work_id DESC NULLS LAST, status NULLS FIRST, content_rating NULLS FIRST, en_chapter_count NULLS FIRST);
+CREATE INDEX idx_bc_all_added
+    ON browse_catalogue(created_at DESC NULLS LAST, work_id DESC NULLS LAST, status NULLS FIRST, content_rating NULLS FIRST, en_chapter_count NULLS FIRST);
+CREATE INDEX idx_bc_all_chapters
+    ON browse_catalogue(en_chapter_count DESC NULLS LAST, work_id DESC NULLS LAST, status NULLS FIRST, content_rating NULLS FIRST);
+CREATE INDEX idx_bc_all_follows
+    ON browse_catalogue(follows DESC NULLS LAST, work_id DESC NULLS LAST);
+CREATE INDEX idx_bc_all_order
+    ON browse_catalogue(released_at DESC NULLS LAST, work_id DESC NULLS LAST, status NULLS FIRST, content_rating NULLS FIRST, en_chapter_count NULLS FIRST);
+CREATE INDEX idx_bc_all_rating
+    ON browse_catalogue(rating DESC NULLS LAST, work_id DESC NULLS LAST);
+CREATE INDEX idx_bc_all_title
+    ON browse_catalogue(translate(title, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NULLS FIRST, work_id NULLS FIRST);
+CREATE INDEX idx_bc_all_year
+    ON browse_catalogue(year DESC NULLS LAST, work_id DESC NULLS LAST);
+CREATE INDEX idx_bc_chapters
+    ON browse_catalogue(is_nsfw NULLS FIRST, en_chapter_count DESC NULLS LAST, work_id DESC NULLS LAST, status NULLS FIRST, content_rating NULLS FIRST);
+CREATE INDEX idx_bc_content_rating
+    ON browse_catalogue(content_rating NULLS FIRST, is_nsfw NULLS FIRST);
+CREATE INDEX idx_bc_demographic
+    ON browse_catalogue(demographic NULLS FIRST, is_nsfw NULLS FIRST);
+CREATE INDEX idx_bc_follows
+    ON browse_catalogue(is_nsfw NULLS FIRST, follows DESC NULLS LAST, work_id DESC NULLS LAST);
+CREATE INDEX idx_bc_language
+    ON browse_catalogue(original_language NULLS FIRST, is_nsfw NULLS FIRST);
+CREATE INDEX idx_bc_order
+    ON browse_catalogue(is_nsfw NULLS FIRST, released_at DESC NULLS LAST, work_id DESC NULLS LAST, status NULLS FIRST, content_rating NULLS FIRST, en_chapter_count NULLS FIRST);
+CREATE INDEX idx_bc_rating
+    ON browse_catalogue(is_nsfw NULLS FIRST, rating DESC NULLS LAST, work_id DESC NULLS LAST);
+CREATE INDEX idx_bc_status
+    ON browse_catalogue(status NULLS FIRST, is_nsfw NULLS FIRST);
+CREATE INDEX idx_bc_title
+    ON browse_catalogue(is_nsfw NULLS FIRST, translate(title, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NULLS FIRST, work_id NULLS FIRST);
+CREATE INDEX idx_bc_type_added
+    ON browse_catalogue(is_nsfw NULLS FIRST, comic_type NULLS FIRST, created_at DESC NULLS LAST, work_id DESC NULLS LAST, status NULLS FIRST, content_rating NULLS FIRST, en_chapter_count NULLS FIRST);
+CREATE INDEX idx_bc_type_all_added
+    ON browse_catalogue(comic_type NULLS FIRST, created_at DESC NULLS LAST, work_id DESC NULLS LAST, status NULLS FIRST, content_rating NULLS FIRST, en_chapter_count NULLS FIRST);
+CREATE INDEX idx_bc_type_all_chapters
+    ON browse_catalogue(comic_type NULLS FIRST, en_chapter_count DESC NULLS LAST, work_id DESC NULLS LAST, status NULLS FIRST, content_rating NULLS FIRST);
+CREATE INDEX idx_bc_type_all_order
+    ON browse_catalogue(comic_type NULLS FIRST, released_at DESC NULLS LAST, work_id DESC NULLS LAST, status NULLS FIRST, content_rating NULLS FIRST, en_chapter_count NULLS FIRST);
+CREATE INDEX idx_bc_type_chapters
+    ON browse_catalogue(is_nsfw NULLS FIRST, comic_type NULLS FIRST, en_chapter_count DESC NULLS LAST, work_id DESC NULLS LAST, status NULLS FIRST, content_rating NULLS FIRST);
+CREATE INDEX idx_bc_type_order
+    ON browse_catalogue(is_nsfw NULLS FIRST, comic_type NULLS FIRST, released_at DESC NULLS LAST, work_id DESC NULLS LAST, status NULLS FIRST, content_rating NULLS FIRST, en_chapter_count NULLS FIRST);
+CREATE INDEX idx_bc_year
+    ON browse_catalogue(is_nsfw NULLS FIRST, year DESC NULLS LAST, work_id DESC NULLS LAST);
+CREATE INDEX idx_canonical_progress_work ON canonical_progress(user_id NULLS FIRST, work_id NULLS FIRST);
+CREATE INDEX idx_chapter_external_id
+    ON chapter (external_id NULLS FIRST);
+CREATE INDEX idx_chapter_key
+    ON chapter (source_series_id NULLS FIRST, chapter_key NULLS FIRST);
+CREATE INDEX idx_chapter_needs_group
+    ON chapter (source_series_id NULLS FIRST)
+    WHERE scanlator IS NULL AND external_id LIKE '%-%';
+CREATE INDEX idx_chapter_needs_key
+    ON chapter (id NULLS FIRST)
+    WHERE chapter_key IS NULL;
+CREATE INDEX idx_chapter_needs_readable_at
+    ON chapter (source_series_id NULLS FIRST)
+    WHERE readable_at IS NULL;
+CREATE INDEX idx_chapter_ss_lang_pubdate
+    ON chapter(source_series_id NULLS FIRST, lang NULLS FIRST, published_at NULLS FIRST, created_at NULLS FIRST);
+CREATE INDEX idx_comment_media_gc ON comment_media(comment_id NULLS FIRST, created_at NULLS FIRST);
+CREATE INDEX idx_comment_media_user ON comment_media(user_id NULLS FIRST);
+CREATE INDEX idx_comments_parent ON comments(parent_id NULLS FIRST);
+CREATE INDEX idx_comments_target ON comments(target_type NULLS FIRST, target_id NULLS FIRST);
+CREATE INDEX idx_comments_user ON comments(user_id NULLS FIRST, created_at DESC NULLS LAST);
+CREATE INDEX idx_content_block_rule_user ON content_block_rule(user_id NULLS FIRST);
+CREATE INDEX idx_cover_source_backoff_retry
+    ON cover_source_backoff (retry_after NULLS FIRST);
+CREATE INDEX idx_feed_updates_latest
+    ON feed_updates (latest_at DESC NULLS LAST, work_id DESC NULLS LAST);
+CREATE INDEX idx_feed_updates_order ON feed_updates(is_nsfw NULLS FIRST, latest_at DESC NULLS LAST, work_id DESC NULLS LAST);
+CREATE INDEX idx_fsu_all_announce_order
+    ON feed_series_updates (announced_at DESC NULLS LAST, work_id DESC NULLS LAST);
+CREATE INDEX idx_fsu_announce_order
+    ON feed_series_updates (is_nsfw NULLS FIRST, announced_at DESC NULLS LAST, work_id DESC NULLS LAST);
+CREATE INDEX idx_fsu_type_all_announce_order
+    ON feed_series_updates (comic_type NULLS FIRST, announced_at DESC NULLS LAST, work_id DESC NULLS LAST);
+CREATE INDEX idx_fsu_type_announce_order
+    ON feed_series_updates (is_nsfw NULLS FIRST, comic_type NULLS FIRST, announced_at DESC NULLS LAST, work_id DESC NULLS LAST);
+CREATE INDEX idx_merge_candidate_source
+    ON merge_candidate(source_series_id NULLS FIRST);
+CREATE INDEX idx_merge_candidate_status ON merge_candidate(status NULLS FIRST);
+CREATE INDEX idx_merge_candidate_work
+    ON merge_candidate(candidate_work_id NULLS FIRST);
+CREATE INDEX idx_notifications_comment ON notifications(comment_id NULLS FIRST);
+CREATE UNIQUE INDEX idx_notifications_like_milestone
+    ON notifications (comment_id NULLS FIRST, count NULLS FIRST)
+    WHERE kind = 'like_milestone';
+CREATE INDEX idx_notifications_read_created
+    ON notifications(created_at NULLS FIRST, id NULLS FIRST) WHERE read_at IS NOT NULL;
+CREATE INDEX idx_notifications_unread ON notifications (user_id NULLS FIRST, read_at NULLS FIRST);
+CREATE INDEX idx_notifications_user ON notifications (user_id NULLS FIRST, created_at DESC NULLS LAST);
+CREATE INDEX idx_release_event_announced
+    ON release_event (work_id NULLS FIRST)
+    WHERE announce_at IS NOT NULL;
+CREATE INDEX idx_release_event_recent
+    ON release_event (first_seen_at DESC NULLS LAST);
+CREATE INDEX idx_report_kind_created ON report (kind NULLS FIRST, created_at DESC NULLS LAST);
+CREATE INDEX idx_report_status_created ON report (status NULLS FIRST, created_at DESC NULLS LAST);
+CREATE INDEX idx_reviews_user ON reviews(user_id NULLS FIRST);
+CREATE INDEX idx_scan_state_detected_series
+    ON series_scan_state(series_id NULLS FIRST)
+    WHERE last_new_chapter_at IS NOT NULL;
+CREATE INDEX idx_scan_state_new_chapter
+    ON series_scan_state(last_new_chapter_at DESC NULLS LAST)
+    WHERE last_new_chapter_at IS NOT NULL;
+CREATE INDEX idx_scan_state_next_scan
+    ON series_scan_state(next_scan_at NULLS FIRST);
+CREATE INDEX idx_scan_state_source_next
+    ON series_scan_state(source_id NULLS FIRST, next_scan_at NULLS FIRST);
+CREATE INDEX idx_series_view_bucket_hour ON series_view_bucket (hour_ts NULLS FIRST);
+CREATE INDEX idx_sessions_expires ON sessions(expires_at NULLS FIRST);
+CREATE INDEX idx_sessions_user ON sessions(user_id NULLS FIRST);
+CREATE INDEX idx_source_health_bucket_hour
+    ON source_health_bucket (hour_ts NULLS FIRST);
+CREATE INDEX idx_source_series_suwayomi_key
+    ON source_series(source_key NULLS FIRST, source_id NULLS FIRST) WHERE source_type = 'suwayomi';
+CREATE INDEX idx_source_series_suwayomi_nsfw
+    ON source_series(source_type NULLS FIRST, source_key NULLS FIRST, work_id NULLS FIRST);
+CREATE INDEX idx_source_series_type_created ON source_series(source_type NULLS FIRST, created_at NULLS FIRST);
+CREATE INDEX idx_source_series_work ON source_series(work_id NULLS FIRST);
+CREATE INDEX idx_suwayomi_chapter_manga ON suwayomi_chapter(manga_id NULLS FIRST);
+CREATE INDEX idx_suwayomi_cover_issue_last_seen
+    ON suwayomi_cover_issue (last_seen DESC NULLS LAST);
+CREATE INDEX idx_suwayomi_cover_issue_retry
+    ON suwayomi_cover_issue (retry_after NULLS FIRST);
+CREATE INDEX idx_suwayomi_progress_series ON suwayomi_progress(user_id NULLS FIRST, series_id NULLS FIRST);
+CREATE INDEX idx_suwayomi_series_latest_chapter
+    ON suwayomi_series(in_library NULLS FIRST, latest_chapter_at DESC NULLS LAST, id DESC NULLS LAST);
+CREATE INDEX idx_user_activity_user ON user_activity (user_id NULLS FIRST, created_at DESC NULLS LAST);
+CREATE INDEX idx_user_library_user ON user_library(user_id NULLS FIRST, created_at NULLS FIRST);
+CREATE INDEX idx_work_alias_match_key ON work_alias(match_key NULLS FIRST, work_id NULLS FIRST);
+CREATE INDEX idx_work_alias_norm ON work_alias(normalized_title NULLS FIRST);
+CREATE UNIQUE INDEX idx_work_alias_nulllang_unique
+    ON work_alias (work_id NULLS FIRST, normalized_title NULLS FIRST, raw_title NULLS FIRST)
+    WHERE lang IS NULL;
+CREATE INDEX idx_work_alias_token_token_work ON work_alias_token(token NULLS FIRST, work_id NULLS FIRST);
+CREATE INDEX idx_work_cover_issue_last_seen
+    ON work_cover_issue (last_seen DESC NULLS LAST);
+CREATE INDEX idx_work_cover_pending
+    ON work(cover_cached_version NULLS FIRST)
+    WHERE cover_cached_version IS NULL;
+CREATE INDEX idx_work_external_work ON work_external_id(work_id NULLS FIRST);
+CREATE INDEX idx_work_nsfw_flags
+    ON work(id NULLS FIRST, is_nsfw_override NULLS FIRST, is_nsfw NULLS FIRST);
+CREATE INDEX idx_work_redirect_new ON work_redirect (new_id NULLS FIRST);
+CREATE INDEX idx_work_stats_fetched ON work_stats(fetched_at NULLS FIRST);
+CREATE INDEX idx_work_tag_key_work ON work_tag(tag_key NULLS FIRST, work_id NULLS FIRST);
+CREATE INDEX idx_work_tag_tag ON work_tag(tag NULLS FIRST, work_id NULLS FIRST);
+CREATE INDEX idx_work_tag_work_key ON work_tag(work_id NULLS FIRST, tag_key NULLS FIRST);
+CREATE INDEX idx_work_tag_work_source ON work_tag(work_id NULLS FIRST, source NULLS FIRST);
+CREATE UNIQUE INDEX uq_source_ingest_running
+    ON source_ingest_job(source_id NULLS FIRST) WHERE state = 'running';
+CREATE UNIQUE INDEX uq_source_series_suwayomi_key
+    ON source_series(source_key NULLS FIRST) WHERE source_type = 'suwayomi';
+CREATE UNIQUE INDEX uq_source_series_unknown_key
+    ON source_series(source_type NULLS FIRST, source_key NULLS FIRST) WHERE source_id IS NULL;
+
+-- Replace four users_*_nocase guards with concurrency-safe unique indexes.
+-- Import MUST first prove no legacy ASCII-folded username/email collisions.
+CREATE UNIQUE INDEX users_username_ascii_unique ON users
+    (translate(username, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'));
+CREATE UNIQUE INDEX users_email_ascii_unique ON users
+    (translate(email, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'));
+
+-- BEFORE normalization avoids the intermediate empty-string unique-key conflict.
+CREATE FUNCTION source_series_normalize_source() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+BEGIN
+    NEW.source_id := NULLIF(NEW.source_id, '');
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER source_series_unknown_source_insert BEFORE INSERT ON source_series
+FOR EACH ROW EXECUTE FUNCTION source_series_normalize_source();
+CREATE TRIGGER source_series_unknown_source_update BEFORE UPDATE OF source_id ON source_series
+FOR EACH ROW EXECUTE FUNCTION source_series_normalize_source();
+
+-- SQLite CAST(text AS INTEGER) reads a signed decimal prefix, returns 0 for
+-- nonnumeric text, and saturates at the signed 64-bit bounds. Keep that pin behavior.
+CREATE FUNCTION sqlite_integer_pin(value text) RETURNS bigint
+LANGUAGE plpgsql IMMUTABLE STRICT SET search_path = pg_catalog, public AS $$
+DECLARE
+    digits text;
+    number numeric;
+BEGIN
+    digits := substring(value FROM E'^[ \t\n\r\f\013]*([+-]?[0-9]+)');
+    IF digits IS NULL THEN RETURN 0; END IF;
+    -- Strip leading zeros before numeric conversion; huge inputs must also saturate.
+    IF length(ltrim(ltrim(digits, '+-'), '0')) > 19 THEN
+        IF left(digits, 1) = '-' THEN RETURN '-9223372036854775808'::bigint; END IF;
+        RETURN '9223372036854775807'::bigint;
+    END IF;
+    digits := CASE WHEN left(digits, 1) = '-' THEN '-' ELSE '' END
+        || coalesce(nullif(ltrim(ltrim(digits, '+-'), '0'), ''), '0');
+    number := digits::numeric;
+    RETURN greatest('-9223372036854775808'::numeric,
+                    least('9223372036854775807'::numeric, number))::bigint;
+END;
+$$;
+
+-- SQLite printf('%g') uses six significant digits. The scanner restricts chapter
+-- numbers to [0, 5000]; preserve its label spelling including scientific tiny values.
+CREATE FUNCTION sqlite_general_number(value double precision) RETURNS text
+LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE SET search_path = pg_catalog, public AS $$
+DECLARE exponent integer; binary_exponent integer; encoded bytea; significand bigint;
+        exact_value numeric; rounded numeric; mantissa text; i integer;
+BEGIN
+    IF value IS NULL THEN RETURN NULL; END IF;
+    IF value = 0 THEN RETURN '0'; END IF;
+    IF value = 'Infinity'::double precision THEN RETURN 'Inf'; END IF;
+    IF value = '-Infinity'::double precision THEN RETURN '-Inf'; END IF;
+    IF value = 'NaN'::double precision THEN RETURN '0'; END IF;
+    -- A float8::numeric cast keeps a short decimal rendering and loses the side
+    -- of halfway boundaries. Decode IEEE 754 to an exact decimal before rounding.
+    encoded := float8send(value);
+    exponent := (get_byte(encoded, 0) & 127) * 16 + (get_byte(encoded, 1) >> 4);
+    significand := get_byte(encoded, 1) & 15;
+    FOR i IN 2..7 LOOP significand := significand * 256 + get_byte(encoded, i); END LOOP;
+    IF exponent = 0 THEN
+        binary_exponent := -1074;
+    ELSE
+        significand := significand + 4503599627370496;
+        binary_exponent := exponent - 1075;
+    END IF;
+    IF binary_exponent >= 0 THEN
+        exact_value := significand::numeric * power(2::numeric, binary_exponent);
+    ELSE
+        -- n / 2^k = (n * 5^k) * 10^-k. Parsing this exact decimal avoids
+        -- numeric division's implicit significant-digit limit.
+        exact_value := ((significand::numeric * power(5::numeric, -binary_exponent))::text
+                        || 'e-' || (-binary_exponent)::text)::numeric;
+    END IF;
+    IF get_byte(encoded, 0) >= 128 THEN exact_value := -exact_value; END IF;
+    exponent := floor(log(abs(exact_value)))::integer;
+    rounded := round(exact_value, 5 - exponent);
+    IF abs(rounded) >= 1000000 OR abs(rounded) < 0.0001 THEN
+        exponent := floor(log(abs(rounded)))::integer;
+        mantissa := (rounded / power(10::numeric, exponent))::text;
+        IF position('.' in mantissa) > 0 THEN mantissa := rtrim(rtrim(mantissa, '0'), '.'); END IF;
+        RETURN mantissa || 'e' || CASE WHEN exponent < 0 THEN '-' ELSE '+' END
+               || lpad(abs(exponent)::text, greatest(2, length(abs(exponent)::text)), '0');
+    END IF;
+    mantissa := rounded::text;
+    IF position('.' in mantissa) > 0 THEN mantissa := rtrim(rtrim(mantissa, '0'), '.'); END IF;
+    RETURN mantissa;
+END $$;
+
+-- Lock order REQUIRED for pin/unpin writers: work row first, then work_field_pin.
+-- Removing SELECT FOR UPDATE does not remove the source_value UPDATE lock.
+-- work_pin_artist: source attempt is recorded before NEW is restored to the pin.
+CREATE FUNCTION work_pin_artist_fn() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+DECLARE pin text;
+BEGIN
+    SELECT value INTO pin FROM work_field_pin
+      WHERE work_id = NEW.id AND field = 'artist' FOR UPDATE;
+    IF FOUND AND pin IS DISTINCT FROM NEW.artist THEN
+        UPDATE work_field_pin SET source_value = NEW.artist
+          WHERE work_id = NEW.id AND field = 'artist';
+        NEW.artist := pin;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER work_pin_artist BEFORE UPDATE OF artist ON work
+FOR EACH ROW EXECUTE FUNCTION work_pin_artist_fn();
+
+-- work_pin_author: source attempt is recorded before NEW is restored to the pin.
+CREATE FUNCTION work_pin_author_fn() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+DECLARE pin text;
+BEGIN
+    SELECT value INTO pin FROM work_field_pin
+      WHERE work_id = NEW.id AND field = 'author' FOR UPDATE;
+    IF FOUND AND pin IS DISTINCT FROM NEW.author THEN
+        UPDATE work_field_pin SET source_value = NEW.author
+          WHERE work_id = NEW.id AND field = 'author';
+        NEW.author := pin;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER work_pin_author BEFORE UPDATE OF author ON work
+FOR EACH ROW EXECUTE FUNCTION work_pin_author_fn();
+
+-- work_pin_content_rating: source attempt is recorded before NEW is restored to the pin.
+CREATE FUNCTION work_pin_content_rating_fn() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+DECLARE pin text;
+BEGIN
+    SELECT value INTO pin FROM work_field_pin
+      WHERE work_id = NEW.id AND field = 'content_rating' FOR UPDATE;
+    IF FOUND AND pin IS DISTINCT FROM NEW.content_rating THEN
+        UPDATE work_field_pin SET source_value = NEW.content_rating
+          WHERE work_id = NEW.id AND field = 'content_rating';
+        NEW.content_rating := pin;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER work_pin_content_rating BEFORE UPDATE OF content_rating ON work
+FOR EACH ROW EXECUTE FUNCTION work_pin_content_rating_fn();
+
+-- work_pin_demographic: source attempt is recorded before NEW is restored to the pin.
+CREATE FUNCTION work_pin_demographic_fn() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+DECLARE pin text;
+BEGIN
+    SELECT value INTO pin FROM work_field_pin
+      WHERE work_id = NEW.id AND field = 'demographic' FOR UPDATE;
+    IF FOUND AND pin IS DISTINCT FROM NEW.demographic THEN
+        UPDATE work_field_pin SET source_value = NEW.demographic
+          WHERE work_id = NEW.id AND field = 'demographic';
+        NEW.demographic := pin;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER work_pin_demographic BEFORE UPDATE OF demographic ON work
+FOR EACH ROW EXECUTE FUNCTION work_pin_demographic_fn();
+
+-- work_pin_original_language: source attempt is recorded before NEW is restored to the pin.
+CREATE FUNCTION work_pin_original_language_fn() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+DECLARE pin text;
+BEGIN
+    SELECT value INTO pin FROM work_field_pin
+      WHERE work_id = NEW.id AND field = 'original_language' FOR UPDATE;
+    IF FOUND AND pin IS DISTINCT FROM NEW.original_language THEN
+        UPDATE work_field_pin SET source_value = NEW.original_language
+          WHERE work_id = NEW.id AND field = 'original_language';
+        NEW.original_language := pin;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER work_pin_original_language BEFORE UPDATE OF original_language ON work
+FOR EACH ROW EXECUTE FUNCTION work_pin_original_language_fn();
+
+-- work_pin_status: source attempt is recorded before NEW is restored to the pin.
+CREATE FUNCTION work_pin_status_fn() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+DECLARE pin text;
+BEGIN
+    SELECT value INTO pin FROM work_field_pin
+      WHERE work_id = NEW.id AND field = 'status' FOR UPDATE;
+    IF FOUND AND pin IS DISTINCT FROM NEW.status THEN
+        UPDATE work_field_pin SET source_value = NEW.status
+          WHERE work_id = NEW.id AND field = 'status';
+        NEW.status := pin;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER work_pin_status BEFORE UPDATE OF status ON work
+FOR EACH ROW EXECUTE FUNCTION work_pin_status_fn();
+
+-- work_pin_year: source attempt is recorded before NEW is restored to the pin.
+CREATE FUNCTION work_pin_year_fn() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+DECLARE pin text;
+BEGIN
+    SELECT value INTO pin FROM work_field_pin
+      WHERE work_id = NEW.id AND field = 'year' FOR UPDATE;
+    IF FOUND AND sqlite_integer_pin(pin) IS DISTINCT FROM NEW.year THEN
+        UPDATE work_field_pin SET source_value = NEW.year::text
+          WHERE work_id = NEW.id AND field = 'year';
+        NEW.year := sqlite_integer_pin(pin);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER work_pin_year BEFORE UPDATE OF year ON work
+FOR EACH ROW EXECUTE FUNCTION work_pin_year_fn();
+
+-- C5: folded RAW alias/effective-title text for both word and typo search.
+-- Rust-normalized work_alias.normalized_title remains available for ranking.
+CREATE FUNCTION search_fold(value text) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+SET search_path = pg_catalog, public AS $$
+    SELECT trim(regexp_replace(
+        lower(normalize(regexp_replace(normalize(value, NFKD),
+            U&'[\0300-\036F]+', '', 'g'), NFC)),
+        '[^[:alnum:]]+', ' ', 'g'));
+$$;
+
+-- Input MUST already be search_fold(text); query-side uses the same fold then key.
+-- Four MD5 hex digits per non-ASCII character: scrambled, deterministic, 16-bit.
+-- Collisions are possible; this is a fuzzy candidate key, never exact identity.
+CREATE FUNCTION search_trigram_key(value text) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+SET search_path = pg_catalog, public AS $$
+    SELECT CASE WHEN value !~ '[^a-z0-9 ]' THEN value ELSE
+        (SELECT coalesce(string_agg(
+            CASE WHEN ch ~ '^[a-z0-9 ]$' THEN ch ELSE substr(md5(ch), 1, 4) END,
+            '' ORDER BY ord), '')
+         FROM regexp_split_to_table(value, '') WITH ORDINALITY AS t(ch, ord))
+    END;
+$$;
+
+-- Trigram similarity is only a candidate probe: recheck bounded folded words.
+-- Optimal string alignment allows adjacent transpositions. One edit for words
+-- of at most five characters, two for longer words, and at most 256 characters.
+-- O(n) memory; complete folded strings remain the exact/prefix identity domain.
+CREATE FUNCTION search_typo_close(query_word text, candidate_word text) RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE
+SET search_path = pg_catalog, public AS $$
+DECLARE
+    m integer := length(query_word);
+    n integer := length(candidate_word);
+    budget integer := CASE WHEN least(m, n) <= 5 THEN 1 ELSE 2 END;
+    prevprev integer[];
+    prev integer[];
+    curr integer[];
+    i integer;
+    j integer;
+    cost integer;
+BEGIN
+    IF m = 0 OR n = 0 OR m > 256 OR n > 256 OR abs(m - n) > budget THEN
+        RETURN false;
+    END IF;
+    IF query_word = candidate_word THEN RETURN true; END IF;
+    prev := array_fill(0, ARRAY[n + 1], ARRAY[0]);
+    FOR j IN 0..n LOOP prev[j] := j; END LOOP;
+    prevprev := prev;
+    FOR i IN 1..m LOOP
+        curr := array_fill(0, ARRAY[n + 1], ARRAY[0]);
+        curr[0] := i;
+        FOR j IN 1..n LOOP
+            cost := CASE WHEN substr(query_word, i, 1) = substr(candidate_word, j, 1) THEN 0 ELSE 1 END;
+            curr[j] := least(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+            IF i > 1 AND j > 1
+                AND substr(query_word, i, 1) = substr(candidate_word, j - 1, 1)
+                AND substr(query_word, i - 1, 1) = substr(candidate_word, j, 1) THEN
+                curr[j] := least(curr[j], prevprev[j - 2] + 1);
+            END IF;
+        END LOOP;
+        prevprev := prev;
+        prev := curr;
+    END LOOP;
+    RETURN prev[n] <= budget;
+END;
+$$;
+
+-- Probe the ASCII KEY, never libc's classification of raw Unicode for pg_trgm.
+DO $$
+BEGIN
+    IF public.show_trgm(public.search_trigram_key(public.search_fold('リゼロ'))) = '{}'::text[]
+        OR public.show_trgm(public.search_trigram_key(public.search_fold('Привет'))) = '{}'::text[]
+        OR public.show_trgm(public.search_trigram_key(public.search_fold('한국어'))) = '{}'::text[]
+        OR public.show_trgm(public.search_trigram_key(public.search_fold('Ō'))) = '{}'::text[]
+        OR public.search_trigram_key(public.search_fold('リゼロ okami'))
+            IS DISTINCT FROM 'fca05ad7d889 okami' THEN
+        RAISE EXCEPTION 'ASCII search trigram key probe failed';
+    END IF;
+END;
+$$;
+
+CREATE TABLE work_search_alias (
+    id text NOT NULL,
+    work_id text NOT NULL,
+    normalized_title text NOT NULL,
+    raw_title text NOT NULL,
+    kind text NOT NULL,
+    trigram_key text GENERATED ALWAYS AS (search_trigram_key(normalized_title)) STORED,
+    doc tsvector GENERATED ALWAYS AS (to_tsvector('pg_catalog.simple'::regconfig, normalized_title)) STORED,
+    CONSTRAINT work_search_alias_pkey PRIMARY KEY (id),
+    CONSTRAINT work_search_alias_kind_check CHECK (kind IN ('alias', 'title')),
+    CONSTRAINT work_search_alias_work_fk FOREIGN KEY (work_id) REFERENCES work(id)
+        ON DELETE CASCADE ON UPDATE NO ACTION
+);
+CREATE INDEX work_search_alias_doc_gin ON work_search_alias USING gin (doc);
+CREATE INDEX work_search_alias_trgm_gin ON work_search_alias USING gin (trigram_key gin_trgm_ops);
+CREATE INDEX work_search_alias_work_idx ON work_search_alias (work_id);
+-- At most 1024 UTF8 bytes. Exact queries MUST recheck the complete folded value.
+-- Prefix queries longer than 256 characters use this candidate key then recheck.
+CREATE INDEX work_search_alias_exact_idx ON work_search_alias (left(normalized_title, 256));
+
+CREATE FUNCTION work_search_alias_sync() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+DECLARE folded text;
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.id IS NOT DISTINCT FROM NEW.id
+            AND OLD.work_id IS NOT DISTINCT FROM NEW.work_id
+            AND OLD.raw_title IS NOT DISTINCT FROM NEW.raw_title THEN
+            RETURN NULL;
+        END IF;
+    END IF;
+    IF TG_OP <> 'INSERT' THEN
+        DELETE FROM work_search_alias WHERE id = 'alias:' || OLD.id;
+    END IF;
+    IF TG_OP <> 'DELETE' THEN
+        folded := search_fold(NEW.raw_title);
+        IF folded <> '' THEN
+            INSERT INTO work_search_alias (id, work_id, normalized_title, raw_title, kind)
+              VALUES ('alias:' || NEW.id, NEW.work_id, folded, NEW.raw_title, 'alias');
+        END IF;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+CREATE TRIGGER work_search_alias_sync AFTER INSERT OR UPDATE OR DELETE ON work_alias
+FOR EACH ROW EXECUTE FUNCTION work_search_alias_sync();
+
+CREATE FUNCTION work_search_title_sync() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+DECLARE folded text;
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.id IS NOT DISTINCT FROM NEW.id
+            AND COALESCE(OLD.title_override, OLD.primary_title)
+                IS NOT DISTINCT FROM COALESCE(NEW.title_override, NEW.primary_title) THEN
+            RETURN NULL;
+        END IF;
+        DELETE FROM work_search_alias WHERE id = 'title:' || OLD.id;
+    END IF;
+    folded := search_fold(COALESCE(NEW.title_override, NEW.primary_title));
+    IF folded <> '' THEN
+        INSERT INTO work_search_alias (id, work_id, normalized_title, raw_title, kind)
+          VALUES ('title:' || NEW.id, NEW.id, folded,
+            COALESCE(NEW.title_override, NEW.primary_title), 'title');
+    END IF;
+    RETURN NULL;
+END;
+$$;
+CREATE TRIGGER work_search_title_sync AFTER INSERT OR UPDATE OF id, primary_title, title_override ON work
+FOR EACH ROW EXECUTE FUNCTION work_search_title_sync();
+
+CREATE FUNCTION work_search_alias_truncate() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+BEGIN
+    DELETE FROM work_search_alias WHERE kind = 'alias';
+    RETURN NULL;
+END;
+$$;
+CREATE TRIGGER work_search_alias_truncate AFTER TRUNCATE ON work_alias
+FOR EACH STATEMENT EXECUTE FUNCTION work_search_alias_truncate();
+
+-- Importer recovery: caller owns transaction; SHARE locks exclude base writers.
+CREATE FUNCTION rebuild_work_search_alias() RETURNS void
+LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+BEGIN
+    LOCK TABLE work, work_alias IN SHARE MODE;
+    DELETE FROM work_search_alias;
+    -- Fold once per source row; generated key/doc run once per inserted row.
+    -- Two set-based INSERTs avoid row-trigger dispatch during importer rebuild.
+    WITH folded AS MATERIALIZED (
+        SELECT id, work_id, raw_title, search_fold(raw_title) AS value FROM work_alias
+    )
+    INSERT INTO work_search_alias (id, work_id, normalized_title, raw_title, kind)
+      SELECT 'alias:' || id, work_id, value, raw_title, 'alias'
+        FROM folded WHERE value <> '';
+    WITH folded AS MATERIALIZED (
+        SELECT id, COALESCE(title_override, primary_title) AS raw_title,
+            search_fold(COALESCE(title_override, primary_title)) AS value FROM work
+    )
+    INSERT INTO work_search_alias (id, work_id, normalized_title, raw_title, kind)
+      SELECT 'title:' || id, id, value, raw_title, 'title'
+        FROM folded WHERE value <> '';
+END;
+$$;

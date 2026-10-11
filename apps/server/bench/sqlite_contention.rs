@@ -38,7 +38,7 @@ mod sqlite_writer_benchmark {
             VALUES ('sqlite-local-benchmark','sqlite_local_benchmark','sqlite-local-benchmark@example.invalid','unused',0,'2026-10-08T00:00:00Z')")
             .execute(pool).await.unwrap();
         sqlx::query(
-            "INSERT OR REPLACE INTO sessions(token,user_id,created_at,expires_at) VALUES (?, \
+            "INSERT OR REPLACE INTO sessions(token,user_id,created_at,expires_at) VALUES ($1, \
             'sqlite-local-benchmark','2026-10-08T00:00:00Z','2999-01-01T00:00:00Z')",
         )
         .bind(crate::auth::hash_token(token))
@@ -47,7 +47,7 @@ mod sqlite_writer_benchmark {
         .unwrap();
         let state = Arc::new(AppState {
             pool: pool.clone(),
-            cover_pool: pool.clone(),
+            cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:").await.unwrap(),
             suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
             mangadex: Arc::new(crate::mangadex::MangaDexClient::new(
                 "sqlite-local-benchmark",

@@ -11,9 +11,11 @@
 #                  chapters, page images). Bootstrapped with MangaDex + repos.
 #   flaresolverr — Cloudflare-challenge solver; Suwayomi routes protected sources
 #                  through it (enabled by bootstrap.sh). Internal-only.
-#   server       — komika-server (axum + async-graphql + SQLite): federates
+#   server       — komika-server (axum + async-graphql + PostgreSQL): federates
 #                  suwayomi, adds accounts + social + admin, and runs the adaptive
 #                  scan scheduler that keeps the library auto-updated.
+#   postgres     — main database, SCRAM application role, pgBackRest WAL archive.
+#   postgres-backup — serial UTC full/incremental/check scheduler.
 #   reader       — static SvelteKit SPA (nginx), pointed at the server.
 #
 # Public wiring: GraphQL federation stays on the internal network
@@ -108,7 +110,7 @@ services:
     # render could have made the kernel pick an OOM victim out of an unrelated
     # stack on this box (clubsite-db / torchy-db). Measured idle RSS is ~12 MiB;
     # 2g is far above any legitimate single-challenge solve while still bounding
-    # a runaway. Ceilings across the stack: 8g + 6g + 2g = 16g of 23.4 GiB.
+    # a runaway. Ceilings across the stack: 8g + 4g + 2g + 4g + 512m = 18.5 GiB of about 23 GiB.
     mem_limit: 2g
     logging:
       driver: json-file
@@ -133,56 +135,106 @@ services:
       retries: 5
       start_period: 30s
 
+  postgres:
+    build:
+      context: ./postgres
+    image: komika-postgres:18.6-pgbackrest-2.59
+    init: true
+    restart: unless-stopped
+    # Fast shutdown plus pgBackRest's 180-second archive wait.
+    stop_grace_period: 240s
+    mem_limit: 4g
+    memswap_limit: 4g
+    shm_size: 1g
+    logging:
+      driver: json-file
+      options: { max-size: 20m, max-file: '5' }
+    environment: &postgres-environment
+      PGDATA: /var/lib/postgresql/18/docker
+      KOMIKA_POSTGRES_PASSWORD: ${KOMIKA_POSTGRES_PASSWORD:?set a URI-safe PostgreSQL password in deploy/.env}
+      KOMIKA_PG_INIT_NEW: ${KOMIKA_PG_INIT_NEW:-0}
+      KOMIKA_PG_ALLOWED_CIDRS: ${KOMIKA_PG_ALLOWED_CIDRS:-172.21.0.0/16,fd00:21::/64}
+      KOMIKA_R2_ENDPOINT: ${KOMIKA_R2_ENDPOINT:-}
+      KOMIKA_R2_BUCKET: ${KOMIKA_R2_BUCKET:-}
+      KOMIKA_R2_PREFIX: ${KOMIKA_R2_PREFIX:-}
+      KOMIKA_R2_KEY: ${KOMIKA_R2_KEY:-}
+      KOMIKA_R2_SECRET: ${KOMIKA_R2_SECRET:-}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - postgres-socket:/var/run/postgresql
+    # Secrets are generated as postgres-owned 0600 files, never on PGDATA.
+    tmpfs:
+      - /run/komika:mode=0700
+    # No published port. HBA uses validated KOMIKA_PG_ALLOWED_CIDRS.
+    networks: [komika]
+    healthcheck:
+      test: ['CMD', '/opt/komika-postgres/health.sh']
+      interval: 20s
+      timeout: 5s
+      retries: 8
+      start_period: 120s
+
+  postgres-backup:
+    build:
+      context: ./postgres
+    image: komika-postgres:18.6-pgbackrest-2.59
+    command: [scheduler]
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 240s
+    mem_limit: 512m
+    memswap_limit: 512m
+    logging:
+      driver: json-file
+      options: { max-size: 20m, max-file: '5' }
+    environment: *postgres-environment
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - postgres-socket:/var/run/postgresql
+    tmpfs:
+      - /run/komika:mode=0700
+    networks: [komika]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'python3', '/opt/komika-postgres/hosted.py', 'health']
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10m
+
   server:
     build:
       context: ..
       dockerfile: deploy/server.Dockerfile
     restart: unless-stopped
-    # Bounded application drain (20s), then time for Litestream's final sync.
+    # Application drain is bounded at 20 seconds.
     stop_grace_period: 30s
-    # Measured baseline (cgroup v2 memory.stat, steady state at 42h uptime):
-    # memory.current 2.14 GiB = 1.73 GiB anon + 0.38 GiB file. Only the ANON part
-    # is unreclaimable, so 6g is ~3.2x the number that can actually OOM us.
-    #
-    # Sized against the 1.5 GiB `mmap_size` the main pool now takes (db.rs). Under
-    # cgroup v2, mmap'd file pages ARE charged to this cgroup — they show up in
-    # memory.stat `file` / `file_mapped` and count toward memory.max. They are not
-    # a hazard here, for three reasons:
-    #   1. It is address space, not an allocation. mmap_size is a ceiling; only
-    #      pages actually touched become resident.
-    #   2. 8 pool connections x 1.5 GiB is NOT 12 GiB. They map the SAME file, so
-    #      the page cache is shared and the charge is bounded by the file itself
-    #      (komika.sqlite3 = 1.28 GiB). The covers pool adds <=256 MiB, likewise
-    #      shared across its 4 connections.
-    #   3. SQLite maps the DB read-only (writes still go through pwrite), so those
-    #      pages are always CLEAN. On hitting memory.max the kernel unmaps and
-    #      evicts them rather than invoking the OOM killer.
-    # Worst case therefore lands near 1.9 GiB anon + ~1.5 GiB mapped file = 3.4
-    # GiB, against a 6 GiB cap.
-    #
-    # Expect `memory.current` to sit much closer to 6g than it does today: page
-    # cache grows to fill whatever headroom a cgroup has. That is normal, not a
-    # leak. `docker stats` subtracts inactive_file, so watch that, or watch
-    # memory.stat `anon`, not memory.current.
-    #
-    # The point of the limit is to stop a runaway from letting the kernel choose
-    # an OOM victim out of an unrelated stack on this host, not to squeeze a
-    # healthy process.
-    mem_limit: 6g
+    # Main data now lives in PostgreSQL; only the <=256 MiB covers SQLite map
+    # remains here. 4 GiB replaces the SQLite build's 6 GiB ceiling. It is the
+    # limit for serving, not for the one-time SQLite import: the import's work
+    # copy must stay in this container's page cache, and a 3.2 GB source under
+    # a 3 GiB limit made the repair stage take 75 minutes instead of 5 to 6
+    # (2026-10-13). The hosted cutover starts the import from an override with
+    # 8 GiB (postgres/CUTOVER.md, "The memory of the import"). Still to
+    # confirm for serving: this reduction under realistic scanner/search load.
+    mem_limit: 4g
     logging:
       driver: json-file
       options: { max-size: 20m, max-file: '5' }
     environment:
       PORT: '8080'
-      DATABASE_URL: sqlite:///data/komika.sqlite3
+      DATABASE_URL: postgres://komika:${KOMIKA_POSTGRES_PASSWORD:?set a URI-safe PostgreSQL password in deploy/.env}@postgres:5432/komika
+      COVERS_DATABASE_URL: sqlite:///data/covers.sqlite3
+      KOMIKA_SQLITE_IMPORT_PATH: /data/komika.sqlite3
       # Port for the /metrics scrape endpoint. It is served on a SEPARATE listener
       # bound to 127.0.0.1 INSIDE the container (never on the public router), and
       # the publish below maps it to the HOST loopback only — so the endpoint is
       # reachable for scraping but not off-host. Default 9090; keep this in sync
       # with the publish line under `ports:` if you change it.
       KOMIKA_METRICS_PORT: ${KOMIKA_METRICS_PORT:-9090}
-      # User avatars are stored as BLOBs in the SQLite DB, so they are
-      # Litestream-replicated with it and any replica can serve any avatar.
+      # User avatars are PostgreSQL bytea and are included in pgBackRest backups.
       SUWAYOMI_URL: http://suwayomi:4567
       EXTENSION_AUTO_UPDATE_INTERVAL_SECONDS: ${EXTENSION_AUTO_UPDATE_INTERVAL_SECONDS:-21600}
       # Public base for the Suwayomi cover/page image URLs handed to the browser.
@@ -261,13 +313,6 @@ services:
       FEED_RECONCILE_INTERVAL_SECS: ${FEED_RECONCILE_INTERVAL_SECS:-86400}
       COVER_PHASH: ${COVER_PHASH:-off}
       RUST_LOG: komika_server=info,tower_http=warn
-      # Continuous backup (Litestream → S3-compatible; Cloudflare R2 reference).
-      # Blank = run without backup. For R2 set LITESTREAM_REGION=auto.
-      LITESTREAM_BUCKET: ${LITESTREAM_BUCKET:-}
-      LITESTREAM_ENDPOINT: ${LITESTREAM_ENDPOINT:-}
-      LITESTREAM_REGION: ${LITESTREAM_REGION:-auto}
-      LITESTREAM_ACCESS_KEY_ID: ${LITESTREAM_ACCESS_KEY_ID:-}
-      LITESTREAM_SECRET_ACCESS_KEY: ${LITESTREAM_SECRET_ACCESS_KEY:-}
     volumes:
       - server-data:/data
     ports:
@@ -311,12 +356,14 @@ services:
       # publish — scrape with curl http://127.0.0.1:${KOMIKA_METRICS_PORT:-9090}/metrics.
       - '127.0.0.1:${KOMIKA_METRICS_PORT:-9090}:9090'
     depends_on:
+      postgres:
+        condition: service_healthy
       suwayomi:
         condition: service_healthy
     networks: [komika]
     healthcheck:
       # READINESS, not liveness. `/health` is `async fn health() -> "ok"`: it
-      # only proves the listener accepts a connection, so a wedged SQLite pool
+      # only proves the listener accepts a connection, so a wedged PostgreSQL pool
       # would report healthy forever. `/health/ready` runs `SELECT 1` against
       # the pool. Measured live: HTTP 200 in ~0.6 ms.
       #
@@ -408,3 +455,5 @@ networks:
 volumes:
   suwayomi-data:
   server-data:
+  postgres-data:
+  postgres-socket:

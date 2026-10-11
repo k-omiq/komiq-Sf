@@ -7,7 +7,7 @@ use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
 /// A persisted user (row from `users`).
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct User {
     pub id: String,
     pub username: String,
@@ -20,6 +20,22 @@ pub struct User {
     /// Set while the account holds a temporary password (`createUser`,
     /// `resetUserPassword`); cleared by `changePassword`.
     pub must_change_password: i64,
+}
+
+impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for User {
+    fn from_row(row: &sqlx::postgres::PgRow) -> sqlx::Result<Self> {
+        use crate::db_types::Row;
+        Ok(Self {
+            id: row.try_get("id")?,
+            username: row.try_get("username")?,
+            email: row.try_get("email")?,
+            password_hash: row.try_get("password_hash")?,
+            avatar_url: row.try_get("avatar_url")?,
+            is_admin: row.try_get("is_admin")?,
+            is_banned: row.try_get("is_banned")?,
+            must_change_password: row.try_get("must_change_password")?,
+        })
+    }
 }
 
 /// Argon2id parameters pinned by the 2026-09 security review: 64 MiB memory,
@@ -73,13 +89,11 @@ pub fn hash_token(token: &str) -> String {
     hex::encode(digest)
 }
 
-/// Format a UTC instant as a fixed-width, lexically-sortable timestamp
-/// (`YYYY-MM-DDTHH:MM:SSZ`). Session `expires_at` values and the comparison
-/// bound both use this, so a plain string comparison agrees with chronological
-/// order — unlike `to_rfc3339()`, whose optional `+00:00` offset and variable
-/// fractional-second width make lexical comparison unsafe.
+/// Preserve the existing whole-second session clock while using C10 spelling.
+/// PostgreSQL compares the resulting native instants, independently of spelling.
 pub fn format_ts(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    use chrono::Timelike;
+    crate::db_types::format_date(t.with_nanosecond(0).unwrap())
 }
 
 /// Resolve the user a session token may ACT as: [`session_user_for_token`], minus
@@ -97,7 +111,7 @@ pub async fn user_for_token(pool: &Database, token: &str) -> Result<Option<User>
 /// that must change their password first: only the session query and
 /// `changePassword` want those; everything else calls [`user_for_token`].
 pub async fn session_user_for_token(pool: &Database, token: &str) -> Result<Option<User>> {
-    let now = format_ts(Utc::now());
+    let now = crate::db_types::date(&format_ts(Utc::now()))?;
     // The column stores `sha256(token)` (hex), never the raw token — hash the
     // presented token the same way before looking it up.
     let token_hash = hash_token(token);
@@ -105,10 +119,10 @@ pub async fn session_user_for_token(pool: &Database, token: &str) -> Result<Opti
         "SELECT u.id, u.username, u.email, u.password_hash, u.avatar_url, u.is_admin, u.is_banned, \
                 u.must_change_password \
          FROM sessions s JOIN users u ON u.id = s.user_id \
-         WHERE s.token = ? AND u.is_banned = 0 AND s.expires_at > ?",
+         WHERE s.token = $1 AND u.is_banned = FALSE AND s.expires_at > $2",
     )
     .bind(&token_hash)
-    .bind(&now)
+    .bind(now)
     .fetch_optional(pool)
     .await?;
     Ok(user)
@@ -120,9 +134,7 @@ mod tests {
 
     #[tokio::test]
     async fn username_guard_closes_races_without_merging_legacy_accounts() {
-        let pool = crate::database::TestPoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
+        let pool = crate::sqlite_database::SqliteDatabase::connect("sqlite::memory:")
             .await
             .unwrap();
         sqlx::raw_sql("CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT UNIQUE); INSERT INTO users VALUES ('legacy-a', 'Alice'), ('legacy-b', 'ALICE');")
@@ -145,13 +157,13 @@ mod tests {
             .await
             .is_err());
         assert!(
-            sqlx::query("UPDATE users SET username = 'Alice' WHERE id = 'legacy-a'")
+            sqlx::query(r#"UPDATE users SET username = 'Alice' WHERE id = 'legacy-a'"#)
                 .execute(&pool)
                 .await
                 .is_ok()
         );
         assert!(
-            sqlx::query("UPDATE users SET username = 'bob' WHERE id = 'legacy-a'")
+            sqlx::query(r#"UPDATE users SET username = 'bob' WHERE id = 'legacy-a'"#)
                 .execute(&pool)
                 .await
                 .is_err()
@@ -236,13 +248,13 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, created_at) \
-             VALUES ('u1', 'alice', 'a@e', 'h', 't')",
+             VALUES ('00000000-0000-4000-8000-000000000001', 'alice', 'a@e', 'h', '2020-01-01T00:00:00Z')",
         )
         .execute(&pool)
         .await
@@ -252,7 +264,7 @@ mod tests {
         let tok = generate_token();
         sqlx::query(
             "INSERT INTO sessions (token, user_id, created_at, expires_at) \
-             VALUES (?, 'u1', '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
+             VALUES ($1, '00000000-0000-4000-8000-000000000001', '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
         )
         .bind(hash_token(&tok))
         .execute(&pool)
@@ -264,22 +276,25 @@ mod tests {
             .await
             .unwrap()
             .expect("resolves");
-        assert_eq!(user.id, "u1");
+        assert_eq!(user.id, "00000000-0000-4000-8000-000000000001");
 
         // The stored column is the HASH, not the raw token.
-        let stored: String = sqlx::query_scalar("SELECT token FROM sessions WHERE user_id = 'u1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let stored: String = crate::db_types::query_scalar(
+            "SELECT token FROM sessions WHERE user_id = '00000000-0000-4000-8000-000000000001'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_ne!(stored, tok, "raw token must never be persisted");
         assert_eq!(stored, hash_token(&tok));
 
         // A raw-token lookup (i.e. querying by the plaintext directly) finds nothing.
-        let none: Option<String> = sqlx::query_scalar("SELECT token FROM sessions WHERE token = ?")
-            .bind(&tok)
-            .fetch_optional(&pool)
-            .await
-            .unwrap();
+        let none: Option<String> =
+            crate::db_types::query_scalar("SELECT token FROM sessions WHERE token = $1")
+                .bind(&tok)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
         assert!(none.is_none(), "plaintext token is not in the table");
     }
 }

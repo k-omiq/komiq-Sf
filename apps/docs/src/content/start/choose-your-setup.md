@@ -15,13 +15,13 @@ The global server is a shared testing environment. You cannot add custom private
 
 ## Run the admin app on your computer
 
-Use the admin desktop app on macOS, Windows, or Linux to run your own server without Docker. It bundles the komiq server and Suwayomi source engine as background processes. Suwayomi is the engine that connects to sources through extensions.
+Use the admin desktop app on macOS, Windows, or Linux to run your own server without Docker. It bundles PostgreSQL, the komiq server and Suwayomi source engine as background processes. Suwayomi is the engine that connects to sources through extensions.
 
 When you launch the admin app, it starts these components automatically. It retrieves the initial setup code from the server and opens the setup wizard with the code filled in.
 
 Application data stays in your operating system's user application folder:
 
-- Server data and user accounts live in `server/komika.sqlite3`. Cover images live in `server/covers.sqlite3`.
+- PostgreSQL holds server data and user accounts. Cover images live in the separate `server/covers.sqlite3` cache. Old SQLite installations convert automatically at the first start after the update. The server verifies the copy first, then keeps the original file under a new name and never deletes it.
 - Source engine files and installed extensions live in `suwayomi/`.
 
 ### For this computer
@@ -32,18 +32,19 @@ The server listens locally at `127.0.0.1`, on port `7580` by default. Use this o
 
 Turn on **Allow other devices** in the admin app to read from phones, tablets, and other computers on your home network. Those devices connect to the computer running the server.
 
-Follow [Run the desktop app](/self-host/desktop-app) and [Connect other devices](/self-host/other-devices).
+Follow [Run it on your computer](/self-host/desktop-app) and [Connect your devices](/self-host/other-devices).
 
 ## Run the admin app with Docker
 
 Use Docker on a home server, network-attached storage (NAS), or a virtual private server (VPS) if you want a server that runs continuously in the background.
 
-Docker Compose runs two containers:
+Docker Compose runs three containers:
 
+- `postgres`: the private accounts, library and catalogue database.
 - `server`: the komiq server, embedded reader, and admin console.
 - `suwayomi`: the source engine that manages extensions and source connections.
 
-Your accounts, libraries, reading history, and extensions persist across updates in two volumes: `komiq_server-data` and `komiq_engine-data`. The setup needs Docker Engine and 2 GB of memory to run. One script, `deploy/selfhost/install.sh`, checks your machine, starts both containers and runs setup in the terminal.
+Your accounts, libraries, reading history, and extensions persist across updates in three volumes: `komiq_postgres-data`, `komiq_server-data` and `komiq_engine-data`. One script, `deploy/selfhost/install.sh`, checks your machine, generates a private database password, starts PostgreSQL before the server and runs setup in the terminal. Updates from SQLite convert the old database automatically. Use PostgreSQL dumps to back up your accounts and library.
 
 Devices on your local network can open `http://192.168.1.20:8080` in a browser or enter `192.168.1.20:8080` in the native reader app. Replace the example with your server's address. See [Install with Docker](/self-host/docker).
 
@@ -55,7 +56,7 @@ The admin setup wizard and **Settings › Access** support Cloudflare setup. A t
 
 Without a domain, readers type your server's public address, such as `203.0.113.5`. This needs no Cloudflare account, and it suits a cloud VPS. The connection is HTTPS: your server gets a free certificate for the address and renews it by itself.
 
-Follow [Internet access](/self-host/internet-access) for setup. Connect the reader app with your domain or address, a pasted link, or the admin app's QR code on a phone.
+Follow [Reach it from the internet](/self-host/internet-access) for setup. Connect the reader app with your domain or address, a pasted link, or the admin app's QR code on a phone.
 
 ## Setup comparison
 
@@ -64,8 +65,12 @@ Follow [Internet access](/self-host/internet-access) for setup. Connect the read
 | Global server                    | Only reading or trying komiq    | Browser only                  | Global server                  |
 | Admin desktop app, this computer | Reading on one computer         | macOS, Windows, or Linux      | User application folder        |
 | Admin desktop app, local network | Reading across home devices     | **Allow other devices**       | User application folder        |
-| Admin app with Docker            | An always-on home server or VPS | Docker Engine, 2 GB memory    | Persistent Docker volumes      |
+| Admin app with Docker            | An always-on home server or VPS | Docker Engine and Compose     | Persistent Docker volumes      |
 | Internet access for your server  | Reading away from home          | A domain, or a public address | Your server's existing storage |
+
+## Status
+
+Desktop installer validation is planned. While it runs, the desktop app saves a PostgreSQL dump when the newest is at least 20 hours old and keeps seven. Keep copies outside the application data folder to protect against loss of this computer.
 
 ## Next steps
 

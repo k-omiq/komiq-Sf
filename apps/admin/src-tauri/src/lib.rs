@@ -9,9 +9,11 @@ use std::sync::{Arc, OnceLock};
 use tauri::{Manager, State};
 
 mod firewall;
-mod local;
-mod logbuf;
+pub mod import;
+pub mod local;
+pub mod logbuf;
 mod network;
+pub mod postgres;
 
 // The engine supervisor is the reader's own (apps/reader/src-tauri/src/suwayomi.rs),
 // compiled into this crate rather than copied: same jar pin, JRE layout, server.conf,
@@ -66,6 +68,14 @@ impl local::Engine for BundledEngine {
     {
       self.started.store(false, Ordering::SeqCst);
     }
+  }
+
+  fn stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    Box::pin(async move {
+      if self.started.load(Ordering::SeqCst) {
+        self.sup.stop_and_wait().await;
+      }
+    })
   }
 
   fn state(&self) -> local::EngineState {
@@ -180,7 +190,7 @@ pub fn run() {
     .setup(move |app| {
       let data_dir = app.path().app_data_dir()?;
       // Children die with the app, even a force-killed one (see child.rs).
-      child::init(&data_dir);
+      // The local supervisor acquires the app-data OS lock before child::init.
       suwayomi::set_child_hooks(suwayomi::ChildHooks {
         before_spawn: child::before_spawn,
         after_spawn: child::after_spawn,
@@ -201,6 +211,7 @@ pub fn run() {
         bin: local::server_bin(),
         web_dir: web_dir(app),
         data_dir: data_dir.join("server"),
+        postgres_runtime: Some(postgres::resolve(&app.path().resource_dir()?)),
       };
       let server = local::LocalServer::new(launch, engine, engine_log.clone(), true);
       server.server_log.add_secret(suwayomi::engine_password());
@@ -219,8 +230,8 @@ pub fn run() {
     .build(tauri::generate_context!())
     .expect("error while building tauri application");
 
-  // Quit: stop the server first (it holds the database), then the engine. block_on is
-  // safe here, the run callback is on the main thread. kill_on_drop on both children is
+  // Quit: stop dumps and server, then engine, then database. block_on is
+  // safe here, the run callback is on the main thread. kill_on_drop on children is
   // the backstop; child.rs covers a force-kill, which never gets here.
   app.run(|handle, event| {
     if let tauri::RunEvent::Exit = event {

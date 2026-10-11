@@ -12,6 +12,7 @@
 
 use std::time::Duration;
 
+use crate::database::SqliteDatabase;
 use crate::db::Database;
 
 /// Staged (unlinked) uploads older than this are swept. A user posting a comment
@@ -28,8 +29,38 @@ const NOTIFICATION_DELETE_BUDGET: u64 = 1024;
 /// How often the sweep runs.
 const SWEEP_INTERVAL_SECS: u64 = 3600;
 
+/// Staged comment media past the TTL (T095). The rows are chosen and locked by the
+/// subquery in primary-key order, and a row another transaction holds is skipped, not
+/// waited for: `postComment` locks a staged row while it links it to a comment, and a
+/// sweep that waited there could close a lock cycle with it. A skipped row is still
+/// staged and still old at the next hourly sweep, or it has been linked and is no
+/// longer a candidate. `$1` is the cutoff.
+const STAGED_MEDIA_SWEEP_SQL: &str = "DELETE FROM comment_media WHERE id IN \
+     (SELECT id FROM comment_media WHERE comment_id IS NULL AND created_at < $1 \
+      ORDER BY id FOR UPDATE SKIP LOCKED)";
+
+/// One batch of read notifications past the TTL (T096).
+///
+/// The batch is CHOSEN oldest first through the partial index
+/// `idx_notifications_read_created` (innermost query, no lock, no sort). Its rows are
+/// then LOCKED in primary-key order, the order `markNotificationsRead` and
+/// `deleteComment` lock notifications in, and a row another transaction holds is
+/// skipped. The prune therefore never waits for a row lock while it holds one, so it
+/// cannot be part of a lock cycle with `DELETE FROM notifications WHERE comment_id = $1`
+/// or with a mark-read; before this it could be, and one side then failed with 40P01.
+/// The DELETE only touches rows this statement has already locked. A skipped row is
+/// pruned by a later batch or the next hourly sweep. `$1` is the cutoff, `$2` the batch.
+const READ_NOTIFICATION_PRUNE_SQL: &str = "DELETE FROM notifications WHERE id IN \
+     (SELECT id FROM notifications \
+       WHERE id = ANY(ARRAY( \
+               SELECT id FROM notifications \
+                WHERE read_at IS NOT NULL AND created_at < $1 \
+                ORDER BY created_at NULLS FIRST, id NULLS FIRST LIMIT $2)) \
+         AND read_at IS NOT NULL AND created_at < $1 \
+       ORDER BY id FOR UPDATE SKIP LOCKED)";
+
 /// Spawn the recurring GC sweep. Runs until `shutdown` resolves.
-pub fn spawn(pool: Database, covers: Database, shutdown: tokio::sync::watch::Receiver<bool>) {
+pub fn spawn(pool: Database, covers: SqliteDatabase, shutdown: tokio::sync::watch::Receiver<bool>) {
     // Panic-supervised (crate::task::supervise): a panic in `sweep` used to end the GC
     // job silently for the process lifetime, letting the staged-media BLOB store grow
     // unbounded. `factory` re-clones the pools + shutdown handle on each restart.
@@ -43,7 +74,7 @@ pub fn spawn(pool: Database, covers: Database, shutdown: tokio::sync::watch::Rec
 
 async fn run_loop(
     pool: Database,
-    covers: Database,
+    covers: SqliteDatabase,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     // Start 150s behind the scanner so the boot burst is spread across the five
@@ -77,19 +108,15 @@ async fn sweep(pool: &Database, shutdown: &tokio::sync::watch::Receiver<bool>) {
     // created_at is written as `chrono::Utc::now().to_rfc3339()`, so a UTC RFC-3339
     // cutoff compares correctly against it lexically.
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(STAGED_TTL_HOURS)).to_rfc3339();
-    match sqlx::query("DELETE FROM comment_media WHERE comment_id IS NULL AND created_at < ?")
-        .bind(&cutoff)
-        .execute(pool)
-        .await
-    {
-        Ok(r) if r.rows_affected() > 0 => {
-            tracing::info!(
-                deleted = r.rows_affected(),
-                "gc: swept orphaned comment media"
-            );
+    match sweep_staged_media(pool, &cutoff).await {
+        Ok(deleted) if deleted > 0 => {
+            tracing::info!(deleted, "gc: swept orphaned comment media");
         }
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "gc: comment-media sweep failed"),
+        Err(e) => {
+            crate::db::record_database_error(&e);
+            tracing::warn!(error = %e, "gc: comment-media sweep failed");
+        }
     }
 
     // Prune view buckets past the retention window so `series_view_bucket` stays bounded
@@ -97,24 +124,43 @@ async fn sweep(pool: &Database, shutdown: &tokio::sync::watch::Receiver<bool>) {
     match crate::views::prune_buckets(pool).await {
         Ok(n) if n > 0 => tracing::info!(deleted = n, "gc: pruned old view buckets"),
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "gc: view-bucket prune failed"),
+        Err(e) => {
+            let e = crate::db::observed_database_error(e);
+            tracing::warn!(error = %e, "gc: view-bucket prune failed");
+        }
     }
     // Same for the per-source request health buckets (migration 0110).
     match crate::source_health::prune_buckets(pool).await {
         Ok(n) if n > 0 => tracing::info!(deleted = n, "gc: pruned old source health buckets"),
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "gc: source-health prune failed"),
+        Err(e) => {
+            let e = crate::db::observed_database_error(e);
+            tracing::warn!(error = %e, "gc: source-health prune failed");
+        }
     }
     let notification_cutoff =
         (chrono::Utc::now() - chrono::Duration::days(READ_NOTIFICATION_TTL_DAYS)).to_rfc3339();
     match prune_read_notifications(pool, &notification_cutoff, shutdown).await {
         Ok(n) if n > 0 => tracing::info!(deleted = n, "gc: pruned old read notifications"),
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "gc: notification prune failed"),
+        Err(e) => {
+            let e = crate::db::observed_database_error(e);
+            tracing::warn!(error = %e, "gc: notification prune failed");
+        }
     }
 }
 
-async fn prune_read_notifications(
+/// One statement, one implicit transaction: delete the staged media older than `cutoff`
+/// that no other transaction holds (see [`STAGED_MEDIA_SWEEP_SQL`]).
+async fn sweep_staged_media(pool: &Database, cutoff: &str) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(STAGED_MEDIA_SWEEP_SQL)
+        .bind(crate::db_types::date(cutoff).expect("internally generated UTC timestamp"))
+        .execute(pool)
+        .await?
+        .rows_affected())
+}
+
+pub(crate) async fn prune_read_notifications(
     pool: &Database,
     cutoff: &str,
     shutdown: &tokio::sync::watch::Receiver<bool>,
@@ -134,15 +180,11 @@ async fn prune_read_notifications(
                 tx.rollback().await?;
                 return Ok(0);
             }
-            let result = sqlx::query(
-                "DELETE FROM notifications WHERE id IN \
-                 (SELECT id FROM notifications WHERE read_at IS NOT NULL AND created_at < ? \
-                  ORDER BY created_at, id LIMIT ?)",
-            )
-            .bind(cutoff)
-            .bind(NOTIFICATION_DELETE_BATCH as i64)
-            .execute(&mut *tx)
-            .await?;
+            let result = sqlx::query(READ_NOTIFICATION_PRUNE_SQL)
+                .bind(crate::db_types::date(cutoff)?)
+                .bind(NOTIFICATION_DELETE_BATCH as i64)
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await?;
             Ok(result.rows_affected())
         })
@@ -252,7 +294,7 @@ const COVER_MAX_ORPHAN_PCT: u64 = 25;
 /// rewrites all 20.5 GB and is deliberately not done here.
 async fn sweep_cover_blobs(
     pool: &Database,
-    covers: &Database,
+    covers: &SqliteDatabase,
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) {
     let cutoff =
@@ -261,7 +303,10 @@ async fn sweep_cover_blobs(
     match sweep_work_cover_blobs(pool, covers, &cutoff, shutdown).await {
         Ok(0) => {}
         Ok(n) => tracing::info!(deleted = n, "gc: reclaimed orphaned work cover blobs"),
-        Err(e) => tracing::warn!(error = %e, "gc: work cover blob sweep failed"),
+        Err(e) => {
+            let e = crate::db::observed_database_error(e);
+            tracing::warn!(error = %e, "gc: work cover blob sweep failed");
+        }
     }
     if *shutdown.borrow() {
         return;
@@ -269,23 +314,25 @@ async fn sweep_cover_blobs(
     match sweep_suwayomi_cover_blobs(pool, covers, &cutoff, shutdown).await {
         Ok(0) => {}
         Ok(n) => tracing::info!(deleted = n, "gc: reclaimed orphaned suwayomi cover blobs"),
-        Err(e) => tracing::warn!(error = %e, "gc: suwayomi cover blob sweep failed"),
+        Err(e) => {
+            let e = crate::db::observed_database_error(e);
+            tracing::warn!(error = %e, "gc: suwayomi cover blob sweep failed");
+        }
     }
 }
 
 /// Drop every derivative of the given cover keys. Called right after a master is
 /// reclaimed: `cover_variant` lives in the same file with no foreign key, so nothing
 /// else would ever remove these rows. A no-op on an empty slice.
-async fn purge_cover_variants<K>(covers: &Database, keys: &[K]) -> anyhow::Result<()>
+async fn purge_cover_variants<'e, K, E>(covers: E, keys: &[K]) -> anyhow::Result<()>
 where
     K: AsRef<str>,
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
     if keys.is_empty() {
         return Ok(());
     }
-    let placeholders = std::iter::repeat_n("?", keys.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let placeholders = crate::sql_params::placeholders(1, keys.len());
     let sql = format!("DELETE FROM cover_variant WHERE asset_key IN ({placeholders})");
     let mut q = sqlx::query(&sql);
     for k in keys {
@@ -295,13 +342,16 @@ where
     Ok(())
 }
 
+#[cfg(test)]
+tokio::task_local! { static GC_DISCOVERY_PAUSE: crate::locks::pause_points::PausePoints; }
+
 async fn sweep_work_cover_blobs(
     pool: &Database,
-    covers: &Database,
+    covers: &SqliteDatabase,
     cutoff: &str,
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<u64> {
-    let live_works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+    let live_works: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
         .fetch_one(pool)
         .await?;
     if live_works < COVER_SWEEP_MIN_WORKS {
@@ -318,7 +368,7 @@ async fn sweep_work_cover_blobs(
     // merely populated-but-wrong (which the row-count floor above waves through) costs
     // four probe queries instead of the cover store.
     let sample: Vec<String> =
-        sqlx::query_scalar("SELECT work_id FROM work_cover_blob ORDER BY work_id LIMIT ?")
+        sqlx::query_scalar("SELECT work_id FROM work_cover_blob ORDER BY work_id LIMIT $1")
             .bind(COVER_RATIO_SAMPLE as i64)
             .fetch_all(covers)
             .await?;
@@ -348,7 +398,7 @@ async fn sweep_work_cover_blobs(
             break;
         }
         let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT work_id FROM work_cover_blob WHERE work_id > ? ORDER BY work_id LIMIT ?",
+            "SELECT work_id FROM work_cover_blob WHERE work_id > $1 ORDER BY work_id LIMIT $2",
         )
         .bind(&cursor)
         .bind(COVER_SCAN_BATCH as i64)
@@ -361,27 +411,36 @@ async fn sweep_work_cover_blobs(
 
         let orphans = missing_work_ids(pool, &ids).await?;
         if !orphans.is_empty() {
-            let placeholders = std::iter::repeat_n("?", orphans.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            // `updated_at < ?` is re-evaluated here, inside the delete — a blob
-            // re-materialized since the probe has a newer stamp and survives.
-            let sql = format!(
-                "DELETE FROM work_cover_blob WHERE work_id IN ({placeholders}) AND updated_at < ?"
-            );
-            let mut q = sqlx::query(&sql);
-            for id in &orphans {
-                q = q.bind(id);
+            #[cfg(test)]
+            if let Ok(points) = GC_DISCOVERY_PAUSE.try_with(Clone::clone) {
+                points.hit("gc-orphans-discovered").await;
             }
-            let res = q.bind(cutoff).execute(covers).await?;
-            deleted += res.rows_affected();
-            // Derivatives (`cover_variant`) key off the same work id and have no FK to
-            // follow the master out. Reclaiming the master without them would leave rows
-            // that nothing can ever reach — the work is gone, so no request will ever
-            // ask for its `?w=` again, and no future write will invalidate them.
-            // Unconditional on the master delete's own `updated_at` guard: a derivative
-            // whose master survived is simply re-generated on the next request.
-            purge_cover_variants(covers, &orphans).await?;
+            for id in &orphans {
+                let mut tx = pool.begin().await?;
+                let _asset = crate::cover::lock_asset(&mut tx, id).await?;
+                #[cfg(test)]
+                if let Ok(points) = GC_DISCOVERY_PAUSE.try_with(Clone::clone) {
+                    points.hit("gc-asset-locked").await;
+                }
+                let live: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work WHERE id = $1)")
+                        .bind(id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                if !live {
+                    let version: Option<i64> = sqlx::query_scalar("SELECT version FROM work_cover_blob WHERE work_id = $1 AND updated_at < $2").bind(id).bind(cutoff).fetch_optional(covers).await?;
+                    if let Some(version) = version {
+                        let mut cache = covers.begin().await?;
+                        let n = sqlx::query("DELETE FROM work_cover_blob WHERE work_id = $1 AND version = $2 AND updated_at < $3").bind(id).bind(version).bind(cutoff).execute(&mut *cache).await?.rows_affected();
+                        deleted += n;
+                        if n > 0 {
+                            purge_cover_variants(&mut *cache, &[id]).await?;
+                        }
+                        cache.commit().await?;
+                    }
+                }
+                tx.commit().await?;
+            }
             if deleted as usize >= COVER_DELETE_BUDGET {
                 tracing::info!(
                     deleted,
@@ -415,11 +474,9 @@ async fn missing_work_ids(pool: &Database, ids: &[String]) -> anyhow::Result<Vec
     if ids.is_empty() {
         return Ok(Vec::new()); // `IN ()` is a syntax error; never build it
     }
-    let placeholders = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let placeholders = crate::sql_params::placeholders(1, ids.len());
     let sql = format!("SELECT id FROM work WHERE id IN ({placeholders})");
-    let mut q = sqlx::query_scalar::<_, String>(&sql);
+    let mut q = crate::db_types::query_scalar::<String>(&sql);
     for id in ids {
         q = q.bind(id);
     }
@@ -438,11 +495,9 @@ async fn missing_series_ids(pool: &Database, ids: &[i64]) -> anyhow::Result<Vec<
     if ids.is_empty() {
         return Ok(Vec::new()); // `IN ()` is a syntax error; never build it
     }
-    let placeholders = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let placeholders = crate::sql_params::placeholders(1, ids.len());
     let sql = format!("SELECT id FROM suwayomi_series WHERE id IN ({placeholders})");
-    let mut q = sqlx::query_scalar::<_, i64>(&sql);
+    let mut q = crate::db_types::query_scalar::<i64>(&sql);
     for id in ids {
         q = q.bind(*id);
     }
@@ -456,11 +511,11 @@ async fn missing_series_ids(pool: &Database, ids: &[i64]) -> anyhow::Result<Vec<
 
 async fn sweep_suwayomi_cover_blobs(
     pool: &Database,
-    covers: &Database,
+    covers: &SqliteDatabase,
     cutoff: &str,
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<u64> {
-    let live_series: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM suwayomi_series")
+    let live_series: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM suwayomi_series")
         .fetch_one(pool)
         .await?;
     if live_series < COVER_SWEEP_MIN_SERIES {
@@ -476,7 +531,7 @@ async fn sweep_suwayomi_cover_blobs(
     // `COVER_MAX_ORPHAN_PCT`. The row-count floor above cannot tell a wrong-but-populated
     // main DB from the right one; this can.
     let sample: Vec<i64> =
-        sqlx::query_scalar("SELECT manga_id FROM suwayomi_cover_blob ORDER BY manga_id LIMIT ?")
+        sqlx::query_scalar("SELECT manga_id FROM suwayomi_cover_blob ORDER BY manga_id LIMIT $1")
             .bind(COVER_RATIO_SAMPLE as i64)
             .fetch_all(covers)
             .await?;
@@ -502,8 +557,8 @@ async fn sweep_suwayomi_cover_blobs(
             break;
         }
         let ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT manga_id FROM suwayomi_cover_blob WHERE manga_id > ? \
-             ORDER BY manga_id LIMIT ?",
+            "SELECT manga_id FROM suwayomi_cover_blob WHERE manga_id > $1 \
+             ORDER BY manga_id LIMIT $2",
         )
         .bind(cursor)
         .bind(COVER_SCAN_BATCH as i64)
@@ -525,24 +580,38 @@ async fn sweep_suwayomi_cover_blobs(
         // the re-derivable-cache contract this store is built on.
         let orphans = missing_series_ids(pool, &ids).await?;
         if !orphans.is_empty() {
-            let list = orphans
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let res = sqlx::query(&format!(
-                "DELETE FROM suwayomi_cover_blob WHERE manga_id IN ({list}) AND updated_at < ?"
-            ))
-            .bind(cutoff)
-            .execute(covers)
-            .await?;
-            deleted += res.rows_affected();
-            // Same orphan rule as the work sweep above, under the Suwayomi key space.
-            let keys: Vec<String> = orphans
-                .iter()
-                .map(|id| crate::cover::suwayomi_variant_key(*id))
-                .collect();
-            purge_cover_variants(covers, &keys).await?;
+            #[cfg(test)]
+            if let Ok(points) = GC_DISCOVERY_PAUSE.try_with(Clone::clone) {
+                points.hit("gc-orphans-discovered").await;
+            }
+            for id in &orphans {
+                let asset = crate::cover::suwayomi_variant_key(*id);
+                let mut tx = pool.begin().await?;
+                let _asset = crate::cover::lock_asset(&mut tx, &asset).await?;
+                #[cfg(test)]
+                if let Ok(points) = GC_DISCOVERY_PAUSE.try_with(Clone::clone) {
+                    points.hit("gc-asset-locked").await;
+                }
+                let live: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM suwayomi_series WHERE id = $1)",
+                )
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if !live {
+                    let stamp: Option<String> = sqlx::query_scalar("SELECT updated_at FROM suwayomi_cover_blob WHERE manga_id = $1 AND updated_at < $2").bind(id).bind(cutoff).fetch_optional(covers).await?;
+                    if let Some(stamp) = stamp {
+                        let mut cache = covers.begin().await?;
+                        let n = sqlx::query("DELETE FROM suwayomi_cover_blob WHERE manga_id = $1 AND updated_at = $2 AND updated_at < $3").bind(id).bind(stamp).bind(cutoff).execute(&mut *cache).await?.rows_affected();
+                        deleted += n;
+                        if n > 0 {
+                            purge_cover_variants(&mut *cache, &[asset]).await?;
+                        }
+                        cache.commit().await?;
+                    }
+                }
+                tx.commit().await?;
+            }
             if deleted as usize >= COVER_DELETE_BUDGET {
                 break;
             }
@@ -557,10 +626,216 @@ mod tests {
     use super::*;
     use crate::database::TestPoolOptions;
 
+    /// What the other writer does to the orphan the sweep has already selected.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Overlap {
+        /// The owner comes back and publishes a new master and a derivative
+        /// before the sweep takes the asset guard.
+        Republished,
+        /// The owner comes back, the old blob is all it has.
+        RecreatedOnly,
+        /// The owner comes back while the sweep holds the asset guard; its
+        /// publication has to wait for the sweep's decision.
+        PublisherWaits,
+    }
+    const OVERLAPS: [Overlap; 3] = [
+        Overlap::Republished,
+        Overlap::RecreatedOnly,
+        Overlap::PublisherWaits,
+    ];
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    #[tokio::test]
+    async fn work_cover_gc_preserves_a_new_publication_and_its_derivatives() {
+        for overlap in OVERLAPS {
+            let pool = main_pool().await.foreground();
+            let covers = covers_pool().await;
+            seed_works(&pool, 0, COVER_SWEEP_MIN_WORKS).await;
+            seed_work_blobs(&covers, 0, 3, "2000-01-01T00:00:00Z").await;
+            sqlx::query(
+                "INSERT INTO work_cover_blob VALUES ('w_z',x'00',1,'2000-01-01T00:00:00Z')",
+            )
+            .execute(&covers)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO cover_variant VALUES ('w_z',192,x'01','2000-01-01T00:00:00Z')",
+            )
+            .execute(&covers)
+            .await
+            .unwrap();
+            let points = crate::locks::pause_points::PausePoints::default();
+            let armed = points.arm(if overlap == Overlap::PublisherWaits {
+                "gc-asset-locked"
+            } else {
+                "gc-orphans-discovered"
+            });
+            let writer = pool.clone();
+            let cache = covers.clone();
+            let (_stop, rx) = tokio::sync::watch::channel(false);
+            let first = tokio::spawn(GC_DISCOVERY_PAUSE.scope(points, async move {
+                sweep_work_cover_blobs(&writer, &cache, "2025-01-01T00:00:00Z", &rx).await
+            }));
+            tokio::time::timeout(WAIT, armed.reached())
+                .await
+                .expect("the sweep never reached its pause point");
+            sqlx::query("INSERT INTO work(id,created_at,updated_at) VALUES ('w_z',now(),now())")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let publisher = match overlap {
+                Overlap::Republished => {
+                    crate::cover::put_work_cover(&pool, &covers, "w_z", b"fresh")
+                        .await
+                        .unwrap();
+                    crate::cover::put_current_variant(
+                        &pool,
+                        &covers,
+                        "w_z",
+                        192,
+                        b"fresh",
+                        b"fresh-small",
+                    )
+                    .await
+                    .unwrap();
+                    None
+                }
+                Overlap::RecreatedOnly => None,
+                Overlap::PublisherWaits => {
+                    let writer = pool.clone();
+                    let cache = covers.clone();
+                    let publisher = tokio::spawn(async move {
+                        crate::cover::put_work_cover(&writer, &cache, "w_z", b"fresh").await
+                    });
+                    crate::cover::wait_for_writer_lock(&pool).await;
+                    Some(publisher)
+                }
+            };
+            armed.release();
+            assert_eq!(first.await.unwrap().unwrap(), 0, "{overlap:?}");
+            if let Some(publisher) = publisher {
+                publisher.await.unwrap().unwrap();
+            }
+            let master: Vec<u8> =
+                sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id='w_z'")
+                    .fetch_optional(&covers)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| {
+                        panic!("{overlap:?}: the sweep deleted a live work's cover")
+                    });
+            let variant = crate::cover::get_cover_variant(&covers, "w_z", 192).await;
+            match overlap {
+                Overlap::Republished => {
+                    assert_eq!(master, b"fresh");
+                    assert_eq!(variant.as_deref(), Some(b"fresh-small".as_slice()));
+                }
+                Overlap::RecreatedOnly => {
+                    assert_eq!(master, [0u8]);
+                    assert_eq!(variant.as_deref(), Some([1u8].as_slice()));
+                }
+                Overlap::PublisherWaits => {
+                    assert_eq!(master, b"fresh");
+                    assert_eq!(variant, None, "the old master's derivative survived");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn source_cover_gc_rechecks_recreated_series_before_deleting_variants() {
+        for overlap in OVERLAPS {
+            let pool = main_pool().await.foreground();
+            let covers = covers_pool().await;
+            sqlx::query("INSERT INTO suwayomi_series(id,title,status,in_library,source_id,updated_at) SELECT n,'Series','ONGOING',true,'1',now() FROM generate_series(1,1000) n").execute(&pool).await.unwrap();
+            for id in [1, 2, 3, 1001] {
+                sqlx::query(
+                    "INSERT INTO suwayomi_cover_blob VALUES ($1,x'00','2000-01-01T00:00:00Z')",
+                )
+                .bind(id)
+                .execute(&covers)
+                .await
+                .unwrap();
+            }
+            sqlx::query(
+                "INSERT INTO cover_variant VALUES ('s:1001',192,x'01','2000-01-01T00:00:00Z')",
+            )
+            .execute(&covers)
+            .await
+            .unwrap();
+            let points = crate::locks::pause_points::PausePoints::default();
+            let armed = points.arm(if overlap == Overlap::PublisherWaits {
+                "gc-asset-locked"
+            } else {
+                "gc-orphans-discovered"
+            });
+            let writer = pool.clone();
+            let cache = covers.clone();
+            let (_stop, rx) = tokio::sync::watch::channel(false);
+            let first = tokio::spawn(GC_DISCOVERY_PAUSE.scope(points, async move {
+                sweep_suwayomi_cover_blobs(&writer, &cache, "2025-01-01T00:00:00Z", &rx).await
+            }));
+            tokio::time::timeout(WAIT, armed.reached())
+                .await
+                .expect("the sweep never reached its pause point");
+            sqlx::query("INSERT INTO suwayomi_series(id,title,status,in_library,source_id,updated_at) VALUES (1001,'Series','ONGOING',true,'1',now())").execute(&pool).await.unwrap();
+            let publisher = match overlap {
+                Overlap::Republished => {
+                    crate::cover::publish_suwayomi_cover(&pool, &covers, 1001, b"fresh")
+                        .await
+                        .unwrap();
+                    crate::cover::put_current_variant(
+                        &pool,
+                        &covers,
+                        "s:1001",
+                        192,
+                        b"fresh",
+                        b"fresh-small",
+                    )
+                    .await
+                    .unwrap();
+                    None
+                }
+                Overlap::RecreatedOnly => None,
+                Overlap::PublisherWaits => {
+                    let writer = pool.clone();
+                    let cache = covers.clone();
+                    let publisher = tokio::spawn(async move {
+                        crate::cover::publish_suwayomi_cover(&writer, &cache, 1001, b"fresh").await
+                    });
+                    crate::cover::wait_for_writer_lock(&pool).await;
+                    Some(publisher)
+                }
+            };
+            armed.release();
+            assert_eq!(first.await.unwrap().unwrap(), 0, "{overlap:?}");
+            if let Some(publisher) = publisher {
+                publisher.await.unwrap().unwrap();
+            }
+            let master = crate::cover::get_suwayomi_cover(&covers, 1001)
+                .await
+                .unwrap_or_else(|| panic!("{overlap:?}: the sweep deleted a live series' cover"));
+            let variant = crate::cover::get_cover_variant(&covers, "s:1001", 192).await;
+            match overlap {
+                Overlap::Republished => {
+                    assert_eq!(master, b"fresh");
+                    assert_eq!(variant.as_deref(), Some(b"fresh-small".as_slice()));
+                }
+                Overlap::RecreatedOnly => {
+                    assert_eq!(master, [0u8]);
+                    assert_eq!(variant.as_deref(), Some([1u8].as_slice()));
+                }
+                Overlap::PublisherWaits => {
+                    assert_eq!(master, b"fresh");
+                    assert_eq!(variant, None, "the old master's derivative survived");
+                }
+            }
+        }
+    }
     #[tokio::test]
     async fn notification_gc_keeps_unread_recent_boundary_and_release_history() {
         let pool = main_pool().await;
-        sqlx::query("INSERT INTO users(id, username, email, password_hash, created_at) VALUES ('gc-user', 'gc-user', 'gc@example.test', 'unused', '2026-01-01T00:00:00+00:00')")
+        sqlx::query("INSERT INTO users(id, username, email, password_hash, created_at) VALUES ('8834b774-e415-4d35-952e-299c9fb4381a', '8834b774-e415-4d35-952e-299c9fb4381a', 'gc@example.test', 'unused', '2026-01-01T00:00:00+00:00')")
             .execute(&pool).await.unwrap();
         let cutoff = "2026-07-10T12:00:00+00:00";
         for (id, created_at, read_at) in [
@@ -573,11 +848,11 @@ mod tests {
             ("recent-read", "2026-07-11T12:00:00+00:00", Some(cutoff)),
             ("boundary-read", cutoff, Some(cutoff)),
         ] {
-            sqlx::query("INSERT INTO notifications(id, user_id, kind, created_at, read_at) VALUES (?, 'gc-user', 'reply', ?, ?)")
-                .bind(id).bind(created_at).bind(read_at).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO notifications(id, user_id, kind, created_at, read_at) VALUES ($1, '8834b774-e415-4d35-952e-299c9fb4381a', 'reply', $2, $3)")
+                .bind(crate::db_types::test_uuid(id)).bind(crate::db_types::date(created_at).unwrap()).bind(crate::db_types::optional_date(read_at).unwrap()).execute(&pool).await.unwrap();
         }
         seed_works(&pool, 0, 1).await;
-        sqlx::query("INSERT INTO release_event(work_id, chapter_key, label, first_seen_at) VALUES ('w_00000', '10', '1', 1)")
+        sqlx::query("INSERT INTO release_event(work_id, chapter_key, label, first_seen_at) VALUES ('w_00000', '10', '1', TIMESTAMPTZ '1970-01-01 00:00:00.001+00')")
             .execute(&pool).await.unwrap();
         assert_eq!(
             prune_read_notifications(&pool, cutoff, &never_shutdown().1)
@@ -585,16 +860,22 @@ mod tests {
                 .unwrap(),
             1
         );
-        let kept: Vec<String> = sqlx::query_scalar("SELECT id FROM notifications ORDER BY id")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        assert_eq!(kept, ["boundary-read", "old-unread", "recent-read"]);
-        let release: (String, String, String, i64) =
-            sqlx::query_as("SELECT work_id, chapter_key, label, first_seen_at FROM release_event")
-                .fetch_one(&pool)
+        let kept: Vec<String> =
+            crate::db_types::query_scalar("SELECT id FROM notifications ORDER BY id")
+                .fetch_all(&pool)
                 .await
                 .unwrap();
+        let mut expected: Vec<String> = ["boundary-read", "old-unread", "recent-read"]
+            .map(|id| crate::db_types::test_uuid(id).to_string())
+            .to_vec();
+        expected.sort();
+        assert_eq!(kept, expected);
+        let release: (String, String, String, i64) = crate::db_types::query_tuple(
+            "SELECT work_id, chapter_key, label, first_seen_at FROM release_event",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(release, ("w_00000".into(), "10".into(), "1".into(), 1));
         assert_eq!(
             prune_read_notifications(&pool, cutoff, &never_shutdown().1)
@@ -607,22 +888,23 @@ mod tests {
     #[tokio::test]
     async fn notification_gc_batches_uses_partial_index_and_resumes_backlog() {
         let pool = main_pool().await;
-        sqlx::query("INSERT INTO users(id, username, email, password_hash, created_at) VALUES ('gc-user', 'gc-user', 'gc@example.test', 'unused', '2026-01-01T00:00:00+00:00')")
+        sqlx::query("INSERT INTO users(id, username, email, password_hash, created_at) VALUES ('8834b774-e415-4d35-952e-299c9fb4381a', '8834b774-e415-4d35-952e-299c9fb4381a', 'gc@example.test', 'unused', '2026-01-01T00:00:00+00:00')")
             .execute(&pool).await.unwrap();
-        sqlx::query("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1400) INSERT INTO notifications(id,user_id,kind,created_at,read_at) SELECT printf('old-%04d',i), 'gc-user', 'reply', '2020-01-01T00:00:00+00:00', '2020-01-02T00:00:00+00:00' FROM n")
+        sqlx::query("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1400) INSERT INTO notifications(id,user_id,kind,created_at,read_at) SELECT md5('gc-old-' || i)::uuid, '8834b774-e415-4d35-952e-299c9fb4381a', 'reply', '2020-01-01T00:00:00+00:00', '2020-01-02T00:00:00+00:00' FROM n")
             .execute(&pool).await.unwrap();
-        let plans: Vec<(i64, i64, i64, String)> = sqlx::query_as("EXPLAIN QUERY PLAN SELECT id FROM notifications WHERE read_at IS NOT NULL AND created_at < ? ORDER BY created_at, id LIMIT 128")
-            .bind("2026-07-10T12:00:00+00:00").fetch_all(&pool).await.unwrap();
+        sqlx::query("ANALYZE notifications")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let plans: Vec<String> = crate::db_types::query_scalar("EXPLAIN SELECT id FROM notifications WHERE read_at IS NOT NULL AND created_at < $1 ORDER BY created_at NULLS FIRST, id NULLS FIRST LIMIT 128")
+            .bind(crate::db_types::date("2026-07-10T12:00:00+00:00").unwrap()).fetch_all(&pool).await.unwrap();
         assert!(
             plans
                 .iter()
-                .any(|row| row.3.contains("idx_notifications_read_created")),
+                .any(|row| row.contains("idx_notifications_read_created")),
             "{plans:?}"
         );
-        assert!(
-            !plans.iter().any(|row| row.3.contains("TEMP B-TREE")),
-            "{plans:?}"
-        );
+        assert!(!plans.iter().any(|row| row.contains("Sort")), "{plans:?}");
         assert_eq!(
             prune_read_notifications(&pool, "2026-07-10T12:00:00+00:00", &never_shutdown().1)
                 .await
@@ -640,9 +922,9 @@ mod tests {
     #[tokio::test]
     async fn notification_gc_rechecks_shutdown_after_waiting_for_writer() {
         let pool = main_pool().await;
-        sqlx::query("INSERT INTO users(id, username, email, password_hash, created_at) VALUES ('gc-user', 'gc-user', 'gc@example.test', 'unused', '2020-01-01T00:00:00+00:00')")
+        sqlx::query("INSERT INTO users(id, username, email, password_hash, created_at) VALUES ('8834b774-e415-4d35-952e-299c9fb4381a', '8834b774-e415-4d35-952e-299c9fb4381a', 'gc@example.test', 'unused', '2020-01-01T00:00:00+00:00')")
             .execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO notifications(id,user_id,kind,created_at,read_at) VALUES ('old-read','gc-user','reply','2020-01-01T00:00:00+00:00','2020-01-02T00:00:00+00:00')")
+        sqlx::query("INSERT INTO notifications(id,user_id,kind,created_at,read_at) VALUES ('102bf39e-f4ca-4574-b7bc-4afd5cb24482','8834b774-e415-4d35-952e-299c9fb4381a','reply','2020-01-01T00:00:00+00:00','2020-01-02T00:00:00+00:00')")
             .execute(&pool).await.unwrap();
         let writer = pool.begin().await.unwrap();
         let (signal, shutdown) = never_shutdown();
@@ -654,11 +936,179 @@ mod tests {
         signal.send(true).unwrap();
         writer.rollback().await.unwrap();
         assert_eq!(pruning.await.unwrap().unwrap(), 0);
-        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notifications")
+        let remaining: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM notifications")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(remaining, 1);
+    }
+
+    /// A second session of the test database, outside the one-connection pool.
+    async fn other_session(pool: &Database) -> sqlx::PgConnection {
+        use sqlx::ConnectOptions;
+        pool.connect_options()
+            .as_ref()
+            .clone()
+            .connect()
+            .await
+            .expect("second session")
+    }
+
+    const SKIP_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// T096. Another transaction holds one old read notification (as `deleteComment`
+    /// and `markNotificationsRead` do while they work). The prune must not wait for
+    /// it: it deletes the rows nobody holds and leaves the held one for a later run.
+    /// With the plain `DELETE ... WHERE id IN (...)` the prune waited behind the holder
+    /// while it already held other rows, which is one half of a deadlock.
+    #[tokio::test]
+    async fn notification_gc_skips_rows_another_writer_holds_and_never_waits() {
+        let pool = main_pool().await;
+        sqlx::query("INSERT INTO users(id, username, email, password_hash, created_at) VALUES ('8834b774-e415-4d35-952e-299c9fb4381a', '8834b774-e415-4d35-952e-299c9fb4381a', 'gc@example.test', 'unused', '2020-01-01T00:00:00+00:00')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<40) INSERT INTO notifications(id,user_id,kind,created_at,read_at) SELECT md5('gc-held-' || i)::uuid, '8834b774-e415-4d35-952e-299c9fb4381a', 'reply', '2020-01-01T00:00:00+00:00', '2020-01-02T00:00:00+00:00' FROM n")
+            .execute(&pool).await.unwrap();
+        // The holder takes the rows that sort FIRST and LAST by id, so whichever order
+        // the prune walks in, it meets a held row after it has locked others.
+        let held: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "(SELECT id FROM notifications ORDER BY id LIMIT 1) UNION ALL \
+             (SELECT id FROM notifications ORDER BY id DESC LIMIT 1)",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let mut holder = other_session(&pool).await;
+        sqlx::query("BEGIN").execute(&mut holder).await.unwrap();
+        let locked: Vec<uuid::Uuid> =
+            sqlx::query_scalar("SELECT id FROM notifications WHERE id = ANY($1) FOR UPDATE")
+                .bind(&held)
+                .fetch_all(&mut holder)
+                .await
+                .unwrap();
+        assert_eq!(locked.len(), 2);
+
+        let cutoff = "2026-07-10T12:00:00+00:00";
+        let (pruned, seen) = crate::db::test_counters::scope(tokio::time::timeout(
+            SKIP_BOUND,
+            prune_read_notifications(&pool, cutoff, &never_shutdown().1),
+        ))
+        .await;
+        let pruned = pruned
+            .expect("the prune waited for a row another transaction holds")
+            .unwrap();
+        assert_eq!(pruned, 38, "every row nobody holds is pruned");
+        assert_eq!(seen.database.deadlocks, 0);
+        assert_eq!(seen.database.lock_timeouts, 0);
+        assert_eq!(seen.database.retries, 0);
+        let mut kept: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT id FROM notifications")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        kept.sort_unstable();
+        let mut expected = held.clone();
+        expected.sort_unstable();
+        assert_eq!(kept, expected, "exactly the held rows are left");
+
+        // The holder decides to keep its rows (a rollback): the next sweep prunes them.
+        sqlx::query("ROLLBACK").execute(&mut holder).await.unwrap();
+        assert_eq!(
+            prune_read_notifications(&pool, cutoff, &never_shutdown().1)
+                .await
+                .unwrap(),
+            2
+        );
+        let _ = sqlx::Connection::close(holder).await;
+    }
+
+    /// The lock order of the prune statement: the rows are locked by a `LockRows` node
+    /// that sits above the sort on the primary key, and the batch itself is still read
+    /// oldest first through the partial index, without sorting the backlog.
+    #[tokio::test]
+    async fn notification_gc_locks_its_batch_in_id_order_and_reads_it_through_the_partial_index() {
+        let pool = main_pool().await;
+        sqlx::query("INSERT INTO users(id, username, email, password_hash, created_at) VALUES ('8834b774-e415-4d35-952e-299c9fb4381a', '8834b774-e415-4d35-952e-299c9fb4381a', 'gc@example.test', 'unused', '2020-01-01T00:00:00+00:00')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1400) INSERT INTO notifications(id,user_id,kind,created_at,read_at) SELECT md5('gc-plan-' || i)::uuid, '8834b774-e415-4d35-952e-299c9fb4381a', 'reply', '2020-01-01T00:00:00+00:00', '2020-01-02T00:00:00+00:00' FROM n")
+            .execute(&pool).await.unwrap();
+        sqlx::query("ANALYZE notifications")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let plan: Vec<String> =
+            crate::db_types::query_scalar(&format!("EXPLAIN {READ_NOTIFICATION_PRUNE_SQL}"))
+                .bind(crate::db_types::date("2026-07-10T12:00:00+00:00").unwrap())
+                .bind(NOTIFICATION_DELETE_BATCH as i64)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let line = |needle: &str| plan.iter().position(|row| row.contains(needle));
+        let lock = line("LockRows").unwrap_or_else(|| panic!("no LockRows: {plan:?}"));
+        let sort = line("Sort Key: notifications").unwrap_or_else(|| panic!("no sort: {plan:?}"));
+        assert!(
+            lock < sort,
+            "rows must be locked after the id sort: {plan:?}"
+        );
+        assert!(
+            plan[sort].contains("id") && !plan[sort].contains("created_at"),
+            "the lock order is the primary key: {plan:?}"
+        );
+        assert!(
+            line("idx_notifications_read_created").is_some(),
+            "the batch is chosen through the partial index: {plan:?}"
+        );
+        assert_eq!(
+            plan.iter().filter(|row| row.contains("Sort Key")).count(),
+            1,
+            "only the batch of ids is sorted, never the backlog: {plan:?}"
+        );
+    }
+
+    /// T095. `postComment` holds a staged media row while it links it. The sweep
+    /// deletes the other old drafts and does not wait for that row.
+    #[tokio::test]
+    async fn staged_media_sweep_skips_a_draft_another_writer_holds_and_never_waits() {
+        let pool = main_pool().await;
+        sqlx::query("INSERT INTO users(id, username, email, password_hash, created_at) VALUES ('8834b774-e415-4d35-952e-299c9fb4381a', '8834b774-e415-4d35-952e-299c9fb4381a', 'gc@example.test', 'unused', '2020-01-01T00:00:00+00:00')")
+            .execute(&pool).await.unwrap();
+        for (name, created_at) in [
+            ("held-draft", "2020-01-01T00:00:00+00:00"),
+            ("free-draft", "2020-01-01T00:00:00+00:00"),
+            ("fresh-draft", "2026-07-11T00:00:00+00:00"),
+        ] {
+            sqlx::query("INSERT INTO comment_media(id,comment_id,user_id,webp,width,height,created_at) VALUES ($1,NULL,'8834b774-e415-4d35-952e-299c9fb4381a','\\x00',1,1,$2)")
+                .bind(crate::db_types::test_uuid(name))
+                .bind(crate::db_types::date(created_at).unwrap())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let mut holder = other_session(&pool).await;
+        sqlx::query("BEGIN").execute(&mut holder).await.unwrap();
+        sqlx::query("SELECT id FROM comment_media WHERE id = $1 FOR UPDATE")
+            .bind(crate::db_types::test_uuid("held-draft"))
+            .fetch_one(&mut holder)
+            .await
+            .unwrap();
+        let cutoff = "2026-07-10T12:00:00+00:00";
+        let swept = tokio::time::timeout(SKIP_BOUND, sweep_staged_media(&pool, cutoff))
+            .await
+            .expect("the sweep waited for a draft another transaction holds")
+            .unwrap();
+        assert_eq!(swept, 1);
+        let mut kept: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT id FROM comment_media")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        kept.sort_unstable();
+        let mut expected = vec![
+            crate::db_types::test_uuid("held-draft"),
+            crate::db_types::test_uuid("fresh-draft"),
+        ];
+        expected.sort_unstable();
+        assert_eq!(kept, expected);
+        sqlx::query("ROLLBACK").execute(&mut holder).await.unwrap();
+        assert_eq!(sweep_staged_media(&pool, cutoff).await.unwrap(), 1);
+        let _ = sqlx::Connection::close(holder).await;
     }
 
     /// Main DB with the real schema. `max_connections(1)` because a `sqlite::memory:`
@@ -669,7 +1119,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -679,8 +1129,8 @@ mod tests {
     /// Covers DB, schema copied from `db::init_covers` (which can't be reused here: it
     /// opens a 4-connection pool, and four `sqlite::memory:` connections are four
     /// different databases).
-    async fn covers_pool() -> Database {
-        let pool = TestPoolOptions::new()
+    async fn covers_pool() -> SqliteDatabase {
+        let pool = crate::sqlite_database::SqliteTestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
@@ -703,8 +1153,8 @@ mod tests {
     async fn seed_works(pool: &Database, lo: i64, hi: i64) {
         sqlx::query(
             "INSERT INTO work (id, primary_title, created_at, updated_at) \
-             WITH RECURSIVE n(i) AS (SELECT ? UNION ALL SELECT i + 1 FROM n WHERE i < ?) \
-             SELECT printf('w_%05d', i), 'T', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z' \
+             WITH RECURSIVE n(i) AS (SELECT $1 UNION ALL SELECT i + 1 FROM n WHERE i < $2) \
+             SELECT 'w_' || lpad(i::text, 5, '0'), 'T', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z' \
              FROM n",
         )
         .bind(lo)
@@ -714,11 +1164,11 @@ mod tests {
         .unwrap();
     }
 
-    async fn seed_work_blobs(covers: &Database, lo: i64, hi: i64, updated_at: &str) {
+    async fn seed_work_blobs(covers: &SqliteDatabase, lo: i64, hi: i64, updated_at: &str) {
         sqlx::query(
             "INSERT INTO work_cover_blob (work_id, webp, version, updated_at) \
-             WITH RECURSIVE n(i) AS (SELECT ? UNION ALL SELECT i + 1 FROM n WHERE i < ?) \
-             SELECT printf('w_%05d', i), x'00', 1, ? FROM n",
+             WITH RECURSIVE n(i) AS (SELECT $1 UNION ALL SELECT i + 1 FROM n WHERE i < $2) \
+             SELECT printf('w_%05d', i), x'00', 1, $3 FROM n",
         )
         .bind(lo)
         .bind(hi - 1)
@@ -728,7 +1178,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn blob_count(covers: &Database) -> i64 {
+    async fn blob_count(covers: &SqliteDatabase) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_blob")
             .fetch_one(covers)
             .await
@@ -809,7 +1259,7 @@ mod tests {
         for key in ["w_00001", "w_90000"] {
             sqlx::query(
                 "INSERT INTO cover_variant (asset_key, width, webp, updated_at) \
-                 VALUES (?, 192, X'00', '2020-01-01T00:00:00+00:00')",
+                 VALUES ($1, 192, X'00', '2020-01-01T00:00:00+00:00')",
             )
             .bind(key)
             .execute(&covers)
@@ -958,7 +1408,7 @@ mod tests {
             (90_002, chrono::Utc::now().to_rfc3339()),             // fresh orphan
         ] {
             sqlx::query(
-                "INSERT INTO suwayomi_cover_blob (manga_id, webp, updated_at) VALUES (?, x'00', ?)",
+                "INSERT INTO suwayomi_cover_blob (manga_id, webp, updated_at) VALUES ($1, x'00', $2)",
             )
             .bind(id)
             .bind(at)

@@ -3,6 +3,7 @@
 # Prepare everything the desktop app bundles besides its own window (tauri.conf.json
 # runs this in `beforeBuildCommand`, before the console's `desktop` build):
 #
+#   0. the verified, trimmed PostgreSQL 18.6 runtime for this target;
 #   1. the source engine: the pinned Suwayomi-Server jar and a jlink'd JRE, made by the
 #      READER's scripts into apps/reader/src-tauri/{suwayomi,jre}/, which this app's
 #      tauri.conf.json bundles from there (one copy, one pin, for both apps);
@@ -17,6 +18,8 @@
 #   KOMIKA_SERVER_PROFILE=debug build the server in debug (default: release)
 #   KOMIKA_SERVER_TARGET_DIR    cargo target dir for the server (default: CARGO_TARGET_DIR,
 #                               else apps/server/target)
+#   KOMIKA_POSTGRES_ARCHIVE     use an existing archive for offline staging
+#   KOMIKA_PYTHON               Python >=3.12 executable (default: python3)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,6 +33,12 @@ READER_TAURI="${REPO}/apps/reader/src-tauri"
 TARGET_TRIPLE="${TAURI_ENV_TARGET_TRIPLE:-$(rustc -vV | sed -n 's/^host: //p')}"
 unset TAURI_ENV_PLATFORM TAURI_ENV_ARCH TAURI_ENV_FAMILY TAURI_ENV_PLATFORM_VERSION \
   TAURI_ENV_PLATFORM_TYPE TAURI_ENV_DEBUG TAURI_ENV_TARGET_TRIPLE
+
+# ---- PostgreSQL: pinned, target-only resource tree ------------------------------------
+PG_ARCHIVE_ARGS=()
+[[ -z "${KOMIKA_POSTGRES_ARCHIVE:-}" ]] || PG_ARCHIVE_ARGS+=(--archive "${KOMIKA_POSTGRES_ARCHIVE}")
+"${KOMIKA_PYTHON:-python3}" "${REPO}/scripts/postgres-desktop-bundle.py" \
+  --triple "${TARGET_TRIPLE}" "${PG_ARCHIVE_ARGS[@]}"
 
 # ---- 1. engine ------------------------------------------------------------------------
 if [[ "${KOMIKA_SKIP_ENGINE:-}" == "1" ]]; then
@@ -76,7 +85,10 @@ cp -R "${REPO}/apps/reader/build" "${WEB}/reader"
 # Console: the `embedded` build under /admin, for browsers on the home network. The
 # window's own `desktop` build runs after this script and replaces apps/admin/build.
 echo "building the admin console (served at /admin)"
-ADMIN_TARGET=embedded ADMIN_BASE_PATH=/admin PUBLIC_KOMIKA_API= pnpm -C "${ADMIN}" build
+# MSYS2_ENV_CONV_EXCL: under Git Bash on Windows the runtime rewrites an environment value
+# that looks like a POSIX path ("/admin" became "C:/Program Files/Git/admin") when it
+# starts a native program; this keeps the base path as written. It has no effect elsewhere.
+MSYS2_ENV_CONV_EXCL=ADMIN_BASE_PATH ADMIN_TARGET=embedded ADMIN_BASE_PATH=/admin PUBLIC_KOMIKA_API= pnpm -C "${ADMIN}" build
 cp -R "${ADMIN}/build" "${WEB}/admin"
 
 echo "ok: web/reader and web/admin ready"

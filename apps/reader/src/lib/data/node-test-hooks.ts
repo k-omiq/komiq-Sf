@@ -19,6 +19,13 @@ import { fileURLToPath } from 'node:url';
 
 export interface TestGlobals {
 	backend: Record<string, unknown>;
+	auth: { user: { id: string; username: string; isAdmin: boolean } | null };
+	config: {
+		backendEnabled: boolean;
+		backendKind: string;
+		nativeEngine: boolean;
+		apiEndpoint: string;
+	};
 	images: { resolvePage: (p: { sourceUrl?: string }) => Promise<string> };
 	/** Every key passed to the stubbed `invalidate`, in order. */
 	invalidated: string[];
@@ -30,6 +37,13 @@ export interface TestGlobals {
 const g = globalThis as unknown as { __komikaTest?: TestGlobals };
 g.__komikaTest ??= {
 	backend: {},
+	auth: { user: null },
+	config: {
+		backendEnabled: true,
+		backendKind: 'komika',
+		nativeEngine: false,
+		apiEndpoint: 'https://comments.test/graphql',
+	},
 	images: { resolvePage: async (p) => p.sourceUrl ?? '' },
 	invalidated: [],
 	page: { route: { id: null } },
@@ -49,8 +63,9 @@ const STUBS: Record<string, string> = {
 		'export const page = globalThis.__komikaTest.page;' +
 		'export const navigating = globalThis.__komikaTest.navigating;',
 	'$lib/config':
-		'export const config = { backendEnabled: true, nativeEngine: false };' +
+		'export const config = globalThis.__komikaTest.config;' +
 		'export const apiAssetSrc = (s) => s;',
+	'$lib/auth.svelte': 'export const auth = globalThis.__komikaTest.auth;',
 	'@komika/api': 'export const isTauri = () => false;',
 	'./translator-pref.svelte':
 		'export const getPreferredTranslator = () => undefined;' +

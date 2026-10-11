@@ -1,138 +1,120 @@
 ---
 title: Update and back up
-description: Update your Docker installation of the admin app and back up or restore your own server’s data.
+description: Update your Docker admin app and protect its PostgreSQL database, server files and source engine data.
 ---
 
-You maintain the server you host, including its accounts, libraries and source engine data. This page covers the Docker installation of the admin app on your home server or VPS. Use it to update, back up and restore your data, or remove the installation.
+You maintain the server you host, including its accounts, libraries and source engine data. This page covers the Docker installation of the admin app on your home server or virtual private server (VPS). The desktop app runs the same SQLite conversion in its own `server/` folder. The reader app connects to that server and does not manage its backups.
 
 ## Update komiq
 
-To update your server, fetch the latest code and rebuild the container image.
-
-From the repository root, pull the latest changes and rebuild the containers:
+Make a backup before updating and keep the previous image until you have checked the new version. From the repository root:
 
 ```sh
 git pull
-cd deploy/selfhost
-docker compose up -d --build
+bash deploy/selfhost/install.sh
 ```
 
-Your data persists across updates because it is stored in Docker named volumes outside the container images.
+The installer keeps your database password and other settings in `deploy/selfhost/.env`. It starts PostgreSQL before building and starting the server. Database structure changes, called migrations, run automatically at server startup.
 
-When an update includes changes to the database structure, komiq applies database migrations automatically when the server boots. Always make a backup before applying updates so you can revert if necessary.
+For an installation already using PostgreSQL, you can also run `docker compose up -d --build` from `deploy/selfhost`. An old SQLite installation needs the installer once to add a random database password to its existing `.env`.
 
-Only one server can use a data directory at a time. The server holds a file lock on `.komiq-server.lock` in that directory until it exits. If startup reports that the directory is locked, stop the other server using the same volume. Deleting the lock file while a server is running can allow a second server to start.
+### Automatic SQLite conversion
 
-### Clean up disk space
+The first start after the update converts an old SQLite installation. Before it listens, the server looks for `komika.sqlite3` in the server volume. If PostgreSQL is empty, it copies the data in, checks the copy against the source, and only then renames the file to `komika.sqlite3.imported-<UTC time>`, a time like `20261012T093000Z`. It serves only after that check passes. The server removes only its own work files. It never deletes the old file, the renamed file or a kept copy (below). Delete them yourself once you have checked your data.
 
-Docker keeps old image layers and build cache on disk after each build. Over time, these files consume disk space.
-
-Run these cleanup commands periodically to reclaim storage:
-
-```sh
-docker image prune
-docker builder prune
-```
-
-## Back up your data
-
-For the Docker installation, your server’s persistent data resides in two named volumes, storage directories Docker manages outside the containers:
-
-| Volume              | Contents                                                                                                       |
-| ------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `komiq_server-data` | Accounts, personal libraries, reading progress, comments, settings, cached covers, and Cloudflare credentials. |
-| `komiq_engine-data` | Installed source extensions and the Suwayomi source engine database.                                           |
-
-### Stop containers before copying
-
-Komiq uses SQLite to store your account and library data. The server writes to the database frequently using Write-Ahead Logging (WAL). If you copy the database files while the server is actively writing, the resulting copy may be corrupted or unreadable.
-
-Always stop the containers before creating a backup.
-
-Both Docker configurations give the server 30 seconds to stop. The server spends up to 20 seconds finishing active requests and buffered writes. Wait for `docker compose stop` to return before copying files. A forced stop can interrupt that drain.
-
-The cover cache is a separate `covers.sqlite3` file in the server volume. Its contents can be fetched again. If SQLite cannot open it or finds corruption during the startup checks, komiq renames it to `covers.sqlite3.quarantined-<id>` and creates a fresh cache. SQLite's related `-wal` and `-shm` files move with it when present. The main account and library database stays in place.
-
-After a cache loss, komiq clears saved cover pointers in small batches when the corresponding cover is missing. Covers return as the cache fills. The quarantined files remain in the volume for inspection and consume disk space until you remove them. Keep them until the new cache is working.
-
-> [!NOTE]
-> Timed automated backups are planned for a later release. For now, create backups manually before system maintenance.
-
-### Create the backup archives
-
-Stop the stack, then use a temporary container to create compressed archives of both volumes:
+The installer detects the old file, explains the conversion and shows progress. Watch from another terminal:
 
 ```sh
 cd deploy/selfhost
-docker compose stop
-docker run --rm -v komiq_server-data:/data -v "$PWD":/backup busybox \
-  tar czf /backup/komiq-server-data.tgz -C /data .
-docker run --rm -v komiq_engine-data:/data -v "$PWD":/backup busybox \
-  tar czf /backup/komiq-engine-data.tgz -C /data .
-docker compose start
+docker compose logs -f server
 ```
 
-This procedure produces two compressed archive files in your current directory: `komiq-server-data.tgz` and `komiq-engine-data.tgz`. Once the archives are created, `docker compose start` resumes normal server operations.
+Progress lines begin with `sqlite import:`. Advancing progress extends the installer's wait. A stop in the middle resumes at the next start. If PostgreSQL already holds application data, the server leaves the SQLite file alone, logs the warning `PostgreSQL already holds data or a completed import; leaving SQLite in place` and starts.
 
-Store these backup files in a safe location outside the host machine.
+### Kept copies and their two warnings
 
-## Restore from a backup
+During conversion the server keeps a saved copy of the SQLite file, `komika.sqlite3.import-work-source`, and a record, `komika.sqlite3.import-work-state`. If the SQLite file differs from that copy at a later start, for example because you put back another file, the server converts again from the beginning. First it moves the saved copy aside as `komika.sqlite3.import-kept-<UTC time>` (with `-wal` or `-journal` files if the original had them) and logs:
 
-You can restore your backups onto a new server installation or after resetting a broken environment.
+```text
+sqlite import: warning: the copy of the SQLite database that an earlier import attempt made differs from the file now at ...
+```
 
-First, create the containers and volumes without starting them:
+The line says whether the kept file is an exact copy. A second warning, `the database being imported is smaller than the copy kept at`, appears when one of `users`, `user_library`, `comments` or `work` holds fewer rows now than in the kept copy. It lists the counts, for example `users: 0 now, 3 before`. The conversion goes on after both warnings. Check which database holds your data, and delete the kept copy only then.
+
+### If conversion fails
+
+The server exits and leaves the SQLite file in place. The installer prints the failure line and stops the server to prevent repeated restarts. Some failures are refusals that name exact commands: read [Fix server problems](/self-host/troubleshooting).
+
+Before a successful conversion, you can return to the previous SQLite image. The installer tags it as `komiq-selfhost:<project>-pre-postgres` and records its immutable image ID beside `.env`. For the default `komiq` project:
 
 ```sh
 cd deploy/selfhost
-docker compose create
+KOMIQ_IMAGE=komiq-selfhost:komiq-pre-postgres docker compose \
+  -f docker-compose.yml -f docker-compose.rollback.yml \
+  up -d --no-build --no-deps server
 ```
 
-Next, extract the backup archives into the corresponding volumes and restore file ownership:
+If none was saved, use your previous release image or its archive: this repository specifies no published SQLite tag. Add your HTTPS and certificate-check Compose files if you used them. After a successful conversion and new writes, the kept SQLite file is behind and cannot restore your latest reading history. Use a current PostgreSQL backup instead.
+
+## Where data lives
+
+Docker named volumes are storage directories outside container images:
+
+| Volume                | Contents                                                                           |
+| --------------------- | ---------------------------------------------------------------------------------- |
+| `komiq_postgres-data` | Accounts, libraries, reading progress, comments, catalogue and settings.           |
+| `komiq_server-data`   | SQLite cover cache, connector files, and the old SQLite file with its kept copies. |
+| `komiq_engine-data`   | Installed extensions and the source engine's own data.                             |
+
+Names use your Compose project prefix if you changed it. Keep `.env` securely too: it holds the database password. Changing that password in `.env` does not change the password inside an existing PostgreSQL cluster.
+
+## Dump the database
+
+A dump is a consistent database export. The included `backup.sh` makes one with `pg_dump` while komiq runs: a custom-format file named `komiq-<UTC time>.dump` in the private `$HOME/komiq-backups` directory, or in the directory you pass as its first argument. It publishes a dump only after success, keeps the newest seven, and leaves earlier dumps in place when a dump fails or is empty. A dump excludes the refetchable `covers.sqlite3` cache and the source engine's data.
+
+Run `bash deploy/selfhost/backup.sh` from the repository root once, then add this line to the host user's crontab with `crontab -e`. Replace the example repository path with yours:
 
 ```sh
-docker run --rm -v komiq_server-data:/data -v "$PWD":/backup busybox \
-  sh -c 'tar xzf /backup/komiq-server-data.tgz -C /data && chown -R 10001:10001 /data'
-docker run --rm -v komiq_engine-data:/data -v "$PWD":/backup busybox \
-  sh -c 'tar xzf /backup/komiq-engine-data.tgz -C /data && chown -R 1000:1000 /data'
+0 2 * * * /bin/bash /path/to/komika/deploy/selfhost/backup.sh >> "$HOME/komiq-backups/backup.log" 2>&1
 ```
 
-Finally, start the restored stack in detached mode:
+Run it as a host user that can access Docker. The job needs `flock` or Perl and never prints the password. Keep the directory outside the repository checkout so image builds cannot copy it, and copy completed dumps off this machine.
+
+## Restore into a fresh install
+
+Copy the repository and create a private `.env` with a random `KOMIQ_DB_PASSWORD`, as described in [Install with Docker](/self-host/docker). Start only the database, restore into its empty `komiq` database, then start the rest:
 
 ```sh
+cd deploy/selfhost
+DUMP="$HOME/komiq-backups/komiq-20261012T020000Z.dump"
+docker compose up -d --wait postgres
+docker compose exec -T postgres sh -c \
+  'PGPASSWORD="$KOMIQ_DB_PASSWORD" exec pg_restore -h 127.0.0.1 -U komiq -d komiq --no-owner --no-acl --exit-on-error' \
+  < "$DUMP"
 docker compose up -d
 ```
 
-### File ownership requirements
+Restore before starting the server so its migrations do not create conflicting tables. Check the restore exit status, then inspect your library.
 
-The `chown` command in the restore procedure is necessary for security and file access.
+### Server and engine files
 
-The komiq server runs as an unprivileged system user with user identifier (UID) `10001` (`komika`). The Suwayomi source engine runs under UID `1000`. If you extract the backup without setting the correct user ownership, the processes cannot write to their data directories and the containers will fail to start.
-
-## Remove komiq
-
-If you want to stop or remove your komiq installation, choose one of these options based on whether you want to preserve your data.
-
-### Stop and keep data
-
-To shut down the containers while preserving your libraries and accounts:
+Stop the stack before archiving its non-database volumes:
 
 ```sh
-cd deploy/selfhost
-docker compose down
+umask 077
+mkdir -p "$HOME/komiq-backups"
+docker compose stop
+for v in server engine; do
+  docker run --rm -v "komiq_$v-data":/data -v "$HOME/komiq-backups":/backup busybox \
+    tar czf "/backup/komiq-$v-data.tgz" -C /data .
+done
+docker compose start
 ```
 
-Your Docker volumes remain intact on the host disk. Running `docker compose up -d` at any point restarts the server with all your data present.
+On a fresh restore, create these volumes with `docker compose create` and extract each archive with a temporary container. Set server file ownership to user ID `10001` and engine file ownership to `1000` before starting. The cover cache can be omitted and fetched again. Never treat a copied live PostgreSQL data directory as a database dump.
 
-### Remove containers and delete all data
+## Stop or remove komiq
 
-To completely remove the containers, networks, and data volumes:
-
-```sh
-cd deploy/selfhost
-docker compose down -v
-```
-
-> [!WARNING]
-> The `-v` flag permanently deletes the `komiq_server-data` and `komiq_engine-data` volumes. All user accounts, reading history, saved bookmarks, and installed source extensions will be deleted.
+`docker compose down` removes containers and keeps volumes. `docker compose down -v` deletes all three volumes and their data permanently. Keep verified backups before using `-v`.
 
 Next: [Fix server problems](/self-host/troubleshooting).

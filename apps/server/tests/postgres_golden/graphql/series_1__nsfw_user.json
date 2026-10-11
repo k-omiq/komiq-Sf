@@ -1,0 +1,131 @@
+{
+  "data": {
+    "canonicalSeries": {
+      "altTitles": [
+        "Only Alias Hero",
+        "Shared Alias",
+        "나 혼자만 레벨업"
+      ],
+      "artist": "Artist 1",
+      "author": "Author 1",
+      "chapterCount": 4,
+      "coverUrl": "/covers/w_00000000000040008000000000000001.webp?v=7",
+      "covers": [
+        {
+          "fileName": "cover-1.jpg",
+          "isPrimary": true,
+          "lang": "ja",
+          "thumbnailUrl": "https://uploads.mangadex.org/covers/00000000-0000-4000-8000-000000000001/cover-1.jpg.512.jpg",
+          "url": "https://uploads.mangadex.org/covers/00000000-0000-4000-8000-000000000001/cover-1.jpg",
+          "volume": "1"
+        },
+        {
+          "fileName": "cover-extra.jpg",
+          "isPrimary": false,
+          "lang": null,
+          "thumbnailUrl": "https://uploads.mangadex.org/covers/00000000-0000-4000-8000-000000000001/cover-extra.jpg.512.jpg",
+          "url": "https://uploads.mangadex.org/covers/00000000-0000-4000-8000-000000000001/cover-extra.jpg",
+          "volume": "0.5"
+        }
+      ],
+      "createdAt": "2020-01-01T01:02:03.000000+00:00",
+      "credits": [
+        {
+          "name": "Artist 1",
+          "role": "artist"
+        },
+        {
+          "name": "Author 1",
+          "role": "author"
+        }
+      ],
+      "description": "Description 1: café / 漫画",
+      "detectedAt": null,
+      "genres": [
+        "Action",
+        "Gore"
+      ],
+      "id": "w_00000000000040008000000000000001",
+      "isFavorite": true,
+      "isMarked": true,
+      "isNsfw": false,
+      "latestChapter": null,
+      "latestChapterAt": "2020-01-08T01:02:03.000000+00:00",
+      "libraryStatus": "reading",
+      "localizedDescriptions": [
+        {
+          "description": "English description",
+          "lang": "en"
+        },
+        {
+          "description": "日本語の説明",
+          "lang": "ja"
+        }
+      ],
+      "mangadexRating": 5.1,
+      "metadata": {
+        "contentRating": "safe",
+        "demographic": null,
+        "originalLanguage": "ja",
+        "tags": [
+          {
+            "group": "genre",
+            "id": "00000000-0000-4000-8000-000000000301",
+            "name": "Action"
+          },
+          {
+            "group": "content",
+            "id": "00000000-0000-4000-8000-000000000310",
+            "name": "Gore"
+          }
+        ],
+        "trackers": [
+          {
+            "externalId": "00000000-0000-4000-8000-000000000001",
+            "provider": "mangadex",
+            "url": "https://mangadex.org/title/00000000-0000-4000-8000-000000000001"
+          }
+        ],
+        "year": 1991
+      },
+      "rating": {
+        "average": 7.666666666666667,
+        "count": 3,
+        "distribution": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          1,
+          1,
+          0
+        ]
+      },
+      "scan": {
+        "avgIntervalHours": 0.0,
+        "lastScannedAt": null,
+        "nextScanAt": null,
+        "overrideIntervalHours": null,
+        "paused": false,
+        "pausedOverride": null,
+        "pollEveryMinutes": 30,
+        "pollEveryMinutesOverride": null,
+        "statusOverride": null
+      },
+      "sourceId": "mangadex",
+      "status": "ONGOING",
+      "title": "Solo Leveling",
+      "type": "MANGA",
+      "updatedAt": "2020-01-08T01:02:03.000000+00:00",
+      "views": {
+        "last24h": 0,
+        "last7d": 0,
+        "total": 42
+      },
+      "workId": "w_00000000000040008000000000000001"
+    }
+  }
+}

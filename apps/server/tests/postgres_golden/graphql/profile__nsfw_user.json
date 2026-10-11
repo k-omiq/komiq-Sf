@@ -1,0 +1,49 @@
+{
+  "data": {
+    "myActivity": [
+      {
+        "createdAt": "2020-01-06T01:02:03.123456+00:00",
+        "id": "00000000-0000-4000-8000-000000001202",
+        "kind": "review",
+        "targetId": "w_00000000000040008000000000000001",
+        "targetType": "series"
+      }
+    ],
+    "myComments": {
+      "hasNextPage": false,
+      "items": [
+        {
+          "body": "Another root",
+          "chapterNumber": null,
+          "createdAt": "2020-01-03T01:02:03.000000+00:00",
+          "dislikes": 0,
+          "hasSpoiler": false,
+          "id": "00000000-0000-4000-8000-000000001102",
+          "likes": 0,
+          "parentId": null,
+          "replyCount": 0,
+          "seriesId": "w_00000000000040008000000000000001",
+          "seriesTitle": "Solo Leveling",
+          "targetId": "w_00000000000040008000000000000001",
+          "targetType": "series"
+        }
+      ],
+      "page": 1,
+      "total": 1
+    },
+    "session": {
+      "token": "golden-nsfw-user",
+      "user": {
+        "avatarUrl": null,
+        "bio": "Reads manga, 만화 and 漫画",
+        "displayName": "CJK reader",
+        "id": "00000000-0000-4000-8000-000000000902",
+        "isAdmin": false,
+        "joinedAt": "2020-01-03T01:02:03.000000+00:00",
+        "mustChangePassword": false,
+        "showNsfw": true,
+        "username": "cjk-reader"
+      }
+    }
+  }
+}

@@ -8,6 +8,7 @@
 # Reader at `/`, admin console at `/admin`, API and images on the same address.
 #
 # Services:
+#   postgres     Main database, private to this stack.
 #   server       komiq: API, reader, admin, image proxy. The only published port.
 #   suwayomi     The source engine. It runs the extensions you install in the
 #                admin console. Not published: its API has no authentication,
@@ -25,7 +26,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/selfhost/Dockerfile
-    image: komiq-selfhost:local
+    image: ${KOMIQ_IMAGE:-komiq-selfhost:local}
     restart: unless-stopped
     # The server drains requests and buffered writes within 20s.
     stop_grace_period: 30s
@@ -33,6 +34,9 @@ services:
     # stop signals.
     init: true
     environment:
+      DATABASE_URL: postgres://komiq:${KOMIQ_DB_PASSWORD:?Run install.sh to generate KOMIQ_DB_PASSWORD in .env}@postgres:5432/komiq
+      COVERS_DATABASE_URL: sqlite:///data/covers.sqlite3
+      KOMIKA_SQLITE_IMPORT_PATH: /data/komika.sqlite3
       TZ: ${TZ:-UTC}
       # The port published below: the server names it in the addresses it suggests.
       # Inside the container it always listens on 8080.
@@ -48,10 +52,60 @@ services:
     volumes:
       - server-data:/data
     depends_on:
+      postgres:
+        condition: service_healthy
       # Started, not healthy: the setup screens work while the engine is still
       # booting, and the server retries the engine on its own.
       suwayomi:
         condition: service_started
+    healthcheck:
+      # Import timing rule: docs/audits/postgres-phase5b-selfhost.md.
+      # install.sh increases and saves this grace for large SQLite sources.
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:8080/health/ready']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: ${KOMIQ_IMPORT_START_PERIOD:-24h}
+    logging:
+      driver: json-file
+      options: { max-size: 20m, max-file: '5' }
+
+  postgres:
+    image: postgres:18.6-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c
+    restart: unless-stopped
+    stop_grace_period: 60s
+    shm_size: 256mb
+    environment:
+      # The bootstrap superuser can connect only over a local Unix socket.
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD: ${KOMIQ_DB_PASSWORD:?Run install.sh to generate KOMIQ_DB_PASSWORD in .env}
+      KOMIQ_DB_PASSWORD: ${KOMIQ_DB_PASSWORD:?Run install.sh to generate KOMIQ_DB_PASSWORD in .env}
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale-provider=builtin --builtin-locale=C.UTF-8 --lc-collate=C --lc-ctype=C --auth-host=scram-sha-256
+    command:
+      # Bound the shared cache on a small host; other services need memory too.
+      - -c
+      - shared_buffers=256MB
+      # Bound per-connection memory and leave room above the server's pools.
+      - -c
+      - max_connections=40
+      # Reduce WAL disk traffic, trading a little CPU for compression.
+      - -c
+      - wal_compression=on
+      - -c
+      - password_encryption=scram-sha-256
+    volumes:
+      # PostgreSQL 18 uses versioned directories below /var/lib/postgresql.
+      - postgres-data:/var/lib/postgresql
+      - ./postgres-init.sh:/docker-entrypoint-initdb.d/10-komiq.sh:ro
+    healthcheck:
+      # A TCP query as the application role proves SCRAM and database access.
+      test: ['CMD-SHELL', 'PGPASSWORD="$$KOMIQ_DB_PASSWORD" psql -h 127.0.0.1 -U komiq -d komiq -Atqc "SELECT 1" | grep -qx 1']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
     logging:
       driver: json-file
       options: { max-size: 20m, max-file: '5' }
@@ -100,7 +154,9 @@ services:
       options: { max-size: 20m, max-file: '5' }
 
 volumes:
-  # Database, cover cache, uploaded avatars, Cloudflare connector files.
+  # Covers, connector files and the retained SQLite source.
   server-data:
   # Installed extensions and the engine's own database.
   engine-data:
+  # Main accounts, library, catalogue and settings database.
+  postgres-data:

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "file": "tests/postgres_golden/search_observed.json",
+      "expected_sha256": "324f494b5ffb50e49416b2481c2d2df9d237d1def0d45074b2ae711aa07c848f",
+      "actual_sha256": "90088ac38ecb2245462e9451a1e98cc1e2a326f2477aa0179d6946354c98d788",
+      "reason": "Required typo recall for seven formerly empty queries and short title/prefix matches for X, Go, su; other32 search outputs unchanged. Full concrete output review in postgres-phase3-search-compatibility.md.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-10",
+        "evidence": "Owner reply to the concrete ten-query review: Accept the ten listed search differences"
+      }
+    }
+  ]
+}

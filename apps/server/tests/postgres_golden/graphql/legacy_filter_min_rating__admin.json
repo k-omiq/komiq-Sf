@@ -1,0 +1,39 @@
+{
+  "data": {
+    "search": {
+      "hasNextPage": false,
+      "items": [
+        {
+          "chapterCount": 6,
+          "createdAt": "2020-01-01T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000001",
+          "isNsfw": false,
+          "latestChapter": "Oneshot",
+          "latestChapterAt": "2020-01-05T01:02:03.000000+00:00",
+          "rating": {
+            "average": 7.666666666666667,
+            "count": 3,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              1,
+              0,
+              1,
+              1,
+              0
+            ]
+          },
+          "status": "ONGOING",
+          "title": "Solo Leveling",
+          "type": "MANGA",
+          "updatedAt": "2020-01-05T01:02:03.000000+00:00"
+        }
+      ],
+      "page": 1,
+      "total": 1
+    }
+  }
+}

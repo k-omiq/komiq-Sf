@@ -1,0 +1,299 @@
+{
+  "data": {
+    "search": {
+      "items": [
+        {
+          "altTitles": [],
+          "artist": "Artist 14",
+          "author": "Author 14",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000014.webp",
+          "createdAt": "2020-01-06T01:02:03.123456+00:00",
+          "description": "Description 14: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Romance"
+          ],
+          "id": "w_00000000000040008000000000000014",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "14",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 6.4,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "CANCELLED",
+          "title": "Chronicle Star",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 9",
+          "author": "Author 9",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000009.webp",
+          "createdAt": "2020-01-01T01:02:03.000000+00:00",
+          "description": "Description 9: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Action"
+          ],
+          "id": "w_00000000000040008000000000000009",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "9",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 5.9,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "CANCELLED",
+          "title": "進撃の巨人",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 7",
+          "author": "Author 7",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000007.webp",
+          "createdAt": "2020-01-07T01:02:03.123456+00:00",
+          "description": "Description 7: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Action"
+          ],
+          "id": "w_00000000000040008000000000000007",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "7",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 5.7,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "COMPLETED",
+          "title": "Go",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 4",
+          "author": "Author 4",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000004.webp",
+          "createdAt": "2020-01-04T01:02:03.000000+00:00",
+          "description": "Description 4: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Romance"
+          ],
+          "id": "w_00000000000040008000000000000004",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "4",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": null,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "CANCELLED",
+          "title": "Dr.STONE",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [
+            "Shared Alias"
+          ],
+          "artist": "Artist 2",
+          "author": "Author 2",
+          "chapterCount": 1,
+          "coverUrl": "/covers/w_00000000000040008000000000000002.webp",
+          "createdAt": "2020-01-02T01:02:03.000000+00:00",
+          "description": "Description 2: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Romance",
+            "Gore"
+          ],
+          "id": "w_00000000000040008000000000000002",
+          "isFavorite": false,
+          "isMarked": false,
+          "isNsfw": false,
+          "latestChapter": "2",
+          "latestChapterAt": "2020-01-01T01:02:03.000000+00:00",
+          "libraryStatus": null,
+          "mangadexRating": 5.2,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "COMPLETED",
+          "title": "Solo Leveling: Side Story",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "altTitles": [],
+          "artist": "Artist 12",
+          "author": "Author 12",
+          "chapterCount": 0,
+          "coverUrl": "/covers/w_00000000000040008000000000000012.webp",
+          "createdAt": "2020-01-04T01:02:03.000000+00:00",
+          "description": "Description 12: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Romance"
+          ],
+          "id": "w_00000000000040008000000000000012",
+          "isFavorite": false,
+          "isMarked": true,
+          "isNsfw": false,
+          "latestChapter": null,
+          "latestChapterAt": "",
+          "libraryStatus": null,
+          "mangadexRating": null,
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "COMPLETED",
+          "title": "Chronicle Zero",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-04T01:02:03.000000+00:00"
+        }
+      ],
+      "total": 6
+    },
+    "updatesFeed": {
+      "items": [
+        {
+          "announcedAt": "2020-01-01T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000014",
+          "releasedAt": "2020-01-01T01:02:03.000000+00:00",
+          "workId": "w_00000000000040008000000000000014"
+        },
+        {
+          "announcedAt": "2020-01-01T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000009",
+          "releasedAt": "2020-01-01T01:02:03.000000+00:00",
+          "workId": "w_00000000000040008000000000000009"
+        },
+        {
+          "announcedAt": "2020-01-01T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000007",
+          "releasedAt": "2020-01-01T01:02:03.000000+00:00",
+          "workId": "w_00000000000040008000000000000007"
+        },
+        {
+          "announcedAt": "2020-01-01T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000004",
+          "releasedAt": "2020-01-01T01:02:03.000000+00:00",
+          "workId": "w_00000000000040008000000000000004"
+        },
+        {
+          "announcedAt": "2020-01-01T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000002",
+          "releasedAt": "2020-01-01T01:02:03.000000+00:00",
+          "workId": "w_00000000000040008000000000000002"
+        }
+      ],
+      "total": 5
+    }
+  }
+}

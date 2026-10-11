@@ -1,0 +1,106 @@
+name: PostgreSQL desktop spike (manual draft)
+
+# Phase 5c research only. Review before dispatching; this does not build installers.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  spike:
+    name: PostgreSQL (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-macos
+            runner: macos-14
+            triple: aarch64-apple-darwin
+          - target: x86_64-macos
+            runner: macos-15-intel
+            triple: x86_64-apple-darwin
+          - target: x86_64-linux
+            runner: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+          - target: x86_64-windows
+            runner: windows-latest
+            triple: x86_64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Python's own log output is UTF-8; child tool bytes use the spike decoder.
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run private PostgreSQL spike
+        # Short paths leave space for sockaddr_un's small path limit on macOS.
+        # This path is unique to this job's runner and run attempt; never use --force.
+        env:
+          SPIKE_TRIPLE: ${{ matrix.triple }}
+        run: |
+          if [[ "$RUNNER_OS" == 'Windows' ]]; then
+            spike_work="${RUNNER_TEMP}/pgs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          else
+            spike_work="/tmp/pgs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          fi
+          echo "SPIKE_WORK=${spike_work}" >> "$GITHUB_ENV"
+          python scripts/postgres-desktop-spike.py \
+            --work-dir "$spike_work" \
+            --triple "$SPIKE_TRIPLE" \
+            --json-out result.json \
+            --summary-md summary.md
+      - name: Print the summary and the failed steps to the log
+        # The artifact quota can be full; the log must hold the result by itself.
+        if: always()
+        run: |
+          cat "${SPIKE_WORK}/summary.md" || true
+          python - "${SPIKE_WORK}/result.json" <<'PY' || true
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          matrix = data.get("windows_path_matrix", {})
+          if matrix.get("applicable"):
+              print("=== WINDOWS JUNCTION LOCATIONS")
+              print(json.dumps(matrix.get("junction_locations", {}), indent=1, ensure_ascii=True))
+              for trial in matrix.get("trials", []):
+                  print("=== WINDOWS PATH OBSERVATIONS", trial.get("name"))
+                  for name in ("path-observations", "restart-different-cwd", "restart-fresh-junction", "crash-recovery", "final-path-observations", "dump-restore"):
+                      if name in trial.get("stages", {}):
+                          print(name, json.dumps(trial["stages"][name], indent=1, ensure_ascii=True))
+          # Observation timeouts must remain visible when the lifecycle passes.
+          for step in data.get("steps", []):
+              if step.get("step") == 11:
+                  print("=== PRIVATE SERVER CLEANUP")
+                  print(json.dumps(step, indent=1, ensure_ascii=True))
+              if step.get("status") not in ("pass", "skipped"):
+                  print("=== FAILED STEP", step.get("step"), step.get("name"))
+                  print(json.dumps(step, indent=1, ensure_ascii=True))
+          # Failed trials matter even when another strategy makes the step PASS.
+          for trial in data.get("windows_path_matrix", {}).get("trials", []):
+              if trial.get("status") == "fail":
+                  print("=== FAILED TRIAL", trial.get("name"), trial.get("stage_reached"))
+                  print(trial.get("error", ""))
+                  print(trial.get("cleanup_error", ""))
+                  span = trial.get("command_range", {"start": 0, "end": 0})
+                  for command in data.get("commands", [])[span["start"]:span["end"]]:
+                      if command.get("error") or command.get("returncode", 0) != 0:
+                          print(json.dumps(command, indent=1, ensure_ascii=True))
+          PY
+      - name: Upload full result even when a spike step fails
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-desktop-spike-${{ matrix.target }}
+          path: |
+            ${{ env.SPIKE_WORK }}/result.json
+            ${{ env.SPIKE_WORK }}/summary.md
+          if-no-files-found: error
+          retention-days: 30

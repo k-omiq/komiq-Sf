@@ -1,0 +1,38 @@
+{
+  "data": {
+    "genreFacets": [
+      {
+        "count": 8,
+        "genre": "Action"
+      },
+      {
+        "count": 7,
+        "genre": "Romance"
+      },
+      {
+        "count": 3,
+        "genre": "Gore"
+      }
+    ],
+    "tags": [
+      {
+        "count": 8,
+        "group": "GENRE",
+        "id": "action",
+        "name": "Action"
+      },
+      {
+        "count": 7,
+        "group": "GENRE",
+        "id": "romance",
+        "name": "Romance"
+      },
+      {
+        "count": 3,
+        "group": "CONTENT",
+        "id": "gore",
+        "name": "Gore"
+      }
+    ]
+  }
+}

@@ -3,9 +3,9 @@ title: Deployment
 description: Understand how the project deploys the global server with Cloudflare, Docker, and backups.
 ---
 
-This page describes how the project deploys the global server at `komiq.cc`, its free work-in-progress demo. It is one example of the self-hostable komiq model: the admin app provides the server, management portal and Suwayomi engine, and the reader app connects to that server. For your own installation, start with [Install with Docker](/self-host/docker) and [Internet access](/self-host/internet-access).
+This page describes how the project deploys the global server at `komiq.cc`, its free work-in-progress demo. It is one example of the self-hostable komiq model: the admin app provides the server, management portal and Suwayomi engine, and the reader app connects to that server. For your own installation, start with [Install with Docker](/self-host/docker) and [Reach it from the internet](/self-host/internet-access).
 
-The global server combines Cloudflare Workers with backend services running in Docker containers, isolated service environments. This deployment isolates untrusted extensions, uses the optional image proxy, and continuously replicates the database to object storage.
+The global server combines Cloudflare Workers with backend services running in Docker containers, isolated service environments. This deployment isolates untrusted extensions, uses the optional image proxy, and uses scheduled full and incremental backups with continuous write-ahead log (WAL) archiving to object storage.
 
 ## Workers and edge routing
 
@@ -31,7 +31,7 @@ The [reader app](/developers/reader-app) runs on `komiq.cc` and `www.komiq.cc`. 
 
 ### The admin app's console Worker
 
-This deployment uses the secondary `hosted` build of the [admin console](/developers/admin-app) on `admin.komiq.cc`. It is deployed from `apps/admin` using the Worker name `komika-admin`:
+This deployment uses the secondary `hosted` build of the [admin app](/developers/admin-app) on `admin.komiq.cc`. It is deployed from `apps/admin` using the Worker name `komika-admin`:
 
 - Built with `@sveltejs/adapter-static` with fallback `index.html`.
 - Serves prebuilt client-side assets through Cloudflare Workers Static Assets.
@@ -40,7 +40,7 @@ This deployment uses the secondary `hosted` build of the [admin console](/develo
 
 ### The image proxy Worker
 
-The [image proxy](/developers/image-proxy) runs on `img.komiq.cc`. It is deployed from `apps/worker` using the Worker name `komika-img`:
+The [image proxy Worker](/developers/image-proxy) runs on `img.komiq.cc`. It is deployed from `apps/worker` using the Worker name `komika-img`:
 
 - Provides an edge proxy and caching layer for chapter pages and cover images.
 - Enforces an upstream host allowlist through `ALLOWED_SOURCE_HOSTS`. The proxy allows `uploads.mangadex.org`, `mangadex.network`, and `api.komiq.cc`. Any request targeting an unapproved host is rejected.
@@ -63,15 +63,17 @@ The backend API is reachable at `api.komiq.cc`. This hostname routes public API 
 
 The admin app's server and Suwayomi engine run alongside a FlareSolverr sidecar inside Docker on a private bridge network (`komika`), configured in `deploy/docker-compose.yml`:
 
-| Service        | Image                                 | Ports                              | Memory limit |
-| -------------- | ------------------------------------- | ---------------------------------- | ------------ |
-| `server`       | Built from `deploy/server.Dockerfile` | `127.0.0.1:8080`, `127.0.0.1:9090` | 6 GB         |
-| `suwayomi`     | Digest-pinned `tachidesk`             | `127.0.0.1:4567`                   | 8 GB         |
-| `flaresolverr` | Digest-pinned `flaresolverr`          | None (internal network only)       | 2 GB         |
+| Service           | Image                                   | Ports                              | Memory limit              |
+| ----------------- | --------------------------------------- | ---------------------------------- | ------------------------- |
+| `postgres`        | Built from `deploy/postgres/Dockerfile` | None, internal network             | See Compose configuration |
+| `postgres-backup` | Same database tooling image             | None, internal network             | See Compose configuration |
+| `server`          | Built from `deploy/server.Dockerfile`   | `127.0.0.1:8080`, `127.0.0.1:9090` | 6 GB                      |
+| `suwayomi`        | Digest-pinned `tachidesk`               | `127.0.0.1:4567`                   | 8 GB                      |
+| `flaresolverr`    | Digest-pinned `flaresolverr`            | None (internal network only)       | 2 GB                      |
 
 ### The server container
 
-The `server` container runs `komika-server`, a Rust application based on Axum, async-graphql, and SQLite:
+The `server` container runs `komika-server`, a Rust application based on Axum, async-graphql, and PostgreSQL:
 
 - Binds internal port 8080 to loopback `127.0.0.1:8080`. Public ingress reaches it through a reverse proxy or tunnel.
 - Serves GraphQL queries and mutations at `/graphql`.
@@ -99,60 +101,31 @@ The `flaresolverr` container runs a headless Chromium browser designed to solve 
 - Exposes no host ports.
 - Memory is capped at 2 GB.
 
-## Database replication and backups
+## PostgreSQL and backups
 
-The core application database lives in SQLite at `/data/komika.sqlite3` on a persistent Docker volume (`server-data`). It stores user accounts, hashed credentials, sessions, reading history, library entries, and review discussions.
+The packaging uses PostgreSQL 18 for accounts, sessions, reading history, library entries, discussions and catalogue state. A private `postgres` service stores its cluster in `postgres-data`. The server authenticates with a non-superuser application role. PostgreSQL initialization fixes the encoding and locale so search and import checks behave consistently.
 
-Continuous backups are managed by Litestream, configured in `deploy/litestream.yml`:
+The `postgres-backup` service packages pgBackRest, a database backup manager, for object storage. It schedules full and incremental backups and archives write-ahead logs (WAL), the transaction records PostgreSQL uses for recovery. Backup configuration and restore operations live in `deploy/postgres/`. This replaces the previous file replication path.
 
-```yaml
-dbs:
-  - path: /data/komika.sqlite3
-    replicas:
-      - type: s3
-        bucket: ${LITESTREAM_BUCKET}
-        path: komika
-        endpoint: ${LITESTREAM_ENDPOINT}
-        region: ${LITESTREAM_REGION}
-        force-path-style: true
-        sync-interval: 10s
-        retention: 36h
-        snapshot-interval: 24h
-```
+The separate `/data/covers.sqlite3` cache stays in `server-data` and is excluded from PostgreSQL backups. An open or corruption failure preserves its files with a `.quarantined-<id>` suffix and recreates the cache. Accounts and libraries remain in PostgreSQL. Connector files are separate too; a database backup does not preserve filesystem credentials.
 
-### Replication mechanics
+### Conversion and restoration
 
-Litestream runs alongside the server process inside the `server` container. It is invoked via `litestream replicate -config /etc/litestream.yml -exec "komika-server"` in `deploy/server-entrypoint.sh`.
+The server can import an old main SQLite database at first start when PostgreSQL is empty. It verifies the converted data before serving, renames the original after success and never deletes it. Progress starts with `sqlite import:`. A failure exits without serving partial data. A populated PostgreSQL database is never overwritten by automatic import. [Data model](/developers/data-model) lists what the import decides and refuses.
 
-- SQLite operates in Write-Ahead Logging (WAL) mode.
-- Litestream monitors the WAL and streams changes to an S3-compatible bucket, such as Cloudflare R2.
-- The synchronization interval is set to 10 seconds (`sync-interval: 10s`), giving a recovery point objective (RPO) of approximately 10 seconds.
-- A full database snapshot is generated every 24 hours (`snapshot-interval: 24h`).
-- Litestream checks retention hourly. It keeps snapshots inside `retention: 36h` and removes earlier snapshots and WAL segments before the oldest retained snapshot. The usable history varies with snapshot timing. Budget for two daily snapshots plus retained WAL and measure bucket usage to confirm your storage limit.
+Hosted recovery uses pgBackRest restore into an empty cluster directory with PostgreSQL stopped. The procedure, with its rehearsal, is `deploy/postgres/RESTORE.md`; it is a runbook for operators of this packaging, and this page does not repeat it. A point-in-time restore combines a backup with archived WAL up to the chosen recovery point. Review the restore tooling and verify the restored database before making it available to users. Keep recovery separate from ordinary startup; never substitute an empty database for a failed restore.
 
-The separate `/data/covers.sqlite3` cache is excluded from Litestream. The server checks its tables at startup. An open or corruption failure preserves the file and its SQLite sidecars with a `.quarantined-<id>` suffix, then recreates the derived cache. It clears main-database cover pointers whose blobs are missing in batches of 256. A partly missing cache receives the same reconciliation.
+The server holds `.komiq-server.lock` in the covers directory for its lifetime. A second server using that directory fails to start. The `phase-f` maintenance command connects to existing databases without running migrations or recreating covers. It refuses a missing, behind or incompatible main schema.
 
-The server holds `.komiq-server.lock` in the main database's directory for its lifetime, before running migrations. A second server using that directory fails to start. The `phase-f` maintenance command connects to existing files without running migrations or recreating covers. It refuses a missing, behind or incompatible main schema.
+### Self-host and desktop
 
-The Compose server service has a 30-second stop grace period. The application bounds its request and buffered-write drain to 20 seconds after the stop signal, leaving time for Litestream's final sync.
+The self-host Compose file runs stock PostgreSQL privately alongside the server and source engine. `deploy/selfhost/install.sh` generates the password, keeps `.env` private and detects old SQLite volumes. It extends readiness waits as import progress arrives. Self-host backups use `deploy/selfhost/backup.sh`, a documented `pg_dump` job rather than the global deployment's pgBackRest setup. Read [Update and back up](/self-host/update-and-backup) for dump and fresh-install restore commands.
 
-### Recovery and restoration
+The desktop admin app bundles PostgreSQL, converts an old SQLite database at first start and saves a local dump while running when the newest is at least 20 hours old. It keeps seven completed dumps. The reader app does not run the account database.
 
-Restoration is automatic on initial deployment. When the `server` container starts with Litestream variables configured and discovers an empty `/data` volume, `deploy/server-entrypoint.sh` executes a restore operation before launching the server:
+## Status
 
-```sh
-litestream restore -if-db-not-exists -if-replica-exists -config /etc/litestream.yml /data/komika.sqlite3
-```
-
-This downloads the latest snapshot and replays recent WAL files, recovering database state up to the last replicated transaction.
-
-With the pinned Litestream 0.3.13, both skip conditions return success: the local database already exists, or no replica exists yet. Any other nonzero restore result aborts startup before replication or the application can create a database. Correct the restore error before restarting the container.
-
-Administrators can also perform manual point-in-time restores:
-
-```sh
-docker compose exec server litestream restore -o /tmp/komika.sqlite3 /data/komika.sqlite3
-```
+Production cutover and a restore rehearsal of this packaging are planned. Backup storage use, object-store request counts and recovery duration for this deployment have not been measured. Packaging code does not establish that the global server has already switched engines. Desktop installer validation is also planned.
 
 ## Where to look
 
@@ -162,5 +135,6 @@ docker compose exec server litestream restore -o /tmp/komika.sqlite3 /data/komik
 - `apps/docs/wrangler.toml`: Static documentation site routing on Cloudflare Workers.
 - `deploy/docker-compose.yml`: Service definitions, memory caps, network settings, and volume mappings.
 - `deploy/server.Dockerfile`: Build stages for the Rust server container.
-- `deploy/server-entrypoint.sh`: Container startup script handling automatic Litestream restoration and process execution.
-- `deploy/litestream.yml`: Database replication schedules, snapshot intervals, and S3 replica settings.
+- `deploy/server-entrypoint.sh`: Container startup checks and server process execution.
+- `deploy/postgres/`: PostgreSQL initialization, pgBackRest backup scheduling and restore tooling.
+- `deploy/postgres/RESTORE.md`: the hosted backup, restore and rehearsal procedure.

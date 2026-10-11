@@ -17,15 +17,15 @@
  *    show a 1–5 star row at the end of a chapter that only ever reached localStorage —
  *    no table, no field, no resolver, nothing that could read it back on another device
  *    — so it was removed rather than left looking like it counted for something.
- *  - Likes/replies aren't modelled server-side; in live mode they're ephemeral
- *    client-only affordances (reset on reload).
+ *  - Comment votes, reply trees and deletion tombstones come from the live backend;
+ *    the offline fallback persists the same thread shape on this device.
  */
 import type { Comment, CommentTargetType, Review } from '@komika/types';
 import { backend } from '$lib/context';
 import { config, apiAssetSrc } from '$lib/config';
 import { auth } from '$lib/auth.svelte';
 import * as local from './social';
-import type { ReaderComment, SeriesComment } from './types';
+import type { CommentDeletion, ReaderComment, SeriesComment } from './types';
 
 /** Live social requires the unified backend (Suwayomi/mock have no auth layer). */
 export function socialLive(): boolean {
@@ -56,6 +56,8 @@ export interface CommentView {
 	authorId: string;
 	/** Parent comment id, or null for a top-level comment. Drives the reply tree. */
 	parentId: string | null;
+	/** Null for live comments; deleted comments retain their place in the reply tree. */
+	deleted: CommentDeletion | null;
 	name: string;
 	initial: string;
 	/** Uploaded avatar URL (live backend only); undefined → render an initial. */
@@ -150,10 +152,11 @@ function reviewToView(r: Review): ReviewView {
 
 function commentToView(c: Comment): CommentView {
 	const av = avatarFor(c.author.id);
-	return {
+	const view: CommentView = {
 		id: c.id,
 		authorId: c.author.id,
 		parentId: c.parentId ?? null,
+		deleted: c.deletedBy ?? null,
 		name: c.author.username,
 		initial: initialOf(c.author.username),
 		avatarUrl: c.author.avatarUrl,
@@ -170,6 +173,30 @@ function commentToView(c: Comment): CommentView {
 		likes: c.likes,
 		dislikes: c.dislikes,
 		myVote: c.myVote,
+	};
+	return view.deleted ? tombstone(view, view.deleted) : view;
+}
+
+function tombstone(c: CommentView, deleted: CommentDeletion): CommentView {
+	return {
+		...c,
+		deleted,
+		authorId: '',
+		name: '',
+		initial: '',
+		avatarUrl: null,
+		bg: '',
+		fg: '',
+		body: '',
+		hasSpoiler: false,
+		mediaUrl: null,
+		mediaWidth: null,
+		mediaHeight: null,
+		isOp: false,
+		mine: false,
+		likes: 0,
+		dislikes: 0,
+		myVote: 0,
 	};
 }
 
@@ -333,23 +360,41 @@ async function loadComments(
 	}
 	// No seeded thread — honest empty state; offline user comments persist locally.
 	const seeded = local.getComments(bucket, key, [] as ReaderComment[]);
-	return seeded.map((c) => ({
+	return seeded.map((c): CommentView => ({
 		id: c.id,
-		authorId: '',
-		parentId: null,
+		authorId: c.authorId ?? '',
+		parentId: c.parentId ?? null,
+		deleted: c.deleted ?? null,
 		name: c.name,
 		initial: c.initial,
+		avatarUrl: c.avatarUrl,
 		bg: c.bg,
 		fg: c.fg,
 		body: c.body,
 		time: c.time,
 		hasSpoiler: c.hasSpoiler ?? false,
+		mediaUrl: c.mediaUrl,
+		mediaWidth: c.mediaWidth,
+		mediaHeight: c.mediaHeight,
 		isOp: c.isOp,
-		mine: false,
+		mine: !c.deleted && (c.authorId ? c.authorId === auth.user?.id : (c.mine ?? false)),
 		likes: c.likes,
-		dislikes: 0,
-		myVote: c.liked ? 1 : 0,
+		dislikes: c.dislikes ?? 0,
+		myVote: c.myVote ?? (c.liked ? 1 : 0),
 	}));
+}
+
+function saveLocalComments(bucket: LocalBucket, key: string, comments: CommentView[]): void {
+	local.saveComments(
+		bucket,
+		key,
+		comments.map((c): ReaderComment => ({
+			...c,
+			ts: 999,
+			liked: c.myVote === 1,
+			replies: comments.filter((reply) => reply.parentId === c.id).length,
+		})),
+	);
 }
 
 /** Reply/attachment options for {@link submitComment}. */
@@ -395,6 +440,7 @@ async function submitComment(
 			id: 'local-' + Date.now(),
 			authorId: auth.user?.id ?? '',
 			parentId,
+			deleted: null,
 			name: me,
 			initial: initialOf(me),
 			bg: '#f2f1ee',
@@ -412,29 +458,8 @@ async function submitComment(
 			myVote: 0,
 		},
 	];
-	// The localStorage fallback shape is flat and doesn't model replies/media;
-	// persist the top-level rows only so offline mode still shows the discussion.
-	local.saveComments(
-		bucket,
-		key,
-		next
-			.filter((c) => c.parentId == null)
-			.map((c) => ({
-				id: c.id,
-				name: c.name,
-				initial: c.initial,
-				bg: c.bg,
-				fg: c.fg,
-				ts: 999,
-				time: c.time,
-				isOp: c.isOp,
-				hasSpoiler: c.hasSpoiler,
-				likes: c.likes,
-				liked: c.myVote === 1,
-				replies: 0,
-				body: c.body,
-			})),
-	);
+	// Persist the whole tree, including replies and tombstones, across offline reloads.
+	saveLocalComments(bucket, key, next);
 	return next;
 }
 
@@ -509,7 +534,7 @@ export function submitSeriesComment(
 	);
 }
 
-// ---- admin moderation ------------------------------------------------------
+// ---- comment deletion + admin moderation -----------------------------------
 
 /** True when the signed-in user may moderate (admin on the live backend). */
 export function canModerate(): boolean {
@@ -517,32 +542,45 @@ export function canModerate(): boolean {
 }
 
 /**
- * Delete a comment (admin moderation) and return the list without it. In live
- * mode this removes it server-side; the local fallback just drops it from view.
+ * Authors and admins may delete comments. Keep a tombstone when replies exist;
+ * otherwise remove the comment and prune newly-empty tombstone ancestors.
+ * The optional local target persists the same rule in the offline store.
  */
 export async function deleteComment(
 	commentId: string,
 	current: CommentView[],
+	localTarget?: { targetType: CommentTargetType; storageKey: string },
 ): Promise<CommentView[]> {
+	const comment = current.find((c) => c.id === commentId);
+	const own = !!comment && (socialLive() ? comment.authorId === auth.user?.id : comment.mine);
+	if (!own && !canModerate()) throw new Error('You can only delete your own comments.');
 	if (socialLive()) {
-		if (!auth.user?.isAdmin) throw new Error('Admin access required.');
 		if (!backend.deleteComment) throw new Error('Moderation is unavailable on this backend.');
 		await backend.deleteComment(commentId);
 	}
-	// The server deletes the whole reply subtree; mirror that locally so replies of
-	// a removed comment don't linger as orphans until the next reload.
-	const doomed = new Set<string>([commentId]);
-	let grew = true;
-	while (grew) {
-		grew = false;
-		for (const c of current) {
-			if (c.parentId && doomed.has(c.parentId) && !doomed.has(c.id)) {
-				doomed.add(c.id);
-				grew = true;
-			}
+	let next: CommentView[];
+	if (current.some((c) => c.parentId === commentId)) {
+		next = current.map((c) =>
+			c.id === commentId ? tombstone(c, own ? 'author' : 'moderator') : c,
+		);
+	} else {
+		next = current.filter((c) => c.id !== commentId);
+		let parentId = comment?.parentId;
+		while (parentId) {
+			const parent = next.find((c) => c.id === parentId);
+			if (!parent?.deleted || next.some((c) => c.parentId === parentId)) break;
+			next = next.filter((c) => c.id !== parentId);
+			parentId = parent.parentId;
 		}
 	}
-	return current.filter((c) => !doomed.has(c.id));
+	if (!socialLive() && localTarget) {
+		saveLocalComments(
+			localTarget.targetType === 'series' ? 'seriesThread' : 'chapter',
+			localTarget.storageKey,
+			next,
+		);
+	}
+	return next;
 }
 
 /**

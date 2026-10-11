@@ -1105,6 +1105,9 @@ export interface Comment {
 	likes: number;
 	dislikes: number;
 	myVote: number;
+	/** Set on a deleted comment kept as a tombstone because it has replies: who
+	 *  removed it. The server blanks its body, media, votes and author. */
+	deletedBy?: 'author' | 'moderator' | null;
 }
 
 /** The result of `voteComment`: a comment's fresh vote tallies + the viewer's vote. */

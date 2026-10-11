@@ -1,5 +1,11 @@
 use std::env;
 
+/// Absolute legacy main database path for first-start import. Unset searches
+/// beside the SQLite covers file. An empty or relative value is rejected at boot.
+pub fn sqlite_import_path() -> Option<std::path::PathBuf> {
+    env::var_os("KOMIKA_SQLITE_IMPORT_PATH").map(std::path::PathBuf::from)
+}
+
 /// A secret string that never prints its value in `Debug` output (Config is
 /// logged wholesale at startup via `?cfg`).
 #[derive(Clone, Default)]
@@ -136,7 +142,7 @@ pub fn parse_scan_source_rate_limits(raw: &str) -> Vec<SourceRateLimit> {
 }
 
 /// Runtime configuration, sourced from env vars (see `.env.example`).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     /// Address the public listener binds (`BIND_ADDR`, default `0.0.0.0`). An IPv4
     /// or IPv6 literal; `main` refuses to start on anything else rather than
@@ -150,8 +156,8 @@ pub struct Config {
     pub database_url: String,
     /// SQLite URL for the SEPARATE cover-cache DB. Kept out of `database_url` on
     /// purpose: cover blobs are large and re-derivable from MangaDex, so this DB is
-    /// NOT Litestream-replicated (only `database_url` is). Defaults to a
-    /// `covers.sqlite3` sibling of the main DB; override with `COVERS_DATABASE_URL`.
+    /// not stored in PostgreSQL. Defaults to `sqlite://covers.sqlite3`; override
+    /// with `COVERS_DATABASE_URL`.
     pub covers_database_url: String,
     /// Directory holding the vendored extension icons served at
     /// `/ext-icons/{pkgName}.png`. Populated from `assets/ext-icons/` in the repo
@@ -291,10 +297,9 @@ impl Config {
             .filter(|&v| v > 0)
             .unwrap_or(9090);
         let database_url =
-            env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://komika.sqlite3".to_string());
-        // Cover-cache DB lives next to the main DB by default (a `covers.sqlite3`
-        // sibling), but is a distinct file so Litestream (which replicates only
-        // `database_url`) never ships cover bytes to R2.
+            env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/komika".to_string());
+        // The derived cover cache retains a local SQLite file independently of
+        // the PostgreSQL database endpoint.
         let covers_database_url =
             env::var("COVERS_DATABASE_URL").unwrap_or_else(|_| derive_covers_url(&database_url));
         let ext_icons_dir =
@@ -561,11 +566,14 @@ impl Config {
     }
 }
 
-/// Place `covers.sqlite3` next to the main DB file, preserving the URL's scheme
-/// prefix. Handles `sqlite:///abs/dir/komika.sqlite3`, `sqlite://rel.sqlite3`, and
+/// PostgreSQL endpoints default to the local `covers.sqlite3` cache. Legacy
+/// SQLite URLs still derive a sibling file for offline/source tooling. Handles `sqlite:///abs/dir/komika.sqlite3`, `sqlite://rel.sqlite3`, and
 /// `sqlite:rel.sqlite3`. A `:memory:` URL (tests only — prod is always a file) maps
 /// to its own in-memory DB.
 fn derive_covers_url(database_url: &str) -> String {
+    if database_url.starts_with("postgres:") || database_url.starts_with("postgresql:") {
+        return "sqlite://covers.sqlite3".to_string();
+    }
     if database_url.contains(":memory:") {
         return "sqlite::memory:".to_string();
     }
@@ -577,4 +585,127 @@ fn derive_covers_url(database_url: &str) -> String {
         return format!("{}:covers.sqlite3", &database_url[..i]);
     }
     "covers.sqlite3".to_string()
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("bind_addr", &self.bind_addr)
+            .field("port", &self.port)
+            .field("metrics_port", &self.metrics_port)
+            .field("database_url", &"<redacted>")
+            .field("covers_database_url", &self.covers_database_url)
+            .finish_non_exhaustive()
+    }
+}
+
+/// PostgreSQL session limits. Values are milliseconds; zero/invalid overrides
+/// fall back to the bounded default rather than disabling a timeout.
+#[derive(Clone, Copy, Debug)]
+pub struct DatabaseSessionLimits {
+    pub statement_ms: u64,
+    pub lock_ms: u64,
+    pub idle_transaction_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DatabaseLimits {
+    pub read_connections: u32,
+    pub foreground_connections: u32,
+    pub readers: DatabaseSessionLimits,
+    pub foreground: DatabaseSessionLimits,
+    pub background: DatabaseSessionLimits,
+}
+
+impl Default for DatabaseLimits {
+    fn default() -> Self {
+        Self {
+            read_connections: 16,
+            foreground_connections: 8,
+            readers: DatabaseSessionLimits {
+                statement_ms: 30_000,
+                lock_ms: 5_000,
+                idle_transaction_ms: 60_000,
+            },
+            foreground: DatabaseSessionLimits {
+                statement_ms: 15_000,
+                lock_ms: 5_000,
+                idle_transaction_ms: 30_000,
+            },
+            background: DatabaseSessionLimits {
+                statement_ms: 1_800_000,
+                lock_ms: 60_000,
+                idle_transaction_ms: 900_000,
+            },
+        }
+    }
+}
+
+impl DatabaseLimits {
+    pub fn from_env() -> Self {
+        Self::parse(|name| env::var(name).ok())
+    }
+
+    fn parse(get: impl Fn(&str) -> Option<String>) -> Self {
+        fn positive(get: &impl Fn(&str) -> Option<String>, name: &str, default: u64) -> u64 {
+            get(name)
+                .and_then(|v| v.trim().parse().ok())
+                .filter(|v| *v > 0 && *v <= i32::MAX as u64)
+                .unwrap_or(default)
+        }
+        let mut limits = Self {
+            read_connections: positive(&get, "DATABASE_READ_POOL_SIZE", 16) as u32,
+            foreground_connections: positive(&get, "DATABASE_FOREGROUND_POOL_SIZE", 8) as u32,
+            ..Self::default()
+        };
+        for (lane, session) in [
+            ("READ", &mut limits.readers),
+            ("FOREGROUND", &mut limits.foreground),
+            ("BACKGROUND", &mut limits.background),
+        ] {
+            session.statement_ms = positive(
+                &get,
+                &format!("DATABASE_{lane}_STATEMENT_TIMEOUT_MS"),
+                session.statement_ms,
+            );
+            session.lock_ms = positive(
+                &get,
+                &format!("DATABASE_{lane}_LOCK_TIMEOUT_MS"),
+                session.lock_ms,
+            );
+            session.idle_transaction_ms = positive(
+                &get,
+                &format!("DATABASE_{lane}_IDLE_TRANSACTION_TIMEOUT_MS"),
+                session.idle_transaction_ms,
+            );
+        }
+        limits
+    }
+}
+
+#[cfg(test)]
+mod database_limit_tests {
+    use super::*;
+
+    #[test]
+    fn database_limits_defaults_and_overrides_are_bounded() {
+        let defaults = DatabaseLimits::parse(|_| None);
+        assert_eq!(
+            defaults.read_connections + defaults.foreground_connections + 1,
+            25
+        );
+        assert_eq!(defaults.foreground.statement_ms, 15_000);
+        assert_eq!(defaults.background.idle_transaction_ms, 900_000);
+        let overridden = DatabaseLimits::parse(|name| match name {
+            "DATABASE_FOREGROUND_POOL_SIZE" => Some("3".into()),
+            "DATABASE_FOREGROUND_LOCK_TIMEOUT_MS" => Some("50".into()),
+            "DATABASE_READ_STATEMENT_TIMEOUT_MS" => Some("0".into()),
+            "DATABASE_BACKGROUND_LOCK_TIMEOUT_MS" => Some("invalid".into()),
+            _ => None,
+        });
+        assert_eq!(overridden.foreground_connections, 3);
+        assert_eq!(overridden.foreground.lock_ms, 50);
+        assert_eq!(overridden.readers.statement_ms, 30_000);
+        assert_eq!(overridden.background.lock_ms, 60_000);
+    }
 }

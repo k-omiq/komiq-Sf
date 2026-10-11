@@ -31,7 +31,7 @@
 //!    the pager's "showing 61-90 of N" becomes fiction. Same precedent as
 //!    `graphql::updates_feed`.
 //! 2. **Every branchable predicate is BRANCHED into the SQL text, never parameterized.**
-//!    `WHERE (? = 1 OR f.is_nsfw = 0)` is opaque to the planner: it cannot tell `is_nsfw`
+//!    `WHERE (? = 1 OR f.is_nsfw = FALSE)` is opaque to the planner: it cannot tell `is_nsfw`
 //!    is constant, so it cannot use the index's leading column and falls back to sorting
 //!    all 115k rows through a temp B-tree. Migration 0064's header and `updates_feed` both
 //!    document this. `comic_type` is branched for the same reason — as an equality it
@@ -202,8 +202,8 @@ impl From<BrowseSort> for Sort {
 /// a `browse_catalogue` column (the two-phase rankings and RELEVANCE).
 ///
 /// Every column here has a `(is_nsfw, key DESC, work_id DESC)` + `(key DESC, work_id DESC)`
-/// index pair (0069/0102/0106), and `title` carries `COLLATE NOCASE` in both the index and
-/// this expression — they must match or the planner cannot use the index for the ORDER BY.
+/// index pair (0069/0102/0106), and the title sort uses the baseline ASCII-folded `sort_title` expression.
+/// The expression must match its index for native ordered access.
 fn sort_column(key: SortKey) -> Option<(&'static str, bool)> {
     match key {
         SortKey::LatestUpdate => Some(("f.released_at", true)),
@@ -212,7 +212,10 @@ fn sort_column(key: SortKey) -> Option<(&'static str, bool)> {
         SortKey::MostFollows => Some(("f.follows", true)),
         SortKey::HighestRated => Some(("f.rating", true)),
         SortKey::Year => Some(("f.year", true)),
-        SortKey::Title => Some(("f.title COLLATE NOCASE", false)),
+        SortKey::Title => Some((
+            "translate(f.title, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')",
+            false,
+        )),
         SortKey::Relevance | SortKey::MostViewed | SortKey::CommunityRating => None,
     }
 }
@@ -229,7 +232,7 @@ fn dir(desc: bool) -> &'static str {
 /// first. Fixed regardless of the requested direction — the remainder is the UNRANKED tail,
 /// which sorts last either way, and "newest first" is the only order in which a reader who
 /// scrolls that far finds anything.
-const NEWEST_ORDER: &str = "f.released_at DESC, f.work_id DESC";
+const NEWEST_ORDER: &str = "f.released_at DESC NULLS LAST, f.work_id DESC";
 
 /// The per-work review aggregate, keyed by **work id**, for both the RATING sort and the
 /// `minRating`/`maxRating` bounds.
@@ -267,23 +270,7 @@ const NEWEST_ORDER: &str = "f.released_at DESC, f.work_id DESC";
 /// would drift apart.
 macro_rules! rated_votes_sql {
     () => {
-        "SELECT wid, user_id, score FROM ( \
-             SELECT wid, user_id, score, \
-                    ROW_NUMBER() OVER (PARTITION BY wid, user_id \
-                                       ORDER BY updated_at DESC, rid DESC) AS rn \
-             FROM ( \
-                 SELECT r.series_id AS wid, r.user_id AS user_id, r.score AS score, \
-                        r.updated_at AS updated_at, r.id AS rid \
-                   FROM reviews r \
-                   WHERE r.series_id LIKE 'w!_%' ESCAPE '!' \
-               UNION ALL \
-                 SELECT ss.work_id AS wid, r.user_id AS user_id, r.score AS score, \
-                        r.updated_at AS updated_at, r.id AS rid \
-                   FROM reviews r \
-                   JOIN source_series ss ON ss.source_key = r.series_id \
-                                        AND ss.source_type = 'suwayomi' \
-             ) \
-         ) WHERE rn = 1"
+        r#"SELECT wid, user_id, score FROM ( SELECT wid, user_id, score, ROW_NUMBER() OVER (PARTITION BY wid, user_id ORDER BY updated_at DESC NULLS LAST, rid DESC NULLS LAST) AS rn FROM ( SELECT r.series_id AS wid, r.user_id AS user_id, r.score AS score, r.updated_at AS updated_at, r.id AS rid FROM reviews r WHERE r.series_id LIKE 'w!_%' ESCAPE '!' UNION ALL SELECT ss.work_id AS wid, r.user_id AS user_id, r.score AS score, r.updated_at AS updated_at, r.id AS rid FROM reviews r JOIN source_series ss ON ss.source_key = r.series_id AND ss.source_type = 'suwayomi' ) ) WHERE rn = 1"#
     };
 }
 pub(crate) use rated_votes_sql;
@@ -291,13 +278,13 @@ pub(crate) use rated_votes_sql;
 /// The `rated_per_work` CTE's DEFINITION, without the `WITH` — for a statement that has
 /// other CTEs of its own (text search) and must list them all after one `WITH`.
 const RATED_PER_WORK_DEF: &str = concat!(
-    "rated_per_work AS (SELECT wid, AVG(score) AS avg FROM (",
+    "rated_per_work AS (SELECT wid, AVG(score)::double precision AS avg FROM (",
     rated_votes_sql!(),
     ") GROUP BY wid)"
 );
 
 const RATED_PER_WORK_CTE: &str = concat!(
-    "WITH rated_per_work AS (SELECT wid, AVG(score) AS avg FROM (",
+    "WITH rated_per_work AS (SELECT wid, AVG(score)::double precision AS avg FROM (",
     rated_votes_sql!(),
     ") GROUP BY wid) "
 );
@@ -314,15 +301,23 @@ const BROWSE_COLS: &str = "f.work_id, f.reader_id, f.title, f.cover_url, f.suway
 /// One `browse_catalogue` row as Browse reads it.
 #[derive(sqlx::FromRow, Clone, Debug)]
 pub struct BrowseRow {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub work_id: String,
     /// The id the card NAVIGATES to, which is **not** always `work_id` — see
     /// [`BrowseQuery`]'s note and migration 0069.
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub reader_id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub title: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub cover_url: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub suwayomi_thumbnail: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub comic_type: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub status: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     pub en_chapter_count: i64,
     /// The newest chapter's LABEL — "151", "10.5", "Oneshot" (migration 0095). A different
     /// quantity from [`Self::en_chapter_count`], which is how many chapters we know of: the
@@ -335,15 +330,18 @@ pub struct BrowseRow {
     ///
     /// TEXT, and never parsed back to a float: it is `release_event.label`, whose
     /// vocabulary is defined once in `chapter_label::ChapterLabel`.
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub latest_chapter: Option<String>,
     /// Newest upstream chapter release (epoch millis), or **`None` for a work with no dated
     /// chapter** — 67,000 of the 115,567 rows. NULLABLE is the whole point of migration
     /// 0069; `feed_series_updates.released_at` is NOT NULL by contract.
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     pub released_at: Option<i64>,
     pub is_nsfw: bool,
     /// When the WORK entered the catalogue (ISO-8601). Read off the row rather than from the
     /// per-page `work` lookup, which is what lets a chapterless card carry an honest
     /// `updatedAt` — the only other candidate, `released_at`, is NULL for exactly those.
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub created_at: String,
 }
 
@@ -387,7 +385,7 @@ pub struct BrowseQuery<'a> {
     /// gate. Part of the memo key, so two viewers share a memoized page only when the
     /// same works are blocked for both.
     pub blocks: Option<&'a crate::block::BlockSet>,
-    /// The viewer's NSFW posture. `false` pins `f.is_nsfw = 0`; `true` emits no predicate
+    /// The viewer's NSFW posture. `false` pins `f.is_nsfw = FALSE`; `true` emits no predicate
     /// at all (not `is_nsfw IN (0,1)`) so the opted-in branch reads a different index.
     pub show_nsfw: bool,
     /// Collapsed format words (`collapsed_comic_type_word`), deduped; empty = all formats.
@@ -485,9 +483,9 @@ enum Bind {
 }
 
 fn bind_rows<'q>(
-    mut q: sqlx::query::QueryAs<'q, sqlx::Sqlite, BrowseRow, sqlx::sqlite::SqliteArguments<'q>>,
+    mut q: sqlx::query::QueryAs<'q, sqlx::Postgres, BrowseRow, sqlx::postgres::PgArguments>,
     binds: &[Bind],
-) -> sqlx::query::QueryAs<'q, sqlx::Sqlite, BrowseRow, sqlx::sqlite::SqliteArguments<'q>> {
+) -> sqlx::query::QueryAs<'q, sqlx::Postgres, BrowseRow, sqlx::postgres::PgArguments> {
     for b in binds {
         q = match b {
             Bind::Text(s) => q.bind(s.clone()),
@@ -499,9 +497,9 @@ fn bind_rows<'q>(
 }
 
 fn bind_count<'q>(
-    mut q: sqlx::query::QueryScalar<'q, sqlx::Sqlite, i64, sqlx::sqlite::SqliteArguments<'q>>,
+    mut q: sqlx::query::QueryScalar<'q, sqlx::Postgres, i64, sqlx::postgres::PgArguments>,
     binds: &[Bind],
-) -> sqlx::query::QueryScalar<'q, sqlx::Sqlite, i64, sqlx::sqlite::SqliteArguments<'q>> {
+) -> sqlx::query::QueryScalar<'q, sqlx::Postgres, i64, sqlx::postgres::PgArguments> {
     for b in binds {
         q = match b {
             Bind::Text(s) => q.bind(s.clone()),
@@ -510,10 +508,6 @@ fn bind_count<'q>(
         };
     }
     q
-}
-
-fn placeholders(n: usize) -> String {
-    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
 }
 
 /// Trim, drop blanks, DEDUPE and SORT a client genre list, then cap it at
@@ -986,13 +980,17 @@ fn store_rows_with(key: String, rows: Vec<BrowseRow>, ttl: std::time::Duration) 
 /// Each clause pushes its SQL and its binds TOGETHER, so the bind order is the clause order
 /// by construction rather than by a second list that has to be kept in step.
 fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
+    build_where_from(q, 1)
+}
+
+fn build_where_from(q: &BrowseQuery<'_>, start: usize) -> (String, Vec<Bind>, bool) {
     let mut parts: Vec<String> = Vec::new();
     let mut binds: Vec<Bind> = Vec::new();
 
     // The NSFW gate, BRANCHED. `false` pins the index's leading column to a constant and
     // leaves the rest of the index in ORDER BY order (the hot, edge-cacheable path);
     // `true` emits nothing, which is what lets the planner pick the `is_nsfw`-less index
-    // instead of sorting 48k rows. NEVER `(? = 1 OR f.is_nsfw = 0)`.
+    // instead of sorting 48k rows. NEVER `(? = 1 OR f.is_nsfw = FALSE)`.
     //
     // NOTHING BELOW CAN WIDEN THIS. Every other clause is ANDed onto it, so the content-rating
     // allow-list in particular can only narrow inside it — `contentRatings: [EROTICA,
@@ -1000,20 +998,20 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
     // which the effective rating (migration 0106) makes empty. Tested as an explicit bypass
     // attempt.
     if !q.show_nsfw {
-        parts.push("f.is_nsfw = 0".into());
+        parts.push("f.is_nsfw = FALSE".into());
     }
     // NSFW_ONLY, the one non-cumulative content-rating value: the complement of SAFE
     // rather than a ceiling above it. Pushed as its own clause because it constrains
     // `is_nsfw`, not `content_rating`.
     //
     // Deliberately emitted even when the viewer is opted OUT, where it combines with the
-    // gate above into `is_nsfw = 0 AND is_nsfw = 1` and yields an empty page. That is the
+    // gate above into `is_nsfw = 0 AND is_nsfw = TRUE` and yields an empty page. That is the
     // honest answer — they may not see those works — and it is why this is NOT skipped as
     // a redundant clause: dropping it would turn "adult only" into "everything you're
     // allowed to see", which is the opposite of what was asked for. The gate still reads
     // the index first, so the empty result costs a seek, not a scan.
     if q.nsfw_only {
-        parts.push("f.is_nsfw = 1".into());
+        parts.push("f.is_nsfw = TRUE".into());
     }
     // The content block rules. ANDed like every other clause, so they can only narrow.
     // The rating a rule names is this table's own column (the effective rating, index
@@ -1031,21 +1029,45 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
     // gives it that (verified: every shape plans as `SEARCH … USING INDEX idx_fsu_* (is_nsfw=?
     // AND comic_type=?)`). It is `(? = 1 OR …)` that defeats it, because there the column is
     // not constrained at all.
-    fn any_of(parts: &mut Vec<String>, binds: &mut Vec<Bind>, col: &str, vals: &[String]) {
+    fn any_of(
+        start: usize,
+        parts: &mut Vec<String>,
+        binds: &mut Vec<Bind>,
+        col: &str,
+        vals: &[String],
+    ) {
         match vals.len() {
             0 => {}
-            1 => parts.push(format!("{col} = ?")),
-            n => parts.push(format!("{col} IN ({})", placeholders(n))),
+            1 => parts.push(format!(
+                "{col} = {}",
+                crate::sql_params::placeholders(start + binds.len(), 1)
+            )),
+            n => parts.push(format!(
+                "{col} IN ({})",
+                crate::sql_params::placeholders(start + binds.len(), n)
+            )),
         }
         binds.extend(vals.iter().cloned().map(Bind::Text));
     }
     let owned = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     // Format. Several formats are ORed (v2); one stays the index-prefix equality v1 had.
-    any_of(&mut parts, &mut binds, "f.comic_type", &owned(&q.types));
+    any_of(
+        start,
+        &mut parts,
+        &mut binds,
+        "f.comic_type",
+        &owned(&q.types),
+    );
     // Status over the normalized five-word vocabulary migration 0068 materializes.
     // Un-normalized this could not be an equality at all — `komika_status` has no `ON_HIATUS`
     // member, so those rows would be unreachable by every filter value.
-    any_of(&mut parts, &mut binds, "f.status", &owned(&q.statuses));
+    any_of(
+        start,
+        &mut parts,
+        &mut binds,
+        "f.status",
+        &owned(&q.statuses),
+    );
     // Content rating: an allow-list over the EFFECTIVE rating (see the gate note above).
     // v1's ALL and PORNOGRAPHIC tiers arrive as `None` and emit no clause (they admit every
     // stored value), which is also why they are cheaper than SAFE.
@@ -1055,7 +1077,7 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
             // SQL `IN ()` it would otherwise format is a syntax error.
             parts.push("0".into());
         } else {
-            any_of(&mut parts, &mut binds, "f.content_rating", &owned(r));
+            any_of(start, &mut parts, &mut binds, "f.content_rating", &owned(r));
         }
     }
     // Demographic. `'none'` is MangaDex's "no demographic", materialized as NULL
@@ -1071,17 +1093,23 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
         match (named.is_empty(), none) {
             (true, false) => {}
             (true, true) => parts.push("f.demographic IS NULL".into()),
-            (false, false) => any_of(&mut parts, &mut binds, "f.demographic", &named),
+            (false, false) => any_of(start, &mut parts, &mut binds, "f.demographic", &named),
             (false, true) => {
                 parts.push(format!(
                     "(f.demographic IN ({}) OR f.demographic IS NULL)",
-                    placeholders(named.len())
+                    crate::sql_params::placeholders(start + binds.len(), named.len())
                 ));
                 binds.extend(named.into_iter().map(Bind::Text));
             }
         }
     }
-    any_of(&mut parts, &mut binds, "f.original_language", &q.languages);
+    any_of(
+        start,
+        &mut parts,
+        &mut binds,
+        "f.original_language",
+        &q.languages,
+    );
     // The `hasChapters` gate. `en_chapter_count` is the leading sort key of the four CHAPTERS
     // indices and index PAYLOAD on the four `released_at` ones (migration 0069), so this stays
     // index-only on both orderings — measured 2.1-2.5 ms for the COUNT at 115,567 rows versus
@@ -1106,12 +1134,18 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
         ("f.follows", ">=", q.min_follows),
     ] {
         if let Some(v) = v {
-            parts.push(format!("{col} {op} ?"));
+            parts.push(format!(
+                "{col} {op} {}",
+                crate::sql_params::placeholders(start + binds.len(), 1)
+            ));
             binds.push(Bind::Int(v));
         }
     }
     if let Some(v) = q.min_md_rating {
-        parts.push("f.rating >= ?".into());
+        parts.push(format!(
+            "f.rating >= {}",
+            crate::sql_params::placeholders(start + binds.len(), 1)
+        ));
         binds.push(Bind::Real(v));
     }
     // Source. `EXISTS` over `source_series` by `idx_source_series_work(work_id)` — one probe per
@@ -1129,12 +1163,12 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
                 .into(),
         ),
         Some(SourceFilter::SuwayomiSource(id)) => {
-            parts.push(
+            parts.push(format!(
                 "EXISTS (SELECT 1 FROM source_series ss \
                   WHERE ss.work_id = f.work_id AND ss.source_type = 'suwayomi' \
-                    AND ss.source_id = ?)"
-                    .into(),
-            );
+                    AND ss.source_id = {})",
+                crate::sql_params::placeholders(start + binds.len(), 1)
+            ));
             binds.push(Bind::Text(id.clone()));
         }
     }
@@ -1160,37 +1194,44 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
     // under include-AND nothing has it so nothing matches; under include-OR it adds nothing;
     // excluded, it excludes nothing. `browse::tests::tag_filters_use_the_tag_indexes` pins all
     // four plans.
-    fn all_of_list(n: usize) -> String {
+    fn all_of_list(start: usize, n: usize) -> String {
         if n == 1 {
-            "SELECT t.work_id FROM work_tag t WHERE t.tag_key = ?".to_string()
+            format!(
+                "SELECT t.work_id FROM work_tag t WHERE t.tag_key = {}",
+                crate::sql_params::placeholders(start, 1)
+            )
         } else {
             format!(
                 "SELECT t.work_id FROM work_tag t WHERE t.tag_key IN ({}) \
                  GROUP BY t.work_id HAVING COUNT(DISTINCT t.tag_key) = {n}",
-                placeholders(n)
+                crate::sql_params::placeholders(start, n)
             )
         }
     }
-    fn any_probe(n: usize) -> String {
+    fn any_probe(start: usize, n: usize) -> String {
         format!(
             "SELECT 1 FROM work_tag t WHERE t.work_id = f.work_id AND t.tag_key IN ({})",
-            placeholders(n)
+            crate::sql_params::placeholders(start, n)
         )
     }
     if !q.include_tags.is_empty() {
         let n = q.include_tags.len();
         parts.push(match q.include_mode {
-            TagMode::And => format!("f.work_id IN ({})", all_of_list(n)),
-            TagMode::Or => format!("EXISTS ({})", any_probe(n)),
+            TagMode::And => format!("f.work_id IN ({})", all_of_list(start + binds.len(), n)),
+            TagMode::Or => format!("EXISTS ({})", any_probe(start + binds.len(), n)),
         });
         binds.extend(q.include_tags.iter().cloned().map(Bind::Text));
     }
     if !q.exclude_tags.is_empty() {
         let n = q.exclude_tags.len();
         parts.push(match q.exclude_mode {
-            TagMode::And if n > 1 => format!("f.work_id NOT IN ({})", all_of_list(n)),
+            TagMode::And if n > 1 => {
+                format!("f.work_id NOT IN ({})", all_of_list(start + binds.len(), n))
+            }
             // One tag: "all of {x}" and "any of {x}" are the same set; the probe is cheaper.
-            TagMode::And | TagMode::Or => format!("NOT EXISTS ({})", any_probe(n)),
+            TagMode::And | TagMode::Or => {
+                format!("NOT EXISTS ({})", any_probe(start + binds.len(), n))
+            }
         });
         binds.extend(q.exclude_tags.iter().cloned().map(Bind::Text));
     }
@@ -1209,7 +1250,7 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
     if !genres.is_empty() {
         parts.push(format!(
             "EXISTS (SELECT 1 FROM work_tag t WHERE t.work_id = f.work_id AND t.tag IN ({}))",
-            placeholders(genres.len())
+            crate::sql_params::placeholders(start + binds.len(), genres.len())
         ));
         for g in &genres {
             binds.push(Bind::Text(g.clone()));
@@ -1227,14 +1268,14 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
         if let Some(v) = bound {
             uses_rated = true;
             parts.push(format!(
-                "COALESCE((SELECT rp.avg FROM rated_per_work rp WHERE rp.wid = f.work_id), 0) {op} ?"
+                "COALESCE((SELECT rp.avg FROM rated_per_work rp WHERE rp.wid = f.work_id), 0) {op} {}", crate::sql_params::placeholders(start + binds.len(), 1)
             ));
             binds.push(Bind::Real(v));
         }
     }
 
     let where_sql = if parts.is_empty() {
-        "1".to_string()
+        "TRUE".to_string()
     } else {
         parts.join(" AND ")
     };
@@ -1260,13 +1301,11 @@ fn build_where(q: &BrowseQuery<'_>) -> (String, Vec<Bind>, bool) {
 /// order, which filled "Latest added" with actively-updating (and therefore trending) works
 /// while genuinely new intake sat pages deep. `created_at` is `work.created_at` verbatim:
 /// when the work entered OUR catalogue, the same field `Series.createdAt` and the reader's
-/// `addedAt` resolve from. TEXT ISO-8601 under BINARY collation, which is chronological
-/// here: every production writer stamps either chrono `to_rfc3339()` ("…+00:00") or the
-/// schema's strftime("…Z"), and the date-time digits decide every comparison before the
-/// suffix. NOT NULL on every row (0069). Index shapes: migration 0102.
+/// `addedAt` resolve from. PostgreSQL orders its native timestamptz value, and
+/// the API emits C10 through the shared decoder. It is NOT NULL on every row.
 fn order_by(col: &str, desc: bool) -> String {
     let d = dir(desc);
-    format!("{col} {d}, f.work_id {d}")
+    format!("{col} {d} NULLS LAST, f.work_id {d}")
 }
 
 /// Run one page statement.
@@ -1284,25 +1323,28 @@ async fn fetch_page(
     offset: i64,
 ) -> Result<Vec<BrowseRow>> {
     let prelude = if cte { RATED_PER_WORK_CTE } else { "" };
+    let page_args = crate::sql_params::placeholders(binds.len() + 1, 2);
+    let mut page_args = page_args.split(", ");
+    let limit_arg = page_args.next().unwrap();
+    let offset_arg = page_args.next().unwrap();
     let sql = format!(
         "{prelude}SELECT {BROWSE_COLS} FROM browse_catalogue f \
-         WHERE {where_sql}{extra} ORDER BY {order} LIMIT ? OFFSET ?"
+         WHERE {where_sql}{extra} ORDER BY {order} LIMIT {limit_arg} OFFSET {offset_arg}"
     );
     let q = bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), binds);
     Ok(q.bind(limit).bind(offset).fetch_all(pool).await?)
 }
 
 /// Fetch `browse_catalogue` rows for an explicit, already-ordered list of work ids,
-/// **preserving the caller's order**. Used by text search, which ranks in `work_fts` and
+/// **preserving the caller's order**. Used by text search, which ranks PostgreSQL title/alias candidates and
 /// then needs the same card payload Browse renders — above all `reader_id`, without which a
 /// Suwayomi-only hit would be handed to the client as a bare `w_…` that `canonicalSeries`
 /// rejects (see `graphql::map_browse_rows`).
 ///
-/// One indexed `IN` over the PRIMARY KEY, then a reorder in Rust. SQLite has no
-/// `ORDER BY FIELD(...)`, and the alternatives — a `CASE` ladder of `ids.len()` branches, or
-/// a values-CTE join — are both more SQL for a reorder of at most `BROWSE_PAGE_SIZE` rows.
+/// One indexed `IN` over the PRIMARY KEY, then a reorder in Rust for at most
+/// `BROWSE_PAGE_SIZE` rows.
 ///
-/// A work in `work_fts` with NO `browse_catalogue` row is DROPPED rather than rendered from
+/// A search work with NO `browse_catalogue` row is DROPPED rather than rendered from
 /// a fallback. Both tables are rebuilt from the same predicate in the same chain
 /// (`refresh_feed_updates`), so a miss means the work lost its last source or its title
 /// between the two rebuilds — exactly the shell Browse also refuses to show. Silent by
@@ -1313,7 +1355,7 @@ pub async fn rows_by_work_ids(pool: &Database, ids: &[String]) -> Result<Vec<Bro
     }
     let sql = format!(
         "SELECT {BROWSE_COLS} FROM browse_catalogue f WHERE f.work_id IN ({})",
-        placeholders(ids.len())
+        crate::sql_params::placeholders(1, ids.len())
     );
     let mut q = sqlx::query_as::<_, BrowseRow>(&sql);
     for id in ids {
@@ -1339,10 +1381,12 @@ pub async fn rows_by_work_ids(pool: &Database, ids: &[String]) -> Result<Vec<Bro
 /// that path refused to filter at all. Here the filter is part of the candidate query, so
 /// `total` counts exactly what the pages walk.
 ///
-/// THE SHAPE. `m` is the FTS match set with its bm25 rank; it is JOINed to `browse_catalogue f`
-/// by primary key, so [`build_where`]'s clauses — written against `f` — apply VERBATIM (one
-/// WHERE for Browse and search, invariant 1). The FTS index drives: a match set is small next
-/// to the catalogue, and each candidate costs one PK probe plus the filter's own probes.
+/// THE SHAPE. `m` is the FTS match set with its rank, already narrowed: [`build_where`]'s
+/// clauses — written against `f` — go VERBATIM into the eligibility SELECT that
+/// `search::match_ctes` probes by primary key for each ranked work (one WHERE for Browse and
+/// search, invariant 1). `m` carries every `f` column, so the statements read it under the
+/// alias `f` and join nothing again. The FTS index drives: a match set is small next to the
+/// catalogue, and each candidate costs one PK probe plus the filter's own probes.
 ///
 /// RELEVANCE keeps `search_works_fts`' ranking exactly — the title tier
 /// (`catalog::fts_title_tier`, shared, not copied), then `chapters DESC`, then bm25, then
@@ -1367,9 +1411,10 @@ pub async fn search_text(
     raw_query: &str,
     q: &BrowseQuery<'_>,
 ) -> Result<(i64, Vec<BrowseRow>)> {
-    let Some(match_expr) = crate::catalog::fts_match_query(raw_query) else {
+    if !crate::search::valid_query(raw_query) {
         return Ok((0, Vec::new()));
-    };
+    }
+    let match_expr = raw_query.to_owned();
     // Resolve optional view rankings before owning a reader: this helper acquires from
     // the pool itself and would deadlock with a single-reader pool otherwise.
     let trending = if q.sort.key == SortKey::MostViewed {
@@ -1378,7 +1423,7 @@ pub async fn search_text(
         None
     };
     let mut connection = crate::catalog::SearchConnection::new(pool).await?;
-    let (where_sql, where_binds, uses_rated) = build_where(q);
+    let (where_sql, where_binds, uses_rated) = build_where_from(q, 2);
     let page_size = BROWSE_PAGE_SIZE;
     let page = q.page.max(1);
     let offset = (page - 1) * page_size;
@@ -1386,7 +1431,7 @@ pub async fn search_text(
     let gate = if q.show_nsfw {
         ""
     } else {
-        " AND COALESCE(w.is_nsfw_override, w.is_nsfw) = 0"
+        " AND NOT COALESCE(w.is_nsfw_override, w.is_nsfw)"
     };
     let relevance = q.sort.key == SortKey::Relevance;
     let community = q.sort.key == SortKey::CommunityRating;
@@ -1395,12 +1440,10 @@ pub async fn search_text(
     } else {
         String::new()
     };
-    const M_CTE: &str = "m AS (SELECT work_fts.work_id AS work_id, \
-                                 CAST(work_fts.chapters AS INTEGER) AS chapters, \
-                                 bm25(work_fts, 0.0, 0.0, 10.0, 1.0) AS rank \
-                            FROM work_fts WHERE work_fts MATCH ?)";
-    let from = "FROM m JOIN browse_catalogue f ON f.work_id = m.work_id \
-                JOIN work w ON w.id = f.work_id";
+    let m_cte = crate::search::match_ctes(
+        "SELECT f.* FROM browse_catalogue f JOIN work w ON w.id=f.work_id",
+        &format!("{where_sql}{gate}"),
+    );
     let mut head: Vec<Bind> = vec![Bind::Text(match_expr.clone())];
     head.extend(where_binds.iter().cloned());
 
@@ -1416,22 +1459,20 @@ pub async fn search_text(
     let total = match cached_count(&ckey) {
         Some(t) => t,
         None => {
+            let window_arg = crate::sql_params::placeholders(head.len() + 1, 1);
             let (sql, binds) = if relevance {
                 let mut b = head.clone();
                 b.push(Bind::Int(window));
                 (
                     format!(
-                        "WITH {rated_def}{M_CTE} SELECT COUNT(*) FROM \
-                         (SELECT 1 {from} WHERE {where_sql}{gate} LIMIT ?)"
+                        "WITH {rated_def}{m_cte} SELECT COUNT(*) FROM \
+                         (SELECT 1 FROM m LIMIT {window_arg})"
                     ),
                     b,
                 )
             } else {
                 (
-                    format!(
-                        "WITH {rated_def}{M_CTE} SELECT COUNT(*) {from} \
-                         WHERE {where_sql}{gate}"
-                    ),
+                    format!("WITH {rated_def}{m_cte} SELECT COUNT(*) FROM m"),
                     head.clone(),
                 )
             };
@@ -1448,19 +1489,19 @@ pub async fn search_text(
     }
 
     if relevance {
-        let (tier, tier_params) = crate::catalog::fts_title_tier(raw_query);
+        let window_arg = crate::sql_params::placeholders(head.len() + 1, 1);
+        let page_args = crate::sql_params::placeholders(head.len() + 2, 2);
+        let mut page_args = page_args.split(", ");
+        let limit_arg = page_args.next().unwrap();
+        let offset_arg = page_args.next().unwrap();
+        let cand = crate::search::window_cte(&window_arg);
         let sql = format!(
-            "WITH {rated_def}{M_CTE}, \
-             cand AS (SELECT m.work_id AS work_id, m.chapters AS chapters, m.rank AS rank \
-                        {from} WHERE {where_sql}{gate} ORDER BY m.rank LIMIT ?) \
-             SELECT {BROWSE_COLS} FROM cand c \
-               JOIN browse_catalogue f ON f.work_id = c.work_id \
-               JOIN work w ON w.id = c.work_id \
-              ORDER BY {tier}, c.chapters DESC, c.rank, c.work_id LIMIT ? OFFSET ?"
+            "WITH {rated_def}{m_cte}, {cand} SELECT {BROWSE_COLS} FROM cand f \
+             ORDER BY f.tier, f.chapters DESC NULLS LAST, f.rank, f.work_id \
+             LIMIT {limit_arg} OFFSET {offset_arg}"
         );
         let mut binds = head;
         binds.push(Bind::Int(window));
-        binds.extend(tier_params.into_iter().map(Bind::Text));
         let rows = bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), &binds)
             .bind(page_size.min(window))
             .bind(offset)
@@ -1484,8 +1525,11 @@ pub async fn search_text(
             if ranked.is_empty() {
                 NEWEST_ORDER.to_string()
             } else {
-                let values = (0..ranked.len())
-                    .map(|i| format!("(?, {i})"))
+                let parameters = crate::sql_params::placeholders(2, ranked.len());
+                let values = parameters
+                    .split(", ")
+                    .enumerate()
+                    .map(|(i, parameter)| format!("({parameter}, {i})"))
                     .collect::<Vec<_>>()
                     .join(", ");
                 extra_cte = format!(", tr(wid, pos) AS (VALUES {values})");
@@ -1506,9 +1550,18 @@ pub async fn search_text(
             None => NEWEST_ORDER.to_string(),
         },
     };
+    let (where_sql, _, _) = build_where_from(q, 2 + cte_binds.len());
+    let m_cte = crate::search::match_ctes(
+        "SELECT f.* FROM browse_catalogue f JOIN work w ON w.id=f.work_id",
+        &format!("{where_sql}{gate}"),
+    );
+    let page_args = crate::sql_params::placeholders(2 + cte_binds.len() + where_binds.len(), 2);
+    let mut page_args = page_args.split(", ");
+    let limit_arg = page_args.next().unwrap();
+    let offset_arg = page_args.next().unwrap();
     let sql = format!(
-        "WITH {rated_def}{M_CTE}{extra_cte} SELECT {BROWSE_COLS} {from}{extra_join} \
-         WHERE {where_sql}{gate} ORDER BY {order} LIMIT ? OFFSET ?"
+        "WITH {rated_def}{m_cte}{extra_cte} SELECT {BROWSE_COLS} FROM m f{extra_join} \
+         ORDER BY {order} LIMIT {limit_arg} OFFSET {offset_arg}"
     );
     // Bind order follows the text: the MATCH (in `m`), the VALUES ids (in `tr`), then the
     // WHERE's binds.
@@ -1748,10 +1801,14 @@ async fn rating_page(
 
     let mut rows = Vec::with_capacity(page_size as usize);
     if take_rated > 0 {
+        let page_args = crate::sql_params::placeholders(binds.len() + 1, 2);
+        let mut page_args = page_args.split(", ");
+        let limit_arg = page_args.next().unwrap();
+        let offset_arg = page_args.next().unwrap();
         let sql = format!(
             "{RATED_PER_WORK_CTE}SELECT {BROWSE_COLS} FROM browse_catalogue f \
              JOIN rated_per_work rp ON rp.wid = f.work_id WHERE {where_sql} \
-             ORDER BY rp.avg {d}, f.work_id {d} LIMIT ? OFFSET ?"
+             ORDER BY rp.avg {d}, f.work_id {d} LIMIT {limit_arg} OFFSET {offset_arg}"
         );
         let q = bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), binds);
         rows.extend(q.bind(take_rated).bind(offset).fetch_all(pool).await?);
@@ -1835,7 +1892,7 @@ async fn trending_page(
     let sql = format!(
         "{prelude}SELECT {BROWSE_COLS} FROM browse_catalogue f \
          WHERE {where_sql} AND f.work_id IN ({})",
-        placeholders(ranked.len())
+        crate::sql_params::placeholders(binds.len() + 1, ranked.len())
     );
     let mut q = bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), binds);
     for id in &ranked {
@@ -1860,7 +1917,10 @@ async fn trending_page(
         // Excludes the WHOLE resolved key list, not just the part that passed the filter:
         // the ones that failed the filter are excluded by the WHERE anyway, so the two
         // spellings agree, and this one needs no second bind list.
-        let extra = format!(" AND f.work_id NOT IN ({})", placeholders(ranked.len()));
+        let extra = format!(
+            " AND f.work_id NOT IN ({})",
+            crate::sql_params::placeholders(binds.len() + 1, ranked.len())
+        );
         let mut rest_binds = binds.to_vec();
         for id in &ranked {
             rest_binds.push(Bind::Text(id.clone()));
@@ -1910,7 +1970,7 @@ async fn trending_work_ids(pool: &Database, limit: i64) -> Vec<String> {
         let sql = format!(
             "SELECT source_key, work_id FROM source_series \
              WHERE source_type = 'suwayomi' AND source_key IN ({})",
-            placeholders(numeric.len())
+            crate::sql_params::placeholders(1, numeric.len())
         );
         let mut q = sqlx::query_as::<_, (String, String)>(&sql);
         for k in &numeric {
@@ -1957,8 +2017,7 @@ pub async fn genre_facets(pool: &Database, show_nsfw: bool) -> Result<Vec<(Strin
     // One of two hard-coded identifiers, never input.
     let col = if show_nsfw { "all_count" } else { "safe_count" };
     let sql = format!(
-        "SELECT tag, {col} FROM feed_genre_facet WHERE {col} > 0 \
-         ORDER BY {col} DESC, tag ASC"
+        r#"SELECT tag, {col} FROM feed_genre_facet WHERE {col} > 0 ORDER BY {col} DESC NULLS LAST, tag ASC NULLS FIRST"#
     );
     Ok(sqlx::query_as::<_, (String, i64)>(&sql)
         .fetch_all(pool)
@@ -1969,11 +2028,15 @@ pub async fn genre_facets(pool: &Database, show_nsfw: bool) -> Result<Vec<(Strin
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct SourceFacet {
     /// What [`parse_source`] takes: `"mangadex"`, or a Suwayomi source id.
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub id: String,
     /// The source's extension package (`source_extension`), when one is recorded. NULL
     /// for the MangaDex mirror.
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub pkg_name: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub lang: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     pub count: i64,
 }
 
@@ -1989,19 +2052,13 @@ pub struct SourceFacet {
 /// mappings (about 0.5 s over 115k works), so the resolver memoizes it for minutes.
 pub async fn source_facets(pool: &Database, show_nsfw: bool) -> Result<Vec<SourceFacet>> {
     // One of two hard-coded fragments, never input.
-    let gate = if show_nsfw { "" } else { "AND f.is_nsfw = 0" };
+    let gate = if show_nsfw {
+        ""
+    } else {
+        "AND f.is_nsfw = FALSE"
+    };
     let sql = format!(
-        "SELECT CASE WHEN ss.source_type = 'mangadex' THEN 'mangadex' ELSE ss.source_id END AS id, \
-                MAX(e.pkg_name) AS pkg_name, MAX(e.lang) AS lang, \
-                COUNT(DISTINCT ss.work_id) AS count \
-           FROM source_series ss \
-           JOIN browse_catalogue f ON f.work_id = ss.work_id \
-           LEFT JOIN source_extension e \
-                  ON e.source_id = ss.source_id AND ss.source_type = 'suwayomi' \
-          WHERE (ss.source_type = 'mangadex' \
-                 OR (ss.source_type = 'suwayomi' AND ss.source_id != '')) {gate} \
-          GROUP BY 1 \
-          ORDER BY count DESC, id"
+        r#"SELECT CASE WHEN ss.source_type = 'mangadex' THEN 'mangadex' ELSE ss.source_id END AS id, MAX(e.pkg_name) AS pkg_name, MAX(e.lang) AS lang, COUNT(DISTINCT ss.work_id) AS count FROM source_series ss JOIN browse_catalogue f ON f.work_id = ss.work_id LEFT JOIN source_extension e ON e.source_id = ss.source_id AND ss.source_type = 'suwayomi' WHERE (ss.source_type = 'mangadex' OR (ss.source_type = 'suwayomi' AND ss.source_id != '')) {gate} GROUP BY 1 ORDER BY count DESC NULLS LAST, id"#
     );
     Ok(sqlx::query_as::<_, SourceFacet>(&sql)
         .fetch_all(pool)
@@ -2019,7 +2076,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -2046,13 +2103,13 @@ mod tests {
         sqlx::query(
             "INSERT INTO work (id, primary_title, status, content_rating, is_nsfw, \
                                created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+             VALUES ($1, $2, $3, $4, $5, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
         )
         .bind(work_id)
         .bind(title)
         .bind(status)
         .bind(content_rating)
-        .bind(is_nsfw)
+        .bind(is_nsfw != 0)
         .execute(pool)
         .await
         .unwrap();
@@ -2060,7 +2117,7 @@ mod tests {
             "INSERT INTO browse_catalogue \
                (work_id, reader_id, title, comic_type, status, content_rating, \
                 en_chapter_count, released_at, is_nsfw, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z')",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '2026-01-01T00:00:00Z')",
         )
         .bind(work_id)
         .bind(work_id)
@@ -2069,8 +2126,8 @@ mod tests {
         .bind(status)
         .bind(content_rating)
         .bind(en_chapters)
-        .bind(released_at)
-        .bind(is_nsfw)
+        .bind(crate::db_types::optional_epoch_millis(released_at).unwrap())
+        .bind(is_nsfw != 0)
         .execute(pool)
         .await
         .unwrap();
@@ -2175,22 +2232,22 @@ mod tests {
             ("w_d", Some(2000)),
             ("w_e", Some(4000)),
         ] {
-            sqlx::query("UPDATE browse_catalogue SET announced_at = ? WHERE work_id = ?")
-                .bind(announced_at)
+            sqlx::query("UPDATE browse_catalogue SET announced_at = $1 WHERE work_id = $2")
+                .bind(crate::db_types::optional_epoch_millis(announced_at).unwrap())
                 .bind(work_id)
                 .execute(&pool)
                 .await
                 .unwrap();
         }
         for (work_id, created_at) in [
-            ("w_a", "2026-05-05T00:00:00Z"),
-            ("w_b", "2026-05-01T00:00:00Z"),
-            ("w_c", "2026-05-04T00:00:00Z"),
-            ("w_d", "2026-05-03T00:00:00Z"),
-            ("w_e", "2026-05-02T00:00:00Z"),
+            ("w_a", "2026-05-05T00:00:00.000000+00:00"),
+            ("w_b", "2026-05-01T00:00:00.000000+00:00"),
+            ("w_c", "2026-05-04T00:00:00.000000+00:00"),
+            ("w_d", "2026-05-03T00:00:00.000000+00:00"),
+            ("w_e", "2026-05-02T00:00:00.000000+00:00"),
         ] {
-            sqlx::query("UPDATE browse_catalogue SET created_at = ? WHERE work_id = ?")
-                .bind(created_at)
+            sqlx::query("UPDATE browse_catalogue SET created_at = $1 WHERE work_id = $2")
+                .bind(crate::db_types::date(created_at).unwrap())
                 .bind(work_id)
                 .execute(&pool)
                 .await
@@ -2356,7 +2413,7 @@ mod tests {
         assert_eq!(tier(None, true).await.1, ["A", "B", "C", "D", "E"]);
 
         // Opted OUT: the EROTICA tier returns the SUGGESTIVE set — the erotica work is
-        // `is_nsfw = 1`, and the rating filter cannot reach past the gate.
+        // `is_nsfw = TRUE`, and the rating filter cannot reach past the gate.
         let suggestive = tier(Some(&["safe", "suggestive"]), false).await;
         let erotica = tier(Some(&["safe", "suggestive", "erotica"]), false).await;
         assert_eq!(suggestive.1, ["A", "B", "D"]);
@@ -2425,7 +2482,7 @@ mod tests {
             ("w_b", "Action", "admin"),
             ("w_c", "Romance", "mangadex"),
         ] {
-            sqlx::query("INSERT INTO work_tag (work_id, tag, ord, source) VALUES (?, ?, 0, ?)")
+            sqlx::query("INSERT INTO work_tag (work_id, tag, ord, source) VALUES ($1, $2, 0, $3)")
                 .bind(w)
                 .bind(tag)
                 .bind(source)
@@ -2474,18 +2531,16 @@ mod tests {
         }
         // Two reviews so the RATING sort has a real prefix, and some views so does TRENDING.
         sqlx::query(
-            "INSERT INTO users (id, username, email, password_hash, created_at) \
-             VALUES ('u1','u','u@e','h','t')",
+            r#"INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468','u','u@e','h','2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
         .unwrap();
         for (i, (w, score)) in [("w_0005", 9), ("w_0060", 4)].iter().enumerate() {
             sqlx::query(
-                "INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) \
-                 VALUES (?, ?, 'u1', ?, 'b', 't', 't')",
+                r#"INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) VALUES ($1, $2, '11ac9418-0c9e-4237-9e42-3ace93d7c468', $3, 'b', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
             )
-            .bind(format!("rv{i}"))
+            .bind(crate::db_types::test_uuid(&(format!("rv{i}"))))
             .bind(*w)
             .bind(*score)
             .execute(&pool)
@@ -2495,7 +2550,7 @@ mod tests {
         let hour = chrono::Utc::now().timestamp() / 3600;
         for (w, v) in [("w_0009", 50i64), ("w_0011", 5)] {
             sqlx::query(
-                "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES (?, ?, ?)",
+                "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES ($1, $2, $3)",
             )
             .bind(w)
             .bind(hour)
@@ -2556,8 +2611,7 @@ mod tests {
             .await;
         }
         sqlx::query(
-            "INSERT INTO users (id, username, email, password_hash, created_at) \
-             VALUES ('u1','u','u@e','h','t')",
+            r#"INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468','u','u@e','h','2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -2565,10 +2619,9 @@ mod tests {
         // Rated prefix: w_1 (avg 9) then w_3 (avg 5).
         for (i, (w, score)) in [("w_1", 9), ("w_3", 5)].iter().enumerate() {
             sqlx::query(
-                "INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) \
-                 VALUES (?, ?, 'u1', ?, 'b', 't', 't')",
+                r#"INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) VALUES ($1, $2, '11ac9418-0c9e-4237-9e42-3ace93d7c468', $3, 'b', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
             )
-            .bind(format!("rv{i}"))
+            .bind(crate::db_types::test_uuid(&(format!("rv{i}"))))
             .bind(*w)
             .bind(*score)
             .execute(&pool)
@@ -2659,18 +2712,16 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO users (id, username, email, password_hash, created_at) \
-             VALUES ('u1','u','u@e','h','t')",
+            r#"INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468','u','u@e','h','2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
         .unwrap();
         for (id, key, score) in [("rv1", "4242", 10), ("rv2", "w_b", 6)] {
             sqlx::query(
-                "INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) \
-                 VALUES (?, ?, 'u1', ?, 'b', 't', 't')",
+                r#"INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) VALUES ($1, $2, '11ac9418-0c9e-4237-9e42-3ace93d7c468', $3, 'b', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
             )
-            .bind(id)
+            .bind(crate::db_types::test_uuid(id))
             .bind(key)
             .bind(score)
             .execute(&pool)
@@ -2692,15 +2743,13 @@ mod tests {
         let pool = pool().await;
         fixture(&pool).await;
         sqlx::query(
-            "INSERT INTO users (id, username, email, password_hash, created_at) \
-             VALUES ('u1','u','u@e','h','t')",
+            r#"INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468','u','u@e','h','2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) \
-             VALUES ('rv1', 'w_b', 'u1', 8, 'b', 't', 't')",
+            r#"INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) VALUES ('a43dbc7f-2ea6-464e-8649-c9cebb9ebc82', 'w_b', '11ac9418-0c9e-4237-9e42-3ace93d7c468', 8, 'b', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
@@ -2736,7 +2785,7 @@ mod tests {
         let hour = chrono::Utc::now().timestamp() / 3600;
         for (key, views) in [("99", 100i64), ("w_c", 10)] {
             sqlx::query(
-                "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES (?, ?, ?)",
+                "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES ($1, $2, $3)",
             )
             .bind(key)
             .bind(hour)
@@ -2953,7 +3002,7 @@ mod tests {
             // Migration 0095. The row memo is keyed and sized independently of this
             // column, so `None` keeps the fixture minimal without weakening the test.
             latest_chapter: None,
-            created_at: "2026-01-01T00:00:00Z".into(),
+            created_at: "2026-01-01T00:00:00.000000+00:00".into(),
         }
     }
 
@@ -3047,13 +3096,15 @@ mod tests {
     async fn genre_facets_come_from_the_materialized_table_and_are_nsfw_gated() {
         let pool = pool().await;
         for (tag, safe, all) in [("Action", 10, 12), ("Romance", 3, 3), ("Hentai", 0, 40)] {
-            sqlx::query("INSERT INTO feed_genre_facet (tag, safe_count, all_count) VALUES (?,?,?)")
-                .bind(tag)
-                .bind(safe)
-                .bind(all)
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO feed_genre_facet (tag, safe_count, all_count) VALUES ($1,$2,$3)",
+            )
+            .bind(tag)
+            .bind(safe)
+            .bind(all)
+            .execute(&pool)
+            .await
+            .unwrap();
         }
         // Opted out: safe counts, and a tag no safe work carries is not offered at all.
         assert_eq!(
@@ -3086,8 +3137,8 @@ mod tests {
         tags: &[&str],
     ) {
         sqlx::query(
-            "UPDATE browse_catalogue SET demographic = ?, original_language = ?, year = ?, \
-                    follows = ?, rating = ? WHERE work_id = ?",
+            "UPDATE browse_catalogue SET demographic = $1, original_language = $2, year = $3, \
+                    follows = $4, rating = $5 WHERE work_id = $6",
         )
         .bind(demographic)
         .bind(lang)
@@ -3106,7 +3157,7 @@ mod tests {
     /// One `work_tag` row with an explicit display name and key.
     async fn tag(pool: &Database, work_id: &str, name: &str, key: &str, source: &str) {
         sqlx::query(
-            "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) VALUES (?, ?, 0, ?, ?)",
+            "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) VALUES ($1, $2, 0, $3, $4)",
         )
         .bind(work_id)
         .bind(name)
@@ -3293,7 +3344,7 @@ mod tests {
         // The EFFECTIVE rating: a source-flagged NSFW work with no MangaDex rating was
         // stored as 'safe'. Materialized through the real expression it reads as 'erotica', so
         // SAFE never returns an adult work, even to an opted-in viewer.
-        sqlx::query("UPDATE browse_catalogue SET content_rating = 'safe', is_nsfw = 1 WHERE work_id = 'w_c'")
+        sqlx::query("UPDATE browse_catalogue SET content_rating = 'safe', is_nsfw = TRUE WHERE work_id = 'w_c'")
             .execute(&pool)
             .await
             .unwrap();
@@ -3487,15 +3538,15 @@ mod tests {
         // An undated work for the chapter clock; created_at spread for RECENTLY_ADDED.
         seed(&pool, "w_f", "F", "MANGA", "ONGOING", "safe", 0, 5, None).await;
         for (w, at) in [
-            ("w_a", "2026-05-03T00:00:00Z"),
-            ("w_b", "2026-05-05T00:00:00Z"),
-            ("w_c", "2026-05-01T00:00:00Z"),
-            ("w_d", "2026-05-04T00:00:00Z"),
-            ("w_e", "2026-05-02T00:00:00Z"),
-            ("w_f", "2026-05-06T00:00:00Z"),
+            ("w_a", "2026-05-03T00:00:00.000000+00:00"),
+            ("w_b", "2026-05-05T00:00:00.000000+00:00"),
+            ("w_c", "2026-05-01T00:00:00.000000+00:00"),
+            ("w_d", "2026-05-04T00:00:00.000000+00:00"),
+            ("w_e", "2026-05-02T00:00:00.000000+00:00"),
+            ("w_f", "2026-05-06T00:00:00.000000+00:00"),
         ] {
-            sqlx::query("UPDATE browse_catalogue SET created_at = ? WHERE work_id = ?")
-                .bind(at)
+            sqlx::query("UPDATE browse_catalogue SET created_at = $1 WHERE work_id = $2")
+                .bind(crate::db_types::date(at).unwrap())
                 .bind(w)
                 .execute(&pool)
                 .await
@@ -3510,7 +3561,7 @@ mod tests {
             ("w_e", "echo"),
             ("w_f", "Foxtrot"),
         ] {
-            sqlx::query("UPDATE browse_catalogue SET title = ? WHERE work_id = ?")
+            sqlx::query("UPDATE browse_catalogue SET title = $1 WHERE work_id = $2")
                 .bind(t)
                 .bind(w)
                 .execute(&pool)
@@ -3554,7 +3605,7 @@ mod tests {
         let hour = chrono::Utc::now().timestamp() / 3600;
         for (key, views) in [("w_c", 30i64), ("w_e", 20), ("w_b", 10)] {
             sqlx::query(
-                "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES (?, ?, ?)",
+                "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES ($1, $2, $3)",
             )
             .bind(key)
             .bind(hour)
@@ -3569,18 +3620,16 @@ mod tests {
         // READER_RATED (our own reviews): rated works by average, the unrated remainder
         // newest-first, and ASC reverses only the rated prefix — unrated is still last.
         sqlx::query(
-            "INSERT INTO users (id, username, email, password_hash, created_at) \
-             VALUES ('u1','u','u@e','h','t')",
+            r#"INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468','u','u@e','h','2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
         .unwrap();
         for (i, (w, score)) in [("w_d", 9), ("w_a", 4)].iter().enumerate() {
             sqlx::query(
-                "INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) \
-                 VALUES (?, ?, 'u1', ?, 'b', 't', 't')",
+                r#"INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) VALUES ($1, $2, '11ac9418-0c9e-4237-9e42-3ace93d7c468', $3, 'b', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
             )
-            .bind(format!("rv{i}"))
+            .bind(crate::db_types::test_uuid(&(format!("rv{i}"))))
             .bind(*w)
             .bind(*score)
             .execute(&pool)
@@ -3613,7 +3662,7 @@ mod tests {
             .await;
             // Every third work has no follows; the rest descend with i so ASC reverses them.
             let follows = (i % 3 != 0).then_some(10_000 - i);
-            sqlx::query("UPDATE browse_catalogue SET follows = ? WHERE work_id = ?")
+            sqlx::query("UPDATE browse_catalogue SET follows = $1 WHERE work_id = $2")
                 .bind(follows)
                 .bind(&id)
                 .execute(&pool)
@@ -3632,7 +3681,7 @@ mod tests {
             }
             for r in rows {
                 let f: Option<i64> =
-                    sqlx::query_scalar("SELECT follows FROM browse_catalogue WHERE work_id = ?")
+                    sqlx::query_scalar("SELECT follows FROM browse_catalogue WHERE work_id = $1")
                         .bind(&r.work_id)
                         .fetch_one(&pool)
                         .await
@@ -3663,21 +3712,16 @@ mod tests {
         );
     }
 
-    async fn fts(pool: &Database, work_id: &str, title: &str, chapters: i64) {
-        sqlx::query(
-            "INSERT INTO work_fts (work_id, chapters, title, aliases) VALUES (?, ?, ?, '')",
-        )
-        .bind(work_id)
-        .bind(chapters)
-        .bind(title)
-        .execute(pool)
-        .await
-        .unwrap();
+    async fn fts(pool: &Database, work_id: &str, _title: &str, chapters: i64) {
+        let source_id = format!("search-source:{work_id}");
+        sqlx::query("INSERT INTO source_series(id,work_id,source_type,source_key,created_at) VALUES($1,$2,'mangadex',$1,'2026-01-01T00:00:00Z') ON CONFLICT DO NOTHING")
+            .bind(&source_id).bind(work_id).execute(pool).await.unwrap();
+        for n in 0..chapters {
+            sqlx::query("INSERT INTO chapter(id,source_series_id,external_id,created_at) VALUES($1,$2,$1,'2026-01-01T00:00:00Z')")
+                .bind(format!("search-chapter:{work_id}:{n}")).bind(&source_id).execute(pool).await.unwrap();
+        }
     }
 
-    /// TEXT QUERY + FILTERS. The filter narrows the match set (and `total` counts the
-    /// narrowed set), RELEVANCE ranking is preserved by default, any other sort re-orders the
-    /// filtered matches, and the NSFW gate holds on this path too.
     #[tokio::test]
     async fn text_search_applies_the_filters_and_keeps_relevance() {
         let pool = pool().await;
@@ -3701,8 +3745,8 @@ mod tests {
                 Some(1000),
             )
             .await;
-            sqlx::query("UPDATE work SET is_nsfw = ? WHERE id = ?")
-                .bind(nsfw)
+            sqlx::query("UPDATE work SET is_nsfw = $1 WHERE id = $2")
+                .bind(nsfw != 0)
                 .bind(id)
                 .execute(&pool)
                 .await
@@ -3774,18 +3818,16 @@ mod tests {
         // READER_RATED re-orders the matches by OUR review average, both directions, with
         // the unrated matches after the rated ones either way.
         sqlx::query(
-            "INSERT INTO users (id, username, email, password_hash, created_at) \
-             VALUES ('u1','u','u@e','h','t')",
+            r#"INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468','u','u@e','h','2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
         .unwrap();
         for (i, (w, score)) in [("w_3", 9), ("w_1", 4)].iter().enumerate() {
             sqlx::query(
-                "INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) \
-                 VALUES (?, ?, 'u1', ?, 'b', 't', 't')",
+                r#"INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) VALUES ($1, $2, '11ac9418-0c9e-4237-9e42-3ace93d7c468', $3, 'b', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
             )
-            .bind(format!("rv{i}"))
+            .bind(crate::db_types::test_uuid(&(format!("rv{i}"))))
             .bind(*w)
             .bind(*score)
             .execute(&pool)
@@ -3806,11 +3848,15 @@ mod tests {
             assert_eq!(t, 4, "a sort never changes the total");
             assert_eq!(titles[..2], rated, "reader rating desc={desc}");
         }
-        // A too-short query is no query: (0, []), exactly like `search_works_fts`.
+        // A short prefix finds the three eligible titles; the fourth is NSFW.
         let none = search_text(&pool, "so", &BrowseQuery::default())
             .await
             .unwrap();
-        assert_eq!((none.0, none.1.len()), (0, 0));
+        assert_eq!(
+            (none.0, none.1.len()),
+            (3, 3),
+            "short prefixes obey the anonymous NSFW gate"
+        );
         // Over-range page: honest total, no rows.
         let (t, rows) = search_text(
             &pool,
@@ -3825,6 +3871,113 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((t, rows.len()), (4, 0));
+    }
+
+    /// Every sort key of text search, in both directions, over the same four
+    /// matches: each one is its own statement over the match set. The non-matching
+    /// work leads on every key and must never appear.
+    #[tokio::test]
+    async fn text_search_orders_the_matches_by_every_sort_key() {
+        let pool = pool().await;
+        //     id      title        ch  released follows md-rating year
+        for (id, title, ch, released, follows, rating, year) in [
+            (
+                "w_1",
+                "Ember Dawn",
+                40,
+                4000,
+                Some(10),
+                Some(9.0),
+                Some(2001),
+            ),
+            (
+                "w_2",
+                "ember ash",
+                10,
+                1000,
+                Some(900),
+                Some(6.0),
+                Some(2020),
+            ),
+            ("w_3", "Ember Coast", 30, 3000, None, None, None),
+            (
+                "w_4",
+                "Ember Bay",
+                20,
+                2000,
+                Some(500),
+                Some(7.5),
+                Some(2010),
+            ),
+            ("w_5", "Other", 99, 9000, Some(9999), Some(9.9), Some(2025)),
+        ] {
+            seed(
+                &pool,
+                id,
+                title,
+                "MANGA",
+                "ONGOING",
+                "safe",
+                0,
+                ch,
+                Some(released),
+            )
+            .await;
+            v2(&pool, id, None, Some("ja"), year, follows, rating, &[]).await;
+            fts(&pool, id, title, 0).await;
+        }
+        // `created_at` in the reverse of the id order.
+        sqlx::query(
+            "UPDATE browse_catalogue SET created_at = \
+             '2026-01-01T00:00:00Z'::timestamptz - (right(work_id, 1)::int * interval '1 day')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Views: w_4 most, then w_2; the rest unviewed (newest release first).
+        let hour = chrono::Utc::now().timestamp() / 3600;
+        for (key, views) in [("w_4", 100i64), ("w_2", 10)] {
+            sqlx::query(
+                "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES ($1, $2, $3)",
+            )
+            .bind(key)
+            .bind(hour)
+            .bind(views)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let order = |key: SortKey, desc: bool| {
+            let pool = pool.clone();
+            async move {
+                let query = BrowseQuery {
+                    sort: Sort { key, desc },
+                    ..Default::default()
+                };
+                let (total, rows) = search_text(&pool, "ember", &query).await.unwrap();
+                assert_eq!(total, 4, "{key:?} desc={desc}");
+                rows.into_iter()
+                    .map(|row| row.work_id[2..].to_owned())
+                    .collect::<Vec<_>>()
+                    .join("")
+            }
+        };
+        for (key, desc, asc) in [
+            (SortKey::LatestUpdate, "1342", "2431"),
+            (SortKey::RecentlyAdded, "1234", "4321"),
+            (SortKey::MostChapters, "1342", "2431"),
+            // NULL keys last in both directions.
+            (SortKey::MostFollows, "2413", "1423"),
+            (SortKey::HighestRated, "1423", "2413"),
+            (SortKey::Year, "2413", "1423"),
+            (SortKey::Title, "1342", "2431"),
+            // Viewed works first in both directions, then the newest release.
+            (SortKey::MostViewed, "4213", "2413"),
+        ] {
+            assert_eq!(order(key, true).await, desc, "{key:?} descending");
+            assert_eq!(order(key, false).await, asc, "{key:?} ascending");
+        }
+        pool.close().await;
     }
 
     /// Client input is bounded and canonical before it reaches SQL or the memo key.
@@ -3940,11 +4093,9 @@ mod tests {
         assert_ne!(row_key(&BrowseQuery::default()), row_key(&asc));
     }
 
-    /// EXPLAIN QUERY PLAN over a fixture catalogue with realistic tag skew and statistics:
-    /// every tag shape must reach `work_tag` through one of migration 0106's indexes — a
-    /// covering SEEK on `tag_key` for the AND forms, a covering probe on `(work_id, tag_key)`
-    /// for the OR forms — and never by scanning it. The plans are printed so they can be
-    /// quoted.
+    /// PostgreSQL EXPLAIN ANALYZE over realistic tag skew. Index probes and a
+    /// single decorrelated hash/semi-join scan are valid; repeated full scans
+    /// per candidate card are forbidden. The complete plans remain in test output.
     #[tokio::test]
     async fn tag_filters_use_the_tag_indexes() {
         let pool = pool().await;
@@ -3954,7 +4105,7 @@ mod tests {
             let id = format!("w_{i:05}");
             sqlx::query(
                 "INSERT INTO work (id, primary_title, created_at, updated_at) \
-                 VALUES (?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                 VALUES ($1, $2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
             )
             .bind(&id)
             .bind(&id)
@@ -3964,14 +4115,14 @@ mod tests {
             sqlx::query(
                 "INSERT INTO browse_catalogue (work_id, reader_id, title, is_nsfw, \
                      en_chapter_count, released_at, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z')",
+                 VALUES ($1, $2, $3, $4, $5, $6, '2026-01-01T00:00:00Z')",
             )
             .bind(&id)
             .bind(&id)
             .bind(&id)
-            .bind(i64::from(i % 10 == 0))
+            .bind(i % 10 == 0)
             .bind((i % 50) as i64)
-            .bind(1000 + i as i64)
+            .bind(crate::db_types::epoch_millis(1000 + i as i64).unwrap())
             .execute(&mut *tx)
             .await
             .unwrap();
@@ -3979,8 +4130,8 @@ mod tests {
             for k in 0..6usize {
                 let t = &vocab[(i * (k + 1) * 7 + k * k) % (10 + k * 10)];
                 sqlx::query(
-                    "INSERT OR IGNORE INTO work_tag (work_id, tag, ord, source, tag_key) \
-                     VALUES (?, ?, 0, 'mangadex', ?)",
+                    "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) \
+                     VALUES ($1, $2, 0, 'mangadex', $3) ON CONFLICT DO NOTHING",
                 )
                 .bind(&id)
                 .bind(t)
@@ -3993,10 +4144,9 @@ mod tests {
         tx.commit().await.unwrap();
         sqlx::query("ANALYZE").execute(&pool).await.unwrap();
 
-        async fn plan(pool: &Database, sql: &str, binds: &[Bind]) -> Vec<String> {
-            use sqlx::Row;
-            let text = format!("EXPLAIN QUERY PLAN {sql}");
-            let mut qq = sqlx::query(&text);
+        async fn plan(pool: &Database, sql: &str, binds: &[Bind]) -> serde_json::Value {
+            let text = format!("EXPLAIN (FORMAT JSON, ANALYZE, BUFFERS) {sql}");
+            let mut qq = sqlx::query_scalar::<_, serde_json::Value>(&text);
             for b in binds {
                 qq = match b {
                     Bind::Text(s) => qq.bind(s.clone()),
@@ -4004,12 +4154,17 @@ mod tests {
                     Bind::Int(v) => qq.bind(*v),
                 };
             }
-            qq.fetch_all(pool)
-                .await
-                .unwrap()
-                .iter()
-                .map(|r| r.get::<String, _>("detail"))
-                .collect()
+            qq.fetch_one(pool).await.unwrap()
+        }
+        fn nodes<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+            if value.get("Node Type").is_some() {
+                out.push(value);
+            }
+            if let Some(children) = value.get("Plans").and_then(serde_json::Value::as_array) {
+                for child in children {
+                    nodes(child, out);
+                }
+            }
         }
         use TagMode::{And, Or};
         /// `(label, include, include mode, exclude, exclude mode, the index work_tag must use)`.
@@ -4087,38 +4242,75 @@ mod tests {
                         format!("SELECT COUNT(*) FROM browse_catalogue f WHERE {where_sql}"),
                     ),
                 ] {
-                    let lines = plan(&pool, &sql, &binds).await;
-                    eprintln!("--- {label} / {kind} / show_nsfw={show_nsfw}");
-                    for l in &lines {
-                        eprintln!("    {l}");
-                    }
-                    let tag_lines: Vec<&String> = lines
+                    let output = plan(&pool, &sql, &binds).await;
+                    eprintln!("{label} / {kind} / show_nsfw={show_nsfw}: {output}");
+                    let mut all = Vec::new();
+                    nodes(&output[0]["Plan"], &mut all);
+                    let accesses: Vec<_> = all
                         .iter()
-                        .filter(|l| l.contains(" t ") || l.ends_with(" t"))
+                        .filter(|node| {
+                            node["Relation Name"] == "work_tag"
+                                || node["Index Name"]
+                                    .as_str()
+                                    .is_some_and(|name| name.starts_with("idx_work_tag_"))
+                        })
                         .collect();
                     assert!(
-                        !tag_lines.is_empty(),
-                        "{label}: no work_tag access in {lines:?}"
+                        !accesses.is_empty(),
+                        "{label}/{kind}: no work_tag access: {output}"
                     );
-                    for l in &tag_lines {
-                        assert!(
-                            l.contains(want_index),
-                            "{label}/{kind}: work_tag must be read through {want_index}: {l}"
-                        );
-                        assert!(
-                            l.contains("COVERING INDEX"),
-                            "{label}/{kind}: the tag lookup must be index-only: {l}"
-                        );
-                        assert!(
-                            l.starts_with("SEARCH"),
-                            "{label}/{kind}: a seek, never a scan of work_tag: {l}"
-                        );
+                    let bounded_per_work_seek = |node: &serde_json::Value| {
+                        let condition = node["Index Cond"]
+                            .as_str()
+                            .or_else(|| node["Recheck Cond"].as_str())
+                            .unwrap_or("");
+                        let inspected = node["Actual Rows"].as_f64().unwrap_or(0.0)
+                            + node["Rows Removed by Filter"].as_f64().unwrap_or(0.0);
+                        // At most six tags were seeded per work; JSON rounds the
+                        // average removed-row count. A parameterized work-ID seek
+                        // through work_source is also bounded, even if tag_key is
+                        // rechecked instead of included in that index condition.
+                        condition.contains("= f.work_id")
+                            && inspected <= 7.0
+                            && matches!(
+                                node["Node Type"].as_str(),
+                                Some(
+                                    "Index Scan"
+                                        | "Index Only Scan"
+                                        | "Bitmap Heap Scan"
+                                        | "Bitmap Index Scan"
+                                )
+                            )
+                    };
+                    for node in &accesses {
+                        // One decorrelated scan is valid. Every repeated access
+                        // must instead prove a bounded, parameterized work-ID seek;
+                        // this rejects repeated full table AND full index scans.
+                        if node["Actual Loops"].as_f64().unwrap_or(0.0) > 1.0 {
+                            assert!(
+                                bounded_per_work_seek(node),
+                                "{label}/{kind}: repeated unbounded tag access: {node}"
+                            );
+                        }
                     }
+                    let indexed = all.iter().any(|node| {
+                        node["Index Name"].as_str().is_some_and(|name| {
+                            name == want_index
+                                || name == "idx_work_tag_key_work"
+                                || name == "idx_work_tag_work_key"
+                        })
+                    }) || accesses.iter().any(|node| bounded_per_work_seek(node));
+                    let once = accesses.iter().any(|node| {
+                        node["Relation Name"] == "work_tag"
+                            && node["Actual Loops"].as_f64().unwrap_or(0.0) <= 1.0
+                    });
+                    assert!(indexed || once,
+                        "{label}/{kind}: neither expected seek nor single decorrelated tag access: {output}");
                     assert!(
-                        !lines
-                            .iter()
-                            .any(|l| l.starts_with("SCAN work ") || l == "SCAN work"),
-                        "{label}/{kind}: no scan of `work` per tag: {lines:?}"
+                        !all.iter().any(|node| node["Relation Name"] == "work"
+                            && node["Node Type"] == "Seq Scan"
+                            && node["Actual Loops"].as_f64().unwrap_or(0.0) > 1.0),
+                        "{label}/{kind}: repeated work-table scan: {output}"
                     );
                 }
             }
@@ -4142,7 +4334,7 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) \
-                 VALUES (?, ?, 0, 'mangadex', ?)",
+                 VALUES ($1, $2, 0, 'mangadex', $3) ON CONFLICT DO NOTHING",
             )
             .bind(work_id)
             .bind(tag)
@@ -4207,28 +4399,32 @@ mod tests {
         };
         assert_eq!(titles(&pool, &query).await, (1, vec!["D".to_string()]));
 
-        // The tag probe is a covering seek.
-        use sqlx::Row;
+        // Verify that the bound block predicate permits an indexed tag probe.
+        // This five-row fixture is too small for PostgreSQL's cost model to
+        // prefer an index by default, so inspect the available path explicitly.
         let query = BrowseQuery {
             blocks: Some(&cases[3].0),
             ..q(BrowseSort::Newest, 1)
         };
         let (where_sql, binds, _) = build_where(&query);
         assert!(binds.is_empty(), "a rule adds no bind");
-        let plan: Vec<String> = sqlx::query(&format!(
-            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM browse_catalogue f WHERE {where_sql}"
+        let mut reader = pool.read().acquire().await.unwrap();
+        reader.close_on_drop();
+        sqlx::query("SELECT set_config('enable_seqscan','off',false)")
+            .execute(&mut *reader)
+            .await
+            .unwrap();
+        let output: serde_json::Value = sqlx::query_scalar(&format!(
+            "EXPLAIN (FORMAT JSON) SELECT COUNT(*) FROM browse_catalogue f WHERE {where_sql}"
         ))
-        .fetch_all(&pool)
+        .fetch_one(&mut *reader)
         .await
-        .unwrap()
-        .iter()
-        .map(|r| r.get::<String, _>("detail"))
-        .collect();
-        let probes: Vec<&String> = plan.iter().filter(|l| l.contains(" bt ")).collect();
-        assert!(!probes.is_empty(), "no work_tag probe in {plan:?}");
-        for line in probes {
-            assert!(line.starts_with("SEARCH"), "{line}");
-            assert!(line.contains("COVERING INDEX"), "{line}");
-        }
+        .unwrap();
+        let rendered = output.to_string();
+        assert!(
+            rendered.contains("idx_work_tag_work_key")
+                || rendered.contains("idx_work_tag_key_work"),
+            "no indexed block tag probe: {output}"
+        );
     }
 }

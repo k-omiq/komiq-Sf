@@ -1,0 +1,22 @@
+{
+  "data": {
+    "canonicalChapters": [
+      {
+        "bookmarked": false,
+        "externalUrl": null,
+        "foundAt": "2020-01-01T01:02:03.000000+00:00",
+        "id": "00000000-0000-4000-8000-000000001501",
+        "isDownloaded": false,
+        "label": "15",
+        "lastPageRead": 0,
+        "number": 15.0,
+        "pageCount": 0,
+        "read": false,
+        "scanlator": "Group Café",
+        "seriesId": "w_00000000000040008000000000000015",
+        "title": "Chapter 15",
+        "uploadedAt": "2020-01-01T01:02:03.000000+00:00"
+      }
+    ]
+  }
+}

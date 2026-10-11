@@ -1,0 +1,49 @@
+{
+  "data": {
+    "myActivity": [
+      {
+        "createdAt": "2020-01-04T01:02:03.000000+00:00",
+        "id": "00000000-0000-4000-8000-000000001200",
+        "kind": "review",
+        "targetId": "w_00000000000040008000000000000001",
+        "targetType": "series"
+      }
+    ],
+    "myComments": {
+      "hasNextPage": false,
+      "items": [
+        {
+          "body": "Root discussion",
+          "chapterNumber": null,
+          "createdAt": "2020-01-01T01:02:03.000000+00:00",
+          "dislikes": 1,
+          "hasSpoiler": false,
+          "id": "00000000-0000-4000-8000-000000001100",
+          "likes": 1,
+          "parentId": null,
+          "replyCount": 1,
+          "seriesId": "w_00000000000040008000000000000001",
+          "seriesTitle": "Solo Leveling",
+          "targetId": "w_00000000000040008000000000000001",
+          "targetType": "series"
+        }
+      ],
+      "page": 1,
+      "total": 1
+    },
+    "session": {
+      "token": "golden-admin",
+      "user": {
+        "avatarUrl": null,
+        "bio": "Reads manga, 만화 and 漫画",
+        "displayName": "Owner",
+        "id": "00000000-0000-4000-8000-000000000900",
+        "isAdmin": true,
+        "joinedAt": "2020-01-01T01:02:03.000000+00:00",
+        "mustChangePassword": false,
+        "showNsfw": false,
+        "username": "owner"
+      }
+    }
+  }
+}

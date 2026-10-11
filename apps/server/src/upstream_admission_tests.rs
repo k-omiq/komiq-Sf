@@ -232,16 +232,14 @@ fn start_cold(tasks: &mut tokio::task::JoinSet<()>, app: &Router, id: usize, cli
 async fn cached_reader_requests_survive_all_upstream_slots_hanging_and_client_limit() {
     let engine = Engine::start().await;
     let pool = db::Database::connect("sqlite::memory:").await.unwrap();
-    sqlx::migrate!("./migrations")
-        .run(pool.write())
-        .await
-        .unwrap();
+    crate::db::MIGRATOR_PG.run(pool.write()).await.unwrap();
     let covers = db::init_covers("sqlite::memory:").await.unwrap();
     let reserved = ReadyDb::connect(&pool).await.unwrap();
-    sqlx::query("INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('admission-reader', 'admission-reader', 'admission@example.test', 'unused', '2020-01-01T00:00:00Z')")
-        .execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, 'admission-reader', '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')")
-        .bind(auth::hash_token(READER_TOKEN)).execute(&pool).await.unwrap();
+    let reader_id = crate::db_types::test_uuid("admission-reader");
+    sqlx::query("INSERT INTO users (id, username, email, password_hash, created_at) VALUES ($1, 'admission-reader', 'admission@example.test', 'unused', '2020-01-01T00:00:00Z')")
+        .bind(reader_id).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES ($1, $2, '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')")
+        .bind(auth::hash_token(READER_TOKEN)).bind(reader_id).execute(&pool).await.unwrap();
     catalog::upsert_work_from_mangadex(
         &pool,
         "admission-md",
@@ -269,7 +267,7 @@ async fn cached_reader_requests_survive_all_upstream_slots_hanging_and_client_li
     )
     .await
     .unwrap();
-    let work_id: String = sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
+    let work_id: String = sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = $1")
         .bind(&canonical_source)
         .fetch_one(&pool)
         .await
@@ -592,8 +590,9 @@ async fn cached_reader_requests_survive_all_upstream_slots_hanging_and_client_li
         json!({"title": "Cached mirror title", "isMarked": true})
     );
     let member: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM user_library WHERE user_id = 'admission-reader' AND series_id = ?",
+        "SELECT COUNT(*) FROM user_library WHERE user_id = $1 AND series_id = $2",
     )
+    .bind(reader_id)
     .bind(&work_id)
     .fetch_one(&pool)
     .await

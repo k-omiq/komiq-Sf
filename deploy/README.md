@@ -9,7 +9,7 @@ manually refresh.
 
 ```sh
 cd deploy
-cp .env.example .env      # edit: PUBLIC_HOST, KOMIKA_ADMIN_PASSWORD, SEED_SERIES…
+cp .env.example .env      # edit: PUBLIC_HOST, KOMIKA_ADMIN_PASSWORD, KOMIKA_POSTGRES_PASSWORD…
 ./deploy.sh
 ```
 
@@ -60,14 +60,15 @@ user into one auth rate-limit bucket, and a world-bound port lets clients forge
 which is why `./deploy.sh` is the documented path.
 
 **Resource + log limits** are set per-service in `docker-compose.yml`: `mem_limit`
-(suwayomi 8g / server 6g / flaresolverr 2g, of a 23.4 GiB host) so a runaway can't
+(suwayomi 8g / server 4g / flaresolverr 2g / postgres 4g / backup 512m;
+18.5 GiB of about 23 GiB; the server reduction needs a Phase 6 load test) so a runaway can't
 make the kernel pick an OOM victim from an unrelated stack, and `json-file` logging
 capped at `20m × 5` so container logs can't fill the disk. `/etc/docker/daemon.json`
 carries the same log cap as a **daemon-wide default** for containers started by other
 stacks — but daemon.json is only read at Docker-daemon start, so it takes effect at
 the next daemon restart, not at the next `docker compose up`.
 
-## The four services
+## Services
 
 | Service          | What it does                                                                                                                                                                                     |
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -75,6 +76,9 @@ the next daemon restart, not at the next `docker compose up`.
 | **flaresolverr** | Headless-browser sidecar that solves Cloudflare "checking your browser" challenges. Internal-only; Suwayomi calls it at `http://flaresolverr:8191`.                                              |
 | **server**       | `komika-server` — federates Suwayomi + adds accounts/social/admin, and runs the **adaptive scan scheduler** (auto-updates the library on a cadence derived from each series' chapter frequency). |
 | **reader**       | Static SvelteKit SPA (nginx), pointed at the server. **Opt-in** — compose profile `selfhost`; in production the reader is a Cloudflare Worker instead.                                           |
+
+| **postgres** | PostgreSQL 18.6, private port 5432, main data and pgBackRest WAL archive. |
+| **postgres-backup** | Weekly full, daily incremental and daily check, serialized inside Compose. |
 
 ## How it's wired (important gotcha)
 
@@ -90,9 +94,11 @@ the next daemon restart, not at the next `docker compose up`.
 - The reader's backend config is baked in **at build time** (Vite inlines `PUBLIC_*`), so
   the compose `reader` build args carry `PUBLIC_KOMIKA_API` / `PUBLIC_KOMIKA_IMG_MODE`.
   Rebuilding is automatic via `deploy.sh`.
-- **Persistence:** the SQLite DB (accounts, reviews, comments, admin overrides) lives on
-  the `server-data` volume at `/data`; Suwayomi's library + downloaded images on
-  `suwayomi-data`. Both survive `down`; `destroy` deletes them.
+- **Persistence:** main data and avatars live in `postgres-data`. Covers remain a
+  refetchable SQLite cache in `server-data:/data/covers.sqlite3`; pgBackRest excludes
+  it. The legacy `/data/komika.sqlite3` is automatically imported only into an empty
+  PostgreSQL database and renamed only after verification. Suwayomi uses
+  `suwayomi-data`. `down` retains volumes; `destroy` deletes all of them.
 
 ## Auto-updating catalog
 
@@ -103,76 +109,138 @@ source, and records new chapters — so the Updates/Library screens stay current
 user action. Admins can add/adjust more series and per-series scan policy in the
 **admin "manga DB" console**.
 
-## Backups & restore (Litestream)
+## Backups and restore (pgBackRest)
 
-The server DB (`/data/komika.sqlite3` — accounts, sessions, reviews, comments,
-admin overrides, scan-state) is backed up with **Litestream**: it streams the SQLite
-WAL to an S3-compatible bucket continuously (point-in-time restore, ~seconds RPO) and
-**restores the latest snapshot automatically** when the server starts on a fresh volume.
+This branch packages PostgreSQL 18.6 with pgBackRest 2.59.x. Production still runs
+SQLite from another checkout; this package has not been deployed or rehearsed.
+Fill all five `KOMIKA_R2_*` values in `.env`, with a dedicated R2 prefix. No backup
+variables means local initdb with a loud warning and archiving disabled. Partial
+configuration, repository errors and failed restores stop startup.
 
-- **Off by default.** Leave the `LITESTREAM_*` vars blank in `.env` and the server runs
-  without backup (fine for local/testing). Set them to enable it — no code change.
-- **Enable it:** create a **Cloudflare R2** bucket (S3-compatible) + an API token with
-  Object Read & Write, then fill `LITESTREAM_BUCKET` / `LITESTREAM_ENDPOINT` /
-  `LITESTREAM_REGION` / `LITESTREAM_ACCESS_KEY_ID` / `LITESTREAM_SECRET_ACCESS_KEY` in
-  `deploy/.env` and `./deploy.sh` (or `docker compose up -d --build server`). For R2 use
-  `LITESTREAM_ENDPOINT=https://<accountid>.r2.cloudflarestorage.com` and
-  `LITESTREAM_REGION=auto`. WAL mode is already on in the DB, and the server runs under
-  `litestream replicate -exec` inside its container. (Any S3-compatible store works — the
-  vars are storage-agnostic — but R2 is the reference target.)
-- **Disaster recovery** is automatic: on a brand-new host/volume with the vars set, the
-  server pulls the newest snapshot before it starts. To restore manually to a file:
-  ```sh
-  docker compose exec server litestream restore -o /tmp/komika.sqlite3 /data/komika.sqlite3
-  ```
-- Litestream config: `deploy/litestream.yml`; the container entrypoint is
-  `deploy/server-entrypoint.sh` (runs the server plain when Litestream is unconfigured).
+A fresh data volume restores the latest valid backup. A reachable empty prefix
+requires `KOMIKA_PG_INIT_NEW=1`; it never silently creates a replacement database.
+Create the stanza and first full explicitly using [postgres/RESTORE.md](postgres/RESTORE.md),
+then return `KOMIKA_PG_INIT_NEW` to 0. Existing cluster credentials must match `.env`.
+Missing-path repository errors require a separate signed HTTPS emptiness check;
+authentication, network and metadata errors never authorize initdb.
 
-### Verify backup → restore locally (tested procedure)
+For database rehearsals only the directory `postgres` (this repository's
+`deploy/postgres`) goes to the host, and `./rehearsal.sh` is run from inside
+that copy; the rest of this directory (the hosted Compose file with project
+`komika`, `deploy.sh`) does not belong on a rehearsal host. On a host that
+also runs production the order is fixed: inventory and measurements first;
+the image is built and saved on another machine, its hash is checked on the
+host and the disk is measured again before `docker load`; the kit is unpacked
+into a new directory (never `rsync --delete` into an existing one); nothing is
+built or pruned on the host; a baseline of every other container (ID, start
+time, restart count) is recorded before the first step and compared after
+every large one; the whole run happens in one tmux session, with a read-only
+watch loop in a second window while `import` and `restore` run and abort
+criteria agreed before they start; the restored directory and, at the very
+end, the run's directory are each removed by their literal path as the last
+link of an identity check, never as a separate command, and that check
+stops when `findmnt` or `docker ps` itself fails (a command that prints
+nothing is no proof that nothing is mounted or running); the records and
+reports are copied off the host before the last removal. The pre-flight
+blocks are shell functions: paste one block, read it, then the next; a
+failed check prints `STOP`, and no later block runs in that shell. `sudo -n true || sudo -v`
+is run alone before the two blocks that need root, so that no password
+prompt reads a pasted line; the baseline of the other containers must not be
+empty; the drill lines are entered one at a time and never pasted whole,
+because they do not stop themselves. The exact
+commands are the sections "Pre-flight on the host", "While `import` and
+`restore` run" and "Full drill order" of
+[postgres/RESTORE.md](postgres/RESTORE.md).
 
-Don't trust a backup you've never restored. This exercises the **real** path — the
-server image's bundled Litestream + `server-entrypoint.sh` + `litestream.yml` —
-against a local **MinIO** standing in for R2 (both are S3-compatible). Verified on
-2026-07-11: a user registered before a full volume wipe was recovered intact.
+`rehearsal.sh` has a fixed list of subcommands (`preflight`, `up`, `import`,
+`verify`, `backup`, `restore`, ...) and builds every Docker command line
+itself: no argument is passed through to Docker, Compose or pgBackRest, and
+`restore.sh`, `pitr-drill.sh` and `deploy.sh` refuse rehearsal selections.
+Export only `KOMIKA_REHEARSAL_PROJECT` (`komika-pg-rehearsal-*`),
+`KOMIKA_COMPOSE_ENV_FILE` and `KOMIKA_REHEARSAL_ROOT`; all settings, the
+`rehearsal/` R2 prefix and the actual nonsecret `KOMIKA_PRODUCTION_R2_PREFIX`
+live in the mode-0600 env file. What the wrapper checks:
 
-```sh
-# 0. A MinIO container as an R2/S3 stand-in, on a docker network, + a bucket.
-docker network create lstest-net
-docker run -d --name lstest-minio --network lstest-net -p 9000:9000 \
-  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin123 \
-  minio/minio:latest server /data
-docker run --rm --network lstest-net --entrypoint sh minio/mc:latest -c \
-  "mc alias set l http://lstest-minio:9000 minioadmin minioadmin123 && mc mb -p l/komika-backup"
+- One operation at a time. Every subcommand except `status`, `logs`,
+  `psql-check` and `archive-status` takes a host-wide lock
+  (`/run/lock/komika-pg-rehearsal.lock`) before it validates or measures
+  anything and holds it through its cleanup. A second invocation is refused
+  at once. The lock directory `/run/lock` must be owned by root and sticky;
+  when it is missing, not root's or not sticky, the refusal says which.
+- Before each subcommand: the pinned hash of `rehearsal-compose.yml`, the
+  rendered Compose configuration against an exact expectation, resource
+  labels, disjoint prefixes, and no `DOCKER_*` or `COMPOSE_*` variable.
+- A label is not proof of storage. An existing source volume must be a plain
+  `local` volume without driver options whose mountpoint is its own directory
+  below Docker's data root, with nothing mounted on it and no other container
+  mounting or overlapping it; the containers' real mount sources must be
+  those directories. `preflight --init-root` creates a root only for a project
+  of which no container, volume or network exists.
+- Before every `docker exec` and after `up`: the live container's real memory,
+  swap, CPU, PID, shm and log limits and its restart policy equal the
+  validated model, and its environment holds no name outside the model and
+  the image's own six.
+- Before a container starts from the image: the seven kit files inside the
+  image equal the kit directory (file identity only, not the base image).
+- The root is created by `preflight --init-root` and fenced against Docker
+  data, volume mountpoints and other containers' bind mounts by path, inode
+  and mount table.
 
-# Reusable env pointing Litestream at MinIO (R2 in prod: endpoint=https://<acct>.r2…, region=auto).
-LS="-e LITESTREAM_BUCKET=komika-backup -e LITESTREAM_ENDPOINT=http://lstest-minio:9000 \
- -e LITESTREAM_REGION=us-east-1 -e LITESTREAM_ACCESS_KEY_ID=minioadmin \
- -e LITESTREAM_SECRET_ACCESS_KEY=minioadmin123 -e SUWAYOMI_URL=http://localhost:9999 \
- -e DATABASE_URL=sqlite:///data/komika.sqlite3 -e KOMIKA_ADMIN_USERS=admin"
+The two services have their own volumes and bridge, no published ports, and
+memory, CPU and PID ceilings (PostgreSQL 3 GiB and 1 CPU by default); every
+job, reader and restore container has explicit log bounds; block I/O is not
+limited. Each step that writes estimates what it will write and refuses when
+that would leave less than a floor of free disk space (3 GiB by default). The
+estimate is measured once, under the lock, before the step: it is no
+reservation, and production can still use the disk meanwhile, so the runbook
+measures after every step. A rehearsal `up` never restores: with an empty or
+absent data volume and a prefix that already holds a backup it refuses and
+names `restore --target`. Importer, verifier and repository readers are
+removed when their step ends, also after an interrupt. If a container's
+creation was interrupted and it did not appear in time, the kit reports it as
+unresolved, every later step refuses, and `stop-source` or `down` removes it.
+The runbook's order writes one marker before and one after the target time
+and makes `restore` check both. Record source settings before deleting the
+source volume; `--source-settings` retains later recovery-ceiling increases.
+Restore-only works after source removal; its restore bridge is separate from
+production and the selected source bridge. `info --json --out FILE` and
+`repo-usage --out FILE` keep the sizes and the object count of the rehearsal
+prefix for the storage and request budget. Keep a `docker save` file of the
+image off the host: the pgBackRest package is pinned to one exact version
+that the package repository will stop offering.
 
-# 1. Boot the server under Litestream on a fresh volume, write data, let it replicate.
-docker build -f deploy/server.Dockerfile -t komika-server .   # DOCKER_BUILDKIT=0 on old buildx
-docker run -d --name s1 --network lstest-net -v lstest-data:/data -p 8791:8080 $LS komika-server
-#   → docker logs s1 should show: [entrypoint] Litestream backup ENABLED
-curl -s localhost:8791/graphql -H 'content-type: application/json' --data \
-  '{"query":"mutation{register(input:{username:\"u\",email:\"u@x.dev\",password:\"pw12345\"}){token}}"}'
-sleep 4    # let the WAL replicate; `mc ls -r l/komika-backup` now shows a snapshot + WAL
+`KOMIKA_PG_ALLOWED_CIDRS` defaults to `172.21.0.0/16,fd00:21::/64`; match it to
+your bridge. Only strict RFC1918/IPv6 ULA subnets are allowed. Application access
+uses TCP SCRAM; only postgres can use the Unix socket. Readiness stays false
+through recovery.
 
-# 2. Graceful stop (flushes a final snapshot), then DESTROY the volume.
-docker stop s1 && docker rm s1 && docker volume rm lstest-data
+The scheduler runs a full Sunday 02:00 UTC, a check daily 02:00 UTC, and an
+incremental daily 03:00 UTC. It retains two full chains (roughly 7–14 days of
+history, not a guaranteed fourteen days). It catches up the latest missed slot,
+and records attempts before execution so restart cannot duplicate a slot.
+It recomputes due slots after each job, including jobs that cross 03:00 UTC.
+Interrupted/failed jobs require an explicit retry or wait for the next slot.
+Health fails on incremental/check age >26 hours, full age >8 days, or a job error.
 
-# 3. Boot fresh: the entrypoint restores from MinIO before the server starts.
-docker run -d --name s2 --network lstest-net -v lstest-data:/data -p 8791:8080 $LS komika-server
-#   → docker logs s2 shows: msg="restoring snapshot" … then "restoring wal files"
+WAL switches every five minutes while active. The 1 GiB archive queue sacrifices
+PITR continuity if uploads fall behind; it is not a hard disk bound. Alert on
+pgBackRest dropped-WAL warnings, archiver lag/failures, free disk and backup health.
+After dropped WAL, repair archiving, take a new full, and repeat the restore drill.
+The spike proved synthetic restores; real WAL/day, R2 peak size/request counts,
+whole-host memory and restore duration still need Phase 6 measurement.
 
-# 4. Confirm the data came back: login must succeed (proves the user row survived the wipe).
-curl -s localhost:8791/graphql -H 'content-type: application/json' --data \
-  '{"query":"mutation{login(username:\"u\",password:\"pw12345\"){user{username}}}"}'
-#   → {"data":{"login":{"user":{"username":"u"}}}}
+Credentials enter only PostgreSQL and backup container environments. Startup
+writes a postgres-owned 0600 config on container-private tmpfs and removes R2
+variables before launching PostgreSQL. Host root, Docker administrators and the
+container's root/postgres user can still read `.env`, Docker environment metadata,
+the config or process memory. Keep `.env` mode 0600, use a bucket-scoped token,
+and rotate it by recreating both database containers. No secrets are in images
+or command arguments.
 
-# Cleanup.
-docker rm -f s2 lstest-minio && docker volume rm lstest-data && docker network rm lstest-net
-```
+Offline checks: `sh server-entrypoint.test.sh` and `sh postgres/tests.sh`.
+After building, `sh image-tests.sh` also runs the owned PostgreSQL image checks
+against the files inside the image (the kit is mounted only for its tests).
+Restore/latest/PITR commands and Phase 2 verification are in the runbook.
 
 ## Notes for a real (internet-facing) deploy
 
@@ -190,8 +258,8 @@ docker rm -f s2 lstest-minio && docker volume rm lstest-data && docker network r
   (MangaDex is an open API and doesn't use it). Drop the service if you only run API-based
   sources.
 - **Data durability.** Continuous backup is built in — see **Backups & restore** above;
-  just set the `LITESTREAM_*` vars. (The `server-data` volume holds argon2 password hashes
-  - session tokens + all social data, so keep the bucket private.)
+  set all `KOMIKA_R2_*` vars and bootstrap the stanza/full backup.
+  The PostgreSQL volume holds password hashes, tokens and social data; keep R2 private.
 - **Secrets.** Nothing sensitive in the image or compose file; `deploy/.env` is
   git-ignored. Use your platform's secret store for `KOMIKA_ADMIN_PASSWORD` and any keys.
 
@@ -199,6 +267,7 @@ docker rm -f s2 lstest-minio && docker volume rm lstest-data && docker network r
 
 ```sh
 # from repo root
+docker build -t komika-postgres:18.6-pgbackrest-2.59 deploy/postgres
 docker build -f deploy/server.Dockerfile -t komika-server .
 docker build -f deploy/reader.Dockerfile -t komika-reader \
   --build-arg PUBLIC_KOMIKA_API=https://komika.example.com/graphql .

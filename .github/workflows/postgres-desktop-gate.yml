@@ -1,0 +1,396 @@
+name: PostgreSQL desktop gate
+
+# Two ways to start it:
+# * by hand (workflow_dispatch), once this file is on the default branch: all targets;
+# * by a push to a branch named ci/postgres-desktop-gate-**, so that it can run before it
+#   is on the default branch: Linux and Windows only (see the matrix).
+on:
+  workflow_dispatch:
+  push:
+    branches: ['ci/postgres-desktop-gate-**']
+
+permissions:
+  contents: read
+
+# A newer push to the same branch replaces a run that is still going.
+concurrency:
+  group: postgres-desktop-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: Desktop PostgreSQL (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    # A cold run builds the server in release mode and the desktop crate twice.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # Gate targets in CI: x86_64-linux and x86_64-windows on every run, and
+        # aarch64-macos only when the workflow is started by hand (a macOS minute costs
+        # ten Linux minutes, and that target is also run on a real Mac). Not here:
+        # aarch64-linux, which is run on the owner's ARM servers, and x86_64-macos, which
+        # the owner dropped from the gate list on 2026-10-11 (the bundle script can still
+        # stage it). One line per event, each a JSON list of
+        # {target, runner, triple, exe}.
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '[{"target":"aarch64-macos","runner":"macos-14","triple":"aarch64-apple-darwin","exe":""},{"target":"x86_64-linux","runner":"ubuntu-latest","triple":"x86_64-unknown-linux-gnu","exe":""},{"target":"x86_64-windows","runner":"windows-latest","triple":"x86_64-pc-windows-msvc","exe":".exe"}]' || '[{"target":"x86_64-linux","runner":"ubuntu-latest","triple":"x86_64-unknown-linux-gnu","exe":""},{"target":"x86_64-windows","runner":"windows-latest","triple":"x86_64-pc-windows-msvc","exe":".exe"}]') }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+      TAURI_CONFIG: '{"bundle":{"externalBin":[]}}'
+      KOMIKA_POSTGRES_RUNTIME: ${{ github.workspace }}/apps/admin/src-tauri/postgres/${{ matrix.target }}/18
+      KOMIKA_TEST_SERVER_BIN: ${{ github.workspace }}/apps/server/target/release/komika-server${{ matrix.exe }}
+      KOMIKA_PYTHON: python
+    # Every action is pinned to a full commit. The tag each commit is meant to be:
+    #   actions/checkout          3d3c42e5aac5ba805825da76410c181273ba90b1  v7.0.1
+    #   actions/setup-python      5fda3b95a4ea91299a34e894583c3862153e4b97  v7.0.0
+    #   dtolnay/rust-toolchain    4360b52568e2003a75bf9bc1d59f33a8e3fc893c  stable branch commit, no tag
+    #                             (the commit pins the action; the Rust version is its input)
+    #   Swatinem/rust-cache       6323deb102c322ba6fcbdcafc7e3dddab59af2b6  v2.9.2
+    #   actions/upload-artifact   043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  v7.0.1
+    # (checked against GitHub by the orchestrator on 2026-10-11). To move a pin, change the
+    # commit and the tag here and on the step together.
+    steps:
+      # The `runner` context does not exist in a job-level `env` block (GitHub refuses the
+      # whole file), so the two paths under the runner's temporary folder are set here.
+      - name: Set gate paths
+        run: |
+          echo "KOMIKA_DESKTOP_GATE_ROOT=${RUNNER_TEMP}/komiq-desktop-gate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          echo "KOMIKA_DESKTOP_GATE_JSON=${RUNNER_TEMP}/komiq-desktop-gate-${{ matrix.target }}.json" >> "$GITHUB_ENV"
+      - name: Initialize failure evidence before any action
+        run: |
+          node -e 'require("fs").writeFileSync(process.env.KOMIKA_DESKTOP_GATE_JSON, JSON.stringify({status:"blocked",steps:[],error:"Preparation or build did not finish; inspect job log."}))'
+      # The installer gate (the steps at the end of this job): its paths, and the same kind
+      # of "blocked" evidence, so that a run in which it never started is red there too.
+      - name: Set installer gate paths and initialize its failure evidence
+        if: runner.os != 'macOS'
+        run: |
+          echo "KOMIKA_INSTALLER_GATE_ROOT=${RUNNER_TEMP}/komiq-installer-gate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          echo "KOMIKA_INSTALLER_GATE_JSON=${RUNNER_TEMP}/komiq-installer-gate-${{ matrix.target }}.json" >> "$GITHUB_ENV"
+          echo "KOMIKA_INSTALLER_GATE_BUILD_JSON=${RUNNER_TEMP}/komiq-installer-build-${{ matrix.target }}.json" >> "$GITHUB_ENV"
+          KOMIKA_INSTALLER_GATE_JSON="${RUNNER_TEMP}/komiq-installer-gate-${{ matrix.target }}.json" node -e 'require("fs").writeFileSync(process.env.KOMIKA_INSTALLER_GATE_JSON, JSON.stringify({gate:"desktop_installer",status:"blocked",installer_run:false,steps:[],error:"The installer gate did not start; inspect job log."}))'
+      # No inputs: the default checkout of the ref that started the run. A clean checkout
+      # is enough for every cargo step below: the folders that tauri.conf.json names and
+      # that hold generated files (`web/`, the reader's `jre/` and `suwayomi/`) are in
+      # git with a placeholder, build.rs makes `postgres/bundle` in a debug build, and
+      # `../build` (frontendDist) is not looked at because the config has a devUrl and
+      # the crate is built without the `custom-protocol` feature. What was checked, all on
+      # 2026-10-11: on macOS arm64, a copy of the git-visible files only, every cargo step
+      # of this file. On Linux arm64 (the owner's ARM server, in a container, not this
+      # workflow): staging, the payload check, strict clippy with `--features
+      # desktop-gate`, the unit tests (`cargo test --lib`) and gate steps 1 to 6 of the
+      # list of that day; the gate failed there in step 7 for a reason in the gate itself
+      # (the `instance_setting` count), which round 5 corrected. Run 38172246950 of this
+      # workflow (round 5 sources): x86_64 Linux passed every step, the gate included;
+      # x86_64 Windows passed up to strict clippy, failed four unit tests, and did not
+      # reach the gate.
+      #
+      # The token of the job can only read, and it is not left in the checkout's git
+      # configuration: no later step needs git.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      # The Rust version is fixed, the one the crate is developed with: clippy runs with
+      # `-D warnings`, and a newer compiler brings new lints that would fail this job for
+      # no change in the code. To move it, change it here and run all targets.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch commit, no tag (verified to exist upstream 2026-10-11)
+        with:
+          toolchain: 1.96.0
+          components: clippy
+      - name: Install Tauri build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            apps/server
+            apps/admin/src-tauri
+      - name: Stage pinned target runtime
+        run: python scripts/postgres-desktop-bundle.py --triple '${{ matrix.triple }}'
+      # A release build refuses a missing, empty or wrong-target payload in build.rs
+      # (postgres_bundle_check.rs). The gate below builds the debug profile, which skips
+      # that check, so it is run here on the payload just staged for this target.
+      - name: Release payload check of build.rs on this target
+        env:
+          KOMIKA_POSTGRES_BUNDLE_TRIPLE: ${{ matrix.triple }}
+        run: |
+          # The check function with its controls (missing, empty, wrong target, wrong
+          # version), and on the staged payload of this target.
+          cargo test --locked --manifest-path apps/admin/src-tauri/Cargo.toml --test postgres_bundle_check -- --include-ignored
+          # The bundle hook's check (tauri.conf.json beforeBundleCommand).
+          python scripts/postgres-desktop-bundle.py --check --triple '${{ matrix.triple }}'
+          # build.rs itself, release branch (TAURI_ENV_DEBUG=false selects it without
+          # needing the web build a release compile embeds).
+          TAURI_ENV_DEBUG=false cargo check --locked --manifest-path apps/admin/src-tauri/Cargo.toml
+          # Control: the same command must fail when the payload is not there.
+          mv apps/admin/src-tauri/postgres/bundle apps/admin/src-tauri/postgres/bundle.aside
+          if TAURI_ENV_DEBUG=false cargo check --locked --manifest-path apps/admin/src-tauri/Cargo.toml; then
+            mv apps/admin/src-tauri/postgres/bundle.aside apps/admin/src-tauri/postgres/bundle
+            echo "::error::build.rs accepted a release build without the PostgreSQL payload"
+            exit 1
+          fi
+          rm -rf apps/admin/src-tauri/postgres/bundle
+          mv apps/admin/src-tauri/postgres/bundle.aside apps/admin/src-tauri/postgres/bundle
+          TAURI_ENV_DEBUG=false cargo check --locked --manifest-path apps/admin/src-tauri/Cargo.toml
+      - name: Build the real server
+        run: cargo build --locked --release --manifest-path apps/server/Cargo.toml
+      - name: Strict desktop clippy
+        id: clippy
+        run: cargo clippy --locked --manifest-path apps/admin/src-tauri/Cargo.toml --all-targets --features desktop-gate -- -D warnings
+      # Every unit test of the crate: postgres::, import::, child::, local::, firewall::,
+      # logbuf::, network::. The local:: tests start `src/local/fake_server.py` through a
+      # shell script in place of the server, so they need a Unix shell and `python3`.
+      - name: Desktop unit tests (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: cargo test --locked --manifest-path apps/admin/src-tauri/Cargo.toml --lib
+      # Windows cannot start that shell script as a program: everything but local::.
+      - name: Desktop unit tests (Windows, without local::)
+        if: runner.os == 'Windows'
+        # A block scalar: a plain YAML value must not end with a colon.
+        run: |
+          cargo test --locked --manifest-path apps/admin/src-tauri/Cargo.toml --lib -- --skip local::
+      # The gate also runs when the unit tests failed, so that one run shows both results
+      # (run 38172246950 failed four unit tests on Windows and so never showed what the
+      # gate does there). The job still fails: a failed step stays failed. The gate does
+      # not run when a step before the unit tests failed or was skipped: the strict
+      # clippy step is the last of those and only runs when all before it passed, and
+      # without the staged runtime, the built server and a crate that compiles there is
+      # nothing to run. Windows: the runner has administrator rights, which PostgreSQL
+      # refuses; the gate driver starts itself again with a restricted token (see `mod
+      # rights` in tests/desktop_postgres_gate.rs).
+      - name: Run headless native lifecycle gate
+        if: ${{ !cancelled() && steps.clippy.outcome == 'success' }}
+        run: cargo test --locked --manifest-path apps/admin/src-tauri/Cargo.toml --features desktop-gate --test desktop_postgres_gate -- --ignored --exact desktop_postgres_gate --nocapture
+      # The evidence of record: the job log. (The upload below can fail for a reason that
+      # is not the gate's, such as the account's artifact storage being full.) When the
+      # gate did not pass, the end of every log file under the gate root is printed too,
+      # so that a failure can be read from the job log alone.
+      - name: Print JSON evidence
+        if: always()
+        run: |
+          cat "$KOMIKA_DESKTOP_GATE_JSON"
+          echo
+          # The status of the whole run, not of a step: the file is JSON, read as JSON.
+          if ! node -e 'process.exit(JSON.parse(require("fs").readFileSync(process.env.KOMIKA_DESKTOP_GATE_JSON)).status === "pass" ? 0 : 1)' && [ -d "$KOMIKA_DESKTOP_GATE_ROOT" ]; then
+            find "$KOMIKA_DESKTOP_GATE_ROOT" -type f -name '*.log' -print0 | while IFS= read -r -d '' log; do
+              echo "::group::last 200 lines of ${log}"
+              tail -n 200 "$log" || true
+              echo "::endgroup::"
+            done
+          fi
+      - name: Upload JSON even on failure
+        if: always()
+        # Never the reason a run fails: see "Print JSON evidence".
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgres-desktop-gate-${{ matrix.target }}
+          path: |
+            ${{ env.KOMIKA_DESKTOP_GATE_JSON }}
+            ${{ env.KOMIKA_DESKTOP_GATE_ROOT }}/**/*.log
+          if-no-files-found: error
+          retention-days: 30
+      # The job is green only with a passed gate in the evidence file: status "pass", and
+      # exactly the steps of this target in their order, each passed (nine on Linux and
+      # macOS; six on Windows, which does not run the three earlier-database steps). So a
+      # run in which the gate test was filtered out, or in which no test ran at all, is
+      # red: the file then still holds the "blocked" text written at the start. The same
+      # two lists are in tests/desktop_postgres_gate.rs (`expected_steps`).
+      - name: Require a passed gate with every step of this target
+        if: always()
+        env:
+          EXPECTED_STEPS: ${{ runner.os == 'Windows' && 'new_install_and_clean_persistence,stale_lock_file_of_a_reused_process_number,crash_of_app_and_database_then_recovery,relocated_runtime_same_data,sqlite_upgrade_and_later_launches,dump_restore_retention_and_failure' || 'new_install_and_clean_persistence,stale_lock_file_of_a_reused_process_number,crash_of_app_and_database_then_recovery,relocated_runtime_same_data,earlier_database_still_running_after_data_folder_rename,earlier_database_whose_program_was_moved_or_deleted,earlier_database_after_rename_and_a_start_at_the_old_name,sqlite_upgrade_and_later_launches,dump_restore_retention_and_failure' }}
+        run: |
+          node -e '
+            const expected = process.env.EXPECTED_STEPS.split(",");
+            let evidence;
+            try {
+              evidence = JSON.parse(require("fs").readFileSync(process.env.KOMIKA_DESKTOP_GATE_JSON));
+            } catch (error) {
+              console.error("::error::The gate evidence file cannot be read as JSON: " + error.message);
+              process.exit(1);
+            }
+            const steps = Array.isArray(evidence.steps) ? evidence.steps : [];
+            const names = steps.map((step) => step.name);
+            const problems = [];
+            if (evidence.status !== "pass") problems.push("status is " + JSON.stringify(evidence.status));
+            if (JSON.stringify(names) !== JSON.stringify(expected)) problems.push("steps are " + JSON.stringify(names) + ", expected " + JSON.stringify(expected));
+            for (const step of steps) if (step.status !== "pass") problems.push("step " + step.name + " has status " + JSON.stringify(step.status));
+            if (problems.length) {
+              console.error("::error::The gate did not pass with every step of this target: " + problems.join("; "));
+              process.exit(1);
+            }
+            console.log("Gate passed with " + names.length + " steps: " + names.join(", "));
+          '
+
+      # ---------------------------------------------------------------------------------
+      # Installer gate (fix round 12): "reinstall with data kept" with a real installer.
+      # x86_64 Linux: the `.deb`, with dpkg. x86_64 Windows: the NSIS `-setup.exe`, silent.
+      # (aarch64 macOS is run on a real Mac with a scratch home folder, aarch64 Linux in a
+      # container on the owner's ARM server; see docs/audits/postgres-phase5c-desktop.md.)
+      #
+      # The package is the product's own `tauri build` (scripts/installer-gate-build.sh):
+      # tauri.conf.json as it is, stock installer templates, unsigned, and only the engine
+      # payload (jar, JRE) left out. The test is `desktop_installer_gate` in
+      # tests/desktop_postgres_gate.rs: install, start the database and the server from
+      # the installed files on the app's real data folder, install again over it,
+      # uninstall with the installer's defaults, install again; on Linux also what
+      # `dpkg -P` does. A runner is a throwaway machine, so the install is a real one, for
+      # the real user profile.
+      #
+      # These steps run when the crate compiles (strict clippy passed), also when the
+      # lifecycle gate above failed: the two results are independent. Each of them then
+      # needs the one before it. What the runner images have (read on 2026-10-12, images
+      # ubuntu-24.04 20261004.327.1 and windows-2025 20261004.281.1): Node 22.23.3 and npm
+      # 10.9.9, no pnpm; dpkg and passwordless sudo on Linux; Git Bash on Windows. The
+      # Tauri CLI downloads its own NSIS. No action is added: pnpm comes from npm, at the
+      # version of package.json (`packageManager`).
+      - name: Put pnpm on the path (installer gate)
+        id: installer_pnpm
+        if: ${{ !cancelled() && runner.os != 'macOS' && steps.clippy.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          node --version
+          npm install --no-audit --no-fund --prefix "${RUNNER_TEMP}/pnpm-cli" pnpm@11.9.0
+          # A path in the form of this system (Windows: with backslashes only).
+          node -e 'console.log(require("path").resolve(process.env.RUNNER_TEMP, "pnpm-cli", "node_modules", ".bin"))' >> "$GITHUB_PATH"
+      - name: Install the workspace's Node packages (installer gate)
+        id: installer_packages
+        if: ${{ !cancelled() && steps.installer_pnpm.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          pnpm --version
+          pnpm install --frozen-lockfile
+      # Windows: whether the WebView2 runtime is there (the installer downloads it when it
+      # is not). Told, not required.
+      - name: WebView2 runtime on this runner (installer gate, Windows)
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.installer_packages.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $key = 'Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          foreach ($root in "HKLM:\SOFTWARE\WOW6432Node\$key", "HKCU:\SOFTWARE\$key") {
+            $version = (Get-ItemProperty -Path $root -Name pv -ErrorAction SilentlyContinue).pv
+            Write-Host "$root pv = '$version'"
+          }
+          exit 0
+      # The build script takes TAURI_CONFIG (the job's test override) out of its own
+      # environment and builds with the product's configuration.
+      - name: Build the unsigned installer (installer gate)
+        id: installer_build
+        if: ${{ !cancelled() && steps.installer_packages.outcome == 'success' }}
+        timeout-minutes: 45
+        run: bash apps/admin/src-tauri/scripts/installer-gate-build.sh "$KOMIKA_INSTALLER_GATE_BUILD_JSON"
+      # What the installer script that Tauri generated for this package does with the
+      # app's data on uninstall, with line numbers (the test puts the same lines into its
+      # evidence). The script is UTF-8 or UTF-16; node reads both.
+      - name: Lines of the generated NSIS script about app data (installer gate, Windows)
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.installer_build.outcome == 'success' }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const facts = JSON.parse(fs.readFileSync(process.env.KOMIKA_INSTALLER_GATE_BUILD_JSON));
+            if (!facts.generated_nsis_script) { console.log("The build facts name no generated script."); process.exit(0); }
+            const bytes = fs.readFileSync(facts.generated_nsis_script);
+            const text = bytes[0] === 0xff && bytes[1] === 0xfe ? bytes.subarray(2).toString("utf16le") : bytes.toString("utf8");
+            const wanted = ["!define BUNDLEID", "!define PRODUCTNAME", "!define MAINBINARYNAME", "!define INSTALLMODE", "!define UNINSTKEY", "DeleteAppDataCheckboxState", "RmDir /r \"$APPDATA", "RmDir /r \"$LOCALAPPDATA", "Function un.ConfirmLeave", "NSIS_HOOK_"];
+            console.log(facts.generated_nsis_script);
+            text.split(/\r?\n/).forEach((line, index) => { if (wanted.some((word) => line.includes(word))) console.log((index + 1) + ": " + line.trim()); });
+          '
+      - name: Run the installer gate
+        id: installer_gate
+        if: ${{ !cancelled() && steps.installer_build.outcome == 'success' }}
+        timeout-minutes: 30
+        env:
+          # A runner is thrown away after the job: a system package (Linux) and an install
+          # for the real user with its registry entries and its real data folder (Windows).
+          KOMIKA_INSTALLER_GATE_THROWAWAY_MACHINE: '1'
+          KOMIKA_INSTALLER_GATE_REAL_PROFILE: '1'
+        run: cargo test --locked --manifest-path apps/admin/src-tauri/Cargo.toml --features desktop-gate --test desktop_postgres_gate -- --ignored --exact desktop_installer_gate --nocapture
+      # The evidence of record is this print (the upload below can fail for a reason that
+      # is not the gate's). When the installer gate did not pass, the end of every log and
+      # command output it left is printed too: below its scratch root, and the worker's
+      # logs in the app's data folder.
+      - name: Print installer evidence
+        if: ${{ always() && runner.os != 'macOS' }}
+        run: |
+          cat "$KOMIKA_INSTALLER_GATE_JSON"
+          echo
+          if [ -f "$KOMIKA_INSTALLER_GATE_BUILD_JSON" ]; then cat "$KOMIKA_INSTALLER_GATE_BUILD_JSON"; fi
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            let evidence = {};
+            try { evidence = JSON.parse(fs.readFileSync(process.env.KOMIKA_INSTALLER_GATE_JSON)); } catch (error) { console.log("The evidence is not JSON: " + error.message); }
+            if (evidence.status === "pass") process.exit(0);
+            const files = [];
+            const walk = (dir, depth) => {
+              let entries = [];
+              try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+              for (const entry of entries) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) { if (depth > 0) walk(full, depth - 1); }
+                else if (/\.(log|txt)$/.test(entry.name)) files.push(full);
+              }
+            };
+            walk(process.env.KOMIKA_INSTALLER_GATE_ROOT, 1);
+            const data = ((evidence.previous || evidence).isolation || {}).app_data_dir;
+            if (data && data.path) walk(data.path, 0);
+            for (const file of files) {
+              console.log("::group::last 200 lines of " + file);
+              try { console.log(fs.readFileSync(file, "utf8").split(/\r?\n/).slice(-200).join("\n")); } catch (error) { console.log(error.message); }
+              console.log("::endgroup::");
+            }
+          '
+      - name: Upload installer evidence even on failure
+        if: ${{ always() && runner.os != 'macOS' }}
+        # Never the reason a run fails: see "Print installer evidence".
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgres-desktop-installer-gate-${{ matrix.target }}
+          path: |
+            ${{ env.KOMIKA_INSTALLER_GATE_JSON }}
+            ${{ env.KOMIKA_INSTALLER_GATE_BUILD_JSON }}
+            ${{ env.KOMIKA_INSTALLER_GATE_ROOT }}/command output/*.txt
+          if-no-files-found: error
+          retention-days: 30
+      # Green only with a passed installer gate in the evidence file: status "pass", an
+      # installer that ran, and exactly the steps of this target in their order, each
+      # passed (seven on Linux, where `dpkg -P` is recorded as a last step; six on
+      # Windows). The same lists are in tests/desktop_postgres_gate.rs
+      # (`installer_expected_steps`).
+      - name: Require a passed installer gate with every step of this target
+        if: ${{ always() && runner.os != 'macOS' }}
+        env:
+          EXPECTED_STEPS: ${{ runner.os == 'Linux' && 'package_identity,install,first_start_from_the_installed_files,install_again_over_the_installed_one,uninstall_with_the_installers_defaults,install_again_after_the_uninstall,purge_recorded_only' || 'package_identity,install,first_start_from_the_installed_files,install_again_over_the_installed_one,uninstall_with_the_installers_defaults,install_again_after_the_uninstall' }}
+        run: |
+          node -e '
+            const expected = process.env.EXPECTED_STEPS.split(",");
+            let evidence;
+            try {
+              evidence = JSON.parse(require("fs").readFileSync(process.env.KOMIKA_INSTALLER_GATE_JSON));
+            } catch (error) {
+              console.error("::error::The installer evidence file cannot be read as JSON: " + error.message);
+              process.exit(1);
+            }
+            const steps = Array.isArray(evidence.steps) ? evidence.steps : [];
+            const names = steps.map((step) => step.name);
+            const problems = [];
+            if (evidence.status !== "pass") problems.push("status is " + JSON.stringify(evidence.status));
+            if (evidence.installer_run !== true) problems.push("installer_run is " + JSON.stringify(evidence.installer_run));
+            if (JSON.stringify(names) !== JSON.stringify(expected)) problems.push("steps are " + JSON.stringify(names) + ", expected " + JSON.stringify(expected));
+            for (const step of steps) if (step.status !== "pass") problems.push("step " + step.name + " has status " + JSON.stringify(step.status));
+            if (problems.length) {
+              console.error("::error::The installer gate did not pass with every step of this target: " + problems.join("; "));
+              process.exit(1);
+            }
+            console.log("Installer gate passed with " + names.length + " steps: " + names.join(", "));
+          '

@@ -45,7 +45,7 @@ The reader app (`apps/reader`) is the client you use to browse and read. It runs
 
 You self-host the admin app on your own computer with its desktop app, or with Docker on a home server or a virtual private server (VPS). The desktop app can serve this computer alone or every device on your network with **Allow other devices**. For internet access, you can use a domain, a Cloudflare Tunnel, or a public IP address. A tunnel connects your server to the internet without opening router ports.
 
-The server (`apps/server`) is written in Rust using axum and async-graphql. GraphQL is the interface the reader uses to ask the server for data. The server stores user accounts, authentication sessions, personal libraries, ratings, and comments in a SQLite database. It communicates with Suwayomi to manage catalog data and chapter lists.
+The server (`apps/server`) is written in Rust using axum and async-graphql. GraphQL is the interface the reader uses to ask the server for data. The server stores user accounts, authentication sessions, personal libraries, ratings, and comments in PostgreSQL. Covers remain a separate SQLite cache. It communicates with Suwayomi to manage catalog data and chapter lists.
 
 Komiq embeds Suwayomi-Server as its source engine. The engine manages extensions, communicates with external sources, and retrieves chapter data. With Docker, the engine runs in a container alongside the server. In the admin desktop app, it runs directly on your computer.
 
@@ -69,5 +69,5 @@ Learn more about the architecture and setup options:
 
 - [How it works](/start/how-it-works): See how data flows through each component.
 - [Choose your setup](/start/choose-your-setup): Pick the best way to run or test komiq.
-- [Privacy policy](/guide/privacy): Read how the global server handles user data.
-- [Copyright policy](/guide/copyright): Review rules for third-party works and notice procedures.
+- [Privacy and your data](/guide/privacy): Read how the global server handles user data.
+- [Content and copyright](/guide/copyright): Review rules for third-party works and notice procedures.

@@ -1,0 +1,470 @@
+{
+  "data": {
+    "seriesPage": {
+      "aggregated": [
+        {
+          "firstReleasedAt": "2020-01-01T01:02:03.000000+00:00",
+          "label": "0",
+          "number": 0.0,
+          "readAnywhere": false,
+          "sources": [
+            {
+              "chapterId": "00000000-0000-4000-8000-000000000101",
+              "copyExternalUrl": null,
+              "copyReleasedAt": "2020-01-01T01:02:03.000000+00:00",
+              "scanlator": "Group Café",
+              "sourceId": "mangadex",
+              "sourceType": "mangadex",
+              "suwayomiMangaId": null
+            }
+          ],
+          "title": "Chapter 0"
+        },
+        {
+          "firstReleasedAt": "2020-01-03T01:02:03.000000+00:00",
+          "label": "1",
+          "number": 1.0,
+          "readAnywhere": false,
+          "sources": [
+            {
+              "chapterId": "00000000-0000-4000-8000-000000000102",
+              "copyExternalUrl": null,
+              "copyReleasedAt": "2020-01-03T01:02:03.000000+00:00",
+              "scanlator": null,
+              "sourceId": "mangadex",
+              "sourceType": "mangadex",
+              "suwayomiMangaId": null
+            },
+            {
+              "chapterId": "00000000-0000-4000-8000-000000000106",
+              "copyExternalUrl": null,
+              "copyReleasedAt": "2020-01-07T01:02:03.123456+00:00",
+              "scanlator": "Alpha & Beta",
+              "sourceId": "mangadex",
+              "sourceType": "mangadex",
+              "suwayomiMangaId": null
+            }
+          ],
+          "title": "Chapter 1"
+        },
+        {
+          "firstReleasedAt": "2020-01-03T01:02:03.000000+00:00",
+          "label": "10.5",
+          "number": 10.5,
+          "readAnywhere": false,
+          "sources": [
+            {
+              "chapterId": "710101",
+              "copyExternalUrl": null,
+              "copyReleasedAt": "2020-01-05T01:02:03.123000+00:00",
+              "scanlator": "Alpha & Beta",
+              "sourceId": "source-710001",
+              "sourceType": "suwayomi",
+              "suwayomiMangaId": "710001"
+            },
+            {
+              "chapterId": "710102",
+              "copyExternalUrl": null,
+              "copyReleasedAt": "2020-01-05T01:02:03.123000+00:00",
+              "scanlator": "Alpha & Beta",
+              "sourceId": "source-710002",
+              "sourceType": "suwayomi",
+              "suwayomiMangaId": "710002"
+            },
+            {
+              "chapterId": "00000000-0000-4000-8000-000000000103",
+              "copyExternalUrl": null,
+              "copyReleasedAt": "2020-01-03T01:02:03.000000+00:00",
+              "scanlator": "Alpha & Beta",
+              "sourceId": "mangadex",
+              "sourceType": "mangadex",
+              "suwayomiMangaId": null
+            }
+          ],
+          "title": "Curated half chapter"
+        },
+        {
+          "firstReleasedAt": null,
+          "label": "11",
+          "number": 11.0,
+          "readAnywhere": false,
+          "sources": [
+            {
+              "chapterId": "00000000-0000-4000-8000-000000000107",
+              "copyExternalUrl": null,
+              "copyReleasedAt": null,
+              "scanlator": null,
+              "sourceId": "mangadex",
+              "sourceType": "mangadex",
+              "suwayomiMangaId": null
+            }
+          ],
+          "title": "Undated chapter"
+        },
+        {
+          "firstReleasedAt": "2020-01-05T01:02:03.123000+00:00",
+          "label": "Oneshot",
+          "number": 0.0,
+          "readAnywhere": false,
+          "sources": [
+            {
+              "chapterId": "00000000-0000-4000-8000-000000000104",
+              "copyExternalUrl": null,
+              "copyReleasedAt": "2020-01-05T01:02:03.123000+00:00",
+              "scanlator": "Group Café",
+              "sourceId": "mangadex",
+              "sourceType": "mangadex",
+              "suwayomiMangaId": null
+            }
+          ],
+          "title": "Oneshot"
+        },
+        {
+          "firstReleasedAt": "2020-01-05T01:02:03.123000+00:00",
+          "label": "Extra",
+          "number": 0.0,
+          "readAnywhere": false,
+          "sources": [
+            {
+              "chapterId": "00000000-0000-4000-8000-000000000105",
+              "copyExternalUrl": "https://example.invalid/chapter",
+              "copyReleasedAt": "2020-01-05T01:02:03.123000+00:00",
+              "scanlator": null,
+              "sourceId": "mangadex",
+              "sourceType": "mangadex",
+              "suwayomiMangaId": null
+            }
+          ],
+          "title": "Special extra"
+        }
+      ],
+      "series": {
+        "altTitles": [
+          "Only Alias Hero",
+          "Shared Alias",
+          "나 혼자만 레벨업"
+        ],
+        "artist": "Artist 1",
+        "author": "Author 1",
+        "chapterCount": 4,
+        "coverUrl": "/covers/w_00000000000040008000000000000001.webp?v=7",
+        "createdAt": "2020-01-01T01:02:03.000000+00:00",
+        "description": "Description 1: café / 漫画",
+        "detectedAt": null,
+        "genres": [
+          "Action",
+          "Gore"
+        ],
+        "id": "w_00000000000040008000000000000001",
+        "isFavorite": true,
+        "isMarked": true,
+        "isNsfw": false,
+        "latestChapter": null,
+        "latestChapterAt": "2020-01-08T01:02:03.000000+00:00",
+        "libraryStatus": "reading",
+        "mangadexRating": 5.1,
+        "rating": {
+          "average": 7.666666666666667,
+          "count": 3,
+          "distribution": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            1,
+            1,
+            0
+          ]
+        },
+        "sourceId": "mangadex",
+        "status": "ONGOING",
+        "title": "Solo Leveling",
+        "type": "MANGA",
+        "updatedAt": "2020-01-08T01:02:03.000000+00:00"
+      },
+      "sources": [
+        {
+          "chapters": [],
+          "series": null,
+          "source": {
+            "extension": null,
+            "isNsfw": false,
+            "lang": null,
+            "sourceId": "mangadex",
+            "sourceKey": "00000000-0000-4000-8000-000000000001",
+            "sourceType": "mangadex",
+            "sourceUrl": "https://example.invalid/manga/1"
+          }
+        },
+        {
+          "chapters": [
+            {
+              "bookmarked": true,
+              "externalUrl": null,
+              "foundAt": "2020-01-10T01:02:03.456000+00:00",
+              "id": "710101",
+              "isDownloaded": false,
+              "label": "10.5",
+              "lastPageRead": 12,
+              "number": 10.5,
+              "pageCount": 24,
+              "read": true,
+              "scanlator": "Alpha & Beta",
+              "seriesId": "710001",
+              "title": "Chapter 10.5",
+              "uploadedAt": "2020-01-02T01:02:03.123000+00:00"
+            }
+          ],
+          "series": {
+            "altTitles": [
+              "Only Alias Hero",
+              "Shared Alias",
+              "Solo Leveling",
+              "나 혼자만 레벨업"
+            ],
+            "artist": null,
+            "author": "Mirror author",
+            "chapterCount": 1,
+            "coverUrl": "/covers/w_00000000000040008000000000000001.webp?v=7",
+            "createdAt": "",
+            "description": "Cached only",
+            "detectedAt": "2020-01-05T01:02:03.123000+00:00",
+            "genres": [
+              "Action",
+              "Gore"
+            ],
+            "id": "710001",
+            "isFavorite": true,
+            "isMarked": true,
+            "isNsfw": false,
+            "latestChapter": "Oneshot",
+            "latestChapterAt": "2020-01-02T01:02:03.123000+00:00",
+            "libraryStatus": "reading",
+            "mangadexRating": 5.1,
+            "rating": {
+              "average": 7.666666666666667,
+              "count": 3,
+              "distribution": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                1,
+                1,
+                0
+              ]
+            },
+            "sourceId": "source-710001",
+            "status": "ONGOING",
+            "title": "Solo mirror 710001",
+            "type": "MANGA",
+            "updatedAt": ""
+          },
+          "source": {
+            "extension": {
+              "apkName": "fixture.apk",
+              "lang": "en",
+              "pkgName": "org.example.710001",
+              "repoUrl": "https://example.invalid/repo",
+              "versionCode": 3
+            },
+            "isNsfw": false,
+            "lang": "en",
+            "sourceId": "source-710001",
+            "sourceKey": "710001",
+            "sourceType": "suwayomi",
+            "sourceUrl": "https://example.invalid/710001"
+          }
+        },
+        {
+          "chapters": [
+            {
+              "bookmarked": true,
+              "externalUrl": null,
+              "foundAt": "2020-01-10T01:02:03.456000+00:00",
+              "id": "710102",
+              "isDownloaded": false,
+              "label": "10.5",
+              "lastPageRead": 0,
+              "number": 10.5,
+              "pageCount": 24,
+              "read": true,
+              "scanlator": "Alpha & Beta",
+              "seriesId": "710002",
+              "title": "Chapter 10.5",
+              "uploadedAt": "2020-01-02T01:02:03.123000+00:00"
+            }
+          ],
+          "series": {
+            "altTitles": [
+              "Only Alias Hero",
+              "Shared Alias",
+              "Solo Leveling",
+              "나 혼자만 레벨업"
+            ],
+            "artist": null,
+            "author": "Mirror author",
+            "chapterCount": 1,
+            "coverUrl": "/covers/w_00000000000040008000000000000001.webp?v=7",
+            "createdAt": "",
+            "description": "Cached only",
+            "detectedAt": "2020-01-05T01:02:03.123000+00:00",
+            "genres": [
+              "Action",
+              "Gore"
+            ],
+            "id": "710002",
+            "isFavorite": true,
+            "isMarked": true,
+            "isNsfw": false,
+            "latestChapter": "Oneshot",
+            "latestChapterAt": "2020-01-02T01:02:03.123000+00:00",
+            "libraryStatus": "reading",
+            "mangadexRating": 5.1,
+            "rating": {
+              "average": 7.666666666666667,
+              "count": 3,
+              "distribution": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                1,
+                1,
+                0
+              ]
+            },
+            "sourceId": "source-710002",
+            "status": "ONGOING",
+            "title": "Solo mirror 710002",
+            "type": "MANGA",
+            "updatedAt": ""
+          },
+          "source": {
+            "extension": {
+              "apkName": "fixture.apk",
+              "lang": "en",
+              "pkgName": "org.example.710002",
+              "repoUrl": "https://example.invalid/repo",
+              "versionCode": 3
+            },
+            "isNsfw": false,
+            "lang": "en",
+            "sourceId": "source-710002",
+            "sourceKey": "710002",
+            "sourceType": "suwayomi",
+            "sourceUrl": "https://example.invalid/710002"
+          }
+        }
+      ],
+      "spineChapters": [
+        {
+          "bookmarked": false,
+          "externalUrl": null,
+          "foundAt": "2020-01-01T01:02:03.000000+00:00",
+          "id": "00000000-0000-4000-8000-000000000101",
+          "isDownloaded": false,
+          "label": "0",
+          "lastPageRead": 8,
+          "number": 0.0,
+          "pageCount": 0,
+          "read": false,
+          "scanlator": "Group Café",
+          "seriesId": "w_00000000000040008000000000000001",
+          "title": "Chapter 0",
+          "uploadedAt": "2020-01-01T01:02:03.000000+00:00"
+        },
+        {
+          "bookmarked": false,
+          "externalUrl": null,
+          "foundAt": "2020-01-10T01:02:03.456000+00:00",
+          "id": "00000000-0000-4000-8000-000000000106",
+          "isDownloaded": false,
+          "label": "1",
+          "lastPageRead": 0,
+          "number": 1.0,
+          "pageCount": 0,
+          "read": false,
+          "scanlator": "Alpha & Beta",
+          "seriesId": "w_00000000000040008000000000000001",
+          "title": "Chapter 001.00",
+          "uploadedAt": "2020-01-07T01:02:03.123456+00:00"
+        },
+        {
+          "bookmarked": false,
+          "externalUrl": null,
+          "foundAt": "2020-01-10T01:02:03.456000+00:00",
+          "id": "00000000-0000-4000-8000-000000000103",
+          "isDownloaded": false,
+          "label": "10.5",
+          "lastPageRead": 0,
+          "number": 10.5,
+          "pageCount": 0,
+          "read": true,
+          "scanlator": "Alpha & Beta",
+          "seriesId": "w_00000000000040008000000000000001",
+          "title": "Chapter 10.5",
+          "uploadedAt": "2020-01-03T01:02:03.000000+00:00"
+        },
+        {
+          "bookmarked": false,
+          "externalUrl": null,
+          "foundAt": null,
+          "id": "00000000-0000-4000-8000-000000000107",
+          "isDownloaded": false,
+          "label": "11",
+          "lastPageRead": 0,
+          "number": 11.0,
+          "pageCount": 0,
+          "read": false,
+          "scanlator": null,
+          "seriesId": "w_00000000000040008000000000000001",
+          "title": "Undated chapter",
+          "uploadedAt": null
+        },
+        {
+          "bookmarked": false,
+          "externalUrl": null,
+          "foundAt": "2020-01-10T01:02:03.456000+00:00",
+          "id": "00000000-0000-4000-8000-000000000104",
+          "isDownloaded": false,
+          "label": "Oneshot",
+          "lastPageRead": 0,
+          "number": 0.0,
+          "pageCount": 0,
+          "read": false,
+          "scanlator": "Group Café",
+          "seriesId": "w_00000000000040008000000000000001",
+          "title": "Oneshot",
+          "uploadedAt": "2020-01-05T01:02:03.123000+00:00"
+        },
+        {
+          "bookmarked": false,
+          "externalUrl": "https://example.invalid/chapter",
+          "foundAt": "2020-01-10T01:02:03.456000+00:00",
+          "id": "00000000-0000-4000-8000-000000000105",
+          "isDownloaded": false,
+          "label": "Extra",
+          "lastPageRead": 0,
+          "number": 0.0,
+          "pageCount": 0,
+          "read": false,
+          "scanlator": null,
+          "seriesId": "w_00000000000040008000000000000001",
+          "title": "Special extra",
+          "uploadedAt": "2020-01-05T01:02:03.123000+00:00"
+        }
+      ],
+      "workId": "w_00000000000040008000000000000001"
+    }
+  }
+}

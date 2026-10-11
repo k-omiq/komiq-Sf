@@ -25,6 +25,25 @@ pnpm install
 
 The command installs dependencies across all workspaces and establishes internal workspace links. Prebuilt binaries such as esbuild, sharp, and workerd do not run build scripts during install because `allowBuilds` disables them in `pnpm-workspace.yaml`.
 
+## Start a local database
+
+The server needs PostgreSQL 18 and a separate SQLite cover cache. Use native PostgreSQL tools to create a private development cluster from the repository root. Do this once, in a directory that does not already contain a cluster:
+
+```sh
+initdb -D .komiq-pg --encoding=UTF8 --locale-provider=builtin \
+  --builtin-locale=C.UTF-8 --lc-collate=C --lc-ctype=C \
+  --auth-local=peer --auth-host=scram-sha-256 --pwprompt
+pg_ctl -D .komiq-pg -o '-h 127.0.0.1' start
+createuser --pwprompt --no-superuser --no-createdb --no-createrole komika
+createdb --owner=komika --template=template0 --encoding=UTF8 \
+  --locale-provider=builtin --builtin-locale=C.UTF-8 \
+  --lc-collate=C --lc-ctype=C komika
+```
+
+The password prompts do not print the secrets. These commands use local socket access for cluster administration and password authentication for TCP. Give the server the `komika` application role, not the cluster administrator. Set `DATABASE_URL` privately to `postgres://komika:<URL-encoded-password>@127.0.0.1:5432/komika` in your development environment. Do not commit credentials or shell history containing them.
+
+To stop this development cluster, run `pg_ctl -D .komiq-pg stop`. Keep its directory across development sessions. The self-host Compose database publishes no host port, so a native development server cannot use its private container address directly.
+
 ## Run the admin app server
 
 The server component of the admin app lives in `apps/server`. It exposes GraphQL, the query language used by the apps, on port 8080.
@@ -38,8 +57,8 @@ PORT=8080 GRAPHIQL_ENABLED=on CATALOGUE_SYNC=on CORS_ORIGINS='http://localhost:5
 
 On startup, the server performs these steps:
 
-1. Creates the SQLite database file at `DATABASE_URL` (default `sqlite://komika.sqlite3`) if it does not already exist.
-2. Applies pending database migrations located in `apps/server/migrations/`.
+1. Connects to the PostgreSQL database supplied in `DATABASE_URL` and initializes the separate SQLite covers cache.
+2. Applies migrations from `apps/server/migrations_pg/`. An old main SQLite file (`komika.sqlite3`) beside the covers cache converts automatically when PostgreSQL is empty; verification precedes serving and renaming the source. [Data model](/developers/data-model) lists the cases the server refuses.
 3. If no admin account exists, prints a one-time setup code to the terminal log.
 4. Binds to port 8080.
 

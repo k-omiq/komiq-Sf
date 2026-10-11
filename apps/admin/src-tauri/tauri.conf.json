@@ -6,6 +6,7 @@
 	"build": {
 		"frontendDist": "../build",
 		"devUrl": "http://localhost:5273",
+		"beforeBundleCommand": "bash src-tauri/scripts/check-postgres-bundle.sh",
 		"beforeDevCommand": "pnpm dev",
 		"beforeBuildCommand": "bash src-tauri/scripts/prepare-bundle.sh && pnpm build"
 	},
@@ -31,6 +32,7 @@
 		"externalBin": ["binaries/komika-server"],
 		"resources": {
 			"web/": "web/",
+			"postgres/bundle/": "postgres/",
 			"../../reader/src-tauri/suwayomi/": "suwayomi/",
 			"../../reader/src-tauri/jre/": "jre/"
 		},

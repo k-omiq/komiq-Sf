@@ -1,0 +1,58 @@
+{
+  "data": {
+    "search": {
+      "hasNextPage": false,
+      "items": [
+        {
+          "altTitles": [
+            "Only Alias Hero",
+            "Shared Alias",
+            "나 혼자만 레벨업"
+          ],
+          "artist": "Artist 1",
+          "author": "Author 1",
+          "chapterCount": 6,
+          "coverUrl": "/covers/w_00000000000040008000000000000001.webp?v=7",
+          "createdAt": "2020-01-01T01:02:03.000000+00:00",
+          "description": "Description 1: café / 漫画",
+          "detectedAt": null,
+          "genres": [
+            "Action",
+            "Gore"
+          ],
+          "id": "w_00000000000040008000000000000001",
+          "isFavorite": true,
+          "isMarked": true,
+          "isNsfw": false,
+          "latestChapter": "Oneshot",
+          "latestChapterAt": "2020-01-05T01:02:03.000000+00:00",
+          "libraryStatus": "reading",
+          "mangadexRating": 5.1,
+          "rating": {
+            "average": 7.666666666666667,
+            "count": 3,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              1,
+              0,
+              1,
+              1,
+              0
+            ]
+          },
+          "sourceId": "mangadex",
+          "status": "ONGOING",
+          "title": "Solo Leveling",
+          "type": "MANGA",
+          "updatedAt": "2020-01-05T01:02:03.000000+00:00"
+        }
+      ],
+      "page": 1,
+      "total": 1
+    }
+  }
+}

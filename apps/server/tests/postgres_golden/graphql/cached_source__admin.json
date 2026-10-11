@@ -1,0 +1,58 @@
+{
+  "data": {
+    "chapters": [
+      {
+        "bookmarked": true,
+        "externalUrl": null,
+        "foundAt": "2020-01-10T01:02:03.456000+00:00",
+        "id": "710101",
+        "isDownloaded": false,
+        "label": "10.5",
+        "lastPageRead": 12,
+        "number": 10.5,
+        "pageCount": 24,
+        "read": true,
+        "scanlator": "Alpha & Beta",
+        "seriesId": "710001",
+        "title": "Chapter 10.5",
+        "uploadedAt": "2020-01-02T01:02:03.123000+00:00"
+      }
+    ],
+    "series": {
+      "chapterCount": 1,
+      "createdAt": "",
+      "id": "710001",
+      "isNsfw": false,
+      "latestChapter": "Oneshot",
+      "latestChapterAt": "2020-01-02T01:02:03.123000+00:00",
+      "rating": {
+        "average": 7.666666666666667,
+        "count": 3,
+        "distribution": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          1,
+          1,
+          0
+        ]
+      },
+      "scan": {
+        "avgIntervalHours": 12.5,
+        "lastScannedAt": "2020-01-01T01:02:03.000000+00:00",
+        "nextScanAt": "2020-01-08T01:02:03.000000+00:00",
+        "paused": false,
+        "pollEveryMinutes": 30
+      },
+      "status": "ONGOING",
+      "title": "Solo mirror 710001",
+      "type": "MANGA",
+      "updatedAt": "",
+      "workId": "w_00000000000040008000000000000001"
+    }
+  }
+}

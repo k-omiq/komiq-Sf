@@ -1,0 +1,200 @@
+{
+  "baseline_commit": "591379fbf03dd55180103c8301c4b039309fce82",
+  "candidate": "all six SQLite phases plus main through 05b9ece1af5d0c33c7d1c13a49358829a9879cc1",
+  "database_backup_bytes": 1974300672,
+  "platform": {
+    "os": "macOS",
+    "architecture": "arm64",
+    "rust": "1.96.0",
+    "node": "26.3.0",
+    "build_profile": "unoptimized, debug=0, strip=none, incremental=0"
+  },
+  "workload": {
+    "read_requests_per_second": 10,
+    "write_requests_per_second": 2,
+    "http_window_seconds": 20,
+    "write_operation": "authenticated setFavorite (facets operation overridden with --queries)",
+    "background": [
+      "full feed",
+      "merged feed",
+      "browse catalogue",
+      "work FTS"
+    ],
+    "probe_interval_ms": 5,
+    "limitations": [
+      "loopback minimal router; production middleware tested separately",
+      "same harness pool options without main 8GiB mmap",
+      "local data and hardware; no competing builds/tests during measurements",
+      "candidate also incorporates newer main features; not an isolated microbenchmark"
+    ]
+  },
+  "before": {
+    "application_lock_error_events": 35,
+    "longest_sampled_writer_hold_ms": 14040,
+    "background_elapsed_ms": 31852,
+    "busy_probes": 4293,
+    "reads": {
+      "loadtest_arguments": {
+        "target": "http://127.0.0.1:18089",
+        "scenario": "mixed",
+        "vus": null,
+        "rate": 10,
+        "duration": 20,
+        "warmup": 0,
+        "maxP95": 60000,
+        "json": "/tmp/komiq-sqlite-safety/before-read.json",
+        "think": 5,
+        "list": false
+      },
+      "results": {
+        "rate": 10,
+        "requests": 202,
+        "ok": 202,
+        "httpErrors": 0,
+        "gqlErrors": 0,
+        "netErrors": 0,
+        "rps": 10,
+        "okRps": 10,
+        "bytesPerSec": 569389,
+        "p50": 15.33,
+        "p90": 23.52,
+        "p95": 24.97,
+        "p99": 34.6,
+        "max": 184.69,
+        "mean": 17.28,
+        "users": 50
+      }
+    },
+    "writes": {
+      "loadtest_arguments": {
+        "target": "http://127.0.0.1:18089",
+        "scenario": "facets",
+        "vus": null,
+        "rate": 2,
+        "duration": 20,
+        "warmup": 0,
+        "maxP95": 60000,
+        "json": "/tmp/komiq-sqlite-safety/before-write.json",
+        "think": 5,
+        "list": false
+      },
+      "results": {
+        "rate": 2,
+        "requests": 41,
+        "ok": 6,
+        "httpErrors": 0,
+        "gqlErrors": 35,
+        "netErrors": 0,
+        "rps": 2,
+        "okRps": 0.3,
+        "bytesPerSec": 218,
+        "p50": 0.96,
+        "p90": 2.17,
+        "p95": 2.41,
+        "p99": 10.77,
+        "max": 10.77,
+        "mean": 1.37,
+        "users": 2
+      }
+    }
+  },
+  "after": {
+    "application_lock_error_events": 0,
+    "longest_sampled_writer_hold_ms": 295,
+    "background_elapsed_ms": 38345,
+    "busy_probes": 461,
+    "reads": {
+      "loadtest_arguments": {
+        "target": "http://127.0.0.1:18089",
+        "scenario": "mixed",
+        "vus": null,
+        "rate": 10,
+        "duration": 20,
+        "warmup": 0,
+        "maxP95": 60000,
+        "json": "/tmp/komiq-sqlite-safety/final-after-read.json",
+        "think": 5,
+        "list": false
+      },
+      "results": {
+        "rate": 10,
+        "requests": 201,
+        "ok": 201,
+        "httpErrors": 0,
+        "gqlErrors": 0,
+        "netErrors": 0,
+        "rps": 10,
+        "okRps": 10,
+        "bytesPerSec": 558274,
+        "p50": 18.34,
+        "p90": 27.16,
+        "p95": 29.22,
+        "p99": 34.54,
+        "max": 92.58,
+        "mean": 18.33,
+        "users": 50
+      }
+    },
+    "writes": {
+      "loadtest_arguments": {
+        "target": "http://127.0.0.1:18089",
+        "scenario": "facets",
+        "vus": null,
+        "rate": 2,
+        "duration": 20,
+        "warmup": 0,
+        "maxP95": 60000,
+        "json": "/tmp/komiq-sqlite-safety/final-after-write.json",
+        "think": 5,
+        "list": false
+      },
+      "results": {
+        "rate": 2,
+        "requests": 41,
+        "ok": 41,
+        "httpErrors": 0,
+        "gqlErrors": 0,
+        "netErrors": 0,
+        "rps": 2,
+        "okRps": 2,
+        "bytesPerSec": 139,
+        "p50": 2.7,
+        "p90": 3.37,
+        "p95": 4.04,
+        "p99": 13.23,
+        "max": 13.23,
+        "mean": 3.02,
+        "users": 10
+      }
+    }
+  },
+  "baseline_write_latency_caveat": "p95 includes 35 fast GraphQL failures among 41 requests; compare successful counts, not latency alone",
+  "incremental_projection": {
+    "fts_corpus_rows": 114892,
+    "sources": 128,
+    "chapters": 8192,
+    "merge_hold_ms": 60,
+    "split_hold_ms": 66,
+    "merge_busy_probes": 9,
+    "split_busy_probes": 10
+  },
+  "sqlx_bundled_sqlite_real_copy_migration_ms": {
+    "119": 1146.471,
+    "120": 43188.815
+  },
+  "verification": {
+    "rust_suite": {
+      "passed": 880,
+      "failed": 0,
+      "ignored": 6,
+      "elapsed_seconds": 181.5
+    },
+    "sql_regressions_passed": 10,
+    "fmt": "passed",
+    "standalone_bench_rustfmt": "passed",
+    "clippy_all_targets_deny_warnings": "passed",
+    "entrypoint_shell_tests": "passed",
+    "selfhost_install_stub_tests": "passed",
+    "new_ignored_real_size_benchmarks": "both passed separately"
+  }
+}

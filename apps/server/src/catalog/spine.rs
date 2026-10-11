@@ -31,7 +31,7 @@ use crate::db::Database;
 use anyhow::Result;
 use std::time::Duration;
 
-use super::{replace_source_chapters, spine_key_and_label, suwayomi_spine_input, ChapterInput};
+use super::{spine_key_and_label, suwayomi_spine_input, ChapterInput};
 
 /// Rows re-keyed per transaction. Small enough that the transaction is short even under a
 /// concurrent scanner write, large enough that per-statement overhead does not dominate.
@@ -78,9 +78,14 @@ impl DrainOutcome {
 /// non-numeric chapters would be keyed as chapter 0 and collide with real chapter zeros —
 /// which is precisely the bug the `x:<external_id>` namespace exists to prevent.
 pub async fn drain_chapter_keys(pool: &Database) -> Result<u64> {
-    let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT id, external_id, number, title FROM chapter \
-         WHERE chapter_key IS NULL LIMIT ?",
+    crate::db::retry_transaction(|| drain_chapter_keys_attempt(pool)).await
+}
+
+async fn drain_chapter_keys_attempt(pool: &Database) -> Result<u64> {
+    type UnkeyedChapter = (String, String, String, Option<String>, Option<String>);
+    let rows: Vec<UnkeyedChapter> = crate::db_types::query_tuple(
+        "SELECT id, source_series_id, external_id, number, title FROM chapter \
+         WHERE chapter_key IS NULL ORDER BY source_series_id, external_id LIMIT $1",
     )
     .bind(KEY_BATCH)
     .fetch_all(pool)
@@ -88,22 +93,26 @@ pub async fn drain_chapter_keys(pool: &Database) -> Result<u64> {
     if rows.is_empty() {
         return Ok(0);
     }
+    #[cfg(test)]
+    super::guards::pause("keys-discovered").await;
     let mut tx = pool.begin().await?;
+    let sources: Vec<&str> = rows.iter().map(|row| row.1.as_str()).collect();
+    crate::locks::lock_source_series(&mut tx, &sources).await?;
+    super::guards::held().await;
     let mut keyed = 0u64;
-    for (id, external_id, number, title) in rows {
+    for (id, _, external_id, number, title) in rows {
         let (key, label) = spine_key_and_label(&ChapterInput {
-            external_id,
-            number,
-            title,
+            external_id: external_id.clone(),
+            number: number.clone(),
+            title: title.clone(),
             ..Default::default()
         });
-        sqlx::query("UPDATE chapter SET chapter_key = ?, label = ? WHERE id = ?")
+        keyed += sqlx::query("UPDATE chapter SET chapter_key = $1, label = $2 WHERE id = $3 AND chapter_key IS NULL AND external_id = $4 AND number IS NOT DISTINCT FROM $5 AND title IS NOT DISTINCT FROM $6")
             .bind(&key)
             .bind(&label)
-            .bind(&id)
+            .bind(&id).bind(&external_id).bind(&number).bind(&title)
             .execute(&mut *tx)
-            .await?;
-        keyed += 1;
+            .await?.rows_affected();
     }
     tx.commit().await?;
     Ok(keyed)
@@ -118,14 +127,14 @@ pub async fn drain_chapter_keys(pool: &Database) -> Result<u64> {
 /// rows, so this stays a cheap query even when it returns nothing — which is what it will
 /// do for the rest of the deployment's life once the drain finishes.
 pub async fn drain_suwayomi_series(pool: &Database) -> Result<u64> {
-    let pending: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT ss.id, CAST(ss.source_key AS INTEGER) \
+    let pending: Vec<(String, i64)> = crate::db_types::query_tuple(
+        "SELECT ss.id, sqlite_integer_pin(ss.source_key) \
          FROM source_series ss \
          WHERE ss.source_type = 'suwayomi' \
            AND EXISTS (SELECT 1 FROM suwayomi_chapter sc \
-                        WHERE sc.manga_id = CAST(ss.source_key AS INTEGER)) \
+                        WHERE sc.manga_id = sqlite_integer_pin(ss.source_key)) \
            AND NOT EXISTS (SELECT 1 FROM chapter c WHERE c.source_series_id = ss.id) \
-         LIMIT ?",
+         LIMIT $1",
     )
     .bind(SERIES_BATCH)
     .fetch_all(pool)
@@ -136,32 +145,31 @@ pub async fn drain_suwayomi_series(pool: &Database) -> Result<u64> {
     type CachedChapterRow = (i64, String, f64, Option<String>, Option<String>);
     let mut done = 0u64;
     for (ssid, manga_id) in pending {
-        let chapters: Vec<CachedChapterRow> = sqlx::query_as(
-            "SELECT id, name, chapter_number, scanlator, upload_date \
-             FROM suwayomi_chapter WHERE manga_id = ?",
-        )
-        .bind(manga_id)
-        .fetch_all(pool)
-        .await?;
-        if chapters.is_empty() {
-            // Raced with a `put_chapters` that emptied the list. Nothing to do, and the
-            // `EXISTS` guard will stop offering it.
-            continue;
-        }
-        let inputs: Vec<ChapterInput> = chapters
-            .iter()
-            .map(|(id, name, number, scanlator, upload_date)| {
-                suwayomi_spine_input(
-                    *id,
-                    name,
-                    *number,
-                    scanlator.as_deref(),
-                    upload_date.as_deref(),
-                )
-            })
-            .collect();
-        replace_source_chapters(pool, &ssid, &inputs).await?;
-        done += 1;
+        let materialised = crate::db::retry_transaction(|| async {
+            let mut tx = pool.begin().await?;
+            crate::locks::advisory(&mut tx, &[crate::locks::AdvisoryKey::new(crate::locks::KeyClass::Series, &[&manga_id.to_string()])]).await?;
+            let locked = crate::locks::lock_source_series(&mut tx, &[&ssid]).await?;
+            if locked.missing.is_empty() {
+                sqlx::query("SELECT id FROM suwayomi_series WHERE id = $1 FOR NO KEY UPDATE")
+                    .bind(manga_id).fetch_optional(&mut *tx).await?;
+                super::guards::held().await;
+                let chapters: Vec<CachedChapterRow> = sqlx::query_as(
+                    "SELECT id, name, chapter_number, scanlator, upload_date FROM suwayomi_chapter WHERE manga_id = $1 ORDER BY id")
+                    .bind(manga_id).fetch_all(&mut *tx).await?;
+                let already: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chapter WHERE source_series_id = $1)")
+                    .bind(&ssid).fetch_one(&mut *tx).await?;
+                if !chapters.is_empty() && !already {
+                    let inputs: Vec<ChapterInput> = chapters.iter().map(|(id,name,number,scanlator,upload_date)|
+                        suwayomi_spine_input(*id,name,*number,scanlator.as_deref(),upload_date.as_deref())).collect();
+                    super::replace_source_chapters_on(&mut tx, &ssid, &inputs).await?;
+                    tx.commit().await?;
+                    return Ok(true);
+                }
+            }
+            tx.commit().await?;
+            Ok(false)
+        }).await?;
+        done += u64::from(materialised);
     }
     Ok(done)
 }
@@ -199,14 +207,15 @@ pub async fn seed_ledger_if_spine_complete(pool: &Database) -> Result<Option<u64
 /// `COUNT(*)` over migration 0090's partial index reads an index that is by then empty,
 /// not the 877k-row table.
 pub async fn remaining(pool: &Database) -> Result<(i64, i64)> {
-    let unkeyed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chapter WHERE chapter_key IS NULL")
-        .fetch_one(pool)
-        .await?;
-    let unmaterialised: i64 = sqlx::query_scalar(
+    let unkeyed: i64 =
+        crate::db_types::query_scalar("SELECT COUNT(*) FROM chapter WHERE chapter_key IS NULL")
+            .fetch_one(pool)
+            .await?;
+    let unmaterialised: i64 = crate::db_types::query_scalar(
         "SELECT COUNT(*) FROM source_series ss \
          WHERE ss.source_type = 'suwayomi' \
            AND EXISTS (SELECT 1 FROM suwayomi_chapter sc \
-                        WHERE sc.manga_id = CAST(ss.source_key AS INTEGER)) \
+                        WHERE sc.manga_id = sqlite_integer_pin(ss.source_key)) \
            AND NOT EXISTS (SELECT 1 FROM chapter c WHERE c.source_series_id = ss.id)",
     )
     .fetch_one(pool)
@@ -238,7 +247,10 @@ async fn report(pool: &Database) {
                         events,
                         "spine: drained — chapter spine and release ledger complete"
                     ),
-                    Err(e) => tracing::error!(error = %e, "spine: RELEASE LEDGER IS CORRUPT"),
+                    Err(e) => {
+                        crate::db::observe_database_error(&e);
+                        tracing::error!(error = %e, "spine: RELEASE LEDGER IS CORRUPT");
+                    }
                 }
             }
             Ok((events, pending)) => tracing::warn!(
@@ -246,7 +258,10 @@ async fn report(pool: &Database) {
                 pending,
                 "spine: ledger seed idle but chapters remain unrecorded"
             ),
-            Err(e) => tracing::warn!(error = %e, "spine: ledger remaining check failed"),
+            Err(e) => {
+                crate::db::observe_database_error(&e);
+                tracing::warn!(error = %e, "spine: ledger remaining check failed");
+            }
         },
         Ok((unkeyed, unmaterialised)) => tracing::warn!(
             unkeyed,
@@ -254,7 +269,10 @@ async fn report(pool: &Database) {
             "spine: drains reported idle but work remains — \
              rows are unreachable, not merely pending"
         ),
-        Err(e) => tracing::warn!(error = %e, "spine: remaining check failed"),
+        Err(e) => {
+            crate::db::observe_database_error(&e);
+            tracing::warn!(error = %e, "spine: remaining check failed");
+        }
     }
 }
 
@@ -303,6 +321,7 @@ pub fn spawn(pool: Database, mut shutdown: tokio::sync::watch::Receiver<bool>) {
                     }
                 }
                 Err(e) => {
+                    crate::db::observe_database_error(&e);
                     tracing::warn!(error = %e, "spine: drain pass failed — retrying");
                     if nap(IDLE_RECHECK, &mut shutdown).await {
                         return;

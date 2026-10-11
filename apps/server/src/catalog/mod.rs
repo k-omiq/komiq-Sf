@@ -7,12 +7,15 @@
 //! queries. Runtime queries only (matching the rest of the crate), so the build
 //! needs no sqlx offline metadata.
 
+pub mod date_repair;
+pub(crate) mod guards;
 pub mod ledger;
 pub mod normalize;
 pub mod pair;
 pub mod similarity;
 pub mod spine;
 
+use crate::database::SqliteDatabase;
 use crate::db::Database;
 use anyhow::Result;
 use chrono::Utc;
@@ -162,13 +165,21 @@ const MATCH_DATA_COLUMNS: &str = "w.id, w.primary_title, w.description, w.author
 
 #[derive(sqlx::FromRow)]
 struct MatchDataRow {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     id: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     primary_title: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     description: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     author: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     artist: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     year: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     original_language: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     cover_phash: Option<String>,
     mangadex_anchored: bool,
 }
@@ -196,17 +207,31 @@ fn new_id(prefix: &str) -> String {
 
 /// Find the work already claiming `(provider, external_id)`, if any. The
 /// highest-precision match key (CATALOGUE.md §4, step 1).
+#[allow(dead_code)] // pool form kept for callers outside a transaction; the matcher uses the `_on` form
 pub async fn find_work_by_external(
     pool: &Database,
     provider: &str,
     external_id: &str,
 ) -> Result<Option<String>> {
-    let id = sqlx::query_scalar::<_, String>(
-        "SELECT work_id FROM work_external_id WHERE provider = ? AND external_id = ?",
+    let mut conn = pool.acquire().await?;
+    find_work_by_external_on(&mut conn, provider, external_id).await
+}
+
+/// [`find_work_by_external`] on the caller's connection. Read only; takes no lock and
+/// does not commit. To ACT on the answer in the same transaction the caller must already
+/// hold `AdvisoryKey::external_identity(provider, external_id)`, which is what stops a
+/// second writer from claiming the identity between this read and the caller's write.
+pub async fn find_work_by_external_on(
+    conn: &mut sqlx::PgConnection,
+    provider: &str,
+    external_id: &str,
+) -> Result<Option<String>> {
+    let id = crate::db_types::query_scalar::<String>(
+        "SELECT work_id FROM work_external_id WHERE provider = $1 AND external_id = $2",
     )
     .bind(provider)
     .bind(external_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     Ok(id)
 }
@@ -217,11 +242,25 @@ pub async fn find_works_by_alias(pool: &Database, normalized: &str) -> Result<Ve
     if normalized.is_empty() {
         return Ok(Vec::new());
     }
-    let ids = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT work_id FROM work_alias WHERE normalized_title = ?",
+    let mut conn = pool.acquire().await?;
+    find_works_by_alias_on(&mut conn, normalized).await
+}
+
+/// [`find_works_by_alias`] on the caller's connection. Read only; takes no lock and does
+/// not commit. A caller that mints a work when this is empty must already hold the
+/// `MatchDomain` key of the title (`dedup::match_domain_keys`).
+pub async fn find_works_by_alias_on(
+    conn: &mut sqlx::PgConnection,
+    normalized: &str,
+) -> Result<Vec<String>> {
+    if normalized.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = crate::db_types::query_scalar::<String>(
+        "SELECT DISTINCT work_id FROM work_alias WHERE normalized_title = $1",
     )
     .bind(normalized)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(ids)
 }
@@ -230,15 +269,32 @@ pub async fn find_works_by_alias(pool: &Database, normalized: &str) -> Result<Ve
 /// (`normalize::match_key`) is `key`, so "The X" finds "X". Weaker than
 /// [`find_works_by_alias`]: callers treat a hit as a LOOSE title match and use it only
 /// when the exact lookup found nothing.
+#[cfg(test)]
 pub async fn find_works_by_match_key(pool: &Database, key: &str) -> Result<Vec<String>> {
     if key.is_empty() {
         return Ok(Vec::new());
     }
-    let ids = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT work_id FROM work_alias WHERE match_key = ?",
+    let mut conn = pool.acquire().await?;
+    find_works_by_match_key_on(&mut conn, key).await
+}
+
+/// [`find_works_by_match_key`] on the caller's connection. Read only; takes no lock and
+/// does not commit. A caller that merges or mints on the answer must already hold
+/// `AdvisoryKey::new(KeyClass::MatchDomain, &[key])` and, before it changes any of the
+/// returned works, their work locks (complete set, sorted) with this lookup repeated
+/// after the locks are held.
+pub async fn find_works_by_match_key_on(
+    conn: &mut sqlx::PgConnection,
+    key: &str,
+) -> Result<Vec<String>> {
+    if key.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = crate::db_types::query_scalar::<String>(
+        "SELECT DISTINCT work_id FROM work_alias WHERE match_key = $1",
     )
     .bind(key)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(ids)
 }
@@ -254,6 +310,7 @@ pub async fn find_works_by_match_key(pool: &Database, key: &str) -> Result<Vec<S
 /// preserved because the block always feeds whole normalized words (never substrings)
 /// and every alias word is indexed — so a distinctive mid/end-title word like "slime"
 /// in "...as a Slime" still matches, now via the index instead of a scan.
+#[allow(dead_code)] // pool form kept for callers outside a transaction; the matcher uses the `_on` form
 pub async fn candidate_work_ids_by_token(
     pool: &Database,
     token: &str,
@@ -262,12 +319,27 @@ pub async fn candidate_work_ids_by_token(
     if token.len() < 2 {
         return Ok(Vec::new());
     }
-    let ids = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT work_id FROM work_alias_token WHERE token = ? LIMIT ?",
+    let mut conn = pool.acquire().await?;
+    candidate_work_ids_by_token_on(&mut conn, token, limit).await
+}
+
+/// [`candidate_work_ids_by_token`] on the caller's connection. Read only; takes no lock
+/// and does not commit. A fuzzy block is evidence, never a reservation: no advisory key
+/// covers it, so a caller must re-read the chosen work under its work lock before acting.
+pub async fn candidate_work_ids_by_token_on(
+    conn: &mut sqlx::PgConnection,
+    token: &str,
+    limit: i64,
+) -> Result<Vec<String>> {
+    if token.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let ids = crate::db_types::query_scalar::<String>(
+        "SELECT DISTINCT work_id FROM work_alias_token WHERE token = $1 LIMIT $2",
     )
     .bind(token)
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(ids)
 }
@@ -283,38 +355,52 @@ fn alias_word_tokens(normalized_title: &str) -> Vec<&str> {
 }
 
 /// Upsert the word tokens of one normalized alias into the `work_alias_token`
-/// inverted index (H9). Idempotent via `INSERT OR IGNORE` on the UNIQUE(work_id,
+/// inverted index (H9). Idempotent via `ON CONFLICT DO NOTHING` on the UNIQUE(work_id,
 /// token) key. Runs inside the caller's alias-write transaction.
 async fn insert_alias_tokens(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     work_id: &str,
     normalized_title: &str,
 ) -> Result<()> {
     for token in alias_word_tokens(normalized_title) {
-        sqlx::query("INSERT OR IGNORE INTO work_alias_token (work_id, token) VALUES (?, ?)")
-            .bind(work_id)
-            .bind(token)
-            .execute(&mut **tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO work_alias_token (work_id, token) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(work_id)
+        .bind(token)
+        .execute(&mut **tx)
+        .await?;
     }
     Ok(())
 }
 
 /// Load the corroboration fields + normalized aliases for one work.
 pub async fn load_match_data(pool: &Database, work_id: &str) -> Result<Option<WorkMatchData>> {
+    let mut conn = pool.acquire().await?;
+    load_match_data_on(&mut conn, work_id).await
+}
+
+/// [`load_match_data`] on the caller's connection. Read only; takes no lock and does not
+/// commit. The result is a decision input only while the caller holds the work lock of
+/// `work_id` (`locks::lock_works`): without it a metadata or alias edit can change the
+/// fields between this read and the caller's write.
+pub async fn load_match_data_on(
+    conn: &mut sqlx::PgConnection,
+    work_id: &str,
+) -> Result<Option<WorkMatchData>> {
     let row = sqlx::query_as::<_, MatchDataRow>(&format!(
-        "SELECT {MATCH_DATA_COLUMNS} FROM work w WHERE w.id = ?"
+        "SELECT {MATCH_DATA_COLUMNS} FROM work w WHERE w.id = $1"
     ))
     .bind(work_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     let Some(row) = row else { return Ok(None) };
     let mut data = row.into_match_data();
-    data.aliases_norm = sqlx::query_scalar::<_, String>(
-        "SELECT normalized_title FROM work_alias WHERE work_id = ?",
+    data.aliases_norm = crate::db_types::query_scalar::<String>(
+        "SELECT normalized_title FROM work_alias WHERE work_id = $1",
     )
     .bind(work_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(Some(data))
 }
@@ -332,6 +418,20 @@ pub async fn load_match_data_batch(
     pool: &Database,
     work_ids: &[String],
 ) -> Result<std::collections::HashMap<String, WorkMatchData>> {
+    if work_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut conn = pool.acquire().await?;
+    load_match_data_batch_on(&mut conn, work_ids).await
+}
+
+/// [`load_match_data_batch`] on the caller's connection. Read only; takes no lock and
+/// does not commit. As for [`load_match_data_on`], the rows are decision inputs only for
+/// the works whose locks the caller already holds.
+pub async fn load_match_data_batch_on(
+    conn: &mut sqlx::PgConnection,
+    work_ids: &[String],
+) -> Result<std::collections::HashMap<String, WorkMatchData>> {
     let mut out: std::collections::HashMap<String, WorkMatchData> =
         std::collections::HashMap::new();
     if work_ids.is_empty() {
@@ -342,9 +442,7 @@ pub async fn load_match_data_batch(
     let mut ids: Vec<&String> = work_ids.iter().collect();
     ids.sort();
     ids.dedup();
-    let placeholders = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let placeholders = crate::sql_params::placeholders(1, ids.len());
 
     let work_sql =
         format!("SELECT {MATCH_DATA_COLUMNS} FROM work w WHERE w.id IN ({placeholders})");
@@ -352,18 +450,18 @@ pub async fn load_match_data_batch(
     for id in &ids {
         q = q.bind(*id);
     }
-    for row in q.fetch_all(pool).await? {
+    for row in q.fetch_all(&mut *conn).await? {
         out.insert(row.id.clone(), row.into_match_data());
     }
 
     let alias_sql = format!(
         "SELECT work_id, normalized_title FROM work_alias WHERE work_id IN ({placeholders})"
     );
-    let mut q = sqlx::query_as::<_, (String, String)>(&alias_sql);
+    let mut q = crate::db_types::query_tuple::<(String, String)>(&alias_sql);
     for id in &ids {
         q = q.bind(*id);
     }
-    for (work_id, normalized_title) in q.fetch_all(pool).await? {
+    for (work_id, normalized_title) in q.fetch_all(&mut *conn).await? {
         // Only attach aliases to works that had a `work` row (mirror per-item semantics).
         if let Some(md) = out.get_mut(&work_id) {
             md.aliases_norm.push(normalized_title);
@@ -411,24 +509,32 @@ pub struct CanonicalWork {
 /// via MangaDex@Home.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct CanonicalChapter {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub external_id: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub number: Option<String>,
     /// Selected by the mirror query and carried for completeness; not surfaced yet.
     #[allow(dead_code)]
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub volume: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub lang: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub title: Option<String>,
     /// The chapter's RELEASE time — `COALESCE(readable_at, published_at)`, not raw
     /// `published_at`. Keeps the field name the callers already use while the query
     /// underneath switched clocks (migration 0073).
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub published_at: Option<String>,
     /// Set when the chapter is hosted off-site (MangaPlus, Comikey, NamiComi, BiliBili)
     /// and has no pages for us to serve — the reader must send the user there instead of
     /// rendering an empty page. ~35,000 mirrored chapters, 4% of the mirror.
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub external_url: Option<String>,
     /// The scanlation group(s) of THIS copy — `"No Group"` when MangaDex lists none, NULL
     /// when unknown (not backfilled yet, or the backfill's `''` "asked, could not learn",
     /// which the query folds to NULL so no surface ever prints an empty label).
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub scanlator: Option<String>,
 }
 
@@ -450,25 +556,31 @@ pub struct CanonicalChapter {
 /// A page of feed items should use [`work_effective_genres_batch_checked`] instead: this issues
 /// up to three round-trips per work.
 pub async fn work_effective_genres(pool: &Database, work_id: &str) -> Vec<String> {
-    let curated = sqlx::query_scalar::<_, String>(
-        "SELECT tag FROM work_tag WHERE work_id = ? AND source = 'admin' ORDER BY ord, tag",
+    let curated = crate::db_types::query_scalar::<String>(
+        "SELECT tag FROM work_tag WHERE work_id = $1 AND source = 'admin' ORDER BY ord, tag",
     )
     .bind(work_id)
     .fetch_all(pool)
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|error| {
+        crate::db::record_read_database_error(&error);
+        Vec::new()
+    });
     if !curated.is_empty() {
         return curated;
     }
     // `ord` is the group ranking `mangadex::tag_names` assigned (genre, theme, format,
     // content), so this preserves "the axes a reader browses by, first".
-    let upstream = sqlx::query_scalar::<_, String>(
-        "SELECT tag FROM work_tag WHERE work_id = ? AND source = 'mangadex' ORDER BY ord, tag",
+    let upstream = crate::db_types::query_scalar::<String>(
+        "SELECT tag FROM work_tag WHERE work_id = $1 AND source = 'mangadex' ORDER BY ord, tag",
     )
     .bind(work_id)
     .fetch_all(pool)
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|error| {
+        crate::db::record_read_database_error(&error);
+        Vec::new()
+    });
     if !upstream.is_empty() {
         return upstream;
     }
@@ -478,15 +590,18 @@ pub async fn work_effective_genres(pool: &Database, work_id: &str) -> Vec<String
     // across all 13,802 rows of `suwayomi_series` for EVERY work looked up. Measured
     // on production: 14.98 ms -> 0.01 ms (EXPLAIN QUERY PLAN goes from `SCAN sw` to
     // `SEARCH sw USING INTEGER PRIMARY KEY (rowid=?)`). Same shape, ~1,500x.
-    let jsons = sqlx::query_scalar::<_, String>(
+    let jsons = crate::db_types::query_scalar::<String>(
         "SELECT sw.genre FROM source_series ss \
-         JOIN suwayomi_series sw ON sw.id = CAST(ss.source_key AS INTEGER) \
-         WHERE ss.work_id = ? AND ss.source_type = 'suwayomi' AND sw.genre IS NOT NULL",
+         JOIN suwayomi_series sw ON sw.id = sqlite_integer_pin(ss.source_key) \
+         WHERE ss.work_id = $1 AND ss.source_type = 'suwayomi' AND sw.genre IS NOT NULL",
     )
     .bind(work_id)
     .fetch_all(pool)
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|error| {
+        crate::db::record_read_database_error(&error);
+        Vec::new()
+    });
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
     for j in jsons {
@@ -523,16 +638,14 @@ pub async fn work_effective_genres_batch_checked(
     if work_ids.is_empty() {
         return Ok(out);
     }
-    let ph = std::iter::repeat_n("?", work_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let ph = crate::sql_params::placeholders(1, work_ids.len());
 
     // 1) Admin-curated tags win outright wherever they exist.
     let curated_sql = format!(
         "SELECT work_id, tag FROM work_tag WHERE work_id IN ({ph}) AND source = 'admin' \
          ORDER BY work_id, ord, tag"
     );
-    let mut q = sqlx::query_as::<_, (String, String)>(&curated_sql);
+    let mut q = crate::db_types::query_tuple::<(String, String)>(&curated_sql);
     for id in work_ids {
         q = q.bind(id);
     }
@@ -544,14 +657,12 @@ pub async fn work_effective_genres_batch_checked(
     //    Bound to the works still missing so a fully-curated page costs nothing here.
     let uncurated: Vec<&String> = work_ids.iter().filter(|w| !out.contains_key(*w)).collect();
     if !uncurated.is_empty() {
-        let ph_up = std::iter::repeat_n("?", uncurated.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let ph_up = crate::sql_params::placeholders(1, uncurated.len());
         let up_sql = format!(
             "SELECT work_id, tag FROM work_tag WHERE work_id IN ({ph_up}) AND source = 'mangadex' \
              ORDER BY work_id, ord, tag"
         );
-        let mut qu = sqlx::query_as::<_, (String, String)>(&up_sql);
+        let mut qu = crate::db_types::query_tuple::<(String, String)>(&up_sql);
         for id in &uncurated {
             qu = qu.bind(*id);
         }
@@ -566,16 +677,14 @@ pub async fn work_effective_genres_batch_checked(
     if remaining.is_empty() {
         return Ok(out);
     }
-    let ph2 = std::iter::repeat_n("?", remaining.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let ph2 = crate::sql_params::placeholders(1, remaining.len());
     let src_sql = format!(
         "SELECT ss.work_id, sw.genre FROM source_series ss \
-         JOIN suwayomi_series sw ON sw.id = CAST(ss.source_key AS INTEGER) \
+         JOIN suwayomi_series sw ON sw.id = sqlite_integer_pin(ss.source_key) \
          WHERE ss.work_id IN ({ph2}) AND ss.source_type = 'suwayomi' AND sw.genre IS NOT NULL \
          ORDER BY ss.work_id, ss.id"
     );
-    let mut q2 = sqlx::query_as::<_, (String, String)>(&src_sql);
+    let mut q2 = crate::db_types::query_tuple::<(String, String)>(&src_sql);
     for id in &remaining {
         q2 = q2.bind(*id);
     }
@@ -603,28 +712,44 @@ pub async fn work_effective_genres_batch_checked(
 pub async fn load_canonical_work(pool: &Database, work_id: &str) -> Result<Option<CanonicalWork>> {
     #[derive(sqlx::FromRow)]
     struct Row {
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         primary_title: Option<String>,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         description: Option<String>,
+        #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
         year: Option<i64>,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         original_language: Option<String>,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         status: Option<String>,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         author: Option<String>,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         artist: Option<String>,
+        #[sqlx(try_from = "crate::db_types::DbI64")]
         is_nsfw: i64,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         content_type_override: Option<String>,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         title_override: Option<String>,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         description_override: Option<String>,
+        #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
         is_nsfw_override: Option<i64>,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
         cover_file_name: Option<String>,
+        #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
         cover_cached_version: Option<i64>,
+        #[sqlx(try_from = "crate::db_types::DbString")]
         created_at: String,
+        #[sqlx(try_from = "crate::db_types::DbString")]
         updated_at: String,
     }
     let row = sqlx::query_as::<_, Row>(
         "SELECT primary_title, description, year, original_language, status, author, artist, \
                 is_nsfw, content_type_override, title_override, description_override, \
                 is_nsfw_override, cover_file_name, cover_cached_version, created_at, updated_at \
-         FROM work WHERE id = ?",
+         FROM work WHERE id = $1",
     )
     .bind(work_id)
     .fetch_optional(pool)
@@ -636,17 +761,17 @@ pub async fn load_canonical_work(pool: &Database, work_id: &str) -> Result<Optio
     // on the target. Order deterministically (oldest first, id as final tiebreak) so
     // the cover/page anchor is stable across loads instead of whatever the planner
     // happens to return first.
-    let mangadex_id = sqlx::query_scalar::<_, String>(
+    let mangadex_id = crate::db_types::query_scalar::<String>(
         "SELECT source_key FROM source_series \
-         WHERE work_id = ? AND source_type = 'mangadex' \
+         WHERE work_id = $1 AND source_type = 'mangadex' \
          ORDER BY created_at ASC, id ASC LIMIT 1",
     )
     .bind(work_id)
     .fetch_optional(pool)
     .await?;
 
-    let alt_titles = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT raw_title FROM work_alias WHERE work_id = ? ORDER BY raw_title",
+    let alt_titles = crate::db_types::query_scalar::<String>(
+        "SELECT DISTINCT raw_title FROM work_alias WHERE work_id = $1 ORDER BY raw_title",
     )
     .bind(work_id)
     .fetch_all(pool)
@@ -693,8 +818,8 @@ pub async fn load_canonical_chapters(
                 COALESCE(c.readable_at, c.published_at) AS published_at, c.external_url, \
                 NULLIF(c.scanlator, '') AS scanlator \
          FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
-         WHERE ss.work_id = ? AND ss.source_type = 'mangadex' AND c.lang = 'en' \
-         ORDER BY COALESCE(c.readable_at, c.published_at) DESC, c.external_id ASC",
+         WHERE ss.work_id = $1 AND ss.source_type = 'mangadex' AND c.lang = 'en' \
+         ORDER BY COALESCE(c.readable_at, c.published_at) DESC NULLS LAST, c.external_id ASC",
     )
     .bind(work_id)
     .fetch_all(pool)
@@ -729,13 +854,13 @@ pub async fn load_canonical_chapters(
 /// Suwayomi half is English-by-construction and stamps `lang = 'en'` on every spine row it
 /// writes (`suwayomi_spine_input`), so keeping the language filter admits it in full.
 pub async fn latest_english_chapter_at(pool: &Database, work_id: &str) -> Result<Option<String>> {
-    let at = sqlx::query_scalar::<_, Option<String>>(
+    let at = crate::db_types::query_scalar::<Option<String>>(
         // `readable_at` first (migration 0073): a work whose newest chapter is external
         // carries a 2037 `publish_at`, which would otherwise report a "last updated" a
         // decade in the future.
         "SELECT MAX(COALESCE(c.readable_at, c.published_at, c.created_at)) \
          FROM chapter c JOIN source_series ss ON ss.id = c.source_series_id \
-         WHERE ss.work_id = ? AND c.lang = 'en'",
+         WHERE ss.work_id = $1 AND c.lang = 'en'",
     )
     .bind(work_id)
     .fetch_optional(pool)
@@ -782,15 +907,14 @@ const FEED_UPDATES_COLUMNS: &str = "work_id, mangadex_id, title, is_nsfw, cover_
 /// rather than by a field-mapping agreement that has to be re-checked by hand — the same
 /// arrangement [`browse_catalogue_select`] has with its two writers.
 ///
-/// The single `MAX()` alongside bare `c.number` / `c.title` is SQLite's documented
-/// bare-columns-in-an-aggregate rule: both labels come from the row that produced the newest
-/// release time, never smeared across chapters. Do not add a second aggregate here.
+/// PostgreSQL chooses the complete newest chapter row with DISTINCT ON. The
+/// equal-release tie uses chapter ID ascending and is recorded in the Phase 3 audit.
 ///
 /// `?` is bound FIRST and is the release-time ceiling ("now"), which bounds out MangaDex's
 /// far-future scheduled `publishAt` values. A `scope` that binds anything binds it after.
 fn feed_updates_select(scope: &str) -> String {
     format!(
-        "SELECT ss.work_id AS work_id, ss.source_key AS mangadex_id, \
+        "SELECT DISTINCT ON (ss.work_id) ss.work_id AS work_id, ss.source_key AS mangadex_id, \
                 w.primary_title AS title, \
                 COALESCE(w.is_nsfw_override, w.is_nsfw) AS is_nsfw, \
                 CASE WHEN w.cover_cached_version IS NOT NULL \
@@ -799,110 +923,245 @@ fn feed_updates_select(scope: &str) -> String {
                      THEN '/covers/' || w.id || '.webp' \
                      ELSE NULL END AS cover_url, \
                 c.number AS latest_chapter, c.title AS latest_chapter_title, \
-                MAX(COALESCE(c.readable_at, c.published_at, c.created_at)) AS latest_at \
+                COALESCE(c.readable_at, c.published_at, c.created_at) AS latest_at \
          FROM chapter c \
          JOIN source_series ss ON ss.id = c.source_series_id \
          JOIN work w ON w.id = ss.work_id \
          WHERE ss.source_type = 'mangadex' AND c.lang = 'en' \
-           AND COALESCE(c.readable_at, c.published_at, c.created_at) <= ? {scope} \
-         GROUP BY ss.work_id"
+           AND COALESCE(c.readable_at, c.published_at, c.created_at) <= $1 {scope} \
+         ORDER BY ss.work_id, COALESCE(c.readable_at, c.published_at, c.created_at) DESC, c.id ASC"
     )
 }
 
-/// Keep expensive catalogue SELECTs off the main database's writer. The connection opens
-/// the main file read-only; only its private TEMP tables can be modified. Each staged row
-/// is complete (including type and count facets) before a bounded publication transaction.
-struct RefreshSnapshot(sqlx::SqliteConnection);
-
-impl std::ops::Deref for RefreshSnapshot {
-    type Target = sqlx::SqliteConnection;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+/// Keep expensive catalogue SELECTs on a dedicated PostgreSQL connection. Its private
+/// temporary tables stage complete rows; bounded writer turns publish with a full-row
+/// compare-and-swap against the captured previous version.
+struct RefreshSnapshot {
+    connection: sqlx::PgConnection,
+    // Fields drop in declaration order: close the session before returning its slot.
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
+impl std::ops::Deref for RefreshSnapshot {
+    type Target = sqlx::PgConnection;
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
 impl std::ops::DerefMut for RefreshSnapshot {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.connection
     }
 }
 
 const REFRESH_BATCH_ROWS: i64 = 128;
+/// A publication turn stops taking new rows after this long, so a foreground writer of
+/// a work in the batch waits for a small fraction of its 5 s lock timeout. The clock
+/// starts at BEGIN: the turn's lock statement and its authority read count too.
+const REFRESH_TURN: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The work rows of one publication turn that are free right now, in id order.
+///
+/// `SKIP LOCKED`, so a turn never waits for a work lock. A turn that waited would do so
+/// while holding the locks of the works before it in the batch, and a foreground writer
+/// of one of THOSE works would then wait behind the publication for as long as some
+/// unrelated writer keeps its transaction open.
+const REFRESH_LOCK_FREE_WORKS: &str =
+    "SELECT id FROM public.work WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE SKIP LOCKED";
+
+/// MVCC row versions detect changed or removed inputs even when a live projection
+/// has not caught up yet. Versions are compared under the work lock at publication.
+///
+/// The snapshot session is REPEATABLE READ, so asking it for a work's version at
+/// publication time returns the version its staged row was derived from. That is why
+/// there is no up-front capture: one statement over every work (nine aggregates for
+/// each of about 115k works) does not fit the Readers statement timeout, and almost
+/// all of those versions are never compared because their rows did not change.
+fn refresh_authority_sql(scope: &str) -> String {
+    format!(
+        "SELECT w.id, md5(concat_ws('|', w.xmin::text, \
+        COALESCE((SELECT string_agg(jsonb_build_array(s.id, s.xmin::text)::text, '' ORDER BY s.id) FROM public.source_series s WHERE s.work_id = w.id), ''), \
+        COALESCE((SELECT string_agg(jsonb_build_array(c.id, c.xmin::text)::text, '' ORDER BY c.id) FROM public.chapter c JOIN public.source_series s ON s.id = c.source_series_id WHERE s.work_id = w.id), ''), \
+        COALESCE((SELECT string_agg(jsonb_build_array(sc.id, sc.xmin::text)::text, '' ORDER BY sc.id) FROM public.suwayomi_chapter sc JOIN public.source_series s ON s.source_type = 'suwayomi' AND sc.manga_id = public.sqlite_integer_pin(s.source_key) WHERE s.work_id = w.id), ''), \
+        COALESCE((SELECT string_agg(jsonb_build_array(a.id, a.xmin::text)::text, '' ORDER BY a.id) FROM public.work_alias a WHERE a.work_id = w.id), ''), \
+        COALESCE((SELECT string_agg(jsonb_build_array(t.tag, t.xmin::text)::text, '' ORDER BY t.tag) FROM public.work_tag t WHERE t.work_id = w.id), ''), \
+        COALESCE((SELECT string_agg(jsonb_build_array(e.chapter_key, e.xmin::text)::text, '' ORDER BY e.chapter_key) FROM public.release_event e WHERE e.work_id = w.id), ''), \
+        COALESCE((SELECT string_agg(jsonb_build_array(y.id, y.xmin::text)::text, '' ORDER BY y.id) FROM public.suwayomi_series y JOIN public.source_series s ON s.source_type = 'suwayomi' AND y.id = public.sqlite_integer_pin(s.source_key) WHERE s.work_id = w.id), ''), \
+        COALESCE((SELECT string_agg(jsonb_build_array(st.series_id, st.xmin::text)::text, '' ORDER BY st.series_id) FROM public.series_scan_state st JOIN public.source_series s ON s.source_type = 'suwayomi' AND s.source_key = st.series_id WHERE s.work_id = w.id), ''), \
+        COALESCE((SELECT st.xmin::text FROM public.work_stats st WHERE st.work_id = w.id), ''))) \
+        FROM public.work w {scope}"
+    )
+}
+
+/// Authority versions of `ids`, as this connection's transaction sees them.
+async fn refresh_authority(
+    conn: &mut sqlx::PgConnection,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as(&refresh_authority_sql("WHERE w.id = ANY($1)"))
+            .bind(ids)
+            .fetch_all(&mut *conn)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// First and longest wait between two attempts to take a projection's refresh key.
+const REFRESH_JOB_POLL: (std::time::Duration, std::time::Duration) = (
+    std::time::Duration::from_millis(10),
+    std::time::Duration::from_millis(500),
+);
+
+/// Single flight for the refresh of one projection (named by its first table): take
+/// the projection's Job key on the snapshot session, for as long as that session lives.
+///
+/// Two refreshes of one projection used to overlap freely (boot, the catalogue cycle,
+/// the chapter cycle and an admin reconcile all start one). Both staged the whole
+/// catalogue, and their publication turns interleaved over the same rows. With the key
+/// the second refresh waits for the first, and its snapshot is taken afterwards, so it
+/// sees everything the first one published.
+///
+/// A session lock, taken BEFORE the snapshot transaction begins: a transaction lock
+/// would have to be requested inside that transaction, and the first statement of a
+/// REPEATABLE READ transaction fixes its snapshot. It is released when the session
+/// closes, which is when [`RefreshSnapshot`] drops.
+///
+/// `pg_try_advisory_lock` in a loop, never a blocking lock: background staging has
+/// bounded statement limits, and waiting for another whole refresh must not consume
+/// that statement budget or masquerade as foreground row contention.
+async fn lock_refresh_job(conn: &mut sqlx::PgConnection, projection: &str) -> Result<()> {
+    let (class, digest) = guards::advisory_ints(
+        crate::locks::KeyClass::Job,
+        &["catalogue-refresh", projection],
+    );
+    let mut wait = REFRESH_JOB_POLL.0;
+    let mut announced = false;
+    loop {
+        let taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, $2)")
+            .bind(class)
+            .bind(digest)
+            .fetch_one(&mut *conn)
+            .await?;
+        if taken {
+            return Ok(());
+        }
+        if !announced {
+            tracing::info!(
+                projection,
+                "catalogue refresh: waiting for the running refresh of this projection"
+            );
+            announced = true;
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(REFRESH_JOB_POLL.1);
+    }
+}
+
+/// Whole-catalogue staging is background work, even when a foreground operation
+/// requests a rebuild. Its private connection has the bounded background budget;
+/// ordinary request readers and writers keep their own limits. The snapshot itself
+/// remains explicitly REPEATABLE READ READ ONLY, and publication uses short turns.
+pub(crate) const REFRESH_STAGING_LANE: crate::db::Lane = crate::db::Lane::Background;
 
 async fn refresh_snapshot(pool: &Database, tables: &[&str]) -> Result<RefreshSnapshot> {
     use sqlx::Connection;
-    let options = (*pool.connect_options())
-        .clone()
-        .read_only(true)
-        .foreign_keys(false)
-        .pragma("query_only", "OFF");
-    let mut conn = sqlx::SqliteConnection::connect_with(&options).await?;
+    let permit = crate::db::snapshot_session_permit().await?;
+    let mut conn = sqlx::PgConnection::connect_with(&pool.connect_options()).await?;
+    crate::db::apply_session_limits(&mut conn, REFRESH_STAGING_LANE).await?;
+    lock_refresh_job(&mut conn, tables[0]).await?;
+    // Read-only transactions permit temporary DML but prohibit all DDL. Create
+    // private staging relations first, then capture their previous rows atomically.
     for table in tables {
-        let schema: String = sqlx::query_scalar(
-            "SELECT sql FROM main.sqlite_schema WHERE type = 'table' AND name = ?",
-        )
-        .bind(table)
-        .fetch_one(&mut conn)
-        .await?;
-        let create = if *table == "work_fts" {
-            // This shadow is never searched with MATCH. A regular keyed table avoids
-            // repeated full scans when publishing/pruning FTS's UNINDEXED work_id.
-            "CREATE TEMP TABLE work_fts (work_id TEXT PRIMARY KEY, chapters INTEGER, title TEXT, aliases TEXT)".to_owned()
-        } else {
-            let (_, definition) = schema
-                .split_once('(')
-                .ok_or_else(|| anyhow::anyhow!("invalid catalogue table schema: {table}"))?;
-            format!("CREATE TEMP TABLE {table} ({definition}")
-        };
-        // Save the old version so a scanner/admin write during staging wins over stale
-        // snapshot data. Publication and pruning both compare against this version.
-        sqlx::query(&format!(
-            "CREATE TEMP TABLE previous_{table} AS \
-            SELECT rowid AS snapshot_rowid, * FROM main.{table}"
-        ))
-        .execute(&mut conn)
-        .await?;
         let key = match *table {
             "tag" => "id",
             "feed_genre_facet" => "tag",
             _ => "work_id",
         };
         sqlx::query(&format!(
-            "CREATE INDEX temp.previous_{table}_key \
-            ON previous_{table}({key})"
+            "CREATE TEMP TABLE previous_{table} (LIKE public.{table})"
         ))
         .execute(&mut conn)
         .await?;
-        sqlx::query(&create).execute(&mut conn).await?;
+        sqlx::query(&format!(
+            "CREATE INDEX previous_{table}_key ON previous_{table}({key})"
+        ))
+        .execute(&mut conn)
+        .await?;
+        sqlx::query(&format!(
+            "CREATE TEMP TABLE {table} (LIKE public.{table} INCLUDING ALL)"
+        ))
+        .execute(&mut conn)
+        .await?;
     }
-    Ok(RefreshSnapshot(conn))
+    sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut conn)
+        .await?;
+    for table in tables {
+        sqlx::query(&format!(
+            "INSERT INTO previous_{table} SELECT * FROM public.{table}"
+        ))
+        .execute(&mut conn)
+        .await?;
+    }
+    Ok(RefreshSnapshot {
+        connection: conn,
+        _permit: permit,
+    })
 }
 
 #[derive(Debug, PartialEq)]
 enum RefreshValue {
-    Null,
+    NullText,
+    NullInteger,
+    NullReal,
+    NullBoolean,
+    NullDate,
+    NullUuid,
+    NullBlob,
+    NullJson,
     Integer(i64),
     Real(f64),
+    Boolean(bool),
+    Date(chrono::DateTime<Utc>),
+    Uuid(Uuid),
     Text(String),
     Blob(Vec<u8>),
+    Json(serde_json::Value),
 }
 
 fn refresh_values(
-    row: &sqlx::sqlite::SqliteRow,
+    row: &sqlx::postgres::PgRow,
     start: usize,
     count: usize,
 ) -> Result<Vec<RefreshValue>> {
     use sqlx::{Row, TypeInfo, ValueRef};
     (start..start + count)
         .map(|i| {
-            let value = row.try_get_raw(i)?;
-            Ok(if value.is_null() {
-                RefreshValue::Null
+            let raw = row.try_get_raw(i)?;
+            let name = raw.type_info().name().to_owned();
+            Ok(if raw.is_null() {
+                match name.as_str() {
+                    "INT8" | "INT4" | "INT2" => RefreshValue::NullInteger,
+                    "FLOAT8" | "FLOAT4" => RefreshValue::NullReal,
+                    "BOOL" => RefreshValue::NullBoolean,
+                    "TIMESTAMPTZ" => RefreshValue::NullDate,
+                    "UUID" => RefreshValue::NullUuid,
+                    "BYTEA" => RefreshValue::NullBlob,
+                    "JSONB" => RefreshValue::NullJson,
+                    _ => RefreshValue::NullText,
+                }
             } else {
-                match value.type_info().name() {
-                    "INTEGER" | "BOOLEAN" => RefreshValue::Integer(row.try_get(i)?),
-                    "REAL" | "NUMERIC" => RefreshValue::Real(row.try_get(i)?),
-                    "BLOB" => RefreshValue::Blob(row.try_get(i)?),
+                match name.as_str() {
+                    "INT8" => RefreshValue::Integer(row.try_get(i)?),
+                    "INT4" => RefreshValue::Integer(i64::from(row.try_get::<i32, _>(i)?)),
+                    "INT2" => RefreshValue::Integer(i64::from(row.try_get::<i16, _>(i)?)),
+                    "FLOAT8" => RefreshValue::Real(row.try_get(i)?),
+                    "FLOAT4" => RefreshValue::Real(f64::from(row.try_get::<f32, _>(i)?)),
+                    "BOOL" => RefreshValue::Boolean(row.try_get(i)?),
+                    "TIMESTAMPTZ" => RefreshValue::Date(row.try_get(i)?),
+                    "UUID" => RefreshValue::Uuid(row.try_get(i)?),
+                    "BYTEA" => RefreshValue::Blob(row.try_get(i)?),
+                    "JSONB" => RefreshValue::Json(row.try_get(i)?),
                     _ => RefreshValue::Text(row.try_get(i)?),
                 }
             })
@@ -911,34 +1170,81 @@ fn refresh_values(
 }
 
 fn bind_refresh_values<'q>(
-    mut query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    mut query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
     values: &'q [RefreshValue],
-) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
     for value in values {
         query = match value {
-            RefreshValue::Null => query.bind(Option::<String>::None),
+            RefreshValue::NullText => query.bind(Option::<String>::None),
+            RefreshValue::NullInteger => query.bind(Option::<i64>::None),
+            RefreshValue::NullReal => query.bind(Option::<f64>::None),
+            RefreshValue::NullBoolean => query.bind(Option::<bool>::None),
+            RefreshValue::NullDate => query.bind(Option::<chrono::DateTime<Utc>>::None),
+            RefreshValue::NullUuid => query.bind(Option::<Uuid>::None),
+            RefreshValue::NullBlob => query.bind(Option::<Vec<u8>>::None),
+            RefreshValue::NullJson => query.bind(Option::<serde_json::Value>::None),
             RefreshValue::Integer(v) => query.bind(*v),
             RefreshValue::Real(v) => query.bind(*v),
+            RefreshValue::Boolean(v) => query.bind(*v),
+            RefreshValue::Date(v) => query.bind(*v),
+            RefreshValue::Uuid(v) => query.bind(*v),
             RefreshValue::Text(v) => query.bind(v),
             RefreshValue::Blob(v) => query.bind(v),
+            RefreshValue::Json(v) => query.bind(v),
         };
     }
     query
 }
 
+/// How many changed rows the next publication turn takes, given how long this one held
+/// its transaction. Halved when the turn reached [`REFRESH_TURN`] (its locks and its
+/// authority read alone can take that long on works with thousands of chapters), doubled
+/// again after a turn that needed less than half of it.
+fn next_turn_rows(turn_rows: usize, held: std::time::Duration) -> usize {
+    if held >= REFRESH_TURN {
+        (turn_rows / 2).max(1)
+    } else if held < REFRESH_TURN / 2 {
+        (turn_rows * 2).min(REFRESH_BATCH_ROWS as usize)
+    } else {
+        turn_rows
+    }
+}
+
+/// One staged row that differs from the row captured when staging began.
+struct RefreshChange {
+    id: String,
+    /// The staged row; `None` prunes a row that staging no longer produces.
+    values: Option<Vec<RefreshValue>>,
+    previous_exists: bool,
+    old: Vec<RefreshValue>,
+}
+
 /// Publish in short FIFO writer turns. A failed batch leaves earlier complete rows usable;
 /// a subsequent reconcile converges. Never replace a row changed since staging began.
+///
+/// Only rows that DIFFER from the captured previous row open a writer turn. A turn locks
+/// the works of its changed rows (sorted, FOR NO KEY UPDATE), compares each work's
+/// authority version with the snapshot's, and then applies a full-row compare-and-swap.
+/// An unchanged catalogue therefore takes no work lock and no writer connection at all.
+///
+/// A turn never waits for a work ([`REFRESH_LOCK_FREE_WORKS`]). A work that another
+/// transaction holds is being written right now, so the staged row is about to be stale
+/// in the same way a changed authority version makes it stale: the row is left as it is
+/// and the next refresh publishes it. The turn's row count adapts to [`REFRESH_TURN`]:
+/// a turn that ran out of time halves the next one, a quick turn doubles it again.
 async fn publish_snapshot(
     pool: &Database,
     snapshot: &mut RefreshSnapshot,
     table: &str,
 ) -> Result<u64> {
-    use sqlx::Row;
-    let columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
-        sqlx::query_as(&format!("PRAGMA temp.table_info({table})"))
-            .fetch_all(&mut **snapshot)
-            .await?;
-    let names: Vec<&str> = columns.iter().map(|c| c.1.as_str()).collect();
+    use crate::db_types::Row;
+    #[cfg(test)]
+    guards::pause("snapshot-staged").await;
+    let columns: Vec<String> = crate::db_types::query_scalar(
+        "SELECT attname::text FROM pg_attribute WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum")
+        .bind(format!("pg_temp.{table}"))
+        .fetch_all(&mut **snapshot).await?;
+    let names: Vec<&str> = columns.iter().map(String::as_str).collect();
     let key = match table {
         "tag" => "id",
         "feed_genre_facet" => "tag",
@@ -946,12 +1252,28 @@ async fn publish_snapshot(
     };
     let key_index = names.iter().position(|name| *name == key).unwrap();
     let column_list = names.join(", ");
-    let placeholders = vec!["?"; names.len()].join(", ");
-    let same_previous = names
-        .iter()
-        .map(|c| format!("{c} IS ?"))
-        .collect::<Vec<_>>()
-        .join(" AND ");
+    let placeholders = crate::sql_params::placeholders(1, names.len());
+    let same_previous = |start| {
+        let parameters = crate::sql_params::placeholders(start, names.len());
+        names
+            .iter()
+            .zip(parameters.split(", "))
+            .map(|(c, parameter)| format!("{table}.{c} IS NOT DISTINCT FROM {parameter}"))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    let needs_parent = matches!(
+        table,
+        "feed_updates" | "feed_series_updates" | "browse_catalogue"
+    );
+    let tail = crate::sql_params::placeholders(names.len() + 1, 4);
+    let tail: Vec<_> = tail.split(", ").collect();
+    let old_exists = tail[0];
+    let key_arg = tail[1];
+    let parent_arg = tail[2];
+    let update_guard = tail[2 + usize::from(needs_parent)];
+    let same_upsert = same_previous(names.len() + 4 + usize::from(needs_parent));
+    let same_delete = same_previous(2);
     let mutable = names
         .iter()
         .filter(|c| **c != key)
@@ -968,137 +1290,159 @@ async fn publish_snapshot(
         .map(|c| format!("p.{c}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let is_fts = table == "work_fts";
     let upsert = format!(
-        "INSERT INTO main.{table} ({column_list}) SELECT {placeholders} \
-        WHERE (? = 0 OR EXISTS (SELECT 1 FROM main.{table} WHERE {key} = ?)) {} \
-        ON CONFLICT({key}) DO UPDATE SET {mutable} WHERE ? AND {same_previous}",
-        if matches!(
-            table,
-            "feed_updates" | "feed_series_updates" | "browse_catalogue"
-        ) {
-            "AND EXISTS (SELECT 1 FROM main.work WHERE id = ?)"
+        "INSERT INTO public.{table} ({column_list}) SELECT {placeholders} \
+        WHERE (NOT {old_exists} OR EXISTS (SELECT 1 FROM public.{table} WHERE {key} = {key_arg})) {} \
+        ON CONFLICT({key}) DO UPDATE SET {mutable} WHERE {update_guard} AND {same_upsert}",
+        if needs_parent {
+            format!("AND EXISTS (SELECT 1 FROM public.work WHERE id = {parent_arg})")
         } else {
-            ""
+            String::new()
         }
     );
+    let delete = format!("DELETE FROM public.{table} WHERE {key} = $1 AND {same_delete}");
     let select = format!(
-        "SELECT {staged_names}, p.snapshot_rowid, {previous_names} \
-        FROM temp.{table} s LEFT JOIN temp.previous_{table} p ON p.{key} = s.{key} \
-        WHERE s.{key} > ? ORDER BY s.{key} LIMIT {REFRESH_BATCH_ROWS}"
+        "SELECT {staged_names}, (p.{key} IS NOT NULL) AS previous_exists, {previous_names} \
+        FROM pg_temp.{table} s LEFT JOIN pg_temp.previous_{table} p ON p.{key} = s.{key} \
+        WHERE s.{key} > $1 ORDER BY s.{key} LIMIT {REFRESH_BATCH_ROWS}"
     );
-    let mut cursor = String::new();
+    let prune = format!(
+        "SELECT {previous_names} FROM pg_temp.previous_{table} p \
+        WHERE p.{key} > $1 AND NOT EXISTS (SELECT 1 FROM pg_temp.{table} s WHERE s.{key} = p.{key}) \
+        ORDER BY p.{key} LIMIT {REFRESH_BATCH_ROWS}"
+    );
+    let text_key = |values: &[RefreshValue]| match &values[key_index] {
+        RefreshValue::Text(id) => Ok(id.clone()),
+        _ => Err(anyhow::anyhow!("non-text refresh key")),
+    };
     let mut changed = 0;
+    let mut turns = 0u64;
+    let mut busy = 0u64;
+    let mut turn_rows = REFRESH_BATCH_ROWS as usize;
     let mut longest_hold = std::time::Duration::ZERO;
-    loop {
-        let rows = sqlx::query(&select)
-            .bind(&cursor)
-            .fetch_all(&mut **snapshot)
-            .await?;
-        if rows.is_empty() {
-            break;
-        }
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        let started = std::time::Instant::now();
-        for row in rows {
-            if started.elapsed() >= std::time::Duration::from_millis(100) {
+    for pruning in [false, true] {
+        let mut cursor = String::new();
+        loop {
+            let rows = sqlx::query(if pruning { &prune } else { &select })
+                .bind(&cursor)
+                .fetch_all(&mut **snapshot)
+                .await?;
+            let Some(last) = rows.last() else {
                 break;
-            }
-            let values = refresh_values(&row, 0, names.len())?;
-            let old_rowid: Option<i64> = row.try_get(names.len())?;
-            let old = refresh_values(&row, names.len() + 1, names.len())?;
-            let id = match &values[key_index] {
-                RefreshValue::Text(s) => s,
-                _ => anyhow::bail!("non-text refresh key"),
             };
-            cursor.clone_from(id);
-            if old_rowid.is_some() && values == old {
+            let batch_end: String = last.try_get(key_index)?;
+            let mut changes = Vec::new();
+            for row in &rows {
+                if pruning {
+                    let old = refresh_values(row, 0, names.len())?;
+                    changes.push(RefreshChange {
+                        id: text_key(&old)?,
+                        values: None,
+                        previous_exists: true,
+                        old,
+                    });
+                    continue;
+                }
+                let values = refresh_values(row, 0, names.len())?;
+                let previous_exists: bool = row.try_get(names.len())?;
+                let old = refresh_values(row, names.len() + 1, names.len())?;
+                if previous_exists && values == old {
+                    continue;
+                }
+                changes.push(RefreshChange {
+                    id: text_key(&values)?,
+                    values: Some(values),
+                    previous_exists,
+                    old,
+                });
+            }
+            if changes.is_empty() {
+                cursor = batch_end;
                 continue;
             }
-            if is_fts {
-                if let Some(rowid) = old_rowid {
-                    let sql =
-                        format!("DELETE FROM main.work_fts WHERE rowid = ? AND {same_previous}");
-                    if bind_refresh_values(sqlx::query(&sql).bind(rowid), &old)
-                        .execute(&mut *tx)
-                        .await?
-                        .rows_affected()
-                        == 0
-                    {
+            // The rows this turn does not take stay behind the cursor for the next one.
+            let mut complete = changes.len() <= turn_rows;
+            changes.truncate(turn_rows);
+            let ids: Vec<String> = changes.iter().map(|change| change.id.clone()).collect();
+            // Read before BEGIN: the snapshot session must not make a writer turn wait.
+            let expected = if needs_parent {
+                refresh_authority(snapshot, &ids).await?
+            } else {
+                Default::default()
+            };
+            let mut tx = pool.begin_with("BEGIN").await?;
+            let started = std::time::Instant::now();
+            let locked: std::collections::HashSet<String> = if needs_parent {
+                sqlx::query_scalar(REFRESH_LOCK_FREE_WORKS)
+                    .bind(&ids)
+                    .fetch_all(&mut *tx)
+                    .await?
+                    .into_iter()
+                    .collect()
+            } else {
+                Default::default()
+            };
+            guards::held().await;
+            let current = if needs_parent {
+                refresh_authority(&mut tx, &ids).await?
+            } else {
+                Default::default()
+            };
+            for (index, change) in changes.iter().enumerate() {
+                // The first row always publishes, so every turn makes progress.
+                if index > 0 && started.elapsed() >= REFRESH_TURN {
+                    complete = false;
+                    break;
+                }
+                cursor.clone_from(&change.id);
+                if needs_parent {
+                    // Present and not locked: another transaction holds the work. (A
+                    // work that is gone has no row to lock; its projection row is
+                    // pruned by the compare-and-swap below.)
+                    if current.contains_key(&change.id) && !locked.contains(&change.id) {
+                        busy += 1;
+                        continue;
+                    }
+                    if current.get(&change.id) != expected.get(&change.id) {
                         continue;
                     }
                 }
-                let sql = format!(
-                    "INSERT INTO main.work_fts ({column_list}) SELECT {placeholders} \
-                    WHERE EXISTS (SELECT 1 FROM main.work WHERE id = ?) \
-                      AND (? OR NOT EXISTS (SELECT 1 FROM main.work_fts WHERE work_id = ?))"
-                );
-                changed += bind_refresh_values(sqlx::query(&sql), &values)
-                    .bind(id)
-                    .bind(old_rowid.is_some())
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?
-                    .rows_affected();
-            } else {
-                let mut query = bind_refresh_values(sqlx::query(&upsert), &values)
-                    .bind(old_rowid.is_some())
-                    .bind(id);
-                if matches!(
-                    table,
-                    "feed_updates" | "feed_series_updates" | "browse_catalogue"
-                ) {
-                    query = query.bind(id);
-                }
-                changed += bind_refresh_values(query.bind(old_rowid.is_some()), &old)
-                    .execute(&mut *tx)
-                    .await?
-                    .rows_affected();
+                changed += match &change.values {
+                    Some(values) => {
+                        let mut query = bind_refresh_values(sqlx::query(&upsert), values)
+                            .bind(change.previous_exists)
+                            .bind(&change.id);
+                        if needs_parent {
+                            query = query.bind(&change.id);
+                        }
+                        bind_refresh_values(query.bind(change.previous_exists), &change.old)
+                            .execute(&mut *tx)
+                            .await?
+                            .rows_affected()
+                    }
+                    None => bind_refresh_values(sqlx::query(&delete).bind(&change.id), &change.old)
+                        .execute(&mut *tx)
+                        .await?
+                        .rows_affected(),
+                };
             }
-        }
-        tx.commit().await?;
-        longest_hold = longest_hold.max(started.elapsed());
-        tokio::task::yield_now().await;
-    }
-    let prune = format!(
-        "SELECT p.snapshot_rowid, {previous_names} FROM temp.previous_{table} p \
-        WHERE p.{key} > ? AND NOT EXISTS (SELECT 1 FROM temp.{table} s WHERE s.{key} = p.{key}) \
-        ORDER BY p.{key} LIMIT {REFRESH_BATCH_ROWS}"
-    );
-    cursor.clear();
-    loop {
-        let rows = sqlx::query(&prune)
-            .bind(&cursor)
-            .fetch_all(&mut **snapshot)
-            .await?;
-        if rows.is_empty() {
-            break;
-        }
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        let started = std::time::Instant::now();
-        for row in rows {
-            if started.elapsed() >= std::time::Duration::from_millis(100) {
-                break;
+            tx.commit().await?;
+            if complete {
+                // Rows after the last change in this batch were equal: skip them too.
+                cursor = batch_end;
             }
-            let old = refresh_values(&row, 1, names.len())?;
-            let id = match &old[key_index] {
-                RefreshValue::Text(s) => s,
-                _ => anyhow::bail!("non-text refresh key"),
-            };
-            cursor.clone_from(id);
-            let sql = format!("DELETE FROM main.{table} WHERE rowid = ? AND {same_previous}");
-            changed += bind_refresh_values(sqlx::query(&sql).bind(row.try_get::<i64, _>(0)?), &old)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
+            turns += 1;
+            let held = started.elapsed();
+            longest_hold = longest_hold.max(held);
+            turn_rows = next_turn_rows(turn_rows, held);
+            tokio::task::yield_now().await;
         }
-        tx.commit().await?;
-        longest_hold = longest_hold.max(started.elapsed());
-        tokio::task::yield_now().await;
     }
     tracing::info!(
         table,
         changed,
+        turns,
+        busy_works_left_for_next_refresh = busy,
         longest_writer_hold_ms = longest_hold.as_millis(),
         "catalogue snapshot published"
     );
@@ -1115,17 +1459,21 @@ pub async fn refresh_feed_updates(pool: &Database) -> Result<u64> {
         "INSERT INTO feed_updates ({FEED_UPDATES_COLUMNS}) {}",
         feed_updates_select("")
     ))
-    .bind(&now)
+    .bind(crate::db_types::date(&now)?)
     .execute(&mut *tx)
     .await?
     .rows_affected();
     publish_snapshot(pool, &mut tx, "feed_updates").await?;
+    drop(tx);
+    #[cfg(test)]
+    guards::pause("snapshot-published").await;
     // The reader's merged Updates feed is derived FROM the table we just rebuilt (plus
     // the scanner's half), so it is refreshed here rather than wired separately: every
     // existing caller of this function — boot (`main`) and each post-sync pass
     // (`mangadex`) — is exactly when both halves change. Best-effort: a failure here
     // must not make the canonical feed's refresh look like it failed.
     if let Err(e) = refresh_feed_series_updates(pool).await {
+        crate::db::observe_database_error(&e);
         tracing::warn!(error = %e, "feed_series_updates: refresh failed");
     }
     Ok(n)
@@ -1150,7 +1498,7 @@ pub async fn refresh_feed_updates(pool: &Database) -> Result<u64> {
 /// **THIS IS WHAT FIXES F7**, and it fixes it structurally rather than by convention.
 ///
 /// Both halves of the feed used to merge their own clocks with
-/// `released_at = MAX(feed_series_updates.released_at, excluded.released_at)`, so a second
+/// `released_at = GREATEST(feed_series_updates.released_at, excluded.released_at)`, so a second
 /// source mirroring a chapter a first source had already reported moved the card's clock
 /// FORWARD and re-floated it to the top of /updates. The owner's requirement is the exact
 /// opposite: *"if more sources update the chapters later, they won't hit the updates page
@@ -1176,11 +1524,26 @@ pub async fn refresh_feed_updates(pool: &Database) -> Result<u64> {
 /// both compute the same expression over the same table, and running it twice changes
 /// nothing the second time.
 pub async fn project_feed_from_ledger(
-    tx: &mut sqlx::SqliteConnection,
+    tx: &mut sqlx::PgConnection,
+    work_id: Option<&str>,
+) -> Result<u64> {
+    if let Some(work_id) = work_id {
+        use sqlx::Connection;
+        let mut unit = tx.begin().await?;
+        guards::work(&mut unit, work_id).await?;
+        let count = project_feed_from_ledger_on(&mut unit, Some(work_id)).await?;
+        unit.commit().await?;
+        return Ok(count);
+    }
+    project_feed_from_ledger_on(tx, None).await
+}
+
+async fn project_feed_from_ledger_on(
+    tx: &mut sqlx::PgConnection,
     work_id: Option<&str>,
 ) -> Result<u64> {
     let scope = if work_id.is_some() {
-        "AND re.work_id = ?"
+        "AND re.work_id = $1"
     } else {
         ""
     };
@@ -1188,12 +1551,12 @@ pub async fn project_feed_from_ledger(
         "UPDATE feed_series_updates SET \
              released_at = led.newest, \
              latest_chapter = led.label \
-           FROM (SELECT re.work_id AS work_id, \
-                        MAX(re.first_seen_at) AS newest, \
+           FROM (SELECT DISTINCT ON (re.work_id) re.work_id AS work_id, \
+                        re.first_seen_at AS newest, \
                         re.label AS label \
                    FROM release_event re \
                   WHERE 1 = 1 {scope} \
-                  GROUP BY re.work_id) AS led \
+                  ORDER BY re.work_id, re.first_seen_at DESC, re.chapter_key ASC) AS led \
           WHERE led.work_id = feed_series_updates.work_id"
     );
     let mut q = sqlx::query(&sql);
@@ -1253,7 +1616,7 @@ pub async fn work_id_for_source_series(
     source_series_id: &str,
 ) -> Result<Option<String>> {
     Ok(
-        sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
+        crate::db_types::query_scalar("SELECT work_id FROM source_series WHERE id = $1")
             .bind(source_series_id)
             .fetch_optional(pool)
             .await?,
@@ -1261,35 +1624,47 @@ pub async fn work_id_for_source_series(
 }
 
 /// [`project_feed_from_ledger`] for one work, off a pool, and only once the ledger is
-/// complete. This is the incremental counterpart of the rebuild's pass (5) — the two run the
-/// same statement over the same table, which is what makes them converge by construction
-/// rather than by a field-mapping agreement that has to be tested into place.
+/// complete: the same statement the rebuild's pass (5) runs, in its own guarded unit.
+///
+/// TEST-ONLY. No production path calls it any more: the scanner projects inside the
+/// transaction of its feed write (`scanner::upsert_feed_series_update`), and the mirror
+/// half inside [`publish_mirror_feed_row`]. It stays for the ledger and guard tests,
+/// which need the projection of one work without either of those writers around it.
+#[cfg(test)]
 pub async fn project_feed_from_ledger_for_work(pool: &Database, work_id: &str) -> Result<u64> {
-    let complete = ledger::is_complete(pool).await.unwrap_or(false);
-    let mut conn = pool.write().acquire().await?;
-    let n = if complete {
-        project_feed_from_ledger(&mut conn, Some(work_id)).await?
-    } else {
-        0
-    };
+    let complete = ledger::is_complete(pool).await.unwrap_or_else(|error| {
+        let _ = crate::db::observed_read_database_error(error);
+        false
+    });
+    crate::db::retry_transaction(|| async {
+        let mut conn = pool.begin().await?;
+        let Some(resolved) = guards::resolve_work_optional(&mut conn, work_id).await? else {
+            return Ok(0);
+        };
+        let work_id = resolved.as_str();
+        let n = if complete {
+            project_feed_from_ledger(&mut conn, Some(work_id)).await?
+        } else {
+            0
+        };
 
-    // BEST-EFFORT, AND NEVER `?`. This function is called from `scanner::
-    // upsert_feed_series_update`, i.e. the scanner's hot path, and before 0099 it returned
-    // `Ok(0)` without touching the database at all while the ledger was incomplete. Bubbling
-    // an error out of the floor pass would newly fail a whole scan on a transient
-    // `SQLITE_BUSY` — the rebuild holds a ~13 s write lock against a 15 s `busy_timeout`, so
-    // that is a real collision, not a theoretical one — and the scan is worth more than the
-    // sort key.
-    //
-    // Swallowing is safe precisely because this is a FLOOR and not the only writer: migration
-    // 0099 populated every existing row, the rebuild's own ungated pass re-establishes it for
-    // the whole table, and the next incremental write retries this work. The worst case of a
-    // loss here is one newly-inserted row sorting last until either of those runs, which is
-    // strictly better than dropping the scan that discovered it.
-    if let Err(e) = default_announced_at(&mut conn, Some(work_id)).await {
-        tracing::warn!(work_id, error = %e, "feed: announce-clock floor skipped");
-    }
-    Ok(n)
+        // BEST-EFFORT, AND NEVER `?`: the announce-clock floor is not the only writer of
+        // its column (the rebuild's ungated pass re-establishes it for the whole table),
+        // so a failure here is logged and the projection above still commits.
+        use sqlx::Connection;
+        let mut floor = conn.begin().await?;
+        match default_announced_at(&mut floor, Some(work_id)).await {
+            Ok(_) => floor.commit().await?,
+            Err(error) => {
+                floor.rollback().await?;
+                crate::db::observe_database_error(&error);
+                tracing::warn!(work_id, %error, "feed: announce-clock floor skipped");
+            }
+        }
+        conn.commit().await?;
+        Ok(n)
+    })
+    .await
 }
 
 /// Give every feed row that has no announce clock the one honest default: its own release
@@ -1315,12 +1690,12 @@ pub async fn project_feed_from_ledger_for_work(pool: &Database, work_id: &str) -
 /// inline would have added a second one and quietly made `title`/`cover_url`/`reader_id` come
 /// from an arbitrary source row.
 pub async fn default_announced_at(
-    conn: &mut sqlx::SqliteConnection,
+    conn: &mut sqlx::PgConnection,
     work_id: Option<&str>,
 ) -> Result<u64> {
     let sql = if work_id.is_some() {
         "UPDATE feed_series_updates SET announced_at = released_at \
-          WHERE announced_at IS NULL AND work_id = ?"
+          WHERE announced_at IS NULL AND work_id = $1"
     } else {
         "UPDATE feed_series_updates SET announced_at = released_at WHERE announced_at IS NULL"
     };
@@ -1333,7 +1708,10 @@ pub async fn default_announced_at(
 
 pub async fn refresh_feed_series_updates(pool: &Database) -> Result<u64> {
     // This gate is a read; the expensive derivations below only modify TEMP tables.
-    let ledger_ready = ledger::is_complete(pool).await.unwrap_or(false);
+    let ledger_ready = ledger::is_complete(pool).await.unwrap_or_else(|error| {
+        let _ = crate::db::observed_read_database_error(error);
+        false
+    });
     let mut tx = refresh_snapshot(pool, &["feed_series_updates"]).await?;
     sqlx::query("DELETE FROM feed_series_updates")
         .execute(&mut *tx)
@@ -1359,12 +1737,12 @@ pub async fn refresh_feed_series_updates(pool: &Database) -> Result<u64> {
          SELECT fu.work_id, fu.work_id, COALESCE(w.title_override, fu.title), \
                 fu.cover_url, NULL, NULL, \
                 fu.latest_chapter, fu.latest_chapter_title, NULL, \
-                CAST(strftime('%s', fu.latest_at) AS INTEGER) * 1000, \
+                date_trunc('second', fu.latest_at + INTERVAL '500 microseconds'), \
                 NULL, fu.is_nsfw, \
                 {FSU_STATUS_SQL}, COALESCE(w.content_rating, 'safe') \
          FROM feed_updates fu \
          JOIN work w ON w.id = fu.work_id \
-         WHERE strftime('%s', fu.latest_at) IS NOT NULL"
+         WHERE fu.latest_at IS NOT NULL"
     ))
     .execute(&mut *tx)
     .await?
@@ -1419,7 +1797,7 @@ pub async fn refresh_feed_series_updates(pool: &Database) -> Result<u64> {
              (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, \
               latest_chapter, latest_chapter_title, chapter_count, released_at, \
               detected_at, is_nsfw, status, content_rating) \
-         SELECT ss.work_id, \
+         SELECT DISTINCT ON (ss.work_id) ss.work_id, \
                 CASE WHEN EXISTS (SELECT 1 FROM source_series md \
                                    WHERE md.work_id = ss.work_id \
                                      AND md.source_type = 'mangadex') \
@@ -1429,32 +1807,32 @@ pub async fn refresh_feed_series_updates(pool: &Database) -> Result<u64> {
                      THEN '/covers/' || w.id || '.webp?v=' || w.cover_cached_version \
                      END, \
                 sy.thumbnail_url, NULL, \
-                printf('%g', lc.chapter_number), lc.name, sy.chapter_count, \
-                MAX(CAST(sy.latest_chapter_at AS INTEGER)), \
+                sqlite_general_number(lc.chapter_number), lc.name, sy.chapter_count, \
+                TIMESTAMPTZ '1970-01-01 00:00:00+00' + sy.latest_chapter_at * INTERVAL '1 millisecond', \
                 sss.last_new_chapter_at, \
                 COALESCE(w.is_nsfw_override, w.is_nsfw), \
                 {FSU_STATUS_SQL}, COALESCE(w.content_rating, 'safe') \
          FROM source_series ss \
          JOIN work w ON w.id = ss.work_id \
-         JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
+         JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
          LEFT JOIN series_scan_state sss ON sss.series_id = ss.source_key \
          LEFT JOIN (SELECT manga_id, chapter_number, name, \
                             ROW_NUMBER() OVER (PARTITION BY manga_id \
-                                ORDER BY CAST(upload_date AS INTEGER) DESC, \
+                                ORDER BY sqlite_integer_pin(upload_date) DESC NULLS LAST, \
                                          chapter_number DESC) AS rn \
                        FROM suwayomi_chapter \
                       WHERE chapter_number >= 0 AND chapter_number <= 5000) lc \
                 ON lc.manga_id = sy.id AND lc.rn = 1 \
-         WHERE ss.source_type = 'suwayomi' AND sy.in_library = 1 \
+         WHERE ss.source_type = 'suwayomi' AND sy.in_library = TRUE \
            AND sy.latest_chapter_at IS NOT NULL \
-         GROUP BY ss.work_id \
+         ORDER BY ss.work_id, sy.latest_chapter_at DESC, sy.id ASC \
          ON CONFLICT(work_id) DO UPDATE SET \
-             released_at = MAX(feed_series_updates.released_at, excluded.released_at), \
+             released_at = GREATEST(feed_series_updates.released_at, excluded.released_at), \
              detected_at = COALESCE(excluded.detected_at, feed_series_updates.detected_at), \
              chapter_count = COALESCE(feed_series_updates.chapter_count, excluded.chapter_count), \
              cover_url = COALESCE(NULLIF(feed_series_updates.cover_url, ''), excluded.cover_url), \
              suwayomi_thumbnail = COALESCE(feed_series_updates.suwayomi_thumbnail, excluded.suwayomi_thumbnail), \
-             is_nsfw = MAX(feed_series_updates.is_nsfw, excluded.is_nsfw), \
+             is_nsfw = (feed_series_updates.is_nsfw OR excluded.is_nsfw), \
              status = excluded.status, \
              content_rating = excluded.content_rating",
     ))
@@ -1532,14 +1910,19 @@ pub async fn refresh_feed_series_updates(pool: &Database) -> Result<u64> {
     );
 
     publish_snapshot(pool, &mut tx, "feed_series_updates").await?;
+    drop(tx);
+    #[cfg(test)]
+    guards::pause("snapshot-published").await;
 
     // Derive Browse after the feed's bounded publication has completed.
     if let Err(e) = refresh_browse_catalogue(pool).await {
+        crate::db::observe_database_error(&e);
         tracing::warn!(error = %e, "browse_catalogue: refresh failed");
     }
 
     // Search follows Browse so search hits can be hydrated through its reader ids.
     if let Err(e) = refresh_work_fts(pool).await {
+        crate::db::observe_database_error(&e);
         tracing::warn!(error = %e, "work_fts: refresh failed");
     }
 
@@ -1559,7 +1942,7 @@ pub async fn refresh_feed_series_updates(pool: &Database) -> Result<u64> {
 /// ## What was wrong before this existed
 ///
 /// The firehose's per-page write was an un-extracted block inside `mangadex::sync_chapters`
-/// that ran only [`project_feed_from_ledger_for_work`] — an `UPDATE … FROM`. An UPDATE
+/// that ran only the per-work ledger projection — an `UPDATE … FROM`. An UPDATE
 /// cannot create a row, so a work whose FIRST English chapter had just been mirrored (a
 /// brand-new series, or the 4,493-record catalogue gap being back-filled) stayed invisible on
 /// `/updates` until the next wholesale rebuild — which is exactly the F5 staleness the block
@@ -1601,101 +1984,116 @@ pub async fn refresh_feed_series_updates(pool: &Database) -> Result<u64> {
 ///
 /// Returns `true` when the work now has a `feed_series_updates` row from this half.
 pub async fn publish_mirror_feed_row(pool: &Database, work_id: &str) -> Result<bool> {
-    let now = Utc::now().to_rfc3339();
+    let complete = ledger::is_complete(pool).await.unwrap_or_else(|error| {
+        let _ = crate::db::observed_read_database_error(error);
+        false
+    });
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        let Some(resolved) = guards::resolve_work_optional(&mut tx, work_id).await? else {
+            return Ok(false);
+        };
+        let work_id = resolved.as_str();
+        let now = Utc::now().to_rfc3339();
 
-    // (1) The work's `feed_updates` row (migration 0051). Maintained here rather than left to
-    //     the rebuild because `canonicalUpdates` reads THAT table directly, so leaving it
-    //     stale would fix one of the reader's two update surfaces and not the other.
-    //
-    //     Assign every column unconditionally (no "where changed" guard) so `rows_affected`
-    //     answers "does this work still qualify?" — it is one row against a primary key.
-    let set = FEED_UPDATES_COLUMNS
-        .split(", ")
-        .filter(|c| *c != "work_id")
-        .map(|c| format!("{c} = excluded.{c}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let qualified = sqlx::query(&format!(
-        "INSERT INTO feed_updates ({FEED_UPDATES_COLUMNS}) {} \
+        // (1) The work's `feed_updates` row (migration 0051). Maintained here rather than left to
+        //     the rebuild because `canonicalUpdates` reads THAT table directly, so leaving it
+        //     stale would fix one of the reader's two update surfaces and not the other.
+        //
+        //     Assign every column unconditionally (no "where changed" guard) so `rows_affected`
+        //     answers "does this work still qualify?" — it is one row against a primary key.
+        let set = FEED_UPDATES_COLUMNS
+            .split(", ")
+            .filter(|c| *c != "work_id")
+            .map(|c| format!("{c} = excluded.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let qualified = sqlx::query(&format!(
+            "INSERT INTO feed_updates ({FEED_UPDATES_COLUMNS}) {} \
          ON CONFLICT(work_id) DO UPDATE SET {set}",
-        feed_updates_select("AND ss.work_id = ?")
-    ))
-    .bind(&now)
-    .bind(work_id)
-    .execute(pool)
-    .await?
-    .rows_affected()
-        > 0;
-    if !qualified {
-        // Every English chapter is unreleased (or gone). The rebuild's DELETE + INSERT would
-        // drop this row, so drop it — otherwise a scheduled-then-withdrawn chapter would
-        // outlive its own release. The `feed_series_updates` row is deliberately left alone:
-        // the scanner half may legitimately own it, and only the rebuild sees both halves.
-        sqlx::query("DELETE FROM feed_updates WHERE work_id = ?")
-            .bind(work_id)
-            .execute(pool)
-            .await?;
-        return Ok(false);
-    }
+            feed_updates_select("AND ss.work_id = $2")
+        ))
+        .bind(crate::db_types::date(&now)?)
+        .bind(work_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if !qualified {
+            // Every English chapter is unreleased (or gone). The rebuild's DELETE + INSERT would
+            // drop this row, so drop it — otherwise a scheduled-then-withdrawn chapter would
+            // outlive its own release. The `feed_series_updates` row is deliberately left alone:
+            // the scanner half may legitimately own it, and only the rebuild sees both halves.
+            sqlx::query("DELETE FROM feed_updates WHERE work_id = $1")
+                .bind(work_id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Ok(false);
+        }
 
-    // (2) The merged feed's mirror half, narrowed to this work. Field-for-field the rebuild's
-    //     pass (2); see the doc comment for why the conflict clause is restated.
-    let inserted = sqlx::query(&format!(
-        "INSERT INTO feed_series_updates \
+        // (2) The merged feed's mirror half, narrowed to this work. Field-for-field the rebuild's
+        //     pass (2); see the doc comment for why the conflict clause is restated.
+        let inserted = sqlx::query(&format!(
+            "INSERT INTO feed_series_updates \
              (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, \
               latest_chapter, latest_chapter_title, chapter_count, released_at, \
               detected_at, is_nsfw, status, content_rating) \
          SELECT fu.work_id, fu.work_id, COALESCE(w.title_override, fu.title), \
                 fu.cover_url, NULL, NULL, \
                 fu.latest_chapter, fu.latest_chapter_title, NULL, \
-                CAST(strftime('%s', fu.latest_at) AS INTEGER) * 1000, \
+                date_trunc('second', fu.latest_at + INTERVAL '500 microseconds'), \
                 NULL, fu.is_nsfw, \
                 {FSU_STATUS_SQL}, COALESCE(w.content_rating, 'safe') \
          FROM feed_updates fu \
          JOIN work w ON w.id = fu.work_id \
-         WHERE fu.work_id = ? AND strftime('%s', fu.latest_at) IS NOT NULL \
+         WHERE fu.work_id = $1 AND fu.latest_at IS NOT NULL \
          ON CONFLICT(work_id) DO UPDATE SET \
              reader_id = excluded.reader_id, \
              title = excluded.title, \
              latest_chapter = excluded.latest_chapter, \
              latest_chapter_title = excluded.latest_chapter_title, \
              cover_url = COALESCE(NULLIF(excluded.cover_url, ''), feed_series_updates.cover_url), \
-             released_at = MAX(feed_series_updates.released_at, excluded.released_at), \
-             is_nsfw = MAX(feed_series_updates.is_nsfw, excluded.is_nsfw), \
+             released_at = GREATEST(feed_series_updates.released_at, excluded.released_at), \
+             is_nsfw = (feed_series_updates.is_nsfw OR excluded.is_nsfw), \
              status = excluded.status, \
              content_rating = excluded.content_rating"
-    ))
-    .bind(work_id)
-    .execute(pool)
-    .await?
-    .rows_affected()
-        > 0;
-    if !inserted {
-        // `strftime` could not parse the release time, so the rebuild would skip this work
-        // too (its guard is the same expression). Nothing downstream to do.
-        return Ok(false);
-    }
+        ))
+        .bind(work_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if !inserted {
+            // `strftime` could not parse the release time, so the rebuild would skip this work
+            // too (its guard is the same expression). Nothing downstream to do.
+            tx.commit().await?;
+            return Ok(false);
+        }
 
-    // (3)(4) The two passes the INSERT cannot express, scoped to this work and running the
-    //        rebuild's own code. `comic_type` matters most on a row this call just CREATED:
-    //        a NULL type is invisible to the reader's format tabs and to Browse's format
-    //        chips, so a brand-new work would sit in the unfiltered feed and vanish from
-    //        every tab until the next rebuild.
-    let mut conn = pool.write().acquire().await?;
-    fill_comic_types(&mut conn, "feed_series_updates", Some(work_id)).await?;
-    fill_en_chapter_count(&mut conn, Some(work_id)).await?;
-    drop(conn);
+        // (3)(4) The two passes the INSERT cannot express, scoped to this work and running the
+        //        rebuild's own code. `comic_type` matters most on a row this call just CREATED:
+        //        a NULL type is invisible to the reader's format tabs and to Browse's format
+        //        chips, so a brand-new work would sit in the unfiltered feed and vanish from
+        //        every tab until the next rebuild.
+        let conn = &mut *tx;
+        fill_comic_types(conn, "feed_series_updates", Some(work_id)).await?;
+        fill_en_chapter_count(conn, Some(work_id)).await?;
 
-    // (5) The release clock, from the ledger — the same statement the rebuild's pass (5)
-    //     runs, and gated on the same `ledger::is_complete`, so a half-seeded ledger cannot
-    //     sink a live card.
-    project_feed_from_ledger_for_work(pool, work_id).await?;
-    // Publish the matching Browse and search projection together, including the
-    // chapter count used for search ranking, after the feed's derivations settle.
-    let mut tx = pool.begin().await?;
-    upsert_browse_work(&mut tx, work_id).await?;
-    tx.commit().await?;
-    Ok(true)
+        // (5) The release clock, from the ledger — the same statement the rebuild's pass (5)
+        //     runs, and gated on the same `ledger::is_complete`, so a half-seeded ledger cannot
+        //     sink a live card.
+        if complete {
+            project_feed_from_ledger(&mut tx, Some(work_id)).await?;
+        }
+        default_announced_at(&mut tx, Some(work_id)).await?;
+        // Publish the matching Browse and search projection together, including the
+        // chapter count used for search ranking, after the feed's derivations settle.
+        upsert_browse_work(&mut tx, work_id).await?;
+        tx.commit().await?;
+        Ok(true)
+    })
+    .await
 }
 
 /// The SELECT behind `browse_catalogue` (migration 0069): one row per BROWSABLE work,
@@ -1734,12 +2132,12 @@ fn browse_catalogue_select_for(scope: &str) -> String {
     let source_scope = if scope.is_empty() {
         ""
     } else {
-        "AND work_id = ?1"
+        "AND work_id = $1"
     };
     let joined_scope = if scope.is_empty() {
         ""
     } else {
-        "AND ss.work_id = ?1"
+        "AND ss.work_id = $1"
     };
     browse_catalogue_select_scoped(scope, source_scope, joined_scope)
 }
@@ -1777,7 +2175,7 @@ fn browse_catalogue_select_scoped(scope: &str, source_scope: &str, joined_scope:
             -- source, and every `suwayomi_series` row is `lang='en'` (14,182/14,182), so
             -- there is no non-English inflation to guard against. The 3,737 works where
             -- the English spine is larger are unaffected — MAX picks it, as before.
-            MAX(COALESCE(en.n, 0), COALESCE(swc.n, 0)), \
+            GREATEST(COALESCE(en.n, 0), COALESCE(swc.n, 0)), \
             f.latest_chapter, \
             f.released_at, \
             f.announced_at, \
@@ -1792,15 +2190,15 @@ fn browse_catalogue_select_scoped(scope: &str, source_scope: &str, joined_scope:
        LEFT JOIN work_stats st ON st.work_id = w.id \
        LEFT JOIN (SELECT work_id FROM source_series \
                    WHERE source_type = 'mangadex' {source_scope} GROUP BY work_id) md ON md.work_id = w.id \
-       LEFT JOIN (SELECT ss.work_id AS work_id, ss.source_key AS source_key, \
-                         sy.title AS title, sy.thumbnail_url AS thumbnail_url, MIN(ss.id) \
+       LEFT JOIN (SELECT DISTINCT ON (ss.work_id) ss.work_id AS work_id, ss.source_key AS source_key, \
+                         sy.title AS title, sy.thumbnail_url AS thumbnail_url \
                     FROM source_series ss \
-                    LEFT JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
+                    LEFT JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
                    WHERE ss.source_type = 'suwayomi' {joined_scope} \
-                   GROUP BY ss.work_id) sw ON sw.work_id = w.id \
+                   ORDER BY ss.work_id, ss.id ASC) sw ON sw.work_id = w.id \
        LEFT JOIN (SELECT ss.work_id AS work_id, MAX(sy.chapter_count) AS n \
                     FROM source_series ss \
-                    JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
+                    JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
                    WHERE ss.source_type = 'suwayomi' {joined_scope} \
                    GROUP BY ss.work_id) swc ON swc.work_id = w.id \
        LEFT JOIN (SELECT ss.work_id AS work_id, COUNT(DISTINCT c.number) AS n \
@@ -1832,10 +2230,7 @@ pub async fn library_browse_fallback(
     }
     anyhow::ensure!(ids.len() <= 256, "library hydration batch is too large");
     // Numbered parameters are shared by the four subqueries and the outer scope.
-    let ph = (1..=ids.len())
-        .map(|n| format!("?{n}"))
-        .collect::<Vec<_>>()
-        .join(",");
+    let ph = crate::sql_params::placeholders(1, ids.len());
     let select = browse_catalogue_select_scoped(
         &format!(" AND w.id IN ({ph})"),
         &format!("AND work_id IN ({ph})"),
@@ -1890,7 +2285,7 @@ pub(crate) const BROWSE_YEAR_SQL: &str = "CASE WHEN w.year BETWEEN 1800 AND 2200
 /// HOW `is_nsfw` IS DERIVED TODAY (verified, not assumed). A MangaDex work is `is_nsfw = 1`
 /// exactly when its rating is `erotica` or `pornographic` (`mangadex::to_work_input`) —
 /// SUGGESTIVE IS NOT NSFW, and stays visible to an opted-out viewer. On top of that, a source
-/// can ESCALATE a work (`mark_work_nsfw`: a Suwayomi source flagged NSFW, or an adult genre
+/// can ESCALATE a work (`mark_work_nsfw_on`: a Suwayomi source flagged NSFW, or an adult genre
 /// via `genre_is_nsfw`), except where MangaDex authoritatively rated it safe/suggestive; and an
 /// admin `is_nsfw_override` wins over everything. That gate is unchanged here.
 ///
@@ -1913,7 +2308,7 @@ pub(crate) const BROWSE_YEAR_SQL: &str = "CASE WHEN w.year BETWEEN 1800 AND 2200
 /// with a feed row both pass the feed row's `content_rating`/`is_nsfw`, so they converge.
 pub(crate) fn effective_content_rating_sql(rating: &str, nsfw: &str) -> String {
     format!(
-        "CASE WHEN ({nsfw}) = 1 AND ({rating}) IN ('safe', 'suggestive') \
+        "CASE WHEN ({nsfw}) = TRUE AND ({rating}) IN ('safe', 'suggestive') \
               THEN 'erotica' ELSE ({rating}) END"
     )
 }
@@ -2012,7 +2407,10 @@ pub async fn refresh_browse_catalogue(pool: &Database) -> Result<u64> {
             "tags: synced Suwayomi-derived tags"
         ),
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "tags: Suwayomi genre sync failed"),
+        Err(e) => {
+            crate::db::observe_database_error(&e);
+            tracing::warn!(error = %e, "tags: Suwayomi genre sync failed");
+        }
     }
 
     let keyed = crate::tags::fill_tag_keys(pool).await?;
@@ -2025,7 +2423,7 @@ pub async fn refresh_browse_catalogue(pool: &Database) -> Result<u64> {
         .join(", ");
     let changed = BROWSE_CATALOGUE_MUTABLE
         .iter()
-        .map(|c| format!("browse_catalogue.{c} IS NOT excluded.{c}"))
+        .map(|c| format!("browse_catalogue.{c} IS DISTINCT FROM excluded.{c}"))
         .collect::<Vec<_>>()
         .join(" OR ");
     let select = browse_catalogue_select();
@@ -2078,7 +2476,7 @@ pub async fn refresh_browse_catalogue(pool: &Database) -> Result<u64> {
         .await?;
     let facets = sqlx::query(
         "INSERT INTO feed_genre_facet(tag, safe_count, all_count) \
-         SELECT t.tag, SUM(CASE WHEN b.is_nsfw = 0 THEN 1 ELSE 0 END), COUNT(*) \
+         SELECT t.tag, SUM(CASE WHEN b.is_nsfw = FALSE THEN 1 ELSE 0 END), COUNT(*) \
            FROM work_tag t JOIN browse_catalogue b ON b.work_id = t.work_id \
           GROUP BY t.tag",
     )
@@ -2097,10 +2495,13 @@ pub async fn refresh_browse_catalogue(pool: &Database) -> Result<u64> {
     crate::browse::clear_count_cache();
 
     // The centralized bounded ANALYZE pass owns statistics for both catalogue tables.
-    let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM browse_catalogue")
+    let total = crate::db_types::query_scalar::<i64>("SELECT COUNT(*) FROM browse_catalogue")
         .fetch_one(pool)
         .await
-        .unwrap_or(0);
+        .unwrap_or_else(|error| {
+            crate::db::record_read_database_error(&error);
+            0
+        });
     tracing::info!(
         total,
         upserted,
@@ -2160,13 +2561,13 @@ pub const FSU_STATUS_SQL: &str = "CASE w.status \
 /// [`publish_mirror_feed_row`] run this derivation rather than a copy of it. `f.work_id` is
 /// the primary key of both tables this is ever called on, so a scoped pass is four seeks.
 async fn fill_comic_types(
-    conn: &mut sqlx::SqliteConnection,
+    conn: &mut sqlx::PgConnection,
     table: &'static str,
     work_id: Option<&str>,
 ) -> Result<u64> {
     use std::collections::HashMap;
     let scope = if work_id.is_some() {
-        "AND f.work_id = ?"
+        "AND f.work_id = $1"
     } else {
         ""
     };
@@ -2181,7 +2582,7 @@ async fn fill_comic_types(
          WHERE wt.source = 'admin' {scope} \
          ORDER BY wt.work_id, wt.ord, wt.tag"
     );
-    let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+    let mut q = crate::db_types::query_tuple::<(String, String)>(&sql);
     if let Some(w) = work_id {
         q = q.bind(w);
     }
@@ -2200,7 +2601,7 @@ async fn fill_comic_types(
          WHERE wt.source = 'mangadex' {scope} \
          ORDER BY wt.work_id, wt.ord, wt.tag"
     );
-    let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+    let mut q = crate::db_types::query_tuple::<(String, String)>(&sql);
     if let Some(w) = work_id {
         q = q.bind(w);
     }
@@ -2216,12 +2617,12 @@ async fn fill_comic_types(
     let mut seen: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
     let sql = format!(
         "SELECT ss.work_id, sw.genre FROM source_series ss \
-         JOIN suwayomi_series sw ON sw.id = CAST(ss.source_key AS INTEGER) \
+         JOIN suwayomi_series sw ON sw.id = sqlite_integer_pin(ss.source_key) \
          JOIN {table} f ON f.work_id = ss.work_id \
          WHERE ss.source_type = 'suwayomi' AND sw.genre IS NOT NULL {scope} \
          ORDER BY ss.work_id, ss.id"
     );
-    let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+    let mut q = crate::db_types::query_tuple::<(String, String)>(&sql);
     if let Some(w) = work_id {
         q = q.bind(w);
     }
@@ -2241,7 +2642,8 @@ async fn fill_comic_types(
         "SELECT f.work_id, w.content_type_override, w.original_language, f.title \
          FROM {table} f JOIN work w ON w.id = f.work_id WHERE 1 = 1 {scope}"
     );
-    let mut q = sqlx::query_as::<_, (String, Option<String>, Option<String>, String)>(&sql);
+    let mut q =
+        crate::db_types::query_tuple::<(String, Option<String>, Option<String>, String)>(&sql);
     if let Some(w) = work_id {
         q = q.bind(w);
     }
@@ -2287,12 +2689,11 @@ async fn fill_comic_types(
     let mut n = 0u64;
     for (word, ids) in &by_type {
         for chunk in ids.chunks(CHUNK) {
-            let ph = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
+            let ph = crate::sql_params::placeholders(2, chunk.len());
+            let last = crate::sql_params::placeholders(chunk.len() + 2, 1);
             let sql = format!(
-                "UPDATE {table} SET comic_type = ? \
-                 WHERE work_id IN ({ph}) AND comic_type IS NOT ?"
+                "UPDATE {table} SET comic_type = $1 \
+                 WHERE work_id IN ({ph}) AND comic_type IS DISTINCT FROM {last}"
             );
             let mut q = sqlx::query(&sql).bind(*word);
             for id in chunk {
@@ -2327,11 +2728,11 @@ async fn fill_comic_types(
 /// `NOT NULL DEFAULT 0` on the row just inserted, and in a work-scoped call would mean
 /// whatever the row already held. Stating the 0 is what makes the two agree.
 async fn fill_en_chapter_count(
-    conn: &mut sqlx::SqliteConnection,
+    conn: &mut sqlx::PgConnection,
     work_id: Option<&str>,
 ) -> Result<u64> {
     let scope = if work_id.is_some() {
-        "AND feed_series_updates.work_id = ?"
+        "AND feed_series_updates.work_id = $1"
     } else {
         ""
     };
@@ -2353,7 +2754,7 @@ async fn fill_en_chapter_count(
         "UPDATE feed_series_updates SET en_chapter_count = sw.n \
              FROM (SELECT ss.work_id AS work_id, MAX(sy.chapter_count) AS n \
                      FROM source_series ss \
-                     JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
+                     JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
                     WHERE ss.source_type = 'suwayomi' \
                     GROUP BY ss.work_id) AS sw \
             WHERE sw.work_id = feed_series_updates.work_id \
@@ -2370,68 +2771,33 @@ async fn fill_en_chapter_count(
 /// Maintain the search row inside the transaction that updates its work/source/browse
 /// projection. The caller owns the connection; no nested pool acquisition is allowed.
 pub(crate) async fn refresh_work_fts_in(
-    conn: &mut sqlx::SqliteConnection,
-    work_id: &str,
+    _conn: &mut sqlx::PgConnection,
+    _work_id: &str,
 ) -> Result<()> {
-    let desired: Option<(i64, String, String)> = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM chapter ch JOIN source_series ss ON ss.id = ch.source_series_id \
-                  WHERE ss.work_id = w.id), \
-                COALESCE(w.title_override, w.primary_title, ''), \
-                COALESCE((SELECT group_concat(a.raw_title, ' ') FROM work_alias a WHERE a.work_id = w.id), '') \
-           FROM work w WHERE w.id = ? AND COALESCE(w.title_override, w.primary_title, '') <> '' \
-            AND EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id)")
-        .bind(work_id).fetch_optional(&mut *conn).await?;
-    let previous: Vec<(i64, i64, String, String)> = sqlx::query_as(
-        "SELECT rowid, COALESCE(CAST(chapters AS INTEGER), 0), COALESCE(title, ''), COALESCE(aliases, '') FROM work_fts WHERE work_id = ?",
-    )
-    .bind(work_id)
-    .fetch_all(&mut *conn)
-    .await?;
-    if let (Some((chapters, title, aliases)), [(.., old_chapters, old_title, old_aliases)]) =
-        (&desired, previous.as_slice())
-    {
-        if chapters == old_chapters && title == old_title && aliases == old_aliases {
-            return Ok(());
-        }
-    }
-    // work_id is UNINDEXED on FTS5. Find its rowids once, then delete by rowid instead of
-    // scanning the full corpus again for each delete. Also repair any historical duplicate.
-    for (rowid, ..) in previous {
-        sqlx::query("DELETE FROM work_fts WHERE rowid = ?")
-            .bind(rowid)
-            .execute(&mut *conn)
-            .await?;
-    }
-    if let Some((chapters, title, aliases)) = desired {
-        sqlx::query("INSERT INTO work_fts(work_id, chapters, title, aliases) VALUES (?, ?, ?, ?)")
-            .bind(work_id)
-            .bind(chapters)
-            .bind(title)
-            .bind(aliases)
-            .execute(&mut *conn)
-            .await?;
-    }
+    // PostgreSQL's title/alias triggers maintain the derived search rows in the
+    // caller's transaction. Chapter counts are read live by the search query.
     Ok(())
 }
 
-pub(crate) async fn upsert_browse_work(
-    conn: &mut sqlx::SqliteConnection,
-    work_id: &str,
-) -> Result<()> {
+pub(crate) async fn upsert_browse_work(conn: &mut sqlx::PgConnection, work_id: &str) -> Result<()> {
     upsert_browse_work_inner(conn, work_id, true).await
 }
 
 async fn upsert_browse_work_inner(
-    conn: &mut sqlx::SqliteConnection,
+    conn: &mut sqlx::PgConnection,
     work_id: &str,
     search_changed: bool,
 ) -> Result<()> {
+    use sqlx::Connection;
+    let mut unit = conn.begin().await?;
+    let conn = &mut *unit;
+    guards::work(conn, work_id).await?;
     // The feed's cached title otherwise masks a fresh title override during projection.
     sqlx::query(
         "UPDATE feed_series_updates SET title = COALESCE( \
-        (SELECT COALESCE(w.title_override, w.primary_title) FROM work w WHERE w.id = ?1), title) \
-        WHERE work_id = ?1 AND title IS NOT COALESCE( \
-        (SELECT COALESCE(w.title_override, w.primary_title) FROM work w WHERE w.id = ?1), title)",
+        (SELECT COALESCE(w.title_override, w.primary_title) FROM work w WHERE w.id = $1), title) \
+        WHERE work_id = $1 AND title IS DISTINCT FROM COALESCE( \
+        (SELECT COALESCE(w.title_override, w.primary_title) FROM work w WHERE w.id = $1), title)",
     )
     .bind(work_id)
     .execute(&mut *conn)
@@ -2443,10 +2809,10 @@ async fn upsert_browse_work_inner(
         .join(", ");
     let changed = BROWSE_CATALOGUE_MUTABLE
         .iter()
-        .map(|c| format!("browse_catalogue.{c} IS NOT excluded.{c}"))
+        .map(|c| format!("browse_catalogue.{c} IS DISTINCT FROM excluded.{c}"))
         .collect::<Vec<_>>()
         .join(" OR ");
-    let select = browse_catalogue_select_for(" AND w.id = ?1");
+    let select = browse_catalogue_select_for(" AND w.id = $1");
     sqlx::query(&format!(
         "INSERT INTO browse_catalogue ({BROWSE_CATALOGUE_COLUMNS}) {select} \
         ON CONFLICT(work_id) DO UPDATE SET {set} WHERE {changed}"
@@ -2454,313 +2820,114 @@ async fn upsert_browse_work_inner(
     .bind(work_id)
     .execute(&mut *conn)
     .await?;
-    sqlx::query("DELETE FROM browse_catalogue WHERE work_id = ? \
+    sqlx::query("DELETE FROM browse_catalogue WHERE work_id = $1 \
         AND NOT EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = browse_catalogue.work_id)")
         .bind(work_id).execute(&mut *conn).await?;
     fill_comic_types(conn, "browse_catalogue", Some(work_id)).await?;
     if search_changed {
         refresh_work_fts_in(conn, work_id).await?;
     }
+    unit.commit().await?;
     Ok(())
 }
 
-/// Rebuild `work_fts` without a long main-database write transaction. Read-only-main
-/// staging computes the entire corpus; short batches update changed rows and prune stale
-/// ones. Unchanged rows retain their rowids and concurrent incremental updates win.
-///
-/// THE CORPUS IS EVERY SOURCED WORK, not just the MangaDex-anchored ones. 0052 restricted
-/// it to MangaDex because `canonicalSeries` rejects a work with no MangaDex anchor, so a
-/// non-anchored hit would have been a result that 404s on click. 0064's `reader_id` removed
-/// that constraint — a non-anchored work navigates by its numeric Suwayomi id instead — and
-/// the search resolver now hydrates through `browse_catalogue`, which carries that id. The
-/// WHERE below is therefore 0069's exclusion rule verbatim (a source to open, a title to
-/// label), so Browse and search agree on which works exist. Leaving 0052's predicate in
-/// place hid 1,824 Suwayomi-only works from every query — see migration 0071.
-///
-/// Called at the end of the `refresh_feed_updates` chain, i.e. at boot and after each
-/// MangaDex catalogue sync, on exactly the cadence that rebuilds `browse_catalogue`. Search
-/// and Browse therefore go stale together rather than one lagging the other, which is the
-/// property that made this bug invisible: the work was in the grid but not in the index.
+/// Reconcile the derived PostgreSQL title/alias index. Row triggers maintain
+/// ordinary edits inside their transaction; this remains the boot/repair API.
 pub async fn refresh_work_fts(pool: &Database) -> Result<u64> {
-    let mut tx = refresh_snapshot(pool, &["work_fts"]).await?;
-    sqlx::query("DELETE FROM work_fts")
-        .execute(&mut *tx)
+    let works: Vec<String> = sqlx::query_scalar(
+        "WITH expected AS MATERIALIZED ( \
+           SELECT 'alias:' || a.id AS id, a.work_id, public.search_fold(a.raw_title) AS normalized_title, a.raw_title, 'alias'::text AS kind \
+             FROM work_alias a WHERE public.search_fold(a.raw_title) <> '' \
+           UNION ALL SELECT 'title:' || w.id, w.id, public.search_fold(COALESCE(w.title_override,w.primary_title)), COALESCE(w.title_override,w.primary_title), 'title' \
+             FROM work w WHERE public.search_fold(COALESCE(w.title_override,w.primary_title)) <> ''), \
+         missing AS (SELECT * FROM expected EXCEPT SELECT id,work_id,normalized_title,raw_title,kind FROM work_search_alias), \
+         stale AS (SELECT id,work_id,normalized_title,raw_title,kind FROM work_search_alias EXCEPT SELECT * FROM expected) \
+         SELECT work_id FROM missing UNION SELECT work_id FROM stale ORDER BY work_id")
+        .fetch_all(pool)
         .await?;
-    // Mirrors migration 0071's backfill exactly (chapter count grouped once via a
-    // derived join, not a per-work correlated subquery).
-    let n = sqlx::query(
-        "INSERT INTO work_fts (work_id, chapters, title, aliases) \
-         SELECT w.id, COALESCE(cc.n, 0), \
-                COALESCE(w.title_override, w.primary_title, ''), \
-                COALESCE((SELECT group_concat(a.raw_title, ' ') \
-                          FROM work_alias a WHERE a.work_id = w.id), '') \
-         FROM work w \
-         LEFT JOIN (SELECT ss.work_id, COUNT(*) AS n FROM chapter ch \
-                    JOIN source_series ss ON ss.id = ch.source_series_id \
-                    GROUP BY ss.work_id) cc ON cc.work_id = w.id \
-         WHERE COALESCE(w.title_override, w.primary_title, '') <> '' \
-           AND EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id)",
-    )
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    publish_snapshot(pool, &mut tx, "work_fts").await?;
-    Ok(n)
+    for work in works {
+        let mut tx = pool.begin().await?;
+        guards::work(&mut tx, &work).await?;
+        sqlx::query("INSERT INTO work_search_alias (id,work_id,normalized_title,raw_title,kind) \
+            SELECT 'alias:' || a.id, a.work_id, public.search_fold(a.raw_title), a.raw_title, 'alias' \
+            FROM work_alias a WHERE a.work_id = $1 AND public.search_fold(a.raw_title) <> '' \
+            UNION ALL SELECT 'title:' || w.id, w.id, public.search_fold(COALESCE(w.title_override,w.primary_title)), COALESCE(w.title_override,w.primary_title), 'title' \
+            FROM work w WHERE w.id = $1 AND public.search_fold(COALESCE(w.title_override,w.primary_title)) <> '' \
+            ON CONFLICT(id) DO UPDATE SET work_id = excluded.work_id, normalized_title = excluded.normalized_title, raw_title = excluded.raw_title, kind = excluded.kind WHERE (work_search_alias.work_id,work_search_alias.normalized_title,work_search_alias.raw_title,work_search_alias.kind) IS DISTINCT FROM (excluded.work_id,excluded.normalized_title,excluded.raw_title,excluded.kind)")
+            .bind(&work).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM work_search_alias s WHERE s.work_id = $1 AND NOT EXISTS(SELECT 1 FROM work_alias a WHERE s.kind = 'alias' AND s.id = 'alias:' || a.id AND a.work_id = $1 AND public.search_fold(a.raw_title) <> '') \
+            AND NOT EXISTS(SELECT 1 FROM work w WHERE s.kind = 'title' AND s.id = 'title:' || w.id AND w.id = $1 AND public.search_fold(COALESCE(w.title_override,w.primary_title)) <> '')")
+            .bind(&work).execute(&mut *tx).await?;
+        tx.commit().await?;
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT work_id) FROM work_search_alias")
+        .fetch_one(pool)
+        .await?;
+    Ok(count as u64)
 }
 
-/// Shortest ASCII query we will run through FTS. `q=a` prefix-matched 40k of the
-/// 109k indexed works and `q=th` 30k — measured 0.5-2.5s of unauthenticated server
-/// time per keystroke, for a result set no user can use. Non-Latin scripts are
-/// exempt (see `fts_match_query`): a 1-2 character CJK query is a real word, and
-/// measures at ~30-100 matches.
-const MIN_FTS_QUERY_CHARS: usize = 3;
-
-/// How many bm25-best matches the ranking re-sort considers. The exact/prefix title
-/// tier costs two correlated `work_alias` lookups PER ROW, so evaluating it over
-/// every match (tens of thousands on a short query) and then sorting the lot through
-/// a temp B-tree was the search hot path. Ranking a bounded window of the bm25-best
-/// candidates instead makes the tail cost flat, and `total` is capped to the same
-/// window so pagination never promises a page the window can't serve.
+/// Search examines a bounded candidate window before paging.
 pub(crate) const RANK_WINDOW: i64 = 500;
 
-/// Bound anonymous search work before allocating tokens or constructing ranking binds.
+/// Bound anonymous input before PostgreSQL folds or tokenizes it.
 pub(crate) const MAX_FTS_QUERY_CHARS: usize = 256;
-const MAX_FTS_TERMS: usize = 12;
 
-/// Build an FTS5 MATCH expression from raw user input: split into unicode
-/// alphanumeric word tokens, quote each (so an FTS keyword like `and`/`or`/`near`
-/// or a stray operator char is treated as a literal, never as syntax), and append
-/// `*` to the LAST token for prefix matching so "solo lev" matches "Solo Leveling"
-/// as you type. Tokens are implicitly AND-ed. Returns `None` when the query has no
-/// usable token, or is too short to run (see `MIN_FTS_QUERY_CHARS`).
-///
-/// Only the last token is prefix-matched: while typing, the earlier tokens are
-/// complete words and starring them only widens the postings list scanned ("one
-/// piece" scanned every work containing a word starting with "one").
-pub(crate) fn fts_match_query(raw: &str) -> Option<String> {
-    if raw.len() > MAX_FTS_QUERY_CHARS * 4
-        || raw.chars().take(MAX_FTS_QUERY_CHARS + 1).count() > MAX_FTS_QUERY_CHARS
-    {
-        return None;
-    }
-    let mut terms: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for ch in raw.chars() {
-        if ch.is_alphanumeric() {
-            cur.extend(ch.to_lowercase());
-        } else if !cur.is_empty() {
-            terms.push(std::mem::take(&mut cur));
-        }
-    }
-    if !cur.is_empty() {
-        terms.push(cur);
-    }
-    let last = terms.last()?;
-    // A repeated final token already has an exact clause, so its prefix clause is
-    // redundant. Retaining the exact clause preserves the original AND semantics.
-    let prefix_last = terms.iter().filter(|term| *term == last).count() == 1;
-    let mut seen = std::collections::HashSet::new();
-    terms.retain(|term| seen.insert(term.clone()));
-    if terms.len() > MAX_FTS_TERMS {
-        return None;
-    }
-    let chars: usize = terms.iter().map(|t| t.chars().count()).sum();
-    if chars < MIN_FTS_QUERY_CHARS && terms.iter().all(|t| t.is_ascii()) {
-        return None;
-    }
-    let last_index = terms.len() - 1;
-    Some(
-        terms
-            .iter()
-            .enumerate()
-            .map(|(i, term)| {
-                if prefix_last && i == last_index {
-                    format!("\"{term}\"*")
-                } else {
-                    format!("\"{term}\"")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
-}
-
-/// Escape SQLite `LIKE` metacharacters (`\`, `%`, `_`) so a user query is matched
-/// literally under `ESCAPE '\'` — a title containing `%` can't turn into a wildcard.
-fn escape_like(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
-/// The exact/prefix title TIER of [`search_works_fts`]' ranking — a SQL `CASE` over a `work`
-/// row aliased `w` — plus its bind values in order, chosen by script (see that function's doc
-/// comment for the tiers and why the case-folding is script-dependent).
-///
-/// Factored out so Browse v2's filtered text search (`browse::search_text`) ranks RELEVANCE
-/// with the IDENTICAL expression: "the filters narrowed my search" must never also mean "and
-/// the order changed", and two copies of a six-branch CASE is exactly how that would happen.
-pub(crate) fn fts_title_tier(query: &str) -> (&'static str, Vec<String>) {
-    if query.is_ascii() {
-        let qx = query.trim().to_lowercase();
-        let qp = format!("{}%", escape_like(&qx));
-        // Tiers 2/3 repeat the exact/prefix test over `normalized_title` — punctuation
-        // folded away, diacritics folded, noise tails stripped — BELOW the raw tiers,
-        // never merged into them. Without them the tier compared the user's RAW text
-        // against raw titles, so punctuation the user typed differently from the title
-        // dropped EVERY row into one bottom tier, leaving `chapters DESC` to decide and
-        // letting an unrelated spin-off outrank the work itself. Verified on production:
-        // `dr stone` put "Dr. STONE reboot: Byakuya" above "Dr.STONE", and `spy family`
-        // ranked "SPY×FAMILY" purely on chapter count; both are top-of-page correct with
-        // these tiers, and `dr. stone` / `spy x family` still resolve at tier 0.
-        //
-        // They must stay BELOW the raw tiers because `normalize_title` ALSO strips noise
-        // tails: "Naruto (Official Colored)" normalizes to plain "naruto", so promoting
-        // normalized-exact into tier 0 would tie the re-release with *Naruto* itself.
-        // Verified unchanged by this addition: naruto / one piece / bleach / dragon ball
-        // / chainsaw man all keep the canonical work at rank 1.
-        //
-        // RESIDUAL (tested, see `search_ranks_the_exact_title_first_despite_punctuation_
-        // differences`): because of that same tail-stripping, a punctuation-MISMATCHED
-        // query still cannot separate a work from its own re-release — both land in tier
-        // 2 and the re-release's larger chapter count wins. That is exactly what the
-        // single-tier version did too, so this is a strict improvement rather than a new
-        // regression; closing it needs a punctuation-folded but noise-PRESERVING key,
-        // which no column stores today.
-        (
-            "CASE \
-               WHEN lower(COALESCE(w.title_override, w.primary_title)) = ? \
-                 OR EXISTS (SELECT 1 FROM work_alias a \
-                            WHERE a.work_id = w.id AND lower(a.raw_title) = ?) THEN 0 \
-               WHEN lower(COALESCE(w.title_override, w.primary_title)) LIKE ? ESCAPE '\\' \
-                 OR EXISTS (SELECT 1 FROM work_alias a \
-                            WHERE a.work_id = w.id AND lower(a.raw_title) LIKE ? ESCAPE '\\') THEN 1 \
-               WHEN EXISTS (SELECT 1 FROM work_alias a \
-                            WHERE a.work_id = w.id AND a.normalized_title = ?) THEN 2 \
-               WHEN EXISTS (SELECT 1 FROM work_alias a \
-                            WHERE a.work_id = w.id \
-                              AND a.normalized_title LIKE ? ESCAPE '\\') THEN 3 \
-               ELSE 4 END",
-            {
-                let nq = normalize_title(query);
-                let np = format!("{}%", escape_like(&nq));
-                vec![qx.clone(), qx, qp.clone(), qp, nq, np]
-            },
-        )
-    } else {
-        let nq = normalize_title(query);
-        let np = format!("{}%", escape_like(&nq));
-        (
-            "CASE \
-               WHEN EXISTS (SELECT 1 FROM work_alias a \
-                            WHERE a.work_id = w.id AND a.normalized_title = ?) THEN 0 \
-               WHEN EXISTS (SELECT 1 FROM work_alias a \
-                            WHERE a.work_id = w.id \
-                              AND a.normalized_title LIKE ? ESCAPE '\\') THEN 1 \
-               ELSE 2 END",
-            vec![nq, np],
-        )
-    }
-}
-
-/// A search owns one reader until its SQLite statements have stopped. The progress
-/// handler interrupts the SQLite VM itself; dropping a cancelled request also trips it.
-/// An unfinished connection is closed rather than returned with a stale handler.
+/// Search owns one reader for one transaction, with a PostgreSQL statement
+/// timeout and its trigram thresholds set for that transaction only. Dropping an
+/// unfinished request closes its connection before it can return to the pool.
 pub(crate) struct SearchConnection {
-    connection: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
-    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    connection: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
 }
-
 impl std::ops::Deref for SearchConnection {
-    type Target = sqlx::SqliteConnection;
+    type Target = sqlx::PgConnection;
     fn deref(&self) -> &Self::Target {
         self.connection.as_deref().unwrap()
     }
 }
-
 impl std::ops::DerefMut for SearchConnection {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.connection.as_deref_mut().unwrap()
     }
 }
-
 impl Drop for SearchConnection {
     fn drop(&mut self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(connection) = &mut self.connection {
             connection.close_on_drop();
         }
     }
 }
-
 impl SearchConnection {
     pub(crate) async fn new(pool: &Database) -> Result<Self> {
         Self::with_budget(pool, std::time::Duration::from_secs(2)).await
     }
-
+    // The budget and the trigram thresholds are local to one transaction, so they
+    // end with it and cannot reach the next user of the pooled session. The
+    // connection is wrapped before the first statement: an error or a cancelled
+    // request from here on closes it.
     async fn with_budget(pool: &Database, budget: std::time::Duration) -> Result<Self> {
-        let mut connection = pool.acquire().await?;
-        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let check_cancelled = cancelled.clone();
-        let deadline = std::time::Instant::now() + budget;
-        {
-            let mut handle = connection.lock_handle().await?;
-            handle.set_progress_handler(1_000, move || {
-                !check_cancelled.load(std::sync::atomic::Ordering::Relaxed)
-                    && std::time::Instant::now() < deadline
-            });
-        }
-        Ok(Self {
-            connection: Some(connection),
-            cancelled,
-        })
+        let mut search = Self {
+            connection: Some(pool.acquire().await?),
+        };
+        sqlx::query("BEGIN").execute(&mut *search).await?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true), set_config('pg_trgm.similarity_threshold', '0.3', true), set_config('pg_trgm.word_similarity_threshold', '0.2', true)")
+            .bind(format!("{}ms", budget.as_millis().max(1)))
+            .execute(&mut *search).await?;
+        Ok(search)
     }
-
     pub(crate) async fn finish(mut self) -> Result<()> {
-        self.connection
-            .as_mut()
-            .unwrap()
-            .lock_handle()
-            .await?
-            .remove_progress_handler();
-        // Only a connection with its handler removed may return to the shared reader pool.
+        sqlx::query("ROLLBACK").execute(&mut *self).await?;
         self.connection.take();
         Ok(())
     }
 }
 
-/// Full-text search over the canonical catalogue (AD-5). Returns `(total, page)`
-/// where `page` is the `w_` work ids for the requested page. NSFW works are gated in
-/// SQL (before LIMIT) unless `show_nsfw`, so `total` and pagination stay honest. An
-/// empty / tokenless / too-short query yields `(0, [])` — the caller browses the
-/// catalogue.
-///
-/// Ranking, in order: (1) an exact/prefix full-title TIER — a work whose title (or an
-/// alias) equals the query ranks above one it merely prefixes, above a pure token
-/// match; this is what makes "naruto" surface *Naruto* instead of a short doujinshi
-/// that bm25's term-frequency bias would float up. (2) `chapters` DESC as a
-/// notability proxy (a real series has hundreds of chapters, a spin-off one). (3)
-/// bm25 as the final tie-break. The `chapters` proxy is interim — replace it with
-/// MangaDex `follows` once `work_stats` is ingested (AD-6) for accurate ranking on
-/// short/partial queries (e.g. a single distinctive word).
-///
-/// That tier is evaluated over a BOUNDED WINDOW of the `RANK_WINDOW` bm25-best matches
-/// rather than over every match: its two correlated `work_alias` lookups per row cost
-/// ~0.5-2.5s on a short query that matches tens of thousands of works, for rows no
-/// page would ever show. `total` is capped to the same window so `has_next` can't
-/// promise a page beyond it. The trade-off is that a match ranked worse than
-/// `RANK_WINDOW` by bm25 can no longer be lifted into view by the title tier — bm25
-/// favours short fields, so an exact title hit sits near the top of its own query's
-/// window by construction.
-///
-/// The tier's case-folding is script-dependent: SQLite's built-in `lower()` folds
-/// ASCII ONLY (`lower('ЖУРНАЛ')` = `'ЖУРНАЛ'`), so for a query carrying any non-ASCII
-/// character the tier compares against `work_alias.normalized_title` — the key written
-/// by Rust's unicode-aware `normalize_title`, which every work's titles are indexed
-/// under. Latin queries keep the raw `lower()` comparison: `normalized_title` also
-/// strips noise tails ("Naruto (Official Colored)" normalizes to "naruto"), which
-/// would let a re-release tie with the work itself in the exact tier.
+/// PostgreSQL title/alias search over the canonical catalogue. The legacy API
+/// name is retained. NSFW/block eligibility applies before term preference and
+/// the bounded 500-work window. Each term prefers eligible word/prefix hits and
+/// falls back to indexed ASCII-key trigram hits only when it has no word match.
+/// Every term intersects by work ID across title/alias rows. Exact and prefix
+/// folded full titles rank first; chapter popularity, similarity and work ID
+/// settle a tier. Empty/tokenless/oversized queries return no hits.
 pub async fn search_works_fts(
     pool: &Database,
     query: &str,
@@ -2769,59 +2936,31 @@ pub async fn search_works_fts(
     page: i64,
     page_size: i64,
 ) -> Result<(i64, Vec<String>)> {
-    let Some(match_expr) = fts_match_query(query) else {
+    if !crate::search::valid_query(query) {
         return Ok((0, Vec::new()));
-    };
+    }
     let mut connection = SearchConnection::new(pool).await?;
     let offset = (page.max(1) - 1) * page_size;
-    // The viewer's content block rules, in the candidate query like the NSFW gate, so
-    // `total` and the pages count the same works. Empty when there is no rule. It adds
-    // no bind (see `block.rs`), so the bind order below is unchanged.
     let not_blocked = blocks.and_not_blocked("w.id", Some(&crate::block::work_rating_sql("w")));
-    // NSFW gate mirrors map_canonical_series' effective flag (override wins). The FTS
-    // table is referenced by NAME (`work_fts MATCH`), not the join alias — FTS5's
-    // MATCH operator reads a bare alias as a column, not the table.
-    let total = sqlx::query_scalar::<_, i64>(&format!(
-        "SELECT COUNT(*) FROM (SELECT 1 FROM work_fts JOIN work w ON w.id = work_fts.work_id \
-          WHERE work_fts MATCH ? AND (? = 1 OR COALESCE(w.is_nsfw_override, w.is_nsfw) = 0)\
-          {not_blocked} LIMIT ?)"
+    let gate = format!("($2 OR NOT COALESCE(w.is_nsfw_override,w.is_nsfw)){not_blocked}");
+    let m_cte = crate::search::match_ctes("SELECT w.id AS work_id FROM work w", &gate);
+    let total = crate::db_types::query_scalar::<i64>(&format!(
+        "WITH {m_cte} SELECT COUNT(*) FROM (SELECT 1 FROM m LIMIT $3) counted"
     ))
-    .bind(&match_expr)
-    .bind(show_nsfw as i64)
+    .bind(query)
+    .bind(show_nsfw)
     .bind(RANK_WINDOW)
     .fetch_one(&mut *connection)
     .await?;
-    if offset >= RANK_WINDOW {
+    if offset >= total {
         connection.finish().await?;
         return Ok((total, Vec::new()));
     }
-    let (tier, tier_params) = fts_title_tier(query);
-    let sql = format!(
-        "WITH cand AS ( \
-           SELECT work_fts.work_id AS work_id, \
-                  CAST(work_fts.chapters AS INTEGER) AS chapters, \
-                  bm25(work_fts, 0.0, 0.0, 10.0, 1.0) AS rank \
-             FROM work_fts JOIN work w ON w.id = work_fts.work_id \
-            WHERE work_fts MATCH ? AND (? = 1 OR COALESCE(w.is_nsfw_override, w.is_nsfw) = 0)\
-            {not_blocked} \
-            ORDER BY bm25(work_fts, 0.0, 0.0, 10.0, 1.0) \
-            LIMIT ?) \
-         SELECT c.work_id FROM cand c JOIN work w ON w.id = c.work_id \
-          ORDER BY {tier}, c.chapters DESC, c.rank, c.work_id \
-          LIMIT ? OFFSET ?"
-    );
-    let mut q = sqlx::query_scalar::<_, String>(&sql)
-        .bind(&match_expr)
-        .bind(show_nsfw as i64)
-        .bind(RANK_WINDOW);
-    for p in &tier_params {
-        q = q.bind(p);
-    }
-    let ids = q
-        .bind(page_size.min(RANK_WINDOW))
-        .bind(offset)
-        .fetch_all(&mut *connection)
-        .await?;
+    let ids = sqlx::query_scalar::<_,String>(&format!(
+        "WITH {m_cte}, {} SELECT work_id FROM cand ORDER BY tier,chapters DESC,rank,work_id LIMIT $4 OFFSET $5",
+        crate::search::window_cte("$3")))
+        .bind(query).bind(show_nsfw).bind(RANK_WINDOW).bind(page_size.min(RANK_WINDOW)).bind(offset)
+        .fetch_all(&mut *connection).await?;
     connection.finish().await?;
     Ok((total, ids))
 }
@@ -2829,11 +2968,11 @@ pub async fn search_works_fts(
 /// NSFW flag of the work owning a mirrored MangaDex chapter (by chapter uuid), for
 /// gating `canonicalPages`. `None` if the chapter isn't in the mirror.
 pub async fn chapter_owner_is_nsfw(pool: &Database, external_id: &str) -> Result<Option<bool>> {
-    let v = sqlx::query_scalar::<_, i64>(
+    let v = crate::db_types::query_scalar::<i64>(
         "SELECT COALESCE(w.is_nsfw_override, w.is_nsfw) FROM chapter c \
          JOIN source_series ss ON ss.id = c.source_series_id \
          JOIN work w ON w.id = ss.work_id \
-         WHERE c.external_id = ? AND ss.source_type = 'mangadex' LIMIT 1",
+         WHERE c.external_id = $1 AND ss.source_type = 'mangadex' LIMIT 1",
     )
     .bind(external_id)
     .fetch_optional(pool)
@@ -2865,7 +3004,16 @@ fn prefer_reader_chapter(candidate: &CanonicalChapter, existing: &CanonicalChapt
     }
     // Same English-ness: prefer the latest publish (a present date beats `None`),
     // then the lowest `external_id` as a stable final tiebreak.
-    match candidate.published_at.cmp(&existing.published_at) {
+    match candidate
+        .published_at
+        .as_deref()
+        .and_then(|value| crate::db_types::date(value).ok())
+        .cmp(
+            &existing
+                .published_at
+                .as_deref()
+                .and_then(|value| crate::db_types::date(value).ok()),
+        ) {
         Ordering::Greater => true,
         Ordering::Less => false,
         Ordering::Equal => candidate.external_id < existing.external_id,
@@ -2916,19 +3064,128 @@ pub async fn upsert_work_from_mangadex(
     mangadex_id: &str,
     input: &WorkInput,
 ) -> Result<String> {
-    // IMMEDIATE, not DEFERRED: this transaction READS (the existing external-id
-    // mapping) before it writes, and a DEFERRED read-then-write upgrade fails with
-    // SQLITE_BUSY_SNAPSHOT (517) — which `busy_timeout` structurally cannot retry
-    // (see `db::is_locked_error`). Taking the write lock up front turns that into
-    // ordinary, retryable writer contention.
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    crate::db::retry_transaction(|| upsert_work_from_mangadex_attempt(pool, mangadex_id, input))
+        .await
+}
 
-    let existing = sqlx::query_as::<_, (String, Option<String>)>(
-        "SELECT e.work_id, w.primary_title FROM work_external_id e JOIN work w ON w.id = e.work_id WHERE e.provider = 'mangadex' AND e.external_id = ?",
+async fn upsert_work_from_mangadex_attempt(
+    pool: &Database,
+    mangadex_id: &str,
+    input: &WorkInput,
+) -> Result<String> {
+    // Identity guards cover absent rows as well as existing authoritative owners. The
+    // source policy key is taken in shared mode: two MangaDex upserts of different
+    // works do not wait for each other, and both still exclude a policy change.
+    let mut tx = pool.begin_with("BEGIN").await?;
+    guards::lock_source_claim(
+        &mut tx,
+        &mangadex_identity_keys(mangadex_id, input),
+        "mangadex",
     )
-    .bind(mangadex_id)
-    .fetch_optional(&mut *tx)
     .await?;
+    guards::held().await;
+    let work_id = upsert_work_from_mangadex_on(&mut tx, mangadex_id, input).await?;
+    tx.commit().await?;
+    Ok(work_id)
+}
+
+/// The advisory keys one MangaDex upsert needs: the `mangadex` source identity and source
+/// policy, the MangaDex external identity, and every other external identity in `input`.
+/// Unsorted; pass them in the unit's single `locks::advisory` call.
+///
+/// That call takes the source policy key exclusively, which is correct but makes two
+/// upserts of different MangaDex works wait for each other. The pool facade
+/// [`upsert_work_from_mangadex`] takes it in shared mode instead.
+// Used by callers that build one larger unit around the `_on` helper (GraphQL). The
+// facades of this module take the identity keys and a SHARED policy key instead.
+#[allow(dead_code)]
+pub fn mangadex_upsert_keys(
+    mangadex_id: &str,
+    input: &WorkInput,
+) -> Vec<crate::locks::AdvisoryKey> {
+    let mut keys = mangadex_identity_keys(mangadex_id, input);
+    keys.push(crate::locks::AdvisoryKey::new(
+        crate::locks::KeyClass::SourcePolicy,
+        &["mangadex"],
+    ));
+    keys
+}
+
+/// [`mangadex_upsert_keys`] without the source policy key.
+fn mangadex_identity_keys(mangadex_id: &str, input: &WorkInput) -> Vec<crate::locks::AdvisoryKey> {
+    let mut keys = guards::source_identity_keys("mangadex", "mangadex", mangadex_id);
+    keys.push(crate::locks::AdvisoryKey::external_identity(
+        "mangadex",
+        mangadex_id,
+    ));
+    keys.extend(
+        input
+            .external_ids
+            .iter()
+            .filter(|(p, e)| !p.is_empty() && !e.is_empty())
+            .map(|(p, e)| crate::locks::AdvisoryKey::external_identity(p, e)),
+    );
+    keys
+}
+
+const MANGADEX_OWNER: &str = "COALESCE((SELECT work_id FROM work_external_id WHERE provider = 'mangadex' AND external_id = $1), (SELECT work_id FROM source_series WHERE source_type = 'mangadex' AND source_key = $1 ORDER BY id LIMIT 1))";
+
+/// The work that owns a MangaDex id right now: its external-identity row first, then
+/// its `mangadex` source mapping. Read only; takes no lock and does not commit. The
+/// answer is stable only while the caller holds [`mangadex_upsert_keys`] for the id.
+/// A unit that also touches OTHER works calls this to learn every work id before it
+/// locks them all in one sorted `locks::lock_works` call.
+pub async fn mangadex_owner_on(
+    conn: &mut sqlx::PgConnection,
+    mangadex_id: &str,
+) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar::<_, Option<String>>(&format!("SELECT {MANGADEX_OWNER}"))
+            .bind(mangadex_id)
+            .fetch_one(&mut *conn)
+            .await?,
+    )
+}
+
+/// [`upsert_work_from_mangadex`] inside the caller's transaction. Never commits and
+/// never retries: the caller owns BEGIN through COMMIT and wraps that whole unit in
+/// `db::retry_transaction`.
+///
+/// Guards the CALLER must already hold: every key of [`mangadex_upsert_keys`] for this
+/// id and input, taken in the unit's single `locks::advisory` call. This function then
+/// locks the owning work itself (`FOR NO KEY UPDATE`) and re-reads the owner; a changed
+/// owner returns `locks::RestartTransaction`. If the unit locks any other work, the
+/// caller must have locked the owner ([`mangadex_owner_on`]) together with those works
+/// in sorted order first; the lock taken here is then a repeat of one already held.
+pub async fn upsert_work_from_mangadex_on(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    mangadex_id: &str,
+    input: &WorkInput,
+) -> Result<String> {
+    guards::assert_source_claim_held(
+        tx,
+        &mangadex_identity_keys(mangadex_id, input),
+        "mangadex",
+        "catalog::upsert_work_from_mangadex_on",
+    )
+    .await?;
+    let owner_row =
+        format!("SELECT w.id, w.primary_title FROM work w WHERE w.id = {MANGADEX_OWNER}");
+    let existing = crate::db_types::query_tuple::<(String, Option<String>)>(&owner_row)
+        .bind(mangadex_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if let Some((id, _)) = &existing {
+        let locked = crate::locks::lock_works(tx, &[id]).await?;
+        let current = mangadex_owner_on(tx, mangadex_id).await?;
+        if !locked.missing.is_empty() || current.as_deref() != Some(id.as_str()) {
+            return Err(crate::locks::RestartTransaction.into());
+        }
+    }
+    let existing = crate::db_types::query_tuple::<(String, Option<String>)>(&owner_row)
+        .bind(mangadex_id)
+        .fetch_optional(&mut **tx)
+        .await?;
     let title_changed = existing
         .as_ref()
         .is_none_or(|(_, title)| title != &input.primary_title);
@@ -2944,7 +3201,7 @@ pub async fn upsert_work_from_mangadex(
         "INSERT INTO work \
            (id, primary_title, primary_lang, description, year, original_language, status, \
             demographic, content_rating, is_nsfw, author, artist, cover_phash, cover_file_name, created_at, updated_at, metadata_synced_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
          ON CONFLICT(id) DO UPDATE SET \
            primary_title = excluded.primary_title, primary_lang = excluded.primary_lang, \
            description = excluded.description, year = excluded.year, \
@@ -2964,44 +3221,44 @@ pub async fn upsert_work_from_mangadex(
     .bind(&input.status)
     .bind(&input.demographic)
     .bind(&input.content_rating)
-    .bind(input.is_nsfw as i64)
+    .bind(input.is_nsfw)
     .bind(&input.author)
     .bind(&input.artist)
     .bind(&input.cover_phash)
     .bind(&input.cover_file_name)
-    .bind(&now)
-    .bind(&now)
-    .bind(&now) // metadata_synced_at
-    .execute(&mut *tx)
+    .bind(crate::db_types::date(&now)?)
+    .bind(crate::db_types::date(&now)?)
+    .bind(crate::db_types::date(&now)?) // metadata_synced_at
+    .execute(&mut **tx)
     .await?;
 
     // Ensure the MangaDex external id maps to this work, plus any cross-catalogue ids.
     sqlx::query(
-        "INSERT OR IGNORE INTO work_external_id (work_id, provider, external_id) VALUES (?, 'mangadex', ?)",
+        "INSERT INTO work_external_id (work_id, provider, external_id) VALUES ($1, 'mangadex', $2) ON CONFLICT DO NOTHING",
     )
     .bind(&work_id)
     .bind(mangadex_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     for (provider, ext) in &input.external_ids {
         if provider.is_empty() || ext.is_empty() {
             continue;
         }
         sqlx::query(
-            "INSERT OR IGNORE INTO work_external_id (work_id, provider, external_id) VALUES (?, ?, ?)",
+            "INSERT INTO work_external_id (work_id, provider, external_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
         )
         .bind(&work_id)
         .bind(provider)
         .bind(ext)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
 
-    let aliases_changed = insert_aliases(&mut tx, &work_id, &input.aliases).await?;
-    insert_descriptions_and_credits(&mut tx, &work_id, input).await?;
-    replace_mangadex_details(&mut tx, &work_id, input).await?;
+    let aliases_changed = insert_aliases(tx, &work_id, &input.aliases).await?;
+    insert_descriptions_and_credits(tx, &work_id, input).await?;
+    replace_mangadex_details(tx, &work_id, input).await?;
     ensure_source_series(
-        &mut tx,
+        tx,
         &work_id,
         "mangadex",
         "mangadex",
@@ -3012,26 +3269,98 @@ pub async fn upsert_work_from_mangadex(
     )
     .await?;
 
-    upsert_browse_work_inner(&mut tx, &work_id, title_changed || aliases_changed).await?;
-    tx.commit().await?;
+    upsert_browse_work_inner(tx, &work_id, title_changed || aliases_changed).await?;
     Ok(work_id)
 }
 
 /// Create a brand-new first-class canonical work (no MangaDex anchor) from an input.
 /// Used by the Tier-2 add flow when the matcher decides "new work".
+#[cfg(test)]
 pub async fn create_work(pool: &Database, input: &WorkInput) -> Result<String> {
-    // IMMEDIATE: a write-only transaction here today, but it shares the single writer
-    // with the sync/scan/cover paths — taking the lock up front keeps it out of the
-    // un-retryable SQLITE_BUSY_SNAPSHOT class if a read is ever added ahead of the
-    // first INSERT (see `db::is_locked_error`).
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    crate::db::retry_transaction(|| create_work_attempt(pool, input)).await
+}
+
+#[cfg(test)]
+async fn create_work_attempt(pool: &Database, input: &WorkInput) -> Result<String> {
+    // Explicit external identities serialize discovery and adoption. A title-only
+    // matcher must still reserve its match domain in the caller's complete unit.
+    let mut tx = pool.begin_with("BEGIN").await?;
+    crate::locks::advisory(&mut tx, &create_work_keys(input)).await?;
+    let work_id = create_work_on(&mut tx, input).await?;
+    tx.commit().await?;
+    Ok(work_id)
+}
+
+/// The advisory keys [`create_work_on`] needs by itself: one `ExternalIdentity` key for
+/// each external id in `input`. Unsorted; pass them in the unit's single
+/// `locks::advisory` call. A caller that decided "new work" from a TITLE must add
+/// `dedup::match_domain_keys` of its candidate, because nothing here reserves a title.
+pub fn create_work_keys(input: &WorkInput) -> Vec<crate::locks::AdvisoryKey> {
+    input
+        .external_ids
+        .iter()
+        .filter(|(p, e)| !p.is_empty() && !e.is_empty())
+        .map(|(p, e)| crate::locks::AdvisoryKey::external_identity(p, e))
+        .collect()
+}
+
+/// [`create_work`] inside the caller's transaction. Never commits and never retries: the
+/// caller owns BEGIN through COMMIT and wraps that whole unit in `db::retry_transaction`.
+///
+/// Guards the CALLER must already hold: every key of [`create_work_keys`] for `input`
+/// and, when the decision to mint came from a title match, the `MatchDomain` keys of
+/// `dedup::match_domain_keys`, all taken in the unit's single `locks::advisory` call.
+///
+/// If one of the supplied external ids already belongs to a work, that work is ADOPTED
+/// instead of minting a duplicate: it is locked here (`FOR NO KEY UPDATE`), gains any
+/// external id it lacks, and its id is returned; ids owned by two different works are an
+/// error. If the unit locks any other work, the caller must have locked the adopted
+/// owner (`find_work_by_external_on` for each id) with those works in sorted order
+/// first. A newly minted work needs no lock: nobody can see it before the commit.
+pub async fn create_work_on(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    input: &WorkInput,
+) -> Result<String> {
+    guards::assert_keys_held(tx, &create_work_keys(input), "catalog::create_work_on").await?;
+    let identities: Vec<_> = input
+        .external_ids
+        .iter()
+        .filter(|(p, e)| !p.is_empty() && !e.is_empty())
+        .collect();
+    let mut owners = Vec::new();
+    for (provider, external) in identities {
+        if let Some(owner) = find_work_by_external_on(tx, provider, external).await? {
+            owners.push(owner);
+        }
+    }
+    owners.sort();
+    owners.dedup();
+    if owners.len() > 1 {
+        anyhow::bail!("external identities belong to different works");
+    }
+    if let Some(owner) = owners.first() {
+        let locked = crate::locks::lock_works(tx, &owners).await?;
+        if !locked.missing.is_empty() {
+            return Err(crate::locks::RestartTransaction.into());
+        }
+        guards::held().await;
+        for (provider, external) in &input.external_ids {
+            if provider.is_empty() || external.is_empty() {
+                continue;
+            }
+            sqlx::query("INSERT INTO work_external_id (work_id, provider, external_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+                .bind(owner).bind(provider).bind(external).execute(&mut **tx).await?;
+        }
+        return Ok(owner.clone());
+    }
+    guards::held().await;
     let work_id = new_id("w_");
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO work \
            (id, primary_title, primary_lang, description, year, original_language, status, \
             demographic, content_rating, is_nsfw, author, artist, cover_phash, cover_file_name, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
     )
     .bind(&work_id)
     .bind(&input.primary_title)
@@ -3042,41 +3371,63 @@ pub async fn create_work(pool: &Database, input: &WorkInput) -> Result<String> {
     .bind(&input.status)
     .bind(&input.demographic)
     .bind(&input.content_rating)
-    .bind(input.is_nsfw as i64)
+    .bind(input.is_nsfw)
     .bind(&input.author)
     .bind(&input.artist)
     .bind(&input.cover_phash)
     .bind(&input.cover_file_name)
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
+    .bind(crate::db_types::date(&now)?)
+    .bind(crate::db_types::date(&now)?)
+    .execute(&mut **tx)
     .await?;
     for (provider, ext) in &input.external_ids {
         if provider.is_empty() || ext.is_empty() {
             continue;
         }
         sqlx::query(
-            "INSERT OR IGNORE INTO work_external_id (work_id, provider, external_id) VALUES (?, ?, ?)",
+            "INSERT INTO work_external_id (work_id, provider, external_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
         )
         .bind(&work_id)
         .bind(provider)
         .bind(ext)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
-    insert_aliases(&mut tx, &work_id, &input.aliases).await?;
-    insert_descriptions_and_credits(&mut tx, &work_id, input).await?;
-    tx.commit().await?;
+    insert_aliases(tx, &work_id, &input.aliases).await?;
+    insert_descriptions_and_credits(tx, &work_id, input).await?;
     Ok(work_id)
 }
 
 /// Delete a work and its child rows. Intended to reclaim a freshly-minted work
 /// that lost a concurrent dedup claim (H6) — such a work has no `source_series`,
 /// `reviews`, or `user_library` rows yet, only the child metadata `create_work`
-/// wrote. Explicit child deletes make this correct regardless of the connection's
-/// `foreign_keys` pragma (mirrors the `merge_works` cleanup).
+/// wrote. A work that has since been adopted is preserved under the parent lock.
+#[cfg(test)]
 pub async fn delete_work_cascade(pool: &Database, work_id: &str) -> Result<()> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    crate::db::retry_transaction(|| delete_work_cascade_attempt(pool, work_id)).await
+}
+
+#[cfg(test)]
+async fn delete_work_cascade_attempt(pool: &Database, work_id: &str) -> Result<()> {
+    let mut tx = pool.begin_with("BEGIN").await?;
+    crate::locks::lock_works_for_delete(&mut tx, &[work_id]).await?;
+    guards::held().await;
+    let claimed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM source_series WHERE work_id = $1) OR \
+         EXISTS(SELECT 1 FROM user_library WHERE series_id = $1) OR \
+         EXISTS(SELECT 1 FROM reviews WHERE series_id = $1) OR \
+         EXISTS(SELECT 1 FROM canonical_progress WHERE work_id = $1) OR \
+         EXISTS(SELECT 1 FROM comments WHERE target_type = 'series' AND target_id = $1) OR \
+         EXISTS(SELECT 1 FROM user_activity WHERE target_type = 'series' AND target_id = $1) OR \
+         EXISTS(SELECT 1 FROM notifications WHERE target_type = 'series' AND target_id = $1)",
+    )
+    .bind(work_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if claimed {
+        tx.commit().await?;
+        return Ok(());
+    }
     // Explicitly remove work_cover_issue as well: its suppression record must not
     // survive the work and exclude a later recycled id from the cover crawl. Keep
     // this list aligned with merge_works and purge_foreign_language_suwayomi.
@@ -3098,12 +3449,12 @@ pub async fn delete_work_cascade(pool: &Database, work_id: &str) -> Result<()> {
         } else {
             "work_id"
         };
-        sqlx::query(&format!("DELETE FROM {table} WHERE {col} = ?"))
+        sqlx::query(&format!("DELETE FROM {table} WHERE {col} = $1"))
             .bind(work_id)
             .execute(&mut *tx)
             .await?;
     }
-    sqlx::query("DELETE FROM work WHERE id = ?")
+    sqlx::query("DELETE FROM work WHERE id = $1")
         .bind(work_id)
         .execute(&mut *tx)
         .await?;
@@ -3115,7 +3466,7 @@ pub async fn delete_work_cascade(pool: &Database, work_id: &str) -> Result<()> {
 /// re-sync overwrites each `(work, lang)` description in place and `INSERT OR
 /// IGNORE`s credits (names never mutate, they only accumulate).
 async fn insert_descriptions_and_credits(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     work_id: &str,
     input: &WorkInput,
 ) -> Result<()> {
@@ -3124,7 +3475,7 @@ async fn insert_descriptions_and_credits(
             continue;
         }
         sqlx::query(
-            "INSERT INTO work_description (work_id, lang, description) VALUES (?, ?, ?) \
+            "INSERT INTO work_description (work_id, lang, description) VALUES ($1, $2, $3) \
              ON CONFLICT(work_id, lang) DO UPDATE SET description = excluded.description",
         )
         .bind(work_id)
@@ -3137,12 +3488,14 @@ async fn insert_descriptions_and_credits(
         if name.trim().is_empty() || !matches!(role.as_str(), "author" | "artist") {
             continue;
         }
-        sqlx::query("INSERT OR IGNORE INTO work_credit (work_id, role, name) VALUES (?, ?, ?)")
-            .bind(work_id)
-            .bind(role)
-            .bind(name.trim())
-            .execute(&mut **tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO work_credit (work_id, role, name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(work_id)
+        .bind(role)
+        .bind(name.trim())
+        .execute(&mut **tx)
+        .await?;
     }
     // F2: covers ACCUMULATE (INSERT OR IGNORE — never delete), so the recurring
     // sweep (which only knows the primary) can't wipe an already-enriched full
@@ -3152,14 +3505,14 @@ async fn insert_descriptions_and_credits(
             continue;
         }
         sqlx::query(
-            "INSERT OR IGNORE INTO work_cover (work_id, cover_file_name, lang, volume, is_primary) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO work_cover (work_id, cover_file_name, lang, volume, is_primary) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
         )
         .bind(work_id)
         .bind(&c.file_name)
         .bind(&c.lang)
         .bind(&c.volume)
-        .bind(c.is_primary as i64)
+        .bind(c.is_primary)
         .execute(&mut **tx)
         .await?;
     }
@@ -3180,15 +3533,16 @@ async fn insert_descriptions_and_credits(
 /// (work_id, tag): a tag the admin ALSO curated collides. Ignoring keeps the admin's row
 /// — and crucially its `source = 'admin'` — so the work stays on the curated tier
 /// instead of being quietly demoted to the upstream one.
+/// Caller holds the owning work through the complete metadata replacement.
 async fn replace_source_tags(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     work_id: &str,
     tags: &[String],
 ) -> Result<()> {
     // Deletes UNCONDITIONALLY rather than early-returning on an empty list. An empty
     // upstream tag list is a legitimate state, and a work whose tags were all removed
     // upstream must end up with none here — an early return would keep them forever.
-    sqlx::query("DELETE FROM work_tag WHERE work_id = ? AND source = 'mangadex'")
+    sqlx::query("DELETE FROM work_tag WHERE work_id = $1 AND source = 'mangadex'")
         .bind(work_id)
         .execute(&mut **tx)
         .await?;
@@ -3200,8 +3554,8 @@ async fn replace_source_tags(
         // `tag_key` (migration 0106) at write time, so a freshly ingested tag is filterable
         // without waiting for the rebuild's `tags::fill_tag_keys` safety net.
         sqlx::query(
-            "INSERT OR IGNORE INTO work_tag (work_id, tag, ord, source, tag_key) \
-             VALUES (?, ?, ?, 'mangadex', ?)",
+            "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) \
+             VALUES ($1, $2, $3, 'mangadex', $4) ON CONFLICT DO NOTHING",
         )
         .bind(work_id)
         .bind(tag)
@@ -3215,28 +3569,28 @@ async fn replace_source_tags(
 
 /// Refresh imported fields without changing admin overrides or historical IDs.
 async fn replace_mangadex_details(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     work_id: &str,
     input: &WorkInput,
 ) -> Result<()> {
     replace_source_tags(tx, work_id, &input.tags).await?;
     for tag in &input.tag_details {
-        sqlx::query("UPDATE work_tag SET tag_id = ?, tag_group = ? WHERE work_id = ? AND tag = ? AND source = 'mangadex'")
+        sqlx::query("UPDATE work_tag SET tag_id = $1, tag_group = $2 WHERE work_id = $3 AND tag = $4 AND source = 'mangadex'")
             .bind(&tag.id).bind(&tag.group).bind(work_id).bind(&tag.name)
             .execute(&mut **tx).await?;
     }
-    sqlx::query("DELETE FROM work_tracker_link WHERE work_id = ?")
+    sqlx::query("DELETE FROM work_tracker_link WHERE work_id = $1")
         .bind(work_id)
         .execute(&mut **tx)
         .await?;
     for (provider, external_id) in input.external_ids.iter().chain(&input.official_links) {
         if crate::mangadex::tracker_url(provider, external_id).is_some() {
-            sqlx::query("INSERT OR REPLACE INTO work_tracker_link (work_id, provider, external_id) VALUES (?, ?, ?)")
+            sqlx::query("INSERT INTO work_tracker_link (work_id, provider, external_id) VALUES ($1, $2, $3) ON CONFLICT(work_id, provider) DO UPDATE SET external_id = excluded.external_id")
                 .bind(work_id).bind(provider).bind(external_id).execute(&mut **tx).await?;
         }
     }
-    sqlx::query("UPDATE work SET mangadex_details_synced_at = ? WHERE id = ?")
-        .bind(Utc::now().to_rfc3339())
+    sqlx::query("UPDATE work SET mangadex_details_synced_at = $1 WHERE id = $2")
+        .bind(Utc::now())
         .bind(work_id)
         .execute(&mut **tx)
         .await?;
@@ -3251,22 +3605,38 @@ pub async fn refresh_mangadex_details(
     work_id: &str,
     input: &WorkInput,
 ) -> Result<()> {
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    replace_mangadex_details(&mut tx, work_id, input).await?;
-    tx.commit().await?;
-    Ok(())
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin_with("BEGIN").await?;
+        let Some(resolved) = guards::resolve_work_optional(&mut tx, work_id).await? else {
+            return Ok(());
+        };
+        let work_id = resolved.as_str();
+        replace_mangadex_details(&mut tx, work_id, input).await?;
+        tx.commit().await?;
+        Ok(())
+    })
+    .await
 }
 
 /// Load a work's cover set (F2), primary first then by volume/file name.
 pub async fn load_work_covers(pool: &Database, work_id: &str) -> Result<Vec<Cover>> {
-    let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, i64)>(
-        "SELECT cover_file_name, lang, volume, is_primary FROM work_cover WHERE work_id = ? \
-         ORDER BY is_primary DESC, \
-                  CAST(COALESCE(NULLIF(volume, ''), '0') AS REAL), cover_file_name",
+    let mut rows = crate::db_types::query_tuple::<(String, Option<String>, Option<String>, i64)>(
+        "SELECT cover_file_name, lang, volume, is_primary FROM work_cover WHERE work_id = $1",
     )
     .bind(work_id)
     .fetch_all(pool)
     .await?;
+    // Preserve SQLite REAL's float64 numeric-prefix ordering, including malformed
+    // volume text and over/underflow. PostgreSQL text casts are strict (REAL is float32).
+    rows.sort_by(|a, b| {
+        b.3.cmp(&a.3)
+            .then_with(|| {
+                sqlite_real_prefix(a.2.as_deref())
+                    .partial_cmp(&sqlite_real_prefix(b.2.as_deref()))
+                    .unwrap()
+            })
+            .then_with(|| a.0.cmp(&b.0))
+    });
     Ok(rows
         .into_iter()
         .map(|(file_name, lang, volume, is_primary)| Cover {
@@ -3278,8 +3648,47 @@ pub async fn load_work_covers(pool: &Database, work_id: &str) -> Result<Vec<Cove
         .collect())
 }
 
+/// SQLite CAST(text AS REAL) consumes a signed numeric prefix and returns zero
+/// when none exists. This is used only to preserve cover volume ordering.
+pub(crate) fn sqlite_real_prefix(value: Option<&str>) -> f64 {
+    let value = value
+        .unwrap_or("")
+        .trim_start_matches([' ', '\t', '\n', '\r', '\u{000b}', '\u{000c}']);
+    let bytes = value.as_bytes();
+    let mut i = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let mut digits = 0;
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+        digits += 1;
+    }
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return 0.0;
+    }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        let mut end = i + 1;
+        if matches!(bytes.get(end), Some(b'+' | b'-')) {
+            end += 1;
+        }
+        let first_digit = end;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+        if end > first_digit {
+            i = end;
+        }
+    }
+    value[..i].parse().unwrap_or(0.0)
+}
+
 async fn insert_aliases(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     work_id: &str,
     aliases: &[Alias],
 ) -> Result<bool> {
@@ -3290,8 +3699,8 @@ async fn insert_aliases(
             continue;
         }
         let inserted = sqlx::query(
-            "INSERT OR IGNORE INTO work_alias (id, work_id, normalized_title, raw_title, lang) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO work_alias (id, work_id, normalized_title, raw_title, lang) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
         )
         .bind(new_id("al_"))
         .bind(work_id)
@@ -3318,19 +3727,24 @@ pub async fn add_work_alias(pool: &Database, work_id: &str, raw_title: &str) -> 
     if norm.is_empty() {
         return Ok(String::new());
     }
-    let mut tx = pool.begin().await?;
-    insert_aliases(
-        &mut tx,
-        work_id,
-        &[Alias {
-            raw: raw.to_string(),
-            lang: None,
-        }],
-    )
-    .await?;
-    upsert_browse_work(&mut tx, work_id).await?;
-    tx.commit().await?;
-    Ok(norm)
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        let resolved = guards::resolve_work(&mut tx, work_id).await?;
+        let work_id = resolved.as_str();
+        insert_aliases(
+            &mut tx,
+            work_id,
+            &[Alias {
+                raw: raw.to_string(),
+                lang: None,
+            }],
+        )
+        .await?;
+        upsert_browse_work(&mut tx, work_id).await?;
+        tx.commit().await?;
+        Ok(norm.clone())
+    })
+    .await
 }
 
 /// Choose the best survivor among a set of works being merged together: a
@@ -3343,9 +3757,21 @@ pub async fn pick_survivor(pool: &Database, work_ids: &[String]) -> Result<Strin
     if work_ids.len() == 1 {
         return Ok(work_ids[0].clone());
     }
-    let placeholders = std::iter::repeat_n("?", work_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let mut conn = pool.acquire().await?;
+    pick_survivor_on(&mut conn, work_ids).await
+}
+
+/// [`pick_survivor`] on the caller's connection. Read only; takes no lock and does not
+/// commit. The choice counts each work's sources, so it is stable only while the caller
+/// holds the work locks of every id in `work_ids`.
+pub async fn pick_survivor_on(
+    conn: &mut sqlx::PgConnection,
+    work_ids: &[String],
+) -> Result<String> {
+    if work_ids.len() == 1 {
+        return Ok(work_ids[0].clone());
+    }
+    let placeholders = crate::sql_params::placeholders(1, work_ids.len());
     let sql = format!(
         "SELECT w.id FROM work w WHERE w.id IN ({placeholders}) \
          ORDER BY (SELECT COUNT(*) FROM source_series ss \
@@ -3353,11 +3779,11 @@ pub async fn pick_survivor(pool: &Database, work_ids: &[String]) -> Result<Strin
                   (SELECT COUNT(*) FROM source_series ss WHERE ss.work_id = w.id) DESC, \
                   w.id ASC LIMIT 1"
     );
-    let mut q = sqlx::query_scalar::<_, String>(&sql);
+    let mut q = crate::db_types::query_scalar::<String>(&sql);
     for id in work_ids {
         q = q.bind(id);
     }
-    Ok(q.fetch_one(pool).await?)
+    Ok(q.fetch_one(&mut *conn).await?)
 }
 
 /// A source-owned `work` column an admin may set by hand (migration 0112). The value is
@@ -3391,8 +3817,8 @@ impl PinnedField {
     /// SQL for the bound pin value in the column's own type.
     fn typed_value(self) -> &'static str {
         match self {
-            PinnedField::Year => "CAST(? AS INTEGER)",
-            _ => "?",
+            PinnedField::Year => "sqlite_integer_pin($1)",
+            _ => "$1",
         }
     }
 }
@@ -3401,49 +3827,62 @@ impl PinnedField {
 /// now and keeps it across later syncs. The source's own value is remembered so
 /// [`unpin_work_field`] can restore it.
 pub async fn pin_work_field(
-    conn: &mut sqlx::SqliteConnection,
+    conn: &mut sqlx::PgConnection,
     work_id: &str,
     field: PinnedField,
     value: Option<&str>,
 ) -> Result<()> {
+    use sqlx::Connection;
+    let mut unit = conn.begin().await?;
+    let conn = &mut *unit;
+    guards::work(conn, work_id).await?;
+    // Every source UPDATE already locks work before its BEFORE pin trigger can lock
+    // work_field_pin. Admin pin writers must take the same parent-first order.
+
     let column = field.column();
     let now = Utc::now().to_rfc3339();
     // The pin first: with it in place the UPDATE below already agrees with it, so the
     // restore trigger stays quiet. A re-pin keeps the remembered source value.
     sqlx::query(&format!(
         "INSERT INTO work_field_pin (work_id, field, value, source_value, pinned_at) \
-         VALUES (?1, ?2, ?3, (SELECT CAST({column} AS TEXT) FROM work WHERE id = ?1), ?4) \
+         VALUES ($1, $2, $3, (SELECT CAST({column} AS TEXT) FROM work WHERE id = $1), $4) \
          ON CONFLICT(work_id, field) DO UPDATE SET \
              value = excluded.value, pinned_at = excluded.pinned_at"
     ))
     .bind(work_id)
     .bind(column)
     .bind(value)
-    .bind(&now)
+    .bind(crate::db_types::date(&now)?)
     .execute(&mut *conn)
     .await?;
     sqlx::query(&format!(
-        "UPDATE work SET {column} = {}, updated_at = ? WHERE id = ?",
+        "UPDATE work SET {column} = {}, updated_at = $2 WHERE id = $3",
         field.typed_value()
     ))
     .bind(value)
-    .bind(&now)
+    .bind(crate::db_types::date(&now)?)
     .bind(work_id)
     .execute(&mut *conn)
     .await?;
+    unit.commit().await?;
     Ok(())
 }
 
 /// Remove a pin and give the column back to the source: it takes the last value a source
 /// wrote, and later syncs update it again. A no-op for a field that is not pinned.
 pub async fn unpin_work_field(
-    conn: &mut sqlx::SqliteConnection,
+    conn: &mut sqlx::PgConnection,
     work_id: &str,
     field: PinnedField,
 ) -> Result<()> {
+    use sqlx::Connection;
+    let mut unit = conn.begin().await?;
+    let conn = &mut *unit;
+    guards::work(conn, work_id).await?;
+
     let column = field.column();
-    let pinned: Option<Option<String>> = sqlx::query_scalar(
-        "DELETE FROM work_field_pin WHERE work_id = ? AND field = ? RETURNING source_value",
+    let pinned: Option<Option<String>> = crate::db_types::query_scalar(
+        "DELETE FROM work_field_pin WHERE work_id = $1 AND field = $2 RETURNING source_value",
     )
     .bind(work_id)
     .bind(column)
@@ -3453,25 +3892,26 @@ pub async fn unpin_work_field(
         return Ok(());
     };
     sqlx::query(&format!(
-        "UPDATE work SET {column} = {}, updated_at = ? WHERE id = ?",
+        "UPDATE work SET {column} = {}, updated_at = $2 WHERE id = $3",
         field.typed_value()
     ))
     .bind(source_value)
-    .bind(Utc::now().to_rfc3339())
+    .bind(Utc::now())
     .bind(work_id)
     .execute(&mut *conn)
     .await?;
+    unit.commit().await?;
     Ok(())
 }
 
 /// The `work` columns an admin has pinned on this work.
 pub async fn pinned_work_fields(pool: &Database, work_id: &str) -> Result<Vec<String>> {
-    Ok(
-        sqlx::query_scalar("SELECT field FROM work_field_pin WHERE work_id = ? ORDER BY field")
-            .bind(work_id)
-            .fetch_all(pool)
-            .await?,
+    Ok(crate::db_types::query_scalar(
+        "SELECT field FROM work_field_pin WHERE work_id = $1 ORDER BY field",
     )
+    .bind(work_id)
+    .fetch_all(pool)
+    .await?)
 }
 
 /// Admin: remove an alt-title from a work — matched by its normalized key OR its exact
@@ -3480,34 +3920,39 @@ pub async fn pinned_work_fields(pool: &Database, work_id: &str) -> Result<Vec<St
 pub async fn remove_work_alias(pool: &Database, work_id: &str, raw_title: &str) -> Result<()> {
     let raw = raw_title.trim();
     let norm = normalize_title(raw);
-    let mut tx = pool.begin().await?;
-    sqlx::query(
-        "DELETE FROM work_alias WHERE work_id = ? AND (normalized_title = ? OR raw_title = ?)",
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        let resolved = guards::resolve_work(&mut tx, work_id).await?;
+        let work_id = resolved.as_str();
+        sqlx::query(
+        "DELETE FROM work_alias WHERE work_id = $1 AND (normalized_title = $2 OR raw_title = $3)",
     )
     .bind(work_id)
     .bind(&norm)
     .bind(raw)
     .execute(&mut *tx)
     .await?;
-    rebuild_work_alias_tokens(&mut tx, work_id).await?;
-    upsert_browse_work(&mut tx, work_id).await?;
-    tx.commit().await?;
-    Ok(())
+        rebuild_work_alias_tokens(&mut tx, work_id).await?;
+        upsert_browse_work(&mut tx, work_id).await?;
+        tx.commit().await?;
+        Ok(())
+    })
+    .await
 }
 
 /// Rebuild the `work_alias_token` inverted index for one work from its current alias
 /// set. Used after an alias removal, where a shared token might still be carried by
 /// another remaining alias — a blind per-token delete would corrupt the index.
 async fn rebuild_work_alias_tokens(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     work_id: &str,
 ) -> Result<()> {
-    sqlx::query("DELETE FROM work_alias_token WHERE work_id = ?")
+    sqlx::query("DELETE FROM work_alias_token WHERE work_id = $1")
         .bind(work_id)
         .execute(&mut **tx)
         .await?;
     let norms: Vec<String> =
-        sqlx::query_scalar("SELECT normalized_title FROM work_alias WHERE work_id = ?")
+        crate::db_types::query_scalar("SELECT normalized_title FROM work_alias WHERE work_id = $1")
             .bind(work_id)
             .fetch_all(&mut **tx)
             .await?;
@@ -3519,7 +3964,7 @@ async fn rebuild_work_alias_tokens(
 
 #[allow(clippy::too_many_arguments)]
 async fn ensure_source_series(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     work_id: &str,
     source_type: &str,
     source_id: &str,
@@ -3528,38 +3973,42 @@ async fn ensure_source_series(
     is_nsfw: bool,
     now: &str,
 ) -> Result<String> {
-    let id = sqlx::query_scalar::<_, String>(
-        "INSERT INTO source_series \
-           (id, work_id, source_type, source_id, source_key, source_url, is_nsfw, last_seen, created_at) \
-         VALUES (?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?) \
-         ON CONFLICT(source_key) WHERE source_type = 'suwayomi' DO UPDATE SET \
-           last_seen = excluded.last_seen, is_nsfw = excluded.is_nsfw, \
-           source_id = COALESCE(excluded.source_id, source_series.source_id), \
-           source_url = COALESCE(excluded.source_url, source_series.source_url) \
-         ON CONFLICT(source_type, source_key) WHERE source_id IS NULL DO UPDATE SET \
-           last_seen = excluded.last_seen, is_nsfw = excluded.is_nsfw, \
-           source_url = COALESCE(excluded.source_url, source_series.source_url) \
-         ON CONFLICT(source_type, source_id, source_key) DO UPDATE SET \
-           last_seen = excluded.last_seen, is_nsfw = excluded.is_nsfw, \
-           source_url = COALESCE(excluded.source_url, source_series.source_url) \
-         RETURNING id",
-    )
-    .bind(new_id("ss_"))
-    .bind(work_id)
-    .bind(source_type)
-    .bind(source_id)
-    .bind(source_key)
-    .bind(source_url)
-    .bind(is_nsfw as i64)
-    .bind(now)
-    .bind(now)
-    .fetch_one(&mut **tx)
-    .await?;
+    let conflict = if source_type == "suwayomi" {
+        "(source_key) WHERE source_type = 'suwayomi'"
+    } else if source_id.is_empty() {
+        "(source_type, source_key) WHERE source_id IS NULL"
+    } else {
+        "(source_type, source_id, source_key)"
+    };
+    let source_update = if source_type == "suwayomi" {
+        "source_id = COALESCE(excluded.source_id, source_series.source_id),"
+    } else {
+        ""
+    };
+    let sql = format!("INSERT INTO source_series \
+        (id, work_id, source_type, source_id, source_key, source_url, is_nsfw, last_seen, created_at) \
+        VALUES ($1,$2,$3,NULLIF($4,''),$5,$6,$7,$8,$9) \
+        ON CONFLICT {conflict} DO UPDATE SET last_seen = excluded.last_seen, \
+        is_nsfw = excluded.is_nsfw, {source_update} \
+        source_url = COALESCE(excluded.source_url, source_series.source_url) RETURNING id");
+    let id = crate::db_types::query_scalar::<String>(&sql)
+        .bind(new_id("ss_"))
+        .bind(work_id)
+        .bind(source_type)
+        .bind(source_id)
+        .bind(source_key)
+        .bind(source_url)
+        .bind(is_nsfw)
+        .bind(crate::db_types::date(now)?)
+        .bind(crate::db_types::date(now)?)
+        .fetch_one(&mut **tx)
+        .await?;
     Ok(id)
 }
 
 /// Public, non-transactional variant of `ensure_source_series` for the add flow.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub async fn upsert_source_series(
     pool: &Database,
     work_id: &str,
@@ -3569,12 +4018,172 @@ pub async fn upsert_source_series(
     source_url: Option<&str>,
     is_nsfw: bool,
 ) -> Result<String> {
+    crate::db::retry_transaction(|| async {
+        // Natural-key and policy guards precede both proposed and stored parents. The
+        // policy key is shared among claims and exclusive for a pin or an outage.
+        let mut tx = pool.begin_with("BEGIN").await?;
+        guards::lock_source_claim(
+            &mut tx,
+            &guards::source_identity_keys(source_type, source_id, source_key),
+            source_id,
+        )
+        .await?;
+        let id = upsert_source_series_on(
+            &mut tx,
+            work_id,
+            source_type,
+            source_id,
+            source_key,
+            source_url,
+            is_nsfw,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    })
+    .await
+}
+
+/// The advisory keys of one source claim: the source's natural key (and Suwayomi's
+/// global key) plus the source policy key that an admin NSFW pin of the source takes.
+/// Unsorted; pass them in the unit's single `locks::advisory` call.
+// Used by callers that build one larger unit around the `_on` helper (GraphQL). The
+// facades of this module take the identity keys and a SHARED policy key instead.
+pub fn source_claim_keys(
+    source_type: &str,
+    source_id: &str,
+    source_key: &str,
+) -> Vec<crate::locks::AdvisoryKey> {
+    guards::source_keys(source_type, source_id, source_key)
+}
+
+const SOURCE_CLAIM_LOOKUP: &str = "SELECT id, work_id FROM source_series WHERE source_type = $1 AND source_key = $3 AND (source_type = 'suwayomi' OR source_id IS NOT DISTINCT FROM NULLIF($2, ''))";
+/// Find the mapping and authoritative work for a source key on the caller's connection.
+/// Read only; stable while the caller holds the source identity keys.
+pub async fn find_source_series_on(
+    conn: &mut sqlx::PgConnection,
+    source_type: &str,
+    source_id: &str,
+    source_key: &str,
+) -> Result<Option<(String, String)>> {
+    Ok(sqlx::query_as(SOURCE_CLAIM_LOOKUP)
+        .bind(source_type)
+        .bind(source_id)
+        .bind(source_key)
+        .fetch_optional(&mut *conn)
+        .await?)
+}
+
+const WORK_REDIRECT_TARGET: &str =
+    "SELECT COALESCE((SELECT new_id FROM work_redirect WHERE old_id = $1), $1)";
+
+/// The works one source claim locks: the proposed work after following its redirect,
+/// and the work that already owns this source key, if any. Read only; takes no lock and
+/// does not commit. A unit that touches several works calls this to learn every work id
+/// before it locks them all in one sorted `locks::lock_works` call.
+pub async fn source_claim_works_on(
+    conn: &mut sqlx::PgConnection,
+    work_id: &str,
+    source_type: &str,
+    source_id: &str,
+    source_key: &str,
+) -> Result<Vec<String>> {
+    let existing: Option<(String, String)> = sqlx::query_as(SOURCE_CLAIM_LOOKUP)
+        .bind(source_type)
+        .bind(source_id)
+        .bind(source_key)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let proposed: String = sqlx::query_scalar(WORK_REDIRECT_TARGET)
+        .bind(work_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    let mut works = vec![proposed];
+    works.extend(existing.map(|(_, owner)| owner));
+    works.sort();
+    works.dedup();
+    Ok(works)
+}
+
+/// [`upsert_source_series`] inside the caller's transaction. Never commits and never
+/// retries: the caller owns BEGIN through COMMIT and wraps that whole unit in
+/// `db::retry_transaction`.
+///
+/// Guards the CALLER must already hold: every key of [`source_claim_keys`] for this
+/// source, taken in the unit's single `locks::advisory` call. This function then locks
+/// the works of [`source_claim_works_on`] in sorted order (`FOR NO KEY UPDATE`), re-reads
+/// the stored owner and the redirect, and returns `locks::RestartTransaction` if either
+/// changed while it waited; it then locks the stored source mapping. If the unit locks
+/// any other work, the caller must have locked the [`source_claim_works_on`] set with
+/// those works in sorted order first.
+///
+/// A source key that is already claimed stays with its stored owner: the returned id is
+/// that mapping and `work_id` is ignored for it. Read the mapping's `work_id` back to
+/// learn the authoritative work.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_source_series_on(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    work_id: &str,
+    source_type: &str,
+    source_id: &str,
+    source_key: &str,
+    source_url: Option<&str>,
+    is_nsfw: bool,
+) -> Result<String> {
+    guards::assert_source_claim_held(
+        tx,
+        &guards::source_identity_keys(source_type, source_id, source_key),
+        source_id,
+        "catalog::upsert_source_series_on",
+    )
+    .await?;
     let now = Utc::now().to_rfc3339();
-    // IMMEDIATE: `ensure_source_series` upserts and then READS the row back, so a
-    // DEFERRED start can land in the un-retryable SQLITE_BUSY_SNAPSHOT class.
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let existing: Option<(String, String)> = sqlx::query_as(SOURCE_CLAIM_LOOKUP)
+        .bind(source_type)
+        .bind(source_id)
+        .bind(source_key)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let proposed: String = sqlx::query_scalar(WORK_REDIRECT_TARGET)
+        .bind(work_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let mut works = vec![proposed.clone()];
+    if let Some((_, owner)) = &existing {
+        works.push(owner.clone());
+    }
+    let locked = crate::locks::lock_works(tx, &works).await?;
+    let current: Option<(String, String)> = sqlx::query_as(SOURCE_CLAIM_LOOKUP)
+        .bind(source_type)
+        .bind(source_id)
+        .bind(source_key)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let after_redirect: String = sqlx::query_scalar(WORK_REDIRECT_TARGET)
+        .bind(work_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    if current != existing || after_redirect != proposed {
+        return Err(crate::locks::RestartTransaction.into());
+    }
+    if !locked.missing.is_empty() {
+        anyhow::bail!("no such work: {}", locked.missing.join(", "));
+    }
+    if let Some((ssid, _)) = &existing {
+        lock_discovered_sources(tx, std::slice::from_ref(ssid)).await?;
+    }
+    let work_id = existing
+        .as_ref()
+        .map(|(_, owner)| owner.as_str())
+        .unwrap_or(&proposed);
+    let pinned: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM source_nsfw_pin WHERE source_id = $1)")
+            .bind(source_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    guards::held().await;
     let id = ensure_source_series(
-        &mut tx,
+        tx,
         work_id,
         source_type,
         source_id,
@@ -3584,12 +4193,20 @@ pub async fn upsert_source_series(
         &now,
     )
     .await?;
-    let linked_work: String = sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
-        .bind(&id)
-        .fetch_one(&mut *tx)
+    let linked_work: String =
+        crate::db_types::query_scalar("SELECT work_id FROM source_series WHERE id = $1")
+            .bind(&id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if pinned {
+        sqlx::query(
+            "UPDATE work SET is_nsfw_override = TRUE WHERE id = $1 AND is_nsfw_override IS NULL",
+        )
+        .bind(&linked_work)
+        .execute(&mut **tx)
         .await?;
-    upsert_browse_work(&mut tx, &linked_work).await?;
-    tx.commit().await?;
+    }
+    upsert_browse_work(tx, &linked_work).await?;
     Ok(id)
 }
 
@@ -3619,7 +4236,7 @@ pub async fn upsert_source_extension(
     sqlx::query(
         "INSERT INTO source_extension \
            (source_id, pkg_name, repo_url, apk_name, version_code, lang, is_nsfw, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          ON CONFLICT(source_id) DO UPDATE SET \
            pkg_name = excluded.pkg_name, repo_url = excluded.repo_url, \
            apk_name = excluded.apk_name, version_code = excluded.version_code, \
@@ -3631,8 +4248,8 @@ pub async fn upsert_source_extension(
     .bind(&input.apk_name)
     .bind(input.version_code)
     .bind(&input.lang)
-    .bind(input.is_nsfw as i64)
-    .bind(&now)
+    .bind(input.is_nsfw)
+    .bind(crate::db_types::date(&now)?)
     .execute(pool)
     .await?;
     Ok(())
@@ -3643,19 +4260,19 @@ pub async fn upsert_source_extension(
 /// an extension installed since the last record pass, an extension with no repo). That
 /// is "unknown", never "safe": the caller must ask the engine rather than default.
 pub async fn source_extension_nsfw(pool: &Database, source_id: &str) -> Result<Option<bool>> {
-    Ok(
-        sqlx::query_scalar::<_, i64>("SELECT is_nsfw FROM source_extension WHERE source_id = ?")
-            .bind(source_id)
-            .fetch_optional(pool)
-            .await?
-            .map(|v| v != 0),
+    Ok(crate::db_types::query_scalar::<i64>(
+        "SELECT is_nsfw FROM source_extension WHERE source_id = $1",
     )
+    .bind(source_id)
+    .fetch_optional(pool)
+    .await?
+    .map(|v| v != 0))
 }
 
 /// Whether an admin pinned this whole source adult (`markSourceNsfw`, migration 0114).
 pub async fn source_nsfw_pinned(pool: &Database, source_id: &str) -> Result<bool> {
     Ok(
-        sqlx::query_scalar::<_, i64>("SELECT 1 FROM source_nsfw_pin WHERE source_id = ?")
+        crate::db_types::query_scalar::<i64>("SELECT 1 FROM source_nsfw_pin WHERE source_id = $1")
             .bind(source_id)
             .fetch_optional(pool)
             .await?
@@ -3663,68 +4280,189 @@ pub async fn source_nsfw_pinned(pool: &Database, source_id: &str) -> Result<bool
     )
 }
 
-/// Set or clear the source pin and every linked work override atomically.
-/// Returns the number of affected works. A later ingest sees the same committed
-/// choice as existing works, even if another admin changes the pin concurrently.
+/// Works per transaction of [`set_source_nsfw_pin`].
+const SOURCE_PIN_CHUNK: i64 = 100;
+
+/// Set or clear the source pin and the override of every linked work.
+/// Returns the number of affected works.
+///
+/// NOT one transaction: a large source links thousands of works, and one transaction
+/// over all of them held every work lock (and the source policy key, which every claim
+/// of the source needs) for longer than a foreground writer's lock timeout. The works
+/// are taken in id order, [`SOURCE_PIN_CHUNK`] per transaction, and each transaction
+/// takes the policy key exclusively.
+///
+/// * The pin row is written by the FIRST transaction, together with the first chunk. A
+///   source of up to one chunk is therefore still all-or-nothing, and from that commit
+///   on every later ingest reads the new choice (a claim holds the policy key shared).
+/// * A failure in a later chunk leaves the pin row and the earlier chunks committed and
+///   returns the error. Calling again completes the rest: every statement is idempotent.
+/// * Another admin can change the choice between two chunks. Each later chunk re-reads
+///   the pin row under the policy key and STOPS when it no longer matches: the other
+///   call walks every work itself, so the last committed choice wins everywhere.
 pub async fn set_source_nsfw_pin(pool: &Database, source_id: &str, pinned: bool) -> Result<u64> {
-    crate::db::retry_transaction(|| async {
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        let changed = set_source_nsfw_pin_in(&mut tx, source_id, pinned).await?;
-        tx.commit().await?;
-        Ok(changed)
-    })
-    .await
+    let mut after: Option<String> = None;
+    let mut changed = 0;
+    loop {
+        let chunk = crate::db::retry_transaction(|| {
+            set_source_nsfw_pin_chunk(pool, source_id, pinned, after.as_deref())
+        })
+        .await?;
+        changed += chunk.changed;
+        let Some(last) = chunk.last else {
+            break;
+        };
+        after = Some(last);
+        #[cfg(test)]
+        guards::pause("source-pin-chunk").await;
+    }
+    Ok(changed)
 }
 
-async fn set_source_nsfw_pin_in(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+struct SourcePinChunk {
+    changed: u64,
+    /// The last work of a full chunk; `None` after the final chunk or a stop.
+    last: Option<String>,
+}
+
+/// One transaction of [`set_source_nsfw_pin`]: the works after `after` (`None` = the
+/// first chunk, which also writes the pin row).
+async fn set_source_nsfw_pin_chunk(
+    pool: &Database,
     source_id: &str,
     pinned: bool,
-) -> Result<u64> {
-    let now = Utc::now().to_rfc3339();
-    if pinned {
-        sqlx::query(
-            "INSERT INTO source_nsfw_pin (source_id, created_at) VALUES (?, ?) \
-             ON CONFLICT(source_id) DO NOTHING",
-        )
+    after: Option<&str>,
+) -> Result<SourcePinChunk> {
+    const WORKS: &str = "SELECT DISTINCT work_id FROM source_series \
+         WHERE source_type = 'suwayomi' AND source_id = $1 AND work_id > $2 \
+         ORDER BY work_id LIMIT $3";
+    let mut tx = pool.begin_with("BEGIN").await?;
+    crate::locks::advisory(
+        &mut tx,
+        &[crate::locks::AdvisoryKey::new(
+            crate::locks::KeyClass::SourcePolicy,
+            &[source_id],
+        )],
+    )
+    .await?;
+    if after.is_some() {
+        let current: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM source_nsfw_pin WHERE source_id = $1)")
+                .bind(source_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if current != pinned {
+            tx.rollback().await?;
+            return Ok(SourcePinChunk {
+                changed: 0,
+                last: None,
+            });
+        }
+    }
+    let cursor = after.unwrap_or("");
+    let works: Vec<String> = sqlx::query_scalar(WORKS)
         .bind(source_id)
-        .bind(&now)
-        .execute(&mut **tx)
+        .bind(cursor)
+        .bind(SOURCE_PIN_CHUNK)
+        .fetch_all(&mut *tx)
         .await?;
-    } else {
-        sqlx::query("DELETE FROM source_nsfw_pin WHERE source_id = ?")
+    crate::locks::lock_works(&mut tx, &works).await?;
+    let current: Vec<String> = sqlx::query_scalar(WORKS)
+        .bind(source_id)
+        .bind(cursor)
+        .bind(SOURCE_PIN_CHUNK)
+        .fetch_all(&mut *tx)
+        .await?;
+    if works != current {
+        return Err(crate::locks::RestartTransaction.into());
+    }
+    guards::held().await;
+    let now = Utc::now().to_rfc3339();
+    if after.is_none() {
+        if pinned {
+            sqlx::query(
+                "INSERT INTO source_nsfw_pin (source_id, created_at) VALUES ($1, $2) \
+                 ON CONFLICT(source_id) DO NOTHING",
+            )
             .bind(source_id)
-            .execute(&mut **tx)
+            .bind(crate::db_types::date(&now)?)
+            .execute(&mut *tx)
             .await?;
+        } else {
+            sqlx::query("DELETE FROM source_nsfw_pin WHERE source_id = $1")
+                .bind(source_id)
+                .execute(&mut *tx)
+                .await?;
+        }
     }
     // true pins the override; false returns it to the source-derived value.
-    let changed = sqlx::query(
-        "UPDATE work SET is_nsfw_override = ?, updated_at = ? \
-         WHERE id IN (SELECT work_id FROM source_series \
-                      WHERE source_type = 'suwayomi' AND source_id = ?)",
-    )
-    .bind(pinned.then_some(1_i64))
-    .bind(&now)
-    .bind(source_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(changed.rows_affected())
+    let changed =
+        sqlx::query("UPDATE work SET is_nsfw_override = $1, updated_at = $2 WHERE id = ANY($3)")
+            .bind(pinned.then_some(true))
+            .bind(crate::db_types::date(&now)?)
+            .bind(&works)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    for work in &works {
+        upsert_browse_work(&mut tx, work).await?;
+    }
+    for table in ["feed_updates", "feed_series_updates"] {
+        sqlx::query(&format!(
+            "UPDATE {table} f SET is_nsfw = COALESCE(w.is_nsfw_override, w.is_nsfw) \
+               FROM work w \
+              WHERE f.work_id = w.id AND w.id = ANY($1) \
+                AND f.is_nsfw IS DISTINCT FROM COALESCE(w.is_nsfw_override, w.is_nsfw)"
+        ))
+        .bind(&works)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(SourcePinChunk {
+        changed,
+        last: (works.len() as i64 == SOURCE_PIN_CHUNK)
+            .then(|| works.last().cloned())
+            .flatten(),
+    })
 }
 
 /// Mark the works behind these MangaDex ids as metadata-attempted (H1), so the
 /// backfill advances past ids MangaDex didn't return. Idempotent; a no-op for ids
 /// with no `mangadex` source_series.
+#[cfg(test)]
 pub async fn mark_metadata_synced(pool: &Database, mangadex_ids: &[String]) -> Result<()> {
+    // One autocommit statement for each id: no work lock outlives its own statement.
+    let started = std::time::Instant::now();
+    let acquired = pool.write().acquire().await;
+    crate::db::record_write_wait(started.elapsed());
+    let mut conn = acquired?;
+    mark_metadata_synced_on(&mut conn, mangadex_ids).await
+}
+
+/// [`mark_metadata_synced`] on the caller's connection. Never commits.
+///
+/// Each statement updates the work behind one MangaDex id and so takes that work's row
+/// lock implicitly, in the order of `mangadex_ids`. Guards the CALLER must already hold
+/// when `conn` is inside a transaction: the work locks of every work behind these ids
+/// (`locks::lock_works`, sorted, or `upsert_work_from_mangadex_on` for the same id
+/// earlier in the unit). Without them the implicit locks arrive in input order and can
+/// deadlock with a writer that locks works in sorted order. Outside a transaction (an
+/// autocommit connection) there is nothing to hold: every statement is its own unit.
+pub async fn mark_metadata_synced_on(
+    conn: &mut sqlx::PgConnection,
+    mangadex_ids: &[String],
+) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     for mid in mangadex_ids {
         sqlx::query(
-            "UPDATE work SET metadata_synced_at = ?, mangadex_details_synced_at = ? WHERE id IN \
-             (SELECT work_id FROM source_series WHERE source_type = 'mangadex' AND source_key = ?)",
+            "UPDATE work SET metadata_synced_at = $1, mangadex_details_synced_at = $2 WHERE id IN \
+             (SELECT work_id FROM source_series WHERE source_type = 'mangadex' AND source_key = $3)",
         )
-        .bind(&now)
-        .bind(&now)
+        .bind(crate::db_types::date(&now)?)
+        .bind(crate::db_types::date(&now)?)
         .bind(mid)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     }
     Ok(())
@@ -3732,16 +4470,32 @@ pub async fn mark_metadata_synced(pool: &Database, mangadex_ids: &[String]) -> R
 
 /// Mark the works behind these MangaDex ids as full-cover-fetched (F2), so the
 /// cover backfill advances past ids `/cover` returned nothing for. Idempotent.
+#[cfg(test)]
 pub async fn mark_covers_synced(pool: &Database, mangadex_ids: &[String]) -> Result<()> {
+    // One autocommit statement for each id: no work lock outlives its own statement.
+    let started = std::time::Instant::now();
+    let acquired = pool.write().acquire().await;
+    crate::db::record_write_wait(started.elapsed());
+    let mut conn = acquired?;
+    mark_covers_synced_on(&mut conn, mangadex_ids).await
+}
+
+/// [`mark_covers_synced`] on the caller's connection. Never commits. The caller-held
+/// guards are those of [`mark_metadata_synced_on`]: inside a transaction, the work locks
+/// of every work behind these ids must already be held.
+pub async fn mark_covers_synced_on(
+    conn: &mut sqlx::PgConnection,
+    mangadex_ids: &[String],
+) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     for mid in mangadex_ids {
         sqlx::query(
-            "UPDATE work SET covers_synced_at = ? WHERE id IN \
-             (SELECT work_id FROM source_series WHERE source_type = 'mangadex' AND source_key = ?)",
+            "UPDATE work SET covers_synced_at = $1 WHERE id IN \
+             (SELECT work_id FROM source_series WHERE source_type = 'mangadex' AND source_key = $2)",
         )
-        .bind(&now)
+        .bind(crate::db_types::date(&now)?)
         .bind(mid)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     }
     Ok(())
@@ -3759,15 +4513,16 @@ pub async fn mark_covers_synced(pool: &Database, mangadex_ids: &[String]) -> Res
 /// this is what wrongly hid One Piece / Chainsaw Man from anonymous viewers). Matches
 /// `genre_is_nsfw`'s own rule that "suggestive is kept SFW-visible". Migration 0053
 /// backfilled the historical over-flags; this guard stops them recurring.
-pub async fn mark_work_nsfw(pool: &Database, work_id: &str) -> Result<()> {
+/// Inside the caller's transaction, the caller must already hold the work row lock.
+pub async fn mark_work_nsfw_on(conn: &mut sqlx::PgConnection, work_id: &str) -> Result<()> {
     sqlx::query(
-        "UPDATE work SET is_nsfw = 1, updated_at = ? \
-         WHERE id = ? AND is_nsfw = 0 \
+        "UPDATE work SET is_nsfw = TRUE, updated_at = $1 \
+         WHERE id = $2 AND is_nsfw = FALSE \
            AND (content_rating IS NULL OR content_rating NOT IN ('safe', 'suggestive'))",
     )
-    .bind(Utc::now().to_rfc3339())
+    .bind(Utc::now())
     .bind(work_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -3814,7 +4569,7 @@ pub async fn merge_works(
 /// whereas deleting first could strip a live cover if the merge then rolled back.
 pub async fn merge_works_ex(
     pool: &Database,
-    covers: Option<&Database>,
+    covers: Option<&SqliteDatabase>,
     source_work: &str,
     target_work: &str,
 ) -> Result<MergeOutcome> {
@@ -3826,12 +4581,19 @@ pub async fn merge_works_ex(
 /// the decision cannot be invalidated between the two.
 #[derive(Debug, Clone, PartialEq, Eq, Default, sqlx::FromRow)]
 pub struct WorkIdentity {
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub primary_title: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalI64")]
     pub year: Option<i64>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub author: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub artist: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub original_language: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub description: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub cover_phash: Option<String>,
     /// Whether the work carried a MangaDex source. The gate refuses a loose title match
     /// between two anchored works, so a work gaining its anchor under the gate (another
@@ -3842,6 +4604,7 @@ pub struct WorkIdentity {
     /// (`removeSeriesAltTitle`) cannot leave a merge standing on evidence that is gone.
     /// Not a column: never read back, only verified.
     #[sqlx(skip)]
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub match_key: Option<String>,
 }
 
@@ -3864,7 +4627,7 @@ pub struct WorkIdentity {
 /// to the captured work, inside the transaction that claims and merges it.
 pub async fn merge_works_checked(
     pool: &Database,
-    covers: Option<&Database>,
+    covers: Option<&SqliteDatabase>,
     source_work: &str,
     target_work: &str,
     expected: Option<(&WorkIdentity, &WorkIdentity)>,
@@ -3874,9 +4637,10 @@ pub async fn merge_works_checked(
 
 /// An explicit approval claims its pending review and folds its original owner
 /// under one write transaction. Human approval does not need a metadata identity gate.
+#[cfg(test)]
 pub async fn merge_pending_candidate(
     pool: &Database,
-    covers: Option<&Database>,
+    covers: Option<&SqliteDatabase>,
     source_work: &str,
     target_work: &str,
     candidate_id: &str,
@@ -3894,9 +4658,10 @@ pub async fn merge_pending_candidate(
 
 /// Claim a waiting review and merge under the same write lock. A rejection or
 /// metadata edit that wins the lock prevents the automatic merge.
+#[cfg(test)]
 pub async fn merge_pending_candidate_checked(
     pool: &Database,
-    covers: Option<&Database>,
+    covers: Option<&SqliteDatabase>,
     source_work: &str,
     target_work: &str,
     expected: (&WorkIdentity, &WorkIdentity),
@@ -3913,9 +4678,191 @@ pub async fn merge_pending_candidate_checked(
     .await
 }
 
+#[derive(PartialEq)]
+struct MergeDiscovery {
+    users: Vec<String>,
+    keys: Vec<crate::locks::AdvisoryKey>,
+    sources: Vec<String>,
+}
+
+async fn merge_discovery(
+    conn: &mut sqlx::PgConnection,
+    works: &[&str],
+    planned_pairs: &[(&str, &str)],
+) -> Result<MergeDiscovery> {
+    let users: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM user_library WHERE series_id = ANY($1) \
+         UNION SELECT user_id FROM reviews WHERE series_id = ANY($1) \
+         UNION SELECT user_id FROM canonical_progress WHERE work_id = ANY($1) \
+         UNION SELECT user_id FROM suwayomi_progress WHERE series_id = ANY($1) \
+         UNION SELECT user_id FROM comments WHERE target_type = 'series' AND target_id = ANY($1) \
+         UNION SELECT user_id FROM user_activity WHERE target_type = 'series' AND target_id = ANY($1) \
+         UNION SELECT user_id FROM notifications WHERE target_type = 'series' AND target_id = ANY($1) \
+         ORDER BY user_id",
+    ).bind(works).fetch_all(&mut *conn).await?;
+    let external: Vec<(String, String)> = sqlx::query_as(
+        "SELECT provider, external_id FROM work_external_id WHERE work_id = ANY($1) ORDER BY provider, external_id",
+    ).bind(works).fetch_all(&mut *conn).await?;
+    let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT id, source_type, source_id, source_key FROM source_series WHERE work_id = ANY($1) ORDER BY id",
+    ).bind(works).fetch_all(&mut *conn).await?;
+    let reviews: Vec<(String, String)> = sqlx::query_as(
+        "SELECT ss.work_id, mc.candidate_work_id FROM merge_candidate mc \
+         JOIN source_series ss ON ss.id = mc.source_series_id \
+         WHERE ss.work_id = ANY($1) OR mc.candidate_work_id = ANY($1)",
+    )
+    .bind(works)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut keys: Vec<_> = external
+        .iter()
+        .map(|(p, e)| crate::locks::AdvisoryKey::external_identity(p, e))
+        .collect();
+    for (_, kind, source, key) in &rows {
+        keys.extend(guards::source_keys(
+            kind,
+            source.as_deref().unwrap_or(""),
+            key,
+        ));
+    }
+    for (left, right) in reviews {
+        keys.push(crate::locks::AdvisoryKey::review_pair(&left, &right));
+    }
+    for (left, right) in planned_pairs {
+        keys.push(crate::locks::AdvisoryKey::review_pair(left, right));
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    Ok(MergeDiscovery {
+        users: users.into_iter().map(|id| id.to_string()).collect(),
+        keys,
+        sources: rows.into_iter().map(|r| r.0).collect(),
+    })
+}
+
+async fn lock_discovered_sources(conn: &mut sqlx::PgConnection, ids: &[String]) -> Result<()> {
+    for id in ids {
+        sqlx::query("SELECT id FROM source_series WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn lock_discovered_sources_for_delete(
+    conn: &mut sqlx::PgConnection,
+    ids: &[String],
+) -> Result<()> {
+    for id in ids {
+        sqlx::query("SELECT id FROM source_series WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Take the complete guard set of a merge of `source` into `target`, in protocol order:
+/// every user with rows on either work, then every advisory key (external identities,
+/// source identities, review pairs including the planned pair), then both work rows in
+/// id order, then every source mapping of either work. Discovery is repeated once the
+/// locks are held and a difference restarts the transaction.
+///
+/// Only `source` is deleted by the merge, so only `source` takes the delete-capable
+/// `FOR UPDATE`. `target` keeps its key and takes `FOR NO KEY UPDATE`: that still
+/// excludes every guarded writer of the target, but it does not make a plain child
+/// insert that references the target (a statistics row, a cover issue, a credit) wait
+/// for the merge to commit.
+pub(crate) async fn lock_merge_inputs(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    source: &str,
+    target: &str,
+) -> Result<()> {
+    let works = [source, target];
+    let pairs = [(source, target)];
+    let discovered = merge_discovery(tx, &works, &pairs).await?;
+    #[cfg(test)]
+    guards::pause("merge-discovered").await;
+    crate::locks::lock_users(tx, &discovered.users).await?;
+    crate::locks::advisory(tx, &discovered.keys).await?;
+    let mut ordered = works;
+    ordered.sort_unstable();
+    for id in ordered {
+        if id == source {
+            crate::locks::lock_works_for_delete(tx, &[id]).await?;
+        } else {
+            crate::locks::lock_works(tx, &[id]).await?;
+        }
+    }
+    lock_discovered_sources(tx, &discovered.sources).await?;
+    if merge_discovery(tx, &works, &pairs).await? != discovered {
+        return Err(crate::locks::RestartTransaction.into());
+    }
+    guards::held().await;
+    Ok(())
+}
+
 async fn merge_works_guarded(
     pool: &Database,
-    covers: Option<&Database>,
+    covers: Option<&SqliteDatabase>,
+    source_work: &str,
+    target_work: &str,
+    expected: Option<(&WorkIdentity, &WorkIdentity)>,
+    candidate_id: Option<&str>,
+) -> Result<MergeOutcome> {
+    let outcome = crate::db::retry_transaction(|| {
+        merge_works_attempt(pool, source_work, target_work, expected, candidate_id)
+    })
+    .await?;
+    if let Some(covers) = covers {
+        if let Err(e) = reclaim_cover_blob(covers, source_work).await {
+            crate::db::observe_database_error(&e);
+            tracing::warn!(work_id = %source_work, error = %e, "merge: cover blob reclaim failed (leaked)");
+        }
+    }
+    Ok(outcome)
+}
+
+async fn merge_works_attempt(
+    pool: &Database,
+    source_work: &str,
+    target_work: &str,
+    expected: Option<(&WorkIdentity, &WorkIdentity)>,
+    candidate_id: Option<&str>,
+) -> Result<MergeOutcome> {
+    let mut tx = pool.begin_with("BEGIN").await?;
+    let outcome =
+        merge_works_guarded_on(&mut tx, source_work, target_work, expected, candidate_id).await?;
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+/// The whole guarded merge inside the caller's transaction: this is the
+/// transaction-taking form of [`merge_works_checked`] (`candidate_id = None`),
+/// [`merge_pending_candidate`] (`expected = None`) and
+/// [`merge_pending_candidate_checked`] (both). Never commits and never retries: the
+/// caller owns BEGIN through COMMIT and wraps that whole unit in `db::retry_transaction`.
+///
+/// It takes the complete guard set itself through [`lock_merge_inputs`] (users, the
+/// advisory keys of both works including the review pair, both work rows, every source
+/// mapping) and revalidates discovery under those locks, then runs [`merge_works_on`],
+/// which re-checks `expected`, the split and rejected-pair vetoes, and claims the
+/// pending `candidate_id` (a review that is no longer pending for this exact pair is an
+/// error, so two concurrent confirmations cannot both merge).
+///
+/// Guards the CALLER must already hold: none, and that is a REQUIREMENT, not a
+/// convenience. The guard set starts at the users tier, the first tier of the lock
+/// order after Membership, so this must be the first lock acquisition of the caller's
+/// transaction (a held Membership key is the only exception). A caller that needs other
+/// locks in the same unit takes them AFTER this returns and only if they sort after
+/// everything taken here; otherwise it must do that work in a separate transaction.
+///
+/// The losing work's cached cover lives in another database and is NOT reclaimed here.
+/// After the caller's COMMIT succeeds it must call [`reclaim_cover_blob`] for
+/// `source_work`, outside the retried transaction.
+pub async fn merge_works_guarded_on(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     source_work: &str,
     target_work: &str,
     expected: Option<(&WorkIdentity, &WorkIdentity)>,
@@ -3924,18 +4871,30 @@ async fn merge_works_guarded(
     if source_work == target_work {
         anyhow::bail!("cannot merge a work into itself");
     }
-    // IMMEDIATE, not DEFERRED: this transaction opens with two `SELECT id FROM work`
-    // reads and then writes across a dozen tables. A DEFERRED read-then-write upgrade
-    // fails with SQLITE_BUSY_SNAPSHOT (517), which `busy_timeout` structurally cannot
-    // retry (see `db::is_locked_error`) — and the dedup sweep propagates that error
-    // with `?`, aborting the whole pass partway. Taking the write lock up front makes
-    // the contention ordinary and absorbable.
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    // The guard set starts at the users tier, so nothing may be locked before it.
+    guards::assert_first_lock(tx, "catalog::merge_works_guarded_on").await?;
+    // Discovery is revalidated after the complete ordered guard set is acquired.
+    lock_merge_inputs(tx, source_work, target_work).await?;
+    merge_works_on(tx, source_work, target_work, expected, candidate_id).await
+}
+
+/// The merge itself. Never commits. Guards the CALLER must already hold: the complete
+/// set of [`lock_merge_inputs`] for this exact `(source_work, target_work)`, taken in
+/// this transaction. Prefer [`merge_works_guarded_on`], which takes them and then calls
+/// this; call this directly only to run more than one merge under one guard set.
+pub(crate) async fn merge_works_on(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    source_work: &str,
+    target_work: &str,
+    expected: Option<(&WorkIdentity, &WorkIdentity)>,
+    candidate_id: Option<&str>,
+) -> Result<MergeOutcome> {
     for id in [source_work, target_work] {
-        let exists: Option<String> = sqlx::query_scalar("SELECT id FROM work WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let exists: Option<String> =
+            crate::db_types::query_scalar("SELECT id FROM work WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut **tx)
+                .await?;
         if exists.is_none() {
             anyhow::bail!("no such work: {id}");
         }
@@ -3949,18 +4908,18 @@ async fn merge_works_guarded(
                         w.description, w.cover_phash, \
                         EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id \
                                 AND ss.source_type = 'mangadex') AS mangadex_anchored \
-                 FROM work w WHERE w.id = ?",
+                 FROM work w WHERE w.id = $1",
             )
             .bind(id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
             if let Some(key) = &want.match_key {
-                let still_named: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM work_alias WHERE work_id = ? AND match_key = ?)",
+                let still_named: bool = crate::db_types::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM work_alias WHERE work_id = $1 AND match_key = $2)",
                 )
                 .bind(id)
                 .bind(key)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await?;
                 if still_named {
                     now.match_key = Some(key.clone());
@@ -3973,29 +4932,29 @@ async fn merge_works_guarded(
     }
 
     if expected.is_some() {
-        let blocked: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM work_split WHERE work_a = MIN(?, ?) AND work_b = MAX(?, ?)) \
+        let blocked: bool = crate::db_types::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM work_split WHERE work_a = LEAST($1, $2) AND work_b = GREATEST($3, $4)) \
              OR EXISTS(SELECT 1 FROM merge_candidate mc JOIN source_series ss ON ss.id = mc.source_series_id \
-             WHERE mc.status = 'rejected' AND ((ss.work_id = ? AND mc.candidate_work_id = ?) \
-             OR (ss.work_id = ? AND mc.candidate_work_id = ?)))")
+             WHERE mc.status = 'rejected' AND ((ss.work_id = $5 AND mc.candidate_work_id = $6) \
+             OR (ss.work_id = $7 AND mc.candidate_work_id = $8)))")
             .bind(source_work).bind(target_work).bind(source_work).bind(target_work)
             .bind(source_work).bind(target_work).bind(target_work).bind(source_work)
-            .fetch_one(&mut *tx).await?;
+            .fetch_one(&mut **tx).await?;
         if blocked {
             anyhow::bail!("merge precondition failed: pair was rejected or split");
         }
     }
     if let Some(id) = candidate_id {
         let claim = sqlx::query(
-            "UPDATE merge_candidate SET status = 'confirmed', resolved_at = ? \
-             WHERE id = ? AND status = 'pending' AND candidate_work_id = ? \
-             AND source_series_id IN (SELECT id FROM source_series WHERE work_id = ?)",
+            "UPDATE merge_candidate SET status = 'confirmed', resolved_at = $1 \
+             WHERE id = $2 AND status = 'pending' AND candidate_work_id = $3 \
+             AND source_series_id IN (SELECT id FROM source_series WHERE work_id = $4)",
         )
-        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now())
         .bind(id)
         .bind(target_work)
         .bind(source_work)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         if claim.rows_affected() != 1 {
             anyhow::bail!("merge precondition failed: review is no longer pending for this pair");
@@ -4003,26 +4962,26 @@ async fn merge_works_guarded(
     }
 
     // Fold aliases (fresh ids; UNIQUE(work_id,normalized_title,lang) de-dupes).
-    let src_aliases = sqlx::query_as::<_, (String, String, Option<String>)>(
-        "SELECT normalized_title, raw_title, lang FROM work_alias WHERE work_id = ?",
+    let src_aliases = crate::db_types::query_tuple::<(String, String, Option<String>)>(
+        "SELECT normalized_title, raw_title, lang FROM work_alias WHERE work_id = $1",
     )
     .bind(source_work)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?;
     for (norm, raw, lang) in src_aliases {
         sqlx::query(
-            "INSERT OR IGNORE INTO work_alias (id, work_id, normalized_title, raw_title, lang) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO work_alias (id, work_id, normalized_title, raw_title, lang) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
         )
         .bind(new_id("al_"))
         .bind(target_work)
         .bind(&norm)
         .bind(&raw)
         .bind(&lang)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         // H9: fold the alias's word tokens into the target's inverted index too.
-        insert_alias_tokens(&mut tx, target_work, &norm).await?;
+        insert_alias_tokens(tx, target_work, &norm).await?;
     }
     // Fold external ids by RE-POINTING, not by insert-and-drop.
     //
@@ -4036,14 +4995,14 @@ async fn merge_works_guarded(
     // resolves that uuid through this exact table, so the next sync finds no mapping and
     // mints a BRAND-NEW work for it, silently undoing the merge and re-duplicating the
     // catalogue. An `UPDATE` cannot collide (the key is globally unique, so the target
-    // can never already hold a key the source holds); `OR IGNORE` is belt-and-braces.
-    sqlx::query("UPDATE OR IGNORE work_external_id SET work_id = ? WHERE work_id = ?")
+    // can never already hold a key the source holds).
+    sqlx::query("UPDATE work_external_id SET work_id = $1 WHERE work_id = $2")
         .bind(target_work)
         .bind(source_work)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-    sqlx::query("INSERT OR IGNORE INTO work_tracker_link (work_id, provider, external_id) SELECT ?, provider, external_id FROM work_tracker_link WHERE work_id = ? AND NOT EXISTS (SELECT 1 FROM work WHERE id = ? AND mangadex_details_synced_at IS NOT NULL)")
-        .bind(target_work).bind(source_work).bind(target_work).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO work_tracker_link (work_id, provider, external_id) SELECT $1, provider, external_id FROM work_tracker_link WHERE work_id = $2 AND NOT EXISTS (SELECT 1 FROM work WHERE id = $3 AND mangadex_details_synced_at IS NOT NULL) ON CONFLICT DO NOTHING")
+        .bind(target_work).bind(source_work).bind(target_work).execute(&mut **tx).await?;
     // Fold the source's METADATA child rows into the target instead of dropping them.
     // Every one of these tables is keyed by (work_id, …), so `INSERT OR IGNORE …
     // SELECT` adds only what the target is missing and the target's own row always
@@ -4051,35 +5010,35 @@ async fn merge_works_guarded(
     // picked the leaner survivor silently destroyed its localized descriptions, credit
     // list, cover set (109k rows catalogue-wide), curated tags and chapter overrides.
     sqlx::query(
-        "INSERT OR IGNORE INTO work_description (work_id, lang, description) \
-         SELECT ?, lang, description FROM work_description WHERE work_id = ?",
+        "INSERT INTO work_description (work_id, lang, description) \
+         SELECT $1, lang, description FROM work_description WHERE work_id = $2 ON CONFLICT DO NOTHING",
     )
     .bind(target_work)
     .bind(source_work)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     sqlx::query(
-        "INSERT OR IGNORE INTO work_credit (work_id, role, name) \
-         SELECT ?, role, name FROM work_credit WHERE work_id = ?",
+        "INSERT INTO work_credit (work_id, role, name) \
+         SELECT $1, role, name FROM work_credit WHERE work_id = $2 ON CONFLICT DO NOTHING",
     )
     .bind(target_work)
     .bind(source_work)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     // `is_primary` is forced to 0 for folded covers when the target already has a
     // primary — two primaries would make `load_work_covers`' ordering arbitrary.
     sqlx::query(
-        "INSERT OR IGNORE INTO work_cover (work_id, cover_file_name, lang, volume, is_primary) \
-         SELECT ?, cover_file_name, lang, volume, \
+        "INSERT INTO work_cover (work_id, cover_file_name, lang, volume, is_primary) \
+         SELECT $1, cover_file_name, lang, volume, \
                 CASE WHEN EXISTS (SELECT 1 FROM work_cover t \
-                                  WHERE t.work_id = ? AND t.is_primary = 1) \
-                     THEN 0 ELSE is_primary END \
-         FROM work_cover WHERE work_id = ?",
+                                  WHERE t.work_id = $2 AND t.is_primary = TRUE) \
+                     THEN FALSE ELSE is_primary END \
+         FROM work_cover WHERE work_id = $3",
     )
     .bind(target_work)
     .bind(target_work)
     .bind(source_work)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     // Folded tags are appended AFTER the target's own (ord is the admin's ordering,
     // and the two works numbered theirs independently from 0).
@@ -4091,27 +5050,27 @@ async fn merge_works_guarded(
     // tags — a blob no single work carries. Human curation is the only half worth
     // rescuing from a work that is about to stop existing.
     sqlx::query(
-        "INSERT OR IGNORE INTO work_tag (work_id, tag, ord, source, tag_key, tag_group) \
-         SELECT ?, tag, ord + (SELECT COALESCE(MAX(ord), -1) + 1 FROM work_tag WHERE work_id = ?), \
+        "INSERT INTO work_tag (work_id, tag, ord, source, tag_key, tag_group) \
+         SELECT $1, tag, ord + (SELECT COALESCE(MAX(ord), -1) + 1 FROM work_tag WHERE work_id = $2), \
                 'admin', tag_key, tag_group \
-         FROM work_tag WHERE work_id = ? AND source = 'admin'",
+         FROM work_tag WHERE work_id = $3 AND source = 'admin' ON CONFLICT DO NOTHING",
     )
     .bind(target_work)
     .bind(target_work)
     .bind(source_work)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     // Chapter overrides key on the chapter NUMBER, which is shared across the merged
     // sources — so the source's hide/rename edits stay meaningful on the target.
     sqlx::query(
-        "INSERT OR IGNORE INTO chapter_override \
+        "INSERT INTO chapter_override \
              (work_id, chapter_key, hidden, title_override, updated_at) \
-         SELECT ?, chapter_key, hidden, title_override, updated_at \
-         FROM chapter_override WHERE work_id = ?",
+         SELECT $1, chapter_key, hidden, title_override, updated_at \
+         FROM chapter_override WHERE work_id = $2 ON CONFLICT DO NOTHING",
     )
     .bind(target_work)
     .bind(source_work)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
     // Fold the work row's own carry-over columns in one statement:
@@ -4121,7 +5080,7 @@ async fn merge_works_guarded(
     //     is deliberately NOT copied: the blob is keyed by work_id and belongs to the
     //     loser, so the drainer re-materializes it under the target's id.
     //   * is_nsfw — OR'd in, or the merged work is served SFW to anonymous viewers when
-    //     only the loser was flagged. Guarded exactly like `mark_work_nsfw`: an
+    //     only the loser was flagged. Guarded exactly like `mark_work_nsfw_on`: an
     //     authoritative MangaDex `safe`/`suggestive` rating on the TARGET wins, so this
     //     can't re-create the over-flagging migration 0053 just cleaned up.
     //   * is_nsfw_override — folding only the BASE column leaked adult content: every
@@ -4138,41 +5097,39 @@ async fn merge_works_guarded(
     //     decision (unlike the base column, which 0053 exists to keep honest).
     sqlx::query(
         "UPDATE work SET \
-           cover_phash = COALESCE(cover_phash, (SELECT cover_phash FROM work WHERE id = ?)), \
+           cover_phash = COALESCE(cover_phash, (SELECT cover_phash FROM work WHERE id = $1)), \
            cover_file_name = \
-             COALESCE(cover_file_name, (SELECT cover_file_name FROM work WHERE id = ?)), \
+             COALESCE(cover_file_name, (SELECT cover_file_name FROM work WHERE id = $2)), \
            is_nsfw = CASE \
-             WHEN is_nsfw = 1 THEN 1 \
-             WHEN (SELECT is_nsfw FROM work WHERE id = ?) = 1 \
+             WHEN is_nsfw THEN TRUE \
+             WHEN (SELECT is_nsfw FROM work WHERE id = $3) \
                   AND (content_rating IS NULL \
-                       OR content_rating NOT IN ('safe', 'suggestive')) THEN 1 \
+                       OR content_rating NOT IN ('safe', 'suggestive')) THEN TRUE \
              ELSE is_nsfw END, \
            is_nsfw_override = CASE \
              WHEN is_nsfw_override IS NOT NULL THEN is_nsfw_override \
-             WHEN (SELECT is_nsfw_override FROM work WHERE id = ?) = 1 THEN 1 \
+             WHEN (SELECT is_nsfw_override FROM work WHERE id = $4) THEN TRUE \
              ELSE is_nsfw_override END \
-         WHERE id = ?",
+         WHERE id = $5",
     )
     .bind(source_work)
     .bind(source_work)
     .bind(source_work)
     .bind(source_work)
     .bind(target_work)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
-    // Re-point mappings + user data. `UPDATE OR IGNORE` skips a row that would
-    // collide with one the target already has; the leftover source rows are then
-    // removed (source_series explicitly, the rest by the final cascade delete).
-    let moved = sqlx::query("UPDATE OR IGNORE source_series SET work_id = ? WHERE work_id = ?")
+    // Re-point mappings. work_id is not part of any source_series unique key.
+    let moved = sqlx::query("UPDATE source_series SET work_id = $1 WHERE work_id = $2")
         .bind(target_work)
         .bind(source_work)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?
         .rows_affected();
-    sqlx::query("DELETE FROM source_series WHERE work_id = ?")
+    sqlx::query("DELETE FROM source_series WHERE work_id = $1")
         .bind(source_work)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
     // A user can have both copies in their library. Preserve the favourite from
@@ -4181,52 +5138,56 @@ async fn merge_works_guarded(
     // followed by deleting the loser used to silently discard these preferences.
     sqlx::query(
         "INSERT INTO user_library (user_id, series_id, created_at, status, is_favorite) \
-         SELECT user_id, ?, created_at, status, is_favorite FROM user_library \
-         WHERE series_id = ? \
+         SELECT user_id, $1, created_at, status, is_favorite FROM user_library \
+         WHERE series_id = $2 \
          ON CONFLICT(user_id, series_id) DO UPDATE SET \
-           created_at = MIN(user_library.created_at, excluded.created_at), \
+           created_at = LEAST(user_library.created_at, excluded.created_at), \
            status = COALESCE(user_library.status, excluded.status), \
-           is_favorite = MAX(user_library.is_favorite, excluded.is_favorite)",
+           is_favorite = (user_library.is_favorite OR excluded.is_favorite)",
     )
     .bind(target_work)
     .bind(source_work)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
-    for (table, col) in [
-        ("merge_candidate", "candidate_work_id"),
-        ("reviews", "series_id"),
-    ] {
-        sqlx::query(&format!(
-            "UPDATE OR IGNORE {table} SET {col} = ? WHERE {col} = ?"
-        ))
+    sqlx::query("UPDATE merge_candidate SET candidate_work_id = $1 WHERE candidate_work_id = $2")
         .bind(target_work)
         .bind(source_work)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-    }
+    // Keep the survivor's review for each author, exactly as UPDATE OR IGNORE did.
+    // Only series_id changes; (series_id, user_id) is the only affected unique key.
+    sqlx::query(
+        "UPDATE reviews SET series_id = $1 WHERE series_id = $2 \
+         AND NOT EXISTS (SELECT 1 FROM reviews survivor \
+                         WHERE survivor.series_id = $1 AND survivor.user_id = reviews.user_id)",
+    )
+    .bind(target_work)
+    .bind(source_work)
+    .execute(&mut **tx)
+    .await?;
     // Delete the folded library rows and any colliding reviews so the imminent
     // work delete can't orphan a row pointing at a nonexistent work. Reviews keep
     // the survivor's review when the same user reviewed both copies.
     for (table, col) in [("reviews", "series_id"), ("user_library", "series_id")] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE {col} = ?"))
+        sqlx::query(&format!("DELETE FROM {table} WHERE {col} = $1"))
             .bind(source_work)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
     }
     // canonical_progress.work_id isn't part of any unique key → plain repoint.
-    sqlx::query("UPDATE canonical_progress SET work_id = ? WHERE work_id = ?")
+    sqlx::query("UPDATE canonical_progress SET work_id = $1 WHERE work_id = $2")
         .bind(target_work)
         .bind(source_work)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     // Series comments (polymorphic) re-point to the target series id.
     sqlx::query(
-        "UPDATE OR IGNORE comments SET target_id = ? WHERE target_type = 'series' AND target_id = ?",
+        "UPDATE comments SET target_id = $1 WHERE target_type = 'series' AND target_id = $2",
     )
     .bind(target_work)
     .bind(source_work)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     // The remaining polymorphic `w_`-keyed tables. None carries an FK to `work` (they
     // key series generically, by Suwayomi numeric id OR by `w_` work id), so nothing
@@ -4238,11 +5199,11 @@ async fn merge_works_guarded(
     // Neither has a unique key over the target column, so a plain UPDATE is enough.
     for table in ["user_activity", "notifications"] {
         sqlx::query(&format!(
-            "UPDATE {table} SET target_id = ? WHERE target_type = 'series' AND target_id = ?"
+            "UPDATE {table} SET target_id = $1 WHERE target_type = 'series' AND target_id = $2"
         ))
         .bind(target_work)
         .bind(source_work)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
     // View counters are KEYED by series, so they cannot be repointed blind: the target
@@ -4252,29 +5213,29 @@ async fn merge_works_guarded(
     // onto the Trending row, where it resolves to nothing.
     sqlx::query(
         "INSERT INTO series_views (series_key, total, updated_at) \
-         SELECT ?, total, updated_at FROM series_views WHERE series_key = ? \
+         SELECT $1, total, updated_at FROM series_views WHERE series_key = $2 \
          ON CONFLICT(series_key) DO UPDATE SET \
            total = series_views.total + excluded.total, \
-           updated_at = MAX(series_views.updated_at, excluded.updated_at)",
+           updated_at = GREATEST(series_views.updated_at, excluded.updated_at)",
     )
     .bind(target_work)
     .bind(source_work)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     sqlx::query(
         "INSERT INTO series_view_bucket (series_key, hour_ts, views) \
-         SELECT ?, hour_ts, views FROM series_view_bucket WHERE series_key = ? \
+         SELECT $1, hour_ts, views FROM series_view_bucket WHERE series_key = $2 \
          ON CONFLICT(series_key, hour_ts) DO UPDATE SET \
            views = series_view_bucket.views + excluded.views",
     )
     .bind(target_work)
     .bind(source_work)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     for table in ["series_views", "series_view_bucket"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE series_key = ?"))
+        sqlx::query(&format!("DELETE FROM {table} WHERE series_key = $1"))
             .bind(source_work)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
     }
     // series_admin accepts numeric Suwayomi ids, so it has no canonical-work row
@@ -4299,14 +5260,14 @@ async fn merge_works_guarded(
         "work_tag",
         "chapter_override",
     ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE work_id = ?"))
+        sqlx::query(&format!("DELETE FROM {table} WHERE work_id = $1"))
             .bind(source_work)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
     }
-    sqlx::query("DELETE FROM merge_candidate WHERE candidate_work_id = ?")
+    sqlx::query("DELETE FROM merge_candidate WHERE candidate_work_id = $1")
         .bind(source_work)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     // Folding source_work's sources into target_work turns any candidate that pointed
     // at target_work — and whose source series we just moved there — self-referential
@@ -4317,12 +5278,12 @@ async fn merge_works_guarded(
     // the audit record of a resolved merge (and the very candidate that drove THIS
     // merge is already `confirmed`) — keep those.
     sqlx::query(
-        "DELETE FROM merge_candidate WHERE candidate_work_id = ? AND status = 'pending' \
-         AND source_series_id IN (SELECT id FROM source_series WHERE work_id = ?)",
+        "DELETE FROM merge_candidate WHERE candidate_work_id = $1 AND status = 'pending' \
+         AND source_series_id IN (SELECT id FROM source_series WHERE work_id = $2)",
     )
     .bind(target_work)
     .bind(target_work)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     // Leave a forwarding address (migration 0056) BEFORE the row disappears, so every
     // bookmark, cached reader URL, notification target and shared link minted against
@@ -4331,49 +5292,43 @@ async fn merge_works_guarded(
     //   1. collapse chains — any redirect that pointed AT the work we're about to
     //      delete is rewritten to the survivor, so A->B followed by B->C leaves A->C
     //      and a resolver never has to walk more than one hop;
-    //   2. record source -> target itself. `OR REPLACE` keeps it idempotent if the id
-    //      is somehow redirected twice.
+    //   2. upsert source -> target itself if the id is redirected twice.
+    // Both redirect columns are replaced; this table has no children or triggers.
     let now = Utc::now().to_rfc3339();
-    sqlx::query("UPDATE work_redirect SET new_id = ? WHERE new_id = ?")
+    sqlx::query("UPDATE work_redirect SET new_id = $1 WHERE new_id = $2")
         .bind(target_work)
         .bind(source_work)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     sqlx::query(
-        "INSERT OR REPLACE INTO work_redirect (old_id, new_id, created_at) VALUES (?, ?, ?)",
+        "INSERT INTO work_redirect (old_id, new_id, created_at) VALUES ($1, $2, $3) ON CONFLICT(old_id) DO UPDATE SET new_id = excluded.new_id, created_at = excluded.created_at",
     )
     .bind(source_work)
     .bind(target_work)
-    .bind(&now)
-    .execute(&mut *tx)
+    .bind(crate::db_types::date(&now)?)
+    .execute(&mut **tx)
     .await?;
 
     // BEFORE the delete. `release_event.work_id` cascades, so the losing work's
     // first-seen history is one statement away from being erased — and the earliest time
     // per chapter key is exactly what stops a merge re-announcing the merged-in work's
     // whole back catalogue on /updates.
-    ledger::merge_release_events(&mut tx, source_work, target_work).await?;
+    ledger::merge_release_events(tx, source_work, target_work).await?;
 
-    sqlx::query("DELETE FROM work WHERE id = ?")
+    sqlx::query("DELETE FROM work WHERE id = $1")
         .bind(source_work)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
-    reproject_work_caches_on(&mut tx, target_work).await?;
-    reproject_work_caches_on(&mut tx, source_work).await?;
+    reproject_work_caches_on(tx, target_work).await?;
+    reproject_work_caches_on(tx, source_work).await?;
 
-    tx.commit().await?;
     // Cross-DB, so necessarily outside the transaction and AFTER it commits — which is
     // exactly why this must not use `?`. The merge is already durable at this point; a
     // failure here would report an error for work that DID happen, and the callers act
     // on that: `reconcile`/`consolidate` would abort the whole sweep after a durable
     // merge. A leaked blob is re-derivable from MangaDex and is the same harmless state
     // a crash in this window already leaves behind, so log it and carry on.
-    if let Some(covers) = covers {
-        if let Err(e) = reclaim_cover_blob(covers, source_work).await {
-            tracing::warn!(work_id = %source_work, error = %e, "merge: cover blob reclaim failed (leaked)");
-        }
-    }
     Ok(MergeOutcome {
         moved_source_series: moved,
     })
@@ -4388,11 +5343,12 @@ async fn merge_works_guarded(
 /// Reading through the redirect there turns a permanently dead bookmark back into the
 /// surviving series.
 pub async fn redirect_work_id(pool: &Database, old_id: &str) -> Result<Option<String>> {
-    let new_id =
-        sqlx::query_scalar::<_, String>("SELECT new_id FROM work_redirect WHERE old_id = ?")
-            .bind(old_id)
-            .fetch_optional(pool)
-            .await?;
+    let new_id = crate::db_types::query_scalar::<String>(
+        "SELECT new_id FROM work_redirect WHERE old_id = $1",
+    )
+    .bind(old_id)
+    .fetch_optional(pool)
+    .await?;
     Ok(new_id)
 }
 
@@ -4403,8 +5359,8 @@ pub async fn redirect_work_id(pool: &Database, old_id: &str) -> Result<Option<St
 /// main DB and simply accumulates — a live audit measured 8,868 orphans / 1.53 GB of a
 /// 20.4 GB store. Blobs are re-derivable from MangaDex, so a failure here is logged by
 /// the caller rather than being allowed to fail a merge that already committed.
-pub async fn reclaim_cover_blob(covers: &Database, work_id: &str) -> Result<()> {
-    sqlx::query("DELETE FROM work_cover_blob WHERE work_id = ?")
+pub async fn reclaim_cover_blob(covers: &SqliteDatabase, work_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM work_cover_blob WHERE work_id = $1")
         .bind(work_id)
         .execute(covers)
         .await?;
@@ -4421,23 +5377,34 @@ pub async fn reclaim_cover_blob(covers: &Database, work_id: &str) -> Result<()> 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SourceSeriesRow {
     /// `source_series.id` — the detach key [`split_source_series`] takes.
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub source_type: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub source_id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub source_key: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub source_url: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     pub is_nsfw: i64,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub lang: Option<String>,
     /// How this source titles the series: the cached Suwayomi title where there is one,
     /// else the work's own title. A MangaDex mapping has no per-source title on disk —
     /// the mirror's title IS the work's — so it necessarily falls back.
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub title: String,
     /// Chapters we hold FROM THIS SOURCE (`chapter` is keyed by `source_series_id`, which
     /// is exactly why detaching the row carries its whole run with it).
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     pub chapter_count: i64,
     /// Extension coordinates, for the picker's source logo. Both `None` for a MangaDex
     /// mapping and for a source whose extension isn't catalogued.
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub pkg_name: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub repo_url: Option<String>,
 }
 
@@ -4461,7 +5428,7 @@ async fn work_source_series_rows_using<'e, E>(
     work_id: &str,
 ) -> Result<Vec<SourceSeriesRow>>
 where
-    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
     let rows = sqlx::query_as::<_, SourceSeriesRow>(
         "SELECT ss.id, ss.source_type, COALESCE(ss.source_id, '') AS source_id, ss.source_key, ss.source_url, ss.is_nsfw, \
@@ -4472,10 +5439,10 @@ where
            FROM source_series ss \
            JOIN work w ON w.id = ss.work_id \
            LEFT JOIN suwayomi_series sy \
-                  ON ss.source_type = 'suwayomi' AND sy.id = CAST(ss.source_key AS INTEGER) \
+                  ON ss.source_type = 'suwayomi' AND sy.id = sqlite_integer_pin(ss.source_key) \
            LEFT JOIN source_extension se ON se.source_id = ss.source_id \
-          WHERE ss.work_id = ? \
-          ORDER BY (ss.source_type = 'mangadex') DESC, ss.last_seen DESC",
+          WHERE ss.work_id = $1 \
+          ORDER BY (ss.source_type = 'mangadex') DESC, ss.last_seen DESC NULLS LAST",
     )
     .bind(work_id)
     .fetch_all(executor)
@@ -4565,7 +5532,18 @@ async fn split_source_series_attempt(
     }
     // The source set and last-source guard belong to the writer snapshot. Two
     // disjoint splits must not both treat the other's source as the one kept.
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = pool.begin_with("BEGIN").await?;
+    if let Some(actor) = actor_user_id {
+        crate::locks::lock_user(&mut tx, actor).await?;
+    }
+    let discovered = merge_discovery(&mut tx, &[work_id], &[]).await?;
+    crate::locks::advisory(&mut tx, &discovered.keys).await?;
+    crate::locks::lock_works(&mut tx, &[work_id]).await?;
+    lock_discovered_sources(&mut tx, &discovered.sources).await?;
+    if merge_discovery(&mut tx, &[work_id], &[]).await?.sources != discovered.sources {
+        return Err(crate::locks::RestartTransaction.into());
+    }
+    guards::held().await;
     let all = work_source_series_rows_using(&mut *tx, work_id).await?;
     if all.is_empty() {
         anyhow::bail!("no such work, or it has no sources: {work_id}");
@@ -4620,18 +5598,14 @@ async fn split_source_series_attempt(
     let now = Utc::now().to_rfc3339();
     // Read the parent under the same write lock: the gating columns are what the new work
     // inherits, and `updateSeriesMetadata` is not single-flighted against this.
-    let (parent_rating, parent_nsfw): (Option<String>, i64) = sqlx::query_as(
-        "SELECT content_rating, COALESCE(is_nsfw_override, is_nsfw) FROM work WHERE id = ?",
+    let (parent_rating, parent_nsfw): (Option<String>, i64) = crate::db_types::query_tuple(
+        "SELECT content_rating, COALESCE(is_nsfw_override, is_nsfw) FROM work WHERE id = $1",
     )
     .bind(work_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| anyhow::anyhow!("no such work: {work_id}"))?;
-    let nsfw = if parent_nsfw != 0 || detached.iter().any(|r| r.is_nsfw != 0) {
-        1_i64
-    } else {
-        0_i64
-    };
+    let nsfw = parent_nsfw != 0 || detached.iter().any(|r| r.is_nsfw != 0);
 
     // The detached source's OWN metadata, where it has any on disk. A MangaDex mapping
     // has none (its metadata IS the work's), so those columns stay NULL rather than being
@@ -4639,9 +5613,9 @@ async fn split_source_series_attempt(
     let source_meta: Option<SuwayomiMeta> =
         match detached.iter().find(|r| r.source_type == "suwayomi") {
             Some(r) => {
-                sqlx::query_as(
+                crate::db_types::query_tuple(
                     "SELECT description, author, artist, status, lang FROM suwayomi_series \
-                      WHERE id = CAST(? AS INTEGER)",
+                      WHERE id = sqlite_integer_pin($1)",
                 )
                 .bind(&r.source_key)
                 .fetch_optional(&mut *tx)
@@ -4658,7 +5632,7 @@ async fn split_source_series_attempt(
         "INSERT INTO work \
            (id, primary_title, primary_lang, description, status, content_rating, is_nsfw, \
             author, artist, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(&new_work_id)
     .bind(&title)
@@ -4669,21 +5643,22 @@ async fn split_source_series_attempt(
     .bind(nsfw)
     .bind(&author)
     .bind(&artist)
-    .bind(&now)
-    .bind(&now)
+    .bind(crate::db_types::date(&now)?)
+    .bind(crate::db_types::date(&now)?)
     .execute(&mut *tx)
     .await?;
 
     // The move itself — one UPDATE, no chapter writes, nothing deleted.
     let mut moved = 0_u64;
     for r in &detached {
-        moved += sqlx::query("UPDATE source_series SET work_id = ? WHERE id = ? AND work_id = ?")
-            .bind(&new_work_id)
-            .bind(&r.id)
-            .bind(work_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        moved +=
+            sqlx::query("UPDATE source_series SET work_id = $1 WHERE id = $2 AND work_id = $3")
+                .bind(&new_work_id)
+                .bind(&r.id)
+                .bind(work_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
     }
     if moved as usize != detached.len() {
         // A concurrent merge/split moved a row out from under the read above. Roll back
@@ -4697,8 +5672,8 @@ async fn split_source_series_attempt(
     // and `load_canonical_work` would read a MangaDex id that no longer maps to a mapping.
     for r in detached.iter().filter(|r| r.source_type == "mangadex") {
         sqlx::query(
-            "UPDATE work_external_id SET work_id = ? \
-              WHERE provider = 'mangadex' AND external_id = ? AND work_id = ?",
+            "UPDATE work_external_id SET work_id = $1 \
+              WHERE provider = 'mangadex' AND external_id = $2 AND work_id = $3",
         )
         .bind(&new_work_id)
         .bind(&r.source_key)
@@ -4717,15 +5692,15 @@ async fn split_source_series_attempt(
     // exactly "does a REMAINING source still carry this chapter key".
     for r in &detached {
         sqlx::query(
-            "INSERT OR IGNORE INTO release_event \
+            "INSERT INTO release_event \
                  (work_id, chapter_key, first_seen_at, first_source_series_id, label, announce_at) \
-             SELECT ?, e.chapter_key, e.first_seen_at, e.first_source_series_id, e.label, \
+             SELECT $1, e.chapter_key, e.first_seen_at, e.first_source_series_id, e.label, \
                     e.announce_at \
                FROM release_event e \
-              WHERE e.work_id = ? AND e.first_source_series_id = ? \
+              WHERE e.work_id = $2 AND e.first_source_series_id = $3 \
                 AND NOT EXISTS (SELECT 1 FROM chapter c \
                                   JOIN source_series s ON s.id = c.source_series_id \
-                                 WHERE s.work_id = ? AND c.chapter_key = e.chapter_key)",
+                                 WHERE s.work_id = $4 AND c.chapter_key = e.chapter_key) ON CONFLICT DO NOTHING",
         )
         .bind(&new_work_id)
         .bind(work_id)
@@ -4735,10 +5710,10 @@ async fn split_source_series_attempt(
         .await?;
         sqlx::query(
             "DELETE FROM release_event \
-              WHERE work_id = ? AND first_source_series_id = ? \
+              WHERE work_id = $1 AND first_source_series_id = $2 \
                 AND NOT EXISTS (SELECT 1 FROM chapter c \
                                   JOIN source_series s ON s.id = c.source_series_id \
-                                 WHERE s.work_id = ? AND c.chapter_key = release_event.chapter_key)",
+                                 WHERE s.work_id = $3 AND c.chapter_key = release_event.chapter_key)",
         )
         .bind(work_id)
         .bind(&r.id)
@@ -4770,13 +5745,13 @@ async fn split_source_series_attempt(
         (new_work_id.as_str(), work_id)
     };
     sqlx::query(
-        "INSERT OR IGNORE INTO work_split (work_a, work_b, split_at, split_by) \
-         VALUES (?, ?, ?, ?)",
+        "INSERT INTO work_split (work_a, work_b, split_at, split_by) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
     )
     .bind(a)
     .bind(b)
-    .bind(&now)
-    .bind(actor_user_id)
+    .bind(crate::db_types::date(&now)?)
+    .bind(crate::db_types::optional_uuid(actor_user_id)?)
     .execute(&mut *tx)
     .await?;
 
@@ -4806,23 +5781,37 @@ async fn split_source_series_attempt(
 /// without this they are re-merged on the next pass, destructively: `merge_works` deletes
 /// the loser.
 pub async fn is_split_pair(pool: &Database, one: &str, other: &str) -> Result<bool> {
+    let mut conn = pool.acquire().await?;
+    is_split_pair_on(&mut conn, one, other).await
+}
+
+/// [`is_split_pair`] on the caller's connection. Read only; takes no lock and does not
+/// commit. `work_split` rows are written by a split that holds the work lock of the
+/// work it splits, so the answer is final for a caller that already holds BOTH work
+/// locks (as `lock_merge_inputs` takes them). [`merge_works_on`] repeats this check
+/// itself whenever it is given an expected identity.
+pub async fn is_split_pair_on(
+    conn: &mut sqlx::PgConnection,
+    one: &str,
+    other: &str,
+) -> Result<bool> {
     let (a, b) = if one < other {
         (one, other)
     } else {
         (other, one)
     };
     let hit: Option<i64> =
-        sqlx::query_scalar("SELECT 1 FROM work_split WHERE work_a = ? AND work_b = ?")
+        crate::db_types::query_scalar("SELECT 1 FROM work_split WHERE work_a = $1 AND work_b = $2")
             .bind(a)
             .bind(b)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await?;
     Ok(hit.is_some())
 }
 
 /// Refresh navigation, Browse and search on an existing writer transaction.
 /// Aggregates are scoped to this work, keeping merge/split publication atomic.
-async fn reproject_work_caches_on(conn: &mut sqlx::SqliteConnection, work_id: &str) -> Result<()> {
+async fn reproject_work_caches_on(conn: &mut sqlx::PgConnection, work_id: &str) -> Result<()> {
     // (1) `reader_id`, by the rule both feed writers apply — the MangaDex anchor wins, else
     //     the numeric Suwayomi id. `MIN(ss.id)` (via ORDER BY ... LIMIT 1) matches the
     //     `sw` sub-select in `browse_catalogue_select`, so the two surfaces agree on WHICH
@@ -4839,7 +5828,7 @@ async fn reproject_work_caches_on(conn: &mut sqlx::SqliteConnection, work_id: &s
                            AND ss.source_type = 'suwayomi' \
                          ORDER BY ss.id LIMIT 1) END, \
              feed_series_updates.reader_id) \
-          WHERE work_id = ?",
+          WHERE work_id = $1",
     )
     .bind(work_id)
     .execute(&mut *conn)
@@ -4857,11 +5846,14 @@ pub struct WorkChapterRow {
     pub number: Option<f64>,
     /// What to print for this chapter: "45", "10.5", "Oneshot". Resolved once by
     /// [`crate::chapter_label::chapter_display`] so every surface says the same thing.
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub label: String,
     /// The cross-source grouping key. `round(number * 100)` for numbered chapters (the key
     /// `chapter_override` already uses), `x:<chapter id>` for unnumbered ones so a work's
     /// several oneshots stay several rows instead of colliding on `0`.
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub key: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub title: Option<String>,
     /// When THIS source released this chapter, ISO-8601, or `None` when the source gave us
     /// no date (an undated Suwayomi upload; a MangaDex row with neither timestamp).
@@ -4872,25 +5864,33 @@ pub struct WorkChapterRow {
     /// `readableAt` two weeks BEFORE their `publishAt`, so `published_at` alone is not the
     /// release. Taking a different clock here would make a chapter's date on the series page
     /// disagree with the same chapter's position in `/updates`.
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub released_at: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub source_type: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub source_id: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub suwayomi_manga_id: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub chapter_id: String,
     /// The scanlation group(s) of THIS copy. For the MangaDex half: the group names joined
     /// with `" & "`, `"No Group"` when MangaDex lists none, or `None` when unknown — the
     /// backfill's `''` ("asked, could not learn") is folded to `None` in SQL so no surface
     /// prints an empty label. Several rows sharing one `key` are several uploads of the same
     /// chapter, and this is what tells them apart.
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub scanlator: Option<String>,
     /// Set when THIS copy is hosted off-site (MangaDex externals; always `None` for
     /// Suwayomi). Per copy, not per number: one group's upload of a chapter can be a
     /// MangaPlus redirect while another group's is ordinary pages.
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub external_url: Option<String>,
     /// The volume THIS copy was published in ("3", "12.5"), as MangaDex labels it; `None`
     /// when unknown. Suwayomi sources expose no volume, so their half is always `None`.
     /// Blank is folded to `None` (SQL `NULLIF(TRIM(…), '')`) so no surface prints
     /// "Volume ".
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub volume: Option<String>,
 }
 
@@ -4915,13 +5915,13 @@ pub async fn authoritative_suwayomi_mappings(
     pool: &Database,
     work_id: &str,
 ) -> Result<Vec<AuthMapping>> {
-    let rows = sqlx::query_as::<_, (String, String, String, i64)>(
+    let rows = crate::db_types::query_tuple::<(String, String, String, i64)>(
         "SELECT ss.id, COALESCE(ss.source_id, '') AS source_id, ss.source_key, \
                 (SELECT COUNT(*) FROM suwayomi_chapter sc \
-                 WHERE sc.manga_id = CAST(ss.source_key AS INTEGER)) AS cached \
+                 WHERE sc.manga_id = sqlite_integer_pin(ss.source_key)) AS cached \
          FROM source_series ss \
-         WHERE ss.work_id = ? AND ss.source_type = 'suwayomi' \
-         ORDER BY ss.source_id ASC, cached DESC, ss.last_seen DESC, ss.id ASC",
+         WHERE ss.work_id = $1 AND ss.source_type = 'suwayomi' \
+         ORDER BY ss.source_id ASC NULLS FIRST, cached DESC, ss.last_seen DESC NULLS LAST, ss.id ASC",
     )
     .bind(work_id)
     .fetch_all(pool)
@@ -4965,13 +5965,14 @@ async fn work_source_chapters_two_branch(
         let Ok(manga_id) = m.source_key.parse::<i64>() else {
             continue;
         };
-        let chapters = sqlx::query_as::<_, (f64, String, i64, Option<String>, Option<String>)>(
-            "SELECT chapter_number, name, id, scanlator, upload_date \
-               FROM suwayomi_chapter WHERE manga_id = ?",
-        )
-        .bind(manga_id)
-        .fetch_all(pool)
-        .await?;
+        let chapters =
+            crate::db_types::query_tuple::<(f64, String, i64, Option<String>, Option<String>)>(
+                "SELECT chapter_number, name, id, scanlator, upload_date \
+               FROM suwayomi_chapter WHERE manga_id = $1",
+            )
+            .bind(manga_id)
+            .fetch_all(pool)
+            .await?;
         for (number, title, id, scanlator, upload_date) in chapters {
             // One label rule for both halves (Phase A2). Suwayomi's structured
             // `chapter_number` is right on ~99.85% of rows; the name is the fallback that
@@ -5004,25 +6005,22 @@ async fn work_source_chapters_two_branch(
     // 21,422 works have nothing else. The raw string comes back untouched and
     // `chapter_display` decides, so "Extra" becomes an UNNUMBERED row keyed by its own
     // chapter id instead of either vanishing or colliding onto 0.
-    let md = sqlx::query_as::<
-        _,
-        (
-            Option<String>,
-            Option<String>,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ),
-    >(
+    let md = crate::db_types::query_tuple::<(
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )>(
         "SELECT c.number, c.title, COALESCE(ss.source_id, '') AS source_id, c.external_id, \
                 COALESCE(c.readable_at, c.published_at), c.scanlator, c.external_url, \
                 c.volume \
          FROM source_series ss \
          JOIN chapter c ON c.source_series_id = ss.id \
-         WHERE ss.work_id = ? AND ss.source_type = 'mangadex' AND c.lang = 'en'",
+         WHERE ss.work_id = $1 AND ss.source_type = 'mangadex' AND c.lang = 'en'",
     )
     .bind(work_id)
     .fetch_all(pool)
@@ -5120,9 +6118,9 @@ pub async fn work_source_chapters(pool: &Database, work_id: &str) -> Result<Vec<
                         PARTITION BY ss.source_id \
                         ORDER BY (SELECT COUNT(*) FROM chapter c \
                                    WHERE c.source_series_id = ss.id) DESC, \
-                                 ss.last_seen DESC, ss.id ASC) AS rn \
+                                 ss.last_seen DESC NULLS LAST, ss.id ASC) AS rn \
                FROM source_series ss \
-              WHERE ss.work_id = ?1 AND ss.source_type = 'suwayomi' \
+              WHERE ss.work_id = $1 AND ss.source_type = 'suwayomi' \
          ) \
          SELECT c.number, c.title, a.source_id, c.external_id, c.chapter_key, c.label, \
                 'suwayomi' AS source_type, a.source_key, NULLIF(c.scanlator, '') AS scanlator, \
@@ -5138,8 +6136,8 @@ pub async fn work_source_chapters(pool: &Database, work_id: &str) -> Result<Vec<
                 NULLIF(TRIM(c.volume), '') \
            FROM source_series ss \
            JOIN chapter c ON c.source_series_id = ss.id \
-          WHERE ss.work_id = ?1 AND ss.source_type = 'mangadex' AND c.lang = 'en' \
-          ORDER BY source_type DESC, source_id ASC",
+          WHERE ss.work_id = $1 AND ss.source_type = 'mangadex' AND c.lang = 'en' \
+          ORDER BY source_type DESC, source_id ASC NULLS FIRST",
     )
     .bind(work_id)
     .fetch_all(pool)
@@ -5184,18 +6182,30 @@ pub async fn work_source_chapters(pool: &Database, work_id: &str) -> Result<Vec<
 /// One row of [`work_source_chapters`]'s union.
 #[derive(sqlx::FromRow)]
 struct SpineChapterRow {
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     number: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     title: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     source_id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     external_id: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     chapter_key: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     label: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     source_type: String,
     /// The Suwayomi manga id for the Suwayomi half; NULL on the MangaDex half.
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     source_key: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     scanlator: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     released_at: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     external_url: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     volume: Option<String>,
 }
 
@@ -5274,10 +6284,10 @@ pub async fn aggregate_chapter_count(pool: &Database, work_id: &str) -> Result<i
 /// counts has no such failure mode and can therefore be trusted to RAISE a non-zero English
 /// count — which is what fixes the works whose MangaDex spine is a stub.
 pub async fn suwayomi_chapter_count(pool: &Database, work_id: &str) -> Result<i64> {
-    let n = sqlx::query_scalar::<_, Option<i64>>(
+    let n = crate::db_types::query_scalar::<Option<i64>>(
         "SELECT MAX(sy.chapter_count) FROM source_series ss \
-           JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
-          WHERE ss.work_id = ? AND ss.source_type = 'suwayomi'",
+           JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
+          WHERE ss.work_id = $1 AND ss.source_type = 'suwayomi'",
     )
     .bind(work_id)
     .fetch_optional(pool)
@@ -5294,9 +6304,9 @@ pub async fn find_source_series_id(
     source_id: &str,
     source_key: &str,
 ) -> Result<Option<String>> {
-    let id = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM source_series WHERE source_type = ?1 AND source_key = ?3 \
-           AND (source_type = 'suwayomi' OR source_id IS NULLIF(?2, ''))",
+    let id = crate::db_types::query_scalar::<String>(
+        "SELECT id FROM source_series WHERE source_type = $1 AND source_key = $3 \
+           AND (source_type = 'suwayomi' OR source_id IS NOT DISTINCT FROM NULLIF($2, ''))",
     )
     .bind(source_type)
     .bind(source_id)
@@ -5315,10 +6325,10 @@ pub async fn find_source_series(
     source_id: &str,
     source_key: &str,
 ) -> Result<Option<(String, String)>> {
-    let row = sqlx::query_as::<_, (String, String)>(
+    let row = crate::db_types::query_tuple::<(String, String)>(
         "SELECT id, work_id FROM source_series \
-         WHERE source_type = ?1 AND source_key = ?3 \
-           AND (source_type = 'suwayomi' OR source_id IS NULLIF(?2, ''))",
+         WHERE source_type = $1 AND source_key = $3 \
+           AND (source_type = 'suwayomi' OR source_id IS NOT DISTINCT FROM NULLIF($2, ''))",
     )
     .bind(source_type)
     .bind(source_id)
@@ -5339,8 +6349,8 @@ pub async fn find_source_series_by_key(
     source_type: &str,
     source_key: &str,
 ) -> Result<Option<(String, String)>> {
-    let row = sqlx::query_as::<_, (String, String)>(
-        "SELECT id, work_id FROM source_series WHERE source_type = ? AND source_key = ?",
+    let row = crate::db_types::query_tuple::<(String, String)>(
+        "SELECT id, work_id FROM source_series WHERE source_type = $1 AND source_key = $2",
     )
     .bind(source_type)
     .bind(source_key)
@@ -5368,7 +6378,7 @@ pub fn spine_key_and_label(ch: &ChapterInput) -> (String, String) {
 const CHAPTER_UPSERT_SQL: &str = "INSERT INTO chapter \
        (id, source_series_id, external_id, number, volume, lang, title, published_at, \
         readable_at, external_url, scanlator, chapter_key, label, created_at) \
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
      ON CONFLICT(source_series_id, external_id) DO UPDATE SET \
        number = excluded.number, volume = excluded.volume, lang = excluded.lang, \
        title = excluded.title, published_at = excluded.published_at, \
@@ -5385,37 +6395,47 @@ pub async fn upsert_chapter(
     if ch.external_id.is_empty() {
         return Ok(());
     }
-    let now = Utc::now().to_rfc3339();
-    // Computed on the way in, never in SQL. `round(number * 100)` looks trivial enough to
-    // inline into the statement, but the rule around it is not — the sanity clamp, the
-    // name fallback and the `x:` namespace for unnumbered chapters all live in
-    // `chapter_display`, and a SQL copy would be a fifth labelling rule that drifts.
-    let (chapter_key, label) = spine_key_and_label(ch);
-    sqlx::query(CHAPTER_UPSERT_SQL)
-        .bind(new_id("ch_"))
-        .bind(source_series_id)
-        .bind(&ch.external_id)
-        .bind(&ch.number)
-        .bind(&ch.volume)
-        .bind(&ch.lang)
-        .bind(&ch.title)
-        .bind(&ch.published_at)
-        .bind(&ch.readable_at)
-        .bind(&ch.external_url)
-        .bind(&ch.scanlator)
-        .bind(&chapter_key)
-        .bind(&label)
-        .bind(&now)
-        .execute(pool)
-        .await?;
-    Ok(())
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        let locked = crate::locks::lock_source_series(&mut tx, &[source_series_id]).await?;
+        if !locked.missing.is_empty() {
+            anyhow::bail!("no such source series: {source_series_id}");
+        }
+        guards::held().await;
+        let now = Utc::now().to_rfc3339();
+        // Computed on the way in, never in SQL. `round(number * 100)` looks trivial enough to
+        // inline into the statement, but the rule around it is not — the sanity clamp, the
+        // name fallback and the `x:` namespace for unnumbered chapters all live in
+        // `chapter_display`, and a SQL copy would be a fifth labelling rule that drifts.
+        let (chapter_key, label) = spine_key_and_label(ch);
+        sqlx::query(CHAPTER_UPSERT_SQL)
+            .bind(new_id("ch_"))
+            .bind(source_series_id)
+            .bind(&ch.external_id)
+            .bind(&ch.number)
+            .bind(&ch.volume)
+            .bind(&ch.lang)
+            .bind(&ch.title)
+            .bind(crate::db_types::optional_date(ch.published_at.as_deref())?)
+            .bind(crate::db_types::optional_date(ch.readable_at.as_deref())?)
+            .bind(&ch.external_url)
+            .bind(&ch.scanlator)
+            .bind(&chapter_key)
+            .bind(&label)
+            .bind(crate::db_types::date(&now)?)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    })
+    .await
 }
 
 /// ONE CLOCK IN THE SPINE, AND IT IS ISO-8601 UTC.
 ///
 /// The two halves disagree on how a timestamp is spelled. `chapter.published_at` /
 /// `chapter.readable_at` are ISO-8601 TEXT across 877,824 rows; `suwayomi_chapter
-/// .upload_date` is 13-digit epoch-MILLIS TEXT. Migration 0064's central complaint is
+/// .upload_date` is mixed seconds/milliseconds epoch TEXT. Migration 0064's central complaint is
 /// exactly this, and it is not cosmetic: SQLite compares TEXT under BINARY collation, so
 /// every `'2…'` sorts above every `'1…'` and a millis value and an ISO value in one column
 /// order arbitrarily against each other. `refresh_feed_series_updates` already pays for it
@@ -5431,9 +6451,9 @@ pub async fn upsert_chapter(
 /// the definition of `readable_at` (§6.4). Setting it also keeps migration 0073's
 /// `idx_chapter_needs_readable_at` — the MangaDex external-URL backfill's work-list —
 /// from filling up with 563,095 Suwayomi rows that backfill will never touch.
-fn suwayomi_upload_date_to_iso(upload_date: Option<&str>) -> Option<String> {
-    let ms: i64 = upload_date?.trim().parse().ok()?;
-    chrono::DateTime::from_timestamp_millis(ms).map(|d| d.to_rfc3339())
+pub(crate) fn suwayomi_upload_date_to_iso(upload_date: Option<&str>) -> Option<String> {
+    let ms = crate::series_cache::normalize_epoch_millis(upload_date?)?;
+    chrono::DateTime::from_timestamp_millis(ms).map(crate::db_types::format_date)
 }
 
 /// One Suwayomi chapter in the spine's shape.
@@ -5498,6 +6518,7 @@ pub fn suwayomi_spine_input(
 /// ledger seeds from, and would rewrite ~1,000 rows to record one new one. So existing
 /// rows are updated in place, new ones inserted, and only genuinely-vanished ones deleted
 /// — which is rare enough that the DELETE is skipped entirely when nothing vanished.
+#[allow(dead_code)] // Public facade retained for callers and overlap tests.
 pub async fn replace_source_chapters(
     pool: &Database,
     source_series_id: &str,
@@ -5516,10 +6537,16 @@ pub async fn replace_source_chapters(
 /// share its transaction with the writes so a concurrent replacement cannot make
 /// the prune list stale, and cache writers can commit both structures atomically.
 pub(crate) async fn replace_source_chapters_on(
-    conn: &mut sqlx::SqliteConnection,
+    conn: &mut sqlx::PgConnection,
     source_series_id: &str,
     chapters: &[ChapterInput],
 ) -> Result<()> {
+    use sqlx::Connection;
+    let mut unit = conn.begin().await?;
+    let conn = &mut *unit;
+    if guards::source(conn, source_series_id).await?.is_none() && !chapters.is_empty() {
+        anyhow::bail!("no such source series: {source_series_id}");
+    }
     use std::collections::HashSet;
 
     let incoming: HashSet<&str> = chapters
@@ -5527,11 +6554,12 @@ pub(crate) async fn replace_source_chapters_on(
         .map(|c| c.external_id.as_str())
         .filter(|e| !e.is_empty())
         .collect();
-    let existing: Vec<(String, String)> =
-        sqlx::query_as("SELECT id, external_id FROM chapter WHERE source_series_id = ?")
-            .bind(source_series_id)
-            .fetch_all(&mut *conn)
-            .await?;
+    let existing: Vec<(String, String)> = crate::db_types::query_tuple(
+        "SELECT id, external_id FROM chapter WHERE source_series_id = $1 ORDER BY external_id FOR UPDATE",
+    )
+    .bind(source_series_id)
+    .fetch_all(&mut *conn)
+    .await?;
     let vanished: Vec<String> = existing
         .into_iter()
         .filter(|(_, ext)| !incoming.contains(ext.as_str()))
@@ -5552,22 +6580,23 @@ pub(crate) async fn replace_source_chapters_on(
             .bind(&ch.volume)
             .bind(&ch.lang)
             .bind(&ch.title)
-            .bind(&ch.published_at)
-            .bind(&ch.readable_at)
+            .bind(crate::db_types::optional_date(ch.published_at.as_deref())?)
+            .bind(crate::db_types::optional_date(ch.readable_at.as_deref())?)
             .bind(&ch.external_url)
             .bind(&ch.scanlator)
             .bind(&chapter_key)
             .bind(&label)
-            .bind(&now)
+            .bind(crate::db_types::date(&now)?)
             .execute(&mut *conn)
             .await?;
     }
     for id in &vanished {
-        sqlx::query("DELETE FROM chapter WHERE id = ?")
+        sqlx::query("DELETE FROM chapter WHERE id = $1")
             .bind(id)
             .execute(&mut *conn)
             .await?;
     }
+    unit.commit().await?;
     Ok(())
 }
 
@@ -5593,10 +6622,9 @@ pub(crate) async fn replace_source_chapters_on(
 /// cover hash changed". A genuinely new decision is available through the admin merge
 /// mutation, which is explicit.
 ///
-/// Idempotent and race-free without a UNIQUE index: the existence test and the insert
-/// are ONE statement (`INSERT … SELECT … WHERE NOT EXISTS`), so under SQLite's single
-/// writer a concurrent enqueue of the same pair loses the race and inserts nothing,
-/// rather than erroring out of the ingest path a plain `INSERT` + unique index would.
+/// A transaction advisory lock on the broad work pair precedes parent locks and
+/// the sibling/reverse existence predicate. No narrow UNIQUE key can enforce that rule.
+#[cfg(test)]
 pub async fn insert_merge_candidate(
     pool: &Database,
     source_series_id: &str,
@@ -5604,6 +6632,111 @@ pub async fn insert_merge_candidate(
     score: f64,
     method: &str,
 ) -> Result<Option<String>> {
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        let Some(pair) = review_pair_on(&mut tx, source_series_id, candidate_work_id).await? else {
+            return Ok(None);
+        };
+        crate::locks::advisory(&mut tx, &[pair.key()]).await?;
+        let id = insert_merge_candidate_on(&mut tx, source_series_id, &pair, score, method).await?;
+        tx.commit().await?;
+        Ok(id)
+    })
+    .await
+}
+
+/// The two works a review candidate is about: the work that owns the source mapping
+/// now, and the proposed work after following its redirect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewPair {
+    pub owner: String,
+    pub target: String,
+}
+
+impl ReviewPair {
+    /// The pair's advisory key. It is the same key for both orientations.
+    pub fn key(&self) -> crate::locks::AdvisoryKey {
+        crate::locks::AdvisoryKey::review_pair(&self.owner, &self.target)
+    }
+}
+
+/// Discover the review pair of a proposed candidate. Read only; takes no lock and does
+/// not commit. `None` means the source mapping no longer exists, so there is nothing to
+/// propose. The caller takes [`ReviewPair::key`] in its single `locks::advisory` call
+/// and then calls [`insert_merge_candidate_on`], which re-reads the pair.
+pub async fn review_pair_on(
+    conn: &mut sqlx::PgConnection,
+    source_series_id: &str,
+    candidate_work_id: &str,
+) -> Result<Option<ReviewPair>> {
+    let owner: Option<String> =
+        sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = $1")
+            .bind(source_series_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    let target: String = sqlx::query_scalar(WORK_REDIRECT_TARGET)
+        .bind(candidate_work_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(Some(ReviewPair { owner, target }))
+}
+
+/// [`insert_merge_candidate`] inside the caller's transaction. Never commits and never
+/// retries: the caller owns BEGIN through COMMIT and wraps that whole unit in
+/// `db::retry_transaction`.
+///
+/// Guards the CALLER must already hold: `pair.key()` for the pair that
+/// [`review_pair_on`] returned in this transaction, taken in the unit's single
+/// `locks::advisory` call. This function then locks both works in sorted order
+/// (`FOR NO KEY UPDATE`) and re-reads the pair; if the source mapping moved to another
+/// work or the target was merged away while it waited, the key the caller holds no
+/// longer covers the pair and it returns `locks::RestartTransaction`. It then locks the
+/// source mapping. If the unit locks any other work, the caller must have locked
+/// `pair.owner` and `pair.target` with those works in sorted order first.
+///
+/// One exception to the key: a pair whose owner (or target) was created by this same
+/// transaction needs none. The key serialises writers that can name both works, and no
+/// other transaction can name a work that is not committed yet. That is why this
+/// helper, unlike the other `_on` helpers, does not assert the key in debug builds.
+///
+/// `Ok(None)` means the pair was suppressed (it was already proposed or decided in
+/// either direction) or the two sides are the same work.
+pub async fn insert_merge_candidate_on(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    source_series_id: &str,
+    pair: &ReviewPair,
+    score: f64,
+    method: &str,
+) -> Result<Option<String>> {
+    // Only the transaction is asserted here, not the pair key: see the exception above.
+    guards::assert_in_transaction(tx, "catalog::insert_merge_candidate_on");
+    let (owner, target) = (&pair.owner, &pair.target);
+    let locked = crate::locks::lock_works(tx, &[owner, target]).await?;
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = $1")
+            .bind(source_series_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let redirect: Option<String> =
+        sqlx::query_scalar("SELECT new_id FROM work_redirect WHERE old_id = $1")
+            .bind(target)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if current.as_deref() != Some(owner.as_str()) || redirect.is_some() {
+        return Err(crate::locks::RestartTransaction.into());
+    }
+    if !locked.missing.is_empty() {
+        anyhow::bail!("no such work in review pair");
+    }
+    if owner == target {
+        return Ok(None);
+    }
+    lock_discovered_sources(tx, &[source_series_id.to_owned()]).await?;
+    guards::held().await;
+    let candidate_work_id = target.as_str();
     let id = new_id("mc_");
     let now = Utc::now().to_rfc3339();
     // The pair is the two WORKS, whichever one the row hangs off: the sweep proposes
@@ -5612,22 +6745,22 @@ pub async fn insert_merge_candidate(
     let res = sqlx::query(
         "INSERT INTO merge_candidate \
            (id, source_series_id, candidate_work_id, score, method, status, created_at) \
-         SELECT ?1, ?2, ?3, ?4, ?5, 'pending', ?6 \
+         SELECT $1, $2, $3, $4, $5, 'pending', $6 \
          WHERE NOT EXISTS ( \
              SELECT 1 FROM merge_candidate mc \
              JOIN source_series ss ON ss.id = mc.source_series_id \
-             JOIN source_series mine ON mine.id = ?2 \
-             WHERE mc.source_series_id = ?2 AND mc.candidate_work_id = ?3 \
-                OR ss.work_id = mine.work_id AND mc.candidate_work_id = ?3 \
-                OR ss.work_id = ?3 AND mc.candidate_work_id = mine.work_id)",
+             JOIN source_series mine ON mine.id = $2 \
+             WHERE mc.source_series_id = $2 AND mc.candidate_work_id = $3 \
+                OR ss.work_id = mine.work_id AND mc.candidate_work_id = $3 \
+                OR ss.work_id = $3 AND mc.candidate_work_id = mine.work_id)",
     )
     .bind(&id)
     .bind(source_series_id)
     .bind(candidate_work_id)
     .bind(score)
     .bind(method)
-    .bind(&now)
-    .execute(pool)
+    .bind(crate::db_types::date(&now)?)
+    .execute(&mut **tx)
     .await?;
     Ok((res.rows_affected() > 0).then_some(id))
 }
@@ -5645,101 +6778,249 @@ pub struct SyncState {
 /// Read a job's full sync state (cursor + whether its initial seed has finished).
 /// `None` means the job has never run → do a fresh full `createdAt` seed.
 pub async fn get_sync_state(pool: &Database, job: &str) -> Result<Option<SyncState>> {
-    let row = sqlx::query_as::<_, (String, i64)>(
-        "SELECT last_synced_at, seed_done FROM catalogue_sync_state WHERE job = ?",
+    let row = sqlx::query_as::<_, (chrono::DateTime<Utc>, bool)>(
+        "SELECT last_synced_at, seed_done FROM catalogue_sync_state WHERE job = $1",
     )
     .bind(job)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(cursor, seed_done)| SyncState {
-        cursor,
-        seed_done: seed_done != 0,
+        // This is an upstream MangaDex query cursor, whose API requires whole
+        // seconds without an offset, rather than a public Komika date field.
+        cursor: cursor.format("%Y-%m-%dT%H:%M:%S").to_string(),
+        seed_done,
     }))
+}
+
+/// Which checkpoint a sync job is writing.
+#[derive(Clone, Copy)]
+enum SyncCheckpoint {
+    /// Provisional seed progress; leaves `seed_done` as it is (false on a new row).
+    SeedProgress,
+    /// The initial seed finished; `since` becomes the incremental cursor.
+    SeedDone,
+    /// An incremental cycle finished.
+    Cursor,
+}
+
+/// The reset generation of a sync job lives in `instance_setting` under this key prefix.
+/// It has to outlive [`reset_sync_state`], which deletes the job's `catalogue_sync_state`
+/// row, and a key/value row needs no schema change: a new table or column would also have
+/// to be added to the SQLite importer's table, column and index inventories.
+const SYNC_GENERATION_PREFIX: &str = "catalogue_sync_generation:";
+
+fn sync_job_key(job: &str) -> crate::locks::AdvisoryKey {
+    crate::locks::AdvisoryKey::new(crate::locks::KeyClass::Job, &["catalogue-sync", job])
+}
+
+async fn sync_generation_on(conn: &mut sqlx::PgConnection, job: &str) -> Result<i64> {
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT value FROM instance_setting WHERE key = $1")
+            .bind(format!("{SYNC_GENERATION_PREFIX}{job}"))
+            .fetch_optional(&mut *conn)
+            .await?;
+    match stored {
+        None => Ok(0),
+        Some(value) => value
+            .parse()
+            .map_err(|_| anyhow::anyhow!("sync generation of job {job} is not a number")),
+    }
+}
+
+/// The reset generation of a sync job: 0 until its first [`reset_sync_state`], then one
+/// more after each reset. It never goes down.
+///
+/// A sync cycle reads this ONCE, BEFORE it reads the job's state ([`get_sync_state`]),
+/// and passes it to every checkpoint it writes ([`set_seed_progress_at`],
+/// [`mark_seed_done_at`], [`set_sync_cursor_at`]). A checkpoint whose generation is no
+/// longer current belongs to a cycle that started before a reset; it is dropped instead
+/// of undoing the reset.
+///
+/// "Before the first upstream request" is NOT enough. A cycle that reads the state
+/// first and the generation second can hold the cursor of before a reset together with
+/// the generation of after it: its checkpoints are then accepted, and they put the
+/// deleted row back with a recent cursor. `mangadex::read_cycle_start` is the one place
+/// that performs the two reads, in the safe order.
+pub async fn sync_generation(pool: &Database, job: &str) -> Result<i64> {
+    let mut conn = pool.acquire().await?;
+    sync_generation_on(&mut conn, job).await
+}
+
+/// One checkpoint write as a whole transaction under the job's advisory key. With
+/// `generation = Some(g)` the write is a compare-and-swap: it happens only while the
+/// job's generation is still `g`, and the function says whether it happened.
+/// [`reset_sync_state`] takes the same key, so a checkpoint and a reset never interleave.
+async fn write_sync_checkpoint(
+    pool: &Database,
+    job: &str,
+    since: &str,
+    generation: Option<i64>,
+    checkpoint: SyncCheckpoint,
+) -> Result<bool> {
+    let since = crate::db_types::date(since)?;
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        crate::locks::advisory(&mut tx, &[sync_job_key(job)]).await?;
+        guards::held().await;
+        if let Some(expected) = generation {
+            if sync_generation_on(&mut tx, job).await? != expected {
+                // Dropping the transaction rolls it back; nothing was written.
+                return Ok(false);
+            }
+        }
+        let (seed_done, on_conflict) = match checkpoint {
+            SyncCheckpoint::SeedProgress | SyncCheckpoint::Cursor => (false, ""),
+            SyncCheckpoint::SeedDone => (true, ", seed_done = TRUE"),
+        };
+        sqlx::query(&format!(
+            "INSERT INTO catalogue_sync_state (job, last_synced_at, updated_at, seed_done) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT(job) DO UPDATE SET last_synced_at = excluded.last_synced_at, \
+               updated_at = excluded.updated_at{on_conflict}"
+        ))
+        .bind(job)
+        .bind(since)
+        .bind(crate::db_types::date(&Utc::now().to_rfc3339())?)
+        .bind(seed_done)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    })
+    .await
 }
 
 /// Persist provisional seed progress (leaving `seed_done = 0`) so an interrupted
 /// full seed resumes from `since` instead of restarting at `createdAt`=0 (M6).
+///
+/// UNCONDITIONAL: it cannot tell a checkpoint of a cycle that a reset has since
+/// cancelled from a current one. Test fixtures only; the sync loop writes through
+/// [`set_seed_progress_at`].
+#[cfg(test)]
 pub async fn set_seed_progress(pool: &Database, job: &str, since: &str) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        "INSERT INTO catalogue_sync_state (job, last_synced_at, updated_at, seed_done) \
-         VALUES (?, ?, ?, 0) \
-         ON CONFLICT(job) DO UPDATE SET last_synced_at = excluded.last_synced_at, \
-           updated_at = excluded.updated_at",
-    )
-    .bind(job)
-    .bind(since)
-    .bind(&now)
-    .execute(pool)
-    .await?;
+    write_sync_checkpoint(pool, job, since, None, SyncCheckpoint::SeedProgress).await?;
     Ok(())
+}
+
+/// Persist provisional seed progress for the cycle that read `generation` from
+/// [`sync_generation`] before it read the job's state. `Ok(false)` means the job was
+/// reset since then and nothing was written; the caller stops its cycle.
+pub async fn set_seed_progress_at(
+    pool: &Database,
+    job: &str,
+    since: &str,
+    generation: i64,
+) -> Result<bool> {
+    write_sync_checkpoint(
+        pool,
+        job,
+        since,
+        Some(generation),
+        SyncCheckpoint::SeedProgress,
+    )
+    .await
 }
 
 /// Mark a job's initial full seed complete and set its incremental cursor to
 /// `since` (the wall-clock at the completed cycle's start).
+///
+/// UNCONDITIONAL, like [`set_seed_progress`], and test fixtures only; the sync loop
+/// writes through [`mark_seed_done_at`].
+#[cfg(test)]
 pub async fn mark_seed_done(pool: &Database, job: &str, since: &str) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        "INSERT INTO catalogue_sync_state (job, last_synced_at, updated_at, seed_done) \
-         VALUES (?, ?, ?, 1) \
-         ON CONFLICT(job) DO UPDATE SET last_synced_at = excluded.last_synced_at, \
-           updated_at = excluded.updated_at, seed_done = 1",
-    )
-    .bind(job)
-    .bind(since)
-    .bind(&now)
-    .execute(pool)
-    .await?;
+    write_sync_checkpoint(pool, job, since, None, SyncCheckpoint::SeedDone).await?;
     Ok(())
+}
+
+/// Mark the initial seed complete for the cycle that read `generation` before it read
+/// the job's state. `Ok(false)` means the job was reset since then: the seed this cycle
+/// finished is not the seed the reset asked for, and nothing was written.
+pub async fn mark_seed_done_at(
+    pool: &Database,
+    job: &str,
+    since: &str,
+    generation: i64,
+) -> Result<bool> {
+    write_sync_checkpoint(pool, job, since, Some(generation), SyncCheckpoint::SeedDone).await
 }
 
 /// Whether a one-time maintenance pass (migration 0055) has already completed.
 pub async fn maintenance_flag_present(pool: &Database, key: &str) -> Result<bool> {
-    let n: Option<i64> = sqlx::query_scalar("SELECT 1 FROM maintenance_flag WHERE key = ?")
-        .bind(key)
-        .fetch_optional(pool)
-        .await?;
+    let n: Option<i64> =
+        crate::db_types::query_scalar("SELECT 1 FROM maintenance_flag WHERE key = $1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await?;
     Ok(n.is_some())
 }
 
 /// Record a one-time maintenance pass as complete (idempotent).
 pub async fn set_maintenance_flag(pool: &Database, key: &str) -> Result<()> {
-    sqlx::query("INSERT OR IGNORE INTO maintenance_flag (key, done_at) VALUES (?, ?)")
-        .bind(key)
-        .bind(Utc::now().to_rfc3339())
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO maintenance_flag (key, done_at) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(key)
+    .bind(Utc::now())
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 /// Persist the sync cursor for a job. `since` is the MangaDex `since` timestamp to use
 /// as `updatedAtSince` on the next incremental cycle (typically the wall-clock at the
 /// start of the cycle just completed, so anything updated during it is caught next time).
+///
+/// UNCONDITIONAL, like [`set_seed_progress`], and test fixtures only; the sync loop
+/// writes through [`set_sync_cursor_at`].
+#[cfg(test)]
 pub async fn set_sync_cursor(pool: &Database, job: &str, since: &str) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        "INSERT INTO catalogue_sync_state (job, last_synced_at, updated_at) VALUES (?, ?, ?) \
-         ON CONFLICT(job) DO UPDATE SET last_synced_at = excluded.last_synced_at, \
-           updated_at = excluded.updated_at",
-    )
-    .bind(job)
-    .bind(since)
-    .bind(&now)
-    .execute(pool)
-    .await?;
+    write_sync_checkpoint(pool, job, since, None, SyncCheckpoint::Cursor).await?;
     Ok(())
+}
+
+/// Persist the incremental cursor for the cycle that read `generation` before it read
+/// the job's state. `Ok(false)` means the job was reset since then and nothing was
+/// written.
+pub async fn set_sync_cursor_at(
+    pool: &Database,
+    job: &str,
+    since: &str,
+    generation: i64,
+) -> Result<bool> {
+    write_sync_checkpoint(pool, job, since, Some(generation), SyncCheckpoint::Cursor).await
 }
 
 /// Clear a sync job's row entirely so the next cycle treats it as a fresh seed
 /// (`get_sync_state` → `None` → full createdAt sweep from scratch). Used by the admin
 /// `resyncCatalogue` mutation, since `seed_done` can't be reset via raw SQL (the DB is
 /// container-owned and there's no sqlite3 in the image).
+///
+/// The reset also moves the job to its next generation, in the same transaction and
+/// under the job's advisory key. A cycle that was already running keeps the generation
+/// it read at its start, so its later `*_at` checkpoints are dropped and cannot put the
+/// deleted row back.
 pub async fn reset_sync_state(pool: &Database, job: &str) -> Result<()> {
-    sqlx::query("DELETE FROM catalogue_sync_state WHERE job = ?")
-        .bind(job)
-        .execute(pool)
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        crate::locks::advisory(&mut tx, &[sync_job_key(job)]).await?;
+        guards::held().await;
+        sqlx::query(
+            "INSERT INTO instance_setting (key, value, updated_at) VALUES ($1, '1', $2) \
+             ON CONFLICT(key) DO UPDATE SET \
+               value = (instance_setting.value::bigint + 1)::text, updated_at = excluded.updated_at",
+        )
+        .bind(format!("{SYNC_GENERATION_PREFIX}{job}"))
+        .bind(Utc::now())
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+        sqlx::query("DELETE FROM catalogue_sync_state WHERE job = $1")
+            .bind(job)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    })
+    .await
 }
 
 // ── Extension-level sync subscriptions (source-sync §3) ──────────────────────────
@@ -5754,15 +7035,15 @@ pub async fn set_extension_subscription(
 ) -> Result<()> {
     if subscribed {
         sqlx::query(
-            "INSERT INTO extension_subscription (pkg_name, created_at) VALUES (?, ?) \
+            "INSERT INTO extension_subscription (pkg_name, created_at) VALUES ($1, $2) \
              ON CONFLICT(pkg_name) DO NOTHING",
         )
         .bind(pkg_name)
-        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now())
         .execute(pool)
         .await?;
     } else {
-        sqlx::query("DELETE FROM extension_subscription WHERE pkg_name = ?")
+        sqlx::query("DELETE FROM extension_subscription WHERE pkg_name = $1")
             .bind(pkg_name)
             .execute(pool)
             .await?;
@@ -5775,7 +7056,7 @@ pub async fn subscribed_extensions(pool: &Database) -> Result<Vec<String>> {
     // Breaker-disabled subscriptions are skipped — see SUBSCRIPTION_FAILURE_LIMIT.
     // They stay in the table (so the admin surface can show why they stopped and
     // offer a re-enable) but are not walked.
-    let rows: Vec<(String,)> = sqlx::query_as(
+    let rows: Vec<(String,)> = crate::db_types::query_tuple(
         "SELECT pkg_name FROM extension_subscription WHERE disabled_at IS NULL ORDER BY pkg_name",
     )
     .fetch_all(pool)
@@ -5814,44 +7095,38 @@ pub async fn mark_subscription_synced(
     if error.is_none() {
         sqlx::query(
             "UPDATE extension_subscription \
-             SET last_synced_at = ?, last_added = ?, last_error = NULL, \
+             SET last_synced_at = $1, last_added = $2, last_error = NULL, \
                  consecutive_failures = 0 \
-             WHERE pkg_name = ?",
+             WHERE pkg_name = $3",
         )
-        .bind(&now)
+        .bind(crate::db_types::date(&now)?)
         .bind(added)
         .bind(pkg_name)
         .execute(pool)
         .await?;
         return Ok(false);
     }
-    sqlx::query(
-        "UPDATE extension_subscription \
-         SET last_synced_at = ?, last_added = ?, last_error = ?, \
+    let claimed: Option<bool> = sqlx::query_scalar(
+        "WITH prior AS MATERIALIZED (SELECT pkg_name, disabled_at FROM extension_subscription WHERE pkg_name = $6 FOR NO KEY UPDATE) \
+         UPDATE extension_subscription e \
+         SET last_synced_at = $1, last_added = $2, last_error = $3, \
              consecutive_failures = consecutive_failures + 1, \
              disabled_at = CASE \
-                 WHEN disabled_at IS NOT NULL THEN disabled_at \
-                 WHEN consecutive_failures + 1 >= ? THEN ? \
+                 WHEN e.disabled_at IS NOT NULL THEN e.disabled_at \
+                 WHEN consecutive_failures + 1 >= $4 THEN $5 \
                  ELSE NULL END \
-         WHERE pkg_name = ?",
+         FROM prior WHERE e.pkg_name = prior.pkg_name RETURNING prior.disabled_at IS NULL AND e.disabled_at IS NOT NULL",
     )
-    .bind(&now)
+    .bind(crate::db_types::date(&now)?)
     .bind(added)
     .bind(error)
     .bind(SUBSCRIPTION_FAILURE_LIMIT)
-    .bind(&now)
+    .bind(crate::db_types::date(&now)?)
     .bind(pkg_name)
-    .execute(pool)
-    .await?;
-    let tripped: Option<(String,)> = sqlx::query_as(
-        "SELECT disabled_at FROM extension_subscription \
-         WHERE pkg_name = ? AND disabled_at = ?",
-    )
-    .bind(pkg_name)
-    .bind(&now)
-    .fetch_optional(pool)
-    .await?;
-    Ok(tripped.is_some())
+    .fetch_optional(pool.write()).await?;
+    #[cfg(test)]
+    guards::pause("subscription-returned").await;
+    Ok(claimed.unwrap_or(false))
 }
 
 /// Re-enable a subscription the breaker disabled, clearing its failure state ENTIRELY —
@@ -5866,7 +7141,7 @@ pub async fn reset_subscription_breaker(pool: &Database, pkg_name: &str) -> Resu
     sqlx::query(
         "UPDATE extension_subscription \
          SET disabled_at = NULL, consecutive_failures = 0, last_error = NULL \
-         WHERE pkg_name = ?",
+         WHERE pkg_name = $1",
     )
     .bind(pkg_name)
     .execute(pool)
@@ -5901,8 +7176,8 @@ pub async fn reset_subscription_breaker(pool: &Database, pkg_name: &str) -> Resu
 pub async fn rearm_subscription_breaker_probe(pool: &Database, pkg_name: &str) -> Result<()> {
     sqlx::query(
         "UPDATE extension_subscription \
-         SET disabled_at = NULL, consecutive_failures = MAX(? - 1, 0) \
-         WHERE pkg_name = ?",
+         SET disabled_at = NULL, consecutive_failures = GREATEST($1 - 1, 0) \
+         WHERE pkg_name = $2",
     )
     .bind(SUBSCRIPTION_FAILURE_LIMIT)
     .bind(pkg_name)
@@ -5915,10 +7190,11 @@ pub async fn rearm_subscription_breaker_probe(pool: &Database, pkg_name: &str) -
 /// that re-asserts `inLibrary=true` upstream so drifted/single-added series keep being
 /// scanned. Manga ids are globally unique across sources, so the source_id is not needed.
 pub async fn suwayomi_source_keys(pool: &Database) -> Result<Vec<String>> {
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT source_key FROM source_series WHERE source_type = 'suwayomi'")
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(String,)> = crate::db_types::query_tuple(
+        "SELECT source_key FROM source_series WHERE source_type = 'suwayomi'",
+    )
+    .fetch_all(pool)
+    .await?;
     Ok(rows.into_iter().map(|(k,)| k).collect())
 }
 
@@ -5934,35 +7210,46 @@ pub async fn suwayomi_source_keys(pool: &Database) -> Result<Vec<String>> {
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
 pub struct SourceScanHealth {
     /// Suwayomi source id (`source_series.source_id`).
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub source_id: String,
     /// Owning extension package, if the extension is still known to us. `None` once an
     /// extension is uninstalled and its `source_extension` row is gone — the series and
     /// their scan state outlive it, which is exactly the state E4.4 exists to clean up.
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub pkg_name: Option<String>,
     /// Series of this source that have a scan-state row (i.e. that the scanner tracks).
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     pub series: i64,
     /// Series with any current failure streak (`consecutive_failures > 0`).
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     pub failing: i64,
     /// Series whose streak has reached `SOURCE_OUTAGE_MIN_STREAK` **for a source-side
     /// reason** ('cached_fallback' or 'fetch_error'). This — not `failing` — is what an
     /// outage decision is made on: it excludes both a single blip and our own
     /// 'persist_error'.
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     pub confirmed_failing: i64,
     /// Of `failing`, how many last failed by being served Suwayomi's CACHE (the F11 case,
     /// i.e. broken while looking healthy) …
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     pub cached_fallback: i64,
     /// … versus failing loudly with an upstream error.
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     pub fetch_error: i64,
     /// Series the scanner has never got a chapter for. On a healthy source this is a
     /// handful of genuinely empty entries; across a whole source it is the signature of a
     /// source that has never once worked (all 209 Genz Toons series sat here).
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     pub zero_chapter_series: i64,
     /// Worst current streak on the source, for ordering the admin view.
+    #[sqlx(try_from = "crate::db_types::DbI64")]
     pub worst_streak: i64,
     /// Most recent failure across the source.
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub last_failure_at: Option<String>,
     /// Most recent successful scan across the source. A source whose newest success is old
     /// is stale even if nothing is currently "failing".
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub last_scanned_at: Option<String>,
 }
 
@@ -5976,7 +7263,7 @@ pub async fn source_scan_health(pool: &Database) -> Result<Vec<SourceScanHealth>
                 MAX(se.pkg_name) AS pkg_name, \
                 COUNT(*) AS series, \
                 SUM(CASE WHEN st.consecutive_failures > 0 THEN 1 ELSE 0 END) AS failing, \
-                SUM(CASE WHEN st.consecutive_failures >= ? \
+                SUM(CASE WHEN st.consecutive_failures >= $1 \
                           AND st.last_failure_kind IN ('cached_fallback', 'fetch_error') \
                          THEN 1 ELSE 0 END) AS confirmed_failing, \
                 SUM(CASE WHEN st.last_failure_kind = 'cached_fallback' THEN 1 ELSE 0 END) \
@@ -6017,7 +7304,7 @@ pub const SOURCE_OUTAGE_MIN_STREAK: i64 = 3;
 pub async fn source_exclusive_work_counts(
     pool: &Database,
 ) -> Result<std::collections::HashMap<String, i64>> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
+    let rows: Vec<(String, i64)> = crate::db_types::query_tuple(
         "SELECT COALESCE(ss.source_id, '') AS source_id, COUNT(DISTINCT ss.work_id) \
            FROM source_series ss \
           WHERE ss.source_type = 'suwayomi' \
@@ -6037,10 +7324,15 @@ pub async fn source_exclusive_work_counts(
 /// from [`source_scan_health`] instead, so they are not selected here.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SourceOutage {
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub source_id: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub detected_at: String,
+    #[sqlx(try_from = "crate::db_types::DbString")]
     pub last_alert_at: String,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub kind: Option<String>,
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub parked_until: Option<String>,
 }
 
@@ -6067,21 +7359,23 @@ pub async fn paused_series_due_for_trigger(
     if source_keys.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat_n("?", source_keys.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let placeholders = crate::sql_params::placeholders(1, source_keys.len());
+    let tail = crate::sql_params::placeholders(source_keys.len() + 1, 2);
+    let mut tail = tail.split(", ");
+    let parked = tail.next().unwrap();
+    let scanned = tail.next().unwrap();
     let sql = format!(
         "SELECT series_id FROM series_scan_state \
           WHERE series_id IN ({placeholders}) \
-            AND next_scan_at > ? \
-            AND (last_scanned_at IS NULL OR last_scanned_at < ?)"
+            AND next_scan_at > {parked} \
+            AND (last_scanned_at IS NULL OR last_scanned_at < {scanned})"
     );
-    let mut q = sqlx::query_scalar::<_, String>(&sql);
+    let mut q = crate::db_types::query_scalar::<String>(&sql);
     for k in source_keys {
         q = q.bind(k);
     }
-    Ok(q.bind(parked_after)
-        .bind(scanned_before)
+    Ok(q.bind(crate::db_types::date(parked_after)?)
+        .bind(crate::db_types::date(scanned_before)?)
         .fetch_all(pool)
         .await?)
 }
@@ -6103,13 +7397,14 @@ pub async fn paused_series_due_for_trigger(
 /// permanently, while every pass still reports success. That is the same silent-inertness
 /// class as the dead `w.comic_type` lookup above, and the reason this arm now logs.
 pub async fn source_latest_snapshot(pool: &Database, source_id: &str) -> Result<Option<Vec<i64>>> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT ordered_ids FROM source_latest_snapshot WHERE source_id = ?")
-            .bind(source_id)
-            .fetch_optional(pool)
-            .await?;
-    Ok(
-        row.and_then(|(json,)| match serde_json::from_str::<Vec<i64>>(&json) {
+    let row: Option<(serde_json::Value,)> = crate::db_types::query_tuple(
+        "SELECT ordered_ids FROM source_latest_snapshot WHERE source_id = $1",
+    )
+    .bind(source_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(
+        |(json,)| match serde_json::from_value::<Vec<i64>>(json.clone()) {
             Ok(ids) => Some(ids),
             Err(e) => {
                 // Truncated, because the payload is up to `SNAPSHOT_WINDOW` ids and the useful
@@ -6118,14 +7413,14 @@ pub async fn source_latest_snapshot(pool: &Database, source_id: &str) -> Result<
                 tracing::warn!(
                     source_id,
                     error = %e,
-                    payload = %json.chars().take(120).collect::<String>(),
+                    payload = %json.to_string().chars().take(120).collect::<String>(),
                     "discovery: LATEST snapshot is unparseable — re-baselining this source, which \
                      means it will detect nothing this pass"
                 );
                 None
             }
-        }),
-    )
+        },
+    ))
 }
 
 /// Phase E5. Overwrite one source's page-1 LATEST snapshot. `ids` is already capped to
@@ -6135,16 +7430,15 @@ pub async fn put_source_latest_snapshot(
     source_id: &str,
     ids: &[i64],
 ) -> Result<()> {
-    let json = serde_json::to_string(ids)?;
     sqlx::query(
         "INSERT INTO source_latest_snapshot (source_id, ordered_ids, captured_at) \
-         VALUES (?, ?, ?) \
+         VALUES ($1, $2, $3) \
          ON CONFLICT(source_id) DO UPDATE SET \
            ordered_ids = excluded.ordered_ids, captured_at = excluded.captured_at",
     )
     .bind(source_id)
-    .bind(&json)
-    .bind(Utc::now().to_rfc3339())
+    .bind(sqlx::types::Json(ids))
+    .bind(Utc::now())
     .execute(pool)
     .await?;
     Ok(())
@@ -6155,9 +7449,10 @@ pub async fn put_source_latest_snapshot(
 /// recovering source's pass has successes, not failures, so gating only on failures would
 /// leave the outage row and the tripped breaker behind after recovery).
 pub async fn any_source_outage(pool: &Database) -> Result<bool> {
-    let row: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM source_scan_outage LIMIT 1")
-        .fetch_optional(pool)
-        .await?;
+    let row: Option<(i64,)> =
+        crate::db_types::query_tuple("SELECT 1 FROM source_scan_outage LIMIT 1")
+            .fetch_optional(pool)
+            .await?;
     Ok(row.is_some())
 }
 
@@ -6190,60 +7485,85 @@ pub async fn record_source_outage(
     parked_until: Option<&str>,
     realert_hours: i64,
 ) -> Result<bool> {
-    let now = Utc::now();
-    let now_iso = now.to_rfc3339();
-    let prior: Option<(String, String)> = sqlx::query_as(
-        "SELECT detected_at, last_alert_at FROM source_scan_outage WHERE source_id = ?",
-    )
-    .bind(source_id)
-    .fetch_optional(pool)
-    .await?;
-    let cutoff = now - chrono::Duration::hours(realert_hours);
-    let alert = match prior.as_ref() {
-        // New outage: always alert.
-        None => true,
-        // Ongoing: re-alert only once the quiet window has elapsed, so a source that stays
-        // dead is one line a day rather than one line per tick per series.
-        Some((_, last_alert_at)) => chrono::DateTime::parse_from_rfc3339(last_alert_at)
-            .map(|t| t.with_timezone(&Utc) <= cutoff)
-            .unwrap_or(true),
-    };
-    let detected_at = prior.map(|(d, _)| d).unwrap_or_else(|| now_iso.clone());
-    let last_alert_at = if alert { &now_iso } else { &detected_at };
-    sqlx::query(
-        "INSERT INTO source_scan_outage \
+    crate::db::retry_transaction(|| async {
+        let mut tx = pool.begin().await?;
+        crate::locks::advisory(
+            &mut tx,
+            &[crate::locks::AdvisoryKey::new(
+                crate::locks::KeyClass::SourcePolicy,
+                &[source_id],
+            )],
+        )
+        .await?;
+        guards::held().await;
+        let now = Utc::now();
+        let now_iso = now.to_rfc3339();
+        let prior: Option<(String, String)> = crate::db_types::query_tuple(
+            "SELECT detected_at, last_alert_at FROM source_scan_outage WHERE source_id = $1",
+        )
+        .bind(source_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let cutoff = now - chrono::Duration::hours(realert_hours);
+        let alert = match prior.as_ref() {
+            // New outage: always alert.
+            None => true,
+            // Ongoing: re-alert only once the quiet window has elapsed, so a source that stays
+            // dead is one line a day rather than one line per tick per series.
+            Some((_, last_alert_at)) => chrono::DateTime::parse_from_rfc3339(last_alert_at)
+                .map(|t| t.with_timezone(&Utc) <= cutoff)
+                .unwrap_or(true),
+        };
+        let detected_at = prior.map(|(d, _)| d).unwrap_or_else(|| now_iso.clone());
+        let last_alert_at = if alert { &now_iso } else { &detected_at };
+        sqlx::query(
+            "INSERT INTO source_scan_outage \
            (source_id, pkg_name, detected_at, last_alert_at, series, failing, kind, parked_until) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          ON CONFLICT(source_id) DO UPDATE SET \
            pkg_name = excluded.pkg_name, \
            series = excluded.series, \
            failing = excluded.failing, \
            kind = excluded.kind, \
            parked_until = excluded.parked_until, \
-           last_alert_at = CASE WHEN ? THEN excluded.last_alert_at \
+           last_alert_at = CASE WHEN $9 THEN excluded.last_alert_at \
                                 ELSE source_scan_outage.last_alert_at END",
-    )
-    .bind(source_id)
-    .bind(pkg_name)
-    .bind(&detected_at)
-    .bind(last_alert_at)
-    .bind(series)
-    .bind(failing)
-    .bind(kind)
-    .bind(parked_until)
-    .bind(alert as i64)
-    .execute(pool)
-    .await?;
-    Ok(alert)
+        )
+        .bind(source_id)
+        .bind(pkg_name)
+        .bind(crate::db_types::date(&detected_at)?)
+        .bind(crate::db_types::date(last_alert_at)?)
+        .bind(series)
+        .bind(failing)
+        .bind(kind)
+        .bind(crate::db_types::optional_date(parked_until)?)
+        .bind(alert)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(alert)
+    })
+    .await
 }
 
 /// Close a source's outage. Returns `true` if a row was actually removed, so the caller can
 /// log the recovery once.
 pub async fn clear_source_outage(pool: &Database, source_id: &str) -> Result<bool> {
-    let res = sqlx::query("DELETE FROM source_scan_outage WHERE source_id = ?")
+    let mut tx = pool.begin().await?;
+    crate::locks::advisory(
+        &mut tx,
+        &[crate::locks::AdvisoryKey::new(
+            crate::locks::KeyClass::SourcePolicy,
+            &[source_id],
+        )],
+    )
+    .await?;
+    guards::held().await;
+    let res = sqlx::query("DELETE FROM source_scan_outage WHERE source_id = $1")
         .bind(source_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -6264,10 +7584,10 @@ pub async fn trip_subscription_breaker(
     let now = Utc::now().to_rfc3339();
     let res = sqlx::query(
         "UPDATE extension_subscription \
-            SET disabled_at = ?, last_error = ? \
-          WHERE pkg_name = ? AND disabled_at IS NULL",
+            SET disabled_at = $1, last_error = $2 \
+          WHERE pkg_name = $3 AND disabled_at IS NULL",
     )
-    .bind(&now)
+    .bind(crate::db_types::date(&now)?)
     .bind(reason)
     .bind(pkg_name)
     .execute(pool)
@@ -6289,73 +7609,141 @@ pub async fn trip_subscription_breaker(
 /// `lang IS NULL` rows are deliberately NOT touched: an unknown language must not be
 /// mistaken for non-English and delete a legitimate series.
 pub async fn purge_foreign_language_suwayomi(pool: &Database) -> Result<Vec<i64>> {
-    // The non-English target set, as manga ids (INTEGER) and as TEXT (the form every
-    // satellite table keys the Suwayomi id in).
-    const NON_EN: &str = "SELECT id FROM suwayomi_series WHERE lang IS NOT NULL AND lang <> 'en' ORDER BY id LIMIT 128";
-    let non_en_text = format!("(SELECT CAST(id AS TEXT) FROM ({NON_EN}) t)");
+    let mut purged = Vec::new();
+    loop {
+        let batch = crate::db::retry_transaction(|| purge_foreign_language_batch(pool)).await?;
+        if batch.is_empty() {
+            return Ok(purged);
+        }
+        purged.extend(batch);
+        tokio::task::yield_now().await;
+    }
+}
 
-    // Cheap pre-check OUTSIDE the write lock: the steady state is "nothing to purge"
-    // (this runs every reconcile pass), and opening a write transaction just to discover
-    // that would contend with ingest for the single SQLite writer for no reason.
-    let any: Option<i64> = sqlx::query_scalar(&format!("SELECT id FROM ({NON_EN}) LIMIT 1"))
-        .fetch_optional(pool)
-        .await?;
-    if any.is_none() {
+/// What one purge batch deletes: the works it leaves without any source, and the
+/// Suwayomi source mappings of the batch's series.
+#[derive(PartialEq)]
+struct PurgeTargets {
+    works: std::collections::BTreeSet<String>,
+    sources: std::collections::BTreeSet<String>,
+}
+
+async fn purge_targets(
+    conn: &mut sqlx::PgConnection,
+    works: &[String],
+    series_keys: &[String],
+) -> Result<PurgeTargets> {
+    // A work is orphaned when EVERY one of its sources is a to-be-purged Suwayomi link.
+    // A work still anchored to the MangaDex catalogue or an English source is excluded.
+    let orphans: Vec<String> = sqlx::query_scalar(
+        "SELECT ss.work_id FROM source_series ss WHERE ss.work_id = ANY($1) \
+         GROUP BY ss.work_id \
+         HAVING bool_and(ss.source_type = 'suwayomi' AND ss.source_key = ANY($2))",
+    )
+    .bind(works)
+    .bind(series_keys)
+    .fetch_all(&mut *conn)
+    .await?;
+    let sources: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM source_series WHERE source_type = 'suwayomi' AND source_key = ANY($1)",
+    )
+    .bind(series_keys)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(PurgeTargets {
+        works: orphans.into_iter().collect(),
+        sources: sources.into_iter().collect(),
+    })
+}
+
+async fn purge_foreign_language_batch(pool: &Database) -> Result<Vec<i64>> {
+    let mut tx = pool.begin().await?;
+    let series_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM suwayomi_series WHERE lang IS NOT NULL AND lang <> 'en' ORDER BY id LIMIT 128")
+        .fetch_all(&mut *tx).await?;
+    if series_ids.is_empty() {
         return Ok(Vec::new());
     }
-
-    let mut purged_ids = Vec::new();
-    loop {
-        // Each bounded group stays in ONE write transaction so recovery is atomic and idempotent: a crash
-        // before commit rolls back wholesale and the next reconcile re-runs cleanly; a
-        // commit finishes the job (the previous version cascaded orphans AFTER the commit,
-        // so an ill-timed restart — which a server rebuild causes — permanently leaked the
-        // orphaned works). Delete every row that references `suwayomi_series` via subquery
-        // BEFORE deleting `suwayomi_series` itself, so the subqueries still resolve.
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-
-        // BOTH reads happen INSIDE the write lock, and this is load-bearing, not tidiness.
-        //
-        // `orphan_works` is a snapshot of "works whose every source_series is about to be
-        // deleted", and it is applied as an unconditional `DELETE FROM work WHERE id IN (…)`.
-        // Read outside the transaction, a concurrent ingest linking a NEW source_series to
-        // one of those works in the gap — the federated/admin add path does exactly this —
-        // leaves the work no longer orphaned, but it is cascade-deleted anyway, taking a
-        // live series with it. `BEGIN IMMEDIATE` holds the writer for the whole span, so the
-        // set cannot go stale between being computed and being applied.
-        //
-        // `series_ids` is read here for the same reason: it is RETURNED so the caller can
-        // best-effort `inLibrary=false` those ids upstream, while the deletes below are
-        // driven by the `NON_EN` subquery re-evaluated inside the transaction. Read outside,
-        // a series arriving in the gap would be deleted but not reported, so Suwayomi would
-        // keep it enrolled and re-mirror it on the next scan.
-        let series_ids: Vec<i64> = sqlx::query_scalar(NON_EN).fetch_all(&mut *tx).await?;
-        if series_ids.is_empty() {
-            tx.rollback().await?;
-            return Ok(purged_ids);
+    let numeric: Vec<String> = series_ids.iter().map(ToString::to_string).collect();
+    let works: Vec<String> = sqlx::query_scalar("SELECT DISTINCT work_id FROM source_series WHERE source_type = 'suwayomi' AND source_key = ANY($1) ORDER BY work_id")
+        .bind(&numeric).fetch_all(&mut *tx).await?;
+    let discovery_ids: Vec<&str> = works
+        .iter()
+        .chain(numeric.iter())
+        .map(String::as_str)
+        .collect();
+    let discovered = merge_discovery(&mut tx, &discovery_ids, &[]).await?;
+    crate::locks::lock_users(&mut tx, &discovered.users).await?;
+    let mut keys = discovered.keys.clone();
+    keys.extend(
+        numeric
+            .iter()
+            .map(|id| crate::locks::AdvisoryKey::new(crate::locks::KeyClass::Series, &[id])),
+    );
+    // Even an unlinked cache row can acquire a source claim while purge waits.
+    keys.extend(
+        numeric
+            .iter()
+            .map(|id| crate::locks::AdvisoryKey::source_identity("suwayomi", id)),
+    );
+    crate::locks::advisory(&mut tx, &keys).await?;
+    // Delete-capable locks only on what this batch deletes: the works it orphans and the
+    // source mappings it purges. A consolidated work keeps its row and its other sources,
+    // so a child insert under either (a chapter of its MangaDex source, a library row)
+    // must not wait for the purge. Both sets are read before the locks and again after.
+    let doomed = purge_targets(&mut tx, &works, &numeric).await?;
+    for id in &works {
+        if doomed.works.contains(id) {
+            crate::locks::lock_works_for_delete(&mut tx, &[id]).await?;
+        } else {
+            crate::locks::lock_works(&mut tx, &[id]).await?;
         }
+    }
+    for id in &discovered.sources {
+        if doomed.sources.contains(id) {
+            lock_discovered_sources_for_delete(&mut tx, std::slice::from_ref(id)).await?;
+        } else {
+            lock_discovered_sources(&mut tx, std::slice::from_ref(id)).await?;
+        }
+    }
+    for id in &series_ids {
+        sqlx::query("SELECT id FROM suwayomi_series WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    }
+    let current: Vec<i64> = sqlx::query_scalar("SELECT id FROM suwayomi_series WHERE id = ANY($1) AND lang IS NOT NULL AND lang <> 'en' ORDER BY id")
+        .bind(&series_ids).fetch_all(&mut *tx).await?;
+    let current_works: Vec<String> = sqlx::query_scalar("SELECT DISTINCT work_id FROM source_series WHERE source_type = 'suwayomi' AND source_key = ANY($1) ORDER BY work_id")
+        .bind(&numeric).fetch_all(&mut *tx).await?;
+    if current != series_ids
+        || current_works != works
+        || merge_discovery(&mut tx, &discovery_ids, &[]).await? != discovered
+        || purge_targets(&mut tx, &works, &numeric).await? != doomed
+    {
+        return Err(crate::locks::RestartTransaction.into());
+    }
+    guards::held().await;
+    // Integers came from the database; this freezes every subquery to this batch.
+    let non_en = format!(
+        "SELECT id FROM suwayomi_series WHERE id IN ({})",
+        numeric.join(",")
+    );
+    let non_en_text = format!("(SELECT CAST(id AS TEXT) FROM ({non_en}) t)");
+    // Works that will be ORPHANED by the purge: every one of their source_series is a
+    // to-be-purged Suwayomi link. Computed BEFORE the deletes (it needs the links
+    // intact). A work still anchored to the MangaDex catalogue or an English source is
+    // excluded (the non-purged branch count is > 0), so consolidated works survive and
+    // merely lose the foreign-language translator mapping.
+    //
+    // This is the set that was revalidated under the locks above, and exactly the set
+    // whose work rows hold the delete-capable lock.
+    let orphan_works: Vec<String> = doomed.works.iter().cloned().collect();
 
-        // Works that will be ORPHANED by the purge: every one of their source_series is a
-        // to-be-purged Suwayomi link. Computed BEFORE the deletes (it needs the links
-        // intact). A work still anchored to the MangaDex catalogue or an English source is
-        // excluded (the non-purged branch count is > 0), so consolidated works survive and
-        // merely lose the foreign-language translator mapping.
-        let orphan_works: Vec<String> = sqlx::query_scalar(&format!(
-            "SELECT ss.work_id FROM source_series ss \
-         WHERE ss.work_id IN (SELECT work_id FROM source_series \
-             WHERE source_type = 'suwayomi' AND source_key IN {non_en_text}) \
-         GROUP BY ss.work_id \
-         HAVING SUM(CASE WHEN ss.source_type = 'suwayomi' AND ss.source_key IN {non_en_text} \
-                         THEN 0 ELSE 1 END) = 0"
-        ))
-        .fetch_all(&mut *tx)
-        .await?;
-
-        // Satellite rows keyed by the numeric Suwayomi id (as TEXT): per-user library +
-        // reading progress, admin overrides, and view counters. Left uncleaned these
-        // dangle forever (e.g. a purged series stuck in a user's library, re-rendered live
-        // on every view) since none carry an enforced FK to the refreshable cache.
-        for stmt in [
+    // Satellite rows keyed by the numeric Suwayomi id (as TEXT): per-user library +
+    // reading progress, admin overrides, and view counters. Left uncleaned these
+    // dangle forever (e.g. a purged series stuck in a user's library, re-rendered live
+    // on every view) since none carry an enforced FK to the refreshable cache.
+    for stmt in [
             format!("DELETE FROM user_library      WHERE series_id  IN {non_en_text}"),
             format!("DELETE FROM suwayomi_progress  WHERE series_id  IN {non_en_text}"),
             format!("DELETE FROM series_admin       WHERE series_id  IN {non_en_text}"),
@@ -6365,59 +7753,53 @@ pub async fn purge_foreign_language_suwayomi(pool: &Database) -> Result<Vec<i64>
             format!(
                 "DELETE FROM source_series WHERE source_type = 'suwayomi' AND source_key IN {non_en_text}"
             ),
-            format!("DELETE FROM suwayomi_chapter WHERE manga_id IN ({NON_EN})"),
+            format!("DELETE FROM suwayomi_chapter WHERE manga_id IN ({non_en})"),
         ] {
             sqlx::query(&stmt).execute(&mut *tx).await?;
         }
 
-        // Cascade the orphaned works + their child rows, in the same transaction. Mirrors
-        // `delete_work_cascade`'s table set (kept in sync with it), but set-based so a
-        // first-run purge of thousands doesn't fan out into per-work round-trips.
-        if !orphan_works.is_empty() {
-            let ph = std::iter::repeat_n("?", orphan_works.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            for (table, col) in [
-                ("work_alias", "work_id"),
-                ("work_alias_token", "work_id"),
-                ("work_external_id", "work_id"),
-                ("work_description", "work_id"),
-                ("work_credit", "work_id"),
-                ("work_cover", "work_id"),
-                ("work_cover_issue", "work_id"),
-                ("work_tag", "work_id"),
-                ("chapter_override", "work_id"),
-                ("merge_candidate", "candidate_work_id"),
-                ("work", "id"),
-            ] {
-                let sql = format!("DELETE FROM {table} WHERE {col} IN ({ph})");
-                let mut q = sqlx::query(&sql);
-                for w in &orphan_works {
-                    q = q.bind(w);
-                }
-                q.execute(&mut *tx).await?;
+    // Cascade the orphaned works + their child rows, in the same transaction. Mirrors
+    // `delete_work_cascade`'s table set (kept in sync with it), but set-based so a
+    // first-run purge of thousands doesn't fan out into per-work round-trips.
+    if !orphan_works.is_empty() {
+        let ph = crate::sql_params::placeholders(1, orphan_works.len());
+        for (table, col) in [
+            ("work_alias", "work_id"),
+            ("work_alias_token", "work_id"),
+            ("work_external_id", "work_id"),
+            ("work_description", "work_id"),
+            ("work_credit", "work_id"),
+            ("work_cover", "work_id"),
+            ("work_cover_issue", "work_id"),
+            ("work_tag", "work_id"),
+            ("chapter_override", "work_id"),
+            ("merge_candidate", "candidate_work_id"),
+            ("work", "id"),
+        ] {
+            let sql = format!("DELETE FROM {table} WHERE {col} IN ({ph})");
+            let mut q = sqlx::query(&sql);
+            for w in &orphan_works {
+                q = q.bind(w);
             }
+            q.execute(&mut *tx).await?;
         }
+    }
 
-        // Drop review candidates whose source_series was just removed (dangling by
-        // source_series_id — the candidate_work_id ones are handled by the cascade above).
-        sqlx::query(
-        "DELETE FROM merge_candidate WHERE source_series_id NOT IN (SELECT id FROM source_series)",
-    )
+    // Review candidates of the purged source mappings are already gone:
+    // `merge_candidate.source_series_id` references `source_series` ON DELETE CASCADE,
+    // so the delete of the mappings above removed them through
+    // `idx_merge_candidate_source`. (A `NOT IN (SELECT id FROM source_series)` sweep
+    // stood here: a scan of both tables in every purge batch, under the batch's locks.)
+
+    // suwayomi_series LAST — every subquery above resolves against it.
+    sqlx::query(&format!(
+        "DELETE FROM suwayomi_series WHERE id IN ({non_en})"
+    ))
     .execute(&mut *tx)
     .await?;
 
-        // suwayomi_series LAST — every subquery above resolves against it.
-        sqlx::query(&format!(
-            "DELETE FROM suwayomi_series WHERE id IN ({NON_EN})"
-        ))
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        purged_ids.extend(series_ids);
-        tokio::task::yield_now().await;
-    }
+    tx.commit().await?;
+    Ok(series_ids)
 }
 
 /// Backfill a "due now" scan-state row for every enrolled Suwayomi series that lacks one,
@@ -6433,13 +7815,13 @@ pub async fn backfill_pending_scan_states(pool: &Database) -> Result<u64> {
     // so a NULL row would never be selected and the series would silently never scan.
     let res = sqlx::query(
         "INSERT INTO series_scan_state (series_id, next_scan_at, updated_at) \
-         SELECT ss.source_key, ?, ? FROM source_series ss \
+         SELECT ss.source_key, $1, $2 FROM source_series ss \
          WHERE ss.source_type = 'suwayomi' \
            AND NOT EXISTS (SELECT 1 FROM series_scan_state sst WHERE sst.series_id = ss.source_key) \
          ON CONFLICT(series_id) DO NOTHING",
     )
-    .bind(crate::scanner::DUE_NOW_SENTINEL)
-    .bind(Utc::now().to_rfc3339())
+    .bind(crate::db_types::date(crate::scanner::DUE_NOW_SENTINEL)?)
+    .bind(Utc::now())
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
@@ -6459,14 +7841,12 @@ pub async fn existing_source_keys(
     const CHUNK: usize = 500;
     let mut found = std::collections::HashSet::new();
     for chunk in keys.chunks(CHUNK) {
-        let placeholders = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = crate::sql_params::placeholders(2, chunk.len());
         let sql = format!(
             "SELECT source_key FROM source_series \
-             WHERE source_type = ? AND source_key IN ({placeholders})"
+             WHERE source_type = $1 AND source_key IN ({placeholders})"
         );
-        let mut q = sqlx::query_scalar::<_, String>(&sql).bind(source_type);
+        let mut q = crate::db_types::query_scalar::<String>(&sql).bind(source_type);
         for k in chunk {
             q = q.bind(k);
         }
@@ -6479,10 +7859,10 @@ pub async fn existing_source_keys(
 /// (`source_sync_due`). Singleton row keyed on id=1.
 pub async fn mark_source_sync_pass(pool: &Database) -> Result<()> {
     sqlx::query(
-        "INSERT INTO sync_state (id, last_full_pass_at) VALUES (1, ?) \
+        "INSERT INTO sync_state (id, last_full_pass_at) VALUES (1, $1) \
          ON CONFLICT(id) DO UPDATE SET last_full_pass_at = excluded.last_full_pass_at",
     )
-    .bind(Utc::now().to_rfc3339())
+    .bind(Utc::now())
     .execute(pool)
     .await?;
     Ok(())
@@ -6501,10 +7881,13 @@ pub async fn mark_source_sync_pass(pool: &Database) -> Result<()> {
 /// skipped when a pass ran recently.
 pub async fn source_sync_due(pool: &Database, interval_seconds: u64) -> bool {
     let last: Option<String> =
-        sqlx::query_scalar("SELECT last_full_pass_at FROM sync_state WHERE id = 1")
+        crate::db_types::query_scalar("SELECT last_full_pass_at FROM sync_state WHERE id = 1")
             .fetch_optional(pool)
             .await
-            .ok()
+            .unwrap_or_else(|error| {
+                crate::db::record_read_database_error(&error);
+                None
+            })
             .flatten();
     let threshold = (interval_seconds as i64) * 9 / 10;
     match last.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok()) {
@@ -6519,11 +7902,268 @@ mod tests {
 
     async fn pool() -> Database {
         let pool = Database::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn cover_volume_numeric_prefix_matches_the_sqlite_source_contract() {
+        let source = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        for value in [
+            None,
+            Some(""),
+            Some("volume"),
+            Some("  -1.25 extra"),
+            Some("+.5x"),
+            Some("1e2x"),
+            Some("1e+"),
+            Some("-0"),
+            Some("1e999"),
+            Some("-1e999"),
+            Some("1e-999"),
+            Some("16777217"),
+            Some("0.12345649999999998"),
+        ] {
+            let expected: f64 =
+                sqlx::query_scalar("SELECT CAST(COALESCE(NULLIF($1, ''), '0') AS REAL)")
+                    .bind(value)
+                    .fetch_one(&source)
+                    .await
+                    .unwrap();
+            assert_eq!(sqlite_real_prefix(value), expected, "{value:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn portable_review_repoint_keeps_survivor_and_moves_nonconflicts() {
+        let pool = pool().await;
+        let target = create_work(&pool, &WorkInput::default()).await.unwrap();
+        let source = create_work(&pool, &WorkInput::default()).await.unwrap();
+        for user in ["reviewer_both", "reviewer_source"] {
+            sqlx::query(
+                "INSERT INTO users (id, username, email, password_hash, created_at) \
+                         VALUES ($1, $2, $3, 'hash', '2026-01-01T00:00:00Z')",
+            )
+            .bind(crate::db_types::test_uuid(user))
+            .bind(user)
+            .bind(format!("{user}@example.com"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (id, series, user, score) in [
+            ("review_survivor", &target, "reviewer_both", 9i64),
+            ("review_duplicate", &source, "reviewer_both", 1),
+            ("review_move", &source, "reviewer_source", 7),
+        ] {
+            sqlx::query("INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) \
+                         VALUES ($1, $2, $3, $4, '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+                .bind(crate::db_types::test_uuid(id)).bind(series).bind(crate::db_types::test_uuid(user)).bind(score).execute(&pool).await.unwrap();
+        }
+        merge_works(&pool, &source, &target).await.unwrap();
+        let reviews: Vec<(String, String, i64)> =
+            crate::db_types::query_tuple("SELECT id, series_id, score FROM reviews ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let mut expected = vec![
+            (
+                crate::db_types::test_uuid("review_move").to_string(),
+                target.clone(),
+                7,
+            ),
+            (
+                crate::db_types::test_uuid("review_survivor").to_string(),
+                target,
+                9,
+            ),
+        ];
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(reviews, expected);
+    }
+
+    #[tokio::test]
+    async fn portable_upserts_have_no_replace_delete_or_default_effects() {
+        use crate::db_types::Row;
+        let pool = pool().await;
+        for (table, expected) in [
+            (
+                "work_tracker_link",
+                vec!["work_id", "provider", "external_id"],
+            ),
+            ("work_redirect", vec!["old_id", "new_id", "created_at"]),
+        ] {
+            let columns = sqlx::query(
+                "SELECT a.attname AS name, pg_get_expr(d.adbin, d.adrelid) AS dflt_value \
+                 FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+                 WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+            )
+            .bind(table)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let names: Vec<String> = columns.iter().map(|r| r.get("name")).collect();
+            assert_eq!(
+                names, expected,
+                "all columns must be supplied by the upsert"
+            );
+            assert!(columns
+                .iter()
+                .all(|r| r.get::<Option<String>, _>("dflt_value").is_none()));
+            let triggers: i64 = crate::db_types::query_scalar(
+                "SELECT COUNT(*) FROM pg_trigger WHERE tgrelid = $1::regclass AND NOT tgisinternal",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(triggers, 0);
+            let dependent_fks: i64 = crate::db_types::query_scalar(
+                "SELECT COUNT(*) FROM pg_constraint WHERE contype = 'f' AND confrelid = $1::regclass",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(dependent_fks, 0);
+        }
+        let target = create_work(&pool, &WorkInput::default()).await.unwrap();
+        let source = create_work(&pool, &WorkInput::default()).await.unwrap();
+        refresh_mangadex_details(
+            &pool,
+            &target,
+            &WorkInput {
+                external_ids: vec![("al".into(), "100".into()), ("al".into(), "200".into())],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let tracker: String = crate::db_types::query_scalar(
+            "SELECT external_id FROM work_tracker_link WHERE work_id = $1 AND provider = 'al'",
+        )
+        .bind(&target)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            tracker, "200",
+            "last repeated provider wins, as with REPLACE"
+        );
+        sqlx::query("INSERT INTO work_redirect VALUES ($1, 'legacy', '2000-01-01T00:00:00Z')")
+            .bind(&source)
+            .execute(&pool)
+            .await
+            .unwrap();
+        merge_works(&pool, &source, &target).await.unwrap();
+        let redirect: (String, String) = crate::db_types::query_tuple(
+            "SELECT new_id, created_at FROM work_redirect WHERE old_id = $1",
+        )
+        .bind(&source)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(redirect.0, target);
+        assert_ne!(
+            redirect.1, "2000-01-01T00:00:00.000000+00:00",
+            "REPLACE overwrote every non-key column"
+        );
+        chrono::DateTime::parse_from_rfc3339(&redirect.1).unwrap();
+    }
+
+    #[tokio::test]
+    async fn portable_ignore_writers_never_supply_nullable_required_values() {
+        let pool = pool().await;
+        let work = create_work(&pool, &WorkInput::default()).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        // PostgreSQL conflict handling skips unique collisions, while NOT NULL
+        // violations remain errors. Recover this deliberate error before testing writes.
+        sqlx::query("SAVEPOINT required_value")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let error =
+            sqlx::query("INSERT INTO work_alias_token VALUES ($1, NULL) ON CONFLICT DO NOTHING")
+                .bind(&work)
+                .execute(&mut *tx)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("23502")
+        );
+        sqlx::query("ROLLBACK TO SAVEPOINT required_value")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        // The production helper takes &str for BOTH NOT NULL columns. Empty text is
+        // legal (no CHECK); repeated tokens skip only the unique (work_id, token) key.
+        insert_alias_tokens(&mut tx, &work, "repeat repeat")
+            .await
+            .unwrap();
+        insert_descriptions_and_credits(
+            &mut tx,
+            &work,
+            &WorkInput {
+                credits: vec![
+                    ("author".into(), "Name".into()),
+                    ("author".into(), "Name".into()),
+                ],
+                covers: vec![Cover {
+                    file_name: "cover.jpg".into(),
+                    lang: None,
+                    volume: None,
+                    is_primary: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        insert_aliases(
+            &mut tx,
+            &work,
+            &[
+                Alias {
+                    raw: "Repeat".into(),
+                    lang: None,
+                },
+                Alias {
+                    raw: "Repeat".into(),
+                    lang: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let tokens: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM work_alias_token WHERE work_id = $1",
+        )
+        .bind(&work)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let credits: i64 =
+            crate::db_types::query_scalar("SELECT COUNT(*) FROM work_credit WHERE work_id = $1")
+                .bind(&work)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let aliases: i64 =
+            crate::db_types::query_scalar("SELECT COUNT(*) FROM work_alias WHERE work_id = $1")
+                .bind(&work)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((tokens, credits, aliases), (1, 1, 1));
     }
 
     #[tokio::test]
@@ -6560,8 +8200,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let links: Vec<(String, String)> = sqlx::query_as(
-            "SELECT provider, external_id FROM work_tracker_link WHERE work_id = ? ORDER BY provider",
+        let links: Vec<(String, String)> = crate::db_types::query_tuple(
+            "SELECT provider, external_id FROM work_tracker_link WHERE work_id = $1 ORDER BY provider",
         )
         .bind(&work)
         .fetch_all(&pool)
@@ -6574,8 +8214,8 @@ mod tests {
                 ("engtl".into(), "https://publisher.example/title".into())
             ]
         );
-        let identities: Vec<String> = sqlx::query_scalar(
-            "SELECT provider FROM work_external_id WHERE work_id = ? ORDER BY provider",
+        let identities: Vec<String> = crate::db_types::query_scalar(
+            "SELECT provider FROM work_external_id WHERE work_id = $1 ORDER BY provider",
         )
         .bind(&work)
         .fetch_all(&pool)
@@ -6608,7 +8248,7 @@ mod tests {
         .await
         .unwrap();
         merge_works(&pool, &source, &target).await.unwrap();
-        let links: Vec<(String, String)> = sqlx::query_as("SELECT provider, external_id FROM work_tracker_link WHERE work_id = ? ORDER BY provider")
+        let links: Vec<(String, String)> = crate::db_types::query_tuple("SELECT provider, external_id FROM work_tracker_link WHERE work_id = $1 ORDER BY provider")
             .bind(&target).fetch_all(&pool).await.unwrap();
         assert_eq!(
             links,
@@ -6627,8 +8267,8 @@ mod tests {
         .await
         .unwrap();
         merge_works(&pool, &rich, &provisional).await.unwrap();
-        let id: String = sqlx::query_scalar(
-            "SELECT external_id FROM work_tracker_link WHERE work_id = ? AND provider = 'al'",
+        let id: String = crate::db_types::query_scalar(
+            "SELECT external_id FROM work_tracker_link WHERE work_id = $1 AND provider = 'al'",
         )
         .bind(&provisional)
         .fetch_one(&pool)
@@ -6638,29 +8278,48 @@ mod tests {
             id, "400",
             "a provisional survivor inherits imported tracker details"
         );
+        // The lost-claim cleanup keeps a work that still has a source mapping (Phase 4,
+        // T025). Release the mapping first: this test is about the cascade itself.
+        sqlx::query("DELETE FROM source_series WHERE work_id = $1")
+            .bind(&provisional)
+            .execute(&pool)
+            .await
+            .unwrap();
         delete_work_cascade(&pool, &provisional).await.unwrap();
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM work_tracker_link WHERE work_id = ?")
-                .bind(provisional)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let count: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM work_tracker_link WHERE work_id = $1",
+        )
+        .bind(provisional)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// The authority inputs `publish_snapshot` versions a work by (Phase 4, T009), as
+    /// empty relations: the two staging tests below build their own small schema, and
+    /// with these empty a work's version is its own row version.
+    async fn create_empty_authority_inputs(pool: &Database) {
+        for sql in [
+            "CREATE TABLE source_series(id TEXT PRIMARY KEY, work_id TEXT, source_type TEXT, source_key TEXT)",
+            "CREATE TABLE chapter(id TEXT PRIMARY KEY, source_series_id TEXT)",
+            "CREATE TABLE suwayomi_chapter(id BIGINT PRIMARY KEY, manga_id BIGINT)",
+            "CREATE TABLE suwayomi_series(id BIGINT PRIMARY KEY)",
+            "CREATE TABLE work_alias(id TEXT PRIMARY KEY, work_id TEXT)",
+            "CREATE TABLE work_tag(work_id TEXT, tag TEXT)",
+            "CREATE TABLE release_event(work_id TEXT, chapter_key TEXT)",
+            "CREATE TABLE series_scan_state(series_id TEXT PRIMARY KEY)",
+            "CREATE TABLE work_stats(work_id TEXT PRIMARY KEY)",
+            "CREATE FUNCTION sqlite_integer_pin(value text) RETURNS bigint LANGUAGE sql IMMUTABLE AS 'SELECT 0::bigint'",
+        ] {
+            sqlx::query(sql).execute(pool).await.unwrap();
+        }
     }
 
     #[tokio::test]
     async fn staged_catalogue_refresh_never_locks_main_and_preserves_newer_writes() {
-        let path = std::env::temp_dir().join(format!("komiq-refresh-{}.sqlite3", Uuid::new_v4()));
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .busy_timeout(std::time::Duration::from_millis(100));
-        let pool = crate::database::TestPoolOptions::new()
-            .max_connections(3)
-            .connect_with(options)
-            .await
-            .unwrap();
+        let pool = Database::empty_for_test(3).await.unwrap();
+        create_empty_authority_inputs(&pool).await;
         for sql in [
             "CREATE TABLE work(id TEXT PRIMARY KEY)",
             "CREATE TABLE browse_catalogue(work_id TEXT PRIMARY KEY, title TEXT NOT NULL, comic_type TEXT NOT NULL)",
@@ -6670,19 +8329,27 @@ mod tests {
             sqlx::query(sql).execute(&pool).await.unwrap();
         }
         // Staging still completes while another connection owns the main writer.
-        let writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let writer = pool.begin_with("BEGIN").await.unwrap();
         let mut snapshot = refresh_snapshot(&pool, &["browse_catalogue"])
             .await
             .unwrap();
-        sqlx::query("INSERT INTO temp.browse_catalogue VALUES ('keep','snapshot','MANGA'), ('update','snapshot','MANHWA')")
+        sqlx::query("INSERT INTO pg_temp.browse_catalogue VALUES ('keep','snapshot','MANGA'), ('update','snapshot','MANHWA')")
             .execute(&mut *snapshot).await.unwrap();
+        sqlx::query("SAVEPOINT forbidden_write")
+            .execute(&mut *snapshot)
+            .await
+            .unwrap();
         assert!(
-            sqlx::query("UPDATE main.browse_catalogue SET title = 'forbidden'")
+            sqlx::query("UPDATE public.browse_catalogue SET title = 'forbidden'")
                 .execute(&mut *snapshot)
                 .await
                 .is_err(),
             "main is opened read-only"
         );
+        sqlx::query("ROLLBACK TO SAVEPOINT forbidden_write")
+            .execute(&mut *snapshot)
+            .await
+            .unwrap();
         writer.rollback().await.unwrap();
         // A concurrent cache writer wins over both a stale replacement and stale prune.
         sqlx::query(
@@ -6697,7 +8364,7 @@ mod tests {
                 .unwrap(),
             1
         );
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
+        let rows: Vec<(String, String, String)> = crate::db_types::query_tuple(
             "SELECT work_id, title, comic_type FROM browse_catalogue ORDER BY work_id",
         )
         .fetch_all(&pool)
@@ -6713,37 +8380,30 @@ mod tests {
         );
         drop(snapshot);
         pool.close().await;
-        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
     async fn staged_catalogue_refresh_publishes_complete_rows_in_multiple_writer_turns() {
-        let path = std::env::temp_dir().join(format!("komiq-refresh-{}.sqlite3", Uuid::new_v4()));
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
-        let pool = crate::database::TestPoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .unwrap();
+        let pool = Database::empty_for_test(3).await.unwrap();
+        create_empty_authority_inputs(&pool).await;
         for sql in [
             "CREATE TABLE work(id TEXT PRIMARY KEY)",
             "CREATE TABLE browse_catalogue(work_id TEXT PRIMARY KEY, title TEXT NOT NULL, comic_type TEXT NOT NULL)",
             "CREATE TABLE writer_turns(n INTEGER NOT NULL)",
             "INSERT INTO writer_turns VALUES (0)",
-            "WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n < 385) INSERT INTO work SELECT printf('%04d', n) FROM ids",
+            "WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n < 385) INSERT INTO work SELECT lpad(n::text, 4, '0') FROM ids",
         ] {
             sqlx::query(sql).execute(&pool).await.unwrap();
         }
         let mut snapshot = refresh_snapshot(&pool, &["browse_catalogue"])
             .await
             .unwrap();
-        sqlx::query("INSERT INTO temp.browse_catalogue SELECT id, 'typed', 'MANGA' FROM main.work")
-            .execute(&mut *snapshot)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO pg_temp.browse_catalogue SELECT id, 'typed', 'MANGA' FROM public.work",
+        )
+        .execute(&mut *snapshot)
+        .await
+        .unwrap();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer_pool = pool.clone();
         let writer_stop = stop.clone();
@@ -6753,7 +8413,7 @@ mod tests {
                     .execute(&writer_pool)
                     .await
                     .unwrap();
-                let incomplete: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM browse_catalogue WHERE comic_type IS NULL OR title <> 'typed'")
+                let incomplete: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM browse_catalogue WHERE comic_type IS NULL OR title <> 'typed'")
                     .fetch_one(&writer_pool).await.unwrap();
                 assert_eq!(incomplete, 0);
             }
@@ -6766,7 +8426,7 @@ mod tests {
         );
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         writer.await.unwrap();
-        let turns: i64 = sqlx::query_scalar("SELECT n FROM writer_turns")
+        let turns: i64 = crate::db_types::query_scalar("SELECT n FROM writer_turns")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -6776,7 +8436,6 @@ mod tests {
         );
         drop(snapshot);
         pool.close().await;
-        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -6809,12 +8468,13 @@ mod tests {
                 .1,
             vec![work.clone()]
         );
-        let browse: (String, String) =
-            sqlx::query_as("SELECT reader_id, comic_type FROM browse_catalogue WHERE work_id = ?")
-                .bind(&work)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let browse: (String, String) = crate::db_types::query_tuple(
+            "SELECT reader_id, comic_type FROM browse_catalogue WHERE work_id = $1",
+        )
+        .bind(&work)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(browse, ("1234".into(), "MANGA".into()));
         add_work_alias(&pool, &work, "Hidden Stardust")
             .await
@@ -6859,7 +8519,7 @@ mod tests {
         .await
         .unwrap();
         let mut tx = pool.begin().await.unwrap();
-        sqlx::query("UPDATE work SET title_override = 'Dusk Emperor' WHERE id = ?")
+        sqlx::query("UPDATE work SET title_override = 'Dusk Emperor' WHERE id = $1")
             .bind(&work)
             .execute(&mut *tx)
             .await
@@ -6888,14 +8548,14 @@ mod tests {
             vec![work.clone()]
         );
         let title: String =
-            sqlx::query_scalar("SELECT title FROM browse_catalogue WHERE work_id = ?")
+            crate::db_types::query_scalar("SELECT title FROM browse_catalogue WHERE work_id = $1")
                 .bind(&work)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
         assert_eq!(title, "Dusk Emperor");
         let mut tx = pool.begin().await.unwrap();
-        sqlx::query("UPDATE work SET title_override = 'Rolled Back' WHERE id = ?")
+        sqlx::query("UPDATE work SET title_override = 'Rolled Back' WHERE id = $1")
             .bind(&work)
             .execute(&mut *tx)
             .await
@@ -6949,14 +8609,15 @@ mod tests {
         .await
         .unwrap();
         assert!(publish_mirror_feed_row(&pool, &work).await.unwrap());
-        let browse_count: i64 =
-            sqlx::query_scalar("SELECT en_chapter_count FROM browse_catalogue WHERE work_id = ?")
-                .bind(&work)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let browse_count: i64 = crate::db_types::query_scalar(
+            "SELECT en_chapter_count FROM browse_catalogue WHERE work_id = $1",
+        )
+        .bind(&work)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let search_count: i64 =
-            sqlx::query_scalar("SELECT CAST(chapters AS INTEGER) FROM work_fts WHERE work_id = ?")
+            crate::db_types::query_scalar("SELECT count(*) FROM chapter c JOIN source_series ss ON ss.id=c.source_series_id WHERE ss.work_id=$1")
                 .bind(&work)
                 .fetch_one(&pool)
                 .await
@@ -6981,19 +8642,23 @@ mod tests {
         let work = upsert_work_from_mangadex(&pool, "md-live-edit", &first)
             .await
             .unwrap();
-        let before: i64 = sqlx::query_scalar("SELECT rowid FROM work_fts WHERE work_id = ?")
-            .bind(&work)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let before: String = crate::db_types::query_scalar(
+            "SELECT ctid::text FROM work_search_alias WHERE work_id = $1 AND kind = 'title'",
+        )
+        .bind(&work)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         upsert_work_from_mangadex(&pool, "md-live-edit", &first)
             .await
             .unwrap();
-        let after: i64 = sqlx::query_scalar("SELECT rowid FROM work_fts WHERE work_id = ?")
-            .bind(&work)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let after: String = crate::db_types::query_scalar(
+            "SELECT ctid::text FROM work_search_alias WHERE work_id = $1 AND kind = 'title'",
+        )
+        .bind(&work)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(before, after);
         upsert_work_from_mangadex(
             &pool,
@@ -7050,20 +8715,23 @@ mod tests {
         )
         .await
         .unwrap();
-        sqlx::query(&format!(
-            "CREATE TRIGGER fail_merge_projection BEFORE INSERT ON browse_catalogue \
-             WHEN NEW.work_id = '{target}' BEGIN SELECT RAISE(ABORT, 'forced projection failure'); END"
+        sqlx::raw_sql(&format!(
+            "CREATE FUNCTION fail_merge_projection_fn() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF NEW.work_id = '{target}' THEN RAISE EXCEPTION 'forced projection failure'; END IF; \
+             RETURN NEW; END $$; CREATE TRIGGER fail_merge_projection BEFORE INSERT ON browse_catalogue \
+             FOR EACH ROW EXECUTE FUNCTION fail_merge_projection_fn()"
         )).execute(&pool).await.unwrap();
         assert!(merge_works(&pool, &source, &target)
             .await
             .unwrap_err()
             .to_string()
             .contains("forced projection failure"));
-        let owner: String = sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
-            .bind(&ssid)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let owner: String =
+            crate::db_types::query_scalar("SELECT work_id FROM source_series WHERE id = $1")
+                .bind(&ssid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(owner, source);
         assert_eq!(
             search_works_fts(&pool, "lantern", true, &Default::default(), 1, 20)
@@ -7072,7 +8740,7 @@ mod tests {
                 .1,
             vec![source.clone()]
         );
-        sqlx::query("DROP TRIGGER fail_merge_projection")
+        sqlx::query("DROP TRIGGER fail_merge_projection ON browse_catalogue")
             .execute(&pool)
             .await
             .unwrap();
@@ -7084,11 +8752,13 @@ mod tests {
                 .1,
             vec![target]
         );
-        let stale: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_fts WHERE work_id = ?")
-            .bind(&source)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let stale: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM work_search_alias WHERE work_id = $1",
+        )
+        .bind(&source)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(stale, 0);
     }
 
@@ -7107,7 +8777,7 @@ mod tests {
         for (id, title) in [(880901, "Detached Beacon"), (880902, "Kept Harbour")] {
             sqlx::query(
             "INSERT INTO suwayomi_series(id,title,status,source_id,lang,updated_at,created_at) \
-                 VALUES (?,?,'ONGOING','test','en','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                 VALUES ($1,$2,'ONGOING','test','en','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
         )
         .bind(id)
         .bind(title)
@@ -7122,9 +8792,11 @@ mod tests {
         upsert_source_series(&pool, &work, "suwayomi", "test", "880902", None, false)
             .await
             .unwrap();
-        sqlx::query(
-            "CREATE TRIGGER fail_split_projection BEFORE INSERT ON browse_catalogue \
-             WHEN NEW.title = 'Detached Beacon' BEGIN SELECT RAISE(ABORT, 'forced projection failure'); END"
+        sqlx::raw_sql(
+            "CREATE FUNCTION fail_split_projection_fn() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF NEW.title = 'Detached Beacon' THEN RAISE EXCEPTION 'forced projection failure'; END IF; \
+             RETURN NEW; END $$; CREATE TRIGGER fail_split_projection BEFORE INSERT ON browse_catalogue \
+             FOR EACH ROW EXECUTE FUNCTION fail_split_projection_fn()"
         ).execute(&pool).await.unwrap();
         assert!(
             split_source_series(&pool, &work, std::slice::from_ref(&detached), None)
@@ -7133,13 +8805,14 @@ mod tests {
                 .to_string()
                 .contains("forced projection failure")
         );
-        let owner: String = sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
-            .bind(&detached)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let owner: String =
+            crate::db_types::query_scalar("SELECT work_id FROM source_series WHERE id = $1")
+                .bind(&detached)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(owner, work);
-        let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+        let works: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -7147,7 +8820,7 @@ mod tests {
             works, 1,
             "the split's new work must roll back with its projections"
         );
-        sqlx::query("DROP TRIGGER fail_split_projection")
+        sqlx::query("DROP TRIGGER fail_split_projection ON browse_catalogue")
             .execute(&pool)
             .await
             .unwrap();
@@ -7164,30 +8837,75 @@ mod tests {
     }
 
     #[test]
-    fn fts_match_query_bounds_input_and_deduplicates_terms() {
-        assert!(fts_match_query(&"x".repeat(MAX_FTS_QUERY_CHARS)).is_some());
-        assert!(fts_match_query(&"x".repeat(MAX_FTS_QUERY_CHARS + 1)).is_none());
-        assert!(fts_match_query(&"界".repeat(MAX_FTS_QUERY_CHARS)).is_some());
-        assert!(fts_match_query(&"界".repeat(MAX_FTS_QUERY_CHARS + 1)).is_none());
-        let terms = (0..MAX_FTS_TERMS)
+    fn postgres_search_bounds_input_and_counts_distinct_terms() {
+        let valid = crate::search::valid_query;
+        assert!(valid(&"x".repeat(MAX_FTS_QUERY_CHARS)));
+        assert!(!valid(&"x".repeat(MAX_FTS_QUERY_CHARS + 1)));
+        assert!(valid(&"界".repeat(MAX_FTS_QUERY_CHARS)));
+        assert!(!valid(&"界".repeat(MAX_FTS_QUERY_CHARS + 1)));
+        let terms = (0..12)
             .map(|i| format!("term{i}"))
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(fts_match_query(&terms).is_some());
-        assert!(fts_match_query(&format!("{terms} excess")).is_none());
-        assert_eq!(
-            fts_match_query("Solo solo lev").as_deref(),
-            Some("\"solo\" \"lev\"*")
-        );
-        assert_eq!(
-            fts_match_query("Naruto NARUTO").as_deref(),
-            Some("\"naruto\"")
-        );
-        assert_eq!(fts_match_query("a a a a a"), None);
+        assert!(valid(&terms));
+        assert!(!valid(&format!("{terms} excess")));
+        assert!(valid("Solo solo lev"));
+        assert!(valid("X"));
+        assert!(valid("Go"));
+        assert!(valid("鬼滅"));
+        assert!(!valid("  !! "));
+    }
+
+    /// Search runs on a pool session, and every pool session has JIT off
+    /// (`database::configure_session`): a compile on each execution would spend
+    /// the 2 second budget before the statement starts.
+    #[tokio::test]
+    async fn search_session_has_jit_off() {
+        let pool = pool().await;
+        let mut connection = SearchConnection::new(&pool).await.unwrap();
+        let (jit, budget): (String, String) =
+            sqlx::query_as("SELECT current_setting('jit'), current_setting('statement_timeout')")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+        assert_eq!((jit.as_str(), budget.as_str()), ("off", "2s"));
+        connection.finish().await.unwrap();
+        pool.close().await;
+    }
+
+    /// The one reader of this pool serves a search and goes back to the pool. It
+    /// must then carry what `configure_session` gave it: the lane's statement
+    /// limit and the server's trigram thresholds, not the search's own values.
+    #[tokio::test]
+    async fn a_search_leaves_no_setting_on_the_pooled_reader() {
+        let pool = crate::database::TestPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations_pg")
+            .run(pool.write())
+            .await
+            .unwrap();
+        // The first statement loads pg_trgm, which defines its two settings.
+        let settings = "SELECT public.word_similarity('a', 'a')::text, pg_backend_pid()::text, \
+             current_setting('statement_timeout'), \
+             current_setting('pg_trgm.similarity_threshold'), \
+             current_setting('pg_trgm.word_similarity_threshold')";
+        let fresh: (String, String, String, String, String) =
+            sqlx::query_as(settings).fetch_one(&pool).await.unwrap();
+        assert_ne!(fresh.2, "0", "the lane has a statement limit");
+        search_works_fts(&pool, "sool nights", true, &Default::default(), 1, 30)
+            .await
+            .unwrap();
+        let after: (String, String, String, String, String) =
+            sqlx::query_as(settings).fetch_one(&pool).await.unwrap();
+        assert_eq!(after, fresh);
+        pool.close().await;
     }
 
     #[tokio::test]
-    async fn search_deadline_interrupts_sqlite_and_cleans_up_for_the_next_reader() {
+    async fn search_deadline_interrupts_postgres_and_cleans_up_for_the_next_reader() {
         let pool = crate::database::TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -7198,7 +8916,7 @@ mod tests {
                 .await
                 .unwrap();
         let started = std::time::Instant::now();
-        let error = sqlx::query_scalar::<_, i64>(
+        let error = crate::db_types::query_scalar::<i64>(
             "WITH RECURSIVE n(x) AS \
             (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 1000000000) SELECT SUM(x) FROM n",
         )
@@ -7207,12 +8925,12 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error.as_database_error().and_then(|e| e.code()).as_deref(),
-            Some("9")
+            Some("57014")
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         connection.finish().await.unwrap();
         // More than 1,000 opcodes ensures this actually tests handler removal.
-        let sum: i64 = sqlx::query_scalar(
+        let sum: i64 = crate::db_types::query_scalar(
             "WITH RECURSIVE n(x) AS \
             (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 10000) SELECT SUM(x) FROM n",
         )
@@ -7238,7 +8956,7 @@ mod tests {
                     .await
                     .unwrap();
             ready.send(()).unwrap();
-            let _ = sqlx::query_scalar::<_, i64>(
+            let _ = crate::db_types::query_scalar::<i64>(
                 "WITH RECURSIVE n(x) AS \
                 (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 1000000000) SELECT SUM(x) FROM n",
             )
@@ -7251,7 +8969,7 @@ mod tests {
         let _ = search.await;
         let replacement = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            sqlx::query_scalar::<_, i64>(
+            crate::db_types::query_scalar::<i64>(
                 "WITH RECURSIVE n(x) AS \
                 (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 10000) SELECT SUM(x) FROM n",
             )
@@ -7262,29 +8980,6 @@ mod tests {
         .unwrap();
         assert_eq!(replacement, 50_005_000);
         pool.close().await;
-    }
-
-    #[test]
-    fn fts_match_query_stars_only_the_last_token_and_refuses_tiny_queries() {
-        // Only the trailing (still-being-typed) token is prefix-matched; starring the
-        // complete leading tokens only widened the postings list scanned.
-        assert_eq!(
-            fts_match_query("solo lev").as_deref(),
-            Some("\"solo\" \"lev\"*")
-        );
-        assert_eq!(fts_match_query("naruto").as_deref(), Some("\"naruto\"*"));
-        // Operator/keyword chars stay literal, quoted.
-        assert_eq!(
-            fts_match_query("re:zero AND").as_deref(),
-            Some("\"re\" \"zero\" \"and\"*")
-        );
-        // Too short to run: `a`/`th` prefix-matched 30-40k of 109k indexed works and
-        // cost seconds of unauthenticated server time per keystroke.
-        assert_eq!(fts_match_query("a"), None);
-        assert_eq!(fts_match_query("th"), None);
-        assert_eq!(fts_match_query("  !! "), None);
-        // …but a short NON-ASCII query is a whole word, not a one-letter prefix.
-        assert_eq!(fts_match_query("鬼滅").as_deref(), Some("\"鬼滅\"*"));
     }
 
     fn slime_input() -> WorkInput {
@@ -7308,10 +9003,20 @@ mod tests {
         }
     }
 
+    /// A second work with the same titles and no external identity. `create_work`
+    /// adopts the owner of a supplied external identity (Phase 4, T024); before that
+    /// guard a repeated `slime_input()` minted a second work and silently dropped the
+    /// identity, which is exactly the row state this input produces.
+    fn slime_twin_input() -> WorkInput {
+        WorkInput {
+            external_ids: Vec::new(),
+            ..slime_input()
+        }
+    }
+
     async fn insert_suwayomi_series(pool: &Database, id: i64, lang: Option<&str>) {
         sqlx::query(
-            "INSERT INTO suwayomi_series (id, title, status, source_id, lang, in_library, updated_at) \
-             VALUES (?, ?, 'ONGOING', 'src', ?, 1, '2026-01-01T00:00:00Z')",
+            r#"INSERT INTO suwayomi_series (id, title, status, source_id, lang, in_library, updated_at) VALUES ($1, $2, 'ONGOING', 'src', $3, TRUE, '2026-01-01T00:00:00Z')"#,
         )
         .bind(id)
         .bind(format!("Series {id}"))
@@ -7328,25 +9033,39 @@ mod tests {
         // English series (id 100) — must fully survive.
         let w_en = create_work(&pool, &slime_input()).await.unwrap();
         insert_suwayomi_series(&pool, 100, Some("en")).await;
-        upsert_source_series(&pool, &w_en, "suwayomi", "src", "100", None, false)
+        let ss_en = upsert_source_series(&pool, &w_en, "suwayomi", "src", "100", None, false)
             .await
             .unwrap();
 
         // Non-English series (id 200) CONSOLIDATED onto a MangaDex-anchored work — the
         // work must survive (still has its mangadex link); only the Suwayomi link goes.
-        let w_md = create_work(&pool, &slime_input()).await.unwrap();
+        let w_md = create_work(&pool, &slime_twin_input()).await.unwrap();
         upsert_source_series(
             &pool, &w_md, "mangadex", "mangadex", "uuid-abc", None, false,
         )
         .await
         .unwrap();
         insert_suwayomi_series(&pool, 200, Some("es")).await;
-        upsert_source_series(&pool, &w_md, "suwayomi", "src", "200", None, false)
+        let ss_es = upsert_source_series(&pool, &w_md, "suwayomi", "src", "200", None, false)
             .await
             .unwrap();
+        // Review candidates: one of the mapping that is purged, one of a mapping that
+        // stays. The purged mapping takes its candidate with it (ON DELETE CASCADE).
+        for (id, mapping, candidate) in [("mc_gone", &ss_es, &w_en), ("mc_kept", &ss_en, &w_md)] {
+            sqlx::query(
+                "INSERT INTO merge_candidate (id, source_series_id, candidate_work_id, score, method, created_at) \
+                 VALUES ($1, $2, $3, 0.5, 'fuzzy', now())",
+            )
+            .bind(id)
+            .bind(mapping)
+            .bind(candidate)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
 
         // Non-English series (id 201) STANDALONE — its work must be cascade-deleted.
-        let w_orphan = create_work(&pool, &slime_input()).await.unwrap();
+        let w_orphan = create_work(&pool, &slime_twin_input()).await.unwrap();
         insert_suwayomi_series(&pool, 201, Some("es")).await;
         upsert_source_series(&pool, &w_orphan, "suwayomi", "src", "201", None, false)
             .await
@@ -7354,23 +9073,23 @@ mod tests {
 
         // Satellite rows keyed by the numeric id for the non-English series (id 201),
         // plus an English chapter (manga 100) that must survive.
-        sqlx::query("INSERT INTO suwayomi_chapter (id, manga_id, name, chapter_number, updated_at) VALUES (1, 201, 'c', 1.0, 'now'), (2, 100, 'c', 1.0, 'now')")
+        sqlx::query(r#"INSERT INTO suwayomi_chapter (id, manga_id, name, chapter_number, updated_at) VALUES (1, 201, 'c', 1.0, '2020-01-01T00:00:00Z'), (2, 100, 'c', 1.0, '2020-01-01T00:00:00Z')"#)
             .execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('u1','u1','u1@x','h','now')")
+        sqlx::query(r#"INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468','u1','u1@x','h','2020-01-01T00:00:00Z')"#)
             .execute(&pool).await.unwrap();
         sqlx::query(
-            "INSERT INTO user_library (user_id, series_id, created_at) VALUES ('u1', '201', 'now')",
+            r#"INSERT INTO user_library (user_id, series_id, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468', '201', '2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO series_views (series_key, total, updated_at) VALUES ('201', 3, 'now')",
+            r#"INSERT INTO series_views (series_key, total, updated_at) VALUES ('201', 3, '2020-01-01T00:00:00Z')"#,
         )
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO series_scan_state (series_id, updated_at, next_scan_at) VALUES ('200','now', '1970-01-01T00:00:00+00:00'),('201','now', '1970-01-01T00:00:00+00:00'),('100','now', '1970-01-01T00:00:00+00:00')")
+        sqlx::query(r#"INSERT INTO series_scan_state (series_id, updated_at, next_scan_at) VALUES ('200','2020-01-01T00:00:00Z', '1970-01-01T00:00:00+00:00'),('201','2020-01-01T00:00:00Z', '1970-01-01T00:00:00+00:00'),('100','2020-01-01T00:00:00Z', '1970-01-01T00:00:00+00:00')"#)
             .execute(&pool).await.unwrap();
 
         // --- purge ---
@@ -7381,7 +9100,7 @@ mod tests {
         let count = |sql: &'static str| {
             let pool = pool.clone();
             async move {
-                sqlx::query_scalar::<_, i64>(sql)
+                crate::db_types::query_scalar::<i64>(sql)
                     .fetch_one(&pool)
                     .await
                     .unwrap()
@@ -7421,6 +9140,14 @@ mod tests {
         assert_eq!(
             count("SELECT COUNT(*) FROM series_scan_state WHERE series_id IN ('200','201')").await,
             0
+        );
+        assert_eq!(
+            crate::db_types::query_scalar::<String>("SELECT id FROM merge_candidate ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap(),
+            ["mc_kept"],
+            "the candidate of a purged mapping goes with it, no other candidate does"
         );
         // Consolidated work survives (kept its mangadex link); standalone work deleted.
         assert_eq!(
@@ -7488,7 +9215,7 @@ mod tests {
                     "INSERT INTO series_scan_state \
                        (series_id, next_scan_at, known_chapter_count, consecutive_failures, \
                         last_failure_kind, last_failure_at, last_scanned_at, updated_at) \
-                     VALUES (?, '2026-01-01T00:00:00Z', ?, ?, ?, '2026-01-02T00:00:00Z', \
+                     VALUES ($1, '2026-01-01T00:00:00Z', $2, $3, $4, '2026-01-02T00:00:00Z', \
                              '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
                 )
                 .bind(key)
@@ -7651,7 +9378,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let (disabled_at, err): (Option<String>, Option<String>) = sqlx::query_as(
+        let (disabled_at, err): (Option<String>, Option<String>) = crate::db_types::query_tuple(
             "SELECT disabled_at, last_error FROM extension_subscription WHERE pkg_name='ext.broken'",
         )
         .fetch_one(&pool)
@@ -7685,8 +9412,8 @@ mod tests {
     async fn insert_merge_candidate_never_re_proposes_a_pair_an_admin_resolved() {
         let pool = pool().await;
         let loser = create_work(&pool, &slime_input()).await.unwrap();
-        let survivor = create_work(&pool, &slime_input()).await.unwrap();
-        let other = create_work(&pool, &slime_input()).await.unwrap();
+        let survivor = create_work(&pool, &slime_twin_input()).await.unwrap();
+        let other = create_work(&pool, &slime_twin_input()).await.unwrap();
         insert_suwayomi_series(&pool, 300, Some("en")).await;
         let ssid = upsert_source_series(&pool, &loser, "suwayomi", "src", "300", None, false)
             .await
@@ -7707,7 +9434,7 @@ mod tests {
         );
 
         for decision in ["rejected", "confirmed"] {
-            sqlx::query("UPDATE merge_candidate SET status = ?, resolved_at = '2026-01-01'")
+            sqlx::query("UPDATE merge_candidate SET status = $1, resolved_at = '2026-01-01'")
                 .bind(decision)
                 .execute(&pool)
                 .await
@@ -7724,7 +9451,7 @@ mod tests {
                 );
             }
             let rows: (i64, String) =
-                sqlx::query_as("SELECT COUNT(*), MAX(status) FROM merge_candidate")
+                crate::db_types::query_tuple("SELECT COUNT(*), MAX(status) FROM merge_candidate")
                     .fetch_one(&pool)
                     .await
                     .unwrap();
@@ -7762,8 +9489,8 @@ mod tests {
         let read = |column: &'static str| {
             let (pool, id) = (pool.clone(), id.clone());
             async move {
-                sqlx::query_scalar::<_, Option<String>>(&format!(
-                    "SELECT CAST({column} AS TEXT) FROM work WHERE id = ?"
+                crate::db_types::query_scalar::<Option<String>>(&format!(
+                    "SELECT CAST({column} AS TEXT) FROM work WHERE id = $1"
                 ))
                 .bind(&id)
                 .fetch_one(&pool)
@@ -7826,7 +9553,7 @@ mod tests {
     async fn merge_works_checked_aborts_when_the_snapshot_went_stale() {
         let pool = pool().await;
         let loser = create_work(&pool, &slime_input()).await.unwrap();
-        let survivor = create_work(&pool, &slime_input()).await.unwrap();
+        let survivor = create_work(&pool, &slime_twin_input()).await.unwrap();
         // What a gate reading these two works right now would have captured (both are
         // built from `slime_input`, so their identity columns are identical).
         let snapshot = WorkIdentity {
@@ -7839,7 +9566,7 @@ mod tests {
         let expect_survivor = snapshot;
 
         // The admin edit lands between the gate's read and the merge's write lock.
-        sqlx::query("UPDATE work SET year = NULL WHERE id = ?")
+        sqlx::query("UPDATE work SET year = NULL WHERE id = $1")
             .bind(&loser)
             .execute(&pool)
             .await
@@ -7858,7 +9585,7 @@ mod tests {
             err.to_string().starts_with("merge precondition failed"),
             "the caller distinguishes a stale gate from a real failure by this prefix, got: {err}"
         );
-        let alive: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+        let alive: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -7878,7 +9605,7 @@ mod tests {
         )
         .await
         .expect("a matching snapshot merges normally");
-        let alive: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+        let alive: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -7892,8 +9619,8 @@ mod tests {
     async fn merge_works_ex_still_merges_without_a_precondition() {
         let pool = pool().await;
         let loser = create_work(&pool, &slime_input()).await.unwrap();
-        let survivor = create_work(&pool, &slime_input()).await.unwrap();
-        sqlx::query("UPDATE work SET primary_title = 'renamed under the caller' WHERE id = ?")
+        let survivor = create_work(&pool, &slime_twin_input()).await.unwrap();
+        sqlx::query("UPDATE work SET primary_title = 'renamed under the caller' WHERE id = $1")
             .bind(&loser)
             .execute(&pool)
             .await
@@ -7901,7 +9628,7 @@ mod tests {
         merge_works_ex(&pool, None, &loser, &survivor)
             .await
             .unwrap();
-        let alive: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work")
+        let alive: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -7924,7 +9651,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let disabled: Option<String> = sqlx::query_scalar(
+        let disabled: Option<String> = crate::db_types::query_scalar(
             "SELECT disabled_at FROM extension_subscription WHERE pkg_name='pkg'",
         )
         .fetch_one(&pool)
@@ -7936,7 +9663,7 @@ mod tests {
         rearm_subscription_breaker_probe(&pool, "pkg")
             .await
             .unwrap();
-        let (disabled, fails): (Option<String>, i64) = sqlx::query_as(
+        let (disabled, fails): (Option<String>, i64) = crate::db_types::query_tuple(
             "SELECT disabled_at, consecutive_failures FROM extension_subscription WHERE pkg_name='pkg'",
         )
         .fetch_one(&pool)
@@ -7956,7 +9683,7 @@ mod tests {
 
         // The admin "I've fixed it" reset is the opposite: a clean slate.
         reset_subscription_breaker(&pool, "pkg").await.unwrap();
-        let (disabled, fails): (Option<String>, i64) = sqlx::query_as(
+        let (disabled, fails): (Option<String>, i64) = crate::db_types::query_tuple(
             "SELECT disabled_at, consecutive_failures FROM extension_subscription WHERE pkg_name='pkg'",
         )
         .fetch_one(&pool)
@@ -8027,12 +9754,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM chapter WHERE source_series_id = ?")
-                .bind(&ssid)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let count: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM chapter WHERE source_series_id = $1",
+        )
+        .bind(&ssid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(count, 1, "chapter upsert is idempotent on external id");
     }
 
@@ -8279,7 +10007,7 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("2026-02-01T00:00:00Z"),
+            Some("2026-02-01T00:00:00.000000+00:00"),
         );
     }
 
@@ -8339,7 +10067,7 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("2026-01-01T00:00:00Z"),
+            Some("2026-01-01T00:00:00.000000+00:00"),
             "only the mirror has chapters yet, and the Spanish one is not one of them"
         );
 
@@ -8420,17 +10148,18 @@ mod tests {
         .await
         .unwrap();
 
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source_extension")
+        let count: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM source_extension")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(count, 1, "upsert is idempotent on the source_id PK");
-        let version: i64 =
-            sqlx::query_scalar("SELECT version_code FROM source_extension WHERE source_id = ?")
-                .bind(sid)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let version: i64 = crate::db_types::query_scalar(
+            "SELECT version_code FROM source_extension WHERE source_id = $1",
+        )
+        .bind(sid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(version, 61, "the second upsert updates the row in place");
     }
 
@@ -8455,15 +10184,16 @@ mod tests {
             .await
             .unwrap();
         // No work_description row (nothing to insert)...
-        let descs: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM work_description WHERE work_id = ?")
-                .bind(&w)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let descs: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM work_description WHERE work_id = $1",
+        )
+        .bind(&w)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(descs, 0, "no localized description upstream");
         // ...but the marker IS set, so the backfill selector won't re-pick it.
-        let pending: i64 = sqlx::query_scalar(
+        let pending: i64 = crate::db_types::query_scalar(
             "SELECT COUNT(*) FROM source_series ss JOIN work w ON w.id = ss.work_id \
              WHERE ss.source_type = 'mangadex' AND w.metadata_synced_at IS NULL",
         )
@@ -8474,12 +10204,12 @@ mod tests {
 
         // A pre-S2 work with a NULL marker is selectable, then mark_metadata_synced
         // clears it even without MangaDex returning the record.
-        sqlx::query("UPDATE work SET metadata_synced_at = NULL WHERE id = ?")
+        sqlx::query("UPDATE work SET metadata_synced_at = NULL WHERE id = $1")
             .bind(&w)
             .execute(&pool)
             .await
             .unwrap();
-        let pending: i64 = sqlx::query_scalar(
+        let pending: i64 = crate::db_types::query_scalar(
             "SELECT COUNT(*) FROM source_series ss JOIN work w ON w.id = ss.work_id \
              WHERE ss.source_type = 'mangadex' AND w.metadata_synced_at IS NULL",
         )
@@ -8490,7 +10220,7 @@ mod tests {
         mark_metadata_synced(&pool, &["md-nodesc".to_string()])
             .await
             .unwrap();
-        let pending: i64 = sqlx::query_scalar(
+        let pending: i64 = crate::db_types::query_scalar(
             "SELECT COUNT(*) FROM source_series ss JOIN work w ON w.id = ss.work_id \
              WHERE ss.source_type = 'mangadex' AND w.metadata_synced_at IS NULL",
         )
@@ -8538,13 +10268,13 @@ mod tests {
             for n in 1..=count {
                 sqlx::query(
                     "INSERT INTO suwayomi_chapter (id, manga_id, name, chapter_number, page_count, updated_at) \
-                     VALUES (?, ?, ?, ?, 0, ?)",
+                     VALUES ($1, $2, $3, $4, 0, $5)",
                 )
                 .bind(manga * 1000 + n)
                 .bind(manga)
                 .bind(format!("Ch {n}"))
                 .bind(n as f64)
-                .bind(now)
+                .bind(crate::db_types::date(now).unwrap())
                 .execute(&pool)
                 .await
                 .unwrap();
@@ -8609,13 +10339,13 @@ mod tests {
         for (id, manga, num) in [(1, 333, 1.0), (2, 333, 2.0), (3, 333, 3.0), (4, 999, 1.0)] {
             sqlx::query(
                 "INSERT INTO suwayomi_chapter (id, manga_id, name, chapter_number, page_count, updated_at) \
-                 VALUES (?, ?, ?, ?, 0, ?)",
+                 VALUES ($1, $2, $3, $4, 0, $5)",
             )
             .bind(id)
             .bind(manga)
             .bind(format!("Ch {num}"))
             .bind(num)
-            .bind(now)
+            .bind(crate::db_types::date(now).unwrap())
             .execute(&pool)
             .await
             .unwrap();
@@ -8778,7 +10508,7 @@ mod tests {
             sqlx::query(
                 "INSERT INTO suwayomi_chapter \
                    (id, manga_id, name, chapter_number, scanlator, upload_date, page_count, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, '1767225600000', 0, '2026-01-01T00:00:00Z')",
+                 VALUES ($1, $2, $3, $4, $5, '1767225600000', 0, '2026-01-01T00:00:00Z')",
             )
             .bind(id)
             .bind(manga)
@@ -8826,6 +10556,150 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spine_upload_dates_use_the_cache_normalizer() {
+        for raw in ["1767225600", "1767225600000", " 1767225600 "] {
+            assert_eq!(
+                suwayomi_upload_date_to_iso(Some(raw)).as_deref(),
+                Some("2026-01-01T00:00:00.000000+00:00")
+            );
+        }
+        // Preserve fractional milliseconds and format them with C10.
+        assert_eq!(
+            suwayomi_upload_date_to_iso(Some("1767225600225")).as_deref(),
+            Some("2026-01-01T00:00:00.225000+00:00")
+        );
+        for raw in [
+            "999999999999",
+            "11251332011000",
+            "576861335057225",
+            "-26616935569000",
+            "-37028731301000",
+            "0",
+            "",
+            "   ",
+            "abc",
+        ] {
+            assert_eq!(suwayomi_upload_date_to_iso(Some(raw)), None, "{raw}");
+        }
+        assert_eq!(suwayomi_upload_date_to_iso(None), None);
+        assert!(suwayomi_upload_date_to_iso(Some("2145884400000")).is_some()); // 2037
+    }
+
+    #[tokio::test]
+    async fn seconds_upload_date_reaches_the_spine_and_release_ledger() {
+        let pool = pool().await;
+        let work = upsert_work_from_mangadex(&pool, "md-seconds", &WorkInput::default())
+            .await
+            .unwrap();
+        let ss = upsert_source_series(&pool, &work, "suwayomi", "src", "777", None, false)
+            .await
+            .unwrap();
+        let input = suwayomi_spine_input(9, "Chapter 9", 9.0, None, Some("1767225600"));
+        upsert_chapter(&pool, &ss, &input).await.unwrap();
+        ledger::record_source_series(&pool, &ss).await.unwrap();
+        let dates: (String, String) = crate::db_types::query_tuple(
+            "SELECT published_at, readable_at FROM chapter WHERE external_id = '9'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            dates,
+            (
+                "2026-01-01T00:00:00.000000+00:00".into(),
+                "2026-01-01T00:00:00.000000+00:00".into()
+            )
+        );
+        let release: i64 = crate::db_types::query_scalar("SELECT first_seen_at FROM release_event")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(release, 1_767_225_600_000);
+    }
+
+    #[tokio::test]
+    async fn mirror_and_ledger_release_quantization_matches_locked_sqlite() {
+        let pool = pool().await;
+        let source = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let work = upsert_work_from_mangadex(
+            &pool,
+            "md-fractional-release",
+            &WorkInput {
+                primary_title: Some("Fractional release".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ss = find_source_series_id(&pool, "mangadex", "mangadex", "md-fractional-release")
+            .await
+            .unwrap()
+            .unwrap();
+        for raw in [
+            "1969-12-31T23:59:59.9996Z",
+            "2020-01-01T00:00:00.123456Z",
+            "2020-01-01T00:00:00.999499Z",
+            "2020-01-01T00:00:00.999500Z",
+            "2020-01-01T00:00:00.9996Z",
+        ] {
+            let expected: i64 =
+                sqlx::query_scalar("SELECT CAST(strftime('%s', $1) AS INTEGER) * 1000")
+                    .bind(raw)
+                    .fetch_one(&source)
+                    .await
+                    .unwrap();
+            upsert_chapter(
+                &pool,
+                &ss,
+                &ChapterInput {
+                    external_id: "fractional-release".into(),
+                    number: Some("1".into()),
+                    lang: Some("en".into()),
+                    readable_at: Some(raw.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            sqlx::query("DELETE FROM release_event WHERE work_id=$1")
+                .bind(&work)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(publish_mirror_feed_row(&pool, &work).await.unwrap());
+            let incremental: i64 = crate::db_types::query_scalar(
+                "SELECT released_at FROM feed_series_updates WHERE work_id=$1",
+            )
+            .bind(&work)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(incremental, expected, "incremental mirror {raw}");
+            refresh_feed_updates(&pool).await.unwrap();
+            let rebuilt: i64 = crate::db_types::query_scalar(
+                "SELECT released_at FROM feed_series_updates WHERE work_id=$1",
+            )
+            .bind(&work)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(rebuilt, expected, "rebuilt mirror {raw}");
+            ledger::seed_work(&pool, &work, 1_800_000_000_000)
+                .await
+                .unwrap();
+            let first_seen: i64 = crate::db_types::query_scalar(
+                "SELECT first_seen_at FROM release_event WHERE work_id=$1",
+            )
+            .bind(&work)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(first_seen, expected, "ledger {raw}");
+        }
+        source.close().await;
+    }
+
     /// The clock decision, pinned. `suwayomi_chapter.upload_date` is 13-digit epoch-millis
     /// TEXT and `chapter.published_at` is ISO-8601 TEXT; storing both encodings in one
     /// column makes it sort under BINARY collation, where every '2…' outranks every '1…'.
@@ -8848,25 +10722,29 @@ mod tests {
         .unwrap();
         spine::drain_suwayomi_series(&pool).await.unwrap();
 
-        let (published, readable): (Option<String>, Option<String>) =
-            sqlx::query_as("SELECT published_at, readable_at FROM chapter WHERE external_id = '9'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(published.as_deref(), Some("2026-01-01T00:00:00+00:00"));
-        // `readable_at` is set too, so migration 0073's partial index — the MangaDex
-        // external-URL backfill's work-list — does not fill with Suwayomi rows it will
-        // never touch.
-        assert_eq!(readable, published);
-        // Everything in the column parses as a date. A millis string would not.
-        let unparseable: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM chapter \
-             WHERE published_at IS NOT NULL AND strftime('%s', published_at) IS NULL",
+        let (published, readable): (Option<String>, Option<String>) = crate::db_types::query_tuple(
+            "SELECT published_at, readable_at FROM chapter WHERE external_id = '9'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(unparseable, 0, "one encoding in the column, and it parses");
+        assert_eq!(
+            published.as_deref(),
+            Some("2026-01-01T00:00:00.000000+00:00")
+        );
+        // `readable_at` is set too, so migration 0073's partial index — the MangaDex
+        // external-URL backfill's work-list — does not fill with Suwayomi rows it will
+        // never touch.
+        assert_eq!(readable, published);
+        // Both clocks are decoded natively; the audited type rejects invalid dates.
+        let typ: String = crate::db_types::query_scalar(
+            "SELECT pg_typeof(published_at)::text FROM chapter WHERE external_id = '9'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(typ, "timestamp with time zone");
+        chrono::DateTime::parse_from_rfc3339(published.as_deref().unwrap()).unwrap();
     }
 
     /// The key drain must reproduce exactly what the write path would have written —
@@ -8902,11 +10780,12 @@ mod tests {
             .await
             .unwrap();
         }
-        let written: Vec<(String, Option<String>)> =
-            sqlx::query_as("SELECT external_id, chapter_key FROM chapter ORDER BY external_id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let written: Vec<(String, Option<String>)> = crate::db_types::query_tuple(
+            "SELECT external_id, chapter_key FROM chapter ORDER BY external_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
 
         // Now blank them and let the drain recompute.
         sqlx::query("UPDATE chapter SET chapter_key = NULL")
@@ -8916,11 +10795,12 @@ mod tests {
         assert_eq!(spine::drain_chapter_keys(&pool).await.unwrap(), 4);
         assert_eq!(spine::drain_chapter_keys(&pool).await.unwrap(), 0, "drains");
 
-        let drained: Vec<(String, Option<String>)> =
-            sqlx::query_as("SELECT external_id, chapter_key FROM chapter ORDER BY external_id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let drained: Vec<(String, Option<String>)> = crate::db_types::query_tuple(
+            "SELECT external_id, chapter_key FROM chapter ORDER BY external_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(drained, written);
         // And the shapes that matter, spelled out.
         let by_ext: std::collections::HashMap<_, _> = drained.into_iter().collect();
@@ -8956,22 +10836,24 @@ mod tests {
         replace_source_chapters(&pool, &ssid, &[input(1, 1.0), input(2, 2.0)])
             .await
             .unwrap();
-        let before: Vec<(String, String, String)> =
-            sqlx::query_as("SELECT external_id, id, created_at FROM chapter ORDER BY external_id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let before: Vec<(String, String, String)> = crate::db_types::query_tuple(
+            "SELECT external_id, id, created_at FROM chapter ORDER BY external_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(before.len(), 2);
 
         // Chapter 2 is taken down and chapter 3 appears.
         replace_source_chapters(&pool, &ssid, &[input(1, 1.0), input(3, 3.0)])
             .await
             .unwrap();
-        let after: Vec<(String, String, String)> =
-            sqlx::query_as("SELECT external_id, id, created_at FROM chapter ORDER BY external_id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let after: Vec<(String, String, String)> = crate::db_types::query_tuple(
+            "SELECT external_id, id, created_at FROM chapter ORDER BY external_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         let ids: Vec<&str> = after.iter().map(|(e, _, _)| e.as_str()).collect();
         assert_eq!(ids, vec!["1", "3"], "2 pruned, 3 added");
         assert_eq!(
@@ -9141,21 +11023,23 @@ mod tests {
         assert_eq!(out.moved_source_series, 1, "the Suwayomi mapping moved");
 
         // Source work is gone; the Suwayomi mapping now points at the target.
-        let src_exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work WHERE id = ?")
-            .bind(&source)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(src_exists, 0, "source work deleted");
-        let mapped: String =
-            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_key = '357'")
+        let src_exists: i64 =
+            crate::db_types::query_scalar("SELECT COUNT(*) FROM work WHERE id = $1")
+                .bind(&source)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
+        assert_eq!(src_exists, 0, "source work deleted");
+        let mapped: String = crate::db_types::query_scalar(
+            "SELECT work_id FROM source_series WHERE source_key = '357'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(mapped, target);
         // The source's ja alias was folded into the target.
-        let ja: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM work_alias WHERE work_id = ? AND raw_title = 'ナルト'",
+        let ja: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM work_alias WHERE work_id = $1 AND raw_title = 'ナルト'",
         )
         .bind(&target)
         .fetch_one(&pool)
@@ -9163,11 +11047,12 @@ mod tests {
         .unwrap();
         assert_eq!(ja, 1, "source alias folded into target");
         // No orphaned source_series/aliases remain for the deleted work.
-        let orphans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_alias WHERE work_id = ?")
-            .bind(&source)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let orphans: i64 =
+            crate::db_types::query_scalar("SELECT COUNT(*) FROM work_alias WHERE work_id = $1")
+                .bind(&source)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(orphans, 0);
 
         // Merging a work into itself is rejected.
@@ -9182,23 +11067,23 @@ mod tests {
         let source = create_work(&pool, &WorkInput::default()).await.unwrap();
         let target = create_work(&pool, &WorkInput::default()).await.unwrap();
         for user in ["both", "fallback", "source-only"] {
-            sqlx::query("INSERT INTO users (id, username, email, password_hash, created_at) VALUES (?, ?, ?, 'h', 'now')")
-                .bind(user).bind(user).bind(format!("{user}@x"))
+            sqlx::query(r#"INSERT INTO users (id, username, email, password_hash, created_at) VALUES ($1, $2, $3, 'h', '2020-01-01T00:00:00Z')"#)
+                .bind(crate::db_types::test_uuid(user)).bind(user).bind(format!("{user}@x"))
                 .execute(&pool).await.unwrap();
-            sqlx::query("INSERT INTO user_library (user_id, series_id, created_at, status, is_favorite) VALUES (?, ?, '2026-01-01T00:00:00Z', 'reading', 1)")
-                .bind(user).bind(&source).execute(&pool).await.unwrap();
+            sqlx::query(r#"INSERT INTO user_library (user_id, series_id, created_at, status, is_favorite) VALUES ($1, $2, '2026-01-01T00:00:00Z', 'reading', TRUE)"#)
+                .bind(crate::db_types::test_uuid(user)).bind(&source).execute(&pool).await.unwrap();
         }
         for (user, status) in [("both", Some("onhold")), ("fallback", None)] {
-            sqlx::query("INSERT INTO user_library (user_id, series_id, created_at, status, is_favorite) VALUES (?, ?, '2026-02-01T00:00:00Z', ?, 0)")
-                .bind(user).bind(&target).bind(status)
+            sqlx::query(r#"INSERT INTO user_library (user_id, series_id, created_at, status, is_favorite) VALUES ($1, $2, '2026-02-01T00:00:00Z', $3, FALSE)"#)
+                .bind(crate::db_types::test_uuid(user)).bind(&target).bind(status)
                 .execute(&pool).await.unwrap();
         }
         for (work, chapter, page, read) in [
             (&source, "chapter-24", 7i64, 1i64),
             (&target, "chapter-26", 3, 0),
         ] {
-            sqlx::query("INSERT INTO canonical_progress (user_id, chapter_id, work_id, last_page_read, read, updated_at) VALUES ('both', ?, ?, ?, ?, 'now')")
-                .bind(chapter).bind(work).bind(page).bind(read)
+            sqlx::query(r#"INSERT INTO canonical_progress (user_id, chapter_id, work_id, last_page_read, read, updated_at) VALUES ('b447be50-32fe-4e9d-8bfc-e19234fc22cb', $1, $2, $3, $4, '2020-01-01T00:00:00Z')"#)
+                .bind(chapter).bind(work).bind(page).bind(read != 0)
                 .execute(&pool).await.unwrap();
         }
 
@@ -9209,21 +11094,21 @@ mod tests {
             ("fallback", "reading"),
             ("source-only", "reading"),
         ] {
-            let rows: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
-                "SELECT series_id, created_at, status, is_favorite FROM user_library WHERE user_id = ?",
+            let rows: Vec<(String, String, Option<String>, i64)> = crate::db_types::query_tuple(
+                "SELECT series_id, created_at, status, is_favorite FROM user_library WHERE user_id = $1",
             )
-            .bind(user)
+            .bind(crate::db_types::test_uuid(user))
             .fetch_all(&pool)
             .await
             .unwrap();
             assert_eq!(rows.len(), 1, "only the surviving library card remains");
             assert_eq!(rows[0].0, target);
-            assert_eq!(rows[0].1, "2026-01-01T00:00:00Z");
+            assert_eq!(rows[0].1, "2026-01-01T00:00:00.000000+00:00");
             assert_eq!(rows[0].2.as_deref(), Some(expected_status));
             assert_eq!(rows[0].3, 1, "a favourite on either copy survives");
         }
-        let progress: Vec<(String, i64, i64)> = sqlx::query_as(
-            "SELECT chapter_id, last_page_read, read FROM canonical_progress WHERE work_id = ? ORDER BY chapter_id",
+        let progress: Vec<(String, i64, i64)> = crate::db_types::query_tuple(
+            "SELECT chapter_id, last_page_read, read FROM canonical_progress WHERE work_id = $1 ORDER BY chapter_id",
         )
         .bind(&target)
         .fetch_all(&pool)
@@ -9233,12 +11118,13 @@ mod tests {
             progress,
             vec![("chapter-24".into(), 7, 1), ("chapter-26".into(), 3, 0)]
         );
-        let orphan_progress: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM canonical_progress WHERE work_id = ?")
-                .bind(&source)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let orphan_progress: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM canonical_progress WHERE work_id = $1",
+        )
+        .bind(&source)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(orphan_progress, 0);
     }
 
@@ -9274,22 +11160,20 @@ mod tests {
         .unwrap();
         for (sql, binds) in [
             (
-                "INSERT INTO work_cover (work_id, cover_file_name, lang, volume, is_primary) \
-                 VALUES (?, 'abc.jpg', 'ja', '1', 1)",
+                r#"INSERT INTO work_cover (work_id, cover_file_name, lang, volume, is_primary) VALUES ($1, 'abc.jpg', 'ja', '1', TRUE)"#,
                 vec![source.clone()],
             ),
             (
-                "INSERT INTO work_tag (work_id, tag, ord) VALUES (?, 'isekai', 0)",
+                "INSERT INTO work_tag (work_id, tag, ord) VALUES ($1, 'isekai', 0)",
                 vec![source.clone()],
             ),
             (
-                "INSERT INTO chapter_override (work_id, chapter_key, hidden, updated_at) \
-                 VALUES (?, '100', 1, '2026-01-01T00:00:00Z')",
+                r#"INSERT INTO chapter_override (work_id, chapter_key, hidden, updated_at) VALUES ($1, '100', TRUE, '2026-01-01T00:00:00Z')"#,
                 vec![source.clone()],
             ),
             (
                 "INSERT INTO work_cover_issue (work_id, reason, first_seen, last_seen) \
-                 VALUES (?, 'too_large', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                 VALUES ($1, 'too_large', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
                 vec![source.clone()],
             ),
         ] {
@@ -9303,7 +11187,7 @@ mod tests {
         merge_works(&pool, &source, &target).await.unwrap();
 
         async fn count(pool: &Database, sql: &str, wid: &str) -> i64 {
-            sqlx::query_scalar::<_, i64>(sql)
+            crate::db_types::query_scalar::<i64>(sql)
                 .bind(wid)
                 .fetch_one(pool)
                 .await
@@ -9312,45 +11196,46 @@ mod tests {
         for (what, sql) in [
             (
                 "localized description",
-                "SELECT COUNT(*) FROM work_description WHERE work_id = ? AND lang = 'de'",
+                "SELECT COUNT(*) FROM work_description WHERE work_id = $1 AND lang = 'de'",
             ),
             (
                 "credit",
-                "SELECT COUNT(*) FROM work_credit WHERE work_id = ?",
+                "SELECT COUNT(*) FROM work_credit WHERE work_id = $1",
             ),
             (
                 "cover row",
-                "SELECT COUNT(*) FROM work_cover WHERE work_id = ?",
+                "SELECT COUNT(*) FROM work_cover WHERE work_id = $1",
             ),
-            ("tag", "SELECT COUNT(*) FROM work_tag WHERE work_id = ?"),
+            ("tag", "SELECT COUNT(*) FROM work_tag WHERE work_id = $1"),
             (
                 "chapter override",
-                "SELECT COUNT(*) FROM chapter_override WHERE work_id = ?",
+                "SELECT COUNT(*) FROM chapter_override WHERE work_id = $1",
             ),
         ] {
             assert_eq!(count(&pool, sql, &target).await, 1, "{what} folded");
         }
         // The loser's cover-ISSUE marker is dropped, not repointed — it would exclude
         // the survivor from the cover crawl forever.
-        let issues: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_issue")
+        let issues: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM work_cover_issue")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(issues, 0, "cover issue dropped with the losing work");
 
-        let row: (Option<String>, i64, Option<String>) =
-            sqlx::query_as("SELECT cover_file_name, is_nsfw, cover_phash FROM work WHERE id = ?")
-                .bind(&target)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let row: (Option<String>, i64, Option<String>) = crate::db_types::query_tuple(
+            "SELECT cover_file_name, is_nsfw, cover_phash FROM work WHERE id = $1",
+        )
+        .bind(&target)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(row.0.as_deref(), Some("abc.jpg"), "cover_file_name folded");
         assert_eq!(row.1, 1, "NSFW flag OR'd into the survivor");
         assert_eq!(row.2.as_deref(), Some("ffff0000ffff0000"));
 
         // The merged-away id keeps resolving.
         let redirect: Option<String> =
-            sqlx::query_scalar("SELECT new_id FROM work_redirect WHERE old_id = ?")
+            crate::db_types::query_scalar("SELECT new_id FROM work_redirect WHERE old_id = $1")
                 .bind(&source)
                 .fetch_optional(&pool)
                 .await
@@ -9383,16 +11268,17 @@ mod tests {
         }
         merge_works(&pool, &ids[0], &ids[1]).await.unwrap();
         merge_works(&pool, &ids[1], &ids[2]).await.unwrap();
-        let hops: Vec<(String, String)> =
-            sqlx::query_as("SELECT old_id, new_id FROM work_redirect ORDER BY old_id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let hops: Vec<(String, String)> = crate::db_types::query_tuple(
+            "SELECT old_id, new_id FROM work_redirect ORDER BY old_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(hops.len(), 2);
         for (_, new_id) in &hops {
             assert_eq!(new_id, &ids[2], "chain collapsed to a single hop");
         }
-        let nsfw: i64 = sqlx::query_scalar("SELECT is_nsfw FROM work WHERE id = ?")
+        let nsfw: i64 = crate::db_types::query_scalar("SELECT is_nsfw FROM work WHERE id = $1")
             .bind(&ids[2])
             .fetch_one(&pool)
             .await
@@ -9439,8 +11325,8 @@ mod tests {
 
         merge_works(&pool, &source, &target).await.unwrap();
 
-        let mut owned: Vec<(String, String)> = sqlx::query_as(
-            "SELECT provider, external_id FROM work_external_id WHERE work_id = ? \
+        let mut owned: Vec<(String, String)> = crate::db_types::query_tuple(
+            "SELECT provider, external_id FROM work_external_id WHERE work_id = $1 \
              ORDER BY provider",
         )
         .bind(&target)
@@ -9458,12 +11344,13 @@ mod tests {
             "the loser's external ids moved to the survivor, keeping the target's own"
         );
         // Nothing was orphaned or dropped on the floor.
-        let stray: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM work_external_id WHERE work_id = ?")
-                .bind(&source)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let stray: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM work_external_id WHERE work_id = $1",
+        )
+        .bind(&source)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(stray, 0);
         // The decisive property: the retired uuid still resolves to the SURVIVOR, so the
         // next MangaDex sync updates it instead of creating a second canonical work.
@@ -9499,7 +11386,7 @@ mod tests {
         };
         let target = mk("Survivor", Some("safe")).await;
         let source = mk("Loser", None).await;
-        sqlx::query("UPDATE work SET is_nsfw = 0, is_nsfw_override = 1 WHERE id = ?")
+        sqlx::query(r#"UPDATE work SET is_nsfw = FALSE, is_nsfw_override = TRUE WHERE id = $1"#)
             .bind(&source)
             .execute(&pool)
             .await
@@ -9507,12 +11394,13 @@ mod tests {
 
         merge_works(&pool, &source, &target).await.unwrap();
 
-        let (base, over): (i64, Option<i64>) =
-            sqlx::query_as("SELECT is_nsfw, is_nsfw_override FROM work WHERE id = ?")
-                .bind(&target)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (base, over): (i64, Option<i64>) = crate::db_types::query_tuple(
+            "SELECT is_nsfw, is_nsfw_override FROM work WHERE id = $1",
+        )
+        .bind(&target)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(base, 0, "the `safe` rating still blocks the BASE fold");
         assert_eq!(
             over,
@@ -9525,19 +11413,19 @@ mod tests {
         // the safe failure; propagating it would un-hide the survivor).
         let target2 = mk("Survivor2", None).await;
         let source2 = mk("Loser2", None).await;
-        sqlx::query("UPDATE work SET is_nsfw = 1, is_nsfw_override = 0 WHERE id = ?")
+        sqlx::query(r#"UPDATE work SET is_nsfw = TRUE, is_nsfw_override = FALSE WHERE id = $1"#)
             .bind(&source2)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE work SET is_nsfw_override = 1 WHERE id = ?")
+        sqlx::query(r#"UPDATE work SET is_nsfw_override = TRUE WHERE id = $1"#)
             .bind(&target2)
             .execute(&pool)
             .await
             .unwrap();
         merge_works(&pool, &source2, &target2).await.unwrap();
         let over2: Option<i64> =
-            sqlx::query_scalar("SELECT is_nsfw_override FROM work WHERE id = ?")
+            crate::db_types::query_scalar("SELECT is_nsfw_override FROM work WHERE id = $1")
                 .bind(&target2)
                 .fetch_one(&pool)
                 .await
@@ -9572,17 +11460,15 @@ mod tests {
         };
         let target = mk("Survivor").await;
         let source = mk("Loser").await;
-        sqlx::query("INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('u1','u1','u1@x','h','now')")
+        sqlx::query(r#"INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468','u1','u1@x','h','2020-01-01T00:00:00Z')"#)
             .execute(&pool).await.unwrap();
         for (sql, id) in [
             (
-                "INSERT INTO user_activity (id, user_id, kind, target_type, target_id, created_at) \
-                 VALUES ('a1','u1','library_add','series',?, 'now')",
+                r#"INSERT INTO user_activity (id, user_id, kind, target_type, target_id, created_at) VALUES ('a34f2774-04a4-4140-87f5-515c66070ccc','11ac9418-0c9e-4237-9e42-3ace93d7c468','library_add','series',$1, '2020-01-01T00:00:00Z')"#,
                 &source,
             ),
             (
-                "INSERT INTO notifications (id, user_id, kind, target_type, target_id, created_at) \
-                 VALUES ('n1','u1','reply','series',?, 'now')",
+                r#"INSERT INTO notifications (id, user_id, kind, target_type, target_id, created_at) VALUES ('af5946ab-57ab-4bf9-ad91-a156e49ddbb5','11ac9418-0c9e-4237-9e42-3ace93d7c468','reply','series',$1, '2020-01-01T00:00:00Z')"#,
                 &source,
             ),
         ] {
@@ -9592,7 +11478,7 @@ mod tests {
         // survivor's — a blind repoint would hit the PK and either fail or drop them.
         for (key, total) in [(&source, 10i64), (&target, 4)] {
             sqlx::query(
-                "INSERT INTO series_views (series_key, total, updated_at) VALUES (?, ?, 'now')",
+                r#"INSERT INTO series_views (series_key, total, updated_at) VALUES ($1, $2, '2020-01-01T00:00:00Z')"#,
             )
             .bind(key)
             .bind(total)
@@ -9600,7 +11486,7 @@ mod tests {
             .await
             .unwrap();
             sqlx::query(
-                "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES (?, 100, ?)",
+                "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES ($1, 100, $2)",
             )
             .bind(key)
             .bind(total)
@@ -9610,7 +11496,7 @@ mod tests {
         }
         // A bucket the survivor does NOT share must move across intact.
         sqlx::query(
-            "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES (?, 101, 7)",
+            "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES ($1, 101, 7)",
         )
         .bind(&source)
         .execute(&pool)
@@ -9622,7 +11508,7 @@ mod tests {
         // sqlx). Pinned here: if that ever regresses, the updates feed starts rendering a
         // deleted work.
         sqlx::query(
-            "INSERT INTO feed_updates (work_id, title, latest_at) VALUES (?, 'Loser', 'now')",
+            r#"INSERT INTO feed_updates (work_id, title, latest_at) VALUES ($1, 'Loser', '2020-01-01T00:00:00Z')"#,
         )
         .bind(&source)
         .execute(&pool)
@@ -9634,7 +11520,7 @@ mod tests {
         let one = |sql: &'static str, id: String| {
             let pool = pool.clone();
             async move {
-                sqlx::query_scalar::<_, i64>(sql)
+                crate::db_types::query_scalar::<i64>(sql)
                     .bind(id)
                     .fetch_one(&pool)
                     .await
@@ -9643,7 +11529,7 @@ mod tests {
         };
         assert_eq!(
             one(
-                "SELECT COUNT(*) FROM user_activity WHERE target_id = ?",
+                "SELECT COUNT(*) FROM user_activity WHERE target_id = $1",
                 target.clone()
             )
             .await,
@@ -9652,7 +11538,7 @@ mod tests {
         );
         assert_eq!(
             one(
-                "SELECT COUNT(*) FROM notifications WHERE target_id = ?",
+                "SELECT COUNT(*) FROM notifications WHERE target_id = $1",
                 target.clone()
             )
             .await,
@@ -9661,7 +11547,7 @@ mod tests {
         );
         assert_eq!(
             one(
-                "SELECT total FROM series_views WHERE series_key = ?",
+                "SELECT total FROM series_views WHERE series_key = $1",
                 target.clone()
             )
             .await,
@@ -9670,7 +11556,7 @@ mod tests {
         );
         assert_eq!(
             one(
-                "SELECT SUM(views) FROM series_view_bucket WHERE series_key = ?",
+                "SELECT SUM(views)::bigint FROM series_view_bucket WHERE series_key = $1",
                 target.clone()
             )
             .await,
@@ -9680,23 +11566,23 @@ mod tests {
         // Nothing left pointing at the deleted work.
         for (sql, what) in [
             (
-                "SELECT COUNT(*) FROM user_activity WHERE target_id = ?",
+                "SELECT COUNT(*) FROM user_activity WHERE target_id = $1",
                 "activity",
             ),
             (
-                "SELECT COUNT(*) FROM notifications WHERE target_id = ?",
+                "SELECT COUNT(*) FROM notifications WHERE target_id = $1",
                 "notification",
             ),
             (
-                "SELECT COUNT(*) FROM series_views WHERE series_key = ?",
+                "SELECT COUNT(*) FROM series_views WHERE series_key = $1",
                 "views",
             ),
             (
-                "SELECT COUNT(*) FROM series_view_bucket WHERE series_key = ?",
+                "SELECT COUNT(*) FROM series_view_bucket WHERE series_key = $1",
                 "buckets",
             ),
             (
-                "SELECT COUNT(*) FROM feed_updates WHERE work_id = ?",
+                "SELECT COUNT(*) FROM feed_updates WHERE work_id = $1",
                 "feed row",
             ),
         ] {
@@ -9741,7 +11627,7 @@ mod tests {
         // the resolver back the dead id — the CHECK in migration 0056 makes it
         // impossible, this asserts the merge never even tries).
         let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT old_id, new_id FROM work_redirect")
+            crate::db_types::query_tuple("SELECT old_id, new_id FROM work_redirect")
                 .fetch_all(&pool)
                 .await
                 .unwrap();
@@ -9799,8 +11685,8 @@ mod tests {
         // separates them these outrank the real work — which is exactly the production
         // failure, and what makes this test discriminate rather than pass on bm25 luck.
         for (w, uuid, n) in [(&spinoff, "u-spin", 40), (&colored, "u-col", 30)] {
-            let ssid: String = sqlx::query_scalar(
-                "SELECT id FROM source_series WHERE work_id = ? AND source_key = ?",
+            let ssid: String = crate::db_types::query_scalar(
+                "SELECT id FROM source_series WHERE work_id = $1 AND source_key = $2",
             )
             .bind(w)
             .bind(uuid)
@@ -9810,7 +11696,7 @@ mod tests {
             for i in 0..n {
                 sqlx::query(
                     "INSERT INTO chapter (id, source_series_id, external_id, number, lang, created_at) \
-                     VALUES (?, ?, ?, ?, 'en', '2026-01-01T00:00:00Z')",
+                     VALUES ($1, $2, $3, $4, 'en', '2026-01-01T00:00:00Z')",
                 )
                 .bind(format!("ch_{uuid}_{i}"))
                 .bind(&ssid)
@@ -9834,18 +11720,14 @@ mod tests {
              spin-off won. got {ids:?}"
         );
 
-        // KNOWN RESIDUAL, asserted so it can't drift silently: a punctuation-mismatched
-        // query cannot separate a work from its own noise-tail re-release. `normalize_title`
-        // strips "(Official Colored)", so "Dr.STONE (Official Colored)" normalizes to plain
-        // "dr stone" and TIES the work itself in the normalized tier, where `chapters DESC`
-        // then puts the (longer) re-release first. This is unchanged from before the fix —
-        // there both were in the single bottom tier and chapters decided identically — so
-        // the tiers are a strict improvement, not a new regression. Fixing it needs a
-        // punctuation-folded-but-noise-PRESERVING key that no column stores today.
-        assert!(pos(&ids, &colored) < pos(&ids, &main));
+        // Owner accepted "Accept exact title first" on 2026-10-10 after the
+        // concrete old/new ranking review in
+        // docs/audits/postgres-phase3-search-compatibility.md. The folded key
+        // preserves the suffix, so the exact main title precedes both prefix
+        // titles; their existing chapter-count tie-break remains 40 before 30.
+        assert_eq!(ids, vec![main.clone(), spinoff.clone(), colored.clone()]);
 
-        // Typed exactly, the RAW tier — which is why it must stay above the normalized
-        // one — keeps the work itself above its re-release.
+        // The exact main title also remains first when typed with punctuation.
         let (_, ids) = search_works_fts(&pool, "Dr.STONE", false, &Default::default(), 1, 20)
             .await
             .unwrap();
@@ -10000,8 +11882,8 @@ mod tests {
             .await
             .unwrap();
 
-        let descs: Vec<(String, String)> = sqlx::query_as(
-            "SELECT lang, description FROM work_description WHERE work_id = ? ORDER BY lang",
+        let descs: Vec<(String, String)> = crate::db_types::query_tuple(
+            "SELECT lang, description FROM work_description WHERE work_id = $1 ORDER BY lang",
         )
         .bind(&w)
         .fetch_all(&pool)
@@ -10014,8 +11896,8 @@ mod tests {
                 ("ja".to_string(), "日本語のあらすじ".to_string()),
             ]
         );
-        let credits: Vec<(String, String)> = sqlx::query_as(
-            "SELECT role, name FROM work_credit WHERE work_id = ? ORDER BY role, name",
+        let credits: Vec<(String, String)> = crate::db_types::query_tuple(
+            "SELECT role, name FROM work_credit WHERE work_id = $1 ORDER BY role, name",
         )
         .bind(&w)
         .fetch_all(&pool)
@@ -10035,8 +11917,8 @@ mod tests {
         upsert_work_from_mangadex(&pool, "md-desc", &input)
             .await
             .unwrap();
-        let en: String = sqlx::query_scalar(
-            "SELECT description FROM work_description WHERE work_id = ? AND lang = 'en'",
+        let en: String = crate::db_types::query_scalar(
+            "SELECT description FROM work_description WHERE work_id = $1 AND lang = 'en'",
         )
         .bind(&w)
         .fetch_one(&pool)
@@ -10044,7 +11926,7 @@ mod tests {
         .unwrap();
         assert_eq!(en, "Revised English blurb.");
         let credit_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM work_credit WHERE work_id = ?")
+            crate::db_types::query_scalar("SELECT COUNT(*) FROM work_credit WHERE work_id = $1")
                 .bind(&w)
                 .fetch_one(&pool)
                 .await
@@ -10174,15 +12056,23 @@ mod tests {
             vec![target.clone()],
             "source's distinctive token now blocks to the target"
         );
-        let orphan: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM work_alias_token WHERE work_id = ?")
-                .bind(&source)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let orphan: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM work_alias_token WHERE work_id = $1",
+        )
+        .bind(&source)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(orphan, 0, "no token rows left for the deleted source work");
 
         // Deleting the target cascades its token rows away entirely.
+        // The lost-claim cleanup keeps a work that still has a source mapping (Phase 4,
+        // T025). Release the mapping first: this test is about the cascade itself.
+        sqlx::query("DELETE FROM source_series WHERE work_id = $1")
+            .bind(&target)
+            .execute(&pool)
+            .await
+            .unwrap();
         delete_work_cascade(&pool, &target).await.unwrap();
         assert!(candidate_work_ids_by_token(&pool, "leveling", 10)
             .await
@@ -10216,8 +12106,8 @@ mod tests {
         // full-interval threshold would see 960 < 1000 and wrongly skip, halving the cadence.
         let pool = pool().await;
         let ts = (Utc::now() - chrono::Duration::seconds(960)).to_rfc3339();
-        sqlx::query("INSERT INTO sync_state (id, last_full_pass_at) VALUES (1, ?)")
-            .bind(&ts)
+        sqlx::query("INSERT INTO sync_state (id, last_full_pass_at) VALUES (1, $1)")
+            .bind(crate::db_types::date(&ts).unwrap())
             .execute(&pool)
             .await
             .unwrap();
@@ -10246,7 +12136,7 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
-                 VALUES (?, 'w', ?, ?, '2024-01-01T00:00:00Z')",
+                 VALUES ($1, 'w', $2, $3, '2024-01-01T00:00:00Z')",
             )
             .bind(format!("ss_{ty}_{key}"))
             .bind(ty)
@@ -10306,8 +12196,8 @@ mod tests {
             )
             .await
             .unwrap();
-            sqlx::query("UPDATE source_series SET last_seen = ? WHERE id = ?")
-                .bind(format!("2026-01-0{}T00:00:00Z", i + 1))
+            sqlx::query("UPDATE source_series SET last_seen = $1 WHERE id = $2")
+                .bind(crate::db_types::date(&format!("2026-01-0{}T00:00:00Z", i + 1)).unwrap())
                 .bind(&ss)
                 .execute(pool)
                 .await
@@ -10321,7 +12211,7 @@ mod tests {
         let id = format!("ch_{ss_id}_{chapter_key}");
         sqlx::query(
             "INSERT INTO chapter (id, source_series_id, external_id, number, lang, chapter_key, created_at) \
-             VALUES (?, ?, ?, ?, 'en', ?, '2026-01-01T00:00:00Z')",
+             VALUES ($1, $2, $3, $4, 'en', $5, '2026-01-01T00:00:00Z')",
         )
         .bind(&id)
         .bind(ss_id)
@@ -10335,7 +12225,7 @@ mod tests {
     }
 
     async fn work_of(pool: &Database, ss_id: &str) -> String {
-        sqlx::query_scalar("SELECT work_id FROM source_series WHERE id = ?")
+        crate::db_types::query_scalar("SELECT work_id FROM source_series WHERE id = $1")
             .bind(ss_id)
             .fetch_one(pool)
             .await
@@ -10351,9 +12241,14 @@ mod tests {
 
         // ss[1] has the later `last_seen`, so it heads the picker's list and names the new
         // work after its OWN Suwayomi title — not the shared title that caused the merge.
-        let out = split_source_series(&pool, &work, &[ss[1].clone()], Some("u_admin"))
-            .await
-            .unwrap();
+        let out = split_source_series(
+            &pool,
+            &work,
+            &[ss[1].clone()],
+            Some(&crate::db_types::test_uuid("u_admin").to_string()),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.title, "Series 501");
         assert_eq!(out.moved_sources, 1);
         // No MangaDex anchor anywhere in the detached set, so the reader navigates by the
@@ -10370,9 +12265,9 @@ mod tests {
             let pool = pool.clone();
             let ch = ch.to_string();
             async move {
-                sqlx::query_scalar::<_, String>(
+                crate::db_types::query_scalar::<String>(
                     "SELECT s.work_id FROM chapter c JOIN source_series s ON s.id = c.source_series_id \
-                      WHERE c.id = ?",
+                      WHERE c.id = $1",
                 )
                 .bind(&ch)
                 .fetch_one(&pool)
@@ -10382,7 +12277,7 @@ mod tests {
         };
         assert_eq!(owner(&keep_ch).await, work);
         assert_eq!(owner(&move_ch).await, out.new_work_id);
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chapter")
+        let total: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM chapter")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -10393,12 +12288,13 @@ mod tests {
 
         // The new work is on Browse and in search under its own name straight away, rather
         // than only after the next periodic rebuild.
-        let browsed: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM browse_catalogue WHERE work_id = ?")
-                .bind(&out.new_work_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let browsed: i64 = crate::db_types::query_scalar(
+            "SELECT COUNT(*) FROM browse_catalogue WHERE work_id = $1",
+        )
+        .bind(&out.new_work_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             browsed, 1,
             "the new work must be projected into browse_catalogue"
@@ -10416,9 +12312,14 @@ mod tests {
     async fn split_records_the_pair_so_the_consolidator_cannot_re_merge_it() {
         let pool = pool().await;
         let (work, ss) = work_with_suwayomi_sources(&pool, "Ouroboros", &[510, 511]).await;
-        let out = split_source_series(&pool, &work, &[ss[1].clone()], Some("u_admin"))
-            .await
-            .unwrap();
+        let out = split_source_series(
+            &pool,
+            &work,
+            &[ss[1].clone()],
+            Some(&crate::db_types::test_uuid("u_admin").to_string()),
+        )
+        .await
+        .unwrap();
 
         // Unordered: the sweep picks its own survivor, so the guard has to answer the same
         // either way round.
@@ -10430,11 +12331,13 @@ mod tests {
         // halves share a title by construction, so a copied year/author/pHash would let the
         // automated sweep destroy the split on its next pass even with the guard in place.
         let (year, author, phash): (Option<i64>, Option<String>, Option<String>) =
-            sqlx::query_as("SELECT year, author, cover_phash FROM work WHERE id = ?")
-                .bind(&out.new_work_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+            crate::db_types::query_tuple(
+                "SELECT year, author, cover_phash FROM work WHERE id = $1",
+            )
+            .bind(&out.new_work_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert!(year.is_none() && author.is_none() && phash.is_none());
     }
 
@@ -10480,17 +12383,22 @@ mod tests {
         let sw = upsert_source_series(&pool, &work, "suwayomi", "src", "530", None, false)
             .await
             .unwrap();
-        let md: String = sqlx::query_scalar(
-            "SELECT id FROM source_series WHERE work_id = ? AND source_type = 'mangadex'",
+        let md: String = crate::db_types::query_scalar(
+            "SELECT id FROM source_series WHERE work_id = $1 AND source_type = 'mangadex'",
         )
         .bind(&work)
         .fetch_one(&pool)
         .await
         .unwrap();
 
-        let out = split_source_series(&pool, &work, std::slice::from_ref(&md), Some("u_admin"))
-            .await
-            .unwrap();
+        let out = split_source_series(
+            &pool,
+            &work,
+            std::slice::from_ref(&md),
+            Some(&crate::db_types::test_uuid("u_admin").to_string()),
+        )
+        .await
+        .unwrap();
         // A detached MangaDex mapping makes the new work anchored, so it addresses by `w_…`.
         assert_eq!(out.new_reader_id, out.new_work_id);
         assert_eq!(work_of(&pool, &md).await, out.new_work_id);
@@ -10498,7 +12406,7 @@ mod tests {
         // `work_external_id` is PK (provider, external_id) — globally unique, not per-work —
         // so the uuid has to move with the mapping or it claims an anchor the original no
         // longer has a mapping for.
-        let anchor: String = sqlx::query_scalar(
+        let anchor: String = crate::db_types::query_scalar(
             "SELECT work_id FROM work_external_id WHERE provider = 'mangadex' AND external_id = 'md-split'",
         )
         .fetch_one(&pool)
@@ -10518,7 +12426,7 @@ mod tests {
         for key in ["1", "9"] {
             sqlx::query(
                 "INSERT INTO release_event (work_id, chapter_key, first_seen_at, first_source_series_id, label) \
-                 VALUES (?, ?, 1000, ?, ?)",
+                 VALUES ($1, $2, TIMESTAMPTZ '1970-01-01 00:00:01+00', $3, $4)",
             )
             .bind(&work)
             .bind(key)
@@ -10529,16 +12437,21 @@ mod tests {
             .unwrap();
         }
 
-        let out = split_source_series(&pool, &work, &[ss[1].clone()], Some("u_admin"))
-            .await
-            .unwrap();
+        let out = split_source_series(
+            &pool,
+            &work,
+            &[ss[1].clone()],
+            Some(&crate::db_types::test_uuid("u_admin").to_string()),
+        )
+        .await
+        .unwrap();
 
         let keys_of = |w: &str| {
             let pool = pool.clone();
             let w = w.to_string();
             async move {
-                sqlx::query_scalar::<_, String>(
-                    "SELECT chapter_key FROM release_event WHERE work_id = ? ORDER BY chapter_key",
+                crate::db_types::query_scalar::<String>(
+                    "SELECT chapter_key FROM release_event WHERE work_id = $1 ORDER BY chapter_key",
                 )
                 .bind(&w)
                 .fetch_all(&pool)
@@ -10561,3 +12474,6 @@ include!("../../bench/sqlite_projection.rs");
 
 #[cfg(test)]
 mod production_safety_tests;
+
+#[cfg(test)]
+pub(crate) mod phase4_tests;

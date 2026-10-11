@@ -1,0 +1,308 @@
+[
+  {
+    "query": "Solo Leveling",
+    "expected": [
+      "w_00000000000040008000000000000001",
+      "w_00000000000040008000000000000002"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "solo",
+    "expected": [
+      "w_00000000000040008000000000000001",
+      "w_00000000000040008000000000000002"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Solo Lev",
+    "expected": [
+      "w_00000000000040008000000000000001",
+      "w_00000000000040008000000000000002"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "SOLO LEVELING",
+    "expected": [
+      "w_00000000000040008000000000000001",
+      "w_00000000000040008000000000000002"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "solo leveling side",
+    "expected": [
+      "w_00000000000040008000000000000002"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Solo Levelign",
+    "expected": [
+      "w_00000000000040008000000000000001",
+      "w_00000000000040008000000000000002"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Solo Leveing",
+    "expected": [
+      "w_00000000000040008000000000000001",
+      "w_00000000000040008000000000000002"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Solo Levlng",
+    "expected": [
+      "w_00000000000040008000000000000001",
+      "w_00000000000040008000000000000002"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Sloo Leveling",
+    "expected": [
+      "w_00000000000040008000000000000001",
+      "w_00000000000040008000000000000002"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Café Chronicle",
+    "expected": [
+      "w_00000000000040008000000000000003"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Cafe Chronicle",
+    "expected": [
+      "w_00000000000040008000000000000003"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "CAFÉ CHRONICLE",
+    "expected": [
+      "w_00000000000040008000000000000003"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "cafe",
+    "expected": [
+      "w_00000000000040008000000000000003"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Cafè Chroncle",
+    "expected": [
+      "w_00000000000040008000000000000003"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Dr.STONE",
+    "expected": [
+      "w_00000000000040008000000000000004"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "dr stone",
+    "expected": [
+      "w_00000000000040008000000000000004"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Dr Ston",
+    "expected": [
+      "w_00000000000040008000000000000004"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Dr Stnoe",
+    "expected": [
+      "w_00000000000040008000000000000004"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "SPY×FAMILY",
+    "expected": [
+      "w_00000000000040008000000000000005"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "spy family",
+    "expected": [
+      "w_00000000000040008000000000000005"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "spy fam",
+    "expected": [
+      "w_00000000000040008000000000000005"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "spy famliy",
+    "expected": [
+      "w_00000000000040008000000000000005"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "X",
+    "expected": [
+      "w_00000000000040008000000000000006"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Go",
+    "expected": [
+      "w_00000000000040008000000000000007"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Sun",
+    "expected": [
+      "w_00000000000040008000000000000008"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "su",
+    "expected": [
+      "w_00000000000040008000000000000008"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "進撃の巨人",
+    "expected": [
+      "w_00000000000040008000000000000009"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "進撃",
+    "expected": [
+      "w_00000000000040008000000000000009"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "進",
+    "expected": [
+      "w_00000000000040008000000000000009"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "나 혼자만 레벨업",
+    "expected": [
+      "w_00000000000040008000000000000001",
+      "w_00000000000040008000000000000010"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "나",
+    "expected": [
+      "w_00000000000040008000000000000001",
+      "w_00000000000040008000000000000010"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "혼자만",
+    "expected": [
+      "w_00000000000040008000000000000001",
+      "w_00000000000040008000000000000010"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "魔道祖师",
+    "expected": [
+      "w_00000000000040008000000000000011"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "魔道",
+    "expected": [
+      "w_00000000000040008000000000000011"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "魔",
+    "expected": [
+      "w_00000000000040008000000000000011"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Only Alias Hero",
+    "expected": [
+      "w_00000000000040008000000000000001"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "only alias",
+    "expected": [
+      "w_00000000000040008000000000000001"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Shared Alias",
+    "expected": [
+      "w_00000000000040008000000000000001",
+      "w_00000000000040008000000000000002"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Chronicle",
+    "expected": [
+      "w_00000000000040008000000000000003",
+      "w_00000000000040008000000000000012",
+      "w_00000000000040008000000000000013",
+      "w_00000000000040008000000000000014",
+      "w_00000000000040008000000000000015"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "Chronicle M",
+    "expected": [
+      "w_00000000000040008000000000000013"
+    ],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "not-a-real-work",
+    "expected": [],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  },
+  {
+    "query": "!!!",
+    "expected": [],
+    "note": "Human relevance set, independent of FTS output; order is not a ranking assertion."
+  }
+]

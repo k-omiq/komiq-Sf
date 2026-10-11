@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::db::Database;
 use anyhow::Result;
-use sqlx::SqliteConnection;
+use sqlx::PgConnection;
 
 /// Longest tag id the filter accepts. Real slugs top out around 20 characters ("traditional-
 /// games"); this only bounds what a client can make the server bind and memo-key.
@@ -410,29 +410,69 @@ pub async fn sync_work_suwayomi_tags(
 }
 
 /// The pass behind both entry points: every Suwayomi-linked work, or the one in `only`
-/// with the extra genres it comes with. The four reads take the same ` AND … = ?` when
-/// scoped, so one work costs four index seeks, not four scans.
+/// with the extra genres it comes with.
+///
+/// The full pass first plans over the whole catalogue on a reader, with no lock, only to
+/// learn WHICH works have something to change. Each of those is then synced in its own
+/// guarded transaction, which reads its inputs again under the locks and builds its own
+/// plan: the unlocked plan is never applied. A cycle with nothing to change (the normal
+/// case) therefore takes no work lock and no writer connection.
 async fn sync_suwayomi_tags_in(
     pool: &Database,
     only: Option<(&str, &[String])>,
 ) -> Result<SuwayomiTagSync> {
+    let works: Vec<String> = match only {
+        Some((work, _)) => vec![work.to_owned()],
+        None => {
+            let mut reader = pool.acquire().await?;
+            let plan = suwayomi_tag_plan(&mut reader, None).await?;
+            drop(reader);
+            let works: BTreeSet<String> = plan
+                .delete
+                .into_iter()
+                .map(|(work, _)| work)
+                .chain(plan.insert.into_iter().map(|(work, _, _, _)| work))
+                .chain(plan.demographic.into_iter().map(|(work, _)| work))
+                .collect();
+            works.into_iter().collect()
+        }
+    };
+    let mut total = SuwayomiTagSync::default();
+    for work in works {
+        let fresh = only.map(|(_, fresh)| fresh).unwrap_or(&[]);
+        let changed =
+            crate::db::retry_transaction(|| sync_suwayomi_tags_work(pool, &work, fresh)).await?;
+        total.inserted += changed.inserted;
+        total.deleted += changed.deleted;
+        total.demographics += changed.demographics;
+    }
+    Ok(total)
+}
+
+/// Read the four inputs and plan the derived rows: for every Suwayomi-linked work, or
+/// for the one in `only` with the extra genres it comes with. The four reads take the
+/// same ` AND … = $1` when scoped, so one work costs four index seeks, not four scans.
+async fn suwayomi_tag_plan(
+    conn: &mut PgConnection,
+    only: Option<(&str, &[String])>,
+) -> Result<SuwayomiTagPlan> {
     let scope = |column: &str| match only {
-        Some(_) => format!(" AND {column} = ?"),
+        Some(_) => format!(" AND {column} = $1"),
         None => String::new(),
     };
     let work = only.map(|(work_id, _)| work_id);
 
     let sql = format!(
         "SELECT ss.work_id, sy.genre FROM source_series ss \
-           JOIN suwayomi_series sy ON sy.id = CAST(ss.source_key AS INTEGER) \
+           JOIN suwayomi_series sy ON sy.id = public.sqlite_integer_pin(ss.source_key) \
           WHERE ss.source_type = 'suwayomi' AND sy.genre IS NOT NULL{}",
         scope("ss.work_id")
     );
-    let mut query = sqlx::query_as::<_, (String, String)>(&sql);
+    let mut query = crate::db_types::query_tuple::<(String, String)>(&sql);
     if let Some(work_id) = work {
         query = query.bind(work_id);
     }
-    let rows = query.fetch_all(pool).await?;
+    let rows = query.fetch_all(&mut *conn).await?;
     let mut genres_by_work: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (work_id, json) in rows {
         // A malformed blob is skipped, not fatal: it is one source's cache row, and failing
@@ -458,11 +498,11 @@ async fn sync_suwayomi_tags_in(
             AND t.work_id IN (SELECT work_id FROM source_series WHERE source_type = 'suwayomi'){}",
         scope("t.work_id")
     );
-    let mut query = sqlx::query_scalar::<_, String>(&sql);
+    let mut query = crate::db_types::query_scalar::<String>(&sql);
     if let Some(work_id) = work {
         query = query.bind(work_id);
     }
-    let mangadex_tagged: HashSet<String> = query.fetch_all(pool).await?.into_iter().collect();
+    let mangadex_tagged: HashSet<String> = query.fetch_all(&mut *conn).await?.into_iter().collect();
 
     // Every tier's rows for the Suwayomi-linked works (to skip names already carried), plus
     // every derived row anywhere (to delete the ones whose source went away).
@@ -472,12 +512,12 @@ async fn sync_suwayomi_tags_in(
              OR work_id IN (SELECT work_id FROM source_series WHERE source_type = 'suwayomi')){}",
         scope("work_id")
     );
-    let mut query = sqlx::query_as::<_, (String, String, String)>(&sql);
+    let mut query = crate::db_types::query_tuple::<(String, String, String)>(&sql);
     if let Some(work_id) = work {
         query = query.bind(work_id);
     }
     let mut existing: HashMap<String, BTreeMap<String, String>> = HashMap::new();
-    for (work_id, tag, source) in query.fetch_all(pool).await? {
+    for (work_id, tag, source) in query.fetch_all(&mut *conn).await? {
         existing.entry(work_id).or_default().insert(tag, source);
     }
 
@@ -489,26 +529,56 @@ async fn sync_suwayomi_tags_in(
                              WHERE ss.work_id = w.id AND ss.source_type = 'mangadex'){}",
         scope("w.id")
     );
-    let mut query = sqlx::query_scalar::<_, String>(&sql);
+    let mut query = crate::db_types::query_scalar::<String>(&sql);
     if let Some(work_id) = work {
         query = query.bind(work_id);
     }
-    let demographic_eligible: HashSet<String> = query.fetch_all(pool).await?.into_iter().collect();
+    let demographic_eligible: HashSet<String> =
+        query.fetch_all(&mut *conn).await?.into_iter().collect();
 
-    let plan = plan_suwayomi_tags(
+    Ok(plan_suwayomi_tags(
         &genres_by_work,
         &mangadex_tagged,
         &existing,
         &demographic_eligible,
-    );
+    ))
+}
+
+/// One work's guarded sync. Lock order: the work, its sources, then its Suwayomi cache
+/// rows. The inputs are read and the plan is built after those locks are held.
+async fn sync_suwayomi_tags_work(
+    pool: &Database,
+    work_id: &str,
+    fresh: &[String],
+) -> Result<SuwayomiTagSync> {
+    let mut tx = pool.begin().await?;
+    let locked = crate::locks::lock_works(&mut tx, &[work_id]).await?;
+    if !locked.missing.is_empty() {
+        return Ok(SuwayomiTagSync::default());
+    }
+    let sources: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM source_series WHERE work_id = $1 ORDER BY id")
+            .bind(work_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    crate::locks::lock_source_series(&mut tx, &sources).await?;
+    let cache: Vec<i64> = sqlx::query_scalar("SELECT DISTINCT public.sqlite_integer_pin(source_key) FROM source_series WHERE work_id = $1 AND source_type = 'suwayomi' ORDER BY 1")
+        .bind(work_id).fetch_all(&mut *tx).await?;
+    for id in cache {
+        sqlx::query("SELECT id FROM suwayomi_series WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    }
+    crate::catalog::guards::held().await;
+    let plan = suwayomi_tag_plan(&mut tx, Some((work_id, fresh))).await?;
     let mut out = SuwayomiTagSync::default();
     if plan.insert.is_empty() && plan.delete.is_empty() && plan.demographic.is_empty() {
         return Ok(out);
     }
-    let mut tx = pool.begin().await?;
     for (work_id, tag) in &plan.delete {
         out.deleted += sqlx::query(
-            "DELETE FROM work_tag WHERE work_id = ? AND tag = ? AND source = 'suwayomi'",
+            "DELETE FROM work_tag WHERE work_id = $1 AND tag = $2 AND source = 'suwayomi'",
         )
         .bind(work_id)
         .bind(tag)
@@ -518,8 +588,8 @@ async fn sync_suwayomi_tags_in(
     }
     for (work_id, name, group, ord) in &plan.insert {
         out.inserted += sqlx::query(
-            "INSERT OR IGNORE INTO work_tag (work_id, tag, ord, source, tag_key, tag_group) \
-             VALUES (?, ?, ?, 'suwayomi', ?, ?)",
+            "INSERT INTO work_tag (work_id, tag, ord, source, tag_key, tag_group) \
+             VALUES ($1, $2, $3, 'suwayomi', $4, $5) ON CONFLICT DO NOTHING",
         )
         .bind(work_id)
         .bind(name)
@@ -532,8 +602,8 @@ async fn sync_suwayomi_tags_in(
     }
     for (work_id, demographic) in &plan.demographic {
         out.demographics += sqlx::query(
-            "UPDATE work SET demographic = ? \
-              WHERE id = ? AND demographic IS NULL \
+            "UPDATE work SET demographic = $1 \
+              WHERE id = $2 AND demographic IS NULL \
                 AND NOT EXISTS (SELECT 1 FROM source_series ss \
                                  WHERE ss.work_id = work.id AND ss.source_type = 'mangadex')",
         )
@@ -558,41 +628,73 @@ async fn sync_suwayomi_tags_in(
 ///
 /// Repair at most 128 rows per writer turn and release the writer between batches.
 /// Unknown free-text groups remain unset; settled rows are not rewritten.
+///
+/// A row whose group is unknown stays in the candidate set for ever (its `tag_group` is
+/// NULL and nothing here can fill it), so the candidates are judged BEFORE a writer is
+/// taken: a batch with nothing to write opens no transaction at all. A batch that does
+/// write locks its works first, in sorted order, and is retried as a whole. Without
+/// the parent locks its row updates met the multi-row `DELETE` of a tag replacement of
+/// the same work in opposite orders, which PostgreSQL reports as a deadlock.
 pub async fn fill_tag_keys(pool: &Database) -> Result<u64> {
-    let mut cursor = 0i64;
+    let mut cursor: Option<(String, String)> = None;
     let mut changed = 0;
     loop {
-        let rows: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT rowid, tag FROM work_tag WHERE rowid > ? \
-             AND (tag_key IS NULL OR tag_group IS NULL) ORDER BY rowid LIMIT 128",
+        let rows: Vec<(String, String, bool, bool)> = sqlx::query_as(
+            "SELECT work_id, tag, tag_key IS NULL, tag_group IS NULL FROM work_tag \
+             WHERE ($1::text IS NULL OR (work_id, tag) > ($1, $2)) \
+             AND (tag_key IS NULL OR tag_group IS NULL) ORDER BY work_id, tag LIMIT 128",
         )
-        .bind(cursor)
+        .bind(cursor.as_ref().map(|(work_id, _)| work_id))
+        .bind(cursor.as_ref().map(|(_, tag)| tag))
         .fetch_all(pool)
         .await?;
-        if rows.is_empty() {
+        let Some((work_id, tag, ..)) = rows.last() else {
             return Ok(changed);
+        };
+        cursor = Some((work_id.clone(), tag.clone()));
+        let repairs: Vec<(String, String)> = rows
+            .into_iter()
+            .filter(|(_, tag, no_key, no_group)| *no_key || (*no_group && known_tag(tag).is_some()))
+            .map(|(work_id, tag, ..)| (work_id, tag))
+            .collect();
+        if repairs.is_empty() {
+            continue;
         }
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        for (rowid, name) in rows {
-            cursor = rowid;
-            let group = known_tag(&name).map(|(_, group)| group);
-            changed += sqlx::query(
-                "UPDATE work_tag SET tag_key = COALESCE(tag_key, ?), \
-                tag_group = COALESCE(tag_group, ?) WHERE rowid = ? AND tag = ? \
-                AND (tag_key IS NULL OR (tag_group IS NULL AND ? IS NOT NULL))",
-            )
-            .bind(slug(&name))
-            .bind(group)
-            .bind(rowid)
-            .bind(name)
-            .bind(group)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        }
-        tx.commit().await?;
+        changed += crate::db::retry_transaction(|| fill_tag_keys_batch(pool, &repairs)).await?;
         tokio::task::yield_now().await;
     }
+}
+
+/// One writer turn of [`fill_tag_keys`]: `repairs` is sorted by (work, tag).
+async fn fill_tag_keys_batch(pool: &Database, repairs: &[(String, String)]) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    let mut works: Vec<&str> = repairs
+        .iter()
+        .map(|(work_id, _)| work_id.as_str())
+        .collect();
+    works.dedup();
+    crate::locks::lock_works(&mut tx, &works).await?;
+    let mut changed = 0;
+    for (work_id, name) in repairs {
+        let group = known_tag(name).map(|(_, group)| group);
+        // Conditional on the row still needing it: the candidates were read before the
+        // locks, and a writer of the work may have settled or replaced the row since.
+        changed += sqlx::query(
+            "UPDATE work_tag SET tag_key = COALESCE(tag_key, $1), \
+            tag_group = COALESCE(tag_group, $2) WHERE work_id = $3 AND tag = $4 \
+            AND (tag_key IS NULL OR (tag_group IS NULL AND $5 IS NOT NULL))",
+        )
+        .bind(slug(name))
+        .bind(group)
+        .bind(work_id)
+        .bind(name)
+        .bind(group)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    }
+    tx.commit().await?;
+    Ok(changed)
 }
 
 /// Rebuild the `tag` table from `work_tag` joined to the CURRENT `browse_catalogue`.
@@ -605,7 +707,7 @@ pub async fn fill_tag_keys(pool: &Database) -> Result<u64> {
 /// count must too. `COUNT(DISTINCT work_id)` rather than `COUNT(*)`: `work_tag`'s key is
 /// `(work_id, tag)`, so two NAMES that slug alike ("Sci fi" by an admin, "Sci-Fi" from
 /// MangaDex) are two rows of one work under one key, and the filter counts that work once.
-pub async fn rebuild_tag_table(conn: &mut SqliteConnection) -> Result<u64> {
+pub async fn rebuild_tag_table(conn: &mut PgConnection) -> Result<u64> {
     sqlx::query("DELETE FROM tag").execute(&mut *conn).await?;
     Ok(sqlx::query(
         "INSERT INTO tag (id, name, tag_group, mangadex_id, work_count, safe_work_count) \
@@ -614,8 +716,8 @@ pub async fn rebuild_tag_table(conn: &mut SqliteConnection) -> Result<u64> {
                 COALESCE(MAX(CASE WHEN t.tag_group IN ('genre', 'theme', 'format', 'content') \
                                   THEN t.tag_group END), 'genre'), \
                 MAX(t.tag_id), \
-                COUNT(DISTINCT t.work_id), \
-                COUNT(DISTINCT CASE WHEN b.is_nsfw = 0 THEN t.work_id END) \
+                COUNT(DISTINCT t.work_id)::bigint, \
+                COUNT(DISTINCT CASE WHEN b.is_nsfw = FALSE THEN t.work_id END) \
            FROM work_tag t JOIN browse_catalogue b ON b.work_id = t.work_id \
           WHERE t.tag_key IS NOT NULL AND t.tag_key <> '' \
           GROUP BY t.tag_key",
@@ -649,7 +751,7 @@ pub async fn list_tags(pool: &Database, show_nsfw: bool) -> Result<Vec<TagRow>> 
         "SELECT id, name, tag_group, {col} AS count FROM tag WHERE {col} > 0 \
          ORDER BY CASE tag_group WHEN 'genre' THEN 0 WHEN 'theme' THEN 1 \
                                  WHEN 'format' THEN 2 ELSE 3 END, \
-                  name COLLATE NOCASE, id"
+                  translate(name, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), id"
     );
     Ok(sqlx::query_as::<_, TagRow>(&sql).fetch_all(pool).await?)
 }
@@ -859,7 +961,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -869,7 +971,7 @@ mod tests {
     async fn work(pool: &Database, id: &str, demographic: Option<&str>) {
         sqlx::query(
             "INSERT INTO work (id, primary_title, demographic, created_at, updated_at) \
-             VALUES (?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+             VALUES ($1, $2, $3, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
         )
         .bind(id)
         .bind(id)
@@ -882,7 +984,7 @@ mod tests {
     async fn suwayomi_source(pool: &Database, work_id: &str, sid: i64, genres: &str) {
         sqlx::query(
             "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
-             VALUES (?, ?, 'suwayomi', ?, '2026-01-01T00:00:00Z')",
+             VALUES ($1, $2, 'suwayomi', $3, '2026-01-01T00:00:00Z')",
         )
         .bind(format!("ss_{sid}"))
         .bind(work_id)
@@ -892,18 +994,20 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO suwayomi_series (id, title, genre, status, source_id, updated_at) \
-             VALUES (?, 'T', ?, 'ONGOING', '1', '2026-01-01T00:00:00Z')",
+             VALUES ($1, 'T', $2, 'ONGOING', '1', '2026-01-01T00:00:00Z')",
         )
         .bind(sid)
-        .bind(genres)
+        .bind(sqlx::types::Json(
+            serde_json::from_str::<serde_json::Value>(genres).unwrap(),
+        ))
         .execute(pool)
         .await
         .unwrap();
     }
 
     async fn tags_of(pool: &Database, work_id: &str) -> Vec<(String, String, Option<String>)> {
-        sqlx::query_as(
-            "SELECT tag, source, tag_key FROM work_tag WHERE work_id = ? ORDER BY tag, source",
+        crate::db_types::query_tuple(
+            "SELECT tag, source, tag_key FROM work_tag WHERE work_id = $1 ORDER BY tag, source",
         )
         .bind(work_id)
         .fetch_all(pool)
@@ -972,11 +1076,13 @@ mod tests {
         let demo = |id: &'static str| {
             let pool = pool.clone();
             async move {
-                sqlx::query_scalar::<_, Option<String>>("SELECT demographic FROM work WHERE id = ?")
-                    .bind(id)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap()
+                crate::db_types::query_scalar::<Option<String>>(
+                    "SELECT demographic FROM work WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
             }
         };
         assert_eq!(demo("w_sw").await.as_deref(), Some("shounen"));
@@ -1084,9 +1190,9 @@ mod tests {
         // one-work pass wrote, and only reaches the work it had not seen.
         sqlx::query(
             "INSERT INTO suwayomi_series (id, title, genre, status, source_id, updated_at) \
-             VALUES (2, 'T', ?, 'ONGOING', '1', '2026-01-01T00:00:00Z')",
+             VALUES (2, 'T', $1, 'ONGOING', '1', '2026-01-01T00:00:00Z')",
         )
-        .bind(serde_json::to_string(&fresh).unwrap())
+        .bind(sqlx::types::Json(&fresh))
         .execute(&pool)
         .await
         .unwrap();
@@ -1094,6 +1200,82 @@ mod tests {
         assert_eq!((full.inserted, full.deleted, full.demographics), (1, 0, 0));
         assert_eq!(tags_of(&pool, "w_new").await.len(), 2);
         assert_eq!(tags_of(&pool, "w_other").await.len(), 1);
+    }
+
+    /// A row with a key and an unknown free-text group stays a candidate for ever, and
+    /// nothing can be written to it. Such a batch must not open a writer transaction:
+    /// the lane's only writer connection is busy here, and the repair must still return.
+    #[tokio::test]
+    async fn settled_tag_rows_do_not_open_a_writer_transaction() {
+        let pool = Database::connect("sqlite::memory:").await.unwrap();
+        work(&pool, "w_settled", None).await;
+        sqlx::query(
+            "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) \
+             VALUES ('w_settled', 'My Custom Tag', 0, 'admin', 'my-custom-tag')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let background = pool.background();
+        let busy = background.begin().await.unwrap();
+        let changed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fill_tag_keys(&background),
+        )
+        .await
+        .expect("a batch with nothing to write waited for the writer connection")
+        .unwrap();
+        assert_eq!(changed, 0);
+        busy.rollback().await.unwrap();
+    }
+
+    /// A repair locks the works of its batch before it touches their tag rows, the
+    /// order every other writer of a work's tags uses. Another transaction holds only
+    /// the work row: the repair must wait for it. (Row updates without the parent lock
+    /// met a tag replacement's multi-row DELETE in opposite orders: a deadlock.)
+    #[tokio::test]
+    async fn a_tag_key_repair_waits_for_a_writer_of_the_work() {
+        let pool = Database::connect("sqlite::memory:")
+            .await
+            .unwrap()
+            .foreground();
+        work(&pool, "w_busy", None).await;
+        for tag in ["Gore", "Sci-Fi"] {
+            sqlx::query(
+                "INSERT INTO work_tag (work_id, tag, ord, source) VALUES ('w_busy', $1, 0, 'admin')",
+            )
+            .bind(tag)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let mut writer = pool.begin().await.unwrap();
+        crate::locks::lock_works(&mut writer, &["w_busy"])
+            .await
+            .unwrap();
+        let repairing = pool.clone();
+        let mut repair = tokio::spawn(async move { fill_tag_keys(&repairing).await });
+        tokio::select! {
+            _ = crate::cover::wait_for_writer_lock(&pool) => {}
+            done = &mut repair => panic!("the repair did not wait for the work: {done:?}"),
+        }
+        // The writer replaces the work's tags, as a tag replacement does, and commits.
+        sqlx::query("DELETE FROM work_tag WHERE work_id = 'w_busy' AND tag = 'Gore'")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        writer.commit().await.unwrap();
+        assert_eq!(
+            repair.await.unwrap().unwrap(),
+            1,
+            "only the row that is left"
+        );
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT tag, tag_key FROM work_tag WHERE work_id = 'w_busy'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, [("Sci-Fi".to_owned(), Some("sci-fi".to_owned()))]);
     }
 
     /// The key backfill and the tag table: a row without a key gets one (and a known name
@@ -1106,12 +1288,12 @@ mod tests {
             work(&pool, id, None).await;
             sqlx::query(
                 "INSERT INTO browse_catalogue (work_id, reader_id, title, is_nsfw, created_at) \
-                 VALUES (?, ?, ?, ?, '2026-01-01T00:00:00Z')",
+                 VALUES ($1, $2, $3, $4, '2026-01-01T00:00:00Z')",
             )
             .bind(id)
             .bind(id)
             .bind(id)
-            .bind(nsfw)
+            .bind(nsfw != 0)
             .execute(&pool)
             .await
             .unwrap();
@@ -1127,7 +1309,7 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO work_tag (work_id, tag, ord, source, tag_id, tag_group) \
-                 VALUES (?, ?, 0, ?, ?, CASE WHEN ? = 'mangadex' THEN 'genre' END)",
+                 VALUES ($1, $2, 0, $3, $4, CASE WHEN $5 = 'mangadex' THEN 'genre' END)",
             )
             .bind(w)
             .bind(tag)
@@ -1167,7 +1349,7 @@ mod tests {
             "the opted-out count excludes the NSFW work"
         );
         let md_id: Option<String> =
-            sqlx::query_scalar("SELECT mangadex_id FROM tag WHERE id = 'sci-fi'")
+            crate::db_types::query_scalar("SELECT mangadex_id FROM tag WHERE id = 'sci-fi'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();

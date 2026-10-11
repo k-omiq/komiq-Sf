@@ -22,3 +22,18 @@ apps/server/target
 **/.dev.vars
 .wrangler
 **/.wrangler
+
+# Private self-host backups and installer state (context is the repository root).
+*.dump
+**/*.dump
+*.tgz
+**/*.tgz
+deploy/selfhost/backups
+deploy/selfhost/.sqlite-image-*
+deploy/selfhost/.env*
+**/.dump.*
+# Local agent worktrees and settings are not image inputs.
+.claude
+.codex
+.agents
+.aws

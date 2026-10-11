@@ -1,0 +1,79 @@
+{
+  "data": {
+    "search": {
+      "items": [
+        {
+          "id": "w_00000000000040008000000000000001",
+          "isNsfw": false,
+          "title": "Solo Leveling"
+        },
+        {
+          "id": "w_00000000000040008000000000000014",
+          "isNsfw": false,
+          "title": "Chronicle Star"
+        },
+        {
+          "id": "w_00000000000040008000000000000013",
+          "isNsfw": false,
+          "title": "Chronicle Moon"
+        },
+        {
+          "id": "w_00000000000040008000000000000011",
+          "isNsfw": false,
+          "title": "魔道祖师"
+        },
+        {
+          "id": "w_00000000000040008000000000000010",
+          "isNsfw": false,
+          "title": "나 혼자만 레벨업"
+        },
+        {
+          "id": "w_00000000000040008000000000000009",
+          "isNsfw": false,
+          "title": "進撃の巨人"
+        },
+        {
+          "id": "w_00000000000040008000000000000008",
+          "isNsfw": false,
+          "title": "Sun"
+        },
+        {
+          "id": "w_00000000000040008000000000000007",
+          "isNsfw": false,
+          "title": "Go"
+        },
+        {
+          "id": "w_00000000000040008000000000000006",
+          "isNsfw": false,
+          "title": "X"
+        },
+        {
+          "id": "w_00000000000040008000000000000005",
+          "isNsfw": false,
+          "title": "SPY×FAMILY"
+        },
+        {
+          "id": "w_00000000000040008000000000000004",
+          "isNsfw": false,
+          "title": "Dr.STONE"
+        },
+        {
+          "id": "w_00000000000040008000000000000003",
+          "isNsfw": false,
+          "title": "Café Chronicle"
+        },
+        {
+          "id": "w_00000000000040008000000000000002",
+          "isNsfw": false,
+          "title": "Solo Leveling: Side Story"
+        },
+        {
+          "id": "w_00000000000040008000000000000012",
+          "isNsfw": false,
+          "title": "Chronicle Zero"
+        }
+      ],
+      "total": 14
+    }
+  }
+}

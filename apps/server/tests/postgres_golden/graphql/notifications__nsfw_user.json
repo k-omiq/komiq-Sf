@@ -1,0 +1,24 @@
+{
+  "data": {
+    "notifications": [
+      {
+        "actor": {
+          "avatarUrl": null,
+          "id": "00000000-0000-4000-8000-000000000900",
+          "username": "owner"
+        },
+        "commentExcerpt": "Another root",
+        "commentId": "00000000-0000-4000-8000-000000001102",
+        "count": null,
+        "createdAt": "2020-01-07T01:02:03.123456+00:00",
+        "id": "00000000-0000-4000-8000-000000001302",
+        "kind": "reply",
+        "read": true,
+        "seriesId": null,
+        "targetId": "w_00000000000040008000000000000001",
+        "targetType": "series"
+      }
+    ],
+    "unreadNotificationCount": 0
+  }
+}

@@ -77,8 +77,68 @@ pub async fn resolve(pool: &Database, cand: &Candidate) -> Result<Decision> {
 /// catalogue reconcile re-matches an existing (provisional) work against the spine,
 /// where the work's own title is one of its aliases — without excluding it, the work
 /// would always "match itself". `None` is the normal add-time path.
+/// Returns advisory matching evidence. The caller must revalidate inside the
+/// transaction that links/mints/merges a work; returning a decision releases no
+/// transaction-owned guard and cannot reserve an absent title or external ID.
 pub async fn resolve_ex(
     pool: &Database,
+    cand: &Candidate,
+    exclude_work_id: Option<&str>,
+) -> Result<Decision> {
+    let mut conn = pool.acquire().await?;
+    resolve_on(&mut conn, cand, exclude_work_id).await
+}
+
+/// The advisory keys that reserve a candidate's match domain: one `ExternalIdentity`
+/// key for each external id it supplies and one `MatchDomain` key for each of its
+/// article-insensitive title keys. Two transactions that could mint or link a work for
+/// the same external id or the same exact title therefore wait for each other.
+///
+/// Fuzzy (token-block) matches are deliberately NOT covered: two differently named
+/// candidates that only resemble each other can still be minted side by side, and the
+/// consolidation sweep folds them later. The keys are returned unsorted;
+/// `locks::advisory` sorts and removes duplicates, so pass them in ONE call together
+/// with every other advisory key of the unit.
+pub fn match_domain_keys(cand: &Candidate) -> Vec<crate::locks::AdvisoryKey> {
+    use crate::locks::{AdvisoryKey, KeyClass};
+    let mut keys: Vec<AdvisoryKey> = cand
+        .external_ids
+        .iter()
+        .filter(|(provider, external)| !provider.is_empty() && !external.is_empty())
+        .map(|(provider, external)| AdvisoryKey::external_identity(provider, external))
+        .collect();
+    let mut titles: Vec<String> = std::iter::once(cand.title.as_str())
+        .chain(cand.alt_titles.iter().map(String::as_str))
+        .map(normalize_title)
+        .filter(|title| !title.is_empty())
+        .map(|title| match_key(&title))
+        .filter(|key| !key.is_empty())
+        .collect();
+    titles.sort();
+    titles.dedup();
+    keys.extend(
+        titles
+            .iter()
+            .map(|key| AdvisoryKey::new(KeyClass::MatchDomain, &[key])),
+    );
+    keys
+}
+
+/// [`resolve_ex`] on the caller's connection, so the decision is read inside the same
+/// transaction that then links, mints or merges. Read only: it takes no lock and does
+/// not commit.
+///
+/// Guards the CALLER must already hold for the decision to stay true until its commit:
+/// every key of [`match_domain_keys`] for `cand` (taken in the unit's single
+/// `locks::advisory` call). With those held, `Decision::New` cannot be invalidated by
+/// another writer that holds the same keys, and an `external_id` or `title_exact`
+/// decision names a work that existed when this ran. Before acting on a returned
+/// `work_id` the caller must lock that work (`locks::lock_works`, with every other work
+/// of the unit, sorted) and call this again; if the decision changed, return
+/// `locks::RestartTransaction`. A `fuzzy` decision is evidence only (see
+/// [`match_domain_keys`]).
+pub async fn resolve_on(
+    conn: &mut sqlx::PgConnection,
     cand: &Candidate,
     exclude_work_id: Option<&str>,
 ) -> Result<Decision> {
@@ -87,7 +147,7 @@ pub async fn resolve_ex(
         if provider.is_empty() || ext.is_empty() {
             continue;
         }
-        if let Some(work_id) = catalog::find_work_by_external(pool, provider, ext).await? {
+        if let Some(work_id) = catalog::find_work_by_external_on(&mut *conn, provider, ext).await? {
             if Some(work_id.as_str()) == exclude_work_id {
                 continue;
             }
@@ -114,7 +174,7 @@ pub async fn resolve_ex(
     // 2. Exact normalized aliases shortlist candidates; author names disambiguate them.
     let mut candidate_ids: HashSet<String> = HashSet::new();
     for nt in &norm_titles {
-        candidate_ids.extend(catalog::find_works_by_alias(pool, nt).await?);
+        candidate_ids.extend(catalog::find_works_by_alias_on(&mut *conn, nt).await?);
     }
     if let Some(ex) = exclude_work_id {
         candidate_ids.remove(ex);
@@ -126,7 +186,7 @@ pub async fn resolve_ex(
     let mut article_hit = false;
     if candidate_ids.is_empty() {
         for key in &cand_keys {
-            candidate_ids.extend(catalog::find_works_by_match_key(pool, key).await?);
+            candidate_ids.extend(catalog::find_works_by_match_key_on(&mut *conn, key).await?);
         }
         if let Some(ex) = exclude_work_id {
             candidate_ids.remove(ex);
@@ -141,7 +201,9 @@ pub async fn resolve_ex(
     //    doesn't drop the real match (DD4).
     if candidate_ids.is_empty() {
         for token in top_tokens(&norm_titles, FUZZY_BLOCK_TOKENS) {
-            let ids = catalog::candidate_work_ids_by_token(pool, &token, FUZZY_BLOCK_LIMIT).await?;
+            let ids =
+                catalog::candidate_work_ids_by_token_on(&mut *conn, &token, FUZZY_BLOCK_LIMIT)
+                    .await?;
             candidate_ids.extend(ids);
         }
         if let Some(ex) = exclude_work_id {
@@ -160,7 +222,7 @@ pub async fn resolve_ex(
     // Batch-load all blocked candidates' match data in two queries (OPT-7) rather than
     // 2 round-trips per candidate — up to ~300 candidates on a reconcile.
     let candidate_id_list: Vec<String> = candidate_ids.iter().cloned().collect();
-    let match_data = catalog::load_match_data_batch(pool, &candidate_id_list).await?;
+    let match_data = catalog::load_match_data_batch_on(&mut *conn, &candidate_id_list).await?;
     // Precompute the CANDIDATE's shingle sets once — they're compared against every
     // candidate work's aliases (works carry 20+ localized aliases) and description, so
     // shingling them per comparison inside the loop was the reconcile CPU hot spot (OPT-D).
@@ -205,7 +267,7 @@ pub async fn resolve_ex(
     // Author corroboration disambiguates unrelated namesakes. When several copies
     // qualify, attach to the richest one; the consolidation sweep folds the others.
     if !author_hits.is_empty() {
-        let wid = catalog::pick_survivor(pool, &author_hits).await?;
+        let wid = catalog::pick_survivor_on(&mut *conn, &author_hits).await?;
         let md = &match_data[&wid];
         best = Some((
             score_candidate(
@@ -224,19 +286,19 @@ pub async fn resolve_ex(
 
     // A rejected review or an admin split takes precedence over automatic matching.
     if let Some(self_id) = exclude_work_id {
-        let rejected: bool = sqlx::query_scalar(
+        let rejected: bool = crate::db_types::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM merge_candidate mc JOIN source_series ss \
              ON ss.id = mc.source_series_id WHERE mc.status = 'rejected' AND \
-             ((ss.work_id = ? AND mc.candidate_work_id = ?) OR \
-              (ss.work_id = ? AND mc.candidate_work_id = ?)))",
+             ((ss.work_id = $1 AND mc.candidate_work_id = $2) OR \
+              (ss.work_id = $3 AND mc.candidate_work_id = $4)))",
         )
         .bind(self_id)
         .bind(&work_id)
         .bind(&work_id)
         .bind(self_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
-        if rejected || catalog::is_split_pair(pool, self_id, &work_id).await? {
+        if rejected || catalog::is_split_pair_on(&mut *conn, self_id, &work_id).await? {
             return Ok(Decision::New);
         }
     }
@@ -376,7 +438,7 @@ mod tests {
 
     async fn pool() -> Database {
         let pool = Database::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -873,8 +935,7 @@ mod tests {
             (&split_off, &original)
         };
         sqlx::query(
-            "INSERT INTO work_split (work_a, work_b, split_at, split_by) \
-             VALUES (?, ?, '2026-08-01T00:00:00Z', 'u_admin')",
+            r#"INSERT INTO work_split (work_a, work_b, split_at, split_by) VALUES ($1, $2, '2026-08-01T00:00:00Z', '575494de-4b35-4fe2-8f2d-da78fcf520c8')"#,
         )
         .bind(a)
         .bind(b)
@@ -900,5 +961,101 @@ mod tests {
             resolve_ex(&pool, &cand, Some(&third)).await.unwrap(),
             Decision::AutoMerge { .. } | Decision::Review { .. }
         ));
+    }
+    /// `resolve_on` reads through the caller's transaction: it matches a work that
+    /// transaction has minted and not yet committed, which the pool form cannot see,
+    /// and it leaves the transaction open for the caller to finish.
+    #[tokio::test]
+    async fn resolve_on_reads_inside_the_callers_transaction() {
+        let pool = pool().await;
+        let input = WorkInput {
+            primary_title: Some("Quiet Harbour".into()),
+            author: Some("Mori".into()),
+            aliases: vec![Alias {
+                raw: "Quiet Harbour".into(),
+                lang: None,
+            }],
+            external_ids: vec![("al".into(), "4242".into())],
+            ..Default::default()
+        };
+        let by_title = Candidate {
+            title: "The Quiet Harbour".into(),
+            author: Some("Mori".into()),
+            ..Default::default()
+        };
+        let by_id = Candidate {
+            title: "Unrelated".into(),
+            external_ids: vec![("al".into(), "4242".into())],
+            ..Default::default()
+        };
+        let mut tx = pool.begin().await.unwrap();
+        let mut keys = match_domain_keys(&by_title);
+        keys.extend(match_domain_keys(&by_id));
+        crate::locks::advisory(&mut tx, &keys).await.unwrap();
+        assert_eq!(
+            resolve_on(&mut tx, &by_title, None).await.unwrap(),
+            Decision::New
+        );
+        let minted = catalog::create_work_on(&mut tx, &input).await.unwrap();
+        match resolve_on(&mut tx, &by_title, None).await.unwrap() {
+            Decision::AutoMerge {
+                work_id, method, ..
+            } => {
+                assert_eq!(work_id, minted);
+                assert_eq!(method, "title_exact");
+            }
+            other => panic!("expected an exact-title match, got {other:?}"),
+        }
+        match resolve_on(&mut tx, &by_id, None).await.unwrap() {
+            Decision::AutoMerge {
+                work_id, method, ..
+            } => {
+                assert_eq!(work_id, minted);
+                assert_eq!(method, "external_id");
+            }
+            other => panic!("expected an external-id match, got {other:?}"),
+        }
+        // Excluding the work itself is honoured on the caller's connection too.
+        assert_eq!(
+            resolve_on(&mut tx, &by_id, Some(&minted)).await.unwrap(),
+            Decision::New
+        );
+        // The pool form cannot see the uncommitted work.
+        assert_eq!(resolve(&pool, &by_title).await.unwrap(), Decision::New);
+        tx.rollback().await.unwrap();
+        assert_eq!(resolve(&pool, &by_id).await.unwrap(), Decision::New);
+    }
+
+    /// The match domain is the article-insensitive title plus every external id.
+    #[test]
+    fn match_domain_keys_cover_article_variants_and_external_ids() {
+        use crate::locks::{AdvisoryKey, KeyClass};
+        let with_article = match_domain_keys(&Candidate {
+            title: "The Quiet Harbour".into(),
+            alt_titles: vec!["Shizuka na Minato".into()],
+            external_ids: vec![("al".into(), "4242".into()), (String::new(), "x".into())],
+            ..Default::default()
+        });
+        let bare = match_domain_keys(&Candidate {
+            title: "Quiet Harbour".into(),
+            ..Default::default()
+        });
+        let other = match_domain_keys(&Candidate {
+            title: "Loud Harbour".into(),
+            external_ids: vec![("al".into(), "4243".into())],
+            ..Default::default()
+        });
+        // Two title keys and one external id; the empty provider is skipped.
+        assert_eq!(with_article.len(), 3);
+        assert_eq!(bare.len(), 1);
+        assert!(with_article.contains(&bare[0]));
+        assert!(with_article.contains(&AdvisoryKey::external_identity("al", "4242")));
+        let title_key = match_key(&normalize_title("Quiet Harbour"));
+        assert_eq!(
+            bare[0],
+            AdvisoryKey::new(KeyClass::MatchDomain, &[&title_key])
+        );
+        assert!(!other.iter().any(|key| with_article.contains(key)));
+        assert!(match_domain_keys(&Candidate::default()).is_empty());
     }
 }

@@ -3,41 +3,40 @@ title: Data model
 description: Understand the database schema, table relationships and migrations for the server inside your admin app.
 ---
 
-Komiq is self-hostable: the admin app runs the server and gives you its management portal, and the reader app connects to a server. That server stores user accounts, authentication sessions, reading progress, community discussions and its canonical comic catalogue in SQLite. This page explains its database files, table relationships and migrations at startup.
+Komiq is self-hostable: the admin app runs the server and gives you its management portal, and the reader app connects to a server. That server stores user accounts, authentication sessions, reading progress, community discussions and its canonical comic catalogue in PostgreSQL 18. This page explains storage and migrations.
 
-## Dual-database architecture
+## Main database and cover cache
 
-The server separates persistent application data from transient cover images by maintaining two SQLite databases:
+The server separates durable application records from refetchable images:
 
-1. **Main database**: configured with `DATABASE_URL` (default `sqlite://komika.sqlite3`). This database holds accounts, sessions, reading history, social data and the canonical catalog. When configured, Litestream replicates this file continuously to object storage for automated backup.
-2. **Cover cache database**: configured with `COVERS_DATABASE_URL` (defaulting to a sibling file named `covers.sqlite3`). This database holds WebP image binaries for comic covers and PNG blobs for extension icons.
+1. **Main database**: `DATABASE_URL` is a PostgreSQL connection URL. The standalone default is `postgres://localhost/komika`; Docker and desktop supervisors supply their own endpoint and application role. It holds accounts, sessions, reading history, social data and the canonical catalogue.
+2. **Cover cache**: `COVERS_DATABASE_URL` is a SQLite URL. The standalone default is `sqlite://covers.sqlite3`. It holds WebP covers and PNG extension icons. Docker sets `sqlite:///data/covers.sqlite3`.
 
-Cover images are large binary blobs that can be re-downloaded from upstream sources. Keeping them in a separate database excludes them from Litestream backups of the main database. If the cover database is lost, the server re-populates it on demand without affecting user data.
+Main backups use PostgreSQL tools. The global deployment packages pgBackRest, a backup manager that archives database files and transaction logs to object storage. Self-host Docker uses `pg_dump`, a consistent logical export. The desktop app saves a local dump when the newest is at least 20 hours old and keeps seven. Covers are excluded because they can be fetched again.
 
-### Connection pools and PRAGMA settings
+### Connections and native types
 
-Both databases are opened with asynchronous connection pools managed by `sqlx`. The server configures specific SQLite PRAGMAs in `apps/server/src/db.rs` to optimize concurrency and memory usage:
+`sqlx` manages asynchronous PostgreSQL pools through `apps/server/src/database.rs`. Reader sessions are query-only and use UTC. Inspect the pool settings in code before tuning the PostgreSQL connection limit.
 
-| Setting           | Main pool | Cover pool | Rationale                                                    |
-| ----------------- | --------- | ---------- | ------------------------------------------------------------ |
-| `max_connections` | 8         | 4          | Bounds thread pool concurrency for each workload             |
-| `journal_mode`    | `WAL`     | `WAL`      | Allows concurrent readers alongside background writers       |
-| `synchronous`     | `NORMAL`  | `NORMAL`   | WAL-safe durability setting that reduces disk sync latency   |
-| `busy_timeout`    | 15s       | 15s        | Absorbs write locks during intensive sync and scan passes    |
-| `foreign_keys`    | `ON`      | `OFF`      | Enforces referential integrity on the main relational schema |
-| `mmap_size`       | 1.5 GiB   | 256 MB     | Memory-maps B-tree pages into process address space          |
-| `cache_size`      | -16000    | -16000     | Allocates roughly 16 MB of RAM for the SQLite page cache     |
-| `temp_store`      | `MEMORY`  | `MEMORY`   | Keeps temporary sorting tables and aggregations in RAM       |
+The main schema uses native PostgreSQL values: UUID account identities, timezone-aware timestamps, Boolean flags and JSON values where the application treats them as structured data. Prefixed work IDs and other non-UUID identifiers stay text. API timestamps use UTC with six fractional digits and `+00:00`.
 
-### Query planner statistics
+Covers retain SQLite connection settings and recovery in `apps/server/src/db.rs`. PostgreSQL planner maintenance uses `ANALYZE`; the cover cache retains its separate SQLite maintenance path.
 
-SQLite relies on the `sqlite_stat1` table to choose efficient indexes. Frequent inserts during catalog synchronization can make planner statistics stale.
+### Automatic conversion
 
-A background supervisor runs `ANALYZE` every 6 hours on volatile tables: `browse_catalogue`, `feed_updates`, `feed_series_updates`, `source_series`, `suwayomi_series`, `series_scan_state`, `merge_candidate` and `notifications`. This keeps the query planner accurate without relying on sampled approximations.
+Before `db::init`, every start runs `pg_import::startup::run`. It looks for the old main SQLite file at `KOMIKA_SQLITE_IMPORT_PATH` (absolute) or `komika.sqlite3` beside the covers file. It decides from that file, a record beside it (`<file>.import-work-state`) and what PostgreSQL holds:
+
+- Nothing to import: no output.
+- A file and an empty PostgreSQL: copy, migrate and repair a work copy, import, verify, then rename the original to `<file>.imported-<UTC time>` and serve.
+- A file and a PostgreSQL in use: one warning; the file stays.
+- An unfinished import resumes, or restarts once if the file, the migrations or the plan changed. PostgreSQL rows are reset only when `public.komika_startup_import` proves that this record began the import. A start that only finishes an interrupted archive rename ends with a `sqlite import: complete:` line.
+- Anything else: one `sqlite import: error:` line that names the files and the ways out. Nothing changes.
+
+The server never deletes a file that may be the last copy of the owner's data. A saved copy that differs from the file now at the original name is moved to `<file>.import-kept-<UTC time>` with a warning. A SQLite migration newer than this server knows, or a PostgreSQL migration it does not embed, is refused as from a newer release. `public.komika_server_started` is written before a normal start, and no import starts after that. Work files need 8 times the source size plus 256 MiB free. On Unix the source folder must belong to the server user and not be group- or world-writable.
 
 ## Core tables and relationships
 
-The database schema connects sources, canonical works, chapters and user data through foreign keys:
+Foreign keys connect sources, works, chapters and users:
 
 ```flow
 source_series -> work: maps upstream source to canonical work
@@ -52,13 +51,13 @@ reviews -> users: links user ratings and reviews to works
 
 ### Canonical catalog tables
 
-The catalog models logical works independently from upstream source copies:
+Catalogue works are independent of source copies:
 
-- `work`: the central table for a logical series. It uses a prefixed primary key (`w_...`). Columns include `primary_title`, `description`, `year`, `original_language`, `status`, `demographic`, `content_rating`, `is_nsfw`, `author`, `artist` and `cover_phash` (a perceptual hash used for cover-based matching).
+- `work`: the central table for a logical series. It uses a prefixed primary key (`w_...`). It holds titles, descriptions, credits, classification fields and a perceptual cover hash.
 - `source_series`: represents a concrete series on an upstream source such as MangaDex or Suwayomi. It references `work(id)` with cascade deletion. It enforces uniqueness on `(source_type, source_id, source_key)`.
 - `source_extension`: one row per Suwayomi source, keyed by source id. It holds the extension package name, the repository URL and the source's NSFW flag. The server writes it when an extension is installed or updated and on the scheduled scan. `chapterOrigin` and ingestion read it.
-- `source_nsfw_pin`: one row per source that an administrator marked adult with `markSourceNsfw`. Ingestion reads it, so a series added later from that source is stored adult. The scheduled scan does not rewrite it.
-- `source_rate_limit`: one row per source that an administrator limited with `setSourceRateLimit`. It holds the allowed requests and the window in seconds. The scan supervisor reads it on each reconcile.
+- `source_nsfw_pin`: one row per source that an administrator marked adult with `markSourceNsfw`. Ingestion reads it, so a series added later from that source is stored adult.
+- `source_rate_limit`: one row per source that an administrator limited with `setSourceRateLimit`. It holds the allowed requests and the window in seconds.
 - `scanlator_tag`: one row per scanlator name that an administrator tagged with `setScanlatorAi`. It holds the case-folded name and the level, `ai` or `partial`. The tag applies on read to every chapter credited to that name. A joint credit takes the strongest tag of its members.
 - `source_ai_tag`: one row per Suwayomi source that an administrator tagged with `setSourceAi`, for a site that translates its own series and credits no group. It holds the source id and the level. A chapter copy takes the stronger of its source's tag and its credit's tag.
 - `content_block_rule`: one row per content block rule. `tags` and `ratings` hold sorted, comma-joined tag ids and rating words. A rule matches a work that has all of its tags and, when it names ratings, one of them. A `NULL` `user_id` marks a site-wide rule. Any other value is that user's own rule, deleted with the user.
@@ -70,10 +69,8 @@ The catalog models logical works independently from upstream source copies:
 
 ### Identity and social tables
 
-These tables manage users, sessions, comments and ratings:
-
 - `users`: user accounts with `id`, unique `username`, unique `email`, `password_hash` (Argon2id), `is_admin`, `is_banned`, `show_nsfw`, display profile fields and `must_change_password`.
-- `sessions`: active authentication sessions. The primary key `token` stores a lowercase hexadecimal SHA-256 hash of the bearer token rather than plaintext. It references `users(id)` with cascade deletion and stores an ISO 8601 UTC `expires_at` timestamp.
+- `sessions`: active authentication sessions. The primary key `token` stores a lowercase hexadecimal SHA-256 hash of the bearer token rather than plaintext. It references `users(id)` with cascade deletion and stores a timezone-aware `expires_at` timestamp.
 - `reviews`: user ratings and written reviews for works. Scores range from 1 to 10. A unique constraint on `(series_id, user_id)` ensures each user has at most one review per work.
 - `comments`: discussion comments attached to chapters or series. Comments support markdown formatting and spoiler tags.
 - `comment_media`: image attachments uploaded for comments. Binary image data is stored as WebP blobs.
@@ -84,23 +81,23 @@ These tables manage users, sessions, comments and ratings:
 
 Reading history and personal collections are stored per user:
 
-- `user_library`: links a user to a series (`user_id`, `series_id`). It stores an optional shelf `status` (`reading`, `completed`, `onhold`, `plan`) and an `is_favorite` boolean flag.
+- `user_library`: links a user to a series (`user_id`, `series_id`). It stores shelf status and an `is_favorite` flag.
 - `canonical_progress`: records reading progress for canonical `w_...` works. Keyed by `(user_id, chapter_id)`, it stores `last_page_read`, a `read` boolean flag and an `updated_at` timestamp.
 - `suwayomi_progress`: records reading progress for numeric Suwayomi-sourced series. It mirrors the structure of `canonical_progress` for non-canonical sources.
 - `series_views` and `series_view_bucket`: tracks chapter read counts aggregated across rolling hourly time buckets to calculate trending feeds.
 
 ### Materialized query tables
 
-To keep browse and search screens fast, the database maintains pre-computed summary tables:
+Precomputed tables support browse and search:
 
-- `browse_catalogue`: a wide table containing every browsable canonical work. It includes denormalized columns for demographic, language, year, rating, follow counts and format flags. Complex browse filters query this table directly to avoid multi-table joins during pagination.
+- `browse_catalogue`: a wide table containing every browsable canonical work. It stores filter and ranking fields so browse queries avoid repeated joins.
 - `feed_series_updates`: a materialized feed table storing recent chapter releases ordered by upstream publication dates.
-- `work_fts`: an SQLite FTS5 virtual table indexing titles and aliases for full-text search.
+- `work_search_alias`: normalized titles and aliases with PostgreSQL full-text vectors and `pg_trgm` indexes for typo candidates.
 - `instance_setting`: a key-value store holding runtime configuration changed from the admin console, such as registration toggles and instance names.
 
 ## Cover cache database schema
 
-The separate `covers.sqlite3` database contains tables created inline during startup in `apps/server/src/db.rs`:
+`apps/server/src/db.rs` creates these tables in `covers.sqlite3`:
 
 - `work_cover_blob`: primary storage for canonical work covers. Keyed by `work_id`, it stores the downscaled WebP binary blob, a version integer and an update timestamp.
 - `suwayomi_cover_blob`: cached WebP covers for Suwayomi manga, keyed by numeric Suwayomi manga ID.
@@ -110,47 +107,24 @@ The separate `covers.sqlite3` database contains tables created inline during sta
 
 ## How migrations work
 
-Schema migrations are written in SQL and stored in `apps/server/migrations/`.
-
-Each migration file begins with a four-digit sequential prefix followed by an explanatory name:
-
-```text
-apps/server/migrations/
-├── 0001_init.sql
-├── 0002_series_admin.sql
-├── 0003_series_scan_state.sql
-├── 0004_user_ban.sql
-├── 0005_canonical_works.sql
-└── ...
-```
+The main migration history lives in `apps/server/migrations_pg/`. It begins with the PostgreSQL baseline. The files in `apps/server/migrations/` are frozen SQLite history for old import sources and historical tests; never apply them to PostgreSQL.
 
 ### Execution at startup
 
-When the server initializes in `apps/server/src/db.rs`, it runs migrations automatically using `sqlx::migrate!`:
+`apps/server/src/db.rs` applies main migrations with SQLx's PostgreSQL migrator. `_sqlx_migrations` records versions and checksums, so changing an applied historical migration causes a startup error. Add a new migration for a new schema change.
 
-```rust
-sqlx::migrate!("./migrations").run(&pool).await?;
-```
+The importer prepares the old source schema using the frozen SQLite migrator on a temporary copy. Type conversion and canonical checksums live in `apps/server/src/pg_import/`. The separate covers schema is initialized and checked on its own SQLite connection.
 
-The migration runner inspects the internal `_sqlx_migrations` table in the database. For each file in the migrations folder:
+### Migration changes
 
-1. It checks whether the migration version number has already been applied.
-2. It verifies the SHA-384 checksum of applied migrations to detect unexpected modifications to historical files.
-3. If a migration is new, it executes the SQL statements within a database transaction and records the result in `_sqlx_migrations`.
-
-### Migration design principles
-
-The project follows strict migration guidelines to protect data integrity:
-
-- **Strictly additive changes**: migrations add new columns with `ALTER TABLE ADD COLUMN` or create new tables. Existing columns are not renamed or dropped without compatibility layers.
-- **Deterministic backfills**: when introducing new relational structures, migrations include `INSERT ... SELECT` statements to backfill placeholder rows from existing records.
-- **Triggers for backward compatibility**: migrations create database triggers to synchronize overlapping data across older and newer table structures during multi-step deployments.
-- **Explicit indexing**: every foreign key and query filter column receives an explicit index to prevent table scans during pagination.
+Keep applied migrations immutable. Add new files for schema changes and backfills. Test the resulting constraints and queries on PostgreSQL. Covers and old import sources keep their own SQLite history; a PostgreSQL change must not rewrite that source history.
 
 ## Where to look
 
-- `apps/server/migrations/`: chronological SQL migration scripts defining the database schema.
-- `apps/server/src/db.rs`: SQLite connection pool configuration, PRAGMA settings and migration runner invocation.
+- `apps/server/migrations_pg/`: PostgreSQL baseline and migration history.
+- `apps/server/migrations/`: frozen SQLite source migration history.
+- `apps/server/src/pg_import/`: type conversion, import, verification and the startup decision (`startup.rs`).
+- `apps/server/src/db.rs`: PostgreSQL initialization, migration runners and SQLite cover recovery.
 - `apps/server/src/catalog/`: Rust data access logic for canonical works, aliases, external IDs and duplicate merging.
 - `apps/server/src/cover.rs`: database read and write operations for cover blobs and image variants.
 - `apps/server/src/browse.rs`: queries and index interactions against the materialized `browse_catalogue` table.

@@ -1,0 +1,12 @@
+{
+  "data": {
+    "myActivity": [],
+    "myComments": {
+      "hasNextPage": false,
+      "items": [],
+      "page": 1,
+      "total": 0
+    },
+    "session": null
+  }
+}

@@ -1,1 +1,2 @@
 apps/server/migrations/*.sql text eol=lf
+apps/server/migrations_pg/*.sql text eol=lf

@@ -1,0 +1,1106 @@
+[
+  {
+    "name": "home__anonymous",
+    "role": "anonymous",
+    "query": "{ discovery { kind title genre items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "home__user",
+    "role": "user",
+    "query": "{ discovery { kind title genre items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "home__admin",
+    "role": "admin",
+    "query": "{ discovery { kind title genre items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "home__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ discovery { kind title genre items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_trending__anonymous",
+    "role": "anonymous",
+    "query": "{ search(query: \"\", sort: TRENDING, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_trending__user",
+    "role": "user",
+    "query": "{ search(query: \"\", sort: TRENDING, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_trending__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", sort: TRENDING, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_trending__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ search(query: \"\", sort: TRENDING, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_newest__anonymous",
+    "role": "anonymous",
+    "query": "{ search(query: \"\", sort: NEWEST, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_newest__user",
+    "role": "user",
+    "query": "{ search(query: \"\", sort: NEWEST, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_newest__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", sort: NEWEST, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_newest__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ search(query: \"\", sort: NEWEST, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_latest_added__anonymous",
+    "role": "anonymous",
+    "query": "{ search(query: \"\", sort: LATEST_ADDED, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_latest_added__user",
+    "role": "user",
+    "query": "{ search(query: \"\", sort: LATEST_ADDED, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_latest_added__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", sort: LATEST_ADDED, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_latest_added__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ search(query: \"\", sort: LATEST_ADDED, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_rating__anonymous",
+    "role": "anonymous",
+    "query": "{ search(query: \"\", sort: RATING, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_rating__user",
+    "role": "user",
+    "query": "{ search(query: \"\", sort: RATING, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_rating__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", sort: RATING, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_rating__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ search(query: \"\", sort: RATING, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_chapters__anonymous",
+    "role": "anonymous",
+    "query": "{ search(query: \"\", sort: CHAPTERS, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_chapters__user",
+    "role": "user",
+    "query": "{ search(query: \"\", sort: CHAPTERS, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_chapters__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", sort: CHAPTERS, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v1_chapters__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ search(query: \"\", sort: CHAPTERS, includeNsfw: true) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_relevance_asc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: RELEVANCE, direction: ASC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_relevance_desc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: RELEVANCE, direction: DESC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_latest_update_asc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: LATEST_UPDATE, direction: ASC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_latest_update_desc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: LATEST_UPDATE, direction: DESC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_recently_added_asc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: RECENTLY_ADDED, direction: ASC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_recently_added_desc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: RECENTLY_ADDED, direction: DESC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_most_viewed_asc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: MOST_VIEWED, direction: ASC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_most_viewed_desc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: MOST_VIEWED, direction: DESC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_most_follows_asc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: MOST_FOLLOWS, direction: ASC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_most_follows_desc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: MOST_FOLLOWS, direction: DESC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_highest_rated_asc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: HIGHEST_RATED, direction: ASC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_highest_rated_desc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: HIGHEST_RATED, direction: DESC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_reader_rated_asc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: READER_RATED, direction: ASC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_reader_rated_desc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: READER_RATED, direction: DESC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_most_chapters_asc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: MOST_CHAPTERS, direction: ASC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_most_chapters_desc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: MOST_CHAPTERS, direction: DESC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_title_asc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: TITLE, direction: ASC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_title_desc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: TITLE, direction: DESC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_year_asc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: YEAR, direction: ASC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_v2_year_desc__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", includeNsfw: true, filter: {sort: YEAR, direction: DESC}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_include_and__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {includedTags: [\"action\",\"gore\"], includedTagsMode: AND}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_include_and__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {includedTags: [\"action\",\"gore\"], includedTagsMode: AND}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_include_or__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {includedTags: [\"action\",\"romance\"], includedTagsMode: OR}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_include_or__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {includedTags: [\"action\",\"romance\"], includedTagsMode: OR}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_exclude_and__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {excludedTags: [\"action\",\"gore\"], excludedTagsMode: AND}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_exclude_and__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {excludedTags: [\"action\",\"gore\"], excludedTagsMode: AND}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_exclude_or__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {excludedTags: [\"romance\",\"gore\"], excludedTagsMode: OR}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_exclude_or__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {excludedTags: [\"romance\",\"gore\"], excludedTagsMode: OR}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_status__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {status: [ONGOING, COMPLETED]}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_status__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {status: [ONGOING, COMPLETED]}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_demographic__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {demographics: [SHOUNEN, NONE]}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_demographic__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {demographics: [SHOUNEN, NONE]}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_rating__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {contentRatings: [SAFE, SUGGESTIVE]}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_rating__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {contentRatings: [SAFE, SUGGESTIVE]}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_languages__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {originalLanguages: [\"ja\",\"ko\"]}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_languages__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {originalLanguages: [\"ja\",\"ko\"]}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_year__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {yearFrom: 1992, yearTo: 2000}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_year__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {yearFrom: 1992, yearTo: 2000}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_min_chapters__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {minChapters: 2}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_min_chapters__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {minChapters: 2}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_min_rating__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {minRating: 5.8}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_min_rating__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {minRating: 5.8}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_min_follows__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {minFollows: 500}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_min_follows__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {minFollows: 500}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_has_chapters__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {hasChapters: true}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_has_chapters__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {hasChapters: true}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_no_chapters__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {hasChapters: false}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_no_chapters__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {hasChapters: false}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_source_md__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {source: \"mangadex\"}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_source_md__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {source: \"mangadex\"}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_source_sw__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {source: \"source-710001\"}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_source_sw__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {source: \"source-710001\"}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_source_all_sw__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {source: \"suwayomi\"}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "filter_source_all_sw__user",
+    "role": "user",
+    "query": "{ search(query: \"\", filter: {source: \"suwayomi\"}) { page total hasNextPage items { id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "type_manga__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {types: [MANGA]}) {total items {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} } updatesFeed(type: MANGA) {total items {id workId releasedAt announcedAt}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "type_manhwa__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {types: [MANHWA]}) {total items {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} } updatesFeed(type: MANHWA) {total items {id workId releasedAt announcedAt}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "type_manhua__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {types: [MANHUA]}) {total items {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} } updatesFeed(type: MANHUA) {total items {id workId releasedAt announcedAt}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "type_webtoon__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {types: [WEBTOON]}) {total items {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} } updatesFeed(type: WEBTOON) {total items {id workId releasedAt announcedAt}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "type_comic__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", filter: {types: [COMIC]}) {total items {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} } updatesFeed(type: COMIC) {total items {id workId releasedAt announcedAt}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "tier_all__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", contentRating: ALL, includeNsfw: true) { total items {id title isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "tier_all__user",
+    "role": "user",
+    "query": "{ search(query: \"\", contentRating: ALL, includeNsfw: true) { total items {id title isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "tier_safe__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", contentRating: SAFE, includeNsfw: true) { total items {id title isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "tier_safe__user",
+    "role": "user",
+    "query": "{ search(query: \"\", contentRating: SAFE, includeNsfw: true) { total items {id title isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "tier_suggestive__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", contentRating: SUGGESTIVE, includeNsfw: true) { total items {id title isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "tier_suggestive__user",
+    "role": "user",
+    "query": "{ search(query: \"\", contentRating: SUGGESTIVE, includeNsfw: true) { total items {id title isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "tier_erotica__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", contentRating: EROTICA, includeNsfw: true) { total items {id title isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "tier_erotica__user",
+    "role": "user",
+    "query": "{ search(query: \"\", contentRating: EROTICA, includeNsfw: true) { total items {id title isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "tier_pornographic__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", contentRating: PORNOGRAPHIC, includeNsfw: true) { total items {id title isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "tier_pornographic__user",
+    "role": "user",
+    "query": "{ search(query: \"\", contentRating: PORNOGRAPHIC, includeNsfw: true) { total items {id title isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "tier_nsfw_only__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", contentRating: NSFW_ONLY, includeNsfw: true) { total items {id title isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "tier_nsfw_only__user",
+    "role": "user",
+    "query": "{ search(query: \"\", contentRating: NSFW_ONLY, includeNsfw: true) { total items {id title isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "text_filtered__anonymous",
+    "role": "anonymous",
+    "query": "{ search(query: \"Chronicle\", filter: {includedTags: [\"action\"], sort: RELEVANCE}) { total items { id title } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "text_filtered__user",
+    "role": "user",
+    "query": "{ search(query: \"Chronicle\", filter: {includedTags: [\"action\"], sort: RELEVANCE}) { total items { id title } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "text_filtered__admin",
+    "role": "admin",
+    "query": "{ search(query: \"Chronicle\", filter: {includedTags: [\"action\"], sort: RELEVANCE}) { total items { id title } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "text_filtered__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ search(query: \"Chronicle\", filter: {includedTags: [\"action\"], sort: RELEVANCE}) { total items { id title } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "browse_page_2__anonymous",
+    "role": "anonymous",
+    "query": "{ search(query: \"\", page: 2) { page total hasNextPage items {id title} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "updates__anonymous",
+    "role": "anonymous",
+    "query": "{ updates {page total hasNextPage items {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} } canonicalUpdates(includeNsfw: true) {workId mangadexId title coverUrl latestChapter latestChapterTitle latestAt isNsfw averageRating ratingCount} updatesFeed {page total hasNextPage items {id workId title coverUrl type status latestChapter latestChapterTitle chapterCount releasedAt announcedAt detectedAt rating readerRating mangadexRating isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "updates__user",
+    "role": "user",
+    "query": "{ updates {page total hasNextPage items {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} } canonicalUpdates(includeNsfw: true) {workId mangadexId title coverUrl latestChapter latestChapterTitle latestAt isNsfw averageRating ratingCount} updatesFeed {page total hasNextPage items {id workId title coverUrl type status latestChapter latestChapterTitle chapterCount releasedAt announcedAt detectedAt rating readerRating mangadexRating isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "updates__admin",
+    "role": "admin",
+    "query": "{ updates {page total hasNextPage items {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} } canonicalUpdates(includeNsfw: true) {workId mangadexId title coverUrl latestChapter latestChapterTitle latestAt isNsfw averageRating ratingCount} updatesFeed {page total hasNextPage items {id workId title coverUrl type status latestChapter latestChapterTitle chapterCount releasedAt announcedAt detectedAt rating readerRating mangadexRating isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "updates__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ updates {page total hasNextPage items {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} } canonicalUpdates(includeNsfw: true) {workId mangadexId title coverUrl latestChapter latestChapterTitle latestAt isNsfw averageRating ratingCount} updatesFeed {page total hasNextPage items {id workId title coverUrl type status latestChapter latestChapterTitle chapterCount releasedAt announcedAt detectedAt rating readerRating mangadexRating isNsfw} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "series_1__anonymous",
+    "role": "anonymous",
+    "query": "{ canonicalSeries(workId: \"w_00000000000040008000000000000001\") {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating workId views {total last7d last24h} localizedDescriptions {lang description} credits {role name} covers {fileName url thumbnailUrl lang volume isPrimary} metadata {year originalLanguage demographic contentRating tags {id name group} trackers {provider externalId url}} scan {avgIntervalHours overrideIntervalHours pollEveryMinutes paused statusOverride pausedOverride pollEveryMinutesOverride lastScannedAt nextScanAt} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "series_1__user",
+    "role": "user",
+    "query": "{ canonicalSeries(workId: \"w_00000000000040008000000000000001\") {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating workId views {total last7d last24h} localizedDescriptions {lang description} credits {role name} covers {fileName url thumbnailUrl lang volume isPrimary} metadata {year originalLanguage demographic contentRating tags {id name group} trackers {provider externalId url}} scan {avgIntervalHours overrideIntervalHours pollEveryMinutes paused statusOverride pausedOverride pollEveryMinutesOverride lastScannedAt nextScanAt} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "series_1__admin",
+    "role": "admin",
+    "query": "{ canonicalSeries(workId: \"w_00000000000040008000000000000001\") {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating workId views {total last7d last24h} localizedDescriptions {lang description} credits {role name} covers {fileName url thumbnailUrl lang volume isPrimary} metadata {year originalLanguage demographic contentRating tags {id name group} trackers {provider externalId url}} scan {avgIntervalHours overrideIntervalHours pollEveryMinutes paused statusOverride pausedOverride pollEveryMinutesOverride lastScannedAt nextScanAt} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "series_1__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ canonicalSeries(workId: \"w_00000000000040008000000000000001\") {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating workId views {total last7d last24h} localizedDescriptions {lang description} credits {role name} covers {fileName url thumbnailUrl lang volume isPrimary} metadata {year originalLanguage demographic contentRating tags {id name group} trackers {provider externalId url}} scan {avgIntervalHours overrideIntervalHours pollEveryMinutes paused statusOverride pausedOverride pollEveryMinutesOverride lastScannedAt nextScanAt} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapters_1__anonymous",
+    "role": "anonymous",
+    "query": "{ canonicalChapters(workId: \"w_00000000000040008000000000000001\") {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapters_1__user",
+    "role": "user",
+    "query": "{ canonicalChapters(workId: \"w_00000000000040008000000000000001\") {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapters_1__admin",
+    "role": "admin",
+    "query": "{ canonicalChapters(workId: \"w_00000000000040008000000000000001\") {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapters_1__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ canonicalChapters(workId: \"w_00000000000040008000000000000001\") {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} }",
+    "allow_errors": false
+  },
+  {
+    "name": "series_12__anonymous",
+    "role": "anonymous",
+    "query": "{ canonicalSeries(workId: \"w_00000000000040008000000000000012\") {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating workId views {total last7d last24h} localizedDescriptions {lang description} credits {role name} covers {fileName url thumbnailUrl lang volume isPrimary} metadata {year originalLanguage demographic contentRating tags {id name group} trackers {provider externalId url}} scan {avgIntervalHours overrideIntervalHours pollEveryMinutes paused statusOverride pausedOverride pollEveryMinutesOverride lastScannedAt nextScanAt} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "series_12__user",
+    "role": "user",
+    "query": "{ canonicalSeries(workId: \"w_00000000000040008000000000000012\") {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating workId views {total last7d last24h} localizedDescriptions {lang description} credits {role name} covers {fileName url thumbnailUrl lang volume isPrimary} metadata {year originalLanguage demographic contentRating tags {id name group} trackers {provider externalId url}} scan {avgIntervalHours overrideIntervalHours pollEveryMinutes paused statusOverride pausedOverride pollEveryMinutesOverride lastScannedAt nextScanAt} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "series_12__admin",
+    "role": "admin",
+    "query": "{ canonicalSeries(workId: \"w_00000000000040008000000000000012\") {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating workId views {total last7d last24h} localizedDescriptions {lang description} credits {role name} covers {fileName url thumbnailUrl lang volume isPrimary} metadata {year originalLanguage demographic contentRating tags {id name group} trackers {provider externalId url}} scan {avgIntervalHours overrideIntervalHours pollEveryMinutes paused statusOverride pausedOverride pollEveryMinutesOverride lastScannedAt nextScanAt} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "series_12__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ canonicalSeries(workId: \"w_00000000000040008000000000000012\") {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating workId views {total last7d last24h} localizedDescriptions {lang description} credits {role name} covers {fileName url thumbnailUrl lang volume isPrimary} metadata {year originalLanguage demographic contentRating tags {id name group} trackers {provider externalId url}} scan {avgIntervalHours overrideIntervalHours pollEveryMinutes paused statusOverride pausedOverride pollEveryMinutesOverride lastScannedAt nextScanAt} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapters_12__anonymous",
+    "role": "anonymous",
+    "query": "{ canonicalChapters(workId: \"w_00000000000040008000000000000012\") {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapters_12__user",
+    "role": "user",
+    "query": "{ canonicalChapters(workId: \"w_00000000000040008000000000000012\") {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapters_12__admin",
+    "role": "admin",
+    "query": "{ canonicalChapters(workId: \"w_00000000000040008000000000000012\") {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapters_12__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ canonicalChapters(workId: \"w_00000000000040008000000000000012\") {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} }",
+    "allow_errors": false
+  },
+  {
+    "name": "series_15__anonymous",
+    "role": "anonymous",
+    "query": "{ canonicalSeries(workId: \"w_00000000000040008000000000000015\") {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating workId views {total last7d last24h} localizedDescriptions {lang description} credits {role name} covers {fileName url thumbnailUrl lang volume isPrimary} metadata {year originalLanguage demographic contentRating tags {id name group} trackers {provider externalId url}} scan {avgIntervalHours overrideIntervalHours pollEveryMinutes paused statusOverride pausedOverride pollEveryMinutesOverride lastScannedAt nextScanAt} } }",
+    "allow_errors": true
+  },
+  {
+    "name": "series_15__user",
+    "role": "user",
+    "query": "{ canonicalSeries(workId: \"w_00000000000040008000000000000015\") {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating workId views {total last7d last24h} localizedDescriptions {lang description} credits {role name} covers {fileName url thumbnailUrl lang volume isPrimary} metadata {year originalLanguage demographic contentRating tags {id name group} trackers {provider externalId url}} scan {avgIntervalHours overrideIntervalHours pollEveryMinutes paused statusOverride pausedOverride pollEveryMinutesOverride lastScannedAt nextScanAt} } }",
+    "allow_errors": true
+  },
+  {
+    "name": "series_15__admin",
+    "role": "admin",
+    "query": "{ canonicalSeries(workId: \"w_00000000000040008000000000000015\") {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating workId views {total last7d last24h} localizedDescriptions {lang description} credits {role name} covers {fileName url thumbnailUrl lang volume isPrimary} metadata {year originalLanguage demographic contentRating tags {id name group} trackers {provider externalId url}} scan {avgIntervalHours overrideIntervalHours pollEveryMinutes paused statusOverride pausedOverride pollEveryMinutesOverride lastScannedAt nextScanAt} } }",
+    "allow_errors": true
+  },
+  {
+    "name": "series_15__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ canonicalSeries(workId: \"w_00000000000040008000000000000015\") {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating workId views {total last7d last24h} localizedDescriptions {lang description} credits {role name} covers {fileName url thumbnailUrl lang volume isPrimary} metadata {year originalLanguage demographic contentRating tags {id name group} trackers {provider externalId url}} scan {avgIntervalHours overrideIntervalHours pollEveryMinutes paused statusOverride pausedOverride pollEveryMinutesOverride lastScannedAt nextScanAt} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "chapters_15__anonymous",
+    "role": "anonymous",
+    "query": "{ canonicalChapters(workId: \"w_00000000000040008000000000000015\") {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} }",
+    "allow_errors": true
+  },
+  {
+    "name": "chapters_15__user",
+    "role": "user",
+    "query": "{ canonicalChapters(workId: \"w_00000000000040008000000000000015\") {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} }",
+    "allow_errors": true
+  },
+  {
+    "name": "chapters_15__admin",
+    "role": "admin",
+    "query": "{ canonicalChapters(workId: \"w_00000000000040008000000000000015\") {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} }",
+    "allow_errors": true
+  },
+  {
+    "name": "chapters_15__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ canonicalChapters(workId: \"w_00000000000040008000000000000015\") {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} }",
+    "allow_errors": false
+  },
+  {
+    "name": "series_bundle__anonymous",
+    "role": "anonymous",
+    "query": "{ seriesPage(workId: \"w_00000000000040008000000000000001\") {workId series {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} spineChapters {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} sources {source {sourceType sourceId sourceKey sourceUrl isNsfw lang extension { pkgName repoUrl apkName versionCode lang }} series {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} chapters {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} } aggregated {number label title firstReleasedAt readAnywhere sources {sourceType sourceId suwayomiMangaId chapterId scanlator copyReleasedAt copyExternalUrl} } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "series_bundle__user",
+    "role": "user",
+    "query": "{ seriesPage(workId: \"w_00000000000040008000000000000001\") {workId series {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} spineChapters {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} sources {source {sourceType sourceId sourceKey sourceUrl isNsfw lang extension { pkgName repoUrl apkName versionCode lang }} series {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} chapters {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} } aggregated {number label title firstReleasedAt readAnywhere sources {sourceType sourceId suwayomiMangaId chapterId scanlator copyReleasedAt copyExternalUrl} } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "series_bundle__admin",
+    "role": "admin",
+    "query": "{ seriesPage(workId: \"w_00000000000040008000000000000001\") {workId series {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} spineChapters {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} sources {source {sourceType sourceId sourceKey sourceUrl isNsfw lang extension { pkgName repoUrl apkName versionCode lang }} series {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} chapters {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} } aggregated {number label title firstReleasedAt readAnywhere sources {sourceType sourceId suwayomiMangaId chapterId scanlator copyReleasedAt copyExternalUrl} } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "series_bundle__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ seriesPage(workId: \"w_00000000000040008000000000000001\") {workId series {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} spineChapters {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} sources {source {sourceType sourceId sourceKey sourceUrl isNsfw lang extension { pkgName repoUrl apkName versionCode lang }} series {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} chapters {id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded} } aggregated {number label title firstReleasedAt readAnywhere sources {sourceType sourceId suwayomiMangaId chapterId scanlator copyReleasedAt copyExternalUrl} } } }",
+    "allow_errors": false
+  },
+  {
+    "name": "sources_db__anonymous",
+    "role": "anonymous",
+    "query": "{ workSources(workId: \"w_00000000000040008000000000000001\") {sourceType sourceId sourceKey sourceUrl isNsfw lang extension { pkgName repoUrl apkName versionCode lang }} workSourcesBatch(workIds: [\"w_00000000000040008000000000000001\",\"w_00000000000040008000000000000012\",\"w_00000000000040008000000000000015\"]) {workId sources {sourceType sourceId sourceKey sourceUrl isNsfw lang extension { pkgName repoUrl apkName versionCode lang }}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "sources_db__user",
+    "role": "user",
+    "query": "{ workSources(workId: \"w_00000000000040008000000000000001\") {sourceType sourceId sourceKey sourceUrl isNsfw lang extension { pkgName repoUrl apkName versionCode lang }} workSourcesBatch(workIds: [\"w_00000000000040008000000000000001\",\"w_00000000000040008000000000000012\",\"w_00000000000040008000000000000015\"]) {workId sources {sourceType sourceId sourceKey sourceUrl isNsfw lang extension { pkgName repoUrl apkName versionCode lang }}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "sources_db__admin",
+    "role": "admin",
+    "query": "{ workSources(workId: \"w_00000000000040008000000000000001\") {sourceType sourceId sourceKey sourceUrl isNsfw lang extension { pkgName repoUrl apkName versionCode lang }} workSourcesBatch(workIds: [\"w_00000000000040008000000000000001\",\"w_00000000000040008000000000000012\",\"w_00000000000040008000000000000015\"]) {workId sources {sourceType sourceId sourceKey sourceUrl isNsfw lang extension { pkgName repoUrl apkName versionCode lang }}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "sources_db__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ workSources(workId: \"w_00000000000040008000000000000001\") {sourceType sourceId sourceKey sourceUrl isNsfw lang extension { pkgName repoUrl apkName versionCode lang }} workSourcesBatch(workIds: [\"w_00000000000040008000000000000001\",\"w_00000000000040008000000000000012\",\"w_00000000000040008000000000000015\"]) {workId sources {sourceType sourceId sourceKey sourceUrl isNsfw lang extension { pkgName repoUrl apkName versionCode lang }}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "library__anonymous",
+    "role": "anonymous",
+    "query": "{ library {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} libraryProgress {id read total lastReadAt} }",
+    "allow_errors": false
+  },
+  {
+    "name": "library__user",
+    "role": "user",
+    "query": "{ library {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} libraryProgress {id read total lastReadAt} }",
+    "allow_errors": false
+  },
+  {
+    "name": "library__admin",
+    "role": "admin",
+    "query": "{ library {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} libraryProgress {id read total lastReadAt} }",
+    "allow_errors": false
+  },
+  {
+    "name": "library__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ library {id title altTitles author artist description genres type status coverUrl sourceId chapterCount isMarked libraryStatus isFavorite isNsfw createdAt updatedAt latestChapterAt detectedAt latestChapter rating { average count distribution } mangadexRating} libraryProgress {id read total lastReadAt} }",
+    "allow_errors": false
+  },
+  {
+    "name": "profile__anonymous",
+    "role": "anonymous",
+    "query": "{ session { token user {id username displayName bio avatarUrl isAdmin showNsfw joinedAt mustChangePassword}} myActivity {id kind targetType targetId createdAt} myComments {page total hasNextPage items {id targetType targetId parentId body hasSpoiler createdAt likes dislikes replyCount seriesId seriesTitle chapterNumber}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "profile__user",
+    "role": "user",
+    "query": "{ session { token user {id username displayName bio avatarUrl isAdmin showNsfw joinedAt mustChangePassword}} myActivity {id kind targetType targetId createdAt} myComments {page total hasNextPage items {id targetType targetId parentId body hasSpoiler createdAt likes dislikes replyCount seriesId seriesTitle chapterNumber}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "profile__admin",
+    "role": "admin",
+    "query": "{ session { token user {id username displayName bio avatarUrl isAdmin showNsfw joinedAt mustChangePassword}} myActivity {id kind targetType targetId createdAt} myComments {page total hasNextPage items {id targetType targetId parentId body hasSpoiler createdAt likes dislikes replyCount seriesId seriesTitle chapterNumber}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "profile__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ session { token user {id username displayName bio avatarUrl isAdmin showNsfw joinedAt mustChangePassword}} myActivity {id kind targetType targetId createdAt} myComments {page total hasNextPage items {id targetType targetId parentId body hasSpoiler createdAt likes dislikes replyCount seriesId seriesTitle chapterNumber}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "social__anonymous",
+    "role": "anonymous",
+    "query": "{ reviews(seriesId: \"w_00000000000040008000000000000001\") {page total hasNextPage items {id seriesId author {id username avatarUrl} score body hasSpoiler createdAt updatedAt} } myReview(seriesId: \"w_00000000000040008000000000000001\") {id seriesId author {id username avatarUrl} score body hasSpoiler createdAt updatedAt} comments(targetType: \"series\", targetId: \"w_00000000000040008000000000000001\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "social__user",
+    "role": "user",
+    "query": "{ reviews(seriesId: \"w_00000000000040008000000000000001\") {page total hasNextPage items {id seriesId author {id username avatarUrl} score body hasSpoiler createdAt updatedAt} } myReview(seriesId: \"w_00000000000040008000000000000001\") {id seriesId author {id username avatarUrl} score body hasSpoiler createdAt updatedAt} comments(targetType: \"series\", targetId: \"w_00000000000040008000000000000001\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "social__admin",
+    "role": "admin",
+    "query": "{ reviews(seriesId: \"w_00000000000040008000000000000001\") {page total hasNextPage items {id seriesId author {id username avatarUrl} score body hasSpoiler createdAt updatedAt} } myReview(seriesId: \"w_00000000000040008000000000000001\") {id seriesId author {id username avatarUrl} score body hasSpoiler createdAt updatedAt} comments(targetType: \"series\", targetId: \"w_00000000000040008000000000000001\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "social__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ reviews(seriesId: \"w_00000000000040008000000000000001\") {page total hasNextPage items {id seriesId author {id username avatarUrl} score body hasSpoiler createdAt updatedAt} } myReview(seriesId: \"w_00000000000040008000000000000001\") {id seriesId author {id username avatarUrl} score body hasSpoiler createdAt updatedAt} comments(targetType: \"series\", targetId: \"w_00000000000040008000000000000001\") {page total hasNextPage items {id targetType targetId parentId deletedBy author {id username avatarUrl} body hasSpoiler mediaUrl mediaWidth mediaHeight createdAt likes dislikes myVote} } }",
+    "allow_errors": false
+  },
+  {
+    "name": "notifications__anonymous",
+    "role": "anonymous",
+    "query": "{ notifications {id kind actor {id username avatarUrl} commentId commentExcerpt targetType targetId seriesId count createdAt read} unreadNotificationCount }",
+    "allow_errors": false
+  },
+  {
+    "name": "notifications__user",
+    "role": "user",
+    "query": "{ notifications {id kind actor {id username avatarUrl} commentId commentExcerpt targetType targetId seriesId count createdAt read} unreadNotificationCount }",
+    "allow_errors": false
+  },
+  {
+    "name": "notifications__admin",
+    "role": "admin",
+    "query": "{ notifications {id kind actor {id username avatarUrl} commentId commentExcerpt targetType targetId seriesId count createdAt read} unreadNotificationCount }",
+    "allow_errors": false
+  },
+  {
+    "name": "notifications__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ notifications {id kind actor {id username avatarUrl} commentId commentExcerpt targetType targetId seriesId count createdAt read} unreadNotificationCount }",
+    "allow_errors": false
+  },
+  {
+    "name": "admin_detail__admin",
+    "role": "admin",
+    "query": "{ workReviewDetail(workId: \"w_00000000000040008000000000000001\") {workId title coverUrl author artist year status contentRating originalLanguage isNsfw description chapterCount altTitles sources {sourceType sourceId sourceKey sourceUrl isNsfw lang extension { pkgName repoUrl apkName versionCode lang }} } seriesAdminMeta(seriesId: \"w_00000000000040008000000000000001\") {workId titleOverride descriptionOverride contentTypeOverride isNsfwOverride tags hasCuratedTags author artist year originalLanguage status demographic contentRating pinnedFields} workChaptersAdmin(workId: \"w_00000000000040008000000000000001\") {number key sourceTitle titleOverride effectiveTitle hidden sourceCount} users {page total hasNextPage items {id username email avatarUrl isAdmin isBanned createdAt}} siteBlockRules {tags ratings} }",
+    "allow_errors": false
+  },
+  {
+    "name": "my_blocks__user",
+    "role": "user",
+    "query": "{ myBlockRules { tags ratings } }",
+    "allow_errors": false
+  },
+  {
+    "name": "my_blocks__admin",
+    "role": "admin",
+    "query": "{ myBlockRules { tags ratings } }",
+    "allow_errors": false
+  },
+  {
+    "name": "my_blocks__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ myBlockRules { tags ratings } }",
+    "allow_errors": false
+  },
+  {
+    "name": "facets__anonymous",
+    "role": "anonymous",
+    "query": "{ tags {id name group count} genreFacets {genre count} }",
+    "allow_errors": false
+  },
+  {
+    "name": "facets__user",
+    "role": "user",
+    "query": "{ tags {id name group count} genreFacets {genre count} }",
+    "allow_errors": false
+  },
+  {
+    "name": "facets__admin",
+    "role": "admin",
+    "query": "{ tags {id name group count} genreFacets {genre count} }",
+    "allow_errors": false
+  },
+  {
+    "name": "facets__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ tags {id name group count} genreFacets {genre count} }",
+    "allow_errors": false
+  },
+  {
+    "name": "sources_authorization__anonymous",
+    "role": "anonymous",
+    "query": "{ sources {id name lang isNsfw iconUrl pkgName} }",
+    "allow_errors": true
+  },
+  {
+    "name": "sources_authorization__user",
+    "role": "user",
+    "query": "{ sources {id name lang isNsfw iconUrl pkgName} }",
+    "allow_errors": true
+  },
+  {
+    "name": "admin_authorization__anonymous",
+    "role": "anonymous",
+    "query": "{ workReviewDetail(workId: \"w_00000000000040008000000000000001\") {workId} }",
+    "allow_errors": true
+  },
+  {
+    "name": "admin_authorization__user",
+    "role": "user",
+    "query": "{ workReviewDetail(workId: \"w_00000000000040008000000000000001\") {workId} }",
+    "allow_errors": true
+  },
+  {
+    "name": "legacy_filter_genres__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", genres: [\"Action\"]) {page total hasNextPage items {id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution}}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "legacy_filter_genres__user",
+    "role": "user",
+    "query": "{ search(query: \"\", genres: [\"Action\"]) {page total hasNextPage items {id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution}}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "legacy_filter_min_rating__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", minRating: 7) {page total hasNextPage items {id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution}}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "legacy_filter_min_rating__user",
+    "role": "user",
+    "query": "{ search(query: \"\", minRating: 7) {page total hasNextPage items {id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution}}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "legacy_filter_max_rating__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", maxRating: 8) {page total hasNextPage items {id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution}}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "legacy_filter_max_rating__user",
+    "role": "user",
+    "query": "{ search(query: \"\", maxRating: 8) {page total hasNextPage items {id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution}}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "legacy_filter_types__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", types: [MANGA]) {page total hasNextPage items {id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution}}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "legacy_filter_types__user",
+    "role": "user",
+    "query": "{ search(query: \"\", types: [MANGA]) {page total hasNextPage items {id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution}}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "legacy_filter_status__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", status: COMPLETED) {page total hasNextPage items {id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution}}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "legacy_filter_status__user",
+    "role": "user",
+    "query": "{ search(query: \"\", status: COMPLETED) {page total hasNextPage items {id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution}}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "legacy_filter_no_chapters__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", hasChapters: false) {page total hasNextPage items {id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution}}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "legacy_filter_no_chapters__user",
+    "role": "user",
+    "query": "{ search(query: \"\", hasChapters: false) {page total hasNextPage items {id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution}}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "legacy_filter_has_chapters__admin",
+    "role": "admin",
+    "query": "{ search(query: \"\", hasChapters: true) {page total hasNextPage items {id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution}}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "legacy_filter_has_chapters__user",
+    "role": "user",
+    "query": "{ search(query: \"\", hasChapters: true) {page total hasNextPage items {id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution}}} }",
+    "allow_errors": false
+  },
+  {
+    "name": "cached_source__anonymous",
+    "role": "anonymous",
+    "query": "{ series(id: \"710001\") { id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution} workId scan { lastScannedAt nextScanAt avgIntervalHours pollEveryMinutes paused } } chapters(seriesId: \"710001\") { id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded } }",
+    "allow_errors": false
+  },
+  {
+    "name": "cached_source__user",
+    "role": "user",
+    "query": "{ series(id: \"710001\") { id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution} workId scan { lastScannedAt nextScanAt avgIntervalHours pollEveryMinutes paused } } chapters(seriesId: \"710001\") { id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded } }",
+    "allow_errors": false
+  },
+  {
+    "name": "cached_source__admin",
+    "role": "admin",
+    "query": "{ series(id: \"710001\") { id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution} workId scan { lastScannedAt nextScanAt avgIntervalHours pollEveryMinutes paused } } chapters(seriesId: \"710001\") { id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded } }",
+    "allow_errors": false
+  },
+  {
+    "name": "cached_source__nsfw_user",
+    "role": "nsfw_user",
+    "query": "{ series(id: \"710001\") { id title type status isNsfw createdAt updatedAt latestChapterAt latestChapter chapterCount rating {average count distribution} workId scan { lastScannedAt nextScanAt avgIntervalHours pollEveryMinutes paused } } chapters(seriesId: \"710001\") { id seriesId number label title pageCount uploadedAt foundAt scanlator externalUrl read lastPageRead bookmarked isDownloaded } }",
+    "allow_errors": false
+  },
+  {
+    "name": "scanlator_tags__anonymous",
+    "role": "anonymous",
+    "query": "{ scanlatorTags { name ai } sourceAiTags { sourceId ai } }",
+    "allow_errors": false
+  },
+  {
+    "name": "scanlator_tags__admin",
+    "role": "admin",
+    "query": "{ scanlatorTags { name ai } sourceAiTags { sourceId ai } }",
+    "allow_errors": false
+  }
+]

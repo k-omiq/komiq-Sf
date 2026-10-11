@@ -858,6 +858,8 @@ pub struct Comment {
     pub author: UserRef,
     pub body: String,
     pub has_spoiler: bool,
+    /// Null for live comments; "author" or "moderator" for a content-free tombstone.
+    pub deleted_by: Option<String>,
     /// Path to the attached image (`/comment-media/<id>.webp`), if any.
     pub media_url: Option<String>,
     /// Attached image dimensions, so the client can reserve layout space.
@@ -1914,19 +1916,9 @@ pub fn resolve_comic_type(
 
 /// Coerce a Suwayomi epoch timestamp (seconds or millis, as a string) to ISO 8601.
 pub fn to_iso(v: Option<&str>) -> Option<String> {
-    let s = v?;
-    let n: i64 = s.parse().ok()?;
-    if n <= 0 {
-        return None;
-    }
-    // `checked_mul` so a pathological seconds value can't overflow i64 (panic in
-    // debug, wrong date in release) when scaled to millis.
-    let ms = if n > 1_000_000_000_000 {
-        n
-    } else {
-        n.checked_mul(1000)?
-    };
-    chrono::DateTime::from_timestamp_millis(ms).map(|dt| dt.to_rfc3339())
+    crate::catalog::suwayomi_upload_date_to_iso(v)
+        .and_then(|s| crate::db_types::date(&s).ok())
+        .map(crate::db_types::format_date)
 }
 
 /// Map a Suwayomi chapter onto the Komika `Chapter`. Read state is per-VIEWER

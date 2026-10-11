@@ -1,0 +1,39 @@
+{
+  "data": {
+    "search": {
+      "hasNextPage": false,
+      "items": [
+        {
+          "chapterCount": 0,
+          "createdAt": "2020-01-04T01:02:03.000000+00:00",
+          "id": "w_00000000000040008000000000000012",
+          "isNsfw": false,
+          "latestChapter": null,
+          "latestChapterAt": "",
+          "rating": {
+            "average": 0.0,
+            "count": 0,
+            "distribution": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "status": "COMPLETED",
+          "title": "Chronicle Zero",
+          "type": "MANHWA",
+          "updatedAt": "2020-01-04T01:02:03.000000+00:00"
+        }
+      ],
+      "page": 1,
+      "total": 1
+    }
+  }
+}

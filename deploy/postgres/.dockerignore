@@ -1,0 +1,11 @@
+# Only runtime inputs reach the builder; no local environment/credential files.
+**
+!Dockerfile
+!.dockerignore
+!entrypoint.sh
+!pgbackrest.sh
+!health.sh
+!backup.sh
+!hosted.py
+!safety.py
+!postgresql.conf

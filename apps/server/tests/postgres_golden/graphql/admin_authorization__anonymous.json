@@ -1,0 +1,17 @@
+{
+  "data": null,
+  "errors": [
+    {
+      "locations": [
+        {
+          "column": 3,
+          "line": 1
+        }
+      ],
+      "message": "Not authenticated",
+      "path": [
+        "workReviewDetail"
+      ]
+    }
+  ]
+}

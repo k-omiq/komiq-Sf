@@ -8,11 +8,15 @@ repository = ""
 edition = "2021"
 rust-version = "1.78"
 
+[features]
+desktop-gate = []
+
 [lib]
 name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
+serde_json = "1.0"
 # Same Tauri line as the reader's shell (apps/reader/src-tauri); Cargo.lock started as
 # a copy of the reader's so both apps resolve identical versions.
 tauri-build = { version = "2.6.3", features = [] }
@@ -23,6 +27,11 @@ serde = { version = "1.0", features = ["derive"] }
 # The engine supervisor shared with the reader (src/lib.rs `mod suwayomi`) logs through
 # `log`; src/logbuf.rs installs the logger that keeps those lines for the log view.
 log = "0.4"
+# Small primitives already present in Cargo.lock: runtime integrity, install secrets,
+# local-night scheduling. Readiness uses bundled psql, no database client dependency.
+sha2 = "0.10"
+rand = "0.9"
+chrono = "0.4"
 tauri = { version = "2.11.3", features = [] }
 # Opens `target="_blank"` links (Cloudflare's token page, Let's Encrypt's agreement) in
 # the system browser: the window itself never navigates away. Same plugin as the reader.
@@ -37,13 +46,17 @@ tiny_http = "0.12"
 
 # src/child.rs: `prctl(PR_SET_PDEATHSIG)` so the server and engine end with the app.
 # Already in the tree (tokio, gtk-rs, …); this names the same 0.2 line directly.
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # src/child.rs: a Job Object that ends the server and engine with the app. The same
 # 0.61 line tokio uses on Windows, plus the three API groups the job calls need.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Environment"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "process", "time", "sync", "rt", "macros", "io-util", "rt-multi-thread"] }
+# tests/desktop_postgres_gate.rs, the installer gate: `dirs::data_dir()` is the call behind
+# Tauri's `app_data_dir()`. Same 6.0 line as Tauri's own (one copy in Cargo.lock), so the
+# test resolves the app's data folder with the very code the app runs. Tests only.
+dirs = "6"

@@ -117,7 +117,7 @@ pub struct Tag {
 /// every request and never memoized.
 pub async fn list_tags(pool: &Database) -> Result<Vec<Tag>> {
     let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT name, ai_level FROM scanlator_tag ORDER BY name_key")
+        crate::db_types::query_tuple("SELECT name, ai_level FROM scanlator_tag ORDER BY name_key")
             .fetch_all(pool)
             .await?;
     Ok(rows
@@ -139,7 +139,7 @@ pub async fn set_tag(pool: &Database, name: &str, level: Option<AiLevel>) -> Res
         Some(level) => {
             sqlx::query(
                 "INSERT INTO scanlator_tag (name_key, name, ai_level, updated_at) \
-                 VALUES (?, ?, ?, ?) \
+                 VALUES ($1, $2, $3, $4) \
                  ON CONFLICT(name_key) DO UPDATE SET ai_level = excluded.ai_level, \
                      updated_at = excluded.updated_at \
                  WHERE scanlator_tag.ai_level != excluded.ai_level",
@@ -147,12 +147,12 @@ pub async fn set_tag(pool: &Database, name: &str, level: Option<AiLevel>) -> Res
             .bind(&key)
             .bind(name.trim())
             .bind(level.word())
-            .bind(Utc::now().to_rfc3339())
+            .bind(Utc::now())
             .execute(pool)
             .await?
         }
         None => {
-            sqlx::query("DELETE FROM scanlator_tag WHERE name_key = ?")
+            sqlx::query("DELETE FROM scanlator_tag WHERE name_key = $1")
                 .bind(&key)
                 .execute(pool)
                 .await?
@@ -177,7 +177,7 @@ pub fn is_taggable_source(id: &str) -> bool {
 /// [`list_tags`].
 pub async fn list_source_tags(pool: &Database) -> Result<HashMap<String, AiLevel>> {
     let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT source_id, ai_level FROM source_ai_tag")
+        crate::db_types::query_tuple("SELECT source_id, ai_level FROM source_ai_tag")
             .fetch_all(pool)
             .await?;
     Ok(rows
@@ -193,27 +193,26 @@ pub async fn set_source_tag(
     source_id: &str,
     level: Option<AiLevel>,
 ) -> Result<bool> {
-    let res = match level {
-        Some(level) => {
-            sqlx::query(
-                "INSERT INTO source_ai_tag (source_id, ai_level, updated_at) VALUES (?, ?, ?) \
+    let res =
+        match level {
+            Some(level) => sqlx::query(
+                "INSERT INTO source_ai_tag (source_id, ai_level, updated_at) VALUES ($1, $2, $3) \
                  ON CONFLICT(source_id) DO UPDATE SET ai_level = excluded.ai_level, \
                      updated_at = excluded.updated_at \
                  WHERE source_ai_tag.ai_level != excluded.ai_level",
             )
             .bind(source_id)
             .bind(level.word())
-            .bind(Utc::now().to_rfc3339())
+            .bind(Utc::now())
             .execute(pool)
-            .await?
-        }
-        None => {
-            sqlx::query("DELETE FROM source_ai_tag WHERE source_id = ?")
-                .bind(source_id)
-                .execute(pool)
-                .await?
-        }
-    };
+            .await?,
+            None => {
+                sqlx::query("DELETE FROM source_ai_tag WHERE source_id = $1")
+                    .bind(source_id)
+                    .execute(pool)
+                    .await?
+            }
+        };
     Ok(res.rows_affected() > 0)
 }
 
@@ -253,13 +252,13 @@ async fn count_groups(pool: &Database) -> Result<Vec<GroupStat>> {
     // Grouped by the folded name so two spellings on one series count the series once.
     // SQLite folds ASCII only; the loop below folds the rest. `MIN` picks the spelling
     // that sorts first, which is the capitalized one ("Robo Scans" before "robo scans").
-    let rows: Vec<(String, String, String, i64, i64)> = sqlx::query_as(
+    let rows: Vec<(String, String, String, i64, i64)> = crate::db_types::query_tuple(
         "SELECT MIN(c.scanlator), ss.source_type, COALESCE(ss.source_id, ''), \
                 COUNT(*), COUNT(DISTINCT ss.work_id) \
            FROM chapter c \
            JOIN source_series ss ON ss.id = c.source_series_id \
-          WHERE c.scanlator IS NOT NULL AND c.scanlator != '' AND c.scanlator != ? \
-          GROUP BY lower(trim(c.scanlator)), ss.source_type, ss.source_id",
+          WHERE c.scanlator IS NOT NULL AND c.scanlator != '' AND c.scanlator != $1 \
+          GROUP BY translate(trim(c.scanlator), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), ss.source_type, ss.source_id",
     )
     .bind(crate::mangadex::NO_GROUP)
     .fetch_all(pool)
@@ -445,7 +444,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -558,7 +557,7 @@ mod tests {
         for work in ["w1", "w2"] {
             sqlx::query(
                 "INSERT INTO work (id, primary_title, created_at, updated_at) \
-                 VALUES (?, ?, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+                 VALUES ($1, $2, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
             )
             .bind(work)
             .bind(work)
@@ -573,7 +572,7 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
-                 VALUES (?, ?, ?, ?, ?, '2020-01-01T00:00:00Z')",
+                 VALUES ($1, $2, $3, $4, $5, '2020-01-01T00:00:00Z')",
             )
             .bind(id)
             .bind(work)
@@ -600,7 +599,7 @@ mod tests {
         for (n, (series, scanlator)) in chapters.into_iter().enumerate() {
             sqlx::query(
                 "INSERT INTO chapter (id, source_series_id, external_id, scanlator, created_at) \
-                 VALUES (?, ?, ?, ?, '2020-01-01T00:00:00Z')",
+                 VALUES ($1, $2, $3, $4, '2020-01-01T00:00:00Z')",
             )
             .bind(format!("c{n}"))
             .bind(series)

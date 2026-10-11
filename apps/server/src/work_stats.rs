@@ -137,27 +137,24 @@ pub struct PendingStats {
 /// deterministic order among ties, only a terminating one. Pinned by
 /// `the_stats_worklist_queries_are_index_walks`.
 ///
-/// `INDEXED BY`, and that is measured, not decorative: `source_type = 'mangadex'` is ~90% of
-/// `source_series`, so with statistics the planner rates the predicate unselective and picks
-/// `SCAN ss` + `USE TEMP B-TREE FOR ORDER BY` — a sort of every anchor on every 2-second
-/// batch, to hand back 200 rows (`the_stats_worklist_queries_are_index_walks` caught exactly
-/// that plan on an ANALYZEd fixture). The hint pins the index walk that LIMIT can stop. It is
-/// a FULL index (migration 0058), so unlike the partial-index hint `graphql` once had to drop,
-/// it can answer any predicate.
+/// The PostgreSQL plan must remain a LIMIT-bounded index walk. The PostgreSQL
+/// planner regression checks the real plan after ANALYZE on a populated fixture.
+/// OFFSET 0 keeps the primary-key existence check correlated: otherwise PostgreSQL
+/// can turn it into a hash anti-join and sort every anchor before applying LIMIT.
 const NEVER_FETCHED_SQL: &str = "SELECT ss.work_id, ss.source_key \
-       FROM source_series ss INDEXED BY idx_source_series_type_created \
+       FROM source_series ss \
       WHERE ss.source_type = 'mangadex' \
-        AND NOT EXISTS (SELECT 1 FROM work_stats s WHERE s.work_id = ss.work_id) \
-      ORDER BY ss.created_at LIMIT ?";
+        AND NOT EXISTS (SELECT 1 FROM work_stats s WHERE s.work_id = ss.work_id OFFSET 0) \
+      ORDER BY ss.created_at NULLS FIRST LIMIT $1";
 
 /// The stale half: `idx_work_stats_fetched` walked from the oldest row; the anchor per work is
 /// a `source_series(work_id)` probe (oldest anchor, matching the never-fetched half).
 const STALE_SQL: &str = "SELECT s.work_id, \
             (SELECT ss.source_key FROM source_series ss \
               WHERE ss.work_id = s.work_id AND ss.source_type = 'mangadex' \
-              ORDER BY ss.created_at, ss.id LIMIT 1) \
-       FROM work_stats s WHERE s.fetched_at < ? \
-      ORDER BY s.fetched_at LIMIT ?";
+              ORDER BY ss.created_at NULLS FIRST, ss.id LIMIT 1) \
+       FROM work_stats s WHERE s.fetched_at < $1 \
+      ORDER BY s.fetched_at NULLS FIRST LIMIT $2";
 
 /// The next `limit` works to fetch: never-fetched first, then the stalest past `stale_before`.
 ///
@@ -179,7 +176,7 @@ pub async fn works_needing_stats(
     let mut seen: HashSet<String> = HashSet::new();
     // Asked for 2x: a duplicate-anchored work costs one extra row, and the dedupe below must
     // still be able to fill the batch.
-    let never: Vec<(String, String)> = sqlx::query_as(NEVER_FETCHED_SQL)
+    let never: Vec<(String, String)> = crate::db_types::query_tuple(NEVER_FETCHED_SQL)
         .bind(limit * 2)
         .fetch_all(pool)
         .await?;
@@ -195,8 +192,8 @@ pub async fn works_needing_stats(
         }
     }
     if (out.len() as i64) < limit {
-        let stale: Vec<(String, Option<String>)> = sqlx::query_as(STALE_SQL)
-            .bind(stale_before)
+        let stale: Vec<(String, Option<String>)> = crate::db_types::query_tuple(STALE_SQL)
+            .bind(crate::db_types::date(stale_before)?)
             .bind(limit)
             .fetch_all(pool)
             .await?;
@@ -249,16 +246,34 @@ pub async fn write_work_stats(
     stats: &HashMap<String, MdStats>,
     now: &str,
 ) -> Result<StatsFill> {
+    crate::db::retry_transaction(|| write_work_stats_once(pool, pending, stats, now)).await
+}
+
+async fn write_work_stats_once(
+    pool: &Database,
+    pending: &[PendingStats],
+    stats: &HashMap<String, MdStats>,
+    now: &str,
+) -> Result<StatsFill> {
     let mut out = StatsFill::default();
     let mut tx = pool.begin().await?;
+    let parents: Vec<_> = pending.iter().map(|p| &p.work_id).collect();
+    let locked = crate::locks::lock_works(&mut tx, &parents).await?;
+    let mut pending: Vec<_> = pending.iter().collect();
+    pending.sort_by(|a, b| a.work_id.cmp(&b.work_id));
     for p in pending {
+        if !locked.locked.contains(&p.work_id) {
+            out.fetched += 1;
+            out.unanswered += 1;
+            continue;
+        }
         let answer = p.mangadex_id.as_ref().and_then(|id| stats.get(id));
         match answer {
             Some(s) => {
                 out.answered += 1;
                 sqlx::query(
                     "INSERT INTO work_stats (work_id, follows, rating, rating_avg, fetched_at) \
-                     VALUES (?, ?, ?, ?, ?) \
+                     VALUES ($1, $2, $3, $4, $5) \
                      ON CONFLICT(work_id) DO UPDATE SET follows = excluded.follows, \
                          rating = excluded.rating, rating_avg = excluded.rating_avg, \
                          fetched_at = excluded.fetched_at",
@@ -267,7 +282,7 @@ pub async fn write_work_stats(
                 .bind(s.follows)
                 .bind(s.rating)
                 .bind(s.rating_avg)
-                .bind(now)
+                .bind(crate::db_types::date(now)?)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -275,11 +290,11 @@ pub async fn write_work_stats(
                 out.unanswered += 1;
                 // Keep whatever we knew; only the clock moves.
                 sqlx::query(
-                    "INSERT INTO work_stats (work_id, fetched_at) VALUES (?, ?) \
+                    "INSERT INTO work_stats (work_id, fetched_at) VALUES ($1, $2) \
                      ON CONFLICT(work_id) DO UPDATE SET fetched_at = excluded.fetched_at",
                 )
                 .bind(&p.work_id)
-                .bind(now)
+                .bind(crate::db_types::date(now)?)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -288,9 +303,9 @@ pub async fn write_work_stats(
         sqlx::query(
             "UPDATE browse_catalogue SET follows = s.follows, rating = s.rating \
                FROM work_stats s \
-              WHERE s.work_id = browse_catalogue.work_id AND browse_catalogue.work_id = ? \
-                AND (browse_catalogue.follows IS NOT s.follows \
-                     OR browse_catalogue.rating IS NOT s.rating)",
+              WHERE s.work_id = browse_catalogue.work_id AND browse_catalogue.work_id = $1 \
+                AND (browse_catalogue.follows IS DISTINCT FROM s.follows \
+                     OR browse_catalogue.rating IS DISTINCT FROM s.rating)",
         )
         .bind(&p.work_id)
         .execute(&mut *tx)
@@ -311,13 +326,13 @@ fn stamps(now: chrono::DateTime<chrono::Utc>) -> (String, String) {
 
 /// Works still on the list (never fetched, or stale), for the completion line.
 async fn stats_remaining(pool: &Database, stale_before: &str) -> Result<i64> {
-    Ok(sqlx::query_scalar(
+    Ok(crate::db_types::query_scalar(
         "SELECT (SELECT COUNT(DISTINCT ss.work_id) FROM source_series ss \
                   WHERE ss.source_type = 'mangadex' \
                     AND NOT EXISTS (SELECT 1 FROM work_stats s WHERE s.work_id = ss.work_id)) \
-              + (SELECT COUNT(*) FROM work_stats WHERE fetched_at < ?)",
+              + (SELECT COUNT(*) FROM work_stats WHERE fetched_at < $1)",
     )
-    .bind(stale_before)
+    .bind(crate::db_types::date(stale_before)?)
     .fetch_one(pool)
     .await?)
 }
@@ -400,7 +415,7 @@ pub fn spawn_stats_backfill(
                                  unreachable, not merely pending"
                             ),
                             Err(e) => {
-                                tracing::warn!(error = %e, "stats backfill: remaining check failed")
+                                tracing::warn!(error = %crate::db::observed_database_error(e), "stats backfill: remaining check failed")
                             }
                         }
                         announced = true;
@@ -435,7 +450,7 @@ pub fn spawn_stats_backfill(
                     // Nothing was written; the batch is simply re-offered. Back off to the
                     // idle interval — retrying an unhappy upstream every 2 s is how a
                     // rate-limit becomes a ban.
-                    tracing::warn!(error = %e, batches, "stats backfill: batch failed — retrying later");
+                    tracing::warn!(error = %crate::db::observed_database_error(e), batches, "stats backfill: batch failed — retrying later");
                     if nap(STATS_BACKFILL_IDLE_RECHECK, &mut shutdown).await {
                         return;
                     }
@@ -461,16 +476,14 @@ pub async fn display_rating_batch_checked(
     if work_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let ph = std::iter::repeat_n("?", work_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let ph = crate::sql_params::placeholders(1, work_ids.len());
     let sql = format!(
         "SELECT work_id, \
                 COALESCE(CASE WHEN rating_avg > 0 THEN rating_avg END, \
                          CASE WHEN rating > 0 THEN rating END) \
            FROM work_stats WHERE work_id IN ({ph})"
     );
-    let mut q = sqlx::query_as::<_, (String, Option<f64>)>(&sql);
+    let mut q = crate::db_types::query_tuple::<(String, Option<f64>)>(&sql);
     for id in work_ids {
         q = q.bind(id);
     }
@@ -543,13 +556,61 @@ mod tests {
             .is_empty());
     }
 
+    #[tokio::test]
+    async fn stats_publication_rechecks_a_work_deleted_by_a_concurrent_writer() {
+        let pool = pool().await.foreground();
+        sqlx::query(
+            "INSERT INTO work(id,created_at,updated_at) VALUES ('w_deleted_stats',NOW(),NOW())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut first = pool.begin().await.unwrap();
+        crate::locks::lock_works_for_delete(&mut first, &["w_deleted_stats"])
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM work WHERE id='w_deleted_stats'")
+            .execute(&mut *first)
+            .await
+            .unwrap();
+        let writer = pool.clone();
+        let second = tokio::spawn(async move {
+            write_work_stats(
+                &writer,
+                &[PendingStats {
+                    work_id: "w_deleted_stats".into(),
+                    mangadex_id: None,
+                }],
+                &HashMap::new(),
+                "2026-01-01T00:00:00Z",
+            )
+            .await
+        });
+        crate::cover::wait_for_writer_lock(&pool).await;
+        first.commit().await.unwrap();
+        assert_eq!(
+            second.await.unwrap().unwrap(),
+            StatsFill {
+                fetched: 1,
+                answered: 0,
+                unanswered: 1
+            }
+        );
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM work_stats WHERE work_id='w_deleted_stats'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 0);
+    }
+
     async fn pool() -> Database {
         let pool = crate::database::TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -559,8 +620,8 @@ mod tests {
     /// A work with a MangaDex anchor `key` created at `created`, plus its Browse row.
     async fn anchored(pool: &Database, work_id: &str, key: &str, created: &str) {
         sqlx::query(
-            "INSERT OR IGNORE INTO work (id, primary_title, created_at, updated_at) \
-             VALUES (?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            "INSERT INTO work (id, primary_title, created_at, updated_at) \
+             VALUES ($1, $2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z') ON CONFLICT (id) DO NOTHING",
         )
         .bind(work_id)
         .bind(work_id)
@@ -569,18 +630,18 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
-             VALUES (?, ?, 'mangadex', 'mangadex', ?, ?)",
+             VALUES ($1, $2, 'mangadex', 'mangadex', $3, $4)",
         )
         .bind(format!("ss-{work_id}-{key}"))
         .bind(work_id)
         .bind(key)
-        .bind(created)
+        .bind(crate::db_types::date(created).unwrap())
         .execute(pool)
         .await
         .unwrap();
         sqlx::query(
-            "INSERT OR IGNORE INTO browse_catalogue (work_id, reader_id, title, created_at) \
-             VALUES (?, ?, ?, '2026-01-01T00:00:00Z')",
+            "INSERT INTO browse_catalogue (work_id, reader_id, title, created_at) \
+             VALUES ($1, $2, $3, '2026-01-01T00:00:00Z') ON CONFLICT (work_id) DO NOTHING",
         )
         .bind(work_id)
         .bind(work_id)
@@ -593,10 +654,10 @@ mod tests {
     async fn stats_row(pool: &Database, work_id: &str, fetched_at: &str) {
         sqlx::query(
             "INSERT INTO work_stats (work_id, follows, rating, rating_avg, fetched_at) \
-             VALUES (?, 1, 1.0, 1.0, ?)",
+             VALUES ($1, 1, 1.0, 1.0, $2)",
         )
         .bind(work_id)
-        .bind(fetched_at)
+        .bind(crate::db_types::date(fetched_at).unwrap())
         .execute(pool)
         .await
         .unwrap();
@@ -707,30 +768,50 @@ mod tests {
         let row = |id: &'static str| {
             let pool = pool.clone();
             async move {
-                sqlx::query_as::<_, (Option<i64>, Option<f64>, Option<f64>, String)>(
-                    "SELECT follows, rating, rating_avg, fetched_at FROM work_stats WHERE work_id = ?",
+                let row = crate::db_types::query_tuple::<(Option<i64>, Option<f64>, Option<f64>, chrono::DateTime<chrono::Utc>)>(
+                    "SELECT follows, rating, rating_avg, fetched_at FROM work_stats WHERE work_id = $1",
                 )
                 .bind(id)
                 .fetch_one(&pool)
                 .await
-                .unwrap()
+                .unwrap();
+                (row.0, row.1, row.2, crate::db_types::format_date(row.3))
             }
         };
         assert_eq!(
             row("w_1").await,
-            (Some(1000), Some(9.0), Some(9.1), now.into())
+            (
+                Some(1000),
+                Some(9.0),
+                Some(9.1),
+                crate::db_types::format_date(crate::db_types::date(now).unwrap())
+            )
         );
-        assert_eq!(row("w_2").await, (Some(10), None, None, now.into()));
+        assert_eq!(
+            row("w_2").await,
+            (
+                Some(10),
+                None,
+                None,
+                crate::db_types::format_date(crate::db_types::date(now).unwrap())
+            )
+        );
         assert_eq!(
             row("w_3").await,
-            (Some(77), Some(6.5), Some(6.6), now.into()),
+            (
+                Some(77),
+                Some(6.5),
+                Some(6.6),
+                crate::db_types::format_date(crate::db_types::date(now).unwrap())
+            ),
             "unanswered keeps its values, only the clock moves"
         );
-        let browse: (Option<i64>, Option<f64>) =
-            sqlx::query_as("SELECT follows, rating FROM browse_catalogue WHERE work_id = 'w_1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let browse: (Option<i64>, Option<f64>) = crate::db_types::query_tuple(
+            "SELECT follows, rating FROM browse_catalogue WHERE work_id = 'w_1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(browse, (Some(1000), Some(9.0)), "Browse's copy follows");
         // Terminated: nothing due, and an EMPTY answer for a fresh batch still drains it.
         assert!(works_needing_stats(&pool, 100, stale_before)
@@ -761,11 +842,12 @@ mod tests {
         crate::catalog::refresh_browse_catalogue(&pool)
             .await
             .unwrap();
-        let rebuilt: (Option<i64>, Option<f64>) =
-            sqlx::query_as("SELECT follows, rating FROM browse_catalogue WHERE work_id = 'w_1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let rebuilt: (Option<i64>, Option<f64>) = crate::db_types::query_tuple(
+            "SELECT follows, rating FROM browse_catalogue WHERE work_id = 'w_1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(rebuilt, (Some(1000), Some(9.0)));
     }
 
@@ -776,25 +858,30 @@ mod tests {
     async fn the_stats_worklist_queries_are_index_walks() {
         use sqlx::Row;
         let pool = pool().await;
-        for i in 0..300 {
-            let w = format!("w_{i:04}");
-            anchored(
-                &pool,
-                &w,
-                &format!("{i:08}-0000-0000-0000-000000000000"),
-                "2026-01-01T00:00:00Z",
-            )
-            .await;
-            if i % 2 == 0 {
-                stats_row(&pool, &w, "2026-01-01T00:00:00Z").await;
-            }
-        }
+        // PostgreSQL legitimately sorts a 300-row table rather than opening an
+        // index. Use the audited catalogue scale to verify the production plan;
+        // bulk fixtures keep this bounded test fast without planner overrides.
+        sqlx::query("INSERT INTO work (id, primary_title, created_at, updated_at) \
+            SELECT 'w_' || lpad(i::text, 6, '0'), 'Fixture', TIMESTAMPTZ '2026-01-01T00:00:00Z', TIMESTAMPTZ '2026-01-01T00:00:00Z' \
+            FROM generate_series(0, 115566) i").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
+            SELECT 'ss_' || lpad(i::text, 6, '0'), 'w_' || lpad(i::text, 6, '0'), 'mangadex', 'mangadex', \
+            lpad(i::text, 8, '0') || '-0000-0000-0000-000000000000', TIMESTAMPTZ '2026-01-01T00:00:00Z' \
+            FROM generate_series(0, 115566) i").execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO work_stats (work_id, follows, rating, rating_avg, fetched_at) \
+            SELECT 'w_' || lpad(i::text, 6, '0'), 1, 1.0, 1.0, TIMESTAMPTZ '2026-01-01T00:00:00Z' \
+            FROM generate_series(0, 115566) i WHERE i % 2 = 0",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("ANALYZE").execute(&pool).await.unwrap();
         for (label, sql, want) in [
             ("never", NEVER_FETCHED_SQL, "idx_source_series_type_created"),
             ("stale", STALE_SQL, "idx_work_stats_fetched"),
         ] {
-            let text = format!("EXPLAIN QUERY PLAN {sql}");
+            let text = format!("EXPLAIN (FORMAT JSON) {sql}");
             let rows = if label == "never" {
                 sqlx::query(&text)
                     .bind(200i64)
@@ -803,29 +890,23 @@ mod tests {
                     .unwrap()
             } else {
                 sqlx::query(&text)
-                    .bind("2026-06-01T00:00:00Z")
+                    .bind(crate::db_types::date("2026-06-01T00:00:00Z").unwrap())
                     .bind(100i64)
                     .fetch_all(&pool)
                     .await
                     .unwrap()
             };
-            let lines: Vec<String> = rows.iter().map(|r| r.get::<String, _>("detail")).collect();
-            // A sort at the TOP level (parent 0) is the one that would re-sort the catalogue.
-            // The stale half's per-work anchor lookup sorts its own 1-2 rows ("oldest anchor"),
-            // which is a correlated subquery's business and costs nothing.
-            let top_sort = rows.iter().any(|r| {
-                r.get::<i64, _>("parent") == 0
-                    && r.get::<String, _>("detail").contains("TEMP B-TREE")
-            });
-            eprintln!("--- stats work-list / {label}");
-            for l in &lines {
-                eprintln!("    {l}");
-            }
+            let plan: serde_json::Value = rows[0].get(0);
+            let root = &plan[0]["Plan"];
+            assert_eq!(root["Node Type"], "Limit", "bounded worklist: {plan}");
             assert!(
-                lines.iter().any(|l| l.contains(want)),
-                "{label}: must walk {want}: {lines:?}"
+                plan.to_string().contains(want),
+                "{label}: expected index {want}: {plan}"
             );
-            assert!(!top_sort, "{label}: no top-level sort: {lines:?}");
+            assert_ne!(
+                root["Plans"][0]["Node Type"], "Sort",
+                "unbounded top-level sort: {plan}"
+            );
         }
     }
 

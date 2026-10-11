@@ -368,7 +368,10 @@ async fn direct_mode_gets_a_certificate_and_serves_https() {
     assert!(st.certificate_error.is_none());
     let (_, until) = validity(&std::fs::read_to_string(r.data.join(DIRECT_CERT_FILE)).unwrap())
         .expect("dates are readable");
-    assert_eq!(st.certificate_expires, Some(until.to_rfc3339()));
+    assert_eq!(
+        st.certificate_expires,
+        Some(crate::db_types::format_date(until))
+    );
     {
         let m = r.acme.lock().unwrap();
         assert_eq!(m.orders, 1);

@@ -74,25 +74,31 @@ pub async fn view_key(pool: &Database, series_id: &str) -> String {
     match pool.acquire().await {
         Ok(mut connection) => view_key_in(&mut connection, series_id)
             .await
-            .unwrap_or_else(|_| series_id.to_string()),
-        Err(_) => series_id.to_string(),
+            .unwrap_or_else(|error| {
+                let _ = crate::db::observed_read_database_error(error);
+                series_id.to_string()
+            }),
+        Err(error) => {
+            crate::db::record_read_database_error(&error);
+            series_id.to_string()
+        }
     }
 }
 
-async fn view_key_in(connection: &mut sqlx::SqliteConnection, series_id: &str) -> Result<String> {
+async fn view_key_in(connection: &mut sqlx::PgConnection, series_id: &str) -> Result<String> {
     if !series_id.is_empty() && series_id.bytes().all(|b| b.is_ascii_digit()) {
         return Ok(series_id.to_string());
     }
     let survivor: Option<String> =
-        sqlx::query_scalar("SELECT new_id FROM work_redirect WHERE old_id = ?")
+        crate::db_types::query_scalar("SELECT new_id FROM work_redirect WHERE old_id = $1")
             .bind(series_id)
             .fetch_optional(&mut *connection)
             .await?;
     let work_id = survivor.as_deref().unwrap_or(series_id);
-    let numeric: Option<String> = sqlx::query_scalar(
+    let numeric: Option<String> = crate::db_types::query_scalar(
         "SELECT source_key FROM source_series \
-         WHERE work_id = ? AND source_type = 'suwayomi' \
-         ORDER BY CAST(source_key AS INTEGER) LIMIT 1",
+         WHERE work_id = $1 AND source_type = 'suwayomi' \
+         ORDER BY public.sqlite_integer_pin(source_key) LIMIT 1",
     )
     .bind(work_id)
     .fetch_optional(&mut *connection)
@@ -233,14 +239,22 @@ async fn flush_buffer(buf: &ViewBuffer, pool: &Database) -> Result<usize> {
         return Ok(0);
     }
     let n = drained.len();
-    match crate::db::retry_transaction(|| write_batch(pool, drained.clone())).await {
+    match write_batch_bounded(pool, drained).await {
         Ok(()) => Ok(n),
-        Err(e) => {
-            buf.merge_back(drained);
+        Err((e, unwritten)) => {
+            // Chunks before the failed one are committed; only the rest goes back.
+            buf.merge_back(unwritten);
             Err(e)
         }
     }
 }
+
+/// Distinct series one flush transaction may resolve and lock. A transaction holds a
+/// `work` row lock for every series in it, and a request that needs one of those works
+/// gives up after the foreground lock timeout (5 s). An unbounded flush (the buffer
+/// holds up to [`BUFFER_MAX_KEYS`] series, twice that after failed flushes) could keep
+/// thousands of works locked for longer than that.
+const WRITE_CHUNK_SERIES: usize = 128;
 
 /// Persist a batch of `(series_id, hour) -> count` views in ONE transaction.
 ///
@@ -248,7 +262,70 @@ async fn flush_buffer(buf: &ViewBuffer, pool: &Database) -> Result<usize> {
 /// instead of once per view as the old per-view `record` did. Distinct raw ids that
 /// normalise to the same view key (a `w_` work and its numeric Suwayomi source) are
 /// summed before writing so the upsert count matches the old per-view arithmetic.
+async fn view_parent(conn: &mut sqlx::PgConnection, id: &str) -> Result<Option<String>> {
+    Ok(
+        if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
+            sqlx::query_scalar("SELECT work_id FROM source_series WHERE source_type = 'suwayomi' AND source_key = $1 ORDER BY id LIMIT 1").bind(id).fetch_optional(conn).await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT COALESCE((SELECT new_id FROM work_redirect WHERE old_id = $1), $1)",
+            )
+            .bind(id)
+            .fetch_optional(conn)
+            .await?
+        },
+    )
+}
+
 async fn write_batch(pool: &Database, views: HashMap<(String, i64), i64>) -> Result<()> {
+    write_batch_bounded(pool, views)
+        .await
+        .map_err(|(error, _)| error)
+}
+
+/// Write `views` in transactions of at most [`WRITE_CHUNK_SERIES`] distinct series, in
+/// sorted series order. Each chunk is one complete retried transaction. On failure the
+/// error comes back with every view that is NOT committed (the failed chunk and all
+/// later ones), so the caller can keep exactly those for the next attempt.
+async fn write_batch_bounded(
+    pool: &Database,
+    views: HashMap<(String, i64), i64>,
+) -> std::result::Result<(), (anyhow::Error, HashMap<(String, i64), i64>)> {
+    let mut by_series: std::collections::BTreeMap<String, HashMap<(String, i64), i64>> =
+        std::collections::BTreeMap::new();
+    for ((series_id, hour), n) in views {
+        by_series
+            .entry(series_id.clone())
+            .or_default()
+            .insert((series_id, hour), n);
+    }
+    let mut pending: std::collections::VecDeque<HashMap<(String, i64), i64>> =
+        by_series.into_values().collect();
+    while !pending.is_empty() {
+        let take = pending.len().min(WRITE_CHUNK_SERIES);
+        let chunk: HashMap<(String, i64), i64> =
+            pending
+                .iter()
+                .take(take)
+                .flatten()
+                .fold(HashMap::new(), |mut chunk, (key, n)| {
+                    chunk.insert(key.clone(), *n);
+                    chunk
+                });
+        if let Err(error) =
+            crate::db::retry_transaction(|| write_batch_once(pool, chunk.clone())).await
+        {
+            return Err((error, pending.into_iter().flatten().collect()));
+        }
+        pending.drain(..take);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+tokio::task_local! { static VIEW_DISCOVERY_PAUSE: crate::locks::pause_points::PausePoints; }
+
+async fn write_batch_once(pool: &Database, views: HashMap<(String, i64), i64>) -> Result<()> {
     // Resolve redirects and source keys on the same writer snapshot as the upserts.
     // A merge committed before this writer is acquired must never recreate old keys.
     let mut tx = pool.begin().await?;
@@ -259,27 +336,52 @@ async fn write_batch(pool: &Database, views: HashMap<(String, i64), i64>) -> Res
             key_of.insert(series_id.clone(), key);
         }
     }
+    let mut parents = Vec::new();
+    for id in key_of.keys() {
+        let work = view_parent(&mut tx, id).await?;
+        if let Some(work) = work {
+            parents.push(work);
+        }
+    }
+    #[cfg(test)]
+    if let Ok(points) = VIEW_DISCOVERY_PAUSE.try_with(Clone::clone) {
+        points.hit("views-discovered").await;
+    }
+    let locked = crate::locks::lock_works(&mut tx, &parents).await?;
+    for (id, key) in &key_of {
+        if view_key_in(&mut tx, id).await? != *key {
+            return Err(crate::locks::RestartTransaction.into());
+        }
+        let current = view_parent(&mut tx, id).await?;
+        if current
+            .as_ref()
+            .is_some_and(|work| !locked.locked.contains(work) && !locked.missing.contains(work))
+        {
+            return Err(crate::locks::RestartTransaction.into());
+        }
+    }
     // Fold to (view_key, hour) -> count.
-    let mut by_key: HashMap<(String, i64), i64> = HashMap::new();
+    let mut by_key: std::collections::BTreeMap<(String, i64), i64> =
+        std::collections::BTreeMap::new();
     for ((series_id, hour), n) in views {
         let key = key_of[&series_id].clone();
         *by_key.entry((key, hour)).or_insert(0) += n;
     }
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = chrono::Utc::now();
     for ((key, hour), n) in &by_key {
         sqlx::query(
-            "INSERT INTO series_views (series_key, total, updated_at) VALUES (?, ?, ?) \
+            "INSERT INTO series_views (series_key, total, updated_at) VALUES ($1, $2, $3) \
              ON CONFLICT(series_key) DO UPDATE SET \
-               total = total + excluded.total, updated_at = excluded.updated_at",
+               total = series_views.total + excluded.total, updated_at = excluded.updated_at",
         )
         .bind(key)
         .bind(n)
-        .bind(&now)
+        .bind(now)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES (?, ?, ?) \
-             ON CONFLICT(series_key, hour_ts) DO UPDATE SET views = views + excluded.views",
+            "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES ($1, $2, $3) \
+             ON CONFLICT(series_key, hour_ts) DO UPDATE SET views = series_view_bucket.views + excluded.views",
         )
         .bind(key)
         .bind(hour)
@@ -315,11 +417,13 @@ async fn run_flush_loop(pool: Database, mut shutdown: tokio::sync::watch::Receiv
             _ = tick.tick() => {
                 if let Err(e) = flush(&pool).await {
                     // Views were merged back by `flush`; next tick retries.
+                    let e = crate::db::observed_database_error(e);
                     tracing::warn!(error = %e, "view flush failed; retrying next tick");
                 }
             }
             _ = shutdown.changed() => {
                 if let Err(e) = flush(&pool).await {
+                    let e = crate::db::observed_database_error(e);
                     tracing::warn!(error = %e, "final view flush on shutdown failed");
                 }
                 return;
@@ -342,13 +446,13 @@ pub async fn counts_for(pool: &Database, series_id: &str) -> ViewCounts {
     let since7d = hour - BUCKET_RETENTION_HOURS;
     // An aggregate with no GROUP BY always yields exactly one row, even with zero buckets
     // (the SUMs come back NULL → 0, the scalar subquery → 0), so `fetch_one` is safe.
-    let row = sqlx::query_as::<_, (i64, i64, i64)>(
+    let row = crate::db_types::query_tuple::<(i64, i64, i64)>(
         "SELECT \
-           (SELECT COALESCE(total, 0) FROM series_views WHERE series_key = ?), \
-           COALESCE(SUM(CASE WHEN hour_ts > ? THEN views END), 0), \
-           COALESCE(SUM(views), 0) \
+           COALESCE((SELECT total FROM series_views WHERE series_key = $1), 0), \
+           COALESCE(SUM(CASE WHEN hour_ts > $2 THEN views END), 0)::bigint, \
+           COALESCE(SUM(views), 0)::bigint \
          FROM series_view_bucket \
-         WHERE series_key = ? AND hour_ts > ?",
+         WHERE series_key = $3 AND hour_ts > $4",
     )
     .bind(&key)
     .bind(since24h)
@@ -356,6 +460,7 @@ pub async fn counts_for(pool: &Database, series_id: &str) -> ViewCounts {
     .bind(since7d)
     .fetch_one(pool)
     .await
+    .inspect_err(crate::db::record_read_database_error)
     .unwrap_or((0, 0, 0));
     ViewCounts {
         total: row.0,
@@ -369,9 +474,9 @@ pub async fn counts_for(pool: &Database, series_id: &str) -> ViewCounts {
 /// accumulate (the caller pads a cold-start list with another feed).
 pub async fn trending_keys(pool: &Database, limit: i64) -> Result<Vec<(String, i64)>> {
     let hour = current_hour();
-    let rows = sqlx::query_as::<_, (String, i64)>(
-        "SELECT series_key, SUM(views) AS v FROM series_view_bucket \
-         WHERE hour_ts > ? GROUP BY series_key ORDER BY v DESC, series_key ASC LIMIT ?",
+    let rows = crate::db_types::query_tuple::<(String, i64)>(
+        "SELECT series_key, SUM(views)::bigint AS v FROM series_view_bucket \
+         WHERE hour_ts > $1 GROUP BY series_key ORDER BY v DESC, series_key ASC LIMIT $2",
     )
     .bind(hour - 24)
     .bind(limit)
@@ -387,7 +492,7 @@ pub async fn trending_keys(pool: &Database, limit: i64) -> Result<Vec<(String, i
 /// kept forever.
 pub async fn prune_buckets(pool: &Database) -> Result<u64> {
     let cutoff = current_hour() - BUCKET_RETENTION_HOURS;
-    let r = sqlx::query("DELETE FROM series_view_bucket WHERE hour_ts <= ?")
+    let r = sqlx::query("DELETE FROM series_view_bucket WHERE hour_ts <= $1")
         .bind(cutoff)
         .execute(pool)
         .await?;
@@ -400,7 +505,7 @@ mod tests {
 
     async fn pool() -> Database {
         let pool = Database::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("./migrations_pg")
             .run(pool.write())
             .await
             .unwrap();
@@ -416,6 +521,146 @@ mod tests {
         flush_buffer(&buf, pool).await.unwrap();
     }
 
+    /// A flush is several bounded transactions, not one that locks every viewed work.
+    /// A failure in a later chunk keeps the earlier chunks and returns only the views
+    /// that are not committed, so the retry cannot count a view twice.
+    #[tokio::test]
+    async fn a_flush_commits_bounded_chunks_and_keeps_only_unwritten_views() {
+        let pool = pool().await.foreground();
+        sqlx::raw_sql(
+            "CREATE FUNCTION rest_reject_view() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF NEW.series_key = '0200' THEN RAISE EXCEPTION 'view deliberately rejected'; \
+             END IF; RETURN NEW; END $$; \
+             CREATE TRIGGER rest_reject_view BEFORE INSERT ON series_views \
+             FOR EACH ROW EXECUTE FUNCTION rest_reject_view()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let buffer = ViewBuffer::new();
+        for series in 0..300 {
+            assert!(buffer.push_at(&format!("{series:04}"), 100));
+        }
+        let error = flush_buffer(&buffer, &pool).await.unwrap_err();
+        assert!(
+            error.to_string().contains("view deliberately rejected")
+                || format!("{error:#}").contains("view deliberately rejected"),
+            "unexpected error: {error:#}"
+        );
+        let committed: Vec<String> =
+            sqlx::query_scalar("SELECT series_key FROM series_views ORDER BY series_key")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let first_chunk: Vec<String> = (0..WRITE_CHUNK_SERIES)
+            .map(|series| format!("{series:04}"))
+            .collect();
+        assert_eq!(
+            committed, first_chunk,
+            "exactly the chunks before the failed one are committed"
+        );
+        let mut kept: Vec<(String, i64)> = buffer
+            .lock()
+            .iter()
+            .map(|((series, _), n)| (series.clone(), *n))
+            .collect();
+        kept.sort();
+        let unwritten: Vec<(String, i64)> = (WRITE_CHUNK_SERIES..300)
+            .map(|series| (format!("{series:04}"), 1))
+            .collect();
+        assert_eq!(
+            kept, unwritten,
+            "only uncommitted views return to the buffer"
+        );
+
+        sqlx::query("DROP TRIGGER rest_reject_view ON series_views")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            flush_buffer(&buffer, &pool).await.unwrap(),
+            300 - WRITE_CHUNK_SERIES
+        );
+        let (rows, total, buckets): (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM series_views), \
+                    (SELECT COALESCE(SUM(total), 0)::bigint FROM series_views), \
+                    (SELECT COALESCE(SUM(views), 0)::bigint FROM series_view_bucket)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((rows, total, buckets), (300, 300, 300));
+    }
+
+    /// Two commit orders of a merge that overlaps a flush which has already found the
+    /// old work as its parent.
+    ///
+    /// `merge_open = false`: the merge commits before the flush locks. The recheck
+    /// after the locks sees the redirect and restarts.
+    ///
+    /// `merge_open = true`: the merge still holds its row locks, uncommitted, when the
+    /// flush goes on. Only `lock_works` protects this order: the flush has to WAIT for
+    /// the merge. Without the lock its recheck reads the snapshot before the merge,
+    /// finds nothing changed and commits the views under the retired key.
+    #[tokio::test]
+    async fn a_view_flush_restarts_after_a_concurrent_redirect_commit() {
+        for (through_buffer, merge_open) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let pool = pool().await.foreground();
+            sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES ('w_old',now(),now()),('w_new',now(),now())").execute(&pool).await.unwrap();
+            let points = crate::locks::pause_points::PausePoints::default();
+            let armed = points.arm("views-discovered");
+            let writer = pool.clone();
+            let first = tokio::spawn(VIEW_DISCOVERY_PAUSE.scope(points, async move {
+                if through_buffer {
+                    let buffer = ViewBuffer::new();
+                    assert!(buffer.push_at("w_old", 100));
+                    flush_buffer(&buffer, &writer).await.map(|_| ())
+                } else {
+                    write_batch(&writer, HashMap::from([(("w_old".to_owned(), 100), 1)])).await
+                }
+            }));
+            tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
+                .await
+                .unwrap();
+            let mut tx = pool.begin().await.unwrap();
+            crate::locks::lock_works_for_delete(&mut tx, &["w_old", "w_new"])
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO work_redirect(old_id,new_id,created_at) VALUES ('w_old','w_new',now())").execute(&mut *tx).await.unwrap();
+            sqlx::query("DELETE FROM work WHERE id='w_old'")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            let mut first = first;
+            if merge_open {
+                armed.release();
+                tokio::select! {
+                    _ = crate::cover::wait_for_writer_lock(&pool) => {}
+                    done = &mut first => panic!("the flush did not wait for the open merge: {done:?}"),
+                }
+                tx.commit().await.unwrap();
+            } else {
+                tx.commit().await.unwrap();
+                armed.release();
+            }
+            first.await.unwrap().unwrap();
+            let totals: Vec<(String, i64)> =
+                sqlx::query_as("SELECT series_key,total FROM series_views ORDER BY series_key")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            let buckets: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT series_key,views FROM series_view_bucket ORDER BY series_key",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(totals, vec![("w_new".to_owned(), 1)]);
+            assert_eq!(buckets, totals);
+        }
+    }
     #[tokio::test]
     async fn buffered_views_follow_a_merge_committed_by_another_connection() {
         let pool = pool().await;
@@ -435,15 +680,17 @@ mod tests {
             .is_err());
         merge.commit().await.unwrap();
         flush.await.unwrap().unwrap();
-        let rows: Vec<(String, i64)> = sqlx::query_as("SELECT series_key,total FROM series_views")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
+        let rows: Vec<(String, i64)> =
+            crate::db_types::query_tuple("SELECT series_key,total FROM series_views")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(rows, vec![("w_survivor".into(), 1)]);
-        let keys: Vec<String> = sqlx::query_scalar("SELECT series_key FROM series_view_bucket")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
+        let keys: Vec<String> =
+            crate::db_types::query_scalar("SELECT series_key FROM series_view_bucket")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(keys, vec!["w_survivor"]);
         external.close().await;
         pool.close().await;
@@ -476,7 +723,7 @@ mod tests {
         let pool = pool().await;
         record_flushed(&pool, "42").await;
         let h30 = current_hour() - 30;
-        sqlx::query("UPDATE series_view_bucket SET hour_ts = ? WHERE series_key = '42'")
+        sqlx::query("UPDATE series_view_bucket SET hour_ts = $1 WHERE series_key = '42'")
             .bind(h30)
             .execute(&pool)
             .await
@@ -499,7 +746,7 @@ mod tests {
         record_flushed(&pool, "42").await;
         // Backdate the bucket beyond retention, leaving the all-time total intact.
         let old = current_hour() - (BUCKET_RETENTION_HOURS + 5);
-        sqlx::query("UPDATE series_view_bucket SET hour_ts = ? WHERE series_key = '42'")
+        sqlx::query("UPDATE series_view_bucket SET hour_ts = $1 WHERE series_key = '42'")
             .bind(old)
             .execute(&pool)
             .await
@@ -579,7 +826,7 @@ mod tests {
     async fn failed_flush_keeps_views_for_retry() {
         // Flush into a pool with NO tables (migrations never ran): the write fails,
         // and the drained views must be merged back rather than lost.
-        let broken = Database::connect("sqlite::memory:").await.unwrap();
+        let broken = Database::empty_for_test(4).await.unwrap();
         let buf = ViewBuffer::new();
         record_with(&buf, &broken, "42").await.unwrap();
         record_with(&buf, &broken, "42").await.unwrap();

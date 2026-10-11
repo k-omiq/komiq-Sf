@@ -520,7 +520,7 @@ async fn pool() -> Database {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    sqlx::migrate!("./migrations")
+    sqlx::migrate!("./migrations_pg")
         .run(pool.write())
         .await
         .unwrap();
@@ -682,7 +682,7 @@ async fn completed_remove_save_failure_is_reported_and_preserves_the_checkpoint(
     instance::store(&pool, &instance::ACCESS_MODE, "internet")
         .await
         .unwrap();
-    sqlx::query("CREATE TRIGGER reject_final_domain BEFORE UPDATE ON instance_setting WHEN NEW.key='public_domain' AND NEW.value='' BEGIN SELECT RAISE(ABORT, 'save unavailable'); END")
+    sqlx::raw_sql("CREATE FUNCTION reject_final_domain() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.key='public_domain' AND NEW.value='' THEN RAISE EXCEPTION 'save unavailable'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_final_domain BEFORE UPDATE ON instance_setting FOR EACH ROW EXECUTE FUNCTION reject_final_domain()")
         .execute(&pool).await.unwrap();
     let dir = temp_dir("terminal-save-failure");
     let mgr = manager(
@@ -709,7 +709,7 @@ async fn completed_remove_save_failure_is_reported_and_preserves_the_checkpoint(
         instance::resolve(&pool, &instance::ACCESS_MODE).await.value,
         "internet"
     );
-    sqlx::query("DROP TRIGGER reject_final_domain")
+    sqlx::query("DROP TRIGGER reject_final_domain ON instance_setting")
         .execute(&pool)
         .await
         .unwrap();
@@ -1294,28 +1294,30 @@ async fn graphql_is_admin_only_and_drives_a_setup() {
     for (id, name, admin) in [("a", "owner", 1), ("b", "reader", 0)] {
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, is_admin, created_at) \
-             VALUES (?, ?, ?, 'h', ?, '2020-01-01T00:00:00Z')",
+             VALUES ($1, $2, $3, 'h', $4, '2020-01-01T00:00:00Z')",
         )
-        .bind(id)
+        .bind(crate::db_types::test_uuid(id))
         .bind(name)
         .bind(format!("{name}@e"))
-        .bind(admin)
+        .bind(admin != 0)
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
             "INSERT INTO sessions (token, user_id, created_at, expires_at) \
-             VALUES (?, ?, '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
+             VALUES ($1, $2, '2020-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
         )
         .bind(crate::auth::hash_token(&format!("{name}-session")))
-        .bind(id)
+        .bind(crate::db_types::test_uuid(id))
         .execute(&pool)
         .await
         .unwrap();
     }
     let state = Arc::new(AppState {
         pool: pool.clone(),
-        cover_pool: pool.clone(),
+        cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
+            .await
+            .unwrap(),
         suwayomi: crate::suwayomi::SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
         mangadex: Arc::new(crate::mangadex::MangaDexClient::new("test-ua", 5.0, 40.0)),
         admin_users: vec![],
@@ -2099,7 +2101,10 @@ async fn run_setup_again_replaces_an_origin_certificate_that_is_due() {
     let until = origin_tls::validity(&std::fs::read_to_string(&cert_file).unwrap())
         .unwrap()
         .1;
-    assert_eq!(st.certificate_expires, Some(until.to_rfc3339()));
+    assert_eq!(
+        st.certificate_expires,
+        Some(crate::db_types::format_date(until))
+    );
     assert!(st.certificate_error.is_none());
     mgr.retry_setup(TOKEN).await.unwrap();
     all_done(&wait_job(&mgr).await);
