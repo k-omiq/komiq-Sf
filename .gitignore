@@ -46,6 +46,10 @@ merge-suwayomi-duplicates.done.log
 # Local agent tooling state (worktrees can hold stale copies of anything).
 .claude/worktrees/
 
+# python bytecode
+__pycache__/
+*.pyc
+
 # Planning documents, reviews, gate records and reports on work in progress
 # stay local. The repository holds the source and its documentation
 # (apps/docs, published at docs.komiq.cc).
