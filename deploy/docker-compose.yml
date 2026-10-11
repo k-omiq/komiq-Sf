@@ -216,8 +216,8 @@ services:
     # limit for serving, not for the one-time SQLite import: the import's work
     # copy must stay in this container's page cache, and a 3.2 GB source under
     # a 3 GiB limit made the repair stage take 75 minutes instead of 5 to 6
-    # (2026-10-13). The hosted cutover starts the import from an override with
-    # 8 GiB (postgres/CUTOVER.md, "The memory of the import"). Still to
+    # (2026-10-13). Give a large one-time import an override with a higher
+    # limit; the hosted move used 8 GiB. Still to
     # confirm for serving: this reduction under realistic scanner/search load.
     mem_limit: 4g
     logging:

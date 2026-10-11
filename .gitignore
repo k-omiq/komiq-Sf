@@ -68,6 +68,9 @@ docs/ui-functional-regressions.md
 deploy/GO-LIVE.md
 deploy/CLOUDFLARE-RUNBOOK.md
 apps/server/tests/postgres_golden/VALIDATION.md
+deploy/postgres/CUTOVER.md
+deploy/postgres/staging/
+deploy/postgres/test_cutover.py
 
 # Tools and experiments of the finished move to PostgreSQL stay local too.
 deploy/spikes/
@@ -79,3 +82,8 @@ scripts/postgres-baseline-check.py
 scripts/tests/test_postgres_port_*.py
 scripts/tests/test_postgres_baseline_check.py
 scripts/tests/test_postgres_search_parity.py
+
+# Local tool state and design exports.
+.claude/
+apps/docs/.impeccable/
+/*.zip

@@ -1214,9 +1214,9 @@ restores fail startup. Do not bypass a failure with the new-install flag.
 The server that `hc up -d --build server` starts imports under the Compose
 file's serving limit of 4 GiB. That does not hold a large SQLite file: with
 3 GiB and a source of 3.24 GB the import's repair stage took 75 minutes
-instead of 5 to 6 (2026-10-13). For the hosted cutover follow `CUTOVER.md`,
-which starts the import from an override with a limit of 8 GiB and checks
-that limit against the file sizes first ("The memory of the import").
+instead of 5 to 6 (2026-10-13). Give a large import an override with a
+higher limit (the hosted move used 8 GiB) and check that limit against the
+file sizes first.
 
 The scheduler runs full Sunday 02:00 UTC, check daily 02:00 UTC and incremental
 daily 03:00 UTC, including Sunday. Two full chains are retained, normally about
