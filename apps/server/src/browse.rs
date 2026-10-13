@@ -698,7 +698,8 @@ const COUNT_CACHE_CAP: usize = 2048;
 /// cannot change a total.) The two-phase rankings' `rated_count` / trending prefix length are
 /// separate, unmemoized counts; a nullable ASC sort's non-NULL prefix is a separate count
 /// memoized under its own `nn:` key ([`key_for_nulls`]); text search's total under an `fts|`
-/// key carrying the MATCH expression ([`search_text`]). None of them is this number.
+/// key carrying the MATCH expression, and its retry statement's under `fts-retry|`
+/// ([`search_text`]). None of them is this number.
 ///
 /// `v4|` PREFIX. The memo is a process-wide static and the totals it holds are computed over
 /// whichever table this module read when they were stored. Each repointing has changed that
@@ -1402,6 +1403,18 @@ pub async fn rows_by_work_ids(pool: &Database, ids: &[String]) -> Result<Vec<Bro
 /// 3-character query floor keeps the worst case to tens of thousands of rows) rather than by
 /// the catalogue. NULL keys sort last in both directions, as in Browse.
 ///
+/// NO MATCH AT ALL runs one more statement, `search::retry_ctes`, with the same filter,
+/// window, sorts and binds: a misspelt term that is a word of other titles, and a query
+/// written without its spaces. A query with any match never runs it. `total` and the page
+/// come from the same statement, so they agree.
+///
+/// OVER BUDGET. A first statement that runs out of the search budget is run once more
+/// without typo matching (`search::plain_ctes`), as in `catalog::search_works_fts` and for
+/// the reason given there. Its total has its own memo tag, so it is never read as the
+/// total of the full statement. A retry statement that runs out of its budget is no error:
+/// the answer is the first statement's, nothing. One request runs at most five statements
+/// and they take at most `catalog::SEARCH_ALLOWANCE` together, as there.
+///
 /// NSFW: [`build_where`]'s gate on the materialized flag, PLUS the live
 /// `COALESCE(is_nsfw_override, is_nsfw)` on `work` that `search_works_fts` always applied — an
 /// override written since the last Browse rebuild is honoured here immediately, and the
@@ -1414,7 +1427,6 @@ pub async fn search_text(
     if !crate::search::valid_query(raw_query) {
         return Ok((0, Vec::new()));
     }
-    let match_expr = raw_query.to_owned();
     // Resolve optional view rankings before owning a reader: this helper acquires from
     // the pool itself and would deadlock with a single-reader pool otherwise.
     let trending = if q.sort.key == SortKey::MostViewed {
@@ -1422,7 +1434,32 @@ pub async fn search_text(
     } else {
         None
     };
-    let mut connection = crate::catalog::SearchConnection::new(pool).await?;
+    let full = crate::search::match_ctes;
+    let connection = crate::catalog::SearchConnection::new(pool).await?;
+    match text_pass(connection, raw_query, q, trending.clone(), full, "fts").await? {
+        Ok(found) => Ok(found),
+        Err((error, left)) => {
+            tracing::warn!(%error, "search: over budget, answering without typo matching");
+            let plain = crate::search::plain_ctes;
+            let connection = crate::catalog::SearchConnection::with_allowance(pool, left).await?;
+            let found = text_pass(connection, raw_query, q, trending, plain, "fts-plain").await?;
+            Ok(found.map_err(|(error, _)| error)?)
+        }
+    }
+}
+
+/// One text search on its reader: the `first` statement with its memo tag, then the retry
+/// statement when that finds nothing. The inner error is a statement built from `first`
+/// that ran out of its budget, with what the request has left; the reader is closed by then.
+async fn text_pass(
+    mut connection: crate::catalog::SearchConnection,
+    raw_query: &str,
+    q: &BrowseQuery<'_>,
+    trending: Option<Vec<String>>,
+    first: fn(&str, &str) -> String,
+    first_memo: &str,
+) -> Result<std::result::Result<(i64, Vec<BrowseRow>), (sqlx::Error, std::time::Duration)>> {
+    let match_expr = raw_query.to_owned();
     let (where_sql, where_binds, uses_rated) = build_where_from(q, 2);
     let page_size = BROWSE_PAGE_SIZE;
     let page = q.page.max(1);
@@ -1440,52 +1477,74 @@ pub async fn search_text(
     } else {
         String::new()
     };
-    let m_cte = crate::search::match_ctes(
-        "SELECT f.* FROM browse_catalogue f JOIN work w ON w.id=f.work_id",
-        &format!("{where_sql}{gate}"),
-    );
+    let eligible = "SELECT f.* FROM browse_catalogue f JOIN work w ON w.id=f.work_id";
     let mut head: Vec<Bind> = vec![Bind::Text(match_expr.clone())];
     head.extend(where_binds.iter().cloned());
 
     // total. The memo key carries the MATCH expression (length-prefixed — it is client text)
     // and the window flag, on top of the filter signature.
-    let ckey = format!(
-        "fts|{}|{}:{}|{}",
-        u8::from(relevance),
-        match_expr.len(),
-        match_expr,
-        count_key(q)
-    );
-    let total = match cached_count(&ckey) {
-        Some(t) => t,
-        None => {
-            let window_arg = crate::sql_params::placeholders(head.len() + 1, 1);
-            let (sql, binds) = if relevance {
-                let mut b = head.clone();
-                b.push(Bind::Int(window));
-                (
-                    format!(
-                        "WITH {rated_def}{m_cte} SELECT COUNT(*) FROM \
-                         (SELECT 1 FROM m LIMIT {window_arg})"
-                    ),
-                    b,
-                )
-            } else {
-                (
-                    format!("WITH {rated_def}{m_cte} SELECT COUNT(*) FROM m"),
-                    head.clone(),
-                )
-            };
-            let t = bind_count(sqlx::query_scalar::<_, i64>(&sql), &binds)
-                .fetch_one(&mut *connection)
-                .await?;
-            store_count(ckey, t);
-            t
+    //
+    // The first statement, then `search::retry_ctes` when that one counts nothing: a
+    // misspelt term that is a word elsewhere, a query without its spaces. `ctes` ends as
+    // the statement `total` was counted with, and the page below is built with the same
+    // one, so the two agree. Each has its own memo entry. `in_first` is true while the
+    // statement in hand is built from `first`.
+    let mut in_first = true;
+    let mut ctes = first;
+    let mut m_cte = String::new();
+    let mut total = 0;
+    for memo in [first_memo, "fts-retry"] {
+        m_cte = ctes(eligible, &format!("{where_sql}{gate}"));
+        let ckey = format!(
+            "{memo}|{}|{}:{}|{}",
+            u8::from(relevance),
+            match_expr.len(),
+            match_expr,
+            count_key(q)
+        );
+        total = match cached_count(&ckey) {
+            Some(t) => t,
+            None => {
+                let window_arg = crate::sql_params::placeholders(head.len() + 1, 1);
+                let (sql, binds) = if relevance {
+                    let mut b = head.clone();
+                    b.push(Bind::Int(window));
+                    (
+                        format!(
+                            "WITH {rated_def}{m_cte} SELECT COUNT(*) FROM \
+                             (SELECT 1 FROM m LIMIT {window_arg})"
+                        ),
+                        b,
+                    )
+                } else {
+                    (
+                        format!("WITH {rated_def}{m_cte} SELECT COUNT(*) FROM m"),
+                        head.clone(),
+                    )
+                };
+                connection.next_budget().await?;
+                let counted = bind_count(sqlx::query_scalar::<_, i64>(&sql), &binds)
+                    .fetch_one(&mut *connection)
+                    .await;
+                let t = match counted {
+                    Err(error) if crate::search::over_budget(&error) => {
+                        return Ok(connection.cancelled(error, in_first))
+                    }
+                    counted => counted?,
+                };
+                store_count(ckey, t);
+                t
+            }
+        };
+        if total > 0 {
+            break;
         }
-    };
+        in_first = false;
+        ctes = crate::search::retry_ctes;
+    }
     if offset >= total {
         connection.finish().await?;
-        return Ok((total, Vec::new()));
+        return Ok(Ok((total, Vec::new())));
     }
 
     if relevance {
@@ -1502,13 +1561,20 @@ pub async fn search_text(
         );
         let mut binds = head;
         binds.push(Bind::Int(window));
+        connection.next_budget().await?;
         let rows = bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), &binds)
             .bind(page_size.min(window))
             .bind(offset)
             .fetch_all(&mut *connection)
-            .await?;
+            .await;
+        let rows = match rows {
+            Err(error) if crate::search::over_budget(&error) => {
+                return Ok(connection.cancelled(error, in_first))
+            }
+            rows => rows?,
+        };
         connection.finish().await?;
-        return Ok((total, rows));
+        return Ok(Ok((total, rows)));
     }
 
     // Every other sort over the filtered match set.
@@ -1551,10 +1617,7 @@ pub async fn search_text(
         },
     };
     let (where_sql, _, _) = build_where_from(q, 2 + cte_binds.len());
-    let m_cte = crate::search::match_ctes(
-        "SELECT f.* FROM browse_catalogue f JOIN work w ON w.id=f.work_id",
-        &format!("{where_sql}{gate}"),
-    );
+    let m_cte = ctes(eligible, &format!("{where_sql}{gate}"));
     let page_args = crate::sql_params::placeholders(2 + cte_binds.len() + where_binds.len(), 2);
     let mut page_args = page_args.split(", ");
     let limit_arg = page_args.next().unwrap();
@@ -1568,13 +1631,20 @@ pub async fn search_text(
     let mut binds: Vec<Bind> = vec![Bind::Text(match_expr)];
     binds.extend(cte_binds);
     binds.extend(where_binds);
+    connection.next_budget().await?;
     let rows = bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), &binds)
         .bind(page_size)
         .bind(offset)
         .fetch_all(&mut *connection)
-        .await?;
+        .await;
+    let rows = match rows {
+        Err(error) if crate::search::over_budget(&error) => {
+            return Ok(connection.cancelled(error, in_first))
+        }
+        rows => rows?,
+    };
     connection.finish().await?;
-    Ok((total, rows))
+    Ok(Ok((total, rows)))
 }
 
 /// Catalogue-wide Browse. Returns `(total, page)` where `total` counts exactly the row set
@@ -3976,6 +4046,222 @@ mod tests {
         ] {
             assert_eq!(order(key, true).await, desc, "{key:?} descending");
             assert_eq!(order(key, false).await, asc, "{key:?} ascending");
+        }
+        pool.close().await;
+    }
+
+    /// A query the first statement finds nothing for runs `search::retry_ctes`, as in
+    /// catalogue search: a misspelt term that is a word of another title, and a query
+    /// without its spaces. The filter, the other sort keys and the pages apply to that
+    /// answer, with one total. A query with an answer builds no retry statement.
+    #[tokio::test]
+    async fn text_search_retries_a_query_with_no_match() {
+        let pool = pool().await;
+        //     id      title              demo       follows ch
+        let mut works = vec![
+            ("w_1".to_owned(), "One Piece".to_owned(), "shounen", 10, 5),
+            ("w_2".into(), "One Piece Party".into(), "seinen", 900, 9),
+            ("w_3".into(), "Jujutsu Kaisen".into(), "shounen", 500, 7),
+            ("w_4".into(), "Kaizen Notes".into(), "seinen", 1, 1),
+        ];
+        // More than one page of works for one joined query.
+        for n in 10..42 {
+            works.push((format!("e_{n}"), format!("Ember Fall {n}"), "josei", n, 0));
+        }
+        for (id, title, demo, follows, ch) in &works {
+            seed(
+                &pool,
+                id,
+                title,
+                "MANGA",
+                "ONGOING",
+                "safe",
+                0,
+                *ch,
+                Some(1000),
+            )
+            .await;
+            v2(
+                &pool,
+                id,
+                Some(demo),
+                Some("ja"),
+                None,
+                Some(*follows),
+                None,
+                &[],
+            )
+            .await;
+            fts(&pool, id, title, *ch).await;
+        }
+        let search = |text: &'static str, f: &dyn Fn(&mut BrowseQuery<'static>)| {
+            let mut query = BrowseQuery {
+                sort: Sort::desc(SortKey::Relevance),
+                ..Default::default()
+            };
+            f(&mut query);
+            let pool = pool.clone();
+            async move {
+                let before = crate::search::RETRIES.with(std::cell::Cell::get);
+                let (t, rows) = search_text(&pool, text, &query).await.unwrap();
+                let retried = crate::search::RETRIES.with(std::cell::Cell::get) > before;
+                let titles = rows.into_iter().map(|r| r.title).collect::<Vec<_>>();
+                (t, titles, retried)
+            }
+        };
+        let set = |v: &[&str], retried: bool| (v.len() as i64, ids(v), retried);
+        // The first statement answers: no retry, and its answer alone.
+        assert_eq!(
+            search("one piece", &|_| {}).await,
+            set(&["One Piece", "One Piece Party"], false)
+        );
+        assert_eq!(
+            search("kaizen", &|_| {}).await,
+            set(&["Kaizen Notes"], false)
+        );
+        // Without its spaces: the equal title first, then the longer one.
+        assert_eq!(
+            search("onepiece", &|_| {}).await,
+            set(&["One Piece", "One Piece Party"], true)
+        );
+        // `kaizen` is a word of w_4 only, and no work has both terms.
+        assert_eq!(
+            search("jujutsu kaizen", &|_| {}).await,
+            set(&["Jujutsu Kaisen"], true)
+        );
+        // The filter narrows the retry's answer and its total.
+        assert_eq!(
+            search("onepiece", &|q| q.demographics = vec!["seinen"]).await,
+            set(&["One Piece Party"], true)
+        );
+        assert_eq!(
+            search("jujutsu kaizen", &|q| q.demographics = vec!["seinen"]).await,
+            set(&[], true)
+        );
+        // This filter hides w_4, so `kaizen` has no eligible word hit and the first
+        // statement gives it typo matching, as it always did.
+        assert_eq!(
+            search("jujutsu kaizen", &|q| q.demographics = vec!["shounen"]).await,
+            set(&["Jujutsu Kaisen"], false)
+        );
+        // Another sort key orders the same answer, in both directions.
+        for (desc, expected) in [
+            (true, ["One Piece Party", "One Piece"]),
+            (false, ["One Piece", "One Piece Party"]),
+        ] {
+            assert_eq!(
+                search("onepiece", &|q| {
+                    q.sort = Sort {
+                        key: SortKey::MostFollows,
+                        desc,
+                    }
+                })
+                .await,
+                set(&expected, true),
+                "follows desc={desc}"
+            );
+        }
+        // Pages: one total, every work once, nothing past the end.
+        for sort in [SortKey::Relevance, SortKey::MostFollows] {
+            let mut seen = std::collections::BTreeSet::new();
+            for (page, rows) in [(1, 30), (2, 2), (3, 0)] {
+                let (t, titles, retried) = search("emberfall", &|q| {
+                    q.sort = Sort::desc(sort);
+                    q.page = page;
+                })
+                .await;
+                assert_eq!(
+                    (t, titles.len(), retried),
+                    (32, rows, true),
+                    "{sort:?} {page}"
+                );
+                seen.extend(titles);
+            }
+            assert_eq!(seen.len(), 32, "{sort:?}");
+        }
+        pool.close().await;
+    }
+
+    /// A first statement that runs out of the search budget on typo matching is no
+    /// error here either: Browse answers with what the search finds without typo
+    /// matching, total and page, for relevance and for another sort key. The typo test
+    /// of this database outlasts the budget from the second search on. A retry statement
+    /// over the budget gives the first statement's answer, nothing. Last, the count fits
+    /// the budget and each kind of page statement does not: the request starts again
+    /// without typo matching and answers from that pass.
+    #[tokio::test]
+    async fn text_search_over_budget_answers_without_typo_matching() {
+        let pool = pool().await;
+        for (id, title, follows) in [
+            ("w_1", "One Piece", 10),
+            ("w_2", "One Piece Party", 900),
+            ("w_3", "Onepiecf Saga", 5),
+            ("w_4", "Jujutsu Kaisen", 7),
+            ("w_5", "Kaizen Notes", 1),
+        ] {
+            seed(
+                &pool,
+                id,
+                title,
+                "MANGA",
+                "ONGOING",
+                "safe",
+                0,
+                1,
+                Some(1000),
+            )
+            .await;
+            v2(&pool, id, None, Some("ja"), None, Some(follows), None, &[]).await;
+            fts(&pool, id, title, 1).await;
+        }
+        let search = |text: &'static str, key: SortKey| {
+            let query = BrowseQuery {
+                sort: Sort::desc(key),
+                ..Default::default()
+            };
+            let pool = pool.clone();
+            async move {
+                let (t, rows) = search_text(&pool, text, &query).await.unwrap();
+                (t, rows.into_iter().map(|r| r.title).collect::<Vec<_>>())
+            }
+        };
+        assert_eq!(
+            search("onepiece", SortKey::Relevance).await,
+            (1, ids(&["Onepiecf Saga"]))
+        );
+        assert_eq!(
+            search("jujutsu kaizen", SortKey::Relevance).await,
+            (1, ids(&["Jujutsu Kaisen"]))
+        );
+        crate::search::slow_typo_test(&pool, "10").await;
+        assert_eq!(
+            search("onepiece", SortKey::Relevance).await,
+            (2, ids(&["One Piece", "One Piece Party"]))
+        );
+        assert_eq!(
+            search("onepiece", SortKey::MostFollows).await,
+            (2, ids(&["One Piece Party", "One Piece"]))
+        );
+        // No term in fallback: the first statement counts nothing at once, and the
+        // retry asks the typo test for `kaizen`.
+        assert_eq!(
+            search("jujutsu kaizen", SortKey::Relevance).await,
+            (0, Vec::new())
+        );
+        for (key, expected) in [
+            (SortKey::Relevance, ["One Piece", "One Piece Party"]),
+            (SortKey::MostFollows, ["One Piece Party", "One Piece"]),
+        ] {
+            let slow = "CASE WHEN waited < 0.8 THEN 0.9 WHEN waited < 2.5 THEN 10 ELSE 0 END";
+            crate::search::slow_typo_test(&pool, slow).await;
+            let started = std::time::Instant::now();
+            assert_eq!(
+                search("onepiece", key).await,
+                (2, ids(&expected)),
+                "{key:?}"
+            );
+            let seconds = started.elapsed().as_secs_f64();
+            assert!((2.8..4.0).contains(&seconds), "{key:?}: {seconds} s");
         }
         pool.close().await;
     }

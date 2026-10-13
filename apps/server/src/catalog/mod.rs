@@ -2872,11 +2872,25 @@ pub(crate) const RANK_WINDOW: i64 = 500;
 /// Bound anonymous input before PostgreSQL folds or tokenizes it.
 pub(crate) const MAX_FTS_QUERY_CHARS: usize = 256;
 
+/// The most one search statement may take before PostgreSQL cancels it.
+const SEARCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The most one search request may spend on its statements in all: a count and
+/// a page at the statement budget. A request with more statements than those
+/// two shares this among them, see [`SearchConnection::next_budget`].
+pub(crate) const SEARCH_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(4);
+
 /// Search owns one reader for one transaction, with a PostgreSQL statement
 /// timeout and its trigram thresholds set for that transaction only. Dropping an
 /// unfinished request closes its connection before it can return to the pool.
+///
+/// `allowance` is what the request had left for its statements when this reader
+/// was `opened`, and `timeout` is the statement timeout now in force.
 pub(crate) struct SearchConnection {
     connection: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    allowance: std::time::Duration,
+    timeout: std::time::Duration,
+    opened: std::time::Instant,
 }
 impl std::ops::Deref for SearchConnection {
     type Target = sqlx::PgConnection;
@@ -2898,7 +2912,16 @@ impl Drop for SearchConnection {
 }
 impl SearchConnection {
     pub(crate) async fn new(pool: &Database) -> Result<Self> {
-        Self::with_budget(pool, std::time::Duration::from_secs(2)).await
+        Self::with_allowance(pool, SEARCH_ALLOWANCE).await
+    }
+    /// The reader of a request that has `allowance` left for its statements.
+    pub(crate) async fn with_allowance(
+        pool: &Database,
+        allowance: std::time::Duration,
+    ) -> Result<Self> {
+        let mut search = Self::with_budget(pool, allowance.min(SEARCH_BUDGET)).await?;
+        search.allowance = allowance;
+        Ok(search)
     }
     // The budget and the trigram thresholds are local to one transaction, so they
     // end with it and cannot reach the next user of the pooled session. The
@@ -2907,18 +2930,67 @@ impl SearchConnection {
     async fn with_budget(pool: &Database, budget: std::time::Duration) -> Result<Self> {
         let mut search = Self {
             connection: Some(pool.acquire().await?),
+            allowance: SEARCH_ALLOWANCE,
+            timeout: budget,
+            opened: std::time::Instant::now(),
         };
         sqlx::query("BEGIN").execute(&mut *search).await?;
         sqlx::query("SELECT set_config('statement_timeout', $1, true), set_config('pg_trgm.similarity_threshold', '0.3', true), set_config('pg_trgm.word_similarity_threshold', '0.2', true)")
             .bind(format!("{}ms", budget.as_millis().max(1)))
             .execute(&mut *search).await?;
+        search.opened = std::time::Instant::now();
         Ok(search)
+    }
+    /// What the request has left for its statements. The time since this reader
+    /// was opened counts as spent: it runs statements and little else.
+    fn left(&self) -> std::time::Duration {
+        self.allowance.saturating_sub(self.opened.elapsed())
+    }
+    /// Call before each statement. The statement gets the statement budget, or
+    /// what the request has left when that is less, so the statements of one
+    /// request never take more than [`SEARCH_ALLOWANCE`] together. The timeout
+    /// only ever goes down, and a count and its page never need the change.
+    pub(crate) async fn next_budget(&mut self) -> Result<()> {
+        #[cfg(test)]
+        STATEMENTS.with(|statements| statements.set(statements.get() + 1));
+        let budget = self.left().min(SEARCH_BUDGET);
+        if budget.as_millis() < self.timeout.as_millis() {
+            sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+                .bind(format!("{}ms", budget.as_millis().max(1)))
+                .execute(&mut **self)
+                .await?;
+            self.timeout = budget;
+        }
+        Ok(())
+    }
+    /// What a pass answers when PostgreSQL cancelled a statement of it at the
+    /// budget. A statement of the pass's own kind (`in_first`) gives the error
+    /// back with what the request has left, for the caller to decide. The retry
+    /// statement is an extra: the first statement found nothing inside its
+    /// budget, and that empty answer stands.
+    pub(crate) fn cancelled<T>(
+        &self,
+        error: sqlx::Error,
+        in_first: bool,
+    ) -> std::result::Result<(i64, Vec<T>), (sqlx::Error, std::time::Duration)> {
+        if in_first {
+            return Err((error, self.left()));
+        }
+        tracing::warn!(%error, "search: retry over budget, answering with no result");
+        Ok((0, Vec::new()))
     }
     pub(crate) async fn finish(mut self) -> Result<()> {
         sqlx::query("ROLLBACK").execute(&mut *self).await?;
         self.connection.take();
         Ok(())
     }
+}
+
+// How many search statements this test thread was about to run. A test runs on
+// one thread, so it reads its own requests and no other test's.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static STATEMENTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// PostgreSQL title/alias search over the canonical catalogue. The legacy API
@@ -2928,6 +3000,28 @@ impl SearchConnection {
 /// Every term intersects by work ID across title/alias rows. Exact and prefix
 /// folded full titles rank first; chapter popularity, similarity and work ID
 /// settle a tier. Empty/tokenless/oversized queries return no hits.
+///
+/// A query with no hit at all gets a second statement, `search::retry_ctes`:
+/// a wrongly spelt term that is a word of other titles, and a query written
+/// without its spaces. A query with a hit never runs it, so its answer is the
+/// first statement's alone. Each statement has the whole budget to itself.
+///
+/// A first statement that runs out of its budget is run once more without typo
+/// matching (`search::plain_ctes`), and the search goes on from there. Typo
+/// matching is what a misspelt word costs, and a reader who misspelt one is
+/// better served by what the cheaper statements find, or by no result, than by
+/// an error. A query that is over the budget without typo matching is over it
+/// again, and that error stands: an empty answer would be false for it.
+///
+/// A retry statement that runs out of its budget is no error: the first
+/// statement answered with nothing in time, and that answer is given.
+///
+/// One request runs at most five statements: a count and its page, and after
+/// one of them is cancelled a count without typo matching, then that count's
+/// page or the retry's count and page. Together they take at most
+/// [`SEARCH_ALLOWANCE`], which is what the count and the page alone could
+/// always take. The total and the items of one request come from one statement
+/// text. Nothing is remembered from one request to the next.
 pub async fn search_works_fts(
     pool: &Database,
     query: &str,
@@ -2939,30 +3033,81 @@ pub async fn search_works_fts(
     if !crate::search::valid_query(query) {
         return Ok((0, Vec::new()));
     }
-    let mut connection = SearchConnection::new(pool).await?;
     let offset = (page.max(1) - 1) * page_size;
     let not_blocked = blocks.and_not_blocked("w.id", Some(&crate::block::work_rating_sql("w")));
     let gate = format!("($2 OR NOT COALESCE(w.is_nsfw_override,w.is_nsfw)){not_blocked}");
-    let m_cte = crate::search::match_ctes("SELECT w.id AS work_id FROM work w", &gate);
-    let total = crate::db_types::query_scalar::<i64>(&format!(
-        "WITH {m_cte} SELECT COUNT(*) FROM (SELECT 1 FROM m LIMIT $3) counted"
-    ))
-    .bind(query)
-    .bind(show_nsfw)
-    .bind(RANK_WINDOW)
-    .fetch_one(&mut *connection)
-    .await?;
+    let pass = |connection, first| {
+        search_works_pass(
+            connection, first, &gate, query, show_nsfw, offset, page_size,
+        )
+    };
+    let connection = SearchConnection::new(pool).await?;
+    match pass(connection, crate::search::match_ctes).await? {
+        Ok(found) => Ok(found),
+        Err((error, left)) => {
+            tracing::warn!(%error, "search: over budget, answering without typo matching");
+            let connection = SearchConnection::with_allowance(pool, left).await?;
+            let found = pass(connection, crate::search::plain_ctes).await?;
+            Ok(found.map_err(|(error, _)| error)?)
+        }
+    }
+}
+
+/// One search on its reader: `first`, then the retry statement when that finds
+/// nothing. The inner error is a statement built from `first` that ran out of
+/// its budget, with what the request has left; the reader is closed by then.
+async fn search_works_pass(
+    mut connection: SearchConnection,
+    first: fn(&str, &str) -> String,
+    gate: &str,
+    query: &str,
+    show_nsfw: bool,
+    offset: i64,
+    page_size: i64,
+) -> Result<std::result::Result<(i64, Vec<String>), (sqlx::Error, std::time::Duration)>> {
+    let mut in_first = true;
+    let mut m_cte = String::new();
+    let mut total = 0;
+    for ctes in [first, crate::search::retry_ctes] {
+        m_cte = ctes("SELECT w.id AS work_id FROM work w", gate);
+        connection.next_budget().await?;
+        let counted = crate::db_types::query_scalar::<i64>(&format!(
+            "WITH {m_cte} SELECT COUNT(*) FROM (SELECT 1 FROM m LIMIT $3) counted"
+        ))
+        .bind(query)
+        .bind(show_nsfw)
+        .bind(RANK_WINDOW)
+        .fetch_one(&mut *connection)
+        .await;
+        total = match counted {
+            Err(error) if crate::search::over_budget(&error) => {
+                return Ok(connection.cancelled(error, in_first))
+            }
+            counted => counted?,
+        };
+        if total > 0 {
+            break;
+        }
+        in_first = false;
+    }
     if offset >= total {
         connection.finish().await?;
-        return Ok((total, Vec::new()));
+        return Ok(Ok((total, Vec::new())));
     }
+    connection.next_budget().await?;
     let ids = sqlx::query_scalar::<_,String>(&format!(
         "WITH {m_cte}, {} SELECT work_id FROM cand ORDER BY tier,chapters DESC,rank,work_id LIMIT $4 OFFSET $5",
         crate::search::window_cte("$3")))
         .bind(query).bind(show_nsfw).bind(RANK_WINDOW).bind(page_size.min(RANK_WINDOW)).bind(offset)
-        .fetch_all(&mut *connection).await?;
+        .fetch_all(&mut *connection).await;
+    let ids = match ids {
+        Err(error) if crate::search::over_budget(&error) => {
+            return Ok(connection.cancelled(error, in_first))
+        }
+        ids => ids?,
+    };
     connection.finish().await?;
-    Ok((total, ids))
+    Ok(Ok((total, ids)))
 }
 
 /// NSFW flag of the work owning a mirrored MangaDex chapter (by chapter uuid), for
@@ -8898,6 +9043,65 @@ mod tests {
         search_works_fts(&pool, "sool nights", true, &Default::default(), 1, 30)
             .await
             .unwrap();
+        let after: (String, String, String, String, String) =
+            sqlx::query_as(settings).fetch_one(&pool).await.unwrap();
+        assert_eq!(after, fresh);
+        pool.close().await;
+    }
+
+    /// The retry statement has the gate of the first. A hidden work and a work
+    /// with no source are no answer of it. A hidden answer of the first statement
+    /// is no answer either, so the retry still runs for the viewer who cannot
+    /// see it. Both statements run on the one reader and leave it as it was.
+    #[tokio::test]
+    async fn a_retried_search_keeps_the_gate_and_leaves_the_reader_clean() {
+        let pool = crate::database::TestPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations_pg")
+            .run(pool.write())
+            .await
+            .unwrap();
+        for (id, title, nsfw, source) in [
+            ("open", "One Piece Omake", false, true),
+            ("hidden", "One Piece", true, true),
+            ("shell", "One Piece Zero", false, false),
+        ] {
+            sqlx::query("INSERT INTO work(id,primary_title,is_nsfw,created_at,updated_at) VALUES($1,$2,$3,'2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')")
+                .bind(id).bind(title).bind(nsfw).execute(&pool).await.unwrap();
+            if source {
+                sqlx::query("INSERT INTO source_series(id,work_id,source_type,source_key,created_at) VALUES($1 || ':s',$1,'mangadex',$1 || ':k','2020-01-01T00:00:00Z')")
+                    .bind(id).execute(&pool).await.unwrap();
+            }
+        }
+        let settings = "SELECT public.word_similarity('a', 'a')::text, pg_backend_pid()::text, \
+             current_setting('statement_timeout'), \
+             current_setting('pg_trgm.similarity_threshold'), \
+             current_setting('pg_trgm.word_similarity_threshold')";
+        let fresh: (String, String, String, String, String) =
+            sqlx::query_as(settings).fetch_one(&pool).await.unwrap();
+        let found = |show_nsfw: bool| {
+            let pool = pool.clone();
+            async move {
+                search_works_fts(&pool, "onepiece", show_nsfw, &Default::default(), 1, 20)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(found(false).await, (1, vec!["open".to_owned()]));
+        assert_eq!(
+            found(true).await,
+            (2, vec!["hidden".to_owned(), "open".to_owned()])
+        );
+        // The first statement now has an answer, and it is hidden.
+        sqlx::query("INSERT INTO work(id,primary_title,is_nsfw,created_at,updated_at) VALUES('only','Onepiece',TRUE,'2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO source_series(id,work_id,source_type,source_key,created_at) VALUES('only:s','only','mangadex','only:k','2020-01-01T00:00:00Z')")
+            .execute(&pool).await.unwrap();
+        assert_eq!(found(false).await, (1, vec!["open".to_owned()]));
+        assert_eq!(found(true).await, (1, vec!["only".to_owned()]));
         let after: (String, String, String, String, String) =
             sqlx::query_as(settings).fetch_one(&pool).await.unwrap();
         assert_eq!(after, fresh);
