@@ -1765,16 +1765,18 @@
 		opacity: 0.55;
 		transform: scale(1.08);
 	}
+	/* A light wash of the page colour, and a mask that fades the band out into the
+	   page itself (a gradient background shows through, see $lib/theme.css). The
+	   cover shows at 65% at the top, 30% at 55% and none at the bottom. */
+	.banner {
+		-webkit-mask-image: linear-gradient(180deg, #000, rgb(0 0 0 / 0.46) 55%, transparent);
+		mask-image: linear-gradient(180deg, #000, rgb(0 0 0 / 0.46) 55%, transparent);
+	}
 	.banner::after {
 		content: '';
 		position: absolute;
 		inset: 0;
-		background: linear-gradient(
-			180deg,
-			color-mix(in srgb, var(--k-bg) 35%, transparent) 0%,
-			color-mix(in srgb, var(--k-bg) 70%, transparent) 55%,
-			var(--k-bg) 100%
-		);
+		background: color-mix(in srgb, var(--k-bg) 35%, transparent);
 	}
 	.banner-empty {
 		background: var(--k-surface-2);
@@ -2151,15 +2153,11 @@
 		max-height: 132px;
 		overflow: hidden;
 	}
-	.about-box:not(.open)::after {
-		content: '';
-		position: absolute;
-		left: 0;
-		right: 0;
-		bottom: 0;
-		height: 64px;
-		background: linear-gradient(transparent, var(--k-bg));
-		pointer-events: none;
+	/* A mask, not a fade to the page colour, so it also works over a gradient
+	   background (see $lib/theme.css). */
+	.about-box:not(.open) {
+		-webkit-mask-image: linear-gradient(#000 calc(100% - 64px), transparent);
+		mask-image: linear-gradient(#000 calc(100% - 64px), transparent);
 	}
 	.about-box.open {
 		max-height: none;

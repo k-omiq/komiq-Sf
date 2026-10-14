@@ -112,7 +112,7 @@ h4 {
 }
 
 ::selection {
-	background: rgba(224, 131, 105, 0.3);
+	background: color-mix(in srgb, var(--k-accent) 30%, transparent);
 }
 
 input[type='range'] {

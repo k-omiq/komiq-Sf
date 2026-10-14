@@ -3,69 +3,128 @@
  *
  *  - mode: light / dark / follow-system, as `data-theme`. The design tokens
  *    (@komika/ui) carry the light and dark values.
- *  - palette: one seed colour, as `data-palette` + `--k-seed`. `theme.css` derives the
- *    accent, the primary button and a tint for every surface from that seed, so a
- *    preset and a colour the reader picked go through the same rules. The default
- *    palette sets neither and leaves the tokens as they are.
+ *  - background: none, one colour or a two-colour gradient, as `data-tint` plus the
+ *    `--k-tint-*` variables. `theme.css` tints the page and every surface from them.
+ *  - accent: the app's own coral (nothing set), or the reader's colour as
+ *    `data-accent` + `--k-accent-seed`. `theme.css` derives the accent and the
+ *    primary button from it.
  *  - pure black: `data-black`, a true-black background for the dark theme.
  *  - MangaDex ratings: `data-md-ratings="off"` hides MangaDex's rating wherever a
  *    rating is shown ($lib/components/Ratings.svelte owns the rule), so a card says
  *    the same thing on its first paint as after the app has started.
  *
- * A no-FOUC script (static/theme-init.js) applies the same four before first paint;
- * `initTheme()` re-syncs the reactive store on mount and tracks OS changes while the
- * mode is "system". Both read the same two keys: keep them in step.
+ * Only hue and saturation come from the reader's colours. theme.css keeps the
+ * lightness of each token, so text stays readable whatever colour is picked.
+ *
+ * A no-FOUC script (static/theme-init.js) applies the same before first paint from
+ * the `attrs` and `vars` saved here; `initTheme()` re-syncs the reactive store on
+ * mount and tracks OS changes while the mode is "system". Both read the same two
+ * keys: keep them in step.
  */
-export type ThemePref = 'light' | 'dark' | 'system';
+import { untrack } from 'svelte';
+import { isHex, midpoint } from './color';
 
-export interface Palette {
-	id: string;
-	name: string;
-	/** The seed colour, `#rrggbb`. */
-	seed: string;
+export type ThemePref = 'light' | 'dark' | 'system';
+export type Backdrop = 'none' | 'solid' | 'gradient';
+
+export interface Look {
+	backdrop: Backdrop;
+	/** The background colour, and where a gradient starts. `#rrggbb`. */
+	a: string;
+	/** Where a gradient ends. `#rrggbb`. */
+	b: string;
+	/** Gradient direction in degrees, 0 = towards the top. */
+	angle: number;
+	/** How much colour the background takes, 0-100. */
+	strength: number;
+	/** The accent colour, or null for the app's own. */
+	accent: string | null;
 }
 
-/** The id of the palette that leaves the design tokens untouched. */
-export const DEFAULT_PALETTE = 'default';
-/** The id of the palette whose seed the reader picked. */
-export const CUSTOM_PALETTE = 'custom';
+export interface Preset {
+	id: string;
+	name: string;
+	look: Look;
+}
 
-/** Presets, in the order the settings screen shows them. The first is the default,
- * and its seed is only the swatch colour (the tokens' own coral accent). */
-export const PALETTES: readonly Palette[] = [
-	{ id: DEFAULT_PALETTE, name: 'komiq', seed: '#e0836a' },
-	{ id: 'strawberry', name: 'Strawberry', seed: '#d8475d' },
-	{ id: 'dusk', name: 'Midnight dusk', seed: '#e5398a' },
-	{ id: 'lavender', name: 'Lavender', seed: '#9b7fe0' },
-	{ id: 'sapphire', name: 'Sapphire', seed: '#3f6fe0' },
-	{ id: 'tidal', name: 'Tidal wave', seed: '#2f93cf' },
-	{ id: 'nord', name: 'Nord', seed: '#6f9bc4' },
-	{ id: 'teal', name: 'Teal', seed: '#1fa39b' },
-	{ id: 'apple', name: 'Green apple', seed: '#56a644' },
-	{ id: 'honey', name: 'Honey', seed: '#d39a2c' },
-	{ id: 'mocha', name: 'Mocha', seed: '#a9805c' },
-	{ id: 'mono', name: 'Monochrome', seed: '#8a8a8a' },
+export const STRENGTH_DEFAULT = 45;
+
+function solid(seed: string, strength = STRENGTH_DEFAULT): Look {
+	return { backdrop: 'solid', a: seed, b: seed, angle: 160, strength, accent: seed };
+}
+function gradient(a: string, b: string, accent: string, angle = 160): Look {
+	return { backdrop: 'gradient', a, b, angle, strength: 60, accent };
+}
+
+/** The look of a fresh install: the tokens as @komika/ui ships them. */
+export const DEFAULT_LOOK: Look = {
+	backdrop: 'none',
+	a: '#3f6fe0',
+	b: '#1fa39b',
+	angle: 160,
+	strength: STRENGTH_DEFAULT,
+	accent: null,
+};
+
+/** Ready-made looks, in the order the settings screen shows them. The ids of the
+ * one-colour presets are the palette ids an older version saved. */
+export const PRESETS: readonly Preset[] = [
+	{ id: 'default', name: 'komiq', look: DEFAULT_LOOK },
+	{ id: 'dusk', name: 'Midnight dusk', look: gradient('#e5398a', '#5b3fd0', '#e5398a') },
+	{ id: 'tidal', name: 'Tidal wave', look: gradient('#2f93cf', '#1fa39b', '#2f93cf') },
+	{ id: 'ember', name: 'Ember', look: gradient('#d39a2c', '#d8475d', '#e0836a', 200) },
+	{ id: 'forest', name: 'Forest', look: gradient('#1fa39b', '#56a644', '#7fc06d', 135) },
+	{ id: 'strawberry', name: 'Strawberry', look: solid('#d8475d') },
+	{ id: 'lavender', name: 'Lavender', look: solid('#9b7fe0') },
+	{ id: 'sapphire', name: 'Sapphire', look: solid('#3f6fe0') },
+	{ id: 'nord', name: 'Nord', look: solid('#6f9bc4') },
+	{ id: 'teal', name: 'Teal', look: solid('#1fa39b') },
+	{ id: 'apple', name: 'Green apple', look: solid('#56a644') },
+	{ id: 'honey', name: 'Honey', look: solid('#d39a2c') },
+	{ id: 'mocha', name: 'Mocha', look: solid('#a9805c') },
+	{ id: 'mono', name: 'Monochrome', look: { ...solid('#8a8a8a'), backdrop: 'none' } },
+];
+
+/** Quick picks: the accent row and the colour picker offer these. */
+export const SWATCHES: readonly { name: string; hex: string }[] = [
+	{ name: 'Coral', hex: '#e0836a' },
+	{ name: 'Strawberry', hex: '#d8475d' },
+	{ name: 'Pink', hex: '#e5398a' },
+	{ name: 'Lavender', hex: '#9b7fe0' },
+	{ name: 'Indigo', hex: '#5b3fd0' },
+	{ name: 'Sapphire', hex: '#3f6fe0' },
+	{ name: 'Sky', hex: '#2f93cf' },
+	{ name: 'Teal', hex: '#1fa39b' },
+	{ name: 'Green apple', hex: '#56a644' },
+	{ name: 'Honey', hex: '#d39a2c' },
+	{ name: 'Mocha', hex: '#a9805c' },
+	{ name: 'Grey', hex: '#8a8a8a' },
 ];
 
 const MODE_KEY = 'komika-theme';
-/** `{ palette, seed, custom, black, md }` — `seed` is what theme-init.js applies, and
- * `md` is false only when the reader turned MangaDex ratings off. */
+/** `{ v: 2, look, black, md, attrs, vars }`. `attrs` and `vars` are what theme-init.js
+ * puts on <html>; `md` is false only when the reader turned MangaDex ratings off. An
+ * older version saved `{ palette, seed, custom, black, md }`: see `fromV1`. */
 const LOOK_KEY = 'komiq-look';
-const HEX = /^#[0-9a-f]{6}$/i;
+/** The variables `apply()` may set, so it can also clear them. */
+const VARS = [
+	'--k-tint-a',
+	'--k-tint-b',
+	'--k-tint-mid',
+	'--k-tint-angle',
+	'--k-tint',
+	'--k-accent-seed',
+];
 
 export const theme = $state<{
 	pref: ThemePref;
-	/** A preset id, or `CUSTOM_PALETTE`. */
-	palette: string;
-	/** The reader's own colour, kept while a preset is in use. */
-	custom: string;
+	look: Look;
 	pureBlack: boolean;
 	/** Show MangaDex's rating next to our own readers' rating. */
 	mdRatings: boolean;
 }>({
 	pref: 'system',
-	palette: DEFAULT_PALETTE,
-	custom: '#7c6cf0',
+	look: { ...DEFAULT_LOOK },
 	pureBlack: false,
 	mdRatings: true,
 });
@@ -79,34 +138,58 @@ export function resolvedTheme(pref: ThemePref = theme.pref): 'light' | 'dark' {
 	return pref === 'system' ? (systemDark() ? 'dark' : 'light') : pref;
 }
 
-/** The seed colour in use, or null for the default palette. */
-function seed(): string | null {
-	if (theme.palette === CUSTOM_PALETTE) return theme.custom;
-	if (theme.palette === DEFAULT_PALETTE) return null;
-	return PALETTES.find((p) => p.id === theme.palette)?.seed ?? null;
+export function sameLook(x: Look, y: Look): boolean {
+	if (x.backdrop !== y.backdrop || x.accent !== y.accent) return false;
+	if (x.backdrop === 'none') return true;
+	if (x.a !== y.a || x.strength !== y.strength) return false;
+	return x.backdrop === 'solid' || (x.b === y.b && x.angle === y.angle);
+}
+
+/** The preset the current look is, if it is one. */
+export function activePreset(): string | null {
+	return PRESETS.find((p) => sameLook(p.look, theme.look))?.id ?? null;
+}
+
+/** What goes on <html> for a look: the data attributes and the CSS variables. */
+function paint(look: Look): { attrs: Record<string, string>; vars: Record<string, string> } {
+	const attrs: Record<string, string> = {};
+	const vars: Record<string, string> = {};
+	if (look.backdrop !== 'none') {
+		const b = look.backdrop === 'gradient' ? look.b : look.a;
+		attrs.tint = look.backdrop;
+		vars['--k-tint-a'] = look.a;
+		vars['--k-tint-b'] = b;
+		vars['--k-tint-mid'] = look.backdrop === 'gradient' ? midpoint(look.a, b) : look.a;
+		vars['--k-tint-angle'] = `${look.angle}deg`;
+		vars['--k-tint'] = String(look.strength / 100);
+	}
+	if (look.accent) {
+		attrs.accent = '';
+		vars['--k-accent-seed'] = look.accent;
+	}
+	return { attrs, vars };
 }
 
 function apply(): void {
 	if (typeof document === 'undefined') return;
 	const root = document.documentElement;
-	const mode = resolvedTheme();
-	root.dataset.theme = mode;
-	const s = seed();
-	if (s) {
-		root.dataset.palette = theme.palette;
-		root.style.setProperty('--k-seed', s);
-	} else {
-		delete root.dataset.palette;
-		root.style.removeProperty('--k-seed');
+	root.dataset.theme = resolvedTheme();
+	const { attrs, vars } = paint(theme.look);
+	for (const key of ['tint', 'accent']) {
+		if (key in attrs) root.dataset[key] = attrs[key];
+		else delete root.dataset[key];
+	}
+	for (const name of VARS) {
+		if (name in vars) root.style.setProperty(name, vars[name]);
+		else root.style.removeProperty(name);
 	}
 	if (theme.pureBlack) root.dataset.black = '';
 	else delete root.dataset.black;
 	if (theme.mdRatings) delete root.dataset.mdRatings;
 	else root.dataset.mdRatings = 'off';
-	// The browser / OS bar around the page. A palette tints the background by a few
-	// percent only, so the untinted value is close enough here.
-	const bar = mode === 'light' ? '#f4f2ee' : theme.pureBlack ? '#000000' : '#0c0c0d';
-	document.querySelector('meta[name="theme-color"]')?.setAttribute('content', bar);
+	// The browser / OS bar around the page: whatever the page background resolved to.
+	const bar = getComputedStyle(root).backgroundColor;
+	if (bar) document.querySelector('meta[name="theme-color"]')?.setAttribute('content', bar);
 }
 
 function save(): void {
@@ -115,11 +198,11 @@ function save(): void {
 		localStorage.setItem(
 			LOOK_KEY,
 			JSON.stringify({
-				palette: theme.palette,
-				seed: seed(),
-				custom: theme.custom,
+				v: 2,
+				look: theme.look,
 				black: theme.pureBlack,
 				md: theme.mdRatings,
+				...paint(theme.look),
 			}),
 		);
 	} catch {
@@ -127,27 +210,52 @@ function save(): void {
 	}
 }
 
-/** Restore the saved look and start tracking OS changes. Call once on mount. */
+/** A saved look, checked field by field; anything damaged falls back to the default. */
+function readLook(raw: unknown): Look {
+	const r = (raw ?? {}) as Partial<Record<keyof Look, unknown>>;
+	const num = (x: unknown, lo: number, hi: number, d: number) =>
+		typeof x === 'number' && Number.isFinite(x) ? Math.min(hi, Math.max(lo, Math.round(x))) : d;
+	return {
+		backdrop: r.backdrop === 'solid' || r.backdrop === 'gradient' ? r.backdrop : 'none',
+		a: isHex(r.a) ? r.a.toLowerCase() : DEFAULT_LOOK.a,
+		b: isHex(r.b) ? r.b.toLowerCase() : DEFAULT_LOOK.b,
+		angle: num(r.angle, 0, 359, DEFAULT_LOOK.angle),
+		strength: num(r.strength, 0, 100, DEFAULT_LOOK.strength),
+		accent: isHex(r.accent) ? r.accent.toLowerCase() : null,
+	};
+}
+
+/** The look an older version saved: one palette colour that tinted the app and was
+ * its accent too. */
+function fromV1(saved: { palette?: unknown; custom?: unknown }): Look {
+	if (saved.palette === 'custom' && isHex(saved.custom)) return solid(saved.custom.toLowerCase());
+	return PRESETS.find((p) => p.id === saved.palette)?.look ?? DEFAULT_LOOK;
+}
+
+/** Restore the saved look and start tracking OS changes. Call once on mount. It is
+ * called from an effect: untracked, so that writing the look does not re-run it. */
 export function initTheme(): void {
-	try {
-		const mode = localStorage.getItem(MODE_KEY);
-		if (mode === 'light' || mode === 'dark' || mode === 'system') theme.pref = mode;
-		const look = JSON.parse(localStorage.getItem(LOOK_KEY) || '{}') ?? {};
-		if (typeof look.custom === 'string' && HEX.test(look.custom)) theme.custom = look.custom;
-		if (look.palette === CUSTOM_PALETTE || PALETTES.some((p) => p.id === look.palette)) {
-			theme.palette = look.palette;
-		}
-		theme.pureBlack = look.black === true;
-		theme.mdRatings = look.md !== false;
-	} catch {
-		/* private mode or a damaged value: keep the defaults */
-	}
-	apply();
+	untrack(restore);
 	if (typeof matchMedia !== 'undefined') {
 		matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
 			if (theme.pref === 'system') apply();
 		});
 	}
+}
+
+function restore(): void {
+	try {
+		const mode = localStorage.getItem(MODE_KEY);
+		if (mode === 'light' || mode === 'dark' || mode === 'system') theme.pref = mode;
+		const saved = JSON.parse(localStorage.getItem(LOOK_KEY) || '{}') ?? {};
+		theme.look = saved.v === 2 ? readLook(saved.look) : { ...fromV1(saved) };
+		theme.pureBlack = saved.black === true;
+		theme.mdRatings = saved.md !== false;
+		if (saved.v !== 2 && saved.palette !== undefined) save();
+	} catch {
+		/* private mode or a damaged value: keep the defaults */
+	}
+	apply();
 }
 
 export function setTheme(pref: ThemePref): void {
@@ -156,18 +264,20 @@ export function setTheme(pref: ThemePref): void {
 	apply();
 }
 
-/** Use a preset palette (`DEFAULT_PALETTE` for the app's own colours). */
-export function setPalette(id: string): void {
-	theme.palette = id;
+/** Use a ready-made look. */
+export function applyPreset(id: string): void {
+	const preset = PRESETS.find((p) => p.id === id);
+	if (!preset) return;
+	theme.look = { ...preset.look };
 	save();
 	apply();
 }
 
-/** Use the reader's own colour (`#rrggbb`) as the palette. */
-export function setCustomColor(hex: string): void {
-	if (!HEX.test(hex)) return;
-	theme.custom = hex;
-	theme.palette = CUSTOM_PALETTE;
+/** Change part of the look. Colours that are not `#rrggbb` are ignored. */
+export function updateLook(patch: Partial<Look>): void {
+	const next = { ...theme.look, ...patch };
+	if (!isHex(next.a) || !isHex(next.b) || (next.accent !== null && !isHex(next.accent))) return;
+	theme.look = readLook(next);
 	save();
 	apply();
 }
@@ -189,7 +299,7 @@ export function setMdRatings(on: boolean): void {
  * look and stays as it is. */
 export function resetTheme(): void {
 	theme.pref = 'system';
-	theme.palette = DEFAULT_PALETTE;
+	theme.look = { ...DEFAULT_LOOK };
 	theme.pureBlack = false;
 	save();
 	apply();

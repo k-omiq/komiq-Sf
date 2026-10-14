@@ -8,6 +8,7 @@
 	import Icon from '$lib/components/Icon.svelte';
 	import Avatar from '$lib/components/Avatar.svelte';
 	import Dropdown from '$lib/components/Dropdown.svelte';
+	import ColorPicker from '$lib/components/ColorPicker.svelte';
 	import { auth, logout } from '$lib/auth.svelte';
 	import { backend } from '$lib/context';
 	import {
@@ -21,15 +22,18 @@
 	import { fetchLocked, instance, loadInstance } from '$lib/instance.svelte';
 	import { connectScreen, engineSupported } from '$lib/server-connect.svelte';
 	import {
-		CUSTOM_PALETTE,
-		PALETTES,
+		PRESETS,
+		SWATCHES,
+		activePreset,
+		applyPreset,
 		resetTheme,
-		setCustomColor,
 		setMdRatings,
-		setPalette,
 		setPureBlack,
 		setTheme,
 		theme,
+		updateLook,
+		type Backdrop,
+		type Look,
 		type ThemePref,
 	} from '$lib/theme.svelte';
 	import {
@@ -68,6 +72,43 @@
 		{ value: 'light', label: 'Light' },
 		{ value: 'dark', label: 'Dark' },
 	];
+	const BACKDROPS: { value: Backdrop; label: string }[] = [
+		{ value: 'none', label: 'None' },
+		{ value: 'solid', label: 'Colour' },
+		{ value: 'gradient', label: 'Gradient' },
+	];
+	const preset = $derived(activePreset());
+	const look = $derived(theme.look);
+	/** The colour of the app's own accent, for its swatch. */
+	const KOMIQ_ACCENT = '#e0836a';
+	/** The accent is the reader's own pick, not one of the quick picks. */
+	const customAccent = $derived(
+		look.accent !== null && !SWATCHES.some((s) => s.hex === look.accent),
+	);
+
+	/** Which colour the inline picker edits, if it is open. */
+	type Target = 'a' | 'b' | 'accent';
+	let editing = $state<Target | null>(null);
+	function toggleEditing(target: Target): void {
+		editing = editing === target ? null : target;
+	}
+	function pick(target: Target, hex: string): void {
+		updateLook(target === 'accent' ? { accent: hex } : { [target]: hex });
+	}
+	function setBackdrop(backdrop: Backdrop): void {
+		updateLook({ backdrop });
+		if (backdrop === 'none' || (backdrop === 'solid' && editing === 'b')) {
+			editing = editing === 'accent' ? 'accent' : null;
+		}
+	}
+	/** What a preset tile shows: its background colours over the theme's own surface,
+	 * stronger than the app shows them so a tile reads at a glance. */
+	function presetFill(l: Look): string {
+		if (l.backdrop === 'none') return 'var(--k-surface-5)';
+		const mix = (hex: string) => `color-mix(in oklab, ${hex} 55%, var(--k-surface-5))`;
+		if (l.backdrop === 'solid') return mix(l.a);
+		return `linear-gradient(${l.angle}deg, ${mix(l.a)}, ${mix(l.b)})`;
+	}
 
 	// --- Reading ----------------------------------------------------------------
 	// The same object the chapter reader restores on open (see $lib/reader-prefs).
@@ -307,6 +348,24 @@
 	<title>Settings · komiq</title>
 </svelte:head>
 
+{#snippet well(target: 'a' | 'b', name: string, hex: string)}
+	<button
+		type="button"
+		class="well"
+		class:open={editing === target}
+		aria-expanded={editing === target}
+		aria-controls="picker-panel"
+		onclick={() => toggleEditing(target)}
+	>
+		<span class="well-chip" style:background={hex}></span>
+		<span class="well-text">
+			<span class="well-name">{name}</span>
+			<span class="well-hex">{hex.slice(1).toUpperCase()}</span>
+		</span>
+		<span class="well-caret"><Icon name="chevron-down" size={16} /></span>
+	</button>
+{/snippet}
+
 {#snippet toggle(
 	id: string,
 	label: string,
@@ -374,43 +433,197 @@
 			</div>
 			<div class="stack">
 				<div class="text">
-					<span class="label" id="palette-label">Colour palette</span>
-					<span class="desc">Changes the accent colour and tints the whole app to match.</span>
+					<span class="label" id="preset-label">Presets</span>
+					<span class="desc">
+						A background and an accent that go together. Change either below.
+					</span>
 				</div>
-				<div class="palettes" role="radiogroup" aria-labelledby="palette-label">
-					{#each PALETTES as p (p.id)}
+				<div class="presets" role="radiogroup" aria-labelledby="preset-label">
+					{#each PRESETS as p (p.id)}
+						{@const on = preset === p.id}
 						<button
 							type="button"
 							role="radio"
-							class="palette"
-							aria-label={p.name}
-							aria-checked={theme.palette === p.id}
-							class:on={theme.palette === p.id}
-							onclick={() => setPalette(p.id)}
+							class="preset"
+							aria-checked={on}
+							class:on
+							onclick={() => applyPreset(p.id)}
 						>
-							<span class="swatch" style:background={p.seed}>
-								{#if theme.palette === p.id}<Icon name="check" size={15} />{/if}
+							<span class="preset-fill" style:background={presetFill(p.look)}>
+								<span class="preset-accent" style:background={p.look.accent ?? KOMIQ_ACCENT}></span>
+								{#if on}
+									<span class="preset-check">
+										<Icon name="check" size={12} strokeWidth={3} />
+									</span>
+								{/if}
 							</span>
-							<span class="palette-name">{p.name}</span>
+							<span class="preset-name">{p.name}</span>
 						</button>
 					{/each}
-					<!-- The reader's own colour. The native colour input covers the whole tile,
-					     so a tap anywhere on it opens the picker. -->
-					<label class="palette custom" class:on={theme.palette === CUSTOM_PALETTE}>
-						<span class="swatch" style:background={theme.custom}>
-							{#if theme.palette === CUSTOM_PALETTE}<Icon name="check" size={15} />
-							{:else}<Icon name="plus" size={15} />{/if}
-						</span>
-						<span class="palette-name">Custom</span>
-						<input
-							type="color"
-							aria-label="Custom colour"
-							value={theme.custom}
-							oninput={(e) => setCustomColor(e.currentTarget.value)}
-							onclick={() => setCustomColor(theme.custom)}
-						/>
-					</label>
 				</div>
+			</div>
+
+			<div class="stack">
+				<div class="row">
+					<div class="text">
+						<span class="label" id="backdrop-label">Background</span>
+						<span class="desc">
+							{look.backdrop === 'none'
+								? 'The neutral grey of the theme.'
+								: 'Tints the page and every surface. Text keeps its contrast.'}
+						</span>
+					</div>
+					<div class="seg" role="radiogroup" aria-labelledby="backdrop-label">
+						{#each BACKDROPS as b (b.value)}
+							<button
+								type="button"
+								role="radio"
+								aria-checked={look.backdrop === b.value}
+								class:on={look.backdrop === b.value}
+								onclick={() => setBackdrop(b.value)}>{b.label}</button
+							>
+						{/each}
+					</div>
+				</div>
+
+				{#if look.backdrop !== 'none'}
+					<div class="tint">
+						<div class="wells">
+							{@render well('a', look.backdrop === 'gradient' ? 'From' : 'Colour', look.a)}
+							{#if look.backdrop === 'gradient'}
+								<button
+									type="button"
+									class="swap k-hit"
+									aria-label="Swap the two colours"
+									title="Swap"
+									onclick={() => updateLook({ a: look.b, b: look.a })}
+								>
+									<Icon name="arrow-left-right" size={16} />
+								</button>
+								{@render well('b', 'To', look.b)}
+							{/if}
+						</div>
+						{#if editing === 'a' || (editing === 'b' && look.backdrop === 'gradient')}
+							<div class="picker-panel" id="picker-panel">
+								{#key editing}
+									{@const target = editing}
+									<ColorPicker
+										value={target === 'a' ? look.a : look.b}
+										label={target === 'a' ? 'Background colour' : 'Gradient end colour'}
+										swatches={SWATCHES}
+										onchange={(hex) => pick(target, hex)}
+									/>
+								{/key}
+							</div>
+						{/if}
+						{#if look.backdrop === 'gradient'}
+							<div class="slider">
+								<label class="text between" for="angle-range">
+									<span class="label sub">Direction</span>
+									<span class="value">
+										<span class="compass" style:rotate="{look.angle - 90}deg" aria-hidden="true">
+											<Icon name="arrow-right" size={14} strokeWidth={2.4} />
+										</span>
+										{look.angle}°
+									</span>
+								</label>
+								<input
+									id="angle-range"
+									type="range"
+									min="0"
+									max="359"
+									step="1"
+									value={look.angle}
+									oninput={(e) => updateLook({ angle: e.currentTarget.valueAsNumber })}
+								/>
+							</div>
+						{/if}
+						<div class="slider">
+							<label class="text between" for="strength-range">
+								<span class="label sub">Strength</span>
+								<span class="value">{look.strength}%</span>
+							</label>
+							<input
+								id="strength-range"
+								type="range"
+								min="0"
+								max="100"
+								step="1"
+								value={look.strength}
+								oninput={(e) => updateLook({ strength: e.currentTarget.valueAsNumber })}
+							/>
+						</div>
+					</div>
+				{/if}
+			</div>
+
+			<div class="stack">
+				<div class="text">
+					<span class="label" id="accent-label">Accent</span>
+					<span class="desc">Links, highlights and the main buttons.</span>
+				</div>
+				<div class="accents" role="radiogroup" aria-labelledby="accent-label">
+					<button
+						type="button"
+						role="radio"
+						class="accent-dot k-hit"
+						style:background={KOMIQ_ACCENT}
+						aria-checked={look.accent === null}
+						aria-label="komiq (default)"
+						title="komiq (default)"
+						class:on={look.accent === null}
+						onclick={() => updateLook({ accent: null })}
+					>
+						{#if look.accent === null}<Icon name="check" size={14} strokeWidth={3} />{/if}
+					</button>
+					<span class="accent-gap" aria-hidden="true"></span>
+					{#each SWATCHES.slice(1) as s (s.hex)}
+						{@const on = look.accent === s.hex}
+						<button
+							type="button"
+							role="radio"
+							class="accent-dot k-hit"
+							style:background={s.hex}
+							aria-checked={on}
+							aria-label={s.name}
+							title={s.name}
+							class:on
+							onclick={() => updateLook({ accent: s.hex })}
+						>
+							{#if on}<Icon name="check" size={14} strokeWidth={3} />{/if}
+						</button>
+					{/each}
+					<!-- Opens the picker, so a disclosure button rather than a radio. -->
+					<button
+						type="button"
+						class="accent-dot custom k-hit"
+						class:on={customAccent}
+						class:open={editing === 'accent'}
+						style:--own={customAccent ? look.accent : null}
+						aria-expanded={editing === 'accent'}
+						aria-controls="accent-picker"
+						aria-label={customAccent ? 'Your own colour (in use)' : 'Your own colour'}
+						title="Your own colour"
+						onclick={() => {
+							toggleEditing('accent');
+							if (!customAccent && editing === 'accent') {
+								updateLook({ accent: look.accent ?? KOMIQ_ACCENT });
+							}
+						}}
+					>
+						{#if customAccent}<Icon name="check" size={14} strokeWidth={3} />
+						{:else}<Icon name="plus" size={14} strokeWidth={2.6} />{/if}
+					</button>
+				</div>
+				{#if editing === 'accent'}
+					<div class="picker-panel" id="accent-picker">
+						<ColorPicker
+							value={look.accent ?? KOMIQ_ACCENT}
+							label="Accent colour"
+							onchange={(hex) => pick('accent', hex)}
+						/>
+					</div>
+				{/if}
 			</div>
 			<div class="row">
 				<label class="text" for="black-switch">
@@ -796,7 +1009,7 @@
 					<span class="desc" role="status">
 						{done === 'look'
 							? 'Done. The app is back to its own colours.'
-							: 'Theme, colour palette and pure black.'}
+							: 'Theme, background, accent and pure black.'}
 					</span>
 				</div>
 				<button type="button" class="btn k-hit" onclick={resetLook}>Reset</button>
@@ -975,60 +1188,246 @@
 		color: var(--k-on-primary);
 	}
 
-	/* ---- Palette tiles ------------------------------------------------------ */
-	.palettes {
+	/* ---- Presets ------------------------------------------------------------ */
+	.presets {
 		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
-		gap: 8px;
+		grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+		gap: 6px;
 	}
-	.palette {
-		position: relative;
+	.preset {
 		display: flex;
 		flex-direction: column;
-		align-items: center;
 		gap: 8px;
-		padding: 12px 6px 10px;
+		padding: 6px 6px 9px;
 		border: none;
-		border-radius: 12px;
+		border-radius: 14px;
 		background: transparent;
 		color: var(--k-text-dim);
 		font-family: inherit;
+		text-align: left;
 		cursor: pointer;
-		transition: background var(--k-dur) var(--k-ease);
+		transition:
+			background var(--k-dur) var(--k-ease),
+			color var(--k-dur) var(--k-ease);
 	}
-	.palette:hover {
+	.preset:hover {
 		background: var(--k-hover-fill);
+		color: var(--k-text-1);
 	}
-	.palette.on {
+	.preset.on {
 		background: var(--k-surface-5);
 		color: var(--k-text);
 	}
-	.swatch {
-		width: 36px;
-		height: 36px;
-		border-radius: 50%;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		color: #fff;
+	.preset-fill {
+		position: relative;
+		height: 52px;
+		border-radius: 10px;
+		transition: transform 220ms cubic-bezier(0.16, 1, 0.3, 1);
 	}
-	.palette-name {
-		font-size: 12px;
+	.preset:active .preset-fill {
+		transform: scale(0.97);
+	}
+	.preset-accent {
+		position: absolute;
+		left: 9px;
+		bottom: 9px;
+		width: 22px;
+		height: 8px;
+		border-radius: 999px;
+	}
+	.preset-check {
+		position: absolute;
+		top: 7px;
+		right: 7px;
+		width: 20px;
+		height: 20px;
+		border-radius: 50%;
+		display: grid;
+		place-items: center;
+		background: var(--k-primary);
+		color: var(--k-on-primary);
+	}
+	.preset-name {
+		padding: 0 4px;
+		font-size: 12.5px;
 		font-weight: 600;
 		line-height: 1.2;
-		text-align: center;
+		overflow-wrap: anywhere;
 	}
-	.palette.custom input {
-		position: absolute;
-		inset: 0;
-		width: 100%;
-		height: 100%;
-		opacity: 0;
+
+	/* ---- Background controls ------------------------------------------------- */
+	.tint {
+		display: flex;
+		flex-direction: column;
+		gap: 16px;
+		padding: 16px;
+		border-radius: 14px;
+		background: var(--k-surface-3);
+	}
+	.wells {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.well {
+		flex: 1 1 0;
+		min-width: 0;
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		min-height: 52px;
+		padding: 8px 10px 8px 8px;
+		border: none;
+		border-radius: 12px;
+		background: var(--k-surface-5);
+		color: var(--k-text-1);
+		font-family: inherit;
+		text-align: left;
 		cursor: pointer;
+		transition: background var(--k-dur) var(--k-ease);
 	}
-	.palette.custom:focus-within {
-		outline: 2px solid var(--k-focus-ring);
-		outline-offset: 2px;
+	.well:hover {
+		background: var(--k-border-4);
+	}
+	.well-chip {
+		flex: 0 0 auto;
+		width: 36px;
+		height: 36px;
+		border-radius: 9px;
+	}
+	.well-text {
+		flex: 1 1 auto;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+	}
+	.well-name {
+		font-size: 13px;
+		font-weight: 600;
+	}
+	.well-hex {
+		font-family: var(--k-font-mono);
+		font-size: 12px;
+		color: var(--k-text-faint);
+	}
+	.well-caret {
+		display: flex;
+		color: var(--k-text-faint);
+		transition: transform 220ms cubic-bezier(0.16, 1, 0.3, 1);
+	}
+	.well.open .well-caret {
+		transform: rotate(180deg);
+	}
+	.swap {
+		flex: 0 0 auto;
+		width: 36px;
+		height: 36px;
+		border: none;
+		border-radius: 50%;
+		display: grid;
+		place-items: center;
+		background: transparent;
+		color: var(--k-text-dim);
+		cursor: pointer;
+		transition:
+			background var(--k-dur) var(--k-ease),
+			color var(--k-dur) var(--k-ease);
+	}
+	.swap:hover {
+		background: var(--k-hover-fill);
+		color: var(--k-text);
+	}
+	.picker-panel {
+		padding: 14px;
+		border-radius: 14px;
+		background: var(--k-surface-4);
+		animation: panel-in 260ms cubic-bezier(0.16, 1, 0.3, 1);
+	}
+	@keyframes panel-in {
+		from {
+			opacity: 0;
+			transform: translateY(-4px);
+		}
+	}
+	.slider {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+	}
+	.label.sub {
+		font-size: 13px;
+	}
+	.value {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+	}
+	.compass {
+		display: inline-flex;
+		color: var(--k-text-faint);
+	}
+
+	/* ---- Accent ---------------------------------------------------------------- */
+	.accents {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 10px;
+	}
+	.accent-gap {
+		width: 1px;
+		height: 20px;
+		margin: 0 2px;
+		background: var(--k-border-2);
+	}
+	.accent-dot {
+		width: 32px;
+		height: 32px;
+		padding: 0;
+		border: none;
+		border-radius: 50%;
+		display: grid;
+		place-items: center;
+		color: #fff;
+		cursor: pointer;
+		transition:
+			transform 220ms cubic-bezier(0.16, 1, 0.3, 1),
+			box-shadow var(--k-dur) var(--k-ease);
+	}
+	.accent-dot:hover {
+		transform: scale(1.1);
+	}
+	/* The chosen one gets a ring in the page colour, then one in the text colour, so
+	   it shows on any swatch. */
+	.accent-dot.on {
+		box-shadow:
+			0 0 0 2px var(--k-surface-2),
+			0 0 0 4px var(--k-text-2);
+	}
+	.accent-dot :global(svg) {
+		filter: drop-shadow(0 1px 1px rgb(0 0 0 / 0.4));
+	}
+	/* "Your own colour": a colour wheel until there is one, then that colour. */
+	.accent-dot.custom {
+		background: conic-gradient(
+			from 90deg,
+			hsl(0 85% 60%),
+			hsl(60 85% 55%),
+			hsl(120 70% 50%),
+			hsl(180 75% 50%),
+			hsl(240 80% 62%),
+			hsl(300 75% 60%),
+			hsl(360 85% 60%)
+		);
+	}
+	.accent-dot.custom.on {
+		background: var(--own);
+	}
+	.accent-dot.custom.open:not(.on) {
+		box-shadow:
+			0 0 0 2px var(--k-surface-2),
+			0 0 0 4px var(--k-border-4);
 	}
 
 	/* ---- Switch ------------------------------------------------------------- */
@@ -1337,8 +1736,28 @@
 		.seg button {
 			flex: 1;
 		}
-		.palettes {
-			grid-template-columns: repeat(auto-fill, minmax(76px, 1fr));
+		.presets {
+			grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+		}
+		.row:has(.seg) .seg {
+			width: 100%;
+		}
+		.tint {
+			padding: 12px;
+		}
+		.picker-panel {
+			padding: 12px;
+		}
+		/* Seven to a row on a phone: the default and six picks, then the rest. */
+		.accents {
+			gap: 12px 10px;
+		}
+		.accent-gap {
+			display: none;
+		}
+		.accent-dot {
+			width: 34px;
+			height: 34px;
 		}
 		/* Finger-sized chips, and a search field iOS does not zoom into. */
 		.chip {
@@ -1347,6 +1766,16 @@
 		.tag-search {
 			min-height: 44px;
 			font-size: 16px;
+		}
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.picker-panel {
+			animation: none;
+		}
+		.preset-fill,
+		.accent-dot,
+		.well-caret {
+			transition: none;
 		}
 	}
 </style>
