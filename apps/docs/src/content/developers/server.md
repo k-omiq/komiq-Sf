@@ -177,7 +177,7 @@ The server exposes Prometheus metrics on loopback:
 curl http://127.0.0.1:9090/metrics
 ```
 
-The listener binds to `127.0.0.1` on `KOMIKA_METRICS_PORT` (default 9090). It exports scan counts, circuit breaker state and feed freshness, plus database storage, pool size and idle connections, writer queue waits and database lock errors. Historical metric names may still contain `sqlite` for compatibility. These aggregate metrics contain no user data.
+The listener binds to `KOMIKA_METRICS_BIND_ADDR` (default `127.0.0.1`) on `KOMIKA_METRICS_PORT` (default 9090). The Compose deployment binds `0.0.0.0` inside the container, because Docker forwards a published port to the container network address and not to its loopback. It publishes the port on host `127.0.0.1` only. It exports scan counts, circuit breaker state and feed freshness, plus database storage, pool size and idle connections, writer queue waits and database lock errors. Historical metric names may still contain `sqlite` for compatibility. These aggregate metrics contain no user data.
 
 ## Where to look
 

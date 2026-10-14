@@ -80,7 +80,7 @@ The `server` container runs `komika-server`, a Rust application based on Axum, a
 - Exposes readiness health checks at `/health/ready`, which performs an active database query (`SELECT 1`) to ensure connection pool availability.
 - Proxies cover and page images from the internal Suwayomi engine at `/api/v1/manga/...` via `SUWAYOMI_PUBLIC_URL`.
 - Runs background tasks including library scan schedules, chapter update discovery, and canonical catalog synchronization.
-- Serves Prometheus metrics on an isolated internal listener bound to loopback `127.0.0.1:9090` at `/metrics`.
+- Serves Prometheus metrics at `/metrics` on a separate listener, port 9090. Inside the container it binds `0.0.0.0` (`KOMIKA_METRICS_BIND_ADDR`), and Compose publishes it on host loopback `127.0.0.1:9090` only.
 - Memory is capped at 6 GB to prevent runaway allocations from affecting host stability.
 
 ### The Suwayomi engine

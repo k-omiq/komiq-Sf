@@ -1801,9 +1801,11 @@ async fn health() -> &'static str {
 /// Database gauges and small process counters expose writer contention without
 /// requiring a metrics registry. The remaining gauges track scan-scheduler health
 /// (the herd/backoff signals), the subscription circuit breaker, and updates-feed
-/// freshness. Served on its OWN listener bound to 127.0.0.1:{metrics_port}, so it
-/// is unreachable from outside the host by construction (no reliance on ingress
-/// filtering). Even leaked it discloses only aggregate counts, not user data.
+/// freshness. Served on its OWN listener, bound to 127.0.0.1:{metrics_port} by
+/// default, so it is unreachable from outside the host by construction (no
+/// reliance on ingress filtering). In a container, `KOMIKA_METRICS_BIND_ADDR`
+/// widens the bind and the host-loopback publish keeps it on-host. Even leaked
+/// it discloses only aggregate counts, not user data.
 async fn metrics(State(pool): State<crate::db::Database>) -> impl IntoResponse {
     // One helper so a single failed query degrades to a `-1` gauge rather than 500ing
     // the whole scrape (a metrics endpoint that fails is worse than one with a hole).
@@ -2565,8 +2567,11 @@ async fn main() -> anyhow::Result<()> {
         cloudflare.clone(),
     );
 
-    // Loopback-only metrics listener, separate from the public router: binding to
-    // 127.0.0.1 makes the scrape endpoint unreachable off-host by construction.
+    // Metrics listener, separate from the public router. It binds 127.0.0.1 by
+    // default, which makes the scrape endpoint unreachable off-host by
+    // construction. A container sets KOMIKA_METRICS_BIND_ADDR=0.0.0.0, because
+    // Docker forwards a published port to the container's network address and
+    // never to its loopback; the compose publish stays on the host's 127.0.0.1.
     // The handler extracts `State<Database>`, so a minimal router over the main
     // pool is all it needs. No graceful shutdown of its own — a detached task lets
     // the process exit when `axum::serve` on the public port returns (an in-flight
@@ -2579,9 +2584,15 @@ async fn main() -> anyhow::Result<()> {
     let metrics_app = Router::new()
         .route("/metrics", get(metrics))
         .with_state(pool.clone());
-    let metrics_addr = format!("127.0.0.1:{}", cfg.metrics_port);
-    let metrics_listener = tokio::net::TcpListener::bind(&metrics_addr).await?;
-    tracing::info!("metrics listening on http://{metrics_addr}/metrics (loopback only)");
+    let metrics_ip: IpAddr = cfg.metrics_bind_addr.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "KOMIKA_METRICS_BIND_ADDR must be an IP address (e.g. 127.0.0.1), got {:?}",
+            cfg.metrics_bind_addr
+        )
+    })?;
+    let metrics_addr = SocketAddr::new(metrics_ip, cfg.metrics_port);
+    let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
+    tracing::info!("metrics listening on http://{metrics_addr}/metrics");
     tokio::spawn(async move {
         let _ = axum::serve(metrics_listener, metrics_app).await;
     });

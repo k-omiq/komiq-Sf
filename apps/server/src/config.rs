@@ -149,8 +149,14 @@ pub struct Config {
     /// silently widening a loopback-only intent to every interface.
     pub bind_addr: String,
     pub port: u16,
-    /// Port for the `/metrics` scrape endpoint, served on its own listener
-    /// bound to 127.0.0.1 (never the public router). Default 9090, the de-facto
+    /// Address the `/metrics` listener binds (`KOMIKA_METRICS_BIND_ADDR`, default
+    /// `127.0.0.1`). It is a separate listener, never the public router. Only a
+    /// container sets this to `0.0.0.0`: Docker forwards a published port to the
+    /// container's network address, not to its loopback, so the compose file
+    /// widens the bind inside the container and keeps the HOST publish on
+    /// 127.0.0.1. `main` refuses anything but an IP literal, like `bind_addr`.
+    pub metrics_bind_addr: String,
+    /// Port for the `/metrics` scrape endpoint. Default 9090, the de-facto
     /// Prometheus sidecar convention. Override with `KOMIKA_METRICS_PORT`.
     pub metrics_port: u16,
     pub database_url: String,
@@ -282,11 +288,8 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        let bind_addr = env::var("BIND_ADDR")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "0.0.0.0".to_string());
+        let bind_addr = addr_or(env::var("BIND_ADDR").ok(), "0.0.0.0");
+        let metrics_bind_addr = addr_or(env::var("KOMIKA_METRICS_BIND_ADDR").ok(), "127.0.0.1");
         let port = env::var("PORT")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -522,6 +525,7 @@ impl Config {
         Self {
             bind_addr,
             port,
+            metrics_bind_addr,
             metrics_port,
             database_url,
             suwayomi_url,
@@ -570,6 +574,13 @@ impl Config {
 /// SQLite URLs still derive a sibling file for offline/source tooling. Handles `sqlite:///abs/dir/komika.sqlite3`, `sqlite://rel.sqlite3`, and
 /// `sqlite:rel.sqlite3`. A `:memory:` URL (tests only — prod is always a file) maps
 /// to its own in-memory DB.
+/// A listener address from an env value: trimmed, with `default` when unset or blank.
+fn addr_or(raw: Option<String>, default: &str) -> String {
+    raw.map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 fn derive_covers_url(database_url: &str) -> String {
     if database_url.starts_with("postgres:") || database_url.starts_with("postgresql:") {
         return "sqlite://covers.sqlite3".to_string();
@@ -592,6 +603,7 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("bind_addr", &self.bind_addr)
             .field("port", &self.port)
+            .field("metrics_bind_addr", &self.metrics_bind_addr)
             .field("metrics_port", &self.metrics_port)
             .field("database_url", &"<redacted>")
             .field("covers_database_url", &self.covers_database_url)
@@ -707,5 +719,18 @@ mod database_limit_tests {
         assert_eq!(overridden.foreground.lock_ms, 50);
         assert_eq!(overridden.readers.statement_ms, 30_000);
         assert_eq!(overridden.background.lock_ms, 60_000);
+    }
+}
+
+#[cfg(test)]
+mod listener_addr_tests {
+    use super::addr_or;
+
+    #[test]
+    fn metrics_bind_addr_defaults_to_loopback_and_takes_an_override() {
+        assert_eq!(addr_or(None, "127.0.0.1"), "127.0.0.1");
+        assert_eq!(addr_or(Some("  ".into()), "127.0.0.1"), "127.0.0.1");
+        assert_eq!(addr_or(Some(" 0.0.0.0 ".into()), "127.0.0.1"), "0.0.0.0");
+        assert_eq!(addr_or(Some("::1".into()), "127.0.0.1"), "::1");
     }
 }
