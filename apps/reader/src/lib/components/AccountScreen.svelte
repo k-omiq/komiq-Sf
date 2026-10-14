@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
-	import mark from '$lib/assets/mark.png';
+	import BrandMark from './BrandMark.svelte';
 
 	// A full-page screen that stands in for the whole app (the server is not set up,
 	// or the account must pick a new password first). Same card, fields and primary
@@ -22,7 +22,7 @@
 
 <div class="screen">
 	<div class="brand" role="img" aria-label="komiq">
-		<img class="brand-mark" width="32" height="32" src={mark} alt="" />
+		<BrandMark />
 		<span>omiq</span>
 	</div>
 	<section class="card" aria-labelledby="account-screen-title">
@@ -58,12 +58,6 @@
 		font-size: 22px;
 		letter-spacing: -0.01em;
 		color: var(--k-text);
-	}
-	.brand-mark {
-		width: auto;
-		height: 0.8em;
-		margin-right: 1.5px;
-		transform: translateY(0.07em);
 	}
 	.card {
 		width: 100%;

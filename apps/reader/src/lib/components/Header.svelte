@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import mark from '$lib/assets/mark.png';
+	import BrandMark from './BrandMark.svelte';
 	import { auth, logout } from '$lib/auth.svelte';
 	import { theme, cycleTheme, resolvedTheme } from '$lib/theme.svelte';
 	import Icon from './Icon.svelte';
@@ -53,7 +53,7 @@
 <header>
 	<div class="left">
 		<a class="brand k-hit" href="/" aria-label="komiq">
-			<img class="brand-mark" width="32" height="32" src={mark} alt="" />
+			<BrandMark />
 			<span>omiq</span>
 		</a>
 		<nav>
@@ -244,12 +244,6 @@
 		letter-spacing: -0.01em;
 		color: var(--k-text);
 		text-decoration: none;
-	}
-	.brand-mark {
-		width: auto;
-		height: 0.8em;
-		margin-right: 1.5px;
-		transform: translateY(0.07em);
 	}
 	nav {
 		display: none;

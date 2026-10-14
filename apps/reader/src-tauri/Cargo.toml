@@ -24,7 +24,8 @@ tauri-build = { version = "2.6.3", features = [] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-tauri = { version = "2.11.3", features = [] }
+# `image-png`: the accent-coloured window icon on Windows and Linux (`set_app_icon`).
+tauri = { version = "2.11.3", features = ["image-png"] }
 tauri-plugin-log = "2"
 # Links to other sites (`target="_blank"`: "Read on source", a source's page) open in the
 # system's default browser. Without it the web view loads them over the app itself.
@@ -59,6 +60,12 @@ jni-sys = "0.3"
 # One Objective-C message to tao's view controller, to hide the status bar in the chapter
 # reader (`set_status_bar_hidden`). Already in the tree through wry; no new crate.
 objc2 = "0.6"
+
+# The accent-coloured Dock icon (`set_app_icon`). Already in the tree through tauri.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSImage"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
 
 # In-process engine on Android (`suwayomi_inprocess_android.rs`): the JNI types, `dlopen`
 # of the bundled libjvm.so, and a zip reader to unpack the engine's files from the APK.

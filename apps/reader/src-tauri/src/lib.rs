@@ -506,6 +506,53 @@ fn set_status_bar_hidden(window: tauri::WebviewWindow, hidden: bool) {
   let _ = (window, hidden);
 }
 
+/// The app icon in the reader's accent colour, drawn by `$lib/app-icon.ts`: the Dock
+/// icon on macOS, each window's taskbar and title icon on Windows and Linux. An empty
+/// `png` puts the shipped icon back. An installed phone app keeps the icon of its
+/// package (iOS and Android only switch between icons shipped inside it), so the
+/// command does nothing there and the frontend calls it unguarded.
+#[tauri::command]
+fn set_app_icon(app: tauri::AppHandle, png: Vec<u8>) {
+  #[cfg(target_os = "macos")]
+  {
+    // AppKit wants the main thread.
+    let _ = app.run_on_main_thread(move || {
+      use objc2::{AllocAnyThread, MainThreadMarker};
+      use objc2_app_kit::{NSApplication, NSImage};
+      use objc2_foundation::NSData;
+      let Some(mtm) = MainThreadMarker::new() else {
+        return;
+      };
+      let ns_app = NSApplication::sharedApplication(mtm);
+      if png.is_empty() {
+        // nil is AppKit's "the bundle's own icon".
+        unsafe { ns_app.setApplicationIconImage(None) };
+        return;
+      }
+      let data = NSData::with_bytes(&png);
+      if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
+        unsafe { ns_app.setApplicationIconImage(Some(&image)) };
+      }
+    });
+  }
+  #[cfg(any(target_os = "windows", target_os = "linux"))]
+  {
+    use tauri::Manager;
+    let icon = if png.is_empty() {
+      app.default_window_icon().cloned()
+    } else {
+      tauri::image::Image::from_bytes(&png).ok().map(|i| i.to_owned())
+    };
+    if let Some(icon) = icon {
+      for window in app.webview_windows().values() {
+        let _ = window.set_icon(icon.clone());
+      }
+    }
+  }
+  #[cfg(any(target_os = "ios", target_os = "android"))]
+  let _ = (app, png);
+}
+
 /// The address scheme of an engine image. The web view asks for
 /// `engine-image://localhost/api/v1/…` (`http://engine-image.localhost/api/v1/…` on
 /// Windows); `packages/api/src/image-provider.ts` builds those addresses. Android does
@@ -627,6 +674,7 @@ pub fn run() {
       engine_image_base,
       suwayomi_start,
       set_status_bar_hidden,
+      set_app_icon,
       suwayomi::suwayomi_gql,
       suwayomi::suwayomi_image,
       suwayomi::suwayomi_status,

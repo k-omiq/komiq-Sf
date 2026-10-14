@@ -1,7 +1,6 @@
 /**
- * Small colour helpers for the theme controls: `#rrggbb` <-> HSV for the picker, and
- * an OKLab midpoint for a two-colour background. Everything else about a colour (the
- * lightness it is shown at, how strong the tint is) is CSS's job, in theme.css.
+ * Small colour helpers for the theme: `#rrggbb` <-> HSV for the picker, OKLab for
+ * midpoints and lightness steps, and WCAG contrast for picking readable text.
  */
 export interface Hsv {
 	/** 0-360 */
@@ -63,7 +62,11 @@ export function hsvToHex({ h, s, v }: Hsv): string {
 
 // sRGB <-> OKLab (Björn Ottosson's matrices).
 const lin = (c: number) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
-const gam = (c: number) => (c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055);
+const gam = (x: number) => {
+	// A colour sRGB cannot show comes back out of 0-1 here: clip it.
+	const c = Math.min(1, Math.max(0, x));
+	return c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055;
+};
 
 function toOklab(hex: string): [number, number, number] {
 	const [r, g, b] = toRgb(hex).map((x) => lin(x / 255));
@@ -94,4 +97,42 @@ export function midpoint(a: string, b: string): string {
 	const x = toOklab(a);
 	const y = toOklab(b);
 	return fromOklab((x[0] + y[0]) / 2, (x[1] + y[1]) / 2, (x[2] + y[2]) / 2);
+}
+
+/** WCAG relative luminance, 0 (black) to 1 (white). */
+export function luminance(hex: string): number {
+	const [r, g, b] = toRgb(hex).map((x) => lin(x / 255));
+	return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/** WCAG contrast ratio between two colours, 1 to 21. */
+export function contrast(x: string, y: string): number {
+	const a = luminance(x);
+	const b = luminance(y);
+	return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+}
+
+/** The same colour, lighter (positive) or darker (negative) by `d` OKLab lightness.
+ * Hue and chroma stay; what sRGB cannot show is clipped. */
+export function shiftL(hex: string, d: number): string {
+	const [L, a, b] = toOklab(hex);
+	return fromOklab(Math.min(1, Math.max(0, L + d)), a, b);
+}
+
+/** A colour from OKLCH (lightness 0-1, chroma, hue in degrees). */
+export function oklchToHex(L: number, C: number, H: number): string {
+	const h = (H * Math.PI) / 180;
+	return fromOklab(L, C * Math.cos(h), C * Math.sin(h));
+}
+
+/** OKLCH of a colour: [lightness, chroma, hue in degrees]. */
+export function hexToOklch(hex: string): [number, number, number] {
+	const [L, a, b] = toOklab(hex);
+	return [L, Math.hypot(a, b), ((Math.atan2(b, a) * 180) / Math.PI + 360) % 360];
+}
+
+/** `#rrggbb` as a CSS colour with an alpha. */
+export function withAlpha(hex: string, alpha: number): string {
+	const [r, g, b] = toRgb(hex);
+	return `rgb(${r} ${g} ${b} / ${alpha})`;
 }

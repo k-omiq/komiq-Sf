@@ -1,82 +1,18 @@
-/* The reader's background, accent and the pure-black background (see
- * $lib/theme.svelte.ts).
+/* The reader's own looks (see $lib/theme.svelte.ts).
  *
- * Background: `data-tint` ("solid" or "gradient") with `--k-tint-a`, `--k-tint-b`,
- * `--k-tint-mid` (their OKLab midpoint), `--k-tint-angle` and `--k-tint` (strength,
- * 0-1). Accent: `data-accent` with `--k-accent-seed`. Without the attributes nothing
- * here applies and the tokens stay as @komika/ui ships them.
- *
- * Only hue and chroma come from the reader's colours. Every token keeps the lightness
- * it ships with (the numbers below are those lightnesses in OKLCH), and the accent is
- * clamped to a band that reads on the theme's background, so text contrast holds for
- * any colour picked. The `color-mix()` line before each `oklch(from …)` one is for an
- * engine without relative colours: it drops the second line and keeps the first.
- *
- * The accent tokens derived in tokens.css (`--k-accent-soft`, `--k-focus-ring`, …)
- * read `--k-accent` through var(), so they follow too.
- *
- * Loaded after tokens.css. Each selector carries `data-theme` so that it outranks the
- * tokens' own `:root[data-theme='light']` block instead of depending on file order.
- */
+ * The colours themselves are inline variables on <html>: `--k-bg`, the surfaces and the
+ * accent tokens, worked out from what the reader picked. They override the token
+ * blocks of @komika/ui, which still supply text, borders and overlays for the text set
+ * in `data-theme`. What is left here is what a variable cannot do on its own. */
 
-/* ---- Background, dark ------------------------------------------------------ */
-:root[data-theme='dark'][data-tint] {
-	--k-bg-a: color-mix(in oklab, var(--k-tint-a) calc(var(--k-tint) * 16%), #0c0c0d);
-	--k-bg-a: oklch(from var(--k-tint-a) 0.155 calc(c * var(--k-tint) * 0.5) h);
-	--k-bg-b: color-mix(in oklab, var(--k-tint-b) calc(var(--k-tint) * 16%), #0c0c0d);
-	--k-bg-b: oklch(from var(--k-tint-b) 0.155 calc(c * var(--k-tint) * 0.5) h);
-	--k-bg: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 16%), #0c0c0d);
-	--k-bg: oklch(from var(--k-tint-mid) 0.155 calc(c * var(--k-tint) * 0.5) h);
-
-	--k-surface: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 16%), #0f0f10);
-	--k-surface: oklch(from var(--k-tint-mid) 0.169 calc(c * var(--k-tint) * 0.45) h);
-	--k-surface-2: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 18%), #141415);
-	--k-surface-2: oklch(from var(--k-tint-mid) 0.192 calc(c * var(--k-tint) * 0.45) h);
-	--k-surface-3: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 18%), #161617);
-	--k-surface-3: oklch(from var(--k-tint-mid) 0.201 calc(c * var(--k-tint) * 0.45) h);
-	--k-surface-4: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 20%), #1a1a1b);
-	--k-surface-4: oklch(from var(--k-tint-mid) 0.218 calc(c * var(--k-tint) * 0.45) h);
-	--k-surface-5: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 20%), #1f1f21);
-	--k-surface-5: oklch(from var(--k-tint-mid) 0.24 calc(c * var(--k-tint) * 0.45) h);
-	--k-avatar: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 20%), #1b1b1c);
-	--k-avatar: oklch(from var(--k-tint-mid) 0.223 calc(c * var(--k-tint) * 0.45) h);
-	--k-cover: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 18%), #141415);
-	--k-cover: oklch(from var(--k-tint-mid) 0.192 calc(c * var(--k-tint) * 0.45) h);
-	--k-glass: color-mix(in oklab, var(--k-bg) 78%, transparent);
-	--k-glass-strong: color-mix(in oklab, var(--k-bg) 90%, transparent);
+/* The komiq "k" (header, account screens) is drawn in this colour. */
+:root {
+	--k-mark: #e0836a;
 }
 
-/* ---- Background, light ----------------------------------------------------- */
-:root[data-theme='light'][data-tint] {
-	--k-bg-a: color-mix(in oklab, var(--k-tint-a) calc(var(--k-tint) * 14%), #f4f2ee);
-	--k-bg-a: oklch(from var(--k-tint-a) 0.962 calc(c * var(--k-tint) * 0.3) h);
-	--k-bg-b: color-mix(in oklab, var(--k-tint-b) calc(var(--k-tint) * 14%), #f4f2ee);
-	--k-bg-b: oklch(from var(--k-tint-b) 0.962 calc(c * var(--k-tint) * 0.3) h);
-	--k-bg: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 14%), #f4f2ee);
-	--k-bg: oklch(from var(--k-tint-mid) 0.962 calc(c * var(--k-tint) * 0.3) h);
-
-	--k-surface: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 4%), #ffffff);
-	--k-surface: oklch(from var(--k-tint-mid) 0.993 calc(c * var(--k-tint) * 0.06) h);
-	--k-surface-2: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 8%), #faf9f6);
-	--k-surface-2: oklch(from var(--k-tint-mid) 0.982 calc(c * var(--k-tint) * 0.12) h);
-	--k-surface-3: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 12%), #f4f2ee);
-	--k-surface-3: oklch(from var(--k-tint-mid) 0.962 calc(c * var(--k-tint) * 0.16) h);
-	--k-surface-4: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 14%), #ece9e3);
-	--k-surface-4: oklch(from var(--k-tint-mid) 0.935 calc(c * var(--k-tint) * 0.18) h);
-	--k-surface-5: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 16%), #e4e1da);
-	--k-surface-5: oklch(from var(--k-tint-mid) 0.91 calc(c * var(--k-tint) * 0.2) h);
-	--k-avatar: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 16%), #e7e4dd);
-	--k-avatar: oklch(from var(--k-tint-mid) 0.919 calc(c * var(--k-tint) * 0.2) h);
-	--k-cover: color-mix(in oklab, var(--k-tint-mid) calc(var(--k-tint) * 14%), #ece9e3);
-	--k-cover: oklch(from var(--k-tint-mid) 0.935 calc(c * var(--k-tint) * 0.18) h);
-	--k-glass: color-mix(in oklab, var(--k-bg) 82%, transparent);
-	--k-glass-strong: color-mix(in oklab, var(--k-bg) 94%, transparent);
-}
-
-/* ---- Gradient backdrop -------------------------------------------------------
-   The gradient sits on a fixed layer behind the page, so it fills the screen and
-   stays put while the page scrolls. `--k-bg` is its midpoint, for the few places
-   that paint the page colour themselves. */
+/* A gradient background sits on a fixed layer behind the page, so it fills the screen
+   and stays put while the page scrolls. `--k-bg` is its midpoint, for the places that
+   paint the page colour themselves. */
 :root[data-tint='gradient'] body {
 	background: transparent;
 }
@@ -90,46 +26,11 @@
 	background: linear-gradient(in oklab var(--k-tint-angle), var(--k-bg-a), var(--k-bg-b));
 }
 
-/* ---- Accent ------------------------------------------------------------------
-   The accent is text and icon colour on the background; the primary is a button
-   fill with `--k-on-primary` on it. Lightness is clamped per theme, so a very dark
-   or very pale pick still reads. Chroma is capped where sRGB runs out. */
-:root[data-theme='dark'][data-accent] {
-	--k-accent: color-mix(in oklab, var(--k-accent-seed) 78%, white);
-	--k-accent: oklch(from var(--k-accent-seed) clamp(0.72, l, 0.9) min(c, 0.17) h);
-	--k-primary: color-mix(in oklab, var(--k-accent-seed) 62%, white);
-	--k-primary: oklch(from var(--k-accent-seed) clamp(0.74, l, 0.86) min(c, 0.17) h);
-	--k-primary-hover: color-mix(in oklab, var(--k-accent-seed) 46%, white);
-	--k-primary-hover: oklch(from var(--k-accent-seed) clamp(0.8, l, 0.92) min(c, 0.15) h);
-	--k-on-primary: color-mix(in oklab, var(--k-accent-seed) 16%, #0c0c0d);
-	--k-on-primary: oklch(from var(--k-accent-seed) 0.2 calc(c * 0.2) h);
-	--k-on-accent: var(--k-on-primary);
-}
-
-:root[data-theme='light'][data-accent] {
-	--k-accent: color-mix(in oklab, var(--k-accent-seed) 74%, black);
-	--k-accent: oklch(from var(--k-accent-seed) clamp(0.36, l, 0.52) min(c, 0.2) h);
-	--k-primary: color-mix(in oklab, var(--k-accent-seed) 68%, black);
-	--k-primary: oklch(from var(--k-accent-seed) clamp(0.32, l, 0.5) min(c, 0.2) h);
-	--k-primary-hover: color-mix(in oklab, var(--k-accent-seed) 54%, black);
-	--k-primary-hover: oklch(from var(--k-accent-seed) clamp(0.26, l, 0.44) min(c, 0.2) h);
-	--k-on-primary: #ffffff;
-	--k-on-accent: #ffffff;
-}
-
-/* ---- Pure black --------------------------------------------------------------
-   Only the page and the first surface go to black, so cards and controls (tinted
-   or not) still stand out from it. Dark theme only. Later than the blocks above at
-   the same specificity, so it wins when both are on; a gradient steps aside. */
-:root[data-theme='dark'][data-black] {
-	--k-bg: #000000;
-	--k-surface: #070707;
-	--k-glass: rgba(0, 0, 0, 0.78);
-	--k-glass-strong: rgba(0, 0, 0, 0.9);
-}
-:root[data-theme='dark'][data-black] body {
-	background: var(--k-bg);
-}
-:root[data-theme='dark'][data-black] body::before {
-	display: none;
+/* Reduced transparency: solid bars. app.css does this for the default look; an inline
+   `--k-glass` would win over it, so it is repeated here with `!important`. */
+@media (prefers-reduced-transparency: reduce) {
+	:root[data-tint] {
+		--k-glass: var(--k-bg) !important;
+		--k-glass-strong: var(--k-bg) !important;
+	}
 }

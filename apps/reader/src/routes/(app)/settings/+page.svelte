@@ -2,7 +2,7 @@
 	// The settings screen. Everything about the look and the chapter reader is kept on
 	// this device and works signed out; the content filter and the block rules are the
 	// account's own settings on the server, so they need a session.
-	import { tick } from 'svelte';
+	import { onDestroy, tick } from 'svelte';
 	import { isTauri, type BlockRule, type ContentRating } from '@komika/api';
 	import type { TagInfo } from '@komika/types';
 	import Icon from '$lib/components/Icon.svelte';
@@ -22,18 +22,23 @@
 	import { fetchLocked, instance, loadInstance } from '$lib/instance.svelte';
 	import { connectScreen, engineSupported } from '$lib/server-connect.svelte';
 	import {
+		KOMIQ_ACCENT,
 		PRESETS,
 		SWATCHES,
 		activePreset,
 		applyPreset,
+		readability,
 		resetTheme,
+		resolvedTheme,
 		setMdRatings,
-		setPureBlack,
+		setPreview,
 		setTheme,
+		swatch,
 		theme,
 		updateLook,
 		type Backdrop,
 		type Look,
+		type Mode as ThemeMode,
 		type ThemePref,
 	} from '$lib/theme.svelte';
 	import {
@@ -77,14 +82,33 @@
 		{ value: 'solid', label: 'Colour' },
 		{ value: 'gradient', label: 'Gradient' },
 	];
-	const preset = $derived(activePreset());
-	const look = $derived(theme.look);
-	/** The colour of the app's own accent, for its swatch. */
-	const KOMIQ_ACCENT = '#e0836a';
+	const LOOK_MODES: { value: ThemeMode; label: string }[] = [
+		{ value: 'light', label: 'Light' },
+		{ value: 'dark', label: 'Dark' },
+	];
+
+	/** The theme whose look is being edited. The app shows it while this screen is
+	 * open, even when the other one is in use. */
+	let mode = $state<ThemeMode>(resolvedTheme());
+	function editMode(m: ThemeMode): void {
+		mode = m;
+		editing = null;
+		setPreview(m);
+	}
+	function chooseTheme(pref: ThemePref): void {
+		setTheme(pref);
+		editMode(resolvedTheme(pref));
+	}
+	onDestroy(() => setPreview(null));
+
+	const look = $derived(theme.looks[mode]);
+	const preset = $derived(activePreset(mode));
+	const readable = $derived(readability(look, mode));
 	/** The accent is the reader's own pick, not one of the quick picks. */
 	const customAccent = $derived(
 		look.accent !== null && !SWATCHES.some((s) => s.hex === look.accent),
 	);
+	const edit = (patch: Partial<Look>) => updateLook(mode, patch);
 
 	/** Which colour the inline picker edits, if it is open. */
 	type Target = 'a' | 'b' | 'accent';
@@ -93,21 +117,13 @@
 		editing = editing === target ? null : target;
 	}
 	function pick(target: Target, hex: string): void {
-		updateLook(target === 'accent' ? { accent: hex } : { [target]: hex });
+		edit(target === 'accent' ? { accent: hex } : { [target]: hex });
 	}
 	function setBackdrop(backdrop: Backdrop): void {
-		updateLook({ backdrop });
+		edit({ backdrop });
 		if (backdrop === 'none' || (backdrop === 'solid' && editing === 'b')) {
 			editing = editing === 'accent' ? 'accent' : null;
 		}
-	}
-	/** What a preset tile shows: its background colours over the theme's own surface,
-	 * stronger than the app shows them so a tile reads at a glance. */
-	function presetFill(l: Look): string {
-		if (l.backdrop === 'none') return 'var(--k-surface-5)';
-		const mix = (hex: string) => `color-mix(in oklab, ${hex} 55%, var(--k-surface-5))`;
-		if (l.backdrop === 'solid') return mix(l.a);
-		return `linear-gradient(${l.angle}deg, ${mix(l.a)}, ${mix(l.b)})`;
 	}
 
 	// --- Reading ----------------------------------------------------------------
@@ -417,7 +433,7 @@
 			<div class="row">
 				<div class="text">
 					<span class="label" id="mode-label">Theme</span>
-					<span class="desc">System follows the light or dark setting of this device.</span>
+					<span class="desc">Which look the app uses. System follows this device.</span>
 				</div>
 				<div class="seg" role="radiogroup" aria-labelledby="mode-label">
 					{#each THEME_MODES as m (m.value)}
@@ -426,215 +442,235 @@
 							role="radio"
 							aria-checked={theme.pref === m.value}
 							class:on={theme.pref === m.value}
-							onclick={() => setTheme(m.value)}>{m.label}</button
+							onclick={() => chooseTheme(m.value)}>{m.label}</button
 						>
-					{/each}
-				</div>
-			</div>
-			<div class="stack">
-				<div class="text">
-					<span class="label" id="preset-label">Presets</span>
-					<span class="desc">
-						A background and an accent that go together. Change either below.
-					</span>
-				</div>
-				<div class="presets" role="radiogroup" aria-labelledby="preset-label">
-					{#each PRESETS as p (p.id)}
-						{@const on = preset === p.id}
-						<button
-							type="button"
-							role="radio"
-							class="preset"
-							aria-checked={on}
-							class:on
-							onclick={() => applyPreset(p.id)}
-						>
-							<span class="preset-fill" style:background={presetFill(p.look)}>
-								<span class="preset-accent" style:background={p.look.accent ?? KOMIQ_ACCENT}></span>
-								{#if on}
-									<span class="preset-check">
-										<Icon name="check" size={12} strokeWidth={3} />
-									</span>
-								{/if}
-							</span>
-							<span class="preset-name">{p.name}</span>
-						</button>
 					{/each}
 				</div>
 			</div>
 
 			<div class="stack">
-				<div class="row">
+				<div class="text">
+					<span class="label" id="looks-label">Your looks</span>
+					<span class="desc">
+						Light and dark each have their own colours. Pick one to change it.
+					</span>
+				</div>
+				<div class="looks" role="radiogroup" aria-labelledby="looks-label">
+					{#each LOOK_MODES as m (m.value)}
+						{@const sw = swatch(theme.looks[m.value], m.value)}
+						{@const on = mode === m.value}
+						<button
+							type="button"
+							role="radio"
+							class="look-tile"
+							class:on
+							aria-checked={on}
+							onclick={() => editMode(m.value)}
+						>
+							<span class="look-fill" style:background={sw.fill} style:color={sw.text}>
+								<span class="look-line"></span>
+								<span class="look-line short"></span>
+								<span class="look-accent" style:background={sw.accent}></span>
+							</span>
+							<span class="look-name">
+								{m.label}
+								{#if resolvedTheme() === m.value}<span class="look-use">In use</span>{/if}
+							</span>
+						</button>
+					{/each}
+				</div>
+			</div>
+
+			<div class="editor">
+				<div class="stack">
 					<div class="text">
-						<span class="label" id="backdrop-label">Background</span>
-						<span class="desc">
-							{look.backdrop === 'none'
-								? 'The neutral grey of the theme.'
-								: 'Tints the page and every surface. Text keeps its contrast.'}
-						</span>
+						<span class="label" id="preset-label">Presets</span>
+						<span class="desc">A background and an accent that go together.</span>
 					</div>
-					<div class="seg" role="radiogroup" aria-labelledby="backdrop-label">
-						{#each BACKDROPS as b (b.value)}
+					<div class="presets" role="radiogroup" aria-labelledby="preset-label">
+						{#each PRESETS[mode] as p (p.id)}
+							{@const sw = swatch(p.look, mode)}
+							{@const on = preset === p.id}
 							<button
 								type="button"
 								role="radio"
-								aria-checked={look.backdrop === b.value}
-								class:on={look.backdrop === b.value}
-								onclick={() => setBackdrop(b.value)}>{b.label}</button
+								class="preset"
+								aria-checked={on}
+								class:on
+								onclick={() => applyPreset(mode, p.id)}
 							>
+								<span class="preset-fill" style:background={sw.fill}>
+									<span class="preset-accent" style:background={sw.accent}></span>
+									{#if on}
+										<span class="preset-check">
+											<Icon name="check" size={12} strokeWidth={3} />
+										</span>
+									{/if}
+								</span>
+								<span class="preset-name">{p.name}</span>
+							</button>
 						{/each}
 					</div>
 				</div>
 
-				{#if look.backdrop !== 'none'}
-					<div class="tint">
-						<div class="wells">
-							{@render well('a', look.backdrop === 'gradient' ? 'From' : 'Colour', look.a)}
-							{#if look.backdrop === 'gradient'}
+				<div class="stack">
+					<div class="row">
+						<div class="text">
+							<span class="label" id="backdrop-label">Background</span>
+							<span class="desc">
+								{look.backdrop === 'none'
+									? 'The theme’s own neutral colour.'
+									: 'The page is exactly this colour. Cards and controls are shades of it.'}
+							</span>
+						</div>
+						<div class="seg" role="radiogroup" aria-labelledby="backdrop-label">
+							{#each BACKDROPS as b (b.value)}
 								<button
 									type="button"
-									class="swap k-hit"
-									aria-label="Swap the two colours"
-									title="Swap"
-									onclick={() => updateLook({ a: look.b, b: look.a })}
+									role="radio"
+									aria-checked={look.backdrop === b.value}
+									class:on={look.backdrop === b.value}
+									onclick={() => setBackdrop(b.value)}>{b.label}</button
 								>
-									<Icon name="arrow-left-right" size={16} />
-								</button>
-								{@render well('b', 'To', look.b)}
-							{/if}
-						</div>
-						{#if editing === 'a' || (editing === 'b' && look.backdrop === 'gradient')}
-							<div class="picker-panel" id="picker-panel">
-								{#key editing}
-									{@const target = editing}
-									<ColorPicker
-										value={target === 'a' ? look.a : look.b}
-										label={target === 'a' ? 'Background colour' : 'Gradient end colour'}
-										swatches={SWATCHES}
-										onchange={(hex) => pick(target, hex)}
-									/>
-								{/key}
-							</div>
-						{/if}
-						{#if look.backdrop === 'gradient'}
-							<div class="slider">
-								<label class="text between" for="angle-range">
-									<span class="label sub">Direction</span>
-									<span class="value">
-										<span class="compass" style:rotate="{look.angle - 90}deg" aria-hidden="true">
-											<Icon name="arrow-right" size={14} strokeWidth={2.4} />
-										</span>
-										{look.angle}°
-									</span>
-								</label>
-								<input
-									id="angle-range"
-									type="range"
-									min="0"
-									max="359"
-									step="1"
-									value={look.angle}
-									oninput={(e) => updateLook({ angle: e.currentTarget.valueAsNumber })}
-								/>
-							</div>
-						{/if}
-						<div class="slider">
-							<label class="text between" for="strength-range">
-								<span class="label sub">Strength</span>
-								<span class="value">{look.strength}%</span>
-							</label>
-							<input
-								id="strength-range"
-								type="range"
-								min="0"
-								max="100"
-								step="1"
-								value={look.strength}
-								oninput={(e) => updateLook({ strength: e.currentTarget.valueAsNumber })}
-							/>
+							{/each}
 						</div>
 					</div>
-				{/if}
-			</div>
 
-			<div class="stack">
-				<div class="text">
-					<span class="label" id="accent-label">Accent</span>
-					<span class="desc">Links, highlights and the main buttons.</span>
+					{#if look.backdrop !== 'none'}
+						<div class="tint">
+							<div class="wells">
+								{@render well('a', look.backdrop === 'gradient' ? 'From' : 'Colour', look.a)}
+								{#if look.backdrop === 'gradient'}
+									<button
+										type="button"
+										class="swap k-hit"
+										aria-label="Swap the two colours"
+										title="Swap"
+										onclick={() => edit({ a: look.b, b: look.a })}
+									>
+										<Icon name="arrow-left-right" size={16} />
+									</button>
+									{@render well('b', 'To', look.b)}
+								{/if}
+							</div>
+							{#if editing === 'a' || (editing === 'b' && look.backdrop === 'gradient')}
+								<div class="picker-panel" id="picker-panel">
+									{#key editing}
+										{@const target = editing}
+										<ColorPicker
+											value={target === 'a' ? look.a : look.b}
+											label={target === 'a' ? 'Background colour' : 'Gradient end colour'}
+											swatches={SWATCHES}
+											onchange={(hex) => pick(target, hex)}
+										/>
+									{/key}
+								</div>
+							{/if}
+							{#if look.backdrop === 'gradient'}
+								<div class="slider">
+									<label class="text between" for="angle-range">
+										<span class="label sub">Direction</span>
+										<span class="value">
+											<span class="compass" style:rotate="{look.angle - 90}deg" aria-hidden="true">
+												<Icon name="arrow-right" size={14} strokeWidth={2.4} />
+											</span>
+											{look.angle}°
+										</span>
+									</label>
+									<input
+										id="angle-range"
+										type="range"
+										min="0"
+										max="359"
+										step="1"
+										value={look.angle}
+										oninput={(e) => edit({ angle: e.currentTarget.valueAsNumber })}
+									/>
+								</div>
+							{/if}
+						</div>
+					{/if}
+					{#if readable.text < 4.5}
+						<p class="hint" role="status">
+							Some text is hard to read on this background. Try a lighter or darker colour.
+						</p>
+					{/if}
 				</div>
-				<div class="accents" role="radiogroup" aria-labelledby="accent-label">
-					<button
-						type="button"
-						role="radio"
-						class="accent-dot k-hit"
-						style:background={KOMIQ_ACCENT}
-						aria-checked={look.accent === null}
-						aria-label="komiq (default)"
-						title="komiq (default)"
-						class:on={look.accent === null}
-						onclick={() => updateLook({ accent: null })}
-					>
-						{#if look.accent === null}<Icon name="check" size={14} strokeWidth={3} />{/if}
-					</button>
-					<span class="accent-gap" aria-hidden="true"></span>
-					{#each SWATCHES.slice(1) as s (s.hex)}
-						{@const on = look.accent === s.hex}
+
+				<div class="stack">
+					<div class="text">
+						<span class="label" id="accent-label">Accent</span>
+						<span class="desc">Links, highlights and the main buttons.</span>
+					</div>
+					<div class="accents" role="radiogroup" aria-labelledby="accent-label">
 						<button
 							type="button"
 							role="radio"
 							class="accent-dot k-hit"
-							style:background={s.hex}
-							aria-checked={on}
-							aria-label={s.name}
-							title={s.name}
-							class:on
-							onclick={() => updateLook({ accent: s.hex })}
+							style:background={KOMIQ_ACCENT}
+							aria-checked={look.accent === null}
+							aria-label="komiq (default)"
+							title="komiq (default)"
+							class:on={look.accent === null}
+							onclick={() => edit({ accent: null })}
 						>
-							{#if on}<Icon name="check" size={14} strokeWidth={3} />{/if}
+							{#if look.accent === null}<Icon name="check" size={14} strokeWidth={3} />{/if}
 						</button>
-					{/each}
-					<!-- Opens the picker, so a disclosure button rather than a radio. -->
-					<button
-						type="button"
-						class="accent-dot custom k-hit"
-						class:on={customAccent}
-						class:open={editing === 'accent'}
-						style:--own={customAccent ? look.accent : null}
-						aria-expanded={editing === 'accent'}
-						aria-controls="accent-picker"
-						aria-label={customAccent ? 'Your own colour (in use)' : 'Your own colour'}
-						title="Your own colour"
-						onclick={() => {
-							toggleEditing('accent');
-							if (!customAccent && editing === 'accent') {
-								updateLook({ accent: look.accent ?? KOMIQ_ACCENT });
-							}
-						}}
-					>
-						{#if customAccent}<Icon name="check" size={14} strokeWidth={3} />
-						{:else}<Icon name="plus" size={14} strokeWidth={2.6} />{/if}
-					</button>
-				</div>
-				{#if editing === 'accent'}
-					<div class="picker-panel" id="accent-picker">
-						<ColorPicker
-							value={look.accent ?? KOMIQ_ACCENT}
-							label="Accent colour"
-							onchange={(hex) => pick('accent', hex)}
-						/>
+						<span class="accent-gap" aria-hidden="true"></span>
+						{#each SWATCHES.slice(1) as s (s.hex)}
+							{@const on = look.accent === s.hex}
+							<button
+								type="button"
+								role="radio"
+								class="accent-dot k-hit"
+								style:background={s.hex}
+								aria-checked={on}
+								aria-label={s.name}
+								title={s.name}
+								class:on
+								onclick={() => edit({ accent: s.hex })}
+							>
+								{#if on}<Icon name="check" size={14} strokeWidth={3} />{/if}
+							</button>
+						{/each}
+						<!-- Opens the picker, so a disclosure button rather than a radio. -->
+						<button
+							type="button"
+							class="accent-dot custom k-hit"
+							class:on={customAccent}
+							class:open={editing === 'accent'}
+							style:--own={customAccent ? look.accent : null}
+							aria-expanded={editing === 'accent'}
+							aria-controls="accent-picker"
+							aria-label={customAccent ? 'Your own colour (in use)' : 'Your own colour'}
+							title="Your own colour"
+							onclick={() => {
+								toggleEditing('accent');
+								if (!customAccent && editing === 'accent') {
+									edit({ accent: look.accent ?? KOMIQ_ACCENT });
+								}
+							}}
+						>
+							{#if customAccent}<Icon name="check" size={14} strokeWidth={3} />
+							{:else}<Icon name="plus" size={14} strokeWidth={2.6} />{/if}
+						</button>
 					</div>
-				{/if}
-			</div>
-			<div class="row">
-				<label class="text" for="black-switch">
-					<span class="label">Pure black</span>
-					<span class="desc" id="black-switch-desc">
-						A true black background in the dark theme. It saves power on an OLED screen.
-					</span>
-				</label>
-				{@render toggle('black-switch', 'Pure black', theme.pureBlack, () =>
-					setPureBlack(!theme.pureBlack),
-				)}
+					{#if readable.accent < 3}
+						<p class="hint" role="status">
+							This accent is hard to see on the background. Links and highlights may be hard to
+							spot.
+						</p>
+					{/if}
+					{#if editing === 'accent'}
+						<div class="picker-panel" id="accent-picker">
+							<ColorPicker
+								value={look.accent ?? KOMIQ_ACCENT}
+								label="Accent colour"
+								onchange={(hex) => pick('accent', hex)}
+							/>
+						</div>
+					{/if}
+				</div>
 			</div>
 		</div>
 	</section>
@@ -1009,7 +1045,7 @@
 					<span class="desc" role="status">
 						{done === 'look'
 							? 'Done. The app is back to its own colours.'
-							: 'Theme, background, accent and pure black.'}
+							: 'Theme, and the colours of your light and dark looks.'}
 					</span>
 				</div>
 				<button type="button" class="btn k-hit" onclick={resetLook}>Reset</button>
@@ -1186,6 +1222,95 @@
 	.seg button.on {
 		background: var(--k-primary);
 		color: var(--k-on-primary);
+	}
+
+	/* ---- Your looks ---------------------------------------------------------- */
+	.looks {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 8px;
+	}
+	.look-tile {
+		display: flex;
+		flex-direction: column;
+		gap: 9px;
+		padding: 6px 6px 10px;
+		border: none;
+		border-radius: 16px;
+		background: transparent;
+		color: var(--k-text-dim);
+		font-family: inherit;
+		text-align: left;
+		cursor: pointer;
+		transition:
+			background var(--k-dur) var(--k-ease),
+			color var(--k-dur) var(--k-ease);
+	}
+	.look-tile:hover {
+		background: var(--k-hover-fill);
+		color: var(--k-text-1);
+	}
+	.look-tile.on {
+		background: var(--k-surface-5);
+		color: var(--k-text);
+	}
+	/* A small page in that look: two lines of its text and its accent. */
+	.look-fill {
+		position: relative;
+		display: flex;
+		flex-direction: column;
+		gap: 7px;
+		height: 78px;
+		padding: 16px 14px;
+		border-radius: 12px;
+		box-shadow: 0 1px 3px rgb(0 0 0 / 0.18);
+	}
+	.look-line {
+		width: 58%;
+		height: 6px;
+		border-radius: 999px;
+		background: currentColor;
+		opacity: 0.8;
+	}
+	.look-line.short {
+		width: 36%;
+		opacity: 0.45;
+	}
+	.look-accent {
+		position: absolute;
+		right: 12px;
+		bottom: 12px;
+		width: 34px;
+		height: 14px;
+		border-radius: 999px;
+	}
+	.look-name {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 0 4px;
+		font-size: 13.5px;
+		font-weight: 600;
+	}
+	.look-use {
+		padding: 2px 8px;
+		border-radius: 999px;
+		background: var(--k-surface-3);
+		color: var(--k-text-dim);
+		font-size: 11px;
+		font-weight: 700;
+	}
+	/* The controls for the look picked above. */
+	.editor {
+		display: flex;
+		flex-direction: column;
+		gap: 22px;
+	}
+	.hint {
+		margin: 0;
+		font-size: 12.5px;
+		line-height: 1.45;
+		color: var(--k-warning);
 	}
 
 	/* ---- Presets ------------------------------------------------------------ */
