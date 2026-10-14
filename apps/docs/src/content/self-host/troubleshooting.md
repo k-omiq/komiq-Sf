@@ -112,6 +112,8 @@ FLARESOLVERR_ENABLED=true
 
 Apply the changes by running `docker compose up -d`.
 
+If the chapter list loads but the page images fail, and `docker compose logs flaresolverr` says `Cloudflare has blocked this request`, the site blocks your server's address. A solver cannot get past a block. Send the engine's requests through Cloudflare WARP instead. Read [Add sources](/self-host/sources).
+
 ## Build fails or the machine runs out of memory
 
 If the compiler stops for lack of memory, add memory or swap, or build the image on another computer, load it here and run `docker compose up -d` without `--build`.

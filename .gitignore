@@ -85,5 +85,7 @@ scripts/tests/test_postgres_search_parity.py
 
 # Local tool state and design exports.
 .claude/
+# Production server addresses for the load and watch refusals (never in git).
+deploy/production-ips.local
 apps/docs/.impeccable/
 /*.zip

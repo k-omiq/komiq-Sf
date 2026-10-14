@@ -1,7 +1,7 @@
 use super::{
     convert::{date_text, value, Value},
     export::{self, Arguments, Report},
-    tables::{copied, is_copied, TABLES},
+    tables::{copied, is_copied, TABLES, UNSUPPORTED_POSTGRES_ONLY},
     template,
 };
 use crate::pg_import::{
@@ -291,6 +291,20 @@ fn classification_covers_the_import_plan() {
         "one line for each planned table, in plan order"
     );
     assert!(TABLES.iter().all(|(_, _, reason)| !reason.is_empty()));
+    assert_eq!(
+        UNSUPPORTED_POSTGRES_ONLY
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<BTreeSet<_>>(),
+        plan::POSTGRES_ONLY
+            .iter()
+            .map(|table| table.name)
+            .collect::<BTreeSet<_>>(),
+        "every PostgreSQL-only table needs a rollback disposition"
+    );
+    assert!(UNSUPPORTED_POSTGRES_ONLY
+        .iter()
+        .all(|(_, reason)| !reason.is_empty()));
     assert_eq!(TABLES.iter().filter(|(_, copied, _)| *copied).count(), 24);
     // No table outside the copied set has a foreign key into it: replacing the
     // copied tables cannot break a row the export does not write.
@@ -1342,6 +1356,119 @@ async fn refusal(args: &Arguments) -> String {
         "{:#}",
         export::run(args, None).await.err().expect("refused")
     )
+}
+
+#[tokio::test]
+async fn refuses_postgres_only_user_rows_without_writing_or_deleting_anything() {
+    let scratch = Scratch::new();
+    let database = crate::test_postgres::empty_database().unwrap();
+    let kept = kept_file(&scratch, 121).await;
+    let kept_sha256 = template::sha256(&kept).unwrap();
+    cut_over(&scratch, &kept, &database.url).await;
+    let mut pg = PgConnection::connect(&database.url).await.unwrap();
+    sqlx::query(
+        "INSERT INTO scanlator_rating (scanlator_id,user_id,score,created_at,updated_at) \
+         VALUES ('group:example',$1::uuid,8,now(),now())",
+    )
+    .bind(READER)
+    .execute(&mut pg)
+    .await
+    .unwrap();
+    let args = arguments(&scratch, &kept, &database.url);
+    let error = refusal(&args).await;
+    assert!(
+        error.contains("scanlator_rating: 1 rows would be lost")
+            && error.contains("nothing was exported")
+            && error.contains("keep PostgreSQL and its backups"),
+        "{error}"
+    );
+    assert_nothing_written(&args, &kept_sha256);
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM scanlator_rating WHERE score=8")
+        .fetch_one(&mut pg)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "refusal must preserve the unsupported user data");
+    pg.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn empty_postgres_only_tables_are_reported_and_keep_both_sqlite_levels_supported() {
+    for level in [121, 122] {
+        let scratch = Scratch::new();
+        let database = crate::test_postgres::empty_database().unwrap();
+        let kept = kept_file(&scratch, level).await;
+        cut_over(&scratch, &kept, &database.url).await;
+        let args = arguments(&scratch, &kept, &database.url);
+        let report = export::run(&args, None).await.unwrap();
+        assert!(report.complete);
+        assert_eq!(report.target_sqlite_migration, level);
+        assert_eq!(report.postgres_only_not_copied.len(), 1);
+        assert_eq!(report.postgres_only_not_copied["scanlator_rating"], 0);
+        let report = serde_json::to_value(report).unwrap();
+        assert_eq!(report["postgres_only_not_copied"]["scanlator_rating"], 0);
+        let mut output = sqlite(&args.output, false).await;
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+            .fetch_one(&mut output)
+            .await
+            .unwrap();
+        assert_eq!(rows, 3);
+        let has_ratings: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM sqlite_schema WHERE name='scanlator_rating'")
+                .fetch_one(&mut output)
+                .await
+                .unwrap();
+        assert_eq!(has_ratings, 0);
+        output.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn refuses_unclassified_postgres_tables_even_when_empty_or_outside_public() {
+    for (schema, with_rows) in [("public", false), ("public", true), ("other", true)] {
+        let scratch = Scratch::new();
+        let database = crate::test_postgres::empty_database().unwrap();
+        let kept = kept_file(&scratch, 121).await;
+        let kept_sha256 = template::sha256(&kept).unwrap();
+        cut_over(&scratch, &kept, &database.url).await;
+        let mut pg = PgConnection::connect(&database.url).await.unwrap();
+        if schema != "public" {
+            sqlx::query("CREATE SCHEMA other")
+                .execute(&mut pg)
+                .await
+                .unwrap();
+        }
+        sqlx::query(&format!(
+            "CREATE TABLE {schema}.future_user_data (value bigint)"
+        ))
+        .execute(&mut pg)
+        .await
+        .unwrap();
+        if with_rows {
+            sqlx::query(&format!(
+                "INSERT INTO {schema}.future_user_data VALUES (42)"
+            ))
+            .execute(&mut pg)
+            .await
+            .unwrap();
+        }
+        let args = arguments(&scratch, &kept, &database.url);
+        let error = refusal(&args).await;
+        assert!(
+            error.contains("unclassified relations")
+                && error.contains("future_user_data")
+                && error.contains(schema)
+                && error.contains("nothing was exported"),
+            "{error}"
+        );
+        assert_nothing_written(&args, &kept_sha256);
+        let rows: i64 =
+            sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.future_user_data"))
+                .fetch_one(&mut pg)
+                .await
+                .unwrap();
+        assert_eq!(rows, i64::from(with_rows));
+        pg.close().await.unwrap();
+    }
 }
 
 #[tokio::test]

@@ -62,9 +62,12 @@ import type {
 	MangadexSetting,
 	BlockRule,
 	BrowseSource,
+	RatedScanlator,
+	RatedScanlatorPage,
 	ScanlatorAi,
 	ScanlatorPage,
 	ScanlatorQuery,
+	ScanlatorRatingQuery,
 	ScanlatorSite,
 	ScanlatorTag,
 	SourceAiTag,
@@ -96,6 +99,8 @@ export interface BackendConfig {
 	endpoint: string;
 	/** Bearer token for authenticated requests, if signed in. */
 	token?: string | null;
+	/** API schema/deploy generation, when known. Capability negatives never cross it. */
+	schemaGeneration?: string;
 	/** Optional fetch override (SSR / tests). Defaults to global fetch. */
 	fetch?: typeof fetch;
 }
@@ -151,12 +156,61 @@ function canonicalUrl(url: string): string {
 	}
 }
 
+/** Negative schema discovery is shared by fetch views, bounded and retried after upgrades. */
+const CAPABILITY_NEGATIVE_TTL_MS = 5 * 60_000;
+const CAPABILITY_ENDPOINT_CAPACITY = 64;
+
+interface EndpointCapabilities {
+	expiresAt: number;
+	unsupportedFields: Set<string>;
+	unsupportedArgs: Set<string>;
+	unsupportedLists: Set<string>;
+	getUnsupported: boolean;
+	fetchPolicyUnsupported: boolean;
+	tagsUnsupported: boolean;
+	setChapterReadUnsupported: boolean;
+	chapterOriginUnsupported: boolean;
+	seriesPageUnsupported: boolean;
+}
+
+const capabilitiesByEndpoint = new Map<string, EndpointCapabilities>();
+
+function endpointCapabilities(config: BackendConfig): EndpointCapabilities {
+	const key = JSON.stringify([canonicalUrl(config.endpoint), config.schemaGeneration ?? null]);
+	const now = Date.now();
+	let capabilities = capabilitiesByEndpoint.get(key);
+	if (!capabilities || capabilities.expiresAt <= now) {
+		capabilities = {
+			expiresAt: now + CAPABILITY_NEGATIVE_TTL_MS,
+			unsupportedFields: new Set(),
+			unsupportedArgs: new Set(),
+			unsupportedLists: new Set(),
+			getUnsupported: false,
+			fetchPolicyUnsupported: false,
+			tagsUnsupported: false,
+			setChapterReadUnsupported: false,
+			chapterOriginUnsupported: false,
+			seriesPageUnsupported: false,
+		};
+	}
+	capabilitiesByEndpoint.delete(key);
+	capabilitiesByEndpoint.set(key, capabilities);
+	while (capabilitiesByEndpoint.size > CAPABILITY_ENDPOINT_CAPACITY) {
+		capabilitiesByEndpoint.delete(capabilitiesByEndpoint.keys().next().value!);
+	}
+	return capabilities;
+}
+
 /**
  * GraphQL-backed implementation of {@link Backend}, targeting Komika's unified
  * API. Operations are domain-shaped (see `operations.ts` + `schema/komika.graphql`),
  * so responses map 1:1 onto `@komika/types` with no translation layer.
  */
 export class GraphQLBackend implements Backend {
+	private get capabilities(): EndpointCapabilities {
+		return endpointCapabilities(this.config);
+	}
+
 	/**
 	 * The bearer token, in a cell SHARED with every {@link withFetch} view of this
 	 * backend rather than copied into each one.
@@ -167,14 +221,14 @@ export class GraphQLBackend implements Backend {
 	 * sending anonymous GETs after the viewer signed in would be served (and could cache)
 	 * another viewer's answer.
 	 */
-	private readonly auth: { token: string | null };
+	private readonly auth: { token: string | null; revision: number };
 
 	/** `auth` is passed only by {@link withFetch}, to share the parent's cell. */
 	constructor(
 		private config: BackendConfig,
-		auth?: { token: string | null },
+		auth?: { token: string | null; revision: number },
 	) {
-		this.auth = auth ?? { token: config.token ?? null };
+		this.auth = auth ?? { token: config.token ?? null, revision: 0 };
 	}
 
 	withFetch(fetch: typeof globalThis.fetch): Backend {
@@ -182,22 +236,18 @@ export class GraphQLBackend implements Backend {
 	}
 
 	setToken(token: string | null): void {
+		if (this.auth.token === token) return;
 		this.auth.token = token;
+		this.auth.revision += 1;
 	}
 
-	/**
-	 * Optional fields (see {@link ops.OPTIONAL_SERIES_FIELDS}) this API has told us
-	 * it doesn't know. Process-wide: the reader and the API deploy separately, so a
-	 * client shipped first must not break — and once one document is rejected every
-	 * document that shares the fragment would be too.
-	 */
-	private static readonly unsupportedFields = new Set<string>();
-
-	/**
-	 * Optional ARGUMENTS (see {@link ops.OPTIONAL_ARGUMENTS}) this API has told us it
-	 * doesn't know. Same lifetime and rationale as {@link unsupportedFields}.
-	 */
-	private static readonly unsupportedArgs = new Set<string>();
+	private assertAuthRevision(revision: number): void {
+		// An ordinary error prevents callers' schema-error catches from retrying an
+		// old viewer's operation using the token of the newly signed-in viewer.
+		if (this.auth.revision !== revision) {
+			throw new Error('Session changed while the request was in flight');
+		}
+	}
 
 	/**
 	 * Drop already-known-unsupported field selections (one per line by construction)
@@ -226,10 +276,13 @@ export class GraphQLBackend implements Backend {
 	 *    error, which is the honest outcome.
 	 */
 	private stripUnsupported(query: string): string {
-		if (GraphQLBackend.unsupportedFields.size === 0 && GraphQLBackend.unsupportedArgs.size === 0)
+		if (
+			this.capabilities.unsupportedFields.size === 0 &&
+			this.capabilities.unsupportedArgs.size === 0
+		)
 			return query;
 		let out = query;
-		for (const field of GraphQLBackend.unsupportedFields) {
+		for (const field of this.capabilities.unsupportedFields) {
 			// Metadata has only field selections with two levels of child objects.
 			// Remove the balanced complete selection, including formatted multiline
 			// children, so a newer reader still works against an older server.
@@ -239,7 +292,7 @@ export class GraphQLBackend implements Backend {
 			}
 			out = out.replace(new RegExp(`^[\\t ]*${field}[\\t ]*\\r?\\n`, 'gm'), '');
 		}
-		for (const arg of GraphQLBackend.unsupportedArgs) {
+		for (const arg of this.capabilities.unsupportedArgs) {
 			out = out
 				.replace(new RegExp(`\\b${arg}\\s*:\\s*\\$${arg}\\b`, 'g'), '')
 				.replace(
@@ -253,7 +306,7 @@ export class GraphQLBackend implements Backend {
 		}
 		// `(` + nothing but ignored tokens + `)` — never valid, so dropping it is always
 		// an improvement (`query Q()` -> `query Q`, `field()` -> `field`).
-		if (GraphQLBackend.unsupportedArgs.size > 0) out = out.replace(/\(\s*(?:,\s*)*\)/g, '');
+		if (this.capabilities.unsupportedArgs.size > 0) out = out.replace(/\(\s*(?:,\s*)*\)/g, '');
 		// Emptied a selection set? Only count sets the strip CREATED, so a legitimately
 		// empty object value in the source document (`input: {}`) can't disable this.
 		const emptySets = (s: string) => (s.match(/\{\s*\}/g) ?? []).length;
@@ -262,11 +315,10 @@ export class GraphQLBackend implements Backend {
 	}
 
 	/**
-	 * Whether this API has told us it doesn't serve `GET /graphql` (P3). Process-wide
+	 * Whether this API has told us it doesn't serve `GET /graphql` (P3). Endpoint/schema-scoped
 	 * for the same deploy-order reason as {@link unsupportedFields}: a 404/405 from one
 	 * GET means every GET would fail, so remember it and go straight to POST.
 	 */
-	private static getUnsupported = false;
 
 	/**
 	 * @param tolerate Response paths this caller can render WITHOUT. A response whose every
@@ -278,7 +330,11 @@ export class GraphQLBackend implements Backend {
 		variables?: Record<string, unknown>,
 		retried = false,
 		tolerate?: readonly (readonly PathSegment[])[],
+		authRevision = this.auth.revision,
+		forcePost = false,
 	): Promise<T> {
+		this.assertAuthRevision(authRevision);
+		const token = this.auth.token;
 		const doFetch = this.config.fetch ?? fetch;
 		const stripped = this.stripUnsupported(query);
 		// Anonymous READS go over GET so Cloudflare and the browser's HTTP cache can
@@ -290,8 +346,9 @@ export class GraphQLBackend implements Backend {
 		// `operations.ts` always writes a top-level `mutation Name(`/`query Name(`
 		// (fragments may come first, hence the newline alternative).
 		const useGet =
-			!this.auth.token &&
-			!GraphQLBackend.getUnsupported &&
+			!token &&
+			!forcePost &&
+			!this.capabilities.getUnsupported &&
 			!/(^|\n)\s*mutation[\s(]/.test(stripped);
 		let res: Response;
 		if (useGet) {
@@ -302,26 +359,29 @@ export class GraphQLBackend implements Backend {
 				(variables ? `&variables=${encodeURIComponent(JSON.stringify(variables))}` : '');
 			res = await doFetch(canonicalUrl(`${this.config.endpoint}?${params}`));
 			if (res.status === 404 || res.status === 405) {
+				this.assertAuthRevision(authRevision);
 				// The server predates GET /graphql — schema-drift fallback, not an outage.
 				// Memoize and re-enter: the retry re-evaluates the transport and lands on
 				// POST, preserving `retried` so the unknown-field loop is unaffected. Any
 				// OTHER status is NOT memoized — a 500 or a network failure must throw
-				// exactly as it does on POST.
-				GraphQLBackend.getUnsupported = true;
-				return this.gql<T>(query, variables, retried, tolerate);
+				// exactly as it does on POST. Force this retry to POST even if the slow
+				// rejection outlived the capability capsule's TTL.
+				this.capabilities.getUnsupported = true;
+				return this.gql<T>(query, variables, retried, tolerate, authRevision, true);
 			}
 		} else {
 			res = await doFetch(this.config.endpoint, {
 				method: 'POST',
 				headers: {
 					'content-type': 'application/json',
-					...(this.auth.token ? { authorization: `Bearer ${this.auth.token}` } : {}),
+					...(token ? { authorization: `Bearer ${token}` } : {}),
 				},
 				body: JSON.stringify({ query: stripped, variables }),
 			});
 		}
 		if (!res.ok) throw new Error(`Backend error ${res.status}`);
 		const json = (await res.json()) as { data?: T; errors?: GraphQLErrorLike[] };
+		if (json.errors?.length) this.assertAuthRevision(authRevision);
 		if (tolerablePartialErrors(json.data, json.errors, tolerate)) {
 			// A partial result the caller opted into: the named fields came back null and
 			// everything else is real. Logged, never silent — the null is a failure, not data.
@@ -343,18 +403,18 @@ export class GraphQLBackend implements Backend {
 			if (!retried) {
 				const dropped = ops.OPTIONAL_SERIES_FIELDS.filter(
 					(f) =>
-						!GraphQLBackend.unsupportedFields.has(f) &&
+						!this.capabilities.unsupportedFields.has(f) &&
 						messages.some((m) => m.includes(`Unknown field "${f}"`)),
 				);
 				const droppedArgs = ops.OPTIONAL_ARGUMENTS.filter(
 					(a) =>
-						!GraphQLBackend.unsupportedArgs.has(a) &&
+						!this.capabilities.unsupportedArgs.has(a) &&
 						messages.some((m) => m.includes(`Unknown argument "${a}"`)),
 				);
 				if (dropped.length || droppedArgs.length) {
-					for (const f of dropped) GraphQLBackend.unsupportedFields.add(f);
-					for (const a of droppedArgs) GraphQLBackend.unsupportedArgs.add(a);
-					return this.gql<T>(query, variables, true, tolerate);
+					for (const f of dropped) this.capabilities.unsupportedFields.add(f);
+					for (const a of droppedArgs) this.capabilities.unsupportedArgs.add(a);
+					return this.gql<T>(query, variables, true, tolerate, authRevision, forcePost);
 				}
 			}
 			throw new GraphQLRequestError(json.errors);
@@ -379,24 +439,26 @@ export class GraphQLBackend implements Backend {
 	async logout(): Promise<void> {
 		await this.gql<{ logout: boolean }>(ops.LOGOUT);
 	}
-	/** Process-wide, like {@link seriesPageUnsupported}: one `Unknown field` answer means
+	/** Endpoint/schema-scoped, like {@link seriesPageUnsupported}: one `Unknown field` answer means
 	 *  every later call would get it too. */
-	private static fetchPolicyUnsupported = false;
 	async instance(): Promise<InstanceInfo> {
+		const authRevision = this.auth.revision;
 		try {
 			const d = await this.gql<{ instance: InstanceInfo }>(
-				ops.instanceQuery(!GraphQLBackend.fetchPolicyUnsupported),
+				ops.instanceQuery(!this.capabilities.fetchPolicyUnsupported),
 			);
 			return d.instance;
 		} catch (e) {
+			this.assertAuthRevision(authRevision);
 			const msg = e instanceof Error ? e.message : String(e);
 			// The server predates the field — deploy-order drift, not a server to refuse.
 			if (
-				!GraphQLBackend.fetchPolicyUnsupported &&
+				!this.capabilities.fetchPolicyUnsupported &&
 				msg.includes('Unknown field "appsFetchThemselves"')
 			) {
-				GraphQLBackend.fetchPolicyUnsupported = true;
-				return this.instance();
+				this.capabilities.fetchPolicyUnsupported = true;
+				const d = await this.gql<{ instance: InstanceInfo }>(ops.instanceQuery(false));
+				return d.instance;
 			}
 			throw e;
 		}
@@ -466,43 +528,45 @@ export class GraphQLBackend implements Backend {
 	}
 	/**
 	 * Set once the API answers `Unknown field "tags"`, so a server that predates Browse
-	 * v2 costs one rejected request per process rather than one per Browse visit. Same
+	 * v2 costs one rejected request per endpoint/schema window rather than one per Browse visit. Same
 	 * lifetime and rationale as {@link unsupportedFields}.
 	 */
-	private static tagsUnsupported = false;
 	async tags(): Promise<TagInfo[]> {
-		if (GraphQLBackend.tagsUnsupported) return [];
+		const authRevision = this.auth.revision;
+		if (this.capabilities.tagsUnsupported) return [];
 		try {
 			const d = await this.gql<{ tags: TagInfo[] }>(ops.TAGS);
 			return d.tags;
 		} catch (err) {
+			this.assertAuthRevision(authRevision);
 			// ONLY the deploy-order case degrades to []: any other failure (outage, 5xx)
 			// must reach the caller as a failure, exactly like every other method here.
 			const msg = err instanceof Error ? err.message : String(err);
 			if (!msg.includes('Unknown field "tags"')) throw err;
-			GraphQLBackend.tagsUnsupported = true;
+			this.capabilities.tagsUnsupported = true;
 			return [];
 		}
 	}
 	/**
 	 * Root fields a server that predates them rejected (`browseSources`,
 	 * `scanlatorTags`, `sourceAiTags`). Same deploy-order handling as {@link tagsUnsupported}: one
-	 * rejected request per process, then `[]` without asking.
+	 * rejected request per endpoint/schema window, then `[]` without asking.
 	 */
-	private static unsupportedLists = new Set<string>();
 	private async optionalList<T>(
 		field: string,
 		query: string,
 		variables?: Record<string, unknown>,
 	): Promise<T[]> {
-		if (GraphQLBackend.unsupportedLists.has(field)) return [];
+		const authRevision = this.auth.revision;
+		if (this.capabilities.unsupportedLists.has(field)) return [];
 		try {
 			const d = await this.gql<Record<string, T[]>>(query, variables);
 			return d[field];
 		} catch (err) {
+			this.assertAuthRevision(authRevision);
 			const msg = err instanceof Error ? err.message : String(err);
 			if (!msg.includes(`Unknown field "${field}"`)) throw err;
-			GraphQLBackend.unsupportedLists.add(field);
+			this.capabilities.unsupportedLists.add(field);
 			return [];
 		}
 	}
@@ -518,7 +582,7 @@ export class GraphQLBackend implements Backend {
 		return this.optionalList<SourceAiTag>('sourceAiTags', ops.SOURCE_AI_TAGS);
 	}
 	browseFilterSupported(): boolean {
-		return !GraphQLBackend.unsupportedArgs.has('filter');
+		return !this.capabilities.unsupportedArgs.has('filter');
 	}
 	async series(id: Id): Promise<Series> {
 		const d = await this.gql<{ series: Series }>(ops.SERIES, { id });
@@ -566,19 +630,20 @@ export class GraphQLBackend implements Backend {
 	async setProgress(chapterId: Id, lastPageRead: number, read: boolean): Promise<void> {
 		await this.gql<{ setProgress: boolean }>(ops.SET_PROGRESS, { chapterId, lastPageRead, read });
 	}
-	/** Process-wide, like {@link seriesPageUnsupported}: one `Unknown field` answer means
+	/** Endpoint/schema-scoped, like {@link seriesPageUnsupported}: one `Unknown field` answer means
 	 *  every later call would get it too. */
-	private static setChapterReadUnsupported = false;
 	async setChapterRead(chapterId: Id, read: boolean): Promise<boolean> {
-		if (GraphQLBackend.setChapterReadUnsupported) return false;
+		const authRevision = this.auth.revision;
+		if (this.capabilities.setChapterReadUnsupported) return false;
 		try {
 			await this.gql<{ setChapterRead: boolean }>(ops.SET_CHAPTER_READ, { chapterId, read });
 			return true;
 		} catch (e) {
+			this.assertAuthRevision(authRevision);
 			const msg = e instanceof Error ? e.message : String(e);
 			// The API predates the mutation — deploy-order drift, not a failure to report.
 			if (msg.includes('Unknown field "setChapterRead"')) {
-				GraphQLBackend.setChapterReadUnsupported = true;
+				this.capabilities.setChapterReadUnsupported = true;
 				return false;
 			}
 			throw e;
@@ -828,6 +893,32 @@ export class GraphQLBackend implements Backend {
 		return d.scanlators;
 	}
 
+	async scanlatorRatings(query: ScanlatorRatingQuery = {}): Promise<RatedScanlatorPage> {
+		const d = await this.gql<{ scanlatorRatings: RatedScanlatorPage }>(ops.SCANLATOR_RATINGS, {
+			search: query.search?.trim() || null,
+			kind: query.kind ?? null,
+			mine: query.mine ?? null,
+			sort: query.sort ?? null,
+			page: pageArg(query.page),
+		});
+		return d.scanlatorRatings;
+	}
+
+	async ratedScanlator(id: Id): Promise<RatedScanlator | null> {
+		const d = await this.gql<{ ratedScanlator: RatedScanlator | null }>(ops.RATED_SCANLATOR, {
+			id,
+		});
+		return d.ratedScanlator;
+	}
+
+	async rateScanlator(id: Id, score: number | null): Promise<RatedScanlator> {
+		const d = await this.gql<{ rateScanlator: RatedScanlator }>(ops.RATE_SCANLATOR, {
+			id,
+			score,
+		});
+		return d.rateScanlator;
+	}
+
 	async setScanlatorAi(name: string, ai: ScanlatorAi | null): Promise<boolean> {
 		const d = await this.gql<{ setScanlatorAi: boolean }>(ops.SET_SCANLATOR_AI, { name, ai });
 		return d.setScanlatorAi;
@@ -919,6 +1010,7 @@ export class GraphQLBackend implements Backend {
 		domain: string,
 		connection?: CloudflareConnection,
 	): Promise<CloudflareTokenCheck> {
+		const authRevision = this.auth.revision;
 		type Found = Omit<CloudflareTokenCheck, 'missing'> & { missing?: string[] | null };
 		if (connection) {
 			try {
@@ -928,6 +1020,7 @@ export class GraphQLBackend implements Backend {
 				);
 				return { ...d.checkCloudflareToken, missing: d.checkCloudflareToken.missing ?? [] };
 			} catch (e) {
+				this.assertAuthRevision(authRevision);
 				// The server predates the argument or the field: both fail validation, before
 				// anything runs, so the plain check below is the first one Cloudflare sees.
 				const msg = e instanceof Error ? e.message : String(e);
@@ -1348,21 +1441,22 @@ export class GraphQLBackend implements Backend {
 	}
 
 	// --- native-embedded-Suwayomi source routing ---
-	/** Process-wide, like {@link seriesPageUnsupported}: one `Unknown field` answer means
+	/** Endpoint/schema-scoped, like {@link seriesPageUnsupported}: one `Unknown field` answer means
 	 *  every later call would get it too. */
-	private static chapterOriginUnsupported = false;
 	async chapterOrigin(chapterId: Id): Promise<ChapterOrigin | null | undefined> {
-		if (GraphQLBackend.chapterOriginUnsupported) return undefined;
+		const authRevision = this.auth.revision;
+		if (this.capabilities.chapterOriginUnsupported) return undefined;
 		try {
 			const d = await this.gql<{ chapterOrigin: ChapterOrigin | null }>(ops.CHAPTER_ORIGIN, {
 				chapterId,
 			});
 			return d.chapterOrigin;
 		} catch (e) {
+			this.assertAuthRevision(authRevision);
 			const msg = e instanceof Error ? e.message : String(e);
 			// The server predates the query — deploy-order drift, not an outage.
 			if (msg.includes('Unknown field "chapterOrigin"')) {
-				GraphQLBackend.chapterOriginUnsupported = true;
+				this.capabilities.chapterOriginUnsupported = true;
 				return undefined;
 			}
 			throw e;
@@ -1374,19 +1468,19 @@ export class GraphQLBackend implements Backend {
 		return d.workSources;
 	}
 	/**
-	 * Whether the API has told us it predates `seriesPage` (P2.1). Process-wide for
+	 * Whether the API has told us it predates `seriesPage` (P2.1). Endpoint/schema-scoped for
 	 * the same deploy-order reason as {@link unsupportedFields}: once one request
 	 * gets `Unknown field "seriesPage"`, every later call would too — remember it
 	 * and answer `undefined` immediately so callers fall back without a wasted
 	 * round trip per page view.
 	 */
-	private static seriesPageUnsupported = false;
 
 	async seriesPage(
 		workId: Id,
 		withAggregated = false,
 	): Promise<SeriesPageBundle | null | undefined> {
-		if (GraphQLBackend.seriesPageUnsupported) return undefined;
+		const authRevision = this.auth.revision;
+		if (this.capabilities.seriesPageUnsupported) return undefined;
 		try {
 			// The aggregation is an optional enrichment the reader can open a chapter without
 			// (it lists one copy per number instead of every group's), so ITS failure must
@@ -1405,6 +1499,7 @@ export class GraphQLBackend implements Backend {
 			}
 			return d.seriesPage;
 		} catch (e) {
+			this.assertAuthRevision(authRevision);
 			// An API that still types `aggregated` NON-null: the same failure nulls all of
 			// `data`, but its error path still names the field. Ask once more without it.
 			if (withAggregated && failedOnlyAt(e, [SERIES_PAGE_AGGREGATED])) {
@@ -1415,7 +1510,7 @@ export class GraphQLBackend implements Backend {
 			const msg = e instanceof Error ? e.message : String(e);
 			// The server predates the resolver — schema-drift fallback, not an outage.
 			if (msg.includes('Unknown field "seriesPage"')) {
-				GraphQLBackend.seriesPageUnsupported = true;
+				this.capabilities.seriesPageUnsupported = true;
 				return undefined;
 			}
 			// The resolver's own not-found (unknown id / NSFW-gated): the page 404s,

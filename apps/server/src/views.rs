@@ -140,15 +140,19 @@ impl ViewBuffer {
     /// buffer is at [`BUFFER_MAX_KEYS`] distinct entries AND this view would add a new
     /// one — an existing entry can always keep counting.
     fn push_at(&self, series_id: &str, hour: i64) -> bool {
+        let stats = &crate::telemetry::QUEUE_VIEW_BUFFER;
         let mut m = self.lock();
         if let Some(n) = m.get_mut(&(series_id.to_string(), hour)) {
             *n += 1;
+            stats.accepted(m.len());
             return true;
         }
         if m.len() >= BUFFER_MAX_KEYS {
+            stats.refused();
             return false;
         }
         m.insert((series_id.to_string(), hour), 1);
+        stats.accepted(m.len());
         true
     }
 
@@ -176,6 +180,7 @@ impl ViewBuffer {
                 let keys: Vec<_> = m.keys().take(excess).cloned().collect();
                 keys.iter().filter_map(|k| m.remove(k)).sum()
             };
+            crate::telemetry::QUEUE_VIEW_BUFFER.dropped(excess as u64);
             tracing::warn!(
                 entries = excess,
                 views = dropped,
@@ -810,8 +815,14 @@ mod tests {
             assert!(buf.push_at(&format!("id{i}"), hour));
         }
         // A NEW entry is refused… but an existing one can still keep counting.
+        let (_, refused_before, _, _) = crate::telemetry::QUEUE_VIEW_BUFFER.snapshot();
         assert!(!buf.push_at("overflow", hour));
         assert!(buf.push_at("id0", hour));
+        // Process-global counters: lower bounds only.
+        let (accepted, refused, _, depth_max) = crate::telemetry::QUEUE_VIEW_BUFFER.snapshot();
+        assert!(refused > refused_before);
+        assert!(accepted > BUFFER_MAX_KEYS as u64);
+        assert!(depth_max >= BUFFER_MAX_KEYS as u64);
 
         // `record` on a new series id while full writes DIRECTLY instead of dropping.
         record_with(&buf, &pool, "42").await.unwrap();

@@ -95,7 +95,7 @@ Once the server is healthy, go to [First-run setup](/self-host/first-run) to cre
 
 The password is required. Other settings have defaults. The installer writes `.env` for you and preserves the password on later runs. Do not copy the example over an existing `.env`.
 
-Edit settings, then run `docker compose up -d`. Use `KOMIQ_PORT` for the published HTTP port. `COMPOSE_FILE` selects HTTPS and certificate-check overrides; the installer sets it from your access choice. `COMPOSE_PROFILES=flaresolverr` and `FLARESOLVERR_ENABLED=true` enable the optional challenge solver. Read [Settings reference](/self-host/configuration) for other settings.
+Edit settings, then run `docker compose up -d`. Use `KOMIQ_PORT` for the published HTTP port. `COMPOSE_FILE` selects HTTPS and certificate-check overrides; the installer sets it from your access choice. `COMPOSE_PROFILES=flaresolverr` and `FLARESOLVERR_ENABLED=true` enable the optional challenge solver. `COMPOSE_PROFILES=warp` and `WARP_ENABLED=true` send the engine's source requests through Cloudflare WARP, for sites that block your server's address; read [Add sources](/self-host/sources). Read [Settings reference](/self-host/configuration) for other settings.
 
 Use `KOMIQ_BIND=127.0.0.1` on a VPS that you reach through a Cloudflare Tunnel. Keep the default `0.0.0.0` if devices on your home network connect directly. Read [Connect your devices](/self-host/other-devices).
 

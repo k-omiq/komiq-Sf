@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::source_health::{Subject, Surface};
+use crate::telemetry::BodySource;
 use crate::upstream_cache::TtlMemo;
 
 /// Max simultaneous upstream COVER fetches (Suwayomi -> source CDN) across the whole
@@ -199,6 +200,57 @@ async fn read_capped(mut res: reqwest::Response, cap: usize) -> Result<Vec<u8>> 
         out.extend_from_slice(&chunk);
     }
     Ok(out)
+}
+
+/// Wait up to `wait` for a page-pool slot, counting the outcome in `lane`. Only a
+/// wait that obtains a slot adds wait time, as in the other waiting lanes.
+async fn acquire_page_slot(
+    lane: &crate::telemetry::LaneStats,
+    slots: &Arc<Semaphore>,
+    wait: std::time::Duration,
+) -> std::result::Result<OwnedSemaphorePermit, PageFetchError> {
+    let waiting = std::time::Instant::now();
+    match tokio::time::timeout(wait, slots.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => {
+            lane.waited(waiting.elapsed());
+            lane.admitted();
+            Ok(permit)
+        }
+        // Semaphore closed (shutdown) — treat as an upstream failure, not a retry.
+        Ok(Err(e)) => Err(PageFetchError::Upstream(anyhow!(e))),
+        // Waited past the cap without a slot — shed, retryably.
+        Err(_) => {
+            lane.refuse();
+            Err(PageFetchError::Busy)
+        }
+    }
+}
+
+/// `read_capped` fails either in transport (a `reqwest::Error`) or at its cap.
+fn count_oversize(source: BodySource, error: &anyhow::Error) {
+    if error.downcast_ref::<reqwest::Error>().is_none() {
+        crate::telemetry::MEDIA.body_check(source, crate::telemetry::BodyCheck::TooLarge);
+    }
+}
+
+/// Retain only a bounded prefix of an upstream error. A displayed 160-character
+/// snippet must not first allocate an arbitrarily large error document.
+async fn error_snippet(mut res: reqwest::Response) -> String {
+    const CAP: usize = 4096;
+    let mut bytes = Vec::new();
+    while bytes.len() < CAP {
+        match res.chunk().await {
+            Ok(Some(chunk)) => {
+                bytes.extend_from_slice(&chunk[..chunk.len().min(CAP - bytes.len())])
+            }
+            _ => break,
+        }
+    }
+    String::from_utf8_lossy(&bytes)
+        .trim()
+        .chars()
+        .take(160)
+        .collect()
 }
 
 const MANGA_FIELDS: &str = r#"
@@ -480,8 +532,16 @@ impl SuwayomiClient {
             bg_sem: Arc::new(Semaphore::new(BG_MATERIALIZE_CONCURRENCY)),
             page_http,
             page_sem: Arc::new(Semaphore::new(PAGE_FETCH_CONCURRENCY)),
-            pages_memo: Arc::new(TtlMemo::new(READER_MEMO_TTL, READER_MEMO_CAP)),
-            chapter_owner_memo: Arc::new(TtlMemo::new(READER_MEMO_TTL, READER_MEMO_CAP)),
+            pages_memo: Arc::new(TtlMemo::new(
+                READER_MEMO_TTL,
+                READER_MEMO_CAP,
+                &crate::telemetry::CACHE_ENGINE_PAGES,
+            )),
+            chapter_owner_memo: Arc::new(TtlMemo::new(
+                READER_MEMO_TTL,
+                READER_MEMO_CAP,
+                &crate::telemetry::CACHE_ENGINE_CHAPTER_OWNER,
+            )),
         }
     }
 
@@ -565,9 +625,12 @@ impl SuwayomiClient {
         &self,
         path: &str,
     ) -> std::result::Result<(Vec<u8>, String), CoverFetchError> {
+        let lane = crate::telemetry::ADMISSION.lane(crate::telemetry::Lane::CoverFetch);
         let Ok(_permit) = self.cover_sem.clone().try_acquire_owned() else {
+            lane.refuse();
             return Err(CoverFetchError::Busy);
         };
+        lane.admitted();
         self.fetch_cover_inner(path)
             .await
             .map_err(CoverFetchError::Upstream)
@@ -598,8 +661,7 @@ impl SuwayomiClient {
             // transient cover failure (see `cover::classify_fetch_error`) and the only
             // thing that makes those rows diagnosable in the admin Bugs panel.
             let status = res.status();
-            let body = res.text().await.unwrap_or_default();
-            let snippet: String = body.trim().chars().take(160).collect();
+            let snippet = error_snippet(res).await;
             return Err(if snippet.is_empty() {
                 anyhow!("Suwayomi cover error {status}")
             } else {
@@ -610,11 +672,14 @@ impl SuwayomiClient {
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .filter(|ct| ct.starts_with("image/"))
-            .unwrap_or("image/jpeg")
+            .unwrap_or("")
             .to_string();
-        let bytes = read_capped(res, MAX_COVER_SOURCE_BYTES).await?;
-        crate::avatar::ensure_complete(&bytes)?;
+        let bytes = read_capped(res, MAX_COVER_SOURCE_BYTES)
+            .await
+            .inspect_err(|error| count_oversize(BodySource::EngineCover, error))?;
+        let content_type =
+            crate::image_delivery::validate_from(BodySource::EngineCover, &bytes, &content_type)?
+                .to_string();
         Ok((bytes, content_type))
     }
 
@@ -632,24 +697,23 @@ impl SuwayomiClient {
     pub async fn fetch_page_now(
         &self,
         path: &str,
-    ) -> std::result::Result<(Vec<u8>, String), PageFetchError> {
+    ) -> std::result::Result<(axum::body::Bytes, String), PageFetchError> {
         // Held for the whole fetch below (bound to a named local, not `_`, so it is not
         // dropped early) — that is what makes the concurrency bound effective.
-        let _permit = match tokio::time::timeout(
+        let permit = acquire_page_slot(
+            crate::telemetry::ADMISSION.lane(crate::telemetry::Lane::PageFetch),
+            &self.page_sem,
             std::time::Duration::from_secs(PAGE_ACQUIRE_WAIT_SECS),
-            self.page_sem.clone().acquire_owned(),
         )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            // Semaphore closed (shutdown) — treat as an upstream failure, not a retry.
-            Ok(Err(e)) => return Err(PageFetchError::Upstream(anyhow!(e))),
-            // Waited past the cap without a slot — shed, retryably.
-            Err(_) => return Err(PageFetchError::Busy),
-        };
-        self.fetch_page_inner(path)
+        .await?;
+        let (bytes, content_type) = self
+            .fetch_page_inner(path)
             .await
-            .map_err(PageFetchError::Upstream)
+            .map_err(PageFetchError::Upstream)?;
+        Ok((
+            crate::image_delivery::retain_fetch_slot(bytes, permit),
+            content_type,
+        ))
     }
 
     /// Shared body of the page fetcher. Assumes the caller holds a page-pool permit.
@@ -661,8 +725,7 @@ impl SuwayomiClient {
             // its own 500 with the SOURCE's error ("HTTP error 403") in the body, and
             // that is the only thing that says why the page failed.
             let status = res.status();
-            let body = res.text().await.unwrap_or_default();
-            let snippet: String = body.trim().chars().take(160).collect();
+            let snippet = error_snippet(res).await;
             return Err(if snippet.is_empty() {
                 anyhow!("Suwayomi page error {status}")
             } else {
@@ -673,10 +736,14 @@ impl SuwayomiClient {
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .filter(|ct| ct.starts_with("image/"))
-            .unwrap_or("image/jpeg")
+            .unwrap_or("")
             .to_string();
-        let bytes = read_capped(res, MAX_PAGE_SOURCE_BYTES).await?;
+        let bytes = read_capped(res, MAX_PAGE_SOURCE_BYTES)
+            .await
+            .inspect_err(|error| count_oversize(BodySource::Page, error))?;
+        let content_type =
+            crate::image_delivery::validate_from(BodySource::Page, &bytes, &content_type)?
+                .to_string();
         Ok((bytes, content_type))
     }
 
@@ -1731,6 +1798,148 @@ mod tests {
 
     fn client(base: &str) -> SuwayomiClient {
         SuwayomiClient::new(base.to_string(), None, Some("1".into()))
+    }
+
+    #[tokio::test]
+    async fn image_fetches_reject_empty_challenges_mismatched_and_truncated_bodies() {
+        let jpeg = testsrv::jpeg(8, 8);
+        let cases = [
+            (Vec::new(), "image/jpeg"),
+            (b"<html>challenge</html>".to_vec(), "image/jpeg"),
+            (jpeg[..jpeg.len() - 2].to_vec(), "image/jpeg"),
+            (jpeg.clone(), "image/png"),
+            (jpeg, "text/html"),
+        ];
+        for (body, mime) in cases {
+            let origin = testsrv::spawn_status(200, mime, body, Duration::ZERO).await;
+            let c = client(&origin.base_url);
+            assert!(
+                matches!(
+                    c.fetch_cover_now("/cover").await,
+                    Err(CoverFetchError::Upstream(_))
+                ),
+                "{mime}"
+            );
+            assert!(
+                matches!(
+                    c.fetch_page_now("/page").await,
+                    Err(PageFetchError::Upstream(_))
+                ),
+                "{mime}"
+            );
+            assert_eq!(c.page_sem.available_permits(), PAGE_FETCH_CONCURRENCY);
+        }
+    }
+
+    #[tokio::test]
+    async fn fetched_page_keeps_its_slot_until_every_byte_owner_is_dropped() {
+        let jpeg = testsrv::jpeg(8, 8);
+        let origin = testsrv::spawn_status(
+            200,
+            "application/octet-stream",
+            jpeg.clone(),
+            Duration::ZERO,
+        )
+        .await;
+        let c = client(&origin.base_url);
+        let (bytes, mime) = c.fetch_page_now("/page").await.unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(bytes.as_ref(), jpeg);
+        let clone = bytes.clone();
+        drop(bytes);
+        assert_eq!(c.page_sem.available_permits(), PAGE_FETCH_CONCURRENCY - 1);
+        drop(clone);
+        assert_eq!(c.page_sem.available_permits(), PAGE_FETCH_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn page_slot_telemetry_counts_wait_only_for_an_obtained_slot() {
+        let stats = crate::telemetry::AdmissionStats::leak();
+        let lane = stats.lane(crate::telemetry::Lane::PageFetch);
+        let slots = Arc::new(Semaphore::new(1));
+        let held = acquire_page_slot(lane, &slots, std::time::Duration::from_millis(50))
+            .await
+            .unwrap();
+        let refused = acquire_page_slot(lane, &slots, std::time::Duration::from_millis(30)).await;
+        assert!(matches!(refused, Err(PageFetchError::Busy)));
+        // (admitted, refused, in flight, high water); fetch slots are not held here.
+        assert_eq!(lane.snapshot(), (1, 1, 0, 0));
+        assert!(
+            lane.wait_micros() < 30_000,
+            "a refused wait is not counted: {}us",
+            lane.wait_micros()
+        );
+        let waiter = {
+            let slots = slots.clone();
+            tokio::spawn(async move {
+                acquire_page_slot(lane, &slots, std::time::Duration::from_secs(5))
+                    .await
+                    .is_ok()
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        drop(held);
+        assert!(waiter.await.unwrap());
+        assert_eq!(lane.snapshot(), (2, 1, 0, 0));
+        assert!(lane.wait_micros() >= 25_000, "{}us", lane.wait_micros());
+    }
+
+    #[tokio::test]
+    async fn cancelled_page_fetch_releases_its_slot() {
+        let origin = testsrv::spawn_status(
+            200,
+            "image/jpeg",
+            testsrv::jpeg(8, 8),
+            Duration::from_secs(30),
+        )
+        .await;
+        let c = client(&origin.base_url);
+        let fetch = {
+            let c = c.clone();
+            tokio::spawn(async move { c.fetch_page_now("/page").await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while origin.hits.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("page fetch never reached the origin");
+        assert_eq!(c.page_sem.available_permits(), PAGE_FETCH_CONCURRENCY - 1);
+        // A client disconnect or the route deadline drops the handler future.
+        fetch.abort();
+        assert!(fetch.await.unwrap_err().is_cancelled());
+        assert_eq!(c.page_sem.available_permits(), PAGE_FETCH_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn error_prefix_does_not_wait_for_an_unbounded_response_tail() {
+        use futures::StreamExt;
+        let app = axum::Router::new().fallback(axum::routing::get(|| async {
+            let prefix = futures::stream::once(async {
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(vec![b'x'; 4096]))
+            });
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                axum::body::Body::from_stream(prefix.chain(futures::stream::pending())),
+            )
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = client(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let error = tokio::time::timeout(Duration::from_secs(2), c.fetch_page_now("/page"))
+            .await
+            .expect("page error tried to consume the stalled tail")
+            .unwrap_err();
+        assert!(error.to_string().contains(&"x".repeat(160)));
+        let error = tokio::time::timeout(Duration::from_secs(2), c.fetch_cover_now("/cover"))
+            .await
+            .expect("cover error tried to consume the stalled tail")
+            .unwrap_err();
+        assert!(error.to_string().contains(&"x".repeat(160)));
+        server.abort();
     }
 
     /// An engine that answers every GraphQL request with `body`.

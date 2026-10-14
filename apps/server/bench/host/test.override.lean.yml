@@ -1,0 +1,35 @@
+# Test host only. Lean profile. Not for production.
+services:
+  suwayomi:
+    restart: "no"
+    mem_limit: 1536m
+    cpus: 3.0
+    environment:
+      JAVA_TOOL_OPTIONS: -Xmx1g -XX:+UseSerialGC -Xss512k -XX:ReservedCodeCacheSize=96m -XX:TieredStopAtLevel=1 -Djava.awt.headless=true
+      KCEF_ENABLED: 'false'
+      WEB_UI_ENABLED: 'false'
+      BACKUP_INTERVAL: '0'
+      UPDATE_INTERVAL: '0'
+    volumes:
+      - /dev/null:/usr/bin/Xvfb
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -fsS http://localhost:4567/api/v1/settings/about >/dev/null || exit 1']
+  flaresolverr:
+    restart: "no"
+  postgres:
+    restart: "no"
+    mem_limit: 1g
+    memswap_limit: 1g
+    shm_size: 256m
+    volumes:
+      - ./pgconf/postgresql.lean.conf:/opt/komika-postgres/postgresql.conf:ro
+  server:
+    image: komika-server:pg-71b96aacb501
+    restart: "no"
+    mem_limit: 512m
+    environment:
+      COVER_CACHE: 'off'
+      KOMIKA_REGISTRATION_OPEN: 'on'
+      DATABASE_READ_POOL_SIZE: '4'
+      DATABASE_FOREGROUND_POOL_SIZE: '2'
+      MALLOC_ARENA_MAX: '2'

@@ -1,7 +1,7 @@
 # @komika/worker — image proxy
 
 A Cloudflare Worker that fetches upstream manga image bytes server-side and
-re-serves them with permissive CORS and long cache headers. The web reader can't
+re-serves them with permissive CORS and a bounded cache lifetime. The web reader can't
 cross-origin-fetch arbitrary source CDNs (CORS), so it points its `<img src>` at
 this Worker instead. The Worker is a **pure proxy backed by the Cloudflare edge
 cache** — there is no object-storage tier and it needs no secrets.
@@ -17,19 +17,34 @@ GET /img?src=<url-encoded upstream image URL>
 
 - **`src`** (required) — absolute `http(s)` URL of the upstream image. Rejected
   with `400` if missing, not `http(s)`, or not in the `ALLOWED_SOURCE_HOSTS`
-  allowlist. The upstream response must be an `image/*` type or it's rejected
-  `502`.
+  allowlist. The upstream response must declare a supported raster MIME type and
+  contain a nonempty image with matching container framing. SVG, mislabeled bodies,
+  incomplete images and bodies over 32 MiB are rejected with an uncacheable `502`.
 
 Also: `GET /` and `GET /healthz` return `ok`. `OPTIONS` is handled as a CORS
 preflight.
 
 ## Caching
 
-1. **Cloudflare edge** (`caches.default`) — keyed on the normalized upstream URL,
-   so hotlink/query noise shares one entry. Served with a 7-day immutable
-   `Cache-Control`.
+1. **Cloudflare edge** (`caches.default`) — keyed on the normalized upstream URL
+   plus an internal validation-version token, so hotlink/query noise shares one
+   entry. Current source URLs are mutable and use
+   `Cache-Control: public, max-age=300, must-revalidate`.
 2. **Upstream** — origin of last resort; the response is written back to the edge
-   cache.
+   cache only after a capped body read and raster-container validation. Errors are
+   `no-store`. The new internal key avoids reusing earlier unvalidated edge entries.
+
+Container validation checks framing, MIME and recognized signatures; it does not
+decode every pixel or authenticate source art. A future signed manifest must bind
+exact revisions and digests before regional caches can promise exact bytes.
+
+Validation buffers up to 32 MiB before returning an image, including when the
+upstream supplies Content-Length. This changes first-byte latency, CPU and isolate
+memory use from the earlier streaming path. Realistic image sizes, concurrent
+cold fills, CPU limits and slow clients require an isolated Worker performance
+gate before deployment. Previously issued browser `immutable` entries cannot be
+recalled by changing these response headers; rollout needs fresh public locators
+or an explicit cache-bust plan.
 
 There is no B2 / object-storage tier (removed in favor of edge-cache-only).
 

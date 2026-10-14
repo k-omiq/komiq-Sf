@@ -432,6 +432,15 @@ export interface Backend {
 	/** Tag a whole source as using AI, or with `null` remove its tag. `false` when
 	 * nothing changed. Optional. */
 	setSourceAi?(sourceId: string, ai: ScanlatorAi | null): Promise<boolean>;
+	/** The public scanlator list: every site and every group, each with the rating the
+	 * readers of this server gave it. 30 per page. Optional: a server that predates it
+	 * rejects the field, and the reader then says the server has no scanlator ratings. */
+	scanlatorRatings?(query?: ScanlatorRatingQuery): Promise<RatedScanlatorPage>;
+	/** One scanlator by its id; `null` when the server has no such scanlator. Optional. */
+	ratedScanlator?(id: Id): Promise<RatedScanlator | null>;
+	/** Set or change the viewer's rating of a scanlator (1 to 10), or with `null` remove
+	 * it. Resolves to the scanlator with its new numbers. Needs sign-in. Optional. */
+	rateScanlator?(id: Id, score: number | null): Promise<RatedScanlator>;
 	/** The site-wide content block rules. Optional. */
 	siteBlockRules?(): Promise<BlockRule[]>;
 	/** Replace the site-wide content block rules; returns the stored list. Optional. */
@@ -918,6 +927,58 @@ export interface Scanlator {
 
 export interface ScanlatorPage {
 	items: Scanlator[];
+	page: number;
+	hasNextPage: boolean;
+	total: number;
+}
+
+/** A scanlator is a site that translates its own series, or a group that chapters
+ *  credit. MangaDex is not a site: its groups are the scanlators. */
+export type ScanlatorKind = 'SITE' | 'GROUP';
+
+/** `TOP`: ranked scanlators first, by rank. `VOTES`: most ratings first. `CHAPTERS`:
+ *  most chapters first. `NAME`: A to Z. */
+export type ScanlatorSort = 'TOP' | 'VOTES' | 'CHAPTERS' | 'NAME';
+
+export interface ScanlatorRatingQuery {
+	/** Part of the name, any case. */
+	search?: string;
+	kind?: ScanlatorKind;
+	/** Only the scanlators the viewer rated. An empty page when signed out. */
+	mine?: boolean;
+	sort?: ScanlatorSort;
+	page?: number;
+}
+
+/** One row of the public scanlator list. */
+export interface RatedScanlator {
+	/** `site:<source id>` or `group:<name key>`. Also the `targetId` of its comment
+	 *  thread (`targetType: 'scanlator'`). */
+	id: Id;
+	kind: ScanlatorKind;
+	name: string;
+	/** Sites only. */
+	lang: string | null;
+	seriesCount: number;
+	/** Null when the server has no count for it. */
+	chapterCount: number | null;
+	/** The AI tag that applies; null when it has none. */
+	ai: ScanlatorAi | null;
+	/** The plain average of the scores, 1 to 10; null when nobody rated it. */
+	rating: number | null;
+	ratingCount: number;
+	/** 1-based place among every ranked scanlator; null below the server's minimum
+	 *  number of ratings. */
+	rank: number | null;
+	/** Ten numbers: how many readers gave 1, 2, … 10. */
+	distribution: number[];
+	/** The viewer's own score; null when signed out or not rated. */
+	myScore: number | null;
+	commentCount: number;
+}
+
+export interface RatedScanlatorPage {
+	items: RatedScanlator[];
 	page: number;
 	hasNextPage: boolean;
 	total: number;

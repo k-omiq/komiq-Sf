@@ -42,6 +42,27 @@ pub(crate) fn tables() -> Vec<Table> {
     serde_json::from_str(include_str!("plan.json")).expect("checked-in import plan")
 }
 
+/// A table that only PostgreSQL has: a migration after the baseline created it, so no
+/// SQLite file holds it, the import plan does not list it and the importer copies
+/// nothing into it. It is empty until the server that runs on the imported database
+/// writes to it.
+pub(crate) struct PostgresOnly {
+    pub name: &'static str,
+    /// The version of the `migrations_pg` file that creates it. A target that an older
+    /// release migrated does not have the table yet.
+    pub since: i64,
+    /// (column, parent table, parent column) of each of its foreign keys.
+    pub fks: &'static [(&'static str, &'static str, &'static str)],
+}
+
+/// Every such table. The importer's inventory, its reset and the verifier's foreign-key
+/// expectation read this list; the indexes are read from the migration files themselves.
+pub(crate) const POSTGRES_ONLY: &[PostgresOnly] = &[PostgresOnly {
+    name: "scanlator_rating",
+    since: 4,
+    fks: &[("user_id", "users", "id")],
+}];
+
 pub(crate) fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }

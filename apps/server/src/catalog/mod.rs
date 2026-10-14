@@ -12671,12 +12671,6 @@ mod tests {
 }
 
 #[cfg(test)]
-include!("../../bench/sqlite_contention.rs");
-
-#[cfg(test)]
-include!("../../bench/sqlite_projection.rs");
-
-#[cfg(test)]
 mod production_safety_tests;
 
 #[cfg(test)]

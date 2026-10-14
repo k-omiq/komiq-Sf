@@ -2,7 +2,7 @@
 
 The **Komika unified GraphQL API**. Implements `packages/api/src/schema/komika.graphql`
 by federating a Suwayomi/Tachidesk server (catalog, chapters, pages, library,
-progress) and adding Komika-native **multi-user social + auth + discovery** on SQLite.
+progress) and adding Komika-native **multi-user social + auth + discovery** on PostgreSQL.
 
 Chosen in Rust for the smallest process footprint (~5–15 MB RSS, no GC) and to allow
 sharing crates with the Tauri Rust core (`apps/reader/src-tauri`) later.
@@ -10,7 +10,9 @@ sharing crates with the Tauri Rust core (`apps/reader/src-tauri`) later.
 ## Stack
 
 - **axum 0.8** + **async-graphql 7** (code-first schema, a 1:1 mirror of the SDL)
-- **SQLite** via **sqlx** (single file, `create_if_missing`, migrations at startup)
+- **PostgreSQL 18** via **sqlx** (migrations from `migrations_pg/` at startup). SQLite remains for the
+  separate cover cache (`covers.sqlite3`) and as the source of the one-time import of an old main
+  database (`migrations/` is that frozen history)
 - **argon2id** password hashing + opaque session tokens (`Authorization: Bearer <token>`)
 - **reqwest** for server-side Suwayomi federation
 
@@ -24,10 +26,10 @@ health:    http://localhost:8080/health
 
 Build from this directory, or from the repository root with `--manifest-path
 apps/server/Cargo.toml`. The root `.cargo/config.toml` fixes bundled SQLite's mmap
-ceiling at 8 GiB; both Docker builders copy it. The main pool requests that amount
-of virtual address space, without eagerly loading the database into memory.
+ceiling at 8 GiB; both Docker builders copy it.
 
-Config (env / `.env`): `PORT`, `DATABASE_URL` (default `sqlite://komika.sqlite3`),
+Config (env / `.env`): `PORT`, `DATABASE_URL` (default `postgres://localhost/komika`; the cover cache URL is derived
+as `sqlite://covers.sqlite3`, or set `COVERS_DATABASE_URL`),
 `SUWAYOMI_URL` (default `http://localhost:4567`), `SUWAYOMI_SOURCE_ID` (optional pin),
 `CORS_ORIGINS` (reader dev/preview origins — add the admin origin `http://localhost:5273`
 to use the console), `KOMIKA_ADMIN_USERS` (comma-separated reserved admin usernames;
@@ -135,7 +137,7 @@ PUBLIC_KOMIKA_IMG_MODE=direct
 | ---------------------- | ---------------------------------------------------------- |
 | `src/main.rs`          | axum wiring, CORS, GraphiQL, bearer → GraphQL context      |
 | `src/config.rs`        | env config                                                 |
-| `src/db.rs`            | SQLite pool + migrations                                   |
+| `src/db.rs`            | PostgreSQL pool + migrations; SQLite cover cache           |
 | `src/auth.rs`          | argon2 hashing, token gen, session→user lookup             |
 | `src/suwayomi.rs`      | federation client (mirrors the TS `SuwayomiBackend`)       |
 | `src/graphql/types.rs` | GraphQL types + Suwayomi→Komika mapping helpers            |

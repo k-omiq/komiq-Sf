@@ -9,8 +9,8 @@
 //! To honour a size budget without a lossy quality knob we pick the *largest*
 //! candidate longest-edge whose encoded size fits [`MAX_MEDIA_BYTES`]; a busy
 //! photo lands on a smaller edge, a flat screenshot keeps full size. Storage is
-//! the SQLite `comment_media` table (a BLOB per image), Litestream-replicated
-//! with the rest of the DB. Upload/serve wiring lives in `main.rs`.
+//! the main-database `comment_media` table (a BLOB per image), backed up with
+//! the rest of the DB. Upload/serve wiring lives in `main.rs`.
 
 use anyhow::{anyhow, bail, Context, Result};
 use image::codecs::webp::WebPEncoder;
@@ -22,7 +22,7 @@ pub const MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
 
 /// Size budget for the stored WebP. Larger than an avatar's (comment images are
 /// viewed at content width, not a 40px chip) but still small enough to keep the
-/// SQLite BLOB store and its Litestream replication cheap.
+/// database BLOB store and its backups cheap.
 pub const MAX_MEDIA_BYTES: usize = 500 * 1024;
 
 /// Candidate longest-edge lengths (px), largest first. The first that encodes

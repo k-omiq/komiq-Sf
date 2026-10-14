@@ -1,0 +1,102 @@
+{
+	"name": "m2-baseline",
+	"description": "M2 baseline: each workload class on its own, in a fixed order, into one JSON. Test host only. Durations are the real ones; pass --duration/--warmup on the command line for a short smoke run.",
+	"defaults": {
+		"metrics-interval": 5,
+		"max-errors": 0.01,
+		"image-chapters": 24,
+		"image-urls": 600,
+		"accounts": 2000
+	},
+	"steps": [
+		{
+			"name": "metadata",
+			"note": "Anonymous metadata reads (home, browse, series page, text search). No images, no writes.",
+			"scenario": "read",
+			"vus": [8, 16, 32, 64],
+			"warmup": 10,
+			"duration": 60
+		},
+		{
+			"name": "writes-sequential",
+			"note": "Established readers: page n+1 of the same chapter, then the next chapter.",
+			"scenario": "write",
+			"mix": "progress=1,mark=0,comment=0",
+			"progress-pattern": "sequential",
+			"vus": [8, 16, 32, 64],
+			"warmup": 10,
+			"duration": 60
+		},
+		{
+			"name": "writes-random",
+			"note": "New or random positions: a random chapter at a random page every write.",
+			"scenario": "write",
+			"mix": "progress=1,mark=0,comment=0",
+			"progress-pattern": "random",
+			"vus": [8, 16, 32, 64],
+			"warmup": 10,
+			"duration": 60
+		},
+		{
+			"name": "writes-hot20",
+			"note": "Write contention: every writer on the same 20 works.",
+			"scenario": "write",
+			"hot-works": 20,
+			"progress-pattern": "random",
+			"vus": [32, 64],
+			"warmup": 10,
+			"duration": 60
+		},
+		{
+			"name": "session",
+			"note": "Signed-in readers following the SESSION MODEL, spread over the whole pool. No images.",
+			"scenario": "session",
+			"users": [500, 1000, 2000],
+			"warmup": 60,
+			"duration": 180
+		},
+		{
+			"name": "session-hot20",
+			"note": "All readers on the same 20 works.",
+			"scenario": "session",
+			"hot-works": 20,
+			"users": [1000, 2000],
+			"warmup": 60,
+			"duration": 180
+		},
+		{
+			"name": "images-warm",
+			"note": "Store covers, plus fixture page stand-ins when --fixture-images is given, after the warm pass. No real-source images.",
+			"scenario": "image-warm",
+			"vus": [8, 16, 32, 64],
+			"warmup": 10,
+			"duration": 60
+		},
+		{
+			"name": "images-cold",
+			"note": "Unique fixture images, each fetched once, after the page stand-ins. Skipped (and listed in `omitted`) without --fixture-images.",
+			"scenario": "image-cold",
+			"requires": ["fixture-images"],
+			"vus": [8, 16, 32],
+			"warmup": 0,
+			"duration": 60
+		},
+		{
+			"name": "mixed",
+			"note": "Session plus the page images the reader loads while reading, as fixture stand-ins. Skipped without --fixture-images.",
+			"scenario": "mixed",
+			"users": [250, 500, 1000],
+			"warmup": 60,
+			"duration": 180
+		},
+		{
+			"name": "release-burst",
+			"note": "Every user opens the newest chapter of 3 works at the same instant, then reads it (fixture page stand-ins). Skipped without --fixture-images.",
+			"scenario": "release-burst",
+			"burst-works": 3,
+			"users": [500, 1000],
+			"warmup": 0,
+			"duration": 180
+		}
+	]
+}

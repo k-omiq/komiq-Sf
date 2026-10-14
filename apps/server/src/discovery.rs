@@ -608,6 +608,7 @@ mod tests {
             scan_health: std::sync::Mutex::new(crate::graphql::ScanHealth::default()),
             auth_limiter: crate::graphql::RateLimiter::new(100, 60),
             comment_limiter: crate::graphql::comment_limiter(),
+            rating_limiter: crate::graphql::rating_limiter(),
             password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: crate::graphql::RateLimiter::new(100, 60),
             session_ttl_secs: 3600,

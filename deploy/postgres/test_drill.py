@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import math
 from pathlib import Path
 import tempfile
 import subprocess
@@ -850,6 +851,98 @@ class DrillTests(unittest.TestCase):
         for bad in ("text", 7, None):
             with self.subTest(listing=bad), self.assertRaises(ValueError):
                 drill.usage(bad)
+
+
+class GapTests(unittest.TestCase):
+    """A PITR target inside a recorded dropped-WAL gap is refused (hosted)."""
+
+    def setUp(self):
+        p = patch.object(drill, "HOSTED_RECOVERY", True)
+        p.start()
+        self.addCleanup(p.stop)
+        p = patch.dict(os.environ, HOSTED, clear=True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    @staticmethod
+    def backup(label, kind, start, stop):
+        return {"label": label, "type": kind, "timestamp": {"start": start, "stop": stop}}
+
+    def test_target_inside_a_gap_is_refused_and_outside_passes(self):
+        backups = [self.backup("F1", "full", 100, 200), self.backup("I1", "incr", 300, 350),
+                   self.backup("I2", "incr", 600, 650), self.backup("F2", "full", 900, 1000)]
+        # Dropped at 500: the gap may begin after I1 (350) and closes at F2's stop (1000).
+        self.assertEqual(drill.gap_windows([500], backups), [(350, 1000, 500)])
+        with patch.object(drill, "dropped_wal_events", return_value=[500]):
+            for instant in (351, 500, 700, 999):
+                with self.subTest(instant=instant), self.assertRaisesRegex(ValueError, "recorded archive gap"):
+                    drill.refuse_gap(instant, backups)
+            for instant in (250, 350, 1000, 1200):
+                with self.subTest(instant=instant):
+                    drill.refuse_gap(instant, backups)
+        # No full backup since the drop: open to the end.
+        with patch.object(drill, "dropped_wal_events", return_value=[700]), \
+                self.assertRaisesRegex(ValueError, "no full backup has completed since"):
+            drill.refuse_gap(10 ** 10, backups[:3])
+
+    def test_drop_in_the_same_second_as_a_full_start_stays_open(self):
+        backups = [self.backup("F1", "full", 100, 200), self.backup("F2", "full", 900, 1000)]
+        # pgBackRest starts have whole seconds: F2 (900) may have begun after 900.5.
+        self.assertEqual(drill.gap_windows([900.5], backups), [(200, math.inf, 900.5)])
+        self.assertEqual(drill.gap_windows([900], backups), [(200, math.inf, 900)])
+        self.assertEqual(drill.gap_windows([899.999], backups), [(200, 1000, 899.999)])
+
+    def test_latest_state_restore_refuses_an_open_gap_unless_accepted(self):
+        backups = [self.backup("F1", "full", 100, 200), self.backup("I1", "incr", 600, 650)]
+        for events in ([500], [500, 100.25]):
+            with self.subTest(events=events), patch.object(drill, "dropped_wal_events", return_value=events):
+                with self.assertRaisesRegex(ValueError, "archive gap is open.*--accept-gap"):
+                    drill.refuse_open_gap(backups)
+                with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                    drill.refuse_open_gap(backups, accept=True)
+                self.assertIn("WARNING: --accept-gap", stderr.getvalue())
+        # Closed by a full that started after the latest drop, or nothing dropped.
+        for events, extra in (([500], [self.backup("F2", "full", 501, 900)]), ([], [])):
+            with self.subTest(events=events), patch.object(drill, "dropped_wal_events", return_value=events), \
+                    patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                drill.refuse_open_gap(backups + extra)
+                self.assertEqual(stderr.getvalue(), "")
+        with patch.object(drill, "dropped_wal_events", return_value=[500]), \
+                self.assertRaisesRegex(ValueError, "archive gap is open"):
+            drill.refuse_open_gap(backups + [self.backup("F2", "full", 500, 900)])
+        # Unreachable record: said loudly, not refused (the source may be gone).
+        with patch.object(drill, "dropped_wal_events", return_value=None), \
+                patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            drill.refuse_open_gap(backups)
+        self.assertIn("may stop silently", stderr.getvalue())
+
+    def test_accept_gap_only_for_a_latest_state_restore(self):
+        for kwargs in ({"restore_only": False}, {"restore_only": True, "target_time": "2026-10-13T10:00:00Z"}):
+            with self.subTest(**kwargs), patch.object(drill, "source", side_effect=AssertionError("no source")), \
+                    self.assertRaisesRegex(ValueError, "--accept-gap applies only"):
+                drill.run(Path("/nonexistent"), accept_gap=True, **kwargs)
+
+    def test_unreachable_record_is_said_not_silently_promised(self):
+        with patch.object(drill, "dropped_wal_events", return_value=None), \
+                patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            drill.refuse_gap(500, [])
+        self.assertIn("dropped-WAL record is unreachable", stderr.getvalue())
+
+    def test_record_is_read_from_the_running_source_only(self):
+        calls = []
+        def run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "2026-10-13T10:00:00Z 0000000100000000000000A0\nbroken\n"
+                                               "2026-10-13T10:00:00.250000Z 0000000100000000000000A1\n", "")
+        with patch.object(drill.subprocess, "run", side_effect=run):
+            self.assertEqual(drill.dropped_wal_events(), [1791885600.0, 1791885600.25])
+        self.assertEqual(calls[0][-6:-3], ["postgres", "sh", "-c"])
+        self.assertIn("--user", calls[0])
+        self.assertEqual(calls[0][-1], drill.DROPPED_RECORD)
+        with patch.object(drill.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "no such service")):
+            self.assertIsNone(drill.dropped_wal_events())
+        with patch.object(drill.subprocess, "run", side_effect=subprocess.TimeoutExpired("docker", 60)):
+            self.assertIsNone(drill.dropped_wal_events())
 
 
 if __name__ == "__main__":

@@ -135,6 +135,8 @@ export function createMemoryStorageAdapter(): StorageAdapter {
  */
 export class OfflineWriteQueue {
 	private ops: WriteOp[];
+	private replayGeneration = 0;
+	private replay: Promise<void> | undefined;
 
 	constructor(private adapter: StorageAdapter) {
 		this.ops = this.read();
@@ -204,9 +206,19 @@ export class OfflineWriteQueue {
 	 * sign-out. No-op when nothing changes.
 	 */
 	dropForeign(userId: string | null): void {
+		this.cancelReplay();
 		const before = this.ops.length;
 		this.ops = userId == null ? [] : this.ops.filter((op) => op.userId === userId);
 		if (this.ops.length !== before) this.persist();
+	}
+
+	/** Stop a drain at its next await boundary. Already-sent writes cannot be
+	 * recalled, but a new token or identity must never send the remaining backlog. */
+	cancelReplay(): void {
+		this.replayGeneration += 1;
+		// A hung request from an obsolete auth context must not block this account's
+		// replay. Its eventual completion still owns only its old generation/head.
+		this.replay = undefined;
 	}
 
 	/**
@@ -227,19 +239,50 @@ export class OfflineWriteQueue {
 		// Identity unknown (e.g. token restored but session not yet validated): defer.
 		// Never drop here — the owner may still sign in and reclaim these ops.
 		if (currentUserId == null) return;
+		const generation = this.replayGeneration;
+		// Serialize drains before they inspect or send the head. Defer the first
+		// callback by one microtask so ownership exists even for reentrant flushes.
+		while (this.replay) await this.replay;
+		if (generation !== this.replayGeneration) return;
+		const replay = Promise.resolve().then(() => this.drainOwned(flush, currentUserId, generation));
+		this.replay = replay;
+		try {
+			await replay;
+		} finally {
+			if (this.replay === replay) this.replay = undefined;
+		}
+	}
+
+	private async drainOwned(
+		flush: (op: WriteOp) => Promise<void>,
+		currentUserId: string,
+		generation: number,
+	): Promise<void> {
+		if (generation !== this.replayGeneration) return;
 		// Cross-user safety net: purge anything not owned by the current user before
 		// replaying. Redundant with `dropForeign` on identity-change, but guarantees a
 		// foreign op is impossible to replay even if an identity transition was missed.
 		const before = this.ops.length;
 		this.ops = this.ops.filter((op) => op.userId === currentUserId);
 		if (this.ops.length !== before) this.persist();
-		while (this.ops.length > 0) {
+		while (this.ops.length > 0 && generation === this.replayGeneration) {
 			const op = this.ops[0];
+			if (op.userId !== currentUserId) {
+				this.ops.shift();
+				this.persist();
+				continue;
+			}
 			try {
 				await flush(op);
+				if (generation !== this.replayGeneration) return;
+				// Enqueue can replace the head with a newer state while a write waits.
+				// A late completion only removes the exact operation it sent.
+				if (this.ops[0] !== op) continue;
 				this.ops.shift();
 				this.persist();
 			} catch {
+				if (generation !== this.replayGeneration) return;
+				if (this.ops[0] !== op) continue;
 				op.tries += 1;
 				if (op.tries >= MAX_TRIES) {
 					this.ops.shift();

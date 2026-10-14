@@ -340,10 +340,17 @@ export async function submitSeriesReview(
 // ---- comments: per-chapter threads AND series-level discussion --------------
 //
 // One generalized pipeline serves both (mirrors the backend's polymorphic comment
-// target). `LocalBucket` keeps the offline fallback for the two kinds in separate
+// target). `LocalBucket` keeps the offline fallback for each kind in a separate
 // localStorage slots so a series discussion never collides with its reviews.
 
-type LocalBucket = 'chapter' | 'seriesThread';
+type LocalBucket = 'chapter' | 'seriesThread' | 'scanlatorThread';
+
+/** Where the offline fallback keeps the thread of each target type. */
+const LOCAL_BUCKET: Record<CommentTargetType, LocalBucket> = {
+	chapter: 'chapter',
+	series: 'seriesThread',
+	scanlator: 'scanlatorThread',
+};
 
 async function loadComments(
 	targetType: CommentTargetType,
@@ -534,6 +541,30 @@ export function submitSeriesComment(
 	);
 }
 
+// The thread of one scanlator (Scanlators page). `scanlatorId` is a `RatedScanlator.id`.
+export function loadScanlatorComments(scanlatorId: string, key: string): Promise<CommentView[]> {
+	return loadComments('scanlator', scanlatorId, 'scanlatorThread', key);
+}
+export function submitScanlatorComment(
+	scanlatorId: string,
+	key: string,
+	body: string,
+	hasSpoiler: boolean,
+	currentComments: CommentView[],
+	opts: CommentOpts = {},
+): Promise<CommentView[]> {
+	return submitComment(
+		'scanlator',
+		scanlatorId,
+		'scanlatorThread',
+		key,
+		body,
+		hasSpoiler,
+		currentComments,
+		opts,
+	);
+}
+
 // ---- comment deletion + admin moderation -----------------------------------
 
 /** True when the signed-in user may moderate (admin on the live backend). */
@@ -575,7 +606,7 @@ export async function deleteComment(
 	}
 	if (!socialLive() && localTarget) {
 		saveLocalComments(
-			localTarget.targetType === 'series' ? 'seriesThread' : 'chapter',
+			LOCAL_BUCKET[localTarget.targetType],
 			localTarget.storageKey,
 			next,
 		);

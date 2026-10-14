@@ -115,6 +115,8 @@ The server can import an old main SQLite database at first start when PostgreSQL
 
 Hosted recovery uses pgBackRest restore into an empty cluster directory with PostgreSQL stopped. The procedure, with its rehearsal, is `deploy/postgres/RESTORE.md`; it is a runbook for operators of this packaging, and this page does not repeat it. A point-in-time restore combines a backup with archived WAL up to the chosen recovery point. Review the restore tooling and verify the restored database before making it available to users. Keep recovery separate from ordinary startup; never substitute an empty database for a failed restore.
 
+The server command `export-postgres-to-sqlite` copies user tables into a new SQLite file for a return to an older build. It refuses and writes no file when PostgreSQL holds rows SQLite cannot store, such as per-user scanlator ratings. Keep PostgreSQL and its backups then. A migration 0121 target loses deleted-comment markers, which the report lists.
+
 The server holds `.komiq-server.lock` in the covers directory for its lifetime. A second server using that directory fails to start. The `phase-f` maintenance command connects to existing databases without running migrations or recreating covers. It refuses a missing, behind or incompatible main schema.
 
 ### Self-host and desktop

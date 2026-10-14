@@ -683,7 +683,7 @@ pub(crate) const COUNT_TTL: std::time::Duration = std::time::Duration::ZERO;
 /// Browse v2 made the space effectively unbounded (tag sets, year ranges, text queries), so
 /// the cap is now a memory bound rather than a coverage claim: a v2 key with a few tags is
 /// ~150 bytes, i.e. ~300 KiB at the cap, and the hot heads (no filter / one tab / one tag)
-/// still fit many times over. Eviction is expired-first ([`store_count_with`]).
+/// still fit many times over. Eviction is expired-first, then selective LRU.
 const COUNT_CACHE_CAP: usize = 2048;
 
 /// The memo key for one filter combination.
@@ -811,71 +811,55 @@ fn count_key(q: &BrowseQuery<'_>) -> String {
     key
 }
 
-/// Memoized Browse totals, keyed by the filter signature.
-#[allow(clippy::type_complexity)]
-static COUNT_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, (i64, std::time::Instant)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+/// Count and row values share an epoch, so an invalidated async refill cannot
+/// repopulate either cache. Each value cache evicts only its least-used entry.
+static BROWSE_CACHE_EPOCH: std::sync::LazyLock<crate::catalogue_cache::CacheEpoch> =
+    std::sync::LazyLock::new(crate::catalogue_cache::CacheEpoch::default);
+static COUNT_CACHE: std::sync::LazyLock<crate::catalogue_cache::CatalogueCache<String, i64>> =
+    std::sync::LazyLock::new(|| {
+        crate::catalogue_cache::CatalogueCache::new(
+            COUNT_CACHE_CAP,
+            BROWSE_CACHE_EPOCH.clone(),
+            &crate::telemetry::CACHE_BROWSE_COUNT,
+        )
+    });
+
+pub(crate) fn cache_generation() -> u64 {
+    BROWSE_CACHE_EPOCH.current()
+}
 
 fn cached_count(key: &str) -> Option<i64> {
     cached_count_with(key, COUNT_TTL)
 }
 
 pub(crate) fn cached_count_with(key: &str, ttl: std::time::Duration) -> Option<i64> {
-    let cache = COUNT_CACHE.lock().ok()?;
-    let (total, at) = cache.get(key)?;
-    (at.elapsed() < ttl).then_some(*total)
+    COUNT_CACHE.get(key, ttl)
 }
 
-fn store_count(key: String, total: i64) {
-    store_count_with(key, total, COUNT_TTL)
+fn store_count(key: String, total: i64, generation: u64) {
+    store_count_with_generation(key, total, COUNT_TTL, generation);
 }
 
-/// Evict EXPIRED entries first, and only fall back to a wholesale clear if that frees
-/// nothing.
-///
-/// The cap is reached by cycling distinct filter signatures, which a client controls (see
-/// [`MAX_GENRE_FILTERS`]) — so clearing unconditionally hands anyone a way to evict the hot
-/// anonymous-Browse key on demand and make every page load pay the full COUNT again.
-/// Dropping expired entries first means a flood slower than [`COUNT_TTL`] never touches a
-/// live entry, and a faster one degrades to "no memo" (each miss still computes exactly)
-/// rather than to something worse. Bounded either way.
+pub(crate) fn store_count_with_generation(
+    key: String,
+    total: i64,
+    ttl: std::time::Duration,
+    generation: u64,
+) {
+    COUNT_CACHE.insert(generation, key, total, ttl);
+}
+
+#[cfg(test)]
 pub(crate) fn store_count_with(key: String, total: i64, ttl: std::time::Duration) {
-    let Ok(mut cache) = COUNT_CACHE.lock() else {
-        return; // poisoned → just stop memoizing; every count is still computed exactly
-    };
-    if cache.len() >= COUNT_CACHE_CAP {
-        cache.retain(|_, (_, at)| at.elapsed() < ttl);
-        if cache.len() >= COUNT_CACHE_CAP {
-            cache.clear();
-        }
-    }
-    cache.insert(key, (total, std::time::Instant::now()));
+    store_count_with_generation(key, total, ttl, cache_generation());
 }
 
-/// Drop every memoized total AND every memoized row page. Called at the end of
-/// `catalog::refresh_browse_catalogue` and from `graphql::clear_feed_caches` (the admin
-/// NSFW mutations).
-///
-/// That refresh rewrites the table these totals describe, so a surviving entry can promise a
-/// page that no longer exists — `hasNextPage: true` on the last page, and a pager that
-/// renders "Page 3,853 of 3,853 · showing 115,531-115,560 of 115,530". The window is up to
-/// [`COUNT_TTL`], twice a day, but it costs one `HashMap::clear` to close and the alternative
-/// is a user-visible dead page.
-///
-/// The ROW memo goes with the totals, always: both describe the same generation of the
-/// table, and a row page surviving a rebuild would render cards for works the rebuild
-/// deleted (a merged-away `work_id` 404s) next to a `total` that no longer counts them.
-/// Keeping one `clear` entry point also means every existing invalidation hook — there are
-/// two, and both predate the row memo — invalidates both memos without knowing the row
-/// memo exists.
+/// Invalidate outstanding refills before dropping count and row values. A read
+/// already running may finish, but cannot publish its result into the new epoch.
 pub fn clear_count_cache() {
-    if let Ok(mut c) = COUNT_CACHE.lock() {
-        c.clear();
-    }
-    if let Ok(mut c) = ROW_CACHE.lock() {
-        c.clear();
-    }
+    BROWSE_CACHE_EPOCH.advance();
+    COUNT_CACHE.clear();
+    ROW_CACHE.clear();
 }
 
 // ---- the row-page memo ----------------------------------------------------------------
@@ -911,10 +895,15 @@ const ROW_TTL: std::time::Duration = std::time::Duration::ZERO;
 const ROW_CACHE_CAP: usize = 256;
 
 /// Memoized Browse row pages, keyed by [`row_key`].
-#[allow(clippy::type_complexity)]
 static ROW_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, (Vec<BrowseRow>, std::time::Instant)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    crate::catalogue_cache::CatalogueCache<String, Vec<BrowseRow>>,
+> = std::sync::LazyLock::new(|| {
+    crate::catalogue_cache::CatalogueCache::new(
+        ROW_CACHE_CAP,
+        BROWSE_CACHE_EPOCH.clone(),
+        &crate::telemetry::CACHE_BROWSE_ROWS,
+    )
+});
 
 /// The memo key for one PAGE of rows: the sort (key AND direction, [`Sort::word`]) and the
 /// (clamped) page, then the whole filter signature.
@@ -943,31 +932,16 @@ fn cached_rows(key: &str) -> Option<Vec<BrowseRow>> {
 }
 
 fn cached_rows_with(key: &str, ttl: std::time::Duration) -> Option<Vec<BrowseRow>> {
-    let cache = ROW_CACHE.lock().ok()?;
-    let (rows, at) = cache.get(key)?;
-    (at.elapsed() < ttl).then(|| rows.clone())
+    ROW_CACHE.get(key, ttl)
 }
 
-fn store_rows(key: String, rows: Vec<BrowseRow>) {
-    store_rows_with(key, rows, ROW_TTL)
+fn store_rows(key: String, rows: Vec<BrowseRow>, generation: u64) {
+    ROW_CACHE.insert(generation, key, rows, ROW_TTL);
 }
 
-/// Same bounded-eviction shape as [`store_count_with`], for the same reason: the key space
-/// is client-controlled (genres, and now page), so an unconditional clear at the cap would
-/// hand anyone a way to evict the hot anonymous page-1 entry on demand. Expired entries go
-/// first; only a flood faster than [`ROW_TTL`] degrades the memo to "no memo", where every
-/// miss still computes exactly.
+#[cfg(test)]
 fn store_rows_with(key: String, rows: Vec<BrowseRow>, ttl: std::time::Duration) {
-    let Ok(mut cache) = ROW_CACHE.lock() else {
-        return; // poisoned → just stop memoizing; every page is still computed exactly
-    };
-    if cache.len() >= ROW_CACHE_CAP {
-        cache.retain(|_, (_, at)| at.elapsed() < ttl);
-        if cache.len() >= ROW_CACHE_CAP {
-            cache.clear();
-        }
-    }
-    cache.insert(key, (rows, std::time::Instant::now()));
+    ROW_CACHE.insert(cache_generation(), key, rows, ttl);
 }
 
 // ---- the query ------------------------------------------------------------------------
@@ -1459,6 +1433,7 @@ async fn text_pass(
     first: fn(&str, &str) -> String,
     first_memo: &str,
 ) -> Result<std::result::Result<(i64, Vec<BrowseRow>), (sqlx::Error, std::time::Duration)>> {
+    let generation = cache_generation();
     let match_expr = raw_query.to_owned();
     let (where_sql, where_binds, uses_rated) = build_where_from(q, 2);
     let page_size = BROWSE_PAGE_SIZE;
@@ -1532,7 +1507,7 @@ async fn text_pass(
                     }
                     counted => counted?,
                 };
-                store_count(ckey, t);
+                store_count(ckey, t, generation);
                 t
             }
         };
@@ -1653,6 +1628,7 @@ pub async fn browse_catalogue(
     pool: &Database,
     q: &BrowseQuery<'_>,
 ) -> Result<(i64, Vec<BrowseRow>)> {
+    let generation = cache_generation();
     let (where_sql, binds, uses_rated) = build_where(q);
     let page_size = BROWSE_PAGE_SIZE;
     // `page.max(1)` is the ONLY thing standing between a hand-edited `?page=-5` and a
@@ -1673,15 +1649,15 @@ pub async fn browse_catalogue(
             let t = bind_count(sqlx::query_scalar::<_, i64>(&sql), &binds)
                 .fetch_one(pool)
                 .await?;
-            store_count(key, t);
+            store_count(key, t, generation);
             t
         }
     };
 
     // The row page, memoized like the total but for [`ROW_TTL`] and per (sort, page).
     // Checked AFTER the total so a hit still returns a `total` no older than [`COUNT_TTL`]
-    // — the two memos are cleared together (see [`clear_count_cache`]) so they always
-    // describe the same generation of the table.
+    // — both reject values published by invalidated refills. Normal TTL differences
+    // and concurrent catalogue writes still permit bounded pagination staleness.
     let rkey = row_key(q);
     if let Some(rows) = cached_rows(&rkey) {
         return Ok((total, rows));
@@ -1737,7 +1713,7 @@ pub async fn browse_catalogue(
             }
         }
     };
-    store_rows(rkey, rows.clone());
+    store_rows(rkey, rows.clone(), generation);
     Ok((total, rows))
 }
 
@@ -1772,6 +1748,7 @@ async fn nulls_last_page(
     page_size: i64,
     offset: i64,
 ) -> Result<Vec<BrowseRow>> {
+    let generation = cache_generation();
     let prefix_len = match cached_count(ctx.count_key) {
         Some(n) => n,
         None => {
@@ -1788,7 +1765,7 @@ async fn nulls_last_page(
             let n = bind_count(sqlx::query_scalar::<_, i64>(&sql), ctx.binds)
                 .fetch_one(ctx.pool)
                 .await?;
-            store_count(ctx.count_key.to_string(), n);
+            store_count(ctx.count_key.to_string(), n, generation);
             n
         }
     };
@@ -2893,7 +2870,7 @@ mod tests {
         let anon = "memo-test|v2|0|||||";
         let opted_in = "memo-test|v2|1|||||";
         assert_eq!(cached_count_with(anon, ttl), None, "cold");
-        store_count(anon.to_string(), 43_730);
+        store_count(anon.to_string(), 43_730, cache_generation());
         assert_eq!(cached_count_with(anon, ttl), Some(43_730));
         assert_eq!(cached_count_with(opted_in, ttl), None);
         // An expired entry is ignored rather than served stale.
@@ -3050,7 +3027,7 @@ mod tests {
         for i in 0..COUNT_CACHE_CAP {
             store_count_with(format!("evict-test|flood-{i}"), i as i64, ttl);
         }
-        let len = COUNT_CACHE.lock().unwrap().len();
+        let len = COUNT_CACHE.len();
         assert!(len <= COUNT_CACHE_CAP, "memo must stay bounded (len {len})");
         clear_count_cache();
     }
@@ -3132,7 +3109,7 @@ mod tests {
         // An expired entry is ignored rather than served stale.
         assert!(cached_rows_with(k1, std::time::Duration::ZERO).is_none());
         // The rebuild's invalidation drops rows and totals in ONE call.
-        store_count(format!("{k1}|count"), 42);
+        store_count(format!("{k1}|count"), 42, cache_generation());
         clear_count_cache();
         assert!(cached_rows_with(k1, ttl).is_none());
         assert_eq!(cached_count_with(&format!("{k1}|count"), ttl), None);
@@ -3157,7 +3134,7 @@ mod tests {
                 ttl,
             );
         }
-        let len = ROW_CACHE.lock().unwrap().len();
+        let len = ROW_CACHE.len();
         assert!(len <= ROW_CACHE_CAP, "memo must stay bounded (len {len})");
         clear_count_cache();
     }

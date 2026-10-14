@@ -1481,6 +1481,59 @@ export const SCANLATORS = /* GraphQL */ `
 	}
 `;
 
+// The public scanlator list and its one write. `RATED_SCANLATOR_FIELDS` is shared so a
+// rating answers with exactly the row the list holds.
+const RATED_SCANLATOR_FIELDS = /* GraphQL */ `
+	id
+	kind
+	name
+	lang
+	seriesCount
+	chapterCount
+	ai
+	rating
+	ratingCount
+	rank
+	distribution
+	myScore
+	commentCount
+`;
+
+export const SCANLATOR_RATINGS = /* GraphQL */ `
+	query ScanlatorRatings(
+		$search: String
+		$kind: ScanlatorKind
+		$mine: Boolean
+		$sort: ScanlatorSort
+		$page: Int
+	) {
+		scanlatorRatings(search: $search, kind: $kind, mine: $mine, sort: $sort, page: $page) {
+			items {
+				${RATED_SCANLATOR_FIELDS}
+			}
+			page
+			hasNextPage
+			total
+		}
+	}
+`;
+
+export const RATED_SCANLATOR = /* GraphQL */ `
+	query RatedScanlator($id: ID!) {
+		ratedScanlator(id: $id) {
+			${RATED_SCANLATOR_FIELDS}
+		}
+	}
+`;
+
+export const RATE_SCANLATOR = /* GraphQL */ `
+	mutation RateScanlator($id: ID!, $score: Int) {
+		rateScanlator(id: $id, score: $score) {
+			${RATED_SCANLATOR_FIELDS}
+		}
+	}
+`;
+
 export const SET_SCANLATOR_AI = /* GraphQL */ `
 	mutation SetScanlatorAi($name: String!, $ai: ScanlatorAi) {
 		setScanlatorAi(name: $name, ai: $ai)

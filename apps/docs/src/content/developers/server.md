@@ -179,6 +179,8 @@ curl http://127.0.0.1:9090/metrics
 
 The listener binds to `KOMIKA_METRICS_BIND_ADDR` (default `127.0.0.1`) on `KOMIKA_METRICS_PORT` (default 9090). The Compose deployment binds `0.0.0.0` inside the container, because Docker forwards a published port to the container network address and not to its loopback. It publishes the port on host `127.0.0.1` only. It exports scan counts, circuit breaker state and feed freshness, plus database storage, pool size and idle connections, writer queue waits and database lock errors. Historical metric names may still contain `sqlite` for compatibility. These aggregate metrics contain no user data.
 
+PostgreSQL recovery health is in the same output: archived and failed WAL counts, seconds since the last success and the last failure, `komika_postgres_archive_failing` (1 when the last failure is newer than the last success), raw WAL generated, the WAL directory size and the archive backlog (`.ready` files). The last two need EXECUTE on `pg_ls_waldir()` and `pg_ls_archive_statusdir()` (or `pg_monitor`). Without that grant the value is left out, never shown as -1, and `komika_postgres_metric_available{metric="..."}` reads 0.
+
 ## Where to look
 
 - `apps/server/src/main.rs`: axum router configuration, middleware ordering and server lifecycle management.

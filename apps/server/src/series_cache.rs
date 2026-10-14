@@ -178,33 +178,60 @@ fn note_chapters_fetched(manga_id: i64, now: DateTime<Utc>) {
     let Ok(mut memo) = CHAPTER_FETCH_MEMO.lock() else {
         return; // poisoned → freshness degrades to the DB floor, never to wrong data
     };
-    if memo.len() >= CHAPTER_FETCH_MEMO_CAP {
+    let stats = &crate::telemetry::CACHE_CHAPTER_FETCH_MARKER;
+    if !memo.contains_key(&manga_id) && memo.len() >= CHAPTER_FETCH_MEMO_CAP {
         let cutoff = now - chrono::Duration::seconds(CHAPTERS_TTL_SECS);
+        let before = memo.len();
         memo.retain(|_, t| *t > cutoff);
-        // Expiry alone is only ADVISORY: if every entry is still inside the 90-minute
-        // TTL, `retain` frees nothing and the map grows without bound — while paying an
-        // O(n) scan under this mutex on every subsequent call, on the scanner's hot
-        // path. Hard-drop instead. The cost is bounded and already-understood: an empty
-        // memo is exactly the cold-process state, where `chapters_last_fetched` falls
-        // back to the durable `MAX(updated_at)` floor and the next reader request
-        // revalidates once. Never wrong data, just one extra fetch.
+        stats.expired((before - memo.len()) as u64);
+        // Keep the hard bound without turning one new id into a catalogue-wide
+        // freshness reset. Evict one oldest fetch marker; its next read falls back
+        // to the durable MAX(updated_at) floor and safely revalidates if needed.
         if memo.len() >= CHAPTER_FETCH_MEMO_CAP {
-            tracing::warn!(
-                cap = CHAPTER_FETCH_MEMO_CAP,
-                "chapter fetch memo full of live entries — dropping it wholesale"
-            );
-            memo.clear();
+            if let Some(oldest) = memo
+                .iter()
+                .min_by_key(|(id, fetched)| (**fetched, **id))
+                .map(|(id, _)| *id)
+            {
+                memo.remove(&oldest);
+                stats.evictions(1);
+            }
         }
     }
     memo.insert(manga_id, now);
+    stats.fills(1);
+    stats.set_entries(memo.len());
 }
 
 /// The memoized fetch time for `manga_id`, if this process has fetched it.
 fn memoized_chapters_fetched(manga_id: i64) -> Option<DateTime<Utc>> {
-    CHAPTER_FETCH_MEMO
+    let fetched = CHAPTER_FETCH_MEMO
         .lock()
         .ok()
-        .and_then(|m| m.get(&manga_id).copied())
+        .and_then(|m| m.get(&manga_id).copied());
+    count_marker_lookup(
+        &crate::telemetry::CACHE_CHAPTER_FETCH_MARKER,
+        fetched,
+        Utc::now(),
+    );
+    fetched
+}
+
+/// Telemetry only: a marker counts as a hit only while it can still make a chapter
+/// list look fresh. An older marker (still returned, as the newer of two stamps) or
+/// no marker is a miss.
+fn count_marker_lookup(
+    stats: &crate::telemetry::CacheStats,
+    fetched: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) {
+    let fresh =
+        fetched.is_some_and(|at| now.signed_duration_since(at).num_seconds() < CHAPTERS_TTL_SECS);
+    if fresh {
+        stats.hits(1);
+    } else {
+        stats.misses(1);
+    }
 }
 
 /// The series' newest-chapter time derived from a chapter LIST: the numeric max of the
@@ -2088,6 +2115,8 @@ mod tests {
     fn chapter_fetch_memo_is_hard_bounded_when_every_entry_is_live() {
         // Isolate from other tests, which use small real manga ids.
         CHAPTER_FETCH_MEMO.lock().unwrap().clear();
+        // Process-global counters: other tests move them too, so only lower bounds.
+        let before = crate::telemetry::CACHE_CHAPTER_FETCH_MARKER.snapshot();
         let now = Utc::now();
         // Every stamp is `now`, i.e. inside CHAPTERS_TTL_SECS — the degenerate case.
         for id in 0..(CHAPTER_FETCH_MEMO_CAP as i64 + 64) {
@@ -2098,11 +2127,44 @@ mod tests {
             len <= CHAPTER_FETCH_MEMO_CAP,
             "memo must never exceed its cap (len {len})"
         );
-        // Dropping the memo is safe, not lossy: the most recent write is still there,
-        // and anything evicted degrades to the durable MAX(updated_at) floor.
+        assert_eq!(
+            len, CHAPTER_FETCH_MEMO_CAP,
+            "one new id must not flush live markers"
+        );
+        let retained = CHAPTER_FETCH_MEMO_CAP as i64 - 1;
+        assert_eq!(memoized_chapters_fetched(retained), Some(now));
+        note_chapters_fetched(retained, now);
+        assert_eq!(
+            CHAPTER_FETCH_MEMO.lock().unwrap().len(),
+            len,
+            "an existing id must not evict other markers"
+        );
+        // One eviction safely degrades to the durable MAX(updated_at) floor.
         let last = CHAPTER_FETCH_MEMO_CAP as i64 + 63;
         assert_eq!(memoized_chapters_fetched(last), Some(now));
+        let after = crate::telemetry::CACHE_CHAPTER_FETCH_MARKER.snapshot();
+        assert!(
+            after.evictions >= before.evictions + 64,
+            "one eviction per new id"
+        );
+        assert!(after.fills >= before.fills + CHAPTER_FETCH_MEMO_CAP as u64 + 65);
+        assert!(after.hits >= before.hits + 2);
         CHAPTER_FETCH_MEMO.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn a_marker_past_the_chapter_ttl_is_a_miss_not_a_hit() {
+        let stats = crate::telemetry::CacheStats::leak();
+        let now = Utc::now();
+        count_marker_lookup(stats, Some(now), now);
+        count_marker_lookup(
+            stats,
+            Some(now - chrono::Duration::seconds(CHAPTERS_TTL_SECS + 1)),
+            now,
+        );
+        count_marker_lookup(stats, None, now);
+        let seen = stats.snapshot();
+        assert_eq!((seen.hits, seen.misses), (1, 2));
     }
 
     #[test]

@@ -1,9 +1,13 @@
 # Hosted PostgreSQL backup and recovery
 
-This package is for the migration branch and Phase 6 rehearsal. It has not been
-deployed. Use PostgreSQL 18.6 and this image's pgBackRest 2.59.3 for every
-restore. Do not delete old volumes or SQLite copies. Keep the old
-database/image 30 days.
+This package backs up and restores the production PostgreSQL cluster, which has run
+on it since the cutover on 2026-10-13. Phase 6's gate of two clean rehearsals in a row
+was waived by the owner, not passed: rehearsal 1 was clean, rehearsal 2 was ended
+early. A restore or point-in-time drill against the live post-cutover repository has not
+been recorded yet. Use PostgreSQL 18.6 and this image's pgBackRest 2.59.3 for every
+restore. Do not delete old volumes or SQLite copies. Keep the old SQLite file, image
+and Litestream data until at least 2026-11-12; removing them after that date is a
+separate, explicit decision, never an automatic one.
 
 There are two separate paths:
 
@@ -1452,3 +1456,135 @@ backup work, and recreating postgres and postgres-backup; inspect archive health
 and run check afterwards. The restore helper passes keys through Docker stdin
 rather than arguments or a host secret file; its temporary container has the
 same residual Docker-admin exposure and is removed after use.
+
+## Recovery health
+
+Read-only checks for the hosted stack (use `hc` from "Hosted commands"). None of
+them writes to PostgreSQL, the repository or a container:
+
+```sh
+hc exec -T --user postgres postgres-backup python3 /opt/komika-postgres/hosted.py status
+hc exec -T --user postgres postgres-backup python3 /opt/komika-postgres/hosted.py status --local
+hc exec -T --user postgres postgres-backup python3 /opt/komika-postgres/hosted.py reading
+"$hosted_deploy/watch.sh" --url http://127.0.0.1:8080/health/ready --minutes 62
+```
+
+`status` prints one JSON object: job ages and errors from `status.json`; the
+latest full and latest backup and the archive's first and last WAL from
+`pgbackrest info`; `pg_stat_archiver` with ages, `failing` and `stalled`; `.ready` files (archive
+backlog) and the age of the oldest; spool bytes; free bytes on the data volume;
+recorded dropped-WAL events; `gap_open`; `recoverable_from`;
+`archive_last_success` and `archive_last_wal`; and `health_problems`, the
+reasons Docker health fails (empty when healthy). A value it cannot read is
+`null` and its reason is in `unavailable`, never 0. `--local` skips the
+repository request; the watch and Docker health use only local state.
+
+`pgbackrest.sh` records each pgBackRest `dropped WAL file` warning with its
+UTC time in microseconds in `/var/lib/postgresql/komika-backup/dropped-wal.log`
+(the last 10,000 lines; one queue overflow writes one line per dropped segment).
+A gap stays open until a full backup **starts** after the latest recorded drop.
+pgBackRest's backup times have whole seconds, so a drop in the same second as a
+full's start counts as still open. Every check uses pgBackRest's own start of
+the full: `status` and the restore drill read it from `pgbackrest info`;
+health, `status --local` and the watch use the start that `backup.sh full` or
+the scheduler records from `pgbackrest info` after each full. A full taken any
+other way closes the gap for `status` and the drill, but health stays red until
+the next `backup.sh full` or scheduled full records one.
+
+`recoverable_from` is the stop of the oldest backup, or after a drop the stop
+of the first full backup that started after it. Point-in-time recovery is
+possible only from there and never across missing WAL. `recoverable_until` is
+always `null`: when the archiver last finished a segment (`archive_last_success`)
+says nothing of the newest commit inside it, because old queued WAL can be
+archived late. Only a restore shows how far the archived WAL reaches; the stop
+of `latest_backup` is always reachable. A `.done` file, a passing `check` or a
+healthy container is no proof of continuity; only a marker restore proves the
+chain.
+
+postgres-backup is unhealthy on the job-age rules above, on a job error, on an
+open gap, when the archiver's last failure is newer than its last success and
+there was no success for 15 minutes, when `.ready` files wait and neither the
+last success nor the oldest waiting segment is newer than 15 minutes (a stalled
+archiver without a recorded failure; an idle stack has no `.ready` file), and
+when the data volume has less than 4 GiB free (the 1 GiB archive queue, the
+2 GB `max_wal_size` and 1 GiB margin). Health makes no R2 request. `deploy.sh`
+waits for it like every service; when it stays unhealthy, `deploy.sh` prints
+`health_problems` before it stops (for example: run `backup.sh full`).
+
+After a gap: repair the cause (credentials, network, storage), then
+
+```sh
+hc exec -T --user postgres postgres /opt/komika-postgres/backup.sh check
+hc exec -T --user postgres postgres /opt/komika-postgres/backup.sh full
+```
+
+and run a marker restore drill (`pitr-drill.sh`). `gap_open` turns false once
+that full has completed. Keep `dropped-wal.log`; it is the record of the gap.
+`restore.sh --target-time` refuses a target inside a recorded gap (from the last
+backup before the drop to the stop of the next full) when the source postgres
+container runs. `restore.sh` without `--target-time` (the latest state) refuses
+while a gap is open: recovery would stop at the first missing segment and
+promote that older state without an error. In a real disaster the chain before
+the drop may be all there is; then pass `--accept-gap`, and the restore goes
+ahead with a warning. When the record cannot be read (the source postgres is not
+running) both say so and go ahead; then read the record yourself before
+trusting the result.
+
+`reading` is the budget record for the dated duty (2026-10-20, 2026-10-27,
+2026-11-03, 2026-11-10; act at 7 GB): raw WAL from `pg_stat_wal` since its
+`stats_reset` and the total WAL position, and the repository's bytes split into
+archived WAL and backups from one `repo-ls` listing (itself a few Class A list
+operations). `prefix_over_action_threshold` compares only this pgBackRest prefix
+with 7 GB; the threshold is account-wide (old Litestream data and other services
+share the allowance), so read the account total and the Class A count from the
+Cloudflare dashboard before deciding. Save each output with its date; nothing
+runs on a schedule.
+
+`watch.sh` is the read-only watch after a deploy. It runs until a wall-clock
+deadline (`--minutes`, interval 30 s), not a number of rounds, and ends with
+`covered_seconds` and every gap between rounds longer than twice the interval.
+Each round shows the health answer, restarts and memory kills of the project's
+containers, server log severities since the start (colour codes removed; JSON
+`level` read too), PostgreSQL ERROR/FATAL/PANIC and dropped-WAL lines, and
+`status --local`. A `null` gap or archiver state counts as unavailable, like no
+answer; three such rounds in a row stop the watch. The round that starts at or
+after the deadline is the last observation. A hard failure prints a `STOP` line
+and the exit status is 1. It watches only an `http`/`https` URL without user
+information or `%` in the host. It refuses komiq.cc, its subdomains and the
+production address (any spelling), a `DOCKER_HOST` that is not a local `unix://`
+socket and a Docker context other than `default`, unless `--production` is
+given.
+
+Role `komika` may execute `pg_ls_waldir()` and `pg_ls_archive_statusdir()` and
+nothing more (not `pg_monitor`), so the server's `/metrics` WAL gauges work.
+New clusters get it at initialization; the scheduler grants it on existing ones
+at start and logs one line. Check it as the application role:
+
+```sh
+hc exec -T postgres sh -c 'PGPASSWORD="$KOMIKA_POSTGRES_PASSWORD" psql -X -w -h "$HOSTNAME" -U komika -d komika -Atc "SELECT count(*) FROM pg_ls_waldir()"'
+```
+
+## Returning to an older SQLite build (reverse export)
+
+PostgreSQL is the main database. Going back to an older SQLite build needs a **new** SQLite
+file made by `komika-server export-postgres-to-sqlite`. It copies into a byte copy of the
+kept SQLite file and never writes the kept file or PostgreSQL. After the cutover, users
+wrote to PostgreSQL, so the kept SQLite file alone is behind and cannot be used as it is.
+
+The export **refuses and writes no SQLite output** when PostgreSQL holds data that the
+SQLite build cannot store. Per-user scanlator ratings are the case today: the SQLite
+schema has no table for them, so a nonempty `scanlator_rating` stops the run. It also
+refuses any table of the PostgreSQL database that is not classified in the exporter. The
+error says "nothing was exported" and tells you to keep PostgreSQL. With `--json-out`, the report file
+records the refusal as `complete: false` with the error. Do not work around it. Keep
+PostgreSQL and its pgBackRest backups, and return to an older build only after a
+separately verified way to keep those rows exists.
+
+A run that passes reports the PostgreSQL-only tables it left out, all empty, in
+`postgres_only_not_copied`, and every other table it did not copy in `not_copied`. Read
+the whole report before putting the file in place.
+
+The two targets differ. A kept file at SQLite migration 0121 has no marker for a deleted
+comment that kept its replies. Such comments are written as comments with an empty body,
+and the report lists each one under `comment_tombstones_written_without_marker`. A file
+at 0122 loses nothing of this. The kept file's level is never changed by the export.

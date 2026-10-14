@@ -575,8 +575,9 @@ pub(super) async fn constraints(target: &mut PgConnection) -> Result<()> {
     let fk_count:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname='public' AND c.contype='f'").fetch_one(&mut *target).await?;
     // Every planned foreign key has one column, so constraints and endpoints
     // count alike. The plan is checked against the real migrations by
-    // `plan_matches_real_migrations_baseline_map_and_fk_order`.
-    let planned = expected_foreign_keys();
+    // `plan_matches_real_migrations_baseline_map_and_fk_order`. A table that only
+    // PostgreSQL has is expected from the migration that creates it.
+    let planned = expected_foreign_keys_through(applied_migrations(target).await?);
     ensure!(
         fk_count as usize == planned.len(),
         "PostgreSQL has {fk_count} foreign keys, the import plan and derived search expect {}",
@@ -637,9 +638,43 @@ pub(super) async fn constraints(target: &mut PgConnection) -> Result<()> {
 }
 
 /// (child table, child column, parent table, parent column) of every foreign
-/// key: the import plan's, plus the one of the derived search table.
+/// key: the import plan's, the one of the derived search table, and those of the
+/// tables that only PostgreSQL has (`plan::POSTGRES_ONLY`).
+#[cfg(test)]
 pub(super) fn expected_foreign_keys() -> std::collections::BTreeSet<(String, String, String, String)>
 {
+    expected_foreign_keys_through(usize::MAX)
+}
+
+/// The same for a target that has applied only the first `applied` embedded
+/// migrations: a table that a later migration creates is not expected yet.
+pub(super) fn expected_foreign_keys_through(
+    applied: usize,
+) -> std::collections::BTreeSet<(String, String, String, String)> {
+    let created = embedded_migrations()
+        .into_iter()
+        .take(applied)
+        .map(|m| m.version)
+        .collect::<Vec<_>>();
+    let mut expected = super::plan::POSTGRES_ONLY
+        .iter()
+        .filter(|table| created.contains(&table.since))
+        .flat_map(|table| {
+            table.fks.iter().map(|(column, parent, parent_column)| {
+                (
+                    table.name.to_owned(),
+                    (*column).to_owned(),
+                    (*parent).to_owned(),
+                    (*parent_column).to_owned(),
+                )
+            })
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    expected.extend(planned_foreign_keys());
+    expected
+}
+
+fn planned_foreign_keys() -> std::collections::BTreeSet<(String, String, String, String)> {
     let mut expected = tables()
         .into_iter()
         .flat_map(|t| {

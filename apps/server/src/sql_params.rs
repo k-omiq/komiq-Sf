@@ -1,4 +1,4 @@
-//! Numbered SQL parameters shared by the SQLite and future PostgreSQL paths.
+//! Numbered SQL parameters (`$1, $2, …`), valid for both PostgreSQL and SQLite.
 
 /// Render `count` parameters starting at the one-based argument index `start`.
 /// SQL values always travel through binds; this helper emits only parameter names.

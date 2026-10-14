@@ -15,7 +15,7 @@ One codebase for the web, desktop, iOS and Android.
 ![Tauri](https://img.shields.io/badge/Tauri-0c0c0d?logo=tauri&logoColor=ffc131)
 ![Rust](https://img.shields.io/badge/Rust-0c0c0d?logo=rust&logoColor=white)
 ![GraphQL](https://img.shields.io/badge/GraphQL-0c0c0d?logo=graphql&logoColor=e10098)
-![SQLite](https://img.shields.io/badge/SQLite-0c0c0d?logo=sqlite&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-0c0c0d?logo=postgresql&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-0c0c0d?logo=docker&logoColor=2496ed)
 
 [Docs](https://docs.komiq.cc) · [Try the demo](https://komiq.cc) ·

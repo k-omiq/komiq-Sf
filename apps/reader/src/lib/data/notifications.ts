@@ -7,6 +7,7 @@ import type { Notification } from '@komika/types';
 import { backend } from '$lib/context';
 import { config } from '$lib/config';
 import { auth } from '$lib/auth.svelte';
+import { scanlatorHref } from './scanlators';
 
 export function notificationsLive(): boolean {
 	return (
@@ -68,6 +69,7 @@ function messageFor(n: Notification): string {
  *  would need a server schema change and would buy nothing the reader can't derive. */
 function hrefFor(n: Notification): string | null {
 	if (n.targetType === 'series' && n.targetId) return `/series/${n.targetId}`;
+	if (n.targetType === 'scanlator' && n.targetId) return scanlatorHref(n.targetId);
 	if (n.targetType === 'chapter' && n.seriesId && n.targetId) {
 		return `/read/${n.seriesId}?ch=${n.targetId}`;
 	}

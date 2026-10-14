@@ -8,6 +8,8 @@
 		submitChapterComment,
 		loadSeriesComments,
 		submitSeriesComment,
+		loadScanlatorComments,
+		submitScanlatorComment,
 		uploadCommentMedia,
 		canModerate,
 		deleteComment,
@@ -21,9 +23,10 @@
 	import Avatar from '$lib/components/Avatar.svelte';
 
 	interface Props {
-		/** 'chapter' for a per-chapter thread, 'series' for series-level discussion. */
-		targetType: 'chapter' | 'series';
-		/** Backend id of the target (chapter id or series id). */
+		/** 'chapter' for a per-chapter thread, 'series' for series-level discussion,
+		 *  'scanlator' for the thread of one scanlator. */
+		targetType: 'chapter' | 'series' | 'scanlator';
+		/** Backend id of the target (chapter id, series id or scanlator id). */
 		targetId: string;
 		/** Stable key for the offline/local fallback store. */
 		storageKey: string;
@@ -108,8 +111,17 @@
 		};
 	});
 
-	const load = (id: string, key: string) =>
-		targetType === 'series' ? loadSeriesComments(id, key) : loadChapterComments(id, key);
+	const LOAD = {
+		chapter: loadChapterComments,
+		series: loadSeriesComments,
+		scanlator: loadScanlatorComments,
+	};
+	const SUBMIT = {
+		chapter: submitChapterComment,
+		series: submitSeriesComment,
+		scanlator: submitScanlatorComment,
+	};
+	const load = (id: string, key: string) => LOAD[targetType](id, key);
 	const submit = (
 		id: string,
 		key: string,
@@ -118,9 +130,7 @@
 		cur: CommentView[],
 		opts: CommentOpts,
 	) =>
-		targetType === 'series'
-			? submitSeriesComment(id, key, body, sp, cur, opts)
-			: submitChapterComment(id, key, body, sp, cur, opts);
+		SUBMIT[targetType](id, key, body, sp, cur, opts);
 
 	// (Re)load when the target or sign-in state changes.
 	$effect(() => {
@@ -307,7 +317,7 @@
 </script>
 
 <div class="c-head">
-	<h3><Icon name="comment" size={20} />{commentCount} comments</h3>
+	<h3><Icon name="comment" size={20} />{commentCount} {commentCount === 1 ? 'comment' : 'comments'}</h3>
 </div>
 
 {#if needsAuth}

@@ -124,9 +124,10 @@ without the engine; sources are then unavailable), and the reader's `KOMIKA_JAVA
 and `KOMIKA_SUWAYOMI_JAR`.
 
 On the device the app keeps its data in the OS app-data folder
-(`app.komika.desktop`): `server/komika.sqlite3` (the server's database and covers),
-`server/desktop.json` (the server's port and the "Allow other devices" choice) and
-`suwayomi/` (the engine). The server listens on `127.0.0.1` on port 7580 (or the next
+(`app.komika.desktop`): `server/postgres/18/data` (the server's bundled PostgreSQL
+database), `server/covers.sqlite3` (the cover cache; an old `server/komika.sqlite3` is
+converted at the first start and kept), `server/desktop.json` (the server's port and the
+"Allow other devices" choice) and `suwayomi/` (the engine). The server listens on `127.0.0.1` on port 7580 (or the next
 free port, which is then kept) until "Allow other devices" is turned on in setup. The
 setup code is read from the server's output and handed to the wizard once; it is never
 logged or saved. Both processes' output is kept in memory for the start screen's log

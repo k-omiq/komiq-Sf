@@ -19,6 +19,8 @@ use axum::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::telemetry::{AdmissionStats, Deadline, Held, Lane, LaneStats};
+
 pub(crate) const UPSTREAM_CLIENT_CONCURRENCY: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -30,6 +32,23 @@ enum Class {
 }
 
 impl Class {
+    fn lane(self) -> Lane {
+        match self {
+            Self::Local | Self::Upstream => Lane::Local,
+            Self::Federated => Lane::Federated,
+            Self::Maintenance => Lane::Maintenance,
+        }
+    }
+
+    fn deadline(self) -> Deadline {
+        match self {
+            Self::Local => Deadline::Local,
+            Self::Upstream => Deadline::Upstream,
+            Self::Federated => Deadline::Federated,
+            Self::Maintenance => Deadline::Maintenance,
+        }
+    }
+
     fn timeout(self) -> Duration {
         Duration::from_secs(match self {
             Self::Local => 20,
@@ -52,10 +71,18 @@ pub(crate) struct RequestBudgets {
     federated: Arc<Semaphore>,
     maintenance: Arc<Semaphore>,
     uploads: Arc<Semaphore>,
+    /// Admission telemetry: the process global in production; a test may own one.
+    stats: &'static AdmissionStats,
 }
 
 impl Default for RequestBudgets {
     fn default() -> Self {
+        Self::with_stats(&crate::telemetry::ADMISSION)
+    }
+}
+
+impl RequestBudgets {
+    fn with_stats(stats: &'static AdmissionStats) -> Self {
         Self {
             ingress: Arc::new(Semaphore::new(64)),
             local: Arc::new(Semaphore::new(64)),
@@ -65,11 +92,17 @@ impl Default for RequestBudgets {
             federated: Arc::new(Semaphore::new(2)),
             maintenance: Arc::new(Semaphore::new(2)),
             uploads: Arc::new(Semaphore::new(4)),
+            stats,
         }
     }
-}
 
-impl RequestBudgets {
+    /// Budgets whose admission counters belong to the calling test alone.
+    #[cfg(test)]
+    pub(crate) fn with_test_stats() -> (Self, &'static AdmissionStats) {
+        let stats = AdmissionStats::leak();
+        (Self::with_stats(stats), stats)
+    }
+
     fn lane(&self, class: Class) -> &Arc<Semaphore> {
         match class {
             Class::Local | Class::Upstream => &self.local,
@@ -97,18 +130,19 @@ impl RequestBudgets {
     }
 
     fn try_upstream(&self, client: &str) -> anyhow::Result<UpstreamPermit> {
-        self.try_resource(&self.upstream, client)
+        self.try_resource(&self.upstream, Lane::Upstream, client)
     }
 
     fn try_resource(
         &self,
         resource: &Arc<Semaphore>,
+        lane: Lane,
         client: &str,
     ) -> anyhow::Result<UpstreamPermit> {
-        let global = resource
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| UpstreamBusy)?;
+        let Ok(global) = resource.clone().try_acquire_owned() else {
+            self.stats.lane(lane).refuse();
+            return Err(UpstreamBusy.into());
+        };
         let per_client = {
             let mut clients = self
                 .upstream_clients
@@ -126,8 +160,15 @@ impl RequestBudgets {
                 }
             }
         };
-        let client = per_client.try_acquire_owned().map_err(|_| UpstreamBusy)?;
+        let Ok(client) = per_client.try_acquire_owned() else {
+            self.stats.lane(Lane::UpstreamClient).refuse();
+            return Err(UpstreamBusy.into());
+        };
         Ok(UpstreamPermit {
+            _held: (
+                self.stats.lane(lane).admit(),
+                self.stats.lane(Lane::UpstreamClient).admit(),
+            ),
             _global: global,
             _client: client,
         })
@@ -177,18 +218,34 @@ tokio::task_local! {
 /// Owned through the complete network response/body, with normal drop releasing
 /// both bounds after completion, cancellation or a request deadline.
 pub(crate) struct UpstreamPermit {
+    // Fields drop in order: the in-flight gauges fall BEFORE the permits are
+    // released, so a waiter woken by the release cannot raise the gauge (and its
+    // high water) past the lane's capacity.
+    _held: (Held, Held),
     _global: OwnedSemaphorePermit,
     _client: OwnedSemaphorePermit,
 }
 
 /// Contended cache initializers have a separate bound. They share the client's
 /// three slots with real calls, and cannot fill all 64 local request permits.
+/// A waiter holds this only while it waits. Its wait is counted once it obtains
+/// the initializer ([`Self::obtained`]); a cancelled wait is not counted, as in
+/// the other waiting lanes.
 pub(crate) struct CacheWaitPermit {
     _held: UpstreamPermit,
+    started: std::time::Instant,
+    lane: &'static LaneStats,
+}
+
+impl CacheWaitPermit {
+    /// The wait succeeded: count it and release the waiter's shares.
+    pub(crate) fn obtained(self) {
+        self.lane.waited(self.started.elapsed());
+    }
 }
 
 #[derive(Debug)]
-struct UpstreamBusy;
+pub(crate) struct UpstreamBusy;
 
 impl std::fmt::Display for UpstreamBusy {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -213,10 +270,16 @@ pub(crate) fn upstream_permit() -> anyhow::Result<Option<UpstreamPermit>> {
 pub(crate) fn cache_wait_permit() -> anyhow::Result<Option<CacheWaitPermit>> {
     UPSTREAM_REQUEST
         .try_with(|context| {
-            context
-                .budgets
-                .try_resource(&context.budgets.cache_waiters, &context.client)
-                .map(|held| Some(CacheWaitPermit { _held: held }))
+            let budgets = &context.budgets;
+            budgets
+                .try_resource(&budgets.cache_waiters, Lane::CacheWaiters, &context.client)
+                .map(|held| {
+                    Some(CacheWaitPermit {
+                        _held: held,
+                        started: std::time::Instant::now(),
+                        lane: budgets.stats.lane(Lane::CacheWaiters),
+                    })
+                })
         })
         .unwrap_or(Ok(None))
 }
@@ -233,8 +296,12 @@ pub(crate) async fn lock_cold_cache<T>(
     match lock.try_lock() {
         Ok(guard) => Ok(guard),
         Err(_) => {
-            let _waiter = cache_wait_permit()?;
-            Ok(lock.lock().await)
+            let waiter = cache_wait_permit()?;
+            let guard = lock.lock().await;
+            if let Some(waiter) = waiter {
+                waiter.obtained();
+            }
+            Ok(guard)
         }
     }
 }
@@ -261,9 +328,14 @@ impl std::error::Error for UpstreamRateLimit {}
 
 pub(crate) fn check_upstream_rate(client: Option<&str>) -> anyhow::Result<()> {
     if let Some(client) = client {
-        UPSTREAM_LIMITER
-            .check(&format!("upstream:{client}"))
-            .map_err(UpstreamRateLimit)?;
+        let lane = crate::telemetry::ADMISSION.lane(Lane::UpstreamRate);
+        match UPSTREAM_LIMITER.check(&format!("upstream:{client}")) {
+            Ok(()) => lane.admitted(),
+            Err(retry) => {
+                lane.refuse();
+                return Err(UpstreamRateLimit(retry).into());
+            }
+        }
     }
     Ok(())
 }
@@ -279,15 +351,23 @@ pub(crate) fn is_upstream_rate_limited(error: &anyhow::Error) -> bool {
 }
 
 pub(crate) struct Lease {
+    // Drops before `_permit` (field order), as in `UpstreamPermit`.
+    _held: Option<Held>,
     _permit: OwnedSemaphorePermit,
     timeout: Duration,
+    deadline: Option<(&'static AdmissionStats, Deadline)>,
 }
 
 impl Lease {
     pub(crate) async fn run(self, request: impl Future<Output = Response>) -> Response {
         match tokio::time::timeout(self.timeout, request).await {
             Ok(response) => response,
-            Err(_) => crate::busy_response(),
+            Err(_) => {
+                if let Some((stats, class)) = self.deadline {
+                    stats.deadline(class);
+                }
+                crate::busy_response()
+            }
         }
     }
 }
@@ -311,11 +391,13 @@ where
 
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
         let budgets = Arc::<RequestBudgets>::from_ref(state);
-        let ingress = budgets
-            .ingress
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| crate::busy_response())?;
+        let stats = budgets.stats;
+        let Ok(ingress) = budgets.ingress.clone().try_acquire_owned() else {
+            stats.lane(Lane::Ingress).refuse();
+            return Err(crate::busy_response());
+        };
+        // Tuple elements drop in order: the gauge falls before the permit is released.
+        let ingress = (stats.lane(Lane::Ingress).admit(), ingress);
         let request = match tokio::time::timeout(
             Duration::from_secs(10),
             <GraphQLRequest as FromRequest<S>>::from_request(request, state),
@@ -324,7 +406,10 @@ where
         {
             Ok(Ok(request)) => request,
             Ok(Err(rejection)) => return Err(rejection.into_response()),
-            Err(_) => return Err(crate::busy_response()),
+            Err(_) => {
+                stats.deadline(Deadline::GraphqlBody);
+                return Err(crate::busy_response());
+            }
         };
         let class =
             classify(&request.0.query, request.0.operation_name.as_deref()).map_err(|error| {
@@ -334,16 +419,17 @@ where
                 .into_response()
             })?;
         drop(ingress);
-        let permit = budgets
-            .lane(class)
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| crate::busy_response())?;
+        let Ok(permit) = budgets.lane(class).clone().try_acquire_owned() else {
+            stats.lane(class.lane()).refuse();
+            return Err(crate::busy_response());
+        };
         Ok(Self {
             request,
             lease: Lease {
+                _held: Some(stats.lane(class.lane()).admit()),
                 _permit: permit,
                 timeout: class.timeout(),
+                deadline: Some((stats, class.deadline())),
             },
             upstream: budgets,
         })
@@ -356,11 +442,14 @@ pub(crate) async fn limit_uploads(
     next: Next,
 ) -> Response {
     let Ok(permit) = budgets.uploads.clone().try_acquire_owned() else {
+        budgets.stats.lane(Lane::Uploads).refuse();
         return crate::busy_response();
     };
     Lease {
+        _held: Some(budgets.stats.lane(Lane::Uploads).admit()),
         _permit: permit,
         timeout: Duration::from_secs(120),
+        deadline: Some((budgets.stats, Deadline::Upload)),
     }
     .run(next.run(request))
     .await
@@ -375,7 +464,12 @@ pub(crate) async fn limit_image_time(
 ) -> Response {
     match tokio::time::timeout(timeout, next.run(request)).await {
         Ok(response) => response,
-        Err(_) => crate::busy_response(),
+        Err(_) => {
+            crate::telemetry::ADMISSION.deadline(Deadline::Image);
+            let mut response = crate::busy_response();
+            crate::telemetry::mark(&mut response, crate::telemetry::MediaOutcome::Deadline);
+            response
+        }
     }
 }
 
@@ -1286,8 +1380,10 @@ mod tests {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let permits = Arc::new(Semaphore::new(1));
         let lease = Lease {
+            _held: None,
             _permit: permits.clone().acquire_owned().await.unwrap(),
             timeout: Duration::from_secs(1),
+            deadline: None,
         };
         let flag_for_request = flag.clone();
         let response = lease
@@ -1299,5 +1395,208 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn telemetry_names_the_refusing_graphql_lane_and_in_flight_returns_to_zero() {
+        let (budgets, stats) = RequestBudgets::with_test_stats();
+        let budgets = Arc::new(budgets);
+        let app = router(budgets.clone());
+        let held = budgets.local.clone().acquire_many_owned(64).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(request("{ session { token } }", 0))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // (admitted, refused, in flight, in-flight high water)
+        assert_eq!(stats.lane(Lane::Local).snapshot(), (0, 1, 0, 0));
+        assert_eq!(stats.lane(Lane::Ingress).snapshot(), (1, 0, 0, 1));
+        assert_eq!(stats.lane(Lane::Maintenance).snapshot(), (0, 0, 0, 0));
+        drop(held);
+        let response = app
+            .clone()
+            .oneshot(request("{ session { token } }", 0))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(stats.lane(Lane::Local).snapshot(), (1, 1, 0, 1));
+        let _maintenance = budgets
+            .maintenance
+            .clone()
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(request("mutation { retryCover(workId:\"w\") }", 0))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stats.lane(Lane::Maintenance).snapshot(), (0, 1, 0, 0));
+        assert_eq!(stats.lane(Lane::Local).snapshot(), (1, 1, 0, 1));
+    }
+
+    #[tokio::test]
+    async fn telemetry_separates_global_and_per_client_upstream_refusals() {
+        let (budgets, stats) = RequestBudgets::with_test_stats();
+        let budgets = Arc::new(budgets);
+        let held = budgets
+            .scope_upstream("client".into(), async {
+                let held: Vec<_> = (0..3)
+                    .map(|_| upstream_permit().unwrap().unwrap())
+                    .collect();
+                assert!(is_upstream_busy(&upstream_permit().err().unwrap()));
+                held
+            })
+            .await;
+        assert_eq!(stats.lane(Lane::Upstream).snapshot(), (3, 0, 3, 3));
+        assert_eq!(stats.lane(Lane::UpstreamClient).snapshot(), (3, 1, 3, 3));
+        drop(held);
+        assert_eq!(stats.lane(Lane::Upstream).snapshot(), (3, 0, 0, 3));
+        assert_eq!(stats.lane(Lane::UpstreamClient).snapshot(), (3, 1, 0, 3));
+        let _all = budgets
+            .upstream
+            .clone()
+            .acquire_many_owned(16)
+            .await
+            .unwrap();
+        budgets
+            .scope_upstream("other".into(), async {
+                assert!(is_upstream_busy(&upstream_permit().err().unwrap()));
+            })
+            .await;
+        assert_eq!(stats.lane(Lane::Upstream).snapshot(), (3, 1, 0, 3));
+        assert_eq!(stats.lane(Lane::UpstreamClient).snapshot(), (3, 1, 0, 3));
+    }
+
+    #[tokio::test]
+    async fn telemetry_records_cache_waiter_wait_and_refusal() {
+        let (budgets, stats) = RequestBudgets::with_test_stats();
+        let budgets = Arc::new(budgets);
+        let lock = tokio::sync::Mutex::new(());
+        let guard = lock.lock().await;
+        let lane = stats.lane(Lane::CacheWaiters);
+        budgets
+            .scope_upstream("waiter".into(), async {
+                let waiting = lock_cold_cache(&lock);
+                tokio::pin!(waiting);
+                assert!(futures::poll!(waiting.as_mut()).is_pending());
+                assert_eq!(lane.snapshot(), (1, 0, 1, 1));
+                std::thread::sleep(Duration::from_millis(5));
+                drop(guard);
+                drop(waiting.await.unwrap());
+            })
+            .await;
+        assert_eq!(lane.snapshot(), (1, 0, 0, 1));
+        assert!(lane.wait_micros() >= 5_000, "{}", lane.wait_micros());
+        let _waiters = budgets
+            .cache_waiters
+            .clone()
+            .acquire_many_owned(16)
+            .await
+            .unwrap();
+        budgets
+            .scope_upstream("waiter".into(), async {
+                assert!(is_upstream_busy(&cache_wait_permit().err().unwrap()));
+            })
+            .await;
+        assert_eq!(lane.snapshot(), (1, 1, 0, 1));
+    }
+
+    /// A woken waiter's waker reads the lane gauge at the instant the permit is
+    /// released (Tokio wakes semaphore waiters inside the release).
+    struct GaugeProbe {
+        lane: &'static LaneStats,
+        seen: std::sync::Mutex<Option<u64>>,
+    }
+
+    impl futures::task::ArcWake for GaugeProbe {
+        fn wake_by_ref(probe: &Arc<Self>) {
+            *probe.seen.lock().unwrap() = Some(probe.lane.snapshot().2);
+        }
+    }
+
+    /// Queue a waiter on `semaphore` whose wake records `lane`'s in-flight gauge.
+    fn gauge_at_release(
+        semaphore: &Arc<Semaphore>,
+        lane: &'static LaneStats,
+    ) -> (
+        Arc<GaugeProbe>,
+        std::pin::Pin<
+            Box<impl Future<Output = Result<OwnedSemaphorePermit, tokio::sync::AcquireError>>>,
+        >,
+    ) {
+        let probe = Arc::new(GaugeProbe {
+            lane,
+            seen: std::sync::Mutex::new(None),
+        });
+        let waker = futures::task::waker(probe.clone());
+        let mut waiting = Box::pin(semaphore.clone().acquire_owned());
+        assert!(waiting
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_pending());
+        (probe, waiting)
+    }
+
+    #[tokio::test]
+    async fn telemetry_gauges_fall_before_permits_are_released() {
+        let (budgets, stats) = RequestBudgets::with_test_stats();
+        let budgets = Arc::new(budgets);
+        // Upstream call: the global lane's gauge is already down when its permit
+        // wakes the next acquirer.
+        let call = budgets
+            .scope_upstream("client".into(), async {
+                upstream_permit().unwrap().unwrap()
+            })
+            .await;
+        let _rest = budgets.upstream.clone().try_acquire_many_owned(15).unwrap();
+        let (probe, _waiting) = gauge_at_release(&budgets.upstream, stats.lane(Lane::Upstream));
+        assert_eq!(stats.lane(Lane::Upstream).snapshot().2, 1);
+        drop(call);
+        assert_eq!(*probe.seen.lock().unwrap(), Some(0));
+        assert_eq!(stats.lane(Lane::Upstream).snapshot().3, 1);
+
+        // GraphQL/upload lease: same order.
+        let slots = Arc::new(Semaphore::new(1));
+        let lane = stats.lane(Lane::Uploads);
+        let lease = Lease {
+            _held: Some(lane.admit()),
+            _permit: slots.clone().acquire_owned().await.unwrap(),
+            timeout: Duration::from_secs(1),
+            deadline: None,
+        };
+        let (probe, _waiting) = gauge_at_release(&slots, lane);
+        drop(lease);
+        assert_eq!(*probe.seen.lock().unwrap(), Some(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_counts_class_and_upload_deadlines() {
+        let (budgets, stats) = RequestBudgets::with_test_stats();
+        let budgets = Arc::new(budgets);
+        let app = router(budgets.clone());
+        let response = app
+            .clone()
+            .oneshot(request("{ session { token } }", 21))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stats.deadlines(Deadline::Local), 1);
+        assert_eq!(stats.deadlines(Deadline::Upstream), 0);
+        assert_eq!(stats.lane(Lane::Local).snapshot(), (1, 0, 0, 1));
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/upload-hang")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stats.deadlines(Deadline::Upload), 1);
+        assert_eq!(stats.lane(Lane::Uploads).snapshot(), (1, 0, 0, 1));
     }
 }

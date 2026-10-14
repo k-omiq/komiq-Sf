@@ -17,6 +17,24 @@ use crate::pg_import::plan::{self, Table};
 /// comment-tombstone step (0122).
 pub(super) const TARGETS: [i64; 2] = [121, 122];
 
+/// PostgreSQL-only user tables that the old SQLite schema cannot preserve.
+/// Every entry in `plan::POSTGRES_ONLY` needs an explicit rollback disposition:
+/// an empty table may be omitted and reported, but rows must never be lost.
+pub(super) const UNSUPPORTED_POSTGRES_ONLY: &[(&str, &str)] = &[(
+    "scanlator_rating",
+    "reader ratings have no representation in the kept SQLite schema",
+)];
+
+/// Derived search and migration/import state have no user rows to export.
+pub(super) const REQUIRED_POSTGRES_INTERNAL: &[&str] = &[
+    "work_search_alias",
+    "_sqlx_migrations",
+    "komika_import_state",
+    "komika_import_table",
+];
+pub(super) const OPTIONAL_POSTGRES_INTERNAL: &[&str] =
+    &["komika_startup_import", "komika_server_started"];
+
 /// (table, copied, reason). The record `docs/audits/postgres-reverse-export.md`
 /// repeats this list; `classification_covers_the_import_plan` keeps it complete.
 pub(super) const TABLES: &[(&str, bool, &str)] = &[

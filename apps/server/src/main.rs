@@ -3,6 +3,7 @@ mod avatar;
 mod block;
 mod browse;
 mod catalog;
+mod catalogue_cache;
 mod chapter_label;
 mod cloudflare;
 mod config;
@@ -16,6 +17,7 @@ mod discovery;
 mod ext_icon;
 mod gc;
 mod graphql;
+mod image_delivery;
 mod img_proxy;
 mod ingest;
 mod instance;
@@ -32,6 +34,7 @@ mod phash;
 #[cfg(test)]
 #[path = "../bench/postgres_contention.rs"]
 mod postgres_contention;
+mod postgres_metrics;
 mod rate_limit;
 mod request_budget;
 mod scanlators;
@@ -48,6 +51,7 @@ mod suwayomi;
 mod sync;
 mod tags;
 mod task;
+mod telemetry;
 #[cfg(test)]
 mod test_postgres;
 #[cfg(test)]
@@ -1040,8 +1044,8 @@ fn png_icon_response(bytes: Vec<u8>) -> axum::response::Response {
         .into_response()
 }
 
-/// `GET /avatars/{file}` — serve a stored avatar from `user_avatars`. Immutable +
-/// long-cache; the stored `avatar_url` carries a `?v=<ts>` so a new upload busts
+/// `GET /avatars/{file}` — serve the current stored avatar from `user_avatars`.
+/// The stored `avatar_url` carries a `?v=<ts>` so a new upload busts
 /// the cache. `{file}` is `<user_id>.webp`; the id is looked up as a bind param
 /// (no path/SQL injection surface), returning 404 for a bad shape or unknown id.
 async fn serve_avatar(
@@ -1063,17 +1067,17 @@ async fn serve_avatar(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "avatar read failed");
-                return database_error_response(
+                return media_store_error(database_error_response(
                     db::observed_read_database_error(e.into()),
                     "Internal error",
-                );
+                ));
             }
         };
     match webp {
         Some(bytes) => (
             [
                 (header::CONTENT_TYPE, "image/webp"),
-                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+                (header::CACHE_CONTROL, image_delivery::MUTABLE_CACHE),
             ],
             bytes,
         )
@@ -1083,7 +1087,7 @@ async fn serve_avatar(
 }
 
 /// `GET /covers/{work_id}.webp` — public serve of a work cover from `work_cover_blob`.
-/// Same BLOB-in-SQLite + immutable-cache model as avatars. On a cache MISS for a
+/// Same BLOB-in-SQLite model and revalidating cache as avatars. On a cache MISS for a
 /// MangaDex-anchored work, lazily fetch its MangaDex cover, downscale to a bounded
 /// WebP, store it (so it's on our origin from now on), and serve it — "save covers as
 /// we fetch". If the lazy fetch/resize fails (or the work has a version but a missing
@@ -1112,7 +1116,7 @@ async fn serve_cover(
         Ok(None) => {} // fall through to lazy fetch
         Err(e) => {
             tracing::warn!(error = %e, "cover read failed");
-            return database_error_response(e, "Internal error");
+            return cover_store_unavailable(e);
         }
     }
     // Lazy cache: this URL is only built for MangaDex-anchored works, so look up the
@@ -1195,7 +1199,8 @@ fn is_suwayomi_image_path(rest: &str) -> bool {
 /// image endpoints. Cover/page URLs are built against THIS origin (set
 /// `SUWAYOMI_PUBLIC_URL=https://api.komiq.cc`) and we fetch the bytes internally over the
 /// loopback host (`fetch_cover_now` / `fetch_page_now`, each bounded by its own pool) and
-/// re-serve them with an immutable cache. Both covers and pages load DIRECTLY from this
+/// re-serve them with a short revalidating cache (engine indices are not exact
+/// revisions until M5). Both covers and pages load DIRECTLY from this
 /// origin in the reader — the image Worker is for foreign CDNs (MangaDex) only, never our
 /// own origin. Only the two numeric image paths above are honoured
 /// (`is_suwayomi_image_path`); anything else 404s.
@@ -1265,9 +1270,30 @@ async fn serve_suwayomi_image(
         Err(crate::suwayomi::PageFetchError::Upstream(e)) => {
             health(Err(&e));
             tracing::warn!(error = %e, path = %path, "suwayomi image proxy failed");
-            StatusCode::BAD_GATEWAY.into_response()
+            image_failure_response(StatusCode::BAD_GATEWAY)
         }
     }
+}
+
+/// A failed cover-store read is neither a cold miss nor a reason to fetch the source
+/// again. Pool exhaustion/closure answers a retryable 503; either way the failure is
+/// kept out of every cache.
+fn cover_store_unavailable(error: sqlx::Error) -> axum::response::Response {
+    let mut response = database_error_response(
+        db::observed_read_database_error(error.into()),
+        "Cover cache unavailable",
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, must-revalidate"),
+    );
+    media_store_error(response)
+}
+
+/// A media store read failed: a 500/503 the media telemetry reports as a store error.
+fn media_store_error(mut response: axum::response::Response) -> axum::response::Response {
+    telemetry::mark(&mut response, telemetry::MediaOutcome::StoreError);
+    response
 }
 
 /// Retryable, uncacheable 503 for a page whose fetch pool is saturated. Recovery is the
@@ -1311,8 +1337,15 @@ async fn serve_suwayomi_cover(
     width: Option<u32>,
 ) -> axum::response::Response {
     let variant_key = cover::suwayomi_variant_key(manga_id);
-    if let Some(webp) = cover::get_suwayomi_cover(covers, manga_id).await {
-        return cover_response_at_width(&app.pool, covers, &variant_key, width, webp).await;
+    match cover::read_suwayomi_cover(covers, manga_id).await {
+        Ok(Some(webp)) => {
+            return cover_response_at_width(&app.pool, covers, &variant_key, width, webp).await;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, manga_id, "suwayomi cover cache read failed");
+            return cover_store_unavailable(error);
+        }
     }
     let path = format!("/api/v1/manga/{manga_id}/thumbnail");
     let work = cover::master_cover_work().await;
@@ -1341,7 +1374,7 @@ async fn serve_suwayomi_cover(
         }
         Err(crate::suwayomi::CoverFetchError::Upstream(e)) => {
             tracing::warn!(error = %e, path = %path, "suwayomi cover proxy failed");
-            return StatusCode::BAD_GATEWAY.into_response();
+            return image_failure_response(StatusCode::BAD_GATEWAY);
         }
     };
     let (bytes, content_type) = fetched;
@@ -1365,7 +1398,7 @@ async fn serve_suwayomi_cover(
         }
         Ok(Err((err, bytes))) => {
             tracing::warn!(error = %err, manga_id, "suwayomi cover resize failed; serving raw");
-            raw_image_response(content_type, bytes)
+            raw_cover_fallback_response(content_type, bytes)
         }
         Err(e) => {
             tracing::error!(error = %e, manga_id, "suwayomi cover resize task panicked");
@@ -1568,14 +1601,14 @@ fn resize_cover_variant<T: Send + 'static>(
     })
 }
 
-/// Immutable-cached response for a resized WebP cover.
+/// Current cover bytes: ?v= is a cache bust, not a historical object selector.
 fn webp_cover_response(bytes: Vec<u8>) -> axum::response::Response {
     (
         [
             (header::CONTENT_TYPE, HeaderValue::from_static("image/webp")),
             (
                 header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=31536000, immutable"),
+                HeaderValue::from_static(image_delivery::MUTABLE_CACHE),
             ),
         ],
         bytes,
@@ -1591,18 +1624,42 @@ const GRAPHQL_BODY_LIMIT: usize = 2 * 1024 * 1024;
 /// account start twenty at the same moment.
 static UPLOAD_DECODE_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
-/// Immutable-cached response for a raw proxied image (chapter pages, un-resizable
-/// covers) — passes the upstream `Content-Type` through.
-fn raw_image_response(content_type: String, bytes: Vec<u8>) -> axum::response::Response {
+/// Current proxied page bytes. Engine indices can be reused or their art replaced,
+/// so this locator must revalidate until exact revision URLs are implemented.
+fn raw_image_response(
+    content_type: String,
+    bytes: impl Into<axum::body::Bytes>,
+) -> axum::response::Response {
+    raw_image_response_with_cache(content_type, bytes.into(), image_delivery::MUTABLE_CACHE)
+}
+
+fn raw_cover_fallback_response(content_type: String, bytes: Vec<u8>) -> axum::response::Response {
+    let mut response =
+        raw_image_response_with_cache(content_type, bytes.into(), "no-store, must-revalidate");
+    telemetry::mark(&mut response, telemetry::MediaOutcome::NoStoreFallback);
+    response
+}
+
+fn image_failure_response(status: StatusCode) -> axum::response::Response {
+    (
+        status,
+        [(header::CACHE_CONTROL, "no-store, must-revalidate")],
+    )
+        .into_response()
+}
+
+fn raw_image_response_with_cache(
+    content_type: String,
+    bytes: axum::body::Bytes,
+    cache: &'static str,
+) -> axum::response::Response {
     let ct = HeaderValue::from_str(&content_type)
         .unwrap_or_else(|_| HeaderValue::from_static("image/jpeg"));
     (
         [
             (header::CONTENT_TYPE, ct),
-            (
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=31536000, immutable"),
-            ),
+            (header::CONTENT_LENGTH, HeaderValue::from(bytes.len())),
+            (header::CACHE_CONTROL, HeaderValue::from_static(cache)),
             // The bytes come from a source and are not re-encoded, and `image/*`
             // includes SVG, which can carry script. Opened as a page of its own, it
             // must not run with this origin's rights. An `<img>` is not affected.
@@ -1611,7 +1668,8 @@ fn raw_image_response(content_type: String, bytes: Vec<u8>) -> axum::response::R
                 HeaderValue::from_static("sandbox; default-src 'none'"),
             ),
         ],
-        bytes,
+        // A page payload owns its fetch slot; a stalled client must not pin it.
+        image_delivery::delivery_body(bytes),
     )
         .into_response()
 }
@@ -1771,10 +1829,10 @@ async fn serve_comment_media(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "comment media read failed");
-                return database_error_response(
+                return media_store_error(database_error_response(
                     db::observed_read_database_error(e.into()),
                     "Internal error",
-                );
+                ));
             }
         };
     match webp {
@@ -1819,11 +1877,9 @@ async fn metrics(State(pool): State<crate::db::Database>) -> impl IntoResponse {
             })
     }
 
-    let wal_bytes = scalar(
-        &pool,
-        "SELECT COALESCE(SUM(size), 0)::bigint FROM pg_ls_waldir()",
-    )
-    .await;
+    // WAL directory, archiver and backlog readings; an unreadable one is left out
+    // of the scrape rather than shown as -1 (see `postgres_metrics`).
+    let recovery = postgres_metrics::collect(&pool).await;
     let pool_size = pool.size();
     let pool_idle = pool.num_idle();
     let write_queue_wait = db::write_queue_wait_seconds();
@@ -1876,11 +1932,9 @@ async fn metrics(State(pool): State<crate::db::Database>) -> impl IntoResponse {
     .flatten()
     .unwrap_or(-1);
 
-    let mut body = format!(
-        "# HELP komika_sqlite_wal_bytes Current PostgreSQL WAL segment bytes\n\
-         # TYPE komika_sqlite_wal_bytes gauge\n\
-         komika_sqlite_wal_bytes {wal_bytes}\n\
-         # HELP komika_sqlite_pool_connections Main database read pool connections\n\
+    let mut body = postgres_metrics::prometheus(&recovery);
+    body.push_str(&format!(
+        "# HELP komika_sqlite_pool_connections Main database read pool connections\n\
          # TYPE komika_sqlite_pool_connections gauge\n\
          komika_sqlite_pool_connections {pool_size}\n\
          # HELP komika_sqlite_pool_idle Main database idle read connections\n\
@@ -1922,8 +1976,9 @@ async fn metrics(State(pool): State<crate::db::Database>) -> impl IntoResponse {
          # HELP komika_feed_updates_newest_age_seconds Age of the newest chapter in the feed\n\
          # TYPE komika_feed_updates_newest_age_seconds gauge\n\
          komika_feed_updates_newest_age_seconds {feed_age_secs}\n"
-    );
+    ));
     body.push_str(&db::database_counters().prometheus());
+    body.push_str(&telemetry::prometheus(pool.deferred_queued()));
     (
         axum::http::StatusCode::OK,
         [(
@@ -2007,17 +2062,26 @@ fn public_router(
                     avatar::MAX_UPLOAD_BYTES + 1024 * 1024,
                 )),
         )
-        .route("/avatars/{file}", get(serve_avatar))
+        .route(
+            "/avatars/{file}",
+            get(serve_avatar).layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                telemetry::MediaRoute::Avatar,
+            )),
+        )
         // Public serve of DB-backed work covers (WebP BLOB in `work_cover_blob`).
         // Lets the web reader load covers from our own origin instead of the CF
         // image Worker; the bytes are materialized by `cover::crawl_uncached_covers`
         // (admin `materializeCatalogueCovers`).
         .route(
             "/covers/{file}",
-            get(serve_cover).layer(axum::middleware::from_fn_with_state(
-                std::time::Duration::from_secs(120),
-                request_budget::limit_image_time,
-            )),
+            get(serve_cover)
+                .layer(axum::middleware::from_fn_with_state(
+                    std::time::Duration::from_secs(120),
+                    request_budget::limit_image_time,
+                ))
+                .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                    telemetry::MediaRoute::Cover,
+                )),
         )
         // Public serve of extension icons from the vendored snapshot baked into
         // this image, with a lazy fetch from each extension's own repo for the rest.
@@ -2025,10 +2089,14 @@ fn public_router(
         // `index.pb` migration (see the `ext_icon` module).
         .route(
             "/ext-icons/{file}",
-            get(serve_ext_icon).layer(axum::middleware::from_fn_with_state(
-                std::time::Duration::from_secs(120),
-                request_budget::limit_image_time,
-            )),
+            get(serve_ext_icon)
+                .layer(axum::middleware::from_fn_with_state(
+                    std::time::Duration::from_secs(120),
+                    request_budget::limit_image_time,
+                ))
+                .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                    telemetry::MediaRoute::ExtIcon,
+                )),
         )
         // Admin: replace ONE work's cover from an uploaded image (the "Bugs" panel's
         // manual-upload action for covers the crawl can't process). Same multipart
@@ -2049,10 +2117,15 @@ fn public_router(
         // (`is_suwayomi_image_path`) so it is not a general Suwayomi REST proxy.
         .route(
             "/api/v1/manga/{*rest}",
-            get(serve_suwayomi_image).layer(axum::middleware::from_fn_with_state(
-                std::time::Duration::from_secs(60),
-                request_budget::limit_image_time,
-            )),
+            get(serve_suwayomi_image)
+                .layer(axum::middleware::from_fn_with_state(
+                    std::time::Duration::from_secs(60),
+                    request_budget::limit_image_time,
+                ))
+                // Page, or engine cover for `/thumbnail` paths.
+                .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                    telemetry::MediaRoute::Page,
+                )),
         )
         // Authenticated comment-image upload + public serve, same BLOB-in-SQLite
         // model as avatars. The upload route raises the body limit above the raw
@@ -2066,7 +2139,12 @@ fn public_router(
                 ))
                 .layer(DefaultBodyLimit::max(media::MAX_UPLOAD_BYTES + 1024 * 1024)),
         )
-        .route("/comment-media/{file}", get(serve_comment_media));
+        .route(
+            "/comment-media/{file}",
+            get(serve_comment_media).layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                telemetry::MediaRoute::CommentMedia,
+            )),
+        );
     // Self-host: the server's own image proxy (`img_proxy`), the stand-in for the
     // `img.komiq.cc` Worker. Mounted only where it is wanted — a server that serves
     // the web apps (`KOMIKA_WEB_DIR`) or one told to (`KOMIKA_IMG_PROXY=on`) — so the
@@ -2080,6 +2158,9 @@ fn public_router(
                 .layer(axum::middleware::from_fn_with_state(
                     std::time::Duration::from_secs(180),
                     request_budget::limit_image_time,
+                ))
+                .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                    telemetry::MediaRoute::Proxy,
                 )),
         )
     } else {
@@ -2161,6 +2242,12 @@ fn public_router(
     ))
 }
 
+/// ANSI colour in the human log format: stdout is a terminal and `NO_COLOR` is
+/// unset or empty (no-color.org).
+fn log_ansi(stdout_is_terminal: bool, no_color: Option<std::ffi::OsString>) -> bool {
+    stdout_is_terminal && no_color.is_none_or(|value| value.is_empty())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -2177,7 +2264,16 @@ async fn main() -> anyhow::Result<()> {
             .json()
             .init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        // Colour only for a person at a terminal: `docker logs` and files get plain
+        // text, so a search for ` ERROR ` matches.
+        let ansi = log_ansi(
+            std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            std::env::var_os("NO_COLOR"),
+        );
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(ansi)
+            .init();
     }
 
     let cfg = Config::from_env();
@@ -2227,7 +2323,7 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::init(&cfg.database_url).await?;
     let ready_pool = ReadyDb::connect(&pool).await?;
     // Separate, un-replicated DB for cover blobs — see `db::init_covers`. Kept out
-    // of the main DB so Litestream ships only accounts/social/catalogue to R2, never
+    // of the main DB so its backup carries only accounts/social/catalogue, never
     // the large (re-derivable) cover thumbnails.
     let cover_pool = db::init_covers(&cfg.covers_database_url).await?;
 
@@ -2286,6 +2382,7 @@ async fn main() -> anyhow::Result<()> {
         scan_health: std::sync::Mutex::new(ScanHealth::default()),
         auth_limiter: RateLimiter::new(cfg.auth_rate_limit_max, cfg.auth_rate_limit_window_secs),
         comment_limiter: graphql::comment_limiter(),
+        rating_limiter: graphql::rating_limiter(),
         password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         federated_limiter: RateLimiter::new(
             cfg.federated_rate_limit_max,
@@ -2632,7 +2729,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Leave ten seconds of Compose's 30s stop window for Litestream's final sync.
+/// Leave ten seconds of Compose's 30s stop window for closing the pools and exiting.
 /// The deadline covers both HTTP connections and the final buffered-write drain.
 async fn finish_with_shutdown_deadline<F>(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -2701,6 +2798,38 @@ tokio::task_local! { static UPLOAD_MEDIA_PAUSE: crate::locks::pause_points::Paus
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unoptimized_cover_fallback_is_never_an_immutable_cache_success() {
+        let response =
+            raw_cover_fallback_response("image/jpeg".into(), crate::suwayomi::testsrv::jpeg(8, 8));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, must-revalidate"
+        );
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(
+            image_failure_response(StatusCode::BAD_GATEWAY).headers()[header::CACHE_CONTROL],
+            "no-store, must-revalidate"
+        );
+    }
+
+    #[test]
+    fn mutable_page_and_cover_locators_have_bounded_revalidating_cache_policy() {
+        let page = raw_image_response("image/jpeg".into(), crate::suwayomi::testsrv::jpeg(8, 8));
+        let cover = webp_cover_response(vec![1]);
+        for response in [page, cover] {
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                image_delivery::MUTABLE_CACHE
+            );
+            assert!(!response.headers()[header::CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .contains("immutable"));
+        }
+    }
 
     async fn rest_media_multipart() -> Multipart {
         use axum::extract::FromRequest;
@@ -2832,6 +2961,7 @@ mod tests {
                 scan_health: std::sync::Mutex::new(ScanHealth::default()),
                 auth_limiter: RateLimiter::new(100, 60),
                 comment_limiter: graphql::comment_limiter(),
+                rating_limiter: graphql::rating_limiter(),
                 password_work: Arc::new(tokio::sync::Semaphore::new(4)),
                 federated_limiter: RateLimiter::new(100, 60),
                 session_ttl_secs: 3600,
@@ -2911,6 +3041,7 @@ mod tests {
             scan_health: std::sync::Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
             comment_limiter: graphql::comment_limiter(),
+            rating_limiter: graphql::rating_limiter(),
             password_work: Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 3600,
@@ -2968,6 +3099,80 @@ mod tests {
             .unwrap();
         assert!(cover::get_suwayomi_cover(&covers, 8).await.is_some());
         assert_eq!(origin.hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_cover_store_is_not_a_cold_miss_or_an_upstream_fetch() {
+        let main = crate::db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let covers = crate::database::SqliteTestPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        covers.close().await;
+        assert!(matches!(
+            cover::read_suwayomi_cover(&covers, 7).await,
+            Err(sqlx::Error::PoolClosed)
+        ));
+        let origin = crate::suwayomi::testsrv::spawn(
+            crate::suwayomi::testsrv::jpeg(8, 8),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let app = AppState {
+            pool: main,
+            cover_pool: covers.clone(),
+            suwayomi: SuwayomiClient::new(origin.base_url.clone(), None, None),
+            mangadex: Arc::new(mangadex::MangaDexClient::new(
+                "cover-store-test",
+                100.0,
+                100.0,
+            )),
+            admin_users: vec![],
+            scan_health: std::sync::Mutex::new(ScanHealth::default()),
+            auth_limiter: RateLimiter::new(100, 60),
+            comment_limiter: graphql::comment_limiter(),
+            rating_limiter: graphql::rating_limiter(),
+            password_work: Arc::new(tokio::sync::Semaphore::new(4)),
+            federated_limiter: RateLimiter::new(100, 60),
+            session_ttl_secs: 3600,
+            series_inflight: KeyedLocks::default(),
+            chapters_inflight: KeyedLocks::default(),
+            cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            catalogue_cover_phash: false,
+            ext_icons_dir: std::path::PathBuf::new(),
+            setup_code: instance::SetupCode::default(),
+        };
+        let app = Arc::new(app);
+        let response = serve_suwayomi_cover(&app, &covers, 7, Some(192)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, must-revalidate"
+        );
+        assert_eq!(origin.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // Work covers too: a cold miss would look up the MangaDex anchor and answer
+        // 404 or redirect; a store fault answers before any of that, retryably.
+        let response = serve_cover(
+            State(app),
+            State(CoverDb(covers)),
+            UrlPath("w1.webp".to_string()),
+            RawQuery(Some("w=192".to_string())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, must-revalidate"
+        );
+        assert!(response.headers().get(header::LOCATION).is_none());
+        assert_eq!(
+            response.extensions().get::<telemetry::MediaOutcome>(),
+            Some(&telemetry::MediaOutcome::StoreError),
+            "the media telemetry reports a store fault, not a busy pool"
+        );
     }
 
     #[tokio::test]
@@ -3093,6 +3298,15 @@ mod tests {
         assert_eq!(error.to_string(), "drain error");
     }
 
+    #[test]
+    fn human_logs_use_ansi_only_at_a_terminal_without_no_color() {
+        assert!(log_ansi(true, None));
+        assert!(log_ansi(true, Some("".into())));
+        assert!(!log_ansi(true, Some("1".into())));
+        assert!(!log_ansi(false, None));
+        assert!(!log_ansi(false, Some("1".into())));
+    }
+
     #[tokio::test]
     async fn database_metrics_include_postgres_wal_pool_and_contention_counters() {
         let pool = crate::db::Database::connect("sqlite::memory:")
@@ -3105,18 +3319,109 @@ mod tests {
         let body = std::str::from_utf8(&body).unwrap();
         for metric in [
             "komika_sqlite_wal_bytes ",
+            "komika_postgres_metric_available{metric=\"wal_bytes\"} 1",
+            "komika_postgres_metric_available{metric=\"archive_ready_files\"} 1",
+            "komika_postgres_metric_available{metric=\"archiver\"} 1",
+            "komika_postgres_archive_ready_files ",
+            "komika_postgres_archived_total ",
+            "komika_postgres_archive_failed_total ",
+            "komika_postgres_archive_failing ",
+            "komika_postgres_wal_generated_bytes_total ",
             "komika_sqlite_pool_connections ",
             "komika_sqlite_pool_idle ",
             "komika_sqlite_write_queue_wait_seconds_total ",
             "komika_sqlite_write_queue_acquisitions_total ",
             "komika_sqlite_lock_errors_total ",
+            "komika_postgres_pool_acquire_timeouts_total ",
+            "komika_admission_admitted_total{lane=\"local\"} ",
+            "komika_admission_refused_total{lane=\"upstream_client\"} ",
+            "komika_admission_refused_total{lane=\"page_fetch\"} ",
+            "komika_admission_wait_seconds_total{lane=\"cache_waiters\"} ",
+            "komika_admission_in_flight{lane=\"ingress\"} ",
+            "komika_admission_in_flight_max{lane=\"uploads\"} ",
+            "komika_request_deadline_exceeded_total{class=\"image\"} ",
+            "komika_cache_hits_total{cache=\"browse_rows\"} ",
+            "komika_cache_misses_total{cache=\"engine_pages\"} ",
+            "komika_cache_fills_total{cache=\"feed_discovery\"} ",
+            "komika_cache_evictions_total{cache=\"browse_count\"} ",
+            "komika_cache_stale_refills_rejected_total{cache=\"feed_tags\"} ",
+            "komika_cache_coalesced_waiters_total{cache=\"engine_chapter_owner\"} ",
+            "komika_cache_registry_full_total{cache=\"mangadex_at_home\"} ",
+            "komika_cache_entries{cache=\"chapter_fetch_marker\"} ",
+            "komika_media_responses_total{route=\"page\",outcome=\"upstream_error\"} ",
+            "komika_media_responses_total{route=\"engine_cover\",outcome=\"no_store_fallback\"} ",
+            "komika_media_responses_total{route=\"cover\",outcome=\"store_error\"} ",
+            "komika_media_response_body_bytes_total{route=\"avatar\"} ",
+            "komika_media_body_checks_total{source=\"proxy\",result=\"truncated\"} ",
+            "komika_media_delivered_bytes_total ",
+            "komika_media_retained_bytes_max ",
+            "komika_queue_refused_total{queue=\"deferred_writes\"} ",
+            "komika_queue_depth_max{queue=\"view_buffer\"} ",
+            "komika_queue_depth{queue=\"deferred_writes\"} ",
         ] {
             assert!(
                 body.lines().any(|line| line.starts_with(metric)),
                 "missing {metric}"
             );
         }
+        for line in body.lines() {
+            if let Some(name) = line.strip_prefix("# TYPE komika_") {
+                let name = name.split(' ').next().unwrap();
+                let total = name.ends_with("_total");
+                let counter = line.ends_with(" counter");
+                // Two pre-existing scan gauges end in `_total`; every new counter does.
+                if counter {
+                    assert!(total, "{line}");
+                }
+            }
+        }
         pool.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn media_route_telemetry_counts_outcomes_body_bytes_and_deadlines() {
+        use axum::{body::Body, http::Request};
+        use telemetry::{MediaOutcome, MediaRoute, MEDIA};
+        use tower::ServiceExt;
+        let app = Router::new().route(
+            "/api/v1/manga/{*rest}",
+            get(|UrlPath(rest): UrlPath<String>| async move {
+                if rest.ends_with("thumbnail") {
+                    raw_cover_fallback_response("image/jpeg".into(), vec![1u8; 7])
+                } else if rest.ends_with("hang") {
+                    std::future::pending::<axum::response::Response>().await
+                } else {
+                    image_failure_response(StatusCode::BAD_GATEWAY)
+                }
+            })
+            .layer(axum::middleware::from_fn_with_state(
+                std::time::Duration::from_secs(60),
+                request_budget::limit_image_time,
+            ))
+            .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(MediaRoute::Page)),
+        );
+        // Process-global counters: other tests may add to them, so lower bounds.
+        let before = |route, outcome| MEDIA.responses(route, outcome);
+        let refused = before(MediaRoute::Page, MediaOutcome::UpstreamError);
+        let fallback = before(MediaRoute::EngineCover, MediaOutcome::NoStoreFallback);
+        let deadline = before(MediaRoute::Page, MediaOutcome::Deadline);
+        let bytes = MEDIA.body_bytes(MediaRoute::EngineCover);
+        for (path, status) in [
+            ("/api/v1/manga/1/chapter/2/page/3", StatusCode::BAD_GATEWAY),
+            ("/api/v1/manga/1/thumbnail", StatusCode::OK),
+            ("/api/v1/manga/1/hang", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{path}");
+        }
+        assert!(before(MediaRoute::Page, MediaOutcome::UpstreamError) > refused);
+        assert!(before(MediaRoute::EngineCover, MediaOutcome::NoStoreFallback) > fallback);
+        assert!(before(MediaRoute::Page, MediaOutcome::Deadline) > deadline);
+        assert!(MEDIA.body_bytes(MediaRoute::EngineCover) >= bytes + 7);
     }
 
     #[tokio::test]
@@ -3189,6 +3494,7 @@ mod tests {
             scan_health: std::sync::Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
             comment_limiter: graphql::comment_limiter(),
+            rating_limiter: graphql::rating_limiter(),
             password_work: Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 3600,
@@ -3472,6 +3778,7 @@ mod tests {
             scan_health: std::sync::Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
             comment_limiter: graphql::comment_limiter(),
+            rating_limiter: graphql::rating_limiter(),
             password_work: Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 3600,

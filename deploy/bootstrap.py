@@ -46,7 +46,9 @@ SEED = [s.strip() for s in ENV.get("SEED_SERIES", "").split(",") if s.strip()]
 
 SUWA = f"http://localhost:{SUWA_PORT}/api/graphql"
 SRV = f"http://localhost:{SRV_PORT}/graphql"
-KEIYOUSHI = "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json"
+# Keiyoushi moved to `index.pb`; `index.min.json` now lists only "update your app"
+# placeholders. The pinned engine stores the store under this URL either way.
+KEIYOUSHI = "https://github.com/keiyoushi/extensions/raw/repo/index.pb"
 MANGADEX_PKG = "eu.kanade.tachiyomi.extension.all.mangadex"
 FLARESOLVERR_URL = "http://flaresolverr:8191"
 

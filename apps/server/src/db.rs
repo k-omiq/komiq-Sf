@@ -690,29 +690,11 @@ pub async fn init(database_url: &str) -> Result<Database> {
     Ok(pool)
 }
 
-#[cfg(test)]
-pub async fn init_sqlite(database_url: &str) -> Result<SqliteDatabase> {
-    let opts = SqliteConnectOptions::from_str(database_url)?
-        .create_if_missing(true)
-        .foreign_keys(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
-        // Map projected growth up to 8 GiB. This reserves virtual address space;
-        // only pages actually read become resident. .cargo/config.toml raises the
-        // bundled SQLite ceiling to match. Litestream owns checkpoints.
-        .pragma("mmap_size", "8589934592")
-        .pragma("cache_size", "-16000")
-        .pragma("temp_store", "MEMORY");
-    let pool = SqliteDatabase::connect_with(opts, 8).await?;
-    sqlx::migrate!("./migrations").run(pool.write()).await?;
-    Ok(pool)
-}
-
 /// Open (creating if needed) the SEPARATE cover-cache DB and ensure its schema.
 ///
 /// This DB holds only `work_cover_blob` (large, re-derivable-from-MangaDex cover
-/// thumbnails). It is deliberately NOT the main DB: Litestream replicates only the
-/// main DB to R2, so keeping covers here excludes them from backup while they're
+/// thumbnails). It is deliberately NOT the main DB: only the main PostgreSQL DB is
+/// backed up, so keeping covers here excludes them from backup while they're
 /// still served from our own origin. Schema is a single table, created inline (no
 /// migration directory) — there is no FK to `work` because that table lives in the
 /// other DB; an orphaned blob (its work deleted) is harmless and re-derivable.
@@ -841,7 +823,7 @@ async fn open_covers(database_url: &str) -> Result<SqliteDatabase> {
             // thumbnail` proxy path (full-resolution, up to several MB), so `serve_suwayomi_image`
             // downscales each cover to a bounded WebP on first request and caches it here.
             // Same rationale as `work_cover_blob`: large, re-derivable, and deliberately
-            // excluded from Litestream backup.
+            // excluded from the main-database backup.
             sqlx::query(
                 "CREATE TABLE IF NOT EXISTS suwayomi_cover_blob (\
              manga_id   INTEGER PRIMARY KEY,\
@@ -856,7 +838,7 @@ async fn open_covers(database_url: &str) -> Result<SqliteDatabase> {
             // namespaces the families that share this table: `w_…` for a canonical work,
             // `s:<manga_id>` for a Suwayomi source cover. Purely derived and re-generable from
             // the master on the next request, so — like the masters — it is deliberately
-            // excluded from Litestream backup, and dropping the table is always safe.
+            // excluded from the main-database backup, and dropping the table is always safe.
             sqlx::query(
                 "CREATE TABLE IF NOT EXISTS cover_variant (\
              asset_key  TEXT NOT NULL,\
@@ -889,7 +871,7 @@ async fn open_covers(database_url: &str) -> Result<SqliteDatabase> {
             // this table only backfills extensions added upstream since, so the icons
             // don't go stale between snapshot refreshes. Same rationale as the cover
             // tables for living here: re-derivable from Keiyoushi, so deliberately
-            // excluded from Litestream backup.
+            // excluded from the main-database backup.
             //
             // An EMPTY `png` is a tombstone, not an icon: ~41 extensions publish no icon
             // in either source, and without a recorded miss every request for one would

@@ -9,7 +9,7 @@
 	import Avatar from '$lib/components/Avatar.svelte';
 	import Dropdown from '$lib/components/Dropdown.svelte';
 	import ColorPicker from '$lib/components/ColorPicker.svelte';
-	import { auth, logout } from '$lib/auth.svelte';
+	import { auth, logout, saveShowNsfw } from '$lib/auth.svelte';
 	import { backend } from '$lib/context';
 	import {
 		canChooseFetch,
@@ -69,7 +69,7 @@
 		sameRule,
 		uniqueRules,
 	} from '$lib/data/block-rules';
-	import { blockRulesChanged } from '$lib/block-rules.svelte';
+	import { saveBlockRules } from '$lib/block-rules.svelte';
 
 	// --- Appearance -------------------------------------------------------------
 	const THEME_MODES: { value: ThemePref; label: string }[] = [
@@ -162,8 +162,7 @@
 		savingNsfw = true;
 		nsfwError = '';
 		try {
-			const next = await backend.setShowNsfw(!auth.user.showNsfw);
-			if (auth.user) auth.user.showNsfw = next;
+			await saveShowNsfw(!auth.user.showNsfw);
 		} catch (err) {
 			nsfwError = err instanceof Error ? err.message : 'Could not update the setting.';
 		} finally {
@@ -269,9 +268,10 @@
 		savingRules = true;
 		rulesError = '';
 		try {
-			rules = uniqueRules(await backend.setMyBlockRules(next));
-			// Lists fetched under the old rules must not come back.
-			blockRulesChanged();
+			// Invalidates lists fetched under the old rules (see $lib/block-rules.svelte).
+			const saved = await saveBlockRules(next);
+			if (!saved) return false;
+			rules = uniqueRules(saved);
 			return true;
 		} catch (err) {
 			rulesError = err instanceof Error ? err.message : 'Could not save your rules.';

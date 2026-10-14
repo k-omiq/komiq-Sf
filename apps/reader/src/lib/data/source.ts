@@ -33,6 +33,8 @@ import type { BrowseSort, ContentRatingFilter } from '@komika/api';
 import { isTauri } from '@komika/api';
 import type { Backend } from '@komika/api';
 import { backend, images } from '$lib/context';
+import { auth } from '$lib/auth.svelte';
+import { viewerCache, viewerCacheChanged } from '$lib/viewer-cache.svelte';
 import { invalidate } from '$app/navigation';
 import { navigating, page } from '$app/state';
 import { api, type LoadFetch } from './load-fetch';
@@ -50,6 +52,7 @@ import { loadFirstReadable, settleWithin, withTimeout } from './reader-pages';
 import { isLongStripSeries } from './reader-format';
 import { chapterChip, chapterSourceUrl, externalChapterHref } from './chapter-label';
 import { chapterDateLabel, chapterFoundLabel } from './chapter-date';
+import { scanlatorHref } from './scanlators';
 import {
 	isRedundantMangadexExt,
 	maxSaneChapterNumber,
@@ -2657,12 +2660,13 @@ export async function saveProgress(
 	read: boolean,
 ): Promise<void> {
 	if (!LIVE || !chapterId) return;
+	const scope = currentReaderScope();
 	// Both numeric Suwayomi chapter ids and MangaDex-uuid canonical ids persist:
 	// the server routes on id shape (canonical → `canonical_progress`) (CR6). The
 	// non-empty guard above is the only shape check the client needs.
 	try {
 		await backend.setProgress(chapterId, lastPageRead, read);
-		if (read) markCachedChapterRead(chapterId);
+		if (read && scope === currentReaderScope()) markCachedChapterRead(chapterId);
 		await refreshLibraryIfShown();
 	} catch (err) {
 		console.warn('[komika] setProgress failed:', err);
@@ -2686,9 +2690,16 @@ export async function saveProgress(
  */
 export async function setChapterRead(chapterId: string, read: boolean): Promise<boolean> {
 	if (!LIVE || !chapterId) return false;
+	const scope = currentReaderScope();
 	try {
 		const done = (await backend.setChapterRead?.(chapterId, read)) ?? false;
 		if (!done) return false;
+		if (scope === currentReaderScope()) {
+			// Read state folds across sibling source copies on the server. Refetch the
+			// bundle instead of guessing which other chapter ids this write affected.
+			clearReaderWorkCache();
+			viewerCacheChanged();
+		}
 		await refreshLibraryIfShown();
 		return true;
 	} catch (err) {
@@ -2735,6 +2746,8 @@ export interface ReaderChapterRef {
 	externalUrl?: string | null;
 }
 export interface ReaderView {
+	/** Viewer/backend generation under which this result was fetched, including preloads. */
+	cacheScope?: string;
 	/** Publication format/origin requires continuous vertical reading. */
 	longStrip?: boolean;
 	/** Completion survives reopening a chapter, including native backends. */
@@ -3241,28 +3254,77 @@ const READER_WORK_TIMEOUT_MS = 20_000;
 const READER_SECONDARY_GRACE_MS = 2_500;
 /** How long one resolved work is reused across chapter-to-chapter navigations. */
 const READER_WORK_TTL_MS = 60_000;
+const READER_WORK_CAPACITY = 32;
+
+function currentReaderScope(): string {
+	return JSON.stringify([
+		config.apiEndpoint,
+		config.backendKind,
+		config.suwayomiUrl,
+		config.nativeEngine,
+		viewerCache.readerGeneration,
+		viewerCache.generation,
+		auth.user?.id ?? null,
+		auth.user?.showNsfw ?? false,
+		auth.user?.isAdmin ?? false,
+	]);
+}
+
+/** Also checks results Kit completed before a viewer transition and kept as preloads. */
+export function readerViewIsCurrent(view: ReaderView): boolean {
+	return view.cacheScope === currentReaderScope();
+}
+
+/** Never paint another generation's title, chapter state, source links, or page URLs. */
+export function readerViewForCurrentScope(view: ReaderView): ReaderView {
+	return readerViewIsCurrent(view) ? view : emptyReader(view.seriesId);
+}
+
+/**
+ * Release the page URLs of a view whose generation has passed. Generations only move
+ * forward, so it can never render again; native `blob:` pages would otherwise stay
+ * pinned when Kit hands over a stale completed preload that the guard above hides.
+ */
+export function releaseStaleReaderView(view: ReaderView): void {
+	if (!readerViewIsCurrent(view)) releaseReaderPages(view);
+}
+
+function releaseReaderPages(view: ReaderView): void {
+	for (const page of view.pages) images.release?.(page.url);
+}
 
 interface ReaderWorkEntry {
-	/** When it was started, then when it settled. */
+	/** When a successful resolution settled. */
 	at: number;
-	settled: boolean;
 	promise: Promise<ResolvedWork | null>;
 	value?: ResolvedWork | null;
+	/** Chapters saved read while this fill was in flight; its answer may predate them. */
+	readWhilePending?: Set<string>;
 }
+/** Resolved LRU and in-flight ownership are separate, so eviction never starts a duplicate fill. */
 const readerWorkCache = new Map<string, ReaderWorkEntry>();
+const readerWorkInFlight = new Map<string, ReaderWorkEntry>();
+let readerWorkScope = '';
 
-/** Drop every cached work resolution (tests; a sign-in/out could change what resolves). */
+/** Drop resolved values. Pending owners stay accounted for until their actual RPC settles. */
 export function clearReaderWorkCache(): void {
 	readerWorkCache.clear();
+	viewerCache.readerGeneration += 1;
 }
 
 /** Reflect a just-saved "read" in the memoized lists, so reopening that chapter within the
  *  memo's lifetime still reports it read. */
 function markCachedChapterRead(chapterId: string): void {
-	for (const { value } of readerWorkCache.values()) {
-		for (const cand of value?.candidates ?? []) {
-			for (const c of cand.chapters) if (c.id === chapterId) c.read = true;
-		}
+	for (const { value } of readerWorkCache.values()) markWorkChapterRead(value, chapterId);
+	// A fill that started before this write landed can settle with the old read state.
+	for (const entry of readerWorkInFlight.values()) {
+		(entry.readWhilePending ??= new Set()).add(chapterId);
+	}
+}
+
+function markWorkChapterRead(work: ResolvedWork | null | undefined, chapterId: string): void {
+	for (const cand of work?.candidates ?? []) {
+		for (const c of cand.chapters) if (c.id === chapterId) c.read = true;
 	}
 }
 
@@ -3284,31 +3346,69 @@ function resolveReaderWork(
 	preferred: string | undefined,
 	reuse: boolean,
 ): Promise<ResolvedWork | null> {
-	const key = `${workId}\u0000${preferred ?? ''}`;
+	const scope = currentReaderScope();
+	if (readerWorkScope !== scope) {
+		readerWorkCache.clear();
+		readerWorkScope = scope;
+	}
+	const key = JSON.stringify([scope, workId, preferred ?? null]);
+	const pending = readerWorkInFlight.get(key);
+	if (pending) return withTimeout(pending.promise, READER_WORK_TIMEOUT_MS, 'series bundle');
+	const now = Date.now();
+	for (const [key, entry] of readerWorkCache) {
+		if (now - entry.at >= READER_WORK_TTL_MS) readerWorkCache.delete(key);
+	}
 	const hit = readerWorkCache.get(key);
-	if (hit && (!hit.settled || (reuse && Date.now() - hit.at < READER_WORK_TTL_MS))) {
+	if (hit && reuse) {
+		readerWorkCache.delete(key);
+		readerWorkCache.set(key, hit);
 		return hit.promise;
 	}
-	const promise = withTimeout(
-		resolveWork(workId, preferred, { withAggregated: true }),
-		READER_WORK_TIMEOUT_MS,
-		'series bundle',
-	);
-	const entry: ReaderWorkEntry = { at: Date.now(), settled: false, promise };
-	readerWorkCache.set(key, entry);
+	readerWorkCache.delete(key);
+	if (readerWorkInFlight.size >= READER_WORK_CAPACITY) {
+		return Promise.reject(new Error('Too many reader bundles are already loading'));
+	}
+	// A deadline gives up only THIS wait. It does not abort the underlying GraphQL
+	// request, which remains the single owner and consumes capacity until settlement.
+	const promise = resolveWork(workId, preferred, { withAggregated: true });
+	const entry: ReaderWorkEntry = { at: now, promise };
+	readerWorkInFlight.set(key, entry);
 	const drop = () => {
-		if (readerWorkCache.get(key) === entry) readerWorkCache.delete(key);
+		if (readerWorkInFlight.get(key) === entry) readerWorkInFlight.delete(key);
 	};
 	promise.then((r) => {
-		entry.settled = true;
-		entry.value = r;
-		entry.at = Date.now();
-		if (!r) drop();
+		if (r && currentReaderScope() === scope && readerWorkInFlight.get(key) === entry) {
+			for (const id of entry.readWhilePending ?? []) markWorkChapterRead(r, id);
+			entry.readWhilePending = undefined;
+			entry.value = r;
+			entry.at = Date.now();
+			readerWorkCache.set(key, entry);
+			while (readerWorkCache.size > READER_WORK_CAPACITY) {
+				readerWorkCache.delete(readerWorkCache.keys().next().value!);
+			}
+		}
+		drop();
 	}, drop);
-	return promise;
+	return withTimeout(promise, READER_WORK_TIMEOUT_MS, 'series bundle');
 }
 
-export function getReaderChapter(
+export async function getReaderChapter(
+	seriesId: string,
+	chParam?: string | null,
+	srcParam?: string | null,
+): Promise<ReaderView> {
+	// A token/preference may change between any two awaits, even after the bundle
+	// settled. Discard the complete old view and fetch under the current generation.
+	for (let attempt = 0; attempt < 3; attempt++) {
+		const scope = currentReaderScope();
+		const view = await loadReaderChapter(seriesId, chParam, srcParam);
+		if (scope === currentReaderScope()) return { ...view, cacheScope: scope };
+		releaseReaderPages(view);
+	}
+	return { ...emptyReader(seriesId), cacheScope: currentReaderScope() };
+}
+
+function loadReaderChapter(
 	seriesId: string,
 	chParam?: string | null,
 	srcParam?: string | null,
@@ -3737,6 +3837,7 @@ export async function getMyComments(page = 1): Promise<MyCommentsPage> {
 	const items = res.items.map((c): MyCommentView => {
 		const title = c.seriesTitle?.trim() || null;
 		const chapter = c.targetType === 'chapter';
+		const scanlator = c.targetType === 'scanlator';
 		const ch = c.chapterNumber ? `Ch. ${c.chapterNumber}` : 'a chapter';
 		const where = chapter
 			? title
@@ -3744,12 +3845,16 @@ export async function getMyComments(page = 1): Promise<MyCommentsPage> {
 				: c.chapterNumber
 					? ch
 					: 'A chapter'
-			: (title ?? 'A series discussion');
+			: scanlator
+				? 'A scanlator'
+				: (title ?? 'A series discussion');
 		const href = chapter
 			? c.seriesId
 				? `/read/${encodeURIComponent(c.seriesId)}?ch=${encodeURIComponent(c.targetId)}`
 				: null
-			: `/series/${encodeURIComponent(c.targetId)}#discussion`;
+			: scanlator
+				? scanlatorHref(c.targetId)
+				: `/series/${encodeURIComponent(c.targetId)}#discussion`;
 		return {
 			id: c.id,
 			body: c.body,

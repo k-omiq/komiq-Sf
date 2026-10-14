@@ -14,8 +14,8 @@ const KEY = 'komika-social-v1';
 
 // 'series' = per-series reviews; 'chapter' = per-chapter comments;
 // 'seriesThread' = series-level discussion comments (distinct from reviews so the two
-// don't collide in the local store).
-type Bucket = 'series' | 'chapter' | 'seriesThread';
+// don't collide in the local store); 'scanlatorThread' = the thread of one scanlator.
+type Bucket = 'series' | 'chapter' | 'seriesThread' | 'scanlatorThread';
 
 interface Store {
 	rating: Record<string, number>;

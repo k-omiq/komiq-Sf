@@ -338,6 +338,7 @@ async fn cached_reader_requests_survive_all_upstream_slots_hanging_and_client_li
         scan_health: std::sync::Mutex::new(ScanHealth::default()),
         auth_limiter: RateLimiter::new(100, 60),
         comment_limiter: graphql::comment_limiter(),
+        rating_limiter: graphql::rating_limiter(),
         password_work: Arc::new(tokio::sync::Semaphore::new(4)),
         federated_limiter: RateLimiter::new(100, 60),
         session_ttl_secs: 3600,

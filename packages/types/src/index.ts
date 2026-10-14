@@ -1076,8 +1076,9 @@ export interface Review {
 	updatedAt: string;
 }
 
-/** Comment target: a chapter thread or a series-level discussion. */
-export type CommentTargetType = 'chapter' | 'series';
+/** Comment target: a chapter thread, a series-level discussion, or the thread of one
+ *  scanlator (`targetId` is then a `RatedScanlator.id`). */
+export type CommentTargetType = 'chapter' | 'series' | 'scanlator';
 
 /**
  * A comment on a polymorphic target — a per-chapter thread (`targetType: 'chapter'`)

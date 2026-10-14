@@ -2255,7 +2255,26 @@ fn verifier_index_expectation_reads_every_migration_statement() {
         .iter()
         .map(|table| table.fks.len())
         .sum();
-    assert_eq!(expected_foreign_keys().len(), planned + 1);
+    // A table that only PostgreSQL has adds its own, from the migration that creates it.
+    use crate::pg_import::plan::POSTGRES_ONLY;
+    use crate::pg_import::verifier::expected_foreign_keys_through;
+    let postgres_only: usize = POSTGRES_ONLY.iter().map(|table| table.fks.len()).sum();
+    assert_eq!(expected_foreign_keys().len(), planned + 1 + postgres_only);
+    assert_eq!(expected_foreign_keys_through(1).len(), planned + 1);
+    for table in POSTGRES_ONLY {
+        let created = crate::pg_import::importer::POSTGRES
+            .iter()
+            .any(|m| m.version == table.since && m.sql.contains(table.name));
+        assert!(
+            created,
+            "{} is not created by migration {}",
+            table.name, table.since
+        );
+        assert!(all.contains_key(&format!("{}_pkey", table.name)));
+        assert!(crate::pg_import::plan::tables()
+            .iter()
+            .all(|planned| planned.name != table.name));
+    }
 }
 
 #[tokio::test]

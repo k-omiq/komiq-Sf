@@ -54,7 +54,7 @@ KOMIQ_IMAGE=komiq-selfhost:komiq-pre-postgres docker compose \
   up -d --no-build --no-deps server
 ```
 
-If none was saved, use your previous release image or its archive: this repository specifies no published SQLite tag. Add your HTTPS and certificate-check Compose files if you used them. After a successful conversion and new writes, the kept SQLite file is behind and cannot restore your latest reading history. Use a current PostgreSQL backup instead.
+If none was saved, use your previous release image or its archive: this repository specifies no published SQLite tag. Add your HTTPS and certificate-check Compose files if you used them. After a successful conversion and new writes, the kept SQLite file is behind and cannot restore your latest reading history. Use a current PostgreSQL backup instead. Do not return to an older SQLite release once PostgreSQL holds data it cannot store, such as scanlator ratings: the export back to SQLite refuses and writes no file. Keep PostgreSQL and its backups.
 
 ## Where data lives
 

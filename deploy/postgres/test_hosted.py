@@ -29,6 +29,13 @@ class HostedTests(unittest.TestCase):
         self.exec = patch.object(h.os, "execvp")
         self.execute = self.exec.start()
         self.addCleanup(self.exec.stop)
+        # Health reads the archiver over the socket and the volume's free space.
+        self.facts = {"in_recovery": False, "archived_count": 9, "failed_count": 0, "last_archived_wal": "0000000100000000000000AA",
+                      "last_archived_time": 0, "last_failed_wal": None, "last_failed_time": None, "ready": 0}
+        for name, value in (("archiver_facts", lambda timeout=10: self.facts), ("free_bytes", lambda: 100 << 30)):
+            p = patch.object(h, name, side_effect=value)
+            p.start()
+            self.addCleanup(p.stop)
 
     def configured(self):
         for key, value in zip(h.BACKUP_VARS, ("https://example.r2.cloudflarestorage.com", "komika-backup", "rehearsal/test", "testkey", "testsecret")):
@@ -435,6 +442,10 @@ class HostedTests(unittest.TestCase):
         self.assertIn("NOSUPERUSER", sql_call.kwargs["input"])
         self.assertIn("CREATE EXTENSION IF NOT EXISTS pg_trgm", sql_call.kwargs["input"])
         self.assertNotIn("a" * 32, str(sql_call.args))
+        for granted in ("pg_ls_waldir()", "pg_ls_archive_statusdir()"):
+            self.assertIn(f"GRANT EXECUTE ON FUNCTION pg_catalog.{granted} TO komika", sql_call.kwargs["input"])
+        self.assertNotIn("GRANT pg_monitor", sql_call.kwargs["input"])
+        self.assertLess(sql_call.kwargs["input"].index("\\connect komika"), sql_call.kwargs["input"].index("GRANT EXECUTE"))
         self.assertIn("172.21.0.0/16 scram", (h.DATA / "pg_hba.conf").read_text())
 
     def test_slots_sunday_full_daily_incremental_boundary(self):
@@ -526,6 +537,235 @@ class HostedTests(unittest.TestCase):
         h.save_status(status)
         self.assertFalse(h.health(now - 1))
 
+    def healthy(self, now):
+        self.configured()
+        h.save_status({k: {"success": now, "backup_start": now - 60} for k in ("full", "incr", "check")})
+        self.facts["last_archived_time"] = now
+        self.assertTrue(h.health(now))
+
+    def test_health_dropped_wal_since_latest_full_start_is_a_gap(self):
+        now = epoch("2026-10-11T04:00:00")
+        self.healthy(now)
+        record = h.STATE / h.DROPPED
+        record.write_text("2026-10-11T03:58:59.999999Z 0000000100000000000000A0\n")  # Before the full started.
+        self.assertTrue(h.health(now))
+        # pgBackRest's start has whole seconds: a drop in that same second stays open.
+        for line in ("2026-10-11T03:59:00.000000Z", "2026-10-11T03:59:00.500000Z", "2026-10-11T03:59:00Z",
+                     "2026-10-11T03:59:30Z"):
+            with self.subTest(line=line):
+                record.write_text(line + " 0000000100000000000000A1\n")
+                self.assertFalse(h.health(now))
+                self.assertIn("dropped WAL since the latest recorded full: PITR has a gap (backup.sh full)",
+                              h.health_problems(now))
+        status = h.read_status()
+        del status["full"]["backup_start"]  # No pgBackRest start recorded: any drop stays a gap.
+        h.save_status(status)
+        record.write_text("2026-10-01T00:00:00Z -\n")
+        self.assertFalse(h.health(now))
+
+    def test_health_archiver_failing_fifteen_minutes_and_disk_reserve(self):
+        now = epoch("2026-10-11T04:00:00")
+        self.healthy(now)
+        self.facts.update(last_failed_time=now - 10, last_archived_time=now - 15 * 60)
+        self.assertTrue(h.health(now))
+        self.facts["last_archived_time"] = now - 15 * 60 - 1
+        self.assertFalse(h.health(now))
+        self.facts.update(last_archived_time=None)
+        self.assertFalse(h.health(now))
+        self.facts.update(last_archived_time=now, last_failed_time=None)
+        with patch.object(h, "free_bytes", return_value=h.DISK_RESERVE - 1):
+            self.assertFalse(h.health(now))
+        with patch.object(h, "archiver_facts", side_effect=subprocess.CalledProcessError(2, "psql")):
+            self.assertFalse(h.health(now))
+
+    def test_health_stalled_archiver_backlog_without_a_failure(self):
+        now = epoch("2026-10-11T04:00:00")
+        self.healthy(now)
+        # Idle: no .ready file, however old the last success.
+        self.facts.update(last_archived_time=now - 86400, ready=0, oldest_ready=None)
+        self.assertTrue(h.health(now))
+        # A segment that just became ready after a quiet day is not a stall.
+        self.facts.update(ready=1, oldest_ready=now - 5)
+        self.assertTrue(h.health(now))
+        self.facts.update(oldest_ready=now - 15 * 60 - 1)
+        self.assertFalse(h.health(now))
+        self.assertIn("WAL waits to be archived with no progress for 15 minutes", h.health_problems(now))
+        # Progress within 15 minutes is lag, not a stall.
+        self.facts.update(last_archived_time=now - 60)
+        self.assertTrue(h.health(now))
+        # Never archived: the oldest .ready file decides.
+        self.facts.update(last_archived_time=None, oldest_ready=now - 60)
+        self.assertTrue(h.health(now))
+        self.facts.update(oldest_ready=now - 15 * 60 - 1)
+        self.assertFalse(h.health(now))
+        self.assertIn("oldest_ready", h.FACTS)
+
+    def test_monitoring_grant_retries_quietly_skips_recovery_and_never_raises(self):
+        refused = subprocess.CalledProcessError(2, "psql")
+        with patch.object(h, "query", side_effect=[refused, refused, "f\n"]) as query, \
+                patch.object(h.time, "sleep") as sleep, patch.object(h, "log") as log:
+            self.assertTrue(h.monitoring_grant())
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(log.call_count, 1)
+        sql = query.call_args.args[0]
+        for granted in ("pg_ls_waldir()", "pg_ls_archive_statusdir()"):
+            self.assertIn(f"GRANT EXECUTE ON FUNCTION pg_catalog.{granted} TO komika", sql)
+        self.assertNotIn("pg_monitor", sql)
+        self.assertIn("IF NOT pg_is_in_recovery()", sql)
+        with patch.object(h, "query", return_value="t\n"), patch.object(h, "log") as log:
+            self.assertFalse(h.monitoring_grant())
+        self.assertIn("recovery", log.call_args.args[0])
+        with patch.object(h, "query", side_effect=subprocess.CalledProcessError(3, "psql")), \
+                patch.object(h.time, "sleep") as sleep, patch.object(h, "log") as log:
+            self.assertFalse(h.monitoring_grant())
+        sleep.assert_not_called()
+        self.assertEqual(log.call_count, 1)
+        with patch.object(h, "query", side_effect=refused), patch.object(h.time, "sleep"), \
+                patch.object(h.time, "monotonic", side_effect=[0, 5, 2000]), patch.object(h, "log") as log:
+            self.assertFalse(h.monitoring_grant(deadline=1800))
+        self.assertEqual(log.call_count, 1)
+
+    def test_status_reports_gap_recoverable_window_and_never_zero_for_unreadable(self):
+        now = epoch("2026-10-14T12:00:00")
+        full = {"label": "F1", "type": "full", "timestamp": {"start": epoch("2026-10-11T02:00:00"), "stop": epoch("2026-10-11T02:30:00")}}
+        incr = {"label": "I1", "type": "incr", "timestamp": {"start": epoch("2026-10-13T03:00:00"), "stop": epoch("2026-10-13T03:05:00")}}
+        full2 = {"label": "F2", "type": "full", "timestamp": {"start": epoch("2026-10-14T02:00:00"), "stop": epoch("2026-10-14T02:40:00")}}
+        info = {"name": "komika", "status": {"code": 0, "message": "ok"}, "backup": [incr, full],
+                "archive": [{"min": "000000010000000000000001", "max": "0000000100000000000000AA"}]}
+        self.configured()
+        h.save_status({k: {"success": now - 3600} for k in ("full", "incr", "check")})
+        self.facts.update(last_archived_time=now - 30)
+        with patch.object(h, "repository_info", return_value=info):
+            report = h.report_status(now)
+            self.assertIs(report["gap_open"], False)
+            self.assertEqual(report["recoverable_from"], "2026-10-11T02:30:00Z")
+            # Archive completion time is not a recovery bound: reported on its own.
+            self.assertIsNone(report["recoverable_until"])
+            self.assertTrue(any(u.startswith("recoverable_until: not known without replaying WAL")
+                                for u in report["unavailable"]))
+            self.assertEqual(report["archive_last_success"], "2026-10-14T11:59:30Z")
+            self.assertEqual(report["archive_last_wal"], "0000000100000000000000AA")
+            self.assertIs(report["archiver"]["stalled"], False)
+            self.assertEqual(report["health_problems"], [])
+            self.assertEqual(report["latest_backup"]["label"], "I1")
+            self.assertEqual(report["latest_full_backup"]["label"], "F1")
+            self.assertEqual(report["dropped_wal"], {"events_recorded": 0, "last": None})
+            (h.STATE / h.DROPPED).write_text("2026-10-13T10:00:00Z 0000000100000000000000A0\n")
+            report = h.report_status(now)
+            self.assertIs(report["gap_open"], True)
+            self.assertIsNone(report["recoverable_from"])
+            self.assertIsNone(report["recoverable_until"])
+            self.assertTrue(any(u.startswith("recoverable_from: no full backup") for u in report["unavailable"]))
+            info["backup"].append(full2)
+            report = h.report_status(now)
+            self.assertIs(report["gap_open"], False)
+            self.assertEqual(report["recoverable_from"], "2026-10-14T02:40:00Z")
+            # A drop in the same second as that full's (whole-second) start stays open.
+            (h.STATE / h.DROPPED).write_text("2026-10-14T02:00:00.250000Z 0000000100000000000000A0\n")
+            report = h.report_status(now)
+            self.assertIs(report["gap_open"], True)
+            self.assertIsNone(report["recoverable_from"])
+            (h.STATE / h.DROPPED).write_text("2026-10-14T01:59:59.999999Z 0000000100000000000000A0\n")
+            self.assertIs(h.report_status(now)["gap_open"], False)
+        self.assertIn("never across dropped WAL", report["pitr"])
+        self.assertEqual(json.loads(json.dumps(report)), report)
+        # Unreadable: null plus a reason, never 0.
+        with patch.object(h, "archiver_facts", side_effect=subprocess.CalledProcessError(2, "psql")), \
+                patch.object(h, "repository_info", side_effect=subprocess.CalledProcessError(82, "pgbackrest")):
+            report = h.report_status(now)
+        self.assertIsNone(report["archiver"])
+        self.assertIsNone(report["latest_backup"])
+        self.assertIsNone(report["ready_files"])
+        self.assertEqual(report["spool_bytes"], 0)  # Present and empty: a real zero.
+        reasons = " ".join(report["unavailable"])
+        for field in ("archiver:", "backups: pgbackrest info failed (exit 82)", "ready_files:", "recoverable_from:"):
+            self.assertIn(field, reasons)
+        self.assertNotIn("testsecret", json.dumps(report))
+        # --local never asks the repository; the gap then comes from the pgBackRest
+        # start that perform() recorded in status.json, by the same rule.
+        with patch.object(h, "repository_info", side_effect=AssertionError("no repository request")):
+            report = h.report_status(now, local=True)
+            self.assertIs(report["gap_open"], True)
+            self.assertIn("dropped WAL since the latest recorded full: PITR has a gap (backup.sh full)",
+                          report["health_problems"])
+            status = h.read_status()
+            status["full"]["backup_start"] = epoch("2026-10-14T02:00:00")
+            h.save_status(status)
+            self.assertIs(h.report_status(now, local=True)["gap_open"], False)
+            (h.STATE / h.DROPPED).write_text("2026-10-14T02:00:00.250000Z 0000000100000000000000A0\n")
+            report = h.report_status(now, local=True)
+        self.assertIs(report["gap_open"], True)
+        self.assertIn("backups: not read (--local makes no repository request)", report["unavailable"])
+
+    def test_status_without_state_reports_unreadable_dropped_record(self):
+        with patch.object(h, "archiver_facts", side_effect=OSError("no psql")):
+            report = h.report_status(epoch("2026-10-14T12:00:00"))
+        self.assertIsNone(report["dropped_wal"])
+        self.assertIsNone(report["gap_open"])
+        self.assertIn("backups: no pgBackRest configuration in this container", report["unavailable"])
+
+    def test_reading_splits_archive_and_backups_against_seven_gigabytes(self):
+        self.configured()
+        listing = {"archive": {"type": "path"}, "archive/komika/18-1/a.zst": {"type": "file", "size": 3 * 10 ** 9},
+                   "backup/komika/F/pg_data.zst": {"type": "file", "size": 4 * 10 ** 9},
+                   "backup/komika/backup.info": {"type": "file", "size": 10}}
+        wal = json.dumps({"wal_bytes": 123, "stats_reset": None, "lsn_bytes": 456})
+        with patch.object(h, "query", return_value=wal), patch.object(h, "collect", return_value=json.dumps(listing)) as collect:
+            report = h.reading(epoch("2026-10-20T09:00:00"))
+        self.assertEqual(collect.call_args.args[0], ["pgbackrest", "--stanza=komika", "--recurse", "--output=json", "repo-ls"])
+        self.assertEqual(report["repository"]["archived_wal_bytes"], 3 * 10 ** 9)
+        self.assertEqual(report["repository"]["backup_bytes"], 4 * 10 ** 9 + 10)
+        self.assertTrue(report["repository"]["prefix_over_action_threshold"])
+        self.assertNotIn("action_needed", report["repository"])
+        self.assertIn("account-wide", report["action_threshold_note"])
+        self.assertEqual(report["raw_wal"]["lsn_bytes"], 456)
+        self.assertEqual(report["duty_dates"], ["2026-10-20", "2026-10-27", "2026-11-03", "2026-11-10"])
+        with patch.object(h, "query", side_effect=subprocess.CalledProcessError(2, "psql")), \
+                patch.object(h, "collect", side_effect=subprocess.CalledProcessError(9, "pgbackrest")):
+            report = h.reading()
+        self.assertIsNone(report["raw_wal"])
+        self.assertIsNone(report["repository"])
+        self.assertEqual(len(report["unavailable"]), 2)
+
+    def test_status_and_reading_never_rewrite_the_configuration(self):
+        self.configured()
+        before = h.CONFIG.read_text()
+        for argv in (["hosted.py", "status", "--local"], ["hosted.py", "reading"]):
+            with self.subTest(argv=argv), patch.object(h.sys, "argv", argv), patch.object(h, "configure") as configure, \
+                    patch.object(h, "query", side_effect=OSError("no psql")), patch.object(h, "collect", side_effect=OSError("no pgbackrest")), \
+                    patch("sys.stdout") as stdout:
+                h.main()
+            configure.assert_not_called()
+            json.loads("".join(c.args[0] for c in stdout.write.call_args_list))
+        self.assertEqual(h.CONFIG.read_text(), before)
+        with patch.object(h.sys, "argv", ["hosted.py", "reading", "--local"]), self.assertRaises(ValueError):
+            h.main()
+
+    def test_full_success_records_pgbackrests_own_start_and_stop(self):
+        self.configured()
+        clock = [epoch("2026-10-11T02:00:00")]
+        old = {"label": "F0", "type": "full", "timestamp": {"start": epoch("2026-10-04T02:00:05"), "stop": epoch("2026-10-04T02:09:00")}}
+        new = {"label": "F1", "type": "full", "timestamp": {"start": epoch("2026-10-11T02:00:07"), "stop": epoch("2026-10-11T02:09:58")}}
+        incr = {"label": "I1", "type": "incr", "timestamp": {"start": epoch("2026-10-11T02:05:00"), "stop": epoch("2026-10-11T02:06:00")}}
+        listings = [[old], [incr, new, old]]
+        def backup(*args, **kwargs):
+            clock[0] += 600
+        with patch.object(h, "backup_info", side_effect=lambda **kwargs: listings.pop(0)), \
+                patch.object(h, "pgbr", side_effect=backup), patch.object(h.time, "time", side_effect=lambda: clock[0]):
+            self.assertTrue(h.perform("full", 1, {}))
+        full = h.read_status()["full"]
+        self.assertEqual((full["backup_label"], full["backup_start"], full["backup_stop"]),
+                         ("F1", epoch("2026-10-11T02:00:07"), epoch("2026-10-11T02:09:58")))
+        self.assertEqual(full["success"], epoch("2026-10-11T02:10:00"))
+        self.assertNotIn("started", full)
+        # Info cannot show it afterwards: the job still succeeds, the older record stays.
+        status = h.read_status()
+        with patch.object(h, "backup_info", side_effect=[[new], ValueError("info")]), patch.object(h, "pgbr"), \
+                patch.object(h, "log") as log:
+            self.assertTrue(h.perform("full", 2, status))
+        self.assertEqual(h.read_status()["full"]["backup_start"], epoch("2026-10-11T02:00:07"))
+        self.assertIn("start is not recorded", log.call_args_list[0].args[0])
+
     def test_local_health_without_backup_is_explicitly_unprotected(self):
         self.assertTrue(h.health())
 
@@ -573,7 +813,9 @@ class HostedTests(unittest.TestCase):
         with patch.object(h, "pgbr", side_effect=pgbr), patch.object(h.time, "time", return_value=now), h.locked():
             self.assertTrue(h.perform("full", h.slots(now)["full"], {}, bootstrap=True))
             self.assertFalse(h.perform("incr", h.slots(now)["incr"], {}))
-        self.assertEqual(calls, [("--output=json", "info"), ("--type=full", "backup"), ("--output=json", "info")])
+        # info before the full, info to record its pgBackRest start, info before the incremental.
+        self.assertEqual(calls, [("--output=json", "info"), ("--type=full", "backup"), ("--output=json", "info"),
+                                 ("--output=json", "info")])
         for code in (3, 4, 5, 6, 99):
             broken = json.loads(fresh)
             broken[0]["repo"][0]["status"]["code"] = code

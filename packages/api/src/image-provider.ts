@@ -106,6 +106,9 @@ export interface WebImageProviderConfig {
 /** API-origin asset paths the reader serves itself (never Worker-proxied). */
 const OWN_ASSET_PREFIXES = ['/covers/', '/avatars/'];
 
+/** One-time rollout key: bypass browser responses cached under the former immutable policy. */
+const CACHE_POLICY_REVISION = '2';
+
 /**
  * The address scheme the native app answers engine images on (`ENGINE_IMAGE_SCHEME` in
  * `apps/reader/src-tauri/src/lib.rs`; the two must stay the same).
@@ -149,20 +152,21 @@ export class WebImageProvider implements ImageProvider {
 		if (this.config.serverProxy) {
 			if (!needsProxy(sourceUrl)) return sourceUrl;
 			const base = this.config.workerBaseUrl.replace(/\/$/, '');
-			return `${base}/img?src=${encodeURIComponent(sourceUrl)}`;
+			return `${base}/img?src=${encodeURIComponent(sourceUrl)}&cache_policy=${CACHE_POLICY_REVISION}`;
 		}
 		if (this.config.direct) {
 			this.warnIfProxyRequired(sourceUrl);
 			return sourceUrl;
 		}
 		const base = this.config.workerBaseUrl.replace(/\/$/, '');
-		return `${base}/img?src=${encodeURIComponent(sourceUrl)}`;
+		return `${base}/img?src=${encodeURIComponent(sourceUrl)}&cache_policy=${CACHE_POLICY_REVISION}`;
 	}
 
 	/** True for an asset the reader serves from its own API origin (cached covers,
 	 * avatars) — relative `/covers/…` or an absolute URL under `apiOrigin`. */
 	private isOwnAsset(url: string): boolean {
-		if (OWN_ASSET_PREFIXES.some((p) => url.startsWith(p))) return true;
+		if (OWN_ASSET_PREFIXES.some((p) => url.startsWith(p)) || url.startsWith('/api/v1/manga/'))
+			return true;
 		const origin = this.config.apiOrigin;
 		if (!origin) return false;
 		// Match on an ORIGIN BOUNDARY, not a bare prefix: `startsWith(origin)` alone would
@@ -178,6 +182,17 @@ export class WebImageProvider implements ImageProvider {
 		if (/^https?:\/\//.test(url)) return url;
 		const origin = (this.config.apiOrigin ?? '').replace(/\/$/, '');
 		return origin + (url.startsWith('/') ? '' : '/') + url;
+	}
+
+	private versionedOwnAsset(sourceUrl: string): string {
+		const absolute = this.toAbsoluteOwn(sourceUrl);
+		// Embedded SSR can resolve its own assets before location exists. Keep those
+		// paths relative; the placeholder base is used only to edit the query safely.
+		const url = new URL(absolute, 'https://komika.invalid');
+		url.searchParams.set('cache_policy', CACHE_POLICY_REVISION);
+		return /^https?:\/\//.test(absolute)
+			? url.toString()
+			: `${url.pathname}${url.search}${url.hash}`;
 	}
 
 	private warnIfProxyRequired(sourceUrl: string): void {
@@ -218,8 +233,8 @@ export class WebImageProvider implements ImageProvider {
 	 */
 	private resolvePageSync(sourceUrl: string): string {
 		if (!sourceUrl) return '';
-		if (!this.config.direct && this.isOwnAsset(sourceUrl)) {
-			return this.toAbsoluteOwn(sourceUrl);
+		if (this.isOwnAsset(sourceUrl)) {
+			return this.versionedOwnAsset(sourceUrl);
 		}
 		return this.resolve(sourceUrl);
 	}
@@ -230,8 +245,8 @@ export class WebImageProvider implements ImageProvider {
 		// Covers cached on our own origin (the DB cover cache) are same-origin /
 		// CORS-safe — serve them directly, never through the Worker. Everything else
 		// (uncached MangaDex covers) still goes through the proxy.
-		if (!this.config.direct && this.isOwnAsset(sourceUrl)) {
-			return this.toAbsoluteOwn(sourceUrl);
+		if (this.isOwnAsset(sourceUrl)) {
+			return this.versionedOwnAsset(sourceUrl);
 		}
 		return this.resolve(sourceUrl);
 	}
@@ -248,6 +263,8 @@ export class WebImageProvider implements ImageProvider {
 	 * carries so a cover's `?v=` cache-bust survives.
 	 */
 	coverCardSrcSet(sourceUrl: string): string {
+		// A matching path on a foreign/signed source is not our resize service.
+		if (!this.isOwnAsset(sourceUrl)) return '';
 		const master = this.resolveCoverSync(sourceUrl);
 		if (!master) return '';
 		let url: URL;

@@ -1,5 +1,7 @@
-import { invalidateAll } from '$app/navigation';
-import { navigating } from '$app/state';
+import type { BlockRule } from '@komika/api';
+import { auth } from './auth.svelte';
+import { backend } from './context';
+import { viewerCacheChanged } from './viewer-cache.svelte';
 
 /**
  * How many times the signed-in viewer changed their block rules in this session.
@@ -23,16 +25,22 @@ export const blockRulesVersion = $state({ n: 0 });
  */
 export function blockRulesChanged(): void {
 	blockRulesVersion.n += 1;
-	if (!navigating.to) {
-		void invalidateAll();
-		return;
-	}
-	const stop = $effect.root(() => {
-		$effect(() => {
-			if (navigating.to) return;
-			void invalidateAll();
-			// Not from inside the effect it ends.
-			queueMicrotask(stop);
-		});
-	});
+	viewerCacheChanged();
+}
+
+/**
+ * Save the viewer's whole rule list and invalidate what was read under the old one.
+ *
+ * Like `saveShowNsfw`, the owner is the account that asked: a write the server applied
+ * still invalidates after an unrelated viewer-cache change, and never applies to a
+ * different signed-in account. Resolves to the stored list, or `null` when it no longer
+ * applies to the viewer on screen.
+ */
+export async function saveBlockRules(next: BlockRule[]): Promise<BlockRule[] | null> {
+	if (!backend.setMyBlockRules) return null;
+	const owner = auth.user?.id;
+	const saved = await backend.setMyBlockRules(next);
+	if (auth.user?.id !== owner) return null;
+	blockRulesChanged();
+	return saved;
 }

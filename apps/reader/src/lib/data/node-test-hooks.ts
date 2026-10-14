@@ -3,23 +3,26 @@
  * (`source.ts`, the shared `@komika/api` client) without a bundler. Import it FIRST, then
  * `await import()` the module under test, so the hooks are live before its graph resolves.
  *
- * Two jobs, both resolution-only — no source is rewritten:
+ * Resolution hooks leave the source files unchanged:
  *   - Bundler-style specifiers Node cannot resolve on its own (`$lib/context`,
  *     `$app/navigation`, `@komika/api`, the runes-based `translator-pref.svelte`) are
  *     served as tiny stub modules. The data backend stub reads `globalThis.__komikaTest`,
  *     so a test swaps backend methods per case on one shared object.
  *   - Extensionless (`./load-fetch`) and `.js`-suffixed (`./operations.js`) relative
  *     imports, which Vite maps onto `.ts`, are mapped onto the `.ts` file that exists.
+ *   - The shared viewer-cache rune module is compiled with the real Svelte compiler.
  *
  * Deliberately not named `*.test.ts`: the test glob would otherwise run it as a suite.
  */
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { registerHooks } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { compileModule } from 'svelte/compiler';
+import ts from 'typescript';
 
 export interface TestGlobals {
 	backend: Record<string, unknown>;
-	auth: { user: { id: string; username: string; isAdmin: boolean } | null };
+	auth: { user: { id: string; username: string; isAdmin: boolean; showNsfw?: boolean } | null };
 	config: {
 		backendEnabled: boolean;
 		backendKind: string;
@@ -31,7 +34,7 @@ export interface TestGlobals {
 	invalidated: string[];
 	/** Stand-ins for `$app/state`'s `page` / `navigating` (only the fields source.ts reads). */
 	page: { route: { id: string | null } };
-	navigating: { to: { url: URL } | null };
+	navigating: { to: { url: URL } | null; complete?: Promise<void> };
 }
 
 const g = globalThis as unknown as { __komikaTest?: TestGlobals };
@@ -57,6 +60,7 @@ const STUBS: Record<string, string> = {
 		'export const images = globalThis.__komikaTest.images;',
 	'$app/navigation':
 		'export const invalidate = async (k) => { globalThis.__komikaTest.invalidated.push(k); };' +
+		'export const invalidateAll = async () => { globalThis.__komikaTest.invalidated.push("all"); };' +
 		'export const goto = async () => {};',
 	// The router state, as plain mutable objects a test points at a route / navigation.
 	'$app/state':
@@ -74,6 +78,12 @@ const STUBS: Record<string, string> = {
 
 registerHooks({
 	resolve(specifier, context, next) {
+		if (specifier === '$lib/viewer-cache.svelte') {
+			return {
+				url: new URL('../viewer-cache.svelte.ts', import.meta.url).href,
+				shortCircuit: true,
+			};
+		}
 		if (Object.hasOwn(STUBS, specifier)) {
 			return { url: `komika-stub:${encodeURIComponent(specifier)}`, shortCircuit: true };
 		}
@@ -94,6 +104,21 @@ registerHooks({
 		return next(specifier, context);
 	},
 	load(url, context, next) {
+		if (url.endsWith('/viewer-cache.svelte.ts')) {
+			return {
+				format: 'module',
+				source: compileModule(
+					ts.transpileModule(readFileSync(fileURLToPath(url), 'utf8'), {
+						compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+					}).outputText,
+					{
+						filename: fileURLToPath(url),
+						generate: 'client',
+					},
+				).js.code,
+				shortCircuit: true,
+			};
+		}
 		if (url.startsWith('komika-stub:')) {
 			const source = STUBS[decodeURIComponent(url.slice('komika-stub:'.length))];
 			return { format: 'module', source, shortCircuit: true };

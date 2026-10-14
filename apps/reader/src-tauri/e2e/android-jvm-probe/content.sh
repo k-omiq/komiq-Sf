@@ -6,7 +6,7 @@ U=http://127.0.0.1:$PORT; AUTH=${ENGINE_AUTH:+-u $ENGINE_AUTH}
 gql(){ curl -s -m 180 $AUTH -H 'Content-Type: application/json' -d "$1" $U/api/graphql; }
 j(){ python3 -c "import json,sys;d=json.loads(sys.stdin.read(),strict=False);$1"; }
 short(){ cut -c1-${1:-220} | tr '\n' ' '; echo; }
-echo "1 addStore: $(gql '{"query":"mutation{addExtensionStore(input:{indexUrl:\"https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json\"}){extensionStore{name}}}"}' | short)"
+echo "1 addStore: $(gql '{"query":"mutation{addExtensionStore(input:{indexUrl:\"https://github.com/keiyoushi/extensions/raw/repo/index.pb\"}){extensionStore{name}}}"}' | short)"
 echo "2 fetchExtensions: $(gql '{"query":"mutation{fetchExtensions(input:{}){extensions{pkgName}}}"}' | j "print(len(d['data']['fetchExtensions']['extensions']),'extensions')")"
 echo "3 install: $(gql "{\"query\":\"mutation{updateExtension(input:{id:\\\"$PKG\\\",patch:{install:true}}){extension{pkgName isInstalled versionName}}}\"}" | short)"
 SRC=$(gql "{\"query\":\"query{sources(filter:{name:{includesInsensitive:\\\"$NAME\\\"}}){nodes{id name lang}}}\"}"); echo "4 sources: $(echo "$SRC" | short)"

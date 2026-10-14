@@ -119,6 +119,7 @@ pub(super) async fn fixture_with_users(
         scan_health: Mutex::new(ScanHealth::default()),
         auth_limiter: RateLimiter::new(100, 60),
         comment_limiter: comment_limiter(),
+        rating_limiter: rating_limiter(),
         password_work: Arc::new(tokio::sync::Semaphore::new(4)),
         federated_limiter: RateLimiter::new(100, 60),
         session_ttl_secs: 3600,

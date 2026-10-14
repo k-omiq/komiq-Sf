@@ -11,6 +11,8 @@
  * SSR is disabled in this app (`ssr = false`), so localStorage is always safe to
  * read from the browser-only `load`/getters that consume this.
  */
+import { viewerCacheChanged } from '$lib/viewer-cache.svelte';
+
 const KEY = 'komiq-translator-prefs';
 
 /** Reactive map so a translator switch re-renders any component reading it. */
@@ -44,12 +46,15 @@ export function getPreferredTranslator(workId: string): string | undefined {
 
 /** Persist the chosen translator key for a work. */
 export function setPreferredTranslator(workId: string, key: string): void {
+	if (translatorPrefs.map[workId] === key) return;
 	translatorPrefs.map = { ...translatorPrefs.map, [workId]: key };
 	save(translatorPrefs.map);
+	viewerCacheChanged();
 }
 
 /** Forget every chosen translator on this device: each series goes back to its default. */
 export function clearPreferredTranslators(): void {
 	translatorPrefs.map = {};
 	save(translatorPrefs.map);
+	viewerCacheChanged();
 }

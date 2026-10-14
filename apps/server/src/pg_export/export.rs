@@ -6,14 +6,17 @@ use futures::TryStreamExt;
 use serde::Serialize;
 use sqlx::{Connection, PgConnection, Row, SqliteConnection};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::Instant,
 };
 
 use super::{
     convert::{value, Value},
-    tables::{copied, is_copied, WORK_REFERENCES},
+    tables::{
+        copied, is_copied, OPTIONAL_POSTGRES_INTERNAL, REQUIRED_POSTGRES_INTERNAL, TABLES,
+        UNSUPPORTED_POSTGRES_ONLY, WORK_REFERENCES,
+    },
     template::{self, sibling, Template},
 };
 use crate::pg_import::{
@@ -153,6 +156,9 @@ pub(super) struct Report {
     /// Tables the export does not copy, with the row count that the template
     /// and the output both have.
     pub not_copied: BTreeMap<String, i64>,
+    /// PostgreSQL-only tables omitted because SQLite cannot hold them. All
+    /// counts are zero: any rows cause refusal before the template is copied.
+    pub postgres_only_not_copied: BTreeMap<String, i64>,
 }
 
 pub(super) struct Arguments {
@@ -213,6 +219,7 @@ pub(super) async fn run(args: &Arguments, stop_after: Option<usize>) -> Result<R
     .fetch_one(&mut pg)
     .await?;
     let postgres_migrations = postgres_level(&mut pg).await?;
+    let postgres_only_not_copied = postgres_only_tables(&mut pg).await?;
     let mut template = template::open(&args.template).await?;
     refuse_without_accounts(&mut pg, &mut template.conn).await?;
     let (template_sha256, template_bytes) = template::copy(&args.template, &partial)?;
@@ -264,6 +271,7 @@ pub(super) async fn run(args: &Arguments, stop_after: Option<usize>) -> Result<R
         work_alias_changes_not_copied: filled.aliases,
         sequences: filled.sequences,
         not_copied: filled.not_copied,
+        postgres_only_not_copied,
     })
 }
 
@@ -319,6 +327,62 @@ async fn postgres_level(pg: &mut PgConnection) -> Result<usize> {
         "PostgreSQL holds no completed import from SQLite: it is not the database of a cutover, and its rows would replace the accounts of the kept file"
     );
     Ok(applied)
+}
+
+/// Classify the whole PostgreSQL relation inventory, not only the frozen
+/// SQLite import plan. A migration checksum proves which migrations ran, but
+/// does not prove that the exporter preserves every table they created.
+async fn postgres_only_tables(pg: &mut PgConnection) -> Result<BTreeMap<String, i64>> {
+    let registered: BTreeSet<_> = plan::POSTGRES_ONLY.iter().map(|table| table.name).collect();
+    let classified: BTreeSet<_> = UNSUPPORTED_POSTGRES_ONLY
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    ensure!(
+        registered == classified,
+        "PostgreSQL-only rollback classification differs from the import inventory; this release cannot safely export to SQLite"
+    );
+    let actual: Vec<(String, String)> = sqlx::query_as(
+        "SELECT n.nspname,c.relname FROM pg_class c \
+         JOIN pg_namespace n ON n.oid=c.relnamespace \
+         WHERE c.relkind IN ('r','p','f','m','v') \
+           AND n.nspname <> 'information_schema' AND n.nspname !~ '^pg_' \
+         ORDER BY n.nspname,c.relname",
+    )
+    .fetch_all(&mut *pg)
+    .await?;
+    let actual: BTreeSet<_> = actual.into_iter().collect();
+    let required: BTreeSet<_> = TABLES
+        .iter()
+        .map(|(name, _, _)| *name)
+        .chain(REQUIRED_POSTGRES_INTERNAL.iter().copied())
+        .chain(classified)
+        .map(|name| ("public".to_owned(), name.to_owned()))
+        .collect();
+    let mut allowed = required.clone();
+    allowed.extend(
+        OPTIONAL_POSTGRES_INTERNAL
+            .iter()
+            .map(|name| ("public".to_owned(), (*name).to_owned())),
+    );
+    let unclassified: Vec<_> = actual.difference(&allowed).collect();
+    let missing: Vec<_> = required.difference(&actual).collect();
+    ensure!(
+        unclassified.is_empty() && missing.is_empty(),
+        "PostgreSQL rollback table inventory differs (unclassified relations: {unclassified:?}; missing required tables: {missing:?}); nothing was exported; keep PostgreSQL and use a release that classifies and preserves this data"
+    );
+    let mut omitted = BTreeMap::new();
+    for (name, reason) in UNSUPPORTED_POSTGRES_ONLY {
+        let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM public.{}", quote(name)))
+            .fetch_one(&mut *pg)
+            .await?;
+        ensure!(
+            rows == 0,
+            "cannot export PostgreSQL-only table {name}: {rows} rows would be lost because {reason}; nothing was exported; keep PostgreSQL and its backups until a verified preservation path exists"
+        );
+        omitted.insert((*name).to_owned(), rows);
+    }
+    Ok(omitted)
 }
 
 /// The importer's mark says that some SQLite file was imported, not that the

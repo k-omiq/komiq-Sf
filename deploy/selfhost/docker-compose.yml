@@ -124,6 +124,14 @@ services:
       WEB_UI_ENABLED: 'false'
       FLARESOLVERR_ENABLED: ${FLARESOLVERR_ENABLED:-false}
       FLARESOLVERR_URL: http://flaresolverr:8191
+      # Optional WARP egress (the `warp` service below). The engine applies the
+      # SOCKS proxy to the whole JVM, so requests to FlareSolverr would go through
+      # WARP too and fail; `http.nonProxyHosts` keeps them on the local network.
+      SOCKS_PROXY_ENABLED: ${WARP_ENABLED:-false}
+      SOCKS_PROXY_VERSION: '5'
+      SOCKS_PROXY_HOST: warp
+      SOCKS_PROXY_PORT: '1080'
+      JAVA_TOOL_OPTIONS: -Dhttp.nonProxyHosts=flaresolverr|localhost|127.*|[::1]
     volumes:
       - engine-data:/home/suwayomi/.local/share/Tachidesk
     healthcheck:
@@ -153,6 +161,25 @@ services:
       driver: json-file
       options: { max-size: 20m, max-file: '5' }
 
+  warp:
+    # Enabled by COMPOSE_PROFILES=warp together with WARP_ENABLED=true (see
+    # .env.example). Cloudflare WARP in proxy mode: the engine's requests to
+    # sources leave through Cloudflare instead of this machine's own address.
+    # Starting it accepts Cloudflare's WARP terms and registers a free device.
+    profiles: [warp]
+    build: ./warp
+    image: komiq-warp:local
+    restart: unless-stopped
+    # WARP installs routing rules for its own connection, even in proxy mode;
+    # without this it never connects.
+    cap_add: [NET_ADMIN]
+    mem_limit: 256m
+    volumes:
+      - warp-data:/var/lib/cloudflare-warp
+    logging:
+      driver: json-file
+      options: { max-size: 20m, max-file: '5' }
+
 volumes:
   # Covers, connector files and the retained SQLite source.
   server-data:
@@ -160,3 +187,5 @@ volumes:
   engine-data:
   # Main accounts, library, catalogue and settings database.
   postgres-data:
+  # WARP device registration (only with the warp profile).
+  warp-data:

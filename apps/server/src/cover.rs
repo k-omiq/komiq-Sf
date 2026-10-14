@@ -3,7 +3,7 @@
 //! The web reader normally routes every cover through the Cloudflare image Worker
 //! (CORS). To take covers off the Worker, we fetch each work's MangaDex cover
 //! once, re-encode it to a bounded lossless WebP, and store the bytes in
-//! `work_cover_blob` (Litestream-replicated, like `user_avatars`). The reader
+//! `work_cover_blob` (in the separate, unreplicated covers file). The reader
 //! then loads covers from our own origin at `/covers/{work_id}.webp` and the
 //! Worker only ever sees chapter PAGES.
 //!
@@ -95,7 +95,7 @@ impl MasterCoverWork {
 
 /// Per-cover size budget for the stored WebP — the "100–150 KB" target. Lossy
 /// encoding (below) keeps detailed art sharp at 512px while landing under this,
-/// so the DB blob store + its Litestream replication stay cheap. Down from the old
+/// so the covers blob store stays cheap. Down from the old
 /// 200 KB lossless budget.
 pub const MAX_COVER_BYTES: usize = 150 * 1024;
 
@@ -360,13 +360,22 @@ pub fn suwayomi_variant_key(manga_id: i64) -> String {
     format!("s:{manga_id}")
 }
 
-/// Read a resized, origin-cached Suwayomi source cover (keyed by numeric manga id),
-/// or `None` if it hasn't been materialized yet. Errors are swallowed to `None` so a
-/// transient DB hiccup falls back to a live resize rather than failing the request.
-pub async fn get_suwayomi_cover(covers: &SqliteDatabase, manga_id: i64) -> Option<Vec<u8>> {
+/// Distinguish a cold cover from a failed cache store. Public serving paths must
+/// not turn a storage outage into a new source fetch.
+pub async fn read_suwayomi_cover(
+    covers: &SqliteDatabase,
+    manga_id: i64,
+) -> std::result::Result<Option<Vec<u8>>, sqlx::Error> {
     sqlx::query_scalar("SELECT webp FROM suwayomi_cover_blob WHERE manga_id = $1")
         .bind(manga_id)
         .fetch_optional(covers)
+        .await
+}
+
+/// Best-effort fixture lookup. Serving uses the error-preserving helper above.
+#[cfg(test)]
+pub async fn get_suwayomi_cover(covers: &SqliteDatabase, manga_id: i64) -> Option<Vec<u8>> {
+    read_suwayomi_cover(covers, manga_id)
         .await
         .inspect_err(crate::db::record_read_database_error)
         .ok()

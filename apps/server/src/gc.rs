@@ -5,7 +5,7 @@
 //! comment. A draft the user never posts stays NULL forever. Migration 0023 always
 //! intended these to be "garbage-collected by age" — this task is that GC. It runs
 //! hourly and deletes staged rows older than [`STAGED_TTL_HOURS`], bounding
-//! unbounded SQLite growth (and the Litestream → R2 replication it drives).
+//! unbounded main-database growth (and the backup volume it drives).
 //!
 //! The same loop reconciles the SEPARATE cover-cache DB (`db::init_covers`) against
 //! the main one — see [`sweep_cover_blobs`].

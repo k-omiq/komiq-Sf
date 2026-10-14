@@ -26,8 +26,9 @@ The Compose file in `deploy/selfhost/docker-compose.yml` requires `KOMIQ_DB_PASS
 | `KOMIQ_BIND`           | `0.0.0.0` | Host address to bind (`0.0.0.0` for local network access, `127.0.0.1` for this machine only).                                          |
 | `COMPOSE_FILE`         | unset     | Extra Compose files that publish port 443 (`docker-compose.https.yml`) and port 80 (`docker-compose.acme.yml`). The installer sets it. |
 | `TZ`                   | `UTC`     | Time zone used for container logs.                                                                                                     |
-| `COMPOSE_PROFILES`     | empty     | Set to `flaresolverr` to start the FlareSolverr container.                                                                             |
+| `COMPOSE_PROFILES`     | empty     | Optional containers to start: `flaresolverr`, `warp`, or both as `flaresolverr,warp`.                                                  |
 | `FLARESOLVERR_ENABLED` | `false`   | Set to `true` with `COMPOSE_PROFILES=flaresolverr` to enable the solver.                                                               |
+| `WARP_ENABLED`         | `false`   | Set to `true` with the `warp` profile to send the engine's source requests through Cloudflare WARP. Read [Add sources](/self-host/sources). |
 
 ## Server network and web settings
 
@@ -42,7 +43,7 @@ These variables configure network listeners, web applications, and proxy endpoin
 | `KOMIKA_WEB_DIR`      | unset         | Path to web assets. Serves reader at `/` and console at `/admin`.                                                                                                                                                                     |
 | `KOMIKA_IMG_PROXY`    | auto          | Controls `/img` proxy. Enabled when `KOMIKA_WEB_DIR` is set.                                                                                                                                                                          |
 | `CORS_ORIGINS`        | local origins | Comma-separated allowed Cross-Origin Resource Sharing (CORS) origins. The native reader apps need `tauri://localhost,http://tauri.localhost,https://tauri.localhost`; the self-host Docker image and the admin desktop app set these. |
-| `LOG_FORMAT`          | unset         | Set to `json` for structured JSON logs, or unset for text.                                                                                                                                                                            |
+| `LOG_FORMAT`          | unset         | `json` for structured JSON logs; unset for text, coloured only at a terminal without `NO_COLOR`.                                                                                                                                      |
 | `GRAPHIQL_ENABLED`    | `false`       | Enables interactive GraphiQL query explorer at `/graphql`.                                                                                                                                                                            |
 
 ## Database and storage settings

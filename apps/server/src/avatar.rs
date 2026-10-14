@@ -6,8 +6,8 @@
 //! *largest* candidate edge whose encoded size fits the budget (busy photos land
 //! on a smaller edge; simple/flat images keep the full edge).
 //!
-//! Storage is the SQLite `user_avatars` table (a BLOB per user), not the data
-//! volume — so avatars are Litestream-replicated with the rest of the DB and any
+//! Storage is the main-database `user_avatars` table (a BLOB per user), not the
+//! data volume — so avatars are backed up with the rest of the DB and any
 //! replica can serve any avatar. The upload/serve wiring lives in `main.rs`;
 //! this module only turns bytes into budgeted WebP.
 

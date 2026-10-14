@@ -7,6 +7,8 @@ mod cache_refresh_tests;
 #[cfg(test)]
 mod postgres_golden_tests;
 #[cfg(test)]
+mod scanlator_rating_tests;
+#[cfg(test)]
 mod sources_tests;
 
 use std::collections::{BTreeMap, HashMap};
@@ -34,6 +36,13 @@ const PAGE_SIZE: i64 = 20;
 /// thread stays far below it; a script that fills threads does not.
 pub fn comment_limiter() -> RateLimiter {
     RateLimiter::new(20, 60)
+}
+
+/// The `rateScanlator` limiter: 30 writes a minute per account, removals included. A
+/// person trying a few scores on a few scanlators stays below it; a script that rewrites
+/// scores, each one a transaction and a fresh read of the list, does not.
+pub fn rating_limiter() -> RateLimiter {
+    RateLimiter::new(30, 60)
 }
 
 /// Replies one comment thread holds, at every depth together. `postComment` refuses
@@ -90,7 +99,7 @@ static VIEW_LIMITER: std::sync::LazyLock<RateLimiter> =
 /// every test builds its own in-memory DB, so two tests whose viewer has the same
 /// NSFW posture would otherwise read each other's feeds depending on scheduling. A
 /// zero TTL makes every resolver compute exactly, always; the memo logic itself is
-/// directly testable via [`cached_feed`] / [`store_feed`], which take the TTL as an
+/// directly testable via [`cached_feed`] / [`store_feed_at_generation`], which take the TTL as an
 /// argument.
 #[cfg(not(test))]
 const FEED_TTL: std::time::Duration = std::time::Duration::from_secs(45);
@@ -115,29 +124,32 @@ fn feed_cache_key(show_nsfw: bool) -> bool {
     show_nsfw
 }
 
-/// Memoized viewer-invariant reads, keyed by [`feed_cache_key`]. Shape follows
-/// `browse::COUNT_CACHE`: a process-wide `Mutex<HashMap<key, (value, when)>>`.
-#[allow(clippy::type_complexity)]
-type FeedCache<T> =
-    std::sync::Mutex<std::collections::HashMap<bool, (std::sync::Arc<T>, std::time::Instant)>>;
+/// Viewer-invariant values share a refill epoch across all feed caches.
+type FeedCache<T> = crate::catalogue_cache::CatalogueCache<bool, std::sync::Arc<T>>;
+static FEED_CACHE_EPOCH: std::sync::LazyLock<crate::catalogue_cache::CacheEpoch> =
+    std::sync::LazyLock::new(crate::catalogue_cache::CacheEpoch::default);
+
+fn new_feed_cache<T>(stats: &'static crate::telemetry::CacheStats) -> FeedCache<T> {
+    FeedCache::new(2, FEED_CACHE_EPOCH.clone(), stats)
+}
 
 /// The curated home-feed rails (`discovery`).
 static DISCOVERY_CACHE: std::sync::LazyLock<FeedCache<Vec<DiscoveryFeed>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    std::sync::LazyLock::new(|| new_feed_cache(&crate::telemetry::CACHE_FEED_DISCOVERY));
 /// Browse's genre chips (`genreFacets`).
 static GENRE_FACETS_CACHE: std::sync::LazyLock<FeedCache<Vec<(String, i64)>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    std::sync::LazyLock::new(|| new_feed_cache(&crate::telemetry::CACHE_FEED_GENRE_FACETS));
 
 /// Browse v2's tag list (`tags`).
 static TAGS_CACHE: std::sync::LazyLock<FeedCache<Vec<crate::tags::TagRow>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    std::sync::LazyLock::new(|| new_feed_cache(&crate::telemetry::CACHE_FEED_TAGS));
 /// Single-flight locks collapsing concurrent refills of [`TAGS_CACHE`].
 static TAGS_INFLIGHT: std::sync::LazyLock<KeyedLocks> =
     std::sync::LazyLock::new(KeyedLocks::default);
 
 /// Browse's source list (`browseSources`).
 static BROWSE_SOURCES_CACHE: std::sync::LazyLock<FeedCache<Vec<BrowseSource>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    std::sync::LazyLock::new(|| new_feed_cache(&crate::telemetry::CACHE_FEED_BROWSE_SOURCES));
 /// Single-flight locks collapsing concurrent refills of [`BROWSE_SOURCES_CACHE`].
 static BROWSE_SOURCES_INFLIGHT: std::sync::LazyLock<KeyedLocks> =
     std::sync::LazyLock::new(KeyedLocks::default);
@@ -161,23 +173,30 @@ static DISCOVERY_INFLIGHT: std::sync::LazyLock<KeyedLocks> =
 static GENRE_FACETS_INFLIGHT: std::sync::LazyLock<KeyedLocks> =
     std::sync::LazyLock::new(KeyedLocks::default);
 
-/// Fresh hit out of a feed memo, if any. Poisoned lock ⇒ "no memo" rather than an
-/// error: the caller recomputes exactly, matching `browse::cached_count_with`.
+/// A fresh current-generation feed value, if any.
 fn cached_feed<T>(cache: &FeedCache<T>, key: bool, ttl: Duration) -> Option<std::sync::Arc<T>> {
-    let map = cache.lock().ok()?;
-    let (value, at) = map.get(&key)?;
-    (at.elapsed() < ttl).then(|| value.clone())
+    cache.get(&key, ttl)
 }
 
-/// Store one computed payload. The map is keyed by a bool, so it is bounded at 2
-/// entries by construction — no cap/evict logic to maintain (unlike COUNT_CACHE,
-/// whose client-controlled key space needs one). Expiry is enforced at READ time
-/// against the stored `Instant`, so storing needs no TTL.
+fn store_feed_at_generation<T>(
+    cache: &FeedCache<T>,
+    key: bool,
+    value: T,
+    generation: u64,
+    ttl: Duration,
+) {
+    cache.insert(generation, key, std::sync::Arc::new(value), ttl);
+}
+
+#[cfg(test)]
 fn store_feed<T>(cache: &FeedCache<T>, key: bool, value: T) {
-    let Ok(mut map) = cache.lock() else {
-        return; // poisoned → just stop memoizing; every read still computes exactly
-    };
-    map.insert(key, (std::sync::Arc::new(value), std::time::Instant::now()));
+    store_feed_at_generation(
+        cache,
+        key,
+        value,
+        cache.generation(),
+        Duration::from_secs(600),
+    );
 }
 
 /// Drop every memoized feed payload, so the next `discovery` / `genreFacets` recomputes.
@@ -225,18 +244,11 @@ fn store_feed<T>(cache: &FeedCache<T>, key: bool, value: T) {
 /// until it expires the viewer keeps downloading the fat pre-recompress bytes we just
 /// replaced. Busting per BATCH (not per cover) keeps that to one clear every tick.
 pub(crate) fn clear_feed_caches() {
-    if let Ok(mut map) = DISCOVERY_CACHE.lock() {
-        map.clear();
-    }
-    if let Ok(mut map) = GENRE_FACETS_CACHE.lock() {
-        map.clear();
-    }
-    if let Ok(mut map) = TAGS_CACHE.lock() {
-        map.clear();
-    }
-    if let Ok(mut map) = BROWSE_SOURCES_CACHE.lock() {
-        map.clear();
-    }
+    FEED_CACHE_EPOCH.advance();
+    DISCOVERY_CACHE.clear();
+    GENRE_FACETS_CACHE.clear();
+    TAGS_CACHE.clear();
+    BROWSE_SOURCES_CACHE.clear();
     crate::browse::clear_count_cache();
 }
 
@@ -307,7 +319,7 @@ impl KeyedLocks {
 pub struct AppState {
     pub pool: Database,
     /// Separate, un-replicated DB for cover blobs (`work_cover_blob`). Kept out of
-    /// `pool` so Litestream/R2 backs up only the main DB; see `db::init_covers`.
+    /// `pool` so the main-database backup carries no covers; see `db::init_covers`.
     pub cover_pool: crate::database::SqliteDatabase,
     pub suwayomi: SuwayomiClient,
     /// Direct MangaDex client — page resolution for canonical (MangaDex-mirrored)
@@ -321,6 +333,8 @@ pub struct AppState {
     pub auth_limiter: RateLimiter,
     /// Per-user sliding-window limiter for `postComment` (see [`comment_limiter`]).
     pub comment_limiter: RateLimiter,
+    /// Per-user sliding-window limiter for `rateScanlator` (see [`rating_limiter`]).
+    pub rating_limiter: RateLimiter,
     /// Bound concurrent 64 MiB password jobs across all client IPs.
     pub password_work: std::sync::Arc<tokio::sync::Semaphore>,
     /// Per-user sliding-window limiter for `searchAllSources` (C1). That endpoint
@@ -2898,6 +2912,7 @@ async fn updates_total(
     blocks: &str,
     ttl: std::time::Duration,
 ) -> Result<i64, sqlx::Error> {
+    let generation = crate::browse::cache_generation();
     let key = updates_count_key(show_nsfw, blocks);
     if let Some(total) = crate::browse::cached_count_with(&key, ttl) {
         return Ok(total);
@@ -2906,7 +2921,7 @@ async fn updates_total(
         .bind(show_nsfw)
         .fetch_one(pool)
         .await?;
-    crate::browse::store_count_with(key, total, ttl);
+    crate::browse::store_count_with_generation(key, total, ttl, generation);
     Ok(total)
 }
 
@@ -4053,8 +4068,9 @@ fn validate_comment_target(target_type: &str) -> Result<&'static str> {
     match target_type {
         "chapter" => Ok("chapter"),
         "series" => Ok("series"),
+        "scanlator" => Ok("scanlator"),
         other => Err(Error::new(format!(
-            "invalid comment target type: {other:?} (expected \"chapter\" or \"series\")"
+            "invalid comment target type: {other:?} (expected \"chapter\", \"series\" or \"scanlator\")"
         ))),
     }
 }
@@ -5169,8 +5185,9 @@ impl QueryRoot {
         if let Some(hit) = cached_feed(&DISCOVERY_CACHE, key, FEED_TTL) {
             return discovery_without_blocked(st, &blocks.lists, (*hit).clone()).await;
         }
+        let generation = FEED_CACHE_EPOCH.current();
         let feeds = compute_discovery(st, show_nsfw).await?;
-        store_feed(&DISCOVERY_CACHE, key, feeds.clone());
+        store_feed_at_generation(&DISCOVERY_CACHE, key, feeds.clone(), generation, FEED_TTL);
         discovery_without_blocked(st, &blocks.lists, feeds).await
     }
 
@@ -6634,10 +6651,17 @@ impl QueryRoot {
             if let Some(hit) = cached_feed(&GENRE_FACETS_CACHE, key, FEED_TTL) {
                 (*hit).clone()
             } else {
+                let generation = FEED_CACHE_EPOCH.current();
                 let facets = crate::browse::genre_facets(&st.pool, show_nsfw)
                     .await
                     .map_err(gql_read_err)?;
-                store_feed(&GENRE_FACETS_CACHE, key, facets.clone());
+                store_feed_at_generation(
+                    &GENRE_FACETS_CACHE,
+                    key,
+                    facets.clone(),
+                    generation,
+                    FEED_TTL,
+                );
                 facets
             }
         };
@@ -6671,10 +6695,11 @@ impl QueryRoot {
             if let Some(hit) = cached_feed(&TAGS_CACHE, key, FEED_TTL) {
                 (*hit).clone()
             } else {
+                let generation = FEED_CACHE_EPOCH.current();
                 let rows = crate::tags::list_tags(&st.pool, show_nsfw)
                     .await
                     .map_err(gql_read_err)?;
-                store_feed(&TAGS_CACHE, key, rows.clone());
+                store_feed_at_generation(&TAGS_CACHE, key, rows.clone(), generation, FEED_TTL);
                 rows
             }
         };
@@ -6870,6 +6895,63 @@ impl QueryRoot {
             has_next_page: (page as usize).saturating_mul(sc::PAGE_SIZE) < total,
             total: total.min(i32::MAX as usize) as i32,
         })
+    }
+
+    /// The readers' scanlator list: every site and every group, each with the scores
+    /// readers gave it. Public. 30 per page. `search` matches part of the name in any
+    /// case; `kind` keeps sites or groups; `mine` keeps the scanlators the viewer rated
+    /// (an empty page when signed out); `sort` defaults to TOP.
+    ///
+    /// A site is a source `browseSources` lists for the viewer, so a viewer who does not
+    /// see adult content does not see a source that has only such series. MangaDex is
+    /// not a site: it credits its groups, and they are listed. A joint credit ("A & B")
+    /// whose members are all groups on their own is not listed: its chapters and series
+    /// count for each member.
+    ///
+    /// The groups and their counts come from the scan the server reuses for ten minutes
+    /// (`scanlators::group_stats`), so a group that arrived a moment ago can be missing;
+    /// the scores are always current.
+    async fn scanlator_ratings(
+        &self,
+        ctx: &Context<'_>,
+        search: Option<String>,
+        kind: Option<ScanlatorKind>,
+        mine: Option<bool>,
+        sort: Option<ScanlatorSort>,
+        #[graphql(default = 1)] page: Option<i32>,
+    ) -> Result<RatedScanlatorPage> {
+        use crate::scanlators::{self as sc, PublicSort};
+        let page = page.unwrap_or(1).max(1);
+        let board = scanlator_board(ctx).await?;
+        let query = sc::PublicQuery {
+            search: search.map(|s| s.chars().take(sc::MAX_NAME_LEN).collect()),
+            kind: kind.map(Into::into),
+            mine: mine == Some(true),
+            sort: match sort.unwrap_or(ScanlatorSort::Top) {
+                ScanlatorSort::Top => PublicSort::Top,
+                ScanlatorSort::Votes => PublicSort::Votes,
+                ScanlatorSort::Chapters => PublicSort::Chapters,
+                ScanlatorSort::Name => PublicSort::Name,
+            },
+            page: page as usize,
+        };
+        let (rows, total) = sc::public_page(board.rows(), &query);
+        Ok(RatedScanlatorPage {
+            items: rated_scanlators(state(ctx), &rows).await?,
+            page,
+            has_next_page: (page as usize).saturating_mul(sc::PUBLIC_PAGE_SIZE) < total,
+            total: total.min(i32::MAX as usize) as i32,
+        })
+    }
+
+    /// One scanlator of the readers' list by its id (`RatedScanlator.id`), for a link to
+    /// it. Public. Null when the id names no scanlator the viewer is shown: see
+    /// `scanlatorRatings` for which those are.
+    async fn rated_scanlator(&self, ctx: &Context<'_>, id: ID) -> Result<Option<RatedScanlator>> {
+        let Some(id) = crate::scanlators::ScanlatorId::parse(&id.0) else {
+            return Ok(None);
+        };
+        rated_scanlator_by_id(ctx, &id).await
     }
 
     /// Federated multi-extension catalogue search (S3). Fans the query out to
@@ -7568,6 +7650,16 @@ impl QueryRoot {
         if target_type == "series" {
             deny_blocked_series(ctx, &target_id.0, no_such_series(&target_id.0)).await?;
         }
+        // A scanlator's thread is closed to a viewer the readers' list does not show the
+        // scanlator, as `postComment` is: a site or a group hidden from a viewer who does
+        // not see adult content, and an id that names no scanlator. It is stored under
+        // the id as `postComment` folds it, so a group's id written in another case reads
+        // the same thread.
+        let target_id = if target_type == "scanlator" {
+            ID(known_scanlator(ctx, &target_id.0).await?.text())
+        } else {
+            target_id
+        };
         let offset = (page.max(1) as i64 - 1) * PAGE_SIZE;
         // The viewer's own vote per comment is selected inline; '' (anonymous) matches
         // no vote row, yielding my_vote = 0.
@@ -8200,9 +8292,10 @@ impl QueryRoot {
         // is a Suwayomi chapter, a uuid a MangaDex one (the `NOT GLOB` guard keeps a uuid
         // that starts with a digit out of the numeric branch). A `w_` series id is a
         // canonical work — its title falls back to a Suwayomi mapping's title while the
-        // work is unenriched — and a numeric one is a Suwayomi series.
+        // work is unenriched — and a numeric one is a Suwayomi series. A scanlator's
+        // thread hangs off no series: its series id, title and chapter number are null.
         let rows: Vec<MyCommentRow> = sqlx::query_as(
-            r#"WITH mine AS ( SELECT c.id, c.target_type, c.target_id, c.parent_id, c.body, c.has_spoiler, c.created_at FROM comments c WHERE c.user_id = $1 AND c.deleted_by IS NULL ORDER BY c.created_at DESC NULLS LAST, c.id DESC NULLS LAST LIMIT $2 OFFSET $3 ), resolved AS ( SELECT m.*, CASE WHEN m.target_type = 'series' THEN m.target_id ELSE COALESCE( (SELECT CAST(sc.manga_id AS TEXT) FROM suwayomi_chapter sc WHERE m.target_id ~ '^[0-9]+$' AND sc.id = sqlite_integer_pin(m.target_id)), (SELECT ss.work_id FROM chapter ch JOIN source_series ss ON ss.id = ch.source_series_id WHERE ch.external_id = m.target_id AND ss.source_type = 'mangadex' LIMIT 1) ) END AS series_id, CASE WHEN m.target_type = 'chapter' THEN COALESCE( (SELECT CAST(sc.chapter_number AS TEXT) FROM suwayomi_chapter sc WHERE m.target_id ~ '^[0-9]+$' AND sc.id = sqlite_integer_pin(m.target_id)), (SELECT ch.number FROM chapter ch JOIN source_series ss ON ss.id = ch.source_series_id WHERE ch.external_id = m.target_id AND ss.source_type = 'mangadex' LIMIT 1) ) END AS chapter_number FROM mine m ) SELECT r.id, r.target_type, r.target_id, r.parent_id, r.body, r.has_spoiler, r.created_at, r.series_id, r.chapter_number, CASE WHEN substr(r.series_id, 1, 2) = 'w_' THEN COALESCE( (SELECT COALESCE(w.title_override, w.primary_title) FROM work w WHERE w.id = r.series_id), (SELECT s.title FROM source_series ss JOIN suwayomi_series s ON s.id = sqlite_integer_pin(ss.source_key) WHERE ss.work_id = r.series_id AND ss.source_type = 'suwayomi' ORDER BY ss.created_at ASC NULLS FIRST LIMIT 1)) WHEN r.series_id ~ '^[0-9]+$' THEN (SELECT s.title FROM suwayomi_series s WHERE s.id = sqlite_integer_pin(r.series_id)) END AS series_title, COALESCE((SELECT COUNT(*) FROM comment_votes v WHERE v.comment_id = r.id AND v.value = 1), 0) AS likes, COALESCE((SELECT COUNT(*) FROM comment_votes v WHERE v.comment_id = r.id AND v.value = -1), 0) AS dislikes, (SELECT COUNT(*) FROM comments k JOIN users u ON u.id = k.user_id WHERE k.parent_id = r.id AND k.deleted_by IS NULL AND u.is_banned = FALSE) AS reply_count FROM resolved r ORDER BY r.created_at DESC NULLS LAST, r.id DESC NULLS LAST"#,
+            r#"WITH mine AS ( SELECT c.id, c.target_type, c.target_id, c.parent_id, c.body, c.has_spoiler, c.created_at FROM comments c WHERE c.user_id = $1 AND c.deleted_by IS NULL ORDER BY c.created_at DESC NULLS LAST, c.id DESC NULLS LAST LIMIT $2 OFFSET $3 ), resolved AS ( SELECT m.*, CASE WHEN m.target_type = 'series' THEN m.target_id WHEN m.target_type = 'chapter' THEN COALESCE( (SELECT CAST(sc.manga_id AS TEXT) FROM suwayomi_chapter sc WHERE m.target_id ~ '^[0-9]+$' AND sc.id = sqlite_integer_pin(m.target_id)), (SELECT ss.work_id FROM chapter ch JOIN source_series ss ON ss.id = ch.source_series_id WHERE ch.external_id = m.target_id AND ss.source_type = 'mangadex' LIMIT 1) ) END AS series_id, CASE WHEN m.target_type = 'chapter' THEN COALESCE( (SELECT CAST(sc.chapter_number AS TEXT) FROM suwayomi_chapter sc WHERE m.target_id ~ '^[0-9]+$' AND sc.id = sqlite_integer_pin(m.target_id)), (SELECT ch.number FROM chapter ch JOIN source_series ss ON ss.id = ch.source_series_id WHERE ch.external_id = m.target_id AND ss.source_type = 'mangadex' LIMIT 1) ) END AS chapter_number FROM mine m ) SELECT r.id, r.target_type, r.target_id, r.parent_id, r.body, r.has_spoiler, r.created_at, r.series_id, r.chapter_number, CASE WHEN substr(r.series_id, 1, 2) = 'w_' THEN COALESCE( (SELECT COALESCE(w.title_override, w.primary_title) FROM work w WHERE w.id = r.series_id), (SELECT s.title FROM source_series ss JOIN suwayomi_series s ON s.id = sqlite_integer_pin(ss.source_key) WHERE ss.work_id = r.series_id AND ss.source_type = 'suwayomi' ORDER BY ss.created_at ASC NULLS FIRST LIMIT 1)) WHEN r.series_id ~ '^[0-9]+$' THEN (SELECT s.title FROM suwayomi_series s WHERE s.id = sqlite_integer_pin(r.series_id)) END AS series_title, COALESCE((SELECT COUNT(*) FROM comment_votes v WHERE v.comment_id = r.id AND v.value = 1), 0) AS likes, COALESCE((SELECT COUNT(*) FROM comment_votes v WHERE v.comment_id = r.id AND v.value = -1), 0) AS dislikes, (SELECT COUNT(*) FROM comments k JOIN users u ON u.id = k.user_id WHERE k.parent_id = r.id AND k.deleted_by IS NULL AND u.is_banned = FALSE) AS reply_count FROM resolved r ORDER BY r.created_at DESC NULLS LAST, r.id DESC NULLS LAST"#,
         )
         .bind(crate::db_types::uuid(&user.id )?)
         .bind(PAGE_SIZE)
@@ -9024,10 +9117,17 @@ async fn browse_sources_memo(st: &AppState, show_nsfw: bool) -> Result<Vec<Brows
     if let Some(hit) = cached_feed(&BROWSE_SOURCES_CACHE, key, BROWSE_SOURCES_TTL) {
         return Ok((*hit).clone());
     }
+    let generation = FEED_CACHE_EPOCH.current();
     let sources = compute_browse_sources(st, show_nsfw)
         .await
         .map_err(gql_err)?;
-    store_feed(&BROWSE_SOURCES_CACHE, key, sources.clone());
+    store_feed_at_generation(
+        &BROWSE_SOURCES_CACHE,
+        key,
+        sources.clone(),
+        generation,
+        BROWSE_SOURCES_TTL,
+    );
     Ok(sources)
 }
 
@@ -9089,6 +9189,238 @@ async fn compute_browse_sources(
             }
         })
         .collect())
+}
+
+/// What `rateScanlator` and a scanlator comment answer for an id the readers' list does
+/// not show the viewer.
+const NO_SUCH_SCANLATOR: &str = "No such scanlator";
+
+/// The sites of the readers' scanlator list for one NSFW posture: the sources
+/// `browseSources` lists for it (same ten-minute memo), without MangaDex, which credits
+/// its groups. Kept to the ids a `site:` id can name (`is_taggable_source`).
+///
+/// `show_nsfw: true` is every site that EXISTS, whoever asks; the viewer's own posture
+/// is the sites they are shown.
+async fn scanlator_sites(st: &AppState, show_nsfw: bool) -> Result<Vec<BrowseSource>> {
+    let mut sites = browse_sources_memo(st, show_nsfw).await?;
+    sites.retain(|s| crate::scanlators::is_taggable_source(&s.id));
+    Ok(sites)
+}
+
+/// Everything the readers' scanlator list is built from, read once for a request: the
+/// viewer's NSFW posture and the sites it shows them, the memoized group counts, the
+/// scores of every scanlator that exists (one grouped read) and the viewer's own.
+struct ScanlatorBoard {
+    show_nsfw: bool,
+    sites: Vec<BrowseSource>,
+    stats: std::sync::Arc<Vec<crate::scanlators::GroupStat>>,
+    ratings: crate::scanlators::Ratings,
+    mine: crate::scanlators::Scores,
+}
+
+impl ScanlatorBoard {
+    /// Every scanlator the viewer is shown, unfiltered and unordered.
+    fn rows(&self) -> Vec<crate::scanlators::PublicRow<'_>> {
+        use crate::scanlators::{self as sc, PublicRow};
+        let mut rows: Vec<PublicRow<'_>> = self
+            .sites
+            .iter()
+            .map(|s| {
+                PublicRow::site(
+                    &s.id,
+                    &s.name,
+                    s.lang.as_deref(),
+                    i64::from(s.count),
+                    &self.ratings,
+                    &self.mine,
+                )
+            })
+            .collect();
+        // A group follows the posture the sites follow: without the opt-in, a group
+        // whose chapters are all on adult works is not shown.
+        rows.extend(
+            sc::public_groups(&self.stats)
+                .iter()
+                .filter(|g| g.visible(self.show_nsfw))
+                .map(|g| PublicRow::group(g, self.show_nsfw, &self.ratings, &self.mine)),
+        );
+        rows
+    }
+}
+
+async fn scanlator_board(ctx: &Context<'_>) -> Result<ScanlatorBoard> {
+    use crate::scanlators::{self as sc, Kind};
+    let st = state(ctx);
+    let show_nsfw = viewer_show_nsfw(ctx).await?;
+    // Every site that exists, whatever this viewer is shown: what the rank is over.
+    let every_site = scanlator_sites(st, true).await?;
+    let stats = sc::group_stats(&st.pool).await.map_err(gql_read_err)?;
+    let ratings = {
+        let sites: std::collections::HashSet<&str> =
+            every_site.iter().map(|s| s.id.as_str()).collect();
+        let groups: std::collections::HashSet<&str> =
+            sc::public_groups(&stats).iter().map(|g| g.key).collect();
+        sc::ratings(&st.pool, |id| match id.kind {
+            Kind::Site => sites.contains(id.key.as_str()),
+            Kind::Group => groups.contains(id.key.as_str()),
+        })
+        .await
+        .map_err(gql_read_err)?
+    };
+    let sites = if show_nsfw {
+        every_site
+    } else {
+        scanlator_sites(st, false).await?
+    };
+    let mine = match current_user(ctx).await? {
+        Some(user) => sc::user_scores(&st.pool, crate::db_types::uuid(&user.id)?)
+            .await
+            .map_err(gql_read_err)?,
+        None => sc::Scores::default(),
+    };
+    Ok(ScanlatorBoard {
+        show_nsfw,
+        sites,
+        stats,
+        ratings,
+        mine,
+    })
+}
+
+/// Finish a page of the readers' list: the AI tag that applies to each row and its
+/// comment count. Two small tag reads and ONE comment count for the whole page.
+async fn rated_scanlators(
+    st: &AppState,
+    rows: &[crate::scanlators::PublicRow<'_>],
+) -> Result<Vec<RatedScanlator>> {
+    use crate::scanlators::{self as sc, Kind};
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let group_tags = sc::tag_index(&sc::list_tags(&st.pool).await.map_err(gql_read_err)?);
+    let site_tags = sc::list_source_tags(&st.pool).await.map_err(gql_read_err)?;
+    let ids: Vec<String> = rows.iter().map(sc::PublicRow::id).collect();
+    // What the thread shows, at every depth: the subtree of a banned author is pruned
+    // exactly as `comments` prunes it. A deleted comment that kept its replies holds the
+    // tree together but is not counted, as in `MyComment.replyCount`.
+    let counted: Vec<(String, i64)> = crate::db_types::query_tuple(
+        "WITH RECURSIVE thread(id, target_id, deleted) AS ( \
+             SELECT c.id, c.target_id, c.deleted_by IS NOT NULL \
+               FROM comments c JOIN users u ON u.id = c.user_id \
+              WHERE c.target_type = 'scanlator' AND c.target_id = ANY($1) \
+                AND c.parent_id IS NULL \
+                AND (c.deleted_by IS NOT NULL OR u.is_banned = FALSE) \
+             UNION ALL \
+             SELECT c.id, t.target_id, c.deleted_by IS NOT NULL \
+               FROM comments c JOIN thread t ON c.parent_id = t.id \
+               JOIN users u ON u.id = c.user_id \
+              WHERE c.deleted_by IS NOT NULL OR u.is_banned = FALSE \
+         ) \
+         SELECT target_id, COUNT(*) FROM thread WHERE NOT deleted GROUP BY target_id",
+    )
+    .bind(&ids)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(gql_read_err)?;
+    let comments: HashMap<String, i64> = counted.into_iter().collect();
+    let count = |n: i64| n.clamp(0, i64::from(i32::MAX)) as i32;
+    Ok(rows
+        .iter()
+        .zip(ids)
+        .map(|(row, id)| {
+            let ai = match row.kind {
+                Kind::Site => site_tags.get(row.key).copied(),
+                Kind::Group => sc::effective_level(row.name, &group_tags),
+            };
+            RatedScanlator {
+                comment_count: count(comments.get(&id).copied().unwrap_or(0)),
+                id: ID(id),
+                kind: row.kind.into(),
+                name: row.name.to_string(),
+                lang: row.lang.map(str::to_string),
+                series_count: count(row.works),
+                chapter_count: row.chapters.map(count),
+                ai: ai.map(Into::into),
+                rating: row.rating.and_then(sc::Rating::average),
+                rating_count: row.rating.map_or(0, |r| count(r.count)),
+                rank: row.rating.and_then(|r| r.rank).map(count),
+                distribution: row.rating.map_or_else(
+                    || vec![0; 10],
+                    |r| r.distribution.iter().map(|&n| count(n)).collect(),
+                ),
+                my_score: row.my_score,
+            }
+        })
+        .collect())
+}
+
+/// One scanlator of the readers' list as the viewer sees it; `None` when the list does
+/// not show them such a scanlator.
+async fn rated_scanlator_by_id(
+    ctx: &Context<'_>,
+    id: &crate::scanlators::ScanlatorId,
+) -> Result<Option<RatedScanlator>> {
+    let board = scanlator_board(ctx).await?;
+    let row: Vec<_> = board
+        .rows()
+        .into_iter()
+        .filter(|row| row.kind == id.kind && row.key == id.key)
+        .take(1)
+        .collect();
+    Ok(rated_scanlators(state(ctx), &row).await?.pop())
+}
+
+/// Read a scanlator id a client sent and check that the readers' list shows the viewer
+/// such a scanlator. A joint credit that is counted with its members is not one, and
+/// neither is a site or a group hidden from a viewer who does not see adult content.
+async fn known_scanlator(ctx: &Context<'_>, id: &str) -> Result<crate::scanlators::ScanlatorId> {
+    use crate::scanlators::{self as sc, Kind};
+    let missing = || Error::new(NO_SUCH_SCANLATOR);
+    let id = sc::ScanlatorId::parse(id).ok_or_else(missing)?;
+    let st = state(ctx);
+    let show_nsfw = viewer_show_nsfw(ctx).await?;
+    let known = match id.kind {
+        Kind::Site => scanlator_sites(st, show_nsfw)
+            .await?
+            .iter()
+            .any(|s| s.id == id.key),
+        Kind::Group => {
+            let stats = sc::group_stats(&st.pool).await.map_err(gql_read_err)?;
+            sc::public_group(&stats, &id.key).is_some_and(|g| g.visible(show_nsfw))
+        }
+    };
+    if known {
+        Ok(id)
+    } else {
+        Err(missing())
+    }
+}
+
+/// What `rateScanlator` returns after removing a score from a scanlator the readers'
+/// list does not show the viewer: the id and what the id alone says, with nothing
+/// counted. The scanlator may have left the list (a removed source, a joint credit that
+/// is now counted with its members) or be hidden from this viewer, and this row must
+/// not tell the two apart.
+fn unlisted_scanlator(id: &crate::scanlators::ScanlatorId) -> RatedScanlator {
+    use crate::scanlators::Kind;
+    RatedScanlator {
+        id: ID(id.text()),
+        kind: id.kind.into(),
+        name: id.key.clone(),
+        lang: None,
+        series_count: 0,
+        chapter_count: match id.kind {
+            Kind::Site => None,
+            Kind::Group => Some(0),
+        },
+        ai: None,
+        rating: None,
+        rating_count: 0,
+        rank: None,
+        distribution: vec![0; 10],
+        my_score: None,
+        comment_count: 0,
+    }
 }
 
 /// Map a work's `WorkSource` rows onto `Translator`s, enriching each Suwayomi
@@ -10696,6 +11028,48 @@ async fn delete_review_once(
     Ok(removed > 0)
 }
 
+/// One complete `rateScanlator` transaction, retried as a whole by its caller. Sets,
+/// changes or (with `None`) removes one reader's score. Idempotent: the same score again
+/// writes nothing and keeps `updated_at`. The caller has checked the id and the score.
+async fn rate_scanlator_once(
+    pool: &Database,
+    user_id: &str,
+    scanlator_id: &str,
+    score: Option<i32>,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    crate::locks::lock_user(&mut tx, user_id).await?;
+    let user = crate::db_types::uuid(user_id)?;
+    match score {
+        Some(score) => {
+            let now = Utc::now();
+            sqlx::query(
+                "INSERT INTO scanlator_rating (scanlator_id, user_id, score, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT(scanlator_id, user_id) DO UPDATE SET \
+                   score = excluded.score, updated_at = excluded.updated_at \
+                 WHERE scanlator_rating.score != excluded.score",
+            )
+            .bind(scanlator_id)
+            .bind(user)
+            .bind(score)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM scanlator_rating WHERE scanlator_id = $1 AND user_id = $2")
+                .bind(scanlator_id)
+                .bind(user)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn rederive_nsfw_once(pool: &Database, work_id: &str) -> anyhow::Result<bool> {
     let mut tx = pool.begin().await?;
     crate::locks::lock_works(&mut tx, &[work_id]).await?;
@@ -11290,6 +11664,58 @@ impl MutationRoot {
             .map_err(mutation_write_error)
     }
 
+    /// Rate a scanlator from 1 to 10, change the viewer's score, or (with `score: null`)
+    /// remove it. Signed-in only; one score per reader and scanlator. Returns the
+    /// scanlator with the new numbers. Sending the same score again changes nothing.
+    ///
+    /// `id` is a `RatedScanlator.id`. Setting a score needs a scanlator the readers' list
+    /// shows the viewer; any other id is refused ("No such scanlator"): a source that is
+    /// not in the catalogue, MangaDex, a name no chapter carries, a joint credit that is
+    /// counted with its members, or a site or a group hidden from a viewer who does not
+    /// see adult content.
+    ///
+    /// Removing a score (`score: null`) always works for an id of the right form, so a
+    /// reader can take back a score on a scanlator that has since left the list or that
+    /// they no longer see. For such an id the answer is a bare row: `kind` from the id,
+    /// `name` the id's key, counts zero, `rating`, `rank` and `myScore` null. Only an id
+    /// that is not of the form `site:<source id>` / `group:<name key>` is refused
+    /// (`site:mangadex` among them: MangaDex is no site, so no score was ever stored).
+    ///
+    /// At most 30 calls a minute per account.
+    async fn rate_scanlator(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+        score: Option<i32>,
+    ) -> Result<RatedScanlator> {
+        if score.is_some_and(|score| !(1..=10).contains(&score)) {
+            return Err(Error::new("score must be between 1 and 10"));
+        }
+        let user = require_user(ctx).await?;
+        let st = state(ctx);
+        if let Err(retry) = st.rating_limiter.check(&user.id) {
+            return Err(Error::new(format!(
+                "You are rating too fast. Try again in {retry}s."
+            )));
+        }
+        // A new score needs a scanlator the viewer is shown. Taking one back does not:
+        // the row is the viewer's own, whatever became of the scanlator since.
+        let id = match score {
+            Some(_) => known_scanlator(ctx, &id.0).await?,
+            None => crate::scanlators::ScanlatorId::parse(&id.0)
+                .ok_or_else(|| Error::new(NO_SUCH_SCANLATOR))?,
+        };
+        let stored = id.text();
+        crate::db::retry_transaction(|| rate_scanlator_once(&st.pool, &user.id, &stored, score))
+            .await
+            .map_err(mutation_write_error)?;
+        match rated_scanlator_by_id(ctx, &id).await? {
+            Some(row) => Ok(row),
+            None if score.is_none() => Ok(unlisted_scanlator(&id)),
+            None => Err(Error::new(NO_SUCH_SCANLATOR)),
+        }
+    }
+
     async fn post_comment(&self, ctx: &Context<'_>, input: PostCommentInput) -> Result<Comment> {
         let target_type = validate_comment_target(&input.target_type)?;
         let body = input.body.trim().to_string();
@@ -11309,6 +11735,14 @@ impl MutationRoot {
                 "You are posting too fast. Try again in {retry}s."
             )));
         }
+
+        // A scanlator is no row to lock: its id is checked against the readers' list
+        // here, and the thread is stored under the id as that list writes it.
+        let scanlator = if target_type == "scanlator" {
+            Some(known_scanlator(ctx, &input.target_id.0).await?.text())
+        } else {
+            None
+        };
 
         let now = crate::db_types::format_date(Utc::now());
         let id = uuid::Uuid::new_v4().to_string();
@@ -11336,6 +11770,8 @@ impl MutationRoot {
                 // Preserve numeric/source-shaped threads; canonical redirects use
                 // the surviving work. The work lock protects both shapes.
                 if input.target_id.0.starts_with("w_") { identity } else { input.target_id.0.clone() }
+            } else if let Some(scanlator) = scanlator.as_ref() {
+                scanlator.clone()
             } else {
                 crate::locks::lock_source_series(&mut tx, &sources).await?;
                 if progress_sources_on(&mut tx, &input.target_id.0).await? != sources {
@@ -16563,7 +16999,11 @@ mod tests {
     /// this can't leak into the end-to-end resolver tests regardless of scheduling.
     #[test]
     fn feed_memo_is_key_isolated_and_ttl_bounded() {
-        let cache: FeedCache<Vec<u8>> = std::sync::Mutex::new(std::collections::HashMap::new());
+        let cache: FeedCache<Vec<u8>> = FeedCache::new(
+            2,
+            crate::catalogue_cache::CacheEpoch::default(),
+            crate::telemetry::CacheStats::leak(),
+        );
         let long = Duration::from_secs(60);
         let zero = Duration::from_secs(0);
 
@@ -18324,6 +18764,7 @@ mod tests {
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(max, 60),
             comment_limiter: comment_limiter(),
+            rating_limiter: rating_limiter(),
             password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
@@ -20390,6 +20831,7 @@ mod tests {
                 scan_health: Mutex::new(ScanHealth::default()),
                 auth_limiter: RateLimiter::new(100, 60),
                 comment_limiter: comment_limiter(),
+                rating_limiter: rating_limiter(),
                 password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
                 federated_limiter: RateLimiter::new(100, 60),
                 session_ttl_secs: 30 * 24 * 60 * 60,
@@ -20627,6 +21069,7 @@ mod tests {
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
             comment_limiter: comment_limiter(),
+            rating_limiter: rating_limiter(),
             password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
@@ -27799,6 +28242,7 @@ mod tests {
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
             comment_limiter: comment_limiter(),
+            rating_limiter: rating_limiter(),
             password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,
@@ -28319,6 +28763,7 @@ mod tests {
             scan_health: Mutex::new(ScanHealth::default()),
             auth_limiter: RateLimiter::new(100, 60),
             comment_limiter: comment_limiter(),
+            rating_limiter: rating_limiter(),
             password_work: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             federated_limiter: RateLimiter::new(100, 60),
             session_ttl_secs: 30 * 24 * 60 * 60,

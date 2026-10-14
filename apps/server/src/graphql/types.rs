@@ -348,6 +348,96 @@ pub struct ScanlatorSite {
     pub ai: Option<ScanlatorAi>,
 }
 
+/// Which of the two things a scanlator is.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ScanlatorKind {
+    /// A source that translates its own series.
+    Site,
+    /// A group credited on chapters.
+    Group,
+}
+
+impl From<crate::scanlators::Kind> for ScanlatorKind {
+    fn from(kind: crate::scanlators::Kind) -> Self {
+        match kind {
+            crate::scanlators::Kind::Site => ScanlatorKind::Site,
+            crate::scanlators::Kind::Group => ScanlatorKind::Group,
+        }
+    }
+}
+
+impl From<ScanlatorKind> for crate::scanlators::Kind {
+    fn from(kind: ScanlatorKind) -> Self {
+        match kind {
+            ScanlatorKind::Site => crate::scanlators::Kind::Site,
+            ScanlatorKind::Group => crate::scanlators::Kind::Group,
+        }
+    }
+}
+
+/// The order of the readers' scanlator list (`scanlatorRatings`). Equal rows order by
+/// chapters, then series, then name.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ScanlatorSort {
+    /// Ranked scanlators by `rank`, then the rest by number of scores.
+    Top,
+    /// Most scores first.
+    Votes,
+    /// Most chapters first. A site has no chapter count and reads as 0.
+    Chapters,
+    /// By name.
+    Name,
+}
+
+/// One scanlator as readers see it (`scanlatorRatings`, `ratedScanlator`): a site or a
+/// group, with the scores readers gave it.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct RatedScanlator {
+    /// `site:<source id>` or `group:<name>` (the name trimmed and lowercased). Pass it to
+    /// `rateScanlator`, and as `targetId` of a `"scanlator"` comment thread.
+    pub id: ID,
+    pub kind: ScanlatorKind,
+    /// A site's display name; a group's credit as chapters carry it.
+    pub name: String,
+    /// The site's language code ("en", "all", …), when known. Null for a group.
+    pub lang: Option<String>,
+    /// Series it released. For a group this includes its joint releases, and a series it
+    /// released both alone and jointly counts twice.
+    pub series_count: i32,
+    /// Chapter copies credited to the group, joint releases included. Null for a site:
+    /// the server keeps no count of a source's chapters.
+    pub chapter_count: Option<i32>,
+    /// The AI tag that applies: a site's own; a group's own, else the strongest among the
+    /// members of its name when it is a joint credit. Null when untagged.
+    pub ai: Option<ScanlatorAi>,
+    /// The plain average of the scores. Null when nobody rated it.
+    pub rating: Option<f64>,
+    pub rating_count: i32,
+    /// 1-based place among every scanlator on the server with at least 5 scores, by an
+    /// average weighted toward the server's mean. Null with fewer than 5 scores. It does
+    /// not change with `search`, `kind` or `mine`, nor with the viewer: a scanlator hidden
+    /// from a viewer who does not see adult content keeps its place, so the places such a
+    /// viewer is shown can skip a number.
+    pub rank: Option<i32>,
+    /// Exactly 10 numbers: how many gave score 1, 2, … 10.
+    pub distribution: Vec<i32>,
+    /// The viewer's own score. Null when signed out or not rated.
+    pub my_score: Option<i32>,
+    /// Comments a reader can read in its thread (`comments(targetType: "scanlator")`),
+    /// replies included: deleted comments and those of banned accounts do not count.
+    pub comment_count: i32,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct RatedScanlatorPage {
+    #[graphql(complexity = "30 * child_complexity")]
+    pub items: Vec<RatedScanlator>,
+    pub page: i32,
+    pub has_next_page: bool,
+    /// The FILTERED count.
+    pub total: i32,
+}
+
 /// One content block rule (`siteBlockRules`, `myBlockRules`). It matches a series that
 /// carries ALL of `tags` and, when `ratings` is not empty, has ONE of them. A series is
 /// blocked when any rule matches it.
@@ -844,10 +934,11 @@ pub struct Review {
     pub updated_at: String,
 }
 
-/// A comment on a polymorphic target: a chapter thread (`target_type = "chapter"`)
-/// or a series discussion (`target_type = "series"`). Comments form arbitrary-depth
-/// reply trees via `parent_id` (NULL = a top-level comment) and may carry one
-/// optional attached image (`media_url` + its pixel dimensions).
+/// A comment on a polymorphic target: a chapter thread (`target_type = "chapter"`),
+/// a series discussion (`target_type = "series"`) or a scanlator's thread
+/// (`target_type = "scanlator"`, `target_id` = `RatedScanlator.id`). Comments form
+/// arbitrary-depth reply trees via `parent_id` (NULL = a top-level comment) and may
+/// carry one optional attached image (`media_url` + its pixel dimensions).
 #[derive(SimpleObject, Clone)]
 pub struct Comment {
     pub id: ID,
@@ -1030,7 +1121,7 @@ pub struct CommentPage {
 #[derive(SimpleObject, Clone)]
 pub struct MyComment {
     pub id: ID,
-    /// `"chapter"` | `"series"`.
+    /// `"chapter"` | `"series"` | `"scanlator"`.
     pub target_type: String,
     pub target_id: ID,
     /// The comment this one replies to, or `null` for a top-level comment.
@@ -1043,7 +1134,8 @@ pub struct MyComment {
     /// Direct replies to this comment (banned authors excluded, as in the thread).
     pub reply_count: i32,
     /// The series the thread hangs off: `targetId` for a series discussion, the
-    /// chapter's owning series for a chapter thread. Null when it can't be resolved.
+    /// chapter's owning series for a chapter thread. Null when it can't be resolved,
+    /// and for a scanlator's thread (`targetId` is then the scanlator's id).
     pub series_id: Option<ID>,
     /// That series' display title, when the catalogue knows it.
     pub series_title: Option<String>,
@@ -1070,7 +1162,8 @@ pub struct PostReviewInput {
 
 #[derive(InputObject)]
 pub struct PostCommentInput {
-    /// `"chapter"` or `"series"`.
+    /// `"chapter"`, `"series"` or `"scanlator"`. For a scanlator, `target_id` is a
+    /// `RatedScanlator.id`.
     pub target_type: String,
     pub target_id: ID,
     /// The comment being replied to, or `null`/omitted for a top-level comment.

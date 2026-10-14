@@ -353,17 +353,6 @@ impl<'q, O: Send + Unpin + 'static> NativeQuery<'q, O> {
             .fetch_optional(executor)
             .await
     }
-    #[allow(dead_code)]
-    pub fn fetch<'e, 'c: 'e, E>(
-        self,
-        executor: E,
-    ) -> futures::stream::BoxStream<'e, std::result::Result<O, sqlx::Error>>
-    where
-        'q: 'e,
-        E: 'e + sqlx::Executor<'c, Database = Postgres>,
-    {
-        self.inner.try_map(self.decode).fetch(executor)
-    }
 }
 
 pub fn query_scalar<T: NativeDecode + Send + Unpin + 'static>(sql: &str) -> NativeQuery<'_, T> {

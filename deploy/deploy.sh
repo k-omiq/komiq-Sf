@@ -174,6 +174,13 @@ for _ in $(seq 1 100); do
   sleep 3
 done
 # Timed out with services still not healthy → don't bootstrap a partial stack.
+# postgres-backup health also covers an open WAL gap, the archiver and the 4 GiB
+# disk reserve: name its reasons (fixed words, no configuration) before stopping.
+if [ -z "$healthy" ] && [[ " $unhealthy" == *" postgres-backup "* ]]; then
+  reasons=$($DC exec -T --user postgres postgres-backup python3 /opt/komika-postgres/hosted.py status --local 2>/dev/null |
+    python3 -c 'import json, sys; print("\n".join("  - " + r for r in json.load(sys.stdin).get("health_problems") or []))' 2>/dev/null || true)
+  printf "${yl}! postgres-backup is unhealthy:${z}\n%s\n" "${reasons:-  - status unreadable (hosted.py status --local)}" >&2
+fi
 [ -n "$healthy" ] || die "services did not become healthy: ${unhealthy% }. On a new R2 prefix, create the stanza and first full explicitly (postgres/RESTORE.md); inspect postgres-backup status."
 
 # ---- bootstrap ----------------------------------------------------------------

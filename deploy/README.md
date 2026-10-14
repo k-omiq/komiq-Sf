@@ -111,8 +111,12 @@ user action. Admins can add/adjust more series and per-series scan policy in the
 
 ## Backups and restore (pgBackRest)
 
-This branch packages PostgreSQL 18.6 with pgBackRest 2.59.x. Production still runs
-SQLite from another checkout; this package has not been deployed or rehearsed.
+This tree packages PostgreSQL 18.6 with pgBackRest 2.59.x. The global server has run on
+this package since the cutover on 2026-10-13. Its rehearsal gate of two clean rehearsals
+in a row was waived by the owner, not passed, and a restore or point-in-time drill against
+the live repository has not been recorded yet. Litestream is no longer part of the
+runtime; the old SQLite file, image and Litestream data are kept only as rollback assets
+until at least 2026-11-12.
 Fill all five `KOMIKA_R2_*` values in `.env`, with a dedicated R2 prefix. No backup
 variables means local initdb with a loud warning and archiving disabled. Partial
 configuration, repository errors and failed restores stop startup.
@@ -123,6 +127,15 @@ Create the stanza and first full explicitly using [postgres/RESTORE.md](postgres
 then return `KOMIKA_PG_INIT_NEW` to 0. Existing cluster credentials must match `.env`.
 Missing-path repository errors require a separate signed HTTPS emptiness check;
 authentication, network and metadata errors never authorize initdb.
+
+Recovery health is read with `hosted.py status` (JSON: job ages, latest backups,
+archiver, backlog, free space, dropped-WAL gap and the recoverable start) and the
+budget with `hosted.py reading`, both run in the `postgres-backup` container. After
+a deploy, `./watch.sh --url http://127.0.0.1:8080/health/ready --minutes 62` watches
+health, restarts, log severities and the backup side until a wall-clock deadline.
+When pgBackRest drops WAL, PITR cannot cross the gap until a new full backup
+(`backup.sh full`) completes. Commands and meanings: "Recovery health" in
+[postgres/RESTORE.md](postgres/RESTORE.md).
 
 For database rehearsals only the directory `postgres` (this repository's
 `deploy/postgres`) goes to the host, and `./rehearsal.sh` is run from inside

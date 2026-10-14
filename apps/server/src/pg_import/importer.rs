@@ -383,6 +383,7 @@ pub(super) async fn target_state(target: &mut PgConnection) -> Result<Option<Str
     {
         expected.push(("public".into(), "komika_startup_import".into()));
     }
+    expected.extend(postgres_only_present(&existing));
     expected.sort();
     ensure!(
         existing == expected,
@@ -394,6 +395,24 @@ pub(super) async fn target_state(target: &mut PgConnection) -> Result<Option<Str
     .fetch_one(target)
     .await?;
     Ok(Some(identity))
+}
+
+/// The tables of `plan::POSTGRES_ONLY` that the target has. A migration after the
+/// baseline creates such a table, so a target has it or not with its migration level,
+/// and both are the importer's own schema. That the table belongs to the level the
+/// target really has is proven where the schema is: by the pinned fingerprint of an
+/// unfinished import (`schema::verify`) and by the indexes of the applied migrations
+/// (`verifier::schema_at_applied_level`), which include the table's primary key.
+fn postgres_only_present(existing: &[(String, String)]) -> Vec<(String, String)> {
+    super::plan::POSTGRES_ONLY
+        .iter()
+        .filter(|table| {
+            existing
+                .iter()
+                .any(|(schema, name)| schema == "public" && name == table.name)
+        })
+        .map(|table| ("public".to_owned(), table.name.to_owned()))
+        .collect()
 }
 
 // A previous normal server start is deliberately outside this inventory. Its
@@ -417,6 +436,7 @@ pub(super) async fn unowned_empty(target: &mut PgConnection) -> Result<bool> {
     if application.is_empty() {
         return Ok(true);
     }
+    expected.extend(postgres_only_present(&existing));
     expected.sort();
     if application != expected {
         return Ok(false);

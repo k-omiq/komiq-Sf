@@ -51,7 +51,7 @@ type Query {
 	# social
 	reviews(seriesId: ID!, page: Int = 1): ReviewPage! # [komika] the WORK's reviews, whichever of its ids you ask with (a `w_…` work id or any of its sources' numeric ids). ONE ROW PER AUTHOR — a reader holding a row under each id shape appears once, with their newest
 	myReview(seriesId: ID!): Review # [komika] the signed-in viewer's own review for a series, regardless of pagination (null if none / signed out). Resolved through the WORK, so it is found whichever of the work's ids the caller asks with — asking with the literal id showed a viewer who HAD rated an empty star row
-	comments(targetType: String!, targetId: ID!, page: Int = 1): CommentPage! # [komika] chapter thread or series discussion
+	comments(targetType: String!, targetId: ID!, page: Int = 1): CommentPage! # [komika] chapter thread, series discussion, or the thread of one scanlator (targetType="scanlator", targetId = RatedScanlator.id)
 	# auth
 	session: Session # [komika] current session or null
 	instance: Instance! # [komika] public server facts (setup state, sign-up switch); no auth
@@ -74,6 +74,8 @@ type Query {
 	sourceRateLimits: [SourceRateLimit!]! # [komika] admin — every per-source scan rate limit in force: the server's SCAN_SOURCE_RATE_LIMITS defaults (fromEnv) and the ones an admin set, which win (requires isAdmin)
 	scanlators(search: String, ai: ScanlatorAiFilter, source: String, page: Int = 1): ScanlatorPage! # [komika] admin scanlator list — every credit chapters carry, most chapters first, 50 per page, with its AI tag. `search` matches part of the name; `ai` filters by the tag that APPLIES; `source` (a BrowseSource.id) keeps credits with chapters on that source and counts that source only. Counts come from a scan the server reuses for ten minutes; tags are always current (requires isAdmin)
 	scanlatorSites: [ScanlatorSite!]! # [komika] admin site list — every source with a series in the catalogue (never "mangadex": MangaDex credits groups), biggest first, with its AI tag; a tagged source with no series left is still listed so the tag can be removed (requires isAdmin)
+	scanlatorRatings(search: String, kind: ScanlatorKind, mine: Boolean, sort: ScanlatorSort, page: Int = 1): RatedScanlatorPage! # [komika] the readers' scanlator list — every site and every group with the rating this server's readers gave it, 30 per page, public. `search` matches part of the name; `mine` keeps what the viewer rated (empty when signed out); default sort TOP. A joint credit ("A & B") whose members all exist on their own is not listed: its counts go to each member
+	ratedScanlator(id: ID!): RatedScanlator # [komika] one scanlator by id, null when there is none — public
 	siteBlockRules: [BlockRule!]! # [komika] admin — the site-wide content block rules, in saved order (requires isAdmin)
 	myBlockRules: [BlockRule!]! # [komika] the viewer's own content block rules, in saved order (requires auth)
 	sources: [SourceInfo!]! # [komika] installed Suwayomi sources — the sourceBrowse picker. Every installed source is listed incl. NSFW ones, regardless of the admin's reader-side show_nsfw; each carries `isNsfw` for the UI to badge (requires isAdmin)
@@ -92,7 +94,7 @@ type Mutation {
 	recordView(seriesId: ID!): Boolean! # [komika] record one view (chapter open) — no auth REQUIRED, counts anonymous + ordinary signed-in readers; an admin viewer's own reads are silently skipped so admin browsing can't move Trending; the popularity signal behind Trending
 	postReview(input: PostReviewInput!): Review! # [komika] upsert the viewer's review, one per (work, user). `seriesId` may be any of the work's ids; the row is FILED under the canonical work id so the rating counts on every surface that work appears on. `score` is 1..10 — to withdraw a rating use `deleteReview`, not score 0
 	deleteReview(seriesId: ID!): Boolean! # [komika] withdraw the viewer's OWN rating (requires auth; scoped to the caller, so it can never touch anyone else's). `seriesId` may be any of the work's ids and the removal covers the work's WHOLE key set — `reviews.series_id` is polymorphic and historical rows keep the shape they were filed under, so deleting only the canonical id would leave a numeric-keyed row still counting. Returns false when there was nothing to remove. DESTRUCTIVE for a review that carries text: `score` is NOT NULL, so a scoreless review cannot exist and withdrawing means deleting the row
-	postComment(input: PostCommentInput!): Comment! # [komika] chapter thread or series discussion
+	postComment(input: PostCommentInput!): Comment! # [komika] chapter thread, series discussion, or scanlator thread
 	voteComment(commentId: ID!, value: Int!): CommentVote! # [komika] like (1) / dislike (-1) / clear (0) a comment
 	markNotificationsRead(ids: [ID!]): Int! # [komika] mark given (or all, if omitted) notifications read; returns count changed
 	login(username: String!, password: String!): Session! # [komika]
@@ -149,6 +151,7 @@ type Mutation {
 	resyncCatalogue: Boolean! # [komika] admin — force a full catalogue re-seed: clears the catalogue/chapters sync cursors so the next cycle walks the whole createdAt history, and kicks one cycle in the background. Refused while any sync cycle is running (requires isAdmin)
 	setScanlatorAi(name: String!, ai: ScanlatorAi): Boolean! # [komika] admin — tag a scanlator as using AI (AI) or partly using it (PARTIAL); `ai: null` removes the tag. Kept by name, case-folded; applies to every chapter credited to the name on every source, now and later. false when nothing changed (requires isAdmin)
 	setSourceAi(sourceId: String!, ai: ScanlatorAi): Boolean! # [komika] admin — tag a whole source as using AI (AI) or partly using it (PARTIAL); `ai: null` removes the tag. Applies to every chapter copy read from the source, now and later. Not for "mangadex". false when nothing changed (requires isAdmin)
+	rateScanlator(id: ID!, score: Int): RatedScanlator! # [komika] set or change the viewer's rating of a scanlator (1..10); `score: null` removes it. Resolves to the scanlator with its new numbers (requires auth)
 	setSiteBlockRules(rules: [BlockRuleInput!]!): [BlockRule!]! # [komika] admin — replace the site-wide content block rules (at most 50; an empty list clears them). They apply to every viewer, signed in or not: a matching series is left out of every list and cannot be opened or read. Returns the stored list (requires isAdmin)
 	markSourceNsfw(sourceId: String!, isNsfw: Boolean!): Int! # [komika] admin — flag/unflag a whole Suwayomi source as adult and re-derive the NSFW flag of every work ingested from it; the flag is remembered (source_nsfw_pin), so a series ingested LATER from that source is stored adult too; returns works changed (requires isAdmin)
 	rederiveSuwayomiNsfw: Int! # [komika] admin — recompute the DERIVED is_nsfw for every Suwayomi-ingested work under the current rule (adult genre OR adult source, unless MangaDex rated it safe/suggestive). Conservative: only flips 0 -> 1, never un-flags, and leaves isNsfwOverride alone. Returns works flipped (requires isAdmin)
@@ -317,6 +320,39 @@ type ScanlatorSite {
 	lang: String
 	seriesCount: Int! # series in the catalogue that have this source
 	ai: ScanlatorAi # the tag stored for the source
+}
+# [komika] A scanlator is a site that translates its own series, or a group that chapters credit. MangaDex is not a site: its groups are the scanlators.
+enum ScanlatorKind {
+	SITE
+	GROUP
+}
+enum ScanlatorSort {
+	TOP # ranked scanlators by rank, then the rest by number of ratings
+	VOTES
+	CHAPTERS
+	NAME
+}
+# [komika] One row of the readers' scanlator list.
+type RatedScanlator {
+	id: ID! # "site:<source id>" or "group:<name key>"; also the targetId of its comment thread (targetType="scanlator")
+	kind: ScanlatorKind!
+	name: String!
+	lang: String # sites only
+	seriesCount: Int!
+	chapterCount: Int # null for a site: the server has no cheap count
+	ai: ScanlatorAi # the tag that applies
+	rating: Float # plain average of the scores, null when nobody rated it
+	ratingCount: Int!
+	rank: Int # 1-based and global, by a score weighted toward the server mean; null below 5 ratings
+	distribution: [Int!]! # ten numbers: how many readers gave 1, 2, … 10
+	myScore: Int # the viewer's own score; null when signed out or not rated
+	commentCount: Int! # readable comments at any depth
+}
+type RatedScanlatorPage {
+	items: [RatedScanlator!]!
+	page: Int!
+	hasNextPage: Boolean!
+	total: Int!
 }
 # [komika] One content block rule. It matches a series that carries ALL of `tags` and, when `ratings` is not empty, has ONE of them (the EFFECTIVE rating: a series the NSFW gate treats as adult is never below EROTICA, one with no rating is SAFE). A series is blocked when any rule matches.
 type BlockRule {
@@ -532,7 +568,7 @@ type Review {
 # series-level discussion (targetType="series"). Distinct from Review (scored, one/user).
 type Comment {
 	id: ID!
-	targetType: String! # "chapter" | "series"
+	targetType: String! # "chapter" | "series" | "scanlator"
 	targetId: ID!
 	parentId: ID # [komika] reply parent; null = top-level comment (arbitrary-depth trees)
 	author: UserRef!
@@ -552,7 +588,7 @@ type Comment {
 # its title and the chapter number, so a row renders and deep-links without a lookup.
 type MyComment {
 	id: ID!
-	targetType: String! # "chapter" | "series"
+	targetType: String! # "chapter" | "series" | "scanlator"
 	targetId: ID!
 	parentId: ID # reply parent; null = top-level comment
 	body: String!
@@ -735,7 +771,7 @@ input PostReviewInput {
 }
 
 input PostCommentInput {
-	targetType: String! # "chapter" | "series"
+	targetType: String! # "chapter" | "series" | "scanlator"
 	targetId: ID!
 	parentId: ID # [komika] reply target; must be a comment on the same target. Omit for top-level.
 	body: String!

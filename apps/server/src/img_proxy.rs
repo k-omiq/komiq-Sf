@@ -26,10 +26,10 @@
 //!   `*.mangadex.*` source is refused here as well, so the proxy cannot become the
 //!   path around the switch.
 //!
-//! Successes carry the Worker's year-long-ish immutable cache (7 days) so a CDN in
-//! front of the server (the plan's Cloudflare cache rule for `/img`) and the browser
-//! absorb repeat loads; every refusal is `no-store`, so a transient upstream failure is
-//! never pinned in a cache.
+//! Successes carry the Worker's short revalidating cache (`MUTABLE_CACHE`): source
+//! URLs are not exact revisions, so a CDN in front of the server and the browser
+//! absorb repeat loads without pinning replaced art. Every refusal is `no-store`, so a
+//! transient upstream failure is never pinned in a cache.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +40,7 @@ use axum::response::{IntoResponse, Response};
 use reqwest::Url;
 
 use crate::mangadex::MangaDexClient;
+use crate::telemetry::{BodyCheck, BodySource};
 
 /// The upstream hosts `/img` may fetch from. MUST equal the Worker's
 /// `ALLOWED_SOURCE_HOSTS` in `apps/worker/wrangler.toml` (pinned by
@@ -65,7 +66,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// further requests wait for a slot rather than fail.
 const MAX_INFLIGHT: usize = 16;
 
-const IMMUTABLE_CACHE: &str = "public, max-age=604800, immutable";
+const IMAGE_CACHE: &str = crate::image_delivery::MUTABLE_CACHE;
 
 /// The proxy's fixed configuration. Production uses [`ImgProxy::new`]; tests swap the
 /// allowlist and allow a port so a local mock can stand in for MangaDex.
@@ -76,7 +77,7 @@ pub struct ImgProxy {
     /// mock server cannot listen on 80.
     allow_ports: bool,
     max_bytes: usize,
-    inflight: tokio::sync::Semaphore,
+    inflight: Arc<tokio::sync::Semaphore>,
     /// For the MangaDex switch (see the module doc).
     mangadex: Arc<MangaDexClient>,
 }
@@ -104,7 +105,7 @@ impl ImgProxy {
             hosts,
             allow_ports,
             max_bytes,
-            inflight: tokio::sync::Semaphore::new(MAX_INFLIGHT),
+            inflight: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT)),
             mangadex,
         }
     }
@@ -146,12 +147,17 @@ impl ImgProxy {
 
     /// Fetch `start`, following redirects by hand with every hop re-checked, then
     /// apply the content-type and size rules. Returns the content type and bytes.
-    async fn fetch(&self, start: Url) -> Result<(String, Vec<u8>), Refusal> {
-        let _permit = self
+    async fn fetch(&self, start: Url) -> Result<(String, axum::body::Bytes), Refusal> {
+        let waiting = std::time::Instant::now();
+        let permit = self
             .inflight
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|_| Refusal::upstream("proxy is shutting down"))?;
+        let lane = crate::telemetry::ADMISSION.lane(crate::telemetry::Lane::ProxyFetch);
+        lane.waited(waiting.elapsed());
+        lane.admitted();
         let mut current = start;
         for _ in 0..=MAX_REDIRECTS {
             let referer = format!("{}://{}/", current.scheme(), current.authority());
@@ -196,10 +202,17 @@ impl ImgProxy {
                 .unwrap_or("")
                 .to_string();
             if !is_image_content_type(&content_type) {
+                crate::telemetry::MEDIA.body_check(BodySource::Proxy, BodyCheck::Unsupported);
                 return Err(Refusal::upstream("Upstream is not an image"));
             }
             let bytes = read_capped(res, self.max_bytes).await?;
-            return Ok((content_type, bytes));
+            let content_type =
+                crate::image_delivery::validate_from(BodySource::Proxy, &bytes, &content_type)
+                    .map_err(|_| Refusal::upstream("Upstream image is invalid or incomplete"))?;
+            return Ok((
+                content_type.to_string(),
+                crate::image_delivery::retain_fetch_slot(bytes, permit),
+            ));
         }
         Err(Refusal::upstream("Too many redirects"))
     }
@@ -254,8 +267,12 @@ pub fn is_image_content_type(content_type: &str) -> bool {
 
 /// Read the body, refusing a declared or actual length past `cap`.
 async fn read_capped(mut res: reqwest::Response, cap: usize) -> Result<Vec<u8>, Refusal> {
+    let too_large = || {
+        crate::telemetry::MEDIA.body_check(BodySource::Proxy, BodyCheck::TooLarge);
+        Refusal::upstream("Upstream image too large")
+    };
     if res.content_length().is_some_and(|n| n > cap as u64) {
-        return Err(Refusal::upstream("Upstream image too large"));
+        return Err(too_large());
     }
     let mut out = Vec::new();
     while let Some(chunk) = res
@@ -264,7 +281,7 @@ async fn read_capped(mut res: reqwest::Response, cap: usize) -> Result<Vec<u8>, 
         .map_err(|_| Refusal::upstream("Upstream fetch failed"))?
     {
         if out.len() + chunk.len() > cap {
-            return Err(Refusal::upstream("Upstream image too large"));
+            return Err(too_large());
         }
         out.extend_from_slice(&chunk);
     }
@@ -329,13 +346,12 @@ pub async fn serve(State(proxy): State<Arc<ImgProxy>>, RawQuery(query): RawQuery
         Ok((content_type, bytes)) => {
             let ct = HeaderValue::from_str(&content_type)
                 .unwrap_or(HeaderValue::from_static("application/octet-stream"));
+            let length = HeaderValue::from(bytes.len());
             (
                 [
                     (header::CONTENT_TYPE, ct),
-                    (
-                        header::CACHE_CONTROL,
-                        HeaderValue::from_static(IMMUTABLE_CACHE),
-                    ),
+                    (header::CONTENT_LENGTH, length),
+                    (header::CACHE_CONTROL, HeaderValue::from_static(IMAGE_CACHE)),
                     // Never let a browser reinterpret the bytes, nor offer them as a
                     // download (the Worker's same pair).
                     (
@@ -353,7 +369,8 @@ pub async fn serve(State(proxy): State<Arc<ImgProxy>>, RawQuery(query): RawQuery
                         HeaderValue::from_static("*"),
                     ),
                 ],
-                bytes,
+                // The payload owns a proxy slot; a stalled client must not pin it.
+                crate::image_delivery::delivery_body(bytes),
             )
                 .into_response()
         }
@@ -417,7 +434,44 @@ mod tests {
         let app = Router::new()
             .route(
                 "/ok.jpg",
-                get(|| async { ([(header::CONTENT_TYPE, "image/jpeg")], vec![0xFFu8; 64]) }),
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "image/jpeg")],
+                        crate::suwayomi::testsrv::jpeg(8, 8),
+                    )
+                }),
+            )
+            .route(
+                "/invalid.jpg",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "image/jpeg")],
+                        "<html>challenge</html>",
+                    )
+                }),
+            )
+            .route(
+                "/empty.jpg",
+                get(|| async { ([(header::CONTENT_TYPE, "image/jpeg")], "") }),
+            )
+            .route(
+                "/mislabeled.png",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "image/png")],
+                        crate::suwayomi::testsrv::jpeg(8, 8),
+                    )
+                }),
+            )
+            .route(
+                "/truncated.jpg",
+                get(|| async {
+                    let jpeg = crate::suwayomi::testsrv::jpeg(8, 8);
+                    (
+                        [(header::CONTENT_TYPE, "image/jpeg")],
+                        jpeg[..jpeg.len() - 2].to_vec(),
+                    )
+                }),
             )
             .route(
                 "/page.html",
@@ -542,12 +596,12 @@ mod tests {
             call(&app, &format!("http://allowed.test:{port}/ok.jpg")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(ct, "image/jpeg");
-        assert_eq!(cache.as_deref(), Some(IMMUTABLE_CACHE));
-        assert_eq!(body.len(), 64);
+        assert_eq!(cache.as_deref(), Some(IMAGE_CACHE));
+        assert_eq!(body, crate::suwayomi::testsrv::jpeg(8, 8));
         // A same-host redirect is followed (and re-checked).
         let (status, _, _, body) = call(&app, &format!("http://allowed.test:{port}/hop")).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.len(), 64);
+        assert_eq!(body, crate::suwayomi::testsrv::jpeg(8, 8));
         assert_eq!(hits.load(Ordering::SeqCst), 3);
     }
 
@@ -635,9 +689,26 @@ mod tests {
         let (status, _, _, body) = call(&app, &format!("http://allowed.test:{port}/big.jpg")).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(String::from_utf8_lossy(&body), "Upstream image too large");
-        // The 64-byte image still fits.
+        // The small valid image still fits.
         let (status, _, _, _) = call(&app, &format!("http://allowed.test:{port}/ok.jpg")).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn invalid_raster_bodies_are_not_immutable_successes() {
+        let (addr, _) = upstream().await;
+        let app = proxy_app(addr, true, MAX_IMAGE_BYTES);
+        for path in [
+            "invalid.jpg",
+            "empty.jpg",
+            "mislabeled.png",
+            "truncated.jpg",
+        ] {
+            let (status, _, cache, _) =
+                call(&app, &format!("http://allowed.test:{}/{path}", addr.port())).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(cache.as_deref(), Some("no-store"));
+        }
     }
 
     #[tokio::test]

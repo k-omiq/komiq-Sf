@@ -204,6 +204,70 @@ class WrapperTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(self.trace.exists())
 
+    def test_archive_push_records_dropped_wal_and_keeps_stderr_and_status(self):
+        fake = self.base / "bin" / "pgbackrest"
+        fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$TRACE"\nprintf "stdout line\\n\\n"\n'
+                        'printf "%b" "$STDERR_TEXT" >&2\nexit "${PUSH_STATUS:-0}"\n')
+        state = self.base / "state"
+        state.mkdir()
+        record = state / "dropped-wal.log"
+        dropped = ("P00   WARN: dropped WAL file '0000000100000000000000A%d' because archive queue exceeded 1GB\n")
+        text = "P00   INFO: archive-push command begin\n" + dropped % 1 + dropped % 2 + "P00   INFO: archive-push command end"
+        result = self.wrapper(["archive-push", "pg_wal/0000000100000000000000A3"], KOMIKA_BACKUP_STATE=str(state),
+                              STDERR_TEXT=text)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "stdout line\n\n")
+        self.assertEqual(result.stderr, text)  # Byte for byte: no newline added.
+        lines = record.read_text().splitlines()
+        self.assertEqual([line.split()[1] for line in lines], ["0000000100000000000000A1", "0000000100000000000000A2"])
+        self.assertRegex(lines[0], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z ")
+        self.assertIsInstance(hosted.stamp(lines[0].split()[0]), float)
+        # Trailing newlines, empty stderr and a failing status pass through unchanged;
+        # a clean push records nothing.
+        for stderr, status in (("P00  ERROR: [082]: fail\n\n\n", "82"), ("", "0"), ("", "3"), ("\n", "0"),
+                               ("no newline", "1")):
+            with self.subTest(stderr=stderr, status=status):
+                result = self.wrapper(["archive-push", "x"], KOMIKA_BACKUP_STATE=str(state), STDERR_TEXT=stderr,
+                                      PUSH_STATUS=status)
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (int(status), "stdout line\n\n", stderr))
+        self.assertEqual(len(record.read_text().splitlines()), 2)
+        # Bounded to the last 10,000 events, rewritten through a unique temp file.
+        record.write_text("".join(f"2026-10-01T00:00:00Z {n:024X}\n" for n in range(10_000)))
+        many = "".join(dropped.replace("A%d", "%02X") % n for n in range(3))
+        self.assertEqual(self.wrapper(["archive-push", "x"], KOMIKA_BACKUP_STATE=str(state), STDERR_TEXT=many).returncode, 0)
+        lines = record.read_text().splitlines()
+        self.assertEqual(len(lines), 10_000)
+        self.assertEqual(lines[0].split()[1], f"{3:024X}")
+        self.assertTrue(lines[-1].endswith("000000010000000000000002"))
+        self.assertEqual(sorted(p.name for p in state.iterdir()), ["dropped-wal.log"])
+        # No writable state (rehearsal without repository): same stderr and status, no extra output.
+        for missing in (self.base / "absent", "/"):
+            with self.subTest(state=missing):
+                result = self.wrapper(["archive-push", "x"], KOMIKA_BACKUP_STATE=str(missing), STDERR_TEXT=dropped % 5,
+                                      PUSH_STATUS="0")
+                self.assertEqual((result.returncode, result.stderr), (0, dropped % 5))
+        # Other commands are exec'd as before, without the filter.
+        result = self.wrapper(["--output=json", "info"], KOMIKA_BACKUP_STATE=str(state), STDERR_TEXT=dropped % 6)
+        self.assertEqual(result.stderr, dropped % 6)
+        self.assertEqual(len(record.read_text().splitlines()), 10_000)
+
+    def test_archive_push_streams_stderr_before_pgbackrest_exits(self):
+        fake = self.base / "bin" / "pgbackrest"
+        go = self.base / "go"
+        # Exits 7 unless the first stderr line reached the reader while it still ran.
+        fake.write_text('#!/bin/sh\nprintf "first\\n" >&2\ni=0\n'
+                        'while [ ! -e "$GO" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done\n'
+                        '[ -e "$GO" ] || exit 7\nprintf "second" >&2\n')
+        base = {"PATH": str(self.base / "bin") + os.pathsep + os.environ.get("PATH", os.defpath), "GO": str(go),
+                "KOMIKA_BACKUP_STATE": str(self.base / "absent")}
+        with subprocess.Popen(["/bin/sh", str(safety.KIT / "pgbackrest.sh"), "archive-push", "x"], env=base,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+            self.assertEqual(process.stderr.readline(), b"first\n")
+            go.touch()
+            self.assertEqual(process.stderr.read(), b"second")
+            self.assertEqual(process.wait(timeout=30), 0)
+
     @unittest.skipUnless(IN_IMAGE and os.getuid() == 0, "needs /run/komika: runs inside the image (image-test.sh)")
     def test_wrapper_passes_the_kits_commands_with_the_rehearsal_prefix(self):
         directory = Path("/run/komika")

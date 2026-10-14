@@ -4,7 +4,16 @@
 	import { goto, beforeNavigate, preloadData } from '$app/navigation';
 	import { navigating } from '$app/state';
 	import { untrack, onDestroy, tick } from 'svelte';
-	import { saveProgress, recordView, getChapterSourceLinks } from '$lib/data/source';
+	import {
+		saveProgress,
+		recordView,
+		getChapterSourceLinks,
+		readerViewForCurrentScope,
+		readerViewIsCurrent,
+		releaseStaleReaderView,
+		type ReaderView,
+	} from '$lib/data/source';
+	import { refreshViewerLoads } from '$lib/viewer-cache.svelte';
 	import { externalChapterHost, externalChapterHref } from '$lib/data/chapter-label';
 	import { chapterAttribution } from '$lib/data/chapter-versions';
 	import { stripProgress } from '$lib/data/reader-format';
@@ -32,7 +41,15 @@
 	} from '$lib/reader-prefs';
 	import CommentThread from '$lib/components/CommentThread.svelte';
 
-	let { data } = $props();
+	let { data: loadedData } = $props();
+	// Kit can deliver a completed preload without calling load again. Guard the
+	// complete view, including metadata/progress, before it reaches any UI or write.
+	const data = $derived(readerViewForCurrentScope(loadedData));
+	$effect(() => {
+		if (readerViewIsCurrent(loadedData)) return;
+		releaseStaleReaderView(loadedData);
+		void refreshViewerLoads();
+	});
 
 	const seriesTitle = $derived(data.seriesTitle);
 	const seriesHref = $derived(`/series/${data.seriesId}`);
@@ -462,7 +479,9 @@
 			.then((res) => {
 				// `redirect` results carry no data; only a `loaded` one has pages.
 				if (res?.type !== 'loaded') return;
-				const next = (res.data as { pages?: { url?: string }[] } | undefined)?.pages ?? [];
+				const view = res.data as ReaderView;
+				if (!readerViewIsCurrent(view)) return releaseStaleReaderView(view);
+				const next = view.pages;
 				for (const pg of next.slice(0, PREFETCH_IMAGES)) {
 					if (!pg?.url || warmedUrls.has(pg.url)) continue;
 					warmedUrls.add(pg.url);

@@ -388,7 +388,9 @@ impl Database {
         job: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     ) -> bool {
         use std::sync::atomic::Ordering;
+        let stats = &crate::telemetry::QUEUE_DEFERRED_WRITES;
         if !self.deferred.accepting.load(Ordering::Acquire) {
+            stats.refused();
             return false;
         }
         self.deferred.pending.fetch_add(1, Ordering::AcqRel);
@@ -402,9 +404,19 @@ impl Database {
         {
             self.deferred.pending.fetch_sub(1, Ordering::AcqRel);
             self.deferred.drained.notify_waiters();
+            stats.refused();
             return false;
         }
+        // Committed occupancy only: jobs sitting in the channel after this send,
+        // never a concurrent submission that is about to be refused.
+        stats.accepted(self.deferred_queued());
         true
+    }
+    /// Deferred jobs waiting in the bounded channel (not the one running), for
+    /// telemetry.
+    pub fn deferred_queued(&self) -> usize {
+        let sender = &self.deferred.sender;
+        sender.max_capacity() - sender.capacity()
     }
     pub async fn acquire(&self) -> Result<sqlx::pool::PoolConnection<Postgres>, Error> {
         self.readers.acquire().await
@@ -758,6 +770,15 @@ mod tests {
         }
         assert!(accepted <= 65, "one running job plus 64 buffered jobs");
         assert!(accepted > 0);
+        // Process-global counters (other tests defer too): lower bounds only.
+        let (_, refused, _, depth_max) = crate::telemetry::QUEUE_DEFERRED_WRITES.snapshot();
+        assert!(refused >= 100 - accepted as u64);
+        assert!(depth_max >= 1);
+        assert!(database.deferred_queued() >= 1);
+        assert!(
+            database.deferred_queued() <= 64,
+            "never past the channel bound"
+        );
         held.commit().await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), database.close())
             .await

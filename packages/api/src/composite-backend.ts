@@ -54,9 +54,12 @@ import type {
 	MangadexSetting,
 	BlockRule,
 	BrowseSource,
+	RatedScanlator,
+	RatedScanlatorPage,
 	ScanlatorAi,
 	ScanlatorPage,
 	ScanlatorQuery,
+	ScanlatorRatingQuery,
 	ScanlatorSite,
 	ScanlatorTag,
 	SourceAiTag,
@@ -141,15 +144,21 @@ export class CompositeBackend implements Backend {
 	private async flushQueue(): Promise<void> {
 		const queue = this.opts.queue;
 		if (!queue) return;
+		const owner = this.currentUserId;
+		const generation = this.writeGeneration;
 		try {
 			await queue.drain(
-				(op: WriteOp) =>
-					op.kind === 'progress'
+				(op: WriteOp) => {
+					if (!this.writeIsCurrent(owner, generation) || op.userId !== owner) {
+						return Promise.reject(new Error('Offline write identity changed'));
+					}
+					return op.kind === 'progress'
 						? this.opts.hosted.setProgress(op.chapterId, op.lastPageRead, op.read)
-						: this.opts.hosted.mark(op.seriesId, op.marked).then(() => {}),
+						: this.opts.hosted.mark(op.seriesId, op.marked).then(() => {});
+				},
 				// Scope the replay to the signed-in user so A's offline writes can never
 				// be applied under B's account (C1). Null (identity not yet known) defers.
-				this.currentUserId,
+				owner,
 			);
 		} catch {
 			/* defensive: drain is self-contained, but never let a drain reject a caller */
@@ -163,6 +172,12 @@ export class CompositeBackend implements Backend {
 	 * under another (C1). Set via {@link setCurrentUser} by the auth layer.
 	 */
 	private currentUserId: Id | null = null;
+	private writeGeneration = 0;
+	private queueToken: string | null | undefined;
+
+	private writeIsCurrent(owner: Id | null, generation: number): boolean {
+		return owner === this.currentUserId && generation === this.writeGeneration;
+	}
 
 	/**
 	 * Reconciliation map from a hosted canonical chapter id (a globally-unique uuid) to
@@ -228,6 +243,11 @@ export class CompositeBackend implements Backend {
 	/** Forward the bearer token to the hosted backend only — the local engine is
 	 * content-only and never receives a token. */
 	setToken(token: string | null): void {
+		if (this.queueToken !== token) {
+			this.queueToken = token;
+			this.writeGeneration += 1;
+			this.opts.queue?.cancelReplay();
+		}
 		this.opts.hosted.setToken?.(token);
 	}
 	/**
@@ -240,6 +260,7 @@ export class CompositeBackend implements Backend {
 	setCurrentUser(userId: Id | null): void {
 		if (userId === this.currentUserId) return;
 		this.currentUserId = userId;
+		this.writeGeneration += 1;
 		// Clear foreign (and, on logout, all) queued ops before the token is dropped.
 		this.opts.queue?.dropForeign(userId);
 		// Now that identity is known, opportunistically replay this user's own backlog
@@ -372,12 +393,16 @@ export class CompositeBackend implements Backend {
 	 */
 	async mark(seriesId: Id, marked: boolean): Promise<Series> {
 		if (!this.opts.queue) return this.opts.hosted.mark(seriesId, marked);
+		const owner = this.currentUserId;
+		const generation = this.writeGeneration;
 		try {
 			const s = await this.opts.hosted.mark(seriesId, marked);
-			void this.flushQueue();
+			if (this.writeIsCurrent(owner, generation)) void this.flushQueue();
 			return s;
 		} catch (err) {
-			this.opts.queue.enqueue({ kind: 'mark', seriesId, marked, userId: this.currentUserId });
+			if (this.writeIsCurrent(owner, generation)) {
+				this.opts.queue.enqueue({ kind: 'mark', seriesId, marked, userId: owner });
+			}
 			throw err;
 		}
 	}
@@ -403,17 +428,21 @@ export class CompositeBackend implements Backend {
 	 */
 	async setProgress(chapterId: Id, lastPageRead: number, read: boolean): Promise<void> {
 		if (!this.opts.queue) return this.opts.hosted.setProgress(chapterId, lastPageRead, read);
+		const owner = this.currentUserId;
+		const generation = this.writeGeneration;
 		try {
 			await this.opts.hosted.setProgress(chapterId, lastPageRead, read);
-			void this.flushQueue();
+			if (this.writeIsCurrent(owner, generation)) void this.flushQueue();
 		} catch {
-			this.opts.queue.enqueue({
-				kind: 'progress',
-				chapterId,
-				lastPageRead,
-				read,
-				userId: this.currentUserId,
-			});
+			if (this.writeIsCurrent(owner, generation)) {
+				this.opts.queue.enqueue({
+					kind: 'progress',
+					chapterId,
+					lastPageRead,
+					read,
+					userId: owner,
+				});
+			}
 		}
 	}
 
@@ -693,6 +722,15 @@ export class CompositeBackend implements Backend {
 	}
 	scanlators(query?: ScanlatorQuery): Promise<ScanlatorPage> {
 		return this.opts.hosted.scanlators!(query);
+	}
+	scanlatorRatings(query?: ScanlatorRatingQuery): Promise<RatedScanlatorPage> {
+		return this.opts.hosted.scanlatorRatings!(query);
+	}
+	ratedScanlator(id: Id): Promise<RatedScanlator | null> {
+		return this.opts.hosted.ratedScanlator!(id);
+	}
+	rateScanlator(id: Id, score: number | null): Promise<RatedScanlator> {
+		return this.opts.hosted.rateScanlator!(id, score);
 	}
 	setScanlatorAi(name: string, ai: ScanlatorAi | null): Promise<boolean> {
 		return this.opts.hosted.setScanlatorAi!(name, ai);

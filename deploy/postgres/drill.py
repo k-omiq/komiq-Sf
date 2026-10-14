@@ -626,9 +626,110 @@ def record_settings(out):
         output.write(json.dumps({"settings": settings, "pg_controldata": control}, sort_keys=True) + "\n")
 
 
-def run(target, restore_only=False, target_time=None, keep=False, json_out=None, source_settings=None,
-        expect=((), ())):
+DROPPED_RECORD = "/var/lib/postgresql/komika-backup/dropped-wal.log"
+
+
+def dropped_wal_events():
+    """Times of the source's recorded dropped-WAL warnings (pgbackrest.sh), or
+    None when the record cannot be read: its postgres container is not running."""
+    script = 'test -d "${1%/*}" || exit 3; test -f "$1" || exit 0; cat -- "$1"'
+    try:
+        result = subprocess.run([*live_prefix(), "sh", "-c", script, "sh", DROPPED_RECORD],
+                                capture_output=True, text=True, timeout=60, env=child_environment())
+    except (OSError, subprocess.TimeoutExpired, ValueError, RuntimeError):
+        return None
+    if result.returncode:
+        return None
+    events = []
+    for line in result.stdout.splitlines():
+        # Microseconds since the fix; older lines have whole seconds.
+        for layout in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+            try:
+                events.append(datetime.datetime.strptime(line.split()[0], layout)
+                              .replace(tzinfo=datetime.timezone.utc).timestamp())
+                break
+            except (IndexError, ValueError):
+                continue
+    return events
+
+
+def utc(epoch):
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def closes(backup, event):
+    """A full whose start is later than the drop. pgBackRest starts have whole
+    seconds, so a drop in that same second stays open (as in hosted.py)."""
+    return backup.get("type") == "full" and backup["timestamp"]["start"] > event
+
+
+def gap_windows(events, backups):
+    """(start, end) per recorded drop: targets strictly between cannot be reached.
+
+    The dropped segments were queued BEFORE the warning, so a gap may begin
+    right after the last backup that completed before it. It closes at the
+    stop of the first full backup that started after the warning.
+    """
+    windows = []
+    for event in events:
+        before = [b["timestamp"]["stop"] for b in backups if b["timestamp"]["stop"] <= event]
+        after = [b["timestamp"]["stop"] for b in backups if closes(b, event)]
+        windows.append((max(before, default=-math.inf), min(after, default=math.inf), event))
+    return windows
+
+
+def refuse_gap(instant, backups):
     import sys
+    if REHEARSAL is not None:
+        print("NOTE: a rehearsal does not read the dropped-WAL record", file=sys.stderr)
+        return
+    events = dropped_wal_events()
+    if events is None:
+        print("WARNING: the source's dropped-WAL record is unreachable (postgres not running); this restore "
+              "cannot rule out an archive gap before the target time. See RESTORE.md, 'Recovery health'",
+              file=sys.stderr)
+        return
+    for start, end, event in gap_windows(events, backups):
+        if start < instant < end:
+            raise ValueError(
+                f"target time lies in a recorded archive gap: pgBackRest dropped WAL at {utc(event)}; "
+                + (f"the gap may begin after {utc(start)} (the last backup before it) " if start > -math.inf
+                   else "no retained backup precedes it ")
+                + ("and no full backup has completed since" if end == math.inf
+                   else f"and closes at {utc(end)} (the next full backup's stop)")
+                + ". PITR never crosses missing WAL; choose a target outside the gap")
+
+
+def refuse_open_gap(backups, accept=False):
+    """Latest-state restore: with an open gap (no full started after the latest
+    drop) recovery stops at the first missing segment and promotes that older
+    state without an error. --accept-gap allows it: in a real disaster the
+    pre-drop chain may be all there is."""
+    import sys
+    if REHEARSAL is not None:
+        print("NOTE: a rehearsal does not read the dropped-WAL record", file=sys.stderr)
+        return
+    events = dropped_wal_events()
+    if events is None:
+        print("WARNING: the source's dropped-WAL record is unreachable (postgres not running); this latest-state "
+              "restore cannot rule out an archive gap and may stop silently at one. See RESTORE.md, "
+              "'Recovery health'", file=sys.stderr)
+        return
+    if not events or any(closes(b, max(events)) for b in backups):
+        return
+    gap = (f"pgBackRest dropped WAL at {utc(max(events))} and no full backup has started since, so a latest-state "
+           "restore stops at the first missing segment and silently promotes an older state")
+    if not accept:
+        raise ValueError(f"an archive gap is open: {gap}. Take a new full backup first, or pass --accept-gap "
+                         "to restore what the chain before the drop holds")
+    print(f"WARNING: --accept-gap: {gap}", file=sys.stderr)
+
+
+def run(target, restore_only=False, target_time=None, keep=False, json_out=None, source_settings=None,
+        expect=((), ()), accept_gap=False):
+    import sys
+    if accept_gap and (not restore_only or target_time):
+        raise ValueError("--accept-gap applies only to a latest-state restore (restore-only, no target-time)")
     if source_settings and not restore_only:
         raise ValueError("source-settings requires restore-only")
     if (target_time or keep) and not restore_only:
@@ -657,7 +758,10 @@ def run(target, restore_only=False, target_time=None, keep=False, json_out=None,
     backups = info["backup"]
     timestamp = target_time
     if timestamp:
+        refuse_gap(target_instant(timestamp).timestamp(), backups)
         backups = [b for b in backups if b["timestamp"]["stop"] <= target_instant(timestamp).timestamp()]
+    elif restore_only:
+        refuse_open_gap(backups, accept_gap)
     if not backups:
         raise ValueError("no retained backup precedes target")
     backup = max(backups, key=lambda b: b["timestamp"]["stop"])
@@ -720,11 +824,14 @@ def main():
     parser.add_argument("--keep", action="store_true", help="leave throwaway server running for the Phase 2 verifier")
     parser.add_argument("--json-out", type=Path, help="write the final JSON report to a new caller-owned file")
     parser.add_argument("--source-settings", type=Path, help="retained record-settings JSON for source-free recovery")
+    parser.add_argument("--accept-gap", action="store_true",
+                        help="latest-state restore although a recorded archive gap is open (stops at the gap)")
     parser.add_argument("--hosted-recovery", action="store_true", help="explicit real hosted recovery authorization (Phase 6+)")
     args = parser.parse_args()
     HOSTED_RECOVERY = args.hosted_recovery
     hosted_only()
-    run(args.target, args.restore_only, args.target_time, args.keep, args.json_out, args.source_settings)
+    run(args.target, args.restore_only, args.target_time, args.keep, args.json_out, args.source_settings,
+        accept_gap=args.accept_gap)
 
 
 if __name__ == "__main__":

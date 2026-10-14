@@ -525,10 +525,36 @@ async fn checkpoint_ownership(target: &mut PgConnection) -> Result<()> {
     }
     ensure!(done.is_empty(), "unknown table in importer checkpoint");
     let search: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM public.work_search_alias)")
-        .fetch_one(target)
+        .fetch_one(&mut *target)
         .await?;
     ensure!(!search, "unfinished import contains unowned search rows");
+    // The importer writes nothing into a table that only PostgreSQL has.
+    for name in postgres_only_tables(target).await? {
+        let occupied: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM public.{})",
+            super::plan::quote(name)
+        ))
+        .fetch_one(&mut *target)
+        .await?;
+        ensure!(!occupied, "unfinished import contains unowned {name} rows");
+    }
     Ok(())
+}
+
+/// The tables of `plan::POSTGRES_ONLY` that the target has: those the migrations it has
+/// applied create.
+async fn postgres_only_tables(target: &mut PgConnection) -> Result<Vec<&'static str>> {
+    let mut present = Vec::new();
+    for table in super::plan::POSTGRES_ONLY {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(format!("public.{}", super::plan::quote(table.name)))
+            .fetch_one(&mut *target)
+            .await?;
+        if exists {
+            present.push(table.name);
+        }
+    }
+    Ok(present)
 }
 
 /// The identity a startup record wrote into PostgreSQL. A random value that
@@ -687,9 +713,14 @@ async fn reset_in_transaction(tx: &mut PgConnection, journal: &Journal) -> Resul
     // Every row is a row of a checkpointed importer table, with its count.
     checkpoint_ownership(&mut *tx).await?;
     let tables = super::plan::tables();
+    // A table that references a truncated one must be in the same statement, even
+    // when it is empty: the tables that only PostgreSQL has reference `users`.
+    let postgres_only = postgres_only_tables(&mut *tx).await?;
     let names = tables
         .iter()
-        .map(|table| format!("public.{}", super::plan::quote(&table.name)))
+        .map(|table| table.name.as_str())
+        .chain(postgres_only)
+        .map(|name| format!("public.{}", super::plan::quote(name)))
         .chain(std::iter::once("public.work_search_alias".to_owned()))
         .collect::<Vec<_>>()
         .join(",");

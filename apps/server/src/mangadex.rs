@@ -255,7 +255,11 @@ impl MangaDexClient {
             enabled: tokio::sync::watch::Sender::new(false),
             api_base: API_BASE.to_string(),
             covers_base: COVERS_BASE.to_string(),
-            athome_memo: TtlMemo::new(ATHOME_MEMO_TTL, ATHOME_MEMO_CAP),
+            athome_memo: TtlMemo::new(
+                ATHOME_MEMO_TTL,
+                ATHOME_MEMO_CAP,
+                &crate::telemetry::CACHE_MANGADEX_AT_HOME,
+            ),
             limiter: TokenBucket::new(rate_per_sec),
             athome_limiter: TokenBucket::new(athome_per_min / 60.0),
         }

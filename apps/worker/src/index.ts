@@ -3,7 +3,7 @@
  *
  * The web build can't cross-origin-fetch arbitrary source CDNs (CORS), so this
  * Worker fetches image bytes server-side and re-serves them with permissive
- * CORS + long cache headers. Popular images stay hot in Cloudflare's edge cache
+ * CORS + bounded cache headers. Popular images stay hot in Cloudflare's edge cache
  * (caches.default); there is no object-storage tier — the Worker is a pure
  * proxy backed by the edge cache.
  *
@@ -28,7 +28,7 @@ interface Env {
 	IMG_RATE_LIMITER: RateLimit;
 }
 
-const IMMUTABLE_CACHE = 'public, max-age=604800, immutable';
+const IMAGE_CACHE = 'public, max-age=300, must-revalidate';
 // Image size ceiling, mirroring the native reference (`MAX_IMAGE_BYTES`,
 // src-tauri/src/lib.rs). Enforced both from the upstream Content-Length (fail
 // fast) and while streaming (in case the length is absent or lies).
@@ -100,7 +100,7 @@ export default {
 		// Key on the normalized upstream URL so /img?src=X and any hotlink query
 		// noise share one edge entry.
 		const cacheKey = new Request(
-			`${url.origin}/img?src=${encodeURIComponent(upstream.toString())}`,
+			`${url.origin}/img?src=${encodeURIComponent(upstream.toString())}&validated=1`,
 			{ method: 'GET' },
 		);
 		const edge = caches.default;
@@ -142,7 +142,7 @@ export default {
 
 		// Only ever re-serve actual images. Without this, an upstream `text/html`
 		// (or any non-image) body would be laundered under our trusted origin with
-		// permissive CORS + a 7-day immutable cache (content laundering / cache
+		// permissive CORS + a shared cache (content laundering / cache
 		// poisoning) — see I3. Accept only recognized raster media types.
 		const contentType = originResp.headers.get('Content-Type') ?? '';
 		if (!isImageContentType(contentType)) {
@@ -161,7 +161,16 @@ export default {
 			return errorResponse(502, 'Upstream image too large');
 		}
 
-		const res = finalizeImage(originResp, contentType);
+		let bytes: Uint8Array;
+		try {
+			bytes = await readBoundedImage(originResp);
+		} catch {
+			return errorResponse(502, 'Upstream image is incomplete or too large');
+		}
+		if (!validateImageBody(bytes, contentType)) {
+			return errorResponse(502, 'Upstream image is invalid or incomplete');
+		}
+		const res = finalizeImage(bytes, contentType);
 		ctx.waitUntil(edge.put(cacheKey, res.clone()));
 		return withMethod(res, request.method);
 	},
@@ -224,62 +233,220 @@ function isRedirectStatus(status: number): boolean {
 }
 
 /** Build the response we serve + cache: image bytes, CORS, long cache. */
-function finalizeImage(source: Response, contentType: string | null): Response {
+function finalizeImage(bytes: Uint8Array, contentType: string): Response {
 	const headers = new Headers();
 	headers.set('Content-Type', contentType || 'application/octet-stream');
-	headers.set('Cache-Control', IMMUTABLE_CACHE);
+	headers.set('Cache-Control', IMAGE_CACHE);
 	// Defense in depth against content-sniffing: never let a browser reinterpret
 	// these bytes as anything other than the declared image type, and force an
 	// inline disposition so a mislabeled body can't be treated as a download.
 	headers.set('X-Content-Type-Options', 'nosniff');
 	headers.set('Content-Disposition', 'inline');
 	for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
-	// Do NOT forward the upstream Content-Length: a stale/incorrect length can truncate
-	// or hang the response; let the runtime compute the length for the body we emit.
-	//
-	// Stream the body NATIVELY when the upstream declared a length within the cap. Piping
-	// a large body through a JS TransformStream (`capStream`) runs JS for every chunk, and
-	// that per-byte CPU on a multi-MB image can exceed the Worker's CPU limit and kill the
-	// response mid-stream. Pass a trustworthy length-framed body through untouched; fall
-	// back to the JS byte-cap whenever the length can't be trusted.
-	//
-	// Trust requires ALL of: a present, finite, POSITIVE length (`Number('')` is 0, a JS
-	// footgun, so `> 0` keeps an empty/whitespace header on the capped path); within the
-	// cap (re-checked here so this and the pre-fetch gate share one predicate); and NO
-	// `Transfer-Encoding` — per RFC 7230 chunked framing wins over `Content-Length`, so a
-	// response carrying both is chunked-and-unbounded and must stay capped.
-	const declaredLen = source.headers.get('Content-Length');
-	const len = Number(declaredLen);
-	const trustedLen =
-		declaredLen !== null &&
-		Number.isFinite(len) &&
-		len > 0 &&
-		len <= MAX_IMAGE_BYTES &&
-		source.headers.get('Transfer-Encoding') === null;
-	const raw = source.body as ReadableStream<Uint8Array>;
-	const body = trustedLen ? raw : capStream(raw, MAX_IMAGE_BYTES);
-	return new Response(body, { status: 200, headers });
+	return new Response(bytes, { status: 200, headers });
 }
 
-/**
- * Wrap a body stream so it errors out once it exceeds `max` bytes. Guards the
- * case where the upstream omits (or lies about) Content-Length — mirrors the
- * streamed byte accounting in the native `read_capped`.
- */
-function capStream(body: ReadableStream<Uint8Array>, max: number): ReadableStream<Uint8Array> {
-	let total = 0;
-	return body.pipeThrough(
-		new TransformStream<Uint8Array, Uint8Array>({
-			transform(chunk, controller) {
-				total += chunk.byteLength;
-				if (total > max) {
-					controller.error(new Error('image body exceeds size cap'));
-					return;
+/** Read under the byte cap even when Content-Length is present. No response or
+ * cache entry is published until container completeness has been checked. */
+async function readBoundedImage(source: Response): Promise<Uint8Array> {
+	const reader = source.body!.getReader();
+	const chunks: Uint8Array[] = [];
+	let length = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			length += value.byteLength;
+			if (length > MAX_IMAGE_BYTES) throw new Error('image body exceeds size cap');
+			chunks.push(value);
+		}
+	} catch (error) {
+		await reader.cancel().catch(() => {});
+		throw error;
+	} finally {
+		reader.releaseLock();
+	}
+	const declared = source.headers.get('Content-Length');
+	if (
+		declared !== null &&
+		source.headers.get('Transfer-Encoding') === null &&
+		!source.headers.has('Content-Encoding') &&
+		Number(declared) !== length
+	) {
+		throw new Error('image length mismatch');
+	}
+	const bytes = new Uint8Array(length);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return bytes;
+}
+
+/** Raster container validation, without image decoding or transformations. */
+export function validateImageBody(bytes: Uint8Array, contentType: string): boolean {
+	const type = contentType.split(';', 1)[0].trim().toLowerCase();
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const tag = (at: number, text: string) =>
+		at + text.length <= bytes.length &&
+		[...text].every((char, i) => bytes[at + i] === char.charCodeAt(0));
+	try {
+		if (type === 'image/jpeg') {
+			if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff)
+				return false;
+			let cursor = 2,
+				frame = false,
+				scan = false;
+			while (cursor < bytes.length) {
+				if (bytes[cursor++] !== 0xff) return false;
+				while (bytes[cursor] === 0xff) cursor++;
+				const marker = bytes[cursor++];
+				if (marker === 0xd9) return frame && scan;
+				if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+				const length = view.getUint16(cursor);
+				if (length < 2 || cursor + length > bytes.length) return false;
+				if (
+					[0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(
+						marker,
+					)
+				) {
+					if (length < 8 || view.getUint16(cursor + 3) === 0 || view.getUint16(cursor + 5) === 0)
+						return false;
+					frame = true;
 				}
-				controller.enqueue(chunk);
-			},
-		}),
-	);
+				cursor += length;
+				if (marker === 0xda) {
+					scan = true;
+					while (cursor < bytes.length) {
+						if (bytes[cursor] !== 0xff) {
+							cursor++;
+							continue;
+						}
+						if (
+							bytes[cursor + 1] === 0 ||
+							(bytes[cursor + 1] >= 0xd0 && bytes[cursor + 1] <= 0xd7)
+						) {
+							cursor += 2;
+							continue;
+						}
+						break;
+					}
+				}
+			}
+			return false;
+		}
+		if (type === 'image/png') {
+			if (![137, 80, 78, 71, 13, 10, 26, 10].every((n, i) => bytes[i] === n)) return false;
+			let cursor = 8,
+				data = false;
+			while (cursor + 12 <= bytes.length) {
+				const length = view.getUint32(cursor);
+				if (cursor + length + 12 > bytes.length) return false;
+				if (
+					cursor === 8 &&
+					(!tag(cursor + 4, 'IHDR') ||
+						length !== 13 ||
+						view.getUint32(cursor + 8) === 0 ||
+						view.getUint32(cursor + 12) === 0)
+				)
+					return false;
+				if (tag(cursor + 4, 'IDAT')) data = true;
+				if (tag(cursor + 4, 'IEND')) return length === 0 && data;
+				cursor += length + 12;
+			}
+			return false;
+		}
+		if (type === 'image/webp') {
+			if (!tag(0, 'RIFF') || !tag(8, 'WEBP')) return false;
+			const end = view.getUint32(4, true) + 8;
+			if (end > bytes.length) return false;
+			let cursor = 12,
+				data = false;
+			while (cursor + 8 <= end) {
+				const length = view.getUint32(cursor + 4, true);
+				data ||= ['VP8 ', 'VP8L', 'ANMF'].some((kind) => tag(cursor, kind));
+				cursor += 8 + length + (length & 1);
+				if (cursor > end) return false;
+			}
+			return cursor === end && data;
+		}
+		if (type === 'image/gif') {
+			if (
+				(!tag(0, 'GIF87a') && !tag(0, 'GIF89a')) ||
+				bytes.length < 13 ||
+				view.getUint16(6, true) === 0 ||
+				view.getUint16(8, true) === 0
+			)
+				return false;
+			const table = (packed: number) => (packed & 128 ? 3 * (2 << (packed & 7)) : 0);
+			let cursor = 13 + table(bytes[10]),
+				image = false;
+			while (cursor < bytes.length) {
+				const kind = bytes[cursor++];
+				if (kind === 0x3b) return image;
+				if (kind === 0x21) cursor++;
+				else if (kind === 0x2c) {
+					if (cursor + 9 > bytes.length) return false;
+					cursor += 9 + table(bytes[cursor + 8]) + 1;
+					image = true;
+				} else return false;
+				while (cursor < bytes.length) {
+					const length = bytes[cursor++];
+					cursor += length;
+					if (length === 0) break;
+				}
+				if (cursor > bytes.length) return false;
+			}
+			return false;
+		}
+		if (type === 'image/avif') {
+			if (!tag(4, 'ftyp')) return false;
+			const first = view.getUint32(0);
+			if (first < 16 || first > bytes.length) return false;
+			let brand = tag(8, 'avif') || tag(8, 'avis');
+			for (let at = 16; at + 4 <= first; at += 4) brand ||= tag(at, 'avif') || tag(at, 'avis');
+			if (!brand) return false;
+			let cursor = 0,
+				meta = false;
+			while (cursor + 8 <= bytes.length) {
+				let size = view.getUint32(cursor),
+					header = 8;
+				if (size === 1) {
+					size = Number(view.getBigUint64(cursor + 8));
+					header = 16;
+				}
+				if (size === 0) size = bytes.length - cursor;
+				if (!Number.isSafeInteger(size) || size < header || cursor + size > bytes.length)
+					return false;
+				meta ||= tag(cursor + 4, 'meta');
+				cursor += size;
+			}
+			return cursor === bytes.length && meta;
+		}
+		if (type === 'image/bmp') {
+			if (!tag(0, 'BM') || bytes.length < 26) return false;
+			const length = view.getUint32(2, true),
+				pixels = view.getUint32(10, true);
+			return length <= bytes.length && pixels >= 14 && pixels < length;
+		}
+		if (type === 'image/x-icon' || type === 'image/vnd.microsoft.icon') {
+			if (bytes.length < 6 || view.getUint16(0, true) !== 0 || view.getUint16(2, true) !== 1)
+				return false;
+			const count = view.getUint16(4, true),
+				end = 6 + count * 16;
+			if (count === 0 || end > bytes.length) return false;
+			for (let entry = 6; entry < end; entry += 16) {
+				const length = view.getUint32(entry + 8, true),
+					offset = view.getUint32(entry + 12, true);
+				if (length === 0 || offset < end || offset + length > bytes.length) return false;
+			}
+			return true;
+		}
+	} catch {
+		return false;
+	}
+	return false;
 }
 
 /** HEAD requests get headers only. */
@@ -293,7 +460,11 @@ function withMethod(res: Response, method: string): Response {
 function errorResponse(status: number, message: string): Response {
 	return new Response(message, {
 		status,
-		headers: { 'Content-Type': 'text/plain; charset=utf-8', ...CORS_HEADERS },
+		headers: {
+			'Content-Type': 'text/plain; charset=utf-8',
+			'Cache-Control': 'no-store',
+			...CORS_HEADERS,
+		},
 	});
 }
 

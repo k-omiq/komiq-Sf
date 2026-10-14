@@ -136,4 +136,40 @@ Docker Compose starts the `flaresolverr` container and points Suwayomi at `http:
 
 If you run komiq with the desktop app rather than Docker, you do not need FlareSolverr. The desktop app includes a built-in challenge solver using a hidden web view. Read [Run it on your computer](/self-host/desktop-app) for details.
 
+## Send source requests through Cloudflare WARP
+
+Some source websites block whole ranges of server addresses. This is common on a VPS. The chapter list loads, but the page images fail. FlareSolverr cannot help here, because the site sends a block page, not a challenge. The FlareSolverr log then says `Cloudflare has blocked this request`.
+
+Cloudflare WARP is a free Cloudflare service that sends traffic out through Cloudflare's network. The Compose file has an optional `warp` container that runs WARP as a proxy for the source engine. With it on, the engine's requests to source websites leave through WARP, not through your server's own address.
+
+> [!WARNING]
+> Starting the `warp` container accepts Cloudflare's WARP terms of service and registers a free WARP device for your server. Read the terms before you turn it on.
+
+### Turn on WARP in Docker Compose
+
+1. Open `deploy/selfhost/.env`.
+2. Turn on the profile and the proxy:
+   ```sh
+   COMPOSE_PROFILES=warp
+   WARP_ENABLED=true
+   ```
+   To run FlareSolverr as well, list both profiles: `COMPOSE_PROFILES=flaresolverr,warp`.
+3. Build and start the stack:
+   ```sh
+   docker compose up -d --build
+   ```
+
+The first start builds the `warp` image and registers the device. The registration is kept in the `warp-data` volume, so a restart reuses it. Run `docker compose ps warp` to check: the container shows as healthy once WARP is connected.
+
+Things to know before you turn it on:
+
+- WARP carries every request the engine makes to a source, not only the blocked one. A site that works from your own address may treat WARP differently. Check **Sources › Health** after the change.
+- Requests from the engine to FlareSolverr stay on the local Docker network.
+- komiq's own MangaDex connection is made by the server, not the engine, so WARP does not change it.
+- If the `warp` container stops, the engine's source requests fail until it runs again.
+- The container needs the `NET_ADMIN` capability to connect. The Compose file sets it.
+- WARP is part of the Docker setup only. The desktop app does not use it.
+
+To turn it off, set `WARP_ENABLED=false`, remove `warp` from `COMPOSE_PROFILES`, and run `docker compose up -d`. Then stop the old container with `docker compose stop warp`.
+
 Next: [Connect your devices](/self-host/other-devices).
