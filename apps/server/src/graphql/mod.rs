@@ -2925,6 +2925,36 @@ async fn updates_total(
     Ok(total)
 }
 
+fn feed_series_count_key(show_nsfw: bool, type_word: Option<&str>, blocks: &str) -> String {
+    format!(
+        "feed:v1|{}|{}|{blocks}",
+        if show_nsfw { '1' } else { '0' },
+        type_word.unwrap_or("-"),
+    )
+}
+
+async fn feed_series_total(
+    pool: &Database,
+    count_sql: &str,
+    type_word: Option<&str>,
+    show_nsfw: bool,
+    blocks: &str,
+    ttl: std::time::Duration,
+) -> Result<i64, sqlx::Error> {
+    let generation = crate::browse::cache_generation();
+    let key = feed_series_count_key(show_nsfw, type_word, blocks);
+    if let Some(total) = crate::browse::cached_count_with(&key, ttl) {
+        return Ok(total);
+    }
+    let mut q = crate::db_types::query_scalar::<i64>(count_sql);
+    if let Some(w) = type_word {
+        q = q.bind(w);
+    }
+    let total: i64 = q.fetch_one(pool).await?;
+    crate::browse::store_count_with_generation(key, total, ttl, generation);
+    Ok(total)
+}
+
 /// The aggregate bucket key for a chapter number (matches `group_aggregated_chapters`
 /// and the `chapter_override.chapter_key` column).
 ///
@@ -5568,16 +5598,18 @@ impl QueryRoot {
             .fetch_all(&st.pool)
             .await
             .map_err(gql_read_err)?;
-        // Counts exactly the row set the page query walks — same WHERE, so a filtered
-        // feed reports its own total and the pager's "showing 41-60 of N" is honest.
-        // Index-only on all four shapes (`… USING COVERING INDEX …`), 0.15-3.5 ms warm,
-        // so it is NOT memoized the way `series_cache`'s catalogue count had to be.
+        // Memoized: on PostgreSQL this COUNT is a ~22 ms scan per call, not index-only.
         let count_sql = format!("SELECT COUNT(*) FROM feed_series_updates {where_sql}");
-        let mut cq = crate::db_types::query_scalar::<i64>(&count_sql);
-        if let Some(w) = type_word {
-            cq = cq.bind(w);
-        }
-        let total: i64 = cq.fetch_one(&st.pool).await.map_err(gql_read_err)?;
+        let total = feed_series_total(
+            &st.pool,
+            &count_sql,
+            type_word,
+            show_nsfw,
+            &blocks.lists.key(),
+            crate::browse::COUNT_TTL,
+        )
+        .await
+        .map_err(gql_err)?;
 
         // The card's star: the work's aggregate rating, resolved for the <=20 rows of this
         // page in TWO batched queries (never one per row), both keyed by the row's WORK id.
@@ -19686,6 +19718,184 @@ mod tests {
         // Leave nothing behind: the memo is a process-wide static and every other test in
         // this binary shares it.
         crate::browse::clear_count_cache();
+    }
+
+    #[tokio::test]
+    async fn feed_series_total_is_keyed_by_audience_type_and_cleared_by_rebuild() {
+        let (_s, pool) = setup_full(101).await;
+        let work_sfw = crate::catalog::create_work(
+            &pool,
+            &crate::catalog::WorkInput {
+                primary_title: Some("Safe manga".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let work_nsfw = crate::catalog::create_work(
+            &pool,
+            &crate::catalog::WorkInput {
+                primary_title: Some("Adult manhwa".into()),
+                is_nsfw: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO feed_series_updates \
+               (work_id, reader_id, title, comic_type, released_at, is_nsfw) \
+             VALUES ($1, $1, 'Safe manga', 'MANGA', now(), FALSE)",
+        )
+        .bind(&work_sfw)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO feed_series_updates \
+               (work_id, reader_id, title, comic_type, released_at, is_nsfw) \
+             VALUES ($1, $1, 'Adult manhwa', 'MANHWA', now(), TRUE)",
+        )
+        .bind(&work_nsfw)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ttl = std::time::Duration::from_secs(60);
+        crate::browse::clear_count_cache();
+
+        // SFW-only: 1 row.
+        assert_eq!(
+            feed_series_total(
+                &pool,
+                "SELECT COUNT(*) FROM feed_series_updates WHERE is_nsfw = FALSE",
+                None,
+                false,
+                "",
+                ttl,
+            )
+            .await
+            .unwrap(),
+            1,
+        );
+        // All: 2 rows.
+        assert_eq!(
+            feed_series_total(
+                &pool,
+                "SELECT COUNT(*) FROM feed_series_updates",
+                None,
+                true,
+                "",
+                ttl,
+            )
+            .await
+            .unwrap(),
+            2,
+        );
+        // Type-filtered (MANGA only, SFW): 1 row.
+        assert_eq!(
+            feed_series_total(
+                &pool,
+                "SELECT COUNT(*) FROM feed_series_updates WHERE is_nsfw = FALSE AND comic_type = $1",
+                Some("MANGA"),
+                false,
+                "",
+                ttl,
+            )
+            .await
+            .unwrap(),
+            1,
+        );
+        // Type-filtered (MANHWA, SFW): 0 (the manhwa is NSFW).
+        assert_eq!(
+            feed_series_total(
+                &pool,
+                "SELECT COUNT(*) FROM feed_series_updates WHERE is_nsfw = FALSE AND comic_type = $1",
+                Some("MANHWA"),
+                false,
+                "",
+                ttl,
+            )
+            .await
+            .unwrap(),
+            0,
+        );
+
+        // Warm hit returns the stale value after data changes.
+        let work_extra = crate::catalog::create_work(
+            &pool,
+            &crate::catalog::WorkInput {
+                primary_title: Some("Extra".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO feed_series_updates \
+               (work_id, reader_id, title, comic_type, released_at, is_nsfw) \
+             VALUES ($1, $1, 'Extra', 'MANGA', now(), FALSE)",
+        )
+        .bind(&work_extra)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            feed_series_total(
+                &pool,
+                "SELECT COUNT(*) FROM feed_series_updates WHERE is_nsfw = FALSE",
+                None,
+                false,
+                "",
+                ttl,
+            )
+            .await
+            .unwrap(),
+            1,
+            "memo must serve stale — that is the whole point",
+        );
+
+        // clear_count_cache invalidates.
+        crate::browse::clear_count_cache();
+        assert_eq!(
+            feed_series_total(
+                &pool,
+                "SELECT COUNT(*) FROM feed_series_updates WHERE is_nsfw = FALSE",
+                None,
+                false,
+                "",
+                ttl,
+            )
+            .await
+            .unwrap(),
+            2,
+            "after clear the memo must re-query",
+        );
+
+        // Keys do not collide across namespace, audience or type.
+        assert_ne!(
+            feed_series_count_key(false, None, ""),
+            feed_series_count_key(true, None, ""),
+        );
+        assert_ne!(
+            feed_series_count_key(false, None, ""),
+            feed_series_count_key(false, Some("MANGA"), ""),
+        );
+        assert_ne!(
+            feed_series_count_key(false, Some("MANGA"), ""),
+            feed_series_count_key(false, Some("MANHWA"), ""),
+        );
+        assert_ne!(
+            feed_series_count_key(false, None, ""),
+            updates_count_key(false, ""),
+            "feed and updates keys must not collide",
+        );
+
+        crate::browse::clear_count_cache();
+        sqlx::query("DELETE FROM feed_series_updates")
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     /// THE F3 GATE'S REMOVAL, on the `updates` RESOLVER (owner-approved 2026-07-31).
