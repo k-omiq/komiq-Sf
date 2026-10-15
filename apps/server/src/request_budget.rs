@@ -65,6 +65,8 @@ impl Class {
 pub(crate) struct RequestBudgets {
     ingress: Arc<Semaphore>,
     local: Arc<Semaphore>,
+    /// Requests that may wait for a `local` permit at once ([`LOCAL_WAITERS`]).
+    local_waiters: Arc<Semaphore>,
     upstream: Arc<Semaphore>,
     cache_waiters: Arc<Semaphore>,
     upstream_clients: Mutex<HashMap<String, Weak<Semaphore>>>,
@@ -74,6 +76,21 @@ pub(crate) struct RequestBudgets {
     /// Admission telemetry: the process global in production; a test may own one.
     stats: &'static AdmissionStats,
 }
+
+/// Requests that may hold a local permit at once. Not the database pools alone: a
+/// reader waiting on a source holds one too. 64 covers the 16 upstream calls and 16
+/// cache waiters that can be parked on the network plus the default 16 readers and
+/// 8 foreground writers (56). Measured on the test host (2026-10-15): with 24
+/// permits a 500-reader release burst was at most about 10 % faster, while 32
+/// network-bound requests could have taken every permit.
+const LOCAL_PERMITS: usize = 64;
+
+/// Requests that may wait for a local permit at once, and for how long. The same
+/// burst queued about 2,300 requests behind the 64 permits and served all of them,
+/// the slowest series page in 3.7 s. 1,024 places is about what the pools serve
+/// within the wait at the full read mix (about 250 requests a second).
+const LOCAL_WAITERS: usize = 1024;
+const LOCAL_WAIT: Duration = Duration::from_secs(5);
 
 impl Default for RequestBudgets {
     fn default() -> Self {
@@ -85,7 +102,8 @@ impl RequestBudgets {
     fn with_stats(stats: &'static AdmissionStats) -> Self {
         Self {
             ingress: Arc::new(Semaphore::new(64)),
-            local: Arc::new(Semaphore::new(64)),
+            local: Arc::new(Semaphore::new(LOCAL_PERMITS)),
+            local_waiters: Arc::new(Semaphore::new(LOCAL_WAITERS)),
             upstream: Arc::new(Semaphore::new(16)),
             cache_waiters: Arc::new(Semaphore::new(16)),
             upstream_clients: Mutex::new(HashMap::new()),
@@ -109,6 +127,28 @@ impl RequestBudgets {
             Class::Federated => &self.federated,
             Class::Maintenance => &self.maintenance,
         }
+    }
+
+    /// A permit of `class`'s lane. The local lane waits for one, first come first
+    /// served, while fewer than [`LOCAL_WAITERS`] requests wait and for at most
+    /// [`LOCAL_WAIT`]; a burst of readers is queued instead of refused. The admin
+    /// lanes refuse at once.
+    async fn admit(&self, class: Class) -> Option<OwnedSemaphorePermit> {
+        let lane = self.lane(class);
+        if let Ok(permit) = lane.clone().try_acquire_owned() {
+            return Some(permit);
+        }
+        if class.lane() != Lane::Local {
+            return None;
+        }
+        let _waiting = self.local_waiters.clone().try_acquire_owned().ok()?;
+        let started = tokio::time::Instant::now();
+        let permit = tokio::time::timeout(LOCAL_WAIT, lane.clone().acquire_owned())
+            .await
+            .ok()?
+            .ok()?;
+        self.stats.lane(Lane::Local).waited(started.elapsed());
+        Some(permit)
     }
 
     /// The trusted, resolved client identity follows the request's foreground
@@ -190,6 +230,7 @@ impl RequestBudgets {
         for lane in [
             &self.ingress,
             &self.local,
+            &self.local_waiters,
             &self.upstream,
             &self.federated,
             &self.maintenance,
@@ -419,7 +460,7 @@ where
                 .into_response()
             })?;
         drop(ingress);
-        let Ok(permit) = budgets.lane(class).clone().try_acquire_owned() else {
+        let Some(permit) = budgets.admit(class).await else {
             stats.lane(class.lane()).refuse();
             return Err(crate::busy_response());
         };
@@ -983,7 +1024,7 @@ mod tests {
         assert_eq!(classify("invalid", None), Class::Local);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn saturation_is_retryable_and_every_graphql_lane_is_independent() {
         let budgets = Arc::new(RequestBudgets::default());
         let app = router(budgets.clone());
@@ -1397,7 +1438,7 @@ mod tests {
         assert_eq!(permits.available_permits(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn telemetry_names_the_refusing_graphql_lane_and_in_flight_returns_to_zero() {
         let (budgets, stats) = RequestBudgets::with_test_stats();
         let budgets = Arc::new(budgets);
@@ -1434,6 +1475,80 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(stats.lane(Lane::Maintenance).snapshot(), (0, 1, 0, 0));
         assert_eq!(stats.lane(Lane::Local).snapshot(), (1, 1, 0, 1));
+    }
+
+    /// A burst past the local lane's permits is queued, not refused: a waiting
+    /// request takes the next permit that frees and its wait is counted. A request
+    /// that gets no permit within the wait, or finds every waiting place taken, is
+    /// refused as before, and the admin lanes still refuse at once.
+    #[tokio::test(start_paused = true)]
+    async fn local_lane_queues_a_burst_for_a_bounded_wait() {
+        let (budgets, stats) = RequestBudgets::with_test_stats();
+        let budgets = Arc::new(budgets);
+        let app = router(budgets.clone());
+        let lane = stats.lane(Lane::Local);
+        let permits = budgets.local.available_permits() as u32;
+        let mut held = budgets
+            .local
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .unwrap();
+        let waiting = tokio::spawn(app.clone().oneshot(request("{ session { token } }", 0)));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!waiting.is_finished());
+        drop(held.split(1).unwrap());
+        let response = waiting.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // (admitted, refused, in flight, in-flight high water)
+        assert_eq!(lane.snapshot(), (1, 0, 0, 1));
+        assert_eq!(lane.wait_micros(), 2_000_000);
+        held.merge(budgets.local.clone().acquire_owned().await.unwrap());
+
+        let started = tokio::time::Instant::now();
+        let response = app
+            .clone()
+            .oneshot(request("{ session { token } }", 0))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(started.elapsed(), LOCAL_WAIT);
+        assert_eq!(lane.snapshot(), (1, 1, 0, 1));
+
+        let places = budgets.local_waiters.available_permits() as u32;
+        let taken = budgets
+            .local_waiters
+            .clone()
+            .acquire_many_owned(places)
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let response = app
+            .clone()
+            .oneshot(request("{ session { token } }", 0))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(lane.snapshot(), (1, 2, 0, 1));
+        drop(taken);
+
+        let _maintenance = budgets
+            .maintenance
+            .clone()
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let response = app
+            .oneshot(request("mutation { retryCover(workId:\"w\") }", 0))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        drop(held);
+        assert_eq!(budgets.local.available_permits() as u32, permits);
+        assert_eq!(budgets.local_waiters.available_permits() as u32, places);
     }
 
     #[tokio::test]

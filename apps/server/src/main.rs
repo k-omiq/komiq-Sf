@@ -2248,6 +2248,50 @@ fn log_ansi(stdout_is_terminal: bool, no_color: Option<std::ffi::OsString>) -> b
     stdout_is_terminal && no_color.is_none_or(|value| value.is_empty())
 }
 
+/// Highest open-file limit the server asks for. Linux refuses more than `fs.nr_open`
+/// (1,048,576 by default) and macOS more than `OPEN_MAX` (10,240), even when the hard
+/// limit says unlimited.
+#[cfg(unix)]
+const OPEN_FILE_CEILING: u64 = if cfg!(target_os = "macos") {
+    10_240
+} else {
+    1_048_576
+};
+
+/// The open-file soft limit to set, when it should rise: the hard limit, capped at
+/// `ceiling`. `None` is unlimited.
+#[cfg(unix)]
+fn open_file_target(current: Option<u64>, maximum: Option<u64>, ceiling: u64) -> Option<u64> {
+    let target = maximum.map_or(ceiling, |maximum| maximum.min(ceiling));
+    current.filter(|current| *current < target).map(|_| target)
+}
+
+/// Every connection is an open file, and Docker's default soft limit is 1,024. A
+/// 1,000-reader burst on the test host (2026-10-15) held all 1,024 for three minutes:
+/// the server stopped accepting and 858 requests timed out in the listen queue. Raise
+/// the soft limit to the hard limit, as Go does at start.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+    let limit = getrlimit(Resource::Nofile);
+    let Some(target) = open_file_target(limit.current, limit.maximum, OPEN_FILE_CEILING) else {
+        return;
+    };
+    let raised = Rlimit {
+        current: Some(target),
+        maximum: limit.maximum,
+    };
+    match setrlimit(Resource::Nofile, raised) {
+        Ok(()) => tracing::info!(from = ?limit.current, to = target, "open-file limit raised"),
+        Err(error) => {
+            tracing::warn!(%error, current = ?limit.current, "could not raise the open-file limit")
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_open_file_limit() {}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -2275,6 +2319,7 @@ async fn main() -> anyhow::Result<()> {
             .with_ansi(ansi)
             .init();
     }
+    raise_open_file_limit();
 
     let cfg = Config::from_env();
 
@@ -3305,6 +3350,26 @@ mod tests {
         assert!(!log_ansi(true, Some("1".into())));
         assert!(!log_ansi(false, None));
         assert!(!log_ansi(false, Some("1".into())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_file_limit_rises_to_the_hard_limit_under_the_ceiling() {
+        assert_eq!(
+            open_file_target(Some(1_024), Some(524_288), 1_048_576),
+            Some(524_288)
+        );
+        assert_eq!(open_file_target(Some(1_024), None, 10_240), Some(10_240));
+        assert_eq!(
+            open_file_target(Some(256), Some(2_000_000), 1_048_576),
+            Some(1_048_576)
+        );
+        assert_eq!(
+            open_file_target(Some(524_288), Some(524_288), 1_048_576),
+            None
+        );
+        assert_eq!(open_file_target(Some(65_536), Some(1_024), 1_048_576), None);
+        assert_eq!(open_file_target(None, None, 1_048_576), None);
     }
 
     #[tokio::test]

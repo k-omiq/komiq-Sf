@@ -65,6 +65,10 @@ base64 = "0.22"
 # from the terminal without echoing them.
 rpassword = "7"
 
+# `process`: the server raises its open-file soft limit at start (`raise_open_file_limit`).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
 [profile.release]
 opt-level = 3
 lto = true

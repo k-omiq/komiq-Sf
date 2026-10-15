@@ -122,7 +122,7 @@ impl Lane {
     fn waits(self) -> bool {
         matches!(
             self,
-            Lane::CacheWaiters | Lane::PageFetch | Lane::ProxyFetch
+            Lane::Local | Lane::CacheWaiters | Lane::PageFetch | Lane::ProxyFetch
         )
     }
 }

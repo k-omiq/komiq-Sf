@@ -1361,6 +1361,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rpassword",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
