@@ -1236,7 +1236,7 @@ async fn scan_due(state: &AppState, series_id: &str, now: DateTime<Utc>) -> anyh
              so this scan proves nothing about new chapters"
         ));
     }
-    let found = match persist_scan(state, &m, &chapters, &admin, now).await {
+    let found = match persist_scan(&state.pool, &m, &chapters, &admin, now).await {
         Ok(v) => v,
         Err(e) => {
             // A LOCAL write-lock failure is not an upstream failure. Routing it into
@@ -1537,7 +1537,7 @@ pub async fn scan_series(
              so this scan proves nothing about new chapters"
         ));
     }
-    persist_scan(state, m, &chapters, &admin, now).await
+    persist_scan(&state.pool, m, &chapters, &admin, now).await
 }
 
 /// The format Phase E tiers this series on, resolved from the MATERIALIZED `comic_type`
@@ -1592,7 +1592,7 @@ async fn scan_comic_type(pool: &Database, series_id: &str) -> ComicType {
 /// chapters + schedule the next scan (`record_scan`). Cache writes are best-effort — a
 /// cache hiccup must never fail the scan. Shared by `scan_series` and `scan_due`.
 async fn persist_scan(
-    state: &AppState,
+    pool: &Database,
     m: &SuwayomiManga,
     chapters: &[SuwayomiChapter],
     admin: &ScanAdmin,
@@ -1600,12 +1600,12 @@ async fn persist_scan(
 ) -> anyhow::Result<bool> {
     let series_id = m.id.to_string();
     if let Err(e) =
-        crate::db::retry_transaction(|| crate::series_cache::put_series(&state.pool, m)).await
+        crate::db::retry_transaction(|| crate::series_cache::put_series(pool, m)).await
     {
         let e = crate::db::observed_database_error(e);
         tracing::warn!(series_id, error = %e, "scan: series cache write failed");
     }
-    if let Err(e) = crate::series_cache::put_chapters(&state.pool, m.id, chapters).await {
+    if let Err(e) = crate::series_cache::put_chapters(pool, m.id, chapters).await {
         let e = crate::db::observed_database_error(e);
         tracing::warn!(series_id, error = %e, "scan: chapter cache write failed");
     }
@@ -1614,9 +1614,9 @@ async fn persist_scan(
     // default `resolve_comic_type` lands on. Passing `Some` also switches this scan onto the
     // policy path (tier target + `awaiting` off), which is what makes it cheaper than the
     // legacy flat-12h cadence.
-    let comic_type = scan_comic_type(&state.pool, &series_id).await;
+    let comic_type = scan_comic_type(pool, &series_id).await;
     let new_found = record_scan_policy(
-        &state.pool,
+        pool,
         &series_id,
         &m.title,
         admin,
@@ -1629,8 +1629,21 @@ async fn persist_scan(
     // `suwayomi_series.latest_chapter_at` (by `put_chapters`, above) and
     // `series_scan_state.last_new_chapter_at` (by `record_scan`) — so fold the
     // detection straight into the feed instead of waiting for the next rebuild.
-    touch_feed_series_update(&state.pool, &series_id, new_found).await;
+    touch_feed_series_update(pool, &series_id, new_found).await;
     Ok(new_found)
+}
+
+/// The scan write path for the WAL drill (`bench/wal_drill.rs`): a fetched manga and
+/// chapter list, persisted exactly as a scan persists them.
+#[cfg(test)]
+pub(crate) async fn persist_scan_for_drill(
+    pool: &Database,
+    m: &SuwayomiManga,
+    chapters: &[SuwayomiChapter],
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let admin = scan_admin(pool, &m.id.to_string()).await;
+    persist_scan(pool, m, chapters, &admin, now).await
 }
 
 /// Incrementally refresh ONE series' row in the materialized merged Updates feed
@@ -2071,31 +2084,28 @@ async fn fill_feed_en_chapter_count_on(
     let scope = "work_id IN (SELECT work_id FROM source_series \
                              WHERE source_type = 'suwayomi' AND source_key = $1)";
     // The English mirror count. `COALESCE(…, 0)` and not a `WHERE EXISTS` guard: a work whose
-    // English chapters were all UNLINKED must fall back to 0 and then to the Suwayomi count
-    // below, exactly as a full rebuild would compute it from scratch.
+    // English chapters were all UNLINKED must fall back to 0 and then to the Suwayomi count,
+    // exactly as a full rebuild would compute it from scratch. The Suwayomi count may only
+    // ever RAISE a zero. One statement that writes a row only when its count changes
+    // (WAL item 6).
     sqlx::query(&format!(
-        "UPDATE feed_series_updates SET en_chapter_count = COALESCE( \
-             (SELECT COUNT(DISTINCT c.number) FROM chapter c \
-                JOIN source_series ss ON ss.id = c.source_series_id \
-               WHERE ss.work_id = feed_series_updates.work_id \
-                 AND ss.source_type = 'mangadex' AND c.lang = 'en'), 0) \
-         WHERE {scope}"
-    ))
-    .bind(series_id)
-    .execute(&mut *pool)
-    .await?;
-    // Then the Suwayomi fallback, which may only ever RAISE a zero.
-    sqlx::query(&format!(
-        "UPDATE feed_series_updates SET en_chapter_count = \
-             (SELECT MAX(sy.chapter_count) FROM source_series ss \
-                JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
-               WHERE ss.work_id = feed_series_updates.work_id \
-                 AND ss.source_type = 'suwayomi') \
-         WHERE {scope} AND en_chapter_count = 0 \
-           AND COALESCE((SELECT MAX(sy.chapter_count) FROM source_series ss \
-                           JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
-                          WHERE ss.work_id = feed_series_updates.work_id \
-                            AND ss.source_type = 'suwayomi'), 0) > 0"
+        "WITH counted AS ( \
+           SELECT f.work_id, \
+                  COALESCE((SELECT COUNT(DISTINCT c.number) FROM chapter c \
+                              JOIN source_series ss ON ss.id = c.source_series_id \
+                             WHERE ss.work_id = f.work_id \
+                               AND ss.source_type = 'mangadex' AND c.lang = 'en'), 0) AS mirror, \
+                  (SELECT MAX(sy.chapter_count) FROM source_series ss \
+                     JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
+                    WHERE ss.work_id = f.work_id AND ss.source_type = 'suwayomi') AS suwayomi \
+             FROM feed_series_updates f WHERE f.{scope}), \
+         target AS ( \
+           SELECT work_id, CASE WHEN mirror = 0 AND COALESCE(suwayomi, 0) > 0 \
+                                THEN suwayomi ELSE mirror END AS n \
+             FROM counted) \
+         UPDATE feed_series_updates SET en_chapter_count = target.n FROM target \
+          WHERE target.work_id = feed_series_updates.work_id \
+            AND feed_series_updates.en_chapter_count IS DISTINCT FROM target.n"
     ))
     .bind(series_id)
     .execute(&mut *pool)
@@ -2524,6 +2534,9 @@ async fn record_scan_with_admin_once(
         );
     }
 
+    // The schedule columns move on every scan. An unchanged `known_chapter_ids` keeps the
+    // stored value itself (WAL item 6): a long list lives out of line (TOAST), and
+    // assigning the old value reuses it instead of writing a new copy.
     sqlx::query(
         "INSERT INTO series_scan_state \
            (series_id, avg_interval_hours, known_chapter_count, known_max_chapter, \
@@ -2539,7 +2552,9 @@ async fn record_scan_with_admin_once(
            next_scan_at = excluded.next_scan_at, \
            last_new_chapter_at = excluded.last_new_chapter_at, \
            awaiting_since = excluded.awaiting_since, \
-           known_chapter_ids = excluded.known_chapter_ids, \
+           known_chapter_ids = CASE \
+             WHEN series_scan_state.known_chapter_ids IS NOT DISTINCT FROM excluded.known_chapter_ids \
+             THEN series_scan_state.known_chapter_ids ELSE excluded.known_chapter_ids END, \
            consecutive_failures = 0, \
            last_failure_kind = NULL, \
            last_failure_at = NULL, \

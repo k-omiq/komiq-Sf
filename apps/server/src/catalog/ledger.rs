@@ -1124,6 +1124,37 @@ mod tests {
         assert_eq!(before, ms("2026-06-01T00:00:00Z"));
         assert_eq!(label.as_deref(), Some("10"), "the NUMBER, never a count");
 
+        // A repeat projection and count fill change nothing, so they write no row version
+        // (WAL item 6), and they still report every feed row they cover.
+        let version = || async {
+            crate::db_types::query_scalar::<String>(
+                "SELECT xmin::text FROM feed_series_updates WHERE work_id = $1",
+            )
+            .bind(&work)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let mut conn = pool.write().acquire().await.unwrap();
+        crate::catalog::fill_en_chapter_count(&mut conn, Some(&work))
+            .await
+            .unwrap();
+        let settled = version().await;
+        assert_eq!(
+            crate::catalog::project_feed_from_ledger(&mut conn, Some(&work))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::catalog::fill_en_chapter_count(&mut conn, Some(&work))
+                .await
+                .unwrap(),
+            1
+        );
+        drop(conn);
+        assert_eq!(version().await, settled);
+
         // A WEEK LATER, MangaDex mirrors the very same chapter 10.
         crate::catalog::upsert_chapter(
             &pool,

@@ -1556,23 +1556,29 @@ async fn project_feed_from_ledger_on(
     } else {
         ""
     };
+    // Writes a row only when its date or label changes (WAL item 6). The return value is
+    // still every feed row the ledger dates, changed or not.
     let sql = format!(
-        "UPDATE feed_series_updates SET \
-             released_at = led.newest, \
-             latest_chapter = led.label \
-           FROM (SELECT DISTINCT ON (re.work_id) re.work_id AS work_id, \
-                        re.first_seen_at AS newest, \
-                        re.label AS label \
-                   FROM release_event re \
-                  WHERE 1 = 1 {scope} \
-                  ORDER BY re.work_id, re.first_seen_at DESC, re.chapter_key ASC) AS led \
-          WHERE led.work_id = feed_series_updates.work_id"
+        "WITH led AS ( \
+           SELECT DISTINCT ON (re.work_id) re.work_id AS work_id, \
+                  re.first_seen_at AS newest, \
+                  re.label AS label \
+             FROM release_event re \
+            WHERE 1 = 1 {scope} \
+            ORDER BY re.work_id, re.first_seen_at DESC, re.chapter_key ASC), \
+         changed AS ( \
+           UPDATE feed_series_updates SET released_at = led.newest, latest_chapter = led.label \
+             FROM led \
+            WHERE led.work_id = feed_series_updates.work_id \
+              AND (feed_series_updates.released_at, feed_series_updates.latest_chapter) \
+                  IS DISTINCT FROM (led.newest, led.label)) \
+         SELECT COUNT(*) FROM led JOIN feed_series_updates f ON f.work_id = led.work_id"
     );
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query_scalar::<_, i64>(&sql);
     if let Some(w) = work_id {
         q = q.bind(w);
     }
-    let n = q.execute(&mut *tx).await?.rows_affected();
+    let n = q.fetch_one(&mut *tx).await? as u64;
 
     // THE SORT KEY (migration 0099), as a SECOND statement rather than a second column on
     // the one above. Not a style choice: the statement above owes its correctness to
@@ -1605,7 +1611,8 @@ async fn project_feed_from_ledger_on(
                   WHERE re.work_id IN (SELECT work_id FROM release_event \
                                         WHERE announce_at IS NOT NULL) {scope} \
                   GROUP BY re.work_id) AS led \
-          WHERE led.work_id = feed_series_updates.work_id"
+          WHERE led.work_id = feed_series_updates.work_id \
+            AND feed_series_updates.announced_at IS DISTINCT FROM led.announced"
     );
     let mut aq = sqlx::query(&announce_sql);
     if let Some(w) = work_id {
@@ -2743,45 +2750,40 @@ async fn fill_comic_types(
 /// work with no English chapter UNTOUCHED, which in a rebuild means the column's
 /// `NOT NULL DEFAULT 0` on the row just inserted, and in a work-scoped call would mean
 /// whatever the row already held. Stating the 0 is what makes the two agree.
-async fn fill_en_chapter_count(
+pub(crate) async fn fill_en_chapter_count(
     conn: &mut sqlx::PgConnection,
     work_id: Option<&str>,
 ) -> Result<u64> {
     let scope = if work_id.is_some() {
-        "AND feed_series_updates.work_id = $1"
+        "AND f.work_id = $1"
     } else {
         ""
     };
+    // The English mirror count, raised to the largest Suwayomi count when that is
+    // higher. One statement that writes a row only when its count changes (WAL item 6);
+    // the return value stays the number of feed rows in scope.
     let sql = format!(
-        "UPDATE feed_series_updates SET en_chapter_count = COALESCE( \
-             (SELECT COUNT(DISTINCT c.number) FROM chapter c \
-                JOIN source_series ss ON ss.id = c.source_series_id \
-               WHERE ss.work_id = feed_series_updates.work_id \
-                 AND ss.source_type = 'mangadex' AND c.lang = 'en'), 0) \
-         WHERE 1 = 1 {scope}"
+        "WITH counted AS ( \
+           SELECT f.work_id, GREATEST( \
+               COALESCE((SELECT COUNT(DISTINCT c.number) FROM chapter c \
+                           JOIN source_series ss ON ss.id = c.source_series_id \
+                          WHERE ss.work_id = f.work_id \
+                            AND ss.source_type = 'mangadex' AND c.lang = 'en'), 0), \
+               (SELECT MAX(sy.chapter_count) FROM source_series ss \
+                  JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
+                 WHERE ss.work_id = f.work_id AND ss.source_type = 'suwayomi')) AS n \
+             FROM feed_series_updates f WHERE 1 = 1 {scope}), \
+         changed AS ( \
+           UPDATE feed_series_updates SET en_chapter_count = counted.n FROM counted \
+            WHERE counted.work_id = feed_series_updates.work_id \
+              AND feed_series_updates.en_chapter_count IS DISTINCT FROM counted.n) \
+         SELECT COUNT(*) FROM counted"
     );
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query_scalar::<_, i64>(&sql);
     if let Some(w) = work_id {
         q = q.bind(w);
     }
-    let counted = q.execute(&mut *conn).await?.rows_affected();
-
-    let sql2 = format!(
-        "UPDATE feed_series_updates SET en_chapter_count = sw.n \
-             FROM (SELECT ss.work_id AS work_id, MAX(sy.chapter_count) AS n \
-                     FROM source_series ss \
-                     JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
-                    WHERE ss.source_type = 'suwayomi' \
-                    GROUP BY ss.work_id) AS sw \
-            WHERE sw.work_id = feed_series_updates.work_id \
-              AND sw.n > feed_series_updates.en_chapter_count {scope}"
-    );
-    let mut q = sqlx::query(&sql2);
-    if let Some(w) = work_id {
-        q = q.bind(w);
-    }
-    q.execute(&mut *conn).await?;
-    Ok(counted)
+    Ok(q.fetch_one(&mut *conn).await? as u64)
 }
 
 /// Maintain the search row inside the transaction that updates its work/source/browse
@@ -3358,7 +3360,13 @@ pub async fn upsert_work_from_mangadex_on(
     // `metadata_synced_at` is stamped on every MangaDex upsert (H1): it marks that
     // this work's all-language metadata was ATTEMPTED, so the backfill advances
     // past works whose upstream record carries no localized description.
-    sqlx::query(
+    //
+    // The full update runs only when a stored value would change (WAL item 6); otherwise
+    // only the two stamps move, below, which leaves the description and the pin triggers
+    // alone. A pinned field is unchanged when the column holds the pin and the incoming
+    // value is the pin or its recorded `source_value`: the trigger would then only
+    // rewrite that same source value and restore the pin.
+    let written = sqlx::query(
         "INSERT INTO work \
            (id, primary_title, primary_lang, description, year, original_language, status, \
             demographic, content_rating, is_nsfw, author, artist, cover_phash, cover_file_name, created_at, updated_at, metadata_synced_at) \
@@ -3371,7 +3379,27 @@ pub async fn upsert_work_from_mangadex_on(
            is_nsfw = excluded.is_nsfw, author = excluded.author, artist = excluded.artist, \
            cover_phash = COALESCE(excluded.cover_phash, work.cover_phash), \
            cover_file_name = COALESCE(excluded.cover_file_name, work.cover_file_name), \
-           updated_at = excluded.updated_at, metadata_synced_at = excluded.metadata_synced_at",
+           updated_at = excluded.updated_at, metadata_synced_at = excluded.metadata_synced_at \
+         WHERE (work.primary_title, work.primary_lang, work.description, work.is_nsfw, \
+               work.cover_phash, work.cover_file_name) IS DISTINCT FROM \
+              (excluded.primary_title, excluded.primary_lang, excluded.description, \
+               excluded.is_nsfw, COALESCE(excluded.cover_phash, work.cover_phash), \
+               COALESCE(excluded.cover_file_name, work.cover_file_name)) \
+           OR EXISTS (SELECT 1 FROM (VALUES \
+                ('year', work.year::text, excluded.year::text), \
+                ('original_language', work.original_language, excluded.original_language), \
+                ('status', work.status, excluded.status), \
+                ('demographic', work.demographic, excluded.demographic), \
+                ('content_rating', work.content_rating, excluded.content_rating), \
+                ('author', work.author, excluded.author), \
+                ('artist', work.artist, excluded.artist)) AS f(field, stored, incoming) \
+              LEFT JOIN work_field_pin p ON p.work_id = work.id AND p.field = f.field \
+              CROSS JOIN LATERAL (SELECT CASE WHEN f.field = 'year' \
+                  THEN public.sqlite_integer_pin(p.value)::text ELSE p.value END AS pinned) v \
+              WHERE CASE WHEN p.field IS NULL THEN f.stored IS DISTINCT FROM f.incoming \
+                    ELSE f.stored IS DISTINCT FROM v.pinned \
+                      OR (f.incoming IS DISTINCT FROM v.pinned \
+                          AND f.incoming IS DISTINCT FROM p.source_value) END)",
     )
     .bind(&work_id)
     .bind(&input.primary_title)
@@ -3391,7 +3419,15 @@ pub async fn upsert_work_from_mangadex_on(
     .bind(crate::db_types::date(&now)?)
     .bind(crate::db_types::date(&now)?) // metadata_synced_at
     .execute(&mut **tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if written == 0 {
+        sqlx::query("UPDATE work SET updated_at = $1, metadata_synced_at = $1 WHERE id = $2")
+            .bind(crate::db_types::date(&now)?)
+            .bind(&work_id)
+            .execute(&mut **tx)
+            .await?;
+    }
 
     // Ensure the MangaDex external id maps to this work, plus any cross-catalogue ids.
     sqlx::query(
@@ -3635,8 +3671,12 @@ async fn insert_descriptions_and_credits(
         if lang.is_empty() || text.is_empty() {
             continue;
         }
+        // An unchanged row is filtered out before the insert, so it is not even locked
+        // (WAL item 6; the caller holds the work).
         sqlx::query(
-            "INSERT INTO work_description (work_id, lang, description) VALUES ($1, $2, $3) \
+            "INSERT INTO work_description (work_id, lang, description) SELECT $1, $2, $3 \
+             WHERE NOT EXISTS (SELECT 1 FROM work_description \
+                                WHERE work_id = $1 AND lang = $2 AND description = $3) \
              ON CONFLICT(work_id, lang) DO UPDATE SET description = excluded.description",
         )
         .bind(work_id)
@@ -3690,71 +3730,123 @@ async fn insert_descriptions_and_credits(
 /// admin's curated rows survive every re-sync untouched, so "curated wins outright"
 /// stays true (see `work_effective_genres`).
 ///
-/// `INSERT OR IGNORE` rather than a plain INSERT because the primary key is
-/// (work_id, tag): a tag the admin ALSO curated collides. Ignoring keeps the admin's row
-/// — and crucially its `source = 'admin'` — so the work stays on the curated tier
+/// The primary key is (work_id, tag): a tag the admin ALSO curated collides. The admin's
+/// row wins — it keeps its `source = 'admin'`, so the work stays on the curated tier
 /// instead of being quietly demoted to the upstream one.
+///
+/// Written as a diff (WAL item 6): rows no longer upstream are deleted, and only new or
+/// changed rows reach the upsert, so an unchanged row is neither rewritten nor locked. The end state is the one a
+/// delete-all plus reinsert gives: a repeated tag keeps its first position, and its
+/// `tag_id`/`tag_group` come from the last detail of that exact name (none: NULL).
 /// Caller holds the owning work through the complete metadata replacement.
 async fn replace_source_tags(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     work_id: &str,
     tags: &[String],
+    details: &[SourceTag],
 ) -> Result<()> {
-    // Deletes UNCONDITIONALLY rather than early-returning on an empty list. An empty
-    // upstream tag list is a legitimate state, and a work whose tags were all removed
-    // upstream must end up with none here — an early return would keep them forever.
-    sqlx::query("DELETE FROM work_tag WHERE work_id = $1 AND source = 'mangadex'")
-        .bind(work_id)
-        .execute(&mut **tx)
-        .await?;
+    let mut names = Vec::new();
+    let mut ords = Vec::new();
+    let mut keys = Vec::new();
+    let mut ids = Vec::new();
+    let mut groups = Vec::new();
     for (ord, tag) in tags.iter().enumerate() {
         let tag = tag.trim();
-        if tag.is_empty() {
+        if tag.is_empty() || names.iter().any(|n: &String| n == tag) {
             continue;
         }
+        let detail = details.iter().rev().find(|d| d.name == tag);
+        names.push(tag.to_string());
+        ords.push(ord as i64);
         // `tag_key` (migration 0106) at write time, so a freshly ingested tag is filterable
         // without waiting for the rebuild's `tags::fill_tag_keys` safety net.
-        sqlx::query(
-            "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) \
-             VALUES ($1, $2, $3, 'mangadex', $4) ON CONFLICT DO NOTHING",
-        )
-        .bind(work_id)
-        .bind(tag)
-        .bind(ord as i64)
-        .bind(crate::tags::slug(tag))
-        .execute(&mut **tx)
-        .await?;
+        keys.push(crate::tags::slug(tag));
+        ids.push(detail.and_then(|d| d.id.clone()));
+        groups.push(detail.map(|d| d.group.clone()));
     }
+    // Deletes even when the list is empty. An empty upstream tag list is a legitimate
+    // state, and a work whose tags were all removed upstream must end up with none here.
+    sqlx::query(
+        "DELETE FROM work_tag WHERE work_id = $1 AND source = 'mangadex' AND NOT (tag = ANY($2))",
+    )
+    .bind(work_id)
+    .bind(&names)
+    .execute(&mut **tx)
+    .await?;
+    if names.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO work_tag (work_id, tag, ord, source, tag_key, tag_id, tag_group) \
+         SELECT $1, t, o, 'mangadex', k, i, g \
+           FROM UNNEST($2::text[], $3::bigint[], $4::text[], $5::text[], $6::text[]) AS u(t, o, k, i, g) \
+          WHERE NOT EXISTS (SELECT 1 FROM work_tag w WHERE w.work_id = $1 AND w.tag = u.t \
+                  AND (w.source <> 'mangadex' \
+                       OR (w.ord, w.tag_key, w.tag_id, w.tag_group) IS NOT DISTINCT FROM (u.o, u.k, u.i, u.g))) \
+         ON CONFLICT (work_id, tag) DO UPDATE SET ord = excluded.ord, tag_key = excluded.tag_key, \
+             tag_id = excluded.tag_id, tag_group = excluded.tag_group \
+         WHERE work_tag.source = 'mangadex'",
+    )
+    .bind(work_id)
+    .bind(&names)
+    .bind(&ords)
+    .bind(&keys)
+    .bind(&ids)
+    .bind(&groups)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
-/// Refresh imported fields without changing admin overrides or historical IDs.
+/// Refresh imported fields without changing admin overrides or historical IDs. Tags and
+/// tracker links write only what changed (WAL item 6); the sync stamp always moves.
 async fn replace_mangadex_details(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     work_id: &str,
     input: &WorkInput,
 ) -> Result<()> {
-    replace_source_tags(tx, work_id, &input.tags).await?;
-    for tag in &input.tag_details {
-        sqlx::query("UPDATE work_tag SET tag_id = $1, tag_group = $2 WHERE work_id = $3 AND tag = $4 AND source = 'mangadex'")
-            .bind(&tag.id).bind(&tag.group).bind(work_id).bind(&tag.name)
-            .execute(&mut **tx).await?;
-    }
-    sqlx::query("DELETE FROM work_tracker_link WHERE work_id = $1")
-        .bind(work_id)
-        .execute(&mut **tx)
-        .await?;
+    replace_source_tags(tx, work_id, &input.tags, &input.tag_details).await?;
+    // One link per provider; the last one listed wins.
+    let mut providers: Vec<&str> = Vec::new();
+    let mut externals: Vec<&str> = Vec::new();
     for (provider, external_id) in input.external_ids.iter().chain(&input.official_links) {
-        if crate::mangadex::tracker_url(provider, external_id).is_some() {
-            sqlx::query("INSERT INTO work_tracker_link (work_id, provider, external_id) VALUES ($1, $2, $3) ON CONFLICT(work_id, provider) DO UPDATE SET external_id = excluded.external_id")
-                .bind(work_id).bind(provider).bind(external_id).execute(&mut **tx).await?;
+        if crate::mangadex::tracker_url(provider, external_id).is_none() {
+            continue;
+        }
+        match providers.iter().position(|p| *p == provider.as_str()) {
+            Some(i) => externals[i] = external_id,
+            None => {
+                providers.push(provider);
+                externals.push(external_id);
+            }
         }
     }
-    sqlx::query("UPDATE work SET mangadex_details_synced_at = $1 WHERE id = $2")
-        .bind(Utc::now())
+    sqlx::query(
+        "DELETE FROM work_tracker_link WHERE work_id = $1 AND NOT (provider = ANY($2))",
+    )
+    .bind(work_id)
+    .bind(&providers)
+    .execute(&mut **tx)
+    .await?;
+    if !providers.is_empty() {
+        sqlx::query(
+            "INSERT INTO work_tracker_link (work_id, provider, external_id) \
+             SELECT $1, p, e FROM UNNEST($2::text[], $3::text[]) AS u(p, e) \
+              WHERE NOT EXISTS (SELECT 1 FROM work_tracker_link l \
+                                 WHERE l.work_id = $1 AND l.provider = u.p AND l.external_id = u.e) \
+             ON CONFLICT(work_id, provider) DO UPDATE SET external_id = excluded.external_id",
+        )
         .bind(work_id)
+        .bind(&providers)
+        .bind(&externals)
         .execute(&mut **tx)
         .await?;
+    }
+    sqlx::query("UPDATE work SET mangadex_details_synced_at = $1 WHERE id = $2")
+    .bind(Utc::now())
+    .bind(work_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -6545,6 +6637,9 @@ pub fn spine_key_and_label(ch: &ChapterInput) -> (String, String) {
 /// clause is precisely the shape that drifts: `chapter_row_unchanged` compares exactly the
 /// columns this `DO UPDATE SET` touches, so one copy gaining a column silently turns the
 /// firehose's skip-if-unchanged check into a lie.
+///
+/// The `WHERE` skips a row whose values are all unchanged (WAL item 6): a rescan of an
+/// unchanged list writes no new row versions. It names the same columns as the `SET`.
 const CHAPTER_UPSERT_SQL: &str = "INSERT INTO chapter \
        (id, source_series_id, external_id, number, volume, lang, title, published_at, \
         readable_at, external_url, scanlator, chapter_key, label, created_at) \
@@ -6554,7 +6649,13 @@ const CHAPTER_UPSERT_SQL: &str = "INSERT INTO chapter \
        title = excluded.title, published_at = excluded.published_at, \
        readable_at = excluded.readable_at, external_url = excluded.external_url, \
        scanlator = excluded.scanlator, chapter_key = excluded.chapter_key, \
-       label = excluded.label";
+       label = excluded.label \
+     WHERE (chapter.number, chapter.volume, chapter.lang, chapter.title, chapter.published_at, \
+            chapter.readable_at, chapter.external_url, chapter.scanlator, chapter.chapter_key, \
+            chapter.label) IS DISTINCT FROM \
+           (excluded.number, excluded.volume, excluded.lang, excluded.title, excluded.published_at, \
+            excluded.readable_at, excluded.external_url, excluded.scanlator, excluded.chapter_key, \
+            excluded.label)";
 
 /// Upsert one mirrored chapter under a source_series (idempotent on external id).
 pub async fn upsert_chapter(
@@ -9927,6 +10028,243 @@ mod tests {
         assert_eq!(read("year").await.as_deref(), Some("2017"));
     }
 
+    /// The row versions of a work's pins, tags, tracker links and descriptions, as
+    /// `table:key=xmin` strings. A write that stores nothing new must leave all of them
+    /// alone (WAL item 6). The `work` row itself always takes its sync stamps.
+    async fn metadata_row_versions(pool: &Database, id: &str) -> Vec<String> {
+        crate::db_types::query_scalar::<String>(
+            "SELECT 'pin:' || field || '=' || xmin::text FROM work_field_pin WHERE work_id = $1 \
+             UNION ALL SELECT 'tag:' || tag || '=' || xmin::text FROM work_tag WHERE work_id = $1 \
+             UNION ALL SELECT 'tracker:' || provider || '=' || xmin::text FROM work_tracker_link WHERE work_id = $1 \
+             UNION ALL SELECT 'description:' || lang || '=' || xmin::text FROM work_description WHERE work_id = $1 \
+             ORDER BY 1",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    fn rich_slime_input() -> WorkInput {
+        WorkInput {
+            author: Some("Fuse".into()),
+            status: Some("ongoing".into()),
+            descriptions: vec![
+                ("en".into(), "Mikami Satoru is reincarnated as a slime.".into()),
+                ("fr".into(), "Satoru Mikami se réincarne en slime.".into()),
+            ],
+            tags: vec!["Isekai".into(), "Fantasy".into(), " Isekai ".into(), "".into()],
+            tag_details: vec![
+                SourceTag { id: Some("t-isekai-old".into()), name: "Isekai".into(), group: "theme".into() },
+                SourceTag { id: Some("t-fantasy".into()), name: "Fantasy".into(), group: "genre".into() },
+                SourceTag { id: Some("t-isekai".into()), name: "Isekai".into(), group: "theme".into() },
+            ],
+            external_ids: vec![("al".into(), "101517".into()), ("mal".into(), "1".into()), ("al".into(), "86399".into())],
+            ..slime_input()
+        }
+    }
+
+    /// A MangaDex upsert or details refresh that brings nothing new writes no row version
+    /// of the work, its pins, tags, tracker links or descriptions; a real change still
+    /// lands, and a pinned field still records a changed source value.
+    #[tokio::test]
+    async fn an_unchanged_mangadex_resync_writes_no_row_versions() {
+        let pool = pool().await;
+        let input = rich_slime_input();
+        let id = upsert_work_from_mangadex(&pool, "md-slime", &input).await.unwrap();
+        let mut conn = pool.write().acquire().await.unwrap();
+        pin_work_field(&mut conn, &id, PinnedField::Author, Some("Pinned Author"))
+            .await
+            .unwrap();
+        pin_work_field(&mut conn, &id, PinnedField::Year, Some("2014"))
+            .await
+            .unwrap();
+        pin_work_field(&mut conn, &id, PinnedField::Status, None)
+            .await
+            .unwrap();
+        drop(conn);
+        // The tag rows a delete-all plus reinsert gives: first position, last detail.
+        let tags = crate::db_types::query_tuple::<(String, i64, Option<String>, Option<String>, Option<String>)>(
+            "SELECT tag, ord, tag_key, tag_id, tag_group FROM work_tag WHERE work_id = $1 ORDER BY ord",
+        )
+        .bind(&id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            tags,
+            [
+                ("Isekai".into(), 0, Some(crate::tags::slug("Isekai")), Some("t-isekai".into()), Some("theme".into())),
+                ("Fantasy".into(), 1, Some(crate::tags::slug("Fantasy")), Some("t-fantasy".into()), Some("genre".into())),
+            ]
+        );
+        let trackers = crate::db_types::query_tuple::<(String, String)>(
+            "SELECT provider, external_id FROM work_tracker_link WHERE work_id = $1 ORDER BY provider",
+        )
+        .bind(&id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(trackers, [("al".into(), "86399".into()), ("mal".into(), "1".into())]);
+
+        let before = metadata_row_versions(&pool, &id).await;
+        let stamps = || async {
+            crate::db_types::query_tuple::<(String, String, String, Option<String>)>(
+                "SELECT updated_at::text, metadata_synced_at::text, \
+                        mangadex_details_synced_at::text, author FROM work WHERE id = $1",
+            )
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let stamped = stamps().await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        upsert_work_from_mangadex(&pool, "md-slime", &input).await.unwrap();
+        refresh_mangadex_details(&pool, &id, &input).await.unwrap();
+        assert_eq!(metadata_row_versions(&pool, &id).await, before, "nothing new, nothing written");
+        let restamped = stamps().await;
+        assert!(
+            restamped.0 > stamped.0 && restamped.1 > stamped.1 && restamped.2 > stamped.2,
+            "the sync stamps still move: {stamped:?} then {restamped:?}"
+        );
+        assert_eq!(restamped.3.as_deref(), Some("Pinned Author"));
+
+        // A column that no longer holds its pin is put back by the next sync, as the
+        // trigger always did, even when the incoming value is the recorded source value.
+        sqlx::query(
+            "UPDATE work_field_pin SET value = 'Pinned Author 2' \
+             WHERE work_id = $1 AND field = 'author'",
+        )
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        upsert_work_from_mangadex(&pool, "md-slime", &input).await.unwrap();
+        let (author, source): (Option<String>, Option<String>) = crate::db_types::query_tuple(
+            "SELECT w.author, p.source_value FROM work w \
+             JOIN work_field_pin p ON p.work_id = w.id AND p.field = 'author' WHERE w.id = $1",
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (author.as_deref(), source.as_deref()),
+            (Some("Pinned Author 2"), Some("Fuse"))
+        );
+        sqlx::query("DELETE FROM work_field_pin WHERE work_id = $1 AND field IN ('year', 'status')")
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut conn = pool.write().acquire().await.unwrap();
+        pin_work_field(&mut conn, &id, PinnedField::Author, Some("Pinned Author"))
+            .await
+            .unwrap();
+        drop(conn);
+
+        // A changed status rewrites the work; the pin holds and keeps the source value.
+        let changed = WorkInput { status: Some("completed".into()), ..input.clone() };
+        upsert_work_from_mangadex(&pool, "md-slime", &changed).await.unwrap();
+        let (status, author, source): (Option<String>, Option<String>, Option<String>) =
+            crate::db_types::query_tuple(
+                "SELECT w.status, w.author, p.source_value FROM work w \
+                 JOIN work_field_pin p ON p.work_id = w.id AND p.field = 'author' WHERE w.id = $1",
+            )
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            (status.as_deref(), author.as_deref(), source.as_deref()),
+            (Some("completed"), Some("Pinned Author"), Some("Fuse"))
+        );
+        // A new source value for the pinned field alone is recorded under the pin.
+        let renamed = WorkInput { author: Some("Fuse (new)".into()), ..changed.clone() };
+        upsert_work_from_mangadex(&pool, "md-slime", &renamed).await.unwrap();
+        let source: Option<String> = crate::db_types::query_scalar(
+            "SELECT source_value FROM work_field_pin WHERE work_id = $1 AND field = 'author'",
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(source.as_deref(), Some("Fuse (new)"));
+
+        // Tag and tracker changes: removed rows go, kept rows are rewritten only if changed.
+        let before = metadata_row_versions(&pool, &id).await;
+        let retagged = WorkInput {
+            tags: vec!["Fantasy".into(), "Comedy".into()],
+            tag_details: vec![SourceTag { id: Some("t-fantasy".into()), name: "Fantasy".into(), group: "genre".into() }],
+            external_ids: vec![("al".into(), "86399".into())],
+            ..renamed.clone()
+        };
+        refresh_mangadex_details(&pool, &id, &retagged).await.unwrap();
+        let after = metadata_row_versions(&pool, &id).await;
+        let kept = |v: &[String], prefix: &str| v.iter().find(|r| r.starts_with(prefix)).cloned();
+        assert_eq!(kept(&after, "tracker:al="), kept(&before, "tracker:al="), "unchanged link kept");
+        assert_ne!(kept(&after, "tag:Fantasy="), kept(&before, "tag:Fantasy="), "moved to position 0");
+        assert!(kept(&after, "tag:Isekai=").is_none() && kept(&after, "tracker:mal=").is_none());
+        assert!(kept(&after, "tag:Comedy=").is_some());
+
+        // A never-attempted work is stamped even when nothing else differs.
+        sqlx::query("UPDATE work SET metadata_synced_at = NULL WHERE id = $1")
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        upsert_work_from_mangadex(&pool, "md-slime", &renamed).await.unwrap();
+        let stamped: bool = crate::db_types::query_scalar(
+            "SELECT metadata_synced_at IS NOT NULL FROM work WHERE id = $1",
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(stamped);
+    }
+
+    /// An admin's curated tag keeps its row, its `source` and its position when the
+    /// upstream list carries the same tag.
+    #[tokio::test]
+    async fn a_curated_tag_survives_the_diffed_upstream_tags() {
+        let pool = pool().await;
+        let id = upsert_work_from_mangadex(&pool, "md-slime", &slime_input()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) VALUES ($1, 'Isekai', 7, 'admin', 'isekai')",
+        )
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        refresh_mangadex_details(&pool, &id, &rich_slime_input()).await.unwrap();
+        let rows = crate::db_types::query_tuple::<(String, String, i64, Option<String>)>(
+            "SELECT tag, source, ord, tag_id FROM work_tag WHERE work_id = $1 ORDER BY tag",
+        )
+        .bind(&id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("Fantasy".into(), "mangadex".into(), 1, Some("t-fantasy".into())),
+                ("Isekai".into(), "admin".into(), 7, None),
+            ]
+        );
+        refresh_mangadex_details(&pool, &id, &WorkInput { tags: Vec::new(), ..rich_slime_input() })
+            .await
+            .unwrap();
+        let left: Vec<String> =
+            crate::db_types::query_scalar("SELECT source FROM work_tag WHERE work_id = $1")
+                .bind(&id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(left, ["admin"], "an empty upstream list removes only upstream rows");
+    }
+
     #[tokio::test]
     async fn merge_works_checked_aborts_when_the_snapshot_went_stale() {
         let pool = pool().await;
@@ -11238,6 +11576,29 @@ mod tests {
             after[0], before[0],
             "the surviving chapter keeps its id AND its first-sighting time"
         );
+
+        // An unchanged rescan writes no row version (WAL item 6); a changed field does.
+        let versions = || async {
+            crate::db_types::query_scalar::<String>(
+                "SELECT external_id || '=' || xmin::text FROM chapter ORDER BY external_id",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        };
+        let settled = versions().await;
+        replace_source_chapters(&pool, &ssid, &[input(1, 1.0), input(3, 3.0)])
+            .await
+            .unwrap();
+        assert_eq!(versions().await, settled, "an unchanged list rewrites nothing");
+        let mut renamed = input(3, 3.0);
+        renamed.title = Some("Chapter 3: Renamed".into());
+        replace_source_chapters(&pool, &ssid, &[input(1, 1.0), renamed])
+            .await
+            .unwrap();
+        let changed = versions().await;
+        assert_eq!(changed[0], settled[0]);
+        assert_ne!(changed[1], settled[1], "a changed title is written");
     }
 
     /// F2, the second-largest defect in the audit: a work whose chapters are all

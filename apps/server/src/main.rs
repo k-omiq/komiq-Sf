@@ -34,6 +34,9 @@ mod phash;
 #[cfg(test)]
 #[path = "../bench/postgres_contention.rs"]
 mod postgres_contention;
+#[cfg(test)]
+#[path = "../bench/wal_drill.rs"]
+mod wal_drill;
 mod postgres_metrics;
 mod rate_limit;
 mod request_budget;
