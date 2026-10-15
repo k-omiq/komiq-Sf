@@ -23,6 +23,10 @@ pub struct Database {
     // Keep the disposable native PostgreSQL database alive for every pool clone.
     #[cfg(test)]
     _temporary: Option<Arc<crate::test_postgres::DisposableDatabase>>,
+    // Statements sent through this handle and its clones, for tests that pin a
+    // resolver's round trips. Explicit transactions and raw pools are not counted.
+    #[cfg(test)]
+    statements: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -312,6 +316,8 @@ impl Database {
             deferred,
             #[cfg(test)]
             _temporary: temporary,
+            #[cfg(test)]
+            statements: Arc::default(),
         })
     }
 
@@ -331,6 +337,16 @@ impl Database {
             .expect("owned disposable test database")
             .url
             .clone()
+    }
+    /// Statements sent through `&Database` so far (see the field).
+    #[cfg(test)]
+    pub fn statements_sent(&self) -> u64 {
+        self.statements.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    fn count_statement(&self) {
+        self.statements
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     #[cfg(test)]
     pub async fn empty_for_test(read_connections: u32) -> Result<Self, Error> {
@@ -478,6 +494,8 @@ impl<'c> Executor<'c> for &'c Database {
         'c: 'e,
         E: 'q + Execute<'q, Postgres>,
     {
+        #[cfg(test)]
+        self.count_statement();
         Box::pin(async move {
             let started = Instant::now();
             let acquired = self.write().acquire().await;
@@ -493,6 +511,8 @@ impl<'c> Executor<'c> for &'c Database {
         'c: 'e,
         E: 'q + Execute<'q, Postgres>,
     {
+        #[cfg(test)]
+        self.count_statement();
         Box::pin(
             self.write()
                 .fetch_many(query)
@@ -513,6 +533,8 @@ impl<'c> Executor<'c> for &'c Database {
         'c: 'e,
         E: 'q + Execute<'q, Postgres>,
     {
+        #[cfg(test)]
+        self.count_statement();
         Box::pin(self.readers.fetch_many(query))
     }
 
@@ -521,6 +543,8 @@ impl<'c> Executor<'c> for &'c Database {
         'c: 'e,
         E: 'q + Execute<'q, Postgres>,
     {
+        #[cfg(test)]
+        self.count_statement();
         Box::pin(async move {
             let result = self.readers.fetch_optional(query).await;
             result

@@ -70,41 +70,31 @@ fn current_hour() -> i64 {
 /// its pre/post views across the two keys. Fully unifying those would need a persistent
 /// canonical-source-per-work concept; single-source works (the common case) unify
 /// exactly.
-pub async fn view_key(pool: &Database, series_id: &str) -> String {
-    match pool.acquire().await {
-        Ok(mut connection) => view_key_in(&mut connection, series_id)
-            .await
-            .unwrap_or_else(|error| {
-                let _ = crate::db::observed_read_database_error(error);
-                series_id.to_string()
-            }),
-        Err(error) => {
-            crate::db::record_read_database_error(&error);
-            series_id.to_string()
-        }
-    }
-}
-
 async fn view_key_in(connection: &mut sqlx::PgConnection, series_id: &str) -> Result<String> {
-    if !series_id.is_empty() && series_id.bytes().all(|b| b.is_ascii_digit()) {
+    if is_numeric_key(series_id) {
         return Ok(series_id.to_string());
     }
-    let survivor: Option<String> =
-        crate::db_types::query_scalar("SELECT new_id FROM work_redirect WHERE old_id = $1")
+    Ok(
+        crate::db_types::query_scalar::<String>(&format!("{VIEW_KEY_CTE} SELECT key FROM k"))
             .bind(series_id)
-            .fetch_optional(&mut *connection)
-            .await?;
-    let work_id = survivor.as_deref().unwrap_or(series_id);
-    let numeric: Option<String> = crate::db_types::query_scalar(
-        "SELECT source_key FROM source_series \
-         WHERE work_id = $1 AND source_type = 'suwayomi' \
-         ORDER BY public.sqlite_integer_pin(source_key) LIMIT 1",
+            .fetch_one(&mut *connection)
+            .await?,
     )
-    .bind(work_id)
-    .fetch_optional(&mut *connection)
-    .await?;
-    Ok(numeric.unwrap_or_else(|| work_id.to_string()))
 }
+
+fn is_numeric_key(series_id: &str) -> bool {
+    !series_id.is_empty() && series_id.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The key rule of [`view_key_in`] for a non-numeric `$1`, as a CTE `k(key)`: follow
+/// the work redirect, then the numerically smallest Suwayomi mapping, else the work id.
+/// Shared with [`counts_for`] so the read and the flush cannot disagree.
+const VIEW_KEY_CTE: &str =
+    "WITH w AS (SELECT COALESCE((SELECT new_id FROM work_redirect WHERE old_id = $1), $1) AS id), \
+     k AS (SELECT COALESCE((SELECT source_key FROM source_series \
+                            WHERE work_id = w.id AND source_type = 'suwayomi' \
+                            ORDER BY public.sqlite_integer_pin(source_key) LIMIT 1), \
+                           w.id) AS key FROM w)";
 
 /// In-memory view buffer: raw `series_id` views aggregated by the hour they were
 /// recorded in, drained by the background flusher (see [`spawn_flusher`]).
@@ -442,31 +432,42 @@ async fn run_flush_loop(pool: Database, mut shutdown: tokio::sync::watch::Receiv
 /// One aggregate query folds the all-time `total` (from `series_views`) with both hourly
 /// windows (from `series_view_bucket`): the 24h and 7d sums come from the same scan, gated
 /// by per-row `CASE`s. Since 7d ⊇ 24h, the row filter bounds to the 7d cutoff and the 24h
-/// `CASE` narrows within it. This is 2 awaits (`view_key` + this) instead of the former 4 —
-/// every `Series.views` resolver in a feed pays the difference per item.
+/// `CASE` narrows within it. A numeric id is its own key; any other id resolves its key
+/// inside the same statement, by the rule [`view_key_in`] applies (redirect, then the
+/// numerically smallest Suwayomi mapping, else the work id). One round trip per
+/// `Series.views` resolver, which a feed pays per item.
 pub async fn counts_for(pool: &Database, series_id: &str) -> ViewCounts {
-    let key = view_key(pool, series_id).await;
     let hour = current_hour();
     let since24h = hour - 24;
     let since7d = hour - BUCKET_RETENTION_HOURS;
     // An aggregate with no GROUP BY always yields exactly one row, even with zero buckets
     // (the SUMs come back NULL → 0, the scalar subquery → 0), so `fetch_one` is safe.
-    let row = crate::db_types::query_tuple::<(i64, i64, i64)>(
+    let sql = if is_numeric_key(series_id) {
         "SELECT \
            COALESCE((SELECT total FROM series_views WHERE series_key = $1), 0), \
            COALESCE(SUM(CASE WHEN hour_ts > $2 THEN views END), 0)::bigint, \
            COALESCE(SUM(views), 0)::bigint \
          FROM series_view_bucket \
-         WHERE series_key = $3 AND hour_ts > $4",
-    )
-    .bind(&key)
-    .bind(since24h)
-    .bind(&key)
-    .bind(since7d)
-    .fetch_one(pool)
-    .await
-    .inspect_err(crate::db::record_read_database_error)
-    .unwrap_or((0, 0, 0));
+         WHERE series_key = $1 AND hour_ts > $3"
+            .to_string()
+    } else {
+        format!(
+            "{VIEW_KEY_CTE} SELECT \
+               COALESCE((SELECT total FROM series_views WHERE series_key = (SELECT key FROM k)), 0), \
+               COALESCE(SUM(CASE WHEN hour_ts > $2 THEN views END), 0)::bigint, \
+               COALESCE(SUM(views), 0)::bigint \
+             FROM series_view_bucket \
+             WHERE series_key = (SELECT key FROM k) AND hour_ts > $3"
+        )
+    };
+    let row = crate::db_types::query_tuple::<(i64, i64, i64)>(&sql)
+        .bind(series_id)
+        .bind(since24h)
+        .bind(since7d)
+        .fetch_one(pool)
+        .await
+        .inspect_err(crate::db::record_read_database_error)
+        .unwrap_or((0, 0, 0));
     ViewCounts {
         total: row.0,
         last24h: row.1,

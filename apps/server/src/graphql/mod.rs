@@ -816,44 +816,76 @@ impl Series {
     }
 
     /// Imported metadata resolves through the canonical work for every ID shape.
+    ///
+    /// One statement. The work id resolves inside it exactly as [`resolve_work_id`]
+    /// does (a `w_` id must exist; a numeric id takes its lowest Suwayomi mapping), and
+    /// the tags, trackers and MangaDex anchor come back as JSON beside the facts. Six
+    /// round trips per series page became one.
     async fn metadata(&self, ctx: &Context<'_>) -> Result<Option<SeriesMetadata>> {
-        let pool = &state(ctx).pool;
-        let Some(work_id) = resolve_work_id(pool, &self.id.0).await else {
-            return Ok(None);
-        };
-        let facts = crate::db_types::query_tuple::<(
+        let row = crate::db_types::query_tuple::<(
             Option<i64>,
             Option<String>,
             Option<String>,
             Option<String>,
+            i64,
+            String,
+            String,
+            Option<String>,
         )>(
-            "SELECT year, original_language, demographic, content_rating FROM work WHERE id = $1",
+            "WITH target AS ( \
+               SELECT CASE WHEN left($1, 2) = 'w_' \
+                 THEN (SELECT id FROM work WHERE id = $1) \
+                 ELSE (SELECT work_id FROM source_series \
+                       WHERE source_type = 'suwayomi' AND source_key = $1 \
+                       ORDER BY work_id LIMIT 1) END AS work_id), \
+             facts AS ( \
+               SELECT w.id, w.year, w.original_language, w.demographic, w.content_rating, \
+                      EXISTS(SELECT 1 FROM work_tag WHERE work_id = w.id AND source = 'admin') AS curated \
+               FROM work w JOIN target t ON w.id = t.work_id) \
+             SELECT f.year, f.original_language, f.demographic, f.content_rating, f.curated, \
+               (SELECT COALESCE(json_agg(json_build_array(tag_id, tag, tag_group) ORDER BY ord, tag), '[]'::json)::text \
+                FROM work_tag WHERE work_id = f.id \
+                  AND source = CASE WHEN f.curated THEN 'admin' ELSE 'mangadex' END), \
+               (SELECT COALESCE(json_agg(json_build_array(provider, external_id) ORDER BY provider), '[]'::json)::text \
+                FROM work_tracker_link WHERE work_id = f.id), \
+               (SELECT source_key FROM source_series \
+                WHERE work_id = f.id AND source_type = 'mangadex' ORDER BY source_key LIMIT 1) \
+             FROM facts f",
         )
-        .bind(&work_id)
-        .fetch_optional(pool)
+        .bind(&self.id.0)
+        .fetch_optional(&state(ctx).pool)
         .await
         .map_err(gql_read_err)?;
-        let Some((year, original_language, demographic, content_rating)) = facts else {
+        let Some((
+            year,
+            original_language,
+            demographic,
+            content_rating,
+            curated,
+            tags,
+            trackers,
+            mangadex,
+        )) = row
+        else {
             return Ok(None);
         };
-        let curated: bool = crate::db_types::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM work_tag WHERE work_id = $1 AND source = 'admin')",
-        )
-        .bind(&work_id)
-        .fetch_one(pool)
-        .await
-        .map_err(gql_read_err)?;
-        let tags = crate::db_types::query_tuple::<(Option<String>, String, Option<String>)>(
-            "SELECT tag_id, tag, tag_group FROM work_tag WHERE work_id = $1 AND source = $2 ORDER BY ord, tag"
-        ).bind(&work_id).bind(if curated { "admin" } else { "mangadex" })
-            .fetch_all(pool).await.map_err(gql_read_err)?.into_iter()
-            .map(|(id, name, group)| MetadataTag { id: if curated { None } else { id }, name,
-                group: if curated { "custom".into() } else { group.unwrap_or_else(|| "other".into()) } }).collect();
-        let mut rows = crate::db_types::query_tuple::<(String, String)>(
-            "SELECT provider, external_id FROM work_tracker_link WHERE work_id = $1 ORDER BY provider"
-        ).bind(&work_id).fetch_all(pool).await.map_err(gql_read_err)?;
-        if let Some(id) = crate::db_types::query_scalar::<String>("SELECT source_key FROM source_series WHERE work_id = $1 AND source_type = 'mangadex' ORDER BY source_key LIMIT 1")
-            .bind(&work_id).fetch_optional(pool).await.map_err(gql_read_err)? {
+        let curated = curated != 0;
+        let tags: Vec<(Option<String>, String, Option<String>)> =
+            serde_json::from_str(&tags).map_err(gql_err)?;
+        let tags = tags
+            .into_iter()
+            .map(|(id, name, group)| MetadataTag {
+                id: if curated { None } else { id },
+                name,
+                group: if curated {
+                    "custom".into()
+                } else {
+                    group.unwrap_or_else(|| "other".into())
+                },
+            })
+            .collect();
+        let mut rows: Vec<(String, String)> = serde_json::from_str(&trackers).map_err(gql_err)?;
+        if let Some(id) = mangadex {
             rows.insert(0, ("mangadex".into(), id));
         }
         let trackers = rows
@@ -880,22 +912,27 @@ impl Series {
     /// work with no covers stored yet or a non-canonical series. `coverUrl` (the
     /// primary) keeps working independently.
     async fn covers(&self, ctx: &Context<'_>) -> Result<Vec<Cover>> {
-        let pool = &state(ctx).pool;
-        // Cover URLs are `covers/{mangadex_id}/{fileName}` — resolve the anchor.
-        let mangadex_id: Option<String> = crate::db_types::query_scalar(
-            "SELECT source_key FROM source_series \
-             WHERE work_id = $1 AND source_type = 'mangadex' LIMIT 1",
-        )
-        .bind(&self.id.0)
-        .fetch_optional(pool)
-        .await
-        .map_err(gql_read_err)?;
-        let Some(mid) = mangadex_id else {
-            return Ok(Vec::new());
-        };
-        let covers = catalog::load_work_covers(pool, &self.id.0)
+        // Cover URLs are `covers/{mangadex_id}/{fileName}`: the anchor and the rows in
+        // one statement. No anchor or no cover yields no row, as two reads did.
+        let rows =
+            crate::db_types::query_tuple::<(String, String, Option<String>, Option<String>, i64)>(
+                "SELECT a.source_key, wc.cover_file_name, wc.lang, wc.volume, wc.is_primary \
+             FROM (SELECT source_key FROM source_series \
+                   WHERE work_id = $1 AND source_type = 'mangadex' LIMIT 1) a \
+             JOIN work_cover wc ON wc.work_id = $1",
+            )
+            .bind(&self.id.0)
+            .fetch_all(&state(ctx).pool)
             .await
             .map_err(gql_read_err)?;
+        let Some(mid) = rows.first().map(|r| r.0.clone()) else {
+            return Ok(Vec::new());
+        };
+        let covers = catalog::sort_work_covers(
+            rows.into_iter()
+                .map(|(_, file_name, lang, volume, primary)| (file_name, lang, volume, primary))
+                .collect(),
+        );
         Ok(covers
             .into_iter()
             .map(|c| Cover {
@@ -2092,6 +2129,18 @@ fn assemble_series(
 /// same field values, same NSFW flag). Effective genres are batched too — see
 /// `catalog::work_effective_genres_batch`.
 async fn map_series_batch(st: &AppState, list: Vec<SuwayomiManga>) -> Result<Vec<Series>> {
+    map_series_batch_with(st, list, None).await
+}
+
+/// [`map_series_batch`] for a page that already mapped its canonical work: `canonical`'s
+/// `rating`, `mangadex_rating` and `genres` are work-level reads, and every source of
+/// that work takes them from it instead of reading them again. The key-to-work
+/// resolution still runs, so a source that resolves to another work reads its own.
+async fn map_series_batch_with(
+    st: &AppState,
+    list: Vec<SuwayomiManga>,
+    canonical: Option<&Series>,
+) -> Result<Vec<Series>> {
     if list.is_empty() {
         return Ok(Vec::new());
     }
@@ -2112,7 +2161,8 @@ async fn map_series_batch(st: &AppState, list: Vec<SuwayomiManga>) -> Result<Vec
     // for a canonical page, this numeric one otherwise), so keying the aggregate on the
     // literal id made one work print two different star counts on two surfaces — and print 0
     // on the page the rating was actually left from.
-    let ratings = rating_summary_for_series_ids(&st.pool, &ids).await?;
+    let known = canonical.map(|c| (c.id.0.as_str(), &c.rating));
+    let ratings = rating_summary_for_series_ids(&st.pool, &ids, known).await?;
     let admins = admin_overrides_batch(&st.pool, &ids).await?;
     let scans = scan_state_batch(&st.pool, &ids).await?;
     let alts = canonical_alt_titles_batch(&st.pool, &ids).await?;
@@ -2128,16 +2178,25 @@ async fn map_series_batch(st: &AppState, list: Vec<SuwayomiManga>) -> Result<Vec
         let mut set = std::collections::BTreeSet::new();
         for ov in ov_metas.values() {
             if let Some(wid) = &ov.work_id {
-                set.insert(wid.clone());
+                if canonical.is_none_or(|c| c.id.0 != *wid) {
+                    set.insert(wid.clone());
+                }
             }
         }
         set.into_iter().collect()
     };
-    let genres_by_work = catalog::work_effective_genres_batch_checked(&st.pool, &genre_work_ids)
-        .await
-        .map_err(gql_read_err)?;
+    let mut genres_by_work =
+        catalog::work_effective_genres_batch_checked(&st.pool, &genre_work_ids)
+            .await
+            .map_err(gql_read_err)?;
     // MangaDex's rating for the same catalogued works: the second number on the card.
-    let md_ratings = mangadex_rating_batch(&st.pool, &genre_work_ids).await?;
+    let mut md_ratings = mangadex_rating_batch(&st.pool, &genre_work_ids).await?;
+    if let Some(c) = canonical {
+        genres_by_work.insert(c.id.0.clone(), c.genres.clone());
+        if let Some(r) = c.mangadex_rating {
+            md_ratings.insert(c.id.0.clone(), r);
+        }
+    }
     // The REAL newest-chapter time for the whole page in one query. A live-fetched manga
     // carries `latest_chapter_at: None` (not part of Suwayomi's wire shape), and
     // `assemble_series` no longer papers over that with the poll time — so without this
@@ -2393,9 +2452,13 @@ async fn work_ids_for_series_ids(
 /// Keyed by the id that was ASKED with, so callers keep their existing lookups. Ids the
 /// catalogue can't resolve (an uncatalogued Suwayomi series — production has two rated ones)
 /// fall back to the literal-key aggregate, so no existing rating is dropped by this change.
+///
+/// `known` is one work's summary already in hand (work id and its
+/// [`rating_summary_by_work_batch`] answer); that work is not read again.
 async fn rating_summary_for_series_ids(
     pool: &Database,
     ids: &[String],
+    known: Option<(&str, &RatingSummary)>,
 ) -> Result<HashMap<String, RatingSummary>> {
     if ids.is_empty() {
         return Ok(HashMap::new());
@@ -2404,7 +2467,9 @@ async fn rating_summary_for_series_ids(
     let work_ids: Vec<String> = {
         let mut set = std::collections::BTreeSet::new();
         for w in by_work.values() {
-            set.insert(w.clone());
+            if known.is_none_or(|(known_id, _)| known_id != w) {
+                set.insert(w.clone());
+            }
         }
         set.into_iter().collect()
     };
@@ -2417,7 +2482,10 @@ async fn rating_summary_for_series_ids(
         rating_summary_by_work_batch(pool, &work_ids),
         rating_summary_batch(pool, &unresolved),
     );
-    let work_ratings = work_ratings?;
+    let mut work_ratings = work_ratings?;
+    if let Some((known_id, rating)) = known {
+        work_ratings.insert(known_id.to_string(), rating.clone());
+    }
     let mut out = literal?;
     for id in ids {
         if let Some(wid) = by_work.get(id) {
@@ -6008,7 +6076,9 @@ impl QueryRoot {
         // per source; `map_series_batch` does grouped queries once for the lot.
         let mangas: Vec<SuwayomiManga> =
             assembled.iter().filter_map(|(_, _, m)| m.clone()).collect();
-        let mut metas = map_series_batch(st, mangas).await?.into_iter();
+        let mut metas = map_series_batch_with(st, mangas, series.as_ref())
+            .await?
+            .into_iter();
         let sources = assembled
             .into_iter()
             .map(|(source, chapters, manga)| SeriesPageSourceEntry {
@@ -24432,6 +24502,214 @@ mod tests {
         let agg = page["aggregated"].as_array().unwrap();
         let numbers: Vec<f64> = agg.iter().map(|c| c["number"].as_f64().unwrap()).collect();
         assert_eq!(numbers, vec![1.0, 2.0], "{agg:?}");
+    }
+
+    /// The series page's round trips are pinned, and the reads it shares between the
+    /// canonical arm and a source of the same work agree. Every statement holds one of
+    /// the 16 reader connections, so the COUNT is the cost under a release burst
+    /// (M4 item 5, docs/audits/m4-seriespage-2026-10-15): `metadata` was six statements,
+    /// `covers` two, the work load three, each canonical `views` three, and the source
+    /// arm re-read the work's rating, MangaDex rating and genres.
+    #[tokio::test]
+    async fn series_page_statement_count_is_pinned_and_shared_work_reads_agree() {
+        let (s, pool) = setup_full(100).await;
+        let mid = "5b3a7c1e-0d2f-4a6b-9c8d-7e6f5a4b3c2d";
+        let work = crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            mid,
+            &crate::catalog::WorkInput {
+                primary_title: Some("Counted Work".into()),
+                year: Some(2019),
+                original_language: Some("ko".into()),
+                tags: vec!["Drama".into()],
+                tag_details: vec![crate::catalog::SourceTag {
+                    id: Some("b9af3a63-f058-46de-a9a0-e0c13906197a".into()),
+                    name: "Drama".into(),
+                    group: "genre".into(),
+                }],
+                external_ids: vec![("al".into(), "321".into())],
+                descriptions: vec![
+                    ("en".into(), "English".into()),
+                    ("fr".into(), "Français".into()),
+                ],
+                credits: vec![
+                    ("author".into(), "Writer A".into()),
+                    ("artist".into(), "Artist B".into()),
+                ],
+                cover_file_name: Some("v1.jpg".into()),
+                covers: vec![
+                    crate::catalog::Cover {
+                        file_name: "v2.jpg".into(),
+                        lang: Some("ja".into()),
+                        volume: Some("2".into()),
+                        is_primary: false,
+                    },
+                    crate::catalog::Cover {
+                        file_name: "v1.jpg".into(),
+                        lang: Some("ja".into()),
+                        volume: Some("1".into()),
+                        is_primary: true,
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ssid = crate::catalog::find_source_series_id(&pool, "mangadex", "mangadex", mid)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::catalog::upsert_chapter(
+            &pool,
+            &ssid,
+            &crate::catalog::ChapterInput {
+                external_id: "cnt-ch-1".into(),
+                number: Some("1".into()),
+                lang: Some("en".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO suwayomi_series (id, title, status, source_id, chapter_count, updated_at) \
+             VALUES (778, 'Counted Source', 'ONGOING', 'src-c', 1, '2020-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::series_cache::put_chapters(
+            &pool,
+            778,
+            &[crate::suwayomi::SuwayomiChapter {
+                id: 9101,
+                manga_id: 778,
+                name: "Ch 1".into(),
+                chapter_number: 1.0,
+                scanlator: None,
+                upload_date: None,
+                is_read: false,
+                is_bookmarked: false,
+                is_downloaded: false,
+                last_page_read: 0,
+                page_count: 20,
+            }],
+        )
+        .await
+        .unwrap();
+        crate::catalog::upsert_source_series(&pool, &work, "suwayomi", "src-c", "778", None, false)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE suwayomi_series SET last_fetched_at = now() WHERE id = 778")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO work_stats (work_id, rating_avg, fetched_at) VALUES ($1, 8.4, now())",
+        )
+        .bind(&work)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let reviewer: String = crate::db_types::query_scalar("SELECT id::text FROM users LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) \
+             VALUES (gen_random_uuid(), '778', $1::uuid, 7, '', now(), now())",
+        )
+        .bind(&reviewer)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO series_views (series_key, total, updated_at) VALUES ('778', 41, now())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.flush_deferred().await;
+
+        let q = format!(
+            r#"{{ seriesPage(workId: "{work}") {{
+                series {{ id title genres rating {{ average count }} mangadexRating
+                    metadata {{ year tags {{ name group }} trackers {{ provider externalId }} }}
+                    views {{ total }} localizedDescriptions {{ lang }} credits {{ role name }}
+                    covers {{ fileName isPrimary }} }}
+                spineChapters {{ id }}
+                sources {{ source {{ sourceKey }} chapters {{ id }}
+                    series {{ id genres rating {{ average count }} mangadexRating views {{ total }} }} }}
+            }} }}"#
+        );
+        let run = || async {
+            let request = async_graphql::Request::new(q.clone())
+                .data(RequestAuth(None))
+                .data(ClientIp(Some("9.9.9.9".into())))
+                .data(RequestUserCache::default())
+                .data(RequestNsfwPref::default())
+                .data(RequestBlocks::default())
+                .data(RequestLibraryCache::default());
+            let before = pool.statements_sent();
+            let response = s.execute(request).await;
+            (response, pool.statements_sent() - before)
+        };
+        let (response, statements) = run().await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let page = response.data.into_json().unwrap()["seriesPage"].clone();
+        let canonical = &page["series"];
+        let source = &page["sources"][1]["series"];
+        assert_eq!(page["sources"][1]["source"]["sourceKey"], "778");
+        assert_eq!(canonical["genres"], serde_json::json!(["Drama"]));
+        assert_eq!(canonical["rating"]["count"], 1);
+        assert_eq!(canonical["mangadexRating"], 8.4);
+        assert_eq!(
+            canonical["views"]["total"], 41,
+            "w_ folds into its source key"
+        );
+        for field in ["genres", "rating", "mangadexRating", "views"] {
+            assert_eq!(source[field], canonical[field], "{field}");
+        }
+        assert_eq!(canonical["metadata"]["year"], 2019);
+        assert_eq!(
+            canonical["metadata"]["tags"],
+            serde_json::json!([{"name": "Drama", "group": "genre"}])
+        );
+        assert_eq!(
+            canonical["metadata"]["trackers"],
+            serde_json::json!([
+                {"provider": "mangadex", "externalId": mid},
+                {"provider": "al", "externalId": "321"}
+            ])
+        );
+        assert_eq!(
+            canonical["localizedDescriptions"],
+            serde_json::json!([{"lang": "en"}, {"lang": "fr"}])
+        );
+        assert_eq!(
+            canonical["credits"],
+            serde_json::json!([
+                {"role": "artist", "name": "Artist B"},
+                {"role": "author", "name": "Writer A"}
+            ])
+        );
+        assert_eq!(
+            canonical["covers"],
+            serde_json::json!([
+                {"fileName": "v1.jpg", "isPrimary": true},
+                {"fileName": "v2.jpg", "isPrimary": false}
+            ])
+        );
+        // 42 with this fixture before M4 item 5. What is left: the work (1), site
+        // blocks (1), release announcements (1), spine chapters (1), the canonical
+        // arm's rating, MangaDex setting and statistics, counts, latest chapter and
+        // genres (8), the source list and its authoritative keys (2), the cached
+        // source rows (2), the source arm's own per-key reads (8), and one statement
+        // each for metadata, descriptions, credits, covers and the two `views` (6).
+        assert_eq!(statements, 29, "anonymous seriesPage statements");
+        let (_, again) = run().await;
+        assert_eq!(again, statements, "the count is stable run to run");
     }
 
     /// `SeriesPageBundle.aggregated` must stay NULLABLE. Under GraphQL's null propagation

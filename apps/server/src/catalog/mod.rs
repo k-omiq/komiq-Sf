@@ -709,6 +709,9 @@ pub async fn work_effective_genres_batch_checked(
 
 /// Load a canonical work with its MangaDex anchor + cover fileName + alt titles, for
 /// the reader's canonical series path. `None` if the work id is unknown.
+///
+/// One statement: every series page and canonical lookup starts here, and the anchor
+/// and the aliases used to be two more round trips on a pooled connection.
 pub async fn load_canonical_work(pool: &Database, work_id: &str) -> Result<Option<CanonicalWork>> {
     #[derive(sqlx::FromRow)]
     struct Row {
@@ -744,42 +747,35 @@ pub async fn load_canonical_work(pool: &Database, work_id: &str) -> Result<Optio
         created_at: String,
         #[sqlx(try_from = "crate::db_types::DbString")]
         updated_at: String,
+        #[sqlx(try_from = "crate::db_types::DbOptionalString")]
+        mangadex_id: Option<String>,
+        alt_titles: Vec<String>,
     }
+    // `mangadex_id` is the MangaDex source_series (its source_key is the MangaDex manga
+    // uuid). A merge can fold two mangadex works together, leaving >1 mangadex
+    // source_series on the target. Order deterministically (oldest first, id as final
+    // tiebreak) so the cover/page anchor is stable across loads instead of whatever the
+    // planner happens to return first.
     let row = sqlx::query_as::<_, Row>(
-        "SELECT primary_title, description, year, original_language, status, author, artist, \
-                is_nsfw, content_type_override, title_override, description_override, \
-                is_nsfw_override, cover_file_name, cover_cached_version, created_at, updated_at \
-         FROM work WHERE id = $1",
+        "SELECT w.primary_title, w.description, w.year, w.original_language, w.status, \
+                w.author, w.artist, w.is_nsfw, w.content_type_override, w.title_override, \
+                w.description_override, w.is_nsfw_override, w.cover_file_name, \
+                w.cover_cached_version, w.created_at, w.updated_at, \
+                (SELECT ss.source_key FROM source_series ss \
+                 WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' \
+                 ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS mangadex_id, \
+                ARRAY(SELECT DISTINCT wa.raw_title FROM work_alias wa \
+                      WHERE wa.work_id = w.id ORDER BY wa.raw_title) AS alt_titles \
+         FROM work w WHERE w.id = $1",
     )
     .bind(work_id)
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else { return Ok(None) };
 
-    // The MangaDex source_series (its source_key is the MangaDex manga uuid).
-    // A merge can fold two mangadex works together, leaving >1 mangadex source_series
-    // on the target. Order deterministically (oldest first, id as final tiebreak) so
-    // the cover/page anchor is stable across loads instead of whatever the planner
-    // happens to return first.
-    let mangadex_id = crate::db_types::query_scalar::<String>(
-        "SELECT source_key FROM source_series \
-         WHERE work_id = $1 AND source_type = 'mangadex' \
-         ORDER BY created_at ASC, id ASC LIMIT 1",
-    )
-    .bind(work_id)
-    .fetch_optional(pool)
-    .await?;
-
-    let alt_titles = crate::db_types::query_scalar::<String>(
-        "SELECT DISTINCT raw_title FROM work_alias WHERE work_id = $1 ORDER BY raw_title",
-    )
-    .bind(work_id)
-    .fetch_all(pool)
-    .await?;
-
     Ok(Some(CanonicalWork {
         work_id: work_id.to_string(),
-        mangadex_id,
+        mangadex_id: row.mangadex_id,
         primary_title: row.primary_title,
         description: row.description,
         year: row.year,
@@ -794,7 +790,7 @@ pub async fn load_canonical_work(pool: &Database, work_id: &str) -> Result<Optio
         is_nsfw_override: row.is_nsfw_override.map(|v| v != 0),
         cover_file_name: row.cover_file_name,
         cover_cached_version: row.cover_cached_version,
-        alt_titles,
+        alt_titles: row.alt_titles,
         created_at: row.created_at,
         updated_at: row.updated_at,
     }))
@@ -3783,14 +3779,24 @@ pub async fn refresh_mangadex_details(
     .await
 }
 
-/// Load a work's cover set (F2), primary first then by volume/file name.
+/// Load a work's cover set (F2), primary first then by volume/file name. Tests only:
+/// `Series.covers` reads the MangaDex anchor and the rows in one statement.
+#[cfg(test)]
 pub async fn load_work_covers(pool: &Database, work_id: &str) -> Result<Vec<Cover>> {
-    let mut rows = crate::db_types::query_tuple::<(String, Option<String>, Option<String>, i64)>(
+    let rows = crate::db_types::query_tuple::<(String, Option<String>, Option<String>, i64)>(
         "SELECT cover_file_name, lang, volume, is_primary FROM work_cover WHERE work_id = $1",
     )
     .bind(work_id)
     .fetch_all(pool)
     .await?;
+    Ok(sort_work_covers(rows))
+}
+
+/// `work_cover` rows `(file_name, lang, volume, is_primary)` in display order: primary
+/// first, then by volume, then by file name.
+pub fn sort_work_covers(
+    mut rows: Vec<(String, Option<String>, Option<String>, i64)>,
+) -> Vec<Cover> {
     // Preserve SQLite REAL's float64 numeric-prefix ordering, including malformed
     // volume text and over/underflow. PostgreSQL text casts are strict (REAL is float32).
     rows.sort_by(|a, b| {
@@ -3802,15 +3808,14 @@ pub async fn load_work_covers(pool: &Database, work_id: &str) -> Result<Vec<Cove
             })
             .then_with(|| a.0.cmp(&b.0))
     });
-    Ok(rows
-        .into_iter()
+    rows.into_iter()
         .map(|(file_name, lang, volume, is_primary)| Cover {
             file_name,
             lang,
             volume,
             is_primary: is_primary != 0,
         })
-        .collect())
+        .collect()
 }
 
 /// SQLite CAST(text AS REAL) consumes a signed numeric prefix and returns zero
