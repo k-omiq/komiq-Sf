@@ -510,6 +510,20 @@ fn bind_count<'q>(
     q
 }
 
+fn bind_query<'q>(
+    mut q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    binds: &[Bind],
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    for b in binds {
+        q = match b {
+            Bind::Text(s) => q.bind(s.clone()),
+            Bind::Real(v) => q.bind(*v),
+            Bind::Int(v) => q.bind(*v),
+        };
+    }
+    q
+}
+
 /// Trim, drop blanks, DEDUPE and SORT a client genre list, then cap it at
 /// [`MAX_GENRE_FILTERS`].
 ///
@@ -1386,8 +1400,9 @@ pub async fn rows_by_work_ids(pool: &Database, ids: &[String]) -> Result<Vec<Bro
 /// without typo matching (`search::plain_ctes`), as in `catalog::search_works_fts` and for
 /// the reason given there. Its total has its own memo tag, so it is never read as the
 /// total of the full statement. A retry statement that runs out of its budget is no error:
-/// the answer is the first statement's, nothing. One request runs at most five statements
-/// and they take at most `catalog::SEARCH_ALLOWANCE` together, as there.
+/// the answer is the first statement's, nothing. One request runs at most three statements
+/// (see `text_pass`: total and page are one statement) and they take at most
+/// `catalog::SEARCH_ALLOWANCE` together, as there.
 ///
 /// NSFW: [`build_where`]'s gate on the materialized flag, PLUS the live
 /// `COALESCE(is_nsfw_override, is_nsfw)` on `work` that `search_works_fts` always applied — an
@@ -1397,6 +1412,17 @@ pub async fn search_text(
     pool: &Database,
     raw_query: &str,
     q: &BrowseQuery<'_>,
+) -> Result<(i64, Vec<BrowseRow>)> {
+    search_text_with(pool, raw_query, q, COUNT_TTL).await
+}
+
+/// [`search_text`] with the count memo read at `count_ttl`. [`COUNT_TTL`] is zero under
+/// test, so only a test that passes a real TTL reaches the memo-hit statement.
+async fn search_text_with(
+    pool: &Database,
+    raw_query: &str,
+    q: &BrowseQuery<'_>,
+    count_ttl: std::time::Duration,
 ) -> Result<(i64, Vec<BrowseRow>)> {
     if !crate::search::valid_query(raw_query) {
         return Ok((0, Vec::new()));
@@ -1410,21 +1436,65 @@ pub async fn search_text(
     };
     let full = crate::search::match_ctes;
     let connection = crate::catalog::SearchConnection::new(pool).await?;
-    match text_pass(connection, raw_query, q, trending.clone(), full, "fts").await? {
+    match text_pass(
+        connection,
+        raw_query,
+        q,
+        trending.clone(),
+        full,
+        "fts",
+        count_ttl,
+    )
+    .await?
+    {
         Ok(found) => Ok(found),
         Err((error, left)) => {
             tracing::warn!(%error, "search: over budget, answering without typo matching");
             let plain = crate::search::plain_ctes;
             let connection = crate::catalog::SearchConnection::with_allowance(pool, left).await?;
-            let found = text_pass(connection, raw_query, q, trending, plain, "fts-plain").await?;
+            let found = text_pass(
+                connection,
+                raw_query,
+                q,
+                trending,
+                plain,
+                "fts-plain",
+                count_ttl,
+            )
+            .await?;
             Ok(found.map_err(|(error, _)| error)?)
         }
     }
 }
 
+/// The count-memo key of one text-search statement kind (`memo`): the MATCH expression
+/// (length-prefixed — it is client text) and the window flag, on top of the filter
+/// signature.
+fn text_count_key(memo: &str, raw_query: &str, q: &BrowseQuery<'_>) -> String {
+    format!(
+        "{memo}|{}|{}:{}|{}",
+        u8::from(q.sort.key == SortKey::Relevance),
+        raw_query.len(),
+        raw_query,
+        count_key(q)
+    )
+}
+
 /// One text search on its reader: the `first` statement with its memo tag, then the retry
 /// statement when that finds nothing. The inner error is a statement built from `first`
 /// that ran out of its budget, with what the request has left; the reader is closed by then.
+///
+/// ONE STATEMENT PER KIND, total and page together. On a count-memo miss the statement
+/// returns its page and its total, `count(*)` over the same source the page walks: `cand`
+/// (the window, so the total is capped at it) for RELEVANCE, `m` for any other sort. A
+/// separate count statement would build the whole match set a second time, and on
+/// PostgreSQL that count was as costly as the page. The total comes from a one-row
+/// aggregate the page is LEFT JOINed to, so it is there when the page is empty too (a page
+/// past the end, a query with no match). On a memo hit the statement is the page alone: the
+/// RELEVANCE page then stops at the last title tier it needs instead of filling the window.
+///
+/// `count_ttl` is how long a memoized total is read as fresh.
+#[allow(clippy::too_many_arguments)]
 async fn text_pass(
     mut connection: crate::catalog::SearchConnection,
     raw_query: &str,
@@ -1432,10 +1502,11 @@ async fn text_pass(
     trending: Option<Vec<String>>,
     first: fn(&str, &str) -> String,
     first_memo: &str,
+    count_ttl: std::time::Duration,
 ) -> Result<std::result::Result<(i64, Vec<BrowseRow>), (sqlx::Error, std::time::Duration)>> {
+    use sqlx::{FromRow, Row};
     let generation = cache_generation();
     let match_expr = raw_query.to_owned();
-    let (where_sql, where_binds, uses_rated) = build_where_from(q, 2);
     let page_size = BROWSE_PAGE_SIZE;
     let page = q.page.max(1);
     let offset = (page - 1) * page_size;
@@ -1447,179 +1518,142 @@ async fn text_pass(
     };
     let relevance = q.sort.key == SortKey::Relevance;
     let community = q.sort.key == SortKey::CommunityRating;
+
+    // What the page walks and in what order. RELEVANCE keeps `search_works_fts`' ranking
+    // over the window `cand`; every other sort orders the whole filtered match set `m`.
+    let d = dir(q.sort.desc);
+    let mut extra_cte = String::new();
+    let mut extra_join = String::new();
+    let mut cte_binds: Vec<Bind> = Vec::new();
+    let (source, order) = if relevance {
+        (
+            "cand",
+            "f.tier, f.chapters DESC NULLS LAST, f.rank, f.work_id".to_string(),
+        )
+    } else {
+        let order = match q.sort.key {
+            SortKey::MostViewed => {
+                // The view ranking as a VALUES table of (work_id, position) — positions are
+                // our own integers, formatted; the ids are bound. Unviewed works (no row)
+                // sort last in both directions, then newest-first like Browse's remainder.
+                let ranked = trending.unwrap_or_default();
+                if ranked.is_empty() {
+                    NEWEST_ORDER.to_string()
+                } else {
+                    let parameters = crate::sql_params::placeholders(2, ranked.len());
+                    let values = parameters
+                        .split(", ")
+                        .enumerate()
+                        .map(|(i, parameter)| format!("({parameter}, {i})"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    extra_cte = format!(", tr(wid, pos) AS (VALUES {values})");
+                    extra_join = " LEFT JOIN tr ON tr.wid = f.work_id".into();
+                    cte_binds.extend(ranked.into_iter().map(Bind::Text));
+                    // Most viewed = position 0 first, so DESC ranks ascending positions.
+                    let pd = dir(!q.sort.desc);
+                    format!("(tr.pos IS NULL), tr.pos {pd}, {NEWEST_ORDER}")
+                }
+            }
+            SortKey::CommunityRating => {
+                extra_join = " LEFT JOIN rated_per_work rp ON rp.wid = f.work_id".into();
+                format!("(rp.avg IS NULL), rp.avg {d}, {NEWEST_ORDER}")
+            }
+            key => match sort_column(key) {
+                Some((col, true)) => format!("({col} IS NULL), {}", order_by(col, q.sort.desc)),
+                Some((col, false)) => order_by(col, q.sort.desc),
+                None => NEWEST_ORDER.to_string(),
+            },
+        };
+        ("m", order)
+    };
+    // Bind order follows the text: the MATCH (in `m`), the VALUES ids (in `tr`), the
+    // WHERE's binds, the window (in `cand`), then LIMIT and OFFSET.
+    let (where_sql, where_binds, uses_rated) = build_where_from(q, 2 + cte_binds.len());
     let rated_def = if uses_rated || community {
         format!("{RATED_PER_WORK_DEF}, ")
     } else {
         String::new()
     };
-    let eligible = "SELECT f.* FROM browse_catalogue f JOIN work w ON w.id=f.work_id";
-    let mut head: Vec<Bind> = vec![Bind::Text(match_expr.clone())];
-    head.extend(where_binds.iter().cloned());
-
-    // total. The memo key carries the MATCH expression (length-prefixed — it is client text)
-    // and the window flag, on top of the filter signature.
-    //
-    // The first statement, then `search::retry_ctes` when that one counts nothing: a
-    // misspelt term that is a word elsewhere, a query without its spaces. `ctes` ends as
-    // the statement `total` was counted with, and the page below is built with the same
-    // one, so the two agree. Each has its own memo entry. `in_first` is true while the
-    // statement in hand is built from `first`.
-    let mut in_first = true;
-    let mut ctes = first;
-    let mut m_cte = String::new();
-    let mut total = 0;
-    for memo in [first_memo, "fts-retry"] {
-        m_cte = ctes(eligible, &format!("{where_sql}{gate}"));
-        let ckey = format!(
-            "{memo}|{}|{}:{}|{}",
-            u8::from(relevance),
-            match_expr.len(),
-            match_expr,
-            count_key(q)
-        );
-        total = match cached_count(&ckey) {
-            Some(t) => t,
-            None => {
-                let window_arg = crate::sql_params::placeholders(head.len() + 1, 1);
-                let (sql, binds) = if relevance {
-                    let mut b = head.clone();
-                    b.push(Bind::Int(window));
-                    (
-                        format!(
-                            "WITH {rated_def}{m_cte} SELECT COUNT(*) FROM \
-                             (SELECT 1 FROM m LIMIT {window_arg})"
-                        ),
-                        b,
-                    )
-                } else {
-                    (
-                        format!("WITH {rated_def}{m_cte} SELECT COUNT(*) FROM m"),
-                        head.clone(),
-                    )
-                };
-                connection.next_budget().await?;
-                let counted = bind_count(sqlx::query_scalar::<_, i64>(&sql), &binds)
-                    .fetch_one(&mut *connection)
-                    .await;
-                let t = match counted {
-                    Err(error) if crate::search::over_budget(&error) => {
-                        return Ok(connection.cancelled(error, in_first))
-                    }
-                    counted => counted?,
-                };
-                store_count(ckey, t, generation);
-                t
-            }
-        };
-        if total > 0 {
-            break;
-        }
-        in_first = false;
-        ctes = crate::search::retry_ctes;
-    }
-    if offset >= total {
-        connection.finish().await?;
-        return Ok(Ok((total, Vec::new())));
-    }
-
-    if relevance {
-        let window_arg = crate::sql_params::placeholders(head.len() + 1, 1);
-        let page_args = crate::sql_params::placeholders(head.len() + 2, 2);
-        let mut page_args = page_args.split(", ");
-        let limit_arg = page_args.next().unwrap();
-        let offset_arg = page_args.next().unwrap();
-        let cand = crate::search::window_cte(&window_arg);
-        let sql = format!(
-            "WITH {rated_def}{m_cte}, {cand} SELECT {BROWSE_COLS} FROM cand f \
-             ORDER BY f.tier, f.chapters DESC NULLS LAST, f.rank, f.work_id \
-             LIMIT {limit_arg} OFFSET {offset_arg}"
-        );
-        let mut binds = head;
+    let mut binds: Vec<Bind> = vec![Bind::Text(match_expr.clone())];
+    binds.extend(cte_binds);
+    binds.extend(where_binds);
+    let limit = if relevance {
         binds.push(Bind::Int(window));
-        connection.next_budget().await?;
-        let rows = bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), &binds)
-            .bind(page_size.min(window))
-            .bind(offset)
-            .fetch_all(&mut *connection)
-            .await;
-        let rows = match rows {
-            Err(error) if crate::search::over_budget(&error) => {
-                return Ok(connection.cancelled(error, in_first))
-            }
-            rows => rows?,
-        };
-        connection.finish().await?;
-        return Ok(Ok((total, rows)));
-    }
-
-    // Every other sort over the filtered match set.
-    let d = dir(q.sort.desc);
-    let mut extra_cte = String::new();
-    let mut extra_join = String::new();
-    let mut cte_binds: Vec<Bind> = Vec::new();
-    let order = match q.sort.key {
-        SortKey::MostViewed => {
-            // The view ranking as a VALUES table of (work_id, position) — positions are our
-            // own integers, formatted; the ids are bound. Unviewed works (no row) sort last
-            // in both directions, then newest-first like Browse's remainder.
-            let ranked = trending.unwrap_or_default();
-            if ranked.is_empty() {
-                NEWEST_ORDER.to_string()
-            } else {
-                let parameters = crate::sql_params::placeholders(2, ranked.len());
-                let values = parameters
-                    .split(", ")
-                    .enumerate()
-                    .map(|(i, parameter)| format!("({parameter}, {i})"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                extra_cte = format!(", tr(wid, pos) AS (VALUES {values})");
-                extra_join = " LEFT JOIN tr ON tr.wid = f.work_id".into();
-                cte_binds.extend(ranked.into_iter().map(Bind::Text));
-                // Most viewed = position 0 first, so DESC ranks ascending positions.
-                let pd = dir(!q.sort.desc);
-                format!("(tr.pos IS NULL), tr.pos {pd}, {NEWEST_ORDER}")
-            }
-        }
-        SortKey::CommunityRating => {
-            extra_join = " LEFT JOIN rated_per_work rp ON rp.wid = f.work_id".into();
-            format!("(rp.avg IS NULL), rp.avg {d}, {NEWEST_ORDER}")
-        }
-        key => match sort_column(key) {
-            Some((col, true)) => format!("({col} IS NULL), {}", order_by(col, q.sort.desc)),
-            Some((col, false)) => order_by(col, q.sort.desc),
-            None => NEWEST_ORDER.to_string(),
-        },
+        let window_arg = crate::sql_params::placeholders(binds.len(), 1);
+        extra_cte = format!(", {}", crate::search::window_cte(&window_arg));
+        page_size.min(window)
+    } else {
+        page_size
     };
-    let (where_sql, _, _) = build_where_from(q, 2 + cte_binds.len());
-    let m_cte = ctes(eligible, &format!("{where_sql}{gate}"));
-    let page_args = crate::sql_params::placeholders(2 + cte_binds.len() + where_binds.len(), 2);
+    let page_args = crate::sql_params::placeholders(binds.len() + 1, 2);
     let mut page_args = page_args.split(", ");
     let limit_arg = page_args.next().unwrap();
     let offset_arg = page_args.next().unwrap();
-    let sql = format!(
-        "WITH {rated_def}{m_cte}{extra_cte} SELECT {BROWSE_COLS} FROM m f{extra_join} \
+    let page_sql = format!(
+        "SELECT {BROWSE_COLS} FROM {source} f{extra_join} \
          ORDER BY {order} LIMIT {limit_arg} OFFSET {offset_arg}"
     );
-    // Bind order follows the text: the MATCH (in `m`), the VALUES ids (in `tr`), then the
-    // WHERE's binds.
-    let mut binds: Vec<Bind> = vec![Bind::Text(match_expr)];
-    binds.extend(cte_binds);
-    binds.extend(where_binds);
-    connection.next_budget().await?;
-    let rows = bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), &binds)
-        .bind(page_size)
-        .bind(offset)
-        .fetch_all(&mut *connection)
-        .await;
-    let rows = match rows {
-        Err(error) if crate::search::over_budget(&error) => {
-            return Ok(connection.cancelled(error, in_first))
+    let eligible = "SELECT f.* FROM browse_catalogue f JOIN work w ON w.id=f.work_id";
+
+    // The first statement, then `search::retry_ctes` when that one counts nothing: a
+    // misspelt term that is a word elsewhere, a query without its spaces. Each has its own
+    // memo entry, see [`text_count_key`].
+    let retry: fn(&str, &str) -> String = crate::search::retry_ctes;
+    for (memo, ctes, in_first) in [(first_memo, first, true), ("fts-retry", retry, false)] {
+        let m_cte = ctes(eligible, &format!("{where_sql}{gate}"));
+        let with = format!("WITH {rated_def}{m_cte}{extra_cte}");
+        let ckey = text_count_key(memo, raw_query, q);
+        let memoized = cached_count_with(&ckey, count_ttl);
+        let sql = match memoized {
+            Some(0) => continue,
+            Some(total) if offset >= total => {
+                connection.finish().await?;
+                return Ok(Ok((total, Vec::new())));
+            }
+            Some(_) => format!("{with} {page_sql}"),
+            None => format!(
+                "{with} SELECT t.total, p.* FROM (SELECT count(*) AS total FROM {source}) t \
+                 LEFT JOIN LATERAL ({page_sql}) p ON TRUE"
+            ),
+        };
+        connection.next_budget().await?;
+        let fetched = bind_query(sqlx::query(&sql), &binds)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&mut *connection)
+            .await;
+        let fetched = match fetched {
+            Err(error) if crate::search::over_budget(&error) => {
+                return Ok(connection.cancelled(error, in_first))
+            }
+            fetched => fetched?,
+        };
+        let total = match memoized {
+            Some(total) => total,
+            None => {
+                let total = match fetched.first() {
+                    Some(row) => row.try_get::<i64, _>("total")?,
+                    None => 0,
+                };
+                store_count(ckey, total, generation);
+                total
+            }
+        };
+        if total > 0 {
+            // Without a page row the LEFT JOIN leaves the page columns NULL.
+            let mut rows = Vec::with_capacity(fetched.len());
+            for row in &fetched {
+                if row.try_get::<Option<String>, _>("work_id")?.is_some() {
+                    rows.push(BrowseRow::from_row(row)?);
+                }
+            }
+            connection.finish().await?;
+            return Ok(Ok((total, rows)));
         }
-        rows => rows?,
-    };
+    }
     connection.finish().await?;
-    Ok(Ok((total, rows)))
+    Ok(Ok((0, Vec::new())))
 }
 
 /// Catalogue-wide Browse. Returns `(total, page)` where `total` counts exactly the row set
@@ -4163,9 +4197,10 @@ mod tests {
     /// error here either: Browse answers with what the search finds without typo
     /// matching, total and page, for relevance and for another sort key. The typo test
     /// of this database outlasts the budget from the second search on. A retry statement
-    /// over the budget gives the first statement's answer, nothing. Last, the count fits
-    /// the budget and each kind of page statement does not: the request starts again
-    /// without typo matching and answers from that pass.
+    /// over the budget gives the first statement's answer, nothing. On a memo miss one
+    /// statement answers total and page, so it fits the budget or not as a whole. On a
+    /// memo hit the page statement runs alone; when it does not fit, the request starts
+    /// again without typo matching and answers from that pass, total included.
     #[tokio::test]
     async fn text_search_over_budget_answers_without_typo_matching() {
         let pool = pool().await;
@@ -4175,6 +4210,9 @@ mod tests {
             ("w_3", "Onepiecf Saga", 5),
             ("w_4", "Jujutsu Kaisen", 7),
             ("w_5", "Kaizen Notes", 1),
+            ("w_6", "Lark Spur", 3),
+            ("w_7", "Lark Spur Party", 800),
+            ("w_8", "Larkspuf Saga", 2),
         ] {
             seed(
                 &pool,
@@ -4225,21 +4263,443 @@ mod tests {
             search("jujutsu kaizen", SortKey::Relevance).await,
             (0, Vec::new())
         );
-        for (key, expected) in [
-            (SortKey::Relevance, ["One Piece", "One Piece Party"]),
-            (SortKey::MostFollows, ["One Piece Party", "One Piece"]),
-        ] {
-            let slow = "CASE WHEN waited < 0.8 THEN 0.9 WHEN waited < 2.5 THEN 10 ELSE 0 END";
+        // Memo miss: the one statement asks the typo test once, fits (0.9 s) and answers
+        // with typo matching.
+        for key in [SortKey::Relevance, SortKey::MostFollows] {
+            let slow = "CASE WHEN waited < 0.8 THEN 0.9 ELSE 10 END";
             crate::search::slow_typo_test(&pool, slow).await;
             let started = std::time::Instant::now();
             assert_eq!(
                 search("onepiece", key).await,
-                (2, ids(&expected)),
+                (1, ids(&["Onepiecf Saga"])),
                 "{key:?}"
             );
             let seconds = started.elapsed().as_secs_f64();
-            assert!((2.8..4.0).contains(&seconds), "{key:?}: {seconds} s");
+            assert!((0.9..1.8).contains(&seconds), "{key:?}: {seconds} s");
         }
+        // Memo hit: a fast search memoizes the typo pass's total, then the page statement
+        // alone runs out of the budget, and the pass without typo matching answers.
+        let ttl = std::time::Duration::from_secs(60);
+        for (key, expected) in [
+            (SortKey::Relevance, ["Lark Spur", "Lark Spur Party"]),
+            (SortKey::MostFollows, ["Lark Spur Party", "Lark Spur"]),
+        ] {
+            let query = BrowseQuery {
+                sort: Sort::desc(key),
+                ..Default::default()
+            };
+            let titles = |(t, rows): (i64, Vec<BrowseRow>)| {
+                (t, rows.into_iter().map(|r| r.title).collect::<Vec<_>>())
+            };
+            crate::search::slow_typo_test(&pool, "0").await;
+            let found = search_text_with(&pool, "larkspur", &query, ttl)
+                .await
+                .unwrap();
+            assert_eq!(titles(found), (1, ids(&["Larkspuf Saga"])), "{key:?}");
+            crate::search::slow_typo_test(&pool, "10").await;
+            let started = std::time::Instant::now();
+            let found = search_text_with(&pool, "larkspur", &query, ttl)
+                .await
+                .unwrap();
+            assert_eq!(titles(found), (2, ids(&expected)), "{key:?}");
+            let seconds = started.elapsed().as_secs_f64();
+            assert!((2.0..3.0).contains(&seconds), "{key:?}: {seconds} s");
+        }
+        pool.close().await;
+    }
+
+    /// `search_text` as it was before one statement answered both total and page: a count
+    /// statement, then the page statement, each building the match set again. No budget.
+    /// Returns the total, the page as `Debug` text and whether the retry statement answered.
+    /// The oracle of `text_search_one_statement_answers_as_two_did`.
+    async fn two_statement_search(
+        pool: &Database,
+        raw: &str,
+        q: &BrowseQuery<'_>,
+    ) -> (i64, Vec<String>, bool) {
+        if !crate::search::valid_query(raw) {
+            return (0, Vec::new(), false);
+        }
+        let trending = if q.sort.key == SortKey::MostViewed {
+            Some(trending_work_ids(pool, TRENDING_KEY_LIMIT).await)
+        } else {
+            None
+        };
+        let mut tx = pool.read().begin().await.unwrap();
+        sqlx::query(
+            "SELECT set_config('pg_trgm.similarity_threshold', '0.3', true), \
+             set_config('pg_trgm.word_similarity_threshold', '0.2', true)",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let (where_sql, where_binds, uses_rated) = build_where_from(q, 2);
+        let offset = (q.page.max(1) - 1) * BROWSE_PAGE_SIZE;
+        let window = crate::catalog::RANK_WINDOW;
+        let gate = if q.show_nsfw {
+            ""
+        } else {
+            " AND NOT COALESCE(w.is_nsfw_override, w.is_nsfw)"
+        };
+        let relevance = q.sort.key == SortKey::Relevance;
+        let rated_def = if uses_rated || q.sort.key == SortKey::CommunityRating {
+            format!("{RATED_PER_WORK_DEF}, ")
+        } else {
+            String::new()
+        };
+        let eligible = "SELECT f.* FROM browse_catalogue f JOIN work w ON w.id=f.work_id";
+        let mut head: Vec<Bind> = vec![Bind::Text(raw.to_owned())];
+        head.extend(where_binds.iter().cloned());
+        let mut ctes: fn(&str, &str) -> String = crate::search::match_ctes;
+        let mut retried = false;
+        let mut m_cte = String::new();
+        let mut total = 0;
+        for retry in [false, true] {
+            if retry {
+                ctes = crate::search::retry_ctes;
+                retried = true;
+            }
+            m_cte = ctes(eligible, &format!("{where_sql}{gate}"));
+            let (sql, binds) = if relevance {
+                let window_arg = crate::sql_params::placeholders(head.len() + 1, 1);
+                let mut b = head.clone();
+                b.push(Bind::Int(window));
+                let sql = format!(
+                    "WITH {rated_def}{m_cte} SELECT COUNT(*) FROM \
+                     (SELECT 1 FROM m LIMIT {window_arg})"
+                );
+                (sql, b)
+            } else {
+                let sql = format!("WITH {rated_def}{m_cte} SELECT COUNT(*) FROM m");
+                (sql, head.clone())
+            };
+            total = bind_count(sqlx::query_scalar::<_, i64>(&sql), &binds)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            if total > 0 {
+                break;
+            }
+        }
+        if offset >= total {
+            return (total, Vec::new(), retried);
+        }
+        let rows = if relevance {
+            let window_arg = crate::sql_params::placeholders(head.len() + 1, 1);
+            let page_args = crate::sql_params::placeholders(head.len() + 2, 2);
+            let cand = crate::search::window_cte(&window_arg);
+            let mut page_args = page_args.split(", ");
+            let (limit_arg, offset_arg) = (page_args.next().unwrap(), page_args.next().unwrap());
+            let sql = format!(
+                "WITH {rated_def}{m_cte}, {cand} SELECT {BROWSE_COLS} FROM cand f \
+                 ORDER BY f.tier, f.chapters DESC NULLS LAST, f.rank, f.work_id \
+                 LIMIT {limit_arg} OFFSET {offset_arg}"
+            );
+            let mut binds = head;
+            binds.push(Bind::Int(window));
+            bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), &binds)
+                .bind(BROWSE_PAGE_SIZE.min(window))
+                .bind(offset)
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap()
+        } else {
+            let d = dir(q.sort.desc);
+            let mut extra_cte = String::new();
+            let mut extra_join = String::new();
+            let mut cte_binds: Vec<Bind> = Vec::new();
+            let order = match q.sort.key {
+                SortKey::MostViewed => {
+                    let ranked = trending.unwrap_or_default();
+                    if ranked.is_empty() {
+                        NEWEST_ORDER.to_string()
+                    } else {
+                        let parameters = crate::sql_params::placeholders(2, ranked.len());
+                        let values = parameters
+                            .split(", ")
+                            .enumerate()
+                            .map(|(i, parameter)| format!("({parameter}, {i})"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        extra_cte = format!(", tr(wid, pos) AS (VALUES {values})");
+                        extra_join = " LEFT JOIN tr ON tr.wid = f.work_id".into();
+                        cte_binds.extend(ranked.into_iter().map(Bind::Text));
+                        let pd = dir(!q.sort.desc);
+                        format!("(tr.pos IS NULL), tr.pos {pd}, {NEWEST_ORDER}")
+                    }
+                }
+                SortKey::CommunityRating => {
+                    extra_join = " LEFT JOIN rated_per_work rp ON rp.wid = f.work_id".into();
+                    format!("(rp.avg IS NULL), rp.avg {d}, {NEWEST_ORDER}")
+                }
+                key => match sort_column(key) {
+                    Some((col, true)) => {
+                        format!("({col} IS NULL), {}", order_by(col, q.sort.desc))
+                    }
+                    Some((col, false)) => order_by(col, q.sort.desc),
+                    None => NEWEST_ORDER.to_string(),
+                },
+            };
+            let (where_sql, _, _) = build_where_from(q, 2 + cte_binds.len());
+            let m_cte = ctes(eligible, &format!("{where_sql}{gate}"));
+            let page_args =
+                crate::sql_params::placeholders(2 + cte_binds.len() + where_binds.len(), 2);
+            let mut page_args = page_args.split(", ");
+            let (limit_arg, offset_arg) = (page_args.next().unwrap(), page_args.next().unwrap());
+            let sql = format!(
+                "WITH {rated_def}{m_cte}{extra_cte} SELECT {BROWSE_COLS} FROM m f{extra_join} \
+                 ORDER BY {order} LIMIT {limit_arg} OFFSET {offset_arg}"
+            );
+            let mut binds: Vec<Bind> = vec![Bind::Text(raw.to_owned())];
+            binds.extend(cte_binds);
+            binds.extend(where_binds);
+            bind_rows(sqlx::query_as::<_, BrowseRow>(&sql), &binds)
+                .bind(BROWSE_PAGE_SIZE)
+                .bind(offset)
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap()
+        };
+        let rows = rows.iter().map(|row| format!("{row:?}")).collect();
+        (total, rows, retried)
+    }
+
+    /// One statement for total and page gives what the count statement and the page
+    /// statement gave, on a catalogue of 525 matches: RELEVANCE with its title tiers and
+    /// its 500-work cap, filters (format, tag, the NSFW gate, a rating bound), pages inside,
+    /// at the end of and past the cap, typo matching, the retry statement (a query without
+    /// its spaces), no match at all and every other kind of sort statement. Each shape is
+    /// asked three ways and compared with `two_statement_search`: memo miss (one statement),
+    /// memo hit (the page statement alone, with a total that only the memo can have given),
+    /// and a memoized total the page lies past or a memoized nothing (no statement at all).
+    #[tokio::test]
+    async fn text_search_one_statement_answers_as_two_did() {
+        let pool = pool().await;
+        // 520 prefix matches `Quill 000`..`Quill 519`: chapters, follows, release, format,
+        // tag, NSFW and age all vary with n.
+        for statement in [
+            "INSERT INTO work (id, primary_title, status, content_rating, is_nsfw, created_at, updated_at) \
+             SELECT 'q_' || lpad(n::text, 3, '0'), 'Quill ' || lpad(n::text, 3, '0'), 'ONGOING', 'safe', \
+                    n % 10 = 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z' \
+             FROM generate_series(0, 519) n",
+            "INSERT INTO browse_catalogue (work_id, reader_id, title, comic_type, status, content_rating, \
+                    en_chapter_count, released_at, is_nsfw, created_at, follows) \
+             SELECT 'q_' || lpad(n::text, 3, '0'), 'q_' || lpad(n::text, 3, '0'), \
+                    'Quill ' || lpad(n::text, 3, '0'), CASE WHEN n % 2 = 0 THEN 'MANHWA' ELSE 'MANGA' END, \
+                    'ONGOING', 'safe', n % 4, \
+                    CASE WHEN n % 7 = 0 THEN NULL ELSE to_timestamp((n * 7919 % 1000) * 3600) END, \
+                    n % 10 = 0, '2026-01-01T00:00:00Z'::timestamptz - n * interval '1 hour', \
+                    CASE WHEN n % 5 = 0 THEN NULL ELSE n * 37 % 1000 END \
+             FROM generate_series(0, 519) n",
+            "INSERT INTO source_series (id, work_id, source_type, source_key, created_at) \
+             SELECT 'search-source:' || id, id, 'mangadex', 'search-source:' || id, '2026-01-01T00:00:00Z' \
+             FROM work WHERE id LIKE 'q!_%' ESCAPE '!'",
+            "INSERT INTO chapter (id, source_series_id, external_id, created_at) \
+             SELECT 'search-chapter:' || w.id || ':' || c, 'search-source:' || w.id, \
+                    'search-chapter:' || w.id || ':' || c, '2026-01-01T00:00:00Z' \
+             FROM work w CROSS JOIN generate_series(0, 2) c \
+             WHERE w.id LIKE 'q!_%' ESCAPE '!' AND c < right(w.id, 3)::int % 4",
+            "INSERT INTO work_tag (work_id, tag, ord, source, tag_key) \
+             SELECT id, 'Romance', 0, 'mangadex', 'romance' FROM work \
+             WHERE id LIKE 'q!_%' ESCAPE '!' AND right(id, 3)::int % 3 = 0",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        // The other tiers: an exact title, word matches, and two titles for typo matching
+        // and for a query without its spaces.
+        for (id, title, ch) in [
+            ("t_1", "Quill", 2),
+            ("t_2", "Silver Quill", 9),
+            ("t_3", "The Quill Keeper", 1),
+            ("t_4", "Quill Harbor", 3),
+            ("t_5", "Quill Harbor Nights", 5),
+            ("t_6", "Harbor Lights", 4),
+        ] {
+            seed(
+                &pool,
+                id,
+                title,
+                "MANGA",
+                "ONGOING",
+                "safe",
+                0,
+                ch,
+                Some(5_000_000),
+            )
+            .await;
+            v2(&pool, id, None, Some("ja"), None, Some(ch * 11), None, &[]).await;
+            fts(&pool, id, title, ch).await;
+        }
+        // Views and reviews, for the two ranking sorts.
+        let hour = chrono::Utc::now().timestamp() / 3600;
+        for (key, views) in [("q_004", 50i64), ("q_123", 40), ("t_2", 30)] {
+            sqlx::query(
+                "INSERT INTO series_view_bucket (series_key, hour_ts, views) VALUES ($1, $2, $3)",
+            )
+            .bind(key)
+            .bind(hour)
+            .bind(views)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            r#"INSERT INTO users (id, username, email, password_hash, created_at) VALUES ('11ac9418-0c9e-4237-9e42-3ace93d7c468','u','u@e','h','2020-01-01T00:00:00Z')"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (i, (w, score)) in [("q_009", 9), ("q_300", 4), ("t_4", 7)].iter().enumerate() {
+            sqlx::query(
+                r#"INSERT INTO reviews (id, series_id, user_id, score, body, created_at, updated_at) VALUES ($1, $2, '11ac9418-0c9e-4237-9e42-3ace93d7c468', $3, 'b', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"#,
+            )
+            .bind(crate::db_types::test_uuid(&(format!("rv{i}"))))
+            .bind(*w)
+            .bind(*score)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let romance = ids(&["romance"]);
+        let shape = |key: SortKey, desc: bool, page: i64| BrowseQuery {
+            show_nsfw: true,
+            sort: Sort { key, desc },
+            page,
+            ..Default::default()
+        };
+        let relevance = |page: i64| shape(SortKey::Relevance, true, page);
+        let follows = |page: i64| shape(SortKey::MostFollows, true, page);
+        let narrow = |mut q: BrowseQuery<'static>| {
+            q.types = vec!["MANHWA"];
+            q.include_tags = romance.clone();
+            q
+        };
+        let shapes: Vec<(&str, BrowseQuery<'_>)> = vec![
+            ("quill", relevance(1)),
+            ("quill", relevance(2)),
+            ("quill", relevance(17)),
+            ("quill", relevance(18)),
+            (
+                "quill",
+                BrowseQuery {
+                    show_nsfw: false,
+                    ..relevance(1)
+                },
+            ),
+            ("quill", narrow(relevance(1))),
+            ("quill", narrow(relevance(3))),
+            (
+                "quill",
+                BrowseQuery {
+                    min_rating: Some(5.0),
+                    ..relevance(1)
+                },
+            ),
+            ("qu", relevance(1)),
+            ("quill harbor", relevance(1)),
+            ("quill harbr", relevance(1)),
+            ("quillharbor", relevance(1)),
+            ("zzyzx", relevance(1)),
+            ("quill", follows(1)),
+            ("quill", follows(9)),
+            ("quill", follows(18)),
+            ("quill", follows(19)),
+            ("quill", shape(SortKey::MostFollows, false, 1)),
+            (
+                "quill",
+                BrowseQuery {
+                    show_nsfw: false,
+                    ..narrow(follows(2))
+                },
+            ),
+            ("quill", shape(SortKey::Title, false, 1)),
+            ("quill", shape(SortKey::LatestUpdate, true, 2)),
+            ("quill", shape(SortKey::MostViewed, true, 1)),
+            ("quill", shape(SortKey::CommunityRating, true, 1)),
+            ("quillharbor", follows(1)),
+            ("zzyzx", follows(1)),
+        ];
+        let ttl = std::time::Duration::from_secs(60);
+        let statements = || crate::catalog::STATEMENTS.with(std::cell::Cell::get);
+        let debug = |rows: Vec<BrowseRow>| -> Vec<String> {
+            rows.iter().map(|row| format!("{row:?}")).collect()
+        };
+        let mut checked = 0;
+        for (text, q) in &shapes {
+            let label = format!("{text:?} {:?} page {}", q.sort, q.page);
+            let (total, rows, retried) = two_statement_search(&pool, text, q).await;
+            // Memo miss: one statement for each kind that runs.
+            let before = statements();
+            let (t, r) = search_text(&pool, text, q).await.unwrap();
+            assert_eq!((t, debug(r)), (total, rows.clone()), "miss: {label}");
+            let kinds = u32::from(total == 0 || retried) + 1;
+            assert_eq!(statements() - before, kinds, "miss statements: {label}");
+            // Memo hit. Another test that clears the memo between the store and the read
+            // turns a hit into a miss, so each hit gets a few tries.
+            let first = text_count_key("fts", text, q);
+            let retry = text_count_key("fts-retry", text, q);
+            let in_range = (q.page.max(1) - 1) * BROWSE_PAGE_SIZE < total;
+            let (memo_total, expected, expected_statements) = if in_range {
+                (total + 1_000_000, (total + 1_000_000, rows.clone()), 1)
+            } else {
+                (total, (total, Vec::new()), 0)
+            };
+            let mut outcome = None;
+            for _ in 0..5 {
+                if retried {
+                    store_count_with(first.clone(), 0, ttl);
+                    store_count_with(retry.clone(), memo_total, ttl);
+                } else {
+                    store_count_with(first.clone(), memo_total, ttl);
+                }
+                let before = statements();
+                let (t, r) = search_text_with(&pool, text, q, ttl).await.unwrap();
+                let found = ((t, debug(r)), statements() - before);
+                if found == (expected.clone(), expected_statements) {
+                    outcome = Some(found);
+                    break;
+                }
+                outcome = Some(found);
+            }
+            assert_eq!(
+                outcome.unwrap(),
+                (expected, expected_statements),
+                "hit: {label}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, shapes.len());
+        // The shapes reach what they are for.
+        let total = |text: &'static str, q: BrowseQuery<'static>| {
+            let pool = pool.clone();
+            async move { two_statement_search(&pool, text, &q).await }
+        };
+        assert_eq!(
+            total("quill", relevance(1)).await.0,
+            500,
+            "the window caps the total"
+        );
+        assert_eq!(
+            total("quill", relevance(17)).await.1.len(),
+            20,
+            "the last page of the cap"
+        );
+        assert_eq!(
+            total("quill", follows(1)).await.0,
+            525,
+            "no cap without relevance"
+        );
+        assert!(
+            total("quillharbor", relevance(1)).await.2,
+            "a retry answers"
+        );
+        assert_eq!(total("zzyzx", relevance(1)).await.0, 0, "nothing at all");
+        let narrowed = total("quill", narrow(relevance(1))).await.0;
+        assert!(
+            (1..500).contains(&narrowed),
+            "the filter narrows: {narrowed}"
+        );
         pool.close().await;
     }
 
