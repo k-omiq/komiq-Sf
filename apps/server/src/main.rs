@@ -2458,36 +2458,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Populate the materialized updates feed at boot (migration 0051), off the request
-    // path, so `canonicalUpdates` serves real rows immediately — even before the first
-    // catalogue-sync cycle, and even when CATALOGUE_SYNC is off. Spawned so a slow
-    // rebuild doesn't delay the listener coming up: measured on production data it is a
-    // ~13 s transaction for `feed_series_updates` (48.5k rows) followed by a ~6-7 s one for
-    // `browse_catalogue` (115.5k rows, migration 0069), which `refresh_feed_updates` chains.
-    // Delayed ~20s so this heavy writer doesn't land in the same instant as the
-    // scanner's immediate first tick — the scanner would absorb the contention via its
-    // lock-retry, but there's no reason to create it (mirrors the 2C boot stagger).
-    //
-    // Browse serves correct rows for that whole window regardless: migration 0069 backfills
-    // `browse_catalogue` itself, so the first request does not depend on this task.
-    {
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-            match crate::catalog::refresh_feed_updates(&pool).await {
-                Ok(n) => tracing::info!(works = n, "feed_updates: initial build complete"),
-                Err(e) => {
-                    db::observe_database_error(&e);
-                    tracing::warn!(error = %e, "feed_updates: initial build failed");
-                }
-            }
-            // AD-5's `refresh_work_fts` used to be a second call here. It is now the last
-            // link of the `refresh_feed_updates` chain (with `feed_series_updates` and
-            // `browse_catalogue`), so this slot still builds the search index — search and
-            // Browse just can no longer be wired to different cadences by accident.
-        });
-    }
-
     // Background adaptive scan scheduler, sharing the same AppState.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     scanner::spawn(state.clone(), cfg.scan_tick_seconds, shutdown_rx);
@@ -2538,7 +2508,9 @@ async fn main() -> anyhow::Result<()> {
     // Keep PostgreSQL statistics current so the planner can choose the baseline's
     // indexes. Refresh each sampled index in a separate writer turn.
     db::spawn_analyze(pool.clone(), shutdown_tx.subscribe());
-    // Local catalogue/search repair must run even with CATALOGUE_SYNC=off.
+    // Local catalogue/search repair must run even with CATALOGUE_SYNC=off. Its first run,
+    // shortly after boot, is also the start-up build of the derived feed, Browse and
+    // search tables (see `mangadex::RECONCILE_FIRST_RUN`).
     mangadex::spawn_reconciler(
         pool.clone(),
         cfg.feed_reconcile_interval_secs,

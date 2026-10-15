@@ -74,7 +74,7 @@ The recurring sync supervisor in `apps/server/src/mangadex.rs` runs three jobs o
 | Chapter firehose | 15 minutes       | `CHAPTER_SYNC_INTERVAL_SECS`   | Ingests recently published English chapters.        |
 | Feed reconciler  | 24 hours         | `FEED_RECONCILE_INTERVAL_SECS` | Verifies updates feed integrity against the ledger. |
 
-To avoid a resource burst during startup, the tasks delay their first runs. Catalogue sync starts at 60 seconds, chapter sync starts at 150 seconds, and the feed reconciler starts at 300 seconds.
+To avoid a resource burst during startup, the tasks delay their first runs. The feed reconciler starts at 20 seconds, catalogue sync at 60 seconds and chapter sync at 150 seconds. The reconciler's first run is also the start-up build of the updates feed, Browse and search tables. A start builds them once, plus one more time 5 minutes later if that build failed or the release ledger was still being filled.
 
 The chapter firehose requests chapters in English (`translatedLanguage[]=en`). When a chapter lands, the incremental feed writer updates `feed_series_updates` at the end of each page.
 

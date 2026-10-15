@@ -1063,6 +1063,16 @@ async fn lock_refresh_job(conn: &mut sqlx::PgConnection, projection: &str) -> Re
 /// remains explicitly REPEATABLE READ READ ONLY, and publication uses short turns.
 pub(crate) const REFRESH_STAGING_LANE: crate::db::Lane = crate::db::Lane::Background;
 
+/// The primary key of a staged projection table: its only unique index, the conflict
+/// target of every staging statement and the publication cursor.
+fn refresh_key(table: &str) -> &'static str {
+    match table {
+        "tag" => "id",
+        "feed_genre_facet" => "tag",
+        _ => "work_id",
+    }
+}
+
 async fn refresh_snapshot(pool: &Database, tables: &[&str]) -> Result<RefreshSnapshot> {
     use sqlx::Connection;
     let permit = crate::db::snapshot_session_permit().await?;
@@ -1072,11 +1082,7 @@ async fn refresh_snapshot(pool: &Database, tables: &[&str]) -> Result<RefreshSna
     // Read-only transactions permit temporary DML but prohibit all DDL. Create
     // private staging relations first, then capture their previous rows atomically.
     for table in tables {
-        let key = match *table {
-            "tag" => "id",
-            "feed_genre_facet" => "tag",
-            _ => "work_id",
-        };
+        let key = refresh_key(table);
         sqlx::query(&format!(
             "CREATE TEMP TABLE previous_{table} (LIKE public.{table})"
         ))
@@ -1087,8 +1093,18 @@ async fn refresh_snapshot(pool: &Database, tables: &[&str]) -> Result<RefreshSna
         ))
         .execute(&mut conn)
         .await?;
+        // Defaults, NOT NULL and the primary key, but none of the public table's read
+        // indexes: staging only ever reaches a row by its key, and maintaining Browse's
+        // 24 secondary indexes made filling the staged copy take 20 s instead of 0.3 s.
+        // The key is the only unique index of every staged table (a test pins that), so
+        // staging rejects exactly what publication would.
         sqlx::query(&format!(
-            "CREATE TEMP TABLE {table} (LIKE public.{table} INCLUDING ALL)"
+            "CREATE TEMP TABLE {table} (LIKE public.{table} INCLUDING ALL EXCLUDING INDEXES)"
+        ))
+        .execute(&mut conn)
+        .await?;
+        sqlx::query(&format!(
+            "ALTER TABLE pg_temp.{table} ADD PRIMARY KEY ({key})"
         ))
         .execute(&mut conn)
         .await?;
@@ -1245,11 +1261,7 @@ async fn publish_snapshot(
         .bind(format!("pg_temp.{table}"))
         .fetch_all(&mut **snapshot).await?;
     let names: Vec<&str> = columns.iter().map(String::as_str).collect();
-    let key = match table {
-        "tag" => "id",
-        "feed_genre_facet" => "tag",
-        _ => "work_id",
-    };
+    let key = refresh_key(table);
     let key_index = names.iter().position(|name| *name == key).unwrap();
     let column_list = names.join(", ");
     let placeholders = crate::sql_params::placeholders(1, names.len());
@@ -1301,9 +1313,12 @@ async fn publish_snapshot(
         }
     );
     let delete = format!("DELETE FROM public.{table} WHERE {key} = $1 AND {same_delete}");
+    // `p.{key} > $1` restates the cursor on the previous side. It changes no result
+    // (the join is on equal keys), but without it the merge join walked the previous
+    // copy from its first row on every batch: 383 ms for a late batch, 0.28 ms with it.
     let select = format!(
         "SELECT {staged_names}, (p.{key} IS NOT NULL) AS previous_exists, {previous_names} \
-        FROM pg_temp.{table} s LEFT JOIN pg_temp.previous_{table} p ON p.{key} = s.{key} \
+        FROM pg_temp.{table} s LEFT JOIN pg_temp.previous_{table} p ON p.{key} = s.{key} AND p.{key} > $1 \
         WHERE s.{key} > $1 ORDER BY s.{key} LIMIT {REFRESH_BATCH_ROWS}"
     );
     let prune = format!(
@@ -1469,13 +1484,11 @@ pub async fn refresh_feed_updates(pool: &Database) -> Result<u64> {
     guards::pause("snapshot-published").await;
     // The reader's merged Updates feed is derived FROM the table we just rebuilt (plus
     // the scanner's half), so it is refreshed here rather than wired separately: every
-    // existing caller of this function — boot (`main`) and each post-sync pass
-    // (`mangadex`) — is exactly when both halves change. Best-effort: a failure here
-    // must not make the canonical feed's refresh look like it failed.
-    if let Err(e) = refresh_feed_series_updates(pool).await {
-        crate::db::observe_database_error(&e);
-        tracing::warn!(error = %e, "feed_series_updates: refresh failed");
-    }
+    // caller of this function — the feed reconciler, at boot and then daily
+    // (`mangadex::spawn_reconciler`) — runs when both halves may have changed. A failure
+    // there is returned, after `feed_updates` has been published, so the reconciler
+    // retries the chain instead of waiting a day.
+    refresh_feed_series_updates(pool).await?;
     Ok(n)
 }
 
@@ -1914,16 +1927,20 @@ pub async fn refresh_feed_series_updates(pool: &Database) -> Result<u64> {
     #[cfg(test)]
     guards::pause("snapshot-published").await;
 
-    // Derive Browse after the feed's bounded publication has completed.
+    // Derive Browse after the feed's bounded publication has completed. Search follows
+    // Browse so search hits can be hydrated through its reader ids. A failed stage does
+    // not stop the next one; the first failure is returned at the end (already counted,
+    // so the caller's boundary does not count it again).
+    let mut failed = None;
     if let Err(e) = refresh_browse_catalogue(pool).await {
-        crate::db::observe_database_error(&e);
+        let e = crate::db::observed_database_error(e);
         tracing::warn!(error = %e, "browse_catalogue: refresh failed");
+        failed.get_or_insert(e);
     }
-
-    // Search follows Browse so search hits can be hydrated through its reader ids.
     if let Err(e) = refresh_work_fts(pool).await {
-        crate::db::observe_database_error(&e);
+        let e = crate::db::observed_database_error(e);
         tracing::warn!(error = %e, "work_fts: refresh failed");
+        failed.get_or_insert(e);
     }
 
     tracing::info!(
@@ -1933,7 +1950,10 @@ pub async fn refresh_feed_series_updates(pool: &Database) -> Result<u64> {
         counted,
         "feed_series_updates: rebuilt merged updates feed"
     );
-    Ok(mirror + scanner)
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(mirror + scanner),
+    }
 }
 
 /// THE MANGADEX HALF'S INCREMENTAL FEED WRITER, for one work — the mirror-side counterpart
@@ -8579,6 +8599,155 @@ mod tests {
             turns >= 2,
             "other writers must make progress between batches: {turns}"
         );
+        drop(snapshot);
+        pool.close().await;
+    }
+
+    /// Staging copies every projection without its read indexes. That is safe only while
+    /// the primary key is each public table's ONLY unique index: a new unique index would
+    /// make publication refuse rows that staging accepted. This pins both halves.
+    #[tokio::test]
+    async fn staged_projection_copies_keep_only_the_primary_key() {
+        let pool = pool().await;
+        let tables = [
+            "feed_updates",
+            "feed_series_updates",
+            "browse_catalogue",
+            "tag",
+            "feed_genre_facet",
+        ];
+        // `scope` picks the schema (and, for public, unique indexes only).
+        let indexes = |scope: &str, table: &str| {
+            format!(
+                "SELECT i.indisprimary, a.attname::text FROM pg_index i \
+                 JOIN pg_class c ON c.oid = i.indrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey) \
+                 WHERE c.relname = '{table}' AND {scope} ORDER BY 1, 2"
+            )
+        };
+        for table in tables {
+            let public: Vec<(bool, String)> = crate::db_types::query_tuple(&indexes(
+                "n.nspname = 'public' AND i.indisunique",
+                table,
+            ))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(public, [(true, refresh_key(table).to_owned())], "{table}");
+        }
+        let mut snapshot = refresh_snapshot(&pool, &tables).await.unwrap();
+        for table in tables {
+            let staged: Vec<(bool, String)> =
+                crate::db_types::query_tuple(&indexes("n.oid = pg_my_temp_schema()", table))
+                    .fetch_all(&mut *snapshot)
+                    .await
+                    .unwrap();
+            assert_eq!(staged, [(true, refresh_key(table).to_owned())], "{table}");
+            let defaults = |schema: &str| {
+                format!(
+                    "SELECT a.attname::text, pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d \
+                     JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
+                     WHERE d.adrelid = '{schema}.{table}'::regclass ORDER BY 1"
+                )
+            };
+            let public: Vec<(String, String)> = crate::db_types::query_tuple(&defaults("public"))
+                .fetch_all(&mut *snapshot)
+                .await
+                .unwrap();
+            let staged: Vec<(String, String)> = crate::db_types::query_tuple(&defaults("pg_temp"))
+                .fetch_all(&mut *snapshot)
+                .await
+                .unwrap();
+            assert_eq!(staged, public, "{table} keeps its column defaults");
+        }
+        drop(snapshot);
+        pool.close().await;
+    }
+
+    /// A failed Browse stage no longer hides behind a successful feed rebuild: the chain
+    /// returns it (so the reconciler schedules its follow-up) after the feed tables and
+    /// the search stage have still run, and the reconcile still writes its drift report.
+    #[tokio::test]
+    async fn a_failed_browse_stage_fails_the_rebuild_chain() {
+        let pool = pool().await;
+        sqlx::query("ALTER TABLE tag RENAME TO tag_moved")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = ledger::reconcile_feed(&pool).await.unwrap_err();
+        assert!(format!("{error:#}").contains("tag"), "{error:#}");
+        let reports: i64 =
+            crate::db_types::query_scalar("SELECT COUNT(*) FROM feed_reconcile_report")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            reports, 1,
+            "the drift report is kept when a late stage fails"
+        );
+        sqlx::query("ALTER TABLE tag_moved RENAME TO tag")
+            .execute(&pool)
+            .await
+            .unwrap();
+        refresh_feed_updates(&pool).await.unwrap();
+        pool.close().await;
+    }
+
+    /// The compare join bounds the previous copy by the cursor too. Changes, an insert and
+    /// a prune that sit in late batches must still pair with their previous rows, and the
+    /// equal rows around them must not open a writer turn.
+    #[tokio::test]
+    async fn staged_catalogue_refresh_pairs_late_batches_with_their_previous_rows() {
+        let pool = Database::empty_for_test(3).await.unwrap();
+        create_empty_authority_inputs(&pool).await;
+        for sql in [
+            "CREATE TABLE work(id TEXT PRIMARY KEY)",
+            "CREATE TABLE browse_catalogue(work_id TEXT PRIMARY KEY, title TEXT NOT NULL, comic_type TEXT NOT NULL)",
+            "WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n < 386) INSERT INTO work SELECT lpad(n::text, 4, '0') FROM ids",
+            "INSERT INTO browse_catalogue SELECT id, 'same', 'MANGA' FROM work WHERE id <= '0385'",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        let mut snapshot = refresh_snapshot(&pool, &["browse_catalogue"])
+            .await
+            .unwrap();
+        for sql in [
+            "INSERT INTO pg_temp.browse_catalogue SELECT id, 'same', 'MANGA' FROM public.work WHERE id <> '0250'",
+            "UPDATE pg_temp.browse_catalogue SET title = 'changed' WHERE work_id IN ('0200', '0300', '0385')",
+        ] {
+            sqlx::query(sql).execute(&mut *snapshot).await.unwrap();
+        }
+        assert_eq!(
+            publish_snapshot(&pool, &mut snapshot, "browse_catalogue")
+                .await
+                .unwrap(),
+            5,
+            "three updates, one insert, one prune"
+        );
+        let rows: Vec<(String, String)> = crate::db_types::query_tuple(
+            "SELECT work_id, title FROM browse_catalogue WHERE title <> 'same' OR work_id IN ('0249', '0250', '0251', '0386') ORDER BY work_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let expected: Vec<(String, String)> = [
+            ("0200", "changed"),
+            ("0249", "same"),
+            ("0251", "same"),
+            ("0300", "changed"),
+            ("0385", "changed"),
+            ("0386", "same"),
+        ]
+        .into_iter()
+        .map(|(id, title)| (id.to_owned(), title.to_owned()))
+        .collect();
+        assert_eq!(rows, expected);
+        let total: i64 = crate::db_types::query_scalar("SELECT COUNT(*) FROM browse_catalogue")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 385);
         drop(snapshot);
         pool.close().await;
     }

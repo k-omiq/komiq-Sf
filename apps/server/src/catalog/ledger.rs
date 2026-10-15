@@ -469,8 +469,32 @@ pub async fn reconcile_feed(pool: &Database) -> Result<DriftReport> {
             .map(|(w, r, l)| (w, (r, l)))
             .collect();
 
-    crate::catalog::refresh_feed_updates(pool).await?;
+    // A chain error is returned only after the report is written: a late stage (Browse,
+    // search) can fail after the feed was already corrected, and the follow-up run would
+    // then find nothing left to report. An early failure leaves the feed as it was, so
+    // its report shows no drift and the follow-up measures the real one.
+    let rebuilt = crate::catalog::refresh_feed_updates(pool).await;
+    let reported = write_drift_report(pool, &snapshot, started).await;
+    match rebuilt {
+        Ok(_) => reported,
+        Err(error) => {
+            // The chain's error is the one the reconciler must act on and log.
+            if let Err(report_error) = reported {
+                crate::db::observe_database_error(&report_error);
+                tracing::warn!(error = %report_error, "feed reconciler: drift report failed");
+            }
+            Err(error)
+        }
+    }
+}
 
+/// Compare `feed_series_updates` with the rows captured before the rebuild and store the
+/// result as the single `feed_reconcile_report` row.
+async fn write_drift_report(
+    pool: &Database,
+    snapshot: &std::collections::HashMap<String, (i64, Option<String>)>,
+    started: std::time::Instant,
+) -> Result<DriftReport> {
     let after: Vec<(String, i64, Option<String>)> = crate::db_types::query_tuple(DRIFT_COLUMNS)
         .fetch_all(pool)
         .await?;

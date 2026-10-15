@@ -2210,7 +2210,7 @@ const PAGE_ERROR_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// How long the spawned backfill waits before touching the DB or MangaDex at all. The
 /// boot write burst — the scanner's first tick, `refresh_feed_updates` / `refresh_work_fts`
-/// (themselves staggered ~20s in `main.rs`) and Litestream's checkpoint — ran from
+/// (the reconciler's first run, staggered ~20s by `RECONCILE_FIRST_RUN`) and Litestream's checkpoint — ran from
 /// t+0 to roughly t+30s on the 2026-07-24 boot and cost four works to SQLITE_BUSY.
 /// 45s clears that window with margin. `main.rs` isn't ours to stagger, so the delay
 /// lives here, inside the spawned task, and needs no call-site change.
@@ -4601,6 +4601,14 @@ async fn run_recurring(
     }
 }
 
+/// When the reconciler's first run starts after boot. That run is also the start-up build of
+/// `feed_updates`, `feed_series_updates`, Browse and search: it replaced a separate boot build
+/// of the same chain, which ran twice per start (boot at 20 s, this loop at 300 s) and
+/// published nothing the second time. A boot run also reports the drift the previous
+/// process left, which a daily-only first run would miss on servers restarted more often.
+/// A failed or ledger-less run gets one follow-up ([`RECONCILE_FOLLOW_UP`]). 20 s keeps the heavy rebuild clear of the scanner's immediate first tick.
+const RECONCILE_FIRST_RUN: Duration = Duration::from_secs(20);
+
 pub fn spawn_reconciler(
     pool: crate::db::Database,
     interval_secs: u64,
@@ -4620,34 +4628,67 @@ async fn run_reconcile_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval_at(
-        tokio::time::Instant::now() + Duration::from_secs(300),
+        tokio::time::Instant::now() + RECONCILE_FIRST_RUN,
         Duration::from_secs(interval_secs.max(1)),
     );
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut follow_up: Option<tokio::time::Instant> = None;
     loop {
+        let due = follow_up;
         tokio::select! {
             biased;
             _ = shutdown.changed() => return,
             _ = ticker.tick() => {
-                    match crate::catalog::ledger::reconcile_feed(&pool).await {
-                        Ok(r) if r.drifted == 0 => tracing::info!(
-                            rows = r.rows_after,
-                            duration_ms = r.duration_ms,
-                            "feed reconciler: no drift — incremental writers are keeping up"
-                        ),
-                        Ok(r) => tracing::warn!(
-                            rows_before = r.rows_before,
-                            rows_after = r.rows_after,
-                            drifted = r.drifted,
-                            duration_ms = r.duration_ms,
-                            sample = %r.sample.join(" | "),
-                            "feed reconciler: DRIFT — the incremental writers missed rows"
-                        ),
-                        Err(e) => { let e = crate::db::observed_database_error(e); tracing::warn!(error = %e, "feed reconciler: failed"); },
-                    }
+                follow_up = reconcile_once(&pool)
+                    .await
+                    .then(|| tokio::time::Instant::now() + RECONCILE_FOLLOW_UP);
+            }
+            _ = async { tokio::time::sleep_until(due.unwrap()).await }, if due.is_some() => {
+                // One follow-up only: a second failure waits for the next tick.
+                follow_up = None;
+                reconcile_once(&pool).await;
             }
         }
     }
+}
+
+/// How long after an incomplete reconcile its one follow-up starts. It keeps what the
+/// second start-up build used to give for free: a retry after a failed build, and a
+/// ledger projection once the spine's ledger seed has finished (300 s after boot then).
+const RECONCILE_FOLLOW_UP: Duration = Duration::from_secs(300);
+
+/// One reconcile, logged. Returns whether it needs a follow-up: it failed, or the release
+/// ledger was not complete, so the feed's release clocks were left unprojected.
+async fn reconcile_once(pool: &crate::db::Database) -> bool {
+    let ledger_ready = crate::catalog::ledger::is_complete(pool)
+        .await
+        .unwrap_or_else(|error| {
+            let _ = crate::db::observed_read_database_error(error);
+            false
+        });
+    match crate::catalog::ledger::reconcile_feed(pool).await {
+        Ok(r) if r.drifted == 0 => tracing::info!(
+            rows = r.rows_after,
+            duration_ms = r.duration_ms,
+            ledger_ready,
+            "feed reconciler: no drift — incremental writers are keeping up"
+        ),
+        Ok(r) => tracing::warn!(
+            rows_before = r.rows_before,
+            rows_after = r.rows_after,
+            drifted = r.drifted,
+            duration_ms = r.duration_ms,
+            ledger_ready,
+            sample = %r.sample.join(" | "),
+            "feed reconciler: DRIFT — the incremental writers missed rows"
+        ),
+        Err(e) => {
+            let e = crate::db::observed_database_error(e);
+            tracing::warn!(error = %e, "feed reconciler: failed");
+            return true;
+        }
+    }
+    !ledger_ready
 }
 
 #[cfg(test)]
@@ -4751,6 +4792,109 @@ mod tests {
         })
         .await
         .expect("disabled upstream prevented local reconciliation");
+        stop.send(true).unwrap();
+        pool.close().await;
+    }
+
+    async fn reconcile_ran_at(pool: &crate::db::Database) -> Option<chrono::DateTime<chrono::Utc>> {
+        crate::db_types::query_scalar("SELECT ran_at FROM feed_reconcile_report")
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Move the paused clock forward by `by`, then let real time run again.
+    async fn advance_reconciler_clock(by: Duration) {
+        tokio::time::pause();
+        tokio::time::advance(by).await;
+        tokio::time::resume();
+    }
+
+    /// Wait (bounded) for a reconcile report newer than `previous`. A run's report is
+    /// written when it ends, so a new report also means that run has finished.
+    async fn next_reconcile_report(
+        pool: &crate::db::Database,
+        previous: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> chrono::DateTime<chrono::Utc> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match reconcile_ran_at(pool).await {
+                    Some(at) if Some(at) != previous => break at,
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("no reconcile run finished")
+    }
+
+    /// Nothing may start while the clock is short of a deadline. Each check below comes
+    /// after the previous run's report, so no run is in flight; a run that started early
+    /// would finish well inside this second.
+    async fn assert_no_new_reconcile(
+        pool: &crate::db::Database,
+        previous: Option<chrono::DateTime<chrono::Utc>>,
+        why: &str,
+    ) {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(reconcile_ran_at(pool).await, previous, "{why}");
+    }
+
+    /// The reconciler's first run is the start-up build, at `RECONCILE_FIRST_RUN`. With a
+    /// complete release ledger nothing rebuilds again until the interval has passed.
+    #[tokio::test]
+    async fn the_reconciler_builds_once_at_start_up() {
+        let pool = pool().await;
+        let work = crate::catalog::create_work(
+            &pool,
+            &crate::catalog::WorkInput {
+                primary_title: Some("Seeded".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO release_event (work_id, chapter_key, first_seen_at, label) VALUES ($1, '1', now(), '1')")
+            .bind(&work)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(crate::catalog::ledger::is_complete(&pool).await.unwrap());
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        spawn_reconciler(pool.clone(), 86400, shutdown);
+        tokio::task::yield_now().await;
+        advance_reconciler_clock(RECONCILE_FIRST_RUN / 2).await;
+        assert_no_new_reconcile(&pool, None, "no run before the first-run delay").await;
+        advance_reconciler_clock(RECONCILE_FIRST_RUN).await;
+        let first = next_reconcile_report(&pool, None).await;
+        advance_reconciler_clock(RECONCILE_FOLLOW_UP * 3).await;
+        assert_no_new_reconcile(
+            &pool,
+            Some(first),
+            "a complete start-up build needs no second run",
+        )
+        .await;
+        stop.send(true).unwrap();
+        pool.close().await;
+    }
+
+    /// An incomplete start-up build (here: the ledger has not been seeded) gets exactly one
+    /// follow-up, `RECONCILE_FOLLOW_UP` later, as the second boot build used to give.
+    #[tokio::test]
+    async fn an_incomplete_start_up_build_gets_one_follow_up() {
+        let pool = pool().await;
+        assert!(!crate::catalog::ledger::is_complete(&pool).await.unwrap());
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        spawn_reconciler(pool.clone(), 86400, shutdown);
+        tokio::task::yield_now().await;
+        advance_reconciler_clock(RECONCILE_FIRST_RUN * 2).await;
+        let first = next_reconcile_report(&pool, None).await;
+        advance_reconciler_clock(RECONCILE_FOLLOW_UP / 2).await;
+        assert_no_new_reconcile(&pool, Some(first), "the follow-up waits for its delay").await;
+        advance_reconciler_clock(RECONCILE_FOLLOW_UP).await;
+        let second = next_reconcile_report(&pool, Some(first)).await;
+        advance_reconciler_clock(RECONCILE_FOLLOW_UP * 3).await;
+        assert_no_new_reconcile(&pool, Some(second), "only one follow-up").await;
         stop.send(true).unwrap();
         pool.close().await;
     }
