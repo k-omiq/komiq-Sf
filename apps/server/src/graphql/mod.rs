@@ -767,9 +767,17 @@ impl Series {
     /// Every localized description of this work (all languages MangaDex carries),
     /// newest-language-agnostic, ordered by language tag. Empty for a work with no
     /// enrichment yet (run `backfillMangadexMetadata`) or a non-canonical series.
+    ///
+    /// Also empty while an admin `description_override` is set. Readers prefer this list
+    /// over the scalar `description` (which carries the override), so returning the
+    /// stored upstream texts here hid the admin's correction whenever an upstream text
+    /// in the app language or English existed.
     async fn localized_descriptions(&self, ctx: &Context<'_>) -> Result<Vec<LocalizedDescription>> {
         let rows = crate::db_types::query_tuple::<(String, String)>(
-            "SELECT lang, description FROM work_description WHERE work_id = $1 ORDER BY lang",
+            "SELECT d.lang, d.description FROM work_description d WHERE d.work_id = $1 \
+               AND NOT EXISTS (SELECT 1 FROM work w WHERE w.id = d.work_id \
+                               AND w.description_override IS NOT NULL) \
+             ORDER BY d.lang",
         )
         .bind(&self.id.0)
         .fetch_all(&state(ctx).pool)
@@ -3542,7 +3550,13 @@ async fn map_canonical_series(
         r#type: comic_type,
         status,
         cover_url,
-        source_id: "mangadex".to_string(),
+        // Only an anchored work is on MangaDex. Readers key their MangaDex source option
+        // on this, so a federation-only work must not claim it.
+        source_id: if work.mangadex_id.is_some() {
+            "mangadex".to_string()
+        } else {
+            String::new()
+        },
         chapter_count,
         is_nsfw: work.is_nsfw_override.unwrap_or(work.is_nsfw),
         rating,
@@ -5782,7 +5796,19 @@ impl QueryRoot {
     /// An id retired by a merge is followed through `work_redirect` to its survivor
     /// (see `load_work_following_redirect`), and the returned `Series.id` is the NEW id
     /// so a stale bookmark self-corrects instead of 404-ing forever.
-    async fn canonical_series(&self, ctx: &Context<'_>, work_id: ID) -> Result<Series> {
+    ///
+    /// `includeFederated` opts in to works with no MangaDex anchor (work-entity Stage 1):
+    /// the series page shows the WORK's own title, description, authors, status and
+    /// cover whichever source is selected, so every work needs its `Series`. Off by
+    /// default because older readers treat a non-null result as "this work is on
+    /// MangaDex" and would offer an empty MangaDex source for it. Such a `Series` has
+    /// `sourceId: ""`.
+    async fn canonical_series(
+        &self,
+        ctx: &Context<'_>,
+        work_id: ID,
+        #[graphql(default = false)] include_federated: bool,
+    ) -> Result<Series> {
         let st = state(ctx);
         let work = load_work_following_redirect(&st.pool, &work_id.0)
             .await?
@@ -5790,10 +5816,8 @@ impl QueryRoot {
         // Everything below reads the EFFECTIVE id (the survivor after a redirect), not
         // the requested one.
         let work_id = ID(work.work_id.clone());
-        // The canonical path is MangaDex-anchored by contract: a backfilled
-        // `w_<numeric>` work has no mangadex source (mangadex_id = None) → empty cover
-        // and zero chapters. Reject it as not-found rather than serving a shell (CR3).
-        if work.mangadex_id.is_none() {
+        // Without the opt-in the canonical path stays MangaDex-anchored by contract (CR3).
+        if work.mangadex_id.is_none() && !include_federated {
             return Err(Error::new("No such work"));
         }
         if work.is_nsfw_override.unwrap_or(work.is_nsfw) && !viewer_show_nsfw(ctx).await? {
@@ -5923,9 +5947,15 @@ impl QueryRoot {
     /// and metadata. Errors "No such work" exactly where `canonicalSeries` +
     /// `workSources` together would have rendered nothing: unknown id, or an NSFW
     /// work for an opted-out viewer. A federation-only work (no MangaDex anchor)
-    /// IS served, with `series: null` — unlike `canonicalSeries`, which 404s it —
-    /// because its source mappings are still readable.
-    async fn series_page(&self, ctx: &Context<'_>, work_id: ID) -> Result<SeriesPageBundle> {
+    /// IS served, because its source mappings are still readable; its `series` is
+    /// null unless `includeFederated` asks for the work's own `Series` (same opt-in
+    /// and reason as `canonicalSeries`). The spine stays empty without an anchor.
+    async fn series_page(
+        &self,
+        ctx: &Context<'_>,
+        work_id: ID,
+        #[graphql(default = false)] include_federated: bool,
+    ) -> Result<SeriesPageBundle> {
         let st = state(ctx);
         let work = load_work_following_redirect(&st.pool, &work_id.0)
             .await?
@@ -5956,7 +5986,9 @@ impl QueryRoot {
 
         // Canonical spine — only when MangaDex-anchored. `load_canonical_chapters` is
         // loaded ONCE and feeds both the chapter list and the series' chapterCount
-        // (the old resolvers each loaded it independently).
+        // (the old resolvers each loaded it independently). Without an anchor the work
+        // `Series` counts no spine chapters; `map_canonical_series` still raises the
+        // count to the sources' own.
         let (series, spine_chapters) = if work.mangadex_id.is_some() {
             let chapters = catalog::load_canonical_chapters(&st.pool, &effective_id)
                 .await
@@ -5976,6 +6008,9 @@ impl QueryRoot {
                 .collect();
             let s = map_canonical_series(&st.pool, user_id, work, count).await?;
             (Some(s), mapped)
+        } else if include_federated {
+            let s = map_canonical_series(&st.pool, user_id, work, 0).await?;
+            (Some(s), Vec::new())
         } else {
             (None, Vec::new())
         };
@@ -25197,6 +25232,87 @@ mod tests {
             page["sources"][0]["source"]["sourceKey"],
             serde_json::json!("4242")
         );
+
+        // Work-entity Stage 1: `includeFederated` returns the WORK's own Series for a work
+        // with no MangaDex anchor. Its values are the work's (an admin pin included), and
+        // it never claims to be on MangaDex.
+        sqlx::query("UPDATE work SET author = 'Minted Author', status = 'ONGOING', description = 'Work blurb.' WHERE id = 'w_fed'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        {
+            let mut conn = pool.write().acquire().await.unwrap();
+            catalog::pin_work_field(
+                &mut conn,
+                "w_fed",
+                catalog::PinnedField::Author,
+                Some("Pinned Author"),
+            )
+            .await
+            .unwrap();
+        }
+        let q = r#"{ seriesPage(workId: "w_fed", includeFederated: true) { series { id title author status description sourceId } spineChapters { id } } }"#;
+        let r = exec(&s, q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "opt-in must serve: {:?}", r.errors);
+        let page = r.data.into_json().unwrap()["seriesPage"].clone();
+        assert_eq!(
+            page["series"],
+            serde_json::json!({
+                "id": "w_fed",
+                "title": "Fed Only",
+                "author": "Pinned Author",
+                "status": "ONGOING",
+                "description": "Work blurb.",
+                "sourceId": "",
+            })
+        );
+        assert_eq!(page["spineChapters"].as_array().unwrap().len(), 0);
+        // `canonicalSeries` keeps refusing without the opt-in (older readers) and serves
+        // the same Series with it.
+        let q = r#"{ canonicalSeries(workId: "w_fed") { title } }"#;
+        assert_eq!(
+            first_error(&exec(&s, q, Some("bobtok"), "1.1.1.1").await),
+            "No such work"
+        );
+        let q = r#"{ canonicalSeries(workId: "w_fed", includeFederated: true) { title author sourceId } }"#;
+        let r = exec(&s, q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "opt-in must serve: {:?}", r.errors);
+        assert_eq!(
+            r.data.into_json().unwrap()["canonicalSeries"],
+            serde_json::json!({ "title": "Fed Only", "author": "Pinned Author", "sourceId": "" })
+        );
+        // The count rises to the sources' own (no spine to count), and the viewer's
+        // library flag is the one stored under the work id the page writes with.
+        sqlx::query("INSERT INTO suwayomi_series (id, title, status, source_id, chapter_count, updated_at) VALUES (4242, 'Fed Source', 'ONGOING', 'src-a', 7, '2026-01-01T00:00:00+00:00')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_library (user_id, series_id, created_at) SELECT id, 'w_fed', '2026-01-01T00:00:00Z' FROM users WHERE username = 'bob'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let q = r#"{ seriesPage(workId: "w_fed", includeFederated: true) { series { chapterCount isMarked } } }"#;
+        let r = exec(&s, q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "opt-in must serve: {:?}", r.errors);
+        assert_eq!(
+            r.data.into_json().unwrap()["seriesPage"]["series"],
+            serde_json::json!({ "chapterCount": 7, "isMarked": true })
+        );
+        // The opt-in never bypasses the visibility gates.
+        sqlx::query("UPDATE work SET is_nsfw_override = TRUE WHERE id = 'w_fed'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for q in [
+            r#"{ seriesPage(workId: "w_fed", includeFederated: true) { workId } }"#,
+            r#"{ canonicalSeries(workId: "w_fed", includeFederated: true) { title } }"#,
+        ] {
+            assert_eq!(
+                first_error(&exec(&s, q, Some("bobtok"), "1.1.1.1").await),
+                "No such work",
+                "{q}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -25323,6 +25439,38 @@ mod tests {
         assert_eq!(credits[0]["role"], serde_json::json!("artist"));
         assert_eq!(credits[0]["name"], serde_json::json!("Artist Two"));
         assert_eq!(credits[1]["role"], serde_json::json!("author"));
+
+        // An admin description override replaces the upstream texts: readers prefer the
+        // localized list over the scalar, so the list must step aside while it is set.
+        sqlx::query("UPDATE work SET description_override = 'Admin blurb.' WHERE id = $1")
+            .bind(&work_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let q = format!(
+            r#"{{ canonicalSeries(workId: "{work_id}") {{ description localizedDescriptions {{ lang }} }} }}"#
+        );
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
+        assert_eq!(
+            r.data.into_json().unwrap()["canonicalSeries"],
+            serde_json::json!({ "description": "Admin blurb.", "localizedDescriptions": [] })
+        );
+        // Clearing the override brings the upstream texts back.
+        sqlx::query("UPDATE work SET description_override = NULL WHERE id = $1")
+            .bind(&work_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let r = exec(&s, &q, Some("bobtok"), "1.1.1.1").await;
+        let data = r.data.into_json().unwrap();
+        assert_eq!(
+            data["canonicalSeries"]["localizedDescriptions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

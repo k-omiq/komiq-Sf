@@ -687,10 +687,20 @@ interface ResolvedWork {
 	translators: TranslatorOption[];
 	selected: TranslatorOption;
 	chapters: Chapter[];
+	/**
+	 * What the page DISPLAYS: the work's own `Series` (title, description, authors,
+	 * status, cover…) whichever source is selected — the selected source only decides
+	 * which chapters open (work-entity Stage 1). See {@link workDisplaySeries}. Only a
+	 * server that cannot serve the work's `Series` (older servers, for a work with no
+	 * MangaDex anchor) leaves the selected source's own series here.
+	 */
 	meta: Series | null;
-	/** The canonical (MangaDex-mirrored) series for the work when it resolves —
-	 *  carries S2 enrichment (credits + localized descriptions). Null for
-	 *  federation-only works with no MangaDex anchor. */
+	/** The selected source's own series (the work's for the MangaDex spine); null when
+	 *  it failed to load. Only for source-owned facts, e.g. a "Long Strip" tag. */
+	sourceMeta: Series | null;
+	/** The work's own series when it resolves — carries S2 enrichment (credits +
+	 *  localized descriptions). `sourceId` is `"mangadex"` only for a MangaDex-anchored
+	 *  work. Null when the server cannot serve it (see {@link meta}). */
 	canonSeries: Series | null;
 	/**
 	 * The EFFECTIVE canonical `w_` id the backend resolved the request to.
@@ -702,9 +712,9 @@ interface ResolvedWork {
 	 * translator preference, chapter links — otherwise the page keeps writing to
 	 * a retired id forever and the URL never heals.
 	 *
-	 * Null when the work has no MangaDex anchor (federation-only): `canonicalSeries`
-	 * 404s there, so there is nothing to learn the survivor id from and the
-	 * requested id stands.
+	 * Null on the legacy path when the work has no MangaDex anchor (federation-only)
+	 * and the server predates `includeFederated`: `canonicalSeries` 404s there, so
+	 * there is nothing to learn the survivor id from and the requested id stands.
 	 */
 	canonicalId: string | null;
 	/** Whether `chapters` are already server-ordered (the canonical spine). */
@@ -798,10 +808,10 @@ async function resolveWork(
 		// Legacy fan-out: source mappings (suwayomi translators) + the canonical spine
 		// chapters + the canonical series (S2 enrichment: credits + localized
 		// descriptions), in parallel. Individual rejections are tolerated
-		// (canonicalChapters/canonicalSeries legitimately 404 for a federation-only
-		// work), but if every method that is actually present rejects the backend is
-		// effectively down — rethrow so the caller surfaces an honest error rather
-		// than a false "not found".
+		// (canonicalChapters, and an older server's canonicalSeries, legitimately 404
+		// for a federation-only work), but if every method that is actually present
+		// rejects the backend is effectively down — rethrow so the caller surfaces an
+		// honest error rather than a false "not found".
 		const hasWorkSources = !!b.workSources;
 		const hasCanonChapters = !!b.canonicalChapters;
 		const hasCanonSeries = !!b.canonicalSeries;
@@ -841,10 +851,12 @@ async function resolveWork(
 	// elsewhere, go find it". A source you cannot read from is still a source you must be
 	// able to SEE, and its `chapterCount` of 0 says so honestly.
 	// Keyed on `canonSeries`, not on the raw MangaDex mapping: the spine's metadata comes
-	// from it below (`meta = canonSeries`), so offering a spine we have no series row for
-	// would hand `getSeries` a null `meta` and 404 the page. A work whose mapping exists
-	// but whose `canonicalSeries` refused (NSFW gate) correctly keeps its suwayomi
-	// sources only.
+	// from it below, so offering a spine we have no series row for would hand `getSeries`
+	// a null `meta` and 404 the page. A work whose mapping exists but whose
+	// `canonicalSeries` refused (NSFW gate) correctly keeps its suwayomi sources only.
+	// And on its `sourceId`, not its mere presence: every work has a `canonSeries` now
+	// (`includeFederated`), and one with no MangaDex anchor must not grow an empty
+	// "MangaDex" option.
 	const candidates: {
 		view: Omit<TranslatorOption, 'chapterCount'>;
 		chapters: Chapter[];
@@ -856,7 +868,7 @@ async function resolveWork(
 		 */
 		redundant?: boolean;
 	}[] = [];
-	if (spineChapters.length || canonSeries) {
+	if (spineChapters.length || canonSeries?.sourceId === 'mangadex') {
 		candidates.push({
 			view: {
 				key: translatorKey('mangadex', null),
@@ -965,19 +977,25 @@ async function resolveWork(
 	// would render one source's chapters under another source's name.
 	const pick = ordered.find((c) => c.view.key === selected.key) ?? ordered[0];
 
-	// Metadata for the selected translator: the canonical mirror for the spine
-	// (already fetched), otherwise the source series behind the chosen suwayomi
-	// mapping.
-	let meta: Series | null;
+	// The selected translator's own series: the canonical mirror for the spine (already
+	// fetched), otherwise the source series behind the chosen suwayomi mapping. With the
+	// work's series in hand it only fills what the work cannot say (see
+	// `workDisplaySeries`).
+	let sourceMeta: Series | null;
 	if (selected.suwayomiMangaId === null) {
-		meta = canonSeries;
+		sourceMeta = canonSeries;
 	} else if (metaByKey) {
 		// Bundle path: the source's series rode along; a server-side fetch failure
 		// arrived as null, exactly what the legacy catch produced.
-		meta = metaByKey.get(selected.suwayomiMangaId) ?? null;
+		sourceMeta = metaByKey.get(selected.suwayomiMangaId) ?? null;
 	} else {
-		meta = await b.series(selected.suwayomiMangaId).catch(() => null);
+		sourceMeta = await b.series(selected.suwayomiMangaId).catch(() => null);
 	}
+	const meta = workDisplaySeries(
+		canonSeries,
+		sourceMeta,
+		mappingOf(wsList, selected.suwayomiMangaId)?.sourceId ?? null,
+	);
 
 	// Only ever adopt a CANONICAL id here: `canonSeries.id` is a `w_` work id, but
 	// guard the shape anyway so a numeric/source id could never leak onto the
@@ -985,8 +1003,8 @@ async function resolveWork(
 	//
 	// The bundle path improves on the canonSeries-derived id: `seriesPage` reports
 	// the redirect-resolved survivor id for EVERY work, including federation-only
-	// ones (where canonicalSeries 404s and the legacy path has nothing to learn the
-	// survivor from).
+	// ones (where an older server's canonicalSeries 404s and the legacy path has
+	// nothing to learn the survivor from).
 	const canonicalId =
 		effectiveId && isCanonicalId(effectiveId) && effectiveId !== workId
 			? effectiveId
@@ -999,6 +1017,7 @@ async function resolveWork(
 		selected,
 		chapters: pick.chapters,
 		meta,
+		sourceMeta,
 		canonSeries,
 		canonicalId,
 		preserveOrder: selected.suwayomiMangaId === null,
@@ -1013,6 +1032,36 @@ async function resolveWork(
 			sourceId: mappingOf(wsList, c.view.suwayomiMangaId)?.sourceId ?? null,
 		})),
 		aggregated,
+	};
+}
+
+/**
+ * The series a canonical page displays (work-entity Stage 1): the WORK's title,
+ * description, authors, status, cover and the rest, whichever source is selected.
+ * A present work's empty field stays empty — the work is the authority, not a source.
+ *
+ * Three things still come from the selected source:
+ *  - the cover while the work has none cached yet (`coverUrl` is `""` until the cover
+ *    drainer stores one, which it does from a source thumbnail anyway);
+ *  - `detectedAt`, when the source's scanner saw its newest chapter (the work has none);
+ *  - `sourceId`, the provenance of chapter rows listed straight from this series (the
+ *    AI badge). `mappingSourceId` — the selected mapping's — stands in when the source's
+ *    series failed to load, so the rows never take the work's `"mangadex"` or `""`.
+ *
+ * Without the work's series (an older server, for a work with no MangaDex anchor) the
+ * source's own series is all there is.
+ */
+export function workDisplaySeries(
+	work: Series | null,
+	source: Series | null,
+	mappingSourceId: string | null = null,
+): Series | null {
+	if (!work) return source;
+	return {
+		...work,
+		coverUrl: work.coverUrl || source?.coverUrl || '',
+		detectedAt: work.detectedAt ?? source?.detectedAt ?? null,
+		sourceId: source?.sourceId ?? mappingSourceId ?? work.sourceId,
 	};
 }
 
@@ -2333,30 +2382,17 @@ export async function getSeries(id: string, fetch?: LoadFetch): Promise<SeriesRe
 			}
 			// PER-VIEWER FLAGS FOLLOW THE ID, NOT THE METADATA.
 			//
-			// `resolved.meta` is the SELECTED TRANSLATOR's series — for anything but the
-			// MangaDex spine that's `backend.series(<numeric suwayomi id>)`, whose
-			// `isMarked`/`isFavorite`/`libraryStatus` the server resolved against
-			// `user_library.series_id = '<numeric>'`. Overwriting only `id` below left
-			// those three source-scoped while every write on this page addresses
-			// `effectiveId` (a `w_` work id), so the row was stored under one key and
-			// read back under another: "Add to Library" succeeded, the series appeared
-			// in /library, and a reload showed "Add to Library" again — with a second
-			// click then sending `marked: false` and deleting the real row.
-			//
-			// `canonSeries` is the same work fetched under `effectiveId` and already
-			// selects all three (CANONICAL_SERIES), so it costs no extra round trip. It
-			// only applies when the ids actually agree; a federation-only work has no
-			// canonical row and its numeric-scoped flags are already the right ones.
-			const canon = resolved.canonSeries;
-			const viewerScoped =
-				canon && canon.id === effectiveId
-					? {
-							isMarked: canon.isMarked,
-							isFavorite: canon.isFavorite ?? false,
-							libraryStatus: canon.libraryStatus ?? null,
-						}
-					: {};
-			const metaForView: Series = { ...resolved.meta, id: effectiveId, ...viewerScoped };
+			// Every write on this page addresses `effectiveId` (a `w_` work id), so
+			// `isMarked`/`isFavorite`/`libraryStatus` must be the ones the server resolved
+			// for that id. They are: `resolved.meta` is the work's own series (fetched under
+			// `effectiveId`) whenever the server serves one. They once came from the
+			// SELECTED source's `backend.series(<numeric id>)`, resolved against
+			// `user_library.series_id = '<numeric>'`, so the row was stored under one key and
+			// read back under another: "Add to Library" succeeded, a reload showed it again,
+			// and a second click sent `marked: false` and deleted the real row. Only an older
+			// server without the work's series for a federation-only work still hands over
+			// the source series here.
+			const metaForView: Series = { ...resolved.meta, id: effectiveId };
 			const view = mapSeriesView(
 				metaForView,
 				resolved.chapters,
@@ -3666,7 +3702,8 @@ function loadReaderChapter(
 				tmeta,
 				readingSrc,
 				{
-					longStrip: isLongStripSeries(resolved.canonSeries) || isLongStripSeries(resolved.meta),
+					longStrip:
+						isLongStripSeries(resolved.canonSeries) || isLongStripSeries(resolved.sourceMeta),
 					...readerCopyPool(effectiveId, agg, resolved, activeChs, readingSrc),
 					versions: readerVersions(agg, resolved, target, readingSrc, activeCand),
 					sourceName: activeCand?.name,

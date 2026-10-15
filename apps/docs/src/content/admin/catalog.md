@@ -95,7 +95,7 @@ The **Metadata** section lets you replace source values with your own.
 An override replaces what the source sends. Leaving a field blank, or choosing `Auto`, tells your server to use the source value.
 
 - **Title override**: Replaces the title shown to readers.
-- **Description override**: Replaces the synopsis.
+- **Description override**: Replaces the synopsis in every language.
 - **Type**: Selects a comic format or remains on `Auto`.
 - **NSFW**: Forces `SFW`, forces `NSFW`, or follows `Auto`.
 - **Pinned fields** (Author, Artist, Publication year, Original language, Status, Demographic, Content rating):

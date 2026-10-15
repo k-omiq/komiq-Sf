@@ -144,6 +144,12 @@ export const OPTIONAL_ARGUMENTS = [
 	// pass an argument called `filter` as `$filter`, or one old server would strip it there
 	// too.
 	'filter',
+	// Work-entity Stage 1: `canonicalSeries` and `seriesPage` return the work's own
+	// `Series` for a work with no MangaDex anchor too. Opt-in on the server, because an
+	// older reader reads a non-null canonical series as "this work is on MangaDex". A
+	// server that predates it answers as before (null / "No such work" for such a work),
+	// and the reader then falls back to the selected source's metadata.
+	'includeFederated',
 ] as const;
 
 const SERIES_FIELDS = /* GraphQL */ `
@@ -1780,8 +1786,8 @@ export const UPDATES_FEED = /* GraphQL */ `
 // SeriesFields fragment used by native/numeric-id queries.
 export const CANONICAL_SERIES = /* GraphQL */ `
 	${SERIES_FIELDS}
-	query CanonicalSeries($workId: ID!) {
-		canonicalSeries(workId: $workId) {
+	query CanonicalSeries($workId: ID!, $includeFederated: Boolean = true) {
+		canonicalSeries(workId: $workId, includeFederated: $includeFederated) {
 			...SeriesFields
 			metadata {
 				year
@@ -1918,8 +1924,12 @@ export const SERIES_PAGE = /* GraphQL */ `
 	${SERIES_FIELDS}
 	${CHAPTER_FIELDS}
 	${WORK_SOURCE_FIELDS}
-	query SeriesPage($workId: ID!, $withAggregated: Boolean! = false) {
-		seriesPage(workId: $workId) {
+	query SeriesPage(
+		$workId: ID!
+		$withAggregated: Boolean! = false
+		$includeFederated: Boolean = true
+	) {
+		seriesPage(workId: $workId, includeFederated: $includeFederated) {
 			workId
 			series {
 				...SeriesFields

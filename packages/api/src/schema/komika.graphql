@@ -37,7 +37,7 @@ type Query {
 	# Canonical (MangaDex-mirrored) reader path — workId is the `w_`-prefixed canonical
 	# id (distinct from numeric Suwayomi ids), so the reader routes it here. Returns the
 	# shared Series/Chapter/Page shapes; NSFW-gated by the viewer's preference. CATALOGUE.md §6.
-	canonicalSeries(workId: ID!): Series! # [komika] a MangaDex-mirrored work as a Series
+	canonicalSeries(workId: ID!, includeFederated: Boolean = false): Series! # [komika] a work as a Series; a work with no MangaDex anchor only with includeFederated (then sourceId is "")
 	canonicalChapters(workId: ID!): [Chapter!]! # [komika] its chapters from the mirror, deduped/ordered
 	canonicalPages(chapterId: ID!): [Page!]! # [komika] page URLs via MangaDex@Home (chapterId = MangaDex chapter uuid)
 	# native-embedded-Suwayomi source routing — per canonical work, the source

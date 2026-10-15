@@ -82,7 +82,7 @@ If multiple versions of the current chapter number exist, open the reader menu a
 
 ### Change the default source for a series
 
-Chapters open from the default source of the series. You can change it in two places:
+Chapters open from the default source of the series. The series title, description, authors, status and cover stay the same whichever source you pick. You can change it in two places:
 
 - On the series page, click More info, then click a source under Sources. The default source has an accent outline.
 - In the reader menu, choose an option under Default source for this series, shown when more than one source is available. The reader stays on the chapter number you are reading.
