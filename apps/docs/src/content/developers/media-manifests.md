@@ -105,7 +105,7 @@ Exact objects set `s-maxage`, their shared-cache lifetime, to the current lease'
 
 `apps/server/src/media_verify.rs` is the verifier for caches that pin the server's public key. It checks the signature over the exact payload bytes before it reads them, then checks length, MIME type and hash of each object. A key set counts only when a pinned key signed it.
 
-`verify_lease` verifies a signed lease. Pass it to `PolicyGate::accept`, which refuses an expired lease or an older epoch. Without an accepted lease, the gate refuses serving. `PolicyGate::object` refuses a denied copy or a lease older than the manifest's `policy_epoch`. `PolicyGate::work` refuses a denied work, including an old id in a cover URL.
+`verify_lease` verifies a signed lease and refuses a lifetime longer than 900 seconds, the owner's 600-second lease plus 5 minutes of clock skew. Pass it to `PolicyGate::accept`, which also refuses an issue time more than 5 minutes ahead of the cache's clock, an expired lease or an older epoch. Without an accepted lease, the gate refuses serving. `PolicyGate::object` refuses a denied copy or a lease older than the manifest's `policy_epoch`. `PolicyGate::work` refuses a denied work, including an old id in a cover URL.
 
 The gate returns the remaining lease life as `s-maxage`. After expiry, it keeps serving only what the last lease did not deny for 6 hours (`LEASE_GRACE_SECS`), with `s-maxage=0`. After that it fails closed, refusing serving until a valid lease is accepted. Denied content stays denied during the grace period.
 

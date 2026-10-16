@@ -205,10 +205,18 @@ pub fn verify_lease(bytes: &[u8], pins: &PinnedKeys) -> Result<LeaseBody, Verify
 /// Sorted lists without repeats, so a lookup is a binary search that cannot miss.
 fn well_formed(lease: &LeaseBody) -> bool {
     let sorted = |ids: &[String]| ids.windows(2).all(|pair| pair[0] < pair[1]);
-    lease.expires_at > lease.issued_at
+    lease
+        .expires_at
+        .checked_sub(lease.issued_at)
+        .is_some_and(|life| {
+            (1..=crate::media_policy::LEASE_SECS + LEASE_CLOCK_SKEW_SECS).contains(&life)
+        })
         && sorted(&lease.denied_copies)
         && sorted(&lease.denied_works)
 }
+
+/// Maximum clock difference allowed between the owner and a serving cache.
+pub const LEASE_CLOCK_SKEW_SECS: i64 = 5 * 60;
 
 /// After a lease expires, a cache keeps serving what that lease did not deny for this
 /// long (owner question Q7, pick B), then fails closed. A takedown made while the owner
@@ -222,10 +230,10 @@ pub struct PolicyGate {
 }
 
 impl PolicyGate {
-    /// Hold a verified lease. A lease that is already expired, or older than the held
-    /// one, is refused and the held lease stays.
+    /// Hold a verified lease. An expired, future-dated or overlong lease, or one older
+    /// than the held lease, is refused and the held lease stays.
     pub fn accept(&mut self, lease: LeaseBody, now: i64) -> Result<(), VerifyError> {
-        if !well_formed(&lease) {
+        if !well_formed(&lease) || lease.issued_at > now.saturating_add(LEASE_CLOCK_SKEW_SECS) {
             return Err(VerifyError::Malformed);
         }
         if lease.expires_at <= now {
@@ -534,6 +542,64 @@ mod tests {
             Err(VerifyError::Malformed)
         );
     }
+
+    #[test]
+    fn media_verify_policy_rejects_future_issued_leases() {
+        let key = key();
+        let now = 1000;
+        let mut held = lease(5, now, &["mc_denied"], &[]);
+        held.kid = key_id(key.public_key().as_ref());
+        let mut gate = PolicyGate::default();
+        gate.accept(verify_lease(&sign(&key, &held), &pins(&key)).unwrap(), now)
+            .unwrap();
+
+        for ahead in [LEASE_CLOCK_SKEW_SECS + 1, 3600] {
+            let mut future = lease(6, now + ahead, &[], &[]);
+            future.kid = held.kid.clone();
+            let verified = verify_lease(&sign(&key, &future), &pins(&key)).unwrap();
+            assert_eq!(gate.accept(verified, now), Err(VerifyError::Malformed));
+            assert_eq!(gate.object("mc_denied", 5, now), Err(VerifyError::Denied));
+            assert_eq!(gate.work("w_allowed", now), Ok(600));
+        }
+
+        let mut boundary = lease(6, now + LEASE_CLOCK_SKEW_SECS, &[], &[]);
+        boundary.kid = held.kid;
+        gate.accept(verify_lease(&sign(&key, &boundary), &pins(&key)).unwrap(), now)
+            .unwrap();
+        assert_eq!(gate.work("w_allowed", now), Ok(600 + LEASE_CLOCK_SKEW_SECS));
+    }
+
+    #[test]
+    fn media_verify_policy_rejects_overlong_leases() {
+        let key = key();
+        let now = 1000;
+        let max_life = crate::media_policy::LEASE_SECS + LEASE_CLOCK_SKEW_SECS;
+        let mut boundary = lease(5, now, &[], &[]);
+        boundary.kid = key_id(key.public_key().as_ref());
+        boundary.expires_at = now + max_life;
+        let mut gate = PolicyGate::default();
+        gate.accept(verify_lease(&sign(&key, &boundary), &pins(&key)).unwrap(), now)
+            .unwrap();
+        assert_eq!(gate.work("w_allowed", now), Ok(max_life));
+
+        for (issued_at, expires_at) in [
+            (now, now + max_life + 1),
+            (now, now + 3600),
+            (i64::MIN, i64::MAX),
+        ] {
+            let mut overlong = boundary.clone();
+            overlong.epoch += 1;
+            overlong.issued_at = issued_at;
+            overlong.expires_at = expires_at;
+            assert_eq!(
+                verify_lease(&sign(&key, &overlong), &pins(&key)),
+                Err(VerifyError::Malformed)
+            );
+            assert_eq!(gate.accept(overlong, now), Err(VerifyError::Malformed));
+            assert_eq!(gate.work("w_allowed", now), Ok(max_life));
+        }
+    }
+
     #[test]
     fn media_verify_policy_expiry_follows_the_grace_rule() {
         let mut gate = PolicyGate::default();

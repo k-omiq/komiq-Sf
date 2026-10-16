@@ -1937,15 +1937,13 @@ async fn resolve_viewer_blocks(ctx: &Context<'_>) -> Result<std::sync::Arc<Viewe
     // down (`media_policy`, held in memory).
     let policy = st.policy.current(pool).await.map_err(gql_read_err)?;
     let takedowns = policy.has_work_takedowns().then_some(policy.epoch);
-    let site = crate::block::load(pool, None)
-        .await
-        .map_err(gql_read_err)?
-        .with_takedowns(takedowns);
+    let site = policy.site_rules.clone().with_takedowns(takedowns);
     let lists = match current_user(ctx).await? {
-        Some(user) => crate::block::load(pool, Some(&user.id))
-            .await
-            .map_err(gql_read_err)?
-            .with_takedowns(takedowns),
+        Some(user) => site.clone().with_rules(
+            crate::block::list(pool, crate::block::Scope::User(&user.id))
+                .await
+                .map_err(gql_read_err)?,
+        ),
         None => site.clone(),
     };
     Ok(std::sync::Arc::new(ViewerBlocks { site, lists }))
@@ -25633,6 +25631,11 @@ mod tests {
             let response = s.execute(request).await;
             (response, pool.statements_sent() - before)
         };
+        // The first request warms the policy snapshot; pin that cost separately from
+        // the steady state used by production requests below.
+        let (cold, cold_statements) = run().await;
+        assert!(cold.errors.is_empty(), "{:?}", cold.errors);
+        assert_eq!(cold_statements, 32, "cold anonymous seriesPage statements");
         let (response, statements) = run().await;
         assert!(response.errors.is_empty(), "{:?}", response.errors);
         let page = response.data.into_json().unwrap()["seriesPage"].clone();
@@ -25679,13 +25682,11 @@ mod tests {
                 {"fileName": "v2.jpg", "isPrimary": false}
             ])
         );
-        // 42 with this fixture before M4 item 5. What is left: the work (1), site
-        // blocks (1), release announcements (1), spine chapters (1), the canonical
-        // arm's rating, MangaDex setting and statistics, counts, latest chapter and
-        // genres (8), the source list and its authoritative keys (2), the cached
-        // source rows (2), the source arm's own per-key reads (8), and one statement
-        // each for metadata, descriptions, credits, covers and the two `views` (6).
-        assert_eq!(statements, 29, "anonymous seriesPage statements");
+        // 42 with this fixture before M4 item 5, then 29. Steady state is now 28:
+        // site rules come from the shared policy snapshot, saving one read.
+        // Cold is 32: four more reads for the policy marker, site rules, work
+        // takedowns and copy takedowns; no numeric-source read without takedowns.
+        assert_eq!(statements, 28, "warm anonymous seriesPage statements");
         let (_, again) = run().await;
         assert_eq!(again, statements, "the count is stable run to run");
     }

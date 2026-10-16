@@ -38,7 +38,7 @@ The list shows each rule in words:
 | `Any series rated Erotica or Pornographic` | Series with one of these ratings             |
 | `Gore, when rated Erotica or Pornographic` | Series with the tag and one of these ratings |
 
-A series is blocked when it matches any rule. An NSFW series counts as `Erotica` when its own rating is lower. A rule applies at once for signed-in readers. Visitors who are not signed in can see a cached page for up to one minute. To remove a rule, select the bin button on its row and confirm. A server keeps at most 50 rules.
+A series is blocked when it matches any rule. An NSFW series counts as `Erotica` when its own rating is lower. For signed-in readers, a rule applies at once on the server process that saved it and within about 5 seconds on other server processes. Visitors who are not signed in can see a cached page for up to one minute. To remove a rule, select the bin button on its row and confirm. A server keeps at most 50 rules.
 
 Tags that only adult series carry are not listed while `Show NSFW content` is off for your account. The tag and source counts that readers see in the Browse filters do not go down for blocked series.
 

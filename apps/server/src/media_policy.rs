@@ -565,6 +565,8 @@ pub(crate) struct Snapshot {
     pub epoch: i64,
     /// The engine generation (id and state) the numeric sets below were read under.
     generation: Option<String>,
+    /// Site-wide rules, shared by GraphQL viewers until the next policy check.
+    pub site_rules: crate::block::BlockSet,
     /// Taken-down works, plus every old id that redirects to one.
     pub denied_works: BTreeSet<String>,
     /// Taken-down copies, plus every copy of a series whose pages are refused.
@@ -592,12 +594,16 @@ async fn marker(pool: &Database) -> Result<(i64, Option<String>)> {
 }
 
 impl Snapshot {
-    /// Reads the epoch first: a policy change that commits while the sets are read is
-    /// then picked up by the next epoch check, never hidden under a newer epoch.
+    /// The caller reads the marker first: a policy change that commits while the sets
+    /// are read is picked up by the next check, never hidden under a newer epoch.
     /// With exact media off (`exact_media` false) the copy tables are read only when a
     /// copy takedown exists, so a server that never made a copy never reads them.
-    pub(crate) async fn load(pool: &Database, exact_media: bool) -> Result<Self> {
-        let (epoch, generation) = marker(pool).await?;
+    pub(crate) async fn load(
+        pool: &Database,
+        exact_media: bool,
+        epoch: i64,
+        generation: Option<String>,
+    ) -> Result<Self> {
         let site_rules = crate::block::load(pool, None).await?;
         let works: Vec<String> = sqlx::query_scalar(
             "SELECT subject_id FROM media_takedown WHERE subject_kind = 'work' \
@@ -609,15 +615,19 @@ impl Snapshot {
         let parse = |keys: Vec<String>| -> HashSet<i64> {
             keys.iter().filter_map(|key| key.parse().ok()).collect()
         };
-        let takedown_manga = parse(
-            sqlx::query_scalar(
-                "SELECT source_key FROM source_series \
-                 WHERE source_type = 'suwayomi' AND work_id = ANY($1)",
+        let takedown_manga = if works.is_empty() {
+            HashSet::new()
+        } else {
+            parse(
+                sqlx::query_scalar(
+                    "SELECT source_key FROM source_series \
+                     WHERE source_type = 'suwayomi' AND work_id = ANY($1)",
+                )
+                .bind(&works)
+                .fetch_all(pool)
+                .await?,
             )
-            .bind(&works)
-            .fetch_all(pool)
-            .await?,
-        );
+        };
         let blocked_manga = match site_rules.blocked_sql("ss.work_id", None) {
             Some(blocked) => parse(
                 sqlx::query_scalar(&format!(
@@ -670,6 +680,7 @@ impl Snapshot {
         Ok(Self {
             epoch,
             generation,
+            site_rules,
             denied_works: works.into_iter().collect(),
             denied_copies,
             takedown_manga,
@@ -781,7 +792,7 @@ impl Policy {
                 return Ok(held.snapshot.clone());
             }
         }
-        let snapshot = Arc::new(Snapshot::load(pool, self.exact_media).await?);
+        let snapshot = Arc::new(Snapshot::load(pool, self.exact_media, epoch, generation).await?);
         let now = Instant::now();
         *self.held.lock().unwrap() = Some(Held {
             snapshot: snapshot.clone(),

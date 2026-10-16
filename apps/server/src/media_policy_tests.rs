@@ -244,6 +244,31 @@ async fn take_down(app: &AppState, kind: Kind, subject: &str) -> (String, bool) 
 }
 
 #[tokio::test]
+async fn policy_snapshot_reloads_site_rules_on_replace_and_clear() {
+    let pool = pool().await;
+    let policy = media_policy::Policy::new(false);
+    let empty = policy.current(&pool).await.unwrap();
+    assert!(empty.site_rules.is_empty());
+
+    let rule = crate::block::BlockRule::new(["action"], Vec::<&str>::new()).unwrap();
+    crate::block::replace(&pool, crate::block::Scope::Site, &[rule.clone()])
+        .await
+        .unwrap();
+    policy.invalidate();
+    let blocked = policy.current(&pool).await.unwrap();
+    assert!(blocked.epoch > empty.epoch);
+    assert_eq!(blocked.site_rules, crate::block::BlockSet::new(vec![rule]));
+
+    crate::block::replace(&pool, crate::block::Scope::Site, &[])
+        .await
+        .unwrap();
+    policy.invalidate();
+    let cleared = policy.current(&pool).await.unwrap();
+    assert!(cleared.epoch > blocked.epoch);
+    assert!(cleared.site_rules.is_empty());
+}
+
+#[tokio::test]
 async fn policy_epoch_moves_in_the_same_transaction_as_each_change() {
     let pool = pool().await;
     let dir = TempDir::new();

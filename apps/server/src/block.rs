@@ -193,6 +193,14 @@ impl BlockSet {
         BlockSet(rules, None)
     }
 
+    /// Add a viewer's own rules to the site's set, keeping its takedown gate.
+    pub(crate) fn with_rules(mut self, rules: Vec<BlockRule>) -> Self {
+        self.0.extend(rules);
+        self.0.sort();
+        self.0.dedup();
+        self
+    }
+
     /// The same rules, with the takedown clause at policy `epoch`, or without it.
     pub fn with_takedowns(mut self, epoch: Option<i64>) -> Self {
         self.1 = epoch;
@@ -387,8 +395,8 @@ pub async fn replace(pool: &Database, scope: Scope<'_>, rules: &[BlockRule]) -> 
 
 /// The rules that apply to a viewer: the site's, plus `user_id`'s own when signed in.
 ///
-/// One small read per request and never memoized, like `scanlators::list_tags`: a rule an
-/// admin just saved must hold on the next request, on every replica.
+/// One small read. GraphQL keeps site rules in the policy snapshot and reads only the
+/// viewer's own rules per request with [`list`].
 pub async fn load(pool: &Database, user_id: Option<&str>) -> Result<BlockSet> {
     let rows: Vec<(String, String)> = match user_id {
         Some(user_id) => {
@@ -511,6 +519,19 @@ mod tests {
 
     fn rule(tags: &[&str], ratings: &[&str]) -> BlockRule {
         BlockRule::new(tags, ratings).unwrap()
+    }
+
+    #[test]
+    fn viewer_rules_preserve_site_rules_and_takedowns() {
+        let site = BlockSet::new(vec![rule(&["gore"], &[])]).with_takedowns(Some(7));
+        let viewer = site
+            .clone()
+            .with_rules(vec![rule(&["gore"], &[]), rule(&["action"], &[])]);
+        assert_eq!(viewer.key(), "action/;gore/|takedowns@7");
+        assert_eq!(site.key(), "gore/|takedowns@7");
+        let sql = viewer.blocked_sql("w.id", None).unwrap();
+        assert!(sql.contains("'action'") && sql.contains("'gore'"));
+        assert!(sql.contains("media_takedown"));
     }
 
     #[test]
