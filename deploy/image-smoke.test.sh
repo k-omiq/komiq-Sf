@@ -71,6 +71,7 @@ trap cleanup EXIT HUP INT TERM
 
 case "$IMAGE_KIND" in
   server)
+    test -r /srv/web/reader/index.html
     cmp /usr/local/bin/komika-entrypoint.sh /tests/server-entrypoint.sh
     ENTRYPOINT_UNDER_TEST=/usr/local/bin/komika-entrypoint.sh sh /tests/server-entrypoint.test.sh
     start_server() { exec /usr/local/bin/komika-entrypoint.sh; }
@@ -114,6 +115,13 @@ if [ "$ready" != 1 ]; then
 fi
 test -f "$scratch/.komiq-server.lock"
 curl --max-time 1 -fsS http://127.0.0.1:18087/health > /dev/null
+if [ "$IMAGE_KIND" = server ]; then
+  curl --max-time 1 -sS http://127.0.0.1:18087/ > "$scratch/main-root"
+  if cmp -s "$scratch/main-root" /srv/web/reader/index.html; then
+    echo 'FAIL: main listener serves the fallback reader' >&2
+    exit 1
+  fi
+fi
 
 # Different port avoids confusing a bind conflict with a data-directory lock.
 second_status=0

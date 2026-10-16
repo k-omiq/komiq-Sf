@@ -87,6 +87,110 @@ impl SourceRateLimit {
 /// Default [`SourceRateLimit::requests_per_scan`] when an entry does not spell it out.
 pub const DEFAULT_REQUESTS_PER_SCAN: u32 = 2;
 
+/// Independent reader/API HTTPS listener. No fallback variables are consulted
+/// unless KOMIKA_FALLBACK_CERT_FILE is nonempty.
+#[derive(Clone, Debug)]
+pub struct FallbackConfig {
+    pub cert_file: std::path::PathBuf,
+    pub key_file: std::path::PathBuf,
+    pub hosts: Vec<String>,
+    pub port: u16,
+    pub bind_addr: std::net::IpAddr,
+    pub reader_dir: std::path::PathBuf,
+    pub media_bytes_per_day: u64,
+}
+
+impl FallbackConfig {
+    fn parse(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, String> {
+        let Some(cert) = get("KOMIKA_FALLBACK_CERT_FILE").filter(|v| !v.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let required = |name: &str| {
+            get(name)
+                .filter(|v| !v.trim().is_empty())
+                .ok_or_else(|| format!("{name} is required when KOMIKA_FALLBACK_CERT_FILE is set"))
+        };
+        let key = required("KOMIKA_FALLBACK_KEY_FILE")?;
+        let hosts: Vec<_> = required("KOMIKA_FALLBACK_HOSTS")?
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect();
+        if hosts.is_empty() || hosts.iter().any(|v| parse_fallback_authority(v).is_none()) {
+            return Err("KOMIKA_FALLBACK_HOSTS must contain authorities (name or name:port, IPv6 in brackets), without schemes, paths, userinfo or spaces".into());
+        }
+        let port = match get("KOMIKA_FALLBACK_PORT") {
+            Some(v) => v.trim().parse()
+                .map_err(|_| "KOMIKA_FALLBACK_PORT must be a port number")?,
+            None => 8443,
+        };
+        let bind = addr_or(
+            get("KOMIKA_FALLBACK_BIND_ADDR"),
+            &addr_or(get("BIND_ADDR"), "0.0.0.0"),
+        );
+        let bind_addr = bind.parse()
+            .map_err(|_| "KOMIKA_FALLBACK_BIND_ADDR (or BIND_ADDR) must be an IP address")?;
+        let reader_dir = get("KOMIKA_FALLBACK_READER_DIR")
+            .filter(|v| !v.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                get("KOMIKA_WEB_DIR")
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|v| std::path::PathBuf::from(v).join("reader"))
+            })
+            .ok_or("KOMIKA_FALLBACK_READER_DIR is required when KOMIKA_WEB_DIR is unset")?;
+        let media_bytes_per_day = match get("KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY") {
+            Some(v) => v.trim().parse()
+                .map_err(|_| "KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY must be an integer byte count")?,
+            None => 50_000_000_000,
+        };
+        Ok(Some(Self {
+            cert_file: cert.into(),
+            key_file: key.into(),
+            hosts,
+            port,
+            bind_addr,
+            reader_dir,
+            media_bytes_per_day,
+        }))
+    }
+}
+
+/// Strict authority parser shared by fallback configuration and the Host guard.
+/// Canonicalize DNS case/trailing dots and bracketed IPv6; never accept userinfo.
+pub(crate) fn parse_fallback_authority(raw: &str) -> Option<(String, Option<u16>)> {
+    if raw.is_empty()
+        || raw.bytes().any(|b| b.is_ascii_whitespace() || b"/@?#\\".contains(&b))
+    {
+        return None;
+    }
+    let authority: axum::http::uri::Authority = raw.parse().ok()?;
+    let host = authority.host();
+    let port = match raw.get(host.len()..)? {
+        "" => None,
+        suffix => {
+            let digits = suffix.strip_prefix(':')?;
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some(digits.parse().ok()?)
+        }
+    };
+    let host = if let Some(ip) = host.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+        format!("[{}]", ip.parse::<std::net::Ipv6Addr>().ok()?)
+    } else {
+        let host = host.strip_suffix('.').unwrap_or(host);
+        if host.is_empty() || host.split('.').any(str::is_empty)
+            || !host.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        {
+            return None;
+        }
+        host.to_ascii_lowercase()
+    };
+    Some((host, port))
+}
+
 /// Per-source outbound scan rate limits (`SCAN_SOURCE_RATE_LIMITS`).
 ///
 /// Format: comma-separated `source_id=requests/window_seconds[@requests_per_scan]`, e.g.
@@ -185,6 +289,7 @@ pub struct Config {
     /// unset it follows `web_dir` — on for a server that serves the reader itself, off
     /// for the hosted API, which has the image Worker instead.
     pub img_proxy_enabled: bool,
+    pub fallback: Option<FallbackConfig>,
     pub suwayomi_url: String,
     /// Publicly reachable base for Suwayomi image URLs (covers + pages). GraphQL
     /// federation uses the internal `suwayomi_url`, but image URLs are handed to
@@ -528,6 +633,8 @@ impl Config {
             .filter(|&v: &i64| v > 0)
             .unwrap_or(200);
         Self {
+            fallback: FallbackConfig::parse(|name| env::var(name).ok())
+                .unwrap_or_else(|error| panic!("{error}")),
             media_manifests: env::var("KOMIKA_MEDIA_MANIFESTS").is_ok_and(|v| v == "on"),
             media_routes_raw: env::var("KOMIKA_MEDIA_ROUTES").ok(),
             media_signing_key_file: env::var_os("KOMIKA_MEDIA_SIGNING_KEY_FILE")
@@ -742,5 +849,128 @@ mod listener_addr_tests {
         assert_eq!(addr_or(Some("  ".into()), "127.0.0.1"), "127.0.0.1");
         assert_eq!(addr_or(Some(" 0.0.0.0 ".into()), "127.0.0.1"), "0.0.0.0");
         assert_eq!(addr_or(Some("::1".into()), "127.0.0.1"), "::1");
+    }
+}
+
+#[cfg(test)]
+mod fallback_config_tests {
+    use super::FallbackConfig;
+
+    fn values() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("KOMIKA_FALLBACK_CERT_FILE", "/tls/cert.pem"),
+            ("KOMIKA_FALLBACK_KEY_FILE", "/tls/key.pem"),
+            (
+                "KOMIKA_FALLBACK_HOSTS",
+                " Reader.Example , , localhost:8443, [::1], [::1]:443 ",
+            ),
+            ("KOMIKA_FALLBACK_READER_DIR", "/web/reader"),
+        ]
+    }
+
+    fn parse(values: &[(&str, &str)]) -> Result<Option<FallbackConfig>, String> {
+        FallbackConfig::parse(|name| {
+            values.iter().find(|(key, _)| *key == name).map(|(_, v)| v.to_string())
+        })
+    }
+
+    #[test]
+    fn fallback_off_reads_only_cert_switch() {
+        for value in [None, Some(""), Some("  ")] {
+            assert!(FallbackConfig::parse(|name| {
+                assert_eq!(name, "KOMIKA_FALLBACK_CERT_FILE");
+                value.map(str::to_string)
+            }).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn fallback_on_defaults_and_explicit_overrides() {
+        let mut values = values();
+        let cfg = parse(&values).unwrap().unwrap();
+        assert_eq!(cfg.cert_file, std::path::Path::new("/tls/cert.pem"));
+        assert_eq!(cfg.key_file, std::path::Path::new("/tls/key.pem"));
+        assert_eq!(cfg.reader_dir, std::path::Path::new("/web/reader"));
+        assert_eq!(
+            cfg.hosts,
+            ["reader.example", "localhost:8443", "[::1]", "[::1]:443"]
+        );
+        assert_eq!(cfg.port, 8443);
+        assert_eq!(cfg.bind_addr.to_string(), "0.0.0.0");
+        assert_eq!(cfg.media_bytes_per_day, 50_000_000_000);
+        values.extend([
+            ("BIND_ADDR", "127.0.0.1"),
+            ("KOMIKA_FALLBACK_PORT", "9443"),
+            ("KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY", "0"),
+        ]);
+        let cfg = parse(&values).unwrap().unwrap();
+        assert_eq!(cfg.bind_addr.to_string(), "127.0.0.1");
+        assert_eq!(cfg.port, 9443);
+        assert_eq!(cfg.media_bytes_per_day, 0);
+        values.push(("KOMIKA_FALLBACK_BIND_ADDR", "::1"));
+        assert_eq!(parse(&values).unwrap().unwrap().bind_addr.to_string(), "::1");
+    }
+
+    #[test]
+    fn fallback_required_variables_are_named() {
+        for name in [
+            "KOMIKA_FALLBACK_KEY_FILE",
+            "KOMIKA_FALLBACK_HOSTS",
+            "KOMIKA_FALLBACK_READER_DIR",
+        ] {
+            for missing in [None, Some(""), Some(" \t ")] {
+                let mut values = values();
+                values.retain(|(key, _)| *key != name);
+                if let Some(value) = missing {
+                    values.push((name, value));
+                }
+                assert!(parse(&values).unwrap_err().contains(name));
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_rejects_bad_authorities() {
+        for host in [
+            ", ,", "https://reader.example", "reader.example/path", "user@reader.example",
+            "reader .example", "reader\texample", "reader.example?x", "reader.example#x",
+            "reader.example:", "reader.example:no", "reader.example:65536", "::1", "[nope]",
+            "[::1]:no", ".", "x..example",
+        ] {
+            let mut values = values();
+            values.retain(|(key, _)| *key != "KOMIKA_FALLBACK_HOSTS");
+            values.push(("KOMIKA_FALLBACK_HOSTS", host));
+            assert!(
+                parse(&values).unwrap_err().contains("KOMIKA_FALLBACK_HOSTS"),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_reader_defaults_from_web_dir_without_filesystem_checks() {
+        let mut values = values();
+        values.retain(|(key, _)| *key != "KOMIKA_FALLBACK_READER_DIR");
+        values.push(("KOMIKA_WEB_DIR", "/does/not/exist"));
+        assert_eq!(
+            parse(&values).unwrap().unwrap().reader_dir,
+            std::path::Path::new("/does/not/exist/reader")
+        );
+    }
+
+    #[test]
+    fn fallback_rejects_invalid_numeric_and_bind_values() {
+        for (name, invalid) in [
+            ("KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY", "five"),
+            ("KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY", "-1"),
+            ("KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY", "1.5"),
+            ("KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY", "18446744073709551616"),
+            ("KOMIKA_FALLBACK_PORT", "bad"),
+            ("KOMIKA_FALLBACK_BIND_ADDR", "localhost"),
+        ] {
+            let mut values = values();
+            values.push((name, invalid));
+            assert!(parse(&values).unwrap_err().contains(name));
+        }
     }
 }

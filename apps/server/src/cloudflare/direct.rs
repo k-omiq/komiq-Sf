@@ -31,6 +31,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 
 use super::*;
+use crate::fallback::FallbackListener;
 
 pub(super) const DIRECT_TLS_GENERATION: instance::Setting = instance::Setting {
     key: "direct_tls_generation",
@@ -336,7 +337,8 @@ pub async fn plain_http_guard(
         .is_some_and(|peer| from_internet(peer.0.ip()))
         || typed_public(&request, &origin);
     if request.extensions().get::<origin_tls::OverTls>().is_some() {
-        if internet && !manager.https_seen.swap(true, Ordering::Relaxed) {
+        let fallback = request.extensions().get::<FallbackListener>();
+        if internet && fallback.is_none() && !manager.https_seen.swap(true, Ordering::Relaxed) {
             let manager = manager.clone();
             let generation = manager
                 .direct_generation

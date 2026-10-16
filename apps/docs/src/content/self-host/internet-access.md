@@ -130,3 +130,29 @@ After the first visit from the internet over HTTPS, komiq stops handling interne
 > With Docker Desktop or rootless Docker, every connection looks local, so the server goes by the address you typed: a public address counts as the internet.
 
 With **Encrypt the connection** off, readers use plain HTTP, such as `http://203.0.113.5:8080`, and people on the network path can see passwords and pages. With Docker, run the installer with `--access direct --encrypt no` so the HTTP port answers every address.
+
+## Fallback address
+
+A fallback address is a second way in for when your main address or its proxy is down. It is a separate HTTPS listener with its own port and certificate. It serves the reader web app, the API and media. It does not serve the admin console.
+
+You need a second host name that points straight at your server, a publicly trusted certificate and its private key in PEM files (the usual text format for certificates), and an open port. Mount the certificate folder read-only into the server container, publish the port, and set these variables:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `KOMIKA_FALLBACK_CERT_FILE` | unset | Certificate chain file. Unset or empty turns the listener off. |
+| `KOMIKA_FALLBACK_KEY_FILE` | unset | The matching private key file. Required when the listener is on. |
+| `KOMIKA_FALLBACK_HOSTS` | unset | Required. Comma-separated host names, each with an optional `:port`. |
+| `KOMIKA_FALLBACK_PORT` | `8443` | The listener's port inside the container. |
+| `KOMIKA_FALLBACK_BIND_ADDR` | the `BIND_ADDR` value | The address the listener binds. |
+| `KOMIKA_FALLBACK_READER_DIR` | `KOMIKA_WEB_DIR` plus `/reader` | The reader build folder with `index.html`. |
+| `KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY` | `50000000000` | The daily media budget in bytes (50 GB). |
+
+The server refuses to start when the listener is on and a required value is missing or the files are not a valid pair.
+
+A request for a host name that is not on `KOMIKA_FALLBACK_HOSTS` gets `421`. Every media byte the listener sends counts against the daily budget. Once the budget is used, media requests get `503` until the next UTC day, while the reader web app and the API keep working. The count is kept in memory, so a restart sets it back to zero.
+
+Renewing the certificate is your job. Replace the certificate and key files: the server checks them every five minutes and loads a valid new pair without a restart. It keeps the old pair when the new one is not valid.
+
+People sign in again on the fallback address, because the browser keeps sign-in separate for each address.
+
+Some image addresses name your main address. For the reader on the fallback address to load them from itself, set the owner route's `base` in `KOMIKA_MEDIA_ROUTES` to your main public address, for example `https://komiq.example.com`. Read [Media routes](/developers/media-routes).

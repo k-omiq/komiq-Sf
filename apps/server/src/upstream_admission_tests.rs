@@ -384,6 +384,8 @@ async fn cached_reader_requests_survive_all_upstream_slots_hanging_and_client_li
             app_state: state,
         },
         cloudflare,
+        web_dir::Apps::from_config(&cfg),
+        cfg.img_proxy_enabled,
     );
 
     let pages_query = format!("{{ pages(chapterId: \"{CHAPTER_ID}\") {{ index sourceUrl }} }}");

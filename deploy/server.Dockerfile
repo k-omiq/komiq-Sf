@@ -5,6 +5,24 @@
 # The crate is self-contained (no path deps outside apps/server) and uses
 # rustls (no OpenSSL), so the runtime image needs only libc + CA certs.
 
+# ---- web --------------------------------------------------------------------
+# The embedded reader build is for the fallback listener only.
+FROM node:22-slim AS web
+WORKDIR /repo
+RUN corepack enable && corepack prepare pnpm@11.9.0 --activate
+COPY . .
+RUN pnpm install --frozen-lockfile --filter "@komika/reader..."
+# `.env` files are excluded; declare every reader `$env/static/public` import.
+# Embedded builds use their own origin regardless of these values.
+ENV PUBLIC_KOMIKA_BACKEND=on \
+    PUBLIC_KOMIKA_BACKEND_KIND=komika \
+    PUBLIC_KOMIKA_API= \
+    PUBLIC_KOMIKA_IMG_MODE=direct \
+    PUBLIC_KOMIKA_IMG_WORKER= \
+    PUBLIC_KOMIKA_MEDIA_HOSTS= \
+    PUBLIC_SUWAYOMI_URL=
+RUN KOMIKA_TARGET=embedded pnpm --filter @komika/reader build
+
 # ---- builder ----------------------------------------------------------------
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
@@ -33,6 +51,7 @@ RUN apt-get update \
     && chown komika:komika /data
 
 COPY --from=builder /build/apps/server/target/release/komika-server /usr/local/bin/komika-server
+COPY --from=web /repo/apps/reader/build /srv/web/reader
 # Vendored extension icons (~11 MB), served at /ext-icons/{pkgName}.png. Baked in
 # rather than fetched at runtime because Keiyoushi emptied the icon directory we
 # used to link (see apps/server/src/ext_icon.rs); refresh with
@@ -49,6 +68,7 @@ WORKDIR /data
 ENV PORT=8080 \
     DATABASE_URL=postgres://komika@postgres:5432/komika \
     COVERS_DATABASE_URL=sqlite:///data/covers.sqlite3 \
+    KOMIKA_FALLBACK_READER_DIR=/srv/web/reader \
     SUWAYOMI_URL=http://suwayomi:4567 \
     RUST_LOG=komika_server=info,tower_http=warn
 

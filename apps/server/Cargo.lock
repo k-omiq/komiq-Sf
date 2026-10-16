@@ -1356,6 +1356,7 @@ dependencies = [
  "flate2",
  "futures",
  "hex",
+ "http-body",
  "image",
  "rand_core 0.6.4",
  "reqwest",

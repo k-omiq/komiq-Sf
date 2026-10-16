@@ -14,6 +14,8 @@ const routesOn = mediaHosts.length > 0;
 
 /** The route list may hold up the first chapter this long; then the owner serves alone. */
 const ROUTES_DEADLINE_MS = 3000;
+/** A failed embedded owner lookup may be retried after this cooldown. */
+const OWNER_RETRY_MS = 30_000;
 /** The one fresh refresh after an owner failure; then the retry button. */
 const REFRESH_DEADLINE_MS = 15_000;
 
@@ -83,6 +85,7 @@ export function currentMediaRouter(): MediaRouter | null {
 /** One page as the reader loads it: the exact object on the current route, else the
  *  provider's URL for `sourceUrl`. */
 export async function routePage(page: Page, router: MediaRouter | null): Promise<RoutedPage> {
+	await ownerOriginReady();
 	const media = router?.pageMedia(page) ?? null;
 	if (media && router) return { url: router.href(media), media };
 	return { url: await images.resolvePage(page), media: null };
@@ -101,23 +104,45 @@ export async function freshRoutedPages(chapterId: string): Promise<RoutedPage[]>
 }
 
 let ownerOriginPromise: Promise<string | null> | undefined;
+let ownerOriginNow: string | null = null;
+let ownerOriginRetryAt = 0;
+let ownerOriginWait: Promise<string | null> | undefined;
 
 /**
  * Embedded build only: the owner's absolute media origin from `mediaRoutes`, or null when
  * the owner is this same origin (base `''`), the server predates the query, or the lookup
- * failed. The embedded build reads `mediaRoutes` for this alone (to rebase owner URLs
- * onto its own origin when it is served on another address); it never routes pages.
+ * failed. The embedded build reads `mediaRoutes` for
+ * this alone (to rebase owner URLs onto its own origin when it is served on another
+ * address); it never routes pages.
  */
 export function embeddedOwnerOrigin(): Promise<string | null> {
 	if (target !== 'embedded' || typeof window === 'undefined' || !backend.mediaRoutes) {
 		return Promise.resolve(null);
 	}
-	ownerOriginPromise ??= backend
-		.mediaRoutes()
+	if (Date.now() < ownerOriginRetryAt) return Promise.resolve(ownerOriginNow);
+	ownerOriginPromise ??= Promise.resolve()
+		.then(() => backend.mediaRoutes!())
 		.then((listed) => {
 			const base = listed?.find((r) => r.kind === 'OWNER')?.base;
-			return base ? mediaOrigin(base) : null;
+			const owner = base ? mediaOrigin(base) : null;
+			if (owner) images.setRebase?.(owner, window.location.origin);
+			ownerOriginNow = owner;
+			return owner;
 		})
-		.catch(() => null);
+		.catch(() => {
+			ownerOriginRetryAt = Date.now() + OWNER_RETRY_MS;
+			ownerOriginPromise = undefined;
+			return null;
+		});
 	return ownerOriginPromise;
+}
+
+/** Wait once at startup without discarding a late discovery and its rebase. */
+export function ownerOriginReady(): Promise<string | null> {
+	if (target !== 'embedded' || typeof window === 'undefined' || !backend.mediaRoutes) {
+		return Promise.resolve(null);
+	}
+	const discovery = embeddedOwnerOrigin();
+	ownerOriginWait ??= within(discovery, ROUTES_DEADLINE_MS, () => null);
+	return ownerOriginWait.then(() => ownerOriginNow);
 }

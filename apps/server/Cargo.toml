@@ -14,6 +14,8 @@ path = "src/main.rs"
 # supervised child and reads its log lines (cloudflare/connector.rs).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "io-util"] }
 axum = { version = "0.8", features = ["multipart"] }
+# Preserve data/trailer frames while metering the fallback listener's encoded body.
+http-body = "1"
 async-graphql = "7"
 async-graphql-axum = "7"
 tower = "0.5"

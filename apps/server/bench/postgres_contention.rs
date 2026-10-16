@@ -208,6 +208,8 @@ async fn make_router(pool: &db::Database) -> (Router, db::SqliteDatabase, ReadyD
             app_state: state,
         },
         manager,
+        web_dir::Apps::from_config(&cfg),
+        cfg.img_proxy_enabled,
     );
     (router, covers, ready)
 }

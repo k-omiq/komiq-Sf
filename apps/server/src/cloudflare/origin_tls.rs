@@ -282,13 +282,29 @@ pub fn is_for(cert_pem: &str, host: &str) -> bool {
 
 /// A rustls server config from a PEM certificate chain and a PKCS#8 key.
 pub fn server_config(cert_pem: &str, pkcs8: &[u8]) -> Result<Arc<rustls::ServerConfig>, String> {
+    server_config_key(
+        cert_pem,
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec())),
+    )
+}
+
+/// A PEM chain and any supported PEM private key (PKCS#8, SEC1 or PKCS#1).
+pub fn server_config_pem(cert_pem: &str, key_pem: &[u8]) -> Result<Arc<rustls::ServerConfig>, String> {
+    let key = PrivateKeyDer::from_pem_slice(key_pem)
+        .map_err(|_| "The private key is not valid PEM (PKCS#8, SEC1 or PKCS#1).".to_string())?;
+    server_config_key(cert_pem, key)
+}
+
+fn server_config_key(
+    cert_pem: &str,
+    key: PrivateKeyDer<'static>,
+) -> Result<Arc<rustls::ServerConfig>, String> {
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<Result<_, _>>()
         .map_err(|_| "The certificate is not valid PEM.".to_string())?;
     if certs.is_empty() {
         return Err("The certificate file is empty.".to_string());
     }
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec()));
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))

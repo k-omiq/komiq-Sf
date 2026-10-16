@@ -106,6 +106,20 @@ The Rust server uses Axum, async-graphql and PostgreSQL. It serves GraphQL at `/
 
 Public ingress reaches port 8080 through a reverse proxy or tunnel. Compose publishes it on loopback only. Metrics use port 9090, also published on loopback. The server has a 6 GB memory cap.
 
+### The fallback listener
+
+`deploy/server.Dockerfile` also builds the `embedded` reader and copies it to `/srv/web/reader`. It sets `KOMIKA_FALLBACK_READER_DIR` to that folder for the fallback HTTPS listener only. The main port still serves no web files. The fallback serves the reader, the API and media, never the admin console.
+
+The listener is off unless `KOMIKA_FALLBACK_CERT_FILE` is set. The operator supplies a publicly trusted PEM certificate chain and key, and renews them; the server reloads changed files within five minutes. Read [Fallback address](/self-host/internet-access#fallback-address) for the variables, the `421` host check and the daily media budget.
+
+`deploy/docker-compose.fallback.yml` adds the variables, a read-only mount of the certificate folder and the published port (8443 by default). In `deploy/.env`, set `KOMIKA_FALLBACK_TLS_DIR` to a folder with `fullchain.pem` and `privkey.pem` that user 10001 can read, `KOMIKA_FALLBACK_HOSTS` to the fallback host names and `KOMIKA_MEDIA_ROUTES` with the owner `base` set to the main public origin. Then run:
+
+```sh
+docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.fallback.yml up -d
+```
+
+The embedded reader reads the owner entry of `mediaRoutes` and rewrites image addresses on that origin onto its own origin. With the default empty `base` it cannot tell the main origin, so images that name the main host still point there. The static build never rewrites.
+
 ### The Suwayomi engine
 
 Suwayomi runs Tachidesk, which executes source extensions, resolves chapter pages and retrieves covers. Its administrative API has no authentication, so public clients must never reach it directly. Compose publishes port 4567 on loopback only; the server uses the private Docker address `http://suwayomi:4567`.
@@ -166,7 +180,10 @@ Production cutover, restore rehearsal and desktop installer validation are plann
 - `apps/worker/wrangler.toml`: Host allowlists, hotlink restrictions, and rate limiter bindings for the image proxy.
 - `apps/docs/wrangler.toml`: Static documentation site routing on Cloudflare Workers.
 - `deploy/docker-compose.yml`: Service definitions, memory caps, network settings, and volume mappings.
-- `deploy/server.Dockerfile`: Build stages for the Rust server container.
+- `deploy/server.Dockerfile`: Build stages for the Rust server container and the embedded reader for the fallback listener.
+- `deploy/docker-compose.fallback.yml`: Optional fallback listener: variables, certificate mount and port.
+- `apps/server/src/fallback.rs` and `apps/server/src/fallback/tls.rs`: Fallback listener, host check, media budget and certificate reload.
+- `packages/api/src/image-provider.ts` and `apps/reader/src/lib/media.ts`: Owner origin lookup and image address rewriting.
 - `deploy/server-entrypoint.sh`: Container startup checks and server process execution.
 - `deploy/postgres/`: PostgreSQL initialization, pgBackRest backup scheduling and restore tooling.
 - `deploy/postgres/RESTORE.md`: the hosted backup, restore and rehearsal procedure.

@@ -46,6 +46,20 @@ These variables configure network listeners, web applications, and proxy endpoin
 | `LOG_FORMAT`          | unset         | `json` for structured JSON logs; unset for text, coloured only at a terminal without `NO_COLOR`.                                                                                                                                      |
 | `GRAPHIQL_ENABLED`    | `false`       | Enables interactive GraphiQL query explorer at `/graphql`.                                                                                                                                                                            |
 
+### Fallback listener
+
+These variables turn on a second HTTPS listener for a fallback address. Read [Fallback address](/self-host/internet-access#fallback-address).
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `KOMIKA_FALLBACK_CERT_FILE` | unset | PEM certificate chain file. Unset or empty turns the listener off. |
+| `KOMIKA_FALLBACK_KEY_FILE` | unset | The matching PEM private key file. Required when the listener is on. |
+| `KOMIKA_FALLBACK_HOSTS` | unset | Required. Comma-separated host names, each with an optional `:port`. |
+| `KOMIKA_FALLBACK_PORT` | `8443` | HTTPS port of the listener. |
+| `KOMIKA_FALLBACK_BIND_ADDR` | the `BIND_ADDR` value | Address the listener binds. |
+| `KOMIKA_FALLBACK_READER_DIR` | `KOMIKA_WEB_DIR` plus `/reader` | Reader build folder with `index.html`. |
+| `KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY` | `50000000000` | Media bytes the listener sends per UTC day before media gets `503`. |
+
 ## Database and storage settings
 
 These variables configure database connections and file storage paths.

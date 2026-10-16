@@ -25,6 +25,7 @@ ENV PUBLIC_KOMIKA_BACKEND=on \
     PUBLIC_KOMIKA_API= \
     PUBLIC_KOMIKA_IMG_MODE=direct \
     PUBLIC_KOMIKA_IMG_WORKER= \
+    PUBLIC_KOMIKA_MEDIA_HOSTS= \
     PUBLIC_SUWAYOMI_URL=
 RUN KOMIKA_TARGET=embedded pnpm --filter @komika/reader build \
     && ADMIN_TARGET=embedded ADMIN_BASE_PATH=/admin pnpm --filter @komika/admin build \

@@ -1,0 +1,18 @@
+# Optional HTTPS fallback listener for the hosted server (e.g. fallback.example.com).
+# docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.fallback.yml up -d
+# TLS files must be readable by uid 10001. Renewal is the operator's job:
+# replace the files; the server reloads them within 5 minutes.
+services:
+  server:
+    environment:
+      # Without this, the fallback reader keeps loading owner images from the main address.
+      KOMIKA_MEDIA_ROUTES: '${KOMIKA_MEDIA_ROUTES:?set the owner route base to the main public origin using kind owner}'
+      KOMIKA_FALLBACK_CERT_FILE: /run/komika-fallback/fullchain.pem
+      KOMIKA_FALLBACK_KEY_FILE: /run/komika-fallback/privkey.pem
+      KOMIKA_FALLBACK_HOSTS: ${KOMIKA_FALLBACK_HOSTS:?set the fallback host names in deploy/.env}
+      KOMIKA_FALLBACK_PORT: '8443'
+      KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY: ${KOMIKA_FALLBACK_MEDIA_BYTES_PER_DAY:-50000000000}
+    volumes:
+      - '${KOMIKA_FALLBACK_TLS_DIR:?set the folder with fullchain.pem and privkey.pem}:/run/komika-fallback:ro'
+    ports:
+      - '${KOMIKA_FALLBACK_PUBLISH:-8443}:8443'

@@ -627,6 +627,32 @@ fn guarded(mgr: &Arc<Manager>) -> Router {
 }
 
 #[tokio::test]
+async fn fallback_tls_does_not_prove_main_direct_https_works() {
+    use tower::ServiceExt;
+
+    let dir = temp_dir("fallback-guard");
+    let opts = options_with_ports("http://127.0.0.1:9", &dir, None, (0, 0));
+    let pool = pool().await;
+    let trusted = Arc::new(crate::TrustedProxies::for_tests(vec![], false));
+    let mgr = Arc::new(Manager::new(pool, opts, trusted));
+    *mgr.direct_origin.write().unwrap() = Some("https://203.0.113.5".into());
+    let mut request = axum::http::Request::builder()
+        .uri("/health")
+        .header("x-test-peer", "198.51.100.7")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(super::super::origin_tls::OverTls);
+    request
+        .extensions_mut()
+        .insert(crate::fallback::FallbackListener);
+    let response = guarded(&mgr).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!mgr.https_seen.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[tokio::test]
 async fn plain_http_closes_to_the_internet_once_https_was_used() {
     use tower::ServiceExt;
 

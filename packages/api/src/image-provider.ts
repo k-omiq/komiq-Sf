@@ -13,6 +13,8 @@ import { isTauri } from './platform.js';
  *             source CDN and hands back a displayable URL (blob / asset proto).
  */
 export interface ImageProvider {
+	/** Rebase one owner origin onto this reader's origin (web only). Null disables it. */
+	setRebase?(from: string | null, to: string): void;
 	/** Resolve a page image to a displayable URL. */
 	resolvePage(page: Page): Promise<string>;
 	/** Resolve a cover / thumbnail URL (same rules as pages). */
@@ -150,6 +152,34 @@ function needsProxy(sourceUrl: string): boolean {
 export class WebImageProvider implements ImageProvider {
 	constructor(private readonly config: WebImageProviderConfig) {}
 
+	private rebase: { from: string; to: string } | null = null;
+
+	setRebase(from: string | null, to: string): void {
+		this.rebase = null;
+		if (!from) return;
+		try {
+			const source = new URL(from).origin;
+			const destination = new URL(to).origin;
+			if (source !== destination) this.rebase = { from: source, to: destination };
+		} catch {
+			// An invalid origin leaves rebasing disabled.
+		}
+	}
+
+	/** Rebase before classifying own assets, media routes or upstream proxy URLs. */
+	private rebaseSource(sourceUrl: string): string {
+		if (!this.rebase) return sourceUrl;
+		try {
+			const url = new URL(sourceUrl);
+			if (url.origin === this.rebase.from) {
+				return this.rebase.to + url.pathname + url.search + url.hash;
+			}
+		} catch {
+			// Relative paths and non-URLs keep their usual resolution.
+		}
+		return sourceUrl;
+	}
+
 	/** Warn once if `direct` is paired with a host that needs proxying (I6). */
 	private directGuardWarned = false;
 
@@ -185,6 +215,13 @@ export class WebImageProvider implements ImageProvider {
 	private isOwnAsset(url: string): boolean {
 		if (OWN_ASSET_PREFIXES.some((p) => url.startsWith(p)) || url.startsWith('/api/v1/manga/'))
 			return true;
+		if (this.rebase) {
+			try {
+				if (new URL(url).origin === this.rebase.to) return true;
+			} catch {
+				// Continue with the configured API origin for relative paths.
+			}
+		}
 		const origin = this.config.apiOrigin;
 		if (!origin) return false;
 		// Match on an ORIGIN BOUNDARY, not a bare prefix: `startsWith(origin)` alone would
@@ -250,6 +287,7 @@ export class WebImageProvider implements ImageProvider {
 	 * actually required.
 	 */
 	private resolvePageSync(sourceUrl: string): string {
+		sourceUrl = this.rebaseSource(sourceUrl);
 		if (!sourceUrl) return '';
 		if (this.isOwnAsset(sourceUrl)) {
 			return this.versionedOwnAsset(sourceUrl);
@@ -259,6 +297,7 @@ export class WebImageProvider implements ImageProvider {
 
 	/** Synchronous cover resolution (web is pure URL rewriting — no I/O). */
 	resolveCoverSync(sourceUrl: string): string {
+		sourceUrl = this.rebaseSource(sourceUrl);
 		if (!sourceUrl) return '';
 		// Covers cached on our own origin (the DB cover cache) are same-origin /
 		// CORS-safe — serve them directly, never through the Worker. Everything else
@@ -281,6 +320,7 @@ export class WebImageProvider implements ImageProvider {
 	 * carries so a cover's `?v=` cache-bust survives.
 	 */
 	coverCardSrcSet(sourceUrl: string): string {
+		sourceUrl = this.rebaseSource(sourceUrl);
 		// A matching path on a foreign/signed source is not our resize service.
 		if (!this.isOwnAsset(sourceUrl)) return '';
 		const master = this.resolveCoverSync(sourceUrl);

@@ -17,6 +17,7 @@ mod discovery;
 mod engine_generation;
 mod engine_keys;
 mod ext_icon;
+mod fallback;
 mod gc;
 mod graphql;
 mod image_delivery;
@@ -2648,6 +2649,8 @@ fn public_router(
     cfg: &Config,
     router_state: RouterState,
     cloudflare: Arc<cloudflare::Manager>,
+    web: web_dir::Apps,
+    img_proxy: bool,
 ) -> Router {
     let mangadex = router_state.app_state.mangadex.clone();
     let request_budgets = router_state.request_budgets.clone();
@@ -2841,7 +2844,7 @@ fn public_router(
     // `img.komiq.cc` Worker. Mounted only where it is wanted — a server that serves
     // the web apps (`KOMIKA_WEB_DIR`) or one told to (`KOMIKA_IMG_PROXY=on`) — so the
     // hosted API, which has the Worker, exposes no new route.
-    let app = if cfg.img_proxy_enabled {
+    let app = if img_proxy {
         tracing::info!("image proxy enabled at /img");
         app.route(
             "/img",
@@ -2860,12 +2863,13 @@ fn public_router(
     };
     // Self-host: the built reader at `/` and admin at `/admin`, below every API
     // route above. Unset (the default, and the hosted deployment) serves nothing.
-    let app = match &cfg.web_dir {
-        Some(dir) => {
-            tracing::info!(dir, "serving web apps from KOMIKA_WEB_DIR");
-            web_dir::mount(app, std::path::Path::new(dir))
+    let app = match web {
+        web_dir::Apps::ReaderAndAdmin(dir) => {
+            tracing::info!(dir = %dir.display(), "serving web apps from KOMIKA_WEB_DIR");
+            web_dir::mount(app, &dir)
         }
-        None => app,
+        web_dir::Apps::ReaderOnly(dir) => web_dir::mount_reader(app, &dir),
+        web_dir::Apps::None => app,
     };
     let app = app
         // Compress compressible responses (JSON payloads — the home feed alone drops
@@ -3392,20 +3396,27 @@ async fn main() -> anyhow::Result<()> {
         .data(media_routes)
         .finish();
 
+    let router_state = RouterState {
+        schema,
+        pool: pool.foreground(),
+        ready_pool: ready_pool.clone(),
+        request_budgets: Arc::new(request_budget::RequestBudgets::default()),
+        cover_pool,
+        trusted_proxies: trusted_proxies.clone(),
+        upload_limiter: Arc::new(RateLimiter::new(20, 60)),
+        app_state: state,
+    };
     let app = public_router(
         &cfg,
-        RouterState {
-            schema,
-            pool: pool.foreground(),
-            ready_pool: ready_pool.clone(),
-            request_budgets: Arc::new(request_budget::RequestBudgets::default()),
-            cover_pool,
-            trusted_proxies: trusted_proxies.clone(),
-            upload_limiter: Arc::new(RateLimiter::new(20, 60)),
-            app_state: state,
-        },
+        router_state.clone(),
         cloudflare.clone(),
+        web_dir::Apps::from_config(&cfg),
+        cfg.img_proxy_enabled,
     );
+
+    if let Some(fb) = &cfg.fallback {
+        fallback::start(&cfg, fb, router_state, cloudflare.clone()).await?;
+    }
 
     // Metrics listener, separate from the public router. It binds 127.0.0.1 by
     // default, which makes the scrape endpoint unreachable off-host by
@@ -4934,9 +4945,7 @@ mod tests {
         pool.close().await;
     }
 
-    #[tokio::test]
-    async fn production_router_keeps_health_and_images_outside_graphql_admission() {
-        use tower::ServiceExt;
+    async fn production_router_fixture() -> (Config, RouterState, Arc<cloudflare::Manager>) {
         let pool = crate::db::Database::connect("sqlite::memory:")
             .await
             .unwrap();
@@ -4986,8 +4995,8 @@ mod tests {
         let schema = graphql::schema_builder(state.clone(), true)
             .data(cloudflare.clone())
             .finish();
-        let app = public_router(
-            &cfg,
+        (
+            cfg,
             RouterState {
                 schema,
                 pool: pool.clone(),
@@ -4999,6 +5008,84 @@ mod tests {
                 app_state: state,
             },
             cloudflare,
+        )
+    }
+
+    #[tokio::test]
+    async fn fallback_ignores_main_proxy_headers_for_client_rate_limits() {
+        use tower::ServiceExt;
+        let (cfg, state, cloudflare) = production_router_fixture().await;
+        state.trusted_proxies.replace(&["172.17.0.0/16".into()]);
+        let trusted = state.trusted_proxies.clone();
+        for _ in 0..100 {
+            state
+                .app_state
+                .auth_limiter
+                .check("login:172.17.0.1")
+                .unwrap();
+        }
+        let fb = config::FallbackConfig {
+            cert_file: Default::default(),
+            key_file: Default::default(),
+            hosts: vec!["reader.example".into()],
+            port: 8443,
+            bind_addr: "127.0.0.1".parse().unwrap(),
+            reader_dir: Default::default(),
+            media_bytes_per_day: 0,
+        };
+        let app = fallback::router(&cfg, &fb, state, cloudflare, fb.port);
+        for (header, ip) in [
+            ("cf-connecting-ip", "198.51.100.1"),
+            ("x-forwarded-for", "198.51.100.2"),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/graphql")
+                .header(header::HOST, "reader.example")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header, ip)
+                .body(axum::body::Body::from(
+                    serde_json::json!({"query": format!(
+                        "mutation {{ login(username: \"{}\", password: \"wrong\") {{ token }} }}",
+                        "x".repeat(1000)
+                    )})
+                    .to_string(),
+                ))
+                .unwrap();
+            request.extensions_mut().insert(ConnectInfo(
+                "172.17.0.1:1234".parse::<SocketAddr>().unwrap(),
+            ));
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                body["errors"][0]["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Too many login attempts"),
+                "{body}"
+            );
+        }
+        assert_eq!(trusted.raw(), ["172.17.0.0/16"]);
+    }
+
+    #[tokio::test]
+    async fn production_router_keeps_health_and_images_outside_graphql_admission() {
+        use tower::ServiceExt;
+        let (cfg, state, cloudflare) = production_router_fixture().await;
+        let pool = state.pool.clone();
+        let reserved = state.ready_pool.clone();
+        let covers = state.cover_pool.clone();
+        let budgets = state.request_budgets.clone();
+        let app = public_router(
+            &cfg,
+            state,
+            cloudflare,
+            web_dir::Apps::from_config(&cfg),
+            cfg.img_proxy_enabled,
         );
         let request = |path: &str| {
             let mut request = axum::http::Request::builder()
@@ -5062,6 +5149,98 @@ mod tests {
         reserved.0.close().await;
         covers.close().await;
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn production_fallback_router_shares_media_reserve_and_keeps_reader_and_api_available() {
+        use tower::ServiceExt;
+        let (cfg, state, cloudflare) = production_router_fixture().await;
+        let dir = std::env::temp_dir().join(format!("komika-fallback-router-{}", uuid::Uuid::new_v4()));
+        for sub in ["reader", "admin"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+            std::fs::write(dir.join(sub).join("index.html"), format!("{sub}-index")).unwrap();
+        }
+        let fb = config::FallbackConfig {
+            cert_file: dir.join("cert.pem"),
+            key_file: dir.join("key.pem"),
+            hosts: vec!["localhost".into(), "127.0.0.1:8443".into()],
+            port: 8443,
+            bind_addr: "127.0.0.1".parse().unwrap(),
+            reader_dir: dir.join("reader"),
+            media_bytes_per_day: 2,
+        };
+        let request = |path: &str, host: &str| {
+            let mut request = axum::http::Request::builder()
+                .uri(path)
+                .header(header::HOST, host)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
+            request
+        };
+        // Exercise bytes sent under either host exhausting the same listener pool.
+        for first_host in &fb.hosts {
+            let app = fallback::router(&cfg, &fb, state.clone(), cloudflare.clone(), fb.port);
+            let response = app
+                .clone()
+                .oneshot(request("/", "evil.example"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+            let cover = "/covers/cached.webp?v=1";
+            let response = app
+                .clone()
+                .oneshot(request(cover, first_host))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                &[1, 2]
+            );
+            for host in &fb.hosts {
+                let response = app.clone().oneshot(request(cover, host)).await.unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{first_host} exhausted {host}"
+                );
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            }
+            for path in [
+                "/",
+                "/admin/",
+                "/admin/x",
+                "/health",
+                "/graphql?query=%7B__typename%7D",
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(request(path, "localhost"))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path} after exhaustion");
+                let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                if path == "/" || path.starts_with("/admin/") {
+                    assert_eq!(body, "reader-index", "{path} never serves the admin index");
+                } else if path.starts_with("/graphql") {
+                    let graph: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert!(graph.get("errors").is_none(), "{graph}");
+                    assert!(graph["data"]["__typename"].is_string(), "{graph}");
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        state.ready_pool.0.close().await;
+        state.cover_pool.close().await;
+        state.pool.close().await;
     }
 
     #[test]

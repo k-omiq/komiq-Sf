@@ -12,7 +12,6 @@
 	import { initTheme } from '$lib/theme.svelte';
 	import { markHydrated } from '$lib/stream';
 	import { config, needsServer, target } from '$lib/config';
-	import { embeddedOwnerOrigin } from '$lib/media';
 	import { connectScreen } from '$lib/server-connect.svelte';
 	import { extensionConsent } from '$lib/extension-consent.svelte';
 	import { instance, loadInstance } from '$lib/instance.svelte';
@@ -64,10 +63,6 @@
 	const checksSetup = target !== 'web' && config.backendEnabled && config.backendKind === 'komika';
 	$effect(() => {
 		if (checksSetup) void loadInstance();
-	});
-	// The embedded build asks `mediaRoutes` once, only to learn the owner's media origin.
-	$effect(() => {
-		if (target === 'embedded' && config.backendEnabled) void embeddedOwnerOrigin();
 	});
 	const notSetUp = $derived(checksSetup && instance.info?.setupRequired === true);
 	// The embedded build is served by that same server, so it waits for the answer

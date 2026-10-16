@@ -208,6 +208,22 @@ fn spa(root: PathBuf) -> Router {
         ))
 }
 
+/// Choose which built web apps accompany the public API.
+pub enum Apps {
+    None,
+    ReaderAndAdmin(PathBuf),
+    ReaderOnly(PathBuf),
+}
+
+impl Apps {
+    pub fn from_config(cfg: &crate::config::Config) -> Self {
+        match &cfg.web_dir {
+            Some(dir) => Self::ReaderAndAdmin(dir.into()),
+            None => Self::None,
+        }
+    }
+}
+
 /// Mount the reader and admin builds from `dir` under the already-routed `app`.
 pub fn mount<S>(app: Router<S>, dir: &Path) -> Router<S>
 where
@@ -215,6 +231,14 @@ where
 {
     app.nest_service("/admin", spa(dir.join("admin")))
         .fallback_service(spa(dir.join("reader")))
+}
+
+/// Mount only the embedded reader; there is no admin web-app nest.
+pub fn mount_reader<S>(app: Router<S>, reader_dir: &Path) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    app.fallback_service(spa(reader_dir.to_path_buf()))
 }
 
 #[cfg(test)]
