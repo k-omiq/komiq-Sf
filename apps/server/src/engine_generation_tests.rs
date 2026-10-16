@@ -17,6 +17,8 @@ pub(crate) struct MockData {
     pub mangas: Vec<Value>,
     pub chapters: Vec<Value>,
     pub delay: Duration,
+    pub fingerprint_delay: Duration,
+    pub fail_marker_write: bool,
 }
 impl Drop for MockEngine {
     fn drop(&mut self) {
@@ -34,6 +36,8 @@ impl MockEngine {
             mangas: vec![manga_json(7)],
             chapters: vec![chapter_json(8, 7)],
             delay: Duration::ZERO,
+            fingerprint_delay: Duration::ZERO,
+            fail_marker_write: false,
         }));
         let fingerprints = Arc::new(AtomicUsize::new(0));
         let app = axum::Router::new().route("/api/graphql", axum::routing::post({
@@ -43,11 +47,16 @@ impl MockEngine {
                 async move {
                     let delay = data.lock().await.delay;
                     tokio::time::sleep(delay).await;
+                    if request["query"].as_str().unwrap().contains("EngineFingerprint") {
+                        let delay = data.lock().await.fingerprint_delay;
+                        tokio::time::sleep(delay).await;
+                    }
                     let mut d = data.lock().await;
                     let query = request["query"].as_str().unwrap();
                     let vars = &request["variables"];
                     let body = if query.contains("EngineMarker") {
                         if !d.meta { json!({"errors":[{"message":"Cannot query field 'meta' on type 'Query'"}]}) }
+                        else if query.contains("setGlobalMeta") && d.fail_marker_write { json!({"errors":[{"message":"Internal server error"}]}) }
                         else if query.contains("setGlobalMeta") { d.marker = vars["value"].as_str().map(str::to_owned); json!({"data":{"setGlobalMeta":{"meta":{"key":MARKER,"value":d.marker}}}}) }
                         else if d.marker.is_none() && d.missing_error { json!({"errors":[{"message":"Key not found"}]}) }
                         else { json!({"data":{"meta":d.marker.as_ref().map(|v| json!({"key":MARKER,"value":v}))}}) }
@@ -318,7 +327,7 @@ async fn delayed_writers_and_empty_replacements_cannot_cross_generation_change()
     let (pool, _covers, _engine, client, fence) = setup().await;
     let (m, c) = bind(&pool, &client).await;
     let old = crate::engine_keys::token(m.engine_generation.as_deref()).unwrap();
-    fence.start_new_generation().await.unwrap();
+    fence.start_new_generation(Replace::Force).await.unwrap();
     assert!(crate::series_cache::put_series(&pool, &m).await.is_err());
     bind(&pool, &client).await;
     assert!(
@@ -369,6 +378,150 @@ async fn connection_loss_closes_gate_until_check_passes_but_slow_periodic_read_d
     engine.data.lock().await.delay = Duration::ZERO;
     fence.check().await;
     assert!(fence.wait().await.is_ok());
+}
+
+#[tokio::test]
+async fn known_marker_mismatch_closes_gate_before_a_slow_fingerprint() {
+    let (pool, _covers, engine, client, fence) = setup().await;
+    bind(&pool, &client).await;
+    {
+        let mut d = engine.data.lock().await;
+        d.marker = Some(Uuid::new_v4().to_string());
+        d.fingerprint_delay = CHECK_TIMEOUT + Duration::from_millis(100);
+    }
+    fence.check().await;
+    assert!(fence.is_blocked(), "a replaced engine must not serve old ids");
+    assert!(fence.wait().await.is_err());
+}
+
+#[tokio::test]
+async fn start_new_generation_requires_the_shown_quarantined_generation() {
+    let (pool, _covers, engine, client, fence) = setup().await;
+    bind(&pool, &client).await;
+    let old = fence.generation().unwrap();
+    let marker = engine.data.lock().await.marker.clone();
+    // Active: the quarantine the admin saw has ended.
+    assert!(fence
+        .start_new_generation(Replace::Quarantined(old))
+        .await
+        .is_err());
+    assert_eq!(states(&pool).await.unwrap()[0].state, "active");
+    assert_eq!(numeric_epoch(&pool).await.unwrap(), 0);
+    assert_eq!(engine.data.lock().await.marker, marker, "marker untouched");
+    engine.data.lock().await.mangas[0]["url"] = json!("/wrong");
+    fence.check().await;
+    assert!(fence
+        .start_new_generation(Replace::Quarantined(Uuid::new_v4()))
+        .await
+        .is_err());
+    assert_eq!(numeric_epoch(&pool).await.unwrap(), 0);
+    fence
+        .start_new_generation(Replace::Quarantined(old))
+        .await
+        .unwrap();
+    assert_ne!(fence.generation(), Some(old));
+    assert!(fence.wait().await.is_ok());
+}
+
+#[tokio::test]
+async fn new_generation_sets_numeric_references_aside_so_an_empty_engine_adopts() {
+    let (pool, _covers, engine, client, fence) = setup().await;
+    bind(&pool, &client).await;
+    sqlx::query("INSERT INTO series_views(series_key,total,updated_at) VALUES('7',3,now())")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO series_admin(series_id,paused_override,updated_at) VALUES('7',true,now())")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let old = fence.generation().unwrap();
+    {
+        let mut d = engine.data.lock().await;
+        d.marker = None;
+        d.mangas.clear();
+        d.chapters.clear();
+    }
+    fence.check().await;
+    assert_eq!(states(&pool).await.unwrap()[0].state, "quarantined");
+    fence
+        .start_new_generation(Replace::Quarantined(old))
+        .await
+        .unwrap();
+    assert!(!has_references(&pool).await.unwrap());
+    fence.check().await;
+    let current = states(&pool).await.unwrap();
+    let current = current.iter().find(|g| g.state != "detached").unwrap();
+    assert_eq!(current.state, "active", "{:?}", current.reason);
+    let aside: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM engine_detached_row WHERE generation=$1")
+            .bind(old)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(aside, 2);
+}
+
+#[tokio::test]
+async fn reattach_commits_before_the_marker_and_the_next_check_writes_it() {
+    let (pool, _covers, engine, client, fence) = setup().await;
+    bind(&pool, &client).await;
+    let old = fence.generation().unwrap();
+    engine.data.lock().await.marker = None;
+    fence.check().await;
+    engine.data.lock().await.fail_marker_write = true;
+    fence.reattach().await.unwrap();
+    assert!(fence.wait().await.is_err(), "no marker yet");
+    engine.data.lock().await.fail_marker_write = false;
+    fence.check().await;
+    let new = fence.generation().unwrap();
+    assert_ne!(new, old);
+    assert_eq!(engine.data.lock().await.marker, Some(new.to_string()));
+    assert!(fence.wait().await.is_ok());
+}
+
+#[tokio::test]
+async fn queued_work_cover_from_a_replaced_generation_is_not_published() {
+    let (pool, _covers, _engine, client, fence) = setup().await;
+    let covers = crate::db::init_covers("sqlite::memory:").await.unwrap();
+    let thumb = "/api/v1/manga/7/thumbnail";
+    let anchor = |id: &'static str| {
+        format!("INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES('{id}','w_a','suwayomi','source','7',now()); UPDATE suwayomi_series SET thumbnail_url='{thumb}' WHERE id=7")
+    };
+    bind(&pool, &client).await;
+    sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES('w_a',now(),now())")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(&anchor("ss_a")).execute(&pool).await.unwrap();
+    let queued = current(&pool).await.unwrap();
+    assert!(crate::cover::put_work_cover_for_suwayomi_anchor(&pool, &covers, "w_a", b"one", queued, thumb)
+        .await
+        .unwrap());
+    fence.start_new_generation(Replace::Force).await.unwrap();
+    // Even with engine B's series 7 enrolled on the same work, the job's bytes came
+    // from a number of the replaced generation.
+    bind(&pool, &client).await;
+    sqlx::raw_sql(&anchor("ss_b")).execute(&pool).await.unwrap();
+    assert!(!crate::cover::put_work_cover_for_suwayomi_anchor(&pool, &covers, "w_a", b"two", queued, thumb)
+        .await
+        .unwrap());
+    let other_anchor = crate::cover::put_work_cover_for_suwayomi_anchor(
+        &pool,
+        &covers,
+        "w_a",
+        b"three",
+        current(&pool).await.unwrap(),
+        "/api/v1/manga/9/thumbnail",
+    )
+    .await
+    .unwrap();
+    assert!(!other_anchor, "a job for another anchor is not published");
+    let stored: Vec<u8> = sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id='w_a'")
+        .fetch_one(&covers)
+        .await
+        .unwrap();
+    assert_eq!(stored, b"one");
 }
 
 #[tokio::test]

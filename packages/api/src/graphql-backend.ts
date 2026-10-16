@@ -93,7 +93,7 @@ import type {
 	CloudflareTokenCheck,
 } from './backend.js';
 import * as ops from './operations.js';
-import { isNumericChapterId } from './numeric-epoch.js';
+import { isNumericChapterId, isStaleNumericEpoch, notifyStaleNumericEpoch } from './numeric-epoch.js';
 import { failedOnlyAt, GraphQLRequestError, tolerablePartialErrors } from './partial-errors.js';
 import type { GraphQLErrorLike, PathSegment } from './partial-errors.js';
 
@@ -132,6 +132,35 @@ const blockRuleInput = (rule: BlockRule): BlockRule => ({
 	ratings: rule.ratings,
 });
 
+/** Reads that hand out numeric ids. The epoch is read before them, never inside their
+ *  (cacheable) documents. */
+const NUMERIC_ID_READS = new Set([
+	ops.DISCOVERY,
+	ops.UPDATES,
+	ops.SEARCH,
+	ops.SEARCH_ALL_SOURCES,
+	ops.SEARCH_FOR_MERGE,
+	ops.SERIES,
+	ops.CHAPTERS,
+	ops.AGGREGATED_CHAPTERS,
+	ops.PAGES,
+	ops.LIBRARY,
+	ops.LIBRARY_PROGRESS,
+	ops.CANONICAL_UPDATES,
+	ops.UPDATES_FEED,
+	ops.CANONICAL_SERIES,
+	ops.CANONICAL_CHAPTERS,
+	ops.CANONICAL_PAGES,
+	ops.SERIES_PAGE,
+	ops.SOURCE_BROWSE,
+	ops.SERIES_SOURCES_BATCH,
+	ops.REVIEWS,
+	ops.MY_REVIEW,
+	ops.NOTIFICATIONS,
+	ops.MY_COMMENTS,
+	ops.MY_ACTIVITY,
+]);
+
 /**
  * A URL string in its WHATWG-normalized form — what `new URL(s).href` produces.
  *
@@ -167,6 +196,7 @@ interface AuthCell {
 	token: string | null;
 	revision: number;
 	numericEpoch?: Promise<number | null>;
+	staleNumericEpochNotified?: boolean;
 }
 
 
@@ -180,6 +210,7 @@ interface EndpointCapabilities {
 	getUnsupported: boolean;
 	fetchPolicyUnsupported: boolean;
 	tagsUnsupported: boolean;
+	markEpochUnsupported: boolean;
 	setChapterReadUnsupported: boolean;
 	chapterOriginUnsupported: boolean;
 	mediaRoutesUnsupported: boolean;
@@ -201,6 +232,7 @@ function endpointCapabilities(config: BackendConfig): EndpointCapabilities {
 			getUnsupported: false,
 			fetchPolicyUnsupported: false,
 			tagsUnsupported: false,
+			markEpochUnsupported: false,
 			setChapterReadUnsupported: false,
 			chapterOriginUnsupported: false,
 			mediaRoutesUnsupported: false,
@@ -256,12 +288,12 @@ export class GraphQLBackend implements Backend {
 	}
 
 	/**
-	 * The server's numeric epoch, read at the first numeric write and then kept for the
+	 * The server's numeric epoch, read before handing out numeric ids and then kept for the
 	 * life of this backend (one page load or app start; shared with {@link withFetch}
 	 * views). Kept, not refreshed: after an engine change the reader may still hold the
 	 * old engine's chapter ids, and a fresh epoch would let their progress land on
 	 * whatever chapter reuses the number. Those writes are refused until the app is
-	 * reloaded instead. A failed read is forgotten so the next call tries again.
+	 * reloaded instead. A failed write-side read is forgotten so the next call tries again.
 	 */
 	numericEpoch(): Promise<number | null> {
 		const cell = this.auth;
@@ -288,6 +320,13 @@ export class GraphQLBackend implements Backend {
 		if (!isNumericChapterId(chapterId)) return undefined;
 		const epoch = given === undefined ? await this.numericEpoch() : given;
 		return epoch ?? undefined;
+	}
+
+	private staleProgress(chapterId: Id, live: boolean, err: unknown): void {
+		if (!live || !isNumericChapterId(chapterId) || !isStaleNumericEpoch(err)) return;
+		if (this.auth.staleNumericEpochNotified) return;
+		this.auth.staleNumericEpochNotified = true;
+		notifyStaleNumericEpoch();
 	}
 
 	private assertAuthRevision(revision: number): void {
@@ -384,6 +423,22 @@ export class GraphQLBackend implements Backend {
 	): Promise<T> {
 		this.assertAuthRevision(authRevision);
 		const token = this.auth.token;
+		// The epoch numeric writes carry is read before dispatching the first request
+		// that hands out numeric ids, never later at the first write. An
+		// anonymous viewer cannot write, so it skips the read and keeps cacheable GETs.
+		const epochRead =
+			token && NUMERIC_ID_READS.has(query)
+				? this.numericEpoch().catch((e: unknown) => {
+						// These ids must never be paired with a newer generation's epoch. A
+						// read for an account that has since signed out pins nothing.
+						if (this.auth.revision === authRevision) this.auth.numericEpoch = Promise.resolve(null);
+						console.warn('[komika] could not read numeric epoch:', e);
+					})
+				: undefined;
+		if (epochRead) {
+			await epochRead;
+			this.assertAuthRevision(authRevision);
+		}
 		const doFetch = this.config.fetch ?? fetch;
 		const stripped = this.stripUnsupported(query);
 		// Anonymous READS go over GET so Cloudflare and the browser's HTTP cache can
@@ -457,6 +512,7 @@ export class GraphQLBackend implements Backend {
 				);
 				const droppedArgs = ops.OPTIONAL_ARGUMENTS.filter(
 					(a) =>
+						(a !== 'numericEpoch' || query !== ops.MARK) &&
 						!this.capabilities.unsupportedArgs.has(a) &&
 						messages.some((m) => m.includes(`Unknown argument "${a}"`)),
 				);
@@ -662,9 +718,37 @@ export class GraphQLBackend implements Backend {
 	}
 
 	// --- library & progress ---
-	async mark(seriesId: Id, marked: boolean): Promise<Series> {
-		const d = await this.gql<{ mark: Series }>(ops.MARK, { seriesId, marked });
-		return d.mark;
+	async mark(seriesId: Id, marked: boolean, numericEpoch?: number | null): Promise<Series> {
+		const authRevision = this.auth.revision;
+		const epoch = isNumericChapterId(seriesId)
+			? await this.epochFor(seriesId, numericEpoch)
+			: undefined;
+		const query = this.capabilities.markEpochUnsupported ? ops.MARK_LEGACY : ops.MARK;
+		try {
+			const d = await this.gql<{ mark: Series }>(
+				query,
+				{ seriesId, marked, numericEpoch: epoch },
+				false,
+				undefined,
+				authRevision,
+			);
+			return d.mark;
+		} catch (e) {
+			this.assertAuthRevision(authRevision);
+			const msg = e instanceof Error ? e.message : String(e);
+			if (query === ops.MARK && msg.includes('Unknown argument "numericEpoch"')) {
+				this.capabilities.markEpochUnsupported = true;
+				const d = await this.gql<{ mark: Series }>(
+					ops.MARK_LEGACY,
+					{ seriesId, marked },
+					false,
+					undefined,
+					authRevision,
+				);
+				return d.mark;
+			}
+			throw e;
+		}
 	}
 	async setLibraryStatus(seriesId: Id, status: LibraryStatus | null): Promise<Series> {
 		const d = await this.gql<{ setLibraryStatus: Series }>(ops.SET_LIBRARY_STATUS, {
@@ -691,13 +775,20 @@ export class GraphQLBackend implements Backend {
 		read: boolean,
 		numericEpoch?: number | null,
 	): Promise<void> {
+		const authRevision = this.auth.revision;
 		const epoch = await this.epochFor(chapterId, numericEpoch);
-		await this.gql<{ setProgress: boolean }>(ops.SET_PROGRESS, {
-			chapterId,
-			lastPageRead,
-			read,
-			numericEpoch: epoch,
-		});
+		try {
+			await this.gql<{ setProgress: boolean }>(
+				ops.SET_PROGRESS,
+				{ chapterId, lastPageRead, read, numericEpoch: epoch },
+				false,
+				undefined,
+				authRevision,
+			);
+		} catch (e) {
+			this.staleProgress(chapterId, numericEpoch === undefined, e);
+			throw e;
+		}
 	}
 	/** Endpoint/schema-scoped, like {@link seriesPageUnsupported}: one `Unknown field` answer means
 	 *  every later call would get it too. */
@@ -706,14 +797,17 @@ export class GraphQLBackend implements Backend {
 		if (this.capabilities.setChapterReadUnsupported) return false;
 		try {
 			const numericEpoch = await this.epochFor(chapterId, undefined);
-			await this.gql<{ setChapterRead: boolean }>(ops.SET_CHAPTER_READ, {
-				chapterId,
-				read,
-				numericEpoch,
-			});
+			await this.gql<{ setChapterRead: boolean }>(
+				ops.SET_CHAPTER_READ,
+				{ chapterId, read, numericEpoch },
+				false,
+				undefined,
+				authRevision,
+			);
 			return true;
 		} catch (e) {
 			this.assertAuthRevision(authRevision);
+			this.staleProgress(chapterId, true, e);
 			const msg = e instanceof Error ? e.message : String(e);
 			// The API predates the mutation — deploy-order drift, not a failure to report.
 			if (msg.includes('Unknown field "setChapterRead"')) {
@@ -932,9 +1026,10 @@ export class GraphQLBackend implements Backend {
 		return d.engineGenerationState;
 	}
 
-	async startNewEngineGeneration(): Promise<EngineGeneration[]> {
+	async startNewEngineGeneration(generationId: Id): Promise<EngineGeneration[]> {
 		const d = await this.gql<{ startNewEngineGeneration: EngineGeneration[] }>(
 			ops.START_NEW_ENGINE_GENERATION,
+			{ generationId },
 		);
 		return d.startNewEngineGeneration;
 	}

@@ -1493,10 +1493,8 @@ async fn resolve_page_location(
         if tokio::time::Instant::now() >= deadline {
             return Err(page_busy_response());
         }
-        let stamp = locator.snapshot();
-        let location = match tokio::time::timeout_at(deadline, client.chapter_location(chapter_id))
-            .await
-        {
+        let looked_up = locator.lookup(chapter_id, || client.chapter_location(chapter_id));
+        let (stamp, location) = match tokio::time::timeout_at(deadline, looked_up).await {
             Ok(Ok(location)) => location,
             Ok(Err(e)) if request_budget::is_upstream_busy(&e) => return Err(page_busy_response()),
             Ok(Err(e)) => {

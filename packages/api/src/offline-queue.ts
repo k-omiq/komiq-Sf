@@ -62,6 +62,8 @@ export interface MarkOp {
 	tries: number;
 	/** See {@link ProgressOp.userId} (C1). */
 	userId?: string | null;
+	/** See {@link ProgressOp.numericEpoch}. */
+	numericEpoch?: number | null;
 }
 
 /** The queued write union. Discriminated by `kind`. */
@@ -91,6 +93,8 @@ export type EnqueueOp =
 			ts?: number;
 			/** Owning user id (C1); pass `null` when anonymous. */
 			userId?: string | null;
+			/** See {@link ProgressOp.numericEpoch}. */
+			numericEpoch?: number | null;
 	  };
 
 /** Drop an op after this many failed flush attempts so a permanently-rejected
@@ -192,7 +196,15 @@ export class OfflineWriteQueue {
 						userId,
 						numericEpoch: op.numericEpoch ?? null,
 					}
-				: { kind: 'mark', seriesId: op.seriesId, marked: op.marked, ts, tries: 0, userId };
+				: {
+						kind: 'mark',
+						seriesId: op.seriesId,
+						marked: op.marked,
+						ts,
+						tries: 0,
+						userId,
+						numericEpoch: op.numericEpoch ?? null,
+					};
 		this.ops = this.ops.filter((existing) => !sameTarget(existing, full));
 		this.ops.push(full);
 		this.persist();

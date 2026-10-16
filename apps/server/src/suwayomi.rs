@@ -686,6 +686,14 @@ impl SuwayomiClient {
         }
     }
 
+    /// A page's `/media/v1/c` locator URL. `None` while image URLs point at the engine
+    /// itself (`SUWAYOMI_PUBLIC_URL` unset or equal to `SUWAYOMI_URL`): only this server
+    /// answers that route.
+    pub fn page_locator_url(&self, chapter_id: i64, index: usize) -> Option<String> {
+        (self.image_base_url != self.base_url)
+            .then(|| self.abs(Some(&format!("/media/v1/c/{chapter_id}/{index}"))))
+    }
+
     /// Fetch a cover thumbnail's raw bytes for server-side pHash (dedup signal,
     /// DD1). Uses the INTERNAL `base_url` (this runs server-side, not in the
     /// browser, so the public image host may be unreachable). Best-effort: returns
@@ -1277,11 +1285,13 @@ impl SuwayomiClient {
     async fn refresh_chapters<T: DeserializeOwned>(&self, query: &str, manga_id: i64) -> Result<T> {
         let guard = self.page_locator.begin_refresh(manga_id);
         let result = self.gql(query, json!({ "id": manga_id })).await;
-        // Any transport failure leaves the mutation's outcome unknown, including a
-        // timeout. Admission refusals and GraphQL answers have a known outcome.
+        // Once the request may have been sent, the engine may still be running the
+        // mutation: a timeout, a proxy's 5xx or a fence change says nothing about it.
+        // Only an admission refusal (never sent) or the engine's own GraphQL error
+        // answer has a known outcome.
         let known = result.as_ref().err().is_none_or(|error| {
             crate::request_budget::is_upstream_busy(error)
-                || !error.chain().any(|cause| cause.is::<reqwest::Error>())
+                || error.chain().any(|cause| cause.is::<EngineGraphqlError>())
         });
         guard.finish(known);
         result

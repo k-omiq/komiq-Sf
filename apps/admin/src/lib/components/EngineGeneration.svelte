@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { EngineGenerationView } from '$lib/engine-generation';
+	import { generationToReplace, type EngineGenerationView } from '$lib/engine-generation';
 	import { confirm } from '$lib/confirm.svelte';
 	import { toast } from '$lib/toast.svelte';
 	import Button from './Button.svelte';
@@ -16,13 +16,15 @@
 		loading: boolean;
 		error: string | null;
 		onrefresh: () => Promise<void>;
-		onstart: () => Promise<void>;
+		/** Gets the quarantined generation shown, so a changed state is refused. */
+		onstart: (generationId: string) => Promise<void>;
 	} = $props();
 
 	let starting = $state(false);
 
 	async function startGeneration(): Promise<void> {
-		if (starting || loading || view.kind !== 'quarantined') return;
+		const generationId = generationToReplace(view);
+		if (starting || loading || !generationId) return;
 		starting = true;
 		try {
 			const accepted = await confirm({
@@ -38,7 +40,7 @@
 				danger: true,
 			});
 			if (!accepted) return;
-			await onstart();
+			await onstart(generationId);
 			toast.success('Started a new engine generation.');
 			await onrefresh();
 		} catch (err) {

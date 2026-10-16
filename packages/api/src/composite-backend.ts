@@ -172,7 +172,16 @@ export class CompositeBackend implements Backend {
 									if (!isStaleNumericEpoch(e)) throw e;
 									dropStaleProgress(op.chapterId);
 								})
-						: this.opts.hosted.mark(op.seriesId, op.marked).then(() => {});
+						: this.opts.hosted
+								.mark(op.seriesId, op.marked, op.numericEpoch ?? null)
+								.then(() => {})
+								.catch((e: unknown) => {
+									if (!isStaleNumericEpoch(e)) throw e;
+									console.warn(
+										'[offline-queue] dropping library mark from an earlier engine generation:',
+										op.seriesId,
+									);
+								});
 				},
 				// Scope the replay to the signed-in user so A's offline writes can never
 				// be applied under B's account (C1). Null (identity not yet known) defers.
@@ -409,17 +418,28 @@ export class CompositeBackend implements Backend {
 	 * fabricating a `Series` we don't have. A success opportunistically drains any
 	 * backlog (connectivity is clearly back).
 	 */
-	async mark(seriesId: Id, marked: boolean): Promise<Series> {
-		if (!this.opts.queue) return this.opts.hosted.mark(seriesId, marked);
+	async mark(seriesId: Id, marked: boolean, numericEpoch?: number | null): Promise<Series> {
+		if (!this.opts.queue) return this.opts.hosted.mark(seriesId, marked, numericEpoch);
 		const owner = this.currentUserId;
 		const generation = this.writeGeneration;
+		const epoch =
+			numericEpoch !== undefined || !isNumericChapterId(seriesId)
+				? (numericEpoch ?? null)
+				: await (this.opts.hosted.numericEpoch?.() ?? Promise.resolve(null)).catch(() => null);
+		if (!this.writeIsCurrent(owner, generation)) throw new Error('Offline write identity changed');
 		try {
-			const s = await this.opts.hosted.mark(seriesId, marked);
+			const s = await this.opts.hosted.mark(seriesId, marked, epoch);
 			if (this.writeIsCurrent(owner, generation)) void this.flushQueue();
 			return s;
 		} catch (err) {
-			if (this.writeIsCurrent(owner, generation)) {
-				this.opts.queue.enqueue({ kind: 'mark', seriesId, marked, userId: owner });
+			if (!isStaleNumericEpoch(err) && this.writeIsCurrent(owner, generation)) {
+				this.opts.queue.enqueue({
+					kind: 'mark',
+					seriesId,
+					marked,
+					userId: owner,
+					numericEpoch: epoch,
+				});
 			}
 			throw err;
 		}
@@ -461,8 +481,10 @@ export class CompositeBackend implements Backend {
 			numericEpoch !== undefined || !isNumericChapterId(chapterId)
 				? (numericEpoch ?? null)
 				: await (this.opts.hosted.numericEpoch?.() ?? Promise.resolve(null)).catch(() => null);
+		if (!this.writeIsCurrent(owner, generation)) return;
 		try {
-			await this.opts.hosted.setProgress(chapterId, lastPageRead, read, epoch);
+			// Keep live writes distinguishable from replays so stale progress can notify.
+			await this.opts.hosted.setProgress(chapterId, lastPageRead, read, numericEpoch);
 			if (this.writeIsCurrent(owner, generation)) void this.flushQueue();
 		} catch (e) {
 			if (isStaleNumericEpoch(e)) return dropStaleProgress(chapterId);
@@ -744,8 +766,8 @@ export class CompositeBackend implements Backend {
 	engineGenerationState(): Promise<EngineGeneration[]> {
 		return this.opts.hosted.engineGenerationState!();
 	}
-	startNewEngineGeneration(): Promise<EngineGeneration[]> {
-		return this.opts.hosted.startNewEngineGeneration!();
+	startNewEngineGeneration(generationId: Id): Promise<EngineGeneration[]> {
+		return this.opts.hosted.startNewEngineGeneration!(generationId);
 	}
 	setMangadexEnabled(enabled: boolean): Promise<boolean> {
 		return this.opts.hosted.setMangadexEnabled!(enabled);

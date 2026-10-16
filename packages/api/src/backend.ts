@@ -201,7 +201,8 @@ export interface Backend {
 	pages(chapterId: Id, opts?: { fresh?: boolean }): Promise<Page[]>;
 
 	// --- library & progress ---
-	mark(seriesId: Id, marked: boolean): Promise<Series>;
+	/** Numeric series ids use the same epoch rules as {@link setProgress}. */
+	mark(seriesId: Id, marked: boolean, numericEpoch?: number | null): Promise<Series>;
 	/** File a series under an explicit shelf for the viewer, or pass `null` to clear
 	 * it (fall back to progress-derived shelving). Adds the series to the library if
 	 * absent. Optional: only the unified Komika API implements it. */
@@ -217,7 +218,7 @@ export interface Backend {
 	libraryProgress?(): Promise<SeriesProgress[]>;
 	/**
 	 * `numericEpoch` fences numeric (Suwayomi) chapter ids against an engine change. Leave it
-	 * out on a live write: the unified API attaches the server's current epoch for a numeric
+	 * out on a live write: the unified API attaches the cached epoch for a numeric
 	 * id. A replayed write passes the epoch it was queued under, or `null` for none, so a
 	 * write queued before the change is refused rather than filed on a new chapter.
 	 */
@@ -228,7 +229,7 @@ export interface Backend {
 		numericEpoch?: number | null,
 	): Promise<void>;
 	/**
-	 * The server's numeric epoch for this session: read once per signed-in session and kept,
+	 * The server's numeric epoch: read before numeric ids and kept for the backend's lifetime,
 	 * so writes carry the epoch the reader's chapter ids came from. `null` when the server
 	 * predates it. Rejects when the server cannot be reached and nothing is known yet.
 	 * Optional: only the unified Komika API implements it.
@@ -437,8 +438,9 @@ export interface Backend {
 	/** Every engine generation the server knows, oldest first (admin). Optional. */
 	engineGenerationState?(): Promise<EngineGeneration[]>;
 	/** Give up the quarantined engine data and start a new generation (admin). Returns the
-	 * generations after the change. Optional. */
-	startNewEngineGeneration?(): Promise<EngineGeneration[]>;
+	 * generations after the change. `generationId` is the quarantined generation the admin
+	 * was shown: the server refuses if it is no longer current and quarantined. Optional. */
+	startNewEngineGeneration?(generationId: Id): Promise<EngineGeneration[]>;
 	/** Turn MangaDex on or off; returns the new effective value. Refused when the
 	 * server pins it by env (`KOMIKA_MANGADEX`, `CATALOGUE_SYNC=on`). Optional. */
 	setMangadexEnabled?(enabled: boolean): Promise<boolean>;

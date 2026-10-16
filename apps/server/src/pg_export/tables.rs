@@ -29,6 +29,10 @@ pub(super) const UNSUPPORTED_POSTGRES_ONLY: &[(&str, &str)] = &[
         "detached numeric reading progress has no representation in SQLite",
     ),
     (
+        "engine_detached_row",
+        "detached numeric library, review and admin rows have no representation in SQLite",
+    ),
+    (
         "engine_numeric_state",
         "SQLite cannot preserve the generation fence for queued numeric writes",
     ),

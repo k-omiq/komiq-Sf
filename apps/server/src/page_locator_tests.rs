@@ -26,6 +26,8 @@ enum RefreshAnswer {
     Success,
     GraphqlError,
     TransportError,
+    /// A proxy in front of the engine answers 502 while the engine runs the refresh.
+    ProxyError,
 }
 
 #[derive(Default)]
@@ -113,6 +115,10 @@ impl Engine {
                                         Err::<Vec<u8>, _>(std::io::Error::other("lost refresh response"))
                                     }));
                                     return axum::response::Response::new(body);
+                                }
+                                RefreshAnswer::ProxyError => {
+                                    state.swapped = !state.swapped;
+                                    return StatusCode::BAD_GATEWAY.into_response();
                                 }
                                 RefreshAnswer::Success => state.swapped = !state.swapped,
                             }
@@ -330,6 +336,25 @@ async fn lookup_overlapping_refresh_is_repeated_before_page_fetch() {
 }
 
 #[tokio::test]
+async fn a_chapter_opening_all_pages_at_once_sends_one_cold_lookup() {
+    let (engine, app) = fixture().await;
+    let pause = Arc::new(Pause::default());
+    engine.state.lock().unwrap().lookup_pause = Some(pause.clone());
+    let first = tokio::spawn(get_page(app.clone(), "/media/v1/c/8/0"));
+    pause.entered.notified().await;
+    let rest: Vec<_> = (0..20)
+        .map(|_| tokio::spawn(get_page(app.clone(), "/media/v1/c/8/0")))
+        .collect();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    pause.release.notify_one();
+    assert_page(first.await.unwrap(), 8).await;
+    for page in rest {
+        assert_page(page.await.unwrap(), 8).await;
+    }
+    assert_eq!(engine.co(), 1);
+}
+
+#[tokio::test]
 async fn page_waits_for_refresh_then_succeeds() {
     let (engine, app) = fixture().await;
     let pause = Arc::new(Pause::default());
@@ -368,14 +393,15 @@ async fn page_and_legacy_waits_expire_without_fetching_bytes() {
 
 #[tokio::test]
 async fn transport_failure_disables_memo_but_graphql_failure_does_not() {
-    for transport in [false, true] {
+    for answer in [
+        RefreshAnswer::GraphqlError,
+        RefreshAnswer::TransportError,
+        RefreshAnswer::ProxyError,
+    ] {
+        let transport = !matches!(answer, RefreshAnswer::GraphqlError);
         let (engine, app) = fixture().await;
         assert_page(get_page(app.clone(), "/media/v1/c/8/0").await, 8).await;
-        engine.state.lock().unwrap().answer = if transport {
-            RefreshAnswer::TransportError
-        } else {
-            RefreshAnswer::GraphqlError
-        };
+        engine.state.lock().unwrap().answer = answer;
         let (_, provenance) = app.suwayomi.chapters_with_provenance(7).await.unwrap();
         assert_eq!(provenance, suwayomi::Provenance::CachedFallback);
         for _ in 0..2 {
@@ -422,7 +448,13 @@ async fn path_validation_unknown_chapters_and_legacy_index_path() {
 
 #[tokio::test]
 async fn pages_use_locator_only_for_active_generation_keys() {
-    let (engine, app) = fixture().await;
+    let engine = Engine::spawn().await;
+    // The Docker image's setting: image URLs are relative to this server.
+    let app = app_state(
+        SuwayomiClient::new(engine.url.clone(), Some("/".into()), None),
+        page_locator::REFRESH_WAIT,
+    )
+    .await;
     let generation = engine_keys::adopt(&app.pool).await.unwrap();
     sqlx::query("INSERT INTO engine_chapter_key(generation,chapter_id,manga_id,source_order,chapter_key,updated_at) VALUES($1,8,7,0,'/chapter/8',now())")
         .bind(generation).execute(&app.pool).await.unwrap();
@@ -464,11 +496,32 @@ async fn pages_use_locator_only_for_active_generation_keys() {
             } else {
                 format!("/api/v1/manga/7/chapter/0/page/{index}")
             };
-            assert_eq!(
-                data["pages"][index]["sourceUrl"],
-                format!("{}{path}", engine.url)
-            );
+            assert_eq!(data["pages"][index]["sourceUrl"], path);
         }
+    }
+}
+
+#[tokio::test]
+async fn pages_keep_engine_urls_when_images_point_at_the_engine() {
+    let engine = Engine::spawn().await;
+    for public in [None, Some(engine.url.clone())] {
+        let app = app_state(
+            SuwayomiClient::new(engine.url.clone(), public, None),
+            page_locator::REFRESH_WAIT,
+        )
+        .await;
+        let generation = engine_keys::adopt(&app.pool).await.unwrap();
+        sqlx::query("INSERT INTO engine_chapter_key(generation,chapter_id,manga_id,source_order,chapter_key,updated_at) VALUES($1,8,7,0,'/chapter/8',now())")
+            .bind(generation).execute(&app.pool).await.unwrap();
+        let result = graphql::build_schema(app.clone(), false)
+            .execute("{ pages(chapterId: \"8\") { sourceUrl } }")
+            .await;
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        // The engine has no /media/v1 route: a locator URL there would be a 404.
+        assert_eq!(
+            result.data.into_json().unwrap()["pages"][0]["sourceUrl"],
+            format!("{}/api/v1/manga/7/chapter/0/page/0", engine.url)
+        );
     }
 }
 

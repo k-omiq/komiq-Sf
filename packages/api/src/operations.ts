@@ -547,6 +547,17 @@ export const LIBRARY_PROGRESS = /* GraphQL */ `
 
 export const MARK = /* GraphQL */ `
 	${SERIES_FIELDS}
+	mutation Mark($seriesId: ID!, $marked: Boolean!, $numericEpoch: Int) {
+		mark(seriesId: $seriesId, marked: $marked, numericEpoch: $numericEpoch) {
+			...SeriesFields
+			libraryStatus
+			isFavorite
+		}
+	}
+`;
+
+export const MARK_LEGACY = /* GraphQL */ `
+	${SERIES_FIELDS}
 	mutation Mark($seriesId: ID!, $marked: Boolean!) {
 		mark(seriesId: $seriesId, marked: $marked) {
 			...SeriesFields
@@ -1491,8 +1502,8 @@ export const ENGINE_GENERATION_STATE = /* GraphQL */ `
 `;
 
 export const START_NEW_ENGINE_GENERATION = /* GraphQL */ `
-	mutation StartNewEngineGeneration {
-		startNewEngineGeneration {
+	mutation StartNewEngineGeneration($generationId: ID!) {
+		startNewEngineGeneration(generationId: $generationId) {
 			${ENGINE_GENERATION_FIELDS}
 		}
 	}

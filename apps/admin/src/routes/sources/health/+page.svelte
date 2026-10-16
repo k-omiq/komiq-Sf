@@ -33,9 +33,9 @@
 		}
 	}
 
-	async function startGeneration(): Promise<void> {
+	async function startGeneration(generationId: string): Promise<void> {
 		// Keep the mutation's result even if the follow-up query fails.
-		engineRows = await startNewEngineGeneration();
+		engineRows = await startNewEngineGeneration(generationId);
 	}
 
 	$effect(() => {

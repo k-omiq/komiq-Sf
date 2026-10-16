@@ -102,6 +102,14 @@ pub(crate) const POSTGRES_ONLY: &[PostgresOnly] = &[
         fks: &[],
     },
     PostgresOnly {
+        name: "engine_detached_row",
+        since: 8,
+        fks: &[
+            ("generation", "engine_generation", "id"),
+            ("user_id", "users", "id"),
+        ],
+    },
+    PostgresOnly {
         name: "suwayomi_progress_detached",
         since: 6,
         fks: &[

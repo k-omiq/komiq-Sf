@@ -705,7 +705,7 @@ pub async fn put_work_cover(
     work_id: &str,
     webp: &[u8],
 ) -> Result<()> {
-    publish_work_cover(main, covers, work_id, webp, None, None).await?;
+    publish_work_cover(main, covers, work_id, webp, None, None, None).await?;
     Ok(())
 }
 
@@ -716,7 +716,7 @@ pub async fn put_work_cover_if_current(
     webp: &[u8],
     expected: Option<&[u8]>,
 ) -> Result<bool> {
-    publish_work_cover(main, covers, work_id, webp, Some(expected), None).await
+    publish_work_cover(main, covers, work_id, webp, Some(expected), None, None).await
 }
 
 pub async fn put_work_cover_for_missing_anchor(
@@ -734,6 +734,30 @@ pub async fn put_work_cover_for_missing_anchor(
         webp,
         Some(None),
         Some((mangadex_id, file_name)),
+        None,
+    )
+    .await
+}
+
+/// A work cover fetched from the work's Suwayomi anchor: published only while that
+/// anchor and the engine generation it was read under are still current. A queued
+/// crawl job can outlive a generation change, and the number may name another series.
+pub async fn put_work_cover_for_suwayomi_anchor(
+    main: &Database,
+    covers: &SqliteDatabase,
+    work_id: &str,
+    webp: &[u8],
+    generation: Option<uuid::Uuid>,
+    thumbnail_url: &str,
+) -> Result<bool> {
+    publish_work_cover(
+        main,
+        covers,
+        work_id,
+        webp,
+        None,
+        None,
+        Some((generation, thumbnail_url)),
     )
     .await
 }
@@ -745,11 +769,24 @@ async fn publish_work_cover(
     webp: &[u8],
     expected: Option<Option<&[u8]>>,
     expected_anchor: Option<(&str, &str)>,
+    expected_suwayomi: Option<(Option<uuid::Uuid>, &str)>,
 ) -> Result<bool> {
     let now = Utc::now();
 
     let ts = now.to_rfc3339();
     let mut tx = main.begin().await?;
+    // The generation lock comes before any work lock: a new generation holds it
+    // exclusively while it locks works.
+    if let Some((generation, _)) = expected_suwayomi {
+        match crate::engine_generation::shared(&mut tx, generation).await {
+            Ok(_) => {}
+            Err(e) if e.is::<crate::engine_generation::FenceError>() => {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        }
+    }
     let _asset = lock_asset(&mut tx, work_id).await?;
     if !crate::locks::lock_works(&mut tx, &[work_id])
         .await?
@@ -771,6 +808,15 @@ async fn publish_work_cover(
     if taken_down {
         tx.rollback().await?;
         return Ok(false);
+    }
+    if let Some((_, thumbnail_url)) = expected_suwayomi {
+        let current: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT s.thumbnail_url FROM source_series ss JOIN suwayomi_series s ON s.id = CAST(ss.source_key AS INTEGER) WHERE ss.work_id = $1 AND ss.source_type = 'suwayomi' ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1"
+        ).bind(work_id).fetch_optional(&mut *tx).await?;
+        if current.flatten().as_deref() != Some(thumbnail_url) {
+            tx.rollback().await?;
+            return Ok(false);
+        }
     }
     if let Some((mangadex_id, file_name)) = expected_anchor {
         let current: Option<(String, Option<String>)> = sqlx::query_as(
@@ -1829,6 +1875,15 @@ pub async fn crawl_uncached_covers(
                            AND (i.retry_after IS NULL OR i.retry_after > $1)) \
            AND EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id \
                        AND ss.source_type = 'suwayomi')";
+    // Read before the jobs: a job is then never tagged with a newer generation than
+    // the anchor rows it came from.
+    let suw_generation = match crate::engine_generation::current(main).await {
+        Ok(generation) => generation,
+        Err(e) => {
+            tracing::warn!(error = %e, "cover crawl (suwayomi): engine generation unreadable");
+            return;
+        }
+    };
     let suw_loaded = match limit {
         Some(n) => {
             crate::db_types::query_tuple::<(String, Option<String>)>(&format!(
@@ -1893,10 +1948,23 @@ pub async fn crawl_uncached_covers(
                 }
             };
             match work.process(move || process_cover(&bytes)).await {
-                Ok(Ok(webp)) => match put_work_cover(main, covers, &work_id, &webp).await {
-                    Ok(()) => {
+                Ok(Ok(webp)) => match put_work_cover_for_suwayomi_anchor(
+                    main,
+                    covers,
+                    &work_id,
+                    &webp,
+                    suw_generation,
+                    &thumb,
+                )
+                .await
+                {
+                    Ok(true) => {
                         clear_cover_issue(main, &work_id).await;
                         (1, 0)
+                    }
+                    Ok(false) => {
+                        tracing::debug!(work_id = %work_id, "cover crawl (suwayomi): anchor or engine generation changed; skipped");
+                        (0, 0)
                     }
                     Err(e) => {
                         let e = crate::db::observed_database_error(e);

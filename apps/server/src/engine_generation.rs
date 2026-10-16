@@ -217,6 +217,14 @@ impl Fence {
         if unfenced && !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
             tracing::warn!("engine has no global meta support; running unfenced with fingerprint and write guards");
         }
+        if let Some((id, _, _, true)) = &current {
+            if !unfenced && !matches!(&marker, Marker::Value(value) if value == &id.to_string()) {
+                // A known marker mismatch closes the gate now, not after a fingerprint
+                // that may outlast the check timeout. Only the outcome below reopens it.
+                self.gate.write().unwrap_or_else(|e| e.into_inner()).blocked = true;
+                self.engine.clear_numeric_memos();
+            }
+        }
         let Some((id, _, was_unfenced, marker_written)) = current else {
             let id = Uuid::new_v4();
             if !unfenced {
@@ -467,10 +475,6 @@ impl Fence {
             "Cannot reattach: source identities differ or no fingerprint can be verified"
         );
         let id = Uuid::new_v4();
-        ensure!(
-            write_marker(&self.engine, id).await?,
-            "Engine has no global meta write support"
-        );
         self.gate.write().unwrap_or_else(|e| e.into_inner()).blocked = true;
         let mut tx = self.pool.begin().await?;
         exclusive(&mut tx).await?;
@@ -479,7 +483,9 @@ impl Fence {
             "Engine generation changed during reattach"
         );
         sqlx::query("UPDATE engine_generation SET state='detached',reason='Reattached after marker loss',since=now() WHERE id=$1").bind(old).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO engine_generation(id,first_seen,last_seen,state,marker_written) VALUES ($1,now(),now(),'active',true)").bind(id).execute(&mut *tx).await?;
+        // marker_written=false: the check below writes the marker after commit, and
+        // retries it if the process stops in between (the engine marker stays missing).
+        sqlx::query("INSERT INTO engine_generation(id,first_seen,last_seen,state,marker_written) VALUES ($1,now(),now(),'active',false)").bind(id).execute(&mut *tx).await?;
         for table in ["engine_manga_key", "engine_chapter_key"] {
             sqlx::query(&format!(
                 "UPDATE {table} SET generation=$1 WHERE generation=$2"
@@ -492,43 +498,38 @@ impl Fence {
         purge_covers(&self.covers).await?;
         tx.commit().await?;
         self.engine.clear_numeric_memos();
-        self.allow(id, false, self.revision());
+        self.check_locked().await;
         Ok(())
     }
 
-    pub async fn start_new_generation(&self) -> Result<()> {
+    pub async fn start_new_generation(&self, replace: Replace) -> Result<()> {
         let _checking = self.checking.lock().await;
-        let old = current_on(&mut *self.pool.acquire().await?)
-            .await?
-            .map(|r| r.0);
-        let mut unfenced = matches!(read_marker(&self.engine).await?, Marker::Unsupported);
+        let old = replaceable(current_on(&mut *self.pool.acquire().await?).await?, replace)?;
+        let unfenced = matches!(read_marker(&self.engine).await?, Marker::Unsupported);
         let id = Uuid::new_v4();
-        if !unfenced {
-            unfenced = !write_marker(&self.engine, id).await?;
-        }
         self.gate.write().unwrap_or_else(|e| e.into_inner()).blocked = true;
         let mut tx = self.pool.begin().await?;
         exclusive(&mut tx).await?;
         ensure!(
-            current_on(&mut tx).await?.map(|r| r.0) == old,
+            replaceable(current_on(&mut tx).await?, replace)? == old,
             "Engine generation changed during recovery"
         );
-        if let Some(old) = old {
-            sqlx::query("INSERT INTO suwayomi_progress_detached SELECT $1,user_id,chapter_id,series_id,last_page_read,read,updated_at FROM suwayomi_progress").bind(old).execute(&mut *tx).await?;
-            sqlx::query("DELETE FROM suwayomi_progress")
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM progress_untick WHERE chapter_id ~ '^[0-9]+$'")
-                .execute(&mut *tx)
-                .await?;
-            // Keep rows and every FK to them. Prefixing the target with the old
-            // generation also keeps two detached generations' threads separate.
-            for table in ["comments", "notifications", "user_activity"] {
-                sqlx::query(&format!("UPDATE {table} SET target_id=$1 || ':' || target_id, target_type='detached_' || target_type WHERE target_type IN ('series','chapter') AND target_id ~ '^[0-9]+$'"))
-                    .bind(old.to_string()).execute(&mut *tx).await?;
-            }
-            sqlx::query("UPDATE engine_generation SET state='detached',reason='Operator started a new engine generation',since=now() WHERE id=$1").bind(old).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO suwayomi_progress_detached SELECT $1,user_id,chapter_id,series_id,last_page_read,read,updated_at FROM suwayomi_progress").bind(old).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM suwayomi_progress")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM progress_untick WHERE chapter_id ~ '^[0-9]+$'")
+            .execute(&mut *tx)
+            .await?;
+        // Keep rows and every FK to them. Prefixing the target with the old
+        // generation also keeps two detached generations' threads separate.
+        for table in ["comments", "notifications", "user_activity"] {
+            sqlx::query(&format!("UPDATE {table} SET target_id=$1 || ':' || target_id, target_type='detached_' || target_type WHERE target_type IN ('series','chapter') AND target_id ~ '^[0-9]+$'"))
+                .bind(old.to_string()).execute(&mut *tx).await?;
         }
+        // Before the mappings go: they are what resolves a numeric id to its work.
+        detach_numeric_rows(&mut tx, old).await?;
+        sqlx::query("UPDATE engine_generation SET state='detached',reason='Operator started a new engine generation',since=now() WHERE id=$1").bind(old).execute(&mut *tx).await?;
         // Delete the old numeric projections; works and work-level user data stay.
         // Source-series deletion cascades only to that source's spine chapters.
         sqlx::query("DELETE FROM source_series WHERE source_type='suwayomi'")
@@ -548,7 +549,10 @@ impl Fence {
         sqlx::query("DELETE FROM feed_series_updates WHERE reader_id ~ '^[0-9]+$'")
             .execute(&mut *tx)
             .await?;
-        sqlx::query("INSERT INTO engine_generation(id,first_seen,last_seen,state,unfenced,marker_written) VALUES ($1,now(),now(),'active',$2,NOT $2)").bind(id).bind(unfenced).execute(&mut *tx).await?;
+        // marker_written=false: the check below writes the marker only after commit.
+        // A marker written first would quarantine the old generation if this
+        // transaction failed, and a crash in between is retried by that check.
+        sqlx::query("INSERT INTO engine_generation(id,first_seen,last_seen,state,unfenced,marker_written) VALUES ($1,now(),now(),'active',$2,false)").bind(id).bind(unfenced).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO engine_numeric_state(singleton,epoch,changed_at) VALUES (true,1,now()) ON CONFLICT(singleton) DO UPDATE SET epoch=engine_numeric_state.epoch+1,changed_at=now()")
             .execute(&mut *tx).await?;
         self.gate.write().unwrap_or_else(|e| e.into_inner()).blocked = true;
@@ -562,10 +566,108 @@ impl Fence {
         }
         self.gone_manga.lock().await.clear();
         self.gone_chapter.lock().await.clear();
-        self.allow(id, unfenced, self.revision());
         crate::graphql::clear_feed_caches();
+        self.check_locked().await;
         Ok(())
     }
+}
+
+/// Which generation the operator means to give up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replace {
+    /// The quarantined generation the operator was shown.
+    Quarantined(Uuid),
+    /// The current generation, even an active one (CLI `--force` only).
+    Force,
+}
+
+fn replaceable(current: Option<(Uuid, String, bool, bool)>, replace: Replace) -> Result<Uuid> {
+    let (id, state, _, _) =
+        current.ok_or_else(|| anyhow::anyhow!("No engine generation to replace"))?;
+    if let Replace::Quarantined(expected) = replace {
+        ensure!(
+            id == expected,
+            "The engine generation changed since it was shown; refresh and check again"
+        );
+        ensure!(
+            state == "quarantined",
+            "The engine is not quarantined; refresh and check again"
+        );
+    }
+    Ok(id)
+}
+
+/// Resolve to: the work a numeric Suwayomi id is mapped to, while the mapping exists.
+const NUMERIC_WORK: &str = "SELECT DISTINCT ON (source_key) source_key AS sid, work_id FROM source_series WHERE source_type='suwayomi' AND source_key ~ '^[0-9]+$' ORDER BY source_key, work_id";
+
+/// Numeric library, review, view and admin rows would name whatever series the new
+/// engine gives the same number. Move the ones with a work to it, the way a work merge
+/// folds them; set the rest aside with the old generation. `has_references` sees none.
+async fn detach_numeric_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    old: Uuid,
+) -> Result<()> {
+    let mapped_works = format!("SELECT DISTINCT work_id FROM ({NUMERIC_WORK}) m ORDER BY work_id");
+    let works: Vec<String> = sqlx::query_scalar(&mapped_works)
+        .fetch_all(&mut **tx)
+        .await?;
+    crate::locks::lock_works(tx, &works).await?;
+    // A merge may have moved the mappings while we waited. Locking the new set now
+    // would take work locks out of order, so the operator runs it again instead.
+    let current: Vec<String> = sqlx::query_scalar(&mapped_works)
+        .fetch_all(&mut **tx)
+        .await?;
+    ensure!(
+        current == works,
+        "A catalogue merge ran at the same time; start the new generation again"
+    );
+    sqlx::query(&format!(
+        "WITH m AS ({NUMERIC_WORK}), moved AS (DELETE FROM user_library l USING m WHERE l.series_id=m.sid RETURNING l.user_id,m.work_id,l.created_at,l.status,l.is_favorite) \
+         INSERT INTO user_library(user_id,series_id,created_at,status,is_favorite) \
+         SELECT user_id,work_id,min(created_at),(array_agg(status ORDER BY created_at DESC) FILTER (WHERE status IS NOT NULL))[1],bool_or(is_favorite) FROM moved GROUP BY user_id,work_id \
+         ON CONFLICT(user_id,series_id) DO UPDATE SET created_at=LEAST(user_library.created_at,excluded.created_at),status=COALESCE(user_library.status,excluded.status),is_favorite=(user_library.is_favorite OR excluded.is_favorite)"
+    ))
+    .execute(&mut **tx)
+    .await?;
+    // A work keeps one review per author: an existing work review wins, else the newest.
+    sqlx::query(&format!(
+        "WITH m AS ({NUMERIC_WORK}), pick AS (SELECT DISTINCT ON (r.user_id,m.work_id) r.id,m.work_id FROM reviews r JOIN m ON m.sid=r.series_id \
+         WHERE NOT EXISTS(SELECT 1 FROM reviews s WHERE s.series_id=m.work_id AND s.user_id=r.user_id) ORDER BY r.user_id,m.work_id,r.updated_at DESC,r.id) \
+         UPDATE reviews r SET series_id=pick.work_id FROM pick WHERE r.id=pick.id"
+    ))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(&format!(
+        "WITH m AS ({NUMERIC_WORK}), moved AS (DELETE FROM series_views v USING m WHERE v.series_key=m.sid RETURNING m.work_id,v.total,v.updated_at) \
+         INSERT INTO series_views(series_key,total,updated_at) SELECT work_id,sum(total)::bigint,max(updated_at) FROM moved GROUP BY work_id \
+         ON CONFLICT(series_key) DO UPDATE SET total=series_views.total+excluded.total,updated_at=GREATEST(series_views.updated_at,excluded.updated_at)"
+    ))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(&format!(
+        "WITH m AS ({NUMERIC_WORK}), moved AS (DELETE FROM series_view_bucket b USING m WHERE b.series_key=m.sid RETURNING m.work_id,b.hour_ts,b.views) \
+         INSERT INTO series_view_bucket(series_key,hour_ts,views) SELECT work_id,hour_ts,sum(views)::bigint FROM moved GROUP BY work_id,hour_ts \
+         ON CONFLICT(series_key,hour_ts) DO UPDATE SET views=series_view_bucket.views+excluded.views"
+    ))
+    .execute(&mut **tx)
+    .await?;
+    // series_admin is the scanner's per-engine-series row: it never moves to a work.
+    for (table, column, key, user) in [
+        ("user_library", "series_id", "jsonb_build_array(user_id,series_id)", "user_id"),
+        ("reviews", "series_id", "jsonb_build_array(id)", "user_id"),
+        ("series_admin", "series_id", "jsonb_build_array(series_id)", "NULL::uuid"),
+        ("series_views", "series_key", "jsonb_build_array(series_key)", "NULL::uuid"),
+        ("series_view_bucket", "series_key", "jsonb_build_array(series_key,hour_ts)", "NULL::uuid"),
+    ] {
+        sqlx::query(&format!("INSERT INTO engine_detached_row(generation,source_table,row_key,user_id,data) SELECT $1,'{table}',{key}::text,{user},to_jsonb(t) FROM {table} t WHERE {column} ~ '^[0-9]+$'"))
+            .bind(old)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query(&format!("DELETE FROM {table} WHERE {column} ~ '^[0-9]+$'"))
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }
 
 struct Fingerprint {
@@ -700,6 +802,13 @@ pub async fn shared(conn: &mut sqlx::PgConnection, expected: Option<Uuid>) -> Re
     }
     Ok(current.map(|r| r.0))
 }
+/// The current generation id. Read it before loading numeric rows that a later write
+/// checks with [`shared`].
+pub async fn current(pool: &Database) -> Result<Option<Uuid>> {
+    Ok(current_on(&mut *pool.acquire().await?)
+        .await?
+        .map(|r| r.0))
+}
 pub async fn wait(pool: &Database) -> Result<()> {
     if let Some(fence) = pool.engine_fence.get().and_then(std::sync::Weak::upgrade) {
         fence.wait().await?;
@@ -796,20 +905,21 @@ pub async fn run_cli(
     engine: &mut SuwayomiClient,
     args: &[String],
 ) -> Result<()> {
-    ensure!(
-        args.len() == 1 && matches!(args[0].as_str(), "reattach" | "start-new-generation"),
-        "Usage: komika-server engine <reattach|start-new-generation>"
-    );
+    const USAGE: &str =
+        "Usage: komika-server engine <reattach|start-new-generation <generation-id>|start-new-generation --force>";
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let replace = match args.as_slice() {
+        ["reattach"] => None,
+        ["start-new-generation", "--force"] => Some(Replace::Force),
+        ["start-new-generation", id] => Some(Replace::Quarantined(
+            Uuid::parse_str(id).map_err(|_| anyhow::anyhow!("{USAGE}"))?,
+        )),
+        _ => bail!("{USAGE}"),
+    };
     let fence = Fence::attach(pool, covers, engine).await?;
-    match args
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        ["reattach"] => fence.reattach().await,
-        ["start-new-generation"] => fence.start_new_generation().await,
-        _ => bail!("Usage: komika-server engine <reattach|start-new-generation>"),
+    match replace {
+        None => fence.reattach().await,
+        Some(replace) => fence.start_new_generation(replace).await,
     }
 }
 

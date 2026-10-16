@@ -11,6 +11,27 @@ export function isNumericChapterId(id: string): boolean {
 	return /^[0-9]+$/.test(id);
 }
 
+const staleListeners = new Set<() => void>();
+
+/** A live progress write needs a reload before numeric ids can safely be used again. */
+export function onStaleNumericEpoch(listener: () => void): () => void {
+	staleListeners.add(listener);
+	return () => {
+		staleListeners.delete(listener);
+	};
+}
+
+/** Called once by each backend's shared auth cell; queued replays never notify. */
+export function notifyStaleNumericEpoch(): void {
+	for (const listener of staleListeners) {
+		try {
+			listener();
+		} catch (e) {
+			console.warn('[komika] stale numeric epoch listener failed:', e);
+		}
+	}
+}
+
 /**
  * The server refused a numeric progress write because it belongs to an earlier engine
  * generation (`STALE_NUMERIC_EPOCH`). Permanent: the chapter id may now name a different

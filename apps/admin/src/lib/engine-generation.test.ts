@@ -4,6 +4,7 @@ import type { EngineGeneration } from '@komika/api';
 import {
 	engineGenerationView,
 	formatSince,
+	generationToReplace,
 	isUnknownEngineStateField,
 } from './engine-generation.ts';
 
@@ -155,4 +156,14 @@ test('only the unknown engine-state field is treated as unsupported', () => {
 	]) {
 		assert.equal(isUnknownEngineStateField(err), false);
 	}
+});
+
+test('only the quarantined generation on screen can be replaced', () => {
+	assert.equal(
+		generationToReplace(engineGenerationView([generation({ id: 'shown', state: 'quarantined' })])),
+		'shown',
+	);
+	assert.equal(generationToReplace(engineGenerationView([generation({ id: 'shown' })])), null);
+	assert.equal(generationToReplace(engineGenerationView([])), null);
+	assert.equal(generationToReplace(engineGenerationView(null)), null);
 });

@@ -343,9 +343,9 @@ export async function loadEngineGenerations(): Promise<EngineGeneration[] | null
 }
 
 /** Set aside the old extension-source data and return the updated generations. */
-export async function startNewEngineGeneration(): Promise<EngineGeneration[]> {
+export async function startNewEngineGeneration(generationId: string): Promise<EngineGeneration[]> {
 	if (!backend.startNewEngineGeneration) setupUnavailable();
-	return backend.startNewEngineGeneration();
+	return backend.startNewEngineGeneration(generationId);
 }
 
 /** Turn MangaDex on or off; returns the new effective value. */

@@ -7,7 +7,7 @@
 	import '$lib/app.css';
 	import { page } from '$app/state';
 	import { onMount } from 'svelte';
-	import { isTauri } from '@komika/api';
+	import { isTauri, onStaleNumericEpoch } from '@komika/api';
 	import { auth, initAuth } from '$lib/auth.svelte';
 	import { initTheme } from '$lib/theme.svelte';
 	import { markHydrated } from '$lib/stream';
@@ -20,6 +20,13 @@
 	import NotSetUp from '$lib/components/NotSetUp.svelte';
 
 	let { children } = $props();
+	let staleNumericEpoch = $state(false);
+
+	onMount(() =>
+		onStaleNumericEpoch(() => {
+			staleNumericEpoch = true;
+		}),
+	);
 
 	// Entry imports and the initial route have loaded before the root mounts.
 	// End bootstrap recovery and let a later deployment reload once again.
@@ -114,6 +121,13 @@
 	{/if}
 </svelte:head>
 
+{#if staleNumericEpoch}
+	<div class="epoch-notice" role="alert">
+		<span>The server's source engine changed. Reload to keep saving reading progress.</span>
+		<button type="button" onclick={() => window.location.reload()}>Reload</button>
+	</div>
+{/if}
+
 {#if connecting}
 	{#await import('$lib/components/ConnectServer.svelte') then { default: ConnectServer }}
 		<ConnectServer />
@@ -132,3 +146,28 @@
 		<ExtensionConsent />
 	{/await}
 {/if}
+
+<style>
+	.epoch-notice {
+		position: fixed;
+		inset: auto 1rem calc(1rem + env(safe-area-inset-bottom));
+		z-index: 1000;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 1rem;
+		padding: 1rem;
+		border-radius: 0.75rem;
+		background: var(--k-surface-2);
+		color: var(--k-text);
+	}
+	.epoch-notice button {
+		flex-shrink: 0;
+		padding: 0.5rem 1rem;
+		border: 0;
+		border-radius: 0.5rem;
+		background: var(--k-primary);
+		color: var(--k-on-primary);
+		cursor: pointer;
+	}
+</style>

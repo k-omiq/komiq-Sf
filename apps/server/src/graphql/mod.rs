@@ -7465,6 +7465,8 @@ impl QueryRoot {
         if policy.denies_chapter(n) {
             return Err(Error::new("No such chapter"));
         }
+        // The list, the locator decision and the key rows must come from one generation.
+        let generation = st.suwayomi.read_generation();
         let urls = st.suwayomi.pages(n).await;
         // A reader opening a chapter is the request that matters most, and the scanner
         // never makes it — so it is counted here, against the owning source.
@@ -7481,6 +7483,8 @@ impl QueryRoot {
             );
         }
         let urls = urls.map_err(gql_err)?;
+        #[cfg(test)]
+        guard_pause("pages-listed").await;
         let use_locator = match crate::engine_keys::has_active_chapter(&st.pool, n).await {
             Ok(found) => found,
             Err(error) => {
@@ -7526,6 +7530,10 @@ impl QueryRoot {
         } else {
             None
         };
+        st.suwayomi
+            .validate_read_generation(generation)
+            .await
+            .map_err(gql_err)?;
         Ok(urls
             .into_iter()
             .enumerate()
@@ -7539,11 +7547,11 @@ impl QueryRoot {
                     .and_then(|(_, pages)| i32::try_from(pages[index].1).ok()),
                 media_mime: media.as_ref().map(|(_, pages)| pages[index].2.clone()),
                 index: index as i32,
-                source_url: if use_locator {
-                    st.suwayomi.abs(Some(&format!("/media/v1/c/{n}/{index}")))
-                } else {
-                    source_url
-                },
+                source_url: st
+                    .suwayomi
+                    .page_locator_url(n, index)
+                    .filter(|_| use_locator)
+                    .unwrap_or(source_url),
                 width: None,
                 height: None,
             })
@@ -10394,7 +10402,8 @@ async fn consolidate_library_identity(
 
 #[derive(Clone, Copy)]
 enum LibraryEdit<'a> {
-    Marked(bool),
+    /// Membership, with the numeric epoch a queued replay carries (fenced like progress).
+    Marked(bool, Option<i64>),
     Status(Option<&'a str>),
     Favorite(bool),
 }
@@ -10405,15 +10414,29 @@ async fn write_library_once(
     series_id: &str,
     edit: LibraryEdit<'_>,
 ) -> anyhow::Result<String> {
+    // A numeric id may name another series after an engine change: an offline mark
+    // queued before it must not file the new engine's series.
+    let fenced = match edit {
+        LibraryEdit::Marked(_, epoch)
+            if !series_id.is_empty() && series_id.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            crate::engine_generation::wait(pool).await?;
+            Some(epoch)
+        }
+        _ => None,
+    };
     let mut tx = pool.begin().await?;
+    if let Some(epoch) = fenced {
+        crate::engine_generation::progress_guard(&mut tx, epoch).await?;
+    }
     let identity = consolidate_library_identity_on(&mut tx, user_id, series_id).await?;
     let now = crate::db_types::format_date(Utc::now());
     match edit {
-        LibraryEdit::Marked(true) => {
+        LibraryEdit::Marked(true, _) => {
             sqlx::query("INSERT INTO user_library(user_id,series_id,created_at) VALUES($1,$2,$3) ON CONFLICT(user_id,series_id) DO NOTHING")
             .bind(crate::db_types::uuid(user_id )?).bind(&identity).bind(crate::db_types::date(&now )?).execute(&mut *tx).await?;
         }
-        LibraryEdit::Marked(false) => {
+        LibraryEdit::Marked(false, _) => {
             sqlx::query("DELETE FROM user_library WHERE user_id=$1 AND series_id=$2")
                 .bind(crate::db_types::uuid(user_id)?)
                 .bind(&identity)
@@ -11688,7 +11711,14 @@ pub struct MutationRoot;
 
 #[Object]
 impl MutationRoot {
-    async fn mark(&self, ctx: &Context<'_>, series_id: ID, marked: bool) -> Result<Series> {
+    /// `numeric_epoch`: as for `setProgress`, for a numeric series id.
+    async fn mark(
+        &self,
+        ctx: &Context<'_>,
+        series_id: ID,
+        marked: bool,
+        numeric_epoch: Option<i64>,
+    ) -> Result<Series> {
         let st = state(ctx);
         // "Add to library" is a PER-USER action — it writes the viewer's own
         // `user_library`, not Suwayomi's shared in-library flag. Requires a session
@@ -11710,7 +11740,7 @@ impl MutationRoot {
                 &st.pool,
                 &user.id,
                 &series_id.0,
-                LibraryEdit::Marked(marked),
+                LibraryEdit::Marked(marked, numeric_epoch),
             )
         })
         .await
@@ -12062,9 +12092,12 @@ impl MutationRoot {
         Ok(row.into())
     }
 
+    /// `generation_id` is the quarantined generation the admin was shown: an active or
+    /// already replaced generation is refused.
     async fn start_new_engine_generation(
         &self,
         ctx: &Context<'_>,
+        generation_id: ID,
     ) -> Result<Vec<crate::engine_generation::GenerationState>> {
         require_admin(ctx).await?;
         let st = state(ctx);
@@ -12073,7 +12106,12 @@ impl MutationRoot {
             .fence
             .as_ref()
             .ok_or_else(|| Error::new("Engine fence is not configured"))?;
-        fence.start_new_generation().await.map_err(gql_err)?;
+        let expected = uuid::Uuid::parse_str(&generation_id.0)
+            .map_err(|_| Error::new("generationId must be an engine generation id"))?;
+        fence
+            .start_new_generation(crate::engine_generation::Replace::Quarantined(expected))
+            .await
+            .map_err(gql_err)?;
         crate::engine_generation::states(&st.pool)
             .await
             .map_err(gql_read_err)
@@ -19484,6 +19522,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pages_refuse_a_list_from_a_generation_replaced_mid_request() {
+        use crate::engine_generation::tests::MockEngine;
+        let engine = MockEngine::spawn().await;
+        let (schema, pool, state) = setup_with_engine_inner(100, &engine.url, true).await;
+        let (m, c) = state.suwayomi.series_and_chapters(7).await.unwrap();
+        crate::series_cache::put_series(&pool, &m).await.unwrap();
+        crate::series_cache::put_chapters(&pool, 7, &c)
+            .await
+            .unwrap();
+        let points = crate::locks::pause_points::PausePoints::default();
+        let listed = points.arm("pages-listed");
+        let read = tokio::spawn(GUARD_PAUSE.scope(points, {
+            let schema = schema.clone();
+            async move { exec(&schema, r#"{ pages(chapterId:"8") { sourceUrl } }"#, None, "pages-read").await }
+        }));
+        listed.reached().await;
+        state
+            .suwayomi
+            .fence
+            .as_ref()
+            .unwrap()
+            .start_new_generation(crate::engine_generation::Replace::Force)
+            .await
+            .unwrap();
+        listed.release();
+        let r = read.await.unwrap();
+        assert_eq!(
+            r.errors.first().and_then(|e| e.extensions.as_ref()).and_then(|x| x.get("code")),
+            Some(&async_graphql::Value::String("ENGINE_UNAVAILABLE".into())),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[tokio::test]
     async fn engine_generation_admin_state_numeric_quarantine_and_progress_epochs() {
         use crate::engine_generation::tests::{chapter_json, manga_json, MockEngine};
         let engine = MockEngine::spawn().await;
@@ -19583,23 +19656,58 @@ mod tests {
         .await
         .errors
         .is_empty());
+        // Numeric rows the new engine would otherwise re-use: '7' has a work, '99' none.
+        let user = uuid::Uuid::parse_str("964771b0-a2fb-4849-857a-6198947115ec").unwrap();
+        for series in ["7", "99"] {
+            sqlx::query("INSERT INTO user_library(user_id,series_id,created_at,status,is_favorite) VALUES($1,$2,now(),'reading',true)").bind(user).bind(series).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO reviews(id,series_id,user_id,score,body,created_at,updated_at) VALUES($1,$2,$3,8,'r',now(),now())").bind(uuid::Uuid::new_v4()).bind(series).bind(user).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO series_admin(series_id,paused_override,updated_at) VALUES($1,true,now())").bind(series).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO series_views(series_key,total,updated_at) VALUES($1,5,now())").bind(series).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO series_view_bucket(series_key,hour_ts,views) VALUES($1,1,5)").bind(series).execute(&pool).await.unwrap();
+        }
+        let shown = crate::engine_generation::states(&pool).await.unwrap();
+        let shown = shown.iter().find(|g| g.state == "quarantined").unwrap().id.clone();
         assert!(!exec(
             &schema,
-            "mutation { startNewEngineGeneration { state } }",
+            &format!(r#"mutation {{ startNewEngineGeneration(generationId:"{shown}") {{ state }} }}"#),
             Some("bobtok"),
             "generation-admin"
         )
         .await
         .errors
         .is_empty());
+        let stale = exec(
+            &schema,
+            &format!(r#"mutation {{ startNewEngineGeneration(generationId:"{}") {{ state }} }}"#, uuid::Uuid::new_v4()),
+            Some("admintok"),
+            "generation-admin",
+        )
+        .await;
+        assert!(!stale.errors.is_empty(), "another generation id is refused");
+        assert_eq!(crate::engine_generation::numeric_epoch(&pool).await.unwrap(), 0);
         let changed = exec(
             &schema,
-            "mutation { startNewEngineGeneration { state } }",
+            &format!(r#"mutation {{ startNewEngineGeneration(generationId:"{shown}") {{ state }} }}"#),
             Some("admintok"),
             "generation-admin",
         )
         .await;
         assert!(changed.errors.is_empty(), "{:?}", changed.errors);
+        let again = exec(
+            &schema,
+            &format!(r#"mutation {{ startNewEngineGeneration(generationId:"{shown}") {{ state }} }}"#),
+            Some("admintok"),
+            "generation-admin",
+        )
+        .await;
+        assert!(!again.errors.is_empty(), "a replaced generation cannot be replaced twice");
+        assert_eq!(crate::engine_generation::numeric_epoch(&pool).await.unwrap(), 1);
+        let numeric: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM user_library WHERE series_id ~ '^[0-9]+$')+(SELECT count(*) FROM reviews WHERE series_id ~ '^[0-9]+$')+(SELECT count(*) FROM series_admin WHERE series_id ~ '^[0-9]+$')+(SELECT count(*) FROM series_views WHERE series_key ~ '^[0-9]+$')+(SELECT count(*) FROM series_view_bucket WHERE series_key ~ '^[0-9]+$')").fetch_one(&pool).await.unwrap();
+        assert_eq!(numeric, 0);
+        let moved: (Option<String>, bool, i64, i64, i64) = sqlx::query_as("SELECT (SELECT status FROM user_library WHERE user_id=$1 AND series_id=$2),(SELECT is_favorite FROM user_library WHERE user_id=$1 AND series_id=$2),(SELECT count(*) FROM reviews WHERE series_id=$2),(SELECT total FROM series_views WHERE series_key=$2),(SELECT views FROM series_view_bucket WHERE series_key=$2 AND hour_ts=1)").bind(user).bind(&old_mapping.work_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(moved, (Some("reading".into()), true, 1, 5, 5));
+        let aside: Vec<String> = sqlx::query_scalar("SELECT source_table FROM engine_detached_row WHERE generation=$1::uuid ORDER BY source_table").bind(&shown).fetch_all(&pool).await.unwrap();
+        assert_eq!(aside, ["reviews", "series_admin", "series_admin", "series_view_bucket", "series_views", "user_library"]);
         let counts:(i64,i64,i64,i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM suwayomi_progress),(SELECT count(*) FROM suwayomi_progress_detached),(SELECT count(*) FROM comments WHERE target_type='detached_series'),(SELECT count(*) FROM comment_votes),(SELECT count(*) FROM comment_media)").fetch_one(&pool).await.unwrap();
         assert_eq!(counts, (0, 1, 2, 1, 1));
         let old_mapping_gone: bool =
@@ -19646,6 +19754,8 @@ mod tests {
             r#"setProgress(chapterId:"8",lastPageRead:3,read:true)"#,
             r#"setProgress(chapterId:"8",lastPageRead:3,read:true,numericEpoch:0)"#,
             r#"setChapterRead(chapterId:"8",read:true,numericEpoch:0)"#,
+            r#"mark(seriesId:"7",marked:true) { id }"#,
+            r#"mark(seriesId:"7",marked:true,numericEpoch:0) { id }"#,
         ] {
             let r = exec(
                 &schema,
@@ -19695,6 +19805,14 @@ mod tests {
         let r = exec(
             &schema,
             r#"mutation { setProgress(chapterId:"8",lastPageRead:3,read:true,numericEpoch:1) }"#,
+            Some("bobtok"),
+            "generation-write",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let r = exec(
+            &schema,
+            r#"mutation { mark(seriesId:"7",marked:true,numericEpoch:1) { id } }"#,
             Some("bobtok"),
             "generation-write",
         )

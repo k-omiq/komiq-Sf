@@ -66,8 +66,10 @@ These variables configure connections to the Suwayomi source engine.
 | Variable              | Default                 | Description                                              |
 | --------------------- | ----------------------- | -------------------------------------------------------- |
 | `SUWAYOMI_URL`        | `http://localhost:4567` | URL of the internal Suwayomi API.                        |
-| `SUWAYOMI_PUBLIC_URL` | unset                   | Public base URL for Suwayomi for direct client fetching. |
+| `SUWAYOMI_PUBLIC_URL` | unset                   | Public base URL for page and cover URLs. See below.      |
 | `SUWAYOMI_SOURCE_ID`  | unset                   | Pins requests to a specific Suwayomi source identifier.  |
+
+Set `SUWAYOMI_PUBLIC_URL` to this komiq server's public address, or to `/` as the Docker image does. Readers then fetch pages and covers through komiq. Pages use a chapter address (`/media/v1/c/...`) that only komiq answers. When the variable is unset, or equal to `SUWAYOMI_URL`, page and cover URLs point at Suwayomi itself, and readers must be able to reach it.
 
 ## Exact media settings
 

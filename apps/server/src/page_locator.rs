@@ -5,13 +5,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OnceCell, Semaphore};
 use tokio::time::Instant;
 
 static EVENTS: AtomicU64 = AtomicU64::new(0);
 const MEMO_TTL: Duration = Duration::from_secs(30);
 const MEMO_OFF: Duration = Duration::from_secs(60);
 const MEMO_CAP: usize = 4096;
+/// Distinct chapters looked up in the engine at once; requests for the same chapter share one.
+const LOOKUP_CONCURRENCY: usize = 4;
 pub(crate) const REFRESH_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug)]
@@ -49,11 +51,27 @@ struct State {
     last_clear: u64,
 }
 
-#[derive(Default)]
+/// One engine lookup's answer and the event stamp taken just before it was sent.
+pub(crate) type Lookup = (u64, Option<(i64, i32)>);
+
 pub(crate) struct PageLocator {
     state: Mutex<State>,
+    lookups: Mutex<HashMap<i64, Arc<OnceCell<Lookup>>>>,
+    lookup_permits: Semaphore,
     #[cfg(test)]
     refresh_wait: Option<Duration>,
+}
+
+impl Default for PageLocator {
+    fn default() -> Self {
+        Self {
+            state: Default::default(),
+            lookups: Default::default(),
+            lookup_permits: Semaphore::new(LOOKUP_CONCURRENCY),
+            #[cfg(test)]
+            refresh_wait: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -126,6 +144,36 @@ impl PageLocator {
 
     pub(crate) fn snapshot(&self) -> u64 {
         EVENTS.load(Ordering::SeqCst)
+    }
+
+    /// A chapter's cold lookup, shared by every request that arrives while it runs (a
+    /// chapter opens with all its pages at once) and bounded across chapters. Each caller
+    /// checks the shared answer against its stamp, so a follower trusts nothing newer than
+    /// the leader saw. A failed lookup is not shared: the next waiter sends its own.
+    pub(crate) async fn lookup<F, Fut>(&self, chapter_id: i64, fetch: F) -> anyhow::Result<Lookup>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Option<(i64, i32)>>>,
+    {
+        let cell = self
+            .lookups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(chapter_id)
+            .or_default()
+            .clone();
+        let _guard = LookupGuard {
+            locator: self,
+            chapter_id,
+            cell: cell.clone(),
+        };
+        cell.get_or_try_init(|| async {
+            let _permit = self.lookup_permits.acquire().await?;
+            let stamp = self.snapshot();
+            Ok::<_, anyhow::Error>((stamp, fetch().await?))
+        })
+        .await
+        .copied()
     }
 
     pub(crate) fn unchanged(&self, manga_id: i64, stamp: u64) -> bool {
@@ -211,6 +259,26 @@ impl PageLocator {
     }
 }
 
+struct LookupGuard<'a> {
+    locator: &'a PageLocator,
+    chapter_id: i64,
+    cell: Arc<OnceCell<Lookup>>,
+}
+
+impl Drop for LookupGuard<'_> {
+    fn drop(&mut self) {
+        // Finished or cancelled lookups must not leave entries behind, or remove a
+        // newer lookup that replaced this one while another caller held its cell.
+        let mut lookups = self.locator.lookups.lock().unwrap_or_else(|e| e.into_inner());
+        if lookups
+            .get(&self.chapter_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.cell))
+        {
+            lookups.remove(&self.chapter_id);
+        }
+    }
+}
+
 pub(crate) struct RefreshGuard {
     locator: Arc<PageLocator>,
     manga_id: i64,
@@ -235,6 +303,19 @@ impl Drop for RefreshGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_lookup_removes_pending_entry() {
+        let locator = PageLocator::default();
+        let lookup = locator.lookup(8, || async {
+            assert_eq!(locator.lookups.lock().unwrap().len(), 1);
+            std::future::pending().await
+        });
+        assert!(tokio::time::timeout_at(locator.deadline(), lookup)
+            .await
+            .is_err());
+        assert!(locator.lookups.lock().unwrap().is_empty());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn memo_expires_and_keeps_stale_owner_for_waiting() {

@@ -83,3 +83,9 @@ export function isUnknownEngineStateField(err: unknown): boolean {
 	const message = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
 	return message.includes('Unknown field "engineGenerationState"');
 }
+
+/** The generation a confirmed "start a new generation" gives up: only the quarantined one
+ *  on screen. The server refuses the id if the state changed meanwhile. */
+export function generationToReplace(view: EngineGenerationView): string | null {
+	return view.kind === 'quarantined' ? view.current.id : null;
+}

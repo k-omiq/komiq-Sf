@@ -57,20 +57,25 @@ Pick this when you want to keep the engine you have now, for example a fresh eng
 1. Choose **Start a new generation**.
 2. Read the dialog. Confirm with **Start a new generation**.
 
+The button works only while the engine data is quarantined. The console sends the generation it showed you. If the state changed after you opened the page, for example the old engine came back and quarantine ended, the server refuses. Refresh the engine state and check again.
+
 The dialog lists what changes:
 
 - Reading progress on extension-source chapters is set aside. The server keeps it, but readers no longer see it.
 - Comment threads on extension-source series and chapters are set aside with their replies.
 - Extension-source series and chapters leave the catalogue. Scan or add them again from the new engine. The server puts them back on their works.
 - Works, libraries and MangaDex progress stay.
+- Library entries, reviews and view counts on extension-source series move to their works. Entries for a series that has no work are set aside, like progress. Per-series scan settings for extension-source series are set aside: set them again on the new series.
 
-Reader apps that saved progress offline before the change cannot send it. The app drops that progress. It never puts it on a different chapter.
+Reader apps that saved progress or library changes offline before the change cannot send them. The app drops that progress. It never puts it on a different chapter. A reader app that stays open across the change shows a notice. Reload the app to save progress again.
 
-You cannot undo this from the console. Take a backup first. The same action is available as a command in the server container:
+You cannot undo this from the console. Take a backup first. The same action is available as a command in the server container. Give it the generation id of the quarantined generation:
 
 ```sh
-komika-server engine start-new-generation
+komika-server engine start-new-generation <generation-id>
 ```
+
+The server log line `engine quarantined` shows the id as `generation=`. The command refuses unless that generation is current and quarantined. To replace the current generation even while it is active, run `komika-server engine start-new-generation --force`. Use `--force` only when you are sure the engine data does not match.
 
 ## Which one to pick
 
