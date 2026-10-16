@@ -3092,13 +3092,11 @@ async fn main() -> anyhow::Result<()> {
     let cover_pool = db::init_covers(&cfg.covers_database_url).await?;
 
     // Covers are re-derivable. Repair dangling pointers in bounded transactions,
-    // including a partly lost cache and a cache recreated after corruption.
-    let cleared = db::reconcile_cover_pointers(&pool, &cover_pool).await?;
-    if cleared > 0 {
-        tracing::warn!(
-            cleared,
-            "cleared missing cover pointers; covers will re-cache"
-        );
+    // including a partly lost cache and a cache recreated after corruption. An older
+    // local cache never replaces a newer published version from another server copy.
+    let repaired = db::reconcile_cover_pointers(&pool, &cover_pool).await?;
+    if repaired > 0 {
+        tracing::warn!(repaired, "reconciled missing or stale cover pointers");
     }
 
     // Provision/promote configured admin accounts (idempotent). This is the only

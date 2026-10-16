@@ -739,8 +739,8 @@ pub async fn put_work_cover_for_missing_anchor(
     .await
 }
 
-/// A work cover fetched from the work's Suwayomi anchor: published only while that
-/// anchor and the engine generation it was read under are still current. A queued
+/// A work cover fetched from the work's Suwayomi anchor: published only while the
+/// master is missing and the anchor and engine generation are still current. A queued
 /// crawl job can outlive a generation change, and the number may name another series.
 pub async fn put_work_cover_for_suwayomi_anchor(
     main: &Database,
@@ -755,7 +755,7 @@ pub async fn put_work_cover_for_suwayomi_anchor(
         covers,
         work_id,
         webp,
-        None,
+        Some(None),
         None,
         Some((generation, thumbnail_url)),
     )
@@ -774,6 +774,10 @@ async fn publish_work_cover(
     let now = Utc::now();
 
     let ts = now.to_rfc3339();
+    #[cfg(test)]
+    if let Ok(points) = COVER_PUBLICATION_PAUSE.try_with(Clone::clone) {
+        points.hit("cover-before-lock").await;
+    }
     let mut tx = main.begin().await?;
     // The generation lock comes before any work lock: a new generation holds it
     // exclusively while it locks works.
@@ -847,9 +851,15 @@ async fn publish_work_cover(
             .bind(work_id)
             .fetch_optional(covers)
             .await?;
+    let published: Option<i64> =
+        sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id = $1")
+            .bind(work_id)
+            .fetch_one(&mut *tx)
+            .await?;
     let version = now.timestamp_millis().max(
         previous
             .unwrap_or(0)
+            .max(published.unwrap_or(0))
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("cover version exhausted"))?,
     );
@@ -1793,10 +1803,22 @@ pub async fn crawl_uncached_covers(
             .await
         {
             Some(bytes) => match work.process(move || process_cover(&bytes)).await {
-                Ok(Ok(webp)) => match put_work_cover(main, covers, &job.work_id, &webp).await {
-                    Ok(()) => {
+                Ok(Ok(webp)) => match put_work_cover_for_missing_anchor(
+                    main,
+                    covers,
+                    &job.work_id,
+                    &webp,
+                    &job.mangadex_id,
+                    &job.file_name,
+                )
+                .await
+                {
+                    Ok(true) => {
                         saved += 1;
                         clear_cover_issue(main, &job.work_id).await;
+                    }
+                    Ok(false) => {
+                        tracing::debug!(work_id = %job.work_id, "cover crawl: master already stored or anchor changed; skipped");
                     }
                     Err(e) => {
                         failed += 1;
@@ -1963,7 +1985,7 @@ pub async fn crawl_uncached_covers(
                         (1, 0)
                     }
                     Ok(false) => {
-                        tracing::debug!(work_id = %work_id, "cover crawl (suwayomi): anchor or engine generation changed; skipped");
+                        tracing::debug!(work_id = %work_id, "cover crawl (suwayomi): master already stored, anchor or engine generation changed; skipped");
                         (0, 0)
                     }
                     Err(e) => {
@@ -3006,6 +3028,131 @@ mod tests {
         assert_eq!(bytes, b"second");
         assert_eq!(version, 4102444800002);
         assert_eq!(pointer, version);
+    }
+
+    #[tokio::test]
+    async fn separate_cover_databases_mint_distinct_versions_under_the_publication_lock() {
+        let (main, first_covers) = publication_pools().await;
+        let second_covers = crate::db::init_covers("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO work_cover_blob VALUES ('w_publication',x'00',4102444800000,'now')",
+        )
+        .execute(&first_covers)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE work SET cover_cached_version=4102444800001 WHERE id='w_publication'")
+            .execute(&main)
+            .await
+            .unwrap();
+        let points = crate::locks::pause_points::PausePoints::default();
+        let armed = points.arm("cover-locked");
+        let writer = main.clone();
+        let cache = first_covers.clone();
+        let first = tokio::spawn(COVER_PUBLICATION_PAUSE.scope(points, async move {
+            put_work_cover(&writer, &cache, "w_publication", b"first").await
+        }));
+        tokio::time::timeout(Duration::from_secs(30), armed.reached())
+            .await
+            .unwrap();
+        let writer = main.clone();
+        let cache = second_covers.clone();
+        let second = tokio::spawn(async move {
+            put_work_cover(&writer, &cache, "w_publication", b"second").await
+        });
+        wait_for_writer_lock(&main).await;
+        armed.release();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+
+        for (cache, bytes, version) in [
+            (&first_covers, b"first".as_slice(), 4102444800002_i64),
+            (&second_covers, b"second".as_slice(), 4102444800003_i64),
+        ] {
+            let stored: (Vec<u8>, i64) = sqlx::query_as(
+                "SELECT webp,version FROM work_cover_blob WHERE work_id='w_publication'",
+            )
+            .fetch_one(cache)
+            .await
+            .unwrap();
+            assert_eq!(stored, (bytes.to_vec(), version));
+        }
+        let published: i64 =
+            sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id='w_publication'")
+                .fetch_one(&main)
+                .await
+                .unwrap();
+        assert_eq!(published, 4102444800003);
+    }
+
+    #[tokio::test]
+    async fn a_delayed_crawl_fill_cannot_replace_an_admin_upload() {
+        for mangadex_anchor in [true, false] {
+            let (main, covers) = publication_pools().await;
+            sqlx::query("UPDATE work SET cover_file_name='cover.jpg' WHERE id='w_publication'")
+                .execute(&main)
+                .await
+                .unwrap();
+            let (source_type, source_key) = if mangadex_anchor {
+                ("mangadex", "md-uuid")
+            } else {
+                ("suwayomi", "7")
+            };
+            sqlx::query("INSERT INTO source_series(id,work_id,source_type,source_key,created_at) VALUES ('ss_cover','w_publication',$1,$2,now())")
+                .bind(source_type).bind(source_key).execute(&main).await.unwrap();
+            if !mangadex_anchor {
+                insert_series(&main, 7, Some(&thumb_path(7))).await;
+            }
+            let origin = crate::suwayomi::testsrv::spawn(
+                crate::suwayomi::testsrv::jpeg(300, 450),
+                Duration::ZERO,
+            )
+            .await;
+            let suwayomi =
+                crate::suwayomi::SuwayomiClient::new(origin.base_url.clone(), None, None);
+            let mangadex = MangaDexClient::new("cover-crawl-race-test", 5.0, 40.0)
+                .with_bases(&origin.base_url, &origin.base_url);
+            mangadex.set_enabled(mangadex_anchor);
+            let points = crate::locks::pause_points::PausePoints::default();
+            let armed = points.arm("cover-before-lock");
+            let writer = main.clone();
+            let cache = covers.clone();
+            let crawl = tokio::spawn(COVER_PUBLICATION_PAUSE.scope(points, async move {
+                crawl_uncached_covers(&writer, &cache, &mangadex, &suwayomi, Some(10)).await;
+            }));
+            tokio::time::timeout(Duration::from_secs(30), armed.reached())
+                .await
+                .unwrap();
+            // The fetch and encoding finished, but publication has not taken its locks.
+            put_work_cover(&main, &covers, "w_publication", b"admin-upload")
+                .await
+                .unwrap();
+            let uploaded: (Vec<u8>, i64) = sqlx::query_as(
+                "SELECT webp,version FROM work_cover_blob WHERE work_id='w_publication'",
+            )
+            .fetch_one(&covers)
+            .await
+            .unwrap();
+            armed.release();
+            tokio::time::timeout(Duration::from_secs(30), crawl)
+                .await
+                .unwrap()
+                .unwrap();
+            let stored: (Vec<u8>, i64) = sqlx::query_as(
+                "SELECT webp,version FROM work_cover_blob WHERE work_id='w_publication'",
+            )
+            .fetch_one(&covers)
+            .await
+            .unwrap();
+            assert_eq!(stored, uploaded, "{source_type} crawl replaced the upload");
+            let published: i64 = sqlx::query_scalar(
+                "SELECT cover_cached_version FROM work WHERE id='w_publication'",
+            )
+            .fetch_one(&main)
+            .await
+            .unwrap();
+            assert_eq!(published, uploaded.1);
+            assert_eq!(origin.hits.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]

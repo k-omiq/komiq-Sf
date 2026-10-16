@@ -76,6 +76,8 @@ When an upstream source is permanently unreachable, returns a 404 error, is bloc
 3. Your server receives the file, verifies that it is within size limits, processes it as lossy WebP with the 150 KiB target and smallest-encoding fallback, and stores it in the database.
 4. The issue is marked resolved and disappears from the Cover issues list immediately.
 
+A background cover download already in progress cannot replace your uploaded cover.
+
 ## Bulk cover storage
 
 To generate and store covers for eligible uncached works, use the maintenance tools in [Settings](/admin/settings).
