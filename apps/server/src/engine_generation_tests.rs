@@ -3,6 +3,9 @@ use crate::database::{SqliteTestPoolOptions, TestPoolOptions};
 use crate::suwayomi::{testsrv, SuwayomiChapter, SuwayomiManga};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// The pinned Suwayomi engine's answer to `meta(key:)` for a key it does not have.
+const ENGINE_MISSING_META: &str = "The field at path '/meta' was declared as a non null type, but the code involved in retrieving data has wrongly returned a null value.  The graphql specification requires that the parent field be set to null, or if that is non nullable that it bubble up null to its parent and so on. The non-nullable type is 'GlobalMetaType' within parent type 'Query'";
+
 #[derive(Clone)]
 pub(crate) struct MockEngine {
     pub data: Arc<Mutex<MockData>>,
@@ -32,7 +35,7 @@ impl MockEngine {
         let data = Arc::new(Mutex::new(MockData {
             marker: None,
             meta: true,
-            missing_error: false,
+            missing_error: true,
             mangas: vec![manga_json(7)],
             chapters: vec![chapter_json(8, 7)],
             delay: Duration::ZERO,
@@ -58,7 +61,7 @@ impl MockEngine {
                         if !d.meta { json!({"errors":[{"message":"Cannot query field 'meta' on type 'Query'"}]}) }
                         else if query.contains("setGlobalMeta") && d.fail_marker_write { json!({"errors":[{"message":"Internal server error"}]}) }
                         else if query.contains("setGlobalMeta") { d.marker = vars["value"].as_str().map(str::to_owned); json!({"data":{"setGlobalMeta":{"meta":{"key":MARKER,"value":d.marker}}}}) }
-                        else if d.marker.is_none() && d.missing_error { json!({"errors":[{"message":"Key not found"}]}) }
+                        else if d.marker.is_none() && d.missing_error { json!({"errors":[{"message":ENGINE_MISSING_META,"path":["meta"]}]}) }
                         else { json!({"data":{"meta":d.marker.as_ref().map(|v| json!({"key":MARKER,"value":v}))}}) }
                     } else if query.contains("EngineFingerprint") {
                         fingerprints.fetch_add(1,Ordering::SeqCst);
@@ -171,7 +174,7 @@ async fn first_deploy_adopts_and_reads_back_marker_even_with_existing_references
 async fn marker_missing_as_null_or_graphql_error_and_no_meta_support() {
     for body in [
         json!({"data":{"meta":null}}),
-        json!({"errors":[{"message":"Key not found"}]}),
+        json!({"errors":[{"message":ENGINE_MISSING_META,"path":["meta"]}]}),
     ] {
         let origin = testsrv::spawn_status(
             200,
@@ -295,6 +298,107 @@ async fn removed_sample_is_replaced_without_quarantine() {
 }
 
 #[tokio::test]
+async fn restored_marker_requires_a_verified_binding() {
+    let (pool, _covers, engine, client, fence) = setup().await;
+    bind(&pool, &client).await;
+    let marker = engine.data.lock().await.marker.clone();
+    engine.data.lock().await.marker = None;
+    fence.check().await;
+    assert!(fence.is_blocked());
+    {
+        let mut d = engine.data.lock().await;
+        d.marker = marker;
+        d.mangas = vec![manga_json(70)];
+        d.chapters = vec![chapter_json(80, 70)];
+    }
+    fence.check().await;
+    assert!(fence.is_blocked());
+    let state = states(&pool).await.unwrap().remove(0);
+    assert_eq!(state.state, "quarantined");
+    assert_eq!(
+        state.reason.as_deref(),
+        Some("No stored source identity can be verified against the engine")
+    );
+    // The gone-id memo cannot turn the next check into a successful empty sample.
+    fence.check().await;
+    assert!(fence.is_blocked());
+    {
+        let mut d = engine.data.lock().await;
+        d.mangas = vec![manga_json(7)];
+        d.chapters = vec![chapter_json(8, 7)];
+    }
+    fence.check().await;
+    assert!(!fence.is_blocked(), "the original engine's bindings can return");
+}
+
+#[tokio::test]
+async fn timed_out_fingerprint_cannot_reopen_gate_without_a_verified_binding() {
+    let (pool, _covers, engine, client, fence) = setup().await;
+    bind(&pool, &client).await;
+    let marker = engine.data.lock().await.marker.take();
+    fence.check().await;
+    assert!(fence.is_blocked());
+    {
+        let mut d = engine.data.lock().await;
+        d.marker = marker;
+        d.mangas = vec![manga_json(70)];
+        d.chapters = vec![chapter_json(80, 70)];
+        d.fingerprint_delay = Duration::from_millis(1600);
+    }
+    let before = engine.fingerprints.load(Ordering::SeqCst);
+    fence.check().await;
+    assert!(fence.is_blocked());
+    assert_eq!(engine.fingerprints.load(Ordering::SeqCst), before + 1);
+    // The first batch marked every binding gone; the empty follow-up timed out.
+    assert!(fence.gone_manga.lock().await.contains(&7));
+    assert!(fence.gone_chapter.lock().await.contains(&8));
+    engine.data.lock().await.fingerprint_delay = Duration::ZERO;
+    fence.check().await;
+    assert!(fence.is_blocked());
+    let state = states(&pool).await.unwrap().remove(0);
+    assert_eq!(state.state, "quarantined");
+    assert_eq!(
+        state.reason.as_deref(),
+        Some("No stored source identity can be verified against the engine")
+    );
+}
+
+#[tokio::test]
+async fn references_without_captured_keys_stay_active_after_adoption() {
+    // Right after the first adoption no key row is captured yet while Suwayomi
+    // references already exist: that is not a failed verification.
+    let (pool, _covers, _engine, _client, fence) = setup().await;
+    fence.check().await;
+    let generation = fence.generation().unwrap();
+    sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES('w_a',now(),now()); INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES('ss_keyless','w_a','suwayomi','source','7',now())")
+        .execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM engine_manga_key").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM engine_chapter_key").execute(&pool).await.unwrap();
+    fence.check().await;
+    assert!(!fence.is_blocked());
+    let state = states(&pool).await.unwrap().remove(0);
+    assert_eq!((state.state.as_str(), fence.generation()), ("active", Some(generation)));
+}
+
+#[tokio::test]
+async fn missing_fingerprint_batch_resamples_other_stored_bindings() {
+    let (pool, _covers, engine, _client, fence) = setup().await;
+    let generation = fence.generation().unwrap();
+    sqlx::query("INSERT INTO engine_manga_key(generation,manga_id,source_id,manga_key,updated_at) SELECT $1,n,'source','/manga/' || n,now() FROM generate_series(1,33) n")
+        .bind(generation).execute(&pool).await.unwrap();
+    {
+        let mut d = engine.data.lock().await;
+        d.mangas = vec![manga_json(33)];
+        d.chapters.clear();
+    }
+    let before = engine.fingerprints.load(Ordering::SeqCst);
+    fence.check().await;
+    assert!(!fence.is_blocked());
+    assert_eq!(states(&pool).await.unwrap()[0].state, "active");
+    assert_eq!(engine.fingerprints.load(Ordering::SeqCst) - before, 3);
+}
+
+#[tokio::test]
 async fn reattach_checks_all_bindings_and_moves_keys_without_resetting_progress_epoch() {
     let (pool, _covers, engine, client, fence) = setup().await;
     {
@@ -392,6 +496,87 @@ async fn known_marker_mismatch_closes_gate_before_a_slow_fingerprint() {
     fence.check().await;
     assert!(fence.is_blocked(), "a replaced engine must not serve old ids");
     assert!(fence.wait().await.is_err());
+}
+
+#[tokio::test]
+async fn fingerprint_mismatch_closes_gate_before_a_delayed_reference_check() {
+    let (pool, _covers, engine, client, fence) = setup().await;
+    bind(&pool, &client).await;
+    let revision = fence.revision();
+    engine.data.lock().await.mangas[0]["url"] = json!("/wrong");
+    // This blocks has_references, but neither the marker nor fingerprint reads.
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE suwayomi_progress IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    fence.check().await;
+    assert!(
+        fence.is_blocked(),
+        "the reference read exceeded the check timeout"
+    );
+    assert!(
+        fence.revision() > revision,
+        "in-flight reads must be invalidated"
+    );
+    assert!(commit_ready(&pool).is_err());
+    held.rollback().await.unwrap();
+    fence.check().await;
+    assert_eq!(states(&pool).await.unwrap()[0].state, "quarantined");
+}
+
+#[tokio::test]
+async fn numeric_epoch_survives_rolled_back_state() {
+    let (pool, _covers, _engine, _client, fence) = setup().await;
+    assert_eq!(numeric_epoch(&pool).await.unwrap(), 0);
+    let started = chrono::Utc::now().timestamp();
+    fence.start_new_generation(Replace::Force).await.unwrap();
+    let first = numeric_epoch(&pool).await.unwrap();
+    assert!(first >= started);
+    fence.start_new_generation(Replace::Force).await.unwrap();
+    let second = numeric_epoch(&pool).await.unwrap();
+    assert!(
+        second > first,
+        "rapid changes still advance the stored epoch"
+    );
+    // A restore happens later in wall-clock time, but brings back the epoch-0 dump.
+    while chrono::Utc::now().timestamp() <= second {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    sqlx::query("DELETE FROM engine_numeric_state")
+        .execute(&pool)
+        .await
+        .unwrap();
+    fence.start_new_generation(Replace::Force).await.unwrap();
+    let restored = numeric_epoch(&pool).await.unwrap();
+    for issued in [0, first, second] {
+        assert_ne!(restored, issued);
+        let mut tx = pool.begin().await.unwrap();
+        let error = progress_guard(&mut tx, Some(issued)).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<FenceError>(),
+            Some(&FenceError::StaleEpoch)
+        );
+    }
+}
+
+#[tokio::test]
+async fn new_generation_removes_numeric_browse_rows_and_keeps_work_rows() {
+    let (pool, _covers, _engine, client, fence) = setup().await;
+    bind(&pool, &client).await;
+    sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES('w_old',now(),now()),('w_kept',now(),now()); INSERT INTO browse_catalogue(work_id,reader_id,title,created_at) VALUES('w_old','7','Old series',now()),('w_kept','w_kept','Kept work',now())")
+        .execute(&pool).await.unwrap();
+    fence.start_new_generation(Replace::Force).await.unwrap();
+    let readers: Vec<String> = sqlx::query_scalar("SELECT reader_id FROM browse_catalogue")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(readers, ["w_kept"]);
+    let works: i64 = sqlx::query_scalar("SELECT count(*) FROM work")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(works, 2);
 }
 
 #[tokio::test]
@@ -583,6 +768,7 @@ fn missing_meta_keys_are_distinct_from_unsupported_meta_read_or_write_fields() {
     assert!(!meta_unsupported(&missing));
     assert!(missing_meta_key("Key not found"));
     assert!(missing_meta_key("NoSuchElementException: No value present"));
+    assert!(missing_meta_key(ENGINE_MISSING_META));
     assert!(!missing_meta_key("Internal server error"));
 }
 

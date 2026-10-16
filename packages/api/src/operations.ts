@@ -158,7 +158,7 @@ export const OPTIONAL_ARGUMENTS = [
 	// server that predates it answers as before (null / "No such work" for such a work),
 	// and the reader then falls back to the selected source's metadata.
 	'includeFederated',
-	// M5: numeric progress writes carry the server's `numericEpoch`, so a write made before
+	// M5: numeric library and progress writes carry the server's `numericEpoch`, so a write made before
 	// an engine change is refused instead of filed on a chapter that reused the id. A server
 	// that predates engine generations has no fence and needs no epoch.
 	'numericEpoch',
@@ -569,8 +569,8 @@ export const MARK_LEGACY = /* GraphQL */ `
 
 export const SET_LIBRARY_STATUS = /* GraphQL */ `
 	${SERIES_FIELDS}
-	mutation SetLibraryStatus($seriesId: ID!, $status: String) {
-		setLibraryStatus(seriesId: $seriesId, status: $status) {
+	mutation SetLibraryStatus($seriesId: ID!, $status: String, $numericEpoch: Int) {
+		setLibraryStatus(seriesId: $seriesId, status: $status, numericEpoch: $numericEpoch) {
 			...SeriesFields
 			libraryStatus
 			isFavorite
@@ -580,8 +580,8 @@ export const SET_LIBRARY_STATUS = /* GraphQL */ `
 
 export const SET_FAVORITE = /* GraphQL */ `
 	${SERIES_FIELDS}
-	mutation SetFavorite($seriesId: ID!, $favorite: Boolean!) {
-		setFavorite(seriesId: $seriesId, favorite: $favorite) {
+	mutation SetFavorite($seriesId: ID!, $favorite: Boolean!, $numericEpoch: Int) {
+		setFavorite(seriesId: $seriesId, favorite: $favorite, numericEpoch: $numericEpoch) {
 			...SeriesFields
 			libraryStatus
 			isFavorite

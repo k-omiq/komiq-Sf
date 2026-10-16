@@ -28,6 +28,7 @@ The server quarantines when:
 
 - stored numbers answer different source identities;
 - the engine is empty but the server still has series from it;
+- none of the stored source identities can be found in the engine, even if its marker matches;
 - the engine marker is missing or different.
 
 This happens after you restore only the database onto a fresh engine, rebuild the engine, or restore the engine from its own backup file. Quarantine keeps progress and comments from landing on the wrong chapter. MangaDex series are not affected.
@@ -68,6 +69,8 @@ The dialog lists what changes:
 - Library entries, reviews and view counts on extension-source series move to their works. Entries for a series that has no work are set aside, like progress. Per-series scan settings for extension-source series are set aside: set them again on the new series.
 
 Reader apps that saved progress or library changes offline before the change cannot send them. The app drops that progress. It never puts it on a different chapter. A reader app that stays open across the change shows a notice. Reload the app to save progress again.
+
+Library membership, shelves and favourites on extension-source series use the same check as progress. Apps too old to send the generation epoch cannot change them for 30 days after a new generation. Browse and search remove entries that still point to the old engine's series numbers until those series are added again.
 
 You cannot undo this from the console. Take a backup first. The same action is available as a command in the server container. Give it the generation id of the quarantined generation:
 

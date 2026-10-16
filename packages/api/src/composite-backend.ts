@@ -428,7 +428,7 @@ export class CompositeBackend implements Backend {
 				: await (this.opts.hosted.numericEpoch?.() ?? Promise.resolve(null)).catch(() => null);
 		if (!this.writeIsCurrent(owner, generation)) throw new Error('Offline write identity changed');
 		try {
-			const s = await this.opts.hosted.mark(seriesId, marked, epoch);
+			const s = await this.opts.hosted.mark(seriesId, marked, numericEpoch);
 			if (this.writeIsCurrent(owner, generation)) void this.flushQueue();
 			return s;
 		} catch (err) {
@@ -444,11 +444,11 @@ export class CompositeBackend implements Backend {
 			throw err;
 		}
 	}
-	setLibraryStatus(seriesId: Id, status: LibraryStatus | null): Promise<Series> {
-		return this.opts.hosted.setLibraryStatus!(seriesId, status);
+	setLibraryStatus(seriesId: Id, status: LibraryStatus | null, numericEpoch?: number | null): Promise<Series> {
+		return this.opts.hosted.setLibraryStatus!(seriesId, status, numericEpoch);
 	}
-	setFavorite(seriesId: Id, favorite: boolean): Promise<Series> {
-		return this.opts.hosted.setFavorite!(seriesId, favorite);
+	setFavorite(seriesId: Id, favorite: boolean, numericEpoch?: number | null): Promise<Series> {
+		return this.opts.hosted.setFavorite!(seriesId, favorite, numericEpoch);
 	}
 	library(): Promise<Series[]> {
 		return this.opts.hosted.library();

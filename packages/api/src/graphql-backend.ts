@@ -161,6 +161,8 @@ const NUMERIC_ID_READS = new Set([
 	ops.MY_ACTIVITY,
 ]);
 
+const LIBRARY_WRITES = new Set([ops.MARK, ops.SET_LIBRARY_STATUS, ops.SET_FAVORITE]);
+
 /**
  * A URL string in its WHATWG-normalized form — what `new URL(s).href` produces.
  *
@@ -210,7 +212,7 @@ interface EndpointCapabilities {
 	getUnsupported: boolean;
 	fetchPolicyUnsupported: boolean;
 	tagsUnsupported: boolean;
-	markEpochUnsupported: boolean;
+	libraryEpochUnsupported: Set<string>;
 	setChapterReadUnsupported: boolean;
 	chapterOriginUnsupported: boolean;
 	mediaRoutesUnsupported: boolean;
@@ -232,7 +234,7 @@ function endpointCapabilities(config: BackendConfig): EndpointCapabilities {
 			getUnsupported: false,
 			fetchPolicyUnsupported: false,
 			tagsUnsupported: false,
-			markEpochUnsupported: false,
+			libraryEpochUnsupported: new Set(),
 			setChapterReadUnsupported: false,
 			chapterOriginUnsupported: false,
 			mediaRoutesUnsupported: false,
@@ -364,9 +366,11 @@ export class GraphQLBackend implements Backend {
 	 *    error, which is the honest outcome.
 	 */
 	private stripUnsupported(query: string): string {
+		const unsupportedArgs = new Set(this.capabilities.unsupportedArgs);
+		if (this.capabilities.libraryEpochUnsupported.has(query)) unsupportedArgs.add('numericEpoch');
 		if (
 			this.capabilities.unsupportedFields.size === 0 &&
-			this.capabilities.unsupportedArgs.size === 0
+			unsupportedArgs.size === 0
 		)
 			return query;
 		let out = query;
@@ -380,7 +384,7 @@ export class GraphQLBackend implements Backend {
 			}
 			out = out.replace(new RegExp(`^[\\t ]*${field}[\\t ]*\\r?\\n`, 'gm'), '');
 		}
-		for (const arg of this.capabilities.unsupportedArgs) {
+		for (const arg of unsupportedArgs) {
 			out = out
 				.replace(new RegExp(`\\b${arg}\\s*:\\s*\\$${arg}\\b`, 'g'), '')
 				.replace(
@@ -394,7 +398,7 @@ export class GraphQLBackend implements Backend {
 		}
 		// `(` + nothing but ignored tokens + `)` — never valid, so dropping it is always
 		// an improvement (`query Q()` -> `query Q`, `field()` -> `field`).
-		if (this.capabilities.unsupportedArgs.size > 0) out = out.replace(/\(\s*(?:,\s*)*\)/g, '');
+		if (unsupportedArgs.size > 0) out = out.replace(/\(\s*(?:,\s*)*\)/g, '');
 		// Emptied a selection set? Only count sets the strip CREATED, so a legitimately
 		// empty object value in the source document (`input: {}`) can't disable this.
 		const emptySets = (s: string) => (s.match(/\{\s*\}/g) ?? []).length;
@@ -512,13 +516,21 @@ export class GraphQLBackend implements Backend {
 				);
 				const droppedArgs = ops.OPTIONAL_ARGUMENTS.filter(
 					(a) =>
-						(a !== 'numericEpoch' || query !== ops.MARK) &&
+						(a !== 'numericEpoch' || !this.capabilities.libraryEpochUnsupported.has(query)) &&
 						!this.capabilities.unsupportedArgs.has(a) &&
 						messages.some((m) => m.includes(`Unknown argument "${a}"`)),
 				);
 				if (dropped.length || droppedArgs.length) {
 					for (const f of dropped) this.capabilities.unsupportedFields.add(f);
-					for (const a of droppedArgs) this.capabilities.unsupportedArgs.add(a);
+					for (const a of droppedArgs) {
+						// Library arguments arrived after progress epochs. An older
+						// library mutation must not disable the progress fence.
+						if (a === 'numericEpoch' && LIBRARY_WRITES.has(query)) {
+							this.capabilities.libraryEpochUnsupported.add(query);
+						} else {
+							this.capabilities.unsupportedArgs.add(a);
+						}
+					}
 					return this.gql<T>(query, variables, true, tolerate, authRevision, forcePost);
 				}
 			}
@@ -718,48 +730,40 @@ export class GraphQLBackend implements Backend {
 	}
 
 	// --- library & progress ---
-	async mark(seriesId: Id, marked: boolean, numericEpoch?: number | null): Promise<Series> {
+	private async editLibrary(
+		field: 'mark' | 'setLibraryStatus' | 'setFavorite',
+		query: string,
+		seriesId: Id,
+		variables: Record<string, unknown>,
+		numericEpoch?: number | null,
+	): Promise<Series> {
 		const authRevision = this.auth.revision;
 		const epoch = isNumericChapterId(seriesId)
 			? await this.epochFor(seriesId, numericEpoch)
 			: undefined;
-		const query = this.capabilities.markEpochUnsupported ? ops.MARK_LEGACY : ops.MARK;
 		try {
-			const d = await this.gql<{ mark: Series }>(
+			const d = await this.gql<Record<typeof field, Series>>(
 				query,
-				{ seriesId, marked, numericEpoch: epoch },
+				{ ...variables, seriesId, numericEpoch: epoch },
 				false,
 				undefined,
 				authRevision,
 			);
-			return d.mark;
+			return d[field];
 		} catch (e) {
 			this.assertAuthRevision(authRevision);
-			const msg = e instanceof Error ? e.message : String(e);
-			if (query === ops.MARK && msg.includes('Unknown argument "numericEpoch"')) {
-				this.capabilities.markEpochUnsupported = true;
-				const d = await this.gql<{ mark: Series }>(
-					ops.MARK_LEGACY,
-					{ seriesId, marked },
-					false,
-					undefined,
-					authRevision,
-				);
-				return d.mark;
-			}
+			this.staleProgress(seriesId, numericEpoch === undefined, e);
 			throw e;
 		}
 	}
-	async setLibraryStatus(seriesId: Id, status: LibraryStatus | null): Promise<Series> {
-		const d = await this.gql<{ setLibraryStatus: Series }>(ops.SET_LIBRARY_STATUS, {
-			seriesId,
-			status,
-		});
-		return d.setLibraryStatus;
+	mark(seriesId: Id, marked: boolean, numericEpoch?: number | null): Promise<Series> {
+		return this.editLibrary('mark', ops.MARK, seriesId, { marked }, numericEpoch);
 	}
-	async setFavorite(seriesId: Id, favorite: boolean): Promise<Series> {
-		const d = await this.gql<{ setFavorite: Series }>(ops.SET_FAVORITE, { seriesId, favorite });
-		return d.setFavorite;
+	setLibraryStatus(seriesId: Id, status: LibraryStatus | null, numericEpoch?: number | null): Promise<Series> {
+		return this.editLibrary('setLibraryStatus', ops.SET_LIBRARY_STATUS, seriesId, { status }, numericEpoch);
+	}
+	setFavorite(seriesId: Id, favorite: boolean, numericEpoch?: number | null): Promise<Series> {
+		return this.editLibrary('setFavorite', ops.SET_FAVORITE, seriesId, { favorite }, numericEpoch);
 	}
 	async library(): Promise<Series[]> {
 		const d = await this.gql<{ library: Series[] }>(ops.LIBRARY);

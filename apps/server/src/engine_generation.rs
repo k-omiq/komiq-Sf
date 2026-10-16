@@ -266,7 +266,14 @@ impl Fence {
             return Ok(());
         }
         let fingerprint = self.fingerprint(id, false).await?;
-        if !fingerprint.mismatch {
+        if fingerprint.mismatch {
+            // A positive mismatch must fence in-flight writers even if the next
+            // database read outlasts this check's timeout.
+            let mut gate = self.gate.write().unwrap_or_else(|e| e.into_inner());
+            gate.blocked = true;
+            gate.revision += 1;
+            self.engine.clear_numeric_memos();
+        } else {
             let gate = self.gate.read().unwrap_or_else(|e| e.into_inner());
             if !gate.suspect_manga.is_empty() || !gate.suspect_chapter.is_empty() {
                 return Ok(());
@@ -275,7 +282,11 @@ impl Fence {
         let references = has_references(&self.pool).await?;
         let matches =
             unfenced || matches!(&marker, Marker::Value(value) if value == &id.to_string());
-        if !fingerprint.mismatch && matches && (!fingerprint.empty || !references) {
+        if !fingerprint.mismatch
+            && matches
+            && (!fingerprint.unverified || !references)
+            && (!fingerprint.empty || !references)
+        {
             // Cover purge must finish before a previously quarantined generation resumes.
             let mut tx = self.pool.begin().await?;
             exclusive(&mut tx).await?;
@@ -306,6 +317,8 @@ impl Fence {
                 "Stored numeric ids answer different source identities"
             } else if fingerprint.empty {
                 "The engine is empty but PostgreSQL still has Suwayomi references"
+            } else if fingerprint.unverified && references {
+                "No stored source identity can be verified against the engine"
             } else {
                 "The engine generation marker is missing or different"
             };
@@ -356,6 +369,33 @@ impl Fence {
     }
 
     async fn fingerprint(&self, generation: Uuid, full: bool) -> Result<Fingerprint> {
+        let mut sampled_any = false;
+        loop {
+            let mut result = self.fingerprint_sample(generation, full).await?;
+            if full || result.mismatch || result.compared > 0 {
+                return Ok(result);
+            }
+            sampled_any |= result.sampled > 0;
+            if result.empty || result.sampled == 0 {
+                // A later check must be able to verify the original engine if it
+                // returns, including ids that were absent from the replacement.
+                let mut gone_manga = self.gone_manga.lock().await;
+                let mut gone_chapter = self.gone_chapter.lock().await;
+                // Ids found gone by an earlier check that timed out still count as
+                // stored bindings. Only no stored binding at all (keys not captured
+                // yet, e.g. right after the first adoption) is not a failed check.
+                sampled_any |= !gone_manga.is_empty() || !gone_chapter.is_empty();
+                gone_manga.clear();
+                gone_chapter.clear();
+                result.unverified = sampled_any;
+                return Ok(result);
+            }
+            // Every sampled id is gone. The next batch skips those ids so a
+            // restored marker cannot pass without a single verified binding.
+        }
+    }
+
+    async fn fingerprint_sample(&self, generation: Uuid, full: bool) -> Result<Fingerprint> {
         let mut gone_manga = self.gone_manga.lock().await;
         let mut gone_chapter = self.gone_chapter.lock().await;
         let (suspect_manga, suspect_chapter) = {
@@ -407,6 +447,8 @@ impl Fence {
             mismatch: false,
             empty: false,
             compared: 0,
+            sampled: mangas.len() + chapters.len(),
+            unverified: false,
         };
         for batch in 0..batches {
             let ms = &mangas[(batch * 16).min(mangas.len())..((batch + 1) * 16).min(mangas.len())];
@@ -546,15 +588,19 @@ impl Fence {
                 .execute(&mut *tx)
                 .await?;
         }
-        sqlx::query("DELETE FROM feed_series_updates WHERE reader_id ~ '^[0-9]+$'")
-            .execute(&mut *tx)
-            .await?;
+        for table in ["feed_series_updates", "browse_catalogue"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE reader_id ~ '^[0-9]+$'"))
+                .execute(&mut *tx)
+                .await?;
+        }
         // marker_written=false: the check below writes the marker only after commit.
         // A marker written first would quarantine the old generation if this
         // transaction failed, and a crash in between is retried by that check.
         sqlx::query("INSERT INTO engine_generation(id,first_seen,last_seen,state,unfenced,marker_written) VALUES ($1,now(),now(),'active',$2,false)").bind(id).bind(unfenced).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO engine_numeric_state(singleton,epoch,changed_at) VALUES (true,1,now()) ON CONFLICT(singleton) DO UPDATE SET epoch=engine_numeric_state.epoch+1,changed_at=now()")
-            .execute(&mut *tx).await?;
+        // GraphQL Int uses seconds. A restored dump must not restart a small
+        // counter and accept queued writes from a later engine generation.
+        sqlx::query("INSERT INTO engine_numeric_state(singleton,epoch,changed_at) VALUES (true,$1,now()) ON CONFLICT(singleton) DO UPDATE SET epoch=GREATEST(engine_numeric_state.epoch+1,$1),changed_at=now()")
+            .bind(chrono::Utc::now().timestamp()).execute(&mut *tx).await?;
         self.gate.write().unwrap_or_else(|e| e.into_inner()).blocked = true;
         self.engine.clear_numeric_memos();
         purge_covers(&self.covers).await?;
@@ -674,6 +720,9 @@ struct Fingerprint {
     mismatch: bool,
     empty: bool,
     compared: usize,
+    sampled: usize,
+    /// Stored bindings existed, but every one is gone from the engine.
+    unverified: bool,
 }
 fn nodes<'a>(data: &'a Value, field: &str) -> Result<&'a Vec<Value>> {
     data[field]["nodes"]
@@ -702,6 +751,9 @@ fn missing_meta_key(message: &str) -> bool {
         "no meta",
         "could not find",
         "couldn't find",
+        // Suwayomi v2.x: `meta` is non-null, so a missing key comes back as graphql-java's
+        // non-null violation for that field (checked live against the pinned engine).
+        "wrongly returned a null value",
     ]
     .iter()
     .any(|missing| message.contains(missing))
@@ -756,6 +808,7 @@ async fn has_references(pool: &Database) -> Result<bool> {
         "EXISTS(SELECT 1 FROM suwayomi_cover_issue)".to_string(),
         "EXISTS(SELECT 1 FROM source_latest_snapshot WHERE ordered_ids <> '[]'::jsonb)".to_string(),
         "EXISTS(SELECT 1 FROM feed_series_updates WHERE reader_id ~ '^[0-9]+$')".to_string(),
+        "EXISTS(SELECT 1 FROM browse_catalogue WHERE reader_id ~ '^[0-9]+$')".to_string(),
         "EXISTS(SELECT 1 FROM source_series WHERE source_type='suwayomi')".to_string(),
         "EXISTS(SELECT 1 FROM engine_manga_key k JOIN engine_generation g ON g.id=k.generation WHERE g.state <> 'detached')".to_string(),
         "EXISTS(SELECT 1 FROM engine_chapter_key k JOIN engine_generation g ON g.id=k.generation WHERE g.state <> 'detached')".to_string(),

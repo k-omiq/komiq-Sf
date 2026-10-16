@@ -1,6 +1,6 @@
 /**
- * M5 numeric epoch: numeric (Suwayomi engine) chapter ids are only meaningful within one
- * engine generation. Progress writes for them carry the server's `numericEpoch`, and the
+ * M5 numeric epoch: numeric (Suwayomi engine) series and chapter ids are only meaningful within one
+ * engine generation. Library and progress writes for them carry the server's `numericEpoch`, and the
  * server refuses one from an earlier generation.
  */
 import { GraphQLRequestError } from './partial-errors.js';
@@ -13,7 +13,7 @@ export function isNumericChapterId(id: string): boolean {
 
 const staleListeners = new Set<() => void>();
 
-/** A live progress write needs a reload before numeric ids can safely be used again. */
+/** A live library or progress write needs a reload before numeric ids can safely be used again. */
 export function onStaleNumericEpoch(listener: () => void): () => void {
 	staleListeners.add(listener);
 	return () => {

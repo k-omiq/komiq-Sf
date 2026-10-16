@@ -541,6 +541,34 @@ test('M3 composite live progress notifies without queueing the stale write', asy
 	assert.equal(writes.size(), 0);
 });
 
+test('composite live library edits notify while explicit epochs stay silent', async (t) => {
+	const { onStaleNumericEpoch, isStaleNumericEpoch } = await import('../../../../../packages/api/src/numeric-epoch.ts');
+	for (const field of ['mark', 'setLibraryStatus', 'setFavorite'] as const) {
+		await t.test(field, async (t) => {
+			let notices = 0;
+			t.after(onStaleNumericEpoch(() => { notices++; }));
+			const { backend, bodies } = recordingBackend((b) =>
+				isEpochRead(b) ? { data: { numericEpoch: 3 } } : staleResponse(),
+			);
+			const { composite, writes } = signedIn(backend);
+			const write = (id: string, epoch?: number | null) => field === 'setLibraryStatus'
+				? composite.setLibraryStatus(id, 'reading', epoch)
+				: composite[field](id, true, epoch);
+			await assert.rejects(write('7', 2), isStaleNumericEpoch);
+			await assert.rejects(write('7', null), isStaleNumericEpoch);
+			await assert.rejects(write('w_canonical'), isStaleNumericEpoch);
+			assert.equal(notices, 0);
+			await assert.rejects(write('7'), isStaleNumericEpoch);
+			await assert.rejects(write('8'), isStaleNumericEpoch);
+			assert.equal(notices, 1);
+			assert.equal(writes.size(), 0);
+			assert.equal(bodies.filter(isEpochRead).length, 1);
+			assert.deepEqual(bodies.filter((b) => !isEpochRead(b)).map((b) => b.variables?.numericEpoch),
+				[2, undefined, undefined, 3, 3]);
+		});
+	}
+});
+
 test('M7 numeric marks send the cached or explicit epoch and uuid marks send none', async () => {
 	const { backend, bodies } = recordingBackend((b) =>
 		isEpochRead(b) ? { data: { numericEpoch: 3 } } : { data: { mark: { id: '7' } } },
@@ -555,6 +583,89 @@ test('M7 numeric marks send the cached or explicit epoch and uuid marks send non
 		[3, 3, 2, undefined, undefined]);
 	assert.match(bodies[1].query, /\$numericEpoch: Int/);
 	assert.match(bodies[1].query, /mark\([^)]*numericEpoch: \$numericEpoch/);
+});
+
+test('numeric shelf and favourite edits send pinned or explicit epochs through the composite backend', async () => {
+	for (const field of ['setLibraryStatus', 'setFavorite'] as const) {
+		let epoch = 3;
+		const { backend, bodies } = recordingBackend((b) =>
+			isEpochRead(b) ? { data: { numericEpoch: epoch } } : { data: { [field]: { id: '7' } } },
+		);
+		const { composite } = signedIn(backend);
+		const write = (id: string, given?: number | null) => field === 'setLibraryStatus'
+			? composite.setLibraryStatus(id, 'reading', given)
+			: composite.setFavorite(id, true, given);
+		await write('7');
+		epoch = 4;
+		await write('8');
+		await write('7', 2);
+		await write('7', null);
+		await write('w_canonical', 2);
+		assert.equal(bodies.filter(isEpochRead).length, 1);
+		const edits = bodies.filter((b) => !isEpochRead(b));
+		assert.deepEqual(edits.map((b) => b.variables?.numericEpoch), [3, 3, 2, undefined, undefined]);
+		assert.ok(edits.every((b) => b.query.includes('numericEpoch: $numericEpoch')));
+		assert.ok(edits.every((b) => b.query.includes('$numericEpoch: Int')));
+	}
+});
+
+test('old library epoch arguments are stripped per mutation without disabling other fences', async () => {
+	for (const field of ['setLibraryStatus', 'setFavorite'] as const) {
+		const other = field === 'setLibraryStatus' ? 'setFavorite' : 'setLibraryStatus';
+		const { backend, bodies } = recordingBackend((b) => {
+			if (isEpochRead(b)) return { data: { numericEpoch: 3 } };
+			if (b.query.includes(`${field}(`) && b.query.includes('numericEpoch')) {
+				return { errors: [{ message: `Unknown argument "numericEpoch" on field "${field}"` }] };
+			}
+			return { data: { setLibraryStatus: { id: '7' }, setFavorite: { id: '7' }, mark: { id: '7' }, setProgress: true } };
+		});
+		const write = () => field === 'setLibraryStatus'
+			? backend.setLibraryStatus('7', 'reading')
+			: backend.setFavorite('7', true);
+		await write();
+		await write();
+		if (other === 'setFavorite') await backend.setFavorite('7', true);
+		else await backend.setLibraryStatus('7', 'reading');
+		await backend.mark('7', true);
+		await backend.setProgress('8', 1, true);
+		const edits = bodies.filter((b) => b.query.includes(`${field}(`));
+		assert.equal(edits.length, 3, 'one strip and retry, then the remembered form');
+		assert.ok(edits[0].query.includes('numericEpoch'));
+		assert.ok(edits.slice(1).every((b) => !b.query.includes('numericEpoch')));
+		const supported = bodies.filter((b) => b.query.includes(`${other}(`) || /mutation (Mark|SetProgress)\(/.test(b.query));
+		assert.equal(supported.length, 3);
+		assert.ok(supported.every((b) => b.query.includes('numericEpoch: $numericEpoch')));
+		assert.ok(supported.every((b) => b.variables?.numericEpoch === 3));
+	}
+});
+
+test('legacy servers without numeric epochs still accept shelf and favourite edits', async () => {
+	const { backend, bodies } = recordingBackend((b) => {
+		if (isEpochRead(b)) return { errors: [{ message: 'Unknown field "numericEpoch"' }] };
+		if (b.query.includes('numericEpoch')) return { errors: [{ message: 'Unknown argument "numericEpoch"' }] };
+		return { data: { setLibraryStatus: { id: '7' }, setFavorite: { id: '7' } } };
+	});
+	await backend.setLibraryStatus('7', 'reading');
+	await backend.setFavorite('7', true);
+	assert.equal(bodies.filter(isEpochRead).length, 1);
+	assert.ok(bodies.filter((b) => !isEpochRead(b)).every((b) => b.variables?.numericEpoch === undefined));
+	assert.ok(!bodies.at(-1)!.query.includes('numericEpoch'));
+});
+
+test('stale live library edits notify once and never refresh the pinned epoch', async (t) => {
+	const { onStaleNumericEpoch, isStaleNumericEpoch } = await import('../../../../../packages/api/src/numeric-epoch.ts');
+	let notices = 0;
+	t.after(onStaleNumericEpoch(() => notices++));
+	const { backend, bodies } = recordingBackend((b) =>
+		isEpochRead(b) ? { data: { numericEpoch: 3 } } : staleResponse(),
+	);
+	await assert.rejects(backend.setFavorite('7', true, 2), isStaleNumericEpoch);
+	assert.equal(notices, 0, 'an explicit epoch has the replay rule');
+	await assert.rejects(backend.setLibraryStatus('7', 'reading'), isStaleNumericEpoch);
+	await assert.rejects(backend.setFavorite('7', true), isStaleNumericEpoch);
+	assert.equal(notices, 1);
+	assert.equal(bodies.filter(isEpochRead).length, 1);
+	assert.deepEqual(bodies.filter((b) => !isEpochRead(b)).map((b) => b.variables?.numericEpoch), [2, 3, 3]);
 });
 
 test('M7 an old server strips the mark epoch argument and remembers the fallback', async () => {

@@ -206,10 +206,10 @@ export interface Backend {
 	/** File a series under an explicit shelf for the viewer, or pass `null` to clear
 	 * it (fall back to progress-derived shelving). Adds the series to the library if
 	 * absent. Optional: only the unified Komika API implements it. */
-	setLibraryStatus?(seriesId: Id, status: LibraryStatus | null): Promise<Series>;
+	setLibraryStatus?(seriesId: Id, status: LibraryStatus | null, numericEpoch?: number | null): Promise<Series>;
 	/** Toggle the viewer's favourite flag on a series (adds it to the library if
 	 * absent). Optional: only the unified Komika API implements it. */
-	setFavorite?(seriesId: Id, favorite: boolean): Promise<Series>;
+	setFavorite?(seriesId: Id, favorite: boolean, numericEpoch?: number | null): Promise<Series>;
 	library(): Promise<Series[]>;
 	/** Per-series read progress for every in-library series, batched into ONE query
 	 * so the Library/Profile screens can shelve the whole library by progress

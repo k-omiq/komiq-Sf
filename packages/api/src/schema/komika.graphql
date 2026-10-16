@@ -93,8 +93,8 @@ type Query {
 
 type Mutation {
 	mark(seriesId: ID!, marked: Boolean!, numericEpoch: Int): Series! # [suwayomi] updateManga inLibrary (+ [komika] scan priority). `numericEpoch` (M5): as for setProgress, for a numeric series id
-	setLibraryStatus(seriesId: ID!, status: String): Series! # [komika] file a series under an explicit shelf (reading|completed|onhold|plan); null clears to auto-derive; adds to library if absent
-	setFavorite(seriesId: ID!, favorite: Boolean!): Series! # [komika] toggle the viewer's favourite flag; adds to library if absent
+	setLibraryStatus(seriesId: ID!, status: String, numericEpoch: Int): Series! # [komika] file a series under an explicit shelf (reading|completed|onhold|plan); null clears to auto-derive; adds to library if absent; numericEpoch as for mark
+	setFavorite(seriesId: ID!, favorite: Boolean!, numericEpoch: Int): Series! # [komika] toggle the viewer's favourite flag; adds to library if absent; numericEpoch as for mark
 	setProgress(chapterId: ID!, lastPageRead: Int!, read: Boolean!, numericEpoch: Int): Boolean! # [suwayomi] updateChapter. `numericEpoch` (M5): the `numericEpoch` the reader read for a numeric chapter id; a stale one is refused with code STALE_NUMERIC_EPOCH, and none at all is refused for 30 days after an engine generation change
 	startNewEngineGeneration(generationId: ID!): [EngineGeneration!]! # [komika] admin — give up the quarantined engine data (generationId: the quarantined generation shown; anything else is refused): numeric progress, comment threads and numeric library/review/admin rows without a work set aside (rows with a work move to it), Suwayomi series removed for re-enrolment, numericEpoch bumped (requires isAdmin)
 	recordView(seriesId: ID!): Boolean! # [komika] record one view (chapter open) — no auth REQUIRED, counts anonymous + ordinary signed-in readers; an admin viewer's own reads are silently skipped so admin browsing can't move Trending; the popularity signal behind Trending

@@ -503,7 +503,7 @@ async fn two_sessions_consolidation_cannot_overwrite_a_library_edit() {
     reached(&point).await;
     let b_pool = pool.foreground();
     let b = tokio::spawn(async move {
-        write_library_once(&b_pool, BOB, "w_s1", LibraryEdit::Favorite(true)).await
+        write_library_once(&b_pool, BOB, "w_s1", LibraryEdit::Favorite(true), None).await
     });
     lock_wait(&pool).await;
     point.release();
