@@ -1580,9 +1580,11 @@ records the refusal as `complete: false` with the error. Do not work around it. 
 PostgreSQL and its pgBackRest backups, and return to an older build only after a
 separately verified way to keep those rows exists.
 
-A run that passes reports the PostgreSQL-only tables it left out, all empty, in
-`postgres_only_not_copied`, and every other table it did not copy in `not_copied`. Read
-the whole report before putting the file in place.
+A run that passes reports the PostgreSQL-only tables it left out, with row counts, in
+`postgres_only_not_copied`, and every other table it did not copy in `not_copied`.
+Engine-derived identities and `progress_untick` may be populated: unticked chapters
+stay unread in the export, but the old build may read them again on a later finish.
+Read the whole report before putting the file in place.
 
 The two targets differ. A kept file at SQLite migration 0121 has no marker for a deleted
 comment that kept its replies. Such comments are written as comments with an empty body,

@@ -5735,6 +5735,8 @@ pub struct SplitOutcome {
     pub title: String,
     /// How many `source_series` rows moved.
     pub moved_sources: u64,
+    /// Distinct readers whose progress follows the detached sources.
+    pub progress_readers_moved: i64,
 }
 
 /// Detach `source_series_ids` off `work_id` onto a NEW canonical work — the admin fix for
@@ -5748,10 +5750,11 @@ pub struct SplitOutcome {
 /// `source_series_id`, not by work, so re-pointing the mapping carries its ENTIRE chapter
 /// run with it and writes no chapter rows at all. Nothing is deleted here.
 ///
-/// WHAT DOES NOT MOVE: reviews, library entries, reading progress and view counts. They
+/// WHAT DOES NOT MOVE: reviews, library entries and view counts. They
 /// hang off the work and carry no per-source attribution, so there is no honest way to
 /// decide which side of the split they belong to; they stay on the original. The admin UI
-/// says so before confirming rather than letting it be discovered afterwards.
+/// says so before confirming. Reading progress follows the detached sources, except a
+/// chapter id also carried by a staying source keeps its progress on the original.
 ///
 /// THE LAST SOURCE CANNOT BE DETACHED. A work with no `source_series` row is excluded from
 /// both `browse_catalogue` and `work_fts` (see [`refresh_browse_catalogue`] and
@@ -5797,14 +5800,18 @@ async fn split_source_series_attempt(
     // The source set and last-source guard belong to the writer snapshot. Two
     // disjoint splits must not both treat the other's source as the one kept.
     let mut tx = pool.begin_with("BEGIN").await?;
-    if let Some(actor) = actor_user_id {
-        crate::locks::lock_user(&mut tx, actor).await?;
-    }
     let discovered = merge_discovery(&mut tx, &[work_id], &[]).await?;
+    let mut users = discovered.users.clone();
+    if let Some(actor) = actor_user_id {
+        users.push(actor.to_string());
+    }
+    users.sort_unstable();
+    users.dedup();
+    crate::locks::lock_users(&mut tx, &users).await?;
     crate::locks::advisory(&mut tx, &discovered.keys).await?;
     crate::locks::lock_works(&mut tx, &[work_id]).await?;
     lock_discovered_sources(&mut tx, &discovered.sources).await?;
-    if merge_discovery(&mut tx, &[work_id], &[]).await?.sources != discovered.sources {
+    if merge_discovery(&mut tx, &[work_id], &[]).await? != discovered {
         return Err(crate::locks::RestartTransaction.into());
     }
     guards::held().await;
@@ -5838,6 +5845,8 @@ async fn split_source_series_attempt(
         );
     }
 
+    let progress_readers_moved =
+        split_progress_readers(&mut tx, work_id, source_series_ids).await?;
     let title = detached[0].title.trim().to_string();
     if title.is_empty() {
         anyhow::bail!("the detached source has no title to name the new series with");
@@ -5924,6 +5933,7 @@ async fn split_source_series_attempt(
                 .await?
                 .rows_affected();
     }
+    move_split_progress(&mut tx, work_id, &new_work_id, source_series_ids).await?;
     if moved as usize != detached.len() {
         // A concurrent merge/split moved a row out from under the read above. Roll back
         // rather than mint a half-populated work.
@@ -6032,7 +6042,67 @@ async fn split_source_series_attempt(
         new_reader_id,
         title,
         moved_sources: moved,
+        progress_readers_moved,
     })
+}
+
+/// Count readers whose progress follows picked sources currently on this work. Reads
+/// join canonical rows through their stored work id. One row has one owner, so a
+/// chapter id shared with a staying mapping keeps W1, where it is still visible.
+pub(crate) async fn split_progress_readers(
+    conn: &mut sqlx::PgConnection,
+    work_id: &str,
+    source_series_ids: &[String],
+) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "WITH picked AS (SELECT id, source_type, source_key FROM source_series \
+                          WHERE work_id = $1 AND id = ANY($2)) \
+         SELECT COUNT(DISTINCT user_id) FROM ( \
+             SELECT cp.user_id FROM canonical_progress cp \
+              WHERE cp.work_id = $1 \
+                AND cp.chapter_id IN (SELECT c.external_id FROM chapter c \
+                                       JOIN picked p ON p.id = c.source_series_id \
+                                      WHERE p.source_type = 'mangadex') \
+                AND NOT EXISTS (SELECT 1 FROM chapter c \
+                                  JOIN source_series ss ON ss.id = c.source_series_id \
+                                 WHERE ss.work_id = $1 AND NOT (ss.id = ANY($2)) \
+                                   AND c.external_id = cp.chapter_id) \
+             UNION \
+             SELECT sp.user_id FROM suwayomi_progress sp \
+              JOIN picked p ON p.source_type = 'suwayomi' AND p.source_key = sp.series_id \
+         ) readers",
+    )
+    .bind(work_id)
+    .bind(source_series_ids)
+    .fetch_one(conn)
+    .await?)
+}
+
+/// Move canonical progress after the mappings move: reads join canonical rows through
+/// their stored work id. One row has one owner, so a chapter id shared with a staying
+/// mapping keeps W1, where it is still visible. Suwayomi progress follows its source key
+/// without a write, and canonical progress timestamps remain unchanged.
+pub(crate) async fn move_split_progress(
+    conn: &mut sqlx::PgConnection,
+    old_work_id: &str,
+    new_work_id: &str,
+    moved_source_series_ids: &[String],
+) -> Result<u64> {
+    Ok(sqlx::query(
+        "UPDATE canonical_progress cp SET work_id = $1 \
+          WHERE cp.work_id = $2 \
+            AND cp.chapter_id IN (SELECT c.external_id FROM chapter c \
+                                   WHERE c.source_series_id = ANY($3)) \
+            AND NOT EXISTS (SELECT 1 FROM chapter c \
+                              JOIN source_series ss ON ss.id = c.source_series_id \
+                             WHERE ss.work_id = $2 AND c.external_id = cp.chapter_id)",
+    )
+    .bind(new_work_id)
+    .bind(old_work_id)
+    .bind(moved_source_series_ids)
+    .execute(conn)
+    .await?
+    .rows_affected())
 }
 
 /// Is this pair of works one an admin explicitly SPLIT apart (migration 0098)? Order
@@ -13049,6 +13119,188 @@ mod tests {
             found.contains(&out.new_work_id),
             "the new work must be searchable under its own title; got {found:?}"
         );
+    }
+
+    async fn split_progress_sources(pool: &Database) -> (String, String, String, String) {
+        let (work, sw) = work_with_suwayomi_sources(pool, "Split progress", &[550]).await;
+        let a = upsert_source_series(pool, &work, "mangadex", "mangadex", "split-a", None, false)
+            .await
+            .unwrap();
+        let b = upsert_source_series(pool, &work, "mangadex", "mangadex", "split-b", None, false)
+            .await
+            .unwrap();
+        (work, a, b, sw[0].clone())
+    }
+
+    async fn split_progress_user(pool: &Database, name: &str) -> uuid::Uuid {
+        let id = crate::db_types::test_uuid(name);
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, created_at) \
+             VALUES ($1, $2, $3, 'hash', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(format!("{name}@example.com"))
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn split_moves_read_and_partial_progress_and_counts_distinct_readers() {
+        let pool = pool().await;
+        let (work, a, b, sw) = split_progress_sources(&pool).await;
+        let a_ch = add_chapter(&pool, &a, "1").await;
+        let b_read = add_chapter(&pool, &b, "2").await;
+        let b_partial = add_chapter(&pool, &b, "3").await;
+        let sw_ch = add_chapter(&pool, &sw, "4").await;
+        let u1 = split_progress_user(&pool, "split-u1").await;
+        let u2 = split_progress_user(&pool, "split-u2").await;
+        let u3 = split_progress_user(&pool, "split-u3").await;
+        for (user, chapter, page, read) in [
+            (u1, &b_read, 18_i64, true),
+            (u1, &b_partial, 7, false),
+            (u2, &a_ch, 9, true),
+        ] {
+            sqlx::query(
+                "INSERT INTO canonical_progress \
+                 (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, '2026-01-02T03:04:05.123456Z')",
+            )
+            .bind(user)
+            .bind(chapter)
+            .bind(&work)
+            .bind(page)
+            .bind(read)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO suwayomi_progress \
+             (user_id, chapter_id, series_id, last_page_read, read, updated_at) \
+             VALUES ($1, $2, '550', 12, TRUE, '2026-01-02T03:04:05.123456Z')",
+        )
+        .bind(u3)
+        .bind(&sw_ch)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let picked = vec![b, sw];
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            split_progress_readers(&mut conn, &work, &picked)
+                .await
+                .unwrap(),
+            2,
+        );
+        assert_eq!(
+            split_progress_readers(&mut conn, &work, &[]).await.unwrap(),
+            0,
+        );
+        drop(conn);
+        let before: Vec<(String, String, i64, i64, String)> = crate::db_types::query_tuple(
+            "SELECT chapter_id, work_id, last_page_read, read, updated_at \
+             FROM canonical_progress ORDER BY chapter_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let out = split_source_series(&pool, &work, &picked, None)
+            .await
+            .unwrap();
+        assert_eq!(out.progress_readers_moved, 2);
+        assert_eq!(work_of(&pool, &a).await, work);
+        let after: Vec<(String, String, i64, i64, String)> = crate::db_types::query_tuple(
+            "SELECT chapter_id, work_id, last_page_read, read, updated_at \
+             FROM canonical_progress ORDER BY chapter_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let mut expected = before;
+        for row in &mut expected {
+            if row.0 == b_read || row.0 == b_partial {
+                row.1 = out.new_work_id.clone();
+            }
+        }
+        assert_eq!(
+            after, expected,
+            "only ownership changes; pages, read flags and timestamps survive",
+        );
+        let readers: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT user_id FROM canonical_progress WHERE work_id = $1 \
+             UNION SELECT sp.user_id FROM suwayomi_progress sp \
+               JOIN source_series ss ON ss.source_type = 'suwayomi' \
+                AND ss.source_key = sp.series_id WHERE ss.work_id = $1",
+        )
+        .bind(&out.new_work_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            readers
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([u1, u3]),
+        );
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            split_progress_readers(&mut conn, &work, &picked)
+                .await
+                .unwrap(),
+            0,
+        );
+    }
+
+    #[tokio::test]
+    async fn split_keeps_shared_chapter_progress_on_the_original_and_does_not_count_it() {
+        let pool = pool().await;
+        let (work, a, b, _) = split_progress_sources(&pool).await;
+        let shared = add_chapter(&pool, &a, "1").await;
+        let duplicate = add_chapter(&pool, &b, "1").await;
+        sqlx::query("UPDATE chapter SET external_id = $1 WHERE id = $2")
+            .bind(&shared)
+            .bind(&duplicate)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let user = split_progress_user(&pool, "split-shared").await;
+        sqlx::query(
+            "INSERT INTO canonical_progress (user_id, chapter_id, work_id, last_page_read, read, updated_at) \
+             VALUES ($1, $2, $3, 8, TRUE, '2026-01-02T03:04:05Z')",
+        )
+        .bind(user)
+        .bind(&shared)
+        .bind(&work)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let picked = vec![b];
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            split_progress_readers(&mut conn, &work, &picked)
+                .await
+                .unwrap(),
+            0,
+        );
+        drop(conn);
+        let out = split_source_series(&pool, &work, &picked, None)
+            .await
+            .unwrap();
+        assert_eq!(out.progress_readers_moved, 0);
+        let owner: String = sqlx::query_scalar(
+            "SELECT work_id FROM canonical_progress WHERE user_id = $1 AND chapter_id = $2",
+        )
+        .bind(user)
+        .bind(&shared)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(owner, work);
     }
 
     #[tokio::test]

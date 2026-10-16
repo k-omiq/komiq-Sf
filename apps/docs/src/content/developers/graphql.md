@@ -125,7 +125,8 @@ These operations manage personal reading shelves, chapter progress and view coun
 - `mark`: add or remove a series from the user's library.
 - `setLibraryStatus`: file a series into a shelf (`reading`, `completed`, `onhold`, `plan`).
 - `setFavorite`: toggle the favorite status of a series.
-- `setProgress`: save last page read and chapter completion state.
+- `setProgress`: save last page read and chapter completion state. With `read: true` it also runs the catch-up that marks earlier chapters of the same source read (see [Data model](/developers/data-model)), and it clears the untick record of that chapter.
+- `setChapterRead`: mark one chapter read or unread. With `read: false` it records an untick, so catch-up does not mark that chapter read again. With `read: true` it clears the untick record.
 - `recordView`: record a chapter open to update trending counts.
 
 The `recordView` mutation requires no authentication. Readers send it when opening a chapter. The server applies an in-memory sliding-window rate limit per IP address and series ID to prevent tally manipulation.
@@ -164,7 +165,7 @@ Operations in this category require `isAdmin: true` on the authenticated user:
 - **Instance settings**: `accessStatus`, `accessPreflight`, `setAccessMode`, `checkCloudflareToken`, `startCloudflareSetup`, `retryCloudflareSetup`, `removeCloudflareSetup`, `setRegistrationOpen`, `siteBlockRules`, `setSiteBlockRules`.
 - **User moderation**: `users`, `createUser`, `setUserAdmin`, `resetUserPassword`, `banUser`, `deleteComment`.
 - **Sources and extensions**: `extensions`, `extensionRepos`, `sources`, `sourceBrowse`, `installExtension`, `uninstallExtension`, `updateExtension`, `addExtensionRepo`, `removeExtensionRepo`, `mangadexSetting`, `setMangadexEnabled`, `sourceRateLimits`, `setSourceRateLimit`, `removeSourceRateLimit`, `scanlators`, `setScanlatorAi`, `scanlatorSites`, `setSourceAi`, `startSourceIngest`, `cancelSourceIngest`, `startExtensionIngest`, `cancelExtensionIngest`, `setExtensionSubscription`.
-- **Catalog curation**: `mergeQueue`, `resolveMergeCandidate`, `mergeWorks`, `splitSourceSeries`, `workSourceRows`, `workReviewDetail`, `consolidateExactDuplicates`, `reconcileCatalogue`, `resyncCatalogue`, `addSourceSeries`, `bulkAddSourceSeries`, `coverIssues`, `retryCover`, `materializeCatalogueCovers`, `persistCatalogue`, `backfillMangadexMetadata`.
+- **Catalog curation**: `mergeQueue`, `resolveMergeCandidate`, `mergeWorks`, `splitSourceSeries`, `workSourceRows`, `workReviewDetail`, `consolidateExactDuplicates`, `reconcileCatalogue`, `resyncCatalogue`, `splitProgressReaders` (how many readers' progress a split would move), `addSourceSeries`, `bulkAddSourceSeries`, `coverIssues`, `retryCover`, `materializeCatalogueCovers`, `persistCatalogue`, `backfillMangadexMetadata`.
 - **Scanner and series administration**: `scanStatus`, `triggerScan`, `setSeriesPaused`, `rescanWork`, `updateSeriesAdmin`, `seriesAdminMeta`, `updateSeriesMetadata`, `addSeriesAltTitle`, `removeSeriesAltTitle`, `workChaptersAdmin`, `setChapterOverride`.
 - **Adult sources**: `markSourceNsfw` flags a whole Suwayomi source as adult, updates the works already added from it, and remembers the choice for series added later. `rederiveSuwayomiNsfw` recomputes the flag for every work added from a Suwayomi source. The admin console has no control for these two; call them through GraphQL.
 - **Reader reports**: `reports`, `resolveReport`, `submitReport`. The `submitReport` mutation is open to unauthenticated users so readers can report catalog errors without signing in.

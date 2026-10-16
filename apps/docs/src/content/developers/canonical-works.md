@@ -96,7 +96,7 @@ When two series were merged by mistake, an administrator detaches source mapping
 1. **Source selection**: the administrator selects which `source_series` mappings to detach. The server refuses to detach all sources, as a work with zero sources vanishes from browse and search views.
 2. **New work creation**: the server mints a new canonical work (`w_...`) using metadata from the detached source mapping. It avoids copying parent identity fields to prevent immediate re-merges.
 3. **Moving chapters**: because chapters belong to `source_series_id`, updating `source_series.work_id` moves all chapters without touching individual chapter rows.
-4. **Preserved records**: user reviews, library entries, reading progress, and view counts remain on the original work because they cannot be attributed to specific sources.
+4. **Progress and preserved records**: reading progress moves with the detached source mappings. The `canonical_progress` rows of the moved MangaDex chapters get the new work id, and Suwayomi progress already follows its mapping. A row whose chapter id also occurs in a mapping that stays keeps the original work id. Reviews, library entries and view counts stay on the original work. The split locks the affected users first and restarts if they change.
 5. **Split memory**: the server inserts the pair into `work_split` (`work_a` and `work_b`, ordered lexicographically).
 
 `work_split` entries do not use foreign keys. They permanently survive work deletions so background consolidators never re-merge works an administrator split apart.

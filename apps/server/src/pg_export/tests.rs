@@ -1449,10 +1449,18 @@ async fn nonempty_rebuildable_tables_are_omitted_and_reported() {
            ('00000000-0000-4000-8000-000000000001', 8, 7, 0, '/chapter/8', NULL, now()),
            ('00000000-0000-4000-8000-000000000001', 9, 7, 1, '/chapter/9', 'https://example.org/chapter/9', now());",
     ).execute(&mut pg).await.unwrap();
+    sqlx::query(
+        "INSERT INTO progress_untick (user_id,chapter_id,created_at) VALUES ($1::uuid,'unticked-copy',now())",
+    )
+    .bind(READER)
+    .execute(&mut pg)
+    .await
+    .unwrap();
     let args = arguments(&scratch, &kept, &database.url);
     let report = export::run(&args, None).await.unwrap();
     assert!(report.complete);
     for (name, count) in [
+        ("progress_untick", 1),
         ("engine_generation", 1),
         ("engine_manga_key", 1),
         ("engine_chapter_key", 2),
@@ -1465,11 +1473,12 @@ async fn nonempty_rebuildable_tables_are_omitted_and_reported() {
         assert_eq!(preserved, count);
     }
     let mut output = sqlite(&args.output, false).await;
-    let tables: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM sqlite_schema WHERE name LIKE 'engine_%'")
-            .fetch_one(&mut output)
-            .await
-            .unwrap();
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_schema WHERE name LIKE 'engine_%' OR name='progress_untick'",
+    )
+    .fetch_one(&mut output)
+    .await
+    .unwrap();
     assert_eq!(tables, 0);
     output.close().await.unwrap();
     pg.close().await.unwrap();

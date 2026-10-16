@@ -15,8 +15,9 @@
 	// work: moving the mapping carries its entire chapter run with it and writes no
 	// chapter rows at all.
 	//
-	// What does NOT come along: reviews, library entries, reading progress and view
-	// counts, which are keyed to the work and carry no per-source attribution. They stay
+	// Reading progress follows the sources, except chapter ids also on a staying source.
+	// What does NOT come along: reviews, library entries and view counts, which are
+	// keyed to the work and carry no per-source attribution. They stay
 	// on the original. The confirm step says so in as many words rather than letting an
 	// admin discover it afterwards.
 	import Icon from '$lib/components/Icon.svelte';
@@ -47,6 +48,9 @@
 	let pickedIds = $state<Set<string>>(new Set());
 	let confirming = $state(false);
 	let splitting = $state(false);
+	let countingReaders = $state(false);
+	let progressReaders = $state<number | null>(null);
+	let progressCountFailed = $state(false);
 
 	const picked = $derived(rows.filter((r) => pickedIds.has(r.id)));
 	// The new work is titled from the source's own title — the first one picked, in the
@@ -67,6 +71,9 @@
 		error = '';
 		pickedIds = new Set();
 		confirming = false;
+		countingReaders = false;
+		progressReaders = null;
+		progressCountFailed = false;
 	}
 
 	function close(): void {
@@ -97,6 +104,30 @@
 		void load(workId);
 	});
 
+	$effect(() => {
+		if (!open || !confirming || !workId) return;
+		const id = workId;
+		const ids = picked.map((p) => p.id);
+		let cancelled = false;
+		countingReaders = true;
+		progressReaders = null;
+		progressCountFailed = false;
+		void (async () => {
+			try {
+				const count = await backend.splitProgressReaders!(id, ids);
+				if (!cancelled) progressReaders = count;
+			} catch {
+				if (!cancelled) progressCountFailed = true;
+			} finally {
+				if (!cancelled) countingReaders = false;
+			}
+		})();
+		// Back, close, work changes and re-picks invalidate any older answer.
+		return () => {
+			cancelled = true;
+		};
+	});
+
 	async function load(id: string): Promise<void> {
 		loading = true;
 		error = '';
@@ -121,7 +152,7 @@
 	}
 
 	async function run(): Promise<void> {
-		if (!workId || splitting || !canSplit) return;
+		if (!workId || splitting || countingReaders || !canSplit) return;
 		splitting = true;
 		error = '';
 		try {
@@ -234,9 +265,19 @@
 							{picked.length === 1 ? 'source moves' : 'sources move'} to a new series called
 							<strong>{newTitle}</strong>, with
 							{picked.reduce((n, p) => n + p.chapterCount, 0)} chapters.
-							<strong
-								>Reviews, library entries, reading progress and view counts stay with “{workTitle}”</strong
-							> — they aren’t attributed per source, so they can’t follow.
+							{#if countingReaders}
+								Counting readers' progress…
+							{:else if progressCountFailed}
+								Could not count readers' progress.
+							{:else if progressReaders !== null}
+								{progressReaders}
+								{progressReaders === 1 ? "reader's" : "readers'"} progress moves with {picked.length ===
+								1
+									? 'this source'
+									: 'these sources'}.
+							{/if}
+							<strong>Reviews, library entries and view counts stay with “{workTitle}”</strong> — they
+							aren’t attributed per source, so they can’t follow.
 						</div>
 					</div>
 					<ul class="casualties">
@@ -260,7 +301,7 @@
 					<button class="ghost k-hit" onclick={() => (confirming = false)} disabled={splitting}>
 						Back
 					</button>
-					<button class="danger" onclick={run} disabled={splitting || !canSplit}>
+					<button class="danger" onclick={run} disabled={splitting || countingReaders || !canSplit}>
 						{splitting ? 'Splitting…' : `Split off ${picked.length}`}
 					</button>
 				{:else}

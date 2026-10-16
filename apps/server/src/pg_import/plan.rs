@@ -69,6 +69,11 @@ pub(crate) const POSTGRES_ONLY: &[PostgresOnly] = &[
         fks: &[],
     },
     PostgresOnly {
+        name: "progress_untick",
+        since: 10,
+        fks: &[("user_id", "users", "id")],
+    },
+    PostgresOnly {
         name: "media_object",
         since: 7,
         fks: &[],

@@ -518,6 +518,9 @@ impl Fence {
             sqlx::query("DELETE FROM suwayomi_progress")
                 .execute(&mut *tx)
                 .await?;
+            sqlx::query("DELETE FROM progress_untick WHERE chapter_id ~ '^[0-9]+$'")
+                .execute(&mut *tx)
+                .await?;
             // Keep rows and every FK to them. Prefixing the target with the old
             // generation also keeps two detached generations' threads separate.
             for table in ["comments", "notifications", "user_activity"] {

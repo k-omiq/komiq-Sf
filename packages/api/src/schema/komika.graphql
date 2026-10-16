@@ -46,6 +46,7 @@ type Query {
 	workSources(workId: ID!): [WorkSource!]! # [komika] source mappings for one canonical work
 	workSourcesBatch(workIds: [ID!]!): [WorkSourceGroup!]! # [komika] source mappings grouped per work
 	workSourceRows(workId: ID!): [WorkSourceRow!]! # [komika] the same mappings in ADMIN/detachable shape — each row's own `source_series` primary key, the title THAT source gives the series, and its chapter count. Feeds the split picker; `splitSourceSeries` takes the ids. Ungated by NSFW (hiding a mapping would make it silently un-detachable) — `requires isAdmin` is the access control
+	splitProgressReaders(workId: ID!, sourceSeriesIds: [ID!]!): Int! # [komika] distinct readers whose progress follows the picked sources in a split (requires isAdmin)
 	# library
 	library: [Series!]! # [suwayomi] mangas(condition:{inLibrary:true})
 	libraryProgress: [SeriesProgress!]! # [komika] per-series read/total for every in-library series, batched — shelves the Library/Profile screens without an N+1 chapters() fan-out
@@ -130,7 +131,7 @@ type Mutation {
 	addSourceSeries(suwayomiMangaId: ID!): MatchResult! # [komika] Tier-2 add flow — run the dedup matcher, wire into the canonical model (requires isAdmin)
 	resolveMergeCandidate(id: ID!, accept: Boolean!): Boolean! # [komika] resolve a dedup review — accept merges, reject keeps distinct (requires isAdmin)
 	mergeWorks(sourceWorkId: ID!, targetWorkId: ID!): MergeWorksResult! # [komika] D1: fold one existing canonical work into another (dedup cleanup) — source's mappings + user data re-point to target, source deleted; pick target as the enriched/MangaDex-anchored one (requires isAdmin)
-	splitSourceSeries(workId: ID!, sourceSeriesIds: [ID!]!): SplitSourcesResult! # [komika] detach source mappings onto a NEW work — the fix for two different series merged together on a shared title. The counterpart to `mergeWorks`, NOT its inverse (that one deletes the losing work row and keeps no record of it). Lossless where it counts: `chapter` is keyed by `source_series_id`, so the mappings carry their whole chapter runs and nothing is deleted; reviews/library/progress/view-counts stay on the original, which has no per-source attribution to route them by. Refuses to detach the LAST source — a work with none vanishes from Browse and search (requires isAdmin)
+	splitSourceSeries(workId: ID!, sourceSeriesIds: [ID!]!): SplitSourcesResult! # [komika] detach source mappings onto a NEW work — the fix for two different series merged together on a shared title. The counterpart to `mergeWorks`, NOT its inverse (that one deletes the losing work row and keeps no record of it). Lossless where it counts: `chapter` is keyed by `source_series_id`, so the mappings carry their whole chapter runs and nothing is deleted; reading progress follows the sources, except chapter ids also carried by a staying source keep their progress on the original. Reviews/library/view-counts stay on the original, which has no per-source attribution to route them by. Refuses to detach the LAST source — a work with none vanishes from Browse and search (requires isAdmin)
 	addExtensionRepo(indexUrl: String!): Int! # [komika] register an extension repo (store) + refresh; returns the extension count (requires isAdmin)
 	removeExtensionRepo(indexUrl: String!): Boolean! # [komika] admin — remove a repo by the index URL `extensionRepos` lists; "No such repo." otherwise (requires isAdmin)
 	installExtension(pkgName: String!): ExtensionInfo! # [komika] install a store extension, then record its sources' coordinates and NSFW flag in source_extension; NSFW-gated by show_nsfw (requires isAdmin)
@@ -1362,6 +1363,7 @@ type SplitSourcesResult {
 	newReaderId: ID! # where to NAVIGATE for it: the numeric Suwayomi id unless the detached set includes a MangaDex source. `canonicalSeries` rejects a work with no MangaDex anchor, so a Suwayomi-only split must never be linked as /series/w_…
 	title: String! # the new work's primary title, from the detached source's own title
 	movedSources: Int! # how many source_series rows moved
+	progressReadersMoved: Int! # distinct readers whose progress follows the detached sources
 }
 
 # [komika] S2 cross-source chapter aggregation. `Series.chapterCount` on a canonical

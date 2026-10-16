@@ -52,6 +52,10 @@ When you have library series with some but not all chapters read, the top of you
 
 On each series page, every chapter row displays a read mark indicator. When you are signed in, click the checkmark button next to any chapter to toggle it between read and unread. Your read count updates immediately, adjusting your position on your library shelves.
 
+When you finish a chapter, komiq also marks the earlier chapters of the same series on the same source as read.
+
+If you mark a chapter unread, it stays unread. Finishing a later chapter does not mark it read again. Neither does a late save of a later chapter, for example an offline save from another device that syncs afterwards. The chapter becomes read again only when you read it to the end or click its checkmark again. A late save that finished this same chapter also counts as reading it. Reading or ticking the same chapter on another source of the same series counts too. Marking a chapter unread also clears it on the other sources of that series.
+
 ### Filter and sort your library
 
 The library toolbar allows you to filter and sort your titles:

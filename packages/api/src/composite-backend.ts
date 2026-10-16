@@ -852,6 +852,9 @@ export class CompositeBackend implements Backend {
 	workSourceRows(workId: Id): Promise<WorkSourceRow[]> {
 		return this.opts.hosted.workSourceRows!(workId);
 	}
+	splitProgressReaders(workId: Id, sourceSeriesIds: Id[]): Promise<number> {
+		return this.opts.hosted.splitProgressReaders!(workId, sourceSeriesIds);
+	}
 	splitSourceSeries(workId: Id, sourceSeriesIds: Id[]): Promise<SplitSourcesResult> {
 		return this.opts.hosted.splitSourceSeries!(workId, sourceSeriesIds);
 	}

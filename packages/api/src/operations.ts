@@ -1314,6 +1314,13 @@ export const WORK_SOURCE_ROWS = /* GraphQL */ `
 	}
 `;
 
+// Preview how many readers' progress follows the picked sources (admin only).
+export const SPLIT_PROGRESS_READERS = /* GraphQL */ `
+	query SplitProgressReaders($workId: ID!, $sourceSeriesIds: [ID!]!) {
+		splitProgressReaders(workId: $workId, sourceSeriesIds: $sourceSeriesIds)
+	}
+`;
+
 // Detach sources onto a new work. NOT an "unmerge" — see `Backend.splitSourceSeries`.
 //
 // `newReaderId` is the field the caller navigates with, and it is NOT `newWorkId`: a

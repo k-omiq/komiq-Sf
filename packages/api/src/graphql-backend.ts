@@ -1267,6 +1267,14 @@ export class GraphQLBackend implements Backend {
 		return d.workSourceRows;
 	}
 
+	async splitProgressReaders(workId: Id, sourceSeriesIds: Id[]): Promise<number> {
+		const d = await this.gql<{ splitProgressReaders: number }>(ops.SPLIT_PROGRESS_READERS, {
+			workId,
+			sourceSeriesIds,
+		});
+		return d.splitProgressReaders;
+	}
+
 	async splitSourceSeries(workId: Id, sourceSeriesIds: Id[]): Promise<SplitSourcesResult> {
 		const d = await this.gql<{ splitSourceSeries: SplitSourcesResult }>(ops.SPLIT_SOURCE_SERIES, {
 			workId,

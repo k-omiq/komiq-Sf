@@ -69,6 +69,7 @@ Catalogue works are independent of source copies:
 - `engine_generation`, `engine_manga_key` and `engine_chapter_key`: the source engine's own manga and chapter keys and web links, added by migration `0005_engine_keys.sql`. Keys are stored per generation, and each generation row has a state of `active`, `quarantined` or `detached`; the server adopts or creates one `active` generation at start. `chapterOrigin` reads these rows. The tables exist only in PostgreSQL, and the reverse export to SQLite leaves them out because the server rebuilds them from the engine.
 - `engine_numeric_state` and `suwayomi_progress_detached`, added by migration `0006_engine_fence.sql`: the numeric epoch that fences queued progress writes after an engine change, and the extension-source reading progress set aside when an administrator starts a new engine generation. The reverse export to SQLite refuses while either holds rows.
 - `media_policy` and `media_takedown`, added by migration `0009_media_policy.sql`: the policy epoch, which moves with every site-wide block rule or takedown change, and the operator takedowns of works and chapter copies. The reverse export to SQLite leaves `media_policy` out and refuses while `media_takedown` holds rows, because a rollback without it would serve taken-down content again. Read [Takedowns](/admin/takedowns).
+- `progress_untick`, added by migration `0010_progress_untick.sql`: one row per explicit untick of one chapter copy (user id, chapter id, time). The reverse export to SQLite omits it and counts it in its report. It does not refuse, because losing the table only brings back the old behaviour: the chapters stay unread. A new engine generation deletes the records of numeric chapter ids.
 
 ### Identity and social tables
 
@@ -87,6 +88,8 @@ Reading history and personal collections are stored per user:
 - `user_library`: links a user to a series (`user_id`, `series_id`). It stores shelf status and an `is_favorite` flag.
 - `canonical_progress`: records reading progress for canonical `w_...` works. Keyed by `(user_id, chapter_id)`, it stores `last_page_read`, a `read` boolean flag and an `updated_at` timestamp.
 - `suwayomi_progress`: records reading progress for numeric Suwayomi-sourced series. It mirrors the structure of `canonical_progress` for non-canonical sources.
+- `progress_untick`: the catch-up record (see `setProgress` in the GraphQL page). It holds one row per explicit untick of one chapter copy: the user id, the chapter id and the time. The server skips a chapter that has such a record when it marks earlier chapters read.
+- Catch-up: finishing a chapter (`setProgress` with `read: true`) marks the lower-numbered chapters of the same source read. For a MangaDex chapter that means all English MangaDex chapters of the work. For a Suwayomi chapter it means the cached chapters of that one manga. The server writes only missing rows and rows that are not read yet. Rows already read are not touched, so they take no lock and cause no write. It skips chapters with a `progress_untick` record, and every copy with the same chapter key in the same work. Reading or ticking a copy deletes the record for that chapter key.
 - `series_views` and `series_view_bucket`: tracks chapter read counts aggregated across rolling hourly time buckets to calculate trending feeds.
 
 ### Materialized query tables

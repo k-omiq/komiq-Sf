@@ -592,7 +592,17 @@ async fn two_sessions_catch_up_and_unread_keep_the_last_committed_state() {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(earlier, unread_first);
+        // Untick wins in both orders: a finish that commits after the untick skips the
+        // unticked chapter instead of reading it again.
+        assert!(!earlier, "unread_first={unread_first}");
+        let recorded: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM progress_untick WHERE user_id=$1 AND chapter_id='phase4-catch-1')",
+        )
+        .bind(crate::db_types::uuid(BOB).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(recorded);
         let page: i64 = sqlx::query_scalar("SELECT last_page_read FROM canonical_progress WHERE user_id=$1 AND chapter_id='phase4-catch-2'")
             .bind(crate::db_types::uuid(BOB).unwrap()).fetch_one(&pool).await.unwrap();
         assert_eq!(page, 8);

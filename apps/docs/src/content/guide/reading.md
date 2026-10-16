@@ -68,7 +68,7 @@ Moving past chapter boundaries opens adjacent chapters:
 
 To reduce pauses between chapters, komiq prefetches the next chapter once you reach 40 percent of your current chapter, or whenever you move your pointer over a next chapter button.
 
-When you are signed in to the connected server, reading progress is saved to your account automatically when you finish a chapter, click to another chapter, switch browser tabs, or navigate away from the reader. For more details on tracking your reading history, see [Library](/guide/library).
+When you are signed in to the connected server, reading progress is saved to your account automatically when you finish a chapter, click to another chapter, switch browser tabs, or navigate away from the reader. Finishing a chapter also marks the earlier chapters of that source as read, except the ones you marked unread yourself. For more details on tracking your reading history, see [Library](/guide/library).
 
 ## Pick a source
 

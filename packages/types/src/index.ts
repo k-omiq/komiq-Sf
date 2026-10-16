@@ -251,9 +251,9 @@ export interface WorkSourceRow {
  * deletes the source work row and keeps no record of what it folded, so the
  * pre-merge state is unrecoverable. This mints a NEW work carrying the detached
  * sources (and, for free, every chapter they own — `chapter` is keyed by
- * `source_series_id`, not by work). Reviews, library entries, reading progress and
- * view counts stay with the ORIGINAL work, because nothing records which side of
- * the split they came from.
+ * `source_series_id`, not by work). Reading progress follows those sources unless
+ * the chapter id also occurs on a staying source. Reviews, library entries and view
+ * counts stay with the ORIGINAL work, because nothing records which side they came from.
  */
 export interface SplitSourcesResult {
 	/** The freshly minted canonical work id (`w_…`). */

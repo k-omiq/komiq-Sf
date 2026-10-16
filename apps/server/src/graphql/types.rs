@@ -1901,9 +1901,9 @@ pub struct WorkSourceRow {
 /// NOT an undo of `MergeWorksResult` and it cannot be one: `mergeWorks` deletes the
 /// losing work row and keeps no record of what it folded. This mints a NEW work carrying
 /// the detached sources and — for free, since `chapter` is keyed by `source_series_id`
-/// rather than by work — every chapter they own. Reviews, library entries, reading
-/// progress and view counts stay with the ORIGINAL work, which is where they already
-/// were: nothing records which side of the split they came from.
+/// rather than by work — every chapter they own. Reading progress follows them unless
+/// the chapter id also occurs on a staying source. Reviews, library entries and view
+/// counts stay with the ORIGINAL work: nothing records which side they came from.
 #[derive(SimpleObject, Clone)]
 pub struct SplitSourcesResult {
     /// The freshly minted canonical work id (`w_…`).
@@ -1917,6 +1917,8 @@ pub struct SplitSourcesResult {
     pub title: String,
     /// How many `source_series` rows moved.
     pub moved_sources: i32,
+    /// Distinct readers whose progress follows the detached sources.
+    pub progress_readers_moved: i32,
 }
 
 /// Serialize a `SeriesStatus` to its SDL name (for storage).

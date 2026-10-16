@@ -114,7 +114,8 @@ Splitting is performed directly in the reader application:
 1. Connect the reader app to your server, sign in with an administrator account on that server, and open the series page for the affected title.
 2. Click **Split** to open the source splitter dialog.
 3. Select the checkboxes for the source mappings you want to detach.
-4. Click **Review split**, then **Split off N**, where N is the number of selected sources.
+4. Click **Review split**. Before you confirm, the dialog shows how many readers' reading progress moves with the selected sources.
+5. Click **Split off N**, where N is the number of selected sources.
 
 ```flow
 Administrator opens series page -> clicks split button
@@ -127,4 +128,5 @@ Administrator confirms split -> new canonical work created with detached sources
 - **Cannot detach all sources**: You must leave at least one source on the original work. A work without source mappings is excluded from browse listings and search indexes.
 - **New work identity**: Your server creates a new canonical work with a fresh identifier. The new work takes its primary title from the first detached source.
 - **Chapters**: Chapters belong to source series records. All chapters belonging to the detached sources transfer to the new work cleanly.
-- **User data**: Reviews, series comments, work-level reading progress, and library shelves remain on the original work. Chapter records stay attached to their sources.
+- **Reading progress**: Readers' reading progress on the detached sources moves with them to the new series. The exception is a chapter that also exists on a source that stays: it keeps its progress on the original series.
+- **Other user data**: Reviews, series comments, library entries and view counts stay on the original series. Chapter records stay attached to their sources.

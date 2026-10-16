@@ -38,11 +38,17 @@ pub(super) const UNSUPPORTED_POSTGRES_ONLY: &[(&str, &str)] = &[
     ),
 ];
 
-/// Engine-derived identities are omitted even when populated, with counts in the report.
+/// Omitted even when populated, with counts in the report: engine-derived identities
+/// and untick records whose loss only returns the old build's behaviour. The chapters
+/// stay unread in the export; the old build may read them again on a later finish.
 pub(super) const REBUILDABLE_POSTGRES_ONLY: &[(&str, &str)] = &[
     (
         "media_policy",
         "the policy epoch starts again from the next policy change",
+    ),
+    (
+        "progress_untick",
+        "untick records: the chapters stay unread; the old build may read them again on a later finish",
     ),
     (
         "media_object",

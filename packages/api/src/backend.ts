@@ -586,6 +586,8 @@ export interface Backend {
 	 * Optional: only the unified Komika API implements it.
 	 */
 	splitSourceSeries?(workId: Id, sourceSeriesIds: Id[]): Promise<SplitSourcesResult>;
+	/** Distinct readers whose progress follows these sources in a split (admin only). */
+	splitProgressReaders?(workId: Id, sourceSeriesIds: Id[]): Promise<number>;
 
 	// --- reader reports (Support → Report an issue) ---
 	/**
