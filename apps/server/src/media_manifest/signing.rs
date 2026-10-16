@@ -67,6 +67,14 @@ impl Signer {
             if file.metadata()?.permissions().mode() & 0o077 != 0 {
                 bail!("media signing key permits group/other access");
             }
+            // Persist the published name even if another startup linked it into place.
+            let directory = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            std::fs::File::open(directory)
+                .and_then(|directory| directory.sync_all())
+                .context("sync media signing key directory")?;
         }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
@@ -120,6 +128,30 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn concurrent_key_file_creation_keeps_one_key_and_no_temporary_files() {
+        let dir = crate::media_manifest_tests::TempDir::new();
+        let path = dir.0.join("signing.key");
+        let start = std::sync::Barrier::new(8);
+        let kids = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        Signer::load(&path).unwrap().kid
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(kids.iter().all(|kid| *kid == kids[0]));
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+        assert_eq!(Signer::load(&path).unwrap().kid, kids[0]);
     }
 
     #[test]

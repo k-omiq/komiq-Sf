@@ -7442,6 +7442,8 @@ impl QueryRoot {
             .await
             .map_err(gql_err)?;
         let n = chapter_id.0.parse::<i64>().map_err(gql_err)?;
+        // The owner, list, locator decision and key rows must share one generation.
+        let generation = st.suwayomi.read_generation();
         // The NSFW flag lives on the owning series/work, not the chapter, and Suwayomi
         // chapters aren't mirrored locally — so resolve the manga id from the source and
         // gate the page images exactly like `series`/`chapters` (N2). An unknown chapter
@@ -7458,13 +7460,13 @@ impl QueryRoot {
             }
             deny_blocked_series(ctx, &manga_id.to_string(), "No such chapter").await?;
         }
+        #[cfg(test)]
+        guard_pause("pages-owner-resolved").await;
         // A taken-down copy closes this one chapter.
         let policy = st.policy.current(&st.pool).await.map_err(gql_read_err)?;
         if policy.denies_chapter(n) {
             return Err(Error::new("No such chapter"));
         }
-        // The list, the locator decision and the key rows must come from one generation.
-        let generation = st.suwayomi.read_generation();
         let urls = st.suwayomi.pages(n).await;
         // A reader opening a chapter is the request that matters most, and the scanner
         // never makes it — so it is counted here, against the owning source.

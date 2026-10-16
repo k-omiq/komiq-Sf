@@ -75,7 +75,7 @@ A manifest payload holds `v`, `copy_id`, `copy` (source id, manga key, chapter k
 | `/media/v1/policy` | the signed policy lease | `public, max-age=60` |
 | `/media/v1/ready` | `204`, for route probes, also with the feature off | `no-store`, `Access-Control-Allow-Origin: *` |
 
-The server keeps no page bytes. For an object request it finds the newest kept revision naming the hash, checks site-wide block rules and takedowns for the copy's own series, fetches the page and hashes it. A denied copy, a copy of a denied series or a taken-down chapter answers `404` with `no-store, must-revalidate`, even if another copy has identical bytes. The manifest route also refuses a denied copy.
+The server keeps no page bytes. For an object request it finds the newest kept revision naming the hash, checks site-wide block rules and takedowns for the copy's own series, fetches the page and hashes it. It checks the current policy again after the fetch, so a takedown noticed during a slow fill also refuses that response. A denied copy, a copy of a denied series or a taken-down chapter answers `404` with `no-store, must-revalidate`, even if another copy has identical bytes. The manifest route also refuses a denied copy.
 
 Bytes that differ mark the revision stale, queue the chapter again and return `404` with `no-store`. A stale latest revision has no manifest without `?rev`, and `pages` gives no exact paths for it.
 
@@ -95,7 +95,7 @@ Reverse export to SQLite refuses while `media_takedown` has rows. `media_policy`
 
 `GET /media/v1/policy` uses the same signed envelope and key as manifests. Its payload holds `v`, `epoch`, `issued_at`, `expires_at`, `denied_copies`, `denied_works` and `kid`. Times are Unix seconds. The lease lasts 600 seconds from the current minute's start. The server reuses signed bytes per epoch and per minute.
 
-Exact objects set `s-maxage`, their shared-cache lifetime, to the current lease's remaining life, at most 600 seconds. This bounds reuse in shared caches such as a content delivery network (CDN) to one lease. It cannot recall bytes already in a browser, offline chapters or saved copies. Older chapter page and source cover responses keep their 300-second lifetime. Current versioned covers allow 600 seconds in shared caches and a year in browsers. See [Edge rendering and caching](/developers/edge-caching).
+Exact objects set `s-maxage`, their shared-cache lifetime, to the remaining life of the current minute's lease when the response is built, at most 600 seconds. Its expiry can be up to one minute later than the lease that authorized the response. Shared caches such as a content delivery network (CDN) can reuse the bytes until that expiry. This cannot recall bytes already in a browser, offline chapters or saved copies. Older chapter page and source cover responses keep their 300-second lifetime. Current versioned covers allow 600 seconds in shared caches and a year in browsers. See [Edge rendering and caching](/developers/edge-caching).
 
 ## Page fields
 

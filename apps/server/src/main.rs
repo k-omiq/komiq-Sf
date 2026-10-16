@@ -1477,11 +1477,16 @@ async fn resolve_page_location(
     chapter_id: i64,
     fresh: bool,
     deadline: tokio::time::Instant,
-) -> Result<Option<(i64, i32, u64)>, axum::response::Response> {
+) -> Result<Option<(i64, i32, u64, tokio::time::Instant)>, axum::response::Response> {
     let locator = &client.page_locator;
     if !fresh {
         if let Some(entry) = locator.memo_get(chapter_id) {
-            return Ok(Some((entry.manga_id, entry.source_order, entry.stamp)));
+            return Ok(Some((
+                entry.manga_id,
+                entry.source_order,
+                entry.stamp,
+                tokio::time::Instant::now(),
+            )));
         }
     }
     if let Some(manga_id) = locator.memo_manga(chapter_id) {
@@ -1495,7 +1500,7 @@ async fn resolve_page_location(
             return Err(page_busy_response());
         }
         let looked_up = locator.lookup(chapter_id, || client.chapter_location(chapter_id));
-        let (stamp, location) = match tokio::time::timeout_at(deadline, looked_up).await {
+        let (stamp, location, started) = match tokio::time::timeout_at(deadline, looked_up).await {
             Ok(Ok(location)) => location,
             Ok(Err(e)) if request_budget::is_upstream_busy(&e) => return Err(page_busy_response()),
             Ok(Err(e)) => {
@@ -1508,8 +1513,10 @@ async fn resolve_page_location(
             return Ok(None);
         };
         if locator.unchanged(manga_id, stamp) {
-            locator.memo_put(chapter_id, manga_id, order, stamp);
-            return Ok(Some((manga_id, order, stamp)));
+            if locator.cacheable(manga_id, started) {
+                locator.memo_put(chapter_id, manga_id, order, stamp);
+            }
+            return Ok(Some((manga_id, order, stamp, started)));
         }
         locator
             .wait_idle(manga_id, deadline)
@@ -1524,7 +1531,15 @@ async fn serve_chapter_page_inner(
     page: &str,
 ) -> axum::response::Response {
     match fetch_chapter_page(app, chapter_id, page).await {
-        Ok((bytes, mime)) => raw_image_response(mime, bytes),
+        Ok((bytes, mime, cacheable)) => raw_image_response_with_cache(
+            mime,
+            bytes,
+            if cacheable {
+                image_delivery::MUTABLE_CACHE
+            } else {
+                "no-store"
+            },
+        ),
         Err(response) => response,
     }
 }
@@ -1533,10 +1548,10 @@ async fn fetch_chapter_page(
     app: &graphql::AppState,
     chapter_id: i64,
     page: &str,
-) -> Result<(axum::body::Bytes, String), axum::response::Response> {
+) -> Result<(axum::body::Bytes, String, bool), axum::response::Response> {
     let deadline = app.suwayomi.page_locator.deadline();
     for attempt in 0..2 {
-        let (manga_id, order, stamp) =
+        let (manga_id, order, stamp, started) =
             match resolve_page_location(&app.suwayomi, chapter_id, attempt > 0, deadline).await {
                 Ok(Some(location)) => location,
                 Ok(None) => return Err(image_failure_response(StatusCode::NOT_FOUND)),
@@ -1568,7 +1583,13 @@ async fn fetch_chapter_page(
             }
             return Err(page_busy_response());
         }
-        return fetched;
+        return fetched.map(|(bytes, mime)| {
+            (
+                bytes,
+                mime,
+                app.suwayomi.page_locator.cacheable(manga_id, started),
+            )
+        });
     }
     Err(page_busy_response())
 }
@@ -1652,7 +1673,7 @@ async fn serve_media_object_inner(
         Ok(_) => {}
         Err(response) => return Ok(response),
     }
-    let (bytes, _) = match fetch_chapter_page(app, chapter, &idx.to_string()).await {
+    let (bytes, _, _) = match fetch_chapter_page(app, chapter, &idx.to_string()).await {
         Ok(page) => page,
         Err(response) => return Ok(response),
     };
@@ -1664,6 +1685,15 @@ async fn serve_media_object_inner(
             .queue
             .queue_now(chapter);
         return Ok(image_failure_response(StatusCode::NOT_FOUND));
+    }
+    // Recheck after the fetch: a takedown that landed meanwhile must not leave here
+    // with a fresh shared-cache life.
+    match check_page_block(app, bound_manga).await {
+        Ok(policy) if policy.denies_copy(copy) || policy.denies_chapter(chapter) => {
+            return Ok(image_failure_response(StatusCode::NOT_FOUND));
+        }
+        Ok(_) => {}
+        Err(response) => return Ok(response),
     }
     let mut response =
         raw_image_response_with_cache(mime, bytes, "public, max-age=31536000, immutable");

@@ -117,7 +117,6 @@ impl Engine {
                                     return axum::response::Response::new(body);
                                 }
                                 RefreshAnswer::ProxyError => {
-                                    state.swapped = !state.swapped;
                                     return StatusCode::BAD_GATEWAY.into_response();
                                 }
                                 RefreshAnswer::Success => state.swapped = !state.swapped,
@@ -267,11 +266,12 @@ async fn get_page(app: Arc<AppState>, path: &str) -> axum::response::Response {
 }
 
 async fn assert_page(response: axum::response::Response, chapter: u8) {
+    assert_page_with_cache(response, chapter, image_delivery::MUTABLE_CACHE).await;
+}
+
+async fn assert_page_with_cache(response: axum::response::Response, chapter: u8, cache: &str) {
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers()[header::CACHE_CONTROL],
-        image_delivery::MUTABLE_CACHE
-    );
+    assert_eq!(response.headers()[header::CACHE_CONTROL], cache);
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -405,7 +405,16 @@ async fn transport_failure_disables_memo_but_graphql_failure_does_not() {
         let (_, provenance) = app.suwayomi.chapters_with_provenance(7).await.unwrap();
         assert_eq!(provenance, suwayomi::Provenance::CachedFallback);
         for _ in 0..2 {
-            assert_page(get_page(app.clone(), "/media/v1/c/8/0").await, 8).await;
+            assert_page_with_cache(
+                get_page(app.clone(), "/media/v1/c/8/0").await,
+                8,
+                if transport {
+                    "no-store"
+                } else {
+                    image_delivery::MUTABLE_CACHE
+                },
+            )
+            .await;
         }
         assert_eq!(engine.co(), if transport { 3 } else { 2 });
         if transport {
@@ -419,6 +428,25 @@ async fn transport_failure_disables_memo_but_graphql_failure_does_not() {
             assert_eq!(engine.co(), 4);
         }
     }
+}
+
+#[tokio::test]
+async fn unknown_outcome_refresh_late_reorder_is_never_cached() {
+    let (engine, app) = fixture().await;
+    assert_page(get_page(app.clone(), "/media/v1/c/8/0").await, 8).await;
+    engine.state.lock().unwrap().answer = RefreshAnswer::ProxyError;
+    let (_, provenance) = app.suwayomi.chapters_with_provenance(7).await.unwrap();
+    assert_eq!(provenance, suwayomi::Provenance::CachedFallback);
+    let pause = Arc::new(Pause::default());
+    engine.state.lock().unwrap().page_pause = Some(pause.clone());
+    let page = tokio::spawn(get_page(app.clone(), "/media/v1/c/8/0"));
+    pause.entered.notified().await;
+    // The proxy has answered, but the engine finishes reordering after the lookup.
+    engine.state.lock().unwrap().swapped = true;
+    pause.release.notify_one();
+    assert_page_with_cache(page.await.unwrap(), 9, "no-store").await;
+    assert_page_with_cache(get_page(app, "/media/v1/c/8/0").await, 8, "no-store").await;
+    assert_eq!(engine.co(), 3);
 }
 
 #[tokio::test]

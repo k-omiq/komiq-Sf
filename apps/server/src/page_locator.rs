@@ -51,12 +51,18 @@ struct State {
     last_clear: u64,
 }
 
-/// One engine lookup's answer and the event stamp taken just before it was sent.
-pub(crate) type Lookup = (u64, Option<(i64, i32)>);
+/// One engine lookup's answer, event stamp and start time.
+pub(crate) type Lookup = (u64, Option<(i64, i32)>, Instant);
+
+#[derive(Default)]
+struct SharedLookup {
+    cell: Arc<OnceCell<Lookup>>,
+    callers: usize,
+}
 
 pub(crate) struct PageLocator {
     state: Mutex<State>,
-    lookups: Mutex<HashMap<i64, Arc<OnceCell<Lookup>>>>,
+    lookups: Mutex<HashMap<i64, SharedLookup>>,
     lookup_permits: Semaphore,
     #[cfg(test)]
     refresh_wait: Option<Duration>,
@@ -155,25 +161,26 @@ impl PageLocator {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<Option<(i64, i32)>>>,
     {
-        let cell = self
-            .lookups
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(chapter_id)
-            .or_default()
-            .clone();
-        let _guard = LookupGuard {
+        let guard = LookupGuard {
             locator: self,
             chapter_id,
-            cell: cell.clone(),
+            cell: {
+                let mut lookups = self.lookups.lock().unwrap_or_else(|e| e.into_inner());
+                let lookup = lookups.entry(chapter_id).or_default();
+                lookup.callers += 1;
+                lookup.cell.clone()
+            },
         };
-        cell.get_or_try_init(|| async {
-            let _permit = self.lookup_permits.acquire().await?;
-            let stamp = self.snapshot();
-            Ok::<_, anyhow::Error>((stamp, fetch().await?))
-        })
-        .await
-        .copied()
+        guard
+            .cell
+            .get_or_try_init(|| async {
+                let started = Instant::now();
+                let _permit = self.lookup_permits.acquire().await?;
+                let stamp = self.snapshot();
+                Ok::<_, anyhow::Error>((stamp, fetch().await?, started))
+            })
+            .await
+            .copied()
     }
 
     pub(crate) fn unchanged(&self, manga_id: i64, stamp: u64) -> bool {
@@ -183,6 +190,17 @@ impl PageLocator {
                 .mangas
                 .get(&manga_id)
                 .is_none_or(|manga| manga.unchanged(stamp))
+    }
+
+    /// A fetch begun during an unknown-outcome window stays uncacheable even if
+    /// the window expires before the engine returns its bytes.
+    pub(crate) fn cacheable(&self, manga_id: i64, started: Instant) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mangas
+            .get(&manga_id)
+            .is_none_or(|manga| manga.memo_on(started))
     }
 
     pub(crate) fn memo_manga(&self, chapter_id: i64) -> Option<i64> {
@@ -267,14 +285,21 @@ struct LookupGuard<'a> {
 
 impl Drop for LookupGuard<'_> {
     fn drop(&mut self) {
-        // Finished or cancelled lookups must not leave entries behind, or remove a
-        // newer lookup that replaced this one while another caller held its cell.
-        let mut lookups = self.locator.lookups.lock().unwrap_or_else(|e| e.into_inner());
-        if lookups
-            .get(&self.chapter_id)
-            .is_some_and(|current| Arc::ptr_eq(current, &self.cell))
+        // Keep an unfinished lookup until its last caller leaves. Never remove a
+        // newer lookup's cell while an old caller still holds its result.
+        let mut lookups = self
+            .locator
+            .lookups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(current) = lookups
+            .get_mut(&self.chapter_id)
+            .filter(|current| Arc::ptr_eq(&current.cell, &self.cell))
         {
-            lookups.remove(&self.chapter_id);
+            current.callers -= 1;
+            if current.cell.get().is_some() || current.callers == 0 {
+                lookups.remove(&self.chapter_id);
+            }
         }
     }
 }
@@ -314,6 +339,54 @@ mod tests {
         assert!(tokio::time::timeout_at(locator.deadline(), lookup)
             .await
             .is_err());
+        assert!(locator.lookups.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_follower_keeps_shared_lookup_for_next_request() {
+        let locator = PageLocator::default();
+        let calls = AtomicU64::new(0);
+        let release = Notify::new();
+        let leader = locator.lookup(8, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            release.notified().await;
+            Ok(Some((7, 0)))
+        });
+        tokio::pin!(leader);
+        assert!(futures::poll!(&mut leader).is_pending());
+        {
+            let follower = locator.lookup(8, || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some((7, 1)))
+            });
+            tokio::pin!(follower);
+            assert!(futures::poll!(&mut follower).is_pending());
+        }
+        let third = locator.lookup(8, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some((7, 2)))
+        });
+        tokio::pin!(third);
+        assert!(futures::poll!(&mut third).is_pending());
+        release.notify_one();
+        let (first, last) = tokio::join!(leader, third);
+        let first = first.unwrap();
+        assert_eq!(first.1, Some((7, 0)));
+        assert_eq!(last.unwrap(), first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(locator.lookups.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_shared_lookup_is_removed_after_last_caller() {
+        let locator = PageLocator::default();
+        let mut leader = Box::pin(locator.lookup(8, || std::future::pending()));
+        assert!(futures::poll!(&mut leader).is_pending());
+        let mut follower = Box::pin(locator.lookup(8, || std::future::pending()));
+        assert!(futures::poll!(&mut follower).is_pending());
+        drop(leader);
+        assert_eq!(locator.lookups.lock().unwrap().len(), 1);
+        drop(follower);
         assert!(locator.lookups.lock().unwrap().is_empty());
     }
 
@@ -379,6 +452,35 @@ mod tests {
             locator.memo_put(8, 7, 0, locator.snapshot());
             assert!(locator.memo_get(8).is_some());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_refresh_cache_window_covers_fetches_that_outlive_it() {
+        let locator = Arc::new(PageLocator::default());
+        let before = Instant::now();
+        assert!(locator.cacheable(7, before));
+        locator.begin_refresh(7).finish(false);
+        let during = Instant::now();
+        assert!(!locator.cacheable(7, during));
+        assert!(locator.cacheable(99, during));
+        let release = Notify::new();
+        let mut leader = Box::pin(locator.lookup(8, || async {
+            release.notified().await;
+            Ok(Some((7, 0)))
+        }));
+        assert!(futures::poll!(&mut leader).is_pending());
+        tokio::time::advance(MEMO_OFF).await;
+        assert!(!locator.cacheable(7, during));
+        assert!(locator.cacheable(7, Instant::now()));
+        let mut follower = Box::pin(locator.lookup(8, || async {
+            panic!("the late caller must share the earlier lookup")
+        }));
+        assert!(futures::poll!(&mut follower).is_pending());
+        release.notify_one();
+        let (leader, follower) = tokio::join!(leader, follower);
+        let follower = follower.unwrap();
+        assert_eq!(follower, leader.unwrap());
+        assert!(!locator.cacheable(7, follower.2));
     }
 
     #[tokio::test(start_paused = true)]

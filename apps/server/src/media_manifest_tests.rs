@@ -42,6 +42,7 @@ struct Engine {
     /// When set, the engine moves chapter 8 to position 1 once it served a page,
     /// as the engine's own updater could in the middle of an ingest pass.
     reorder_on_page: Arc<std::sync::atomic::AtomicBool>,
+    page_pause: Arc<Mutex<Option<crate::locks::pause_points::PausePoints>>>,
     server: tokio::task::JoinHandle<()>,
 }
 impl Drop for Engine {
@@ -64,6 +65,7 @@ impl Engine {
         let pages = Arc::new(Mutex::new(vec![image_bytes(1), image_bytes(2)]));
         let chapter_url = Arc::new(Mutex::new("/chapter".to_string()));
         let reorder_on_page = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let page_pause: Arc<Mutex<Option<crate::locks::pause_points::PausePoints>>> = Default::default();
         let order = Arc::new(std::sync::atomic::AtomicI32::new(0));
         let routes = Router::new()
             .route("/api/graphql", post({
@@ -97,12 +99,16 @@ impl Engine {
                 let pages = pages.clone();
                 let reorder_on_page = reorder_on_page.clone();
                 let order = order.clone();
+                let page_pause = page_pause.clone();
                 move |UrlPath((m,c,p)): UrlPath<(i64,i32,usize)>| {
                     let pages = pages.clone();
                     let reorder_on_page = reorder_on_page.clone();
                     let order = order.clone();
+                    let page_pause = page_pause.clone();
                     async move {
                         assert_eq!((m,c), (7,0));
+                        let pause = page_pause.lock().unwrap().take();
+                        if let Some(points) = pause { points.hit("page-fetch").await; }
                         if reorder_on_page.load(std::sync::atomic::Ordering::SeqCst) {
                             order.store(1, std::sync::atomic::Ordering::SeqCst);
                         }
@@ -125,6 +131,7 @@ impl Engine {
             pages,
             chapter_url,
             reorder_on_page,
+            page_pause,
             server,
         }
     }
@@ -363,6 +370,54 @@ async fn object_mismatch_marks_stale_and_pages_stop_exact_paths() {
     );
     let signed = body(get_media(&app, &format!("/media/v1/manifest/{copy}?rev=1")).await).await;
     assert_eq!(verify_manifest(&signed, &pins(&app)).unwrap().revision, 1);
+}
+
+#[tokio::test]
+async fn object_fill_rechecks_copy_and_work_takedowns_after_fetch() {
+    for kind in [media_policy::Kind::Copy, media_policy::Kind::Work] {
+        let (_dir, engine, app) = fixture(true).await;
+        sqlx::raw_sql("INSERT INTO work(id,created_at,updated_at) VALUES('w_fill',now(),now()); INSERT INTO source_series(id,work_id,source_type,source_id,source_key,created_at) VALUES('ss_fill','w_fill','suwayomi','source','7',now())")
+            .execute(&app.pool).await.unwrap();
+        ingest_chapter(&app, 8).await.unwrap();
+        let listed = pages(&app).await;
+        let path = listed[0]["mediaPath"].as_str().unwrap().to_string();
+        let copy = path.split('/').nth(4).unwrap();
+        let points = crate::locks::pause_points::PausePoints::default();
+        let fetched = points.arm("page-fetch");
+        *engine.page_pause.lock().unwrap() = Some(points);
+        let request = tokio::spawn({
+            let app = app.clone();
+            let path = path.clone();
+            async move { get_media(&app, &path).await }
+        });
+        fetched.reached().await;
+        let mut tx = app.pool.begin().await.unwrap();
+        let subject = if kind == media_policy::Kind::Copy {
+            copy
+        } else {
+            "w_fill"
+        };
+        media_policy::add(&mut tx, kind, subject, "during object fill", None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        app.policy.invalidate();
+        fetched.release();
+        let response = request.await.unwrap();
+        let denied = get_media(&app, &path).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{kind:?}");
+        assert_eq!(response.status(), denied.status());
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            denied.headers()[header::CACHE_CONTROL]
+        );
+        assert!(response.headers()[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .contains("no-store"));
+        assert_eq!(body(response).await, body(denied).await);
+        assert!(!store::latest(&app.pool, copy).await.unwrap().unwrap().stale);
+    }
 }
 
 #[tokio::test]
