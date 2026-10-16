@@ -1155,6 +1155,21 @@ fn gql_err(e: impl std::fmt::Display + Send + Sync + 'static) -> Error {
             Err(source) => source.into(),
         },
     };
+    if let Some(fence) = source
+        .downcast_ref::<anyhow::Error>()
+        .and_then(|e| e.downcast_ref::<crate::engine_generation::FenceError>())
+    {
+        return Error::new(fence.to_string()).extend_with(|_, extensions| {
+            extensions.set(
+                "code",
+                if *fence == crate::engine_generation::FenceError::StaleEpoch {
+                    "STALE_NUMERIC_EPOCH"
+                } else {
+                    "ENGINE_UNAVAILABLE"
+                },
+            );
+        });
+    }
     let retry = source
         .downcast_ref::<UpstreamRateLimit>()
         .map(|error| error.0)
@@ -3234,13 +3249,23 @@ async fn resolve_series_cached(st: &AppState, id: i64) -> anyhow::Result<Suwayom
     resolve_series_with_cached(st, id, cached, None).await
 }
 
+fn cache_belongs_to_engine(st: &AppState, generation: Option<&str>) -> bool {
+    st.suwayomi
+        .fence
+        .as_ref()
+        .is_none_or(|fence| generation == fence.generation().map(|id| id.to_string()).as_deref())
+}
+
 async fn resolve_series_with_cached(
     st: &AppState,
     id: i64,
     cached: Option<(SuwayomiManga, bool)>,
     client: Option<&str>,
 ) -> anyhow::Result<SuwayomiManga> {
-    if let Some((m, fresh)) = cached {
+    crate::engine_generation::wait(&st.pool).await?;
+    if let Some((m, fresh)) =
+        cached.filter(|(m, _)| cache_belongs_to_engine(st, m.engine_generation.as_deref()))
+    {
         if !fresh {
             if let Some((guard, slot)) = st.series_inflight.try_background_refresh(id) {
                 let pool = st.pool.clone();
@@ -3267,7 +3292,10 @@ async fn resolve_series_with_cached(
     let _guard = crate::request_budget::lock_cold_cache(&lock).await?;
 
     // Re-check after acquiring: a task we queued behind may have just refreshed it.
-    if let Some((m, true)) = crate::series_cache::get_series_fresh(&st.pool, id).await? {
+    if let Some((m, true)) = crate::series_cache::get_series_fresh(&st.pool, id)
+        .await?
+        .filter(|(m, _)| cache_belongs_to_engine(st, m.engine_generation.as_deref()))
+    {
         return Ok(m);
     }
 
@@ -3318,18 +3346,30 @@ async fn resolve_chapters_with_cached(
     cached: Option<(Vec<SuwayomiChapter>, bool)>,
     client: Option<&str>,
 ) -> anyhow::Result<Vec<SuwayomiChapter>> {
-    if let Some((cached, fresh)) = cached.filter(|(rows, _)| !rows.is_empty()) {
+    crate::engine_generation::wait(&st.pool).await?;
+    if let Some((cached, fresh)) = cached.filter(|(rows, _)| {
+        !rows.is_empty()
+            && rows
+                .iter()
+                .all(|c| cache_belongs_to_engine(st, c.engine_generation.as_deref()))
+    }) {
         if !fresh {
             if let Some((guard, slot)) = st.chapters_inflight.try_background_refresh(manga_id) {
                 let pool = st.pool.clone();
                 let client = st.suwayomi.clone();
                 tokio::spawn(async move {
                     let (_guard, _slot) = (guard, slot);
+                    if client.wait_for_generation().await.is_err() {
+                        return;
+                    }
+                    let generation = client.fence.as_ref().and_then(|f| f.generation());
                     if let Ok(refreshed) = client.chapters(manga_id).await {
                         let writer = pool.clone();
                         pool.defer(async move {
-                            crate::series_cache::put_chapters(&writer, manga_id, &refreshed)
-                                .await?;
+                            crate::series_cache::put_chapters_in_generation(
+                                &writer, manga_id, &refreshed, generation,
+                            )
+                            .await?;
                             Ok(())
                         });
                     }
@@ -3344,7 +3384,11 @@ async fn resolve_chapters_with_cached(
     let _guard = crate::request_budget::lock_cold_cache(&lock).await?;
 
     // Re-check after acquiring: a queued-behind task may have just refreshed.
-    let cached = crate::series_cache::get_chapters(&st.pool, manga_id).await?;
+    let cached = crate::series_cache::get_chapters(&st.pool, manga_id)
+        .await?
+        .into_iter()
+        .filter(|c| cache_belongs_to_engine(st, c.engine_generation.as_deref()))
+        .collect::<Vec<_>>();
     if !cached.is_empty() {
         let last = crate::series_cache::chapters_last_fetched(&st.pool, manga_id).await?;
         if crate::series_cache::is_fresh(last.as_deref(), crate::series_cache::CHAPTERS_TTL_SECS) {
@@ -3353,18 +3397,23 @@ async fn resolve_chapters_with_cached(
     }
 
     upstream_budget(client)?;
+    let generation = st.suwayomi.fence.as_ref().and_then(|f| f.generation());
     match st.suwayomi.chapters(manga_id).await {
         Ok(list) => {
             let pool = st.pool.clone();
             let cached = list.clone();
             st.pool.defer(async move {
-                crate::series_cache::put_chapters(&pool, manga_id, &cached).await?;
+                crate::series_cache::put_chapters_in_generation(
+                    &pool, manga_id, &cached, generation,
+                )
+                .await?;
                 Ok(())
             });
             Ok(list)
         }
         // Refetch failed: serve stale cached rows if we have any, else propagate.
         Err(e) => {
+            crate::engine_generation::wait(&st.pool).await?;
             if !cached.is_empty() {
                 Ok(cached)
             } else {
@@ -7172,6 +7221,9 @@ impl QueryRoot {
     #[graphql(complexity = "100 * child_complexity")]
     async fn chapters(&self, ctx: &Context<'_>, series_id: ID) -> Result<Vec<Chapter>> {
         let st = state(ctx);
+        crate::engine_generation::wait(&st.pool)
+            .await
+            .map_err(gql_err)?;
         let n = series_id.0.parse::<i64>().map_err(gql_err)?;
         // Gate the chapter list on the owning series' NSFW flag (same as `series`, N2).
         // On the parsed id, as in `series`.
@@ -7229,6 +7281,9 @@ impl QueryRoot {
     #[graphql(complexity = "100 * child_complexity")]
     async fn pages(&self, ctx: &Context<'_>, chapter_id: ID) -> Result<Vec<Page>> {
         let st = state(ctx);
+        crate::engine_generation::wait(&st.pool)
+            .await
+            .map_err(gql_err)?;
         let n = chapter_id.0.parse::<i64>().map_err(gql_err)?;
         // The NSFW flag lives on the owning series/work, not the chapter, and Suwayomi
         // chapters aren't mirrored locally — so resolve the manga id from the source and
@@ -7286,8 +7341,14 @@ impl QueryRoot {
         chapter_id: ID,
     ) -> Result<Option<ChapterOrigin>> {
         let st = state(ctx);
+        crate::engine_generation::wait(&st.pool)
+            .await
+            .map_err(gql_err)?;
         let n = chapter_id.0.parse::<i64>().map_err(gql_err)?;
-        let Some(origin) = st.suwayomi.chapter_origin(n).await.map_err(gql_err)? else {
+        let Some(origin) = crate::engine_keys::chapter_origin(&st.pool, &st.suwayomi, n)
+            .await
+            .map_err(gql_err)?
+        else {
             return Ok(None);
         };
         if canonical_is_nsfw(&st.pool, &origin.manga_id.to_string()).await
@@ -8294,6 +8355,23 @@ impl QueryRoot {
     /// `no_cache`: setup state and the sign-up switch change at runtime, so the
     /// anonymous GET path must not hand this to an edge or browser cache.
     #[graphql(cache_control(no_cache))]
+    /// Epoch to attach to queued numeric progress writes.
+    async fn numeric_epoch(&self, ctx: &Context<'_>) -> Result<i64> {
+        crate::engine_generation::numeric_epoch(&state(ctx).pool)
+            .await
+            .map_err(gql_read_err)
+    }
+
+    async fn engine_generation_state(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Vec<crate::engine_generation::GenerationState>> {
+        require_admin(ctx).await?;
+        crate::engine_generation::states(&state(ctx).pool)
+            .await
+            .map_err(gql_read_err)
+    }
+
     async fn instance(&self, ctx: &Context<'_>) -> Result<Instance> {
         use crate::instance as inst;
         let pool = &state(ctx).pool;
@@ -10659,8 +10737,16 @@ async fn set_progress_once(
     chapter_id: &str,
     last_page_read: i32,
     read: bool,
+    numeric_epoch: Option<i64>,
 ) -> anyhow::Result<bool> {
+    let numeric = !chapter_id.is_empty() && chapter_id.bytes().all(|b| b.is_ascii_digit());
+    if numeric {
+        crate::engine_generation::wait(pool).await?;
+    }
     let mut tx = pool.begin().await?;
+    if numeric {
+        crate::engine_generation::progress_guard(&mut tx, numeric_epoch).await?;
+    }
     lock_progress_owner(&mut tx, user_id, chapter_id).await?;
     // Canonical chapter ids are MangaDex uuids (not all-digits); persist their
     // progress in `canonical_progress`. Numeric Suwayomi ids fall through (CR6).
@@ -10744,6 +10830,7 @@ async fn set_progress_once(
             catch_up_suwayomi(&mut tx, user_id, &series_id, num, &now).await?;
         }
     }
+    crate::engine_generation::commit_ready(pool)?;
     tx.commit().await?;
     Ok(true)
 }
@@ -10753,11 +10840,18 @@ async fn set_chapter_read_once(
     user_id: &str,
     id: &str,
     read: bool,
+    numeric_epoch: Option<i64>,
 ) -> anyhow::Result<bool> {
     // Same id-shape routing as `set_progress` (CR6): numeric = Suwayomi, else MangaDex.
     let numeric = id.bytes().all(|b| b.is_ascii_digit());
+    if numeric {
+        crate::engine_generation::wait(pool).await?;
+    }
     let now = crate::db_types::format_date(Utc::now());
     let mut tx = pool.begin().await?;
+    if numeric {
+        crate::engine_generation::progress_guard(&mut tx, numeric_epoch).await?;
+    }
     lock_progress_owner(&mut tx, user_id, id).await?;
     if read {
         if numeric {
@@ -10815,6 +10909,9 @@ async fn set_chapter_read_once(
             .execute(&mut *tx)
             .await?;
         }
+        if numeric {
+            crate::engine_generation::commit_ready(pool)?;
+        }
         tx.commit().await?;
         return Ok(true);
     }
@@ -10869,6 +10966,9 @@ async fn set_chapter_read_once(
                 .execute(&mut *tx)
                 .await?;
         }
+    }
+    if numeric {
+        crate::engine_generation::commit_ready(pool)?;
     }
     tx.commit().await?;
     Ok(true)
@@ -11687,12 +11787,30 @@ impl MutationRoot {
         Ok(row.into())
     }
 
+    async fn start_new_engine_generation(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Vec<crate::engine_generation::GenerationState>> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let fence = st
+            .suwayomi
+            .fence
+            .as_ref()
+            .ok_or_else(|| Error::new("Engine fence is not configured"))?;
+        fence.start_new_generation().await.map_err(gql_err)?;
+        crate::engine_generation::states(&st.pool)
+            .await
+            .map_err(gql_read_err)
+    }
+
     async fn set_progress(
         &self,
         ctx: &Context<'_>,
         chapter_id: ID,
         last_page_read: i32,
         read: bool,
+        numeric_epoch: Option<i64>,
     ) -> Result<bool> {
         if last_page_read < 0 {
             return Err(Error::new("lastPageRead must be non-negative"));
@@ -11705,6 +11823,7 @@ impl MutationRoot {
                 &chapter_id.0,
                 last_page_read,
                 read,
+                numeric_epoch,
             )
         })
         .await
@@ -11737,6 +11856,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         chapter_id: ID,
         read: bool,
+        numeric_epoch: Option<i64>,
     ) -> Result<bool> {
         let st = state(ctx);
         let user = require_user(ctx).await?;
@@ -11744,9 +11864,11 @@ impl MutationRoot {
         if id.is_empty() || id.len() > 128 {
             return Err(Error::new("Invalid chapter id"));
         }
-        crate::db::retry_transaction(|| set_chapter_read_once(&st.pool, &user.id, id, read))
-            .await
-            .map_err(mutation_write_error)
+        crate::db::retry_transaction(|| {
+            set_chapter_read_once(&st.pool, &user.id, id, read, numeric_epoch)
+        })
+        .await
+        .map_err(mutation_write_error)
     }
 
     async fn post_review(&self, ctx: &Context<'_>, input: PostReviewInput) -> Result<Review> {
@@ -11889,7 +12011,13 @@ impl MutationRoot {
         // transaction, so a comment never ends up referencing media it failed to
         // link (or media stays orphaned after the comment committed).
         let (media, stored_target) = crate::db::retry_transaction(|| async {
+            if matches!(target_type, "series" | "chapter") && input.target_id.0.bytes().all(|b| b.is_ascii_digit()) {
+                crate::engine_generation::wait(&st.pool).await?;
+            }
             let mut tx = st.pool.begin().await?;
+            if matches!(target_type, "series" | "chapter") && input.target_id.0.bytes().all(|b| b.is_ascii_digit()) {
+                crate::engine_generation::shared(&mut tx, None).await?;
+            }
             crate::locks::lock_user(&mut tx, &user.id).await?;
             let sources = if target_type == "chapter" {
                 progress_sources_on(&mut tx, &input.target_id.0).await?
@@ -13978,6 +14106,11 @@ impl MutationRoot {
         require_admin(ctx).await?;
         let st_arc = ctx.data_unchecked::<std::sync::Arc<AppState>>().clone();
         let library = st_arc.suwayomi.library().await.map_err(gql_err)?;
+        for manga in &library {
+            crate::engine_keys::verify_snapshot(&st_arc.pool, manga, &[])
+                .await
+                .map_err(gql_err)?;
+        }
         let mut ids = Vec::with_capacity(library.len());
         let mut persisted = 0i32;
         let mut refused = 0i32;
@@ -13997,8 +14130,7 @@ impl MutationRoot {
                 }
                 Ok(false) => refused += 1,
                 Err(e) => {
-                    crate::db::observe_database_error(&e);
-                    tracing::warn!(series_id = m.id, error = %e, "persistCatalogue: series write failed")
+                    return Err(gql_err(e));
                 }
             }
         }
@@ -14007,10 +14139,19 @@ impl MutationRoot {
         let st_bg = st_arc.clone();
         tokio::spawn(async move {
             for id in ids {
+                if st_bg.suwayomi.wait_for_generation().await.is_err() {
+                    return;
+                }
+                let generation = st_bg.suwayomi.fence.as_ref().and_then(|f| f.generation());
                 match st_bg.suwayomi.chapters(id).await {
                     Ok(chapters) => {
-                        if let Err(error) =
-                            crate::series_cache::put_chapters(&st_bg.pool, id, &chapters).await
+                        if let Err(error) = crate::series_cache::put_chapters_in_generation(
+                            &st_bg.pool,
+                            id,
+                            &chapters,
+                            generation,
+                        )
+                        .await
                         {
                             crate::db::observe_database_error(&error);
                             tracing::warn!(series_id=id, %error, "persistCatalogue(bg): chapter write failed");
@@ -16657,6 +16798,7 @@ async fn add_source_series_core_ex(
     source: SourceNsfw,
 ) -> anyhow::Result<MatchResult> {
     let source_key = m.id.to_string();
+    crate::engine_keys::capture_manga(pool, m).await?;
 
     // DD2 idempotency, as a lock-free pre-check: a series that is already linked (the
     // usual case of a repeated bulk ingest) is answered from a reader connection, with
@@ -16690,6 +16832,7 @@ async fn add_source_series_core_ex(
     // Suwayomi carries no external tracker IDs (no AniList/MAL on MangaType), so
     // `external_ids` stays empty — the external-ID dedup rung is a no-op here.
     let enrolment = Enrolment {
+        generation: crate::engine_keys::token(m.engine_generation.as_deref())?,
         source_id: &m.source_id,
         source_key: &source_key,
         // The MangaDex Suwayomi extension carries the canonical MangaDex UUID in
@@ -16729,6 +16872,7 @@ async fn add_source_series_core_ex(
 
 /// Everything one enrolment needs, prepared before its transaction begins.
 struct Enrolment<'a> {
+    generation: Option<uuid::Uuid>,
     source_id: &'a str,
     source_key: &'a str,
     mangadex_uuid: Option<String>,
@@ -16767,6 +16911,7 @@ async fn enrol_source_series_once(
 ) -> anyhow::Result<MatchResult> {
     use crate::dedup::Decision;
     let Enrolment {
+        generation,
         source_id,
         source_key,
         mangadex_uuid,
@@ -16779,6 +16924,7 @@ async fn enrol_source_series_once(
     } = enrolment;
     let mangadex_uuid = mangadex_uuid.as_deref();
     let mut tx = pool.begin().await?;
+    crate::engine_generation::shared(&mut tx, *generation).await?;
     let mut keys = catalog::source_claim_keys("suwayomi", source_id, source_key);
     keys.extend(crate::dedup::match_domain_keys(candidate));
     keys.extend(catalog::create_work_keys(work));
@@ -16949,6 +17095,7 @@ async fn enrol_source_series_once(
     }
     #[cfg(test)]
     guard_pause("enrol-written").await;
+    crate::engine_generation::commit_ready(pool)?;
     tx.commit().await?;
 
     Ok(MatchResult {
@@ -17234,6 +17381,8 @@ mod tests {
         source_id: &str,
     ) -> crate::suwayomi::SuwayomiManga {
         crate::suwayomi::SuwayomiManga {
+            engine_generation: None,
+            real_url: None,
             id,
             title: title.into(),
             url: None,
@@ -18838,6 +18987,14 @@ mod tests {
         max: u32,
         engine_url: &str,
     ) -> (ApiSchema, Database, std::sync::Arc<AppState>) {
+        setup_with_engine_inner(max, engine_url, false).await
+    }
+
+    async fn setup_with_engine_inner(
+        max: u32,
+        engine_url: &str,
+        fenced: bool,
+    ) -> (ApiSchema, Database, std::sync::Arc<AppState>) {
         let pool = TestPoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -18888,12 +19045,20 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        let covers = crate::database::SqliteDatabase::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut suwayomi = crate::suwayomi::SuwayomiClient::new(engine_url.into(), None, None);
+        if fenced {
+            sqlx::raw_sql("CREATE TABLE suwayomi_cover_blob(manga_id INTEGER PRIMARY KEY,webp BLOB,updated_at TEXT); CREATE TABLE cover_variant(asset_key TEXT,width INTEGER,webp BLOB)").execute(&covers).await.unwrap();
+            crate::engine_generation::Fence::attach(&pool, &covers, &mut suwayomi)
+                .await
+                .unwrap();
+        }
         let state = std::sync::Arc::new(AppState {
             pool: pool.clone(),
-            cover_pool: crate::database::SqliteDatabase::connect("sqlite::memory:")
-                .await
-                .unwrap(),
-            suwayomi: crate::suwayomi::SuwayomiClient::new(engine_url.into(), None, None),
+            cover_pool: covers,
+            suwayomi,
             mangadex: std::sync::Arc::new(crate::mangadex::MangaDexClient::new(
                 "test-ua", 5.0, 40.0,
             )),
@@ -18913,6 +19078,310 @@ mod tests {
             setup_code: crate::instance::SetupCode::default(),
         });
         (build_schema(state.clone(), false), pool, state)
+    }
+
+    #[tokio::test]
+    async fn engine_generation_series_refresh_and_persist_catalogue_abort_moved_keys() {
+        use crate::engine_generation::tests::{manga_json, MockEngine};
+        let engine = MockEngine::spawn().await;
+        let (schema, pool, state) = setup_with_engine_inner(100, &engine.url, true).await;
+        let m = state.suwayomi.series(7).await.unwrap();
+        crate::series_cache::put_series(&pool, &m).await.unwrap();
+        let before: String =
+            sqlx::query_scalar("SELECT xmin::text FROM suwayomi_series WHERE id=7")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        engine.data.lock().await.mangas[0]["sourceId"] = serde_json::json!("another-source");
+        let result = exec(
+            &schema,
+            "mutation { persistCatalogue }",
+            Some("admintok"),
+            "generation-persist",
+        )
+        .await;
+        assert_eq!(
+            result.errors[0].extensions.as_ref().unwrap().get("code"),
+            Some(&async_graphql::Value::String("ENGINE_UNAVAILABLE".into()))
+        );
+        let after: String = sqlx::query_scalar("SELECT xmin::text FROM suwayomi_series WHERE id=7")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(before, after);
+        engine.data.lock().await.mangas = vec![manga_json(7)];
+        state.suwayomi.fence.as_ref().unwrap().check().await;
+        sqlx::query("UPDATE suwayomi_series SET series_fetched_at='2000-01-01T00:00:00Z'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before: String =
+            sqlx::query_scalar("SELECT xmin::text FROM suwayomi_series WHERE id=7")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        {
+            let mut d = engine.data.lock().await;
+            d.mangas[0]["sourceId"] = serde_json::json!("another-source");
+            d.mangas[0]["title"] = serde_json::json!("Must not publish");
+        }
+        let cached = resolve_series_cached(&state, 7).await.unwrap();
+        assert_eq!(cached.title, "Series");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let quarantined: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM engine_generation WHERE state='quarantined')",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if quarantined {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let after: String = sqlx::query_scalar("SELECT xmin::text FROM suwayomi_series WHERE id=7")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn engine_generation_admin_state_numeric_quarantine_and_progress_epochs() {
+        use crate::engine_generation::tests::{chapter_json, manga_json, MockEngine};
+        let engine = MockEngine::spawn().await;
+        let (schema, pool, state) = setup_with_engine_inner(100, &engine.url, true).await;
+        let (m, c) = state.suwayomi.series_and_chapters(7).await.unwrap();
+        crate::series_cache::put_series(&pool, &m).await.unwrap();
+        crate::series_cache::put_chapters(&pool, 7, &c)
+            .await
+            .unwrap();
+        let old_series_cache = crate::series_cache::get_series_fresh(&pool, 7)
+            .await
+            .unwrap();
+        let old_chapter_cache = crate::series_cache::get_chapters_fresh_batch(&pool, &[7])
+            .await
+            .unwrap()
+            .remove(&7);
+        let old_mapping = add_source_series_core_ex(
+            &pool,
+            &m,
+            None,
+            false,
+            SourceNsfw {
+                adult: false,
+                pinned: false,
+            },
+        )
+        .await
+        .unwrap();
+        let fence = state.suwayomi.fence.as_ref().unwrap();
+        let progress = exec(
+            &schema,
+            r#"mutation { setProgress(chapterId:"8",lastPageRead:2,read:true) }"#,
+            Some("bobtok"),
+            "generation-test",
+        )
+        .await;
+        assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+        let comment=exec(&schema,r#"mutation { postComment(input:{targetType:"series",targetId:"7",body:"kept thread",hasSpoiler:false}) { id } }"#,Some("bobtok"),"generation-test").await;
+        assert!(comment.errors.is_empty(), "{:?}", comment.errors);
+        let root = comment.data.into_json().unwrap()["postComment"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let reply=exec(&schema,&format!(r#"mutation {{ postComment(input:{{targetType:"series",targetId:"7",parentId:"{root}",body:"kept reply",hasSpoiler:false}}) {{ id }} }}"#),Some("admintok"),"generation-test").await;
+        assert!(reply.errors.is_empty(), "{:?}", reply.errors);
+        let chapter_comment=exec(&schema,r#"mutation { postComment(input:{targetType:"chapter",targetId:"8",body:"kept chapter thread",hasSpoiler:false}) { id } }"#,Some("bobtok"),"generation-test").await;
+        assert!(
+            chapter_comment.errors.is_empty(),
+            "{:?}",
+            chapter_comment.errors
+        );
+        sqlx::query("INSERT INTO comment_votes(comment_id,user_id,value,created_at) VALUES($1,'964771b0-a2fb-4849-857a-6198947115ec',1,now())").bind(uuid::Uuid::parse_str(&root).unwrap()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO comment_media(id,comment_id,user_id,webp,width,height,created_at) VALUES($1,$2,'ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c',$3,1,1,now())").bind(uuid::Uuid::new_v4()).bind(uuid::Uuid::parse_str(&root).unwrap()).bind(vec![1_u8]).execute(&pool).await.unwrap();
+        // Source keys with a copied marker but colliding numbers detect a logical restore.
+        engine.data.lock().await.mangas[0]["sourceId"] = serde_json::json!("other-source");
+        fence.check().await;
+        for query in [
+            r#"{ chapters(seriesId:"7") { id } }"#,
+            r#"{ pages(chapterId:"8") { index } }"#,
+            r#"{ chapterOrigin(chapterId:"8") { sourceId } }"#,
+        ] {
+            let r = exec(&schema, query, None, "generation-read").await;
+            assert_eq!(
+                r.errors[0].extensions.as_ref().unwrap().get("code"),
+                Some(&async_graphql::Value::String("ENGINE_UNAVAILABLE".into())),
+                "{:?}",
+                r.errors
+            );
+        }
+        let media = crate::serve_suwayomi_image(
+            axum::extract::State(state.clone()),
+            axum::extract::State(crate::CoverDb(state.cover_pool.clone())),
+            axum::extract::Path("7/thumbnail".into()),
+            axum::extract::RawQuery(None),
+        )
+        .await;
+        assert_eq!(media.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(media.headers()[axum::http::header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .contains("no-store"));
+        assert!(!exec(
+            &schema,
+            "{ engineGenerationState { id state reason since unfenced } }",
+            Some("bobtok"),
+            "generation-admin"
+        )
+        .await
+        .errors
+        .is_empty());
+        assert!(exec(
+            &schema,
+            "{ engineGenerationState { id state reason since unfenced } }",
+            Some("admintok"),
+            "generation-admin"
+        )
+        .await
+        .errors
+        .is_empty());
+        assert!(!exec(
+            &schema,
+            "mutation { startNewEngineGeneration { state } }",
+            Some("bobtok"),
+            "generation-admin"
+        )
+        .await
+        .errors
+        .is_empty());
+        let changed = exec(
+            &schema,
+            "mutation { startNewEngineGeneration { state } }",
+            Some("admintok"),
+            "generation-admin",
+        )
+        .await;
+        assert!(changed.errors.is_empty(), "{:?}", changed.errors);
+        let counts:(i64,i64,i64,i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM suwayomi_progress),(SELECT count(*) FROM suwayomi_progress_detached),(SELECT count(*) FROM comments WHERE target_type='detached_series'),(SELECT count(*) FROM comment_votes),(SELECT count(*) FROM comment_media)").fetch_one(&pool).await.unwrap();
+        assert_eq!(counts, (0, 1, 2, 1, 1));
+        let old_mapping_gone: bool =
+            sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM source_series WHERE id=$1)")
+                .bind(&old_mapping.source_series_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(old_mapping_gone);
+        let work_kept: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work WHERE id=$1)")
+            .bind(&old_mapping.work_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(work_kept);
+        let detached_chapter: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM comments WHERE target_type='detached_chapter'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(detached_chapter, 1);
+
+        let replies: i64 = sqlx::query_scalar("SELECT count(*) FROM comments WHERE parent_id=$1")
+            .bind(uuid::Uuid::parse_str(&root).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(replies, 1);
+        let notifications: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM notifications WHERE target_type='detached_series'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(notifications > 0);
+        let epoch = exec(&schema, "{ numericEpoch }", None, "generation-read").await;
+        assert_eq!(epoch.data.into_json().unwrap()["numericEpoch"], 1);
+        for mutation in [
+            r#"setProgress(chapterId:"8",lastPageRead:3,read:true)"#,
+            r#"setProgress(chapterId:"8",lastPageRead:3,read:true,numericEpoch:0)"#,
+            r#"setChapterRead(chapterId:"8",read:true,numericEpoch:0)"#,
+        ] {
+            let r = exec(
+                &schema,
+                &format!("mutation {{ {mutation} }}"),
+                Some("bobtok"),
+                "generation-write",
+            )
+            .await;
+            assert_eq!(
+                r.errors[0].extensions.as_ref().unwrap().get("code"),
+                Some(&async_graphql::Value::String("STALE_NUMERIC_EPOCH".into()))
+            );
+        }
+        // Enroll the new numbers through the ordinary paths, then only the new
+        // epoch can write and the predecessor's thread cannot appear there.
+        {
+            let mut d = engine.data.lock().await;
+            d.mangas = vec![manga_json(7)];
+            d.chapters = vec![chapter_json(8, 7)];
+        }
+        let (m, c) = state.suwayomi.series_and_chapters(7).await.unwrap();
+        crate::series_cache::put_series(&pool, &m).await.unwrap();
+        crate::series_cache::put_chapters(&pool, 7, &c)
+            .await
+            .unwrap();
+        let refreshed = resolve_series_with_cached(&state, 7, old_series_cache, None)
+            .await
+            .unwrap();
+        assert_eq!(refreshed.engine_generation, m.engine_generation);
+        let refreshed = resolve_chapters_with_cached(&state, 7, old_chapter_cache, None)
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].engine_generation, c[0].engine_generation);
+        let enrolled = add_source_series_core_ex(
+            &pool,
+            &m,
+            None,
+            false,
+            SourceNsfw {
+                adult: false,
+                pinned: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(enrolled.source_series_id, old_mapping.source_series_id);
+        let r = exec(
+            &schema,
+            r#"mutation { setProgress(chapterId:"8",lastPageRead:3,read:true,numericEpoch:1) }"#,
+            Some("bobtok"),
+            "generation-write",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let visible: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM comments WHERE target_type='series' AND target_id='7'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(visible, 0);
+        sqlx::query("UPDATE engine_numeric_state SET changed_at=now()-interval '31 days'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let r = exec(
+            &schema,
+            r#"mutation { setChapterRead(chapterId:"8",read:true) }"#,
+            Some("bobtok"),
+            "generation-write",
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
     }
 
     #[tokio::test]
@@ -19020,7 +19489,7 @@ mod tests {
             200,
             "application/json",
             br##"{"data":{"chapters":{"nodes":[{"url":"#/viewer/1030381",
-                "realUrl":"https://mangaplus.shueisha.co.jp/viewer/1030381","mangaId":77,
+                "realUrl":"https://mangaplus.shueisha.co.jp/viewer/1030381","sourceOrder":5,"mangaId":77,
                 "manga":{"url":"#/titles/100020",
                          "realUrl":"https://mangaplus.shueisha.co.jp/titles/100020",
                          "title":"One Piece","sourceId":"src-9"}}]}}}"##
@@ -19093,6 +19562,11 @@ mod tests {
         let r = exec(&s, Q, Some("bobtok"), "1.1.1.1").await;
         assert!(r.errors.is_empty(), "unexpected: {:?}", r.errors);
         assert!(data_json(&r).contains("#/viewer/1030381"));
+        assert_eq!(
+            engine.hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "stored origins still pass the NSFW gate without another engine request"
+        );
     }
 
     /// One reply that answers every engine document the ingest and extension paths
@@ -19127,7 +19601,7 @@ mod tests {
                 "repo": "https://example.org/index.pb"
             } },
             "chapters": { "nodes": [{
-                "url": "/ch/1", "mangaId": 501,
+                "url": "/ch/1", "sourceOrder": 0, "mangaId": 501,
                 "manga": { "url": "/series/quiet", "title": "Quiet Office Days",
                            "sourceId": "1534" }
             }] }
@@ -24469,6 +24943,11 @@ mod tests {
             &pool,
             777,
             &[crate::suwayomi::SuwayomiChapter {
+                engine_generation: None,
+                manga: None,
+                url: None,
+                real_url: None,
+                source_order: None,
                 id: 9001,
                 manga_id: 777,
                 name: "Ch 1".into(),
@@ -24618,6 +25097,11 @@ mod tests {
             &pool,
             778,
             &[crate::suwayomi::SuwayomiChapter {
+                engine_generation: None,
+                manga: None,
+                url: None,
+                real_url: None,
+                source_order: None,
                 id: 9101,
                 manga_id: 778,
                 name: "Ch 1".into(),
@@ -25015,6 +25499,11 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, id)| crate::suwayomi::SuwayomiChapter {
+                    engine_generation: None,
+                    manga: None,
+                    url: None,
+                    real_url: None,
+                    source_order: None,
                     id: *id,
                     manga_id: 778,
                     name: format!("Ch {}", i + 1),
@@ -30157,6 +30646,8 @@ mod tests {
         // X4: exact-title matches sort first; ties keep incoming (source) order, so
         // the ranking is deterministic regardless of fan-out completion order.
         let mk = |id: i64, title: &str| crate::suwayomi::SuwayomiManga {
+            engine_generation: None,
+            real_url: None,
             id,
             title: title.into(),
             url: None,

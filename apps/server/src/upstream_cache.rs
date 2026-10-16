@@ -87,6 +87,12 @@ impl<V: Clone> TtlMemo<V> {
         }
     }
 
+    /// Drop the registry too, so an in-flight fill cannot repopulate a new generation.
+    pub(crate) fn clear(&self) {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.stats.set_entries(0);
+    }
+
     /// Inspect only an initialized, unexpired answer; do not allocate a slot for
     /// a miss or let a probe extend its lifetime.
     pub(crate) fn has_value(&self, key: &str) -> bool {

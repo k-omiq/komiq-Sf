@@ -6,6 +6,7 @@
 	import '$lib/theme.css';
 	import '$lib/app.css';
 	import { page } from '$app/state';
+	import { onMount } from 'svelte';
 	import { isTauri } from '@komika/api';
 	import { auth, initAuth } from '$lib/auth.svelte';
 	import { initTheme } from '$lib/theme.svelte';
@@ -18,6 +19,12 @@
 	import NotSetUp from '$lib/components/NotSetUp.svelte';
 
 	let { children } = $props();
+
+	// Entry imports and the initial route have loaded before the root mounts.
+	// End bootstrap recovery and let a later deployment reload once again.
+	onMount(() => {
+		window.dispatchEvent(new Event('komiq:started'));
+	});
 
 	// Site-wide head defaults. A route that describes ITSELF (the series page) sets
 	// `ownsMeta` in its `load`, and we stand down for the overridable meta tags — <head>

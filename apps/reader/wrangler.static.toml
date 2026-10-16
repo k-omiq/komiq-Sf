@@ -1,0 +1,10 @@
+# Pure hosted SPA. Build with KOMIKA_TARGET=static. There is no main/script or
+# ASSETS binding: all requests stay in Workers Assets, including series links.
+name = "komika-reader-static"
+compatibility_date = "2024-11-06"
+workers_dev = false
+# No routes: the operator adds a test hostname when ready.
+
+[assets]
+directory = "build"
+not_found_handling = "single-page-application"

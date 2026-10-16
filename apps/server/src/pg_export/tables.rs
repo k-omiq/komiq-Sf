@@ -18,12 +18,37 @@ use crate::pg_import::plan::{self, Table};
 pub(super) const TARGETS: [i64; 2] = [121, 122];
 
 /// PostgreSQL-only user tables that the old SQLite schema cannot preserve.
-/// Every entry in `plan::POSTGRES_ONLY` needs an explicit rollback disposition:
-/// an empty table may be omitted and reported, but rows must never be lost.
-pub(super) const UNSUPPORTED_POSTGRES_ONLY: &[(&str, &str)] = &[(
-    "scanlator_rating",
-    "reader ratings have no representation in the kept SQLite schema",
-)];
+/// Nonempty tables in this disposition prevent rollback.
+pub(super) const UNSUPPORTED_POSTGRES_ONLY: &[(&str, &str)] = &[
+    (
+        "suwayomi_progress_detached",
+        "detached numeric reading progress has no representation in SQLite",
+    ),
+    (
+        "engine_numeric_state",
+        "SQLite cannot preserve the generation fence for queued numeric writes",
+    ),
+    (
+        "scanlator_rating",
+        "reader ratings have no representation in the kept SQLite schema",
+    ),
+];
+
+/// Engine-derived identities are omitted even when populated, with counts in the report.
+pub(super) const REBUILDABLE_POSTGRES_ONLY: &[(&str, &str)] = &[
+    (
+        "engine_generation",
+        "adopted again when the PostgreSQL server starts",
+    ),
+    (
+        "engine_manga_key",
+        "source-native manga keys refill from the engine",
+    ),
+    (
+        "engine_chapter_key",
+        "source-native chapter keys refill from the engine",
+    ),
+];
 
 /// Derived search and migration/import state have no user rows to export.
 pub(super) const REQUIRED_POSTGRES_INTERNAL: &[&str] = &[

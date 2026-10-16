@@ -1,7 +1,7 @@
 use super::{
     convert::{date_text, value, Value},
     export::{self, Arguments, Report},
-    tables::{copied, is_copied, TABLES, UNSUPPORTED_POSTGRES_ONLY},
+    tables::{copied, is_copied, REBUILDABLE_POSTGRES_ONLY, TABLES, UNSUPPORTED_POSTGRES_ONLY},
     template,
 };
 use crate::pg_import::{
@@ -294,6 +294,7 @@ fn classification_covers_the_import_plan() {
     assert_eq!(
         UNSUPPORTED_POSTGRES_ONLY
             .iter()
+            .chain(REBUILDABLE_POSTGRES_ONLY)
             .map(|(name, _)| *name)
             .collect::<BTreeSet<_>>(),
         plan::POSTGRES_ONLY
@@ -304,7 +305,13 @@ fn classification_covers_the_import_plan() {
     );
     assert!(UNSUPPORTED_POSTGRES_ONLY
         .iter()
+        .chain(REBUILDABLE_POSTGRES_ONLY)
         .all(|(_, reason)| !reason.is_empty()));
+    let unsupported: BTreeSet<_> = UNSUPPORTED_POSTGRES_ONLY.iter().map(|(n, _)| n).collect();
+    let rebuildable: BTreeSet<_> = REBUILDABLE_POSTGRES_ONLY.iter().map(|(n, _)| n).collect();
+    assert!(unsupported.is_disjoint(&rebuildable));
+    assert_eq!(unsupported.len(), UNSUPPORTED_POSTGRES_ONLY.len());
+    assert_eq!(rebuildable.len(), REBUILDABLE_POSTGRES_ONLY.len());
     assert_eq!(TABLES.iter().filter(|(_, copied, _)| *copied).count(), 24);
     // No table outside the copied set has a foreign key into it: replacing the
     // copied tables cannot break a row the export does not write.
@@ -1402,7 +1409,13 @@ async fn empty_postgres_only_tables_are_reported_and_keep_both_sqlite_levels_sup
         let report = export::run(&args, None).await.unwrap();
         assert!(report.complete);
         assert_eq!(report.target_sqlite_migration, level);
-        assert_eq!(report.postgres_only_not_copied.len(), 1);
+        assert_eq!(
+            report.postgres_only_not_copied.len(),
+            plan::POSTGRES_ONLY.len()
+        );
+        for (name, _) in REBUILDABLE_POSTGRES_ONLY {
+            assert_eq!(report.postgres_only_not_copied[*name], 0);
+        }
         assert_eq!(report.postgres_only_not_copied["scanlator_rating"], 0);
         let report = serde_json::to_value(report).unwrap();
         assert_eq!(report["postgres_only_not_copied"]["scanlator_rating"], 0);
@@ -1420,6 +1433,46 @@ async fn empty_postgres_only_tables_are_reported_and_keep_both_sqlite_levels_sup
         assert_eq!(has_ratings, 0);
         output.close().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn nonempty_rebuildable_tables_are_omitted_and_reported() {
+    let scratch = Scratch::new();
+    let database = crate::test_postgres::empty_database().unwrap();
+    let kept = kept_file(&scratch, 121).await;
+    cut_over(&scratch, &kept, &database.url).await;
+    let mut pg = PgConnection::connect(&database.url).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO engine_generation(id,first_seen,last_seen,state) VALUES ('00000000-0000-4000-8000-000000000001', now(), now(), 'active');
+         INSERT INTO engine_manga_key VALUES ('00000000-0000-4000-8000-000000000001', 7, 'source', '/manga', NULL, 'Engine title', now());
+         INSERT INTO engine_chapter_key VALUES
+           ('00000000-0000-4000-8000-000000000001', 8, 7, 0, '/chapter/8', NULL, now()),
+           ('00000000-0000-4000-8000-000000000001', 9, 7, 1, '/chapter/9', 'https://example.org/chapter/9', now());",
+    ).execute(&mut pg).await.unwrap();
+    let args = arguments(&scratch, &kept, &database.url);
+    let report = export::run(&args, None).await.unwrap();
+    assert!(report.complete);
+    for (name, count) in [
+        ("engine_generation", 1),
+        ("engine_manga_key", 1),
+        ("engine_chapter_key", 2),
+    ] {
+        assert_eq!(report.postgres_only_not_copied[name], count);
+        let preserved: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {name}"))
+            .fetch_one(&mut pg)
+            .await
+            .unwrap();
+        assert_eq!(preserved, count);
+    }
+    let mut output = sqlite(&args.output, false).await;
+    let tables: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM sqlite_schema WHERE name LIKE 'engine_%'")
+            .fetch_one(&mut output)
+            .await
+            .unwrap();
+    assert_eq!(tables, 0);
+    output.close().await.unwrap();
+    pg.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -1898,4 +1951,59 @@ async fn command_line_writes_the_report_and_fails_without_an_output() {
     ])
     .await
     .is_err());
+}
+
+#[tokio::test]
+async fn engine_generation_detached_progress_and_epoch_refuse_export() {
+    for table in ["suwayomi_progress_detached", "engine_numeric_state"] {
+        let scratch = Scratch::new();
+        let database = crate::test_postgres::empty_database().unwrap();
+        let kept = kept_file(&scratch, 121).await;
+        let kept_sha256 = template::sha256(&kept).unwrap();
+        cut_over(&scratch, &kept, &database.url).await;
+        let mut pg = PgConnection::connect(&database.url).await.unwrap();
+        if table == "engine_numeric_state" {
+            sqlx::query("INSERT INTO engine_numeric_state VALUES(true,1,now())")
+                .execute(&mut pg)
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("INSERT INTO engine_generation(id,first_seen,last_seen,state) VALUES('00000000-0000-4000-8000-000000000001',now(),now(),'detached')").execute(&mut pg).await.unwrap();
+            sqlx::query("INSERT INTO suwayomi_progress_detached VALUES('00000000-0000-4000-8000-000000000001',$1,'8','7',2,true,now())").bind(uuid::Uuid::parse_str(READER).unwrap()).execute(&mut pg).await.unwrap();
+        }
+        let args = arguments(&scratch, &kept, &database.url);
+        let error = refusal(&args).await;
+        assert!(
+            error.contains(&format!("{table}: 1 rows would be lost")),
+            "{error}"
+        );
+        assert_nothing_written(&args, &kept_sha256);
+    }
+}
+
+#[tokio::test]
+async fn engine_generation_detached_comment_targets_export_as_text_with_threads_intact() {
+    let scratch = Scratch::new();
+    let database = crate::test_postgres::empty_database().unwrap();
+    let kept = kept_file(&scratch, 122).await;
+    cut_over(&scratch, &kept, &database.url).await;
+    let mut pg = PgConnection::connect(&database.url).await.unwrap();
+    sqlx::query("INSERT INTO comments(id,target_type,target_id,user_id,body,created_at) VALUES('00000000-0000-4000-8000-000000001191','detached_chapter','old-generation:8',$1,'kept detached comment',now())").bind(uuid::Uuid::parse_str(READER).unwrap()).execute(&mut pg).await.unwrap();
+    sqlx::query("INSERT INTO comments(id,target_type,target_id,user_id,body,created_at,parent_id) VALUES('00000000-0000-4000-8000-000000001192','detached_chapter','old-generation:8',$1,'kept reply',now(),'00000000-0000-4000-8000-000000001191')").bind(uuid::Uuid::parse_str(READER).unwrap()).execute(&mut pg).await.unwrap();
+    let args = arguments(&scratch, &kept, &database.url);
+    assert!(export::run(&args, None).await.unwrap().complete);
+    let mut output = sqlite(&args.output, false).await;
+    let count:i64=sqlx::query_scalar("SELECT count(*) FROM comments WHERE target_type='detached_chapter' AND target_id='old-generation:8'").fetch_one(&mut output).await.unwrap();
+    assert_eq!(count, 2);
+    let parent: Option<String> = sqlx::query_scalar(
+        "SELECT parent_id FROM comments WHERE id='00000000-0000-4000-8000-000000001192'",
+    )
+    .fetch_one(&mut output)
+    .await
+    .unwrap();
+    assert_eq!(
+        parent.as_deref(),
+        Some("00000000-0000-4000-8000-000000001191")
+    );
+    output.close().await.unwrap();
 }

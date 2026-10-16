@@ -54,7 +54,7 @@ KOMIQ_IMAGE=komiq-selfhost:komiq-pre-postgres docker compose \
   up -d --no-build --no-deps server
 ```
 
-If none was saved, use your previous release image or its archive: this repository specifies no published SQLite tag. Add your HTTPS and certificate-check Compose files if you used them. After a successful conversion and new writes, the kept SQLite file is behind and cannot restore your latest reading history. Use a current PostgreSQL backup instead. Do not return to an older SQLite release once PostgreSQL holds data it cannot store, such as scanlator ratings: the export back to SQLite refuses and writes no file. Keep PostgreSQL and its backups.
+If none was saved, use your previous release image or its archive: this repository specifies no published SQLite tag. Add your HTTPS and certificate-check Compose files if you used them. After a successful conversion and new writes, the kept SQLite file is behind and cannot restore your latest reading history. Use a current PostgreSQL backup instead. Do not return to an older SQLite release once PostgreSQL holds data it cannot store, such as scanlator ratings: the export back to SQLite refuses and writes no file. The export does leave out the stored source keys (the source engine's own manga and chapter keys), even when they hold rows, because the server captures them again from the engine. Its report lists how many rows it left out. Keep PostgreSQL and its backups.
 
 ## Where data lives
 
@@ -82,7 +82,9 @@ Run it as a host user that can access Docker. The job needs `flock` or Perl and 
 
 ## Restore into a fresh install
 
-Copy the repository and create a private `.env` with a random `KOMIQ_DB_PASSWORD`, as described in [Install with Docker](/self-host/docker). Start only the database, restore into its empty `komiq` database, then start the rest:
+A complete restore needs the **engine volume archive too**, alongside the PostgreSQL dump. The dump does not contain the engine's numeric series and chapter identities. Restore the `komiq_engine-data` archive before starting the server and engine. An engine's logical backup can renumber those identities, so it is not a substitute for the volume archive.
+
+Copy the repository and create a private `.env` with a random `KOMIQ_DB_PASSWORD`, as described in [Install with Docker](/self-host/docker). Start only the database and restore into its empty `komiq` database:
 
 ```sh
 cd deploy/selfhost
@@ -91,10 +93,9 @@ docker compose up -d --wait postgres
 docker compose exec -T postgres sh -c \
   'PGPASSWORD="$KOMIQ_DB_PASSWORD" exec pg_restore -h 127.0.0.1 -U komiq -d komiq --no-owner --no-acl --exit-on-error' \
   < "$DUMP"
-docker compose up -d
 ```
 
-Restore before starting the server so its migrations do not create conflicting tables. Check the restore exit status, then inspect your library.
+Restore before starting the server so its migrations do not create conflicting tables. Check the restore exit status. Restore the engine volume archive using the next section, then start the rest with `docker compose up -d` and inspect your library.
 
 ### Server and engine files
 
@@ -112,6 +113,16 @@ docker compose start
 ```
 
 On a fresh restore, create these volumes with `docker compose create` and extract each archive with a temporary container. Set server file ownership to user ID `10001` and engine file ownership to `1000` before starting. The cover cache can be omitted and fetched again. Never treat a copied live PostgreSQL data directory as a database dump.
+
+### If the engine was replaced
+
+The server checks an engine marker and stored source identities. If a fresh, rebuilt or logically restored engine does not match PostgreSQL, it quarantines numeric engine data. Readers get a retryable unavailable error for those chapters, pages and thumbnails. The server log says `engine quarantined` and gives the reason. Admins can read `engineGenerationState { id state reason since unfenced }` through GraphQL. The admin console screen for this state is not available yet.
+
+Restore the matching engine volume to resume automatically. If only its marker was lost and its source identities still match, run `komika-server engine reattach` in the server container. It checks all stored bindings and refuses different data.
+
+If you intend to keep the replacement engine, run `komika-server engine start-new-generation`, or use the admin GraphQL mutation `startNewEngineGeneration { id state }`. The server sets numeric reading progress aside, kept but no longer shown, and detaches old numeric comment threads with their replies and attachments. Works, work-level libraries and MangaDex progress stay. Scan or add the new engine's series again. Numeric progress from apps that send no generation epoch is refused for 30 days; an explicitly stale epoch is always refused. SQLite reverse export refuses while detached progress or the queued-write epoch exists.
+
+An older engine without global metadata support runs with a warning, source-identity checks and write guards. Its marker protection is unavailable.
 
 ## Stop or remove komiq
 

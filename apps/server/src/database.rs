@@ -20,6 +20,8 @@ pub struct Database {
     foreground_writer: PgPool,
     lane: WriteLane,
     deferred: Arc<DeferredWrites>,
+    pub(crate) engine_fence:
+        Arc<std::sync::OnceLock<std::sync::Weak<crate::engine_generation::Fence>>>,
     // Keep the disposable native PostgreSQL database alive for every pool clone.
     #[cfg(test)]
     _temporary: Option<Arc<crate::test_postgres::DisposableDatabase>>,
@@ -314,6 +316,7 @@ impl Database {
             foreground_writer,
             lane: WriteLane::Background,
             deferred,
+            engine_fence: Arc::default(),
             #[cfg(test)]
             _temporary: temporary,
             #[cfg(test)]

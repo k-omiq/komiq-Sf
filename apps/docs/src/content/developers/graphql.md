@@ -88,7 +88,7 @@ These operations retrieve comic metadata, chapter lists, page image links and se
 - `aggregatedChapters`: chapters deduplicated by number across all sources.
 - `pages`: page image URLs for a Suwayomi chapter.
 - `canonicalPages`: page image URLs for a mirrored chapter.
-- `chapterOrigin`: for a Suwayomi chapter, the source ID, the source's own manga and chapter keys, and the extension that provides the source. A reader app with its own engine uses them to find the same chapter there. It follows the same adult-content rule as `pages`.
+- `chapterOrigin`: for a Suwayomi chapter, the source ID, the source's own manga and chapter keys, and the extension that provides the source. A reader app with its own engine uses them to find the same chapter there. The server answers from keys it stored earlier and asks the source engine only when it has none. It follows the same adult-content rule as `pages`.
 
 The `search` query supports both full-text search and structured catalog browsing. When the `query` argument is empty, it queries the materialized `browse_catalogue` table:
 

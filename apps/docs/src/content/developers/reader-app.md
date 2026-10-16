@@ -3,19 +3,18 @@ title: The reader app
 description: Learn how the reader chooses a server and handles build targets, routes, data fetching, rendering and strip reading.
 ---
 
-The reader app in `apps/reader` is what you read with. It connects to a komiq server on your local network or one on the internet. It runs across web, desktop and mobile platforms from one codebase.
-
-The app supports public catalog browsing, social discussions, personal library tracking, and chapter reading. Depending on how you run it, the reader executes as an edge-rendered web app on Cloudflare Workers, a static single-page application inside [Tauri](/self-host/desktop-app), or an embedded web interface served directly by the backend server.
+The reader app in `apps/reader` connects to a komiq server on your local network or the internet. One codebase supplies the web app, native apps inside [Tauri](/self-host/desktop-app), and the embedded reader served by the server.
 
 ## Build targets
 
-The reader builds for three targets from the same source tree. Target selection is controlled in `apps/reader/vite.config.ts`:
+The reader builds for four targets from the same source tree. Target selection is controlled in `apps/reader/vite.config.ts`:
 
-- `web`: The default target for `pnpm build`. It uses `@sveltejs/adapter-cloudflare` to output an edge Worker script (`_worker.js`) and static assets. Public catalog pages are server-rendered at the edge for fast delivery.
+- `web`: The default target for `pnpm build`. It uses `@sveltejs/adapter-cloudflare` to output an edge Worker script (`_worker.js`), an `index.html` shell and static assets in `.svelte-kit/cloudflare`. Only `/series/*` reaches the Worker for server-side rendering (SSR), which supplies text and share previews in the HTML. Other documents use the shell and render in the browser.
+- `static`: Setting `KOMIKA_TARGET=static` selects `@sveltejs/adapter-static`, with fallback `index.html` in `build`. It uses the same public configuration and runtime behavior as `web`, with SSR disabled for every route. Series links then have no server-rendered share preview. `wrangler.static.toml` contains no Worker script or assets binding. It uses `komika-reader-static`, with no routes and `workers_dev = false`; an operator adds a test hostname when ready.
 - `tauri`: Used when building desktop and mobile packages. Setting `KOMIKA_TARGET=tauri` or detecting `TAURI_ENV_PLATFORM` selects `@sveltejs/adapter-static` with fallback `index.html`. This produces a pure client-side single-page application without a Node.js or edge server runtime.
 - `embedded`: Used when the backend server hosts the reader directly. Setting `KOMIKA_TARGET=embedded` builds a static single-page application configured to talk to the same host origin at `/graphql`.
 
-Vite defines two compile-time constants during the build: `__KOMIKA_TARGET__` records the build target, and `__KOMIKA_SSR__` indicates whether server-side rendering is enabled.
+Vite defines two compile-time constants during the build: `__KOMIKA_TARGET__` records the runtime target (`static` uses `web`), and `__KOMIKA_SSR__` indicates whether server-side rendering is enabled.
 
 Public configuration is resolved at build time through `$env/static/public` in `apps/reader/src/lib/config.ts`. Inlining these values at build time ensures that edge cold starts on Cloudflare Workers do not rely on dynamic runtime environment variables, which are empty during module evaluation.
 
@@ -48,7 +47,11 @@ Application routes are organized under `apps/reader/src/routes`:
 
 The root layout in `apps/reader/src/routes/+layout.ts` sets `ssr = false` and `prerender = false` as the default. Tauri and static hosts have no server runtime. Authenticated and interactive pages such as the library, user profile, login, and the chapter reader depend on browser storage and state.
 
-Public catalog pages override this default by exporting `export const ssr = SSR_PUBLIC`. The constant `SSR_PUBLIC` in `apps/reader/src/lib/ssr.ts` reflects `__KOMIKA_SSR__`. In web builds, public routes render at the Cloudflare edge to deliver pre-rendered HTML to browsers and search crawlers. In Tauri and embedded builds, `SSR_PUBLIC` is false, keeping all routes client-side.
+Public catalog pages retain their `export const ssr = SSR_PUBLIC` options. The constant `SSR_PUBLIC` in `apps/reader/src/lib/ssr.ts` reflects `__KOMIKA_SSR__`. Workers Assets routes only `/series/*` to the server in web builds, with `!/series/` excluding an empty slug. All other paths receive the static SPA shell without a User Worker invocation, including unknown paths, which the client router handles. In static, Tauri and embedded builds, `SSR_PUBLIC` is false for every route.
+
+The adapter wrapper generates `_headers` after the shell is built. Its Content Security Policy (CSP) hashes the exact inline script text using `deploy/static-csp.mjs`. Security headers come from `apps/reader/_headers`. HTML uses `Cache-Control: no-cache` and `/_app/immutable/*` uses `public, max-age=86400`. Workers Assets can serve the SPA shell at missing chunk URLs, including non-navigation requests, so a path-based immutable policy would also cache fallback HTML for a year. The one-day lifetime bounds that, and missing chunks never receive immutable caching. SvelteKit supplies the dynamic series response's own CSP.
+
+The template registers `vite:preloadError` and a startup-only `unhandledrejection` listener before app imports run. Bare bootstrap entry imports reject without emitting Vite's preload event; both failures use the same `sessionStorage` guard to reload once, then show an error and a Reload button. When the root layout mounts successfully, it clears the guard and removes the bootstrap rejection listener. A failure during startup keeps the guard even if an error layout mounts afterward. If storage is unavailable, recovery shows the button immediately. Release preparation can retain the previous build's immutable chunks; see [Deployment](/developers/deployment).
 
 Universal `load` functions coordinate data hydration through `apps/reader/src/lib/stream.ts`. SvelteKit server-side rendering only outputs the pending branch of an `{#await}` block. If the server returned an unresolved promise, edge HTML would contain only loading skeletons.
 
@@ -75,43 +78,35 @@ During server-side rendering, `apps/reader/src/lib/data/load-fetch.ts` passes Sv
 
 ## The long-strip reader
 
-The chapter reading route in `apps/reader/src/routes/read/[slug]/+page.svelte` supports single-page, double-page, and continuous long-strip reading.
+`apps/reader/src/routes/read/[slug]/+page.svelte` supports single-page, double-page and long-strip reading. Long-strip mode keeps every page mounted:
 
-In long-strip mode, all pages remain mounted in the Document Object Model (DOM). DOM virtualization with dynamic mounting was evaluated and rejected because frequent layout mutations caused visual stutter during rapid scrolling.
+1. The first three pages load with `fetchpriority="high"`.
+2. A low-priority queue loads the rest, at most two requests at once.
+3. Six pages ahead of the furthest scroll position switch to eager loading.
 
-To manage network transfer and rendering performance, long-strip mode uses a three-tier loading system:
+Unloaded cells reserve a 2:3 aspect ratio. If a loaded image changes height above the viewport, `window.scrollBy` compensates. A binary search tracks the reading line at 40 percent of viewport height; animation frames coalesce scroll work.
 
-1. Starters: The first three pages load immediately with `fetchpriority="high"`.
-2. Background queue: Remaining pages load in sequence with low priority. Concurrency is limited to two simultaneous requests, advancing as images finish loading.
-3. Scroll lookahead: Six pages ahead of the furthest scrolled position switch from lazy to eager loading. This prevents delays when readers scroll quickly or jump using the progress bar.
-
-Unloaded strip cells reserve vertical space using an initial aspect ratio of 2:3. As each image loads, the reader measures its natural dimensions. If an image finishes loading above the visible viewport, its height expansion would shift the active reading view. Because browser scroll anchoring is disabled to prevent conflicts with chapter transitions, the reader calculates the height difference and calls `window.scrollBy` to maintain the user's scroll position.
-
-The active reading position is tracked against a reading line set at 40 percent of the viewport height. A binary search in `stripPageAtLine` identifies which page intersects this threshold. Scroll event processing is coalesced into a single `requestAnimationFrame` callback to avoid layout thrashing.
-
-When a reader completes 40 percent of a chapter, the reader automatically preloads the next chapter's metadata and warms its first three page images into the browser cache. The same warming logic triggers when a reader points at, focuses, or touches chapter navigation buttons.
-
-Reading progress persists automatically when a reader reaches the end of a chapter. To ensure mid-chapter progress is not lost, the reader also records progress when the user navigates away, switches browser tabs, or unmounts the component.
+After 40 percent of a chapter, the app preloads the next chapter's metadata and first three images. Pointing at, focusing or touching chapter navigation also warms it. Progress saves at chapter end, navigation away, tab switches and unmounting.
 
 ## Phone layout
 
-Base styles are written for a phone. Wider layouts are added with `min-width` media queries. The shared pieces live in `apps/reader/src/lib/app.css`:
+`apps/reader/src/lib/app.css` holds shared phone styles:
 
-- Safe areas: `--k-safe-top`, `--k-safe-right`, `--k-safe-bottom` and `--k-safe-left` wrap `env(safe-area-inset-*)`. `--k-header-h` is the top bar height plus the top inset. `--k-gutter` is the page gutter, never smaller than a side inset. Use these tokens instead of raw `env()` calls.
-- The phone shell: a bottom tab bar is the primary navigation and the top bar has no nav links. It is on for screens up to 640 pixels wide, and for a phone on its side (`max-height: 500px` and `pointer: coarse`). `--k-tabbar-h` is the space the bar takes, and `0px` where there is none. `BottomNav.svelte`, `Header.svelte` and `routes/(app)/+layout.svelte` share those two conditions.
-- Tap targets: add the `k-hit` class to a control that is smaller than 44 by 44 pixels. On touch screens it adds an invisible touch area around the control and changes nothing you can see. Rows in menus get `min-height: 44px` under `@media (pointer: coarse)`.
-- Text fields: on touch screens every text field is at least 16 pixels, because iOS zooms the page when a smaller field takes focus.
-- Native app only: `apps/reader/static/theme-init.js` sets `data-native` on `<html>` and locks page zoom before first paint. Rules under `html[data-native]` turn off overscroll, the long-press callout, the tap highlight and text selection on controls. A browser keeps its own behaviour.
+- Safe-area tokens wrap `env(safe-area-inset-*)`. Use `--k-safe-top`, `--k-safe-right`, `--k-safe-bottom`, `--k-safe-left`, `--k-header-h` and `--k-gutter`.
+- Bottom navigation appears up to 640 pixels wide, or on a coarse-pointer screen under 500 pixels high. `BottomNav.svelte`, `Header.svelte` and the app layout share those conditions.
+- `k-hit` gives small controls a 44-pixel touch target. Touch text fields use at least 16-pixel text to avoid automatic zoom.
+- `static/theme-init.js` marks native windows with `data-native`. Native rules disable overscroll, callouts, tap highlights and selection on controls.
 
-`apps/reader/src/lib/native.ts` holds the two calls a screen can make. `allowPageZoom()` lets the chapter reader zoom in and locks zoom again when the reader closes. `setStatusBarHidden()` asks the native shell to hide the status bar; see [iOS](/developers/ios).
+`apps/reader/src/lib/native.ts` exposes `allowPageZoom()` and `setStatusBarHidden()`; see [iOS](/developers/ios). A fixed backdrop inside a blurred element uses viewport units, because `backdrop-filter` changes its containing block.
 
-A `backdrop-filter` on an element makes it the containing block for `position: fixed` children. A full-screen backdrop inside the blurred top bar therefore sizes itself with viewport units (`100vw`, `100dvh`), not `inset: 0`.
-
-The rating row in `apps/reader/src/lib/components/Stars.svelte` is one touch target: a finger selects the star under it, a slide corrects the choice, and lifting commits. In paged mode the reader turns the page on a sideways swipe, following the reading direction; it ignores the swipe while the page is zoomed in or wider than the screen.
+The rating row is one touch target, allowing a slide to correct a selection. Paged reading turns pages on sideways swipes and ignores them when zoomed in or wider than the screen.
 
 ## Where to look
 
 - `apps/reader/vite.config.ts`: Target selection, adapter configuration, style inlining thresholds, and Content Security Policy definitions.
+- `apps/reader/wrangler.toml` and `apps/reader/wrangler.static.toml`: Series-only Worker routing and the script-free alternative.
+- `apps/reader/deploy/static-assets.mjs` and `apps/reader/src/app.html`: Generated shell headers and early preload recovery.
+- `apps/reader/deploy/retain-assets.mjs`: Copies previous immutable chunks into a release.
 - `apps/reader/src/lib/config.ts`: Build-time environment variable bindings, server address persistence, and runtime target flags.
 - `apps/reader/src/lib/server-connect.svelte.ts`: Address normalization, server checks and switching servers.
 - `apps/reader/src/lib/components/ConnectServer.svelte`: Connect screen and QR scanning on supported phones.

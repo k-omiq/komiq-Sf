@@ -14,8 +14,8 @@ use std::{
 use super::{
     convert::{value, Value},
     tables::{
-        copied, is_copied, OPTIONAL_POSTGRES_INTERNAL, REQUIRED_POSTGRES_INTERNAL, TABLES,
-        UNSUPPORTED_POSTGRES_ONLY, WORK_REFERENCES,
+        copied, is_copied, OPTIONAL_POSTGRES_INTERNAL, REBUILDABLE_POSTGRES_ONLY,
+        REQUIRED_POSTGRES_INTERNAL, TABLES, UNSUPPORTED_POSTGRES_ONLY, WORK_REFERENCES,
     },
     template::{self, sibling, Template},
 };
@@ -156,8 +156,7 @@ pub(super) struct Report {
     /// Tables the export does not copy, with the row count that the template
     /// and the output both have.
     pub not_copied: BTreeMap<String, i64>,
-    /// PostgreSQL-only tables omitted because SQLite cannot hold them. All
-    /// counts are zero: any rows cause refusal before the template is copied.
+    /// Omitted PostgreSQL-only tables, including nonempty rebuildable tables.
     pub postgres_only_not_copied: BTreeMap<String, i64>,
 }
 
@@ -336,10 +335,12 @@ async fn postgres_only_tables(pg: &mut PgConnection) -> Result<BTreeMap<String, 
     let registered: BTreeSet<_> = plan::POSTGRES_ONLY.iter().map(|table| table.name).collect();
     let classified: BTreeSet<_> = UNSUPPORTED_POSTGRES_ONLY
         .iter()
+        .chain(REBUILDABLE_POSTGRES_ONLY)
         .map(|(name, _)| *name)
         .collect();
     ensure!(
-        registered == classified,
+        registered == classified
+            && classified.len() == UNSUPPORTED_POSTGRES_ONLY.len() + REBUILDABLE_POSTGRES_ONLY.len(),
         "PostgreSQL-only rollback classification differs from the import inventory; this release cannot safely export to SQLite"
     );
     let actual: Vec<(String, String)> = sqlx::query_as(
@@ -380,6 +381,12 @@ async fn postgres_only_tables(pg: &mut PgConnection) -> Result<BTreeMap<String, 
             rows == 0,
             "cannot export PostgreSQL-only table {name}: {rows} rows would be lost because {reason}; nothing was exported; keep PostgreSQL and its backups until a verified preservation path exists"
         );
+        omitted.insert((*name).to_owned(), rows);
+    }
+    for (name, _) in REBUILDABLE_POSTGRES_ONLY {
+        let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM public.{}", quote(name)))
+            .fetch_one(&mut *pg)
+            .await?;
         omitted.insert((*name).to_owned(), rows);
     }
     Ok(omitted)

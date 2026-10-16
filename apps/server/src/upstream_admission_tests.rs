@@ -273,6 +273,8 @@ async fn cached_reader_requests_survive_all_upstream_slots_hanging_and_client_li
         .await
         .unwrap();
     let manga = suwayomi::SuwayomiManga {
+        engine_generation: None,
+        real_url: None,
         id: SERIES_ID,
         title: "Cached mirror title".into(),
         url: None,
@@ -308,6 +310,11 @@ async fn cached_reader_requests_survive_all_upstream_slots_hanging_and_client_li
         &pool,
         SERIES_ID,
         &[suwayomi::SuwayomiChapter {
+            engine_generation: None,
+            manga: None,
+            url: None,
+            real_url: None,
+            source_order: None,
             id: CHAPTER_ID,
             manga_id: SERIES_ID,
             name: "Cached chapter".into(),

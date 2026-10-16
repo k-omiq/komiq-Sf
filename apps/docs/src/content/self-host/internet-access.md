@@ -88,6 +88,10 @@ The database keeps the IDs of what setup created, and no token or private key. C
 
 **I will do it by hand** in the form shows the steps for the Cloudflare dashboard instead.
 
+The server sends a Content-Security-Policy header on its web pages. This tells the browser which scripts and resources it can load. A reverse proxy is a service in front of your server. Do not add a second, different policy there. It can stop the app from loading.
+
+Old cover and avatar links redirect to the current version. Keep these redirects working through your proxy.
+
 ## Optional image proxy Worker
 
 The optional image proxy in `apps/worker` runs on Cloudflare’s network. The bundled web reader and a native reader connected to your server do not need it. Read [Image proxy](/developers/image-proxy).

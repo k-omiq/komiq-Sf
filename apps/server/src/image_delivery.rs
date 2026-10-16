@@ -13,6 +13,7 @@ use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit};
 use crate::telemetry::{BodyCheck, BodySource, MEDIA};
 
 pub(crate) const MUTABLE_CACHE: &str = "public, max-age=300, must-revalidate";
+pub(crate) const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable, s-maxage=600";
 
 struct ImageOwner {
     bytes: Vec<u8>,

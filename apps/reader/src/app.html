@@ -4,6 +4,65 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 		<meta name="text-scale" content="scale" />
+		<!-- Install before bootstrap; bare entry imports reject without a Vite event. -->
+		<!-- Keep the version outside the script body so template CSP hashes stay stable. -->
+		<script id="komiq-preload-recovery" data-version="%sveltekit.version%">
+			{
+				// Never clear a build's guard: deferred imports can fail after root mount.
+				const key = `komiq-preload-reloaded:${document.currentScript.dataset.version}`;
+				let reloading = false;
+				const recover = () => {
+					if (reloading) return;
+					try {
+						if (!sessionStorage.getItem(key)) {
+							sessionStorage.setItem(key, '1');
+							reloading = true;
+							window.location.reload();
+							return;
+						}
+					} catch {
+						// Without a persistent guard, offer a manual reload to avoid a loop.
+					}
+					if (document.getElementById('komiq-preload-error')) return;
+					const panel = document.createElement('section');
+					panel.id = 'komiq-preload-error';
+					panel.setAttribute('role', 'alert');
+					panel.style.cssText =
+						'position:fixed;inset:0;z-index:2147483647;display:grid;align-content:center;justify-items:center;gap:16px;padding:24px;text-align:center;background:var(--k-bg,#111);color:var(--k-text,#eee);font:16px system-ui';
+					const heading = document.createElement('h1');
+					heading.textContent = 'Couldn’t load the app';
+					const message = document.createElement('p');
+					message.textContent =
+						'An app file is unavailable. Check your connection and reload to try again.';
+					const button = document.createElement('button');
+					button.type = 'button';
+					button.textContent = 'Reload';
+					button.style.cssText = 'padding:12px 24px;font:inherit;cursor:pointer';
+					button.addEventListener('click', () => window.location.reload());
+					panel.append(heading, message, button);
+					document.body.append(panel);
+					button.focus();
+				};
+				window.addEventListener('vite:preloadError', (event) => {
+					event.preventDefault();
+					recover();
+				});
+				const bootstrapError = (event) => {
+					event.preventDefault();
+					recover();
+				};
+				window.addEventListener('unhandledrejection', bootstrapError);
+				window.addEventListener(
+					'komiq:started',
+					() => {
+						// Only observe uncaught promises during startup. Later chunk errors
+						// arrive through Vite; unrelated app rejections must stay untouched.
+						window.removeEventListener('unhandledrejection', bootstrapError);
+					},
+					{ once: true },
+				);
+			}
+		</script>
 		<script src="/theme-init.js"></script>
 		%sveltekit.head%
 	</head>

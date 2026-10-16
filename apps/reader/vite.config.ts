@@ -1,19 +1,23 @@
 import adapterStatic from '@sveltejs/adapter-static';
 import adapterCloudflare from '@sveltejs/adapter-cloudflare';
 import { sveltekit } from '@sveltejs/kit/vite';
-import { rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { defineConfig, loadEnv } from 'vite';
 import { readerConnectSources } from './csp';
+import { writeStaticHeaders } from './deploy/static-assets.mjs';
+import { inlineScriptHashes } from '../../deploy/static-csp.mjs';
 
 // Tauri sets this when developing against a physical mobile device.
 const host = process.env.TAURI_DEV_HOST;
 
 // --- Build target selection -------------------------------------------------
-// The reader ships two ways from ONE codebase:
+// The reader ships from ONE codebase:
 //   • Tauri (desktop + mobile) and any server-less static host → adapter-static,
 //     a pure SPA (`fallback: index.html`, no SSR runtime = no server surface).
-//   • Hosted web on Cloudflare → adapter-cloudflare, so the public catalog pages
-//     are server-rendered at the edge for fresh content + fast first paint.
+//   • Hosted web → adapter-cloudflare, with SSR only reached on /series/*.
+//     Workers Assets serves its generated index.html for every other route.
+//   • KOMIKA_TARGET=static → adapter-static, the hosted PUBLIC_* configuration
+//     and a pure SPA, including series. wrangler.static.toml has no script.
 // Tauri sets TAURI_ENV_PLATFORM during its build; a plain `pnpm build` targets
 // the web (Cloudflare). Set KOMIKA_TARGET=tauri to force the static SPA build
 // (e.g. building the web bundle for a static host without Tauri's env present).
@@ -22,12 +26,15 @@ const host = process.env.TAURI_DEV_HOST;
 //     own origin and loads images from there, whatever PUBLIC_* the build env holds
 //     (see $lib/config). One build works on any address the server is reached at.
 const isEmbeddedBuild = process.env.KOMIKA_TARGET === 'embedded';
+const isStaticBuild = process.env.KOMIKA_TARGET === 'static';
 const isTauriBuild =
 	!!process.env.TAURI_ENV_PLATFORM || process.env.KOMIKA_TARGET === 'tauri' || isEmbeddedBuild;
+const isSpaBuild = isTauriBuild || isStaticBuild;
+// A hosted static build keeps web runtime behavior (no self-host setup probes).
 const target = isEmbeddedBuild ? 'embedded' : isTauriBuild ? 'tauri' : 'web';
 // `__KOMIKA_SSR__` gates the per-route `ssr` flags (see $lib/ssr): public pages
 // SSR on the web build, but stay client-only in the Tauri/static SPA build.
-const ssrEnabled = !isTauriBuild;
+const ssrEnabled = !isSpaBuild;
 
 // Files in static/ that only a browser asks for: tab icons, the home-screen install
 // manifest and its icons, the link-preview image, robots.txt. A native app window has
@@ -50,23 +57,27 @@ const WEB_ONLY_STATIC = [
 ];
 const isNativeAppBuild = !!process.env.TAURI_ENV_PLATFORM;
 
-function staticAdapter() {
-	const adapter = adapterStatic({ fallback: 'index.html' });
-	if (!isNativeAppBuild) return adapter;
+function readerAdapter(connectSources: string[]) {
+	const adapter = isSpaBuild ? adapterStatic({ fallback: 'index.html' }) : adapterCloudflare();
 	return {
 		...adapter,
 		async adapt(builder: Parameters<typeof adapter.adapt>[0]) {
 			await adapter.adapt(builder);
-			for (const file of WEB_ONLY_STATIC) rmSync(`build/${file}`, { force: true });
+			if (isNativeAppBuild) {
+				for (const file of WEB_ONLY_STATIC) rmSync(`build/${file}`, { force: true });
+			} else {
+				writeStaticHeaders(isSpaBuild ? 'build' : '.svelte-kit/cloudflare', connectSources);
+			}
 		},
 	};
 }
 
 export default defineConfig(({ command, mode, isPreview }) => {
 	const publicEnv = loadEnv(mode, process.cwd(), 'PUBLIC_');
-	const connectSources = isTauriBuild
-		? []
+	const connectSources: ReturnType<typeof readerConnectSources> = isEmbeddedBuild
+		? ['self']
 		: readerConnectSources(publicEnv, command === 'serve' && !isPreview);
+	const templateHashes = inlineScriptHashes(readFileSync('src/app.html', 'utf8'));
 	return {
 		define: {
 			__KOMIKA_SSR__: JSON.stringify(ssrEnabled),
@@ -97,7 +108,7 @@ export default defineConfig(({ command, mode, isPreview }) => {
 							mode: 'hash',
 							directives: {
 								'default-src': ['self'],
-								'script-src': ['self'],
+								'script-src': ['self', ...templateHashes],
 								'style-src': ['self', 'unsafe-inline'],
 								'img-src': ['self', 'https:', 'http:', 'data:', 'blob:'],
 								'connect-src': connectSources,
@@ -112,10 +123,10 @@ export default defineConfig(({ command, mode, isPreview }) => {
 					runes: ({ filename }) =>
 						filename.split(/[/\\]/).includes('node_modules') ? undefined : true,
 				},
-				// Web build → Cloudflare (edge SSR for public routes). Tauri/static build
+				// Web build → Cloudflare (series SSR plus an assets-only SPA shell). Static build
 				// → static SPA with an index.html fallback so client routing resolves for
 				// every path.
-				adapter: isTauriBuild ? staticAdapter() : adapterCloudflare(),
+				adapter: readerAdapter(connectSources),
 			}),
 		],
 		// --- Tauri-friendly dev server ---

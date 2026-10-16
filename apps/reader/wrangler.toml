@@ -1,12 +1,9 @@
-# Cloudflare Worker config for the hosted reader (edge SSR).
+# Hybrid reader: series SSR and an assets-only SPA for every other route.
 #
 # `pnpm --filter @komika/reader build` (the default, web target) runs
 # adapter-cloudflare and emits `.svelte-kit/cloudflare/` — a Worker (`_worker.js`)
-# plus the static client assets. Deploy with:
-#   cd apps/reader && pnpm dlx wrangler deploy      # or `wrangler deploy`
-#
-# Public catalog routes (home, browse, series, updates, support) are
-# server-rendered here; the rest of the app hydrates client-side (see $lib/ssr).
+# plus index.html and static client assets. Only nonempty /series/* reaches the Worker;
+# the remaining documents use index.html and route in the browser.
 #
 # NOTE: backend wiring (PUBLIC_KOMIKA_API, PUBLIC_KOMIKA_IMG_WORKER, …) is baked at
 # BUILD time by Vite via `$env/static/public` — the committed apps/reader/.env.production
@@ -31,8 +28,12 @@ routes = [
 
 # Static client assets (hashed `_app/immutable/*`, icons, manifest). Wrangler
 # serves these directly from the edge and only invokes the Worker for the
-# SSR/dynamic routes listed in the adapter-generated `_routes.json`. `_worker.js`,
+# /series/* pattern below. `_routes.json` is a Pages setting and is not generated
+# or used by this Workers configuration. `_worker.js`,
 # `_routes.json` and `_headers` are treated as config, not served as assets.
 [assets]
 binding = "ASSETS"
 directory = ".svelte-kit/cloudflare"
+not_found_handling = "single-page-application"
+# Negative patterns take precedence; an empty slug uses the static shell.
+run_worker_first = ["/series/*", "!/series/"]

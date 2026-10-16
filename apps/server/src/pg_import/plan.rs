@@ -57,11 +57,41 @@ pub(crate) struct PostgresOnly {
 
 /// Every such table. The importer's inventory, its reset and the verifier's foreign-key
 /// expectation read this list; the indexes are read from the migration files themselves.
-pub(crate) const POSTGRES_ONLY: &[PostgresOnly] = &[PostgresOnly {
-    name: "scanlator_rating",
-    since: 4,
-    fks: &[("user_id", "users", "id")],
-}];
+pub(crate) const POSTGRES_ONLY: &[PostgresOnly] = &[
+    PostgresOnly {
+        name: "engine_numeric_state",
+        since: 6,
+        fks: &[],
+    },
+    PostgresOnly {
+        name: "suwayomi_progress_detached",
+        since: 6,
+        fks: &[
+            ("generation", "engine_generation", "id"),
+            ("user_id", "users", "id"),
+        ],
+    },
+    PostgresOnly {
+        name: "scanlator_rating",
+        since: 4,
+        fks: &[("user_id", "users", "id")],
+    },
+    PostgresOnly {
+        name: "engine_generation",
+        since: 5,
+        fks: &[],
+    },
+    PostgresOnly {
+        name: "engine_manga_key",
+        since: 5,
+        fks: &[("generation", "engine_generation", "id")],
+    },
+    PostgresOnly {
+        name: "engine_chapter_key",
+        since: 5,
+        fks: &[("generation", "engine_generation", "id")],
+    },
+];
 
 pub(crate) fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))

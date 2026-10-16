@@ -3,9 +3,9 @@ title: Deployment
 description: Understand how the project deploys the global server with Cloudflare, Docker, and backups.
 ---
 
-This page describes how the project deploys the global server at `komiq.cc`, its free work-in-progress demo. It is one example of the self-hostable komiq model: the admin app provides the server, management portal and Suwayomi engine, and the reader app connects to that server. For your own installation, start with [Install with Docker](/self-host/docker) and [Reach it from the internet](/self-host/internet-access).
+This page describes the global server at `komiq.cc`, the demo. The admin app supplies its server, console and engine; the reader supplies its reading interface. For your own server, see [Install with Docker](/self-host/docker) and [Internet access](/self-host/internet-access).
 
-The global server combines Cloudflare Workers with backend services running in Docker containers, isolated service environments. This deployment isolates untrusted extensions, uses the optional image proxy, and uses scheduled full and incremental backups with continuous write-ahead log (WAL) archiving to object storage.
+The global server combines Cloudflare Workers, Docker services and the optional image proxy. PostgreSQL backups use object storage.
 
 ## Workers and edge routing
 
@@ -24,10 +24,36 @@ Image proxy -> Reader app: delivers image bytes
 The [reader app](/developers/reader-app) runs on `komiq.cc` and `www.komiq.cc`. It is deployed from `apps/reader` using the Worker name `komika-reader`:
 
 - Built with `@sveltejs/adapter-cloudflare`.
-- Executes server-side rendering for public catalog routes, including home feeds, browse filters, series overviews, and updates.
+- Executes server-side rendering for `/series/*` only, preserving series text and share previews.
+- Serves an adapter-generated `index.html` SPA shell for every other document, including home, browse, reading, library and unknown paths, without invoking the User Worker.
 - Serves static assets, including styles, bundled scripts, icons, and fonts, through Cloudflare Workers Static Assets.
 - Inlines public configuration like the API endpoint and image proxy URL during build time.
 - Requires no edge secrets because public page rendering only accesses unauthenticated catalog data.
+
+The web build's Workers configuration is:
+
+```toml
+[assets]
+binding = "ASSETS"
+directory = ".svelte-kit/cloudflare"
+not_found_handling = "single-page-application"
+run_worker_first = ["/series/*", "!/series/"]
+```
+
+The adapter generates the shell from the SPA fallback setting. `_routes.json` applies only to Pages. Wrangler's bundled schema sends `run_worker_first` matches to the User Worker; its asset router resolves other paths through the SPA fallback. The negative pattern takes precedence, so `/series/` with no slug uses the static shell. Warm series HTML still invokes the Worker: caching saves rendering, not invocations.
+
+The split has been checked offline against the bundled router and generated output. Production invocation counts have not been measured. No deployment or billing result follows from the local check.
+
+For a pure static alternative, build with `KOMIKA_TARGET=static pnpm -C apps/reader build`. `apps/reader/wrangler.static.toml` serves `build` without a script, including series routes. It uses the separate name `komika-reader-static`, has no routes and disables `workers_dev`. An operator adds a test hostname when ready. Both builds generate `_headers` with exact inline-script CSP hashes, `Cache-Control: no-cache` for HTML and `public, max-age=86400` for `/_app/immutable/*`. The bundled asset worker can return the SPA shell for a missing chunk, even without `Sec-Fetch-Mode: navigate`. Since `_headers` matches the requested URL, an immutable rule would cache that HTML under the missing chunk URL for a year. One day bounds it, and missing assets never receive an immutable cache policy.
+
+Before releasing either build, copy the previous output's immutable files into the new output:
+
+```sh
+node apps/reader/deploy/retain-assets.mjs /path/to/previous-build apps/reader/.svelte-kit/cloudflare
+# For the static target, use apps/reader/build as the second path.
+```
+
+The script copies only `_app/immutable`, preserves current files and refuses same-name files with different bytes. It never copies old HTML or headers. Keep a snapshot of each release output before the next build clears that directory. When starting without a previous release, omit this copy step. The page reloads once on a failed bootstrap import or Vite preload, then offers a manual Reload button. A successful root mount clears the guard so a later failure can recover again.
 
 ### The admin app's console Worker
 
@@ -42,10 +68,9 @@ This deployment uses the secondary `hosted` build of the [admin app](/developers
 
 The [image proxy Worker](/developers/image-proxy) runs on `img.komiq.cc`. It is deployed from `apps/worker` using the Worker name `komika-img`:
 
-- Provides an edge proxy and caching layer for chapter pages and cover images.
-- Enforces an upstream host allowlist through `ALLOWED_SOURCE_HOSTS`. The proxy allows `uploads.mangadex.org`, `mangadex.network`, and `api.komiq.cc`. Any request targeting an unapproved host is rejected.
-- Restricts hotlinking through `ALLOWED_ORIGINS`. Browser requests carrying an Origin or Referer header must match `https://komiq.cc` or `https://www.komiq.cc`. Direct requests without browser origin headers remain permitted.
-- Enforces per-IP rate limiting through a Cloudflare Rate Limiting binding (`IMG_RATE_LIMITER`). The limiter allows 600 requests per 60 seconds per client IP address. Rate limits are evaluated only on cache misses, ensuring that cached image traffic is never throttled.
+- Proxies and caches images. `ALLOWED_SOURCE_HOSTS` permits `uploads.mangadex.org`, `mangadex.network` and `api.komiq.cc`; other upstream hosts are rejected.
+- Checks browser Origin and Referer headers against `ALLOWED_ORIGINS`. Requests without either header remain permitted.
+- Limits each IP to 600 cache misses per minute through `IMG_RATE_LIMITER`. Cache hits do not count.
 
 ### The documentation Worker
 
@@ -73,39 +98,25 @@ The admin app's server and Suwayomi engine run alongside a FlareSolverr sidecar 
 
 ### The server container
 
-The `server` container runs `komika-server`, a Rust application based on Axum, async-graphql, and PostgreSQL:
+The Rust server uses Axum, async-graphql and PostgreSQL. It serves GraphQL at `/graphql`, database readiness at `/health/ready`, and source images at `/api/v1/manga/...`. It also runs catalogue scans and updates.
 
-- Binds internal port 8080 to loopback `127.0.0.1:8080`. Public ingress reaches it through a reverse proxy or tunnel.
-- Serves GraphQL queries and mutations at `/graphql`.
-- Exposes readiness health checks at `/health/ready`, which performs an active database query (`SELECT 1`) to ensure connection pool availability.
-- Proxies cover and page images from the internal Suwayomi engine at `/api/v1/manga/...` via `SUWAYOMI_PUBLIC_URL`.
-- Runs background tasks including library scan schedules, chapter update discovery, and canonical catalog synchronization.
-- Serves Prometheus metrics at `/metrics` on a separate listener, port 9090. Inside the container it binds `0.0.0.0` (`KOMIKA_METRICS_BIND_ADDR`), and Compose publishes it on host loopback `127.0.0.1:9090` only.
-- Memory is capped at 6 GB to prevent runaway allocations from affecting host stability.
+Public ingress reaches port 8080 through a reverse proxy or tunnel. Compose publishes it on loopback only. Metrics use port 9090, also published on loopback. The server has a 6 GB memory cap.
 
 ### The Suwayomi engine
 
-The `suwayomi` container runs Tachidesk, a Java service executing source extensions:
+Suwayomi runs Tachidesk, which executes source extensions, resolves chapter pages and retrieves covers. Its administrative API has no authentication, so public clients must never reach it directly. Compose publishes port 4567 on loopback only; the server uses the private Docker address `http://suwayomi:4567`.
 
-- Binds port 4567 to loopback `127.0.0.1:4567`. Loopback binding is critical because Suwayomi's administrative API lacks authentication. External clients must never reach this port directly.
-- The `server` container communicates with Suwayomi over the internal Docker network at `http://suwayomi:4567`.
-- Manages source extensions, chapter page resolution, and non-canonical cover retrieval.
-- Image tags are pinned by cryptographic sha256 digests to ensure reproducible deployments.
-- Memory is capped at 8 GB. JVM ergonomics are constrained using `JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=70`, ensuring heap allocation stays within container limits.
+The image is pinned by digest. Its memory cap is 8 GB, with `JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=70` limiting JVM heap allocation.
 
 ### The FlareSolverr sidecar
 
-The `flaresolverr` container runs a headless Chromium browser designed to solve challenge pages on protected sources:
-
-- Operates purely on the internal Docker network at `http://flaresolverr:8191`.
-- Exposes no host ports.
-- Memory is capped at 2 GB.
+FlareSolverr handles browser-verification pages on protected sources. It runs at `http://flaresolverr:8191` inside Docker, with no public ports and a 2 GB memory cap.
 
 ## PostgreSQL and backups
 
-The packaging uses PostgreSQL 18 for accounts, sessions, reading history, library entries, discussions and catalogue state. A private `postgres` service stores its cluster in `postgres-data`. The server authenticates with a non-superuser application role. PostgreSQL initialization fixes the encoding and locale so search and import checks behave consistently.
+PostgreSQL 18 stores accounts, sessions, progress, libraries, discussions and catalogue state in the private `postgres-data` volume. The server uses a non-superuser role. Initialization fixes the encoding and locale.
 
-The `postgres-backup` service packages pgBackRest, a database backup manager, for object storage. It schedules full and incremental backups and archives write-ahead logs (WAL), the transaction records PostgreSQL uses for recovery. Backup configuration and restore operations live in `deploy/postgres/`. This replaces the previous file replication path.
+`postgres-backup` runs pgBackRest for full and incremental backups to object storage. It also archives write-ahead logs (WAL), the transaction records needed for recovery. Configuration and restore procedures live in `deploy/postgres/`.
 
 The separate `/data/covers.sqlite3` cache stays in `server-data` and is excluded from PostgreSQL backups. An open or corruption failure preserves its files with a `.quarantined-<id>` suffix and recreates the cache. Accounts and libraries remain in PostgreSQL. Connector files are separate too; a database backup does not preserve filesystem credentials.
 
@@ -115,9 +126,9 @@ The server can import an old main SQLite database at first start when PostgreSQL
 
 Hosted recovery uses pgBackRest restore into an empty cluster directory with PostgreSQL stopped. The procedure, with its rehearsal, is `deploy/postgres/RESTORE.md`; it is a runbook for operators of this packaging, and this page does not repeat it. A point-in-time restore combines a backup with archived WAL up to the chosen recovery point. Review the restore tooling and verify the restored database before making it available to users. Keep recovery separate from ordinary startup; never substitute an empty database for a failed restore.
 
-The server command `export-postgres-to-sqlite` copies user tables into a new SQLite file for a return to an older build. It refuses and writes no file when PostgreSQL holds rows SQLite cannot store, such as per-user scanlator ratings. Keep PostgreSQL and its backups then. A migration 0121 target loses deleted-comment markers, which the report lists.
+`export-postgres-to-sqlite` creates a SQLite export for older builds. It refuses unsupported data, such as per-user scanlator ratings. It leaves out the three `engine_*` key tables even when they hold rows, because the server fills them again, and the report lists their row counts. Its report lists deleted-comment markers lost by a migration 0121 target.
 
-The server holds `.komiq-server.lock` in the covers directory for its lifetime. A second server using that directory fails to start. The `phase-f` maintenance command connects to existing databases without running migrations or recreating covers. It refuses a missing, behind or incompatible main schema.
+`.komiq-server.lock` prevents concurrent servers using one covers directory. `phase-f` requires an existing, compatible schema and neither migrates nor recreates covers.
 
 ### Self-host and desktop
 
@@ -125,13 +136,28 @@ The self-host Compose file runs stock PostgreSQL privately alongside the server 
 
 The desktop admin app bundles PostgreSQL, converts an old SQLite database at first start and saves a local dump while running when the newest is at least 20 hours old. It keeps seven completed dumps. The reader app does not run the account database.
 
+## Local validation
+
+Build the static target, then web, before running the reader tests. The tests inspect both emitted shells:
+
+```sh
+KOMIKA_TARGET=static pnpm -C apps/reader build
+pnpm -C apps/reader build
+pnpm -C apps/reader test
+```
+
+The repository uses Node's test runner. These commands need no additional test dependency.
+
 ## Status
 
-Production cutover and a restore rehearsal of this packaging are planned. Backup storage use, object-store request counts and recovery duration for this deployment have not been measured. Packaging code does not establish that the global server has already switched engines. Desktop installer validation is also planned.
+Production cutover, restore rehearsal and desktop installer validation are planned. Backup costs and recovery duration remain unmeasured. Packaging code does not establish production state.
 
 ## Where to look
 
 - `apps/reader/wrangler.toml`: Worker routing, build output paths, and domain bindings for the reader app.
+- `apps/reader/wrangler.static.toml`: Pure static alternative with no script.
+- `apps/reader/deploy/static-assets.mjs` and `deploy/static-csp.mjs`: Shell headers and exact inline-script hashing.
+- `apps/reader/deploy/retain-assets.mjs`: Previous-release chunk retention.
 - `apps/admin/wrangler.toml`: Static asset configuration and custom domain setup for the admin console.
 - `apps/worker/wrangler.toml`: Host allowlists, hotlink restrictions, and rate limiter bindings for the image proxy.
 - `apps/docs/wrangler.toml`: Static documentation site routing on Cloudflare Workers.

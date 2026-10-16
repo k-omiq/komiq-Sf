@@ -729,6 +729,8 @@ async fn a_rule_reaches_a_series_the_moment_it_is_added() {
     set_site(&s, r#"[{ tags: ["gore"] }]"#).await;
 
     let manga = |id: i64, title: &str, genre: &str| crate::suwayomi::SuwayomiManga {
+        engine_generation: None,
+        real_url: None,
         id,
         title: title.into(),
         url: None,

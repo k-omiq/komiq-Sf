@@ -1201,6 +1201,11 @@ async fn scan_due(state: &AppState, series_id: &str, now: DateTime<Utc>) -> anyh
         match state.suwayomi.series_and_chapters_with_provenance(id).await {
             Ok(v) => v,
             Err(e) => {
+                if e.downcast_ref::<crate::engine_generation::FenceError>()
+                    .is_some()
+                {
+                    return Err(e);
+                }
                 if let Err(be) =
                     record_scan_failure(&state.pool, series_id, now, FailureKind::FetchError).await
                 {
@@ -1239,6 +1244,11 @@ async fn scan_due(state: &AppState, series_id: &str, now: DateTime<Utc>) -> anyh
     let found = match persist_scan(&state.pool, &m, &chapters, &admin, now).await {
         Ok(v) => v,
         Err(e) => {
+            if e.downcast_ref::<crate::engine_generation::FenceError>()
+                .is_some()
+            {
+                return Err(e);
+            }
             // A LOCAL write-lock failure is not an upstream failure. Routing it into
             // `record_scan_failure` bumped `consecutive_failures` and pushed
             // `next_scan_at` out 30m → 1h → 2h, punishing a perfectly healthy series
@@ -1599,13 +1609,30 @@ async fn persist_scan(
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
     let series_id = m.id.to_string();
-    if let Err(e) =
-        crate::db::retry_transaction(|| crate::series_cache::put_series(pool, m)).await
+    crate::engine_keys::verify_snapshot(pool, m, chapters).await?;
+    if let Err(e) = crate::db::retry_transaction(|| crate::series_cache::put_series(pool, m)).await
     {
+        if e.downcast_ref::<crate::engine_generation::FenceError>()
+            .is_some()
+        {
+            return Err(e);
+        }
         let e = crate::db::observed_database_error(e);
         tracing::warn!(series_id, error = %e, "scan: series cache write failed");
     }
-    if let Err(e) = crate::series_cache::put_chapters(pool, m.id, chapters).await {
+    if let Err(e) = crate::series_cache::put_chapters_in_generation(
+        pool,
+        m.id,
+        chapters,
+        crate::engine_keys::token(m.engine_generation.as_deref())?,
+    )
+    .await
+    {
+        if e.downcast_ref::<crate::engine_generation::FenceError>()
+            .is_some()
+        {
+            return Err(e);
+        }
         let e = crate::db::observed_database_error(e);
         tracing::warn!(series_id, error = %e, "scan: chapter cache write failed");
     }
@@ -1615,7 +1642,7 @@ async fn persist_scan(
     // policy path (tier target + `awaiting` off), which is what makes it cheaper than the
     // legacy flat-12h cadence.
     let comic_type = scan_comic_type(pool, &series_id).await;
-    let new_found = record_scan_policy(
+    let new_found = record_scan_policy_in_generation(
         pool,
         &series_id,
         &m.title,
@@ -1623,6 +1650,7 @@ async fn persist_scan(
         chapters,
         Some(comic_type),
         now,
+        crate::engine_keys::token(m.engine_generation.as_deref())?,
     )
     .await?;
     // Both columns the merged Updates feed reads for this series are now written —
@@ -2249,6 +2277,7 @@ async fn record_scan(
             chapters,
             None,
             now,
+            None,
         )
     })
     .await
@@ -2257,6 +2286,7 @@ async fn record_scan(
 /// Phase E record path. When `comic_type` is `Some`, the steady interval is the format/
 /// recency TARGET from [`scan_interval_hours`] and `awaiting` is off (E5's LATEST-diff push
 /// signal replaces it). `None` falls back to the legacy inferred-cadence behaviour.
+#[cfg(test)]
 async fn record_scan_policy(
     pool: &Database,
     series_id: &str,
@@ -2266,9 +2296,32 @@ async fn record_scan_policy(
     comic_type: Option<ComicType>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
+    let generation = chapters
+        .first()
+        .map(|c| crate::engine_keys::token(c.engine_generation.as_deref()))
+        .transpose()?
+        .flatten();
+    record_scan_policy_in_generation(
+        pool, series_id, title, admin, chapters, comic_type, now, generation,
+    )
+    .await
+}
+
+async fn record_scan_policy_in_generation(
+    pool: &Database,
+    series_id: &str,
+    title: &str,
+    admin: &ScanAdmin,
+    chapters: &[SuwayomiChapter],
+    comic_type: Option<ComicType>,
+    now: DateTime<Utc>,
+    generation: Option<uuid::Uuid>,
+) -> anyhow::Result<bool> {
     // Every retry starts a fresh transaction and rereads the guarded state.
     crate::db::retry_transaction(|| {
-        record_scan_once(pool, series_id, title, admin, chapters, comic_type, now)
+        record_scan_once(
+            pool, series_id, title, admin, chapters, comic_type, now, generation,
+        )
     })
     .await
 }
@@ -2282,6 +2335,7 @@ async fn record_scan_once(
     chapters: &[SuwayomiChapter],
     comic_type: Option<ComicType>,
     now: DateTime<Utc>,
+    generation: Option<uuid::Uuid>,
 ) -> anyhow::Result<bool> {
     record_scan_with_admin_once(
         pool,
@@ -2291,6 +2345,7 @@ async fn record_scan_once(
         chapters,
         comic_type,
         now,
+        generation,
     )
     .await
 }
@@ -2309,10 +2364,13 @@ async fn record_scan_with_admin_once(
     chapters: &[SuwayomiChapter],
     comic_type: Option<ComicType>,
     now: DateTime<Utc>,
+    generation: Option<uuid::Uuid>,
 ) -> anyhow::Result<bool> {
     // Serialize scan outcomes even when the state row does not exist yet. Admin
     // writers must share this Series key; current overrides are read after waiting.
+    crate::engine_generation::wait(pool).await?;
     let mut tx = pool.begin_with("BEGIN").await?;
+    crate::engine_generation::shared(&mut tx, generation).await?;
     crate::locks::advisory(
         &mut tx,
         &[crate::locks::AdvisoryKey::new(
@@ -2575,6 +2633,7 @@ async fn record_scan_with_admin_once(
     .execute(&mut *tx)
     .await?;
 
+    crate::engine_generation::commit_ready(pool)?;
     tx.commit().await?;
     Ok(new_found)
 }
@@ -2842,7 +2901,7 @@ async fn unpark_source_series(pool: &Database, source_id: &str) -> u64 {
 
 /// Per-source tick cadence. A tick's due-set is now one source's, not the whole library, so
 /// this can be tight: it drops worst-case polling lag from `SCAN_TICK_SECONDS` (300s) to 60s.
-const SOURCE_TICK_SECONDS: u64 = 60;
+pub(crate) const SOURCE_TICK_SECONDS: u64 = 60;
 
 /// How often the supervisor reconciles its live loops against the DB (on top of explicit
 /// kicks). The desired set is ALWAYS derived from the DB, never from in-memory state, so a
@@ -3325,6 +3384,16 @@ async fn tick_source(
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> TickOutcome {
     use futures::StreamExt as _;
+    if let Some(fence) = &state.suwayomi.fence {
+        fence.scanner_tick().await;
+    }
+    if crate::engine_generation::wait(&state.pool).await.is_err() {
+        return TickOutcome {
+            due: 0,
+            ok: 0,
+            failed: 0,
+        };
+    }
     // A rate-limited source (`SCAN_SOURCE_RATE_LIMITS`, or an admin's `source_rate_limit`
     // row) is scanned strictly one at a time,
     // and a tick takes no more than one window's budget from the due-set — so one tick is at
@@ -4837,6 +4906,11 @@ mod tests {
 
     fn chap_n(id: i64, number: f64, upload_date: Option<&str>) -> SuwayomiChapter {
         SuwayomiChapter {
+            engine_generation: None,
+            manga: None,
+            url: None,
+            real_url: None,
+            source_order: None,
             id,
             manga_id: 1,
             name: "c".into(),
@@ -6476,6 +6550,8 @@ mod tests {
     /// `effective_status` reads.
     fn manga_with_status(id: i64, status: &str) -> SuwayomiManga {
         SuwayomiManga {
+            engine_generation: None,
+            real_url: None,
             id,
             title: format!("S{id}"),
             url: None,
@@ -7394,6 +7470,39 @@ mod tests {
     /// detected nothing must not touch the feed at all. Proven with a fixture that WOULD
     /// produce a row — the series has already had a detection, so the periodic rebuild's
     /// guards all pass — leaving the `new_found` gate as the only thing holding it back.
+    #[tokio::test]
+    async fn engine_generation_scanner_guard_aborts_parent_and_chapters_together() {
+        let pool = migrated_pool().await;
+        let mut m: SuwayomiManga =
+            serde_json::from_value(crate::engine_generation::tests::manga_json(7)).unwrap();
+        let mut c: SuwayomiChapter =
+            serde_json::from_value(crate::engine_generation::tests::chapter_json(8, 7)).unwrap();
+        crate::series_cache::put_series(&pool, &m).await.unwrap();
+        crate::series_cache::put_chapters(&pool, 7, &[c.clone()])
+            .await
+            .unwrap();
+        m.title = "Must not publish".into();
+        c.url = Some("/moved".into());
+        assert!(
+            persist_scan(&pool, &m, &[c], &ScanAdmin::default(), Utc::now())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            crate::series_cache::get_series(&pool, 7)
+                .await
+                .unwrap()
+                .unwrap()
+                .title,
+            "Series"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM series_scan_state")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
     #[tokio::test]
     async fn unchanged_scan_does_not_write_the_feed() {
         let pool = migrated_pool().await;

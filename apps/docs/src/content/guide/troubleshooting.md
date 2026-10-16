@@ -3,9 +3,13 @@ title: Fix reader problems
 description: Fix reader problems on the server you connect to, including pages, connections, accounts, and library items.
 ---
 
-The reader app reads from the komiq server you connect to: a local network server or one on the internet. In a browser, you can also read on the global server at `komiq.cc`. The admin app runs and manages that server. This guide helps you fix pages, connections, sign-in, and library problems.
+The reader connects to a komiq server on your network or the internet. The admin app runs it. This covers loading, connections, accounts and libraries. You can also open the global server at `komiq.cc` in a browser.
 
 ## Pages do not load
+
+### The app itself fails to load
+
+If an app file is unavailable, the reader reloads once in that tab. Another failure shows **Couldn’t load the app** and a **Reload** button. A successful start resets this automatic retry, so the reader can recover again after a later update. Check your connection, then choose Reload. If your browser blocks session storage, it shows the button immediately.
 
 ### Retry an individual page
 
@@ -13,13 +17,7 @@ If an image fails, komiq replaces it with an alert button showing the page numbe
 
 ### Chapter has no available pages
 
-**No pages available for this chapter** means the reader received no readable pages. A page-fetch failure can also cause it.
-
-To continue reading:
-
-1. Click Previous chapter or Next chapter when available to open an adjacent chapter.
-2. Click Back to series to return to the chapter list.
-3. Read only material you are authorised to access. For reader controls, see [Reading](/guide/reading).
+**No pages available for this chapter** means the reader received no readable pages, possibly because a fetch failed. Try Previous chapter or Next chapter, or choose Back to series. Read only material you are authorised to access. See [Reading](/guide/reading).
 
 ### The chapter is hosted off-site
 
@@ -42,21 +40,18 @@ If the native reader app cannot connect, start with [Connect to a server](/guide
 
 On the Connect to a server screen:
 
-- For a server on your local network, enter its IP address and configured port, such as `192.168.1.20:8080`. Docker defaults to `8080`; the admin desktop app defaults to `7580`. Turn on **Allow other devices** in the admin desktop app and use the address it shows.
-- For a server on the internet, enter its domain without spaces, such as `komiq.example.com`, or paste a link to it.
+- Enter the server IP and port, such as `192.168.1.20:8080`. Docker defaults to `8080`; desktop defaults to `7580`. On desktop, turn on **Allow other devices** and use its displayed address.
+- For an internet server, enter its domain, such as `komiq.example.com`, or paste its link.
 - For a server on the same computer, an address such as `localhost:8080` works. On a phone, `localhost` refers to the phone.
 - On phones, tap Scan a QR code to read the connection code displayed at the end of setup or in the admin console under Settings, then Access.
 
 ### The global server address does not connect
 
-For now, the apps cannot connect to the global server. Its API accepts requests from the `komiq.cc` website alone, so the app shows "No komiq server answered at this address." for `komiq.cc` and `api.komiq.cc`. This is on purpose: an API open to every app is open to abuse. The project may open the global server to the apps later, if enough people ask for it.
-
-- To read on the global server, open `komiq.cc` in a browser.
-- To use the app, connect it to a server you or someone else self-hosts. See [Choose your setup](/start/choose-your-setup).
+For now, the global server accepts requests from its website alone. Native apps show "No komiq server answered at this address." for its address. Open `komiq.cc` in a browser, or connect the app to a self-hosted server. See [Choose your setup](/start/choose-your-setup).
 
 ### Check network and firewall settings
 
-Connection errors frequently stem from network isolation:
+Check network isolation:
 
 - For a server reachable only on your home network, check that your phone or reading device is connected to the same local Wi-Fi network as the server. Mobile data or an isolated guest Wi-Fi network may not reach it.
 - Check the firewall on the host machine. If you run Linux with UFW, allow incoming traffic on your configured port. For the default port:
@@ -69,14 +64,14 @@ sudo ufw allow 8080/tcp
 
 ### Check server health
 
-The native app sends a request to the server `/health` endpoint with an 8-second timeout, then checks the server's instance information. If you run the admin app with Docker and the health request fails or returns a response outside the successful 200 to 299 range, inspect the containers from `deploy/selfhost`:
+The native app checks `/health` with an 8-second timeout, then queries instance information. If your Docker server does not answer, inspect it from `deploy/selfhost`:
 
 ```sh
 docker compose ps
 docker compose logs server
 ```
 
-For chapter reading through Suwayomi, check that the `server` and `suwayomi` services are healthy. The setup screens can work while the engine is still starting.
+Check both `server` and `suwayomi`. Setup can work while the engine is still starting.
 
 ### The server does not allow the apps
 
@@ -93,15 +88,11 @@ The Updates page shows two different messages:
 
 ### Setup code is not a login password
 
-During initial setup on a new server, the server log outputs a temporary setup code. This code is used only to register the initial owner account at `/admin/setup`.
-
-The setup code cannot be entered on the `/login` screen. Sign in using the username and password you created during the setup wizard.
+The temporary setup code in the server log registers the initial owner at `/admin/setup`. It is not a password for `/login`. Sign in with the account you created during setup.
 
 ### Public registration is closed
 
-Self-hosted servers allow the owner to disable public sign-ups. When registration is closed, the login page displays only the Sign in form and hides the Create account tab.
-
-If you need an account on a private server, ask the server owner to create an account for you in the admin console.
+When the server owner closes registration, the login page hides Create account. Ask the owner to create an account in the admin console.
 
 ### Check username and password requirements
 
@@ -119,9 +110,7 @@ Komiq stores a session token in browser local storage. This credential keeps you
 
 ### New server catalogue has no sources
 
-On a fresh self-hosted installation, the catalogue contains no series until the owner configures sources. The library displays an empty state explaining that series appear once sources are added.
-
-The server owner can enable MangaDex under Settings, then Sources, or add an extension repository and install a source. Once the server fetches or scans the configured sources, series become available.
+A fresh server has no series until its owner configures sources. The owner can enable MangaDex under Settings, then Sources, or add an extension repository and install a source. Series appear after fetching or scanning.
 
 ### Active shelf and search filters
 
@@ -129,10 +118,8 @@ Filters may hide library titles:
 
 - Check the active shelf tab. If you have selected Plan to Read or Completed, the view hides series assigned to other shelves. Click All to view every series.
 - Clear the Filter by title search box.
-- Check the Format dropdown and reset it to All formats. Click Clear filters to reset the title and format filters. This does not change the selected shelf.
+- Reset Format to All formats. Clear filters resets title and format, but keeps the selected shelf.
 
 ### Check your server and user account
 
-Library memberships, shelf choices, and reading progress are stored per user account on the server you connected to. Check that you are using the same server as before. Switching servers clears the previous sign-in session.
-
-Guests and different accounts do not see your previous library items. Check the account icon in the header. For shelves, see [Library](/guide/library).
+Libraries and progress belong to an account on one server. Check the server address and account icon. Switching servers clears the previous sign-in session. Guests and other accounts cannot see your library. See [Library](/guide/library).

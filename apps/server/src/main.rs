@@ -14,6 +14,8 @@ mod db;
 mod db_types;
 mod dedup;
 mod discovery;
+mod engine_generation;
+mod engine_keys;
 mod ext_icon;
 mod gc;
 mod graphql;
@@ -34,9 +36,6 @@ mod phash;
 #[cfg(test)]
 #[path = "../bench/postgres_contention.rs"]
 mod postgres_contention;
-#[cfg(test)]
-#[path = "../bench/wal_drill.rs"]
-mod wal_drill;
 mod postgres_metrics;
 mod rate_limit;
 mod request_budget;
@@ -61,6 +60,9 @@ mod test_postgres;
 mod upstream_admission_tests;
 mod upstream_cache;
 mod views;
+#[cfg(test)]
+#[path = "../bench/wal_drill.rs"]
+mod wal_drill;
 mod web_dir;
 mod work_stats;
 
@@ -725,7 +727,7 @@ fn avatar_error(status: StatusCode, message: &str) -> axum::response::Response {
 /// `POST /avatar` — authenticated multipart avatar upload. The bytes are decoded,
 /// squared, and re-encoded as budgeted lossless WebP (`avatar::process_avatar`),
 /// stored as a BLOB in `user_avatars`, and the resulting path stored on the user
-/// row. Returns `{ "avatarUrl": "/avatars/<id>.webp?v=<ts>" }`.
+/// row. Returns `{ "avatarUrl": "/avatars/<id>.webp?v=<version>" }`.
 async fn upload_avatar(
     State(pool): State<crate::db::Database>,
     State(limiter): State<Arc<RateLimiter>>,
@@ -795,44 +797,59 @@ async fn upload_avatar(
         }
     };
 
-    // Millisecond granularity so two uploads within the same second still produce
-    // distinct `?v=` values (the served avatar is immutable/1-year-cached).
-    let version = chrono::Utc::now().timestamp_millis();
-    let now = crate::db_types::truncate_date(chrono::Utc::now());
-    let url = avatar::avatar_url(&user.id, version);
+    match save_avatar(&pool, &user.id, &webp, chrono::Utc::now()).await {
+        Ok(url) => Json(serde_json::json!({ "avatarUrl": url })).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "avatar save failed");
+            database_error_response(e, "Could not save avatar")
+        }
+    }
+}
+
+async fn save_avatar(
+    pool: &crate::db::Database,
+    user_id: &str,
+    webp: &[u8],
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<String> {
     // Upsert the BLOB and repoint the user row in one transaction so the stored
     // `avatar_url` version can never disagree with the bytes on record.
-    let stored = async {
-        let mut tx = pool.begin().await?;
-        anyhow::ensure!(
-            crate::locks::lock_user(&mut tx, &user.id).await?,
-            "user no longer exists"
-        );
-        sqlx::query(
-            "INSERT INTO user_avatars (user_id, webp, version, updated_at) VALUES ($1, $2, $3, $4) \
-             ON CONFLICT(user_id) DO UPDATE SET \
-               webp = excluded.webp, version = excluded.version, updated_at = excluded.updated_at",
-        )
-        .bind(uuid::Uuid::parse_str(&user.id).expect("stored user UUID"))
-        .bind(&webp)
-        .bind(version)
-        .bind(now)
+    let mut tx = pool.begin().await?;
+    anyhow::ensure!(
+        crate::locks::lock_user(&mut tx, user_id).await?,
+        "user no longer exists"
+    );
+    let id = uuid::Uuid::parse_str(user_id)?;
+    let previous: Option<i64> =
+        sqlx::query_scalar("SELECT version FROM user_avatars WHERE user_id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let version = now.timestamp_millis().max(
+        previous
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("avatar version exhausted"))?,
+    );
+    let url = avatar::avatar_url(user_id, version);
+    sqlx::query(
+        "INSERT INTO user_avatars (user_id, webp, version, updated_at) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT(user_id) DO UPDATE SET \
+           webp = excluded.webp, version = excluded.version, updated_at = excluded.updated_at",
+    )
+    .bind(id)
+    .bind(webp)
+    .bind(version)
+    .bind(crate::db_types::truncate_date(now))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE users SET avatar_url = $1 WHERE id = $2")
+        .bind(&url)
+        .bind(id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("UPDATE users SET avatar_url = $1 WHERE id = $2")
-            .bind(&url)
-            .bind(uuid::Uuid::parse_str(&user.id).expect("stored user UUID"))
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok::<_, anyhow::Error>(())
-    }
-    .await;
-    if let Err(e) = stored {
-        tracing::error!(error = %e, "avatar save failed");
-        return database_error_response(e, "Could not save avatar");
-    }
-    Json(serde_json::json!({ "avatarUrl": url })).into_response()
+    tx.commit().await?;
+    Ok(url)
 }
 
 /// `POST /admin/cover/{work_id}` — ADMIN multipart cover upload. Decodes the image,
@@ -972,6 +989,7 @@ async fn serve_ext_icon(
     State(app): State<Arc<graphql::AppState>>,
     State(CoverDb(pool)): State<CoverDb>,
     UrlPath(file): UrlPath<String>,
+    headers: HeaderMap,
 ) -> axum::response::Response {
     let Some(pkg) = file
         .strip_suffix(".png")
@@ -981,11 +999,11 @@ async fn serve_ext_icon(
     };
     // Tier 1: the vendored snapshot.
     if let Ok(bytes) = tokio::fs::read(app.ext_icons_dir.join(format!("{pkg}.png"))).await {
-        return png_icon_response(bytes);
+        return png_icon_response(bytes, &headers);
     }
     // Tier 2: previously fetched, or a live "no icon exists" tombstone.
     match ext_icon::cached(&pool, pkg).await {
-        Ok(Some(bytes)) => return png_icon_response(bytes),
+        Ok(Some(bytes)) => return png_icon_response(bytes, &headers),
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(()) => {}
     }
@@ -1028,41 +1046,61 @@ async fn serve_ext_icon(
         (None, _, _) => ext_icon::RepoLookup::Unavailable,
     };
     match ext_icon::fetch_and_cache(&pool, pkg, repo).await {
-        Some(bytes) => png_icon_response(bytes),
+        Some(bytes) => png_icon_response(bytes, &headers),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
-/// Extension icons are content-addressed by package name and effectively never
-/// change, so they carry the same immutable year-long cache as avatars/covers —
-/// the browser and any edge cache in front of us should ask exactly once.
-fn png_icon_response(bytes: Vec<u8>) -> axum::response::Response {
+/// Extension icons can change at the same package path, so caches must revalidate
+/// after one day.
+fn png_icon_response(bytes: Vec<u8>, headers: &HeaderMap) -> axum::response::Response {
+    use sha2::{Digest, Sha256};
+
+    let etag = format!("\"{}\"", hex::encode(Sha256::digest(&bytes)));
+    // If-None-Match uses weak comparison for GET/HEAD, even with a strong validator.
+    let matches = headers.get_all(header::IF_NONE_MATCH).iter().any(|value| {
+        value.to_str().ok().is_some_and(|value| {
+            value.split(',').any(|tag| {
+                let tag = tag.trim();
+                tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag
+            })
+        })
+    });
     (
+        if matches {
+            StatusCode::NOT_MODIFIED
+        } else {
+            StatusCode::OK
+        },
         [
             (header::CONTENT_TYPE, "image/png"),
-            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            (
+                header::CACHE_CONTROL,
+                "public, max-age=86400, must-revalidate",
+            ),
+            (header::ETAG, etag.as_str()),
         ],
-        bytes,
+        if matches { Vec::new() } else { bytes },
     )
         .into_response()
 }
 
-/// `GET /avatars/{file}` — serve the current stored avatar from `user_avatars`.
-/// The stored `avatar_url` carries a `?v=<ts>` so a new upload busts
-/// the cache. `{file}` is `<user_id>.webp`; the id is looked up as a bind param
-/// (no path/SQL injection surface), returning 404 for a bad shape or unknown id.
+/// `GET /avatars/{file}` — serve the current `?v=` with immutable caching.
+/// Older versions and unversioned URLs redirect forward; newer versions get no-store. `{file}`
+/// is `<user_id>.webp`; bad shapes and missing avatars return uncacheable 404s.
 async fn serve_avatar(
     State(pool): State<crate::db::Database>,
     UrlPath(file): UrlPath<String>,
+    RawQuery(query): RawQuery,
 ) -> axum::response::Response {
     let Some(user_id) = file.strip_suffix(".webp") else {
-        return StatusCode::NOT_FOUND.into_response();
+        return media_not_found();
     };
     let Ok(user_id) = crate::db_types::uuid(user_id) else {
-        return StatusCode::NOT_FOUND.into_response();
+        return media_not_found();
     };
-    let webp: Option<Vec<u8>> =
-        match sqlx::query_scalar("SELECT webp FROM user_avatars WHERE user_id = $1")
+    let stored: Option<(Vec<u8>, i64)> =
+        match sqlx::query_as("SELECT webp, version FROM user_avatars WHERE user_id = $1")
             .bind(user_id)
             .fetch_optional(&pool)
             .await
@@ -1076,26 +1114,29 @@ async fn serve_avatar(
                 ));
             }
         };
-    match webp {
-        Some(bytes) => (
-            [
-                (header::CONTENT_TYPE, "image/webp"),
-                (header::CACHE_CONTROL, image_delivery::MUTABLE_CACHE),
-            ],
-            bytes,
-        )
-            .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+    match stored {
+        Some((bytes, version)) => {
+            if let Some(response) = version_redirect(
+                query_param(&query, "v"),
+                version,
+                &avatar::avatar_url(&user_id.to_string(), version),
+            ) {
+                return response;
+            }
+            webp_cover_response(
+                bytes,
+                version_cache_control(query_param(&query, "v"), version),
+            )
+        }
+        None => media_not_found(),
     }
 }
 
 /// `GET /covers/{work_id}.webp` — public serve of a work cover from `work_cover_blob`.
-/// Same BLOB-in-SQLite model and revalidating cache as avatars. On a cache MISS for a
-/// MangaDex-anchored work, lazily fetch its MangaDex cover, downscale to a bounded
-/// WebP, store it (so it's on our origin from now on), and serve it — "save covers as
-/// we fetch". If the lazy fetch/resize fails (or the work has a version but a missing
-/// blob), 302-redirect to the MangaDex CDN so the cover still renders; a genuinely
-/// coverless work 404s, and so does every miss while MangaDex is switched off.
+/// Current `?v=` URLs serve immutable bytes from one master/derivative snapshot;
+/// older versions and unversioned URLs redirect forward; newer versions get no-store. On a blob
+/// miss, MangaDex-anchored works keep the lazy fetch, mutable response and CDN
+/// fallback. Coverless works and misses with MangaDex disabled return no-store 404s.
 async fn serve_cover(
     State(app): State<Arc<graphql::AppState>>,
     State(CoverDb(pool)): State<CoverDb>,
@@ -1103,18 +1144,36 @@ async fn serve_cover(
     RawQuery(query): RawQuery,
 ) -> axum::response::Response {
     let Some(work_id) = file.strip_suffix(".webp") else {
-        return StatusCode::NOT_FOUND.into_response();
+        return media_not_found();
     };
-    // `?v=` (cache bust) is ignored here; only `?w=` changes what we serve.
     let width = cover::variant_width(query_param(&query, "w"));
     // Fast path: already-cached blob.
-    match sqlx::query_scalar::<_, Vec<u8>>("SELECT webp FROM work_cover_blob WHERE work_id = $1")
-        .bind(work_id)
-        .fetch_optional(&pool)
-        .await
-    {
-        Ok(Some(bytes)) => {
-            return cover_response_at_width(&app.pool, &pool, work_id, width, bytes).await;
+    match read_work_cover_snapshot(&pool, work_id, width).await {
+        Ok(Some((master, version, derivative))) => {
+            let requested = query_param(&query, "v");
+            if requested
+                .and_then(|v| v.parse::<i64>().ok())
+                .is_some_and(|v| v < version)
+            {
+                cover::defer_work_cover_version_repair(&app.pool, &pool, work_id);
+            }
+            let mut path = cover::cover_path(work_id, version);
+            if let Some(w) = width {
+                path.push_str(&format!("&w={w}"));
+            }
+            if let Some(response) = version_redirect(query_param(&query, "v"), version, &path) {
+                return response;
+            }
+            return cover_response_at_width(
+                &app.pool,
+                &pool,
+                work_id,
+                width,
+                master,
+                derivative,
+                version_cache_control(requested, version),
+            )
+            .await;
         }
         Ok(None) => {} // fall through to lazy fetch
         Err(e) => {
@@ -1126,7 +1185,7 @@ async fn serve_cover(
     // anchor and materialize the cover on first request.
     let Some((mangadex_id, file_name)) = cover::mangadex_cover_anchor(&app.pool, work_id).await
     else {
-        return StatusCode::NOT_FOUND.into_response();
+        return media_not_found();
     };
     // MangaDex switched off: no lazy fetch and, just as important, no redirect to the
     // MangaDex CDN (that would only move the MangaDex request into the browser). A
@@ -1167,7 +1226,15 @@ async fn serve_cover(
                 }
                 Ok(())
             });
-            cover_response_at_width(&app.pool, &pool, work_id, width, webp).await
+            // A versioned URL names stored bytes; a lazy fill under it may not be them
+            // (for example after a restore without the cover file), so it is not cached.
+            // The next request finds the stored cover and redirects to its version.
+            let cache = if query_param(&query, "v").is_some() {
+                "no-store"
+            } else {
+                image_delivery::MUTABLE_CACHE
+            };
+            uncached_cover_response_at_width(&app.pool, &pool, work_id, width, webp, cache).await
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, work_id, "lazy cover resize failed; redirecting to CDN");
@@ -1215,6 +1282,34 @@ async fn serve_suwayomi_image(
 ) -> axum::response::Response {
     if !is_suwayomi_image_path(&rest) {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    if app.suwayomi.wait_for_generation().await.is_err() {
+        return page_busy_response();
+    }
+    let generation = app.suwayomi.read_generation();
+    let response = serve_suwayomi_image_inner(app.clone(), covers, rest, query).await;
+    if app
+        .suwayomi
+        .validate_read_generation(generation)
+        .await
+        .is_err()
+    {
+        return page_busy_response();
+    }
+    response
+}
+
+async fn serve_suwayomi_image_inner(
+    app: Arc<graphql::AppState>,
+    covers: crate::db::SqliteDatabase,
+    rest: String,
+    query: Option<String>,
+) -> axum::response::Response {
+    if !is_suwayomi_image_path(&rest) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if app.suwayomi.wait_for_generation().await.is_err() {
+        return page_busy_response();
     }
     // Covers (`{id}/thumbnail`) are downscaled to a bounded WebP and origin-cached —
     // the feeds serve these full-resolution (avg ~0.8 MB, up to several MB) at card
@@ -1339,10 +1434,15 @@ async fn serve_suwayomi_cover(
     manga_id: i64,
     width: Option<u32>,
 ) -> axum::response::Response {
+    if app.suwayomi.wait_for_generation().await.is_err() {
+        return page_busy_response();
+    }
+    let generation = app.suwayomi.fence.as_ref().and_then(|f| f.generation());
     let variant_key = cover::suwayomi_variant_key(manga_id);
     match cover::read_suwayomi_cover(covers, manga_id).await {
         Ok(Some(webp)) => {
-            return cover_response_at_width(&app.pool, covers, &variant_key, width, webp).await;
+            return mutable_cover_response_at_width(&app.pool, covers, &variant_key, width, webp)
+                .await;
         }
         Ok(None) => {}
         Err(error) => {
@@ -1394,10 +1494,13 @@ async fn serve_suwayomi_cover(
             let bytes = webp.clone();
             let main = app.pool.background();
             app.pool.defer(async move {
-                cover::publish_suwayomi_cover_if_missing(&main, &writer, manga_id, &bytes).await?;
+                cover::publish_suwayomi_cover_if_missing_in_generation(
+                    &main, &writer, manga_id, &bytes, generation,
+                )
+                .await?;
                 Ok(())
             });
-            cover_response_at_width(&app.pool, covers, &variant_key, width, webp).await
+            mutable_cover_response_at_width(&app.pool, covers, &variant_key, width, webp).await
         }
         Ok(Err((err, bytes))) => {
             tracing::warn!(error = %err, manga_id, "suwayomi cover resize failed; serving raw");
@@ -1444,6 +1547,7 @@ fn spawn_suwayomi_cover_materialize(
     // Captured here, not read in the task: the task is detached, so it must not depend
     // on the request's lane scope, and it outlives the borrow of `app`.
     let main = app.pool.background();
+    let generation = suwayomi.fence.as_ref().and_then(|f| f.generation());
     #[cfg(test)]
     let pause = COVER_RESPONSE_PAUSE.try_with(Clone::clone).ok();
     Some(tokio::spawn(async move {
@@ -1458,8 +1562,10 @@ fn spawn_suwayomi_cover_materialize(
             if let Some(points) = pause {
                 points.hit("materialize-fetched").await;
             }
-            let stored =
-                cover::publish_suwayomi_cover_if_missing(&main, &covers, manga_id, &webp).await;
+            let stored = cover::publish_suwayomi_cover_if_missing_in_generation(
+                &main, &covers, manga_id, &webp, generation,
+            )
+            .await;
             if let Err(e) = stored {
                 // Terminal boundary of a detached task: count the database cause once.
                 db::observe_database_error(&e);
@@ -1512,13 +1618,128 @@ fn cover_warming_response() -> axum::response::Response {
 /// rather than a `Query<T>` extractor: a typed extractor REJECTS the whole request on a
 /// value it cannot parse, and a cover URL carrying a stale or hand-edited `?w=` must
 /// still render the cover. Values here are plain integers, so no percent-decoding is
-/// needed — anything that does not parse falls through to the master.
+/// needed. Invalid widths select the master; invalid versions redirect.
 fn query_param<'a>(raw: &'a Option<String>, key: &str) -> Option<&'a str> {
     raw.as_deref()?
         .split('&')
-        .filter_map(|pair| pair.split_once('='))
+        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
         .find(|(k, _)| *k == key)
         .map(|(_, v)| v)
+}
+
+fn media_not_found() -> axum::response::Response {
+    (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response()
+}
+
+fn version_redirect(
+    requested: Option<&str>,
+    current: i64,
+    path: &str,
+) -> Option<axum::response::Response> {
+    if requested
+        .and_then(|v| v.parse::<i64>().ok())
+        .is_some_and(|v| v >= current)
+    {
+        return None;
+    }
+    let cache = if requested.is_some() {
+        "no-store"
+    } else {
+        "public, max-age=300"
+    };
+    Some(
+        (
+            [(header::CACHE_CONTROL, cache)],
+            axum::response::Redirect::temporary(path),
+        )
+            .into_response(),
+    )
+}
+
+fn version_cache_control(requested: Option<&str>, current: i64) -> &'static str {
+    if requested.and_then(|v| v.parse::<i64>().ok()) == Some(current) {
+        image_delivery::IMMUTABLE_CACHE
+    } else {
+        "no-store"
+    }
+}
+
+async fn read_work_cover_snapshot(
+    covers: &crate::db::SqliteDatabase,
+    work_id: &str,
+    width: Option<u32>,
+) -> Result<Option<(Vec<u8>, i64, Option<Vec<u8>>)>, sqlx::Error> {
+    // A reader transaction pins the WAL snapshot without taking the cache writer.
+    let mut tx = covers.read().begin().await?;
+    let stored: Option<(Vec<u8>, i64)> =
+        sqlx::query_as("SELECT webp, version FROM work_cover_blob WHERE work_id = $1")
+            .bind(work_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let result = if let Some((master, version)) = stored {
+        #[cfg(test)]
+        if let Ok(points) = COVER_RESPONSE_PAUSE.try_with(Clone::clone) {
+            points.hit("cover-master-read").await;
+        }
+        let derivative = if let Some(w) = width {
+            sqlx::query_scalar("SELECT webp FROM cover_variant WHERE asset_key = $1 AND width = $2")
+                .bind(work_id)
+                .bind(w)
+                .fetch_optional(&mut *tx)
+                .await?
+        } else {
+            None
+        };
+        Some((master, version, derivative))
+    } else {
+        None
+    };
+    tx.commit().await?;
+    Ok(result)
+}
+
+async fn mutable_cover_response_at_width(
+    main: &crate::db::Database,
+    covers: &crate::db::SqliteDatabase,
+    asset_key: &str,
+    width: Option<u32>,
+    master: Vec<u8>,
+) -> axum::response::Response {
+    uncached_cover_response_at_width(
+        main,
+        covers,
+        asset_key,
+        width,
+        master,
+        image_delivery::MUTABLE_CACHE,
+    )
+    .await
+}
+
+/// [`cover_response_at_width`] for a master that was not read with its derivative.
+async fn uncached_cover_response_at_width(
+    main: &crate::db::Database,
+    covers: &crate::db::SqliteDatabase,
+    asset_key: &str,
+    width: Option<u32>,
+    master: Vec<u8>,
+    cache_control: &'static str,
+) -> axum::response::Response {
+    let derivative = if let Some(w) = width {
+        cover::variant_of_master(covers, asset_key, w, &master).await
+    } else {
+        None
+    };
+    cover_response_at_width(
+        main,
+        covers,
+        asset_key,
+        width,
+        master,
+        derivative,
+        cache_control,
+    )
+    .await
 }
 
 /// Serve `master`, or an allowlisted `?w=` derivative of it, generating and caching that
@@ -1534,20 +1755,23 @@ fn query_param<'a>(raw: &'a Option<String>, key: &str) -> Option<&'a str> {
 /// as-is and NOTHING is stored, so the 320 rung does not mint a byte-identical copy of
 /// every narrow master.
 ///
-/// Every failure mode falls back to the master: a cover that renders slightly too large
-/// is strictly better than a hole in the grid.
+/// The derivative is captured with the master by the caller; after a resize wait it is
+/// re-read only while that master is still current. Resize failures fall back to the
+/// master without caching it.
 async fn cover_response_at_width(
     main: &crate::db::Database,
     covers: &crate::db::SqliteDatabase,
     asset_key: &str,
     width: Option<u32>,
     master: Vec<u8>,
+    derivative: Option<Vec<u8>>,
+    cache_control: &'static str,
 ) -> axum::response::Response {
     let Some(w) = width else {
-        return webp_cover_response(master);
+        return webp_cover_response(master, cache_control);
     };
-    if let Some(bytes) = cover::get_cover_variant(covers, asset_key, w).await {
-        return webp_cover_response(bytes);
+    if let Some(bytes) = derivative {
+        return webp_cover_response(bytes, cache_control);
     }
     // Bounded: unlike every other resize here, this one has no upstream fetch in front of
     // it to cap concurrency, so a cold grid would otherwise start ~30 at once. See
@@ -1555,10 +1779,10 @@ async fn cover_response_at_width(
     // HTTP route times out while its non-cancellable resize is still running.
     let permit = cover::variant_resize_permit().await;
     // Re-check under the permit: while we waited, another request for this same cover may
-    // have generated and stored it. Skips a duplicate resize on exactly the stampede this
-    // bound exists for.
-    if let Some(bytes) = cover::get_cover_variant(covers, asset_key, w).await {
-        return webp_cover_response(bytes);
+    // have stored it. Only a derivative of this exact master counts, so a newer master's
+    // derivative is never served under this response.
+    if let Some(bytes) = cover::variant_of_master(covers, asset_key, w, &master).await {
+        return webp_cover_response(bytes, cache_control);
     }
     // Decode + Lanczos3 resize + WebP encode is CPU-bound; keep it off the async runtime
     // exactly like `process_cover`'s callers do.
@@ -1570,7 +1794,7 @@ async fn cover_response_at_width(
     let made = resize_cover_variant(permit, move || cover::downscale_variant(&source, w)).await;
     match made {
         // The master is already at or under `w` — serve it, store nothing.
-        Ok(Ok(None)) => webp_cover_response(master),
+        Ok(Ok(None)) => webp_cover_response(master, cache_control),
         Ok(Ok(Some(bytes))) => {
             let writer = covers.clone();
             let asset = asset_key.to_owned();
@@ -1579,15 +1803,15 @@ async fn cover_response_at_width(
             main.defer(async move {
                 cover::put_current_variant(&database, &writer, &asset, w, &master, &cached).await
             });
-            webp_cover_response(bytes)
+            webp_cover_response(bytes, cache_control)
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, asset_key, width = w, "cover variant resize failed");
-            webp_cover_response(master)
+            webp_cover_response(master, "no-store")
         }
         Err(e) => {
             tracing::error!(error = %e, asset_key, width = w, "cover variant task panicked");
-            webp_cover_response(master)
+            webp_cover_response(master, "no-store")
         }
     }
 }
@@ -1604,14 +1828,13 @@ fn resize_cover_variant<T: Send + 'static>(
     })
 }
 
-/// Current cover bytes: ?v= is a cache bust, not a historical object selector.
-fn webp_cover_response(bytes: Vec<u8>) -> axum::response::Response {
+fn webp_cover_response(bytes: Vec<u8>, cache_control: &'static str) -> axum::response::Response {
     (
         [
             (header::CONTENT_TYPE, HeaderValue::from_static("image/webp")),
             (
                 header::CACHE_CONTROL,
-                HeaderValue::from_static(image_delivery::MUTABLE_CACHE),
+                HeaderValue::from_static(cache_control),
             ),
         ],
         bytes,
@@ -1818,10 +2041,10 @@ async fn serve_comment_media(
     UrlPath(file): UrlPath<String>,
 ) -> axum::response::Response {
     let Some(id) = file.strip_suffix(".webp") else {
-        return StatusCode::NOT_FOUND.into_response();
+        return media_not_found();
     };
     let Ok(id) = crate::db_types::uuid(id) else {
-        return StatusCode::NOT_FOUND.into_response();
+        return media_not_found();
     };
     let webp: Option<Vec<u8>> =
         match sqlx::query_scalar("SELECT webp FROM comment_media WHERE id = $1")
@@ -1847,7 +2070,7 @@ async fn serve_comment_media(
             bytes,
         )
             .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+        None => media_not_found(),
     }
 }
 
@@ -2349,6 +2572,15 @@ async fn main() -> anyhow::Result<()> {
     if argv.first().map(String::as_str) == Some("repair-upload-dates") {
         return catalog::date_repair::run_cli(&argv[1..]).await;
     }
+    if argv.first().map(String::as_str) == Some("engine") {
+        let pool = db::connect_existing(&cfg.database_url).await?;
+        let covers = db::connect_existing_covers(&cfg.covers_database_url).await?;
+        let mut engine = SuwayomiClient::new(cfg.suwayomi_url.clone(), None, cfg.source_id.clone());
+        let result = engine_generation::run_cli(&pool, &covers, &mut engine, &argv[1..]).await;
+        pool.close().await;
+        covers.close().await;
+        return result;
+    }
     if argv.first().map(String::as_str) == Some("phase-f") {
         let pool = db::connect_existing(&cfg.database_url).await?;
         let cover_pool = db::connect_existing_covers(&cfg.covers_database_url).await?;
@@ -2395,11 +2627,12 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let suwayomi = SuwayomiClient::new(
+    let mut suwayomi = SuwayomiClient::new(
         cfg.suwayomi_url.clone(),
         cfg.suwayomi_public_url.clone(),
         cfg.source_id.clone(),
     );
+    engine_generation::Fence::attach(&pool, &cover_pool, &mut suwayomi).await?;
     let mangadex = Arc::new(mangadex::MangaDexClient::new(
         &cfg.mangadex_user_agent,
         cfg.mangadex_rate_per_sec,
@@ -2464,6 +2697,11 @@ async fn main() -> anyhow::Result<()> {
     // Background adaptive scan scheduler, sharing the same AppState.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     scanner::spawn(state.clone(), cfg.scan_tick_seconds, shutdown_rx);
+    engine_keys::spawn(
+        pool.clone(),
+        state.suwayomi.clone(),
+        shutdown_tx.subscribe(),
+    );
     maintenance::spawn(
         state.clone(),
         cfg.extension_auto_update_interval_seconds,
@@ -2838,7 +3076,7 @@ mod tests {
     #[test]
     fn mutable_page_and_cover_locators_have_bounded_revalidating_cache_policy() {
         let page = raw_image_response("image/jpeg".into(), crate::suwayomi::testsrv::jpeg(8, 8));
-        let cover = webp_cover_response(vec![1]);
+        let cover = webp_cover_response(vec![1], image_delivery::MUTABLE_CACHE);
         for response in [page, cover] {
             assert_eq!(
                 response.headers()[header::CACHE_CONTROL],
@@ -2849,6 +3087,695 @@ mod tests {
                 .unwrap()
                 .contains("immutable"));
         }
+    }
+
+    async fn own_origin_media_state() -> Arc<AppState> {
+        let main = crate::db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap()
+            .foreground();
+        let covers = crate::db::init_covers("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO work(id,created_at,updated_at) VALUES ('w_exact',NOW(),NOW())")
+            .execute(&main)
+            .await
+            .unwrap();
+        Arc::new(AppState {
+            pool: main,
+            cover_pool: covers,
+            suwayomi: SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),
+            mangadex: Arc::new(
+                mangadex::MangaDexClient::new("own-origin-test", 100.0, 100.0)
+                    .with_bases("http://127.0.0.1:1", "http://127.0.0.1:1"),
+            ),
+            admin_users: vec![],
+            scan_health: std::sync::Mutex::new(ScanHealth::default()),
+            auth_limiter: RateLimiter::new(100, 60),
+            comment_limiter: graphql::comment_limiter(),
+            rating_limiter: graphql::rating_limiter(),
+            password_work: Arc::new(tokio::sync::Semaphore::new(4)),
+            federated_limiter: RateLimiter::new(100, 60),
+            session_ttl_secs: 3600,
+            series_inflight: KeyedLocks::default(),
+            chapters_inflight: KeyedLocks::default(),
+            cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            catalogue_cover_phash: false,
+            ext_icons_dir: std::path::PathBuf::new(),
+            setup_code: instance::SetupCode::default(),
+        })
+    }
+
+    async fn exact_cover_get(app: &Arc<AppState>, query: Option<&str>) -> axum::response::Response {
+        serve_cover(
+            State(app.clone()),
+            State(CoverDb(app.cover_pool.clone())),
+            UrlPath("w_exact.webp".to_owned()),
+            RawQuery(query.map(str::to_owned)),
+        )
+        .await
+    }
+
+    #[test]
+    fn own_origin_versions_only_redirect_forward() {
+        for current in [7, 9] {
+            for requested in [current, current + 1, i64::MAX] {
+                let requested = requested.to_string();
+                assert!(version_redirect(Some(&requested), current, "/current").is_none());
+                assert_eq!(
+                    version_cache_control(Some(&requested), current),
+                    if requested == current.to_string() {
+                        image_delivery::IMMUTABLE_CACHE
+                    } else {
+                        "no-store"
+                    }
+                );
+            }
+            for requested in [
+                None,
+                Some(""),
+                Some("bogus"),
+                Some("6"),
+                Some("9223372036854775808"),
+            ] {
+                let res = version_redirect(requested, current, "/current").unwrap();
+                assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+                assert_eq!(res.headers()[header::LOCATION], "/current");
+                assert_eq!(
+                    res.headers()[header::CACHE_CONTROL],
+                    if requested.is_none() {
+                        "public, max-age=300"
+                    } else {
+                        "no-store"
+                    }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn own_origin_cover_versions_redirect_or_serve_exact_bytes() {
+        let app = own_origin_media_state().await;
+        sqlx::query("INSERT INTO work_cover_blob VALUES ('w_exact',$1,7,'now')")
+            .bind(b"master".as_slice())
+            .execute(&app.cover_pool)
+            .await
+            .unwrap();
+        cover::put_cover_variant(&app.cover_pool, "w_exact", 192, b"derivative")
+            .await
+            .unwrap();
+        for (query, expected) in [
+            ("v=7", b"master".as_slice()),
+            ("v=7&w=192", b"derivative"),
+            ("v=9", b"master"),
+            ("v=9&w=192", b"derivative"),
+        ] {
+            let response = exact_cover_get(&app, Some(query)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                if query.starts_with("v=7") {
+                    image_delivery::IMMUTABLE_CACHE
+                } else {
+                    "no-store"
+                }
+            );
+            assert!(!response.headers().contains_key(header::LOCATION));
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                expected
+            );
+        }
+        for (query, path, cache) in [
+            (
+                Some("v=6&w=192"),
+                "/covers/w_exact.webp?v=7&w=192",
+                "no-store",
+            ),
+            (Some("v=6&w=999"), "/covers/w_exact.webp?v=7", "no-store"),
+            (Some("v"), "/covers/w_exact.webp?v=7", "no-store"),
+            (None, "/covers/w_exact.webp?v=7", "public, max-age=300"),
+            (
+                Some("w=192"),
+                "/covers/w_exact.webp?v=7&w=192",
+                "public, max-age=300",
+            ),
+        ] {
+            let response = exact_cover_get(&app, query).await;
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+            assert_eq!(response.headers()[header::LOCATION], path);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], cache);
+        }
+    }
+
+    #[tokio::test]
+    async fn own_origin_stale_cover_request_repairs_a_failed_publication_without_restart() {
+        let app = own_origin_media_state().await;
+        let work = format!("w_{}", uuid::Uuid::new_v4());
+        sqlx::query("INSERT INTO work(id,cover_cached_version,created_at,updated_at) VALUES ($1,7,NOW(),NOW())")
+            .bind(&work).execute(&app.pool).await.unwrap();
+        sqlx::query("INSERT INTO feed_updates(work_id,title,latest_at,cover_url) VALUES ($1,'Repair',NOW(),$2)")
+            .bind(&work).bind(cover::cover_path(&work, 7)).execute(&app.pool).await.unwrap();
+        sqlx::query("INSERT INTO feed_series_updates(work_id,reader_id,title,released_at,cover_url) VALUES ($1,'7','Repair',NOW(),$2)")
+            .bind(&work).bind(cover::cover_path(&work, 7)).execute(&app.pool).await.unwrap();
+        sqlx::query("INSERT INTO browse_catalogue(work_id,reader_id,title,created_at,cover_url) VALUES ($1,'7','Repair',NOW(),$2)")
+            .bind(&work).bind(cover::cover_path(&work, 7)).execute(&app.pool).await.unwrap();
+        sqlx::query("INSERT INTO work_cover_blob VALUES ($1,$2,7,'now')")
+            .bind(&work)
+            .bind(b"old".as_slice())
+            .execute(&app.cover_pool)
+            .await
+            .unwrap();
+        // Reject the first pointer write, after SQLite has already committed its blob.
+        sqlx::raw_sql("CREATE SEQUENCE reject_cover_once; CREATE FUNCTION reject_cover_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.cover_cached_version IS DISTINCT FROM OLD.cover_cached_version AND nextval('reject_cover_once') = 1 THEN RAISE EXCEPTION 'publication rejected'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_cover_once BEFORE UPDATE ON work FOR EACH ROW EXECUTE FUNCTION reject_cover_once()")
+            .execute(&app.pool).await.unwrap();
+        assert!(
+            cover::put_work_cover(&app.pool, &app.cover_pool, &work, b"new")
+                .await
+                .is_err()
+        );
+        let version: i64 =
+            sqlx::query_scalar("SELECT version FROM work_cover_blob WHERE work_id=$1")
+                .bind(&work)
+                .fetch_one(&app.cover_pool)
+                .await
+                .unwrap();
+        assert!(version > 7);
+        let published: i64 =
+            sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id=$1")
+                .bind(&work)
+                .fetch_one(&app.pool)
+                .await
+                .unwrap();
+        assert_eq!(published, 7);
+        // A queued repair must not delay the redirect while publication locks are busy.
+        let mut held = app.pool.begin().await.unwrap();
+        let guard = cover::lock_asset(&mut held, &work).await.unwrap();
+        for _ in 0..20 {
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                serve_cover(
+                    State(app.clone()),
+                    State(CoverDb(app.cover_pool.clone())),
+                    UrlPath(format!("{work}.webp")),
+                    RawQuery(Some("v=7".into())),
+                ),
+            )
+            .await
+            .expect("repair blocked cover redirect");
+            assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+            assert_eq!(
+                res.headers()[header::LOCATION],
+                cover::cover_path(&work, version)
+            );
+            assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store");
+        }
+        assert!(
+            app.pool.deferred_queued() <= 1,
+            "hot cover queued duplicate repairs"
+        );
+        held.commit().await.unwrap();
+        drop(guard);
+        app.pool.flush_deferred().await;
+        let published: i64 =
+            sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id=$1")
+                .bind(&work)
+                .fetch_one(&app.pool)
+                .await
+                .unwrap();
+        assert_eq!(published, version);
+        for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
+            let url: String =
+                sqlx::query_scalar(&format!("SELECT cover_url FROM {table} WHERE work_id=$1"))
+                    .bind(&work)
+                    .fetch_one(&app.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(url, cover::cover_path(&work, version), "{table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn own_origin_stale_cover_request_preserves_newer_publication_from_another_copy() {
+        let app = own_origin_media_state().await;
+        let other_covers = db::init_covers("sqlite::memory:").await.unwrap();
+        let work = format!("w_{}", uuid::Uuid::new_v4());
+        sqlx::query("INSERT INTO work(id,cover_cached_version,created_at,updated_at) VALUES ($1,9,NOW(),NOW())")
+            .bind(&work).execute(&app.pool).await.unwrap();
+        let url = cover::cover_path(&work, 9);
+        sqlx::query("INSERT INTO feed_updates(work_id,title,latest_at,cover_url) VALUES ($1,'Cover',NOW(),$2)")
+            .bind(&work).bind(&url).execute(&app.pool).await.unwrap();
+        sqlx::query("INSERT INTO feed_series_updates(work_id,reader_id,title,released_at,cover_url) VALUES ($1,'7','Cover',NOW(),$2)")
+            .bind(&work).bind(&url).execute(&app.pool).await.unwrap();
+        sqlx::query("INSERT INTO browse_catalogue(work_id,reader_id,title,created_at,cover_url) VALUES ($1,'7','Cover',NOW(),$2)")
+            .bind(&work).bind(&url).execute(&app.pool).await.unwrap();
+        for (cache, version, bytes) in [
+            (&app.cover_pool, 7_i64, b"version7".as_slice()),
+            (&other_covers, 9, b"version9".as_slice()),
+        ] {
+            sqlx::query("INSERT INTO work_cover_blob VALUES ($1,$2,$3,'now')")
+                .bind(&work)
+                .bind(bytes)
+                .bind(version)
+                .execute(cache)
+                .await
+                .unwrap();
+        }
+        let res = serve_cover(
+            State(app.clone()),
+            State(CoverDb(app.cover_pool.clone())),
+            UrlPath(format!("{work}.webp")),
+            RawQuery(Some("v=6".into())),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(res.headers()[header::LOCATION], cover::cover_path(&work, 7));
+        assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store");
+        app.pool.flush_deferred().await;
+        let published: i64 =
+            sqlx::query_scalar("SELECT cover_cached_version FROM work WHERE id=$1")
+                .bind(&work)
+                .fetch_one(&app.pool)
+                .await
+                .unwrap();
+        assert_eq!(published, 9);
+        for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
+            let published_url: String =
+                sqlx::query_scalar(&format!("SELECT cover_url FROM {table} WHERE work_id=$1"))
+                    .bind(&work)
+                    .fetch_one(&app.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(published_url, url, "{table}");
+        }
+        let res = serve_cover(
+            State(app),
+            State(CoverDb(other_covers)),
+            UrlPath(format!("{work}.webp")),
+            RawQuery(Some("v=9".into())),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()[header::CACHE_CONTROL],
+            image_delivery::IMMUTABLE_CACHE
+        );
+        assert_eq!(
+            axum::body::to_bytes(res.into_body(), 4096)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"version9"
+        );
+    }
+
+    #[tokio::test]
+    async fn own_origin_cover_versioned_lazy_fill_is_not_cached() {
+        use std::sync::atomic::Ordering;
+
+        let jpeg = crate::suwayomi::testsrv::jpeg(300, 450);
+        let expected = cover::process_cover(&jpeg).unwrap();
+        let cdn = crate::suwayomi::testsrv::spawn(jpeg, std::time::Duration::ZERO).await;
+        for (query, cache) in [
+            (Some("v=123"), "no-store"),
+            (None, image_delivery::MUTABLE_CACHE),
+        ] {
+            // Each request starts with no blob, so both exercise the lazy path.
+            let mut app = own_origin_media_state().await;
+            Arc::get_mut(&mut app).unwrap().mangadex = Arc::new(
+                mangadex::MangaDexClient::new("own-origin-lazy-test", 100.0, 100.0)
+                    .with_bases(&cdn.base_url, &cdn.base_url),
+            );
+            app.mangadex.set_enabled(true);
+            sqlx::query("UPDATE work SET cover_file_name='c.jpg' WHERE id='w_exact'")
+                .execute(&app.pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO source_series(id,work_id,source_type,source_key,created_at) VALUES ('ss_exact','w_exact','mangadex','md-exact',NOW())")
+                .execute(&app.pool).await.unwrap();
+            let stored: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM work_cover_blob WHERE work_id='w_exact'")
+                    .fetch_one(&app.cover_pool)
+                    .await
+                    .unwrap();
+            assert_eq!(stored, 0);
+
+            let response = exact_cover_get(&app, query).await;
+            assert_eq!(response.status(), StatusCode::OK, "{query:?}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "image/webp");
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                cache,
+                "{query:?}"
+            );
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                expected.as_slice(),
+                "{query:?}"
+            );
+            app.pool.flush_deferred().await;
+            let stored: Vec<u8> =
+                sqlx::query_scalar("SELECT webp FROM work_cover_blob WHERE work_id='w_exact'")
+                    .fetch_one(&app.cover_pool)
+                    .await
+                    .unwrap();
+            assert_eq!(stored, expected);
+        }
+        assert_eq!(cdn.hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn own_origin_cover_variant_recheck_requires_the_same_master() {
+        let covers = crate::db::init_covers("sqlite::memory:").await.unwrap();
+        for (asset, store_master) in [
+            (
+                "w_exact",
+                "INSERT INTO work_cover_blob(work_id,webp,version,updated_at) VALUES ('w_exact',$1,7,'now') ON CONFLICT(work_id) DO UPDATE SET webp=excluded.webp, version=work_cover_blob.version+1",
+            ),
+            (
+                "s:7",
+                "INSERT INTO suwayomi_cover_blob(manga_id,webp,updated_at) VALUES (7,$1,'now') ON CONFLICT(manga_id) DO UPDATE SET webp=excluded.webp",
+            ),
+        ] {
+            for (master, derivative) in [
+                (b"old master".as_slice(), b"old derivative".as_slice()),
+                (b"new master".as_slice(), b"new derivative".as_slice()),
+            ] {
+                let mut tx = covers.begin().await.unwrap();
+                sqlx::query(store_master)
+                    .bind(master)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                cover::put_cover_variant(&mut *tx, asset, 192, derivative)
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+                assert_eq!(
+                    cover::variant_of_master(&covers, asset, 192, master).await,
+                    Some(derivative.to_vec()),
+                    "{asset}"
+                );
+            }
+            // A newer master and its derivative now exist; the old master must miss.
+            assert_eq!(
+                cover::variant_of_master(&covers, asset, 192, b"old master").await,
+                None,
+                "{asset}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn own_origin_cover_derivative_uses_the_master_read_snapshot() {
+        for has_derivative in [false, true] {
+            let app = own_origin_media_state().await;
+            let master = cover::process_cover(&crate::suwayomi::testsrv::jpeg(512, 768)).unwrap();
+            cover::put_work_cover(&app.pool, &app.cover_pool, "w_exact", &master)
+                .await
+                .unwrap();
+            let version: i64 =
+                sqlx::query_scalar("SELECT version FROM work_cover_blob WHERE work_id='w_exact'")
+                    .fetch_one(&app.cover_pool)
+                    .await
+                    .unwrap();
+            let expected = if has_derivative {
+                cover::put_cover_variant(&app.cover_pool, "w_exact", 192, b"old derivative")
+                    .await
+                    .unwrap();
+                b"old derivative".to_vec()
+            } else {
+                cover::downscale_variant(&master, 192).unwrap().unwrap()
+            };
+            let points = crate::locks::pause_points::PausePoints::default();
+            let armed = points.arm("cover-master-read");
+            let state = app.clone();
+            let request = tokio::spawn(COVER_RESPONSE_PAUSE.scope(points, async move {
+                exact_cover_get(&state, Some(&format!("v={version}&w=192"))).await
+            }));
+            tokio::time::timeout(std::time::Duration::from_secs(30), armed.reached())
+                .await
+                .unwrap();
+            cover::put_work_cover(&app.pool, &app.cover_pool, "w_exact", b"new master")
+                .await
+                .unwrap();
+            cover::put_current_variant(
+                &app.pool,
+                &app.cover_pool,
+                "w_exact",
+                192,
+                b"new master",
+                b"new derivative",
+            )
+            .await
+            .unwrap();
+            armed.release();
+            let response = request.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                image_delivery::IMMUTABLE_CACHE
+            );
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                expected
+            );
+            app.pool.flush_deferred().await;
+            assert_eq!(
+                cover::get_cover_variant(&app.cover_pool, "w_exact", 192)
+                    .await
+                    .unwrap(),
+                b"new derivative"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn own_origin_cover_resize_failure_does_not_cache_the_master() {
+        let app = own_origin_media_state().await;
+        sqlx::query("INSERT INTO work_cover_blob VALUES ('w_exact',$1,7,'now')")
+            .bind(b"undecodable master".as_slice())
+            .execute(&app.cover_pool)
+            .await
+            .unwrap();
+        cover::put_suwayomi_cover(&app.cover_pool, 7, b"undecodable master")
+            .await
+            .unwrap();
+        for response in [
+            exact_cover_get(&app, Some("v=7&w=192")).await,
+            exact_cover_get(&app, Some("v=9&w=192")).await,
+            serve_suwayomi_cover(&app, &app.cover_pool, 7, Some(192)).await,
+        ] {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                b"undecodable master"
+            );
+        }
+        let source = serve_suwayomi_cover(&app, &app.cover_pool, 7, None).await;
+        assert_eq!(
+            source.headers()[header::CACHE_CONTROL],
+            image_delivery::MUTABLE_CACHE
+        );
+    }
+
+    #[tokio::test]
+    async fn own_origin_avatar_versions_redirect_or_serve_exact_bytes() {
+        let pool = crate::db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap()
+            .foreground();
+        let user = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO users(id,username,email,password_hash,created_at) VALUES ($1,'exact-avatar','exact@example.test','unused',NOW())")
+            .bind(user).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO user_avatars(user_id,webp,version,updated_at) VALUES ($1,$2,7,NOW())",
+        )
+        .bind(user)
+        .bind(b"avatar".as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let file = format!("{user}.webp");
+        let response = serve_avatar(
+            State(pool.clone()),
+            UrlPath(file.clone()),
+            RawQuery(Some("v=7".into())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            image_delivery::IMMUTABLE_CACHE
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"avatar"
+        );
+        let response = serve_avatar(
+            State(pool.clone()),
+            UrlPath(file.clone()),
+            RawQuery(Some("v=9".into())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(!response.headers().contains_key(header::LOCATION));
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"avatar"
+        );
+        for (query, cache) in [
+            (Some("v=6"), "no-store"),
+            (Some("v=bogus"), "no-store"),
+            (None, "public, max-age=300"),
+        ] {
+            let response = serve_avatar(
+                State(pool.clone()),
+                UrlPath(file.clone()),
+                RawQuery(query.map(str::to_owned)),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+            assert_eq!(
+                response.headers()[header::LOCATION],
+                avatar::avatar_url(&user.to_string(), 7)
+            );
+            assert_eq!(response.headers()[header::CACHE_CONTROL], cache);
+        }
+    }
+
+    #[tokio::test]
+    async fn own_origin_avatar_uploads_in_one_millisecond_increase_versions() {
+        let pool = crate::db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap()
+            .foreground();
+        let user = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users(id,username,email,password_hash,created_at) VALUES ($1,'avatar-clock','clock@example.test','unused',NOW())")
+            .bind(uuid::Uuid::parse_str(&user).unwrap()).execute(&pool).await.unwrap();
+        let now = chrono::Utc::now();
+        for (offset, bytes) in [(0, b"first".as_slice()), (1, b"second"), (2, b"third")] {
+            let url = save_avatar(&pool, &user, bytes, now).await.unwrap();
+            let version = now.timestamp_millis() + offset;
+            assert_eq!(url, avatar::avatar_url(&user, version));
+            let stored: (Vec<u8>, i64, Option<String>) = sqlx::query_as("SELECT a.webp,a.version,u.avatar_url FROM user_avatars a JOIN users u ON u.id=a.user_id WHERE u.id=$1")
+                .bind(uuid::Uuid::parse_str(&user).unwrap()).fetch_one(&pool).await.unwrap();
+            assert_eq!(stored, (bytes.to_vec(), version, Some(url)));
+        }
+    }
+
+    #[tokio::test]
+    async fn own_origin_media_not_found_is_never_cached() {
+        let app = own_origin_media_state().await;
+        for query in [None, Some("v=7"), Some("v=9999999999999")] {
+            let response = exact_cover_get(&app, query).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        }
+        for file in [
+            "invalid.png".to_owned(),
+            "invalid.webp".to_owned(),
+            format!("{}.webp", uuid::Uuid::new_v4()),
+        ] {
+            for query in [None, Some("v=7")] {
+                let response = serve_avatar(
+                    State(app.pool.clone()),
+                    UrlPath(file.clone()),
+                    RawQuery(query.map(str::to_owned)),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            }
+            let response = serve_comment_media(State(app.pool.clone()), UrlPath(file)).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        }
+        let response = serve_cover(
+            State(app.clone()),
+            State(CoverDb(app.cover_pool.clone())),
+            UrlPath("invalid.png".into()),
+            RawQuery(None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[test]
+    fn own_origin_extension_icons_revalidate_after_one_day() {
+        let response = png_icon_response(vec![1], &HeaderMap::new());
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=86400, must-revalidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn own_origin_extension_icon_etags_revalidate_and_change_with_bytes() {
+        let bytes = b"icon".to_vec();
+        let res = png_icon_response(bytes.clone(), &HeaderMap::new());
+        assert_eq!(res.status(), StatusCode::OK);
+        let etag = res.headers()[header::ETAG].clone();
+        assert_eq!(etag.to_str().unwrap().len(), 66); // Quoted SHA-256 hex, no W/ prefix.
+        assert!(etag.to_str().unwrap().starts_with('"'));
+        assert_eq!(
+            axum::body::to_bytes(res.into_body(), 4096)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"icon"
+        );
+        for value in [
+            etag.to_str().unwrap().to_owned(),
+            format!("\"other\", W/{}", etag.to_str().unwrap()),
+            "*".into(),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::IF_NONE_MATCH, value.parse().unwrap());
+            let res = png_icon_response(bytes.clone(), &headers);
+            assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+            assert_eq!(res.headers()[header::ETAG], etag);
+            assert_eq!(
+                res.headers()[header::CACHE_CONTROL],
+                "public, max-age=86400, must-revalidate"
+            );
+            assert!(axum::body::to_bytes(res.into_body(), 4096)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, etag.clone());
+        let changed = png_icon_response(b"changed icon".to_vec(), &headers);
+        assert_eq!(changed.status(), StatusCode::OK);
+        assert_ne!(changed.headers()[header::ETAG], etag);
+        assert_eq!(
+            axum::body::to_bytes(changed.into_body(), 4096)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"changed icon"
+        );
     }
 
     async fn rest_media_multipart() -> Multipart {
@@ -2972,6 +3899,12 @@ mod tests {
                     .await
                     .unwrap();
             }
+            let version: Option<i64> =
+                sqlx::query_scalar("SELECT version FROM work_cover_blob WHERE work_id = $1")
+                    .bind(asset)
+                    .fetch_optional(&covers)
+                    .await
+                    .unwrap();
             let app = Arc::new(AppState {
                 pool: main.clone(),
                 cover_pool: covers.clone(),
@@ -3003,7 +3936,7 @@ mod tests {
                         State(app),
                         State(CoverDb(cache)),
                         UrlPath("w_handler.webp".to_owned()),
-                        RawQuery(Some("w=192".to_owned())),
+                        RawQuery(Some(format!("v={}&w=192", version.unwrap()))),
                     )
                     .await
                 }
@@ -3587,7 +4520,7 @@ mod tests {
             ("/health", StatusCode::OK),
             ("/health/ready", StatusCode::OK),
             ("/graphiql", StatusCode::OK),
-            ("/covers/cached.webp", StatusCode::OK),
+            ("/covers/cached.webp?v=1", StatusCode::OK),
             ("/img", StatusCode::BAD_REQUEST),
             ("/api/v1/manga/not-numeric", StatusCode::NOT_FOUND),
             ("/ext-icons/not..valid.png", StatusCode::NOT_FOUND),
@@ -3621,7 +4554,7 @@ mod tests {
         drop(held);
         let (images, api, health) = tokio::join!(
             futures::future::join_all(
-                (0..140).map(|_| app.clone().oneshot(request("/covers/cached.webp")))
+                (0..140).map(|_| app.clone().oneshot(request("/covers/cached.webp?v=1")))
             ),
             app.clone().oneshot(request(graphql_path)),
             app.clone().oneshot(request("/health/ready")),
@@ -3873,7 +4806,12 @@ mod tests {
         .expect("deferred cover cache did not persist");
         // Stored: served from our origin from now on, whatever the switch says.
         mangadex.set_enabled(false);
-        assert_eq!(get().await.status(), StatusCode::OK);
+        let response = get().await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=300"
+        );
         assert_eq!(cdn.hits.load(Ordering::SeqCst), 1);
     }
 

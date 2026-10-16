@@ -68,9 +68,10 @@ Key parts of `apps/reader`:
 - `apps/reader/src-tauri/`: Tauri 2 native desktop and mobile shell. Contains Rust wrappers for platform features and supervisor code for running an embedded Suwayomi engine.
 - `apps/reader/src-tauri/scripts/`: Helper scripts to fetch the pinned Suwayomi jar and build tailored Java runtimes using `jlink`.
 
-The reader supports three build targets controlled by `KOMIKA_TARGET`:
+The reader supports four build targets controlled by `KOMIKA_TARGET`:
 
-- Unset (default): Web build configured for Cloudflare Pages edge rendering.
+- Unset (default): Hybrid Workers build, with server rendering on `/series/*` and a static SPA shell for other documents.
+- `static`: Pure hosted SPA using the web public configuration, served by Workers Assets without a script.
 - `tauri`: Static SPA build used inside native desktop and mobile wrappers.
 - `embedded`: Static SPA served directly by `komika-server` at `/`.
 

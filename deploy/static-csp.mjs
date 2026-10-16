@@ -4,17 +4,29 @@ import { pathToFileURL } from 'node:url';
 
 // Hash the exact emitted script text: adapter-static bootstraps change per
 // build, but the final HTML and nginx policy are shipped together.
-export function staticPolicy(html, template) {
+/** @param {string} html */
+export function inlineScriptHashes(html) {
+	/** @type {Set<`sha256-${string}`>} */
 	const sources = new Set();
 	for (const match of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)) {
 		if (/(?:^|\s)src\s*=/i.test(match[1]) || !match[2].trim()) continue;
 		const hash = createHash('sha256').update(match[2]).digest('base64');
-		sources.add(`'sha256-${hash}'`);
+		sources.add(`sha256-${hash}`);
 	}
+	return [...sources];
+}
+
+/** @param {string} html @param {string} template */
+export function staticPolicy(html, template) {
 	if (!template.includes('${CSP_SCRIPT_HASHES}')) {
 		throw new Error('nginx template must contain CSP_SCRIPT_HASHES');
 	}
-	return template.replaceAll('${CSP_SCRIPT_HASHES}', [...sources].join(' '));
+	return template.replaceAll(
+		'${CSP_SCRIPT_HASHES}',
+		inlineScriptHashes(html)
+			.map((hash) => `'${hash}'`)
+			.join(' '),
+	);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

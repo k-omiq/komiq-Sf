@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::source_health::{Subject, Surface};
 use crate::telemetry::BodySource;
@@ -255,7 +255,7 @@ async fn error_snippet(mut res: reqwest::Response) -> String {
 
 const MANGA_FIELDS: &str = r#"
 fragment MangaFields on MangaType {
-    id title url thumbnailUrl author artist description genre status
+    id title url realUrl thumbnailUrl author artist description genre status
     inLibrary inLibraryAt lastFetchedAt sourceId
     source { lang }
     chapters { totalCount }
@@ -263,8 +263,9 @@ fragment MangaFields on MangaType {
 
 const CHAPTER_FIELDS: &str = r#"
 fragment ChapterFields on ChapterType {
-    id mangaId name chapterNumber scanlator uploadDate
+    id mangaId url realUrl sourceOrder name chapterNumber scanlator uploadDate
     isRead isBookmarked isDownloaded lastPageRead pageCount
+    manga { sourceId url realUrl title }
 }"#;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -282,6 +283,9 @@ pub struct ChapterCount {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SuwayomiManga {
+    /// Captured before the engine request, never accepted from the engine wire.
+    #[serde(default, rename = "_komiqGeneration")]
+    pub engine_generation: Option<String>,
     pub id: i64,
     pub title: String,
     /// Source-relative manga URL (`MangaType.url`, e.g. `/manga/<uuid>` for the
@@ -292,6 +296,8 @@ pub struct SuwayomiManga {
     /// to None on any DB-derived manga; only a live fetch (`MANGA_FIELDS`) fills it.
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default)]
+    pub real_url: Option<String>,
     pub thumbnail_url: Option<String>,
     pub author: Option<String>,
     pub artist: Option<String>,
@@ -348,9 +354,30 @@ pub struct SuwayomiExtension {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ChapterManga {
+    pub source_id: String,
+    pub url: String,
+    pub real_url: Option<String>,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SuwayomiChapter {
+    #[serde(default, rename = "_komiqGeneration")]
+    pub engine_generation: Option<String>,
     pub id: i64,
     pub manga_id: i64,
+    /// Selected with chapter-only requests so keys keep their parent's identity.
+    #[serde(default)]
+    pub manga: Option<ChapterManga>,
+    /// Absent on old cached records and DB-derived display rows.
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub real_url: Option<String>,
+    #[serde(default)]
+    pub source_order: Option<i32>,
     pub name: String,
     pub chapter_number: f64,
     pub scanlator: Option<String>,
@@ -363,7 +390,7 @@ pub struct SuwayomiChapter {
 }
 
 /// A chapter's coordinates at its source — see [`SuwayomiClient::chapter_origin`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct ChapterOrigin {
     /// Owning manga's row id in THIS engine (for the NSFW gate; never sent to a client).
     pub manga_id: i64,
@@ -379,6 +406,7 @@ pub struct ChapterOrigin {
     pub chapter_web_url: Option<String>,
     /// The series' page on the source's website (`MangaType.realUrl`); same caveats.
     pub manga_web_url: Option<String>,
+    pub source_order: i32,
 }
 
 /// One extension row from the configured extension stores — the admin-facing
@@ -455,8 +483,53 @@ fn parse_records<T: DeserializeOwned>(raw: Vec<Value>, what: &str) -> Vec<T> {
     out
 }
 
+#[derive(Debug)]
+pub(crate) struct EngineGraphqlError(pub String);
+impl std::fmt::Display for EngineGraphqlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for EngineGraphqlError {}
+
+/// A read timeout alone does not establish engine replacement. Transport loss does.
+fn is_transport_connection_error(error: &reqwest::Error) -> bool {
+    error.is_connect() || (!error.is_timeout() && (error.is_body() || error.is_request()))
+}
+pub(crate) fn is_connection_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(is_transport_connection_error)
+    })
+}
+
+fn stamp_generation(value: &mut Value, generation: Option<&str>) {
+    match value {
+        Value::Object(object) => {
+            // Overwrite any upstream value, including when no fence is installed.
+            object.insert(
+                "_komiqGeneration".into(),
+                generation.map_or(Value::Null, |id| json!(id)),
+            );
+            for (key, child) in object.iter_mut() {
+                if key != "_komiqGeneration" {
+                    stamp_generation(child, generation);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                stamp_generation(child, generation);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Clone)]
 pub struct SuwayomiClient {
+    pub(crate) fence: Option<Arc<crate::engine_generation::Fence>>,
     base_url: String,
     /// Public base used when building image URLs (covers/pages) handed to the
     /// browser. Defaults to `base_url` when no public URL is configured.
@@ -465,7 +538,7 @@ pub struct SuwayomiClient {
     /// Cached resolved source id; `Some` once resolved. `Arc<Mutex>` so cheap clones
     /// (e.g. into the cover drainer task) share the one resolved id rather than each
     /// re-resolving it against the engine.
-    source_id: std::sync::Arc<Mutex<Option<String>>>,
+    source_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     configured_source: Option<String>,
     /// Separate HTTP client for COVER fetches only, with a much shorter timeout than
     /// `http` (which the scanner shares). Same connection pool semantics, different
@@ -522,10 +595,11 @@ impl SuwayomiClient {
             .build()
             .unwrap_or_else(|_| http.clone());
         Self {
+            fence: None,
             base_url,
             image_base_url,
             http,
-            source_id: std::sync::Arc::new(Mutex::new(configured_source.clone())),
+            source_id: std::sync::Arc::new(std::sync::Mutex::new(configured_source.clone())),
             configured_source,
             cover_http,
             cover_sem: Arc::new(Semaphore::new(COVER_FETCH_CONCURRENCY)),
@@ -543,6 +617,56 @@ impl SuwayomiClient {
                 &crate::telemetry::CACHE_ENGINE_CHAPTER_OWNER,
             )),
         }
+    }
+
+    pub(crate) fn clear_numeric_memos(&self) {
+        *self.source_id.lock().unwrap_or_else(|e| e.into_inner()) = self.configured_source.clone();
+        self.pages_memo.clear();
+        self.chapter_owner_memo.clear();
+    }
+
+    pub(crate) fn read_generation(&self) -> (Option<uuid::Uuid>, Option<u64>) {
+        (
+            self.fence.as_ref().and_then(|f| f.generation()),
+            self.fence.as_ref().map(|f| f.revision()),
+        )
+    }
+
+    pub(crate) async fn validate_read_generation(
+        &self,
+        token: (Option<uuid::Uuid>, Option<u64>),
+    ) -> Result<()> {
+        self.wait_for_generation().await?;
+        if token != self.read_generation() {
+            return Err(crate::engine_generation::FenceError::Unavailable.into());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn wait_for_generation(&self) -> Result<()> {
+        if let Some(fence) = &self.fence {
+            fence.wait().await?;
+        }
+        Ok(())
+    }
+
+    fn connection_failed(&self, error: &reqwest::Error) {
+        if is_transport_connection_error(error) {
+            if let Some(fence) = &self.fence {
+                fence.invalidate();
+            }
+        }
+    }
+
+    fn body_failed(&self, error: &anyhow::Error) {
+        if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+            self.connection_failed(error);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn base_url_for_test(&mut self, url: &str) {
+        self.base_url = url.to_string();
     }
 
     fn endpoint(&self) -> String {
@@ -565,6 +689,7 @@ impl SuwayomiClient {
     /// `None` on any missing URL / network / non-success — a missing hash just
     /// means one fewer dedup signal, never a failure.
     pub async fn cover_bytes(&self, thumbnail_url: Option<&str>) -> Option<Vec<u8>> {
+        self.wait_for_generation().await.ok()?;
         let raw = thumbnail_url?;
         if raw.is_empty() {
             return None;
@@ -583,11 +708,20 @@ impl SuwayomiClient {
         // at the top of this module; see it for the real on-demand floor. If enrolment
         // is ever parallelised it must take a background slot instead of competing here.
         let _permit = self.cover_sem.clone().acquire_owned().await.ok()?;
-        let res = self.cover_http.get(url).send().await.ok()?;
+        let res = self
+            .cover_http
+            .get(url)
+            .send()
+            .await
+            .inspect_err(|e| self.connection_failed(e))
+            .ok()?;
         if !res.status().is_success() {
             return None;
         }
-        let bytes = read_capped(res, MAX_COVER_SOURCE_BYTES).await.ok()?;
+        let bytes = read_capped(res, MAX_COVER_SOURCE_BYTES)
+            .await
+            .inspect_err(|e| self.body_failed(e))
+            .ok()?;
         // A well-formed HTTP response can still carry an INCOMPLETE image: the source
         // CDN (or Suwayomi's proxy of it) closes the body early and `zune-jpeg` decodes
         // the partial data to `Ok` with a flat decoder-fill tail. Reject it here so the
@@ -652,8 +786,15 @@ impl SuwayomiClient {
 
     /// Shared body of the two cover fetchers. Assumes the caller holds a permit.
     async fn fetch_cover_inner(&self, path: &str) -> Result<(Vec<u8>, String)> {
+        self.wait_for_generation().await?;
+        let generation = self.read_generation();
         let url = format!("{}{}", self.base_url, path);
-        let res = self.cover_http.get(url).send().await?;
+        let res = self
+            .cover_http
+            .get(url)
+            .send()
+            .await
+            .inspect_err(|e| self.connection_failed(e))?;
         if !res.status().is_success() {
             // Include a snippet of the body: Suwayomi answers 400 with "Expected URL
             // scheme 'http' or 'https' but was 'data'" when the extension stored a
@@ -676,10 +817,14 @@ impl SuwayomiClient {
             .to_string();
         let bytes = read_capped(res, MAX_COVER_SOURCE_BYTES)
             .await
-            .inspect_err(|error| count_oversize(BodySource::EngineCover, error))?;
+            .inspect_err(|error| {
+                self.body_failed(error);
+                count_oversize(BodySource::EngineCover, error);
+            })?;
         let content_type =
             crate::image_delivery::validate_from(BodySource::EngineCover, &bytes, &content_type)?
                 .to_string();
+        self.validate_read_generation(generation).await?;
         Ok((bytes, content_type))
     }
 
@@ -718,8 +863,15 @@ impl SuwayomiClient {
 
     /// Shared body of the page fetcher. Assumes the caller holds a page-pool permit.
     async fn fetch_page_inner(&self, path: &str) -> Result<(Vec<u8>, String)> {
+        self.wait_for_generation().await?;
+        let generation = self.read_generation();
         let url = format!("{}{}", self.base_url, path);
-        let res = self.page_http.get(url).send().await?;
+        let res = self
+            .page_http
+            .get(url)
+            .send()
+            .await
+            .inspect_err(|e| self.connection_failed(e))?;
         if !res.status().is_success() {
             // Include a snippet of the body, as the cover fetcher does: Suwayomi answers
             // its own 500 with the SOURCE's error ("HTTP error 403") in the body, and
@@ -740,27 +892,45 @@ impl SuwayomiClient {
             .to_string();
         let bytes = read_capped(res, MAX_PAGE_SOURCE_BYTES)
             .await
-            .inspect_err(|error| count_oversize(BodySource::Page, error))?;
+            .inspect_err(|error| {
+                self.body_failed(error);
+                count_oversize(BodySource::Page, error);
+            })?;
         let content_type =
             crate::image_delivery::validate_from(BodySource::Page, &bytes, &content_type)?
                 .to_string();
+        self.validate_read_generation(generation).await?;
         Ok((bytes, content_type))
     }
 
     async fn gql<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<T> {
-        // DB/memo hits never reach this point. Bound actual engine requests, and
-        // retain the permit through JSON decoding rather than just response headers.
+        self.wait_for_generation().await?;
+        let generation = self.fence.as_ref().and_then(|f| f.generation());
+        let revision = self.fence.as_ref().map(|f| f.revision());
+        let mut data = self.identity_query(query, variables).await?;
+        self.validate_read_generation((generation, revision))
+            .await?;
+        stamp_generation(&mut data, generation.map(|id| id.to_string()).as_deref());
+        Ok(serde_json::from_value(data)?)
+    }
+
+    /// Gate-free transport used only by the identity checker and by `gql`.
+    pub(crate) async fn identity_query(&self, query: &str, variables: Value) -> Result<Value> {
         let _permit = crate::request_budget::upstream_permit()?;
         let res = self
             .http
             .post(self.endpoint())
             .json(&json!({ "query": query, "variables": variables }))
             .send()
-            .await?;
+            .await
+            .inspect_err(|e| self.connection_failed(e))?;
         if !res.status().is_success() {
             return Err(anyhow!("Suwayomi error {}", res.status()));
         }
-        let body: Value = res.json().await?;
+        let body: Value = res
+            .json()
+            .await
+            .inspect_err(|e| self.connection_failed(e))?;
         if let Some(errors) = body.get("errors").and_then(|e| e.as_array()) {
             if !errors.is_empty() {
                 let msg = errors
@@ -768,14 +938,12 @@ impl SuwayomiClient {
                     .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
                     .collect::<Vec<_>>()
                     .join("; ");
-                return Err(anyhow!("{msg}"));
+                return Err(EngineGraphqlError(msg).into());
             }
         }
-        let data = body
-            .get("data")
+        body.get("data")
             .cloned()
-            .ok_or_else(|| anyhow!("Suwayomi returned no data"))?;
-        Ok(serde_json::from_value(data)?)
+            .ok_or_else(|| anyhow!("Suwayomi returned no data"))
     }
 
     /// Resolve (and cache) a source id to browse: configured → English → first real.
@@ -787,12 +955,17 @@ impl SuwayomiClient {
     /// deterministic pick), so the extra query is harmless.
     async fn resolve_source(&self) -> Result<String> {
         // Fast path: already cached.
-        if let Some(id) = self.source_id.lock().await.as_ref() {
+        if let Some(id) = self
+            .source_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             return Ok(id.clone());
         }
         // A configured source needs no network round-trip; cache and return.
         if let Some(id) = &self.configured_source {
-            let mut guard = self.source_id.lock().await;
+            let mut guard = self.source_id.lock().unwrap_or_else(|e| e.into_inner());
             let id = guard.get_or_insert_with(|| id.clone()).clone();
             return Ok(id);
         }
@@ -825,7 +998,7 @@ impl SuwayomiClient {
             .or_else(|| real.first())
             .ok_or_else(|| anyhow!("No Suwayomi source installed — add one first"))?;
         // Re-acquire and store. If another caller won the race, keep their value.
-        let mut guard = self.source_id.lock().await;
+        let mut guard = self.source_id.lock().unwrap_or_else(|e| e.into_inner());
         let id = guard.get_or_insert_with(|| chosen.id.clone()).clone();
         Ok(id)
     }
@@ -1028,6 +1201,29 @@ impl SuwayomiClient {
             .map(|(m, c, _)| (m, c))
     }
 
+    /// Read both key sets from the engine's database, without refreshing the source.
+    pub async fn cached_series_and_chapters(
+        &self,
+        id: i64,
+    ) -> Result<(SuwayomiManga, Vec<SuwayomiChapter>)> {
+        let doc = format!(
+            "{MANGA_FIELDS}\n{CHAPTER_FIELDS}\n\
+             query EK($id: Int!) {{ manga(id: $id) {{ ...MangaFields }} \
+             chapters(condition: {{ mangaId: $id }}) {{ nodes {{ ...ChapterFields }} }} }}"
+        );
+        #[derive(Deserialize)]
+        struct Nodes {
+            nodes: Vec<SuwayomiChapter>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            manga: SuwayomiManga,
+            chapters: Nodes,
+        }
+        let d: Data = self.gql(&doc, json!({ "id": id })).await?;
+        Ok((d.manga, d.chapters.nodes))
+    }
+
     /// [`Self::series_and_chapters`], plus where the data came from. See [`Provenance`].
     ///
     /// The provenance is the WEAKER of the two halves: this call is only `Upstream` when
@@ -1075,6 +1271,7 @@ impl SuwayomiClient {
     }
 
     pub async fn pages(&self, chapter_id: i64) -> Result<Vec<String>> {
+        self.wait_for_generation().await?;
         self.pages_memo
             .get_or_try_init(&chapter_id.to_string(), || self.fetch_pages(chapter_id))
             .await
@@ -1111,6 +1308,7 @@ impl SuwayomiClient {
     /// needs the owning series, which isn't mirrored locally for Suwayomi sources.
     /// `None` if the chapter is unknown to the source server.
     pub async fn chapter_manga_id(&self, chapter_id: i64) -> Result<Option<i64>> {
+        self.wait_for_generation().await?;
         self.chapter_owner_memo
             .get_or_try_init_optional(&chapter_id.to_string(), || {
                 self.fetch_chapter_manga_id(chapter_id)
@@ -1147,7 +1345,7 @@ impl SuwayomiClient {
     /// chapter is unknown.
     pub async fn chapter_origin(&self, chapter_id: i64) -> Result<Option<ChapterOrigin>> {
         let doc = "query CO($id: Int!) { chapters(condition: { id: $id }) { nodes { \
-                   url realUrl mangaId manga { url realUrl title sourceId } } } }";
+                   url realUrl sourceOrder mangaId manga { url realUrl title sourceId } } } }";
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Manga {
@@ -1163,6 +1361,7 @@ impl SuwayomiClient {
             url: String,
             #[serde(default)]
             real_url: Option<String>,
+            source_order: i32,
             manga_id: i64,
             manga: Manga,
         }
@@ -1183,6 +1382,7 @@ impl SuwayomiClient {
             chapter_url: n.url,
             chapter_web_url: n.real_url,
             manga_web_url: n.manga.real_url,
+            source_order: n.source_order,
         }))
     }
 
@@ -1953,6 +2153,21 @@ mod tests {
         .await
     }
 
+    #[test]
+    fn old_cached_chapter_json_deserializes_without_source_keys() {
+        let chapter: SuwayomiChapter = serde_json::from_str(
+            r#"{
+            "id": 6, "mangaId": 1, "name": "Chapter 1", "chapterNumber": 1,
+            "scanlator": null, "uploadDate": null, "isRead": false,
+            "isBookmarked": false, "isDownloaded": false, "lastPageRead": 0, "pageCount": 10
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(chapter.url, None);
+        assert_eq!(chapter.real_url, None);
+        assert_eq!(chapter.source_order, None);
+    }
+
     #[tokio::test]
     async fn reader_page_and_positive_owner_memos_are_shared_by_clones() {
         use std::sync::atomic::Ordering;
@@ -1994,7 +2209,7 @@ mod tests {
     async fn chapter_origin_reads_the_sources_own_keys() {
         let engine = engine_answering(
             r##"{"data":{"chapters":{"nodes":[{"url":"#/viewer/1030381",
-                "realUrl":"https://mangaplus.shueisha.co.jp/viewer/1030381","mangaId":1,
+                "realUrl":"https://mangaplus.shueisha.co.jp/viewer/1030381","sourceOrder":5,"mangaId":1,
                 "manga":{"url":"#/titles/100020",
                          "realUrl":"https://mangaplus.shueisha.co.jp/titles/100020",
                          "title":"One Piece","sourceId":"1998944621602463790"}}]}}}"##,
@@ -2011,6 +2226,7 @@ mod tests {
                 chapter_url: "#/viewer/1030381".into(),
                 chapter_web_url: Some("https://mangaplus.shueisha.co.jp/viewer/1030381".into()),
                 manga_web_url: Some("https://mangaplus.shueisha.co.jp/titles/100020".into()),
+                source_order: 5,
             })
         );
     }
@@ -2020,7 +2236,7 @@ mod tests {
     #[tokio::test]
     async fn chapter_origin_tolerates_a_missing_web_url() {
         let engine = engine_answering(
-            r##"{"data":{"chapters":{"nodes":[{"url":"/ch/1","realUrl":null,"mangaId":1,
+            r##"{"data":{"chapters":{"nodes":[{"url":"/ch/1","realUrl":null,"sourceOrder":0,"mangaId":1,
                 "manga":{"url":"/m/1","title":"Local","sourceId":"0"}}]}}}"##,
         )
         .await;
