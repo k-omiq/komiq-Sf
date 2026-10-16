@@ -1333,6 +1333,7 @@ async fn graphql_is_admin_only_and_drives_a_setup() {
         cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         catalogue_cover_phash: false,
         ext_icons_dir: std::path::PathBuf::new(),
+        media_manifests: None,
         setup_code: crate::instance::SetupCode::default(),
     });
     let trusted = Arc::new(crate::TrustedProxies::for_tests(vec![], false));

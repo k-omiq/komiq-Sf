@@ -47,6 +47,7 @@ import type {
 	CreateOwnerInput,
 	CreateUserInput,
 	ExtensionRepo,
+	EngineGeneration,
 	MangadexSetting,
 	ScanlatorAi,
 	ScanlatorPage,
@@ -60,6 +61,7 @@ import type {
 } from '@komika/api';
 import { backend } from './context';
 import { assetSrc } from './config';
+import { isUnknownEngineStateField } from './engine-generation';
 
 /**
  * Fail a long admin mutation client-side after `ms` so a stalled connection can't pin
@@ -327,6 +329,23 @@ export async function removeExtensionRepo(indexUrl: string): Promise<boolean> {
 export async function loadMangadexSetting(): Promise<MangadexSetting> {
 	if (!backend.mangadexSetting) setupUnavailable();
 	return backend.mangadexSetting();
+}
+
+/** Null means this backend or server predates engine-state reporting. */
+export async function loadEngineGenerations(): Promise<EngineGeneration[] | null> {
+	if (!backend.engineGenerationState) return null;
+	try {
+		return await backend.engineGenerationState();
+	} catch (err) {
+		if (isUnknownEngineStateField(err)) return null;
+		throw err;
+	}
+}
+
+/** Set aside the old extension-source data and return the updated generations. */
+export async function startNewEngineGeneration(): Promise<EngineGeneration[]> {
+	if (!backend.startNewEngineGeneration) setupUnavailable();
+	return backend.startNewEngineGeneration();
 }
 
 /** Turn MangaDex on or off; returns the new effective value. */

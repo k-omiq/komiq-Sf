@@ -68,6 +68,17 @@ async fn active_on(conn: &mut sqlx::PgConnection) -> Result<Option<Uuid>> {
     .await?)
 }
 
+pub(crate) async fn has_active_chapter(pool: &Database, chapter_id: i64) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM engine_chapter_key c \
+         JOIN engine_generation g ON g.id = c.generation \
+         WHERE g.state = 'active' AND c.chapter_id = $1)",
+    )
+    .bind(chapter_id)
+    .fetch_one(pool)
+    .await?)
+}
+
 /// Validate a complete scan before either half publishes, so a moved chapter
 /// cannot leave freshly written metadata behind. Writers repeat this under locks.
 pub(crate) async fn verify_snapshot(

@@ -13,6 +13,7 @@
 	import { settleConfirm } from '$lib/confirm.svelte';
 	import { theme, cycleTheme, initTheme } from '$lib/theme.svelte';
 	import { refreshSourcesDown, sourceHealth } from '$lib/source-health.svelte';
+	import { loadEngineGenerations } from '$lib/data';
 	import Brand from '$lib/components/Brand.svelte';
 	import Button from '$lib/components/Button.svelte';
 	import ChoosePassword from '$lib/components/ChoosePassword.svelte';
@@ -50,6 +51,31 @@
 	const onLogin = $derived(path === '/login');
 	// First-run screens: full page, no sidebar, reachable signed out.
 	const onSetup = $derived(path === '/setup' || path === '/start');
+
+	// Reuse the shell's warning notice. Health has the full recovery section itself.
+	// The check does not track `path`, so navigating does not ask the server again.
+	let engineQuarantined = $state(false);
+	const onHealth = $derived(path === '/sources/health');
+	$effect(() => {
+		engineQuarantined = false;
+		if (!auth.user || mustChangePassword || onLogin || onSetup) return;
+		let cancelled = false;
+		async function refreshEngineWarning(): Promise<void> {
+			try {
+				const rows = await loadEngineGenerations();
+				if (!cancelled)
+					engineQuarantined = rows?.some((row) => row.state === 'quarantined') ?? false;
+			} catch {
+				// Best effort; the Health page presents query failures with a retry.
+			}
+		}
+		void refreshEngineWarning();
+		const timer = setInterval(() => void refreshEngineWarning(), 5 * 60_000);
+		return () => {
+			cancelled = true;
+			clearInterval(timer);
+		};
+	});
 
 	// Self-host builds ask the server whether it still needs its owner. The hosted
 	// console never does (its server always has admins), except on /setup itself,
@@ -327,6 +353,15 @@
 			</aside>
 
 			<main id="main-content" class="admin-main" tabindex="-1">
+				{#if engineQuarantined && !onHealth}
+					<p class="signout-warning engine-warning" role="status">
+						Source engine data is quarantined. Extension-source chapters, pages and thumbnails are
+						unavailable.
+						<a class="k-link" href={href('/sources/health#engine-generation')}
+							>Review engine state</a
+						>
+					</p>
+				{/if}
 				{@render children()}
 			</main>
 		</div>
@@ -362,6 +397,11 @@
 		background: var(--k-warning-soft);
 		color: var(--k-warning);
 		font-size: var(--k-text-sm);
+	}
+	.engine-warning {
+		margin: 0 0 var(--k-space-5);
+		border: 0;
+		line-height: 1.6;
 	}
 
 	.shell {

@@ -1,14 +1,47 @@
 <script lang="ts">
 	import { href } from '$lib/paths';
 	import type { SourceHealthStat, SourceScanHealth } from '@komika/types';
+	import type { EngineGeneration as Generation } from '@komika/api';
 	import { auth } from '$lib/auth.svelte';
-	import { loadSourceScanHealth } from '$lib/data';
+	import { loadEngineGenerations, loadSourceScanHealth, startNewEngineGeneration } from '$lib/data';
+	import { engineGenerationView } from '$lib/engine-generation';
 	import Button from '$lib/components/Button.svelte';
+	import EngineGeneration from '$lib/components/EngineGeneration.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 	import LoadState from '$lib/components/LoadState.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 
 	// Auth redirect is centralized in +layout.svelte.
+
+	let engineRows = $state<Generation[] | null>([]);
+	let engineLoading = $state(false);
+	let engineLoaded = $state(false);
+	let engineError = $state<string | null>(null);
+	const engineView = $derived(engineGenerationView(engineRows));
+
+	async function refreshEngine(): Promise<void> {
+		if (engineLoading) return;
+		engineLoading = true;
+		engineError = null;
+		try {
+			engineRows = await loadEngineGenerations();
+		} catch (err) {
+			engineError = err instanceof Error ? err.message : 'Failed to load source engine state.';
+		} finally {
+			engineLoaded = true;
+			engineLoading = false;
+		}
+	}
+
+	async function startGeneration(): Promise<void> {
+		// Keep the mutation's result even if the follow-up query fails.
+		engineRows = await startNewEngineGeneration();
+	}
+
+	$effect(() => {
+		if (!auth.user || engineLoaded || engineLoading) return;
+		void refreshEngine();
+	});
 
 	// ---- Scan health ------------------------------------------------------------
 	// "Is this source actually working?" used to have no honest answer: every Suwayomi
@@ -204,6 +237,16 @@
 	}
 </script>
 
+{#snippet engineSection()}
+	<EngineGeneration
+		view={engineView}
+		loading={engineLoading || !engineLoaded}
+		error={engineError}
+		onrefresh={refreshEngine}
+		onstart={startGeneration}
+	/>
+{/snippet}
+
 <div class="k-page">
 	<PageHeader
 		title="Health"
@@ -215,6 +258,10 @@
 		A failing source is often one extension release behind.
 		<a class="k-link" href={href('/settings#updates')}>Check extension updates in Settings</a>
 	</PageHeader>
+
+	{#if engineView.kind === 'quarantined'}
+		{@render engineSection()}
+	{/if}
 
 	<LoadState
 		loading={(healthLoading || !healthLoaded) && health.length === 0}
@@ -474,6 +521,10 @@
 			</div>
 		</div>
 	</LoadState>
+
+	{#if engineView.kind !== 'quarantined'}
+		{@render engineSection()}
+	{/if}
 </div>
 
 <style>

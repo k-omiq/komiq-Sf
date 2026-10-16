@@ -144,6 +144,9 @@ pub fn parse_scan_source_rate_limits(raw: &str) -> Vec<SourceRateLimit> {
 /// Runtime configuration, sourced from env vars (see `.env.example`).
 #[derive(Clone)]
 pub struct Config {
+    /// Exact media manifests are opt-in (`KOMIKA_MEDIA_MANIFESTS=on`).
+    pub media_manifests: bool,
+    pub media_signing_key_file: std::path::PathBuf,
     /// Address the public listener binds (`BIND_ADDR`, default `0.0.0.0`). An IPv4
     /// or IPv6 literal; `main` refuses to start on anything else rather than
     /// silently widening a loopback-only intent to every interface.
@@ -523,6 +526,10 @@ impl Config {
             .filter(|&v: &i64| v > 0)
             .unwrap_or(200);
         Self {
+            media_manifests: env::var("KOMIKA_MEDIA_MANIFESTS").is_ok_and(|v| v == "on"),
+            media_signing_key_file: env::var_os("KOMIKA_MEDIA_SIGNING_KEY_FILE")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| "media-signing.key".into()),
             bind_addr,
             port,
             metrics_bind_addr,

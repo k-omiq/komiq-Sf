@@ -154,6 +154,7 @@ pub(crate) fn app_state(pool: &db::Database, covers: &db::SqliteDatabase) -> Arc
     ));
     mangadex.set_enabled(false);
     Arc::new(AppState {
+        media_manifests: None,
         pool: pool.background(),
         cover_pool: covers.clone(),
         suwayomi: SuwayomiClient::new("http://127.0.0.1:1".into(), None, None),

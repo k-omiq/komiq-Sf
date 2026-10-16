@@ -28,7 +28,16 @@ mod locks;
 mod maintenance;
 mod mangadex;
 mod media;
+mod media_manifest;
+#[cfg(test)]
+mod media_manifest_tests;
+// The verifier half is for regional caches (M6); until one ships, only tests call it.
+#[cfg_attr(not(test), allow(dead_code))]
+mod media_verify;
 mod notify;
+mod page_locator;
+#[cfg(test)]
+mod page_locator_tests;
 mod pg_export;
 mod pg_import;
 mod phase_f;
@@ -1321,29 +1330,59 @@ async fn serve_suwayomi_image_inner(
     }
     // The owning manga (`is_suwayomi_image_path` already proved the first segment numeric).
     let manga_id = rest.split('/').next().and_then(|id| id.parse::<i64>().ok());
-    // A chapter page of a series a site-wide rule blocks is not served: `pages` refuses
-    // to list its URLs, but the URL is three guessable numbers. Covers stay open, as the
-    // admin console still lists a blocked series and its `<img>` carries no session.
-    // Fails closed: a rule that cannot be read must not let the page out.
     if let Some(id) = manga_id {
-        match graphql::site_blocks_engine_series(&app.pool, id).await {
-            Ok(false) => {}
-            Ok(true) => return StatusCode::NOT_FOUND.into_response(),
-            Err(e) => {
-                tracing::warn!(error = %e, "suwayomi page: block rules unreadable");
-                return database_error_response(
-                    db::observed_read_database_error(e),
-                    "Internal error",
-                );
-            }
+        if let Err(response) = check_page_block(&app, id).await {
+            return response;
+        }
+        if app
+            .suwayomi
+            .page_locator
+            .wait_idle(id, app.suwayomi.page_locator.deadline())
+            .await
+            .is_err()
+        {
+            return page_busy_response();
         }
     }
     let path = format!("/api/v1/manga/{rest}");
-    // Bounded + timed page fetch (own pool, page timeout, byte cap). The old path called
-    // the unbounded `fetch_image`, which shared the 30 s scan timeout and no concurrency
-    // bound, so a burst of page requests (a chapter is tens of pages) could pile onto the
-    // engine behind the scanner and each pay the full 30 s ceiling.
-    // Per-source health buckets, by the owning manga.
+    match fetch_suwayomi_page(&app, manga_id, &path).await {
+        Ok((bytes, content_type)) => raw_image_response(content_type, bytes),
+        Err(response) => response,
+    }
+}
+
+async fn check_page_block(
+    app: &graphql::AppState,
+    manga_id: i64,
+) -> Result<(), axum::response::Response> {
+    // A chapter page of a series a site-wide rule blocks is not served: `pages` refuses
+    // to list its URLs, but the URL is guessable numbers. Covers stay open, as the
+    // admin console still lists a blocked series and its `<img>` carries no session.
+    // Fails closed: a rule that cannot be read must not let the page out.
+    match graphql::site_blocks_engine_series(&app.pool, manga_id).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(image_failure_response(StatusCode::NOT_FOUND)),
+        Err(e) => {
+            tracing::warn!(error = %e, "suwayomi page: block rules unreadable");
+            let mut response =
+                database_error_response(db::observed_read_database_error(e), "Internal error");
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store, must-revalidate"),
+            );
+            Err(response)
+        }
+    }
+}
+
+async fn fetch_suwayomi_page(
+    app: &graphql::AppState,
+    manga_id: Option<i64>,
+    path: &str,
+) -> Result<(axum::body::Bytes, String), axum::response::Response> {
+    // Bounded + timed page fetch (own pool, page timeout, byte cap), so a burst of page
+    // requests (a chapter is tens of pages) cannot pile onto the engine behind the
+    // scanner. Per-source health buckets, by the owning manga.
     let health = |outcome: Result<(), &anyhow::Error>| {
         if let Some(id) = manga_id {
             source_health::observe(
@@ -1353,24 +1392,324 @@ async fn serve_suwayomi_image_inner(
             );
         }
     };
-    match app.suwayomi.fetch_page_now(&path).await {
-        Ok((bytes, content_type)) => {
+    match app.suwayomi.fetch_page_now(path).await {
+        Ok(image) => {
             health(Ok(()));
-            raw_image_response(content_type, bytes)
+            Ok(image)
         }
         Err(crate::suwayomi::PageFetchError::Busy) => {
             // Saturated past the short wait — shed with a retryable 503 rather than queue.
             // `info`, not `warn`: a steady stream is the operator's signal that page demand
             // is outrunning the engine, not an error per request.
             tracing::info!(path = %path, "suwayomi page: pool saturated, 503");
-            page_busy_response()
+            Err(page_busy_response())
         }
         Err(crate::suwayomi::PageFetchError::Upstream(e)) => {
             health(Err(&e));
             tracing::warn!(error = %e, path = %path, "suwayomi image proxy failed");
-            image_failure_response(StatusCode::BAD_GATEWAY)
+            Err(image_failure_response(StatusCode::BAD_GATEWAY))
         }
     }
+}
+
+/// `GET /media/v1/c/{chapterId}/{page}` — a chapter page addressed by the engine's chapter
+/// id, not by its index. The index (`sourceOrder`) moves when a source re-orders its
+/// chapters, so it is looked up per request (30 s memo, `page_locator`), and bytes fetched
+/// while the server refreshed that series are dropped, never served under this URL.
+async fn serve_chapter_page(
+    State(app): State<Arc<graphql::AppState>>,
+    path: Result<UrlPath<(String, String)>, axum::extract::rejection::PathRejection>,
+) -> axum::response::Response {
+    let Ok(UrlPath((chapter, page))) = path else {
+        return image_failure_response(StatusCode::NOT_FOUND);
+    };
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !numeric(&chapter) || !numeric(&page) {
+        return image_failure_response(StatusCode::NOT_FOUND);
+    }
+    let Ok(chapter_id) = chapter.parse::<i64>() else {
+        return image_failure_response(StatusCode::NOT_FOUND);
+    };
+    if app.suwayomi.wait_for_generation().await.is_err() {
+        return page_busy_response();
+    }
+    let generation = app.suwayomi.read_generation();
+    let response = serve_chapter_page_inner(&app, chapter_id, &page).await;
+    if app
+        .suwayomi
+        .validate_read_generation(generation)
+        .await
+        .is_err()
+    {
+        return page_busy_response();
+    }
+    response
+}
+
+async fn resolve_page_location(
+    client: &SuwayomiClient,
+    chapter_id: i64,
+    fresh: bool,
+    deadline: tokio::time::Instant,
+) -> Result<Option<(i64, i32, u64)>, axum::response::Response> {
+    let locator = &client.page_locator;
+    if !fresh {
+        if let Some(entry) = locator.memo_get(chapter_id) {
+            return Ok(Some((entry.manga_id, entry.source_order, entry.stamp)));
+        }
+    }
+    if let Some(manga_id) = locator.memo_manga(chapter_id) {
+        locator
+            .wait_idle(manga_id, deadline)
+            .await
+            .map_err(|_| page_busy_response())?;
+    }
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(page_busy_response());
+        }
+        let stamp = locator.snapshot();
+        let location = match tokio::time::timeout_at(deadline, client.chapter_location(chapter_id))
+            .await
+        {
+            Ok(Ok(location)) => location,
+            Ok(Err(e)) if request_budget::is_upstream_busy(&e) => return Err(page_busy_response()),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, chapter_id, "suwayomi page: chapter lookup failed");
+                return Err(image_failure_response(StatusCode::BAD_GATEWAY));
+            }
+            Err(_) => return Err(page_busy_response()),
+        };
+        let Some((manga_id, order)) = location else {
+            return Ok(None);
+        };
+        if locator.unchanged(manga_id, stamp) {
+            locator.memo_put(chapter_id, manga_id, order, stamp);
+            return Ok(Some((manga_id, order, stamp)));
+        }
+        locator
+            .wait_idle(manga_id, deadline)
+            .await
+            .map_err(|_| page_busy_response())?;
+    }
+}
+
+async fn serve_chapter_page_inner(
+    app: &graphql::AppState,
+    chapter_id: i64,
+    page: &str,
+) -> axum::response::Response {
+    match fetch_chapter_page(app, chapter_id, page).await {
+        Ok((bytes, mime)) => raw_image_response(mime, bytes),
+        Err(response) => response,
+    }
+}
+
+async fn fetch_chapter_page(
+    app: &graphql::AppState,
+    chapter_id: i64,
+    page: &str,
+) -> Result<(axum::body::Bytes, String), axum::response::Response> {
+    let deadline = app.suwayomi.page_locator.deadline();
+    for attempt in 0..2 {
+        let (manga_id, order, stamp) =
+            match resolve_page_location(&app.suwayomi, chapter_id, attempt > 0, deadline).await {
+                Ok(Some(location)) => location,
+                Ok(None) => return Err(image_failure_response(StatusCode::NOT_FOUND)),
+                Err(response) => return Err(response),
+            };
+        check_page_block(app, manga_id).await?;
+        if app
+            .suwayomi
+            .page_locator
+            .wait_idle(manga_id, deadline)
+            .await
+            .is_err()
+        {
+            return Err(page_busy_response());
+        }
+        let path = format!("/api/v1/manga/{manga_id}/chapter/{order}/page/{page}");
+        let fetched = fetch_suwayomi_page(app, Some(manga_id), &path).await;
+        // A refresh may have changed the index while the engine was serving it.
+        // Drop the payload (and its pool slot) before resolving and fetching once more.
+        if !app.suwayomi.page_locator.unchanged(manga_id, stamp) {
+            drop(fetched);
+            if attempt == 0 && tokio::time::Instant::now() < deadline {
+                continue;
+            }
+            return Err(page_busy_response());
+        }
+        return fetched;
+    }
+    Err(page_busy_response())
+}
+
+// S5 replaces this with the policy lease's remaining life.
+const OBJECT_S_MAXAGE_SECS: u64 = 600;
+
+fn valid_media_copy(copy: &str) -> bool {
+    copy.strip_prefix("mc_").is_some_and(|id| {
+        id.len() == 32
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+fn manifest_store_error(error: anyhow::Error) -> axum::response::Response {
+    db::observe_database_error(&error);
+    tracing::warn!(error = %error, "media store failed");
+    image_failure_response(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn serve_media_object(
+    State(app): State<Arc<AppState>>,
+    path: Result<UrlPath<(String, String)>, axum::extract::rejection::PathRejection>,
+) -> axum::response::Response {
+    if app.media_manifests.is_none() {
+        return image_failure_response(StatusCode::NOT_FOUND);
+    }
+    let Ok(UrlPath((copy, hash))) = path else {
+        return image_failure_response(StatusCode::NOT_FOUND);
+    };
+    if !valid_media_copy(&copy)
+        || hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return image_failure_response(StatusCode::NOT_FOUND);
+    }
+    if app.suwayomi.wait_for_generation().await.is_err() {
+        return page_busy_response();
+    }
+    let generation = app.suwayomi.read_generation();
+    let response = match serve_media_object_inner(&app, &copy, &hash).await {
+        Ok(response) => response,
+        Err(error) => manifest_store_error(error),
+    };
+    if app
+        .suwayomi
+        .validate_read_generation(generation)
+        .await
+        .is_err()
+    {
+        return page_busy_response();
+    }
+    response
+}
+
+async fn serve_media_object_inner(
+    app: &AppState,
+    copy: &str,
+    hash: &str,
+) -> anyhow::Result<axum::response::Response> {
+    use sha2::{Digest, Sha256};
+    let raw_hash = hex::decode(hash)?;
+    let Some((revision, idx, length, mime)) =
+        media_manifest::store::object_lookup(&app.pool, copy, &raw_hash).await?
+    else {
+        return Ok(image_failure_response(StatusCode::NOT_FOUND));
+    };
+    let Some((chapter, bound_manga)) =
+        media_manifest::store::chapter_for_copy(&app.pool, copy).await?
+    else {
+        return Ok(image_failure_response(StatusCode::NOT_FOUND));
+    };
+    // The copy's own series decides, not only the series the engine now answers for this
+    // chapter id: identical bytes (a credits page) must not reopen a blocked copy.
+    if let Err(response) = check_page_block(app, bound_manga).await {
+        return Ok(response);
+    }
+    let (bytes, _) = match fetch_chapter_page(app, chapter, &idx.to_string()).await {
+        Ok(page) => page,
+        Err(response) => return Ok(response),
+    };
+    if bytes.len() as i64 != length || Sha256::digest(&bytes).as_slice() != raw_hash {
+        media_manifest::store::mark_stale(&app.pool, copy, revision).await?;
+        app.media_manifests
+            .as_ref()
+            .unwrap()
+            .queue
+            .queue_now(chapter);
+        return Ok(image_failure_response(StatusCode::NOT_FOUND));
+    }
+    let mut response =
+        raw_image_response_with_cache(mime, bytes, "public, max-age=31536000, immutable");
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_str(&format!(
+            "public, max-age=31536000, immutable, s-maxage={OBJECT_S_MAXAGE_SECS}"
+        ))?,
+    );
+    Ok(response)
+}
+
+async fn serve_media_manifest(
+    State(app): State<Arc<AppState>>,
+    path: Result<UrlPath<String>, axum::extract::rejection::PathRejection>,
+    RawQuery(query): RawQuery,
+) -> axum::response::Response {
+    let Some(media) = &app.media_manifests else {
+        return image_failure_response(StatusCode::NOT_FOUND);
+    };
+    let Ok(UrlPath(copy)) = path else {
+        return image_failure_response(StatusCode::NOT_FOUND);
+    };
+    if !valid_media_copy(&copy) {
+        return image_failure_response(StatusCode::NOT_FOUND);
+    }
+    let rev = match query_param(&query, "rev") {
+        Some(raw) => match raw.parse::<i32>() {
+            Ok(rev) if rev > 0 => Some(rev),
+            _ => return image_failure_response(StatusCode::NOT_FOUND),
+        },
+        None => None,
+    };
+    // Eligibility is checked on every request, even when the signed bytes are memoized.
+    let manifest = match rev {
+        Some(rev) => media_manifest::store::revision(&app.pool, &copy, rev).await,
+        None => media_manifest::store::latest(&app.pool, &copy).await,
+    };
+    match manifest {
+        Ok(Some(manifest)) if rev.is_some() || !manifest.stale => {
+            match media.signed(manifest.body).await {
+                Ok(bytes) => signed_media_response(bytes),
+                Err(error) => manifest_store_error(error),
+            }
+        }
+        Ok(_) => image_failure_response(StatusCode::NOT_FOUND),
+        Err(error) => manifest_store_error(error),
+    }
+}
+
+fn signed_media_response(bytes: Vec<u8>) -> axum::response::Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "public, max-age=60"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+async fn serve_media_keys(State(app): State<Arc<AppState>>) -> axum::response::Response {
+    match &app.media_manifests {
+        Some(media) => signed_media_response(media.keys.clone()),
+        None => image_failure_response(StatusCode::NOT_FOUND),
+    }
+}
+
+async fn serve_media_ready() -> axum::response::Response {
+    (
+        StatusCode::NO_CONTENT,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+        ],
+    )
+        .into_response()
 }
 
 /// A failed cover-store read is neither a cold miss nor a reason to fetch the source
@@ -1394,9 +1733,9 @@ fn media_store_error(mut response: axum::response::Response) -> axum::response::
     response
 }
 
-/// Retryable, uncacheable 503 for a page whose fetch pool is saturated. Recovery is the
-/// reader's per-page "failed — tap to retry" affordance, which fires on any non-image
-/// response (browsers do NOT honour `Retry-After` for an `<img>` load, so there is no
+/// Retryable, uncacheable 503 for a page whose engine or fetch pool is unavailable.
+/// Recovery is the reader's per-page "failed — tap to retry" affordance, which fires on
+/// any non-image response (browsers do NOT honour `Retry-After` for an `<img>` load, so there is no
 /// automatic re-request storm); `Retry-After` stays advisory for non-browser clients, and
 /// `no-store` keeps the transient failure out of every cache.
 fn page_busy_response() -> axum::response::Response {
@@ -2353,6 +2692,50 @@ fn public_router(
                     telemetry::MediaRoute::Page,
                 )),
         )
+        .route(
+            "/media/v1/c/{chapterId}/{page}",
+            get(serve_chapter_page)
+                .layer(axum::middleware::from_fn_with_state(
+                    std::time::Duration::from_secs(60),
+                    request_budget::limit_image_time,
+                ))
+                .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                    telemetry::MediaRoute::Page,
+                )),
+        )
+        .route(
+            "/media/v1/o/{copy_id}/{sha256}",
+            get(serve_media_object)
+                .layer(axum::middleware::from_fn_with_state(
+                    std::time::Duration::from_secs(60),
+                    request_budget::limit_image_time,
+                ))
+                .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                    telemetry::MediaRoute::Object,
+                )),
+        )
+        .route(
+            "/media/v1/manifest/{copy_id}",
+            get(serve_media_manifest)
+                .layer(axum::middleware::from_fn_with_state(
+                    std::time::Duration::from_secs(10),
+                    request_budget::limit_image_time,
+                ))
+                .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                    telemetry::MediaRoute::Manifest,
+                )),
+        )
+        .route(
+            "/media/v1/keys",
+            get(serve_media_keys)
+                .layer(axum::middleware::from_fn_with_state(
+                    std::time::Duration::from_secs(10),
+                    request_budget::limit_image_time,
+                ))
+                .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                    telemetry::MediaRoute::Policy,
+                )),
+        )
         // Authenticated comment-image upload + public serve, same BLOB-in-SQLite
         // model as avatars. The upload route raises the body limit above the raw
         // image cap enforced in `media::process_comment_image`.
@@ -2466,6 +2849,8 @@ fn public_router(
             crate::db::Database::foreground_scope(next.run(request)).await
         },
     ))
+    // Public probes keep wildcard CORS even when API CORS is restricted.
+    .route("/media/v1/ready", get(serve_media_ready))
 }
 
 /// ANSI colour in the human log format: stdout is a terminal and `NO_COLOR` is
@@ -2654,7 +3039,9 @@ async fn main() -> anyhow::Result<()> {
         crawl = ?crawl,
         "mangadex switch"
     );
+    let media_manifests = media_manifest::MediaState::from_config(&cfg)?;
     let state = Arc::new(AppState {
+        media_manifests,
         pool: pool.clone(),
         cover_pool: cover_pool.clone(),
         suwayomi,
@@ -2702,6 +3089,7 @@ async fn main() -> anyhow::Result<()> {
         state.suwayomi.clone(),
         shutdown_tx.subscribe(),
     );
+    media_manifest::spawn(state.clone(), shutdown_tx.subscribe());
     maintenance::spawn(
         state.clone(),
         cfg.extension_auto_update_interval_seconds,
@@ -3120,6 +3508,7 @@ mod tests {
             cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
+            media_manifests: None,
             setup_code: instance::SetupCode::default(),
         })
     }
@@ -3923,6 +4312,7 @@ mod tests {
                 cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 catalogue_cover_phash: false,
                 ext_icons_dir: std::path::PathBuf::new(),
+                media_manifests: None,
                 setup_code: instance::SetupCode::default(),
             });
             let points = crate::locks::pause_points::PausePoints::default();
@@ -4003,6 +4393,7 @@ mod tests {
             cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
+            media_manifests: None,
             setup_code: instance::SetupCode::default(),
         });
 
@@ -4096,6 +4487,7 @@ mod tests {
             cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
+            media_manifests: None,
             setup_code: instance::SetupCode::default(),
         };
         let app = Arc::new(app);
@@ -4476,6 +4868,7 @@ mod tests {
             cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
+            media_manifests: None,
             setup_code: instance::SetupCode::default(),
         });
         let trusted = Arc::new(TrustedProxies::for_tests(vec![], false));
@@ -4760,6 +5153,7 @@ mod tests {
             cover_crawl_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
+            media_manifests: None,
             setup_code: instance::SetupCode::default(),
         });
         let get = || {

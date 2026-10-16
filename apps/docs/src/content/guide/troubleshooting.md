@@ -23,6 +23,12 @@ If an image fails, komiq replaces it with an alert button showing the page numbe
 
 **This chapter is read on**, followed by a host name, means the publisher hosts the pages off-site. Komiq has no pages to show. Click **Read on** to open the publisher's chapter in a new tab.
 
+### Extension chapters stay unavailable
+
+If MangaDex series open but chapters from extension sources say they are unavailable, the server may be checking its source engine after a restore. Try again later. If it lasts, tell the server owner. The owner fixes it in the admin console, see [Source engine state](/admin/engine).
+
+After such a change, reading progress your app saved while offline can be dropped. The app never puts it on a different chapter.
+
 ### Upstream source is offline or protected
 
 Komiq retrieves comic pages from sources on demand. Source outages, slow responses, or browser-verification challenges can prevent pages from loading.

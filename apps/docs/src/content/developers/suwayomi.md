@@ -77,7 +77,7 @@ An extension repository is an external index URL listing available extension pac
 
 Suwayomi numbers its own rows, and a chapter's real address on the source is a pair of keys, one for the manga and one for the chapter. `apps/server/src/engine_keys.rs` keeps these keys, with the web links, in PostgreSQL:
 
-- **Start**: the server adopts the engine as the active generation when PostgreSQL has none. After that it checks the engine's generation marker and a sample of stored keys at start, on each scan tick and after a lost connection. `apps/server/src/engine_generation.rs` quarantines numeric reads and writes when the engine was replaced; the self-host backup page explains the ways out.
+- **Start**: the server adopts the engine as the active generation when PostgreSQL has none. After that it checks the engine's generation marker and a sample of stored keys at start, on each scan tick and after a lost connection. `apps/server/src/engine_generation.rs` quarantines numeric reads and writes when the engine was replaced. The admin console's Health page shows the state and both ways out, see [Source engine state](/admin/engine).
 - **Capture**: when the server already fetches a series or its chapter list, it writes the keys in the same transaction as the cache. It skips a write when nothing changed.
 - **Backfill**: a background task runs once per scan tick, 60 seconds, and reads up to four series per run from the engine to fill keys that are missing.
 - **`chapterOrigin`**: the server answers from the stored keys. It asks the engine only on a miss, then stores the answer.

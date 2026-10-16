@@ -116,11 +116,14 @@ On a fresh restore, create these volumes with `docker compose create` and extrac
 
 ### If the engine was replaced
 
-The server checks an engine marker and stored source identities. If a fresh, rebuilt or logically restored engine does not match PostgreSQL, it quarantines numeric engine data. Readers get a retryable unavailable error for those chapters, pages and thumbnails. The server log says `engine quarantined` and gives the reason. Admins can read `engineGenerationState { id state reason since unfenced }` through GraphQL. The admin console screen for this state is not available yet.
+The server checks an engine marker and stored source identities. If a fresh, rebuilt or logically restored engine does not match PostgreSQL, it quarantines the engine data. Readers get a retryable unavailable error for extension-source chapters, pages and thumbnails. The server log says `engine quarantined` and gives the reason. In the admin console, **Sources**, then **Health**, shows the state, the reason and both ways out. See [Source engine state](/admin/engine).
 
-Restore the matching engine volume to resume automatically. If only its marker was lost and its source identities still match, run `komika-server engine reattach` in the server container. It checks all stored bindings and refuses different data.
+There are two ways out:
 
-If you intend to keep the replacement engine, run `komika-server engine start-new-generation`, or use the admin GraphQL mutation `startNewEngineGeneration { id state }`. The server sets numeric reading progress aside, kept but no longer shown, and detaches old numeric comment threads with their replies and attachments. Works, work-level libraries and MangaDex progress stay. Scan or add the new engine's series again. Numeric progress from apps that send no generation epoch is refused for 30 days; an explicitly stale epoch is always refused. SQLite reverse export refuses while detached progress or the queued-write epoch exists.
+- **Re-attach the old engine data.** Restore the matching `engine-data` volume archive and start the stack. The server leaves quarantine by itself. If only its marker was lost and its source identities still match, run `komika-server engine reattach` in the server container. It checks all stored bindings and refuses different data.
+- **Start a new generation.** Keep the replacement engine. Choose **Start a new generation** on the Health page, or run `komika-server engine start-new-generation` in the server container. The server sets extension-source reading progress aside, kept but no longer shown, and sets aside comment threads on extension-source series and chapters with their replies and attachments. Works, libraries and MangaDex progress stay. Scan or add the new engine's series again.
+
+After a new generation, the server refuses progress that reader apps saved offline before the change, and the apps drop it. Apps too old to send the generation epoch cannot save extension-source progress for 30 days. SQLite reverse export refuses while set-aside progress or the epoch exists.
 
 An older engine without global metadata support runs with a warning, source-identity checks and write guards. Its marker protection is unavailable.
 

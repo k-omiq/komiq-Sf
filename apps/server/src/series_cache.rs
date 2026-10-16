@@ -389,7 +389,7 @@ async fn put_chapters_inner(
     generation: Option<uuid::Uuid>,
 ) -> Result<()> {
     let wanted = WantedChapters::of(chapters);
-    if chapters_cached_unchanged(pool, manga_id, chapters, &wanted).await {
+    if chapters_cached_unchanged(pool, manga_id, chapters, &wanted, generation).await {
         // The unchanged path records a successful fetch without a database write.
         note_chapters_fetched(manga_id, Utc::now());
         return Ok(());
@@ -439,12 +439,27 @@ async fn chapters_cached_unchanged(
     manga_id: i64,
     chapters: &[SuwayomiChapter],
     wanted: &WantedChapters,
+    generation: Option<uuid::Uuid>,
 ) -> bool {
     let read = async {
         let mut snapshot = pool
             .read()
             .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .await?;
+        // A list fetched under an earlier engine generation is not "unchanged" even when
+        // it matches: the write path must refuse it at the generation fence instead of
+        // reporting success.
+        if let Some(generation) = generation {
+            let current: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM engine_generation WHERE id = $1 AND state = 'active')",
+            )
+            .bind(generation)
+            .fetch_one(&mut *snapshot)
+            .await?;
+            if !current {
+                return Ok(false);
+            }
+        }
         let derived: Option<(i64, Option<i64>)> = crate::db_types::query_tuple(
             "SELECT chapter_count, latest_chapter_at FROM suwayomi_series WHERE id = $1",
         )
@@ -1108,16 +1123,18 @@ mod tests {
     #[tokio::test]
     async fn concurrent_metadata_writers_publish_cache_and_keys_in_one_transaction() {
         let pool = pool().await.foreground();
+        // The source key stays: the write guard refuses a changed key as another series.
+        // The title and web link are what one publication must change with its key row.
         let mut initial = manga(1, "Initial");
-        initial.url = Some("/initial".into());
+        initial.url = Some("/series".into());
+        initial.real_url = Some("https://source.test/initial".into());
         put_series(&pool, &initial).await.unwrap();
         let mut older = initial.clone();
         older.title = "Older".into();
-        older.url = Some("/older".into());
+        older.real_url = Some("https://source.test/older".into());
         let mut newer = initial;
         newer.title = "Newer".into();
-        newer.url = Some("/newer".into());
-        newer.source_id = "new-source".into();
+        newer.real_url = Some("https://source.test/newer".into());
         let points = crate::locks::pause_points::PausePoints::default();
         let held = points.arm("series-cache-written");
         let writer = pool.clone();
@@ -1136,21 +1153,22 @@ mod tests {
         }
         let read = || {
             sqlx::query_as::<_, (String, String, String, String, String, String)>(
-            "SELECT s.title, s.source_id, m.source_id, m.manga_key, s.xmin::text, m.xmin::text \
+            "SELECT s.title, m.title, m.manga_key, m.web_url, s.xmin::text, m.xmin::text \
              FROM suwayomi_series s JOIN engine_manga_key m ON m.manga_id = s.id WHERE s.id = 1",
         )
         };
         let during = read().fetch_one(&pool).await.unwrap();
         assert_eq!(during.0, "Initial");
-        assert_eq!(during.3, "/initial");
+        assert_eq!(during.1, "Initial");
+        assert_eq!(during.3, "https://source.test/initial");
         held.release();
         first.await.unwrap().unwrap();
         second.await.unwrap().unwrap();
         let after = read().fetch_one(&pool).await.unwrap();
         assert_eq!(after.0, "Newer");
-        assert_eq!(after.1, "new-source");
-        assert_eq!(after.1, after.2);
-        assert_eq!(after.3, "/newer");
+        assert_eq!(after.1, "Newer");
+        assert_eq!(after.2, "/series");
+        assert_eq!(after.3, "https://source.test/newer");
         assert_eq!(
             after.4, after.5,
             "metadata and keys must share their publishing transaction"

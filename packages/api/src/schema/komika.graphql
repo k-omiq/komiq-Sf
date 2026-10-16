@@ -70,6 +70,8 @@ type Query {
 	reports(status: ReportStatus, kind: ReportKind, page: Int = 1): ReportPage! # [komika] reader-report queue (Support → Report an issue), newest first; null status/kind mean "every value". `total` counts the FILTERED set, `openCount` is always the global open backlog (requires isAdmin)
 	extensions(installedOnly: Boolean = false, lang: String, nsfw: Boolean, refresh: Boolean = false): [ExtensionInfo!]! # [komika] Mihon-format extensions from the repos the admin added (none are shipped or seeded); refresh re-fetches the repo indexes. NSFW extensions are ALWAYS listed: this is an admin management view, so the admin's reader-side show_nsfw is deliberately ignored — filter explicitly with the `nsfw` argument (requires isAdmin)
 	extensionRepos: [ExtensionRepo!]! # [komika] admin — the extension repos configured on the engine, asked live (requires isAdmin)
+	numericEpoch: Int! # [komika] M5: the epoch numeric progress writes carry; bumped by startNewEngineGeneration. No auth, never cached
+	engineGenerationState: [EngineGeneration!]! # [komika] admin — every source-engine generation, oldest first; at most one active or quarantined (requires isAdmin)
 	mangadexSetting: MangadexSetting! # [komika] admin — the MangaDex usage switch and whether the server environment pins it (requires isAdmin)
 	sourceRateLimits: [SourceRateLimit!]! # [komika] admin — every per-source scan rate limit in force: the server's SCAN_SOURCE_RATE_LIMITS defaults (fromEnv) and the ones an admin set, which win (requires isAdmin)
 	scanlators(search: String, ai: ScanlatorAiFilter, source: String, page: Int = 1): ScanlatorPage! # [komika] admin scanlator list — every credit chapters carry, most chapters first, 50 per page, with its AI tag. `search` matches part of the name; `ai` filters by the tag that APPLIES; `source` (a BrowseSource.id) keeps credits with chapters on that source and counts that source only. Counts come from a scan the server reuses for ten minutes; tags are always current (requires isAdmin)
@@ -90,7 +92,8 @@ type Mutation {
 	mark(seriesId: ID!, marked: Boolean!): Series! # [suwayomi] updateManga inLibrary (+ [komika] scan priority)
 	setLibraryStatus(seriesId: ID!, status: String): Series! # [komika] file a series under an explicit shelf (reading|completed|onhold|plan); null clears to auto-derive; adds to library if absent
 	setFavorite(seriesId: ID!, favorite: Boolean!): Series! # [komika] toggle the viewer's favourite flag; adds to library if absent
-	setProgress(chapterId: ID!, lastPageRead: Int!, read: Boolean!): Boolean! # [suwayomi] updateChapter
+	setProgress(chapterId: ID!, lastPageRead: Int!, read: Boolean!, numericEpoch: Int): Boolean! # [suwayomi] updateChapter. `numericEpoch` (M5): the `numericEpoch` the reader read for a numeric chapter id; a stale one is refused with code STALE_NUMERIC_EPOCH, and none at all is refused for 30 days after an engine generation change
+	startNewEngineGeneration: [EngineGeneration!]! # [komika] admin — give up the quarantined engine data: numeric progress and comment threads set aside, Suwayomi series removed for re-enrolment, numericEpoch bumped (requires isAdmin)
 	recordView(seriesId: ID!): Boolean! # [komika] record one view (chapter open) — no auth REQUIRED, counts anonymous + ordinary signed-in readers; an admin viewer's own reads are silently skipped so admin browsing can't move Trending; the popularity signal behind Trending
 	postReview(input: PostReviewInput!): Review! # [komika] upsert the viewer's review, one per (work, user). `seriesId` may be any of the work's ids; the row is FILED under the canonical work id so the rating counts on every surface that work appears on. `score` is 1..10 — to withdraw a rating use `deleteReview`, not score 0
 	deleteReview(seriesId: ID!): Boolean! # [komika] withdraw the viewer's OWN rating (requires auth; scoped to the caller, so it can never touch anyone else's). `seriesId` may be any of the work's ids and the removal covers the work's WHOLE key set — `reviews.series_id` is polymorphic and historical rows keep the shape they were filed under, so deleting only the canonical id would leave a numeric-keyed row still counting. Returns false when there was nothing to remove. DESTRUCTIVE for a review that carries text: `score` is NOT NULL, so a scoreless review cannot exist and withdrawing means deleting the row
@@ -530,6 +533,12 @@ type Page {
 	sourceUrl: String!
 	width: Int
 	height: Int
+	# Exact object (/media/v1/o/{copyId}/{sha256}), its hash, length and MIME: set only when
+	# the server keeps a signed manifest for this chapter (M5). Optional on old servers.
+	mediaPath: String
+	mediaSha256: String
+	mediaLength: Int
+	mediaMime: String
 }
 
 enum DiscoveryFeedKind {
@@ -1061,6 +1070,15 @@ type SourceRateLimit {
 	windowSecs: Int!
 	fromEnv: Boolean! # the limit in force is the server's SCAN_SOURCE_RATE_LIMITS default
 	overridesEnv: Boolean! # an admin's limit replaces that default; removing it restores the default
+}
+
+# One source-engine generation (`engineGenerationState`). state: active | quarantined | detached.
+type EngineGeneration {
+	id: ID!
+	state: String!
+	reason: String
+	since: String!
+	unfenced: Boolean! # the engine cannot store the generation marker; only stored source identities are checked
 }
 
 # The MangaDex usage switch (`mangadexSetting`).

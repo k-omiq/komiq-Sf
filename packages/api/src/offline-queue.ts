@@ -42,6 +42,13 @@ export interface ProgressOp {
 	 * existed — treated as foreign and dropped rather than mis-attributed.
 	 */
 	userId?: string | null;
+	/**
+	 * The server's numeric epoch known when the write was queued (M5), replayed as is so
+	 * the server refuses a write from before an engine change. `null` = unknown (the
+	 * server was never reached, or it predates epochs); `undefined` on ops persisted
+	 * before this field existed. Both replay with no epoch.
+	 */
+	numericEpoch?: number | null;
 }
 
 /** A pending on-device library-membership write, reconciled by canonical `seriesId`. */
@@ -74,6 +81,8 @@ export type EnqueueOp =
 			ts?: number;
 			/** Owning user id (C1); pass `null` when anonymous. */
 			userId?: string | null;
+			/** See {@link ProgressOp.numericEpoch}. */
+			numericEpoch?: number | null;
 	  }
 	| {
 			kind: 'mark';
@@ -181,6 +190,7 @@ export class OfflineWriteQueue {
 						ts,
 						tries: 0,
 						userId,
+						numericEpoch: op.numericEpoch ?? null,
 					}
 				: { kind: 'mark', seriesId: op.seriesId, marked: op.marked, ts, tries: 0, userId };
 		this.ops = this.ops.filter((existing) => !sameTarget(existing, full));

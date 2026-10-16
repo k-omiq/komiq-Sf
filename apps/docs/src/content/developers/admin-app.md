@@ -143,5 +143,6 @@ API routes take precedence over static files. Endpoints like `/graphql`, `/healt
 - `apps/admin/src/lib/config.ts`: Target constant inspection, server address persistence, and asset URL rewriting.
 - `apps/admin/src/lib/paths.ts`: Helpers for generating base-aware links and normalizing route pathnames.
 - `apps/admin/src/lib/auth.svelte.ts`: Admin session state management and admin-privilege verification.
+- `apps/admin/src/lib/engine-generation.ts`: The source engine state shown on the Health page, as a view model with its own tests.
 - `apps/server/src/web_dir.rs`: Static directory mounting, SPA fallback handling, and route priority in Axum.
 - `apps/admin/wrangler.toml`: Cloudflare Workers Static Assets configuration for a separate-origin console.

@@ -7237,13 +7237,15 @@ mod tests {
         // seedable — the ledger refuses to invent a release time for one. So populate the
         // cache through the REAL `put_chapters` path with dated chapters, which is also
         // what writes them into the canonical spine (Phase B1).
-        crate::series_cache::put_chapters(
-            &pool,
-            7,
-            &dated_chaps(14, 24, at("2026-01-15T00:00:00Z")),
-        )
-        .await
-        .unwrap();
+        // The fixture's chapters must name the series they are filed under: the write
+        // guard refuses a chapter that answers for another manga.
+        let mut dated = dated_chaps(14, 24, at("2026-01-15T00:00:00Z"));
+        for chapter in &mut dated {
+            chapter.manga_id = 7;
+        }
+        crate::series_cache::put_chapters(&pool, 7, &dated)
+            .await
+            .unwrap();
         crate::catalog::spine::drain_suwayomi_series(&pool)
             .await
             .unwrap();

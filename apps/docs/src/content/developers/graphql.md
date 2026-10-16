@@ -191,7 +191,11 @@ The `GraphQLBackend` class catches this error, removes the offending line from t
 
 ### Opportunistic argument stripping
 
-Arguments in `OPTIONAL_ARGUMENTS` (such as `filter` and `includeNsfw`) receive similar handling. If an older server rejects an argument, `GraphQLBackend` strips the variable declaration and usage before retrying.
+Arguments in `OPTIONAL_ARGUMENTS` (such as `filter`, `includeNsfw` and `numericEpoch`) receive similar handling. If an older server rejects an argument, `GraphQLBackend` strips the variable declaration and usage before retrying.
+
+### Numeric epoch
+
+Numeric chapter ids come from the Suwayomi engine and mean something only within one engine generation. `setProgress` and `setChapterRead` take an optional `numericEpoch` for them. `GraphQLBackend` reads the `numericEpoch` query once, at the first numeric write, and keeps the value for the life of the page or app. It does not refresh it: after an engine change the app may still hold old chapter ids, and a fresh epoch would let their progress land on a chapter that reuses the number. The server refuses a stale epoch with the error code `STALE_NUMERIC_EPOCH` (see `isStaleNumericEpoch` in `packages/api/src/numeric-epoch.ts`). Canonical MangaDex ids carry no epoch.
 
 ### GET fallback
 

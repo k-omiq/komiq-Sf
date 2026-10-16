@@ -69,6 +69,17 @@ These variables configure connections to the Suwayomi source engine.
 | `SUWAYOMI_PUBLIC_URL` | unset                   | Public base URL for Suwayomi for direct client fetching. |
 | `SUWAYOMI_SOURCE_ID`  | unset                   | Pins requests to a specific Suwayomi source identifier.  |
 
+## Exact media settings
+
+These variables turn on signed media manifests: a list of the exact bytes of each chapter page, signed by your server. They are for a server that feeds other caches. A server that serves only its own readers leaves them unset.
+
+| Variable                        | Default                                | Description                                                                                                                   |
+| ------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `KOMIKA_MEDIA_MANIFESTS`        | off                                    | `on` makes the signing key, files opened chapters under their byte hashes and serves `/media/v1/` objects and manifests.     |
+| `KOMIKA_MEDIA_SIGNING_KEY_FILE` | `media-signing.key` in the working folder (`/data` in Docker) | The Ed25519 signing key. The server creates it with owner-only access when it is missing. Back it up: every cache that trusts the old key must be given a new one. |
+
+With `KOMIKA_MEDIA_MANIFESTS` off, the server makes no key file and writes nothing new. Read [Exact media and signing](/developers/media-manifests).
+
 ## Accounts and instance settings
 
 Create the owner in [First-run setup](/self-host/first-run), then manage registration, sources and user accounts in the admin console. Environment overrides take precedence over those choices. For example, `KOMIKA_REGISTRATION_OPEN` pins registration and `KOMIKA_MANGADEX` pins MangaDex access.

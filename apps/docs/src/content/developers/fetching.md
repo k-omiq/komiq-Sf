@@ -29,7 +29,7 @@ Image fetching depends on the image origin:
 
 - Covers cached in the database load directly from `/covers/{work_id}.webp` on the API origin. For card-sized covers, the reader provides responsive variants through a `srcset` attribute at 192 pixels (1x) and 320 pixels (2x) using the `?w=` query parameter, along with the master cover at 3x.
 - User avatars load from `/avatars/{user_id}.webp` on the API origin.
-- Suwayomi chapter pages and thumbnails load directly from `/api/v1/manga/...` on the API origin. The server proxies these from loopback Suwayomi and attaches long-lived cache headers.
+- For engine chapter pages, `pages` hands out `/media/v1/c/...` when the server has stored the chapter's source key. Otherwise it returns the older `/api/v1/manga/...` index path, which still works. Both load directly from the API origin with `Cache-Control: public, max-age=300, must-revalidate`. Thumbnails keep their `/api/v1/manga/...` path.
 - In proxy or server image mode, MangaDex chapter pages and uncached covers route through the Cloudflare Worker at `img.komiq.cc/img?src=...` on the global server, or through `/img?src=...` on your own server. The embedded reader uses the server path without a Worker. This step adds permissive CORS headers and sets an upstream referrer.
 
 ```flow

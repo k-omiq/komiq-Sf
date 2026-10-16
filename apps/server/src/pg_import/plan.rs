@@ -59,6 +59,29 @@ pub(crate) struct PostgresOnly {
 /// expectation read this list; the indexes are read from the migration files themselves.
 pub(crate) const POSTGRES_ONLY: &[PostgresOnly] = &[
     PostgresOnly {
+        name: "media_object",
+        since: 7,
+        fks: &[],
+    },
+    PostgresOnly {
+        name: "media_copy",
+        since: 7,
+        fks: &[],
+    },
+    PostgresOnly {
+        name: "media_manifest",
+        since: 7,
+        fks: &[("copy_id", "media_copy", "id")],
+    },
+    PostgresOnly {
+        name: "media_manifest_page",
+        since: 7,
+        fks: &[
+            ("sha256", "media_object", "sha256"),
+            ("copy_id", "media_copy", "id"),
+        ],
+    },
+    PostgresOnly {
         name: "engine_numeric_state",
         since: 6,
         fks: &[],

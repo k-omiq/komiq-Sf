@@ -1054,6 +1054,16 @@ export interface Page {
 	sourceUrl: string;
 	width?: number;
 	height?: number;
+	/**
+	 * The exact object for this page (`/media/v1/o/{copyId}/{sha256}`, a path on a media
+	 * route, no origin), its SHA-256 (hex), length in bytes and MIME type. Set only by a
+	 * server that keeps signed manifests and has one for this chapter; absent on an older
+	 * server (stripped) and null otherwise. M5 clients keep loading `sourceUrl`.
+	 */
+	mediaPath?: string | null;
+	mediaSha256?: string | null;
+	mediaLength?: number | null;
+	mediaMime?: string | null;
 }
 
 // ---- Social layer ------------------------------------------------------------

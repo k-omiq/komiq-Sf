@@ -98,7 +98,7 @@ The admin app's server and Suwayomi engine run alongside a FlareSolverr sidecar 
 
 ### The server container
 
-The Rust server uses Axum, async-graphql and PostgreSQL. It serves GraphQL at `/graphql`, database readiness at `/health/ready`, and source images at `/api/v1/manga/...`. It also runs catalogue scans and updates.
+The Rust server uses Axum, async-graphql and PostgreSQL. It serves GraphQL at `/graphql`, database readiness at `/health/ready`, and source images at `/api/v1/manga/...`. Chapter-id page locators use `/media/v1/c/{chapterId}/{page}`. With `KOMIKA_MEDIA_MANIFESTS=on` it also serves exact objects and signed manifests under `/media/v1/`; read [Exact media and signing](/developers/media-manifests). It also runs catalogue scans and updates.
 
 Public ingress reaches port 8080 through a reverse proxy or tunnel. Compose publishes it on loopback only. Metrics use port 9090, also published on loopback. The server has a 6 GB memory cap.
 

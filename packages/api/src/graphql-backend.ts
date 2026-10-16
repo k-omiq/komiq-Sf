@@ -60,6 +60,7 @@ import type {
 	InstanceInfo,
 	ExtensionRepo,
 	MangadexSetting,
+	EngineGeneration,
 	BlockRule,
 	BrowseSource,
 	RatedScanlator,
@@ -91,6 +92,7 @@ import type {
 	CloudflareTokenCheck,
 } from './backend.js';
 import * as ops from './operations.js';
+import { isNumericChapterId } from './numeric-epoch.js';
 import { failedOnlyAt, GraphQLRequestError, tolerablePartialErrors } from './partial-errors.js';
 import type { GraphQLErrorLike, PathSegment } from './partial-errors.js';
 
@@ -158,6 +160,15 @@ function canonicalUrl(url: string): string {
 
 /** Negative schema discovery is shared by fetch views, bounded and retried after upgrades. */
 const CAPABILITY_NEGATIVE_TTL_MS = 5 * 60_000;
+
+/** The bearer token and the numeric epoch, shared by a backend and its {@link GraphQLBackend.withFetch} views. */
+interface AuthCell {
+	token: string | null;
+	revision: number;
+	numericEpoch?: Promise<number | null>;
+}
+
+
 const CAPABILITY_ENDPOINT_CAPACITY = 64;
 
 interface EndpointCapabilities {
@@ -221,12 +232,12 @@ export class GraphQLBackend implements Backend {
 	 * sending anonymous GETs after the viewer signed in would be served (and could cache)
 	 * another viewer's answer.
 	 */
-	private readonly auth: { token: string | null; revision: number };
+	private readonly auth: AuthCell;
 
 	/** `auth` is passed only by {@link withFetch}, to share the parent's cell. */
 	constructor(
 		private config: BackendConfig,
-		auth?: { token: string | null; revision: number },
+		auth?: AuthCell,
 	) {
 		this.auth = auth ?? { token: config.token ?? null, revision: 0 };
 	}
@@ -239,6 +250,41 @@ export class GraphQLBackend implements Backend {
 		if (this.auth.token === token) return;
 		this.auth.token = token;
 		this.auth.revision += 1;
+	}
+
+	/**
+	 * The server's numeric epoch, read at the first numeric write and then kept for the
+	 * life of this backend (one page load or app start; shared with {@link withFetch}
+	 * views). Kept, not refreshed: after an engine change the reader may still hold the
+	 * old engine's chapter ids, and a fresh epoch would let their progress land on
+	 * whatever chapter reuses the number. Those writes are refused until the app is
+	 * reloaded instead. A failed read is forgotten so the next call tries again.
+	 */
+	numericEpoch(): Promise<number | null> {
+		const cell = this.auth;
+		if (cell.numericEpoch) return cell.numericEpoch;
+		const read = this.gql<{ numericEpoch: number }>(ops.NUMERIC_EPOCH).then(
+			(d) => d.numericEpoch,
+			(e: unknown) => {
+				// The server predates engine generations: nothing to fence.
+				if (e instanceof Error && e.message.includes('Unknown field "numericEpoch"')) return null;
+				if (cell.numericEpoch === read) cell.numericEpoch = undefined;
+				throw e;
+			},
+		);
+		cell.numericEpoch = read;
+		return read;
+	}
+
+	/** The epoch a write for `chapterId` carries: only numeric ids are fenced. An explicit
+	 *  value (a replayed write) is used as given, `null` meaning none. */
+	private async epochFor(
+		chapterId: Id,
+		given: number | null | undefined,
+	): Promise<number | undefined> {
+		if (!isNumericChapterId(chapterId)) return undefined;
+		const epoch = given === undefined ? await this.numericEpoch() : given;
+		return epoch ?? undefined;
 	}
 
 	private assertAuthRevision(revision: number): void {
@@ -627,8 +673,19 @@ export class GraphQLBackend implements Backend {
 		const d = await this.gql<{ libraryProgress: SeriesProgress[] }>(ops.LIBRARY_PROGRESS);
 		return d.libraryProgress;
 	}
-	async setProgress(chapterId: Id, lastPageRead: number, read: boolean): Promise<void> {
-		await this.gql<{ setProgress: boolean }>(ops.SET_PROGRESS, { chapterId, lastPageRead, read });
+	async setProgress(
+		chapterId: Id,
+		lastPageRead: number,
+		read: boolean,
+		numericEpoch?: number | null,
+	): Promise<void> {
+		const epoch = await this.epochFor(chapterId, numericEpoch);
+		await this.gql<{ setProgress: boolean }>(ops.SET_PROGRESS, {
+			chapterId,
+			lastPageRead,
+			read,
+			numericEpoch: epoch,
+		});
 	}
 	/** Endpoint/schema-scoped, like {@link seriesPageUnsupported}: one `Unknown field` answer means
 	 *  every later call would get it too. */
@@ -636,7 +693,12 @@ export class GraphQLBackend implements Backend {
 		const authRevision = this.auth.revision;
 		if (this.capabilities.setChapterReadUnsupported) return false;
 		try {
-			await this.gql<{ setChapterRead: boolean }>(ops.SET_CHAPTER_READ, { chapterId, read });
+			const numericEpoch = await this.epochFor(chapterId, undefined);
+			await this.gql<{ setChapterRead: boolean }>(ops.SET_CHAPTER_READ, {
+				chapterId,
+				read,
+				numericEpoch,
+			});
 			return true;
 		} catch (e) {
 			this.assertAuthRevision(authRevision);
@@ -849,6 +911,20 @@ export class GraphQLBackend implements Backend {
 	async mangadexSetting(): Promise<MangadexSetting> {
 		const d = await this.gql<{ mangadexSetting: MangadexSetting }>(ops.MANGADEX_SETTING);
 		return d.mangadexSetting;
+	}
+
+	async engineGenerationState(): Promise<EngineGeneration[]> {
+		const d = await this.gql<{ engineGenerationState: EngineGeneration[] }>(
+			ops.ENGINE_GENERATION_STATE,
+		);
+		return d.engineGenerationState;
+	}
+
+	async startNewEngineGeneration(): Promise<EngineGeneration[]> {
+		const d = await this.gql<{ startNewEngineGeneration: EngineGeneration[] }>(
+			ops.START_NEW_ENGINE_GENERATION,
+		);
+		return d.startNewEngineGeneration;
 	}
 
 	async setMangadexEnabled(enabled: boolean): Promise<boolean> {

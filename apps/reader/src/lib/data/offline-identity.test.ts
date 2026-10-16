@@ -4,6 +4,7 @@ import { registerHooks } from 'node:module';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
+import './node-test-hooks.ts';
 import type { Backend } from '../../../../../packages/api/src/backend.ts';
 import type { Series } from '@komika/types';
 

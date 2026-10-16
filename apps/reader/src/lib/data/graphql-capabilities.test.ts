@@ -306,3 +306,26 @@ test('GET compatibility fallback remains bounded when a slow request outlives di
 	assert.deepEqual(await backend.tags(), tags);
 	assert.deepEqual(methods, ['GET', 'POST']);
 });
+
+test('an older server without Page.media* fields still lists pages', async () => {
+	const queries: string[] = [];
+	const page = { index: 0, sourceUrl: 'https://fixture.test/p/0', width: null, height: null };
+	const old = new GraphQLBackend({
+		endpoint: endpoint(),
+		fetch: async (input) => {
+			const query = new URL(String(input)).searchParams.get('query')!;
+			queries.push(query);
+			return queries.length === 1
+				? Response.json({
+						errors: ['mediaPath', 'mediaSha256', 'mediaLength', 'mediaMime'].map((field) => ({
+							message: 'Unknown field "' + field + '"',
+						})),
+					})
+				: Response.json({ data: { pages: [page] } });
+		},
+	});
+	assert.deepEqual(await old.pages('9005'), [page]);
+	assert.match(queries[0], /\n\s*mediaPath\s*\n/);
+	assert.doesNotMatch(queries[1], /media/);
+	assert.match(queries[1], /\n\s*height\s*\n/);
+});

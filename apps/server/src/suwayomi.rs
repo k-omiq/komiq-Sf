@@ -530,6 +530,7 @@ fn stamp_generation(value: &mut Value, generation: Option<&str>) {
 #[derive(Clone)]
 pub struct SuwayomiClient {
     pub(crate) fence: Option<Arc<crate::engine_generation::Fence>>,
+    pub(crate) page_locator: Arc<crate::page_locator::PageLocator>,
     base_url: String,
     /// Public base used when building image URLs (covers/pages) handed to the
     /// browser. Defaults to `base_url` when no public URL is configured.
@@ -596,6 +597,7 @@ impl SuwayomiClient {
             .unwrap_or_else(|_| http.clone());
         Self {
             fence: None,
+            page_locator: Arc::new(crate::page_locator::PageLocator::default()),
             base_url,
             image_base_url,
             http,
@@ -623,6 +625,7 @@ impl SuwayomiClient {
         *self.source_id.lock().unwrap_or_else(|e| e.into_inner()) = self.configured_source.clone();
         self.pages_memo.clear();
         self.chapter_owner_memo.clear();
+        self.page_locator.clear();
     }
 
     pub(crate) fn read_generation(&self) -> (Option<uuid::Uuid>, Option<u64>) {
@@ -731,6 +734,10 @@ impl SuwayomiClient {
             return None;
         }
         Some(bytes)
+    }
+
+    pub(crate) fn page_permits_available(&self) -> usize {
+        self.page_sem.available_permits()
     }
 
     /// Number of free permits in the bounded cover-fetch pool. Exposed for tests and
@@ -1131,10 +1138,7 @@ impl SuwayomiClient {
             #[serde(rename = "fetchMangaAndChapters")]
             f: FetchPayload,
         }
-        match self
-            .gql::<FetchData>(&fetch, json!({ "id": series_id }))
-            .await
-        {
+        match self.refresh_chapters::<FetchData>(&fetch, series_id).await {
             Ok(d) => {
                 crate::source_health::ok(Subject::Manga(series_id), Surface::Chapters);
                 Ok((
@@ -1249,7 +1253,7 @@ impl SuwayomiClient {
             #[serde(rename = "fetchMangaAndChapters")]
             f: Payload,
         }
-        match self.gql::<Data>(&doc, json!({ "id": id })).await {
+        match self.refresh_chapters::<Data>(&doc, id).await {
             Ok(d) => {
                 crate::source_health::ok(Subject::Manga(id), Surface::Chapters);
                 Ok((
@@ -1268,6 +1272,42 @@ impl SuwayomiClient {
                 Ok((m, chapters, m_prov.and(ch_prov)))
             }
         }
+    }
+
+    async fn refresh_chapters<T: DeserializeOwned>(&self, query: &str, manga_id: i64) -> Result<T> {
+        let guard = self.page_locator.begin_refresh(manga_id);
+        let result = self.gql(query, json!({ "id": manga_id })).await;
+        // Any transport failure leaves the mutation's outcome unknown, including a
+        // timeout. Admission refusals and GraphQL answers have a known outcome.
+        let known = result.as_ref().err().is_none_or(|error| {
+            crate::request_budget::is_upstream_busy(error)
+                || !error.chain().any(|cause| cause.is::<reqwest::Error>())
+        });
+        guard.finish(known);
+        result
+    }
+
+    pub(crate) async fn chapter_location(&self, chapter_id: i64) -> Result<Option<(i64, i32)>> {
+        let doc = "query CO($id: Int!) { chapters(condition: { id: $id }) { nodes { mangaId sourceOrder } } }";
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Node {
+            manga_id: i64,
+            source_order: i32,
+        }
+        #[derive(Deserialize)]
+        struct Nodes {
+            nodes: Vec<Node>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            chapters: Nodes,
+        }
+        let d: Data = self.gql(doc, json!({ "id": chapter_id })).await?;
+        Ok(d.chapters
+            .nodes
+            .first()
+            .map(|n| (n.manga_id, n.source_order)))
     }
 
     pub async fn pages(&self, chapter_id: i64) -> Result<Vec<String>> {

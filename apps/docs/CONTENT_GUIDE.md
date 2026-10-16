@@ -146,11 +146,12 @@ Opening paragraph: two or three sentences. What this page covers and who it is f
 /guide/privacy                /guide/copyright
 
 /admin/overview               /admin/catalog                 /admin/duplicates
-/admin/covers                 /admin/sources                 /admin/users
-/admin/settings
+/admin/covers                 /admin/sources                 /admin/engine
+/admin/users                  /admin/settings
 
 /developers/architecture      /developers/repository         /developers/local-development
 /developers/fetching          /developers/image-proxy        /developers/edge-caching
+/developers/media-manifests
 /developers/server            /developers/graphql            /developers/data-model
 /developers/catalogue-sync    /developers/canonical-works    /developers/suwayomi
 /developers/native-engine     /developers/ios                /developers/ios-engine

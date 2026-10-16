@@ -25,6 +25,7 @@ export type PathSegment = string | number;
 export interface GraphQLErrorLike {
 	message: string;
 	path?: readonly PathSegment[];
+	extensions?: { code?: unknown };
 }
 
 function startsWith(path: readonly PathSegment[], prefix: readonly PathSegment[]): boolean {

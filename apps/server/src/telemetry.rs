@@ -71,9 +71,10 @@ pub(crate) enum Lane {
     PageFetch,
     CoverFetch,
     ProxyFetch,
+    Ingest,
 }
 
-const LANE_COUNT: usize = 12;
+const LANE_COUNT: usize = 13;
 
 impl Lane {
     const ALL: [Lane; LANE_COUNT] = [
@@ -89,6 +90,7 @@ impl Lane {
         Lane::PageFetch,
         Lane::CoverFetch,
         Lane::ProxyFetch,
+        Lane::Ingest,
     ];
 
     fn label(self) -> &'static str {
@@ -105,6 +107,7 @@ impl Lane {
             Lane::PageFetch => "page_fetch",
             Lane::CoverFetch => "cover_fetch",
             Lane::ProxyFetch => "proxy_fetch",
+            Lane::Ingest => "ingest",
         }
     }
 
@@ -114,7 +117,11 @@ impl Lane {
     fn tracks_held(self) -> bool {
         !matches!(
             self,
-            Lane::UpstreamRate | Lane::PageFetch | Lane::CoverFetch | Lane::ProxyFetch
+            Lane::UpstreamRate
+                | Lane::PageFetch
+                | Lane::CoverFetch
+                | Lane::ProxyFetch
+                | Lane::Ingest
         )
     }
 
@@ -643,6 +650,9 @@ fn caches_prometheus(text: &mut String) {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MediaRoute {
+    Object,
+    Manifest,
+    Policy,
     /// Engine chapter page (`/api/v1/manga/{id}/chapter/{c}/page/{p}`).
     Page,
     /// Engine cover thumbnail (`/api/v1/manga/{id}/thumbnail`).
@@ -656,10 +666,13 @@ pub(crate) enum MediaRoute {
     Proxy,
 }
 
-const MEDIA_ROUTE_COUNT: usize = 7;
+const MEDIA_ROUTE_COUNT: usize = 10;
 
 impl MediaRoute {
     const ALL: [MediaRoute; MEDIA_ROUTE_COUNT] = [
+        MediaRoute::Object,
+        MediaRoute::Manifest,
+        MediaRoute::Policy,
         MediaRoute::Page,
         MediaRoute::EngineCover,
         MediaRoute::Cover,
@@ -671,6 +684,9 @@ impl MediaRoute {
 
     fn label(self) -> &'static str {
         match self {
+            MediaRoute::Object => "object",
+            MediaRoute::Manifest => "manifest",
+            MediaRoute::Policy => "policy",
             MediaRoute::Page => "page",
             MediaRoute::EngineCover => "engine_cover",
             MediaRoute::Cover => "cover",

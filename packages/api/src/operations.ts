@@ -106,6 +106,14 @@ export const OPTIONAL_SERIES_FIELDS = [
 	// `Instance.showMangadexRatings`: the admin's switch for the above. Stripped, it reads
 	// as absent, which the reader treats as "shown" (an older server has no switch).
 	'showMangadexRatings',
+	// `Page.media*` (M5): the exact object a page's bytes are filed under, set only when the
+	// server keeps signed manifests. Optional for the usual deploy-ordering reason; stripped,
+	// a page has only `sourceUrl`, which is what every reader uses today. The `media` prefix
+	// keeps the names unique across every document, as this stripper matches by name.
+	'mediaPath',
+	'mediaSha256',
+	'mediaLength',
+	'mediaMime',
 ] as const;
 
 /**
@@ -150,6 +158,10 @@ export const OPTIONAL_ARGUMENTS = [
 	// server that predates it answers as before (null / "No such work" for such a work),
 	// and the reader then falls back to the selected source's metadata.
 	'includeFederated',
+	// M5: numeric progress writes carry the server's `numericEpoch`, so a write made before
+	// an engine change is refused instead of filed on a chapter that reused the id. A server
+	// that predates engine generations has no fence and needs no epoch.
+	'numericEpoch',
 ] as const;
 
 const SERIES_FIELDS = /* GraphQL */ `
@@ -499,6 +511,10 @@ export const PAGES = /* GraphQL */ `
 			sourceUrl
 			width
 			height
+			mediaPath
+			mediaSha256
+			mediaLength
+			mediaMime
 		}
 	}
 `;
@@ -563,16 +579,33 @@ export const SET_FAVORITE = /* GraphQL */ `
 `;
 
 export const SET_PROGRESS = /* GraphQL */ `
-	mutation SetProgress($chapterId: ID!, $lastPageRead: Int!, $read: Boolean!) {
-		setProgress(chapterId: $chapterId, lastPageRead: $lastPageRead, read: $read)
+	mutation SetProgress(
+		$chapterId: ID!
+		$lastPageRead: Int!
+		$read: Boolean!
+		$numericEpoch: Int
+	) {
+		setProgress(
+			chapterId: $chapterId
+			lastPageRead: $lastPageRead
+			read: $read
+			numericEpoch: $numericEpoch
+		)
 	}
 `;
 
 // The series list's per-chapter toggle: sets exactly this chapter (no catch-up cascade),
 // and unread clears every copy of it — which `setProgress` cannot express.
 export const SET_CHAPTER_READ = /* GraphQL */ `
-	mutation SetChapterRead($chapterId: ID!, $read: Boolean!) {
-		setChapterRead(chapterId: $chapterId, read: $read)
+	mutation SetChapterRead($chapterId: ID!, $read: Boolean!, $numericEpoch: Int) {
+		setChapterRead(chapterId: $chapterId, read: $read, numericEpoch: $numericEpoch)
+	}
+`;
+
+// The epoch numeric progress writes carry (see `numericEpoch` in OPTIONAL_ARGUMENTS).
+export const NUMERIC_EPOCH = /* GraphQL */ `
+	query NumericEpoch {
+		numericEpoch
 	}
 `;
 
@@ -1430,6 +1463,30 @@ export const MANGADEX_SETTING = /* GraphQL */ `
 			enabled
 			pinned
 			pinnedBy
+		}
+	}
+`;
+
+const ENGINE_GENERATION_FIELDS = /* GraphQL */ `
+	id
+	state
+	reason
+	since
+	unfenced
+`;
+
+export const ENGINE_GENERATION_STATE = /* GraphQL */ `
+	query EngineGenerationState {
+		engineGenerationState {
+			${ENGINE_GENERATION_FIELDS}
+		}
+	}
+`;
+
+export const START_NEW_ENGINE_GENERATION = /* GraphQL */ `
+	mutation StartNewEngineGeneration {
+		startNewEngineGeneration {
+			${ENGINE_GENERATION_FIELDS}
 		}
 	}
 `;

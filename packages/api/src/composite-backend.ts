@@ -52,6 +52,7 @@ import type {
 	InstanceInfo,
 	ExtensionRepo,
 	MangadexSetting,
+	EngineGeneration,
 	BlockRule,
 	BrowseSource,
 	RatedScanlator,
@@ -85,6 +86,16 @@ import type {
 import type { ContentBackend, SourceRef } from './content-backend.js';
 import type { WorkSourceLike } from './local-suwayomi-backend.js';
 import type { OfflineWriteQueue, WriteOp } from './offline-queue.js';
+import { isNumericChapterId, isStaleNumericEpoch } from './numeric-epoch.js';
+
+/** A progress write the server refused as from an earlier engine generation: dropped
+ *  with a log line, never retried (the id may now name another chapter). */
+function dropStaleProgress(chapterId: Id): void {
+	console.warn(
+		'[offline-queue] dropping progress from an earlier engine generation:',
+		chapterId,
+	);
+}
 
 /**
  * The optional source-ref mapping capability layered on the local content backend by
@@ -153,7 +164,14 @@ export class CompositeBackend implements Backend {
 						return Promise.reject(new Error('Offline write identity changed'));
 					}
 					return op.kind === 'progress'
-						? this.opts.hosted.setProgress(op.chapterId, op.lastPageRead, op.read)
+						? this.opts.hosted
+								.setProgress(op.chapterId, op.lastPageRead, op.read, op.numericEpoch ?? null)
+								.catch((e: unknown) => {
+									// Resolving removes the op: it belongs to an earlier engine
+									// generation, and retrying could only file it elsewhere.
+									if (!isStaleNumericEpoch(e)) throw e;
+									dropStaleProgress(op.chapterId);
+								})
 						: this.opts.hosted.mark(op.seriesId, op.marked).then(() => {});
 				},
 				// Scope the replay to the signed-in user so A's offline writes can never
@@ -426,14 +444,28 @@ export class CompositeBackend implements Backend {
 	 * would change nothing but risk an unhandled rejection. A success
 	 * opportunistically drains any backlog.
 	 */
-	async setProgress(chapterId: Id, lastPageRead: number, read: boolean): Promise<void> {
-		if (!this.opts.queue) return this.opts.hosted.setProgress(chapterId, lastPageRead, read);
+	async setProgress(
+		chapterId: Id,
+		lastPageRead: number,
+		read: boolean,
+		numericEpoch?: number | null,
+	): Promise<void> {
+		if (!this.opts.queue)
+			return this.opts.hosted.setProgress(chapterId, lastPageRead, read, numericEpoch);
 		const owner = this.currentUserId;
 		const generation = this.writeGeneration;
+		// The epoch this write belongs to, read now so a queued copy replays with it and
+		// never with whatever epoch the server has by then. Unknown (offline before the
+		// first read) is `null`: such a write replays with no epoch, as an old app's would.
+		const epoch =
+			numericEpoch !== undefined || !isNumericChapterId(chapterId)
+				? (numericEpoch ?? null)
+				: await (this.opts.hosted.numericEpoch?.() ?? Promise.resolve(null)).catch(() => null);
 		try {
-			await this.opts.hosted.setProgress(chapterId, lastPageRead, read);
+			await this.opts.hosted.setProgress(chapterId, lastPageRead, read, epoch);
 			if (this.writeIsCurrent(owner, generation)) void this.flushQueue();
-		} catch {
+		} catch (e) {
+			if (isStaleNumericEpoch(e)) return dropStaleProgress(chapterId);
 			if (this.writeIsCurrent(owner, generation)) {
 				this.opts.queue.enqueue({
 					kind: 'progress',
@@ -441,6 +473,7 @@ export class CompositeBackend implements Backend {
 					lastPageRead,
 					read,
 					userId: owner,
+					numericEpoch: epoch,
 				});
 			}
 		}
@@ -707,6 +740,12 @@ export class CompositeBackend implements Backend {
 	}
 	mangadexSetting(): Promise<MangadexSetting> {
 		return this.opts.hosted.mangadexSetting!();
+	}
+	engineGenerationState(): Promise<EngineGeneration[]> {
+		return this.opts.hosted.engineGenerationState!();
+	}
+	startNewEngineGeneration(): Promise<EngineGeneration[]> {
+		return this.opts.hosted.startNewEngineGeneration!();
 	}
 	setMangadexEnabled(enabled: boolean): Promise<boolean> {
 		return this.opts.hosted.setMangadexEnabled!(enabled);

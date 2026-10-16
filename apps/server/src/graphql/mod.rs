@@ -317,6 +317,7 @@ impl KeyedLocks {
 
 /// Shared, request-independent application state.
 pub struct AppState {
+    pub(crate) media_manifests: Option<std::sync::Arc<crate::media_manifest::MediaState>>,
     pub pool: Database,
     /// Separate, un-replicated DB for cover blobs (`work_cover_blob`). Kept out of
     /// `pool` so the main-database backup carries no covers; see `db::init_covers`.
@@ -6354,6 +6355,10 @@ impl QueryRoot {
             .into_iter()
             .enumerate()
             .map(|(index, source_url)| Page {
+                media_path: None,
+                media_sha256: None,
+                media_length: None,
+                media_mime: None,
                 index: index as i32,
                 source_url,
                 width: None,
@@ -7317,12 +7322,66 @@ impl QueryRoot {
             );
         }
         let urls = urls.map_err(gql_err)?;
+        let use_locator = match crate::engine_keys::has_active_chapter(&st.pool, n).await {
+            Ok(found) => found,
+            Err(error) => {
+                tracing::debug!(error = %error, chapter_id = n, "pages: chapter key unreadable; using engine URLs");
+                false
+            }
+        };
+        // Exact objects need the chapter's source key (copy identity), the same row the
+        // locator needs. Opening the chapter queues an ingest pass (in memory); the read
+        // itself writes nothing.
+        let media = if let Some(media) = st.media_manifests.as_ref().filter(|_| use_locator) {
+            match crate::media_manifest::store::existing_copy_for_chapter(&st.pool, n).await {
+                Ok(Some(copy)) => {
+                    match crate::media_manifest::store::page_media(&st.pool, &copy, urls.len())
+                        .await
+                    {
+                        Ok(Some(pages)) => {
+                            media.queue.queue(n);
+                            Some((copy, pages))
+                        }
+                        Ok(None) => {
+                            media.queue.requeue(n);
+                            None
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "pages: media manifest unreadable");
+                            None
+                        }
+                    }
+                }
+                Ok(None) => {
+                    media.queue.queue(n);
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "pages: media copy unreadable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(urls
             .into_iter()
             .enumerate()
             .map(|(index, source_url)| Page {
+                media_path: media
+                    .as_ref()
+                    .map(|(copy, pages)| format!("/media/v1/o/{copy}/{}", pages[index].0)),
+                media_sha256: media.as_ref().map(|(_, pages)| pages[index].0.clone()),
+                media_length: media
+                    .as_ref()
+                    .and_then(|(_, pages)| i32::try_from(pages[index].1).ok()),
+                media_mime: media.as_ref().map(|(_, pages)| pages[index].2.clone()),
                 index: index as i32,
-                source_url,
+                source_url: if use_locator {
+                    st.suwayomi.abs(Some(&format!("/media/v1/c/{n}/{index}")))
+                } else {
+                    source_url
+                },
                 width: None,
                 height: None,
             })
@@ -8351,17 +8410,17 @@ impl QueryRoot {
         })
     }
 
-    /// Public server facts for the setup screen and sign-up form. No auth needed.
-    /// `no_cache`: setup state and the sign-up switch change at runtime, so the
-    /// anonymous GET path must not hand this to an edge or browser cache.
+    /// Epoch to attach to queued numeric progress writes. `no_cache`: it changes when
+    /// the operator starts a new engine generation, and a cached old value would get
+    /// every later numeric write refused as stale.
     #[graphql(cache_control(no_cache))]
-    /// Epoch to attach to queued numeric progress writes.
     async fn numeric_epoch(&self, ctx: &Context<'_>) -> Result<i64> {
         crate::engine_generation::numeric_epoch(&state(ctx).pool)
             .await
             .map_err(gql_read_err)
     }
 
+    #[graphql(cache_control(no_cache))]
     async fn engine_generation_state(
         &self,
         ctx: &Context<'_>,
@@ -8372,6 +8431,10 @@ impl QueryRoot {
             .map_err(gql_read_err)
     }
 
+    /// Public server facts for the setup screen and sign-up form. No auth needed.
+    /// `no_cache`: setup state and the sign-up switch change at runtime, so the
+    /// anonymous GET path must not hand this to an edge or browser cache.
+    #[graphql(cache_control(no_cache))]
     async fn instance(&self, ctx: &Context<'_>) -> Result<Instance> {
         use crate::instance as inst;
         let pool = &state(ctx).pool;
@@ -19075,6 +19138,7 @@ mod tests {
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
+            media_manifests: None,
             setup_code: crate::instance::SetupCode::default(),
         });
         (build_schema(state.clone(), false), pool, state)
@@ -19304,6 +19368,10 @@ mod tests {
         .unwrap();
         assert!(notifications > 0);
         let epoch = exec(&schema, "{ numericEpoch }", None, "generation-read").await;
+        assert_eq!(
+            epoch.cache_control.max_age, -1,
+            "a cached epoch would refuse every write"
+        );
         assert_eq!(epoch.data.into_json().unwrap()["numericEpoch"], 1);
         for mutation in [
             r#"setProgress(chapterId:"8",lastPageRead:3,read:true)"#,
@@ -21629,6 +21697,7 @@ mod tests {
                 cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 catalogue_cover_phash: false,
                 ext_icons_dir: std::path::PathBuf::new(),
+                media_manifests: None,
                 setup_code: crate::instance::SetupCode::default(),
             })
         };
@@ -21867,6 +21936,7 @@ mod tests {
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
+            media_manifests: None,
             setup_code: crate::instance::SetupCode::default(),
         });
         let s = build_schema(state, false);
@@ -29376,6 +29446,7 @@ mod tests {
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
+            media_manifests: None,
             setup_code: crate::instance::SetupCode::default(),
         });
         let s = build_schema(state, false);
@@ -29897,6 +29968,7 @@ mod tests {
             cover_crawl_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
+            media_manifests: None,
             setup_code: crate::instance::SetupCode::default(),
         })
     }

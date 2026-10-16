@@ -212,7 +212,25 @@ export interface Backend {
 	 * without a `chapters()` fan-out per series. Optional: only the unified Komika
 	 * API implements it; callers fall back to `chapterCount` (unread) when absent. */
 	libraryProgress?(): Promise<SeriesProgress[]>;
-	setProgress(chapterId: Id, lastPageRead: number, read: boolean): Promise<void>;
+	/**
+	 * `numericEpoch` fences numeric (Suwayomi) chapter ids against an engine change. Leave it
+	 * out on a live write: the unified API attaches the server's current epoch for a numeric
+	 * id. A replayed write passes the epoch it was queued under, or `null` for none, so a
+	 * write queued before the change is refused rather than filed on a new chapter.
+	 */
+	setProgress(
+		chapterId: Id,
+		lastPageRead: number,
+		read: boolean,
+		numericEpoch?: number | null,
+	): Promise<void>;
+	/**
+	 * The server's numeric epoch for this session: read once per signed-in session and kept,
+	 * so writes carry the epoch the reader's chapter ids came from. `null` when the server
+	 * predates it. Rejects when the server cannot be reached and nothing is known yet.
+	 * Optional: only the unified Komika API implements it.
+	 */
+	numericEpoch?(): Promise<number | null>;
 	/**
 	 * Mark ONE chapter read or unread, exactly — the series list's toggle. Unlike
 	 * {@link setProgress} (which never un-reads and cascades every earlier chapter to read
@@ -409,6 +427,11 @@ export interface Backend {
 	setShowMangadexRatings?(shown: boolean): Promise<boolean>;
 	/** The MangaDex switch and whether the server's env pins it. Optional. */
 	mangadexSetting?(): Promise<MangadexSetting>;
+	/** Every engine generation the server knows, oldest first (admin). Optional. */
+	engineGenerationState?(): Promise<EngineGeneration[]>;
+	/** Give up the quarantined engine data and start a new generation (admin). Returns the
+	 * generations after the change. Optional. */
+	startNewEngineGeneration?(): Promise<EngineGeneration[]>;
 	/** Turn MangaDex on or off; returns the new effective value. Refused when the
 	 * server pins it by env (`KOMIKA_MANGADEX`, `CATALOGUE_SYNC=on`). Optional. */
 	setMangadexEnabled?(enabled: boolean): Promise<boolean>;
@@ -855,6 +878,21 @@ export interface InstanceInfo {
 	 * server. Absent on a server that predates the field, which reads as false.
 	 */
 	appsFetchThemselves?: boolean;
+}
+
+/**
+ * One source-engine generation (`engineGenerationState`). At most one is `active` or
+ * `quarantined`; earlier ones are `detached`.
+ */
+export interface EngineGeneration {
+	id: string;
+	state: 'active' | 'quarantined' | 'detached' | (string & {});
+	/** Why the server quarantined it (or detached it); null while active. */
+	reason: string | null;
+	/** When the generation entered its current state (server timestamp text). */
+	since: string;
+	/** The engine has no meta support, so the server runs without the marker check. */
+	unfenced: boolean;
 }
 
 /** The MangaDex switch as the admin sees it. */

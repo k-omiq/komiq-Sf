@@ -37,6 +37,22 @@ pub(super) const UNSUPPORTED_POSTGRES_ONLY: &[(&str, &str)] = &[
 /// Engine-derived identities are omitted even when populated, with counts in the report.
 pub(super) const REBUILDABLE_POSTGRES_ONLY: &[(&str, &str)] = &[
     (
+        "media_object",
+        "object metadata is rebuilt by the next ingest",
+    ),
+    (
+        "media_copy",
+        "copy identities are rebuilt by the next ingest",
+    ),
+    (
+        "media_manifest",
+        "manifest revisions are rebuilt by the next ingest",
+    ),
+    (
+        "media_manifest_page",
+        "ordered pages are rebuilt by the next ingest",
+    ),
+    (
         "engine_generation",
         "adopted again when the PostgreSQL server starts",
     ),
