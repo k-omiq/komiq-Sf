@@ -3412,9 +3412,20 @@ async fn main() -> anyhow::Result<()> {
         cfg.img_proxy_enabled,
     );
 
-    if let Some(fb) = &cfg.fallback {
-        fallback::start(&cfg, fb, router_state, cloudflare.clone()).await?;
-    }
+    let fallback_server = if let Some(fb) = &cfg.fallback {
+        Some(
+            fallback::start(
+                &cfg,
+                fb,
+                router_state,
+                cloudflare.clone(),
+                shutdown_tx.subscribe(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
     // Metrics listener, separate from the public router. It binds 127.0.0.1 by
     // default, which makes the scrape endpoint unreachable off-host by
@@ -3462,12 +3473,15 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal(shutdown_tx));
     // Wait for the view flusher's final drain so buffered views hit the DB — then
-    // drain ONCE more: the flusher's shutdown flush races axum's graceful drain, so
-    // a `recordView` served while connections were draining can land in the buffer
+    // drain ONCE more: the flusher's shutdown flush races both listeners' drains,
+    // so a `recordView` served while connections were draining can land in the buffer
     // AFTER that flush (and if the flusher died in its supervisor backoff, its
     // shutdown flush never ran at all). This last call catches both.
     finish_with_shutdown_deadline(shutdown_deadline, async {
         server.await?;
+        if let Some(server) = fallback_server {
+            server.await?;
+        }
         let _ = views_flusher.await;
         let _ = health_flusher.await;
         if let Err(e) = views::flush(&pool).await {

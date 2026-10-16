@@ -1632,7 +1632,7 @@ impl Manager {
         })?;
         let (listener, accept) = origin_tls::TlsListener::new(tcp, config)
             .map_err(|e| format!("Could not start HTTPS: {e}"))?;
-        let serve = tokio::spawn(origin_tls::serve(listener, router));
+        let serve = tokio::spawn(origin_tls::serve(listener, router, None));
         *self.https.lock().unwrap_or_else(|p| p.into_inner()) = Some([serve, accept]);
         Ok(())
     }

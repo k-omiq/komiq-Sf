@@ -311,7 +311,8 @@ pub(crate) async fn start(
     fb: &FallbackConfig,
     state: crate::RouterState,
     cloudflare: Arc<crate::cloudflare::Manager>,
-) -> anyhow::Result<()> {
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     use anyhow::Context;
     validate_reader(fb)?;
     let (config, resolver) = tls::ReloadingCert::load(&fb.cert_file, &fb.key_file)?;
@@ -322,9 +323,9 @@ pub(crate) async fn start(
     let (listener, _accept) = origin_tls::TlsListener::new(tcp, config)?;
     let app = router(cfg, fb, state, cloudflare, addr.port());
     resolver.spawn_reload();
-    tokio::spawn(origin_tls::serve(listener, app));
+    let server = tokio::spawn(origin_tls::serve(listener, app, Some(shutdown)));
     tracing::info!(hosts = ?fb.hosts, "fallback listening on https://{addr}");
-    Ok(())
+    Ok(server)
 }
 
 #[cfg(test)]

@@ -394,20 +394,34 @@ impl axum::serve::Listener for TlsListener {
 #[derive(Clone, Copy, Debug)]
 pub struct OverTls;
 
-/// Serve `app` over TLS until the task is aborted. The handlers read the client
-/// address from `ConnectInfo<SocketAddr>`; axum provides that for any listener whose
-/// `Addr` is `SocketAddr` once it is wrapped in `tap_io`, so the no-op tap is what
-/// keeps the HTTPS port answering exactly like the plain one.
-pub async fn serve(listener: TlsListener, app: axum::Router) {
+/// Serve `app` over TLS until shutdown is signalled, or until aborted without a
+/// shutdown receiver. The handlers read the client address from
+/// `ConnectInfo<SocketAddr>`; axum provides that for any listener whose `Addr` is
+/// `SocketAddr` once it is wrapped in `tap_io`, so the no-op tap is what keeps the
+/// HTTPS port answering exactly like the plain one.
+pub async fn serve(
+    listener: TlsListener,
+    app: axum::Router,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) {
     use axum::serve::ListenerExt;
     let listener = listener.tap_io(|_| {});
     let app = app.layer(axum::Extension(OverTls));
-    if let Err(e) = axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    {
+    );
+    let result = match shutdown {
+        Some(mut shutdown) => {
+            server
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown.wait_for(|stopping| *stopping).await;
+                })
+                .await
+        }
+        None => server.await,
+    };
+    if let Err(e) = result {
         tracing::warn!(error = %e, "https listener stopped");
     }
 }

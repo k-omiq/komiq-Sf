@@ -706,7 +706,10 @@ async fn tls_e2e_authority_reserve_sni_and_certificate_reload() {
         addr.port(),
         reserve.clone(),
     );
-    let _tasks = Tasks(vec![accept, tokio::spawn(origin_tls::serve(listener, app))]);
+    let _tasks = Tasks(vec![
+        accept,
+        tokio::spawn(origin_tls::serve(listener, app, None)),
+    ]);
     let trust = vec![CertificateDer::from(first_der.clone())];
     let (response, peer) = tls_request(addr, &trust, "localhost", "/").await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -757,4 +760,92 @@ async fn tls_e2e_authority_reserve_sni_and_certificate_reload() {
         .1,
         next_der
     );
+}
+
+#[tokio::test]
+async fn tls_shutdown_drains_in_flight_response_and_refuses_new_connections() {
+    use futures::StreamExt;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let dir = TempDir::new();
+    let cfg = fallback_config(&dir);
+    let (cert, key, der) = certificate();
+    std::fs::write(&cfg.cert_file, &cert).unwrap();
+    std::fs::write(&cfg.key_file, &key).unwrap();
+    let (config, _resolver) = tls::ReloadingCert::load(&cfg.cert_file, &cfg.key_file).unwrap();
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fallback TLS shutdown test requires permission to bind a localhost socket");
+    let addr = tcp.local_addr().unwrap();
+    let (listener, accept) = origin_tls::TlsListener::new(tcp, config).unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let inner = Router::new().route(
+        "/media/test",
+        get({
+            let started = started.clone();
+            let finish = finish.clone();
+            move || {
+                let started = started.clone();
+                let finish = finish.clone();
+                async move {
+                    Body::from_stream(stream::iter([Ok::<_, std::io::Error>("before ")]).chain(
+                        stream::once(async move {
+                            started.notify_one();
+                            finish.notified().await;
+                            Ok::<_, std::io::Error>("after")
+                        }),
+                    ))
+                }
+            }
+        }),
+    );
+    let (reserve, _) = reserve(100);
+    let app = protect(inner, &cfg.hosts, addr.port(), reserve.clone());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut tasks = Tasks(vec![
+        tokio::spawn(origin_tls::serve(listener, app, Some(shutdown_rx))),
+        accept,
+    ]);
+    let request = tokio::spawn(async move {
+        tls_request(
+            addr,
+            &[CertificateDer::from(der)],
+            "localhost",
+            "/media/test",
+        )
+        .await
+    });
+    timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    shutdown_tx.send(true).unwrap();
+    // The accept loop must release the port before the in-flight body finishes.
+    timeout(Duration::from_secs(5), &mut tasks.0[1])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::ConnectionRefused
+    );
+    assert!(!tasks.0[0].is_finished());
+    assert!(!request.is_finished());
+    finish.notify_one();
+    let (response, _) = timeout(Duration::from_secs(5), request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains("before "), "{response}");
+    assert!(response.contains("after"), "{response}");
+    assert_eq!(used(&reserve), 12);
+    timeout(Duration::from_secs(5), &mut tasks.0[0])
+        .await
+        .unwrap()
+        .unwrap();
 }
