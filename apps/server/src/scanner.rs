@@ -1707,8 +1707,8 @@ pub(crate) async fn persist_scan_for_drill(
 ///   reader renders `Ch. {latest_chapter ?? chapter_count}`), so such a card can read one
 ///   chapter high until the rebuild — the same single stale number it would have read for
 ///   the whole interval without this call;
-/// * display metadata the periodic rebuild owns outright (`title`, `reader_id`,
-///   `latest_chapter`), which the conflict clause never rewrites in any case.
+/// * display metadata (`title`, `reader_id`, `latest_chapter`) on a work that has a
+///   MangaDex mirror half, which the conflict clause leaves to that half in any case.
 ///
 /// BEST-EFFORT, like the cache writes above: logged and swallowed, never propagated. A
 /// feed row is a pure cache and the periodic rebuild reconstructs it; failing a scan
@@ -1738,14 +1738,14 @@ async fn touch_feed_series_update(pool: &Database, series_id: &str, new_found: b
 /// byte-identical row. (That test therefore also pins this function to the rebuild's
 /// current text — if the rebuild's field mapping is edited, it fails here.)
 ///
-/// The agreement covers every column this feed SORTS or LABELS by. It does NOT cover the
-/// display metadata the conflict clause deliberately never rewrites — `title`,
-/// `reader_id`, `latest_chapter`, and a `cover_url` whose `?v=` has since been bumped: on
-/// a row THIS path created, those stay frozen at the first write until the next rebuild.
-/// That is the same staleness the rebuild-only behaviour had (nothing here makes a column
-/// worse than not running at all), and it is the price of the mirror-wins rule below —
-/// this statement cannot tell "the existing row is the mirror half" from "the existing row
-/// is my own earlier write", and clobbering a mirror row's title would be the worse bug.
+/// The display fields (`reader_id`, `title`, `cover_url`, `latest_chapter`,
+/// `latest_chapter_title`) follow the rebuild's mirror-wins rule by asking the same
+/// question the rebuild does: does the work have a MangaDex mirror half
+/// ([`FEED_HAS_MIRROR_HALF_SQL`])? If it does, the existing values stay, because that
+/// half owns them (`catalog::publish_mirror_feed_row` assigns them on its own writes). If
+/// it does not, the existing row can only be this half's earlier write, so they take the
+/// fresh values. Keeping them unconditionally left a Suwayomi-only card on its first
+/// chapter label until the next rebuild.
 ///
 /// The only narrowing is the `IN (SELECT …)`, which restricts the rebuild's query to the
 /// work this series maps to. Load-bearing details, all inherited:
@@ -1757,9 +1757,9 @@ async fn touch_feed_series_update(pool: &Database, series_id: &str, new_found: b
 /// * `MAX(existing, excluded)` on `released_at`: an incremental write may only move a row
 ///   FORWARD in time, and can never pull it back below a fresher mirror-half value.
 /// * `reader_id` is the canonical `w_…` id when the work is mangadex-anchored (the anchor
-///   test in the SELECT) and the numeric Suwayomi id otherwise, and is left untouched on
-///   CONFLICT — so a mangadex-anchored work navigates to its canonical page whether the
-///   mirror half won the insert race or (a takedown) never fired at all.
+///   test in the SELECT) and the numeric Suwayomi id otherwise — so a mangadex-anchored
+///   work navigates to its canonical page whether the mirror half won the insert race or
+///   (a takedown) never fired at all.
 /// * rows with no release time are excluded (`latest_chapter_at IS NOT NULL`) rather than
 ///   inserted with a NULL into a NOT NULL column.
 ///
@@ -1849,9 +1849,15 @@ const FEED_LATEST_CHAPTER_SQL: &str = "LEFT JOIN LATERAL ( \
           ORDER BY sqlite_integer_pin(c.upload_date) DESC NULLS LAST, c.chapter_number DESC \
           LIMIT 1) lc ON TRUE";
 
+/// True when the work has a MangaDex mirror half: the rebuild's pass (1) inserts a row for
+/// exactly these works, from exactly this test, before the scanner half merges on top.
+const FEED_HAS_MIRROR_HALF_SQL: &str = "EXISTS (SELECT 1 FROM feed_updates fu \
+         WHERE fu.work_id = excluded.work_id AND fu.latest_at IS NOT NULL)";
+
 /// The feed upsert of one Suwayomi series (`$1` is its id as text).
 fn feed_series_upsert_sql() -> String {
     let status_sql = crate::catalog::FSU_STATUS_SQL;
+    let mirror = FEED_HAS_MIRROR_HALF_SQL;
     format!(
         "INSERT INTO feed_series_updates \
          (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, \
@@ -1883,10 +1889,19 @@ fn feed_series_upsert_sql() -> String {
                           WHERE source_type = 'suwayomi' AND source_key = $1) \
      ORDER BY ss.work_id, sy.latest_chapter_at DESC, sy.id ASC \
      ON CONFLICT(work_id) DO UPDATE SET \
+         reader_id = CASE WHEN {mirror} THEN feed_series_updates.reader_id \
+                          ELSE excluded.reader_id END, \
+         title = CASE WHEN {mirror} THEN feed_series_updates.title ELSE excluded.title END, \
+         latest_chapter = CASE WHEN {mirror} THEN feed_series_updates.latest_chapter \
+                               ELSE excluded.latest_chapter END, \
+         latest_chapter_title = CASE WHEN {mirror} THEN feed_series_updates.latest_chapter_title \
+                                     ELSE excluded.latest_chapter_title END, \
          released_at = GREATEST(feed_series_updates.released_at, excluded.released_at), \
          detected_at = COALESCE(excluded.detected_at, feed_series_updates.detected_at), \
          chapter_count = COALESCE(excluded.chapter_count, feed_series_updates.chapter_count), \
-         cover_url = COALESCE(NULLIF(feed_series_updates.cover_url, ''), excluded.cover_url), \
+         cover_url = CASE WHEN {mirror} \
+                          THEN COALESCE(NULLIF(feed_series_updates.cover_url, ''), excluded.cover_url) \
+                          ELSE excluded.cover_url END, \
          suwayomi_thumbnail = COALESCE(feed_series_updates.suwayomi_thumbnail, excluded.suwayomi_thumbnail), \
          is_nsfw = (feed_series_updates.is_nsfw OR excluded.is_nsfw), \
          status = excluded.status, \
@@ -7340,6 +7355,14 @@ mod tests {
         let pool = migrated_pool().await;
         // The Suwayomi source is OLDER than what the mirror half already published.
         seed_feed_fixture(&pool, Some("1700000000000")).await;
+        // The mirror half's row and the `feed_updates` row it was copied from: the scanner
+        // only leaves the display fields alone when the work really has a mirror half.
+        sqlx::query(
+            r#"INSERT INTO feed_updates (work_id, title, latest_at) VALUES ('w1', 'Mirror Title', '2026-07-26T13:13:45Z')"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             r#"INSERT INTO feed_series_updates (work_id, reader_id, title, comic_type, latest_chapter, released_at, is_nsfw) VALUES ('w1', 'w1', 'Mirror Title', 'MANGA', '99', TIMESTAMPTZ '1970-01-01T00:00:00Z' + 1785071625000 * INTERVAL '1 millisecond', FALSE)"#,
         )
@@ -7387,6 +7410,116 @@ mod tests {
             comic_type.as_deref(),
             Some("MANGA"),
             "type is never rewritten"
+        );
+    }
+
+    /// A Suwayomi-only work (no MangaDex mirror half) that gets a newer chapter must show
+    /// it on its EXISTING feed row at once. The conflict clause used to keep every display
+    /// field, so the card stayed on its first chapter label (and title) until the next
+    /// rebuild — while the rebuild, which re-inserts from scratch, showed the new one.
+    #[tokio::test]
+    async fn a_suwayomi_only_card_follows_its_newest_chapter() {
+        let pool = migrated_pool().await;
+        seed_feed_fixture(&pool, Some("1785071625000")).await;
+        let chapter = |id: i64, number: f64, name: &'static str, upload: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO suwayomi_chapter \
+                       (id, manga_id, name, chapter_number, page_count, upload_date, updated_at) \
+                     VALUES ($1, 7, $2, $3, 0, $4, '2026-01-01T00:00:00Z')",
+                )
+                .bind(id)
+                .bind(name)
+                .bind(number)
+                .bind(upload)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        chapter(1, 12.0, "Ch 12", "1785071625000").await;
+        let admin = ScanAdmin::default();
+        record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(12),
+            at("2026-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        let first = record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(13),
+            at("2026-01-08T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        touch_feed_series_update(&pool, "7", first).await;
+        let labels = |pool: Database| async move {
+            crate::db_types::query_tuple::<(String, Option<String>, Option<String>)>(
+                "SELECT title, latest_chapter, latest_chapter_title \
+                   FROM feed_series_updates WHERE work_id = 'w1'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            labels(pool.clone()).await,
+            ("Canonical Title".into(), Some("12".into()), Some("Ch 12".into()))
+        );
+
+        // A newer chapter lands, and an admin renames the work.
+        chapter(2, 13.0, "Ch 13", "1785671625000").await;
+        sqlx::query(
+            "UPDATE suwayomi_series SET chapter_count = 14, latest_chapter_at = 1785671625000 \
+             WHERE id = 7",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE work SET title_override = 'Renamed' WHERE id = 'w1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let second = record_scan(
+            &pool,
+            "7",
+            "S",
+            &admin,
+            &chaps(14),
+            at("2026-01-15T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert!(second);
+        touch_feed_series_update(&pool, "7", second).await;
+        assert_eq!(
+            labels(pool.clone()).await,
+            ("Renamed".into(), Some("13".into()), Some("Ch 13".into())),
+            "the existing scanner-half row must take the new chapter and title"
+        );
+        let incremental = feed_digest(&pool).await.unwrap();
+        let incremental_browse = browse_digest(&pool).await.unwrap();
+
+        crate::catalog::refresh_feed_series_updates(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            incremental,
+            feed_digest(&pool).await.unwrap(),
+            "the incremental writer and the rebuild must agree"
+        );
+        assert_eq!(
+            incremental_browse,
+            browse_digest(&pool).await.unwrap(),
+            "and so must Browse's copy of the row"
         );
     }
 

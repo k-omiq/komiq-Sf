@@ -1863,7 +1863,10 @@ pub async fn refresh_feed_series_updates(pool: &Database) -> Result<u64> {
     // and once the card navigates to the canonical page its label should describe that
     // page. Consequence to know: for a merged work whose Suwayomi source is ahead of the
     // mirror, the card's release time can be newer than the newest chapter the canonical
-    // page lists, until the next MangaDex sync mirrors it.
+    // page lists, until the next MangaDex sync mirrors it. For a work with NO mirror half the
+    // display fields are the scanner's own. `scanner::upsert_feed_series_update` cannot
+    // rely on this insert order, so it asks the same question directly (is there a
+    // `feed_updates` row?) and refreshes them when the answer is no.
     //
     // The scanner half's INSERT above now derives that same canonical `w_` id itself
     // (via the mangadex-anchor test), so a mangadex-anchored work whose MIRROR half never
