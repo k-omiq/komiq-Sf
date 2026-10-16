@@ -351,6 +351,11 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        // A publication refuses a taken-down work (M5 `media_policy`).
+        sqlx::query("CREATE TABLE media_takedown (subject_kind TEXT, subject_id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
         for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
             sqlx::query(&format!(
                 "CREATE TABLE {table} (work_id TEXT PRIMARY KEY, cover_url TEXT)"

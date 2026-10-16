@@ -13,10 +13,6 @@ pub(crate) struct CollectedPage {
     pub height: Option<i32>,
 }
 
-pub(crate) fn current_policy_epoch() -> i64 {
-    0
-}
-
 /// The source-qualified identity of a chapter in the active generation, and the
 /// engine manga it is bound to. Read-only: the copy row is made by `publish`.
 pub(crate) async fn identity_for_chapter(
@@ -188,6 +184,10 @@ pub(crate) async fn publish(
     .fetch_one(&mut *tx)
     .await?;
     let copy_id = copy.as_str();
+    let mut policy_epoch = crate::media_policy::hold_epoch(&mut tx).await?;
+    if let Some(epoch) = crate::media_policy::inherit_for_copy(&mut tx, copy_id).await? {
+        policy_epoch = epoch;
+    }
     let previous: Option<(i32, bool)> = sqlx::query_as(
         "SELECT revision,stale FROM media_manifest WHERE copy_id=$1 ORDER BY revision DESC LIMIT 1",
     )
@@ -237,6 +237,7 @@ pub(crate) async fn publish(
         .execute(&mut *tx)
         .await?;
     }
+    // The epoch the revision is signed at: a lease older than it cannot vouch for it.
     sqlx::query(
         "INSERT INTO media_manifest (copy_id,revision,page_count,policy_epoch,created_at) \
          VALUES ($1,$2,$3,$4,now())",
@@ -244,7 +245,7 @@ pub(crate) async fn publish(
     .bind(copy_id)
     .bind(rev)
     .bind(page_count)
-    .bind(current_policy_epoch())
+    .bind(policy_epoch)
     .execute(&mut *tx)
     .await?;
     for (idx, page) in pages.iter().enumerate() {

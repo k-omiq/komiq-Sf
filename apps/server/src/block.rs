@@ -178,30 +178,46 @@ impl BlockRule {
 
 /// The rules that apply to one viewer: the site's and their own. Sorted and without
 /// repeats, so two viewers with the same rules have the same [`BlockSet::key`].
+///
+/// The second field adds operator takedowns (`media_takedown`, M5): a taken-down work is
+/// blocked for everyone, through the same gate. The GraphQL viewer gate sets it to the
+/// policy epoch while any work is taken down, so a server with none adds no SQL, and a
+/// memo keyed by [`BlockSet::key`] never serves a list built before a takedown.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct BlockSet(Vec<BlockRule>);
+pub struct BlockSet(Vec<BlockRule>, Option<i64>);
 
 impl BlockSet {
     pub fn new(mut rules: Vec<BlockRule>) -> Self {
         rules.sort();
         rules.dedup();
-        BlockSet(rules)
+        BlockSet(rules, None)
     }
 
-    /// No rule at all: nothing is blocked, and no gate adds SQL.
+    /// The same rules, with the takedown clause at policy `epoch`, or without it.
+    pub fn with_takedowns(mut self, epoch: Option<i64>) -> Self {
+        self.1 = epoch;
+        self
+    }
+
+    /// No rule and no takedown: nothing is blocked, and no gate adds SQL.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0.is_empty() && self.1.is_none()
     }
 
     /// The set as text, for a memo key. Two sets have one key only when they block the
     /// same works: a rule is `tags/ratings`, rules are joined with `;`, and neither
     /// separator can occur in a tag id or a rating word.
     pub fn key(&self) -> String {
-        self.0
+        let mut key = self
+            .0
             .iter()
             .map(|r| format!("{}/{}", r.tags.join(","), r.ratings.join(",")))
             .collect::<Vec<_>>()
-            .join(";")
+            .join(";");
+        if let Some(epoch) = self.1 {
+            key.push_str(&format!("|takedowns@{epoch}"));
+        }
+        key
     }
 
     /// A SQL condition that is TRUE for a blocked work, or `None` when the set is empty.
@@ -211,6 +227,20 @@ impl BlockSet {
     /// has one (`browse_catalogue.content_rating`); with `None` the work row is read for
     /// it, one primary-key probe per candidate row.
     pub fn blocked_sql(&self, work_id: &str, rating: Option<&str>) -> Option<String> {
+        let rules = self.rules_sql(work_id, rating);
+        let takedown = self.1.map(|_| {
+            format!(
+                "EXISTS (SELECT 1 FROM media_takedown btd \
+                 WHERE btd.subject_kind = 'work' AND btd.subject_id = {work_id})"
+            )
+        });
+        match (rules, takedown) {
+            (Some(rules), Some(takedown)) => Some(format!("({rules} OR {takedown})")),
+            (rules, takedown) => rules.or(takedown),
+        }
+    }
+
+    fn rules_sql(&self, work_id: &str, rating: Option<&str>) -> Option<String> {
         if self.0.is_empty() {
             return None;
         }
@@ -343,6 +373,11 @@ pub async fn replace(pool: &Database, scope: Scope<'_>, rules: &[BlockRule]) -> 
             .bind(crate::db_types::date(&now)?)
             .execute(&mut *tx)
             .await?;
+        }
+        // Site-wide rules close chapter pages for everyone: a policy change (M5).
+        // A viewer's own rules are a preference and leave the epoch alone.
+        if user_id.is_none() {
+            crate::media_policy::bump(&mut tx).await?;
         }
         tx.commit().await?;
         Ok(())

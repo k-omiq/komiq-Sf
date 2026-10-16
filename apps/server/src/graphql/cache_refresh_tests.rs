@@ -60,6 +60,7 @@ async fn fixture() -> (AppState, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) 
         catalogue_cover_phash: false,
         ext_icons_dir: std::path::PathBuf::new(),
         media_manifests: None,
+        policy: Default::default(),
         setup_code: crate::instance::SetupCode::default(),
     };
     (state, requests, server)

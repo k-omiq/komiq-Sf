@@ -643,6 +643,10 @@ async fn publish_suwayomi_cover_in_generation(
     let mut tx = main.begin().await?;
     crate::engine_generation::shared(&mut tx, generation).await?;
     let _asset = lock_asset(&mut tx, &suwayomi_variant_key(manga_id)).await?;
+    if crate::media_policy::engine_series_taken_down(&mut *tx, manga_id).await? {
+        tx.rollback().await?;
+        return Ok(());
+    }
     put_suwayomi_cover_on(covers, manga_id, webp).await?;
     crate::engine_generation::commit_ready(main)?;
     tx.commit().await?;
@@ -670,6 +674,10 @@ pub async fn publish_suwayomi_cover_if_missing_in_generation(
     let mut tx = main.begin().await?;
     crate::engine_generation::shared(&mut tx, generation).await?;
     let _asset = lock_asset(&mut tx, &suwayomi_variant_key(manga_id)).await?;
+    if crate::media_policy::engine_series_taken_down(&mut *tx, manga_id).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     let mut cache = covers.begin().await?;
     let present: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM suwayomi_cover_blob WHERE manga_id = $1)")
@@ -748,6 +756,19 @@ async fn publish_work_cover(
         .missing
         .is_empty()
     {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    // A takedown locks the same work row, so a fetch that was in flight when it landed
+    // cannot store the art again after the takedown deleted it.
+    let taken_down: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM media_takedown \
+         WHERE subject_kind = 'work' AND subject_id = $1)",
+    )
+    .bind(work_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if taken_down {
         tx.rollback().await?;
         return Ok(false);
     }
@@ -844,6 +865,65 @@ async fn publish_work_cover_version(
         .await?;
     }
     Ok(true)
+}
+
+/// A work takedown (M5 `media_policy`): delete the stored covers of `work_ids` (the work
+/// and its merged-away ids) and of the engine series `manga_ids`, with every derivative,
+/// and clear each work's cover pointer. Under the same locks a publication takes, one
+/// asset at a time. The cover routes refuse a denied work before any lazy fill, and the
+/// drainer skips it, so nothing fetches the art again while the takedown holds.
+pub async fn delete_for_takedown(
+    main: &Database,
+    covers: &SqliteDatabase,
+    work_ids: &[String],
+    manga_ids: &[i64],
+) -> Result<()> {
+    for work_id in work_ids {
+        let mut tx = main.begin().await?;
+        let _asset = lock_asset(&mut tx, work_id).await?;
+        crate::locks::lock_works(&mut tx, &[work_id.as_str()]).await?;
+        let mut cache = covers.begin().await?;
+        sqlx::query("DELETE FROM work_cover_blob WHERE work_id = $1")
+            .bind(work_id)
+            .execute(&mut *cache)
+            .await?;
+        sqlx::query(
+            "DELETE FROM cover_variant WHERE asset_key = $1 \
+             OR substr(asset_key, 1, length($1) + 2) = $1 || '@v'",
+        )
+        .bind(work_id)
+        .execute(&mut *cache)
+        .await?;
+        cache.commit().await?;
+        sqlx::query(
+            "UPDATE work SET cover_cached_version = NULL \
+             WHERE id = $1 AND cover_cached_version IS NOT NULL",
+        )
+        .bind(work_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+    for &manga_id in manga_ids {
+        let key = suwayomi_variant_key(manga_id);
+        let mut tx = main.begin().await?;
+        let _asset = lock_asset(&mut tx, &key).await?;
+        let mut cache = covers.begin().await?;
+        sqlx::query("DELETE FROM suwayomi_cover_blob WHERE manga_id = $1")
+            .bind(manga_id)
+            .execute(&mut *cache)
+            .await?;
+        sqlx::query(
+            "DELETE FROM cover_variant WHERE asset_key = $1 \
+             OR substr(asset_key, 1, length($1) + 2) = $1 || '@v'",
+        )
+        .bind(&key)
+        .execute(&mut *cache)
+        .await?;
+        cache.commit().await?;
+        tx.commit().await?;
+    }
+    Ok(())
 }
 
 /// Request-time counterpart of db::reconcile_cover_pointers. Re-read the blob under
@@ -984,6 +1064,8 @@ pub async fn pending_cover_count(pool: &Database) -> Result<i64> {
     let n: i64 = crate::db_types::query_scalar(
         "SELECT COUNT(*) FROM work w \
          WHERE w.cover_cached_version IS NULL \
+           AND NOT EXISTS (SELECT 1 FROM media_takedown td \
+                           WHERE td.subject_kind = 'work' AND td.subject_id = w.id) \
            AND NOT EXISTS (SELECT 1 FROM work_cover_issue i WHERE i.work_id = w.id \
                            AND (i.retry_after IS NULL OR i.retry_after > $1)) AND ( \
              (w.cover_file_name IS NOT NULL \
@@ -1596,6 +1678,8 @@ pub async fn crawl_uncached_covers(
                 w.cover_file_name \
          FROM work w \
          WHERE w.cover_cached_version IS NULL AND w.cover_file_name IS NOT NULL \
+           AND NOT EXISTS (SELECT 1 FROM media_takedown td \
+                           WHERE td.subject_kind = 'work' AND td.subject_id = w.id) \
            AND NOT EXISTS (SELECT 1 FROM work_cover_issue i WHERE i.work_id = w.id \
                            AND (i.retry_after IS NULL OR i.retry_after > $1))";
     // A marker only hides a work while its backoff is unexpired (0100), so `now` is
@@ -1739,6 +1823,8 @@ pub async fn crawl_uncached_covers(
                  ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS thumbnail_url \
          FROM work w \
          WHERE w.cover_cached_version IS NULL \
+           AND NOT EXISTS (SELECT 1 FROM media_takedown td \
+                           WHERE td.subject_kind = 'work' AND td.subject_id = w.id) \
            AND NOT EXISTS (SELECT 1 FROM work_cover_issue i WHERE i.work_id = w.id \
                            AND (i.retry_after IS NULL OR i.retry_after > $1)) \
            AND EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id \
@@ -1919,7 +2005,7 @@ pub struct WarmCandidate {
 /// Cached series that have a usable thumbnail and are NOT currently backed off, newest
 /// id first, restricted to `id < before_id`.
 ///
-/// Three exclusions, in the SELECT rather than in Rust so the "nothing to do" gauge
+/// Four exclusions, in the SELECT rather than in Rust so the "nothing to do" gauge
 /// ([`pending_suwayomi_cover_count`]) sees exactly what the warmer sees:
 ///
 /// 1. no per-cover marker whose `retry_after` is still in the future;
@@ -1927,7 +2013,8 @@ pub struct WarmCandidate {
 ///    s.last_fetched_at` — SQLite `IS` is null-safe). The extension re-fetching the
 ///    manga is precisely the event that can replace a `data:` thumbnail with a real
 ///    URL, so the marker is void from that moment, permanent or not;
-/// 3. no un-expired park on the whole source (`cover_source_backoff`).
+/// 3. no un-expired park on the whole source (`cover_source_backoff`);
+/// 4. no work takedown for the series.
 async fn warm_candidates(main: &Database, before_id: i64) -> Result<Vec<WarmCandidate>> {
     let now = Utc::now().to_rfc3339();
     Ok(sqlx::query_as::<_, WarmCandidate>(
@@ -1941,6 +2028,10 @@ async fn warm_candidates(main: &Database, before_id: i64) -> Result<Vec<WarmCand
                                AND i.source_fetched_at IS NOT DISTINCT FROM s.last_fetched_at) \
             AND NOT EXISTS (SELECT 1 FROM cover_source_backoff b \
                              WHERE b.source_id = s.source_id AND b.retry_after > $3) \
+            AND NOT EXISTS (SELECT 1 FROM source_series ss \
+                             JOIN media_takedown td ON td.subject_kind = 'work' \
+                               AND td.subject_id = ss.work_id \
+                             WHERE ss.source_type = 'suwayomi' AND ss.source_key = s.id::text) \
           ORDER BY s.id DESC",
     )
     .bind(before_id)

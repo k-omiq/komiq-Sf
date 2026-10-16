@@ -92,6 +92,10 @@ The server sends a Content-Security-Policy header on its web pages. This tells t
 
 Old cover and avatar links redirect to the current version. Keep these redirects working through your proxy.
 
+## Takedowns and cached copies
+
+A [takedown](/admin/takedowns) stops your server serving a work or a chapter copy to everyone. Shared caches, such as Cloudflare's, keep an exact page object for at most one policy lease, 600 seconds, and older page and cover links for their own short lifetimes. A takedown cannot recall pages or covers already in a reader's browser, downloaded or offline chapters, or copies people saved.
+
 ## Optional image proxy Worker
 
 The optional image proxy in `apps/worker` runs on Cloudflare’s network. The bundled web reader and a native reader connected to your server do not need it. Read [Image proxy](/developers/image-proxy).

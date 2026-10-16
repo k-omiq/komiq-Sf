@@ -81,6 +81,7 @@ type Query {
 	ratedScanlator(id: ID!): RatedScanlator # [komika] one scanlator by id, null when there is none — public
 	siteBlockRules: [BlockRule!]! # [komika] admin — the site-wide content block rules, in saved order (requires isAdmin)
 	myBlockRules: [BlockRule!]! # [komika] the viewer's own content block rules, in saved order (requires auth)
+	mediaTakedowns: [MediaTakedown!]! # [komika] admin — every operator takedown, newest first (requires isAdmin)
 	sources: [SourceInfo!]! # [komika] installed Suwayomi sources — the sourceBrowse picker. Every installed source is listed incl. NSFW ones, regardless of the admin's reader-side show_nsfw; each carries `isNsfw` for the UI to badge (requires isAdmin)
 	sourceBrowse(sourceId: ID!, type: SourceBrowseType!, page: Int = 1, query: String): SourceBrowsePage! # [komika] browse/search one source's catalogue for bulk ingest (requires isAdmin)
 	seriesSourcesBatch(seriesIds: [ID!]!): [SeriesSourceGroup!]! # [komika] catalogue provenance per Suwayomi series — linked work + source mappings, input order, ≤200 ids (requires isAdmin)
@@ -157,6 +158,8 @@ type Mutation {
 	setSourceAi(sourceId: String!, ai: ScanlatorAi): Boolean! # [komika] admin — tag a whole source as using AI (AI) or partly using it (PARTIAL); `ai: null` removes the tag. Applies to every chapter copy read from the source, now and later. Not for "mangadex". false when nothing changed (requires isAdmin)
 	rateScanlator(id: ID!, score: Int): RatedScanlator! # [komika] set or change the viewer's rating of a scanlator (1..10); `score: null` removes it. Resolves to the scanlator with its new numbers (requires auth)
 	setSiteBlockRules(rules: [BlockRuleInput!]!): [BlockRule!]! # [komika] admin — replace the site-wide content block rules (at most 50; an empty list clears them). They apply to every viewer, signed in or not: a matching series is left out of every list and cannot be opened or read. Returns the stored list (requires isAdmin)
+	takeDownMedia(kind: TakedownKind!, subjectId: ID!, reason: String!): Boolean! # [komika] admin — stop serving a work (every copy, its covers, its merged-away ids; carried by merges and splits) or one copy to everyone. Lists, pages, manifests and the policy lease drop it; shared caches within one lease; browser and downloaded copies cannot be recalled. reason required, at most 500 characters. false when already taken down (requires isAdmin)
+	liftMediaTakedown(kind: TakedownKind!, subjectId: ID!): Boolean! # [komika] admin — lift a takedown; lifting a work lifts the copy rows recorded with it; a carried takedown is lifted on its own work. false when there was nothing to lift (requires isAdmin)
 	markSourceNsfw(sourceId: String!, isNsfw: Boolean!): Int! # [komika] admin — flag/unflag a whole Suwayomi source as adult and re-derive the NSFW flag of every work ingested from it; the flag is remembered (source_nsfw_pin), so a series ingested LATER from that source is stored adult too; returns works changed (requires isAdmin)
 	rederiveSuwayomiNsfw: Int! # [komika] admin — recompute the DERIVED is_nsfw for every Suwayomi-ingested work under the current rule (adult genre OR adult source, unless MangaDex rated it safe/suggestive). Conservative: only flips 0 -> 1, never un-flags, and leaves isNsfwOverride alone. Returns works flipped (requires isAdmin)
 	retryCover(workId: ID!): Boolean! # [komika] admin "Bugs" panel — clear a work's cover-issue skip marker and re-attempt the cover fetch/encode (requires isAdmin)
@@ -366,6 +369,18 @@ type BlockRule {
 input BlockRuleInput {
 	tags: [String!] # at most 8; unknown ids are refused only when they are not [a-z0-9-]
 	ratings: [ContentRating!] # a rule needs a tag or a rating; all four ratings with no tag is refused
+}
+enum TakedownKind {
+	WORK
+	COPY # one upload of one chapter by one source (the mc_ id in Page.mediaPath)
+}
+type MediaTakedown {
+	kind: TakedownKind!
+	subjectId: ID!
+	reason: String!
+	createdBy: String # an admin's username, or "cli"
+	createdAt: String! # RFC 3339
+	viaWork: ID # a copy row recorded with this work's takedown
 }
 type ScanlatorPage {
 	items: [Scanlator!]!

@@ -203,6 +203,7 @@ async fn app_state(mut suwayomi: SuwayomiClient, wait: Duration) -> Arc<AppState
         catalogue_cover_phash: false,
         ext_icons_dir: Default::default(),
         media_manifests: None,
+        policy: Default::default(),
         setup_code: instance::SetupCode::default(),
     })
 }
@@ -489,6 +490,8 @@ async fn block_rules_refuse_both_page_paths_and_fail_closed_on_read_errors() {
             .contains("no-store"));
     }
     app.pool.close().await;
+    // The denied set is held in memory; a re-read that fails refuses the page.
+    app.policy.invalidate();
     for path in ["/media/v1/c/8/0", "/api/v1/manga/7/chapter/0/page/0"] {
         assert_busy(&get_page(app.clone(), path).await);
     }

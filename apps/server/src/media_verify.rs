@@ -51,6 +51,19 @@ pub struct KeySetBody {
     pub keys: Vec<PublicKeyEntry>,
 }
 
+/// The signed policy lease (`GET /media/v1/policy`): what a serving cache may serve
+/// until `expires_at`. Lists are sorted.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeaseBody {
+    pub v: u32,
+    pub epoch: i64,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub denied_copies: Vec<String>,
+    pub denied_works: Vec<String>,
+    pub kid: String,
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Envelope {
     pub payload: String,
@@ -68,6 +81,16 @@ pub enum VerifyError {
     Length,
     Mime,
     Hash,
+    /// No valid lease has been accepted yet.
+    NoLease,
+    /// The lease expired, past the grace for content it did not deny.
+    Expired,
+    /// A lease with an older epoch than the one held (a replay or a rollback).
+    StaleLease,
+    /// The lease is older than the manifest's policy epoch.
+    EpochBehind,
+    /// The lease denies this copy or work.
+    Denied,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -161,6 +184,103 @@ pub fn verify_key_set(bytes: &[u8], pins: &PinnedKeys) -> Result<Vec<PublicKeyEn
         decode_key(&key.kid, &key.public_key)?;
     }
     Ok(body.keys)
+}
+
+pub fn verify_lease(bytes: &[u8], pins: &PinnedKeys) -> Result<LeaseBody, VerifyError> {
+    let envelope = open_envelope(bytes, pins)?;
+    let body: LeaseBody =
+        serde_json::from_str(&envelope.payload).map_err(|_| VerifyError::Malformed)?;
+    if body.v != 1 {
+        return Err(VerifyError::Version);
+    }
+    if body.kid != envelope.kid {
+        return Err(VerifyError::KeyMismatch);
+    }
+    if !well_formed(&body) {
+        return Err(VerifyError::Malformed);
+    }
+    Ok(body)
+}
+
+/// Sorted lists without repeats, so a lookup is a binary search that cannot miss.
+fn well_formed(lease: &LeaseBody) -> bool {
+    let sorted = |ids: &[String]| ids.windows(2).all(|pair| pair[0] < pair[1]);
+    lease.expires_at > lease.issued_at
+        && sorted(&lease.denied_copies)
+        && sorted(&lease.denied_works)
+}
+
+/// After a lease expires, a cache keeps serving what that lease did not deny for this
+/// long (owner question Q7, pick B), then fails closed. A takedown made while the owner
+/// is unreachable cannot reach a cache anyway.
+pub const LEASE_GRACE_SECS: i64 = 6 * 3600;
+
+/// A serving cache's policy state: the last valid lease. Times are unix seconds.
+#[derive(Default)]
+pub struct PolicyGate {
+    lease: Option<LeaseBody>,
+}
+
+impl PolicyGate {
+    /// Hold a verified lease. A lease that is already expired, or older than the held
+    /// one, is refused and the held lease stays.
+    pub fn accept(&mut self, lease: LeaseBody, now: i64) -> Result<(), VerifyError> {
+        if !well_formed(&lease) {
+            return Err(VerifyError::Malformed);
+        }
+        if lease.expires_at <= now {
+            return Err(VerifyError::Expired);
+        }
+        if let Some(held) = &self.lease {
+            if lease.epoch < held.epoch {
+                return Err(VerifyError::StaleLease);
+            }
+            if lease.epoch == held.epoch && lease.expires_at <= held.expires_at {
+                return Ok(());
+            }
+        }
+        self.lease = Some(lease);
+        Ok(())
+    }
+
+    /// May the cache serve an object of `copy_id` from a manifest signed at
+    /// `manifest_epoch`? `Ok` carries the `s-maxage` to send: the lease's remaining
+    /// life, 0 during the grace.
+    pub fn object(&self, copy_id: &str, manifest_epoch: i64, now: i64) -> Result<i64, VerifyError> {
+        self.check(now, Some(manifest_epoch), |lease| {
+            lease.denied_copies.binary_search_by(|id| id.as_str().cmp(copy_id)).is_ok()
+        })
+    }
+
+    /// May the cache serve a work's cover (keyed by the id in its URL, which may be an
+    /// old merged-away id)?
+    pub fn work(&self, work_id: &str, now: i64) -> Result<i64, VerifyError> {
+        self.check(now, None, |lease| {
+            lease.denied_works.binary_search_by(|id| id.as_str().cmp(work_id)).is_ok()
+        })
+    }
+
+    fn check(
+        &self,
+        now: i64,
+        manifest_epoch: Option<i64>,
+        denied: impl FnOnce(&LeaseBody) -> bool,
+    ) -> Result<i64, VerifyError> {
+        let lease = self.lease.as_ref().ok_or(VerifyError::NoLease)?;
+        if manifest_epoch.is_some_and(|epoch| lease.epoch < epoch) {
+            return Err(VerifyError::EpochBehind);
+        }
+        if denied(lease) {
+            return Err(VerifyError::Denied);
+        }
+        if now < lease.expires_at {
+            Ok(lease.expires_at - now)
+        } else if now < lease.expires_at + LEASE_GRACE_SECS {
+            Ok(0)
+        } else {
+            Err(VerifyError::Expired)
+        }
+    }
 }
 
 pub fn verify_object(page: &ManifestPage, bytes: &[u8], mime: &str) -> Result<(), VerifyError> {
@@ -365,5 +485,102 @@ mod tests {
             verify_object(&expected, b"other", "image/png"),
             Err(VerifyError::Hash)
         );
+    }
+
+    fn lease(epoch: i64, issued_at: i64, copies: &[&str], works: &[&str]) -> LeaseBody {
+        LeaseBody {
+            v: 1,
+            epoch,
+            issued_at,
+            expires_at: issued_at + 600,
+            denied_copies: copies.iter().map(|id| id.to_string()).collect(),
+            denied_works: works.iter().map(|id| id.to_string()).collect(),
+            kid: String::new(),
+        }
+    }
+    #[test]
+    fn media_verify_leases_are_signed_and_well_formed() {
+        let key = key();
+        let mut body = lease(5, 1000, &["mc_a", "mc_b"], &["w_a"]);
+        body.kid = key_id(key.public_key().as_ref());
+        assert_eq!(verify_lease(&sign(&key, &body), &pins(&key)).unwrap(), body);
+        let mut envelope: Envelope = serde_json::from_slice(&sign(&key, &body)).unwrap();
+        let mut changed = body.clone();
+        changed.denied_copies.pop();
+        envelope.payload = serde_json::to_string(&changed).unwrap();
+        assert_eq!(
+            verify_lease(&serde_json::to_vec(&envelope).unwrap(), &pins(&key)),
+            Err(VerifyError::BadSignature)
+        );
+        assert_eq!(
+            verify_lease(&sign(&key, &body), &pins(&self::key())),
+            Err(VerifyError::UnknownKey)
+        );
+        // An unsorted list could hide a denial from the binary search.
+        let mut unsorted = body.clone();
+        unsorted.denied_copies.reverse();
+        assert_eq!(
+            verify_lease(&sign(&key, &unsorted), &pins(&key)),
+            Err(VerifyError::Malformed)
+        );
+        let mut empty_life = body.clone();
+        empty_life.expires_at = empty_life.issued_at;
+        assert_eq!(
+            verify_lease(&sign(&key, &empty_life), &pins(&key)),
+            Err(VerifyError::Malformed)
+        );
+        assert_eq!(
+            PolicyGate::default().accept(unsorted, 1000),
+            Err(VerifyError::Malformed)
+        );
+    }
+    #[test]
+    fn media_verify_policy_expiry_follows_the_grace_rule() {
+        let mut gate = PolicyGate::default();
+        assert_eq!(gate.object("mc_b", 0, 1000), Err(VerifyError::NoLease));
+        assert_eq!(gate.work("w_b", 1000), Err(VerifyError::NoLease));
+        gate.accept(lease(5, 1000, &["mc_a"], &["w_a"]), 1000).unwrap();
+        // Valid lease: s-maxage is the remaining life, down to the last second.
+        assert_eq!(gate.object("mc_b", 5, 1000), Ok(600));
+        assert_eq!(gate.object("mc_b", 5, 1599), Ok(1));
+        assert_eq!(gate.work("w_b", 1300), Ok(300));
+        assert_eq!(gate.object("mc_a", 5, 1000), Err(VerifyError::Denied));
+        assert_eq!(gate.work("w_a", 1000), Err(VerifyError::Denied));
+        // A lease older than the manifest cannot vouch for it.
+        assert_eq!(gate.object("mc_b", 6, 1000), Err(VerifyError::EpochBehind));
+        // Expired: what the last lease did not deny serves for 6 h with s-maxage 0,
+        // then the cache fails closed. Denied stays denied.
+        assert_eq!(gate.object("mc_b", 5, 1600), Ok(0));
+        assert_eq!(gate.work("w_b", 1600 + LEASE_GRACE_SECS - 1), Ok(0));
+        assert_eq!(gate.object("mc_a", 5, 1600), Err(VerifyError::Denied));
+        assert_eq!(gate.object("mc_b", 6, 1600), Err(VerifyError::EpochBehind));
+        assert_eq!(
+            gate.object("mc_b", 5, 1600 + LEASE_GRACE_SECS),
+            Err(VerifyError::Expired)
+        );
+        assert_eq!(
+            gate.work("w_b", 1600 + LEASE_GRACE_SECS),
+            Err(VerifyError::Expired)
+        );
+        // An expired or replayed lease is refused and the held one stays.
+        let late = 1600 + LEASE_GRACE_SECS;
+        assert_eq!(
+            gate.accept(lease(7, late - 700, &[], &[]), late),
+            Err(VerifyError::Expired)
+        );
+        assert_eq!(
+            gate.accept(lease(4, late, &[], &[]), late),
+            Err(VerifyError::StaleLease)
+        );
+        assert_eq!(gate.object("mc_b", 5, late), Err(VerifyError::Expired));
+        // Renewal restores serving, under the new lease's denials.
+        gate.accept(lease(6, late, &["mc_b"], &[]), late).unwrap();
+        assert_eq!(gate.object("mc_a", 5, late), Ok(600));
+        assert_eq!(gate.object("mc_b", 6, late), Err(VerifyError::Denied));
+        // The same epoch reissued later extends the life; an earlier copy does not.
+        gate.accept(lease(6, late + 60, &["mc_b"], &[]), late + 60).unwrap();
+        assert_eq!(gate.object("mc_a", 6, late + 60), Ok(600));
+        gate.accept(lease(6, late, &["mc_b"], &[]), late + 60).unwrap();
+        assert_eq!(gate.object("mc_a", 6, late + 60), Ok(600));
     }
 }

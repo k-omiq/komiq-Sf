@@ -318,6 +318,8 @@ impl KeyedLocks {
 /// Shared, request-independent application state.
 pub struct AppState {
     pub(crate) media_manifests: Option<std::sync::Arc<crate::media_manifest::MediaState>>,
+    /// The in-memory denied set (takedowns, site-wide rules) and the policy lease memo.
+    pub(crate) policy: crate::media_policy::Policy,
     pub pool: Database,
     /// Separate, un-replicated DB for cover blobs (`work_cover_blob`). Kept out of
     /// `pool` so the main-database backup carries no covers; see `db::init_covers`.
@@ -1814,12 +1816,21 @@ async fn viewer_blocks(ctx: &Context<'_>) -> Result<std::sync::Arc<ViewerBlocks>
 
 /// The unmemoized body of [`viewer_blocks`].
 async fn resolve_viewer_blocks(ctx: &Context<'_>) -> Result<std::sync::Arc<ViewerBlocks>> {
-    let pool = &state(ctx).pool;
-    let site = crate::block::load(pool, None).await.map_err(gql_read_err)?;
+    let st = state(ctx);
+    let pool = &st.pool;
+    // Operator takedowns ride the same gate, for every viewer, while any work is taken
+    // down (`media_policy`, held in memory).
+    let policy = st.policy.current(pool).await.map_err(gql_read_err)?;
+    let takedowns = policy.has_work_takedowns().then_some(policy.epoch);
+    let site = crate::block::load(pool, None)
+        .await
+        .map_err(gql_read_err)?
+        .with_takedowns(takedowns);
     let lists = match current_user(ctx).await? {
         Some(user) => crate::block::load(pool, Some(&user.id))
             .await
-            .map_err(gql_read_err)?,
+            .map_err(gql_read_err)?
+            .with_takedowns(takedowns),
         None => site.clone(),
     };
     Ok(std::sync::Arc::new(ViewerBlocks { site, lists }))
@@ -1950,6 +1961,7 @@ async fn deny_blocked_chapter(ctx: &Context<'_>, external_id: &str, not_found: &
     .await
     .map_err(gql_read_err)?;
     let Some(work_id) = owner else {
+        // A chapter with no known work may belong to a blocked or taken-down one.
         return Err(Error::new(not_found));
     };
     if crate::block::is_blocked(pool, &blocks.site, &work_id)
@@ -6998,6 +7010,16 @@ impl QueryRoot {
         Ok(rules.iter().map(Into::into).collect())
     }
 
+    /// Admin: every operator takedown, newest first. A taken-down work or copy is not
+    /// listed, opened or served to anyone; see `takeDownMedia`.
+    async fn media_takedowns(&self, ctx: &Context<'_>) -> Result<Vec<MediaTakedown>> {
+        require_admin(ctx).await?;
+        let rows = crate::media_policy::list(&state(ctx).pool)
+            .await
+            .map_err(gql_read_err)?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     /// The viewer's own content block rules, in the order they were saved. They hide
     /// matching series from the viewer's lists (Browse, search, updates, discovery), on
     /// top of the site-wide rules. They do not lock a series the viewer opens by its
@@ -7306,6 +7328,11 @@ impl QueryRoot {
             }
             deny_blocked_series(ctx, &manga_id.to_string(), "No such chapter").await?;
         }
+        // A taken-down copy closes this one chapter.
+        let policy = st.policy.current(&st.pool).await.map_err(gql_read_err)?;
+        if policy.denies_chapter(n) {
+            return Err(Error::new("No such chapter"));
+        }
         let urls = st.suwayomi.pages(n).await;
         // A reader opening a chapter is the request that matters most, and the scanner
         // never makes it — so it is counted here, against the owning source.
@@ -7334,6 +7361,9 @@ impl QueryRoot {
         // itself writes nothing.
         let media = if let Some(media) = st.media_manifests.as_ref().filter(|_| use_locator) {
             match crate::media_manifest::store::existing_copy_for_chapter(&st.pool, n).await {
+                Ok(Some(copy)) if policy.denies_copy(&copy) => {
+                    return Err(Error::new("No such chapter"));
+                }
                 Ok(Some(copy)) => {
                     match crate::media_manifest::store::page_media(&st.pool, &copy, urls.len())
                         .await
@@ -13513,8 +13543,60 @@ impl MutationRoot {
     ) -> Result<Vec<BlockRule>> {
         let admin = require_admin(ctx).await?;
         let stored = store_block_rules(state(ctx), crate::block::Scope::Site, rules).await?;
+        state(ctx).policy.invalidate();
         tracing::info!(rules = stored.len(), by = %admin.username, "site block rules set by an admin");
         Ok(stored)
+    }
+
+    /// Admin: stop serving a work or one copy to everyone (a rights request). A work id
+    /// that was merged away names its survivor. A work takedown also covers every copy
+    /// the work has now, its old merged-away ids, and a merge or split later; its stored
+    /// covers are deleted. Lists, pages, manifests and the policy lease drop it at once;
+    /// shared caches within one lease. Copies already in a browser or downloaded cannot
+    /// be recalled. `reason` is required (at most 500 characters). Returns false when
+    /// the subject was already taken down.
+    async fn take_down_media(
+        &self,
+        ctx: &Context<'_>,
+        kind: TakedownKind,
+        subject_id: ID,
+        reason: String,
+    ) -> Result<bool> {
+        let admin = require_admin(ctx).await?;
+        let st = state(ctx);
+        let (subject, changed) = crate::media_policy::take_down(
+            &st.pool,
+            &st.cover_pool,
+            kind.into(),
+            &subject_id.0,
+            &reason,
+            Some(&admin.username),
+        )
+        .await
+        .map_err(gql_err)?;
+        st.policy.invalidate();
+        tracing::info!(kind = ?kind, subject = %subject, changed, by = %admin.username, "media takedown set by an admin");
+        Ok(changed)
+    }
+
+    /// Admin: lift a takedown. Lifting a work also lifts the copy rows recorded with it;
+    /// a takedown carried to another work by a merge or split is lifted there by hand.
+    /// A lifted work's cover is fetched again by the next cover pass. Returns false
+    /// when there was nothing to lift.
+    async fn lift_media_takedown(
+        &self,
+        ctx: &Context<'_>,
+        kind: TakedownKind,
+        subject_id: ID,
+    ) -> Result<bool> {
+        let admin = require_admin(ctx).await?;
+        let st = state(ctx);
+        let lifted = crate::media_policy::lift(&st.pool, kind.into(), &subject_id.0)
+            .await
+            .map_err(gql_err)?;
+        st.policy.invalidate();
+        tracing::info!(kind = ?kind, subject = %subject_id.0, lifted, by = %admin.username, "media takedown lifted by an admin");
+        Ok(lifted)
     }
 
     /// Replace the signed-in user's own content block rules with `rules` (at most 50;
@@ -19149,6 +19231,7 @@ mod tests {
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
+            policy: Default::default(),
             setup_code: crate::instance::SetupCode::default(),
         });
         (build_schema(state.clone(), false), pool, state)
@@ -21708,6 +21791,7 @@ mod tests {
                 catalogue_cover_phash: false,
                 ext_icons_dir: std::path::PathBuf::new(),
                 media_manifests: None,
+                policy: Default::default(),
                 setup_code: crate::instance::SetupCode::default(),
             })
         };
@@ -21947,6 +22031,7 @@ mod tests {
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
+            policy: Default::default(),
             setup_code: crate::instance::SetupCode::default(),
         });
         let s = build_schema(state, false);
@@ -29457,6 +29542,7 @@ mod tests {
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
+            policy: Default::default(),
             setup_code: crate::instance::SetupCode::default(),
         });
         let s = build_schema(state, false);
@@ -29979,6 +30065,7 @@ mod tests {
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
+            policy: Default::default(),
             setup_code: crate::instance::SetupCode::default(),
         })
     }

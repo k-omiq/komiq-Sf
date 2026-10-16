@@ -471,6 +471,54 @@ pub struct BlockRuleInput {
     pub ratings: Option<Vec<ContentRating>>,
 }
 
+/// What a takedown names: a work (every copy of it, its covers and its merged-away ids),
+/// or one copy (one upload of one chapter by one source, `Page.mediaPath`'s `mc_` id).
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum TakedownKind {
+    Work,
+    Copy,
+}
+
+impl From<TakedownKind> for crate::media_policy::Kind {
+    fn from(kind: TakedownKind) -> Self {
+        match kind {
+            TakedownKind::Work => crate::media_policy::Kind::Work,
+            TakedownKind::Copy => crate::media_policy::Kind::Copy,
+        }
+    }
+}
+
+/// One operator takedown (`mediaTakedowns`).
+#[derive(SimpleObject, Clone, Debug)]
+pub struct MediaTakedown {
+    pub kind: TakedownKind,
+    pub subject_id: ID,
+    pub reason: String,
+    /// Who set it: an admin's username, or `cli`.
+    pub created_by: Option<String>,
+    /// RFC 3339.
+    pub created_at: String,
+    /// For a copy row recorded with a work takedown: that work. Lifting the work lifts it.
+    pub via_work: Option<ID>,
+}
+
+impl From<crate::media_policy::Takedown> for MediaTakedown {
+    fn from(t: crate::media_policy::Takedown) -> Self {
+        MediaTakedown {
+            kind: if t.subject_kind == "copy" {
+                TakedownKind::Copy
+            } else {
+                TakedownKind::Work
+            },
+            subject_id: ID(t.subject_id),
+            reason: t.reason,
+            created_by: t.created_by,
+            created_at: t.created_at.to_rfc3339(),
+            via_work: t.via_work.map(ID),
+        }
+    }
+}
+
 /// `TagGroup` from the stored `tag.tag_group` word. Anything unrecognized is filed under
 /// GENRE, matching `tags::rebuild_tag_table`'s default for free-text admin tags.
 pub fn tag_group_from_word(w: &str) -> TagGroup {

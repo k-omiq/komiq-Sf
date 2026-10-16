@@ -68,6 +68,7 @@ Catalogue works are independent of source copies:
 - `work_field_pin`: records administrator overrides for source-managed fields like author, artist, year and status. Database triggers automatically restore pinned values if an automated synchronization pass updates the underlying `work` row.
 - `engine_generation`, `engine_manga_key` and `engine_chapter_key`: the source engine's own manga and chapter keys and web links, added by migration `0005_engine_keys.sql`. Keys are stored per generation, and each generation row has a state of `active`, `quarantined` or `detached`; the server adopts or creates one `active` generation at start. `chapterOrigin` reads these rows. The tables exist only in PostgreSQL, and the reverse export to SQLite leaves them out because the server rebuilds them from the engine.
 - `engine_numeric_state` and `suwayomi_progress_detached`, added by migration `0006_engine_fence.sql`: the numeric epoch that fences queued progress writes after an engine change, and the extension-source reading progress set aside when an administrator starts a new engine generation. The reverse export to SQLite refuses while either holds rows.
+- `media_policy` and `media_takedown`, added by migration `0009_media_policy.sql`: the policy epoch, which moves with every site-wide block rule or takedown change, and the operator takedowns of works and chapter copies. The reverse export to SQLite leaves `media_policy` out and refuses while `media_takedown` holds rows, because a rollback without it would serve taken-down content again. Read [Takedowns](/admin/takedowns).
 
 ### Identity and social tables
 
@@ -126,6 +127,7 @@ Keep applied migrations immutable. Add new files for schema changes and backfill
 - `apps/server/migrations_pg/`: PostgreSQL baseline and migration history.
 - `apps/server/migrations/`: frozen SQLite source migration history.
 - `apps/server/src/pg_import/`: type conversion, import, verification and the startup decision (`startup.rs`).
+- `apps/server/src/media_policy.rs`: the policy epoch, takedowns and the in-memory denied set.
 - `apps/server/src/db.rs`: PostgreSQL initialization, migration runners and SQLite cover recovery.
 - `apps/server/src/catalog/`: Rust data access logic for canonical works, aliases, external IDs and duplicate merging.
 - `apps/server/src/cover.rs`: database read and write operations for cover blobs and image variants.

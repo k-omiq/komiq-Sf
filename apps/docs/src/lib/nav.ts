@@ -68,7 +68,17 @@ export const handbooks: Handbook[] = [
 		title: 'Admin console',
 		description: 'The management portal of your server: the catalogue, the sources and the people.',
 		icon: 'wrench',
-		chapters: ['overview', 'catalog', 'duplicates', 'covers', 'sources', 'engine', 'users', 'settings'],
+		chapters: [
+			'overview',
+			'catalog',
+			'duplicates',
+			'covers',
+			'takedowns',
+			'sources',
+			'engine',
+			'users',
+			'settings',
+		],
 	},
 	{
 		id: 'developers',

@@ -21,6 +21,10 @@ pub(super) const TARGETS: [i64; 2] = [121, 122];
 /// Nonempty tables in this disposition prevent rollback.
 pub(super) const UNSUPPORTED_POSTGRES_ONLY: &[(&str, &str)] = &[
     (
+        "media_takedown",
+        "a rollback that dropped operator takedowns would serve taken-down content again",
+    ),
+    (
         "suwayomi_progress_detached",
         "detached numeric reading progress has no representation in SQLite",
     ),
@@ -36,6 +40,10 @@ pub(super) const UNSUPPORTED_POSTGRES_ONLY: &[(&str, &str)] = &[
 
 /// Engine-derived identities are omitted even when populated, with counts in the report.
 pub(super) const REBUILDABLE_POSTGRES_ONLY: &[(&str, &str)] = &[
+    (
+        "media_policy",
+        "the policy epoch starts again from the next policy change",
+    ),
     (
         "media_object",
         "object metadata is rebuilt by the next ingest",

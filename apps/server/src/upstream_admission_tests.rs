@@ -355,6 +355,7 @@ async fn cached_reader_requests_survive_all_upstream_slots_hanging_and_client_li
         catalogue_cover_phash: false,
         ext_icons_dir: std::path::PathBuf::new(),
         media_manifests: None,
+        policy: Default::default(),
         setup_code: instance::SetupCode::default(),
     });
     let trusted = Arc::new(TrustedProxies::for_tests(vec![], false));

@@ -224,7 +224,8 @@ pub(crate) async fn ingest_chapter(app: &AppState, chapter: i64) -> Result<Optio
     else {
         bail!("no active copy identity");
     };
-    if crate::graphql::site_blocks_engine_series(&app.pool, bound_manga).await? {
+    let policy = app.policy.current(&app.pool).await?;
+    if policy.denies_pages(bound_manga) || policy.denies_chapter(chapter) {
         bail!("series blocked");
     }
     let stamp = engine.page_locator.snapshot();

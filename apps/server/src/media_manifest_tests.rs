@@ -167,6 +167,7 @@ async fn fixture(enabled: bool) -> (TempDir, Engine, Arc<AppState>) {
         catalogue_cover_phash: false,
         ext_icons_dir: Default::default(),
         setup_code: instance::SetupCode::default(),
+        policy: media_policy::Policy::new(enabled),
         media_manifests: media_manifest::MediaState::from_config(&config).unwrap(),
     });
     (dir, engine, app)
@@ -331,10 +332,14 @@ async fn object_mismatch_marks_stale_and_pages_stop_exact_paths() {
     assert_eq!(listed[0]["mediaMime"], "image/png");
     let response = get_media(&app, path).await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers()[header::CACHE_CONTROL],
-        "public, max-age=31536000, immutable, s-maxage=600"
-    );
+    // s-maxage is the policy lease's remaining life (S5).
+    let cache = response.headers()[header::CACHE_CONTROL].to_str().unwrap();
+    let s_maxage: i64 = cache
+        .strip_prefix("public, max-age=31536000, immutable, s-maxage=")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=media_policy::LEASE_SECS).contains(&s_maxage), "{cache}");
     assert_eq!(body(response).await, engine.pages.lock().unwrap()[0]);
     engine.pages.lock().unwrap()[0] = image_bytes(9);
     let response = get_media(&app, path).await;

@@ -5570,6 +5570,8 @@ pub(crate) async fn merge_works_on(
     .bind(crate::db_types::date(&now)?)
     .execute(&mut **tx)
     .await?;
+    // A takedown never shrinks on a merge: the losing work's moves onto the survivor.
+    crate::media_policy::carry_merge(tx, source_work, target_work).await?;
 
     // BEFORE the delete. `release_event.work_id` cascades, so the losing work's
     // first-seen history is one statement away from being erased — and the earliest time
@@ -6016,6 +6018,8 @@ async fn split_source_series_attempt(
     .bind(crate::db_types::optional_uuid(actor_user_id)?)
     .execute(&mut *tx)
     .await?;
+    // A takedown never shrinks on a split: the new work inherits the original's.
+    crate::media_policy::carry_split(&mut tx, work_id, &new_work_id).await?;
 
     // Source ownership, navigation and both projections publish together. A failed
     // projection leaves the original split request safe to retry.

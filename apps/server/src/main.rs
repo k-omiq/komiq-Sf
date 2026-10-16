@@ -29,8 +29,11 @@ mod maintenance;
 mod mangadex;
 mod media;
 mod media_manifest;
+mod media_policy;
 #[cfg(test)]
 mod media_manifest_tests;
+#[cfg(test)]
+mod media_policy_tests;
 mod media_routes;
 // The verifier half is for regional caches (M6); until one ships, only tests call it.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1156,6 +1159,13 @@ async fn serve_cover(
     let Some(work_id) = file.strip_suffix(".webp") else {
         return media_not_found();
     };
+    // A taken-down work (or an old id that redirects to one) has no cover, before any
+    // stored blob or lazy fill.
+    match current_policy(&app).await {
+        Ok(policy) if policy.denies_work(work_id) => return media_not_found(),
+        Ok(_) => {}
+        Err(response) => return response,
+    }
     let width = cover::variant_width(query_param(&query, "w"));
     // Fast path: already-cached blob.
     match read_work_cover_snapshot(&pool, work_id, width).await {
@@ -1332,8 +1342,14 @@ async fn serve_suwayomi_image_inner(
     // The owning manga (`is_suwayomi_image_path` already proved the first segment numeric).
     let manga_id = rest.split('/').next().and_then(|id| id.parse::<i64>().ok());
     if let Some(id) = manga_id {
-        if let Err(response) = check_page_block(&app, id).await {
-            return response;
+        let policy = match check_page_block(&app, id).await {
+            Ok(policy) => policy,
+            Err(response) => return response,
+        };
+        // A taken-down copy closes its series under the index path (see
+        // `Snapshot::denies_index_path`).
+        if policy.denies_index_path(id) {
+            return image_failure_response(StatusCode::NOT_FOUND);
         }
         if app
             .suwayomi
@@ -1355,25 +1371,33 @@ async fn serve_suwayomi_image_inner(
 async fn check_page_block(
     app: &graphql::AppState,
     manga_id: i64,
-) -> Result<(), axum::response::Response> {
-    // A chapter page of a series a site-wide rule blocks is not served: `pages` refuses
-    // to list its URLs, but the URL is guessable numbers. Covers stay open, as the
-    // admin console still lists a blocked series and its `<img>` carries no session.
-    // Fails closed: a rule that cannot be read must not let the page out.
-    match graphql::site_blocks_engine_series(&app.pool, manga_id).await {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(image_failure_response(StatusCode::NOT_FOUND)),
-        Err(e) => {
-            tracing::warn!(error = %e, "suwayomi page: block rules unreadable");
-            let mut response =
-                database_error_response(db::observed_read_database_error(e), "Internal error");
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("no-store, must-revalidate"),
-            );
-            Err(response)
-        }
+) -> Result<Arc<media_policy::Snapshot>, axum::response::Response> {
+    // A chapter page of a series a site-wide rule blocks, or of a taken-down work, is not
+    // served: `pages` refuses to list its URLs, but the URL is guessable numbers. Covers
+    // stay open under a rule, as the admin console still lists a blocked series and its
+    // `<img>` carries no session. The denied set is held in memory (`media_policy`).
+    // Fails closed: a set that cannot be read must not let the page out.
+    let policy = current_policy(app).await?;
+    if policy.denies_pages(manga_id) {
+        return Err(image_failure_response(StatusCode::NOT_FOUND));
     }
+    Ok(policy)
+}
+
+/// The in-memory denied set, or the answer for a request when it cannot be read.
+async fn current_policy(
+    app: &graphql::AppState,
+) -> Result<Arc<media_policy::Snapshot>, axum::response::Response> {
+    app.policy.current(&app.pool).await.map_err(|e| {
+        tracing::warn!(error = %e, "media policy unreadable");
+        let mut response =
+            database_error_response(db::observed_read_database_error(e), "Internal error");
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, must-revalidate"),
+        );
+        response
+    })
 }
 
 async fn fetch_suwayomi_page(
@@ -1519,7 +1543,12 @@ async fn fetch_chapter_page(
                 Ok(None) => return Err(image_failure_response(StatusCode::NOT_FOUND)),
                 Err(response) => return Err(response),
             };
-        check_page_block(app, manga_id).await?;
+        if check_page_block(app, manga_id)
+            .await?
+            .denies_chapter(chapter_id)
+        {
+            return Err(image_failure_response(StatusCode::NOT_FOUND));
+        }
         if app
             .suwayomi
             .page_locator
@@ -1544,9 +1573,6 @@ async fn fetch_chapter_page(
     }
     Err(page_busy_response())
 }
-
-// S5 replaces this with the policy lease's remaining life.
-const OBJECT_S_MAXAGE_SECS: u64 = 600;
 
 fn valid_media_copy(copy: &str) -> bool {
     copy.strip_prefix("mc_").is_some_and(|id| {
@@ -1618,9 +1644,14 @@ async fn serve_media_object_inner(
         return Ok(image_failure_response(StatusCode::NOT_FOUND));
     };
     // The copy's own series decides, not only the series the engine now answers for this
-    // chapter id: identical bytes (a credits page) must not reopen a blocked copy.
-    if let Err(response) = check_page_block(app, bound_manga).await {
-        return Ok(response);
+    // chapter id: identical bytes (a credits page) must not reopen a blocked or
+    // taken-down copy through another copy's path.
+    match check_page_block(app, bound_manga).await {
+        Ok(policy) if policy.denies_copy(copy) || policy.denies_chapter(chapter) => {
+            return Ok(image_failure_response(StatusCode::NOT_FOUND));
+        }
+        Ok(_) => {}
+        Err(response) => return Ok(response),
     }
     let (bytes, _) = match fetch_chapter_page(app, chapter, &idx.to_string()).await {
         Ok(page) => page,
@@ -1637,10 +1668,13 @@ async fn serve_media_object_inner(
     }
     let mut response =
         raw_image_response_with_cache(mime, bytes, "public, max-age=31536000, immutable");
+    // Shared caches keep it no longer than the current policy lease lives, so a
+    // takedown reaches every cache within one lease.
+    let s_maxage = media_policy::lease_remaining(chrono::Utc::now().timestamp());
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_str(&format!(
-            "public, max-age=31536000, immutable, s-maxage={OBJECT_S_MAXAGE_SECS}"
+            "public, max-age=31536000, immutable, s-maxage={s_maxage}"
         ))?,
     );
     Ok(response)
@@ -1668,6 +1702,23 @@ async fn serve_media_manifest(
         None => None,
     };
     // Eligibility is checked on every request, even when the signed bytes are memoized.
+    match current_policy(&app).await {
+        Ok(policy) if policy.denies_copy(&copy) => {
+            return image_failure_response(StatusCode::NOT_FOUND)
+        }
+        // A copy made after the set was read is judged by its series.
+        Ok(policy) if policy.closes_any_series() => {
+            match media_manifest::store::chapter_for_copy(&app.pool, &copy).await {
+                Ok(Some((_, manga))) if policy.denies_pages(manga) => {
+                    return image_failure_response(StatusCode::NOT_FOUND)
+                }
+                Ok(_) => {}
+                Err(error) => return manifest_store_error(error),
+            }
+        }
+        Ok(_) => {}
+        Err(response) => return response,
+    }
     let manifest = match rev {
         Some(rev) => media_manifest::store::revision(&app.pool, &copy, rev).await,
         None => media_manifest::store::latest(&app.pool, &copy).await,
@@ -1699,6 +1750,23 @@ async fn serve_media_keys(State(app): State<Arc<AppState>>) -> axum::response::R
     match &app.media_manifests {
         Some(media) => signed_media_response(media.keys.clone()),
         None => image_failure_response(StatusCode::NOT_FOUND),
+    }
+}
+
+/// `GET /media/v1/policy` — the signed policy lease: the epoch and the denied copies and
+/// works, valid for `media_policy::LEASE_SECS`. Memoized per epoch and per minute.
+async fn serve_media_policy(State(app): State<Arc<AppState>>) -> axum::response::Response {
+    let Some(media) = &app.media_manifests else {
+        return image_failure_response(StatusCode::NOT_FOUND);
+    };
+    let policy = match current_policy(&app).await {
+        Ok(policy) => policy,
+        Err(response) => return response,
+    };
+    let now = chrono::Utc::now().timestamp();
+    match app.policy.signed_lease(&policy, &media.signer, now) {
+        Ok(bytes) => signed_media_response(bytes.as_ref().clone()),
+        Err(error) => manifest_store_error(error),
     }
 }
 
@@ -1776,6 +1844,11 @@ async fn serve_suwayomi_cover(
 ) -> axum::response::Response {
     if app.suwayomi.wait_for_generation().await.is_err() {
         return page_busy_response();
+    }
+    match current_policy(app).await {
+        Ok(policy) if policy.denies_engine_cover(manga_id) => return media_not_found(),
+        Ok(_) => {}
+        Err(response) => return response,
     }
     let generation = app.suwayomi.fence.as_ref().and_then(|f| f.generation());
     let variant_key = cover::suwayomi_variant_key(manga_id);
@@ -2737,6 +2810,17 @@ fn public_router(
                     telemetry::MediaRoute::Policy,
                 )),
         )
+        .route(
+            "/media/v1/policy",
+            get(serve_media_policy)
+                .layer(axum::middleware::from_fn_with_state(
+                    std::time::Duration::from_secs(10),
+                    request_budget::limit_image_time,
+                ))
+                .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                    telemetry::MediaRoute::Policy,
+                )),
+        )
         // Authenticated comment-image upload + public serve, same BLOB-in-SQLite
         // model as avatars. The upload route raises the body limit above the raw
         // image cap enforced in `media::process_comment_image`.
@@ -2958,6 +3042,15 @@ async fn main() -> anyhow::Result<()> {
     if argv.first().map(String::as_str) == Some("repair-upload-dates") {
         return catalog::date_repair::run_cli(&argv[1..]).await;
     }
+    // `komika-server takedown add|remove|list` — operator takedowns (`media_policy`).
+    if argv.first().map(String::as_str) == Some("takedown") {
+        let pool = db::connect_existing(&cfg.database_url).await?;
+        let covers = db::connect_existing_covers(&cfg.covers_database_url).await?;
+        let result = media_policy::run_cli(&pool, &covers, &argv[1..]).await;
+        pool.close().await;
+        covers.close().await;
+        return result;
+    }
     if argv.first().map(String::as_str) == Some("engine") {
         let pool = db::connect_existing(&cfg.database_url).await?;
         let covers = db::connect_existing_covers(&cfg.covers_database_url).await?;
@@ -3045,6 +3138,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let media_manifests = media_manifest::MediaState::from_config(&cfg)?;
     let state = Arc::new(AppState {
+        policy: media_policy::Policy::new(media_manifests.is_some()),
         media_manifests,
         pool: pool.clone(),
         cover_pool: cover_pool.clone(),
@@ -3514,6 +3608,7 @@ mod tests {
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
+            policy: Default::default(),
             setup_code: instance::SetupCode::default(),
         })
     }
@@ -4318,6 +4413,7 @@ mod tests {
                 catalogue_cover_phash: false,
                 ext_icons_dir: std::path::PathBuf::new(),
                 media_manifests: None,
+                policy: Default::default(),
                 setup_code: instance::SetupCode::default(),
             });
             let points = crate::locks::pause_points::PausePoints::default();
@@ -4399,6 +4495,7 @@ mod tests {
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
+            policy: Default::default(),
             setup_code: instance::SetupCode::default(),
         });
 
@@ -4493,6 +4590,7 @@ mod tests {
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
+            policy: Default::default(),
             setup_code: instance::SetupCode::default(),
         };
         let app = Arc::new(app);
@@ -4874,6 +4972,7 @@ mod tests {
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
+            policy: Default::default(),
             setup_code: instance::SetupCode::default(),
         });
         let trusted = Arc::new(TrustedProxies::for_tests(vec![], false));
@@ -5159,6 +5258,7 @@ mod tests {
             catalogue_cover_phash: false,
             ext_icons_dir: std::path::PathBuf::new(),
             media_manifests: None,
+            policy: Default::default(),
             setup_code: instance::SetupCode::default(),
         });
         let get = || {
