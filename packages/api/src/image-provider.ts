@@ -224,17 +224,17 @@ export class WebImageProvider implements ImageProvider {
 		}
 		const origin = this.config.apiOrigin;
 		if (!origin) return false;
-		// Match on an ORIGIN BOUNDARY, not a bare prefix: `startsWith(origin)` alone would
-		// treat `https://api.komiq.cc.evil.com/…` as own-origin. Require the URL to be the
-		// origin exactly or continue with a path separator.
-		const trimmed = origin.replace(/\/$/, '');
-		return url === trimmed || url.startsWith(`${trimmed}/`);
+		try {
+			return new URL(url).origin === new URL(origin).origin;
+		} catch {
+			return false;
+		}
 	}
 
 	/** Resolve an own-origin asset to a loadable absolute URL (prefix relative
 	 * paths with `apiOrigin`; already-absolute URLs pass through). */
 	private toAbsoluteOwn(url: string): string {
-		if (/^https?:\/\//.test(url)) return url;
+		if (/^https?:\/\//i.test(url)) return url;
 		const origin = (this.config.apiOrigin ?? '').replace(/\/$/, '');
 		return origin + (url.startsWith('/') ? '' : '/') + url;
 	}
@@ -245,7 +245,7 @@ export class WebImageProvider implements ImageProvider {
 		// paths relative; the placeholder base is used only to edit the query safely.
 		const url = new URL(absolute, 'https://komika.invalid');
 		url.searchParams.set('cache_policy', CACHE_POLICY_REVISION);
-		return /^https?:\/\//.test(absolute)
+		return /^https?:\/\//i.test(absolute)
 			? url.toString()
 			: `${url.pathname}${url.search}${url.hash}`;
 	}

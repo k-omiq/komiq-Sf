@@ -55,7 +55,7 @@ export const SWITCH_ROUNDS = 2;
 
 const STATE_KEY = 'komiq.mediaRoute';
 
-/** `scheme://host[:port]` of an absolute http(s) URL with no credentials, or null. */
+/** `scheme://host[:port]` of an absolute http(s) URL with an exact host and no credentials, or null. */
 export function mediaOrigin(value: string): string | null {
 	let url: URL;
 	try {
@@ -64,6 +64,7 @@ export function mediaOrigin(value: string): string | null {
 		return null;
 	}
 	if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
+	if (url.hostname.includes('*')) return null;
 	if (url.username || url.password) return null;
 	if (url.pathname !== '/' || url.search || url.hash) return null;
 	return url.origin;

@@ -37,7 +37,7 @@ The query has its own capability flag in the GraphQL client, `mediaRoutesUnsuppo
 
 ## Who uses routes
 
-Only the web build (`pnpm build` and `KOMIKA_TARGET=static`) uses routes, and only when its build-time list `PUBLIC_KOMIKA_MEDIA_HOSTS` is not empty. The list holds exact origins, separated by commas or spaces. An entry that is not a bare `http` or `https` origin fails the build.
+Only the web build (`pnpm build` and `KOMIKA_TARGET=static`) uses routes, and only when its build-time list `PUBLIC_KOMIKA_MEDIA_HOSTS` is not empty. The list holds exact origins, separated by commas or spaces. An entry that is not a bare `http` or `https` origin fails the build. Hosts containing `*`, including subdomain wildcards, are rejected. The reader also ignores server route entries with wildcard hosts.
 
 The reader trusts the intersection of that list and the server's list, plus the API origin as the owner. A server cannot add a host to a web build. The owner is the server's owner `base` when it is the API origin or on the list, and the API origin otherwise.
 
@@ -76,6 +76,8 @@ An `<img>` never sends an `Authorization` header, and probes use `credentials: '
 | The API origin, relative `/media/`, `/covers/`, `/avatars/` | direct |
 | An origin on `PUBLIC_KOMIKA_MEDIA_HOSTS` | direct, never Worker-wrapped |
 | Any other host | through the image proxy Worker in proxy mode |
+
+The image provider compares origins in normal form: host names are lower case and default ports are removed.
 
 An exact object is a typed value, `MediaUrl` (route id and path), not a string. The only way to a URL is `MediaRouter.href`, so an object cannot reach the image provider's `resolve()` by mistake.
 

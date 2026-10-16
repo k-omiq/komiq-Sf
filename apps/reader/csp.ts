@@ -59,13 +59,16 @@ function mediaHostOrigins(raw: string | undefined): ConnectSource[] {
 		if (
 			!url ||
 			!['http:', 'https:'].includes(url.protocol) ||
+			url.hostname.includes('*') ||
 			url.username ||
 			url.password ||
 			url.pathname !== '/' ||
 			url.search ||
 			url.hash
 		) {
-			throw new Error(`PUBLIC_KOMIKA_MEDIA_HOSTS: "${entry}" is not an http(s) origin`);
+			throw new Error(
+				`PUBLIC_KOMIKA_MEDIA_HOSTS: "${entry}" is not an http(s) origin with an exact host (wildcards are not allowed)`,
+			);
 		}
 		out.push(url.origin as ConnectSource);
 	}

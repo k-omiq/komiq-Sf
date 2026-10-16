@@ -78,3 +78,22 @@ test('hosted media route hosts join connect-src for probes; bad entries fail the
 		);
 	}
 });
+
+test('wildcard media hosts fail the CSP build with an exact-host error', () => {
+	for (const value of [
+		'https://*',
+		'https://*.example.com',
+		'https://media*.example.com',
+		'http://*.example.com',
+	]) {
+		assert.throws(
+			() =>
+				readerConnectSources({
+					PUBLIC_KOMIKA_BACKEND: 'on',
+					PUBLIC_KOMIKA_MEDIA_HOSTS: value,
+				}),
+			/PUBLIC_KOMIKA_MEDIA_HOSTS.*wildcards are not allowed/,
+			value,
+		);
+	}
+});

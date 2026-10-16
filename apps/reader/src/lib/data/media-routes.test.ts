@@ -33,9 +33,8 @@ registerHooks({
 });
 
 const api = '../../../../../packages/api/src/';
-const { ChapterMediaRecovery, MediaRouter, parseMediaHosts, trustedMediaRoutes } = await import(
-	api + 'media-routes.ts'
-);
+const { ChapterMediaRecovery, MediaRouter, mediaOrigin, parseMediaHosts, trustedMediaRoutes } =
+	await import(api + 'media-routes.ts');
 const { WebImageProvider } = await import(api + 'image-provider.ts');
 const { GraphQLBackend } = await import(api + 'graphql-backend.ts');
 
@@ -139,6 +138,32 @@ test('trusted routes: the server list intersected with the build allowlist, owne
 	assert.throws(() => parseMediaHosts(`${SG}/path`), /PUBLIC_KOMIKA_MEDIA_HOSTS/);
 });
 
+test('wildcard media hosts fail the build allowlist and are ignored in server routes', () => {
+	for (const value of [
+		'https://*',
+		'https://*.example.com',
+		'https://media*.example.com',
+		'http://*.example.com',
+	]) {
+		assert.equal(mediaOrigin(value), null, value);
+		assert.throws(() => parseMediaHosts(value), /PUBLIC_KOMIKA_MEDIA_HOSTS/, value);
+		const routes = trustedMediaRoutes(
+			[
+				{ id: 'owner', base: value, kind: 'OWNER', region: null },
+				{ id: 'wildcard', base: value, kind: 'REGIONAL', region: null },
+				serverRoutes[1],
+			],
+			[value, SG],
+			API,
+		);
+		assert.deepEqual(
+			routes.map((r: { origin: string }) => r.origin),
+			[API, SG],
+			value,
+		);
+	}
+});
+
 test('classification: owner and regional objects load direct, foreign hosts via the Worker', async () => {
 	const images = new WebImageProvider({
 		workerBaseUrl: WORKER,
@@ -155,6 +180,9 @@ test('classification: owner and regional objects load direct, foreign hosts via 
 		[`${EU}/anything.webp`, 'direct'],
 		// foreign hosts: the Worker
 		['https://uploads.mangadex.org/covers/x.jpg', 'worker'],
+		[`${API}:8443/media/v1/c/7/0`, 'worker'],
+		['http://api.example/media/v1/c/7/0', 'worker'],
+		['https://api.example.evil.test/media/v1/c/7/0', 'worker'],
 		['https://media-sg.example.evil.test/x.jpg', 'worker'],
 		['https://evil.example/media/v1/o/x', 'worker'],
 	];
@@ -172,6 +200,42 @@ test('classification: owner and regional objects load direct, foreign hosts via 
 		mediaOrigins: [SG],
 	});
 	assert.equal(await proxied.resolveCover(`${SG}${PATH}`), `${SG}${PATH}`);
+});
+
+test('classification: owner default ports and host case keep locators off the Worker', async () => {
+	for (const [apiOrigin, sourceOrigin] of [
+		[`${API}:443`, API],
+		['https://API.example', API],
+		[API, `${API}:443`],
+		[API, 'https://API.example'],
+	]) {
+		const images = new WebImageProvider({ workerBaseUrl: WORKER, apiOrigin });
+		const sourceUrl = `${sourceOrigin}/media/v1/c/7/0`;
+		assert.equal(
+			await images.resolvePage({ index: 0, sourceUrl }),
+			`${API}/media/v1/c/7/0?cache_policy=2`,
+			`${apiOrigin} owns ${sourceUrl}`,
+		);
+	}
+});
+
+test('owner URLs with upper-case or mixed-case HTTP schemes stay absolute in every web mode', async () => {
+	for (const scheme of ['HTTPS', 'HtTpS', 'HTTP', 'HtTp']) {
+		const apiOrigin = `${scheme.toLowerCase()}://api.example`;
+		for (const mode of [{}, { direct: true }, { serverProxy: true }]) {
+			const images = new WebImageProvider({ workerBaseUrl: WORKER, apiOrigin, ...mode });
+			const sourceOrigin = `${scheme}://api.example`;
+			assert.equal(
+				await images.resolvePage({ index: 0, sourceUrl: `${sourceOrigin}/media/v1/c/7/0` }),
+				`${apiOrigin}/media/v1/c/7/0?cache_policy=2`,
+			);
+			const cover = `${sourceOrigin}/covers/w_case.webp?v=17`;
+			const master = `${apiOrigin}/covers/w_case.webp?v=17&cache_policy=2`;
+			assert.equal(await images.resolveCover(cover), master);
+			assert.equal(images.coverCardSrcSet(cover),
+				`${master}&w=192 1x, ${master}&w=320 2x, ${master} 3x`);
+		}
+	}
 });
 
 test('an exact object never reaches the image provider and goes out without credentials', () =>
