@@ -21,6 +21,8 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FenceError {
     Unavailable,
+    /// The last identity check could not reach the engine (down or still starting).
+    Unreachable,
     BindingMismatch {
         manga_id: i64,
         chapter_id: Option<i64>,
@@ -31,6 +33,7 @@ impl std::fmt::Display for FenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Unavailable => "Source engine identity is being checked or is quarantined",
+            Self::Unreachable => crate::graphql::ENGINE_UNREACHABLE,
             Self::BindingMismatch { .. } => "Source engine returned a different source identity",
             Self::StaleEpoch => "Numeric reading progress belongs to an earlier engine generation",
         })
@@ -64,6 +67,8 @@ async fn current_on(conn: &mut sqlx::PgConnection) -> Result<Option<(Uuid, Strin
 struct Gate {
     generation: Option<Uuid>,
     blocked: bool,
+    /// The last check failed on the connection; cleared by the next completed check.
+    unreachable: bool,
     revision: u64,
     unfenced: bool,
     suspect_manga: BTreeSet<i64>,
@@ -105,6 +110,7 @@ impl Fence {
             gate: RwLock::new(Gate {
                 generation: current.as_ref().map(|r| r.0),
                 blocked: current.as_ref().is_some_and(|r| r.1 == "quarantined"),
+                unreachable: false,
                 unfenced: current.as_ref().is_some_and(|r| r.2),
                 revision: 0,
                 suspect_manga: Default::default(),
@@ -157,14 +163,19 @@ impl Fence {
     async fn check_locked(&self) {
         let revision = self.revision();
         match tokio::time::timeout(CHECK_TIMEOUT, self.check_inner(revision)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                self.gate.write().unwrap_or_else(|e| e.into_inner()).unreachable = false;
+            }
             Ok(Err(error)) => {
-                if crate::suwayomi::is_connection_error(&error) {
-                    let mut gate = self.gate.write().unwrap_or_else(|e| e.into_inner());
+                let unreachable = crate::suwayomi::is_connection_error(&error);
+                let mut gate = self.gate.write().unwrap_or_else(|e| e.into_inner());
+                gate.unreachable = unreachable;
+                if unreachable {
                     gate.blocked = true;
                     gate.revision += 1;
                     self.engine.clear_numeric_memos();
                 }
+                drop(gate);
                 tracing::warn!(%error, "engine generation check did not complete");
             }
             Err(_) => {
@@ -204,7 +215,9 @@ impl Fence {
             let _ = tokio::time::timeout(WAIT_TIMEOUT, self.check()).await;
         }
         if self.is_blocked() || self.generation().is_none() {
-            return Err(FenceError::Unavailable.into());
+            // An engine that is down or still starting (a fresh install) says so plainly.
+            let unreachable = self.gate.read().unwrap_or_else(|e| e.into_inner()).unreachable;
+            return Err(if unreachable { FenceError::Unreachable } else { FenceError::Unavailable }.into());
         }
         Ok(())
     }

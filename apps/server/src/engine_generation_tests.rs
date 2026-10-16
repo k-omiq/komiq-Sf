@@ -364,6 +364,27 @@ async fn timed_out_fingerprint_cannot_reopen_gate_without_a_verified_binding() {
 }
 
 #[tokio::test]
+async fn an_engine_that_is_not_up_yet_reads_as_unreachable() {
+    // A fresh install answers before Suwayomi has started: admin screens show the
+    // plain "not reachable" sentence, not an identity problem.
+    let pool = TestPoolOptions::new()
+        .max_connections(4)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let covers = SqliteTestPoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let mut client = SuwayomiClient::new("http://127.0.0.1:9".into(), None, None);
+    let fence = Fence::attach(&pool, &covers, &mut client).await.unwrap();
+    let error = fence.wait().await.unwrap_err();
+    assert_eq!(error.downcast_ref::<FenceError>(), Some(&FenceError::Unreachable));
+    assert_eq!(error.to_string(), crate::graphql::ENGINE_UNREACHABLE);
+}
+
+#[tokio::test]
 async fn references_without_captured_keys_stay_active_after_adoption() {
     // Right after the first adoption no key row is captured yet while Suwayomi
     // references already exist: that is not a failed verification.

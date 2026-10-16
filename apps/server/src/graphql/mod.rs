@@ -1252,6 +1252,8 @@ fn engine_err(e: anyhow::Error) -> Error {
     let unreachable = e.chain().any(|c| {
         c.downcast_ref::<reqwest::Error>()
             .is_some_and(|r| r.is_connect() || r.is_timeout())
+            || c.downcast_ref::<crate::engine_generation::FenceError>()
+                == Some(&crate::engine_generation::FenceError::Unreachable)
     }) || e.to_string().starts_with("Suwayomi error 5");
     if unreachable {
         tracing::warn!(error = %e, "source engine unreachable");
