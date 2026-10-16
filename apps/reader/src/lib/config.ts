@@ -5,8 +5,9 @@ import {
 	PUBLIC_KOMIKA_BACKEND_KIND,
 	PUBLIC_SUWAYOMI_URL,
 	PUBLIC_KOMIKA_IMG_MODE,
+	PUBLIC_KOMIKA_MEDIA_HOSTS,
 } from '$env/static/public';
-import { isTauri } from '@komika/api';
+import { isTauri, parseMediaHosts } from '@komika/api';
 
 /**
  * App configuration, resolved from PUBLIC_* env vars at BUILD time.
@@ -165,6 +166,17 @@ export const config = {
 	 */
 	nativeEngine: fetchOnDevice,
 };
+
+/**
+ * Media route origins this build trusts (`PUBLIC_KOMIKA_MEDIA_HOSTS`, exact origins).
+ * Only the hosted web build reads them: non-empty there, the reader loads exact media
+ * objects from the server's `mediaRoutes` that are on this list (see `$lib/media`).
+ * Every other build keeps loading page `sourceUrl`s.
+ */
+export const mediaHosts =
+	target === 'web' && !chosenServer && config.backendEnabled && config.backendKind === 'komika'
+		? parseMediaHosts(PUBLIC_KOMIKA_MEDIA_HOSTS)
+		: [];
 
 /**
  * Origin of the Komika API (the GraphQL endpoint minus `/graphql`). User avatars

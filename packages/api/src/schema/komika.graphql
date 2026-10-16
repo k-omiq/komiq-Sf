@@ -32,6 +32,7 @@ type Query {
 	aggregatedChapters(workId: ID!): [AggregatedChapter!]! # [komika] S2: a canonical work's chapters aggregated across ALL sources (installed Suwayomi sources + MangaDex mirror), deduped by number, each carrying per-source availability so the reader can pick a translator
 	pages(chapterId: ID!): [Page!]! # [suwayomi] fetchChapterPages -> normalized pages
 	chapterOrigin(chapterId: ID!): ChapterOrigin # [komika] where a Suwayomi chapter lives at its source, for a reader app that fetches pages with its own engine; null when unknown; NSFW-gated like pages
+	mediaRoutes: [MediaRoute!]! # [komika] M5 typed media origins, the same for every viewer; clients intersect with their build-time allowlist; a server cannot add a host to a hosted reader
 	canonicalUpdates(page: Int = 1, includeNsfw: Boolean): [CanonicalUpdate!]! # [komika] MangaDex mirror updates, newest chapter first, NSFW-filtered (data feed). `includeNsfw` is the same admin-console-only escape hatch as on `search` — honoured for admins, ignored for everyone else
 	updatesFeed(page: Int = 1, type: ComicType): UpdateFeedPage! # [komika] the reader's merged Updates feed: the union of `updates` (scanner detections on Suwayomi library series) and `canonicalUpdates` (the MangaDex mirror), taken server-side and keyed by canonical work, newest REAL upstream release first. Supersedes merging page 1 of each in the client, which could not be paginated — a page of the merged list is not page N of either feed, and the client-side title dedupe left short pages that made `total`/`hasNextPage` wrong. `type` filters by format over the WHOLE feed; NSFW-gated by the viewer's own preference (no admin escape hatch — this is a reader surface)
 	# Canonical (MangaDex-mirrored) reader path — workId is the `w_`-prefixed canonical
@@ -1011,6 +1012,19 @@ type ChapterOrigin {
 	chapterWebUrl: String # ChapterType.realUrl: the chapter's page on the source's website ("Read on source"); validate http(s) before linking
 	mangaWebUrl: String # MangaType.realUrl: the series' page on the source's website
 	extension: SourceExtension # null when the source has no catalogued extension
+}
+
+# [komika] Where exact media objects can be loaded from (M5 typed media routes).
+type MediaRoute {
+	id: String!
+	base: String! # origin (scheme://host[:port], no path), or "" for the server's own origin (same as its API)
+	kind: MediaRouteKind!
+	region: String
+}
+
+enum MediaRouteKind {
+	OWNER
+	REGIONAL
 }
 
 # [komika] All source mappings resolved for one canonical work (batch grouping).

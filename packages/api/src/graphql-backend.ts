@@ -1,5 +1,6 @@
 import type {
 	ChapterOrigin,
+	MediaRoute,
 	AdminUser,
 	CoverIssue,
 	AggregatedChapter,
@@ -181,6 +182,7 @@ interface EndpointCapabilities {
 	tagsUnsupported: boolean;
 	setChapterReadUnsupported: boolean;
 	chapterOriginUnsupported: boolean;
+	mediaRoutesUnsupported: boolean;
 	seriesPageUnsupported: boolean;
 }
 
@@ -201,6 +203,7 @@ function endpointCapabilities(config: BackendConfig): EndpointCapabilities {
 			tagsUnsupported: false,
 			setChapterReadUnsupported: false,
 			chapterOriginUnsupported: false,
+			mediaRoutesUnsupported: false,
 			seriesPageUnsupported: false,
 		};
 	}
@@ -644,8 +647,17 @@ export class GraphQLBackend implements Backend {
 		});
 		return d.aggregatedChapters;
 	}
-	async pages(chapterId: Id): Promise<Page[]> {
-		const d = await this.gql<{ pages: Page[] }>(ops.PAGES, { chapterId });
+	async pages(chapterId: Id, opts?: { fresh?: boolean }): Promise<Page[]> {
+		const d = opts?.fresh
+			? await this.gql<{ pages: Page[] }>(
+					ops.PAGES,
+					{ chapterId },
+					false,
+					undefined,
+					this.auth.revision,
+					true,
+				)
+			: await this.gql<{ pages: Page[] }>(ops.PAGES, { chapterId });
 		return d.pages;
 	}
 
@@ -1533,6 +1545,25 @@ export class GraphQLBackend implements Backend {
 			// The server predates the query — deploy-order drift, not an outage.
 			if (msg.includes('Unknown field "chapterOrigin"')) {
 				this.capabilities.chapterOriginUnsupported = true;
+				return undefined;
+			}
+			throw e;
+		}
+	}
+
+	/** Endpoint/schema-scoped like {@link chapterOrigin}. Anonymous and the same for every
+	 *  viewer, so it rides the cacheable GET. */
+	async mediaRoutes(): Promise<MediaRoute[] | undefined> {
+		const authRevision = this.auth.revision;
+		if (this.capabilities.mediaRoutesUnsupported) return undefined;
+		try {
+			const d = await this.gql<{ mediaRoutes: MediaRoute[] }>(ops.MEDIA_ROUTES);
+			return d.mediaRoutes;
+		} catch (e) {
+			this.assertAuthRevision(authRevision);
+			const msg = e instanceof Error ? e.message : String(e);
+			if (msg.includes('Unknown field "mediaRoutes"')) {
+				this.capabilities.mediaRoutesUnsupported = true;
 				return undefined;
 			}
 			throw e;

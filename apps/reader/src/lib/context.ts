@@ -9,7 +9,7 @@ import {
 	isTauri,
 	OfflineWriteQueue,
 } from '@komika/api';
-import { apiOrigin, chosenServer, config, OFFLINE_WRITES_KEY } from './config';
+import { apiOrigin, chosenServer, config, mediaHosts, OFFLINE_WRITES_KEY } from './config';
 import { confirmExtensionInstall } from './extension-consent.svelte';
 
 /**
@@ -47,6 +47,8 @@ export const images = createImageProvider({
 	apiOrigin,
 	// Native app pointed at a server from the connect screen: load its images from it.
 	serverOrigin: chosenServer,
+	// Media route origins load as they are, never through the Worker.
+	mediaOrigins: mediaHosts,
 });
 export const platform = currentPlatform();
 

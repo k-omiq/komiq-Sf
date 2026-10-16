@@ -40,6 +40,8 @@
 		type Opt,
 	} from '$lib/reader-prefs';
 	import CommentThread from '$lib/components/CommentThread.svelte';
+	import { ChapterMediaRecovery } from '@komika/api';
+	import { currentMediaRouter, freshRoutedPages } from '$lib/media';
 
 	let { data: loadedData } = $props();
 	// Kit can deliver a completed preload without calling load again. Guard the
@@ -655,7 +657,50 @@
 		}
 		settlePage(index);
 	}
+	// Exact media objects (typed media routes): a failed regional object is retried once on
+	// the owner; when the owner fails too, the chapter's pages are fetched again ONCE with
+	// no HTTP cache and pages whose URL changed load again. Then the retry button.
+	let pageUrl = $state<Record<number, string>>({});
+	const recovery = $derived.by(() => {
+		const router = currentMediaRouter();
+		const chapterId = data.chapterId;
+		if (!router || !chapterId || !pages.some((p) => p.media)) return null;
+		return new ChapterMediaRecovery(
+			router,
+			pages.map((p) => ({ url: p.url, media: p.media ?? null })),
+			() => freshRoutedPages(chapterId),
+		);
+	});
+	$effect(() => {
+		recovery;
+		untrack(() => {
+			pageUrl = {};
+		});
+	});
+
 	function onImgError(index: number): void {
+		const rec = recovery;
+		const failed = pageUrl[index] ?? pages[index]?.url;
+		if (!rec || !failed) return failPage(index);
+		void rec.recover(index, failed).then((changes) => {
+			if (rec !== recovery) return;
+			let urls = pageUrl;
+			let errors = pageError;
+			// Every changed page takes its new URL, mounted or not: a loaded image keeps
+			// showing its bytes until the new ones arrive.
+			for (const [i, next] of changes) {
+				urls = { ...urls, [i]: next.url };
+				if (errors[i]) {
+					errors = { ...errors };
+					delete errors[i];
+				}
+			}
+			pageUrl = urls;
+			pageError = errors;
+			if (!changes.has(index)) failPage(index);
+		});
+	}
+	function failPage(index: number): void {
 		pageError = { ...pageError, [index]: true };
 		settlePage(index);
 	}
@@ -1383,7 +1428,7 @@
 						{#if p.url && !pageError[p.index]}
 							<img
 								class="strip-img"
-								src={p.url}
+								src={pageUrl[p.index] ?? p.url}
 								alt={`Page ${p.label}`}
 								loading={p.index < eagerUntil ? 'eager' : 'lazy'}
 								fetchpriority={p.index < STARTER_PAGES
@@ -1416,7 +1461,7 @@
 					{#if p.url && !pageError[p.index]}
 						<img
 							class="paged-img"
-							src={p.url}
+							src={pageUrl[p.index] ?? p.url}
 							alt={`Page ${p.label}`}
 							decoding="async"
 							onload={(e) => onImgLoad(e, p.index)}

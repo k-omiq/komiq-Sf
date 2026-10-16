@@ -83,6 +83,7 @@ export const handbooks: Handbook[] = [
 			'image-proxy',
 			'edge-caching',
 			'media-manifests',
+			'media-routes',
 			'server',
 			'graphql',
 			'data-model',

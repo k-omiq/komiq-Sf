@@ -71,6 +71,10 @@ The [image proxy Worker](/developers/image-proxy) runs on `img.komiq.cc`. It is 
 - Proxies and caches images. `ALLOWED_SOURCE_HOSTS` permits `uploads.mangadex.org`, `mangadex.network` and `api.komiq.cc`; other upstream hosts are rejected.
 - Checks browser Origin and Referer headers against `ALLOWED_ORIGINS`. Requests without either header remain permitted.
 - Limits each IP to 600 cache misses per minute through `IMG_RATE_LIMITER`. Cache hits do not count.
+- Refuses `/media/` paths on every host and the hosts in `MEDIA_ROUTE_HOSTS`, on `src` and every redirect hop. Read [Media routes](/developers/media-routes).
+
+> [!WARNING]
+> Deploy the Worker with the media route rule before you set `KOMIKA_MEDIA_MANIFESTS=on` on the global server. `api.komiq.cc` is on the Worker's host allowlist, so an older Worker would fetch and cache exact objects from `/media/v1/o` outside the server's policy.
 
 ### The documentation Worker
 

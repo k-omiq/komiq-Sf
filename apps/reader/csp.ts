@@ -30,6 +30,9 @@ export function readerConnectSources(
 		// The hosted backend also supplies account/social features in Suwayomi mode.
 		addEndpoint('PUBLIC_KOMIKA_API');
 		if (env.PUBLIC_KOMIKA_BACKEND_KIND === 'suwayomi') addEndpoint('PUBLIC_SUWAYOMI_URL');
+		// Media route probes (`/media/v1/ready`) are fetches; the objects are `<img>`s,
+		// which `img-src https:` already allows.
+		else for (const origin of mediaHostOrigins(env.PUBLIC_KOMIKA_MEDIA_HOSTS)) sources.add(origin);
 	}
 	if (env.PUBLIC_KOMIKA_IMG_MODE === 'proxy') addEndpoint('PUBLIC_KOMIKA_IMG_WORKER');
 	if (development) {
@@ -38,4 +41,33 @@ export function readerConnectSources(
 		sources.add('wss:');
 	}
 	return [...sources];
+}
+
+/**
+ * `PUBLIC_KOMIKA_MEDIA_HOSTS` as origins: comma- or space-separated, each a bare http(s)
+ * origin (the same rule as `parseMediaHosts` in `@komika/api`, which the app uses).
+ */
+function mediaHostOrigins(raw: string | undefined): ConnectSource[] {
+	const out: ConnectSource[] = [];
+	for (const entry of (raw ?? '').split(/[\s,]+/).filter(Boolean)) {
+		let url: URL | null = null;
+		try {
+			url = new URL(entry);
+		} catch {
+			/* reported below */
+		}
+		if (
+			!url ||
+			!['http:', 'https:'].includes(url.protocol) ||
+			url.username ||
+			url.password ||
+			url.pathname !== '/' ||
+			url.search ||
+			url.hash
+		) {
+			throw new Error(`PUBLIC_KOMIKA_MEDIA_HOSTS: "${entry}" is not an http(s) origin`);
+		}
+		out.push(url.origin as ConnectSource);
+	}
+	return out;
 }

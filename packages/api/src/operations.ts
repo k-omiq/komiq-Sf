@@ -1946,6 +1946,19 @@ export const CHAPTER_ORIGIN = /* GraphQL */ `
 	}
 `;
 
+// Its own capability flag (`mediaRoutesUnsupported`): the line stripper cannot remove a
+// field with a sub-selection.
+export const MEDIA_ROUTES = /* GraphQL */ `
+	query MediaRoutes {
+		mediaRoutes {
+			id
+			base
+			kind
+			region
+		}
+	}
+`;
+
 export const WORK_SOURCES = /* GraphQL */ `
 	${WORK_SOURCE_FIELDS}
 	query WorkSources($workId: ID!) {

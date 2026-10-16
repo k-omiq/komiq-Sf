@@ -1,6 +1,7 @@
 import type {
 	ChapterOrigin,
 	AdminUser,
+	MediaRoute,
 	CoverIssue,
 	AggregatedChapter,
 	BulkAddResult,
@@ -195,7 +196,9 @@ export interface Backend {
 	 *  availability so the reader can pick/​fall-back a source. Optional: only the
 	 *  unified Komika API implements it. `workId` is the `w_`-prefixed canonical id. */
 	aggregatedChapters?(workId: Id): Promise<AggregatedChapter[]>;
-	pages(chapterId: Id): Promise<Page[]>;
+	/** `fresh`: skip every HTTP cache (POST, never the cacheable anonymous GET), for a
+	 *  chapter whose exact media paths stopped loading. */
+	pages(chapterId: Id, opts?: { fresh?: boolean }): Promise<Page[]>;
 
 	// --- library & progress ---
 	mark(seriesId: Id, marked: boolean): Promise<Series>;
@@ -309,6 +312,10 @@ export interface Backend {
 	 * `null` = unknown chapter; `undefined` = the server predates the query. Optional:
 	 * the unified Komika API and the direct Suwayomi backend implement it. */
 	chapterOrigin?(chapterId: Id): Promise<ChapterOrigin | null | undefined>;
+	/** Where exact media objects can be loaded from (M5 typed media routes); the same for
+	 * every viewer. `undefined` = the server predates the query. Optional: only the unified
+	 * Komika API implements it. */
+	mediaRoutes?(): Promise<MediaRoute[] | undefined>;
 	/** {@link workSources} for many works at once, grouped by `workId` — for warming
 	 * a native client's source routing over a list. Optional: only the unified
 	 * Komika API implements it. */

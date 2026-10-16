@@ -33,6 +33,14 @@ routes = [
 # `api.komiq.cc/api/v1/manga/.../page/...` and this Worker fetches + edge-caches them.
 ALLOWED_SOURCE_HOSTS = "uploads.mangadex.org,mangadex.network,api.komiq.cc"
 
+# Comma-separated regional media hosts the reader may load exact objects from
+# (none today); entries may be bare hostnames or origin URLs, matched exactly.
+# The /media/ path rule applies on every host whatever this holds.
+# Deploy this guard BEFORE /media/v1/o is turned on for the hosted owner because
+# api.komiq.cc is in ALLOWED_SOURCE_HOSTS for legacy page paths. Deployment needs
+# the owner's OK.
+MEDIA_ROUTE_HOSTS = ""
+
 # Comma-separated allowlist of browser Origin/Referer values permitted to
 # hotlink the proxy. Requests from a browser (i.e. that send an Origin or
 # Referer header) whose origin is not in this list are rejected with 403.

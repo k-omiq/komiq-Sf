@@ -31,8 +31,10 @@ import type { BrowseSort, ContentRatingFilter } from '@komika/api';
 // Runtime check (not a type): the native build must keep the sequential page-fetch
 // order for canonical chapters — see `canStartPagesEarly`.
 import { isTauri } from '@komika/api';
+import type { MediaUrl, RoutedPage } from '@komika/api';
 import type { Backend } from '@komika/api';
 import { backend, images } from '$lib/context';
+import { mediaRouter, routePage } from '$lib/media';
 import { auth } from '$lib/auth.svelte';
 import { viewerCache, viewerCacheChanged } from '$lib/viewer-cache.svelte';
 import { invalidate } from '$app/navigation';
@@ -2764,6 +2766,9 @@ export async function recordView(seriesId: string | undefined): Promise<void> {
 
 export interface ReaderPageView {
 	url: string; // resolved displayable URL ('' → render placeholder)
+	/** Set when `url` is an exact media object (typed media routes): what the reader's
+	 *  owner fallback and one-time refresh work from. */
+	media?: MediaUrl | null;
 	index: number;
 	ratio: string;
 	label: string;
@@ -2899,12 +2904,15 @@ function emptyReader(seriesId: string, tmeta: TranslatorMeta = NO_TRANSLATORS): 
  * index and label in {@link buildReaderView}, so the reader renders its per-page
  * placeholder for exactly those slots and every other page reads normally.
  */
-async function resolvePageUrls(domainPages: Page[]): Promise<string[]> {
-	const settled = await Promise.allSettled(domainPages.map((p) => images.resolvePage(p)));
+async function resolvePageUrls(domainPages: Page[]): Promise<RoutedPage[]> {
+	// An exact media object loads from the session's media route and never goes through
+	// the image provider; every other page does, as before.
+	const router = await mediaRouter();
+	const settled = await Promise.allSettled(domainPages.map((p) => routePage(p, router)));
 	return settled.map((r, i) => {
 		if (r.status === 'fulfilled') return r.value;
 		console.warn(`[komika] page ${i + 1} failed to resolve:`, r.reason);
-		return '';
+		return { url: '', media: null };
 	});
 }
 
@@ -2977,7 +2985,7 @@ function buildReaderView(
 	seriesId: string,
 	chs: Chapter[],
 	target: Chapter,
-	urls: string[],
+	routed: RoutedPage[],
 	seriesTitle: string,
 	tmeta: TranslatorMeta,
 	readingSrc: string | null,
@@ -3016,8 +3024,9 @@ function buildReaderView(
 		chapterRead: target.read,
 		chNum: target.number,
 		chTitle: target.title || `Chapter ${target.number}`,
-		pages: urls.map((url, index) => ({
+		pages: routed.map(({ url, media }, index) => ({
 			url,
+			media,
 			index,
 			ratio: '800 / 1200',
 			label: String(index + 1).padStart(2, '0'),

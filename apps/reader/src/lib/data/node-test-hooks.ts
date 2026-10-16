@@ -69,6 +69,9 @@ const STUBS: Record<string, string> = {
 	'$lib/config':
 		'export const config = globalThis.__komikaTest.config;' +
 		'export const apiAssetSrc = (s) => s;',
+	'$lib/media':
+		'export const mediaRouter = async () => null;' +
+		'export const routePage = async (p) => ({ url: await globalThis.__komikaTest.images.resolvePage(p), media: null });',
 	'$lib/auth.svelte': 'export const auth = globalThis.__komikaTest.auth;',
 	'@komika/api': 'export const isTauri = () => false;',
 	'./translator-pref.svelte':

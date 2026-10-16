@@ -61,6 +61,10 @@ The Worker checks the destination hostname against the `ALLOWED_SOURCE_HOSTS` va
 
 The `api.komiq.cc` entry is the global server API origin. If you deploy your own Worker, set its route to your domain and configure `ALLOWED_SOURCE_HOSTS` for the upstream hosts it should fetch. Your API hostname belongs there only if the Worker fetches images from it.
 
+### Media routes are refused
+
+The Worker never proxies exact media objects. It refuses any upstream URL whose path is `/media` or starts with `/media/`, on every host, and any host listed in `MEDIA_ROUTE_HOSTS` (comma-separated, matched exactly, empty today). It checks the path after percent-decoding, collapsing repeated slashes and lower-casing; a path it cannot decode counts as media. The check runs on `src` and on every redirect hop, before any fetch, and answers HTTP 403 with `no-store`. Read [Media routes](/developers/media-routes).
+
 ### Hotlink protection
 
 The Worker checks browser origin headers against the `ALLOWED_ORIGINS` variable. The global server configuration allows `https://komiq.cc` and `https://www.komiq.cc`. For your own Worker, use your reader origins instead:
@@ -133,7 +137,7 @@ The Worker uses standard HTTP status codes:
 | 200  | OK                 | Successful image delivery.                                                                                                                                                          |
 | 204  | No Content         | Successful CORS `OPTIONS` preflight.                                                                                                                                                |
 | 400  | Bad Request        | Missing `?src`, invalid URL, forbidden host, unsafe port, or redirect to unapproved host.                                                                                           |
-| 403  | Forbidden          | Disallowed browser `Origin` or `Referer`.                                                                                                                                           |
+| 403  | Forbidden          | Disallowed browser `Origin` or `Referer`, or a media route in `src` or a redirect hop.                                                                                              |
 | 404  | Not Found          | Route other than `/img`, `/`, or `/healthz`.                                                                                                                                        |
 | 405  | Method Not Allowed | Request method other than GET, HEAD, or OPTIONS.                                                                                                                                    |
 | 429  | Too Many Requests  | Rate limit exceeded on upstream fetch misses.                                                                                                                                       |

@@ -21,6 +21,7 @@
 
 interface Env {
 	ALLOWED_SOURCE_HOSTS?: string;
+	MEDIA_ROUTE_HOSTS?: string;
 	ALLOWED_ORIGINS?: string;
 	// Cloudflare native per-IP rate limiter for the upstream-fetch path (bandwidth
 	// abuse cap). Configured as an [[unsafe.bindings]] ratelimit in wrangler.toml,
@@ -84,6 +85,9 @@ export default {
 		} catch {
 			return errorResponse(400, 'Invalid ?src URL');
 		}
+		if (isMediaRouteTarget(upstream, env.MEDIA_ROUTE_HOSTS)) {
+			return errorResponse(403, 'media routes are not proxied');
+		}
 		if (!safeUpstreamUrl(upstream)) {
 			return errorResponse(400, 'src must be http(s) without credentials or nonstandard ports');
 		}
@@ -126,7 +130,11 @@ export default {
 		// native reference `fetch_image` (redirect::Policy::none + per-hop revalidation).
 		let originResp: Response;
 		try {
-			originResp = await fetchFollowingRedirects(upstream, env.ALLOWED_SOURCE_HOSTS);
+			originResp = await fetchFollowingRedirects(
+				upstream,
+				env.ALLOWED_SOURCE_HOSTS,
+				env.MEDIA_ROUTE_HOSTS,
+			);
 		} catch (err) {
 			if (err instanceof ProxyError) {
 				console.error(`img proxy: ${err.message} for ${upstream.origin}`);
@@ -180,14 +188,15 @@ export default {
 
 /**
  * Fetch `start`, following up to `MAX_REDIRECTS` redirects MANUALLY and
- * re-validating every hop's resolved host against the allowlist. Relative
- * `Location`s are resolved against the current URL. Any hop to a
+ * rejecting media routes and re-validating every hop's resolved host against the
+ * allowlist. Relative `Location`s are resolved against the current URL. Any hop to a
  * non-allowlisted host (or non-http(s) scheme) rejects — this is what keeps a
  * 3xx from turning the proxy into an SSRF/open-proxy primitive.
  */
 async function fetchFollowingRedirects(
 	start: URL,
 	allowRaw: string | undefined,
+	mediaRouteHosts: string | undefined,
 ): Promise<Response> {
 	let current = start;
 	for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
@@ -212,6 +221,9 @@ async function fetchFollowingRedirects(
 			next = new URL(location, current); // resolves relative Locations
 		} catch {
 			throw new ProxyError(502, 'Upstream redirect to an invalid Location');
+		}
+		if (isMediaRouteTarget(next, mediaRouteHosts)) {
+			throw new ProxyError(403, 'redirect to a media route refused');
 		}
 		if (!safeUpstreamUrl(next)) {
 			throw new ProxyError(
@@ -505,6 +517,27 @@ function parseList(raw: string | undefined): string[] {
 		.split(',')
 		.map((s) => s.trim())
 		.filter(Boolean);
+}
+
+/** Media paths on any host and exact regional media hosts must bypass this proxy. */
+export function isMediaRouteTarget(url: URL, raw: string | undefined): boolean {
+	let path: string;
+	try {
+		path = decodeURIComponent(url.pathname).replace(/\/+/g, '/').toLowerCase();
+	} catch {
+		return true; // An undecodable path cannot safely be classified as non-media.
+	}
+	if (path === '/media' || path.startsWith('/media/')) return true;
+
+	const host = url.hostname.toLowerCase().replace(/\.$/, '');
+	return parseList(raw).some((entry) => {
+		try {
+			const configured = new URL(entry.includes('://') ? entry : `https://${entry}`);
+			return host === configured.hostname.toLowerCase().replace(/\.$/, '');
+		} catch {
+			return false;
+		}
+	});
 }
 
 /**

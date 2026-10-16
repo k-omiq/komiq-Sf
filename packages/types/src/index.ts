@@ -624,6 +624,18 @@ export interface ChapterOrigin {
 	extension: Pick<SourceExtension, 'pkgName' | 'repoUrl'> | null;
 }
 
+/**
+ * One place exact media objects can be loaded from (`mediaRoutes`, M5). `base` is an
+ * origin (`https://host[:port]`, no path) or `''` for the server's own origin. The list
+ * is the same for every viewer; a reader only uses routes on its own build-time list.
+ */
+export interface MediaRoute {
+	id: string;
+	base: string;
+	kind: 'OWNER' | 'REGIONAL';
+	region: string | null;
+}
+
 /** All source mappings resolved for one canonical work (batch grouping). */
 export interface WorkSourceGroup {
 	workId: Id;
@@ -1058,7 +1070,8 @@ export interface Page {
 	 * The exact object for this page (`/media/v1/o/{copyId}/{sha256}`, a path on a media
 	 * route, no origin), its SHA-256 (hex), length in bytes and MIME type. Set only by a
 	 * server that keeps signed manifests and has one for this chapter; absent on an older
-	 * server (stripped) and null otherwise. M5 clients keep loading `sourceUrl`.
+	 * server (stripped) and null otherwise. Only a hosted web build with media routes loads
+	 * it; every other client keeps loading `sourceUrl`.
 	 */
 	mediaPath?: string | null;
 	mediaSha256?: string | null;

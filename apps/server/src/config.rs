@@ -146,6 +146,8 @@ pub fn parse_scan_source_rate_limits(raw: &str) -> Vec<SourceRateLimit> {
 pub struct Config {
     /// Exact media manifests are opt-in (`KOMIKA_MEDIA_MANIFESTS=on`).
     pub media_manifests: bool,
+    /// Raw `KOMIKA_MEDIA_ROUTES` JSON; validated in `main` before startup.
+    pub media_routes_raw: Option<String>,
     pub media_signing_key_file: std::path::PathBuf,
     /// Address the public listener binds (`BIND_ADDR`, default `0.0.0.0`). An IPv4
     /// or IPv6 literal; `main` refuses to start on anything else rather than
@@ -527,6 +529,7 @@ impl Config {
             .unwrap_or(200);
         Self {
             media_manifests: env::var("KOMIKA_MEDIA_MANIFESTS").is_ok_and(|v| v == "on"),
+            media_routes_raw: env::var("KOMIKA_MEDIA_ROUTES").ok(),
             media_signing_key_file: env::var_os("KOMIKA_MEDIA_SIGNING_KEY_FILE")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| "media-signing.key".into()),

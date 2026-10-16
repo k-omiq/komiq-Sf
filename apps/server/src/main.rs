@@ -31,6 +31,7 @@ mod media;
 mod media_manifest;
 #[cfg(test)]
 mod media_manifest_tests;
+mod media_routes;
 // The verifier half is for regional caches (M6); until one ships, only tests call it.
 #[cfg_attr(not(test), allow(dead_code))]
 mod media_verify;
@@ -2978,6 +2979,9 @@ async fn main() -> anyhow::Result<()> {
         return result;
     }
 
+    let media_routes = media_routes::MediaRoutes::parse(cfg.media_routes_raw.as_deref())
+        .map_err(|error| anyhow::anyhow!(error))?;
+
     tracing::info!(?cfg, "starting komika-server");
 
     // Keep the process-lifetime exclusion through the retained covers data
@@ -3293,6 +3297,7 @@ async fn main() -> anyhow::Result<()> {
 
     let schema = graphql::schema_builder(state.clone(), !cfg.graphiql_enabled)
         .data(cloudflare.clone())
+        .data(media_routes)
         .finish();
 
     let app = public_router(

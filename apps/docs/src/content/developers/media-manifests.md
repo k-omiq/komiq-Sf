@@ -80,7 +80,7 @@ Every error answer has `no-store`. No media route reads `Authorization` or cooki
 
 ## Page fields
 
-`pages` adds `mediaPath`, `mediaSha256`, `mediaLength` and `mediaMime`. They are set only when the latest revision is not stale and has as many pages as the engine lists. `mediaPath` is a path without an origin. The reader's GraphQL client lists the four names as optional fields, so it removes them for an older server. Readers keep loading `sourceUrl` for now.
+`pages` adds `mediaPath`, `mediaSha256`, `mediaLength` and `mediaMime`. They are set only when the latest revision is not stale and has as many pages as the engine lists. `mediaPath` is a path without an origin. The reader's GraphQL client lists the four names as optional fields, so it removes them for an older server. Only a web build with media routes loads `mediaPath`; every other build keeps loading `sourceUrl`. Read [Media routes](/developers/media-routes).
 
 ## Verifying
 

@@ -101,10 +101,16 @@ export interface WebImageProviderConfig {
 	 * keeps the built-in routing below.
 	 */
 	serverOrigin?: string | null;
+	/**
+	 * Media route origins on this build's allowlist (`PUBLIC_KOMIKA_MEDIA_HOSTS`). A URL on
+	 * one of them loads as it is: it is never Worker-wrapped, because the Worker refuses
+	 * media routes and must never cache their objects.
+	 */
+	mediaOrigins?: readonly string[];
 }
 
 /** API-origin asset paths the reader serves itself (never Worker-proxied). */
-const OWN_ASSET_PREFIXES = ['/covers/', '/avatars/'];
+const OWN_ASSET_PREFIXES = ['/covers/', '/avatars/', '/media/'];
 
 /** One-time rollout key: bypass browser responses cached under the former immutable policy. */
 const CACHE_POLICY_REVISION = '2';
@@ -149,6 +155,7 @@ export class WebImageProvider implements ImageProvider {
 
 	private resolve(sourceUrl: string): string {
 		if (!sourceUrl) return '';
+		if (this.onMediaRoute(sourceUrl)) return sourceUrl;
 		if (this.config.serverProxy) {
 			if (!needsProxy(sourceUrl)) return sourceUrl;
 			const base = this.config.workerBaseUrl.replace(/\/$/, '');
@@ -160,6 +167,17 @@ export class WebImageProvider implements ImageProvider {
 		}
 		const base = this.config.workerBaseUrl.replace(/\/$/, '');
 		return `${base}/img?src=${encodeURIComponent(sourceUrl)}&cache_policy=${CACHE_POLICY_REVISION}`;
+	}
+
+	/** True for an absolute URL on a configured media route origin. */
+	private onMediaRoute(url: string): boolean {
+		const origins = this.config.mediaOrigins;
+		if (!origins?.length) return false;
+		try {
+			return origins.includes(new URL(url).origin);
+		} catch {
+			return false;
+		}
 	}
 
 	/** True for an asset the reader serves from its own API origin (cached covers,

@@ -7388,6 +7388,16 @@ impl QueryRoot {
             .collect())
     }
 
+    /// Where exact media objects can be loaded from (M5 typed media routes).
+    /// The answer is the same for every viewer. Clients intersect it with their own
+    /// build-time allowlist; a server cannot add a host to a hosted reader.
+    async fn media_routes(&self, ctx: &Context<'_>) -> Vec<crate::media_routes::MediaRoute> {
+        ctx.data_opt::<crate::media_routes::MediaRoutes>()
+            .cloned()
+            .unwrap_or_else(crate::media_routes::MediaRoutes::owner_only)
+            .0
+    }
+
     /// Where a Suwayomi chapter lives at its source, plus the extension that reads it —
     /// for a reader app that fetches pages with its OWN engine instead of through
     /// `pages` (which makes this server fetch the page list and proxy every image).

@@ -24,6 +24,19 @@ GET /img?src=<url-encoded upstream image URL>
 Also: `GET /` and `GET /healthz` return `ok`. `OPTIONS` is handled as a CORS
 preflight.
 
+## Media routes are never proxied
+
+The Worker refuses `/media` and `/media/…` on every host after percent-decoding,
+collapsing repeated slashes and lowercasing the path; undecodable paths also fail
+closed. `MEDIA_ROUTE_HOSTS` adds a comma-separated list of regional media hostnames
+or origin URLs (none today), matched by exact hostname after lowercasing and
+removing a trailing dot. These checks apply to `src` and every redirect hop;
+refusals return an uncacheable `403` before fetching the media target.
+
+Deploy this guard **before** `/media/v1/o` is enabled for the hosted owner, because
+`api.komiq.cc` remains in `ALLOWED_SOURCE_HOSTS` for legacy page paths. Deployment
+requires the owner's OK.
+
 ## Caching
 
 1. **Cloudflare edge** (`caches.default`) — keyed on the normalized upstream URL
