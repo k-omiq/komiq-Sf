@@ -1697,6 +1697,9 @@ pub(crate) async fn persist_scan_for_drill(
 /// stamps on a detection. So an unchanged scan has nothing worth a write — this turns
 /// ~475 writes/hr into a handful.
 ///
+/// The one other trigger is a MISSING row ([`feed_row_missing`]): a first observation is a
+/// baseline and reports no detection, yet the rebuild admits the series all the same.
+///
 /// WHAT THE GATE MISSES, exhaustively. Each is bounded by the next rebuild, and none of
 /// them is worse than the rebuild-only behaviour this call was added to:
 ///
@@ -1716,12 +1719,45 @@ pub(crate) async fn persist_scan_for_drill(
 /// (and with it the scan-state write and the reschedule) over one would be strictly
 /// worse than being one refresh stale.
 async fn touch_feed_series_update(pool: &Database, series_id: &str, new_found: bool) {
-    if !new_found {
+    if !new_found && !feed_row_missing(pool, series_id).await {
         return;
     }
     if let Err(e) = upsert_feed_series_update(pool, series_id).await {
         let e = crate::db::observed_database_error(e);
         tracing::warn!(series_id, error = %e, "scan: updates-feed row upsert failed");
+    }
+}
+
+/// True when the periodic rebuild would admit this series to the merged Updates feed but the
+/// feed has no row for its work: the series is in the library, has a release clock, and maps
+/// to a work with no `feed_series_updates` row.
+///
+/// The rebuild's scanner half has no "a change was observed" condition (the F3 gate is
+/// gone), but the `new_found` gate above has: a series' first observation is a baseline and
+/// never reports a detection. Without this probe a series added to the library, or one that
+/// has never changed since, would only reach `/updates` at the next reconcile — a day on a
+/// default install — and that reconcile would log it as drift. One PK-indexed read per
+/// scan; the write it triggers happens once per missing row.
+///
+/// Best-effort like the write: a failed probe logs and reads as "not missing".
+async fn feed_row_missing(pool: &Database, series_id: &str) -> bool {
+    match crate::db_types::query_scalar::<bool>(
+        "SELECT EXISTS (SELECT 1 FROM source_series ss \
+           JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
+          WHERE ss.source_type = 'suwayomi' AND ss.source_key = $1 \
+            AND sy.in_library = TRUE AND sy.latest_chapter_at IS NOT NULL \
+            AND NOT EXISTS (SELECT 1 FROM feed_series_updates f WHERE f.work_id = ss.work_id))",
+    )
+    .bind(series_id)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(missing) => missing,
+        Err(e) => {
+            let e = crate::db::observed_read_database_error(e.into());
+            tracing::warn!(series_id, error = %e, "scan: updates-feed row probe failed");
+            false
+        }
     }
 }
 
@@ -7076,7 +7112,12 @@ mod tests {
         .await
         .unwrap();
         touch_feed_series_update(&pool, "7", baseline).await;
-        assert!(feed_row(&pool).await.is_none(), "baseline is not an update");
+        // Not a detection, but the rebuild admits the series, so the row exists — with no
+        // detection time, which only the next scan's detection stamps.
+        let (.., baseline_detected_at) = feed_row(&pool)
+            .await
+            .expect("the rebuild admits a baseline series, so the writer must too");
+        assert_eq!(baseline_detected_at, None);
 
         let then = at("2026-01-08T00:00:00Z");
         let new_found = record_scan(&pool, "7", "S", &admin, &chaps(13), then)
@@ -7549,7 +7590,8 @@ mod tests {
         .unwrap();
         touch_feed_series_update(&pool, "7", new_found).await;
         assert!(feed_row(&pool).await.is_some());
-        sqlx::query("DELETE FROM feed_series_updates")
+        // A marker the upsert would overwrite (a Suwayomi-only work takes the fresh title).
+        sqlx::query("UPDATE feed_series_updates SET title = 'marker'")
             .execute(&pool)
             .await
             .unwrap();
@@ -7567,10 +7609,49 @@ mod tests {
         .unwrap();
         assert!(!new_found, "an identical list is not a detection");
         touch_feed_series_update(&pool, "7", new_found).await;
-        assert!(
-            feed_row(&pool).await.is_none(),
-            "an unchanged scan must not write the feed"
-        );
+        let (_, _, _, title, ..) = feed_row(&pool).await.expect("the row is still there");
+        assert_eq!(title, "marker", "an unchanged scan must not write the feed");
+    }
+
+    /// The first scan of a library series is a baseline and reports no detection, yet the
+    /// periodic rebuild admits the series (it needs only `in_library` and a release clock).
+    /// The writer must publish that row too: otherwise a fresh install or a newly added
+    /// series reaches `/updates` only at the next reconcile, which then reports it as drift
+    /// ("feed reconciler: DRIFT", `new row`).
+    #[tokio::test]
+    async fn a_baseline_scan_publishes_the_row_the_rebuild_would_admit() {
+        let pool = migrated_pool().await;
+        seed_feed_fixture(&pool, Some("1785071625000")).await;
+        let baseline = record_scan(
+            &pool,
+            "7",
+            "S",
+            &ScanAdmin::default(),
+            &chaps(12),
+            at("2026-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert!(!baseline, "a first observation is not a detection");
+        touch_feed_series_update(&pool, "7", baseline).await;
+        assert!(feed_row(&pool).await.is_some());
+
+        let report = crate::catalog::ledger::reconcile_feed(&pool).await.unwrap();
+        assert_eq!(report.drifted, 0, "drift sample: {:?}", report.sample);
+    }
+
+    /// The probe admits only what the rebuild admits: a series outside the library gets no
+    /// row from a baseline scan.
+    #[tokio::test]
+    async fn a_baseline_scan_of_a_series_outside_the_library_publishes_nothing() {
+        let pool = migrated_pool().await;
+        seed_feed_fixture(&pool, Some("1785071625000")).await;
+        sqlx::query("UPDATE suwayomi_series SET in_library = FALSE WHERE id = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        touch_feed_series_update(&pool, "7", false).await;
+        assert!(feed_row(&pool).await.is_none());
     }
 
     /// `released_at` is NOT NULL and a work with no dated chapter is not an "update":
