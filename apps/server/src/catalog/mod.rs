@@ -14,6 +14,7 @@ pub mod normalize;
 pub mod pair;
 pub mod similarity;
 pub mod spine;
+pub mod work_chapter;
 
 use crate::database::SqliteDatabase;
 use crate::db::Database;
@@ -4796,6 +4797,9 @@ pub async fn mark_work_nsfw_on(conn: &mut sqlx::PgConnection, work_id: &str) -> 
 #[derive(Debug, Clone, Default)]
 pub struct MergeOutcome {
     pub moved_source_series: u64,
+    /// Every entry of the losing work's chapter list and where it went (W3a): onto the
+    /// survivor's entry with the same key, or moved as it is (`from == to`).
+    pub entry_map: Vec<work_chapter::EntryMove>,
 }
 
 /// Fold `source_work` into `target_work` (D1): re-point every mapping + user-data
@@ -5581,6 +5585,8 @@ pub(crate) async fn merge_works_on(
     // per chapter key is exactly what stops a merge re-announcing the merged-in work's
     // whole back catalogue on /updates.
     ledger::merge_release_events(tx, source_work, target_work).await?;
+    // BEFORE the delete too: `work_chapter.work_id` cascades.
+    let entry_map = work_chapter::merge_entries_on(tx, source_work, target_work).await?;
 
     sqlx::query("DELETE FROM work WHERE id = $1")
         .bind(source_work)
@@ -5598,6 +5604,7 @@ pub(crate) async fn merge_works_on(
     // a crash in this window already leaves behind, so log it and carry on.
     Ok(MergeOutcome {
         moved_source_series: moved,
+        entry_map,
     })
 }
 
@@ -5740,6 +5747,8 @@ pub struct SplitOutcome {
     pub moved_sources: u64,
     /// Distinct readers whose progress follows the detached sources.
     pub progress_readers_moved: i64,
+    /// Chapter-list entries that followed the detached copies (W3a).
+    pub entry_map: Vec<work_chapter::EntryMove>,
 }
 
 /// Detach `source_series_ids` off `work_id` onto a NEW canonical work — the admin fix for
@@ -5937,6 +5946,9 @@ async fn split_source_series_attempt(
                 .rows_affected();
     }
     move_split_progress(&mut tx, work_id, &new_work_id, source_series_ids).await?;
+    let entry_map =
+        work_chapter::split_entries_on(&mut tx, work_id, &new_work_id, source_series_ids, true)
+            .await?;
     if moved as usize != detached.len() {
         // A concurrent merge/split moved a row out from under the read above. Roll back
         // rather than mint a half-populated work.
@@ -6046,6 +6058,7 @@ async fn split_source_series_attempt(
         title,
         moved_sources: moved,
         progress_readers_moved,
+        entry_map,
     })
 }
 
@@ -6179,6 +6192,9 @@ async fn reproject_work_caches_on(conn: &mut sqlx::PgConnection, work_id: &str) 
 /// One raw chapter row from any of a work's sources (S2 aggregation input).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct WorkChapterRow {
+    #[sqlx(skip)]
+    pub entry: Option<RowEntry>,
+    pub work_ready: bool,
     /// The chapter's number when it has one. `None` is an UNNUMBERED chapter (a oneshot,
     /// an `Extra`) — not chapter 0, which is a real and common first chapter. Callers must
     /// group on [`Self::key`] rather than inventing a number for these.
@@ -6231,6 +6247,18 @@ pub struct WorkChapterRow {
     /// "Volume ".
     #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub volume: Option<String>,
+}
+
+/// The work-list entry linked to one source copy.
+#[derive(Debug, Clone)]
+pub struct RowEntry {
+    pub id: String,
+    pub match_key: Option<String>,
+    /// 1-based position over every entry, including hidden and copy-less entries.
+    pub rank: i64,
+    pub special: bool,
+    pub hidden: bool,
+    pub title_override: Option<String>,
 }
 
 /// One reconciled Suwayomi mapping for a work (F1): the authoritative
@@ -6320,6 +6348,8 @@ async fn work_source_chapters_two_branch(
             let label = crate::chapter_label::chapter_display(Some(number), None, Some(&title));
             let chapter_id = id.to_string();
             rows.push(WorkChapterRow {
+                entry: None,
+                work_ready: false,
                 number: label.number(),
                 key: label.key(&chapter_id),
                 label: label.text(),
@@ -6369,6 +6399,8 @@ async fn work_source_chapters_two_branch(
         let label =
             crate::chapter_label::chapter_display(None, number.as_deref(), title.as_deref());
         rows.push(WorkChapterRow {
+            entry: None,
+            work_ready: false,
             number: label.number(),
             key: label.key(&external_id),
             label: label.text(),
@@ -6460,21 +6492,35 @@ pub async fn work_source_chapters(pool: &Database, work_id: &str) -> Result<Vec<
                                  ss.last_seen DESC NULLS LAST, ss.id ASC) AS rn \
                FROM source_series ss \
               WHERE ss.work_id = $1 AND ss.source_type = 'suwayomi' \
+         ), ranked AS ( \
+             SELECT id, row_number() OVER (ORDER BY sort_key, id) AS rank \
+               FROM work_chapter WHERE work_id = $1 \
          ) \
          SELECT c.number, c.title, a.source_id, c.external_id, c.chapter_key, c.label, \
                 'suwayomi' AS source_type, a.source_key, NULLIF(c.scanlator, '') AS scanlator, \
                 COALESCE(c.readable_at, c.published_at) AS released_at, \
-                c.external_url, NULLIF(TRIM(c.volume), '') AS volume \
+                c.external_url, NULLIF(TRIM(c.volume), '') AS volume, \
+                wc.id AS entry_id, wc.match_key, r.rank, \
+                wc.special, wc.hidden, wc.title_override, \
+                COALESCE((SELECT ready FROM work_chapter_state WHERE work_id = $1), false) AS work_ready \
            FROM authoritative a \
            JOIN chapter c ON c.source_series_id = a.ssid \
+           LEFT JOIN work_chapter_link l ON l.chapter_id = c.id \
+           LEFT JOIN work_chapter wc ON wc.id = l.work_chapter_id \
+           LEFT JOIN ranked r ON r.id = wc.id \
           WHERE a.rn = 1 \
          UNION ALL \
          SELECT c.number, c.title, COALESCE(ss.source_id, '') AS source_id, c.external_id, c.chapter_key, c.label, \
                 'mangadex' AS source_type, NULL, NULLIF(c.scanlator, ''), \
                 COALESCE(c.readable_at, c.published_at), c.external_url, \
-                NULLIF(TRIM(c.volume), '') \
+                NULLIF(TRIM(c.volume), ''), \
+                wc.id, wc.match_key, r.rank, wc.special, wc.hidden, wc.title_override, \
+                COALESCE((SELECT ready FROM work_chapter_state WHERE work_id = $1), false) \
            FROM source_series ss \
            JOIN chapter c ON c.source_series_id = ss.id \
+           LEFT JOIN work_chapter_link l ON l.chapter_id = c.id \
+           LEFT JOIN work_chapter wc ON wc.id = l.work_chapter_id \
+           LEFT JOIN ranked r ON r.id = wc.id \
           WHERE ss.work_id = $1 AND ss.source_type = 'mangadex' AND c.lang = 'en' \
           ORDER BY source_type DESC, source_id ASC NULLS FIRST",
     )
@@ -6501,6 +6547,15 @@ pub async fn work_source_chapters(pool: &Database, work_id: &str) -> Result<Vec<
                 r.title.as_deref(),
             );
             WorkChapterRow {
+                entry: r.entry_id.map(|id| RowEntry {
+                    id,
+                    match_key: r.match_key,
+                    rank: r.rank.expect("linked entry has a rank"),
+                    special: r.special.unwrap_or(false),
+                    hidden: r.hidden.unwrap_or(false),
+                    title_override: r.title_override,
+                }),
+                work_ready: r.work_ready,
                 number: derived.number(),
                 key: r.chapter_key.unwrap_or_else(|| derived.key(&r.external_id)),
                 label: r.label.unwrap_or_else(|| derived.text()),
@@ -6546,6 +6601,13 @@ struct SpineChapterRow {
     external_url: Option<String>,
     #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     volume: Option<String>,
+    entry_id: Option<String>,
+    match_key: Option<String>,
+    rank: Option<i64>,
+    special: Option<bool>,
+    hidden: Option<bool>,
+    title_override: Option<String>,
+    work_ready: bool,
 }
 
 /// The count of "main" chapters to display for a series: the number of DISTINCT
@@ -6773,6 +6835,9 @@ pub async fn upsert_chapter(
             .bind(crate::db_types::date(&now)?)
             .execute(&mut *tx)
             .await?;
+        // Link once (W3a): a no-op read when the copy already has its entry.
+        work_chapter::link_source_copies_on(&mut tx, source_series_id, Some(&ch.external_id))
+            .await?;
         tx.commit().await?;
         Ok(())
     })
@@ -6938,6 +7003,8 @@ pub(crate) async fn replace_source_chapters_on(
             .execute(&mut *conn)
             .await?;
     }
+    // Link new copies once (W3a). A vanished copy's link cascades below; its entry stays.
+    work_chapter::link_source_copies_on(conn, source_series_id, None).await?;
     for id in &vanished {
         sqlx::query("DELETE FROM chapter WHERE id = $1")
             .bind(id)

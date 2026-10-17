@@ -29,6 +29,7 @@ The canonical catalogue layer uses several related PostgreSQL tables defined in 
 - `source_series`: represents a concrete series on an upstream source, linked to `work.id` by foreign key. One canonical work can own multiple source mappings from different websites.
 - `chapter`: mirrored chapter records linked to `source_series.id`. Because chapters belong to the source mapping rather than the work, re-pointing a source mapping carries all its chapters automatically.
 - `work_field_pin`: records admin overrides for fields like author, artist, status, or year. Database triggers ensure upstream sync tasks cannot overwrite pinned values, saving incoming source data into `source_value` instead.
+- `work_chapter` and `work_chapter_link`: the work's own chapter list. Each entry is one chapter of the work, and each `chapter` row links to one entry. See "The work's chapter list" below.
 
 ## The matching steps in order
 
@@ -77,6 +78,23 @@ Pairs that cannot be decided automatically are stored in `merge_candidate` with 
 
 The background worker in `apps/server/src/maintenance.rs` rechecks waiting reviews 30 seconds after server startup, hourly, and after catalogue ingestion. If updated metadata provides conclusive evidence, the pair merges automatically as `confirmed`. If updated data proves the works are distinct, the review closes as `dismissed`. A dismissal is a machine verdict, so it allows future merges if new evidence arrives later.
 
+## The work's chapter list
+
+A work keeps one stored chapter list, defined in `apps/server/migrations_pg/0012_work_chapter.sql`. An entry (`work_chapter`) is one chapter of the work. A copy is one `chapter` row: the same chapter as one source carries it. Every copy links to one entry through `work_chapter_link`.
+
+The matcher in `apps/server/src/catalog/work_chapter.rs` links a copy once, when it is first written. It runs inside the same transaction as the chapter write, after the work and source locks that write already holds:
+
+- **A numbered copy** links to the entry whose `match_key` is its spine key, `round(number × 100)`. When there is no such entry, the matcher creates one. Its `sort_key` is the chapter number, so numbered entries keep numeric order. If the copy's title contains the word extra, extras, omake, special, bonus, or side story, the new entry is marked special.
+- **An unnumbered copy** gets its own special entry. Its `match_key` is `x:` plus the copy's stable identity at its source: the MangaDex chapter id, or the Suwayomi source id and chapter URL. The entry goes just after the entry released most recently before the copy. An undated copy goes after the last entry. Special entries sit between two hundredths, so a numbered chapter never takes their place.
+- **A link is never recomputed.** A refresh that renumbers, retitles or relabels a copy keeps its entry. A copy that vanishes loses its link, but its entry stays. When the copy comes back with the same `match_key`, it links to the same entry. Because the `x:` key of a Suwayomi copy uses the chapter URL and not the engine's numeric id, entries also survive a new engine generation.
+- **No new writes on unchanged scans.** The matcher reads only copies with no link. A scan that changes nothing does not reach it.
+
+Copies that existed before the list are linked by a background drain. It walks the works that are not ready, links their copies in small transactions and sets `work_chapter_state.ready` when no copy is left. A Suwayomi chapter without a number waits until the engine's keys for its series are filled in, so it gets its chapter URL as its identity. The drain is the only code that sets `ready`. A new work starts not ready, and the drain picks it up on its next walk. You can run the drain by hand with `komika-server work-chapters drain`, or see what is left with `komika-server work-chapters status`.
+
+When a work is ready, the server builds `aggregatedChapters` from the entries, in `sort_key` order. Until then it groups copies by number as before. Every chapter list carries the entry id and position of each copy (`entryId`, `entryOrder`) and applies the entry's hidden flag and title override. For a copy that is not linked yet, the list falls back to the override stored for its spine key in `chapter_override`. An administrator edits entries with `workChapterList` and `setWorkChapter` (see [GraphQL API](/developers/graphql)). The server writes a numbered entry's hidden flag and title to `chapter_override` too, so the fallback agrees.
+
+The library's chapter total of a ready work counts its visible entries that have at least one copy.
+
 ## Merge and split operations
 
 ### Merge operation
@@ -85,7 +103,7 @@ Merging two works uses a PostgreSQL transaction in `apps/server/src/catalog/mod.
 
 1. **Precondition check**: automated callers supply identity snapshots. The server verifies that the checked fields still match and aborts if they changed. Admin-requested merges omit this check.
 2. **Blocked check**: when snapshots are supplied, the server confirms the pair was not rejected or recorded in `work_split`.
-3. **Data folding**: alternative titles, external IDs, source mappings, chapters, library entries, and reading progress move to the surviving work.
+3. **Data folding**: alternative titles, external IDs, source mappings, chapters, library entries, and reading progress move to the surviving work. Chapter-list entries fold too: a losing entry whose `match_key` the survivor has joins the survivor's entry, and every other entry moves as it is. The survivor's hidden flag and title win; a losing entry's fill a survivor entry that has none. The survivor stays ready only if both works were.
 4. **Redirects**: the server writes the retired ID into `work_redirect` pointing to the survivor, collapsing any existing chains into single-hop lookups.
 5. **Deletion**: the losing work row is deleted.
 
@@ -96,14 +114,16 @@ When two series were merged by mistake, an administrator detaches source mapping
 1. **Source selection**: the administrator selects which `source_series` mappings to detach. The server refuses to detach all sources, as a work with zero sources vanishes from browse and search views.
 2. **New work creation**: the server mints a new canonical work (`w_...`) using metadata from the detached source mapping. It avoids copying parent identity fields to prevent immediate re-merges.
 3. **Moving chapters**: because chapters belong to `source_series_id`, updating `source_series.work_id` moves all chapters without touching individual chapter rows.
-4. **Progress and preserved records**: reading progress moves with the detached source mappings. The `canonical_progress` rows of the moved MangaDex chapters get the new work id, and Suwayomi progress already follows its mapping. A row whose chapter id also occurs in a mapping that stays keeps the original work id. Reviews, library entries and view counts stay on the original work. The split locks the affected users first and restarts if they change.
-5. **Split memory**: the server inserts the pair into `work_split` (`work_a` and `work_b`, ordered lexicographically).
+4. **Chapter-list entries**: an entry whose copies all move goes to the new work. An entry with copies on both sides stays, and the new work gets a new entry with the same key, place and flags for the moving copies. Phase F's `split_mismatched` follows the same rule, except that a moving copy joins the destination's entry with the same `match_key` when the destination already has one. A new work made by a split starts not ready, and the drain marks it ready.
+5. **Progress and preserved records**: reading progress moves with the detached source mappings. The `canonical_progress` rows of the moved MangaDex chapters get the new work id, and Suwayomi progress already follows its mapping. A row whose chapter id also occurs in a mapping that stays keeps the original work id. Reviews, library entries and view counts stay on the original work. The split locks the affected users first and restarts if they change.
+6. **Split memory**: the server inserts the pair into `work_split` (`work_a` and `work_b`, ordered lexicographically).
 
 `work_split` entries do not use foreign keys. They permanently survive work deletions so background consolidators never re-merge works an administrator split apart.
 
 ## Where to look
 
 - `apps/server/src/catalog/mod.rs`: database transactions for `merge_works_checked`, `split_source_series`, and alias indexes.
+- `apps/server/src/catalog/work_chapter.rs`: the work's chapter list: matcher, backfill drain, merge and split of entries, entry edits.
 - `apps/server/src/catalog/pair.rs`: pairwise assessment rules (`pair::assess`), score calculations, and verdict decisions.
 - `apps/server/src/catalog/normalize.rs`: title normalization, article stripping (`match_key`), edition checks, and novel mismatch guards.
 - `apps/server/src/catalog/similarity.rs`: text shingling, author name distance, and cover perceptual hash comparison.

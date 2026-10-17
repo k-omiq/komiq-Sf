@@ -3114,6 +3114,18 @@ async fn main() -> anyhow::Result<()> {
         covers.close().await;
         return result;
     }
+    // `komika-server work-chapters status|drain` — the chapter-list backfill (M9 W3a).
+    // `drain` applies pending migrations first, as the server does at start.
+    if argv.first().map(String::as_str) == Some("work-chapters") {
+        let pool = if argv.get(1).map(String::as_str) == Some("drain") {
+            db::init(&cfg.database_url).await?
+        } else {
+            db::connect_existing(&cfg.database_url).await?
+        };
+        let result = catalog::work_chapter::run_cli(&pool, &argv[1..]).await;
+        pool.close().await;
+        return result;
+    }
     if argv.first().map(String::as_str) == Some("phase-f") {
         let pool = db::connect_existing(&cfg.database_url).await?;
         let cover_pool = db::connect_existing_covers(&cfg.covers_database_url).await?;
@@ -3308,6 +3320,9 @@ async fn main() -> anyhow::Result<()> {
     // release ledger and the incremental feed are built on, not an opt-in feature — but
     // paced, staggered behind boot, and self-terminating once drained.
     catalog::spine::spawn(pool.clone(), shutdown_tx.subscribe());
+    // M9 W3a: link existing chapter copies to their works' chapter lists, paced and
+    // resumable; afterwards it picks up new works and works a merge left not ready.
+    catalog::work_chapter::spawn(pool.clone(), shutdown_tx.subscribe());
 
     // Direct-MangaDex catalogue sync — opt-in (CATALOGUE.md §5). Off unless
     // CATALOGUE_SYNC is set, so the default deployment never hits MangaDex. Recurring:

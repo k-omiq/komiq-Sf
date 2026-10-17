@@ -874,6 +874,15 @@ pub async fn split_mismatched(pool: &Database, apply: Apply) -> Result<StepRepor
             .bind(&r.source_series_id)
             .execute(&mut *tx)
             .await?;
+        // The row's chapter-list entries follow it, as in an admin split (W3a).
+        crate::catalog::work_chapter::split_entries_on(
+            &mut tx,
+            &r.work_id,
+            &target,
+            std::slice::from_ref(&r.source_series_id),
+            false,
+        )
+        .await?;
         // Move the release events this row was the ONLY source of. `INSERT OR IGNORE`
         // then delete: if the target already knows the chapter key, its own (possibly
         // earlier) first_seen_at wins, which is the ledger's rule everywhere else.
@@ -1102,12 +1111,22 @@ pub async fn delete_redundant(
                 anyhow::bail!("source changed under deletion proof — refusing to delete");
             }
             // UUID agreement alone cannot justify cascading a uniquely held chapter.
+            // Parity is by chapter-list entry (W3a): a linked copy needs a mirror copy
+            // linked to the SAME entry; only a copy not linked yet falls back to the
+            // spine key. A linked copy never passes on key equality alone.
             let unique: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM chapter c WHERE c.source_series_id = $1 AND \
-             (c.chapter_key IS NULL OR NOT EXISTS(SELECT 1 FROM chapter mirror \
-                JOIN source_series anchor ON anchor.id = mirror.source_series_id \
-                WHERE anchor.source_type = 'mangadex' AND anchor.work_id = $2 \
-                  AND anchor.source_key = $3 AND mirror.chapter_key = c.chapter_key)))",
+                "SELECT EXISTS(SELECT 1 FROM chapter c \
+                   LEFT JOIN work_chapter_link l ON l.chapter_id = c.id \
+                  WHERE c.source_series_id = $1 AND CASE \
+                    WHEN l.chapter_id IS NOT NULL THEN NOT EXISTS(SELECT 1 FROM chapter mirror \
+                      JOIN work_chapter_link ml ON ml.chapter_id = mirror.id \
+                      JOIN source_series anchor ON anchor.id = mirror.source_series_id \
+                      WHERE anchor.source_type = 'mangadex' AND anchor.work_id = $2 \
+                        AND anchor.source_key = $3 AND ml.work_chapter_id = l.work_chapter_id) \
+                    ELSE (c.chapter_key IS NULL OR NOT EXISTS(SELECT 1 FROM chapter mirror \
+                      JOIN source_series anchor ON anchor.id = mirror.source_series_id \
+                      WHERE anchor.source_type = 'mangadex' AND anchor.work_id = $2 \
+                        AND anchor.source_key = $3 AND mirror.chapter_key = c.chapter_key)) END)",
             )
             .bind(&current.source_series_id)
             .bind(&current.work_id)

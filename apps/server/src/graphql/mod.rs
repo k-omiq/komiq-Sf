@@ -2959,25 +2959,78 @@ fn apply_search_filters(
         .collect()
 }
 
-/// Group raw cross-source chapter rows (S2) into one `AggregatedChapter` per
-/// chapter number, collecting each source that provides it, ascending by number.
+/// Group source copies by work-list entry when ready, otherwise by legacy chapter key.
+/// Each aggregate keeps every copy and its earliest release date.
 /// Pure so the dedupe/ordering is unit-testable without a DB. A number is bucketed
 /// by `round(number*100)` so "10.5" ≠ "10" but float noise can't split a number.
 fn group_aggregated_chapters(rows: Vec<catalog::WorkChapterRow>) -> Vec<AggregatedChapter> {
+    group_aggregated_chapter_states(rows)
+        .into_iter()
+        .filter_map(AggregatedChapterState::visible)
+        .collect()
+}
+
+struct AggregatedChapterState {
+    chapter: AggregatedChapter,
+    source_title: Option<String>,
+    match_key: Option<String>,
+    hidden: bool,
+    title_override: Option<String>,
+}
+
+impl AggregatedChapterState {
+    fn visible(self) -> Option<AggregatedChapter> {
+        (!self.hidden).then_some(self.chapter)
+    }
+}
+
+fn entries_ready(rows: &[catalog::WorkChapterRow]) -> bool {
+    rows.iter().all(|r| r.work_ready && r.entry.is_some())
+}
+
+fn group_aggregated_chapter_states(
+    rows: Vec<catalog::WorkChapterRow>,
+) -> Vec<AggregatedChapterState> {
     use std::collections::BTreeMap;
-    // Ordered by (number, key) rather than by the numeric key alone, so UNNUMBERED
+    // Ready entries sort by exact per-work rank; the number slot is unused then.
+    // Legacy rows sort by (number, key), so UNNUMBERED
     // chapters (`x:<id>`, no number) sort together after the numbered ones instead of
     // interleaving arbitrarily — and, crucially, keep one row each rather than all
     // collapsing onto 0 the way a numeric-only key forced them to (F2).
-    let mut by_key: BTreeMap<(OrderedNumber, String), AggregatedChapter> = BTreeMap::new();
+    let ready = entries_ready(&rows);
+    let mut entry_overrides = HashMap::new();
+    let mut by_key: BTreeMap<(i64, OrderedNumber, String), AggregatedChapter> = BTreeMap::new();
     // Numbers whose `chapter_volume` came from a MangaDex copy, which no later copy may
     // replace. The query yields the Suwayomi half FIRST, so first-seen alone would let a
     // source's label beat the mirror's.
     let mut volume_from_mirror: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for r in rows {
-        let key = (OrderedNumber(r.number), r.key.clone());
+        let (key, entry_id, entry_order, special) = if ready {
+            let e = r.entry.as_ref().expect("ready rows have entries");
+            entry_overrides.insert(
+                e.id.clone(),
+                (e.hidden, e.title_override.clone(), e.match_key.clone()),
+            );
+            (
+                (e.rank, OrderedNumber(None), e.id.clone()),
+                Some(ID(e.id.clone())),
+                i32::try_from(e.rank).ok(),
+                Some(e.special),
+            )
+        } else {
+            (
+                (0, OrderedNumber(r.number), r.key.clone()),
+                None,
+                None,
+                None,
+            )
+        };
+        let group_id = key.2.clone();
         let entry = by_key.entry(key).or_insert_with(|| AggregatedChapter {
+            entry_id,
+            entry_order,
+            special,
             // 0.0 for an unnumbered chapter is a DISPLAY fallback for older clients only —
             // `label` is authoritative and says "Oneshot". Deliberately not a negative
             // sentinel: a client that renders it still shows something harmless.
@@ -3011,10 +3064,11 @@ fn group_aggregated_chapters(rows: Vec<catalog::WorkChapterRow>) -> Vec<Aggregat
         }
         if let Some(v) = r.volume.as_deref().filter(|v| !v.is_empty()) {
             let mirror = r.source_type == "mangadex";
-            if entry.chapter_volume.is_none() || (mirror && !volume_from_mirror.contains(&r.key)) {
+            if entry.chapter_volume.is_none() || (mirror && !volume_from_mirror.contains(&group_id))
+            {
                 entry.chapter_volume = Some(v.to_string());
                 if mirror {
-                    volume_from_mirror.insert(r.key.clone());
+                    volume_from_mirror.insert(group_id.clone());
                 }
             }
         }
@@ -3046,7 +3100,26 @@ fn group_aggregated_chapters(rows: Vec<catalog::WorkChapterRow>) -> Vec<Aggregat
                 .then_with(|| a.chapter_id.0.cmp(&b.chapter_id.0))
         });
     }
-    out
+    out.into_iter()
+        .map(|mut chapter| {
+            let source_title = chapter.title.clone();
+            let (hidden, title_override, match_key) = chapter
+                .entry_id
+                .as_ref()
+                .and_then(|id| entry_overrides.remove(&id.0))
+                .unwrap_or_default();
+            if let Some(title) = &title_override {
+                chapter.title = Some(title.clone());
+            }
+            AggregatedChapterState {
+                chapter,
+                source_title,
+                match_key,
+                hidden,
+                title_override,
+            }
+        })
+        .collect()
 }
 
 /// `Option<f64>` that can be a `BTreeMap` key: numbered chapters ascend, and unnumbered
@@ -3217,6 +3290,89 @@ async fn chapter_overrides(
     .into_iter()
     .map(|r| (r.chapter_key, (r.hidden != 0, r.title_override)))
     .collect()
+}
+
+fn aggregate_override_key(chapter: &AggregatedChapter) -> String {
+    if chapter.key.starts_with("x:") {
+        chapter.key.clone()
+    } else {
+        chapter_key(chapter.number)
+    }
+}
+
+/// Reader and admin aggregates share override state; only the reader drops hidden rows.
+async fn aggregated_chapters_with_overrides(
+    pool: &Database,
+    work_id: &str,
+    rows: Vec<catalog::WorkChapterRow>,
+    include_hidden: bool,
+) -> Vec<AggregatedChapterState> {
+    let ready = entries_ready(&rows);
+    if ready && !include_hidden {
+        return group_aggregated_chapters(rows)
+            .into_iter()
+            .map(|chapter| AggregatedChapterState {
+                source_title: chapter.title.clone(),
+                chapter,
+                match_key: None,
+                hidden: false,
+                title_override: None,
+            })
+            .collect();
+    }
+    let mut chapters = group_aggregated_chapter_states(rows);
+    if !ready {
+        let overrides = chapter_overrides(pool, work_id).await;
+        for state in &mut chapters {
+            let (hidden, title_override) = overrides
+                .get(&aggregate_override_key(&state.chapter))
+                .cloned()
+                .unwrap_or_default();
+            state.hidden = hidden;
+            state.title_override = title_override;
+            if let Some(title) = &state.title_override {
+                state.chapter.title = Some(title.clone());
+            }
+        }
+    }
+    if !include_hidden {
+        chapters.retain(|state| !state.hidden);
+    }
+    chapters
+}
+
+/// Entry overlays are best-effort enrichment, shared by every list in the bundle.
+async fn work_entries_or_default(
+    pool: &Database,
+    work_id: &str,
+) -> catalog::work_chapter::WorkEntries {
+    catalog::work_chapter::work_entries(pool, work_id)
+        .await
+        .unwrap_or_else(|error| {
+            let error = crate::db::observed_read_database_error(error);
+            tracing::warn!(error = %error, work_id, "work_entries query failed");
+            catalog::work_chapter::WorkEntries::default()
+        })
+}
+
+fn overlay_chapter(
+    mut chapter: Chapter,
+    entries: &catalog::work_chapter::WorkEntries,
+    source_type: &str,
+    spine_key: &str,
+) -> Option<Chapter> {
+    let overlay = entries.overlay(source_type, &chapter.id.0, spine_key);
+    if overlay.hidden {
+        return None;
+    }
+    chapter.entry_id = overlay.entry_id.map(ID);
+    chapter.entry_order = overlay
+        .entry_order
+        .and_then(|rank| i32::try_from(rank).ok());
+    if let Some(title) = overlay.title_override {
+        chapter.title = Some(title);
+    }
+    Some(chapter)
 }
 
 /// Resolve a catalog series id (numeric Suwayomi id or `w_` canonical id) to the
@@ -4058,6 +4214,8 @@ fn map_canonical_chapter(
         crate::chapter_label::chapter_display(None, c.number.as_deref(), c.title.as_deref());
     let (last_page_read, read) = progress.unwrap_or((0, false));
     Chapter {
+        entry_id: None,
+        entry_order: None,
         id: ID(c.external_id),
         series_id: ID(work_id.to_string()),
         number: label.number().unwrap_or(0.0),
@@ -5407,16 +5565,11 @@ impl SeriesPageBundle {
         let rows = catalog::work_source_chapters(&st.pool, &self.work_id.0)
             .await
             .map_err(gql_read_err)?;
-        let mut chapters = group_aggregated_chapters(rows);
-        let ov = chapter_overrides(&st.pool, &self.work_id.0).await;
-        if !ov.is_empty() {
-            chapters.retain(|c| !matches!(ov.get(&chapter_key(c.number)), Some((true, _))));
-            for c in &mut chapters {
-                if let Some((_, Some(t))) = ov.get(&chapter_key(c.number)) {
-                    c.title = Some(t.clone());
-                }
-            }
-        }
+        let chapters = aggregated_chapters_with_overrides(&st.pool, &self.work_id.0, rows, false)
+            .await
+            .into_iter()
+            .map(|state| state.chapter)
+            .collect();
         Ok(Some(chapters))
     }
 }
@@ -6053,15 +6206,16 @@ impl QueryRoot {
         // on — so the found date follows a chapter across a translator switch exactly the
         // way its read marker does.
         let found = announce_map_for_work(&st.pool, &work_id.0).await;
+        let entries = work_entries_or_default(&st.pool, &work_id.0).await;
         Ok(chapters
             .into_iter()
-            .map(|c| {
+            .filter_map(|c| {
                 let p = progress.get(&c.external_id).copied();
                 let key = canonical_chapter_key(&c);
                 let mut ch = map_canonical_chapter(&work_id.0, c, p);
                 ch.read = ch.read || read_keys.contains(&key);
                 ch.found_at = found.get(&key).cloned();
-                ch
+                overlay_chapter(ch, &entries, "mangadex", &key)
             })
             .collect())
     }
@@ -6091,19 +6245,12 @@ impl QueryRoot {
         let rows = catalog::work_source_chapters(&st.pool, &work_id.0)
             .await
             .map_err(gql_read_err)?;
-        // (the NSFW gate above uses the effective flag incl. admin override)
-        let mut chapters = group_aggregated_chapters(rows);
-        // Apply admin chapter overrides: drop soft-hidden chapters and apply renames
-        // (non-destructive — the underlying cached rows are untouched).
-        let ov = chapter_overrides(&st.pool, &work_id.0).await;
-        if !ov.is_empty() {
-            chapters.retain(|c| !matches!(ov.get(&chapter_key(c.number)), Some((true, _))));
-            for c in &mut chapters {
-                if let Some((_, Some(t))) = ov.get(&chapter_key(c.number)) {
-                    c.title = Some(t.clone());
-                }
-            }
-        }
+        let mut chapters: Vec<AggregatedChapter> =
+            aggregated_chapters_with_overrides(&st.pool, &work_id.0, rows, false)
+                .await
+                .into_iter()
+                .map(|state| state.chapter)
+                .collect();
         // Cross-source read state (F-switch): the aggregated list is the ONLY list the
         // series page renders once a work has several sources, and every row a translator
         // does not carry used to render unread by construction.
@@ -6146,20 +6293,12 @@ impl QueryRoot {
         let user = current_user(ctx).await?;
         let user_id = user.as_ref().map(|u| u.id.as_str());
 
-        // WORK-LEVEL ENRICHMENT, ONCE, FOR EVERY ARM BELOW.
-        //
-        // The row mappers (`map_canonical_chapter`, `map_chapter`) are pure projections
-        // that own no database, so the resolver has always been the thing that finishes a
-        // `Chapter`: `canonicalChapters` and `chapters` each do exactly these two lookups.
-        // This bundle replaced BOTH of them on the series page, so omitting them here does
-        // not degrade — it silently deletes a column ("Found —" on every row) and every
-        // read marker earned under a sibling source. Two queries per bundle, not per
-        // source, so the whole point of the single round trip survives.
-        //
-        // Both are keyed on the SPINE KEY, which is what makes one lookup serve every arm:
-        // the same chapter number carries the same key whichever source it came from.
+        // Share these work reads across the spine and every source: dates and read
+        // state use spine keys, while entry overlays also identify each source copy.
+        // Loading them per source would turn the bundle back into an N+1.
         let found = announce_map_for_work(&st.pool, &effective_id).await;
         let read_keys = work_read_keys(&st.pool, user_id, &effective_id).await;
+        let entries = work_entries_or_default(&st.pool, &effective_id).await;
 
         // Canonical spine — only when MangaDex-anchored. `load_canonical_chapters` is
         // loaded ONCE and feeds both the chapter list and the series' chapterCount
@@ -6174,13 +6313,13 @@ impl QueryRoot {
             let progress = canonical_progress_map(&st.pool, user_id, &effective_id).await;
             let mapped: Vec<Chapter> = chapters
                 .into_iter()
-                .map(|c| {
+                .filter_map(|c| {
                     let p = progress.get(&c.external_id).copied();
                     let key = canonical_chapter_key(&c);
                     let mut ch = map_canonical_chapter(&effective_id, c, p);
                     ch.read = ch.read || read_keys.contains(&key);
                     ch.found_at = found.get(&key).cloned();
-                    ch
+                    overlay_chapter(ch, &entries, "mangadex", &key)
                 })
                 .collect();
             let s = map_canonical_series(&st.pool, user_id, work, count).await?;
@@ -6262,7 +6401,7 @@ impl QueryRoot {
                             let progress = source_progress.remove(&n).unwrap_or_default();
                             chapters = list
                                 .into_iter()
-                                .map(|c| {
+                                .filter_map(|c| {
                                     let p = progress.get(&c.id).copied();
                                     // The key the spine stores for THIS row, from the very
                                     // input the spine writer binds — the same rule
@@ -6274,7 +6413,7 @@ impl QueryRoot {
                                     let mut ch = map_chapter(c, p);
                                     ch.read = ch.read || read_keys.contains(&key);
                                     ch.found_at = found.get(&key).cloned();
-                                    ch
+                                    overlay_chapter(ch, &entries, "suwayomi", &key)
                                 })
                                 .collect();
                         }
@@ -6433,25 +6572,41 @@ impl QueryRoot {
         let rows = catalog::work_source_chapters(&st.pool, &work_id.0)
             .await
             .map_err(gql_read_err)?;
-        let aggregated = group_aggregated_chapters(rows);
-        let ov = chapter_overrides(&st.pool, &work_id.0).await;
+        let aggregated = aggregated_chapters_with_overrides(&st.pool, &work_id.0, rows, true).await;
         Ok(aggregated
             .into_iter()
-            .map(|c| {
-                let key = chapter_key(c.number);
-                let (hidden, title_override) = ov.get(&key).cloned().unwrap_or((false, None));
-                let effective_title = title_override.clone().or_else(|| c.title.clone());
+            .map(|state| {
+                let c = state.chapter;
                 AdminChapter {
                     number: c.number,
-                    key,
-                    source_title: c.title,
-                    title_override,
-                    effective_title,
-                    hidden,
+                    key: state
+                        .match_key
+                        .unwrap_or_else(|| aggregate_override_key(&c)),
+                    source_title: state.source_title,
+                    title_override: state.title_override,
+                    effective_title: c.title,
+                    hidden: state.hidden,
                     source_count: c.sources.len() as i32,
                 }
             })
             .collect())
+    }
+
+    /// Admin: the work's chapter list, including hidden entries and entries without copies.
+    async fn work_chapter_list(&self, ctx: &Context<'_>, work_id: ID) -> Result<WorkChapterList> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let work = load_work_following_redirect(&st.pool, &work_id.0)
+            .await?
+            .ok_or_else(|| Error::new("No such work"))?;
+        let (ready, entries) = catalog::work_chapter::admin_entry_list(&st.pool, &work.work_id)
+            .await
+            .map_err(gql_read_err)?;
+        Ok(WorkChapterList {
+            work_id: ID(work.work_id),
+            ready,
+            entries: entries.into_iter().map(WorkChapterEntry::from).collect(),
+        })
     }
 
     /// Ordered page URLs for a mirrored MangaDex chapter, via MangaDex@Home
@@ -7422,9 +7577,13 @@ impl QueryRoot {
             Some(w) => announce_map_for_work(&st.pool, w).await,
             None => HashMap::new(),
         };
+        let entries = match &work {
+            Some(w) => work_entries_or_default(&st.pool, w).await,
+            None => catalog::work_chapter::WorkEntries::default(),
+        };
         Ok(list
             .into_iter()
-            .map(|c| {
+            .filter_map(|c| {
                 let p = progress.get(&c.id).copied();
                 // The key the spine stores for THIS row, from the very input the spine
                 // writer binds — no second labelling rule, no SQL `round(number * 100)`.
@@ -7432,7 +7591,7 @@ impl QueryRoot {
                 let mut ch = map_chapter(c, p);
                 ch.read = ch.read || read_keys.contains(&key);
                 ch.found_at = found.get(&key).cloned();
-                ch
+                overlay_chapter(ch, &entries, "suwayomi", &key)
             })
             .collect())
     }
@@ -7876,13 +8035,13 @@ impl QueryRoot {
         // progress row. The first branch matches `w_` works (all their sources), the
         // second numeric Suwayomi rows (that one source); the two id shapes are disjoint,
         // and the outer GROUP BY would fold them anyway.
-        let total_rows = crate::db_types::query_tuple::<(String, i64)>(
+        let total_rows = crate::db_types::query_tuple::<(String, i64, bool)>(
             "WITH library AS ( \
                SELECT ul.user_id, COALESCE(ss.work_id, ul.series_id) AS series_id \
                FROM user_library ul LEFT JOIN source_series ss \
                  ON ss.source_type = 'suwayomi' AND ss.source_key = ul.series_id \
                WHERE ul.user_id = $1 GROUP BY ul.user_id, COALESCE(ss.work_id, ul.series_id) \
-             ) SELECT lib_id, COUNT(DISTINCT ckey) FROM ( \
+             ), totals AS (SELECT lib_id, COUNT(DISTINCT ckey) AS total FROM ( \
                SELECT ul.series_id AS lib_id, c.chapter_key AS ckey \
                  FROM library ul \
                  JOIN source_series ss ON ss.work_id = ul.series_id \
@@ -7895,7 +8054,16 @@ impl QueryRoot {
                       AND ss.source_key = ul.series_id \
                  JOIN chapter c ON c.source_series_id = ss.id \
                 WHERE ul.user_id = $1 \
-             ) GROUP BY lib_id",
+             ) GROUP BY lib_id) \
+             SELECT ul.series_id, \
+                    CASE WHEN COALESCE(wcs.ready, false) THEN \
+                        (SELECT COUNT(*) FROM work_chapter wc \
+                          WHERE wc.work_id = ul.series_id AND NOT wc.hidden \
+                            AND EXISTS (SELECT 1 FROM work_chapter_link l WHERE l.work_chapter_id = wc.id)) \
+                    ELSE COALESCE(t.total, 0) END, COALESCE(wcs.ready, false) \
+               FROM library ul \
+               LEFT JOIN totals t ON t.lib_id = ul.series_id \
+               LEFT JOIN work_chapter_state wcs ON wcs.work_id = ul.series_id",
         )
         .bind(crate::db_types::uuid(&user.id)?)
         .fetch_all(&st.pool)
@@ -7964,15 +8132,23 @@ impl QueryRoot {
             e.read = read as i32;
             e.last_read_at = last_read_at;
         }
-        for (id, total) in total_rows {
+        let mut ready_totals = std::collections::HashSet::new();
+        for (id, total, ready) in total_rows {
+            if ready {
+                ready_totals.insert(id.clone());
+            }
             entry(&mut by_id, id).total = total as i32;
         }
         for (id, read, total) in fallback {
+            let ready = ready_totals.contains(&id);
             let e = entry(&mut by_id, id);
-            if e.total == 0 {
+            if e.total == 0 && !ready {
                 e.read = read as i32;
                 e.total = total as i32;
             }
+        }
+        for progress in by_id.values_mut() {
+            progress.read = progress.read.min(progress.total);
         }
         Ok(by_id.into_values().collect())
     }
@@ -11654,13 +11830,31 @@ async fn set_chapter_override_once(
     }
     // Read-modify-write under ONE transaction so two concurrent partial edits (one
     // toggling `hidden`, one renaming) can't clobber each other's field.
-    let existing = crate::db_types::query_tuple::<(i64, Option<String>)>(
+    let mut existing = crate::db_types::query_tuple::<(i64, Option<String>)>(
         "SELECT hidden, title_override FROM chapter_override WHERE work_id = $1 AND chapter_key = $2",
     )
     .bind(&input.work_id.0)
     .bind(&input.chapter_key)
     .fetch_optional(&mut *tx)
     .await?;
+    if existing.is_none() {
+        // Special entries are not dual-written. Seed a first legacy partial edit
+        // from the entry it will update, preferring the match key over a copy alias.
+        existing = crate::db_types::query_tuple::<(i64, Option<String>)>(
+            "SELECT wc.hidden, wc.title_override FROM work_chapter wc \
+              WHERE wc.work_id = $1 AND (wc.match_key = $2 OR EXISTS ( \
+                    SELECT 1 FROM work_chapter_link l \
+                    JOIN chapter c ON c.id = l.chapter_id \
+                    JOIN source_series ss ON ss.id = c.source_series_id \
+                     WHERE l.work_chapter_id = wc.id AND ss.work_id = $1 AND c.chapter_key = $2 \
+                       AND (wc.match_key LIKE 'x:%') = ($2 LIKE 'x:%'))) \
+              ORDER BY (wc.match_key = $2) DESC, wc.id LIMIT 1",
+        )
+        .bind(&input.work_id.0)
+        .bind(&input.chapter_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+    }
     let (mut hidden, mut title) = existing.map(|(h, t)| (h != 0, t)).unwrap_or((false, None));
     match &input.hidden {
         Undefined => {}
@@ -11682,6 +11876,12 @@ async fn set_chapter_override_once(
             .bind(&input.chapter_key)
             .execute(&mut *tx)
             .await?;
+        catalog::work_chapter::sync_entry_from_override_on(
+            &mut tx,
+            &input.work_id.0,
+            &input.chapter_key,
+        )
+        .await?;
         tx.commit().await?;
         return Ok(true);
     }
@@ -11701,8 +11901,41 @@ async fn set_chapter_override_once(
     .bind(crate::db_types::date(&now)?)
     .execute(&mut *tx)
     .await?;
+    catalog::work_chapter::sync_entry_from_override_on(
+        &mut tx,
+        &input.work_id.0,
+        &input.chapter_key,
+    )
+    .await?;
     tx.commit().await?;
     Ok(true)
+}
+
+async fn set_work_chapter_once(
+    pool: &Database,
+    entry_id: &str,
+    edit: &catalog::work_chapter::EntryEdit,
+) -> anyhow::Result<String> {
+    let work = catalog::work_chapter::entry_work(pool, entry_id)
+        .await?
+        .ok_or(MutationValidation("No such chapter entry"))?;
+    let mut tx = pool.begin().await?;
+    crate::locks::lock_works(&mut tx, &[&work]).await?;
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT work_id FROM work_chapter WHERE id = $1")
+            .bind(entry_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match current {
+        None => return Err(MutationValidation("No such chapter entry").into()),
+        Some(current) if current != work => return Err(crate::locks::RestartTransaction.into()),
+        _ => {}
+    }
+    if !catalog::work_chapter::edit_entry_on(&mut tx, &work, entry_id, edit).await? {
+        return Err(MutationValidation("No such chapter entry").into());
+    }
+    tx.commit().await?;
+    Ok(work)
 }
 
 // ---- Mutation --------------------------------------------------------------
@@ -13533,6 +13766,48 @@ impl MutationRoot {
         crate::db::retry_transaction(|| set_chapter_override_once(&st.pool, &input))
             .await
             .map_err(mutation_write_error)
+    }
+
+    /// Admin: edit the visibility, title, special status or position of a chapter-list entry.
+    async fn set_work_chapter(
+        &self,
+        ctx: &Context<'_>,
+        entry_id: ID,
+        hidden: Option<bool>,
+        title_override: Option<String>,
+        clear_title: Option<bool>,
+        special: Option<bool>,
+        sort_key: Option<f64>,
+    ) -> Result<WorkChapterEntry> {
+        require_admin(ctx).await?;
+        if sort_key.is_some_and(|key| !key.is_finite() || !(-1e6..=1e6).contains(&key)) {
+            return Err(Error::new(
+                "sortKey must be finite and within -1000000..1000000",
+            ));
+        }
+        let st = state(ctx);
+        let edit = catalog::work_chapter::EntryEdit {
+            hidden,
+            title_override: if clear_title == Some(true) {
+                Some(None)
+            } else {
+                title_override.map(Some)
+            },
+            special,
+            sort_key: sort_key.map(|key| key.to_string()),
+        };
+        let work =
+            crate::db::retry_transaction(|| set_work_chapter_once(&st.pool, &entry_id.0, &edit))
+                .await
+                .map_err(mutation_write_error)?;
+        let (_, entries) = catalog::work_chapter::admin_entry_list(&st.pool, &work)
+            .await
+            .map_err(gql_read_err)?;
+        entries
+            .into_iter()
+            .find(|entry| entry.id == entry_id.0)
+            .map(WorkChapterEntry::from)
+            .ok_or_else(|| Error::new("No such chapter entry"))
     }
 
     /// Admin moderation: suspend or restore a user account. A banned user can't
@@ -25434,6 +25709,993 @@ mod tests {
     /// from `canonicalSeries` + `canonicalChapters` + `workSources` + a per-source
     /// `chapters`/`series` N+1: the canonical series, the spine chapters, every
     /// source mapping WITH its chapters and metadata, and (opt-in) the aggregation.
+    async fn seed_work_chapter_graphql_fixture(pool: &Database) -> String {
+        let mid = "97c5fbec-51a4-4f97-a2c6-1654af21e182";
+        let work = catalog::upsert_work_from_mangadex(
+            pool,
+            mid,
+            &catalog::WorkInput {
+                primary_title: Some("Work Chapter Fixture".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ssid = catalog::find_source_series_id(pool, "mangadex", "mangadex", mid)
+            .await
+            .unwrap()
+            .unwrap();
+        for (id, number, title, day) in [
+            ("entry-zero", Some("0"), "Prologue", "01"),
+            ("entry-one", Some("1"), "First", "02"),
+            ("entry-two", Some("2"), "Second", "04"),
+            ("entry-three", Some("3"), "Third", "05"),
+            ("entry-extra", None, "Oneshot", "03"),
+        ] {
+            catalog::upsert_chapter(
+                pool,
+                &ssid,
+                &catalog::ChapterInput {
+                    external_id: id.into(),
+                    number: number.map(Into::into),
+                    title: Some(title.into()),
+                    lang: Some("en".into()),
+                    volume: number.map(|_| "1".into()),
+                    readable_at: Some(format!("2026-01-{day}T00:00:00Z")),
+                    scanlator: Some("Fixture Group".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO suwayomi_series (id, title, status, source_id, chapter_count, updated_at, last_fetched_at) \
+             VALUES (779, 'Entry Source', 'ONGOING', 'm9-source', 4, now(), now())",
+        ).execute(pool).await.unwrap();
+        catalog::upsert_source_series(pool, &work, "suwayomi", "m9-source", "779", None, false)
+            .await
+            .unwrap();
+        let chapters: Vec<SuwayomiChapter> = (0..4)
+            .map(|number| SuwayomiChapter {
+                engine_generation: None,
+                manga: None,
+                url: None,
+                real_url: None,
+                source_order: None,
+                id: 9200 + number,
+                manga_id: 779,
+                name: format!("Ch {number}"),
+                chapter_number: number as f64,
+                scanlator: Some("Source Group".into()),
+                upload_date: None,
+                is_read: false,
+                is_bookmarked: false,
+                is_downloaded: false,
+                last_page_read: 0,
+                page_count: 20,
+            })
+            .collect();
+        crate::series_cache::put_chapters(pool, 779, &chapters)
+            .await
+            .unwrap();
+        work
+    }
+
+    async fn drain_work_chapter_fixture(pool: &Database) {
+        for _ in 0..20 {
+            let (outcome, _) = catalog::work_chapter::drain_once(pool, None).await.unwrap();
+            if outcome.works_visited == 0 {
+                return;
+            }
+        }
+        panic!("work chapter drain did not finish");
+    }
+
+    async fn fixture_entry_id(pool: &Database, work: &str, key: &str) -> String {
+        sqlx::query_scalar("SELECT id FROM work_chapter WHERE work_id = $1 AND match_key = $2")
+            .bind(work)
+            .bind(key)
+            .fetch_one(pool.read())
+            .await
+            .unwrap()
+    }
+
+    async fn work_chapter_gql(schema: &ApiSchema, query: &str) -> serde_json::Value {
+        let response = exec(schema, query, Some("admintok"), "1.1.1.1").await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        response.data.into_json().unwrap()
+    }
+
+    #[tokio::test]
+    async fn ready_work_aggregated_chapters_use_entries_and_entry_order() {
+        let (schema, pool) = setup_full(100).await;
+        let work = seed_work_chapter_graphql_fixture(&pool).await;
+        drain_work_chapter_fixture(&pool).await;
+        let first = fixture_entry_id(&pool, &work, "100").await;
+        let second = fixture_entry_id(&pool, &work, "200").await;
+        let extra = fixture_entry_id(&pool, &work, "x:entry-extra").await;
+        let hidden = fixture_entry_id(&pool, &work, "300").await;
+        for (entry, edit) in [
+            (&first, r#"sortKey: 20, titleOverride: "Renamed first""#),
+            (&second, "sortKey: 10"),
+            (&extra, "sortKey: 15, special: true"),
+            (&hidden, "hidden: true"),
+        ] {
+            work_chapter_gql(
+                &schema,
+                &format!(r#"mutation {{ setWorkChapter(entryId: "{entry}", {edit}) {{ id }} }}"#),
+            )
+            .await;
+        }
+        // A stale legacy override must neither rename nor hide a ready entry.
+        sqlx::query("INSERT INTO chapter_override (work_id, chapter_key, hidden, title_override, updated_at) VALUES ($1, '200', true, 'Stale', now())")
+            .bind(&work).execute(&pool).await.unwrap();
+        let before = pool.statements_sent();
+        let rows = catalog::work_source_chapters(&pool, &work).await.unwrap();
+        assert_eq!(
+            pool.statements_sent() - before,
+            1,
+            "entry data rides on the spine statement"
+        );
+        let before = pool.statements_sent();
+        let grouped = aggregated_chapters_with_overrides(&pool, &work, rows, false).await;
+        assert_eq!(
+            pool.statements_sent(),
+            before,
+            "ready aggregation needs no override statement"
+        );
+        assert_eq!(grouped.len(), 4);
+        let data = work_chapter_gql(&schema, &format!(r#"{{
+            aggregatedChapters(workId: "{work}") {{ number key title entryId entryOrder special chapterVolume firstReleasedAt sources {{ chapterId }} }}
+            seriesPage(workId: "{work}") {{ aggregated {{ number key title entryId entryOrder special chapterVolume firstReleasedAt sources {{ chapterId }} }} }}
+        }}"#)).await;
+        let chapters = data["aggregatedChapters"].as_array().unwrap();
+        assert_eq!(
+            chapters
+                .iter()
+                .map(|c| c["number"].as_f64().unwrap())
+                .collect::<Vec<_>>(),
+            [0.0, 2.0, 0.0, 1.0]
+        );
+        assert_eq!(
+            chapters
+                .iter()
+                .map(|c| c["entryOrder"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 3, 4, 5],
+            "hidden entries still occupy a position"
+        );
+        assert_eq!(chapters[1]["entryId"], second);
+        assert_eq!(chapters[2]["entryId"], extra);
+        assert_eq!(chapters[2]["special"], true);
+        assert_eq!(chapters[3]["entryId"], first);
+        assert_eq!(chapters[3]["special"], false);
+        assert_eq!(chapters[3]["title"], "Renamed first");
+        assert_eq!(chapters[3]["sources"].as_array().unwrap().len(), 2);
+        assert_eq!(chapters[3]["chapterVolume"], "1");
+        assert_eq!(
+            chapters[3]["firstReleasedAt"],
+            "2026-01-02T00:00:00.000000+00:00"
+        );
+        assert_eq!(data["seriesPage"]["aggregated"], data["aggregatedChapters"]);
+        assert!(chapters.iter().all(|c| c["entryId"] != hidden));
+    }
+
+    #[tokio::test]
+    async fn dense_special_midpoints_keep_exact_ranks_in_every_chapter_list() {
+        let (schema, pool) = setup_full(100).await;
+        let work = seed_work_chapter_graphql_fixture(&pool).await;
+        let ss = catalog::find_source_series_by_key(
+            &pool,
+            "mangadex",
+            "97c5fbec-51a4-4f97-a2c6-1654af21e182",
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+        for i in 1..=60 {
+            catalog::upsert_chapter(
+                &pool,
+                &ss,
+                &catalog::ChapterInput {
+                    external_id: format!("dense-{i}"),
+                    title: Some("Appendix".into()),
+                    lang: Some("en".into()),
+                    readable_at: Some(format!("2026-01-03T00:{:02}:{:02}Z", i / 60, i % 60)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO work_chapter (id, work_id, sort_key, created_at) VALUES ('wc_empty_b', $1, 1.001, now()), ('wc_empty_a', $1, 1.001, now())")
+            .bind(&work).execute(&pool).await.unwrap();
+        sqlx::query(
+            "UPDATE work_chapter SET hidden = true WHERE work_id = $1 AND match_key = 'x:dense-20'",
+        )
+        .bind(&work)
+        .execute(&pool)
+        .await
+        .unwrap();
+        drain_work_chapter_fixture(&pool).await;
+        let (_, all) = catalog::work_chapter::admin_entry_list(&pool, &work)
+            .await
+            .unwrap();
+        assert_eq!(
+            (all[2].id.as_str(), all[3].id.as_str()),
+            ("wc_empty_a", "wc_empty_b")
+        );
+        assert!(all.windows(2).any(|w| w[0].sort_key == w[1].sort_key && w[0].sort_key_text != w[1].sort_key_text),
+            "fixture must include distinct numeric midpoints that collapse as floats");
+        let before = pool.statements_sent();
+        let overlays = catalog::work_chapter::work_entries(&pool, &work)
+            .await
+            .unwrap();
+        assert_eq!(pool.statements_sent() - before, 1);
+        let before = pool.statements_sent();
+        let rows = catalog::work_source_chapters(&pool, &work).await.unwrap();
+        assert_eq!(pool.statements_sent() - before, 1);
+        for row in rows {
+            let e = row.entry.unwrap();
+            let rank = all.iter().position(|entry| entry.id == e.id).unwrap() as i64 + 1;
+            assert_eq!(e.rank, rank);
+            assert_eq!(
+                overlays
+                    .overlay(&row.source_type, &row.chapter_id, &row.key)
+                    .entry_order,
+                Some(rank)
+            );
+        }
+        let data = work_chapter_gql(
+            &schema,
+            &format!(
+                r#"{{
+            aggregatedChapters(workId: "{work}") {{ entryId entryOrder }}
+            canonicalChapters(workId: "{work}") {{ entryId entryOrder }}
+        }}"#
+            ),
+        )
+        .await;
+        let expected: Vec<_> = all
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.hidden && !e.copies.is_empty())
+            .map(|(i, e)| serde_json::json!({"entryId": e.id, "entryOrder": i + 1}))
+            .collect();
+        assert_eq!(data["aggregatedChapters"], serde_json::json!(expected));
+        let mut copies = data["canonicalChapters"].as_array().unwrap().clone();
+        copies.sort_by_key(|c| c["entryOrder"].as_i64().unwrap());
+        assert_eq!(copies, expected);
+        let dense: Vec<_> = all
+            .iter()
+            .filter_map(|e| e.match_key.as_deref())
+            .filter(|key| key.starts_with("x:dense-"))
+            .collect();
+        assert_eq!(
+            dense,
+            (1..=60).map(|i| format!("x:dense-{i}")).collect::<Vec<_>>()
+        );
+        let sdl = schema.sdl();
+        for name in ["Chapter", "AggregatedChapter"] {
+            let fields = sdl
+                .split(&format!("type {name} {{"))
+                .nth(1)
+                .unwrap()
+                .split('}')
+                .next()
+                .unwrap();
+            assert!(
+                fields.lines().any(|line| line.trim() == "entryOrder: Int"),
+                "{fields}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn entry_overlay_failure_keeps_series_page_and_both_chapter_resolvers_available() {
+        let (schema, pool) = setup_full(100).await;
+        let work = seed_work_chapter_graphql_fixture(&pool).await;
+        // Break only the overlay statement; all base chapter/cache reads still work.
+        sqlx::query("ALTER TABLE work_chapter_link RENAME TO unavailable_work_chapter_link")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(catalog::work_chapter::work_entries(&pool, &work)
+            .await
+            .is_err());
+        let data = work_chapter_gql(
+            &schema,
+            &format!(
+                r#"{{
+            seriesPage(workId: "{work}") {{
+                spineChapters {{ id entryId entryOrder }}
+                sources {{ source {{ sourceType }} chapters {{ id entryId entryOrder }} }}
+            }}
+            canonicalChapters(workId: "{work}") {{ id entryId entryOrder }}
+            chapters(seriesId: "779") {{ id entryId entryOrder }}
+        }}"#
+            ),
+        )
+        .await;
+        let page = &data["seriesPage"];
+        assert_eq!(page["spineChapters"], data["canonicalChapters"]);
+        let source = page["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["source"]["sourceType"] == "suwayomi")
+            .unwrap();
+        assert_eq!(source["chapters"], data["chapters"]);
+        for (list, count) in [(&data["canonicalChapters"], 5), (&data["chapters"], 4)] {
+            let chapters = list.as_array().unwrap();
+            assert_eq!(chapters.len(), count);
+            assert!(chapters
+                .iter()
+                .all(|c| c["entryId"].is_null() && c["entryOrder"].is_null()));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_special_override_keys_sync_entries_and_admin_returns_the_match_key() {
+        let (schema, pool) = setup_full(100).await;
+        let work = seed_work_chapter_graphql_fixture(&pool).await;
+        let ss = catalog::find_source_series_by_key(&pool, "suwayomi", "779")
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        catalog::upsert_chapter(
+            &pool,
+            &ss,
+            &catalog::ChapterInput {
+                external_id: "9299".into(),
+                title: Some("Appendix".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let special = fixture_entry_id(&pool, &work, "x:m9-source:#9299").await;
+        let native = "x:m9-source:/chapter/appendix";
+        sqlx::query("UPDATE work_chapter SET match_key = $1 WHERE id = $2")
+            .bind(native)
+            .bind(&special)
+            .execute(&pool)
+            .await
+            .unwrap();
+        drain_work_chapter_fixture(&pool).await;
+        work_chapter_gql(
+            &schema,
+            &format!(
+                r#"mutation {{ setChapterOverride(input: {{
+            workId: "{work}", chapterKey: "0", hidden: true, title: "Only zero"
+        }}) }}"#
+            ),
+        )
+        .await;
+        let before: (bool, Option<String>) =
+            sqlx::query_as("SELECT hidden, title_override FROM work_chapter WHERE id = $1")
+                .bind(&special)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            before,
+            (false, None),
+            "key 0 must not reach an unnumbered linked copy"
+        );
+        for key in ["x:9299", native] {
+            work_chapter_gql(
+                &schema,
+                &format!(
+                    r#"mutation {{ setChapterOverride(input: {{
+                workId: "{work}", chapterKey: "{key}", hidden: true, title: "Edited appendix"
+            }}) }}"#
+                ),
+            )
+            .await;
+            let data = work_chapter_gql(
+                &schema,
+                &format!(
+                    r#"{{ workChaptersAdmin(workId: "{work}") {{
+                key hidden titleOverride
+            }} }}"#
+                ),
+            )
+            .await;
+            let admin = data["workChaptersAdmin"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["key"] == native)
+                .unwrap();
+            assert_eq!(admin["hidden"], true);
+            assert_eq!(admin["titleOverride"], "Edited appendix");
+            work_chapter_gql(
+                &schema,
+                &format!(
+                    r#"mutation {{ setChapterOverride(input: {{
+                workId: "{work}", chapterKey: "{key}", hidden: false, title: null
+            }}) }}"#
+                ),
+            )
+            .await;
+            let row: (bool, Option<String>) =
+                sqlx::query_as("SELECT hidden, title_override FROM work_chapter WHERE id = $1")
+                    .bind(&special)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(row, (false, None));
+        }
+        sqlx::query("UPDATE work_chapter SET match_key = NULL WHERE id = $1")
+            .bind(&special)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let data = work_chapter_gql(
+            &schema,
+            &format!(r#"{{ workChaptersAdmin(workId: "{work}") {{ key }} }}"#),
+        )
+        .await;
+        assert!(data["workChaptersAdmin"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["key"] == "x:9299"));
+    }
+
+    #[tokio::test]
+    async fn not_ready_work_aggregated_chapters_match_legacy_grouping() {
+        let (schema, pool) = setup_full(100).await;
+        let work = seed_work_chapter_graphql_fixture(&pool).await;
+        sqlx::query("UPDATE work_chapter SET hidden = true, title_override = 'Entry only', sort_key = -sort_key WHERE work_id = $1")
+            .bind(&work).execute(&pool).await.unwrap();
+        let mut rows = catalog::work_source_chapters(&pool, &work).await.unwrap();
+        assert!(rows.iter().all(|row| !row.work_ready));
+        for row in &mut rows {
+            row.entry = None;
+        }
+        let legacy = group_aggregated_chapters(rows);
+        let expected = serde_json::Value::Array(legacy.into_iter().map(|c| serde_json::json!({
+            "number": c.number, "label": c.label, "key": c.key, "title": c.title,
+            "entryId": null, "special": null, "chapterVolume": c.chapter_volume,
+            "firstReleasedAt": c.first_released_at,
+            "sources": c.sources.into_iter().map(|s| serde_json::json!({"chapterId": s.chapter_id.0})).collect::<Vec<_>>()
+        })).collect());
+        let data = work_chapter_gql(&schema, &format!(r#"{{ aggregatedChapters(workId: "{work}") {{
+            number label key title entryId special chapterVolume firstReleasedAt sources {{ chapterId }}
+        }} }}"#)).await;
+        assert_eq!(data["aggregatedChapters"], expected);
+
+        // Even a ready flag cannot switch a partially linked set away from legacy grouping.
+        drain_work_chapter_fixture(&pool).await;
+        sqlx::query("DELETE FROM work_chapter_link WHERE chapter_id IN (SELECT id FROM chapter WHERE external_id = 'entry-one')")
+            .execute(&pool).await.unwrap();
+        let data = work_chapter_gql(&schema, &format!(r#"{{ aggregatedChapters(workId: "{work}") {{
+            number label key title entryId special chapterVolume firstReleasedAt sources {{ chapterId }}
+        }} }}"#)).await;
+        assert_eq!(data["aggregatedChapters"], expected);
+    }
+
+    #[tokio::test]
+    async fn work_chapter_overrides_apply_to_every_chapter_list() {
+        let (schema, pool) = setup_full(100).await;
+        let work = seed_work_chapter_graphql_fixture(&pool).await;
+        drain_work_chapter_fixture(&pool).await;
+        let renamed = fixture_entry_id(&pool, &work, "100").await;
+        let hidden = fixture_entry_id(&pool, &work, "200").await;
+        work_chapter_gql(&schema, &format!(r#"mutation {{
+            rename: setWorkChapter(entryId: "{renamed}", titleOverride: "Shared title", sortKey: 1.25) {{ id }}
+            hide: setWorkChapter(entryId: "{hidden}", hidden: true) {{ id }}
+        }}"#)).await;
+        let data = work_chapter_gql(&schema, &format!(r#"{{
+            seriesPage(workId: "{work}") {{
+                spineChapters {{ id number title entryId entryOrder }}
+                sources {{ source {{ sourceType }} chapters {{ id number title entryId entryOrder }} }}
+                aggregated {{ number title entryId special }}
+            }}
+            canonicalChapters(workId: "{work}") {{ id number title entryId entryOrder }}
+            chapters(seriesId: "779") {{ id number title entryId entryOrder }}
+            aggregatedChapters(workId: "{work}") {{ number title entryId special }}
+        }}"#)).await;
+        let page = &data["seriesPage"];
+        let source = page["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["source"]["sourceType"] == "suwayomi")
+            .unwrap();
+        for list in [
+            &page["spineChapters"],
+            &source["chapters"],
+            &data["canonicalChapters"],
+            &data["chapters"],
+        ] {
+            let chapters = list.as_array().unwrap();
+            assert!(!chapters.is_empty());
+            assert!(chapters
+                .iter()
+                .all(|c| c["entryId"].is_string() && c["entryOrder"].is_number()));
+            assert!(!chapters.iter().any(|c| c["number"] == 2.0));
+            let first = chapters.iter().find(|c| c["number"] == 1.0).unwrap();
+            assert_eq!(first["title"], "Shared title");
+            assert_eq!(first["entryId"], renamed);
+            assert_eq!(first["entryOrder"], 3);
+        }
+        for list in [&page["aggregated"], &data["aggregatedChapters"]] {
+            let chapters = list.as_array().unwrap();
+            assert!(!chapters.iter().any(|c| c["number"] == 2.0));
+            let first = chapters.iter().find(|c| c["number"] == 1.0).unwrap();
+            assert_eq!(first["title"], "Shared title");
+            assert_eq!(first["entryId"], renamed);
+        }
+    }
+
+    #[tokio::test]
+    async fn chapter_zero_override_never_hides_unnumbered_chapters() {
+        let (schema, pool) = setup_full(100).await;
+        let work = seed_work_chapter_graphql_fixture(&pool).await;
+        work_chapter_gql(
+            &schema,
+            &format!(
+                r#"mutation {{ setChapterOverride(input: {{
+            workId: "{work}", chapterKey: "0", hidden: true
+        }}) }}"#
+            ),
+        )
+        .await;
+        for ready in [false, true] {
+            if ready {
+                drain_work_chapter_fixture(&pool).await;
+            }
+            let data = work_chapter_gql(&schema, &format!(r#"{{
+                aggregatedChapters(workId: "{work}") {{ key entryId title }}
+                workChaptersAdmin(workId: "{work}") {{ key hidden sourceTitle titleOverride effectiveTitle }}
+            }}"#)).await;
+            let chapters = data["aggregatedChapters"].as_array().unwrap();
+            assert!(!chapters.iter().any(|c| c["key"] == "0"));
+            let extra = chapters
+                .iter()
+                .find(|c| c["key"] == "x:entry-extra")
+                .unwrap();
+            assert_eq!(extra["entryId"].is_string(), ready);
+            let admin = data["workChaptersAdmin"].as_array().unwrap();
+            assert_eq!(
+                admin.iter().find(|c| c["key"] == "0").unwrap()["hidden"],
+                true
+            );
+            assert_eq!(
+                admin.iter().find(|c| c["key"] == "x:entry-extra").unwrap()["hidden"],
+                false
+            );
+        }
+        // Legacy unnumbered overrides use their own x: key too.
+        sqlx::query("UPDATE work_chapter_state SET ready = false WHERE work_id = $1")
+            .bind(&work)
+            .execute(&pool)
+            .await
+            .unwrap();
+        work_chapter_gql(
+            &schema,
+            &format!(
+                r#"mutation {{ setChapterOverride(input: {{
+            workId: "{work}", chapterKey: "x:entry-extra", title: "Legacy extra"
+        }}) }}"#
+            ),
+        )
+        .await;
+        let data = work_chapter_gql(
+            &schema,
+            &format!(
+                r#"{{
+            aggregatedChapters(workId: "{work}") {{ key title }}
+            workChaptersAdmin(workId: "{work}") {{ key titleOverride effectiveTitle }}
+        }}"#
+            ),
+        )
+        .await;
+        let extra = data["aggregatedChapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["key"] == "x:entry-extra")
+            .unwrap();
+        assert_eq!(extra["title"], "Legacy extra");
+        let extra = data["workChaptersAdmin"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["key"] == "x:entry-extra")
+            .unwrap();
+        assert_eq!(extra["titleOverride"], "Legacy extra");
+        assert_eq!(extra["effectiveTitle"], "Legacy extra");
+    }
+
+    #[tokio::test]
+    async fn zero_override_leaves_a_special_entry_with_a_renumbered_copy_alone() {
+        let (schema, pool) = setup_full(100).await;
+        let work = seed_work_chapter_graphql_fixture(&pool).await;
+        let special = fixture_entry_id(&pool, &work, "x:entry-extra").await;
+        let source: String = sqlx::query_scalar(
+            "SELECT source_series_id FROM chapter WHERE external_id = 'entry-extra'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        catalog::upsert_chapter(
+            &pool,
+            &source,
+            &catalog::ChapterInput {
+                external_id: "entry-extra".into(),
+                number: Some("0".into()),
+                title: Some("Renumbered appendix".into()),
+                lang: Some("en".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        work_chapter_gql(
+            &schema,
+            &format!(
+                r#"mutation {{ setChapterOverride(input: {{
+                workId: "{work}", chapterKey: "0", hidden: true
+            }}) }}"#
+            ),
+        )
+        .await;
+        let row: (bool, Option<String>) =
+            sqlx::query_as("SELECT hidden, title_override FROM work_chapter WHERE id = $1")
+                .bind(&special)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, (false, None));
+        let zero_hidden: bool = sqlx::query_scalar(
+            "SELECT hidden FROM work_chapter WHERE work_id = $1 AND match_key = '0'",
+        )
+        .bind(&work)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(zero_hidden);
+    }
+
+    #[tokio::test]
+    async fn first_legacy_partial_edit_preserves_special_entry_fields_for_keys_and_aliases() {
+        for alias in [false, true] {
+            for title_only in [false, true] {
+                let (schema, pool) = setup_full(100).await;
+                let work = seed_work_chapter_graphql_fixture(&pool).await;
+                let special = fixture_entry_id(&pool, &work, "x:entry-extra").await;
+                if alias {
+                    sqlx::query(
+                        "UPDATE work_chapter SET match_key = 'x:native-extra' WHERE id = $1",
+                    )
+                    .bind(&special)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                }
+                let entry_edit = if title_only {
+                    "hidden: true"
+                } else {
+                    r#"titleOverride: "Entry title""#
+                };
+                work_chapter_gql(
+                    &schema,
+                    &format!(r#"mutation {{ setWorkChapter(entryId: "{special}", {entry_edit}) {{ id }} }}"#),
+                )
+                .await;
+                let count: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM chapter_override WHERE work_id = $1")
+                        .bind(&work)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(count, 0);
+                let legacy_edit = if title_only {
+                    r#"title: "Legacy title""#
+                } else {
+                    "hidden: true"
+                };
+                work_chapter_gql(
+                    &schema,
+                    &format!(
+                        r#"mutation {{ setChapterOverride(input: {{
+                        workId: "{work}", chapterKey: "x:entry-extra", {legacy_edit}
+                    }}) }}"#
+                    ),
+                )
+                .await;
+                let row: (bool, Option<String>) =
+                    sqlx::query_as("SELECT hidden, title_override FROM work_chapter WHERE id = $1")
+                        .bind(&special)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                let title = if title_only {
+                    "Legacy title"
+                } else {
+                    "Entry title"
+                };
+                assert_eq!(row, (true, Some(title.into())));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn work_chapter_admin_list_and_mutations_preserve_entry_state() {
+        let (schema, pool) = setup_full(100).await;
+        let work = seed_work_chapter_graphql_fixture(&pool).await;
+        drain_work_chapter_fixture(&pool).await;
+        let first = fixture_entry_id(&pool, &work, "100").await;
+        let extra = fixture_entry_id(&pool, &work, "x:entry-extra").await;
+        sqlx::query("INSERT INTO work_chapter (id, work_id, sort_key, created_at) VALUES ('wc_copyless', $1, 50, now())")
+            .bind(&work).execute(&pool).await.unwrap();
+        let data = work_chapter_gql(&schema, &format!(r#"mutation {{ setWorkChapter(
+            entryId: "{first}", hidden: true, titleOverride: "Admin title", special: true, sortKey: 1.125
+        ) {{ id matchKey sortKey sortKeyText number label special specialBy hidden titleOverride
+             copies {{ chapterId sourceSeriesId sourceType sourceId number title lang scanlator releasedAt linkedBy }} }} }}"#)).await;
+        let edited = &data["setWorkChapter"];
+        assert_eq!(edited["id"], first);
+        assert_eq!(edited["matchKey"], "100");
+        assert_eq!(edited["sortKey"], 1.125);
+        assert_eq!(edited["sortKeyText"], "1.125");
+        assert_eq!(edited["special"], true);
+        assert_eq!(edited["specialBy"], "admin");
+        assert_eq!(edited["hidden"], true);
+        assert_eq!(edited["titleOverride"], "Admin title");
+        let copies = edited["copies"].as_array().unwrap();
+        assert_eq!(copies.len(), 2);
+        let md = copies
+            .iter()
+            .find(|c| c["sourceType"] == "mangadex")
+            .unwrap();
+        assert_eq!(md["chapterId"], "entry-one");
+        assert!(md["sourceSeriesId"].is_string());
+        assert_eq!(md["number"], "1");
+        assert_eq!(md["title"], "First");
+        assert_eq!(md["lang"], "en");
+        assert_eq!(md["scanlator"], "Fixture Group");
+        assert_eq!(md["releasedAt"], "2026-01-02T00:00:00.000000+00:00");
+        assert_eq!(md["linkedBy"], "matcher");
+        let row: (bool, Option<String>) = sqlx::query_as("SELECT hidden, title_override FROM chapter_override WHERE work_id = $1 AND chapter_key = '100'")
+            .bind(&work).fetch_one(pool.read()).await.unwrap();
+        assert_eq!(row, (true, Some("Admin title".into())));
+        work_chapter_gql(
+            &schema,
+            &format!(
+                r#"mutation {{ setWorkChapter(
+            entryId: "{extra}", hidden: true, titleOverride: "Extra title"
+        ) {{ id }} }}"#
+            ),
+        )
+        .await;
+        let x_overrides: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chapter_override WHERE work_id = $1 AND chapter_key LIKE 'x:%'",
+        )
+        .bind(&work)
+        .fetch_one(pool.read())
+        .await
+        .unwrap();
+        assert_eq!(x_overrides, 0);
+        let data = work_chapter_gql(&schema, &format!(r#"{{
+            workChapterList(workId: "{work}") {{ workId ready entries {{ id hidden copies {{ chapterId }} }} }}
+            workChaptersAdmin(workId: "{work}") {{ key hidden sourceTitle titleOverride effectiveTitle }}
+        }}"#)).await;
+        assert_eq!(data["workChapterList"]["workId"], work);
+        assert_eq!(data["workChapterList"]["ready"], true);
+        let entries = data["workChapterList"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 6);
+        assert_eq!(
+            entries.iter().find(|c| c["id"] == first).unwrap()["hidden"],
+            true
+        );
+        assert_eq!(
+            entries.iter().find(|c| c["id"] == extra).unwrap()["hidden"],
+            true
+        );
+        assert_eq!(
+            entries.iter().find(|c| c["id"] == "wc_copyless").unwrap()["copies"],
+            serde_json::json!([])
+        );
+        let admin = data["workChaptersAdmin"].as_array().unwrap();
+        let renamed = admin.iter().find(|c| c["key"] == "100").unwrap();
+        assert_eq!(renamed["hidden"], true);
+        assert_eq!(renamed["titleOverride"], "Admin title");
+        assert_eq!(renamed["effectiveTitle"], "Admin title");
+        assert_ne!(renamed["sourceTitle"], renamed["effectiveTitle"]);
+        assert_eq!(
+            admin.iter().find(|c| c["key"] == "x:entry-extra").unwrap()["titleOverride"],
+            "Extra title"
+        );
+        // Omitted fields stay as they were; clearTitle removes only the title.
+        let data = work_chapter_gql(
+            &schema,
+            &format!(
+                r#"mutation {{ setWorkChapter(
+            entryId: "{first}", clearTitle: true
+        ) {{ hidden titleOverride special sortKey }} }}"#
+            ),
+        )
+        .await;
+        assert_eq!(data["setWorkChapter"]["hidden"], true);
+        assert_eq!(
+            data["setWorkChapter"]["titleOverride"],
+            serde_json::Value::Null
+        );
+        assert_eq!(data["setWorkChapter"]["special"], true);
+        assert_eq!(data["setWorkChapter"]["sortKey"], 1.125);
+        work_chapter_gql(
+            &schema,
+            &format!(
+                r#"mutation {{ setChapterOverride(input: {{
+            workId: "{work}", chapterKey: "100", hidden: false, title: "Old mutation title"
+        }}) }}"#
+            ),
+        )
+        .await;
+        let row: (bool, Option<String>) =
+            sqlx::query_as("SELECT hidden, title_override FROM work_chapter WHERE id = $1")
+                .bind(&first)
+                .fetch_one(pool.read())
+                .await
+                .unwrap();
+        assert_eq!(row, (false, Some("Old mutation title".into())));
+        work_chapter_gql(
+            &schema,
+            &format!(
+                r#"mutation {{ setChapterOverride(input: {{
+            workId: "{work}", chapterKey: "100", title: null
+        }}) }}"#
+            ),
+        )
+        .await;
+        let row: (bool, Option<String>) =
+            sqlx::query_as("SELECT hidden, title_override FROM work_chapter WHERE id = $1")
+                .bind(&first)
+                .fetch_one(pool.read())
+                .await
+                .unwrap();
+        assert_eq!(
+            row,
+            (false, None),
+            "deleting the legacy override also clears the entry"
+        );
+        let response = exec(
+            &schema,
+            &format!(
+                r#"mutation {{ setWorkChapter(entryId: "{first}", sortKey: 1000001) {{ id }} }}"#
+            ),
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(first_error(&response).contains("sortKey"));
+        let response = exec(
+            &schema,
+            r#"mutation { setWorkChapter(entryId: "missing") { id } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&response), "No such chapter entry");
+        let response = exec(
+            &schema,
+            r#"{ workChapterList(workId: "missing") { ready } }"#,
+            Some("admintok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert_eq!(first_error(&response), "No such work");
+        let response = exec(
+            &schema,
+            &format!(r#"{{ workChapterList(workId: "{work}") {{ ready }} }}"#),
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(!response.errors.is_empty());
+        let response = exec(
+            &schema,
+            &format!(r#"mutation {{ setWorkChapter(entryId: "{first}", hidden: true) {{ id }} }}"#),
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(!response.errors.is_empty());
+        sqlx::query("INSERT INTO work_redirect (old_id, new_id, created_at) VALUES ('w_retired_entry_fixture', $1, now())")
+            .bind(&work).execute(&pool).await.unwrap();
+        let data = work_chapter_gql(
+            &schema,
+            r#"{ workChapterList(workId: "w_retired_entry_fixture") { workId } }"#,
+        )
+        .await;
+        assert_eq!(data["workChapterList"]["workId"], work);
+    }
+
+    #[tokio::test]
+    async fn library_progress_counts_visible_linked_entries_when_ready() {
+        let (schema, pool) = setup_full(100).await;
+        let work = seed_work_chapter_graphql_fixture(&pool).await;
+        sqlx::query("INSERT INTO user_library (user_id, series_id, created_at) VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', $1, now())")
+            .bind(&work).execute(&pool).await.unwrap();
+        for chapter in [
+            "entry-zero",
+            "entry-one",
+            "entry-two",
+            "entry-three",
+            "entry-extra",
+        ] {
+            sqlx::query("INSERT INTO canonical_progress (user_id, work_id, chapter_id, last_page_read, read, updated_at) VALUES ('ca19534e-7e0c-4aa3-8f2d-6a3799b9c33c', $1, $2, 0, true, now())")
+                .bind(&work).bind(chapter).execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO work_chapter (id, work_id, sort_key, created_at) VALUES ('wc_empty_total', $1, 50, now())")
+            .bind(&work).execute(&pool).await.unwrap();
+        let hidden = fixture_entry_id(&pool, &work, "200").await;
+        work_chapter_gql(
+            &schema,
+            &format!(
+                r#"mutation {{ setWorkChapter(entryId: "{hidden}", hidden: true) {{ id }} }}"#
+            ),
+        )
+        .await;
+        for (ready, expected) in [(false, 5), (true, 4)] {
+            if ready {
+                drain_work_chapter_fixture(&pool).await;
+            }
+            let response = exec(
+                &schema,
+                "{ libraryProgress { id read total } }",
+                Some("bobtok"),
+                "1.1.1.1",
+            )
+            .await;
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            let data = response.data.into_json().unwrap();
+            let progress = data["libraryProgress"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == work)
+                .unwrap();
+            assert_eq!(progress["total"], expected);
+            assert_eq!(
+                progress["read"], expected,
+                "read count is clamped to the visible total"
+            );
+        }
+        sqlx::query("UPDATE work_chapter SET hidden = true WHERE work_id = $1")
+            .bind(&work)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = exec(
+            &schema,
+            "{ libraryProgress { id read total } }",
+            Some("bobtok"),
+            "1.1.1.1",
+        )
+        .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let data = response.data.into_json().unwrap();
+        let progress = data["libraryProgress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == work)
+            .unwrap();
+        assert_eq!(
+            progress["total"], 0,
+            "the cache fallback must not resurrect hidden entries"
+        );
+        assert_eq!(progress["read"], 0);
+    }
+
     #[tokio::test]
     async fn series_page_bundles_series_chapters_sources_and_aggregation() {
         let (s, pool) = setup_full(100).await;
@@ -25722,7 +26984,7 @@ mod tests {
         // the steady state used by production requests below.
         let (cold, cold_statements) = run().await;
         assert!(cold.errors.is_empty(), "{:?}", cold.errors);
-        assert_eq!(cold_statements, 32, "cold anonymous seriesPage statements");
+        assert_eq!(cold_statements, 33, "cold anonymous seriesPage statements");
         let (response, statements) = run().await;
         assert!(response.errors.is_empty(), "{:?}", response.errors);
         let page = response.data.into_json().unwrap()["seriesPage"].clone();
@@ -25769,11 +27031,11 @@ mod tests {
                 {"fileName": "v2.jpg", "isPrimary": false}
             ])
         );
-        // 42 with this fixture before M4 item 5, then 29. Steady state is now 28:
-        // site rules come from the shared policy snapshot, saving one read.
-        // Cold is 32: four more reads for the policy marker, site rules, work
+        // 42 with this fixture before M4 item 5, then 29, then 28. Steady state is now 29:
+        // the shared work-entry overlay adds one read for the whole bundle.
+        // Cold is 33: four more reads for the policy marker, site rules, work
         // takedowns and copy takedowns; no numeric-source read without takedowns.
-        assert_eq!(statements, 28, "warm anonymous seriesPage statements");
+        assert_eq!(statements, 29, "warm anonymous seriesPage statements");
         let (_, again) = run().await;
         assert_eq!(again, statements, "the count is stable run to run");
     }
@@ -31518,6 +32780,8 @@ mod tests {
     ) -> crate::catalog::WorkChapterRow {
         let label = crate::chapter_label::ChapterLabel::Numbered(num);
         crate::catalog::WorkChapterRow {
+            entry: None,
+            work_ready: false,
             number: Some(num),
             key: label.key(cid),
             label: label.text(),

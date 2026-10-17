@@ -831,6 +831,11 @@ pub struct SeriesProgress {
 
 #[derive(SimpleObject, Clone)]
 pub struct Chapter {
+    /// The chapter-list entry this copy is linked to; null while the work's list is not built.
+    pub entry_id: Option<ID>,
+    /// The entry's 1-based position in the work's chapter list; sort by it;
+    /// equal values are one entry; positions shift when entries are added.
+    pub entry_order: Option<i32>,
     pub id: ID,
     pub series_id: ID,
     /// The chapter's number, or `0` when it has none. **Prefer [`Self::label`]** — a
@@ -1386,7 +1391,7 @@ pub struct SeriesAdminMeta {
 #[derive(SimpleObject, Clone)]
 pub struct AdminChapter {
     pub number: f64,
-    /// The aggregate bucket key (`round(number*100)` as text) — the override key.
+    /// The override key: `round(number*100)` as text, or the unnumbered aggregate's `x:` key.
     pub key: String,
     pub source_title: Option<String>,
     pub title_override: Option<String>,
@@ -1394,6 +1399,75 @@ pub struct AdminChapter {
     pub hidden: bool,
     /// How many sources provide this chapter number.
     pub source_count: i32,
+}
+
+#[derive(SimpleObject)]
+pub struct WorkChapterList {
+    pub work_id: ID,
+    pub ready: bool,
+    pub entries: Vec<WorkChapterEntry>,
+}
+
+#[derive(SimpleObject)]
+pub struct WorkChapterEntry {
+    pub id: ID,
+    pub match_key: Option<String>,
+    pub sort_key: f64,
+    pub sort_key_text: String,
+    pub number: Option<String>,
+    pub label: Option<String>,
+    pub special: bool,
+    pub special_by: Option<String>,
+    pub hidden: bool,
+    pub title_override: Option<String>,
+    pub copies: Vec<WorkChapterCopy>,
+}
+
+#[derive(SimpleObject)]
+pub struct WorkChapterCopy {
+    pub chapter_id: ID,
+    pub source_series_id: ID,
+    pub source_type: String,
+    pub source_id: Option<String>,
+    pub number: Option<String>,
+    pub title: Option<String>,
+    pub lang: Option<String>,
+    pub scanlator: Option<String>,
+    pub released_at: Option<String>,
+    pub linked_by: String,
+}
+
+impl From<crate::catalog::work_chapter::AdminEntry> for WorkChapterEntry {
+    fn from(e: crate::catalog::work_chapter::AdminEntry) -> Self {
+        Self {
+            id: ID(e.id),
+            match_key: e.match_key,
+            sort_key: e.sort_key,
+            sort_key_text: e.sort_key_text,
+            number: e.number,
+            label: e.label,
+            special: e.special,
+            special_by: e.special_by,
+            hidden: e.hidden,
+            title_override: e.title_override,
+            copies: e
+                .copies
+                .into_iter()
+                .map(|c| WorkChapterCopy {
+                    chapter_id: ID(c.chapter_id),
+                    source_series_id: ID(c.source_series_id),
+                    source_type: c.source_type,
+                    source_id: c.source_id,
+                    number: c.number,
+                    title: c.title,
+                    lang: c.lang,
+                    scanlator: c.scanlator,
+                    released_at: c.released_at.map(crate::db_types::format_date),
+                    linked_by: c.linked_by,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Admin edit to one chapter of a work (soft-hide / rename). `MaybeUndefined` so a
@@ -1767,11 +1841,17 @@ pub struct ChapterSource {
     pub copy_external_url: Option<String>,
 }
 
-/// One aggregated chapter of a work — a chapter NUMBER available across one or
-/// more sources (S2). Deduped by number; `sources` keeps per-source availability
-/// so the reader can pick a translator.
+/// One chapter-list entry of a ready work, or a legacy chapter-number aggregate.
+/// `sources` keeps every available copy so the reader can pick a translator.
 #[derive(SimpleObject, Clone)]
 pub struct AggregatedChapter {
+    /// The work's chapter-list entry; null while the list is not ready.
+    pub entry_id: Option<ID>,
+    /// The entry's 1-based position in the work's chapter list; sort by it;
+    /// equal values are one entry; positions shift when entries are added.
+    pub entry_order: Option<i32>,
+    /// Whether the entry is special; null while the work's list is not ready.
+    pub special: Option<bool>,
     /// The chapter's number, or `0` when it has none. **Prefer [`Self::label`]** — this
     /// stays non-null only so a client built before Phase A keeps working; a oneshot
     /// reports 0 here and "Oneshot" there.
@@ -2081,6 +2161,8 @@ pub fn map_chapter(c: SuwayomiChapter, progress: Option<(i32, bool)>) -> Chapter
     // and never `Ch.99999999` from a TEST upload.
     let label = crate::chapter_label::chapter_display(Some(c.chapter_number), None, Some(&c.name));
     Chapter {
+        entry_id: None,
+        entry_order: None,
         id: ID(c.id.to_string()),
         series_id: ID(c.manga_id.to_string()),
         number: label.number().unwrap_or(c.chapter_number),

@@ -63,6 +63,7 @@ Catalogue works are independent of source copies:
 - `engine_detached_row`, added by migration `0008_engine_detached_row.sql`: numeric library, review, view-count and per-series scan-setting rows that a new engine generation set aside. Rows whose series had a work moved to that work instead. Each row keeps its old generation, its source table and the original row as JSON.
 - `media_policy` and `media_takedown`, added by migration `0009_media_policy.sql`: the policy epoch, which moves with every site-wide block rule or takedown change, and the operator takedowns of works and chapter copies. Read [Takedowns](/admin/takedowns).
 - `progress_untick`, added by migration `0010_progress_untick.sql`: one row per explicit untick of one chapter copy (user id, chapter id, time). A new engine generation deletes the records of numeric chapter ids.
+- `work_chapter`, `work_chapter_link` and `work_chapter_state`, added by migration `0012_work_chapter.sql`: the work's own chapter list. `work_chapter` holds one entry per chapter of a work (id `wc_...`): its `match_key`, its place in the list (`sort_key`, a decimal), its number and label, a `special` flag and the administrator's `hidden` flag and `title_override`. `work_chapter_link` links each `chapter` row (a source copy) to one entry. `work_chapter_state` holds `ready` (every copy of the work is linked) and `list_rev`, a counter that grows with every change to the list. Read [Canonical works](/developers/canonical-works) for how copies are matched.
 
 ### Identity and social tables
 
