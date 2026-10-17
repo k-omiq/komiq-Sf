@@ -82,7 +82,7 @@ Open **Sources › Health** to check **Engines**, then open **Sources › Browse
 
 ## Failures and undo
 
-If the regional engine is down, its extension version differs, or a regional fetch is missing or fails, the main engine serves instead. A strict route returns HTTP 503, meaning temporarily unavailable, instead of using the main engine. A full regional page pool, or a spent [request limit](/admin/settings#request-limits) for the source, returns a retryable 503 in either mode.
+If the regional engine is down, its extension version differs, or a regional fetch is missing or fails, the main engine serves instead. A strict route returns HTTP 503, meaning temporarily unavailable, instead of using the main engine. A full regional page pool, or a spent [request limit](/admin/settings#request-limits) for the source, returns a retryable 503 in either mode. Reader requests are not spaced out like background checks: they use the limit at once while it has room, and get the 503 only when it is used up.
 
 To undo routing, choose the main engine (`owner`) for each routed source. This removes the routes. Remove engine configuration only after removing its routes, especially strict ones.
 

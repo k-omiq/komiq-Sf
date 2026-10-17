@@ -234,6 +234,9 @@ const COVER_REPAIR_MAX_FAILURES: u64 = 20;
 /// sample mean something (a tiny store is repaired without the check).
 const COVER_PLAUSIBILITY_SAMPLE: usize = 256;
 const COVER_PLAUSIBILITY_MIN_SAMPLE: usize = 32;
+/// How long a plausibility answer stands for the read-path repair before it is checked
+/// again (the GC pass always checks afresh and refreshes it).
+const COVER_PLAUSIBILITY_TTL: Duration = Duration::from_secs(5 * 60);
 /// Read-path repairs queued at once.
 const READ_REPAIR_CAP: usize = 256;
 const COVER_FILE_GRACE: Duration = Duration::from_secs(24 * 3600);
@@ -489,7 +492,7 @@ async fn repair_missing_cover_files(
     if !covers.copy_done() {
         return Ok(0);
     }
-    if !store_plausible(pool, covers).await? {
+    if !store_plausible_cached(pool, covers, Duration::ZERO).await? {
         return Ok(0);
     }
     let mut scanned = 0;
@@ -520,7 +523,7 @@ async fn repair_missing_cover_files(
             // their hash, a quarantined generation) is logged and passed, so the rows after
             // it are still repaired. Many failures in one pass stop it: that is not a row.
             let result = match cover_store::Sha::try_from(raw_sha.as_slice()) {
-                Ok(sha) => repair_lost_object(pool, covers, &key, &kind, sha).await,
+                Ok(sha) => repair_lost_object(pool, covers, &key, &kind, sha, true).await,
                 Err(_) => Err(anyhow::anyhow!("cover index row has a malformed hash")),
             };
             cursor.asset = key;
@@ -577,15 +580,35 @@ async fn store_plausible(pool: &Database, covers: &CoverStore) -> anyhow::Result
             sampled = sample.len(),
             missing,
             "gc: most indexed cover files are missing or unreadable; is KOMIKA_COVERS_DIR \
-             the right directory? skipping the missing-file repair"
+             the right directory? skipping the missing-file repair. If the files are really \
+             gone (a restore without cover files), run `komika-server covers repair-missing` once"
         );
         return Ok(false);
     }
     Ok(true)
 }
 
+/// [`store_plausible`], reusing an answer younger than `max_age` (zero: always check).
+/// The answer is kept on the store, so the GC pass and the read-path repair share it and
+/// a burst of cover misses runs one check, not one each.
+async fn store_plausible_cached(
+    pool: &Database,
+    covers: &CoverStore,
+    max_age: Duration,
+) -> anyhow::Result<bool> {
+    let mut cached = covers.plausibility().lock().await;
+    if let Some((at, plausible)) = *cached {
+        if !max_age.is_zero() && at.elapsed() < max_age {
+            return Ok(plausible);
+        }
+    }
+    let plausible = store_plausible(pool, covers).await?;
+    *cached = Some((tokio::time::Instant::now(), plausible));
+    Ok(plausible)
+}
+
 /// Repair one index row whose file is missing: rewrite an uploaded master from
-/// `cover_upload`; otherwise drop the row (a master takes its derivatives and the work's
+/// `cover_upload`; otherwise, when `drop_rows`, drop the row (a master takes its derivatives and the work's
 /// cover pointer and origin with it, so the cover crawl refills it from its source).
 /// Rechecked under the publish locks; `false` when the row changed or the file is there.
 pub(crate) async fn repair_lost_object(
@@ -594,6 +617,7 @@ pub(crate) async fn repair_lost_object(
     key: &str,
     kind: &str,
     sha: cover_store::Sha,
+    drop_rows: bool,
 ) -> anyhow::Result<bool> {
     if covers.object_exists(&sha).await? {
         return Ok(false);
@@ -621,6 +645,9 @@ pub(crate) async fn repair_lost_object(
         }
         None => None,
     };
+    if staged.is_none() && !drop_rows {
+        return Ok(false);
+    }
     let mut tx = pool.begin().await?;
     if asset.starts_with("s:") {
         // A quarantined generation leaves numeric rows for a later pass, not as failures
@@ -679,11 +706,87 @@ pub(crate) async fn repair_lost_object(
     Ok(repaired)
 }
 
+/// What `komika-server covers repair-missing` did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RepairAll {
+    pub checked: u64,
+    pub repaired: u64,
+    pub failed: u64,
+}
+
+/// `komika-server covers repair-missing`: refuse a covers path that does not exist or is
+/// not a directory. That is a wrong path, not lost files, and opening the store would
+/// create it.
+pub(crate) fn check_covers_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    match std::fs::metadata(dir) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => anyhow::bail!(
+            "KOMIKA_COVERS_DIR {} is not a directory; nothing was repaired",
+            dir.display()
+        ),
+        Err(error) => anyhow::bail!(
+            "KOMIKA_COVERS_DIR {} cannot be read ({error}); nothing was repaired",
+            dir.display()
+        ),
+    }
+}
+
+/// The missing-file repair once over the whole index, WITHOUT [`store_plausible`]: the
+/// operator's answer after a restore without cover files, when most files are really
+/// gone and the guard would refuse forever. Rows are read in batches; each missing file's
+/// row is repaired as the GC pass does (an upload is restored, anything else is dropped
+/// so the cover crawl refills it). A failing row is logged and passed.
+pub(crate) async fn repair_all_missing_cover_files(
+    pool: &Database,
+    covers: &CoverStore,
+) -> anyhow::Result<RepairAll> {
+    anyhow::ensure!(
+        covers.copy_done(),
+        "the old cover cache copy is still running; repair after the log says `cover copy finished`"
+    );
+    let mut done = RepairAll::default();
+    let mut cursor = CoverRepairCursor::default();
+    loop {
+        let rows: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT asset_key, kind, sha256 FROM cover_object WHERE (asset_key, kind) > ($1, $2) \
+             ORDER BY asset_key, kind LIMIT $3",
+        )
+        .bind(&cursor.asset)
+        .bind(&cursor.kind)
+        .bind(COVER_SCAN_BATCH as i64)
+        .fetch_all(pool)
+        .await?;
+        let Some((last_asset, last_kind, _)) = rows.last().cloned() else {
+            break;
+        };
+        for (key, kind, raw_sha) in rows {
+            done.checked += 1;
+            let result = match cover_store::Sha::try_from(raw_sha.as_slice()) {
+                Ok(sha) => repair_lost_object(pool, covers, &key, &kind, sha, true).await,
+                Err(_) => Err(anyhow::anyhow!("cover index row has a malformed hash")),
+            };
+            match result {
+                Ok(true) => done.repaired += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    done.failed += 1;
+                    tracing::warn!(asset = %key, %kind, error = %format!("{error:#}"), "covers repair-missing: row failed");
+                }
+            }
+        }
+        cursor = CoverRepairCursor {
+            asset: last_asset,
+            kind: last_kind,
+        };
+    }
+    Ok(done)
+}
+
 /// Queue the repair of a work master whose file a cover read found missing, so the cover
 /// crawl refills it from its source without waiting for the GC pass to reach the row.
 /// One queued repair per work at a time and at most [`READ_REPAIR_CAP`] in flight; a
 /// miss over the cap is left to the GC pass. Nothing is queued while the SQLite copy runs
-/// (see [`repair_missing_cover_files`]).
+/// (see [`repair_missing_cover_files`]); see [`repair_lost_master_on_read`] for the guard.
 pub(crate) fn defer_lost_master_repair(
     main: &Database,
     covers: &CoverStore,
@@ -714,12 +817,26 @@ pub(crate) fn defer_lost_master_repair(
     let database = main.background();
     let covers = covers.clone();
     main.defer(async move {
-        let key = cover_store::index_key(&slot.0);
-        if let Err(error) = repair_lost_object(&database, &covers, &key, "master", sha).await {
+        if let Err(error) = repair_lost_master_on_read(&database, &covers, &slot.0, sha).await {
             tracing::warn!(work_id = %slot.0, error = %format!("{error:#}"), "cover read repair failed");
         }
         Ok(())
     })
+}
+
+/// The read-path repair of one work master. It takes the GC pass's guard: while the store
+/// looks wrong (most sampled files missing: a wrong, empty or unmounted
+/// `KOMIKA_COVERS_DIR`, or files still being copied in), no index row or cover pointer is
+/// dropped. An uploaded master is still restored from `cover_upload`.
+async fn repair_lost_master_on_read(
+    pool: &Database,
+    covers: &CoverStore,
+    work_id: &str,
+    sha: cover_store::Sha,
+) -> anyhow::Result<bool> {
+    let plausible = store_plausible_cached(pool, covers, COVER_PLAUSIBILITY_TTL).await?;
+    let key = cover_store::index_key(work_id);
+    repair_lost_object(pool, covers, &key, "master", sha, plausible).await
 }
 
 #[cfg(test)]
@@ -1902,6 +2019,125 @@ mod tests {
             1
         );
         assert_eq!(object_count(&pool, "icon:000").await, 0);
+    }
+
+    /// The read-path repair takes the GC guard: against a store that holds almost none of
+    /// the index it drops no row and no cover pointer (an upload is still restored), and
+    /// against the right store it drops the row whose file is really lost.
+    #[tokio::test]
+    async fn read_repair_refuses_a_store_that_holds_almost_none_of_the_index() {
+        let pool = main_pool().await;
+        let dir = cover_store::test_support::TestDir::new();
+        let covers = cover_store::test_support::store(&dir);
+        for n in 0..COVER_PLAUSIBILITY_MIN_SAMPLE + 8 {
+            seed_object(
+                &pool,
+                &covers,
+                &format!("icon:{n:03}"),
+                "master",
+                format!("icon {n}").as_bytes(),
+            )
+            .await;
+        }
+        seed_works(&pool, 0, 2).await;
+        let lost = seed_object(&pool, &covers, "w_00000", "master", b"lost master").await;
+        let uploaded = seed_object(&pool, &covers, "w_00001", "master", b"uploaded").await;
+        sqlx::query("INSERT INTO cover_upload(work_id,bytes,sha256,created_at) VALUES ('w_00001',$1,$2,now())")
+            .bind(b"uploaded".as_slice())
+            .bind(uploaded.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pointer = |work: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<i64>>(
+                    "SELECT cover_cached_version FROM work WHERE id = $1",
+                )
+                .bind(work)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        sqlx::query("UPDATE work SET cover_cached_version = 7 WHERE id = 'w_00000'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = pointer("w_00000").await;
+        assert_eq!(before, Some(7));
+        // A wrong or unmounted KOMIKA_COVERS_DIR: every indexed file looks lost.
+        let empty_dir = cover_store::test_support::TestDir::new();
+        let empty = cover_store::test_support::store(&empty_dir);
+        assert!(!repair_lost_master_on_read(&pool, &empty, "w_00000", lost)
+            .await
+            .unwrap());
+        assert_eq!(object_count(&pool, "w_00000").await, 1, "the row stays");
+        assert_eq!(pointer("w_00000").await, before, "the pointer stays");
+        assert!(
+            repair_lost_master_on_read(&pool, &empty, "w_00001", uploaded)
+                .await
+                .unwrap()
+        );
+        assert!(
+            empty.object_path(&uploaded).exists(),
+            "an upload is restored"
+        );
+        // The right directory with one file really lost: that row is repaired.
+        std::fs::remove_file(covers.object_path(&lost)).unwrap();
+        assert!(repair_lost_master_on_read(&pool, &covers, "w_00000", lost)
+            .await
+            .unwrap());
+        assert_eq!(object_count(&pool, "w_00000").await, 0);
+        assert_eq!(pointer("w_00000").await, None);
+    }
+
+    /// The operator's one-shot repair ignores the guard: with most files gone it clears
+    /// every row whose file is missing and keeps the rows whose files exist. A covers
+    /// path that is missing or not a directory is refused before anything is opened.
+    #[tokio::test]
+    async fn repair_missing_command_clears_lost_rows_even_when_most_are_lost() {
+        let pool = main_pool().await;
+        let dir = cover_store::test_support::TestDir::new();
+        let covers = cover_store::test_support::store(&dir);
+        let rows = COVER_PLAUSIBILITY_MIN_SAMPLE + 8;
+        let mut shas = Vec::new();
+        for n in 0..rows {
+            shas.push(
+                seed_object(
+                    &pool,
+                    &covers,
+                    &format!("icon:{n:03}"),
+                    "master",
+                    format!("icon {n}").as_bytes(),
+                )
+                .await,
+            );
+        }
+        // A restore without cover files: all but the first four are gone.
+        for sha in &shas[4..] {
+            std::fs::remove_file(covers.object_path(sha)).unwrap();
+        }
+        assert!(!store_plausible(&pool, &covers).await.unwrap());
+        assert_eq!(
+            repair_all_missing_cover_files(&pool, &covers)
+                .await
+                .unwrap(),
+            RepairAll {
+                checked: rows as u64,
+                repaired: rows as u64 - 4,
+                failed: 0
+            }
+        );
+        let kept: Vec<String> =
+            sqlx::query_scalar("SELECT asset_key FROM cover_object ORDER BY asset_key")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(kept, ["icon:000", "icon:001", "icon:002", "icon:003"]);
+        check_covers_dir(covers.dir()).unwrap();
+        assert!(check_covers_dir(&covers.dir().join("absent")).is_err());
+        assert!(check_covers_dir(&covers.object_path(&shas[0])).is_err());
     }
 
     #[tokio::test]

@@ -27,7 +27,7 @@ use tokio::time::Instant;
 
 use crate::database::Database;
 use crate::source_budget::{SourceBudgets, SourceUse};
-use crate::suwayomi::{PageFetchError, SuwayomiClient};
+use crate::suwayomi::{EngineGraphqlError, PageFetchError, SuwayomiClient};
 use crate::upstream_cache::TtlMemo;
 
 /// `KOMIKA_ENGINES=sg=http://10.8.0.2:4567,eu=http://10.8.0.3:4567`
@@ -48,8 +48,6 @@ const MISSING_TTL: Duration = Duration::from_secs(10 * 60);
 /// the list is at least this old, so out-of-range requests cannot force a source
 /// request each.
 const PAGE_LIST_REREAD_FLOOR: Duration = Duration::from_secs(30);
-/// How long a read waits for its source's request budget before answering busy.
-const REGIONAL_BUDGET_WAIT: Duration = Duration::from_secs(2);
 const MEMO_CAP: usize = 4096;
 /// Bound on remembered absences; the oldest half goes when it fills.
 const MISSING_CAP: usize = 4096;
@@ -388,7 +386,9 @@ impl RegionalEngine {
     }
 
     /// Take one request from the source's budget before a request the engine passes on
-    /// to the source. Free inside [`prepaid`] and before budgets are set.
+    /// to the source. Free inside [`prepaid`] and before budgets are set. A reader is not
+    /// paced like a background job: the request goes at once while the source's rolling
+    /// window has room, and is refused (busy) at once when it does not.
     async fn admit(&self, source_id: &str) -> Result<()> {
         if PREPAID.try_with(|_| ()).is_ok() {
             return Ok(());
@@ -396,10 +396,7 @@ impl RegionalEngine {
         let Some(budgets) = self.budgets.get() else {
             return Ok(());
         };
-        if budgets
-            .spend_within(source_id, SourceUse::Regional, REGIONAL_BUDGET_WAIT)
-            .await
-        {
+        if budgets.try_spend_burst(source_id, SourceUse::Regional) {
             Ok(())
         } else {
             Err(RegionalBudgetRefused.into())
@@ -429,14 +426,21 @@ impl RegionalEngine {
         if self.known_missing(&key) {
             return Ok(None);
         }
-        let found = self
-            .manga
-            .get_or_try_init_optional(&key, || self.lookup_manga(keys))
-            .await?;
-        if found.is_none() {
-            self.remember_missing(key);
-        }
-        Ok(found)
+        // Absence is remembered before the memo's initializer is released, so readers of
+        // the same manga queued behind a lookup that found nothing take that answer
+        // instead of each spending a source search.
+        self.manga
+            .get_or_try_init_optional(&key, || async {
+                if self.known_missing(&key) {
+                    return Ok(None);
+                }
+                let found = self.lookup_manga(keys).await?;
+                if found.is_none() {
+                    self.remember_missing(key.clone());
+                }
+                Ok(found)
+            })
+            .await
     }
 
     async fn lookup_manga(&self, keys: &SourceKeys) -> Result<Option<i64>> {
@@ -511,14 +515,19 @@ impl RegionalEngine {
         let Some(manga_id) = self.manga_id(keys).await? else {
             return Ok(None);
         };
-        let found = self
-            .chapters
-            .get_or_try_init_optional(&key, || self.lookup_chapter(manga_id, keys))
-            .await?;
-        if found.is_none() {
-            self.remember_missing(key);
-        }
-        Ok(found)
+        // As for the manga: queued readers of one absent chapter share one lookup.
+        self.chapters
+            .get_or_try_init_optional(&key, || async {
+                if self.known_missing(&key) {
+                    return Ok(None);
+                }
+                let found = self.lookup_chapter(manga_id, keys).await?;
+                if found.is_none() {
+                    self.remember_missing(key.clone());
+                }
+                Ok(found)
+            })
+            .await
     }
 
     pub(crate) fn chapter_cached(&self, keys: &SourceKeys) -> bool {
@@ -653,8 +662,14 @@ impl RegionalEngine {
                 result => {
                     // A manga id remembered from before the engine's data was replaced
                     // finds nothing: look the manga up again once, instead of failing
-                    // until the manga memo expires.
-                    if attempt == 0 && remembered_manga {
+                    // until the manga memo expires. Only a "not found" answer (no chapter,
+                    // or the engine's own GraphQL error) says the id may be stale; a
+                    // transport error or timeout would only be waited out twice.
+                    let stale = match &result {
+                        Ok(_) => true,
+                        Err(error) => error.downcast_ref::<EngineGraphqlError>().is_some(),
+                    };
+                    if attempt == 0 && remembered_manga && stale {
                         self.forget(keys);
                         self.unmark_missing(&keys.chapter_memo_key());
                         continue;

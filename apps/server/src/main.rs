@@ -3181,7 +3181,14 @@ fn log_ansi(stdout_is_terminal: bool, no_color: Option<std::ffi::OsString>) -> b
 fn cli_uses_main_database(argv: &[String]) -> bool {
     matches!(
         argv.first().map(String::as_str),
-        Some("backfill-work-metadata" | "takedown" | "engine" | "work-chapters" | "phase-f")
+        Some(
+            "backfill-work-metadata"
+                | "takedown"
+                | "engine"
+                | "work-chapters"
+                | "phase-f"
+                | "covers"
+        )
     )
 }
 
@@ -3373,6 +3380,42 @@ async fn main() -> anyhow::Result<()> {
         let result = catalog::work_chapter::run_cli(&pool, &argv[1..]).await;
         pool.close().await;
         return result;
+    }
+    // `komika-server covers repair-missing` — the lost-file repair once over the whole
+    // cover index, without the GC's plausibility guard (after a restore without cover
+    // files). A covers path that is missing or not a directory is refused first.
+    if argv.first().map(String::as_str) == Some("covers") {
+        anyhow::ensure!(
+            argv.len() == 2 && argv[1] == "repair-missing",
+            "usage: covers repair-missing"
+        );
+        gc::check_covers_dir(&cfg.covers_dir)?;
+        let pool = db::connect_existing(&cfg.database_url).await?;
+        let covers = crate::cover_store::CoverStore::open(
+            &pool,
+            cfg.covers_dir.clone(),
+            &cfg.covers_database_url,
+            true,
+        )
+        .await?;
+        let started = std::time::Instant::now();
+        let result = gc::repair_all_missing_cover_files(&pool, &covers).await;
+        pool.close().await;
+        covers.close().await;
+        let done = result?;
+        println!(
+            "checked {} rows, cleared or restored {}, failed {}, in {:.1} s",
+            done.checked,
+            done.repaired,
+            done.failed,
+            started.elapsed().as_secs_f64()
+        );
+        anyhow::ensure!(
+            done.failed == 0,
+            "{} rows could not be repaired",
+            done.failed
+        );
+        return Ok(());
     }
     if argv.first().map(String::as_str) == Some("phase-f") {
         let pool = db::connect_existing(&cfg.database_url).await?;
@@ -5389,6 +5432,7 @@ mod tests {
             "engine",
             "work-chapters",
             "phase-f",
+            "covers",
         ] {
             assert!(cli_uses_main_database(&argv(cmd)), "{cmd}");
         }

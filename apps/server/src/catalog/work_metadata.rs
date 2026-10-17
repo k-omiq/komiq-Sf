@@ -1368,7 +1368,8 @@ pub async fn reproject_bar(
 }
 
 /// Finish every pending bar re-projection (a dropped admin request, an error or a
-/// restart left it). Returns how many works were re-projected.
+/// restart left it). Returns how many works were re-projected. A marker whose run fails
+/// is logged and left for the next pass; the markers after it still run.
 pub async fn resume_pending_bars(pool: &Database) -> Result<u64> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT key, value FROM instance_setting WHERE starts_with(key, $1) ORDER BY key",
@@ -1388,7 +1389,13 @@ pub async fn resume_pending_bars(pool: &Database) -> Result<u64> {
             tracing::warn!(%key, "skipping a malformed pending metadata bar re-projection");
             continue;
         };
-        projected += reproject_bar(pool, source_id, group, &pending.run).await?;
+        match reproject_bar(pool, source_id, group, &pending.run).await {
+            Ok(works) => projected += works,
+            Err(error) => {
+                let error = crate::db::observed_database_error(error);
+                tracing::warn!(%key, error = %format!("{error:#}"), "pending metadata bar re-projection failed; will retry");
+            }
+        }
     }
     Ok(projected)
 }
@@ -2674,5 +2681,42 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(restored, 150);
+    }
+
+    /// One marker whose run keeps failing must not stop the markers after it.
+    #[tokio::test]
+    async fn a_failing_pending_bar_does_not_block_the_later_ones() {
+        let pool = pool().await;
+        record_bar(&pool, "aaa-failing", FieldGroup::Title, true)
+            .await
+            .unwrap();
+        record_bar(&pool, "zzz-later", FieldGroup::Title, true)
+            .await
+            .unwrap();
+        // The first marker's run fails at its last step, every time.
+        sqlx::query(
+            "CREATE FUNCTION refuse_marker_delete() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER refuse_marker_delete BEFORE DELETE ON instance_setting FOR EACH ROW \
+             WHEN (OLD.key = 'metadata_bar_reproject:aaa-failing:title') \
+             EXECUTE FUNCTION refuse_marker_delete()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        resume_pending_bars(&pool).await.unwrap();
+        let left: Vec<String> = sqlx::query_scalar(
+            "SELECT key FROM instance_setting WHERE starts_with(key, $1) ORDER BY key",
+        )
+        .bind(PENDING_PREFIX)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(left, vec![pending_key("aaa-failing", FieldGroup::Title)]);
     }
 }

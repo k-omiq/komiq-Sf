@@ -279,6 +279,9 @@ struct Inner {
     legacy: Option<SqliteDatabase>,
     done: AtomicBool,
     cursor: RwLock<CopyCursor>,
+    /// The last answer of the GC's store plausibility check and when it was made, shared
+    /// by the GC pass and the read-path repair (see `gc::store_plausible_cached`).
+    plausible: tokio::sync::Mutex<Option<(tokio::time::Instant, bool)>>,
 }
 
 /// The cover store: the object directory, plus the SQLite cache while the copy runs.
@@ -406,6 +409,7 @@ impl CoverStore {
             legacy,
             done: AtomicBool::new(done),
             cursor: RwLock::new(cursor),
+            plausible: tokio::sync::Mutex::new(None),
         })))
     }
 
@@ -424,6 +428,12 @@ impl CoverStore {
 
     pub fn objects_dir(&self) -> PathBuf {
         self.0.dir.join("objects")
+    }
+
+    /// The cached store plausibility answer. Held while one caller recomputes it, so
+    /// concurrent read repairs share one check.
+    pub(crate) fn plausibility(&self) -> &tokio::sync::Mutex<Option<(tokio::time::Instant, bool)>> {
+        &self.0.plausible
     }
 
     /// Whether the SQLite copy has finished.

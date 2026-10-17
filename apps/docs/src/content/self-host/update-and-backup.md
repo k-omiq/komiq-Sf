@@ -79,7 +79,13 @@ docker compose exec -T postgres sh -c \
   < "$DUMP"
 ```
 
-Restore before starting the server so its migrations do not create conflicting tables. Check the restore exit status. Restore the engine volume archive using the next section, then start the rest with `docker compose up -d` and inspect your library. Missing cover files refill from their sources as readers open them. When most files are missing, as after a restore without them, garbage collection does not clear them in bulk. Uploaded covers return from PostgreSQL, except uploads from before this update.
+Restore before starting the server so its migrations do not create conflicting tables. Check the restore exit status. Restore the engine volume archive using the next section, then start the rest with `docker compose up -d` and inspect your library. When only some cover files are missing, they refill from their sources as readers open them. When most are missing, as after a restore without them, neither garbage collection nor cover reads clear them, because the server cannot tell this from a wrong `KOMIKA_COVERS_DIR`. After such a restore, run this once, after the server has started:
+
+```sh
+docker compose exec server komika-server covers repair-missing
+```
+
+The command checks every row of the cover index. It restores uploaded covers from PostgreSQL and clears the other rows whose files are missing, so the background cover crawl fetches those covers from their sources again. It prints how many rows it checked and cleared, and how long it took. It refuses to run when the covers directory does not exist or is not a directory. Uploads from before this update are not in PostgreSQL and do not return.
 
 ### Server and engine files
 

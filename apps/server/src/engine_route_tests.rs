@@ -50,6 +50,8 @@ pub(crate) struct FakeState {
     pub page_pause: Option<crate::locks::pause_points::PausePoints>,
     pub chapters_after_page: Option<(usize, Vec<FakeChapter>)>,
     pub cover_hits: Vec<i64>,
+    /// Every authorized GraphQL request, answered or not (a down engine counts too).
+    pub gql_requests: usize,
 }
 
 pub(crate) struct FakeRegional {
@@ -114,6 +116,7 @@ async fn fake_graphql(
     let query = request["query"].as_str().unwrap_or_default().to_string();
     let vars = &request["variables"];
     let mut state = shared.state.lock().unwrap();
+    state.gql_requests += 1;
     if state.down {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -777,6 +780,93 @@ async fn regional_source_requests_spend_the_source_budget() {
         RegionalPage::Page(..)
     ));
     assert_eq!(fake.calls("page_list"), 2);
+}
+
+/// A reader is not paced like a background job: right after a background scan (whose
+/// even gap at 10 requests / 5 min is 60 s), a cold open's three source requests (search,
+/// chapter list, page list) go at once from the window's room. Only a spent window
+/// answers busy, at once and without a source request.
+#[tokio::test]
+async fn a_cold_regional_open_bursts_within_the_source_window() {
+    let mut state = fixture_state();
+    state.searchable.push(FakeManga {
+        id: 777,
+        source_id: "src".into(),
+        url: "/m/2".into(),
+        title: "Second Story".into(),
+    });
+    state.listable.push(FakeChapter {
+        id: 9100,
+        manga_id: 777,
+        url: "/c/2".into(),
+        order: 4,
+        pages: 2,
+    });
+    let fake = FakeRegional::spawn(state).await;
+    let engines = Engines::new(&[fake.spec("sg")]);
+    let budgets = Arc::new(crate::source_budget::SourceBudgets::default());
+    budgets.apply_limits(&crate::scanner::merge_source_rate_limits(
+        crate::config::parse_scan_source_rate_limits("src=10/300"),
+        Vec::new(),
+    ));
+    engines.set_budgets(&budgets);
+    let engine = engines.engine("sg").unwrap();
+    let (_stop, running) = tokio::sync::watch::channel(false);
+    assert!(budgets.spend("src", SourceUse::Scan, &running).await);
+    let started = Instant::now();
+    let k = keys("/m/2", "/c/2", "Second Story");
+    assert!(matches!(
+        engine.fetch_page(&k, 0).await.unwrap(),
+        RegionalPage::Page(..)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1), "no pacing wait");
+    assert_eq!(engine.counters.snapshot().source_requests, 3);
+    // The scan (2) and the open (3) leave 5 of the window's 10.
+    for _ in 0..5 {
+        assert!(budgets.try_spend_burst("src", SourceUse::Regional));
+    }
+    engine.chapters.forget(&k.chapter_memo_key());
+    let started = Instant::now();
+    assert!(matches!(
+        engine.fetch_page(&k, 1).await.unwrap(),
+        RegionalPage::Busy
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a full window refuses at once"
+    );
+    assert_eq!(fake.calls("page_list"), 1);
+}
+
+/// Readers of one absent manga queued behind each other share the first one's search.
+#[tokio::test]
+async fn concurrent_readers_of_an_absent_manga_share_one_search() {
+    let fake = FakeRegional::spawn(fixture_state()).await;
+    let engine = RegionalEngine::new(&fake.spec("sg"));
+    let k = keys("/m/none", "/c/none", "Nowhere");
+    let reads = futures::future::join_all((0..4).map(|_| engine.chapter(&k))).await;
+    assert!(reads.into_iter().all(|read| read.unwrap().is_none()));
+    assert_eq!(fake.calls("search"), 1);
+}
+
+/// A transport failure of the chapter lookup is not taken for a stale manga id: the
+/// read fails after one attempt instead of waiting the engine out twice.
+#[tokio::test]
+async fn a_down_engine_does_not_retry_the_chapter_lookup() {
+    let fake = FakeRegional::spawn(fixture_state()).await;
+    let engine = RegionalEngine::new(&fake.spec("sg"));
+    let k = keys("/m/1", "/c/1", "Fixture One");
+    engine.chapter(&k).await.unwrap().unwrap();
+    engine.chapters.forget(&k.chapter_memo_key());
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.down = true;
+        state.gql_requests = 0;
+    }
+    assert!(engine.fetch_page(&k, 0).await.is_err());
+    assert_eq!(fake.state.lock().unwrap().gql_requests, 1);
+    // The remembered manga id survives a transport failure.
+    assert!(engine.manga.has_value(&k.manga_memo_key()));
 }
 
 // ---- versions and decisions -----------------------------------------------------------

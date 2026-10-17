@@ -113,21 +113,15 @@ impl SourceBudgets {
         }
     }
 
-    /// Wait up to `max_wait` for this source's budget, for a request someone is waiting
-    /// on; sources without a limit continue at once. A refusal records nothing.
-    pub(crate) async fn spend_within(
-        &self,
-        source_id: &str,
-        usage: SourceUse,
-        max_wait: Duration,
-    ) -> bool {
-        let Some(throttle) = self.throttle(source_id) else {
-            return true;
-        };
-        let (_running, shutdown) = watch::channel(false);
-        tokio::time::timeout(max_wait, throttle.acquire(usage, &shutdown))
-            .await
-            .unwrap_or(false)
+    /// Take this source's budget at once for a request a reader is waiting on: up to the
+    /// rolling window's remaining capacity, WITHOUT the even gap the background jobs keep,
+    /// and without queueing behind them. A full window refuses at once and records
+    /// nothing. Sources without a limit continue at once.
+    pub(crate) fn try_spend_burst(&self, source_id: &str, usage: SourceUse) -> bool {
+        match self.throttle(source_id) {
+            Some(throttle) => throttle.try_burst(usage),
+            None => true,
+        }
     }
 
     /// Wait up to `max_wait` for source pacing, then check the hourly media budget.
@@ -138,7 +132,7 @@ impl SourceBudgets {
         };
         let deadline = Instant::now() + max_wait;
         tokio::time::timeout_at(deadline, async {
-            let mut starts = throttle.starts.lock().await;
+            let _queued = throttle.queue.lock().await;
             loop {
                 let pace = throttle.pace();
                 let cost = SourceUse::MediaPage.cost(pace);
@@ -146,16 +140,20 @@ impl SourceBudgets {
                 if now > deadline {
                     return false;
                 }
-                let mut recent = starts.clone();
-                let wait = SourceThrottle::wait(&mut recent, pace, cost, now);
-                if wait.is_zero() {
-                    if self.media_pages.check(source_id).is_err() {
-                        return false;
+                let wait = {
+                    let mut starts = throttle.starts();
+                    let mut recent = starts.clone();
+                    let wait = SourceThrottle::wait(&mut recent, pace, cost, now, true);
+                    if wait.is_zero() {
+                        if self.media_pages.check(source_id).is_err() {
+                            return false;
+                        }
+                        recent.push_back((now, cost));
+                        *starts = recent;
+                        return true;
                     }
-                    recent.push_back((now, cost));
-                    *starts = recent;
-                    return true;
-                }
+                    wait
+                };
                 tokio::time::sleep(wait).await;
             }
         })
@@ -166,11 +164,14 @@ impl SourceBudgets {
 
 /// A rolling request window plus an even gap after each start, proportional to its cost.
 /// Scan-only traffic keeps exactly the old `window / scans_per_window` pacing.
-/// The async mutex stays held across waits so consumers queue in order. Limit edits
-/// re-pace the same window; a restart begins with an empty, immediately usable window.
+/// The async queue mutex stays held across waits so background consumers queue in order;
+/// the window itself sits behind a short sync lock, so a reader's burst spend
+/// ([`SourceBudgets::try_spend_burst`]) never waits behind a sleeping consumer. Limit
+/// edits re-pace the same window; a restart begins with an empty, immediately usable one.
 pub(crate) struct SourceThrottle {
     pace: std::sync::Mutex<Pace>,
-    starts: tokio::sync::Mutex<VecDeque<(Instant, u32)>>,
+    queue: tokio::sync::Mutex<()>,
+    starts: std::sync::Mutex<VecDeque<(Instant, u32)>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,12 +208,31 @@ impl SourceThrottle {
         let pace = Pace::of(limit);
         Self {
             pace: std::sync::Mutex::new(pace),
-            starts: tokio::sync::Mutex::new(VecDeque::new()),
+            queue: tokio::sync::Mutex::new(()),
+            starts: std::sync::Mutex::new(VecDeque::new()),
         }
     }
 
     fn pace(&self) -> Pace {
         *self.pace.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn starts(&self) -> std::sync::MutexGuard<'_, VecDeque<(Instant, u32)>> {
+        self.starts.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record a start now if the rolling window has room for it, ignoring the even gap.
+    fn try_burst(&self, usage: SourceUse) -> bool {
+        let pace = self.pace();
+        let cost = usage.cost(pace);
+        let now = Instant::now();
+        let mut starts = self.starts();
+        if Self::wait(&mut starts, pace, cost, now, false).is_zero() {
+            starts.push_back((now, cost));
+            true
+        } else {
+            false
+        }
     }
 
     /// Re-pace to `limit`, keeping the recent starts. Returns whether anything changed.
@@ -234,6 +254,7 @@ impl SourceThrottle {
         pace: Pace,
         cost: u32,
         now: Instant,
+        paced: bool,
     ) -> Duration {
         while starts
             .front()
@@ -253,7 +274,7 @@ impl SourceThrottle {
                 }
             }
         }
-        if let Some((last, last_cost)) = starts.back() {
+        if let Some((last, last_cost)) = starts.back().filter(|_| paced) {
             wait = wait.max(
                 pace.gap(*last_cost)
                     .saturating_sub(now.duration_since(*last)),
@@ -265,24 +286,29 @@ impl SourceThrottle {
     /// A stop request interrupts both queueing for the mutex and the pacing sleep.
     async fn acquire(&self, usage: SourceUse, shutdown: &watch::Receiver<bool>) -> bool {
         let mut shutdown = shutdown.clone();
-        let mut starts = tokio::select! {
+        let _queued = tokio::select! {
             biased;
             _ = wait_for_shutdown(&mut shutdown) => return false,
-            starts = self.starts.lock() => starts,
+            queued = self.queue.lock() => queued,
         };
         loop {
             if *shutdown.borrow() {
                 return false;
             }
-            // Read each pass: edits re-pace even a caller already waiting.
+            // Read each pass: edits re-pace even a caller already waiting, and a reader's
+            // burst spend made during the sleep counts.
             let pace = self.pace();
             let cost = usage.cost(pace);
             let now = Instant::now();
-            let wait = Self::wait(&mut starts, pace, cost, now);
-            if wait.is_zero() {
-                starts.push_back((now, cost));
-                return true;
-            }
+            let wait = {
+                let mut starts = self.starts();
+                let wait = Self::wait(&mut starts, pace, cost, now, true);
+                if wait.is_zero() {
+                    starts.push_back((now, cost));
+                    return true;
+                }
+                wait
+            };
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
                 _ = wait_for_shutdown(&mut shutdown) => return false,
@@ -505,10 +531,10 @@ mod tests {
         tokio::time::advance(Duration::from_secs(200)).await;
         let t0 = Instant::now();
         let throttle = budgets.throttle("s").unwrap();
-        let starts = throttle.starts.lock().await.clone();
+        let starts = throttle.starts().clone();
         assert!(!budgets.spend_media_page("s", MEDIA_WAIT).await);
         assert_eq!(Instant::now().duration_since(t0), MEDIA_WAIT);
-        assert_eq!(*throttle.starts.lock().await, starts);
+        assert_eq!(*throttle.starts(), starts);
         assert!(budgets.media_pages.is_limited("s").is_none());
         assert!(budgets.spend_media_page("s", MEDIA_WAIT).await);
         assert!(
@@ -534,10 +560,10 @@ mod tests {
             assert!(budgets.media_pages.check("s").is_ok());
         }
         let throttle = budgets.throttle("s").unwrap();
-        let starts = throttle.starts.lock().await.clone();
+        let starts = throttle.starts().clone();
         assert!(!budgets.spend_media_page("s", MEDIA_WAIT).await);
         assert_eq!(Instant::now().duration_since(t0), Duration::from_secs(6));
-        assert_eq!(*throttle.starts.lock().await, starts);
+        assert_eq!(*throttle.starts(), starts);
     }
 
     #[tokio::test(start_paused = true)]
@@ -590,16 +616,39 @@ mod tests {
         assert!(!second.await);
         assert!(!first.await);
         assert_eq!(Instant::now(), t0);
-        assert_eq!(
-            budgets
-                .throttle("s")
-                .unwrap()
-                .starts
-                .try_lock()
-                .unwrap()
-                .len(),
-            1
+        assert_eq!(budgets.throttle("s").unwrap().starts().len(), 1);
+    }
+
+    /// A reader's burst spend skips the even gap and the queue a sleeping background
+    /// consumer holds, but shares the window: it is refused only when the window is full,
+    /// and what it took delays the background consumers, so the cap still holds.
+    #[tokio::test(start_paused = true)]
+    async fn reader_bursts_share_the_window_without_the_gap_or_the_queue() {
+        let budgets = budgets("s=10/300");
+        let (_tx, rx) = watch::channel(false);
+        let t0 = Instant::now();
+        assert!(budgets.spend("s", SourceUse::Discovery, &rx).await);
+        let scan = budgets.spend("s", SourceUse::Scan, &rx);
+        tokio::pin!(scan);
+        assert!(
+            futures::poll!(&mut scan).is_pending(),
+            "the scan owes a 30 s gap"
         );
+        for _ in 0..9 {
+            assert!(budgets.try_spend_burst("s", SourceUse::Regional));
+        }
+        assert!(
+            !budgets.try_spend_burst("s", SourceUse::Regional),
+            "the window is full"
+        );
+        assert_eq!(Instant::now(), t0);
+        assert_eq!(budgets.throttle("s").unwrap().starts().len(), 10);
+        assert!(
+            budgets.try_spend_burst("other", SourceUse::Regional),
+            "no limit"
+        );
+        assert!(scan.await);
+        assert_eq!(Instant::now().duration_since(t0), Duration::from_secs(300));
     }
 
     #[tokio::test(start_paused = true)]
