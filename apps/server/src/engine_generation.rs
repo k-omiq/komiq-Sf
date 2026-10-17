@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{bail, ensure, Result};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::cover_store::CoverStore;
@@ -18,6 +19,12 @@ const MARKER: &str = "komiq.engine.generation";
 const LOCK: i64 = 0x4b6f6d697147656e;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The engine keeps running a read the server gave up on. After a timed-out check,
+/// scanner ticks and waiters hold off this long (doubling per repeat, up to the cap)
+/// instead of piling another read on top of it.
+const RETRY_AFTER_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_RETRY_AFTER_TIMEOUT: Duration = Duration::from_secs(600);
+const TIMEOUT_WARN_EVERY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FenceError {
@@ -76,6 +83,28 @@ struct Gate {
     suspect_chapter: BTreeSet<i64>,
 }
 
+/// When the next unforced check (scanner tick, waiter) may run.
+#[derive(Debug, Default)]
+struct Pace {
+    last: Option<Instant>,
+    /// Checks that timed out in a row; any completed check resets it.
+    timeouts: u32,
+    retry_at: Option<Instant>,
+    warned_at: Option<Instant>,
+}
+/// The pause after the given number of timed-out checks in a row (at least one).
+fn retry_after(timeouts: u32) -> Duration {
+    RETRY_AFTER_TIMEOUT
+        .saturating_mul(1 << timeouts.saturating_sub(1).min(16))
+        .min(MAX_RETRY_AFTER_TIMEOUT)
+}
+impl Pace {
+    fn allows(&self, now: Instant, min_gap: Duration) -> bool {
+        self.retry_at.is_none_or(|at| now >= at)
+            && self.last.is_none_or(|at| now.duration_since(at) >= min_gap)
+    }
+}
+
 pub struct Fence {
     pool: Database,
     covers: CoverStore,
@@ -86,7 +115,7 @@ pub struct Fence {
     warned: std::sync::atomic::AtomicBool,
     gone_manga: Mutex<BTreeSet<i64>>,
     gone_chapter: Mutex<BTreeSet<i64>>,
-    last_check: Mutex<Option<tokio::time::Instant>>,
+    pace: std::sync::Mutex<Pace>,
 }
 impl std::fmt::Debug for Fence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -121,7 +150,7 @@ impl Fence {
             warned: Default::default(),
             gone_manga: Default::default(),
             gone_chapter: Default::default(),
-            last_check: Default::default(),
+            pace: Default::default(),
         });
         pool.engine_fence
             .set(Arc::downgrade(&fence))
@@ -163,7 +192,44 @@ impl Fence {
 
     async fn check_locked(&self) {
         let revision = self.revision();
-        match tokio::time::timeout(CHECK_TIMEOUT, self.check_inner(revision)).await {
+        let outcome = tokio::time::timeout(CHECK_TIMEOUT, self.check_inner(revision)).await;
+        {
+            let now = Instant::now();
+            let mut pace = self.pace.lock().unwrap_or_else(|e| e.into_inner());
+            pace.last = Some(now);
+            match &outcome {
+                // A completed check, or a lost connection (the engine restarted and
+                // its old read went with it), ends the pause. Another quick failure
+                // says nothing about an old read still running.
+                Ok(result) => {
+                    if result
+                        .as_ref()
+                        .map_or_else(crate::suwayomi::is_connection_error, |_| true)
+                    {
+                        pace.timeouts = 0;
+                        pace.retry_at = None;
+                    }
+                }
+                Err(_) => {
+                    pace.timeouts += 1;
+                    let retry_in = retry_after(pace.timeouts);
+                    pace.retry_at = Some(now + retry_in);
+                    if pace
+                        .warned_at
+                        .is_none_or(|at| now.duration_since(at) >= TIMEOUT_WARN_EVERY)
+                    {
+                        pace.warned_at = Some(now);
+                        // The engine may still be running the abandoned read.
+                        tracing::warn!(
+                            timeouts = pace.timeouts,
+                            retry_in_secs = retry_in.as_secs(),
+                            "engine generation check timed out; pausing periodic checks"
+                        );
+                    }
+                }
+            }
+        }
+        match outcome {
             Ok(Ok(())) => {
                 self.gate
                     .write()
@@ -188,22 +254,24 @@ impl Fence {
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .unreachable = false;
-                tracing::debug!("engine generation check timed out; keeping the current gate")
             }
         }
-        *self.last_check.lock().await = Some(tokio::time::Instant::now());
+    }
+
+    /// Whether an unforced check may run now. Explicit checks (attach, a connection
+    /// loss, a write guard, recovery) always run.
+    fn may_check(&self, min_gap: Duration) -> bool {
+        self.pace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .allows(Instant::now(), min_gap)
     }
 
     pub async fn scanner_tick(&self) {
         // Source loops tick together. Share the identity read across those ticks.
         let _checking = self.checking.lock().await;
-        let recent = self
-            .last_check
-            .lock()
-            .await
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(1));
         let unfenced = self.gate.read().unwrap_or_else(|e| e.into_inner()).unfenced;
-        if !recent && (!unfenced || self.is_blocked()) {
+        if (!unfenced || self.is_blocked()) && self.may_check(Duration::from_secs(1)) {
             self.check_locked().await;
         }
     }
@@ -221,7 +289,15 @@ impl Fence {
             self.gate.write().unwrap_or_else(|e| e.into_inner()).blocked = true;
         }
         if self.is_blocked() || self.generation().is_none() {
-            let _ = tokio::time::timeout(WAIT_TIMEOUT, self.check()).await;
+            // After a timed-out check the gate stays as it is until the pause ends;
+            // the next tick or waiter after that checks again.
+            let _ = tokio::time::timeout(WAIT_TIMEOUT, async {
+                let _checking = self.checking.lock().await;
+                if self.may_check(Duration::ZERO) {
+                    self.check_locked().await;
+                }
+            })
+            .await;
         }
         if self.is_blocked() || self.generation().is_none() {
             // An engine that is down or still starting (a fresh install) says so plainly.
@@ -401,12 +477,20 @@ impl Fence {
 
     async fn fingerprint(&self, generation: Uuid, full: bool) -> Result<Fingerprint> {
         let mut sampled_any = false;
+        let mut empty = None;
         loop {
             let mut result = self.fingerprint_sample(generation, full).await?;
+            // A compared binding proves the engine is not empty. Reattach needs one.
             if full || result.mismatch || result.compared > 0 {
                 return Ok(result);
             }
             sampled_any |= result.sampled > 0;
+            // Ask only when nothing came back, and once per check: the engine's
+            // `mangas` resolver counts and walks every row even with `first:1`.
+            result.empty = match empty {
+                Some(empty) => empty,
+                None => *empty.insert(engine_empty(&self.engine).await?),
+            };
             if result.empty || result.sampled == 0 {
                 // A later check must be able to verify the original engine if it
                 // returns, including ids that were absent from the replacement.
@@ -481,6 +565,9 @@ impl Fence {
             sampled: mangas.len() + chapters.len(),
             unverified: false,
         };
+        if result.sampled == 0 {
+            return Ok(result);
+        }
         for batch in 0..batches {
             let ms = &mangas[(batch * 16).min(mangas.len())..((batch + 1) * 16).min(mangas.len())];
             let cs =
@@ -495,11 +582,10 @@ impl Fence {
                 .map(|r| r.0.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            let doc = format!("query EngineFingerprint {{ probe: mangas(first:1) {{ nodes {{ id }} }} mangas(filter:{{id:{{in:[{mids}]}}}}) {{ nodes {{ id sourceId url }} }} chapters(filter:{{id:{{in:[{cids}]}}}}) {{ nodes {{ id mangaId url manga {{ sourceId url }} }} }} }}");
+            let doc = format!("query EngineFingerprint {{ mangas(filter:{{id:{{in:[{mids}]}}}}) {{ nodes {{ id sourceId url }} }} chapters(filter:{{id:{{in:[{cids}]}}}}) {{ nodes {{ id mangaId url manga {{ sourceId url }} }} }} }}");
             let data = self.engine.identity_query(&doc, json!({})).await?;
             let mn = nodes(&data, "mangas")?;
             let cn = nodes(&data, "chapters")?;
-            result.empty = nodes(&data, "probe")?.is_empty();
             for (id, source, key) in ms {
                 if let Some(live) = mn.iter().find(|r| r["id"].as_i64() == Some(*id)) {
                     result.compared += 1;
@@ -805,6 +891,18 @@ fn nodes<'a>(data: &'a Value, field: &str) -> Result<&'a Vec<Value>> {
     data[field]["nodes"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("Engine fingerprint omitted {field}"))
+}
+/// Whether the engine has no manga at all. The engine's `mangas` resolver counts and
+/// reads every matching row before it applies `first`, so this costs one pass over the
+/// manga table: callers ask only when no sampled binding came back.
+async fn engine_empty(engine: &SuwayomiClient) -> Result<bool> {
+    let data = engine
+        .identity_query(
+            "query EngineEmpty { mangas(first:1) { nodes { id } } }",
+            json!({}),
+        )
+        .await?;
+    Ok(nodes(&data, "mangas")?.is_empty())
 }
 enum Marker {
     Value(String),

@@ -15,7 +15,16 @@ pub(crate) struct MockEngine {
     pub data: Arc<Mutex<MockData>>,
     pub url: String,
     pub fingerprints: Arc<AtomicUsize>,
+    pub empty_probes: Arc<AtomicUsize>,
+    pub load: Arc<EngineLoad>,
     server: Arc<tokio::task::JoinHandle<()>>,
+}
+/// Requests the engine received and is still working on, including ones whose client gave up.
+#[derive(Default)]
+pub(crate) struct EngineLoad {
+    pub requests: AtomicUsize,
+    pub in_flight: AtomicUsize,
+    pub max_in_flight: AtomicUsize,
 }
 pub(crate) struct MockData {
     pub marker: Option<String>,
@@ -47,14 +56,20 @@ impl MockEngine {
             fail_marker_write: false,
         }));
         let fingerprints = Arc::new(AtomicUsize::new(0));
+        let empty_probes = Arc::new(AtomicUsize::new(0));
+        let load = Arc::new(EngineLoad::default());
         let app = axum::Router::new().route("/api/graphql", axum::routing::post({
-            let data = data.clone(); let fingerprints = fingerprints.clone();
+            let data = data.clone(); let fingerprints = fingerprints.clone(); let empty_probes = empty_probes.clone(); let load = load.clone();
             move |axum::Json(request): axum::Json<Value>| {
-                let data = data.clone(); let fingerprints = fingerprints.clone();
-                async move {
+                let data = data.clone(); let fingerprints = fingerprints.clone(); let empty_probes = empty_probes.clone(); let load = load.clone();
+                // Like Suwayomi, the engine finishes a request even after its client has gone.
+                async move { tokio::spawn(async move {
+                    load.requests.fetch_add(1, Ordering::SeqCst);
+                    let now = load.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    load.max_in_flight.fetch_max(now, Ordering::SeqCst);
                     let delay = data.lock().await.delay;
                     tokio::time::sleep(delay).await;
-                    if request["query"].as_str().unwrap().contains("EngineFingerprint") {
+                    if request["query"].as_str().unwrap().contains("EngineFingerprint") || request["query"].as_str().unwrap().contains("EngineEmpty") {
                         let delay = data.lock().await.fingerprint_delay;
                         tokio::time::sleep(delay).await;
                     }
@@ -76,8 +91,10 @@ impl MockEngine {
                             let ids: Vec<i64> = ids.split(',').filter_map(|id| id.parse().ok()).collect();
                             rows.iter().filter(|row| ids.contains(&row["id"].as_i64().unwrap())).cloned().collect::<Vec<_>>()
                         };
-                        json!({"data":{"probe":{"nodes":d.mangas.iter().take(1).cloned().collect::<Vec<_>>()},
-                            "mangas":{"nodes":selected("mangas",&d.mangas)},"chapters":{"nodes":selected("chapters",&d.chapters)}}})
+                        json!({"data":{"mangas":{"nodes":selected("mangas",&d.mangas)},"chapters":{"nodes":selected("chapters",&d.chapters)}}})
+                    } else if query.contains("EngineEmpty") {
+                        empty_probes.fetch_add(1,Ordering::SeqCst);
+                        json!({"data":{"mangas":{"nodes":d.mangas.iter().take(1).cloned().collect::<Vec<_>>()}}})
                     } else if query.contains("fetchMangaAndChapters") {
                         json!({"data":{"fetchMangaAndChapters":{"manga":d.mangas.first(),"chapters":d.chapters}}})
                     } else if query.contains("mangas(condition:") {
@@ -85,8 +102,9 @@ impl MockEngine {
                     } else if query.contains("fetchChapterPages") { json!({"data":{"fetchChapterPages":{"pages":["/api/v1/manga/7/chapter/0/page/0"]}}}) }
                     else if query.contains("nodes { mangaId }") { json!({"data":{"chapters":{"nodes":[{"mangaId":7}]}}}) }
                     else { json!({"data":{"manga":d.mangas.first(),"chapters":{"nodes":d.chapters}}}) };
+                    load.in_flight.fetch_sub(1, Ordering::SeqCst);
                     axum::Json(body)
-                }
+                }).await.unwrap() }
             }
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -98,6 +116,8 @@ impl MockEngine {
             data,
             url,
             fingerprints,
+            empty_probes,
+            load,
             server,
         }
     }
@@ -356,7 +376,7 @@ async fn timed_out_fingerprint_cannot_reopen_gate_without_a_verified_binding() {
     fence.check().await;
     assert!(fence.is_blocked());
     assert_eq!(engine.fingerprints.load(Ordering::SeqCst), before + 1);
-    // The first batch marked every binding gone; the empty follow-up timed out.
+    // The first batch marked every binding gone; the emptiness read timed out.
     assert!(fence.gone_manga.lock().await.contains(&7));
     assert!(fence.gone_chapter.lock().await.contains(&8));
     engine.data.lock().await.fingerprint_delay = Duration::ZERO;
@@ -519,6 +539,72 @@ async fn connection_loss_closes_gate_until_check_passes_but_slow_periodic_read_d
     engine.data.lock().await.delay = Duration::ZERO;
     fence.check().await;
     assert!(fence.wait().await.is_ok());
+}
+
+#[tokio::test]
+async fn a_timed_out_check_pauses_periodic_checks_instead_of_piling_reads_on_the_engine() {
+    let (pool, _covers, engine, client, fence, _cover_dir) = setup().await;
+    bind(&pool, &client).await;
+    assert_eq!(engine.load.in_flight.load(Ordering::SeqCst), 0);
+    engine.data.lock().await.delay = Duration::from_secs(4);
+    engine.load.max_in_flight.store(0, Ordering::SeqCst);
+    let before = engine.load.requests.load(Ordering::SeqCst);
+    let empty_probes = engine.empty_probes.load(Ordering::SeqCst);
+    // Several source loops keep ticking past the timeout and the engine's late answer.
+    let started = Instant::now();
+    let loops: Vec<_> = (0..4)
+        .map(|_| {
+            let fence = fence.clone();
+            tokio::spawn(async move {
+                while started.elapsed() < Duration::from_secs(8) {
+                    fence.scanner_tick().await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        })
+        .collect();
+    for task in loops {
+        task.await.unwrap();
+    }
+    assert_eq!(
+        engine.load.requests.load(Ordering::SeqCst) - before,
+        1,
+        "one read, then a pause while the engine may still be running it"
+    );
+    assert_eq!(engine.load.max_in_flight.load(Ordering::SeqCst), 1);
+    assert!(!fence.is_blocked(), "a slow engine is not a replaced one");
+    {
+        let pace = fence.pace.lock().unwrap();
+        assert_eq!(pace.timeouts, 1);
+        assert!(pace.retry_at.unwrap() >= started + RETRY_AFTER_TIMEOUT);
+    }
+    // A waiter on a closed gate sends no read during the pause either.
+    fence.gate.write().unwrap().blocked = true;
+    assert!(fence.wait().await.is_err());
+    assert_eq!(engine.load.requests.load(Ordering::SeqCst) - before, 1);
+    // When the pause ends, the next tick checks again and the closed gate recovers.
+    engine.data.lock().await.delay = Duration::ZERO;
+    fence.pace.lock().unwrap().retry_at = Some(Instant::now());
+    fence.scanner_tick().await;
+    assert!(!fence.is_blocked());
+    assert!(fence.wait().await.is_ok());
+    assert_eq!(
+        engine.empty_probes.load(Ordering::SeqCst),
+        empty_probes,
+        "a check that compares a binding never asks the whole manga table"
+    );
+    let pace = fence.pace.lock().unwrap();
+    assert_eq!(pace.timeouts, 0);
+    assert!(pace.retry_at.is_none());
+}
+
+#[test]
+fn timeout_pause_doubles_up_to_its_cap() {
+    assert_eq!(retry_after(1), Duration::from_secs(60));
+    assert_eq!(retry_after(2), Duration::from_secs(120));
+    assert_eq!(retry_after(4), Duration::from_secs(480));
+    assert_eq!(retry_after(5), MAX_RETRY_AFTER_TIMEOUT);
+    assert_eq!(retry_after(u32::MAX), MAX_RETRY_AFTER_TIMEOUT);
 }
 
 #[tokio::test]
