@@ -11,12 +11,11 @@
 //! move Trending or the view counters — see `graphql/mod.rs::record_view`.
 //!
 //! Counts are keyed by a NORMALISED series key (`view_key`) so a series read under
-//! either identity accrues to one total. Numeric Suwayomi ids are the primary display
-//! identity (home / browse / library / the `series(id)` query all use them), so keys
-//! normalise TOWARD the numeric id: a canonical `w_` work read via its work page folds
-//! into its Suwayomi source id when it has one — that way Trending links to the same
-//! page the rest of the app uses. A pure MangaDex work with no Suwayomi source keeps
-//! its `w_` key.
+//! any identity accrues to one total. Every id resolves to its work (a numeric Suwayomi
+//! id through its mapping, a `w_` id through the work redirect), and the work keys on
+//! its smallest Suwayomi source id, else its work id. Reads sum every key of the work, so
+//! rows written under an older key (before a merge, or before the work gained a source)
+//! still count, and Trending ranks works, not sources.
 //!
 //! Storage (migration 0036):
 //!   - `series_views`       — all-time total per key (one row per series).
@@ -58,22 +57,16 @@ fn current_hour() -> i64 {
 }
 
 /// Resolve a reader-facing series id to its normalised view key (see module docs).
-/// Numeric Suwayomi ids — the primary display identity — key on themselves; a canonical
-/// `w_` work folds into its Suwayomi source id when it has one, else keeps its `w_` key.
+/// Every id first resolves to its work: a numeric Suwayomi id through its mapping, a
+/// `w_` id through the work redirect. The work's key is then its numerically smallest
+/// Suwayomi source id, else the work id. An id with no work (an uncatalogued numeric
+/// series) keys on itself.
 ///
-/// The fold picks the smallest source id by NUMERIC order (source_key is the numeric
-/// Suwayomi manga id) so it's stable and matches how the app numbers ids.
-///
-/// LIMITATION: for a work with MULTIPLE Suwayomi sources, views recorded via a
-/// non-chosen source's numeric page key under that other id and won't merge into the
-/// work's total — and a pure-MangaDex work that later GAINS a Suwayomi source splits
-/// its pre/post views across the two keys. Fully unifying those would need a persistent
-/// canonical-source-per-work concept; single-source works (the common case) unify
-/// exactly.
+/// The key of a work moves when its smallest source changes (a merge brings a smaller
+/// one, or a mapping goes away), and rows written before that keep the old key. Reads
+/// therefore never trust one key: [`counts_for`] and [`trending_keys`] sum every key of
+/// the work (see [`VIEW_KEYS_CTE`]).
 async fn view_key_in(connection: &mut sqlx::PgConnection, series_id: &str) -> Result<String> {
-    if is_numeric_key(series_id) {
-        return Ok(series_id.to_string());
-    }
     Ok(
         crate::db_types::query_scalar::<String>(&format!("{VIEW_KEY_CTE} SELECT key FROM k"))
             .bind(series_id)
@@ -82,19 +75,39 @@ async fn view_key_in(connection: &mut sqlx::PgConnection, series_id: &str) -> Re
     )
 }
 
-fn is_numeric_key(series_id: &str) -> bool {
-    !series_id.is_empty() && series_id.bytes().all(|b| b.is_ascii_digit())
+/// `VIEW_WORK_CTE`: the work behind `$1`, as a CTE `w(id)`. That is a numeric Suwayomi
+/// id's mapped work, else the redirect target of a merged `w_` id, else `$1` itself.
+/// `uq_source_series_suwayomi_key` makes the mapping lookup return at most one row.
+macro_rules! view_work_cte {
+    () => {
+        "WITH w AS (SELECT COALESCE((SELECT work_id FROM source_series \
+                                 WHERE source_type = 'suwayomi' AND source_key = $1), \
+                                (SELECT new_id FROM work_redirect WHERE old_id = $1), \
+                                $1) AS id)"
+    };
 }
 
-/// The key rule of [`view_key_in`] for a non-numeric `$1`, as a CTE `k(key)`: follow
-/// the work redirect, then the numerically smallest Suwayomi mapping, else the work id.
-/// Shared with [`counts_for`] so the read and the flush cannot disagree.
-const VIEW_KEY_CTE: &str =
-    "WITH w AS (SELECT COALESCE((SELECT new_id FROM work_redirect WHERE old_id = $1), $1) AS id), \
+/// The key rule of [`view_key_in`] as a CTE `k(key)` after `VIEW_WORK_CTE`: the
+/// numerically smallest Suwayomi mapping of the work, else the work id.
+const VIEW_KEY_CTE: &str = concat!(
+    view_work_cte!(),
+    ", \
      k AS (SELECT COALESCE((SELECT source_key FROM source_series \
                             WHERE work_id = w.id AND source_type = 'suwayomi' \
                             ORDER BY public.sqlite_integer_pin(source_key) LIMIT 1), \
-                           w.id) AS key FROM w)";
+                           w.id) AS key FROM w)"
+);
+
+/// Every key a view of the work behind `$1` can be stored under, as a CTE `ks(key)`
+/// after `VIEW_WORK_CTE`: the work id and each of its Suwayomi source ids. Folding all
+/// of them makes a read independent of which key a row was written under.
+const VIEW_KEYS_CTE: &str = concat!(
+    view_work_cte!(),
+    ", \
+     ks AS (SELECT id AS key FROM w \
+            UNION SELECT source_key FROM source_series \
+                  WHERE source_type = 'suwayomi' AND work_id = (SELECT id FROM w))"
+);
 
 /// In-memory view buffer: raw `series_id` views aggregated by the hour they were
 /// recorded in, drained by the background flusher (see [`spawn_flusher`]).
@@ -434,39 +447,29 @@ async fn run_flush_loop(pool: Database, mut shutdown: tokio::sync::watch::Receiv
     }
 }
 
-/// Load the all-time / 7-day / 24-hour view counts for one series (resolves its key).
+/// Load the all-time / 7-day / 24-hour view counts for one series, summed over every
+/// key of its work ([`VIEW_KEYS_CTE`]), so the work's sources all report one count.
 ///
 /// One aggregate query folds the all-time `total` (from `series_views`) with both hourly
 /// windows (from `series_view_bucket`): the 24h and 7d sums come from the same scan, gated
 /// by per-row `CASE`s. Since 7d ⊇ 24h, the row filter bounds to the 7d cutoff and the 24h
-/// `CASE` narrows within it. A numeric id is its own key; any other id resolves its key
-/// inside the same statement, by the rule [`view_key_in`] applies (redirect, then the
-/// numerically smallest Suwayomi mapping, else the work id). One round trip per
-/// `Series.views` resolver, which a feed pays per item.
+/// `CASE` narrows within it. One round trip per `Series.views` resolver, which a feed pays
+/// per item.
 pub async fn counts_for(pool: &Database, series_id: &str) -> ViewCounts {
     let hour = current_hour();
     let since24h = hour - 24;
     let since7d = hour - BUCKET_RETENTION_HOURS;
     // An aggregate with no GROUP BY always yields exactly one row, even with zero buckets
-    // (the SUMs come back NULL → 0, the scalar subquery → 0), so `fetch_one` is safe.
-    let sql = if is_numeric_key(series_id) {
-        "SELECT \
-           COALESCE((SELECT total FROM series_views WHERE series_key = $1), 0), \
+    // (the SUMs come back NULL → 0), so `fetch_one` is safe.
+    let sql = format!(
+        "{VIEW_KEYS_CTE} SELECT \
+           COALESCE((SELECT SUM(total) FROM series_views \
+                     WHERE series_key IN (SELECT key FROM ks)), 0)::bigint, \
            COALESCE(SUM(CASE WHEN hour_ts > $2 THEN views END), 0)::bigint, \
            COALESCE(SUM(views), 0)::bigint \
          FROM series_view_bucket \
-         WHERE series_key = $1 AND hour_ts > $3"
-            .to_string()
-    } else {
-        format!(
-            "{VIEW_KEY_CTE} SELECT \
-               COALESCE((SELECT total FROM series_views WHERE series_key = (SELECT key FROM k)), 0), \
-               COALESCE(SUM(CASE WHEN hour_ts > $2 THEN views END), 0)::bigint, \
-               COALESCE(SUM(views), 0)::bigint \
-             FROM series_view_bucket \
-             WHERE series_key = (SELECT key FROM k) AND hour_ts > $3"
-        )
-    };
+         WHERE series_key IN (SELECT key FROM ks) AND hour_ts > $3"
+    );
     let row = crate::db_types::query_tuple::<(i64, i64, i64)>(&sql)
         .bind(series_id)
         .bind(since24h)
@@ -482,14 +485,24 @@ pub async fn counts_for(pool: &Database, series_id: &str) -> ViewCounts {
     }
 }
 
-/// The most-viewed series keys over the last 24 hours, most-viewed first — the ranking
-/// behind Trending. Returns up to `limit` `(series_key, views)` pairs; empty until reads
-/// accumulate (the caller pads a cold-start list with another feed).
+/// The most-viewed works over the last 24 hours, most-viewed first — the ranking behind
+/// Trending. Returns up to `limit` `(key, views)` pairs; empty until reads accumulate (the
+/// caller pads a cold-start list with another feed).
+///
+/// Each stored key folds into its work before ranking, by the rule of `VIEW_WORK_CTE`, and
+/// the work's keys are summed: a work with two Suwayomi sources ranks once, with both
+/// sources' views. The returned key is therefore the work id, or the stored key itself for
+/// an uncatalogued numeric series.
 pub async fn trending_keys(pool: &Database, limit: i64) -> Result<Vec<(String, i64)>> {
     let hour = current_hour();
     let rows = crate::db_types::query_tuple::<(String, i64)>(
-        "SELECT series_key, SUM(views)::bigint AS v FROM series_view_bucket \
-         WHERE hour_ts > $1 GROUP BY series_key ORDER BY v DESC, series_key ASC LIMIT $2",
+        "WITH b AS (SELECT series_key, SUM(views) AS n FROM series_view_bucket \
+                    WHERE hour_ts > $1 GROUP BY series_key) \
+         SELECT COALESCE(s.work_id, r.new_id, b.series_key) AS key, SUM(b.n)::bigint AS v \
+         FROM b \
+         LEFT JOIN source_series s ON s.source_type = 'suwayomi' AND s.source_key = b.series_key \
+         LEFT JOIN work_redirect r ON r.old_id = b.series_key \
+         GROUP BY 1 ORDER BY v DESC, key ASC LIMIT $2",
     )
     .bind(hour - 24)
     .bind(limit)
@@ -852,6 +865,61 @@ mod tests {
         assert_eq!(keys, vec!["w_survivor"]);
         external.close().await;
         pool.close().await;
+    }
+
+    /// A work merged from two Suwayomi series keeps both numeric source ids. Views read
+    /// through either id write one key, and rows already split across the two ids still
+    /// count once for the work, in `counts_for` and in the Trending ranking.
+    #[tokio::test]
+    async fn views_on_two_sources_of_one_work_count_as_that_work() {
+        let pool = pool().await;
+        sqlx::query("INSERT INTO work(id,created_at,updated_at) VALUES ('w_sand',now(),now())")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for key in ["501", "502"] {
+            crate::catalog::upsert_source_series(
+                &pool, "w_sand", "suwayomi", "src", key, None, false,
+            )
+            .await
+            .unwrap();
+        }
+        // Views split across the second source's id before the fix.
+        sqlx::query("INSERT INTO series_views(series_key,total,updated_at) VALUES ('502',4,now())")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO series_view_bucket(series_key,hour_ts,views) VALUES ('502',$1,4)")
+            .bind(current_hour())
+            .execute(&pool)
+            .await
+            .unwrap();
+        record_flushed(&pool, "502").await;
+        record_flushed(&pool, "502").await;
+        record_flushed(&pool, "501").await;
+
+        let written: Vec<(String, i64)> =
+            sqlx::query_as("SELECT series_key,total FROM series_views ORDER BY series_key")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            written,
+            vec![("501".to_owned(), 3), ("502".to_owned(), 4)],
+            "new views of either source land on the work's one key"
+        );
+        for id in ["501", "502", "w_sand"] {
+            let c = counts_for(&pool, id).await;
+            assert_eq!(
+                (c.total, c.last24h, c.last7d),
+                (7, 7, 7),
+                "counts through {id}"
+            );
+        }
+        assert_eq!(
+            trending_keys(&pool, 10).await.unwrap(),
+            vec![("w_sand".to_owned(), 7)]
+        );
     }
 
     #[tokio::test]

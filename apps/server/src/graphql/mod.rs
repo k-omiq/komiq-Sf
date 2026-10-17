@@ -5418,41 +5418,36 @@ async fn compute_discovery(st: &AppState, show_nsfw: bool) -> Result<Vec<Discove
             .collect()
     };
 
-    // Trending = the 10 most-viewed series over the LAST 24 HOURS (the real
+    // Trending = the 10 most-viewed works over the LAST 24 HOURS (the real
     // popularity signal from `recordView`, replacing the old "first 6 of Popular").
     // During cold start — before reads accumulate — this is empty, so pad with
     // Popular to keep the row populated; it becomes fully view-ranked as views come
-    // in. Dedup by id AND title: a series whose views split across two identities
-    // (its `w_` work and its numeric source — see `views::view_key`) would otherwise
-    // resolve to two cards with the same title, so title-dedup collapses them.
+    // in. `views::trending_keys` already ranks one key per work (the work id). A
+    // Popular card is a Suwayomi source, so the padding maps it to its work too: the
+    // row shows each work once, as the work's own card, however many sources it has.
     let trending = {
-        let keys: Vec<String> = crate::views::trending_keys(&st.pool, 10)
+        let ranked: Vec<String> = crate::views::trending_keys(&st.pool, 10)
             .await
             .map_err(gql_read_err)?
             .into_iter()
             .map(|(k, _)| k)
             .collect();
-        let ranked = filter_nsfw(show_nsfw, series_by_keys(st, &keys).await?);
-        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut seen_titles: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut items: Vec<Series> = Vec::with_capacity(10);
-        for s in ranked.into_iter().chain(popular.iter().cloned()) {
-            if items.len() >= 10 {
-                break;
-            }
-            let title_key = s.title.trim().to_lowercase();
-            let dup = seen_ids.contains(&s.id.0)
-                || (!title_key.is_empty() && seen_titles.contains(&title_key));
-            if dup {
-                continue;
-            }
-            seen_ids.insert(s.id.0.clone());
-            if !title_key.is_empty() {
-                seen_titles.insert(title_key);
-            }
-            items.push(s);
-        }
-        items
+        let padding: Vec<String> = popular.iter().map(|s| s.id.0.clone()).collect();
+        let work_of = work_ids_for_series_ids(&st.pool, &padding).await?;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let keys: Vec<String> = ranked
+            .into_iter()
+            .chain(
+                padding
+                    .into_iter()
+                    .map(|id| work_of.get(&id).cloned().unwrap_or(id)),
+            )
+            .filter(|key| seen.insert(key.clone()))
+            .collect();
+        filter_nsfw(show_nsfw, series_by_keys(st, &keys).await?)
+            .into_iter()
+            .take(10)
+            .collect::<Vec<Series>>()
     };
 
     let mut feeds = vec![
@@ -23680,6 +23675,99 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// REGRESSION: a work merged from two Suwayomi series showed twice on Trending, once
+    /// per source id, each card with its source's own title. The work must show once,
+    /// as the work (its id and title), with the views of both sources summed, and the
+    /// Popular padding must not add either source back.
+    #[tokio::test]
+    async fn trending_shows_a_merged_work_once_with_both_sources_views() {
+        let (s, pool) = setup_full(100).await;
+        let latest = Some("1752969600000");
+        let detected = "2026-07-26T00:00:00.000000+00:00";
+        seed_feed_member(
+            &pool,
+            501,
+            "Sandmancer of the Scorched Desert",
+            latest,
+            detected,
+            1,
+        )
+        .await;
+        seed_feed_member(
+            &pool,
+            502,
+            "Sand Mage of the Scorched Desert",
+            latest,
+            detected,
+            1,
+        )
+        .await;
+        seed_canonical(
+            &pool,
+            "md-sand",
+            "Sand Mage of the Scorched Desert (work)",
+            false,
+            "1",
+        )
+        .await;
+        let work_id: String = crate::db_types::query_scalar(
+            "SELECT id FROM work WHERE primary_title = 'Sand Mage of the Scorched Desert (work)'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        for key in ["501", "502"] {
+            crate::catalog::upsert_source_series(
+                &pool, &work_id, "suwayomi", "src", key, None, false,
+            )
+            .await
+            .unwrap();
+        }
+        let hour = chrono::Utc::now().timestamp() / 3600;
+        for (key, views) in [("501", 5_i64), ("502", 4)] {
+            sqlx::query(
+                "INSERT INTO series_views(series_key,total,updated_at) VALUES ($1,$2,now())",
+            )
+            .bind(key)
+            .bind(views)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO series_view_bucket(series_key,hour_ts,views) VALUES ($1,$2,$3)",
+            )
+            .bind(key)
+            .bind(hour)
+            .bind(views)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let home = exec(
+            &s,
+            "{ discovery { kind items { id title views { last24h } } } }",
+            None,
+            "1.1.1.1",
+        )
+        .await;
+        assert!(home.errors.is_empty(), "{:?}", home.errors);
+        let home = home.data.into_json().unwrap();
+        let trending = home["discovery"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rail| rail["kind"] == "TRENDING")
+            .unwrap();
+        assert_eq!(
+            trending["items"],
+            serde_json::json!([{
+                "id": work_id,
+                "title": "Sand Mage of the Scorched Desert (work)",
+                "views": { "last24h": 9 },
+            }])
+        );
     }
 
     /// REGRESSION: `work_redirect` was followed by `canonicalSeries` ALONE. The reader

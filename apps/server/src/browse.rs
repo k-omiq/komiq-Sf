@@ -1920,10 +1920,8 @@ async fn rating_page(
 
 /// TRENDING: the last 24 h's most-viewed works first, then everything else by newest.
 ///
-/// `views::trending_keys` ranks NORMALIZED view keys, which are polymorphic exactly like
-/// `reviews.series_id` — a numeric Suwayomi id when the work has such a source, else a
-/// `w_…`. They are resolved to work ids here in one grouped query, because the feed and
-/// everything downstream key on `work_id`.
+/// `views::trending_keys` ranks works: every view key, numeric or `w_…`, is folded into
+/// its work there, so the feed and everything downstream key on `work_id`.
 ///
 /// Unlike RATING this phase is bounded ([`TRENDING_KEY_LIMIT`]) rather than exact, and that
 /// is correct rather than a compromise: "trending" IS a top-N over a 24-hour window. Works
@@ -2023,64 +2021,23 @@ async fn trending_page(
     Ok(rows)
 }
 
-/// The trending ranking as WORK ids, most-viewed first, deduped.
+/// The trending ranking as WORK ids, most-viewed first.
 ///
-/// A view key is either a numeric Suwayomi id or a `w_…` (see `views::view_key`). Both
-/// shapes can name the same work — a `w_` work with a Suwayomi source normalizes toward the
-/// numeric id, but rows written before it gained that source keep the `w_` key — so the
-/// resolved list is deduped, KEEPING THE FIRST (highest-ranked) occurrence.
+/// `views::trending_keys` already folds every view key into its work and sums the work's
+/// keys, so each work appears once. A key that is not a work id is an uncatalogued
+/// numeric series, which has no Browse row, so it is dropped here.
 ///
 /// Failures degrade to an empty ranking, i.e. Browse falls back to newest-first, rather
 /// than failing the request: this is a popularity ORDERING, not a filter.
 async fn trending_work_ids(pool: &Database, limit: i64) -> Vec<String> {
-    let keys = crate::views::trending_keys(pool, limit)
+    crate::views::trending_keys(pool, limit)
         .await
         .inspect_err(|e| tracing::warn!(error = %e, "browse: trending ranking unavailable"))
-        .unwrap_or_default();
-    if keys.is_empty() {
-        return Vec::new();
-    }
-    // One grouped lookup for every numeric key, rather than one per key.
-    let numeric: Vec<&String> = keys
-        .iter()
-        .map(|(k, _)| k)
-        .filter(|k| !k.starts_with("w_"))
-        .collect();
-    let mut work_of_numeric: std::collections::HashMap<String, String> = Default::default();
-    if !numeric.is_empty() {
-        let sql = format!(
-            "SELECT source_key, work_id FROM source_series \
-             WHERE source_type = 'suwayomi' AND source_key IN ({})",
-            crate::sql_params::placeholders(1, numeric.len())
-        );
-        let mut q = sqlx::query_as::<_, (String, String)>(&sql);
-        for k in &numeric {
-            q = q.bind(*k);
-        }
-        for (k, w) in q
-            .fetch_all(pool)
-            .await
-            .inspect_err(|e| tracing::warn!(error = %e, "browse: trending key resolve failed"))
-            .unwrap_or_default()
-        {
-            work_of_numeric.insert(k, w);
-        }
-    }
-    let mut seen: std::collections::HashSet<String> = Default::default();
-    let mut out = Vec::with_capacity(keys.len());
-    for (k, _) in &keys {
-        let wid = if k.starts_with("w_") {
-            Some(k.clone())
-        } else {
-            work_of_numeric.get(k).cloned()
-        };
-        if let Some(wid) = wid {
-            if seen.insert(wid.clone()) {
-                out.push(wid);
-            }
-        }
-    }
-    out
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| key.starts_with("w_"))
+        .collect()
 }
 
 /// The genre facets Browse renders as filter chips, from the materialized

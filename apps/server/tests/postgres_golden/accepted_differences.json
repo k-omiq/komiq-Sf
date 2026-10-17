@@ -154,6 +154,39 @@
         "accepted_on": "2026-10-17",
         "evidence": "Owner reply on 2026-10-17 to the concrete review of these W3a and W3b differences: Accept the 3 series_bundle files too (title change plus readAnywhere now true for chapters the test reader really read)."
       }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/home__anonymous.json",
+      "expected_sha256": "15b63b3388c318100381148cf80f0b3f7445547e37232c6d8bfb4002bc42e1bd",
+      "actual_sha256": "b63e73351b41722d1d5ac39ca644f88f488e5321e622242aa290b36661c342a8",
+      "reason": "Trending fix: the Trending rail shows each work once, as the work's own card. Fixture work w_00000000000040008000000000000001 has two Suwayomi sources (710001, 710002); the Popular padding used to add one source card per source (\"Solo mirror 710002\", \"Solo mirror 710001\"). It now shows one card: id w_00000000000040008000000000000001, title \"Solo Leveling\", the same cover. No other field or rail changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these Trending differences: Yes, I accept the 3 Trending golden changes (home anonymous, admin, nsfw_user): one work card instead of two source cards."
+      }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/home__admin.json",
+      "expected_sha256": "a08f50158a3dc7a5b0426690d2f205fa2db8a45b9d2abce91fb7235ad576b0bf",
+      "actual_sha256": "85ecd7415050ae2afd640516f6b858d9313b69b576daa111d88a6f0a27fad611",
+      "reason": "Trending fix: the Trending rail shows each work once, as the work's own card. Fixture work w_00000000000040008000000000000001 has two Suwayomi sources (710001, 710002); the Popular padding used to add one source card per source (\"Solo mirror 710002\", \"Solo mirror 710001\"). It now shows one card: id w_00000000000040008000000000000001, title \"Solo Leveling\", the same cover. No other field or rail changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these Trending differences: Yes, I accept the 3 Trending golden changes (home anonymous, admin, nsfw_user): one work card instead of two source cards."
+      }
+    },
+    {
+      "file": "tests/postgres_golden/graphql/home__nsfw_user.json",
+      "expected_sha256": "e71b02a8fca14f5d6f37bb29a90715c0c4706b1b16d27d9a671d3f83c3f38c8b",
+      "actual_sha256": "1b0749e8434686f9385a9dd311aa6afe08f09d75d678512d1ac88c7fd843cf2b",
+      "reason": "Trending fix: the Trending rail shows each work once, as the work's own card. Fixture work w_00000000000040008000000000000001 has two Suwayomi sources (710001, 710002); the Popular padding used to add one source card per source (\"Solo mirror 710002\", \"Solo mirror 710001\"). It now shows one card: id w_00000000000040008000000000000001, title \"Solo Leveling\", the same cover. No other field or rail changes.",
+      "acceptance": {
+        "accepted_by": "owner",
+        "accepted_on": "2026-10-17",
+        "evidence": "Owner reply on 2026-10-17 to the concrete review of these Trending differences: Yes, I accept the 3 Trending golden changes (home anonymous, admin, nsfw_user): one work card instead of two source cards."
+      }
     }
   ]
 }
