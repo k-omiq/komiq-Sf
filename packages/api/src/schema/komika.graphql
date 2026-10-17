@@ -25,6 +25,8 @@ type Query {
 	browseSources(includeNsfw: Boolean): [BrowseSource!]! # [komika] the sources Browse can filter by (`BrowseFilter.source`), biggest first — "mangadex" for the mirror, else a source id; each `count` is the number of works the filter returns for the viewer (NSFW-gated), and a source with none is not offered. `includeNsfw` is the admin-console escape hatch, as on `search`
 	scanlatorTags: [ScanlatorTag!]! # [komika] every scanlator an admin tagged as using AI — public, so a reader app can mark the chapter copies those names are credited on (match rule on ScanlatorTag.name)
 	sourceAiTags: [SourceAiTag!]! # [komika] every source an admin tagged as using AI — public. A source that translates its own series credits no group, so the source is the scanlator. A chapter copy takes the stronger of this tag (matched on ChapterSource.sourceId, or the series' sourceId) and the tag on its scanlator credit
+	sourceMetadataBars: [SourceMetadataBar!]! # [komika] admin — every source metadata bar, ordered by source id then field group
+	workMetadataSources(workId: ID!): [WorkMetadataSource!]! # [komika] admin — all six metadata field groups for a canonical work or redirected old id; unknown work is an error
 	genreFacets: [GenreFacet!]! # [komika] S4: the genre chips for Browse's filter, most common first then alphabetical, gated by the viewer's NSFW posture. Each `count` is now EXACTLY the number of results the same genre filter returns — it previously came from JSON-parsing 13.8k Suwayomi `genre` blobs per request (301 entries, ungated, top entry literally "Japanese") while the filter ran against the canonical catalogue, so the chip's number and its results disagreed. Empty until MangaDex tags are ingested into `work_tag`
 	searchAllSources(query: String!, page: Int = 1): FederatedSearchPage! # [komika] federated multi-extension search — fans out to every installed source, dedupes to one canonical work per series with its per-source translators; NSFW-gated by the viewer's posture. REQUIRES LOGIN (persists mappings); per-user rate-limited (~20/min); errors "Not authenticated" for anonymous callers
 	series(id: ID!): Series! # [suwayomi] MangaType by id
@@ -167,6 +169,7 @@ type Mutation {
 	resyncCatalogue: Boolean! # [komika] admin — force a full catalogue re-seed: clears the catalogue/chapters sync cursors so the next cycle walks the whole createdAt history, and kicks one cycle in the background. Refused while any sync cycle is running (requires isAdmin)
 	setScanlatorAi(name: String!, ai: ScanlatorAi): Boolean! # [komika] admin — tag a scanlator as using AI (AI) or partly using it (PARTIAL); `ai: null` removes the tag. Kept by name, case-folded; applies to every chapter credited to the name on every source, now and later. false when nothing changed (requires isAdmin)
 	setSourceAi(sourceId: String!, ai: ScanlatorAi): Boolean! # [komika] admin — tag a whole source as using AI (AI) or partly using it (PARTIAL); `ai: null` removes the tag. Applies to every chapter copy read from the source, now and later. Not for "mangadex". false when nothing changed (requires isAdmin)
+	setSourceMetadataBar(sourceId: String!, fieldGroup: MetadataFieldGroup!, barred: Boolean!): SetSourceMetadataBarResult! # [komika] admin — bar or allow a source for a field group and re-project its works; sourceId is trimmed and validated
 	rateScanlator(id: ID!, score: Int): RatedScanlator! # [komika] set or change the viewer's rating of a scanlator (1..10); `score: null` removes it. Resolves to the scanlator with its new numbers (requires auth)
 	setSiteBlockRules(rules: [BlockRuleInput!]!): [BlockRule!]! # [komika] admin — replace the site-wide content block rules (at most 50; an empty list clears them). They apply to every viewer, signed in or not: a matching series is left out of every list and cannot be opened or read. Returns the stored list (requires isAdmin)
 	takeDownMedia(kind: TakedownKind!, subjectId: ID!, reason: String!): Boolean! # [komika] admin — stop serving a work (every copy, its covers, its merged-away ids; carried by merges and splits) or one copy to everyone. Lists, pages, manifests and the policy lease drop it; shared caches within one lease; browser and downloaded copies cannot be recalled. reason required, at most 500 characters. false when already taken down (requires isAdmin)
@@ -330,6 +333,44 @@ type Scanlator {
 type SourceAiTag {
 	sourceId: String! # a Suwayomi source id; match to ChapterSource.sourceId
 	ai: ScanlatorAi!
+}
+enum MetadataFieldGroup {
+	TITLE
+	DESCRIPTION
+	CREDITS
+	TAGS
+	COVER
+	STATUS
+}
+enum MetadataSourceState {
+	SOURCE
+	KEPT_ALL_BARRED
+	KEPT_NOT_OBSERVED
+	NO_SOURCE
+}
+enum MetadataAttribution {
+	OBSERVED
+	INFERRED
+	UNKNOWN
+}
+type SourceMetadataBar {
+	sourceId: String!
+	fieldGroup: MetadataFieldGroup!
+	createdAt: String! # RFC 3339
+}
+type SetSourceMetadataBarResult {
+	sourceId: String!
+	fieldGroup: MetadataFieldGroup!
+	barred: Boolean!
+	works: Int! # works re-projected, including when the bar was already in this state
+}
+type WorkMetadataSource {
+	fieldGroup: MetadataFieldGroup!
+	state: MetadataSourceState!
+	sourceId: String
+	sourceName: String # MangaDex, else the installed source's display name when known
+	sourceSeriesId: String
+	attribution: MetadataAttribution
 }
 # [komika] One row of the admin site list: a source, as a scanlator of its own.
 type ScanlatorSite {

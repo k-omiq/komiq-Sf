@@ -138,11 +138,27 @@ pub async fn advisory(
     tx: &mut Transaction<'_, Postgres>,
     keys: &[AdvisoryKey],
 ) -> Result<(), sqlx::Error> {
-    let mut keys = keys.to_vec();
+    advisory_with_shared(tx, keys, &[]).await
+}
+
+/// Acquire the whole advisory tier together, with policy readers in shared mode.
+/// An exclusive key wins if the same key appears in both sets.
+pub async fn advisory_with_shared(
+    tx: &mut Transaction<'_, Postgres>,
+    exclusive: &[AdvisoryKey],
+    shared: &[AdvisoryKey],
+) -> Result<(), sqlx::Error> {
+    let mut keys = exclusive.to_vec();
+    keys.extend_from_slice(shared);
     keys.sort_unstable();
     keys.dedup();
     for key in keys {
-        let result = sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        let sql = if shared.is_empty() || exclusive.contains(&key) {
+            "SELECT pg_advisory_xact_lock($1, $2)"
+        } else {
+            "SELECT pg_advisory_xact_lock_shared($1, $2)"
+        };
+        let result = sqlx::query(sql)
             .bind(key.class as i32)
             .bind(key.digest)
             .execute(&mut **tx)

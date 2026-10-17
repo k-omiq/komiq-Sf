@@ -343,6 +343,12 @@ async fn copy_work(
         tx.rollback().await?;
         return Ok(false);
     }
+    // A batch may have loaded SQLite bytes before a cover bar removed the indexed
+    // source master. The revocation is durable and checked under the same locks.
+    if cover::legacy_work_cover_revoked(&mut *tx, work_id).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     let inserted = cover_store::row(&mut *tx, work_id, Kind::Master)
         .await?
         .is_none();

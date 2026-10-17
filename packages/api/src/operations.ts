@@ -398,6 +398,29 @@ export const SOURCE_AI_TAGS = /* GraphQL */ `
 	}
 `;
 
+export const SOURCE_METADATA_BARS = /* GraphQL */ `
+	query SourceMetadataBars {
+		sourceMetadataBars {
+			sourceId
+			fieldGroup
+			createdAt
+		}
+	}
+`;
+
+export const WORK_METADATA_SOURCES = /* GraphQL */ `
+	query WorkMetadataSources($workId: ID!) {
+		workMetadataSources(workId: $workId) {
+			fieldGroup
+			state
+			sourceId
+			sourceName
+			sourceSeriesId
+			attribution
+		}
+	}
+`;
+
 // The full genre/tag facet set across the persisted catalogue (S4), most-common
 // first with counts — drives the search genre multi-select.
 export const GENRE_FACETS = /* GraphQL */ `
@@ -1765,6 +1788,21 @@ export const SCANLATOR_SITES = /* GraphQL */ `
 export const SET_SOURCE_AI = /* GraphQL */ `
 	mutation SetSourceAi($sourceId: String!, $ai: ScanlatorAi) {
 		setSourceAi(sourceId: $sourceId, ai: $ai)
+	}
+`;
+
+export const SET_SOURCE_METADATA_BAR = /* GraphQL */ `
+	mutation SetSourceMetadataBar(
+		$sourceId: String!
+		$fieldGroup: MetadataFieldGroup!
+		$barred: Boolean!
+	) {
+		setSourceMetadataBar(sourceId: $sourceId, fieldGroup: $fieldGroup, barred: $barred) {
+			sourceId
+			fieldGroup
+			barred
+			works
+		}
 	}
 `;
 

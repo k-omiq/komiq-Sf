@@ -1857,9 +1857,18 @@ const FEED_HAS_MIRROR_HALF_SQL: &str = "EXISTS (SELECT 1 FROM feed_updates fu \
          WHERE fu.work_id = excluded.work_id AND fu.latest_at IS NOT NULL)";
 
 /// The feed upsert of one Suwayomi series (`$1` is its id as text).
+///
+/// The thumbnail fallback skips mappings whose source is barred for cover with the
+/// rebuild's rule and order (`catalog::suwayomi_cover_thumbnails_select(_, true)`): the
+/// newest-releasing allowed in-library Suwayomi mapping of the work. That function is
+/// private to `catalog`, so this is its one-work form. With no bar this is the chosen
+/// row's own thumbnail.
 fn feed_series_upsert_sql() -> String {
+    use crate::catalog::work_metadata::{barred_sql, mapping_source_sql};
     let status_sql = crate::catalog::FSU_STATUS_SQL;
     let mirror = FEED_HAS_MIRROR_HALF_SQL;
+    let barred = barred_sql(&mapping_source_sql("ss"), "'cover'");
+    let allowed_barred = barred_sql(&mapping_source_sql("a"), "'cover'");
     format!(
         "INSERT INTO feed_series_updates \
          (work_id, reader_id, title, cover_url, suwayomi_thumbnail, comic_type, \
@@ -1874,7 +1883,14 @@ fn feed_series_upsert_sql() -> String {
             CASE WHEN w.cover_cached_version IS NOT NULL \
                  THEN '/covers/' || w.id || '.webp?v=' || w.cover_cached_version \
                  END, \
-            sy.thumbnail_url, NULL, \
+            CASE WHEN {barred} THEN \
+                 (SELECT ay.thumbnail_url FROM source_series a \
+                    JOIN suwayomi_series ay ON ay.id = sqlite_integer_pin(a.source_key) \
+                   WHERE a.work_id = ss.work_id AND a.source_type = 'suwayomi' \
+                     AND NOT {allowed_barred} \
+                     AND ay.in_library = TRUE AND ay.latest_chapter_at IS NOT NULL \
+                   ORDER BY ay.latest_chapter_at DESC, ay.id ASC LIMIT 1) \
+                 ELSE sy.thumbnail_url END, NULL, \
             sqlite_general_number(lc.chapter_number), lc.name, sy.chapter_count, \
             TIMESTAMPTZ '1970-01-01 00:00:00+00' + sy.latest_chapter_at * INTERVAL '1 millisecond', \
             sss.last_new_chapter_at, \
@@ -8065,5 +8081,71 @@ mod tests {
             ],
             "every row is scanned by exactly one selector — no duplicates, no orphans"
         );
+    }
+
+    /// The incremental feed writer skips a Suwayomi thumbnail of a source barred for
+    /// cover for the next allowed one (newest release first, as the rebuild), stores
+    /// none when every mapping is barred, and writes the same row as before with no bar.
+    #[tokio::test]
+    async fn incremental_feed_thumbnail_skips_sources_barred_for_cover() {
+        let pool = migrated_pool().await;
+        seed_feed_fixture(&pool, Some("1785071625000")).await;
+        sqlx::raw_sql(
+            "INSERT INTO source_series (id, work_id, source_type, source_id, source_key, created_at) \
+             VALUES ('ss2', 'w1', 'suwayomi', 'src-b', '8', '2026-01-02T00:00:00Z'); \
+             INSERT INTO suwayomi_series (id, title, thumbnail_url, status, in_library, source_id, \
+                                          chapter_count, latest_chapter_at, updated_at) \
+             VALUES (8, 'Older', '/thumb/8', 'ONGOING', TRUE, '1', 3, 1785000000000, now())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let row = |pool: Database| async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT (to_jsonb(f) - 'suwayomi_thumbnail')::text FROM feed_series_updates f \
+                  WHERE work_id = 'w1'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let thumbnail = |pool: Database| async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT suwayomi_thumbnail FROM feed_series_updates WHERE work_id = 'w1'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(upsert_feed_series_update(&pool, "7").await.unwrap(), 1);
+        assert_eq!(thumbnail(pool.clone()).await.as_deref(), Some("/thumb/7"));
+        let unbarred = row(pool.clone()).await;
+        for (bars, expected) in [
+            (&["suwayomi"][..], Some("/thumb/8")),
+            (&["suwayomi", "src-b"][..], None),
+            (&[][..], Some("/thumb/7")),
+        ] {
+            // From an empty feed, so every run is the same insert.
+            sqlx::raw_sql("DELETE FROM source_metadata_bar; DELETE FROM feed_series_updates")
+                .execute(&pool)
+                .await
+                .unwrap();
+            for source in bars {
+                sqlx::query(
+                    "INSERT INTO source_metadata_bar (source_id, field_group, created_at) \
+                     VALUES ($1, 'cover', now())",
+                )
+                .bind(source)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            assert_eq!(upsert_feed_series_update(&pool, "7").await.unwrap(), 1);
+            assert_eq!(thumbnail(pool.clone()).await.as_deref(), expected, "{bars:?}");
+            // Only the fallback depends on the bars, and the rebuild agrees with it.
+            assert_eq!(row(pool.clone()).await, unbarred, "{bars:?}");
+            crate::catalog::refresh_feed_series_updates(&pool).await.unwrap();
+            assert_eq!(thumbnail(pool.clone()).await.as_deref(), expected, "{bars:?}");
+        }
     }
 }

@@ -184,6 +184,13 @@ export interface Backend {
 	 * query. Optional: only the unified API.
 	 */
 	sourceAiTags?(): Promise<SourceAiTag[]>;
+	/** Admin metadata bars. Resolves to `[]` against a server that predates the query. */
+	sourceMetadataBars?(): Promise<SourceMetadataBar[]>;
+	/** Admin field provenance for a canonical work or a redirected old work id. */
+	workMetadataSources?(workId: Id): Promise<WorkMetadataSource[]>;
+	/** False after a metadata-bars query or mutation is rejected as unknown. Call after
+	 * {@link sourceMetadataBars} to distinguish an old server from an empty bar list. */
+	metadataBarsSupported?(): boolean;
 	/**
 	 * Whether `search(filter:)` is (still believed to be) understood by the server.
 	 * Turns false once the API rejects the argument and it is stripped from the
@@ -504,6 +511,12 @@ export interface Backend {
 	/** Tag a whole source as using AI, or with `null` remove its tag. `false` when
 	 * nothing changed. Optional. */
 	setSourceAi?(sourceId: string, ai: ScanlatorAi | null): Promise<boolean>;
+	/** Bar or allow one source for a metadata group, rechecking its linked works. */
+	setSourceMetadataBar?(
+		sourceId: string,
+		fieldGroup: MetadataFieldGroup,
+		barred: boolean,
+	): Promise<SetSourceMetadataBarResult>;
 	/** The public scanlator list: every site and every group, each with the rating the
 	 * readers of this server gave it. 30 per page. Optional: a server that predates it
 	 * rejects the field, and the reader then says the server has no scanlator ratings. */
@@ -1115,6 +1128,37 @@ export interface RatedScanlatorPage {
 export interface SourceAiTag {
 	sourceId: string;
 	ai: ScanlatorAi;
+}
+
+export type MetadataFieldGroup = 'TITLE' | 'DESCRIPTION' | 'CREDITS' | 'TAGS' | 'COVER' | 'STATUS';
+export type MetadataSourceState =
+	| 'SOURCE'
+	| 'KEPT_ALL_BARRED'
+	| 'KEPT_NOT_OBSERVED'
+	| 'NO_SOURCE';
+export type MetadataAttribution = 'OBSERVED' | 'INFERRED' | 'UNKNOWN';
+
+export interface SourceMetadataBar {
+	sourceId: string;
+	fieldGroup: MetadataFieldGroup;
+	/** RFC 3339 timestamp. */
+	createdAt: string;
+}
+
+export interface SetSourceMetadataBarResult {
+	sourceId: string;
+	fieldGroup: MetadataFieldGroup;
+	barred: boolean;
+	works: number;
+}
+
+export interface WorkMetadataSource {
+	fieldGroup: MetadataFieldGroup;
+	state: MetadataSourceState;
+	sourceId: string | null;
+	sourceName: string | null;
+	sourceSeriesId: string | null;
+	attribution: MetadataAttribution | null;
 }
 
 /** One row of the admin site list: a source, as a scanlator of its own. */

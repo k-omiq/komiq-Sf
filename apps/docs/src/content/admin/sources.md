@@ -1,9 +1,9 @@
 ---
 title: Extensions and source health
-description: Manage your server’s extensions, browse sources for new titles, and monitor source health.
+description: Manage your server’s extensions, browse sources for new titles, choose field sources, and monitor source health.
 ---
 
-The Sources section in the admin app connects your server to comic sources. It contains four pages: Extensions, Browse & add, Health, and Scanlators. Learn each page’s controls.
+The Sources section in the admin app connects your server to comic sources. It contains five pages: Extensions, Browse & add, Health, Metadata, and Scanlators. Learn each page’s controls.
 
 ## Why NSFW settings gate source tools
 
@@ -72,6 +72,22 @@ The grid shows each title returned by the source:
 Selecting titles displays a sticky bottom bar showing the count, a `Clear` button, and `Add selected to catalogue`. Submitting sends the batch to the deduplication pipeline.
 
 When complete, `Result of the last add` shows the outcome for each series: merged into an existing work, added as a new work, sent to [Duplicates](/admin/duplicates) for review, already present, or failed.
+
+## Metadata
+
+Open Metadata to choose which sources may supply series details. Each source has six switches: Title, Description, Authors, Tags, Cover and Status. Authors covers both authors and artists. The built-in catalogue source appears first, followed by installed sources.
+
+A switch on means allowed. Turn it off to bar that source from the field group. Each change saves at once. Controls stay disabled while the save runs. The result says `Re-checked N works`.
+
+A failed save may have applied part of the change. The page reloads the saved switches from the server. You can safely retry the same change.
+
+The server checks linked works again when you change a bar. For title, description, authors and status, it chooses the first allowed source in its ranking. If every source is barred, it keeps the current value. It also keeps the value when the chosen source has not been read yet. Catalogue tags come from the first allowed catalogue listing that has reported them. An empty report clears those tags. Your title and description overrides and pinned values stay in place.
+
+Turning off Cover for a source removes the covers that source supplied. The server then fetches a cover from the next allowed source. Covers you uploaded stay. So do covers stored before this setting existed, because the server does not know their source. Readers may keep an old cover image in their browser cache for a while.
+
+If any linked source is barred from Authors, automatic matching uses the stored author or artist only when an allowed source also supplied it or you pinned it. When filling in older metadata records, the server skips field groups that a source is barred from.
+
+The [series editor](/admin/catalog) shows the source selected for each field group. Older servers show `This server does not support metadata bars` here and have no switches.
 
 ## Health
 

@@ -333,6 +333,110 @@ pub struct SourceAiTag {
     pub ai: ScanlatorAi,
 }
 
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum MetadataFieldGroup {
+    Title,
+    Description,
+    Credits,
+    Tags,
+    Cover,
+    Status,
+}
+
+impl From<MetadataFieldGroup> for crate::catalog::work_metadata::FieldGroup {
+    fn from(group: MetadataFieldGroup) -> Self {
+        match group {
+            MetadataFieldGroup::Title => Self::Title,
+            MetadataFieldGroup::Description => Self::Description,
+            MetadataFieldGroup::Credits => Self::Credits,
+            MetadataFieldGroup::Tags => Self::Tags,
+            MetadataFieldGroup::Cover => Self::Cover,
+            MetadataFieldGroup::Status => Self::Status,
+        }
+    }
+}
+
+impl From<crate::catalog::work_metadata::FieldGroup> for MetadataFieldGroup {
+    fn from(group: crate::catalog::work_metadata::FieldGroup) -> Self {
+        use crate::catalog::work_metadata::FieldGroup;
+        match group {
+            FieldGroup::Title => Self::Title,
+            FieldGroup::Description => Self::Description,
+            FieldGroup::Credits => Self::Credits,
+            FieldGroup::Tags => Self::Tags,
+            FieldGroup::Cover => Self::Cover,
+            FieldGroup::Status => Self::Status,
+        }
+    }
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum MetadataSourceState {
+    Source,
+    KeptAllBarred,
+    KeptNotObserved,
+    NoSource,
+}
+
+impl From<crate::catalog::work_metadata::SourceState> for MetadataSourceState {
+    fn from(state: crate::catalog::work_metadata::SourceState) -> Self {
+        use crate::catalog::work_metadata::SourceState;
+        match state {
+            SourceState::Source => Self::Source,
+            SourceState::KeptAllBarred => Self::KeptAllBarred,
+            SourceState::KeptNotObserved => Self::KeptNotObserved,
+            SourceState::NoSource => Self::NoSource,
+        }
+    }
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum MetadataAttribution {
+    Observed,
+    Inferred,
+    Unknown,
+}
+
+impl From<crate::catalog::work_metadata::Attribution> for MetadataAttribution {
+    fn from(attribution: crate::catalog::work_metadata::Attribution) -> Self {
+        use crate::catalog::work_metadata::Attribution;
+        match attribution {
+            Attribution::Observed => Self::Observed,
+            Attribution::Inferred => Self::Inferred,
+            Attribution::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// One field group a source is barred from supplying.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct SourceMetadataBar {
+    pub source_id: String,
+    pub field_group: MetadataFieldGroup,
+    /// RFC 3339 timestamp.
+    pub created_at: String,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct SetSourceMetadataBarResult {
+    pub source_id: String,
+    pub field_group: MetadataFieldGroup,
+    pub barred: bool,
+    /// Works re-projected, including when the bar was already in this state.
+    pub works: i32,
+}
+
+/// The chosen source, or why the work kept its current value, for one field group.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct WorkMetadataSource {
+    pub field_group: MetadataFieldGroup,
+    pub state: MetadataSourceState,
+    pub source_id: Option<String>,
+    pub source_name: Option<String>,
+    pub source_series_id: Option<String>,
+    pub attribution: Option<MetadataAttribution>,
+}
+
 /// One row of the admin site list (`scanlatorSites`): a source, as a scanlator.
 #[derive(SimpleObject, Clone, Debug)]
 pub struct ScanlatorSite {

@@ -10,6 +10,8 @@ mod config;
 mod cover;
 mod cover_copy;
 #[cfg(test)]
+mod cover_bar_tests;
+#[cfg(test)]
 mod cover_files_tests;
 mod cover_recompress;
 mod cover_store;
@@ -1182,7 +1184,22 @@ async fn serve_cover(
     }
     let width = cover::variant_width(query_param(&query, "w"));
     // Fast path: already-cached blob.
-    match pool.read_master(&app.pool, work_id, width).await {
+    let mut stored = pool.read_master(&app.pool, work_id, width).await;
+    // A revoked indexed master must not expose old SQLite art during the copy.
+    // Indexed cache hits need no additional read.
+    if stored
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .is_some_and(|(master, _)| master.legacy)
+    {
+        match cover::legacy_work_cover_revoked(&app.pool, work_id).await {
+            Ok(true) => stored = Ok(None),
+            Ok(false) => {}
+            Err(error) => return cover_store_unavailable(error.into()),
+        }
+    }
+    match stored {
         Ok(Some((master, derivative))) => {
             let Some(version) = master.version else {
                 return cover_store_unavailable(
@@ -1242,15 +1259,25 @@ async fn serve_cover(
     }
     let cdn_fallback = crate::mangadex::cover_thumb_url(&mangadex_id, &file_name);
     let work = cover::master_cover_work().await;
-    let Some(bytes) = app
+    let fetched = app
         .mangadex
         .cover_thumb_bytes(&mangadex_id, &file_name)
-        .await
-    else {
+        .await;
+    match cover::source_cover_barred(&app.pool, "mangadex").await {
+        Ok(true) => return media_not_found(),
+        Ok(false) => {}
+        Err(error) => return cover_store_unavailable(error.into()),
+    }
+    let Some(bytes) = fetched else {
         return axum::response::Redirect::temporary(&cdn_fallback).into_response();
     };
     // Decode + resize + WebP encode is CPU-bound — keep it off the async runtime.
     let resized = work.process(move || cover::process_cover(&bytes)).await;
+    match cover::source_cover_barred(&app.pool, "mangadex").await {
+        Ok(true) => return media_not_found(),
+        Ok(false) => {}
+        Err(error) => return cover_store_unavailable(error.into()),
+    }
     match resized {
         Ok(Ok(webp)) => {
             let work = work_id.to_owned();
@@ -3192,6 +3219,15 @@ async fn main() -> anyhow::Result<()> {
     if argv.first().map(String::as_str) == Some("repair-upload-dates") {
         return catalog::date_repair::run_cli(&argv[1..]).await;
     }
+    if argv.first().map(String::as_str) == Some("backfill-work-metadata") {
+        anyhow::ensure!(argv.len() == 1, "usage: backfill-work-metadata");
+        let pool = db::connect_existing(&cfg.database_url).await?;
+        let result =
+            catalog::work_metadata_backfill::run_pass(&pool, std::time::Duration::ZERO).await;
+        pool.close().await;
+        println!("{}", serde_json::to_string(&result?)?);
+        return Ok(());
+    }
     // `komika-server takedown add|remove|list` — operator takedowns (`media_policy`).
     if argv.first().map(String::as_str) == Some("takedown") {
         let pool = db::connect_existing(&cfg.database_url).await?;
@@ -3490,6 +3526,8 @@ async fn main() -> anyhow::Result<()> {
     // M9 W3a: link existing chapter copies to their works' chapter lists, paced and
     // resumable; afterwards it picks up new works and works a merge left not ready.
     catalog::work_chapter::spawn(pool.clone(), shutdown_tx.subscribe());
+    // M9 W2: record which source gave each work its metadata (insert-only, paced).
+    catalog::work_metadata_backfill::spawn(pool.clone(), shutdown_tx.subscribe());
 
     // Direct-MangaDex catalogue sync — opt-in (CATALOGUE.md §5). Off unless
     // CATALOGUE_SYNC is set, so the default deployment never hits MangaDex. Recurring:

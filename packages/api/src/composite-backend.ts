@@ -67,6 +67,10 @@ import type {
 	ScanlatorSite,
 	ScanlatorTag,
 	SourceAiTag,
+	MetadataFieldGroup,
+	SourceMetadataBar,
+	SetSourceMetadataBarResult,
+	WorkMetadataSource,
 	SourceRateLimit,
 	MyComment,
 	PostCommentInput,
@@ -357,6 +361,15 @@ export class CompositeBackend implements Backend {
 	}
 	sourceAiTags(): Promise<SourceAiTag[]> {
 		return this.opts.hosted.sourceAiTags?.() ?? Promise.resolve([]);
+	}
+	sourceMetadataBars(): Promise<SourceMetadataBar[]> {
+		return this.opts.hosted.sourceMetadataBars?.() ?? Promise.resolve([]);
+	}
+	workMetadataSources(workId: Id): Promise<WorkMetadataSource[]> {
+		return this.opts.hosted.workMetadataSources?.(workId) ?? Promise.resolve([]);
+	}
+	metadataBarsSupported(): boolean {
+		return this.opts.hosted.metadataBarsSupported?.() ?? false;
 	}
 	browseFilterSupported(): boolean {
 		return this.opts.hosted.browseFilterSupported?.() ?? false;
@@ -960,6 +973,15 @@ export class CompositeBackend implements Backend {
 	}
 	setSourceAi(sourceId: string, ai: ScanlatorAi | null): Promise<boolean> {
 		return this.opts.hosted.setSourceAi!(sourceId, ai);
+	}
+	setSourceMetadataBar(
+		sourceId: string,
+		fieldGroup: MetadataFieldGroup,
+		barred: boolean,
+	): Promise<SetSourceMetadataBarResult> {
+		if (!this.opts.hosted.setSourceMetadataBar)
+			return Promise.reject(new Error('This server does not support metadata bars'));
+		return this.opts.hosted.setSourceMetadataBar(sourceId, fieldGroup, barred);
 	}
 	siteBlockRules(): Promise<BlockRule[]> {
 		return this.opts.hosted.siteBlockRules!();

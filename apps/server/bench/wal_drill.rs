@@ -280,7 +280,7 @@ async fn run_phase(url: &str, phase: &str, n: i64) -> Value {
                         for w in &works {
                             let input = work_input(&pool, &w[0]).await;
                             if details {
-                                crate::catalog::refresh_mangadex_details(&pool, &w[0], &input)
+                                crate::catalog::refresh_mangadex_details(&pool, &w[0], &w[1], &input)
                                     .await
                                     .expect("details");
                             } else {

@@ -4,6 +4,8 @@
 	import type {
 		AdminChapter,
 		PinnableField,
+		MetadataFieldGroup,
+		WorkMetadataSource,
 		SeriesAdminMeta,
 		SeriesMetadataInput,
 		WorkChapterEdit,
@@ -26,6 +28,7 @@
 		loadWorkSources,
 		mergeChapterEntries,
 		relinkChapterCopy,
+		loadWorkMetadataSources,
 		removeSeriesAltTitle,
 		rescanWork,
 		saveSeriesMetadata,
@@ -131,6 +134,17 @@
 		return current ?? 'The source has no value';
 	}
 	let sources = $state<WorkSource[]>([]);
+	let metadataSources = $state<WorkMetadataSource[]>([]);
+	function fieldSource(group: MetadataFieldGroup): string | null {
+		const source = metadataSources.find((row) => row.fieldGroup === group);
+		if (source?.state === 'KEPT_ALL_BARRED') return 'Kept: every source is barred';
+		if (source?.state === 'KEPT_NOT_OBSERVED') return 'Kept: source not read yet';
+		if (source?.state !== 'SOURCE') return null;
+		const name = source.sourceName || source.sourceId;
+		if (!name) return null;
+		const guessed = source.attribution === 'INFERRED' || source.attribution === 'UNKNOWN';
+		return `From ${name}${guessed ? ' (guessed)' : ''}`;
+	}
 	let chapters = $state<AdminChapter[]>([]);
 	let chapterList = $state<WorkChapterList | undefined>(undefined);
 	let loading = $state(true);
@@ -238,18 +252,20 @@
 		try {
 			const s = await loadSeriesDetail(seriesId);
 			const m = await loadSeriesAdminMeta(seriesId);
-			const [srcs, chs, list] = m.workId
+			const [srcs, chs, list, provenance] = m.workId
 				? await Promise.all([
 						loadWorkSources(m.workId),
 						loadWorkChaptersAdmin(m.workId),
 						loadWorkChapterList(m.workId),
+						loadWorkMetadataSources(m.workId),
 					])
-				: [[], [], undefined];
+				: [[], [], undefined, []];
 			if (seq !== loadSeq) return; // a newer load superseded this one
 			series = s;
 			meta = m;
 			seedForm(m);
 			sources = srcs;
+			metadataSources = provenance;
 			chapters = chs;
 			chapterList = list;
 		} catch (err) {
@@ -831,6 +847,9 @@
 										bind:value={fTitle}
 										placeholder={series.title}
 									/>
+									{#if fieldSource('TITLE')}
+										<span class="k-hint">{fieldSource('TITLE')}</span>
+									{/if}
 								</label>
 								<label class="k-field">
 									<span class="k-label">Description override</span>
@@ -842,6 +861,9 @@
 										bind:value={fDescription}
 										placeholder="Leave empty to use the source description"
 									></textarea>
+									{#if fieldSource('DESCRIPTION')}
+										<span class="k-hint">{fieldSource('DESCRIPTION')}</span>
+									{/if}
 								</label>
 
 								<div class="setting">
@@ -895,6 +917,9 @@
 												bind:value={fAuthor}
 												placeholder={autoHint('author', meta.author)}
 											/>
+											{#if fieldSource('CREDITS')}
+												<span class="k-hint">{fieldSource('CREDITS')}</span>
+											{/if}
 										</label>
 										<label class="k-field">
 											<span class="k-label">Artist</span>
@@ -907,6 +932,9 @@
 												bind:value={fArtist}
 												placeholder={autoHint('artist', meta.artist)}
 											/>
+											{#if fieldSource('CREDITS')}
+												<span class="k-hint">{fieldSource('CREDITS')}</span>
+											{/if}
 										</label>
 									</div>
 									<div class="setting">
@@ -953,6 +981,9 @@
 										<div class="setting-text">
 											<label class="setting-name" for="f-status">Status</label>
 											<p class="k-hint">Whether the series is still coming out.</p>
+											{#if fieldSource('STATUS')}
+												<p class="k-hint">{fieldSource('STATUS')}</p>
+											{/if}
 										</div>
 										<select
 											id="f-status"
@@ -1021,6 +1052,9 @@
 
 								<div class="block" role="group" aria-labelledby="tags-title">
 									<h3 id="tags-title" class="block-title">Tags</h3>
+									{#if fieldSource('TAGS')}
+										<p class="k-hint">{fieldSource('TAGS')}</p>
+									{/if}
 									{#if fTags.length === 0}
 										<p class="k-hint">No tags.</p>
 									{:else}

@@ -67,6 +67,20 @@ Catalogue works are independent of source copies:
 - `progress_untick`, added by migration `0010_progress_untick.sql`: one row per explicit untick of one chapter copy (user id, chapter id, time). A new engine generation deletes the records of numeric chapter ids.
 - `work_chapter`, `work_chapter_link` and `work_chapter_state`, added by migration `0012_work_chapter.sql`: the work's own chapter list. `work_chapter` holds one entry per chapter of a work (id `wc_...`): its `match_key`, its place in the list (`sort_key`, a decimal), its number and label, a `special` flag and the administrator's `hidden` flag and `title_override`. `work_chapter_link` links each `chapter` row (a source copy) to one entry. `work_chapter_state` holds `ready` (every copy of the work is linked) and `list_rev`, a counter that grows with every change to the list. Read [Canonical works](/developers/canonical-works) for how copies are matched.
 
+### Metadata trust tables
+
+Migration `0011_source_metadata.sql` adds these tables and one column:
+
+- `source_metadata_bar`: one row per `(source_id, field_group)`, with `created_at`. A row bars a source from title, description, credits, tags, cover or status. No row means allowed.
+- `work_metadata_contribution`: one value per mapping and group. Its primary key is `(source_series_id, field_group, slot, lang, value_key)`. The stored generated column `value_key` is `md5(value)`. It also stores `ord`, optional JSON `detail`, `attribution` and `observed_at`.
+
+- `work.cover_source`: the source that supplied the published cover. Empty for uploads and for covers published before the column existed.
+- `work_cover_revocation`: works whose source cover was removed by a cover bar. The old cover cache is never used for them again.
+
+Contributions reference `source_series(id)` with cascade deletion. They have no `work_id`; the mapping supplies it. Rows follow mappings through merges and splits. An empty slot and value mark an observed empty group. Missing rows mean no observation. Attribution is `observed`, `inferred` or `unknown`.
+
+Read [Canonical works](/developers/canonical-works) for ranking and projection rules.
+
 ### Identity and social tables
 
 - `users`: user accounts with `id`, unique `username`, unique `email`, `password_hash` (Argon2id), `is_admin`, `is_banned`, `show_nsfw`, display profile fields and `must_change_password`.
@@ -140,6 +154,8 @@ Keep applied migrations immutable. Add new files for schema changes and backfill
 - `apps/server/src/media_policy.rs`: the policy epoch, takedowns and the in-memory denied set.
 - `apps/server/src/db.rs`: PostgreSQL initialization, migration runners and legacy SQLite cover recovery.
 - `apps/server/src/catalog/`: Rust data access logic for canonical works, aliases, external IDs and duplicate merging.
+- `apps/server/src/catalog/work_metadata.rs`: contributions, source bars and effective fields.
+- `apps/server/migrations_pg/0011_source_metadata.sql`: metadata trust table constraints.
 - `apps/server/src/cover.rs`: cover fetching, processing and transactional publication.
 - `apps/server/src/cover_store.rs`: file storage, PostgreSQL index and upload recovery.
 - `apps/server/src/cover_copy.rs`: resumable copy from the old SQLite cover cache.

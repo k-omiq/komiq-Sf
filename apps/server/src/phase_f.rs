@@ -942,6 +942,9 @@ pub async fn split_mismatched(pool: &Database, apply: Apply) -> Result<StepRepor
         .bind(&r.source_series_id)
         .execute(&mut *tx)
         .await?;
+        use crate::catalog::work_metadata::FieldGroup::{Title, Description, Credits, Tags, Status};
+        crate::catalog::work_metadata::project_on(&mut tx, &r.work_id, &[Title, Description, Credits, Tags, Status]).await?;
+        crate::catalog::work_metadata::project_on(&mut tx, &target, &[Title, Description, Credits, Tags, Status]).await?;
         tx.commit().await?;
         Ok(())
         }).await?;
@@ -1166,6 +1169,8 @@ pub async fn delete_redundant(
                 .bind(&r.source_series_id)
                 .execute(&mut *tx)
                 .await?;
+            use crate::catalog::work_metadata::FieldGroup::{Title, Description, Credits, Tags, Status};
+            crate::catalog::work_metadata::project_on(&mut tx, &current.work_id, &[Title, Description, Credits, Tags, Status]).await?;
             sqlx::query(
                 "UPDATE all_mangadex_uuid SET disposition = 'deleted', disposed_at = $1 \
               WHERE source_series_id = $2",

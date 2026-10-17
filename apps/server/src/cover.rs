@@ -402,13 +402,17 @@ pub fn work_cover_url(
 /// cover file name. `None` if the work has no MangaDex source or no cover file name, in
 /// which case there's nothing to lazily fetch. Used by `serve_cover`'s lazy cache.
 pub async fn mangadex_cover_anchor(main: &Database, work_id: &str) -> Option<(String, String)> {
-    let row = crate::db_types::query_tuple::<(Option<String>, Option<String>)>(
+    let barred = crate::catalog::work_metadata::barred_sql(
+        &crate::catalog::work_metadata::mapping_source_sql("ss"),
+        "'cover'",
+    );
+    let row = crate::db_types::query_tuple::<(Option<String>, Option<String>)>(&format!(
         "SELECT ss.source_key, w.cover_file_name \
          FROM work w \
          JOIN source_series ss ON ss.work_id = w.id AND ss.source_type = 'mangadex' \
-         WHERE w.id = $1 \
-         ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1",
-    )
+         WHERE w.id = $1 AND NOT {barred} \
+         ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1"
+    ))
     .bind(work_id)
     .fetch_optional(main)
     .await
@@ -467,6 +471,15 @@ pub async fn lock_assets_and_files(
     assets: &[&str],
     files: &[cover_store::Sha],
 ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
+    lock_assets_files_and_source(tx, assets, files, None).await
+}
+
+async fn lock_assets_files_and_source(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    assets: &[&str],
+    files: &[cover_store::Sha],
+    source: Option<&str>,
+) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
     let mut assets = assets.to_vec();
     assets.sort_unstable();
     assets.dedup();
@@ -475,7 +488,13 @@ pub async fn lock_assets_and_files(
         .map(|asset| crate::locks::AdvisoryKey::new(crate::locks::KeyClass::Cover, &[*asset]))
         .collect();
     keys.extend(files.iter().map(cover_store::file_key));
-    crate::locks::advisory(tx, &keys).await?;
+    let shared: Vec<_> = source
+        .into_iter()
+        .map(|source| {
+            crate::locks::AdvisoryKey::new(crate::locks::KeyClass::SourcePolicy, &[source])
+        })
+        .collect();
+    crate::locks::advisory_with_shared(tx, &keys, &shared).await?;
     let mut guards = Vec::with_capacity(assets.len());
     for asset in assets {
         guards.push(asset_mutex(asset).await);
@@ -626,6 +645,9 @@ async fn current_master(
     let Some(legacy) = covers.legacy_for_read(asset) else {
         return Ok(CurrentMaster::None);
     };
+    if !asset.starts_with("s:") && legacy_work_cover_revoked(&mut **tx, asset).await? {
+        return Ok(CurrentMaster::None);
+    }
     let stored: Option<(Vec<u8>, Option<i64>)> = if let Some(id) = asset.strip_prefix("s:") {
         sqlx::query_as("SELECT webp, NULL FROM suwayomi_cover_blob WHERE manga_id = $1")
             .bind(id.parse::<i64>()?)
@@ -727,21 +749,33 @@ tokio::task_local! { pub(crate) static COVER_PUBLICATION_PAUSE: crate::locks::pa
 /// Where a work master comes from. It decides what happens to the work's
 /// `cover_upload` row, which must always name the current master or not exist.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CoverOrigin {
+enum CoverOrigin<'a> {
     /// Fetched from a source: an uploaded cover it replaces is gone.
-    Source,
+    Source(&'a str),
     /// The admin uploaded it: kept in PostgreSQL so it survives the loss of the files.
     Upload,
     /// The same art re-encoded: an uploaded original follows it.
     Recompress,
 }
 
+#[cfg(test)]
 pub async fn put_work_cover(
     main: &Database,
     covers: &CoverStore,
     work_id: &str,
     webp: &[u8],
 ) -> Result<()> {
+    put_source_work_cover(main, covers, work_id, webp, "mangadex").await?;
+    Ok(())
+}
+
+pub async fn put_source_work_cover(
+    main: &Database,
+    covers: &CoverStore,
+    work_id: &str,
+    webp: &[u8],
+    source_id: &str,
+) -> Result<bool> {
     publish_work_cover(
         main,
         covers,
@@ -750,10 +784,9 @@ pub async fn put_work_cover(
         None,
         None,
         None,
-        CoverOrigin::Source,
+        CoverOrigin::Source(source_id),
     )
-    .await?;
-    Ok(())
+    .await
 }
 
 /// The admin upload: published like any cover, and kept in `cover_upload`.
@@ -813,7 +846,7 @@ pub async fn put_work_cover_for_missing_anchor(
         Some(None),
         Some((mangadex_id, file_name)),
         None,
-        CoverOrigin::Source,
+        CoverOrigin::Source("mangadex"),
     )
     .await
 }
@@ -821,6 +854,7 @@ pub async fn put_work_cover_for_missing_anchor(
 /// A work cover fetched from the work's Suwayomi anchor: published only while the
 /// master is missing and the anchor and engine generation are still current. A queued
 /// crawl job can outlive a generation change, and the number may name another series.
+#[cfg(test)]
 pub async fn put_work_cover_for_suwayomi_anchor(
     main: &Database,
     covers: &CoverStore,
@@ -828,6 +862,36 @@ pub async fn put_work_cover_for_suwayomi_anchor(
     webp: &[u8],
     generation: Option<uuid::Uuid>,
     thumbnail_url: &str,
+) -> Result<bool> {
+    let source: Option<String> = sqlx::query_scalar(
+        "SELECT COALESCE(ss.source_id, ss.source_type) FROM source_series ss \
+         WHERE ss.work_id = $1 AND ss.source_type = 'suwayomi' \
+         ORDER BY ss.created_at, ss.id LIMIT 1",
+    )
+    .bind(work_id)
+    .fetch_optional(main)
+    .await?;
+    put_work_cover_for_suwayomi_source_anchor(
+        main,
+        covers,
+        work_id,
+        webp,
+        generation,
+        thumbnail_url,
+        source.as_deref().unwrap_or("suwayomi"),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn put_work_cover_for_suwayomi_source_anchor(
+    main: &Database,
+    covers: &CoverStore,
+    work_id: &str,
+    webp: &[u8],
+    generation: Option<uuid::Uuid>,
+    thumbnail_url: &str,
+    source_id: &str,
 ) -> Result<bool> {
     publish_work_cover(
         main,
@@ -837,7 +901,7 @@ pub async fn put_work_cover_for_suwayomi_anchor(
         Some(None),
         None,
         Some((generation, thumbnail_url)),
-        CoverOrigin::Source,
+        CoverOrigin::Source(source_id),
     )
     .await
 }
@@ -857,7 +921,7 @@ async fn publish_work_cover(
     expected: Option<Option<&[u8]>>,
     expected_anchor: Option<(&str, &str)>,
     expected_suwayomi: Option<(Option<uuid::Uuid>, &str)>,
-    origin: CoverOrigin,
+    origin: CoverOrigin<'_>,
 ) -> Result<bool> {
     let now = Utc::now();
     // Hashing and the temp file write stay outside every lock.
@@ -880,7 +944,12 @@ async fn publish_work_cover(
             Err(e) => return Err(e),
         }
     }
-    let _asset = lock_assets_and_files(&mut tx, &[work_id], &[staged.sha]).await?;
+    let source_id = match origin {
+        CoverOrigin::Source(source) => Some(source),
+        _ => None,
+    };
+    let _asset =
+        lock_assets_files_and_source(&mut tx, &[work_id], &[staged.sha], source_id).await?;
     if !crate::locks::lock_works(&mut tx, &[work_id])
         .await?
         .missing
@@ -891,6 +960,15 @@ async fn publish_work_cover(
     }
     #[cfg(test)]
     crate::catalog::guards::pause("cover-work-locked").await;
+    if let Some(source) = source_id {
+        if crate::catalog::work_metadata::barred_groups_on(&mut tx, source)
+            .await?
+            .contains(&crate::catalog::work_metadata::FieldGroup::Cover)
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+    }
     // A takedown locks the same work row, so a fetch that was in flight when it landed
     // cannot store the art again after the takedown deleted it.
     let taken_down: bool = sqlx::query_scalar(
@@ -905,18 +983,41 @@ async fn publish_work_cover(
         return Ok(false);
     }
     if let Some((_, thumbnail_url)) = expected_suwayomi {
-        let current: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT s.thumbnail_url FROM source_series ss JOIN suwayomi_series s ON s.id = CAST(ss.source_key AS INTEGER) WHERE ss.work_id = $1 AND ss.source_type = 'suwayomi' ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1"
-        ).bind(work_id).fetch_optional(&mut *tx).await?;
-        if current.flatten().as_deref() != Some(thumbnail_url) {
+        let barred = crate::catalog::work_metadata::barred_sql(
+            &crate::catalog::work_metadata::mapping_source_sql("ss"),
+            "'cover'",
+        );
+        let current: Option<(Option<String>, String)> = sqlx::query_as(&format!(
+            "SELECT s.thumbnail_url, COALESCE(ss.source_id, ss.source_type) \
+             FROM source_series ss JOIN suwayomi_series s ON s.id = CAST(ss.source_key AS INTEGER) \
+             WHERE ss.work_id = $1 AND ss.source_type = 'suwayomi' AND NOT {barred} \
+             ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1"
+        ))
+        .bind(work_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if current
+            .as_ref()
+            .map(|(url, source)| (url.as_deref(), Some(source.as_str())))
+            != Some((Some(thumbnail_url), source_id))
+        {
             tx.rollback().await?;
             return Ok(false);
         }
     }
     if let Some((mangadex_id, file_name)) = expected_anchor {
-        let current: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT ss.source_key, w.cover_file_name FROM work w JOIN source_series ss ON ss.work_id = w.id AND ss.source_type = 'mangadex' WHERE w.id = $1 ORDER BY ss.created_at, ss.id LIMIT 1"
-        ).bind(work_id).fetch_optional(&mut *tx).await?;
+        let barred = crate::catalog::work_metadata::barred_sql(
+            &crate::catalog::work_metadata::mapping_source_sql("ss"),
+            "'cover'",
+        );
+        let current: Option<(String, Option<String>)> = sqlx::query_as(&format!(
+            "SELECT ss.source_key, w.cover_file_name FROM work w \
+             JOIN source_series ss ON ss.work_id = w.id AND ss.source_type = 'mangadex' \
+             WHERE w.id = $1 AND NOT {barred} ORDER BY ss.created_at, ss.id LIMIT 1"
+        ))
+        .bind(work_id)
+        .fetch_optional(&mut *tx)
+        .await?;
         if current
             .as_ref()
             .map(|(id, file)| (id.as_str(), file.as_deref()))
@@ -975,7 +1076,7 @@ async fn publish_work_cover(
                 .execute(&mut *tx)
                 .await?;
         }
-        CoverOrigin::Source => {
+        CoverOrigin::Source(_) => {
             sqlx::query("DELETE FROM cover_upload WHERE work_id = $1")
                 .bind(work_id)
                 .execute(&mut *tx)
@@ -985,7 +1086,12 @@ async fn publish_work_cover(
     // Publish the version and every materialized card URL in the same transaction.
     // Updating only work left library/browse cards pointing at immutable damaged
     // thumbnails even after an admin had successfully fetched a replacement.
-    publish_work_cover_version(&mut tx, work_id, version).await?;
+    let provenance = match origin {
+        CoverOrigin::Source(source) => Some(Some(source)),
+        CoverOrigin::Upload => Some(None),
+        CoverOrigin::Recompress => None,
+    };
+    publish_work_cover_version_with_origin(&mut tx, work_id, version, provenance).await?;
     tx.commit().await?;
     Ok(true)
 }
@@ -996,10 +1102,27 @@ pub(crate) async fn publish_work_cover_version(
     work_id: &str,
     version: i64,
 ) -> Result<bool> {
+    publish_work_cover_version_with_origin(tx, work_id, version, None).await
+}
+
+async fn publish_work_cover_version_with_origin(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    work_id: &str,
+    version: i64,
+    origin: Option<Option<&str>>,
+) -> Result<bool> {
     let changed = sqlx::query(
-        "UPDATE work SET cover_cached_version = $1 WHERE id = $2 AND cover_cached_version IS DISTINCT FROM $1",
+        "UPDATE work SET cover_cached_version = $1, \
+         cover_source = CASE WHEN $3 THEN $4 ELSE cover_source END \
+         WHERE id = $2 AND cover_cached_version IS DISTINCT FROM $1",
     )
-    .bind(version).bind(work_id).execute(&mut **tx).await?.rows_affected();
+    .bind(version)
+    .bind(work_id)
+    .bind(origin.is_some())
+    .bind(origin.flatten())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
     if changed == 0 {
         return Ok(false);
     }
@@ -1014,6 +1137,68 @@ pub(crate) async fn publish_work_cover_version(
         .await?;
     }
     Ok(true)
+}
+
+pub(crate) async fn legacy_work_cover_revoked<'e, E>(conn: E, work_id: &str) -> Result<bool>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    Ok(
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM work_cover_revocation WHERE work_id = $1)",
+        )
+        .bind(work_id)
+        .fetch_one(conn)
+        .await?,
+    )
+}
+
+pub(crate) async fn source_cover_barred(main: &Database, source: &str) -> Result<bool> {
+    let mut conn = main.acquire().await?;
+    Ok(
+        crate::catalog::work_metadata::barred_groups_on(&mut conn, source)
+            .await?
+            .contains(&crate::catalog::work_metadata::FieldGroup::Cover),
+    )
+}
+
+/// One retried unit after a cover bar commits. Provenance, rather than today's
+/// mappings, identifies the master to remove. Files are reclaimed by GC.
+pub(crate) async fn remove_barred_work_cover(
+    main: &Database,
+    work_id: &str,
+    source_id: &str,
+) -> Result<bool> {
+    crate::db::retry_transaction(|| async {
+        let mut tx = main.begin().await?;
+        let _asset = lock_assets_files_and_source(&mut tx, &[work_id], &[], Some(source_id)).await?;
+        if !crate::locks::lock_works(&mut tx, &[work_id]).await?.missing.is_empty() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let origin: Option<String> = sqlx::query_scalar("SELECT cover_source FROM work WHERE id = $1")
+            .bind(work_id).fetch_one(&mut *tx).await?;
+        if origin.as_deref() != Some(source_id)
+            || !crate::catalog::work_metadata::barred_groups_on(&mut tx, source_id).await?
+                .contains(&crate::catalog::work_metadata::FieldGroup::Cover)
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        cover_store::delete_asset(&mut tx, work_id).await?;
+        sqlx::query("INSERT INTO work_cover_revocation (work_id) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(work_id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE work SET cover_cached_version = NULL, cover_source = NULL WHERE id = $1")
+            .bind(work_id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM work_cover_issue WHERE work_id = $1")
+            .bind(work_id).execute(&mut *tx).await?;
+        for table in ["feed_updates", "feed_series_updates", "browse_catalogue"] {
+            sqlx::query(&format!("UPDATE {table} SET cover_url = '' WHERE work_id = $1 AND cover_url IS DISTINCT FROM ''"))
+                .bind(work_id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }).await
 }
 
 /// A work takedown (M5 `media_policy`): delete the stored covers of `work_ids` (the work
@@ -1053,7 +1238,7 @@ pub async fn delete_for_takedown(
             cache.commit().await?;
         }
         sqlx::query(
-            "UPDATE work SET cover_cached_version = NULL \
+            "UPDATE work SET cover_cached_version = NULL, cover_source = NULL \
              WHERE id = $1 AND cover_cached_version IS NOT NULL",
         )
         .bind(work_id)
@@ -1096,8 +1281,15 @@ async fn stored_work_version<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
-    if let Some(row) = cover_store::row(conn, work_id, cover_store::Kind::Master).await? {
-        return Ok(row.version);
+    let row: Option<(Option<i64>, bool, bool)> = sqlx::query_as(
+        "SELECT c.version, c.asset_key IS NOT NULL, \
+         EXISTS (SELECT 1 FROM work_cover_revocation r WHERE r.work_id = w.id) \
+         FROM work w LEFT JOIN cover_object c ON c.work_id = w.id AND c.kind = 'master' WHERE w.id = $1",
+    ).bind(work_id).fetch_optional(conn).await?;
+    if let Some((version, indexed, revoked)) = row {
+        if indexed || revoked {
+            return Ok(version);
+        }
     }
     let Some(legacy) = covers.legacy_for_read(work_id) else {
         return Ok(None);
@@ -1237,8 +1429,12 @@ pub async fn pending_cover_count(pool: &Database) -> Result<i64> {
     // because 26 works carry a recorded issue. That made the drainer's `Ok(0) => nothing
     // to do` short-circuit unreachable — it launched a full crawl pass every 300 s to
     // process a single row — and overstated the operator-facing backlog by 27x.
+    let barred = crate::catalog::work_metadata::barred_sql(
+        &crate::catalog::work_metadata::mapping_source_sql("ss"),
+        "'cover'",
+    );
     let n: i64 = crate::db_types::query_scalar(
-        "SELECT COUNT(*) FROM work w \
+        &format!("SELECT COUNT(*) FROM work w \
          WHERE w.cover_cached_version IS NULL \
            AND NOT EXISTS (SELECT 1 FROM media_takedown td \
                            WHERE td.subject_kind = 'work' AND td.subject_id = w.id) \
@@ -1246,9 +1442,9 @@ pub async fn pending_cover_count(pool: &Database) -> Result<i64> {
                            AND (i.retry_after IS NULL OR i.retry_after > $1)) AND ( \
              (w.cover_file_name IS NOT NULL \
               AND EXISTS (SELECT 1 FROM source_series ss \
-                          WHERE ss.work_id = w.id AND ss.source_type = 'mangadex')) \
+                          WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' AND NOT {barred})) \
              OR EXISTS (SELECT 1 FROM source_series ss \
-                        WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi'))",
+                        WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi' AND NOT {barred}))"),
     )
     .bind(Utc::now())
     .fetch_one(pool)
@@ -1701,16 +1897,29 @@ pub async fn clear_source_cover_backoff(main: &Database, source_id: &str) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RepairCoverSource {
     MangaDex { manga_id: String, file_name: String },
-    Suwayomi { path: String },
+    Suwayomi { path: String, source_id: String },
+}
+
+impl RepairCoverSource {
+    fn source_id(&self) -> &str {
+        match self {
+            Self::MangaDex { .. } => "mangadex",
+            Self::Suwayomi { source_id, .. } => source_id,
+        }
+    }
 }
 
 async fn repair_cover_sources(main: &Database, work_id: &str) -> Result<Vec<RepairCoverSource>> {
-    let md = crate::db_types::query_tuple::<(Option<String>, Option<String>)>(
+    let barred = crate::catalog::work_metadata::barred_sql(
+        &crate::catalog::work_metadata::mapping_source_sql("ss"),
+        "'cover'",
+    );
+    let md = crate::db_types::query_tuple::<(Option<String>, Option<String>)>(&format!(
         "SELECT (SELECT ss.source_key FROM source_series ss \
-                 WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' \
+                 WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' AND NOT {barred} \
                  ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1), \
-                w.cover_file_name FROM work w WHERE w.id = $1",
-    )
+                w.cover_file_name FROM work w WHERE w.id = $1"
+    ))
     .bind(work_id)
     .fetch_optional(main)
     .await?;
@@ -1726,20 +1935,22 @@ async fn repair_cover_sources(main: &Database, work_id: &str) -> Result<Vec<Repa
     // Every linked engine manga can supply a cover, even before its metadata is
     // mirrored locally. Use the internal thumbnail endpoint rather than requiring
     // a cached thumbnail_url or following a stale public/CDN URL.
-    let keys: Vec<String> = crate::db_types::query_scalar(
-        "SELECT source_key FROM source_series WHERE work_id = $1 \
-         AND source_type = 'suwayomi' ORDER BY created_at ASC, id ASC",
-    )
+    let keys: Vec<(String, String)> = sqlx::query_as(&format!(
+        "SELECT ss.source_key, COALESCE(ss.source_id, ss.source_type) \
+         FROM source_series ss WHERE ss.work_id = $1 \
+         AND ss.source_type = 'suwayomi' AND NOT {barred} ORDER BY ss.created_at ASC, ss.id ASC"
+    ))
     .bind(work_id)
     .fetch_all(main)
     .await?;
-    for key in keys {
+    for (key, source_id) in keys {
         let Ok(id) = key.parse::<i64>() else { continue };
         if id < 0 {
             continue;
         }
         let candidate = RepairCoverSource::Suwayomi {
             path: format!("/api/v1/manga/{id}/thumbnail"),
+            source_id,
         };
         if !sources.contains(&candidate) {
             sources.push(candidate);
@@ -1751,7 +1962,7 @@ async fn repair_cover_sources(main: &Database, work_id: &str) -> Result<Vec<Repa
 async fn process_repair_sources<F, Fut>(
     sources: Vec<RepairCoverSource>,
     mut fetch: F,
-) -> Result<Option<Vec<u8>>>
+) -> Result<Option<(RepairCoverSource, Vec<u8>)>>
 where
     F: FnMut(RepairCoverSource) -> Fut,
     Fut: std::future::Future<Output = Option<Vec<u8>>>,
@@ -1759,14 +1970,14 @@ where
     let mut last_error = None;
     for source in sources {
         let work = master_cover_work().await;
-        let Some(bytes) = fetch(source).await else {
+        let Some(bytes) = fetch(source.clone()).await else {
             continue;
         };
         // A download is only usable after it has decoded and processed. A corrupt
         // MangaDex image must not prevent trying Suwayomi, nor may a bad first
         // Suwayomi source prevent trying the remaining linked sources.
         match work.process(move || process_cover(&bytes)).await? {
-            Ok(webp) => return Ok(Some(webp)),
+            Ok(webp) => return Ok(Some((source, webp))),
             Err(error) => last_error = Some(error),
         }
     }
@@ -1799,7 +2010,7 @@ pub async fn retry_one_cover(
                 manga_id,
                 file_name,
             } => mangadex.cover_thumb_bytes(&manga_id, &file_name).await,
-            RepairCoverSource::Suwayomi { path } => match crate::engine_route::cover_manga_id(&path) {
+            RepairCoverSource::Suwayomi { path, .. } => match crate::engine_route::cover_manga_id(&path) {
                 Some(id) => crate::engine_route::cover_bytes(
                     suwayomi, main, crate::engine_route::CoverTarget::OwnerManga(id), Some(&path),
                 ).await,
@@ -1809,8 +2020,10 @@ pub async fn retry_one_cover(
     })
     .await;
     match processed {
-        Ok(Some(webp)) => {
-            put_work_cover(main, covers, work_id, &webp).await?;
+        Ok(Some((source, webp))) => {
+            if !put_source_work_cover(main, covers, work_id, &webp, source.source_id()).await? {
+                return Ok(false);
+            }
             clear_cover_issue(main, work_id).await;
             Ok(true)
         }
@@ -1854,24 +2067,34 @@ pub async fn crawl_uncached_covers(
     // deterministic anchor the reader uses (oldest source_series) so the cover
     // matches the pages. `limit` bounds a single (auto-drainer) tick; None = drain
     // everything still uncached (the manual admin crawl).
-    const BASE: &str = "SELECT w.id, \
+    let barred = crate::catalog::work_metadata::barred_sql(
+        &crate::catalog::work_metadata::mapping_source_sql("ss"),
+        "'cover'",
+    );
+    let base = format!(
+        "SELECT w.id, \
                 (SELECT ss.source_key FROM source_series ss \
-                 WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' \
+                 WHERE ss.work_id = w.id AND ss.source_type = 'mangadex' AND NOT {barred} \
                  ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS mangadex_id, \
                 w.cover_file_name \
          FROM work w \
          WHERE w.cover_cached_version IS NULL AND w.cover_file_name IS NOT NULL \
+           AND (NOT EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id \
+                            AND ss.source_type = 'mangadex') \
+                OR EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id \
+                           AND ss.source_type = 'mangadex' AND NOT {barred})) \
            AND NOT EXISTS (SELECT 1 FROM media_takedown td \
                            WHERE td.subject_kind = 'work' AND td.subject_id = w.id) \
            AND NOT EXISTS (SELECT 1 FROM work_cover_issue i WHERE i.work_id = w.id \
-                           AND (i.retry_after IS NULL OR i.retry_after > $1))";
+                           AND (i.retry_after IS NULL OR i.retry_after > $1))"
+    );
     // A marker only hides a work while its backoff is unexpired (0100), so `now` is
     // bound into every crawl SELECT rather than the marker being an absolute exclusion.
     let now = Utc::now().to_rfc3339();
     let loaded = match limit {
         Some(n) => {
             crate::db_types::query_tuple::<(String, Option<String>, Option<String>)>(&format!(
-                "{BASE} LIMIT $2"
+                "{base} LIMIT $2"
             ))
             .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
             .bind(n)
@@ -1879,7 +2102,7 @@ pub async fn crawl_uncached_covers(
             .await
         }
         None => {
-            crate::db_types::query_tuple::<(String, Option<String>, Option<String>)>(BASE)
+            crate::db_types::query_tuple::<(String, Option<String>, Option<String>)>(&base)
                 .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
                 .fetch_all(main)
                 .await
@@ -2011,15 +2234,20 @@ pub async fn crawl_uncached_covers(
     // `cover_cached_version` bump invalidates the ~13.8k Suwayomi-anchored works: ~6 ms
     // x 13.8k = ~80 s of pure scan before a single byte is fetched. Post-fix the plan is
     // `SEARCH s USING INTEGER PRIMARY KEY (rowid=?)`.
-    const SUW_BASE: &str = "SELECT w.id, \
+    let suw_base = format!(
+        "SELECT w.id, \
                 (SELECT s.thumbnail_url FROM source_series ss \
                  JOIN suwayomi_series s ON s.id = CAST(ss.source_key AS INTEGER) \
-                 WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi' \
+                 WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi' AND NOT {barred} \
                  ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS thumbnail_url, \
                 (SELECT s.source_id FROM source_series ss \
                  JOIN suwayomi_series s ON s.id = CAST(ss.source_key AS INTEGER) \
-                 WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi' \
-                 ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS source_id \
+                 WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi' AND NOT {barred} \
+                 ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS source_id, \
+                (SELECT COALESCE(ss.source_id, ss.source_type) FROM source_series ss \
+                 JOIN suwayomi_series s ON s.id = CAST(ss.source_key AS INTEGER) \
+                 WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi' AND NOT {barred} \
+                 ORDER BY ss.created_at ASC, ss.id ASC LIMIT 1) AS origin_source \
          FROM work w \
          WHERE w.cover_cached_version IS NULL \
            AND NOT EXISTS (SELECT 1 FROM media_takedown td \
@@ -2027,7 +2255,8 @@ pub async fn crawl_uncached_covers(
            AND NOT EXISTS (SELECT 1 FROM work_cover_issue i WHERE i.work_id = w.id \
                            AND (i.retry_after IS NULL OR i.retry_after > $1)) \
            AND EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id \
-                       AND ss.source_type = 'suwayomi')";
+                       AND ss.source_type = 'suwayomi' AND NOT {barred})"
+    );
     // Read before the jobs: a job is then never tagged with a newer generation than
     // the anchor rows it came from.
     let suw_generation = match crate::engine_generation::current(main).await {
@@ -2038,27 +2267,36 @@ pub async fn crawl_uncached_covers(
         }
     };
     let suw_loaded = match limit {
-        Some(n) => {
-            crate::db_types::query_tuple::<(String, Option<String>, Option<String>)>(&format!(
-                "{SUW_BASE} LIMIT $2"
-            ))
-            .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
-            .bind(n)
-            .fetch_all(main)
-            .await
-        }
-        None => {
-            crate::db_types::query_tuple::<(String, Option<String>, Option<String>)>(SUW_BASE)
-                .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
-                .fetch_all(main)
-                .await
-        }
+        Some(n) => crate::db_types::query_tuple::<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>(&format!("{suw_base} LIMIT $2"))
+        .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
+        .bind(n)
+        .fetch_all(main)
+        .await,
+        None => crate::db_types::query_tuple::<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>(&suw_base)
+        .bind(crate::db_types::date(&now).expect("internally generated UTC timestamp"))
+        .fetch_all(main)
+        .await,
     };
-    let suw_jobs: Vec<(String, String, Option<String>)> = match suw_loaded {
+    let suw_jobs: Vec<(String, String, Option<String>, String)> = match suw_loaded {
         Ok(rows) => rows
             .into_iter()
-            .filter_map(|(work_id, thumb, source_id)| {
-                Some((work_id, thumb.filter(|t| !t.is_empty())?, source_id))
+            .filter_map(|(work_id, thumb, source_id, origin)| {
+                Some((
+                    work_id,
+                    thumb.filter(|t| !t.is_empty())?,
+                    source_id,
+                    origin?,
+                ))
             })
             .collect(),
         Err(e) => {
@@ -2083,7 +2321,7 @@ pub async fn crawl_uncached_covers(
     // (they wait patiently, on-demand does not queue at all).
     const SUW_CRAWL_CONCURRENCY: usize = crate::suwayomi::WARM_COVER_CONCURRENCY;
     let (suw_saved, suw_failed) = futures::stream::iter(suw_jobs)
-        .map(|(work_id, thumb, source_id)| async move {
+        .map(|(work_id, thumb, source_id, origin)| async move {
             // The source's rate budget first, so a paced fetch holds no work slot.
             if let Some(source_id) = &source_id {
                 if !source_budgets.spend(source_id, SourceUse::Cover, shutdown).await {
@@ -2115,13 +2353,14 @@ pub async fn crawl_uncached_covers(
                 }
             };
             match work.process(move || process_cover(&bytes)).await {
-                Ok(Ok(webp)) => match put_work_cover_for_suwayomi_anchor(
+                Ok(Ok(webp)) => match put_work_cover_for_suwayomi_source_anchor(
                     main,
                     covers,
                     &work_id,
                     &webp,
                     suw_generation,
                     &thumb,
+                    &origin,
                 )
                 .await
                 {
@@ -4123,18 +4362,20 @@ mod tests {
             },
             RepairCoverSource::Suwayomi {
                 path: "/first".into(),
+                source_id: "suwayomi".into(),
             },
             RepairCoverSource::Suwayomi {
                 path: "/second".into(),
+                source_id: "suwayomi".into(),
             },
         ];
         let good = noisy_png(300, 450);
         let mut visited = Vec::new();
-        let webp = process_repair_sources(sources.clone(), |source| {
+        let (winner, webp) = process_repair_sources(sources.clone(), |source| {
             visited.push(source.clone());
             std::future::ready(match source {
                 RepairCoverSource::MangaDex { .. } => Some(b"not an image".to_vec()),
-                RepairCoverSource::Suwayomi { path } if path == "/second" => Some(good.clone()),
+                RepairCoverSource::Suwayomi { path, .. } if path == "/second" => Some(good.clone()),
                 _ => None,
             })
         })
@@ -4142,6 +4383,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(visited, sources);
+        assert_eq!(winner, sources[2]);
         assert_eq!(
             image::load_from_memory(&webp).unwrap().dimensions(),
             (300, 450)
@@ -4159,7 +4401,8 @@ mod tests {
         assert_eq!(
             repair_cover_sources(&main, "w_repair").await.unwrap(),
             vec![RepairCoverSource::Suwayomi {
-                path: "/api/v1/manga/7/thumbnail".into()
+                path: "/api/v1/manga/7/thumbnail".into(),
+                source_id: "suwayomi".into(),
             }]
         );
         record_cover_issue(&main, "w_repair", "unsupported", "old failure").await;

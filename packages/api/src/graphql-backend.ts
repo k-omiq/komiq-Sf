@@ -78,6 +78,10 @@ import type {
 	ScanlatorSite,
 	ScanlatorTag,
 	SourceAiTag,
+	MetadataFieldGroup,
+	SourceMetadataBar,
+	SetSourceMetadataBarResult,
+	WorkMetadataSource,
 	SourceRateLimit,
 	MyComment,
 	PostCommentInput,
@@ -232,6 +236,7 @@ interface EndpointCapabilities {
 	viewerProgressUnsupported: boolean;
 	chapterWorkUnsupported: boolean;
 	workChapterListUnsupported: boolean;
+	setSourceMetadataBarUnsupported: boolean;
 	chapterOriginUnsupported: boolean;
 	mediaRoutesUnsupported: boolean;
 	seriesPageUnsupported: boolean;
@@ -258,6 +263,7 @@ function endpointCapabilities(config: BackendConfig): EndpointCapabilities {
 			viewerProgressUnsupported: false,
 			chapterWorkUnsupported: false,
 			workChapterListUnsupported: false,
+			setSourceMetadataBarUnsupported: false,
 			chapterOriginUnsupported: false,
 			mediaRoutesUnsupported: false,
 			seriesPageUnsupported: false,
@@ -729,6 +735,20 @@ export class GraphQLBackend implements Backend {
 	}
 	sourceAiTags(): Promise<SourceAiTag[]> {
 		return this.optionalList<SourceAiTag>('sourceAiTags', ops.SOURCE_AI_TAGS);
+	}
+	sourceMetadataBars(): Promise<SourceMetadataBar[]> {
+		return this.optionalList<SourceMetadataBar>('sourceMetadataBars', ops.SOURCE_METADATA_BARS);
+	}
+	workMetadataSources(workId: Id): Promise<WorkMetadataSource[]> {
+		return this.optionalList<WorkMetadataSource>('workMetadataSources', ops.WORK_METADATA_SOURCES, {
+			workId,
+		});
+	}
+	metadataBarsSupported(): boolean {
+		return (
+			!this.capabilities.unsupportedLists.has('sourceMetadataBars') &&
+			!this.capabilities.setSourceMetadataBarUnsupported
+		);
 	}
 	browseFilterSupported(): boolean {
 		return !this.capabilities.unsupportedArgs.has('filter');
@@ -1374,6 +1394,28 @@ export class GraphQLBackend implements Backend {
 	async setSourceAi(sourceId: string, ai: ScanlatorAi | null): Promise<boolean> {
 		const d = await this.gql<{ setSourceAi: boolean }>(ops.SET_SOURCE_AI, { sourceId, ai });
 		return d.setSourceAi;
+	}
+
+	async setSourceMetadataBar(
+		sourceId: string,
+		fieldGroup: MetadataFieldGroup,
+		barred: boolean,
+	): Promise<SetSourceMetadataBarResult> {
+		const authRevision = this.auth.revision;
+		if (!this.metadataBarsSupported()) throw new Error('This server does not support metadata bars');
+		try {
+			const d = await this.gql<{ setSourceMetadataBar: SetSourceMetadataBarResult }>(
+				ops.SET_SOURCE_METADATA_BAR,
+				{ sourceId, fieldGroup, barred },
+			);
+			return d.setSourceMetadataBar;
+		} catch (err) {
+			this.assertAuthRevision(authRevision);
+			const msg = err instanceof Error ? err.message : String(err);
+			if (!msg.includes('Unknown field "setSourceMetadataBar"')) throw err;
+			this.capabilities.setSourceMetadataBarUnsupported = true;
+			throw new Error('This server does not support metadata bars');
+		}
 	}
 
 	async siteBlockRules(): Promise<BlockRule[]> {

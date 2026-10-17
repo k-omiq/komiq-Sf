@@ -146,6 +146,8 @@
 					alarm: sourceHealth.down,
 					alarmLabel: 'sources down',
 				},
+				// Which sources may supply each kind of series detail.
+				{ href: '/sources/metadata', label: 'Metadata', icon: 'shield' },
 				// The groups chapters are credited to, and which of them use AI.
 				{ href: '/scanlators', label: 'Scanlators', icon: 'globe' },
 			],

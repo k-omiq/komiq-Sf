@@ -12,6 +12,8 @@ mod cache_refresh_tests;
 #[path = "chapter_work_tests.rs"]
 mod chapter_work_tests;
 #[cfg(test)]
+mod metadata_trust_tests;
+#[cfg(test)]
 mod postgres_golden_tests;
 #[cfg(test)]
 #[path = "progress_w3b_tests.rs"]
@@ -932,39 +934,54 @@ impl Series {
     /// work with no covers stored yet or a non-canonical series. `coverUrl` (the
     /// primary) keeps working independently.
     async fn covers(&self, ctx: &Context<'_>) -> Result<Vec<Cover>> {
-        // Cover URLs are `covers/{mangadex_id}/{fileName}`: the anchor and the rows in
-        // one statement. No anchor or no cover yields no row, as two reads did.
-        let rows =
-            crate::db_types::query_tuple::<(String, String, Option<String>, Option<String>, i64)>(
-                "SELECT a.source_key, wc.cover_file_name, wc.lang, wc.volume, wc.is_primary \
-             FROM (SELECT source_key FROM source_series \
-                   WHERE work_id = $1 AND source_type = 'mangadex' LIMIT 1) a \
-             JOIN work_cover wc ON wc.work_id = $1",
-            )
-            .bind(&self.id.0)
-            .fetch_all(&state(ctx).pool)
+        load_cover_gallery(&state(ctx).pool, &self.id.0)
             .await
-            .map_err(gql_read_err)?;
-        let Some(mid) = rows.first().map(|r| r.0.clone()) else {
-            return Ok(Vec::new());
-        };
-        let covers = catalog::sort_work_covers(
-            rows.into_iter()
-                .map(|(_, file_name, lang, volume, primary)| (file_name, lang, volume, primary))
-                .collect(),
-        );
-        Ok(covers
-            .into_iter()
-            .map(|c| Cover {
-                url: crate::mangadex::cover_url(&mid, &c.file_name),
-                thumbnail_url: crate::mangadex::cover_thumb_url(&mid, &c.file_name),
-                file_name: c.file_name,
-                lang: c.lang,
-                volume: c.volume,
-                is_primary: c.is_primary,
-            })
-            .collect())
+            .map_err(gql_read_err)
     }
+}
+
+pub(crate) async fn load_cover_gallery(
+    pool: &Database,
+    work_id: &str,
+) -> anyhow::Result<Vec<Cover>> {
+    // Cover URLs are `covers/{mangadex_id}/{fileName}`: the anchor and the rows in
+    // one statement. No anchor or no cover yields no row, as two reads did.
+    let barred = catalog::work_metadata::barred_sql(
+        &catalog::work_metadata::mapping_source_sql("ss"),
+        "'cover'",
+    );
+    let rows =
+        crate::db_types::query_tuple::<(String, String, Option<String>, Option<String>, i64)>(
+            &format!(
+                "SELECT a.source_key, wc.cover_file_name, wc.lang, wc.volume, wc.is_primary \
+         FROM (SELECT ss.source_key FROM source_series ss \
+               WHERE ss.work_id = $1 AND ss.source_type = 'mangadex' \
+                 AND NOT {barred} LIMIT 1) a \
+         JOIN work_cover wc ON wc.work_id = $1"
+            ),
+        )
+        .bind(work_id)
+        .fetch_all(pool)
+        .await?;
+    let Some(mid) = rows.first().map(|r| r.0.clone()) else {
+        return Ok(Vec::new());
+    };
+    let covers = catalog::sort_work_covers(
+        rows.into_iter()
+            .map(|(_, file_name, lang, volume, primary)| (file_name, lang, volume, primary))
+            .collect(),
+    );
+    Ok(covers
+        .into_iter()
+        .map(|c| Cover {
+            url: crate::mangadex::cover_url(&mid, &c.file_name),
+            thumbnail_url: crate::mangadex::cover_thumb_url(&mid, &c.file_name),
+            file_name: c.file_name,
+            lang: c.lang,
+            volume: c.volume,
+            is_primary: c.is_primary,
+        })
+        .collect())
 }
 
 /// The current session token, if the request carried one.
@@ -7283,6 +7300,75 @@ impl QueryRoot {
             .collect();
         tags.sort_by(|a, b| a.source_id.cmp(&b.source_id));
         Ok(tags)
+    }
+
+    /// Admin: every source metadata bar, ordered by source id then field group.
+    async fn source_metadata_bars(&self, ctx: &Context<'_>) -> Result<Vec<SourceMetadataBar>> {
+        require_admin(ctx).await?;
+        let bars = catalog::work_metadata::list_bars(&state(ctx).pool)
+            .await
+            .map_err(gql_read_err)?;
+        Ok(bars
+            .into_iter()
+            .map(|(source_id, group, created_at)| SourceMetadataBar {
+                source_id,
+                field_group: group.into(),
+                created_at: created_at.to_rfc3339(),
+            })
+            .collect())
+    }
+
+    /// Admin: the metadata source for each field group, following merged work ids.
+    async fn work_metadata_sources(
+        &self,
+        ctx: &Context<'_>,
+        work_id: ID,
+    ) -> Result<Vec<WorkMetadataSource>> {
+        require_admin(ctx).await?;
+        let st = state(ctx);
+        let work_id = catalog::redirect_work_id(&st.pool, &work_id.0)
+            .await
+            .map_err(gql_read_err)?
+            .unwrap_or(work_id.0);
+        let work_id: String = sqlx::query_scalar("SELECT id FROM work WHERE id = $1")
+            .bind(&work_id)
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(gql_read_err)?
+            .ok_or_else(|| Error::new("No such work"))?;
+        let groups = catalog::work_metadata::work_sources(&st.pool, &work_id)
+            .await
+            .map_err(gql_read_err)?;
+        let mut names: HashMap<String, String> = HashMap::new();
+        if groups
+            .iter()
+            .any(|g| g.source_id.as_deref().is_some_and(|id| id != "mangadex"))
+        {
+            // Display names live in the engine; unavailable names stay null.
+            match st.suwayomi.list_sources().await {
+                Ok(sources) => names.extend(sources.into_iter().map(|s| (s.id, s.name))),
+                Err(e) => {
+                    tracing::warn!(error = %e, "workMetadataSources: source list unavailable")
+                }
+            }
+        }
+        Ok(groups
+            .into_iter()
+            .map(|g| WorkMetadataSource {
+                field_group: g.group.into(),
+                state: g.state.into(),
+                source_name: g.source_id.as_deref().and_then(|id| {
+                    if id == "mangadex" {
+                        Some("MangaDex".to_string())
+                    } else {
+                        names.get(id).cloned()
+                    }
+                }),
+                source_id: g.source_id,
+                source_series_id: g.source_series_id,
+                attribution: g.attribution.map(Into::into),
+            })
+            .collect())
     }
 
     /// Admin: the site list. Every source with a series in the catalogue, biggest
@@ -14536,6 +14622,39 @@ impl MutationRoot {
         Ok(changed)
     }
 
+    /// Admin: bar or allow a source for one metadata group and re-project its works.
+    async fn set_source_metadata_bar(
+        &self,
+        ctx: &Context<'_>,
+        source_id: String,
+        field_group: MetadataFieldGroup,
+        barred: bool,
+    ) -> Result<SetSourceMetadataBarResult> {
+        let admin = require_admin(ctx).await?;
+        let source_id = source_id.trim();
+        if !catalog::work_metadata::valid_source_id(source_id) {
+            return Err(Error::new(
+                "Invalid source id: use 1-32 ASCII letters, digits, or hyphens.",
+            ));
+        }
+        let works = catalog::work_metadata::set_bar(
+            &state(ctx).pool,
+            source_id,
+            field_group.into(),
+            barred,
+        )
+        .await
+        .map_err(gql_err)?;
+        clear_feed_caches();
+        tracing::info!(source_id, ?field_group, barred, works, by = %admin.username, "source metadata bar set by an admin");
+        Ok(SetSourceMetadataBarResult {
+            source_id: source_id.to_string(),
+            field_group,
+            barred,
+            works: works.min(i32::MAX as u64) as i32,
+        })
+    }
+
     /// Admin: replace the site-wide content block rules with `rules` (at most 50; an
     /// empty list removes them all). Applies at once, to every viewer. Returns the
     /// stored list. A rule that names nothing, a tag that is not a tag id, more than 8
@@ -17917,7 +18036,7 @@ async fn add_source_series_checked(
     // content block rule that names one of its genres lets it through. Best-effort: a
     // failure leaves the work as it was before this call existed, and the refresh
     // derives the tags then.
-    if let Err(e) = crate::tags::sync_work_suwayomi_tags(&st.pool, &result.work_id, &m.genre).await
+    if let Err(e) = crate::tags::sync_work_suwayomi_tags(&st.pool, &result.work_id, Some(&m.source_id), &m.genre).await
     {
         crate::db::observe_database_error(&e);
         tracing::warn!(work_id = %result.work_id, error = %e, "enrol: tag derivation failed; the next catalogue refresh retries");
@@ -18107,6 +18226,7 @@ async fn add_source_series_core_ex(
             }],
             ..Default::default()
         },
+        observation: catalog::work_metadata::Observation::from_suwayomi(m),
         title: &m.title,
         consolidate,
         source_nsfw,
@@ -18116,17 +18236,18 @@ async fn add_source_series_core_ex(
 }
 
 /// Everything one enrolment needs, prepared before its transaction begins.
-struct Enrolment<'a> {
-    generation: Option<uuid::Uuid>,
-    source_id: &'a str,
-    source_key: &'a str,
-    mangadex_uuid: Option<String>,
-    candidate: crate::dedup::Candidate,
-    work: crate::catalog::WorkInput,
-    title: &'a str,
-    consolidate: bool,
-    source_nsfw: bool,
-    pinned: bool,
+pub(crate) struct Enrolment<'a> {
+    pub(crate) generation: Option<uuid::Uuid>,
+    pub(crate) source_id: &'a str,
+    pub(crate) source_key: &'a str,
+    pub(crate) mangadex_uuid: Option<String>,
+    pub(crate) candidate: crate::dedup::Candidate,
+    pub(crate) work: crate::catalog::WorkInput,
+    pub(crate) observation: catalog::work_metadata::Observation,
+    pub(crate) title: &'a str,
+    pub(crate) consolidate: bool,
+    pub(crate) source_nsfw: bool,
+    pub(crate) pinned: bool,
 }
 
 /// One enrolment of a Suwayomi series, BEGIN to COMMIT, retried as a whole by its
@@ -18150,7 +18271,7 @@ struct Enrolment<'a> {
 /// title both saw "no such work" and minted two works; a minted work whose claim was
 /// lost had to be deleted again afterwards; a crash between the link and the adult flag
 /// left an adult series served as safe until the next rebuild.
-async fn enrol_source_series_once(
+pub(crate) async fn enrol_source_series_once(
     pool: &Database,
     enrolment: &Enrolment<'_>,
 ) -> anyhow::Result<MatchResult> {
@@ -18162,6 +18283,7 @@ async fn enrol_source_series_once(
         mangadex_uuid,
         candidate,
         work,
+        observation,
         title,
         consolidate,
         source_nsfw,
@@ -18196,6 +18318,16 @@ async fn enrol_source_series_once(
         });
     }
 
+    use catalog::work_metadata::{Attribution, FieldGroup};
+    let barred = catalog::work_metadata::barred_groups_on(&mut tx, source_id).await?;
+    let mut masked;
+    let candidate = if barred.contains(&FieldGroup::Credits) {
+        masked = candidate.clone();
+        masked.author = None;
+        &masked
+    } else {
+        candidate
+    };
     let mut route = enrol_route_on(&mut tx, mangadex_uuid, candidate).await?;
     if let Some(existing) = route.work().map(str::to_owned) {
         // The complete work set of the unit, before any work lock: the route's work
@@ -18306,6 +18438,14 @@ async fn enrol_source_series_once(
     if linked != work_id {
         return Err(crate::locks::RestartTransaction.into());
     }
+    let cached = catalog::work_metadata::cached_suwayomi_observation_on(&mut tx, source_key).await?;
+    let observation = cached.as_ref().unwrap_or(observation);
+    catalog::work_metadata::record_on(&mut tx, &ssid, observation, Attribution::Observed).await?;
+    let groups: Vec<_> = FieldGroup::ALL
+        .into_iter()
+        .filter(|group| *group != FieldGroup::Cover)
+        .collect();
+    catalog::work_metadata::project_on(&mut tx, &work_id, &groups).await?;
 
     // N4: the source-level NSFW signal must reach `work.is_nsfw` — the only column the
     // gating reads consult. A minted work carries it already; a reused (possibly SFW)
@@ -27486,6 +27626,51 @@ mod tests {
         assert_eq!(numbers, vec![1.0, 2.0], "{agg:?}");
     }
 
+    #[tokio::test]
+    async fn series_cover_gallery_respects_the_mangadex_cover_bar() {
+        let (schema, pool) = setup_full(100).await;
+        let work = crate::catalog::upsert_work_from_mangadex(
+            &pool,
+            "md-cover-gallery",
+            &crate::catalog::WorkInput {
+                primary_title: Some("Gallery".into()),
+                covers: vec![crate::catalog::Cover {
+                    file_name: "v1.jpg".into(),
+                    lang: Some("ja".into()),
+                    volume: Some("1".into()),
+                    is_primary: true,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let query = format!(
+            r#"{{ canonicalSeries(workId: "{work}") {{ covers {{ fileName isPrimary }} }} }}"#
+        );
+        for barred in [false, true, false] {
+            crate::catalog::work_metadata::set_bar(
+                &pool,
+                "mangadex",
+                crate::catalog::work_metadata::FieldGroup::Cover,
+                barred,
+            )
+            .await
+            .unwrap();
+            let response = exec(&schema, &query, None, "1.1.1.1").await;
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            let data = response.data.into_json().unwrap();
+            assert_eq!(
+                data["canonicalSeries"]["covers"],
+                if barred {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!([{"fileName": "v1.jpg", "isPrimary": true}])
+                }
+            );
+        }
+    }
+
     /// The series page's round trips are pinned, and the reads it shares between the
     /// canonical arm and a source of the same work agree. Every statement holds one of
     /// the 16 reader connections, so the COUNT is the cost under a release burst
@@ -28607,7 +28792,7 @@ mod tests {
             .await
             .unwrap()
             .contains(&mid.to_string()));
-        catalog::refresh_mangadex_details(&pool, &work, &input)
+        catalog::refresh_mangadex_details(&pool, &work, mid, &input)
             .await
             .unwrap();
         assert!(!works_needing_enrichment(&pool, 100)

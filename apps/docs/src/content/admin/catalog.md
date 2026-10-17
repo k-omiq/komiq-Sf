@@ -105,6 +105,14 @@ An override replaces what the source sends. Leaving a field blank, or choosing `
 
 Click **Save metadata** to commit your changes.
 
+### Field sources
+
+Muted lines under Title, Description, Author, Artist, Tags and Status show the selected field source. `From` names that source. `(guessed)` means the link came from stored data rather than a live observation.
+
+`Kept: every source is barred` means the current value stays because no linked source is allowed. `Kept: source not read yet` means the chosen source has no observation for that group. These lines describe source values beneath your overrides and pins. Older servers show no lines.
+
+Change these permissions in [Sources](/admin/sources), under Metadata.
+
 ### Sources and rescanning
 
 The **Sources** section lists visible external sources attached to the work, subject to your account's NSFW filter:

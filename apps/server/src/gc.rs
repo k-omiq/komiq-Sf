@@ -546,8 +546,11 @@ async fn repair_missing_cover_files(
                     } else if kind == "master" {
                         cover_store::delete_asset(&mut tx, asset).await?;
                         if let Some(work_id) = work_id {
+                            // The origin goes with the master: a later copy is of unknown origin.
                             sqlx::query(
-                                "UPDATE work SET cover_cached_version = NULL WHERE id = $1",
+                                "UPDATE work SET cover_cached_version = NULL, cover_source = NULL \
+                                 WHERE id = $1 \
+                                   AND (cover_cached_version IS NOT NULL OR cover_source IS NOT NULL)",
                             )
                             .bind(work_id)
                             .execute(&mut *tx)

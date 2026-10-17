@@ -981,7 +981,7 @@ pub async fn reconcile_cover_pointers(pool: &Database) -> Result<u64> {
             }
         }
         let cleared = sqlx::query(
-            "UPDATE work w SET cover_cached_version = NULL \
+            "UPDATE work w SET cover_cached_version = NULL, cover_source = NULL \
               WHERE w.id = ANY($1) AND w.cover_cached_version IS NOT NULL AND NOT EXISTS \
                 (SELECT 1 FROM cover_object c WHERE c.work_id = w.id AND c.kind = 'master')",
         )

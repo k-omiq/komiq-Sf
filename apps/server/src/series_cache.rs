@@ -45,7 +45,13 @@ pub fn is_fresh(fetched_at: Option<&str>, ttl_secs: i64) -> bool {
 pub async fn put_series(pool: &Database, m: &SuwayomiManga) -> Result<bool> {
     crate::engine_generation::wait(pool).await?;
     let result = put_series_inner(pool, m).await;
-    crate::engine_generation::observe_write(pool, result)
+    let written = crate::engine_generation::observe_write(pool, result)?;
+    if written {
+        if let Err(error) = crate::catalog::work_metadata::observe_suwayomi(pool, m).await {
+            tracing::warn!(manga = m.id, error = %error, "failed to observe Suwayomi metadata");
+        }
+    }
+    Ok(written)
 }
 
 async fn put_series_inner(pool: &Database, m: &SuwayomiManga) -> Result<bool> {

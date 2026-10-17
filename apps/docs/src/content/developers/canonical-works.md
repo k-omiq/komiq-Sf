@@ -3,7 +3,7 @@ title: One entry per series
 description: Understand how the server inside the admin app groups source series into canonical works and lets you review, merge and split them.
 ---
 
-Komiq is self-hostable: the admin app runs the server and gives you its management portal, and the reader app connects to a server. The server groups series from different websites into a single entry called a canonical work, keeping duplicate cards out of library and browse screens. This page explains the work data model, matching steps and admin review, merge and split operations.
+Komiq is self-hostable: the admin app runs the server and gives you its management portal, and the reader app connects to a server. The server groups series from different websites into a single entry called a canonical work, keeping duplicate cards out of library and browse screens. This page explains the work data model, field sources, matching steps and admin review, merge and split operations.
 
 ## Overview
 
@@ -30,6 +30,26 @@ The canonical catalogue layer uses several related PostgreSQL tables defined in 
 - `chapter`: mirrored chapter records linked to `source_series.id`. Because chapters belong to the source mapping rather than the work, re-pointing a source mapping carries all its chapters automatically.
 - `work_field_pin`: records admin overrides for fields like author, artist, status, or year. Database triggers ensure upstream sync tasks cannot overwrite pinned values, saving incoming source data into `source_value` instead.
 - `work_chapter` and `work_chapter_link`: the work's own chapter list. Each entry is one chapter of the work, and each `chapter` row links to one entry. See "The work's chapter list" below.
+
+## Field sources and bars
+
+`work_metadata_contribution` records what a source mapping last supplied. Each value belongs to one group: title, description, credits, tags, cover or status. It stores a slot, language, value, order, optional details and attribution. The mapping owns these rows through `source_series_id`. They follow its `work_id` through a merge or split and disappear when the mapping is deleted.
+
+A missing group means the source has not been observed for it. An empty slot and value record an observation that supplied nothing. These cases differ: an observed empty description can clear a description, while an unobserved group keeps the current value.
+
+`source_metadata_bar` bars one source from one group. No row means allowed. The source identity is `COALESCE(source_id, source_type)`. Only `mangadex` and `suwayomi` mappings count. Mappings with type `mangadex` rank first. Within each tier, earlier `source_series.created_at` wins, then the lowest `id`.
+
+For title, description, credits and status, the projector, `work_metadata::project_on`, chooses the first allowed mapping. It uses that mapping's rows regardless of attribution. If it has no rows, the current values stay. Values also stay when every mapping is barred. The [series editor](/admin/catalog) reports these cases.
+
+The projector changes only values that differ. It never blanks the primary title. Allowed title aliases form a union. An alias, localized description or credit supplied only by barred mappings is removed. An alias with no contribution stays. The first allowed MangaDex mapping with a tag observation sets the work's MangaDex tags. An empty observation clears them. Barring MangaDex for tags removes that tier. Extension tags are rebuilt separately in `tags.rs`. The projector does not handle covers; the cover code applies the cover bar itself.
+
+Covers follow the same ranking. The cover crawl, cover repair and the first-view MangaDex cover fetch skip sources barred for cover, so the next allowed source supplies the art. Publication checks the bar again under its locks and refuses a barred source. `work.cover_source` records which source supplied the published cover; uploads and covers published before this column leave it empty. Barring a source for cover removes the covers it published, and the crawl then refills them from allowed sources. A removed cover is recorded in `work_cover_revocation`, so the old cover cache cannot restore it. Uploads and covers of unknown origin stay. The MangaDex cover gallery is hidden while MangaDex is barred for cover, and card thumbnails skip barred sources.
+
+Title and alias changes refresh Browse and search in the same transaction. Status changes refresh the update feed before Browse. Title and description overrides remain separate. For pinned author, artist and status fields, the projected value updates `work_field_pin.source_value` instead of the visible value.
+
+Live writers use `observed` attribution. The backfill seeds missing groups from stored values and cached source records without projecting them. It skips groups that the source is barred from. Cached groups that match current values are `inferred`; differing groups are `unknown`. Stored catalogue scalars are `observed`. Existing observations win. The editor labels both inferred and unknown attribution as guessed.
+
+When any source of a work is barred from credits, the matcher uses the stored author or artist only if an allowed source also supplied that value or an administrator pinned it. With no credits bars, matching keeps its previous behaviour.
 
 ## The matching steps in order
 
@@ -109,6 +129,8 @@ Merging two works uses a PostgreSQL transaction in `apps/server/src/catalog/mod.
 4. **Redirects**: the server writes the retired ID into `work_redirect` pointing to the survivor, collapsing any existing chains into single-hop lookups.
 5. **Deletion**: the losing work row is deleted.
 
+Metadata contribution rows belong to source mappings, so they move with them. The server then recomputes the survivor's source-managed fields.
+
 ### Split operation
 
 When two series were merged by mistake, an administrator detaches source mappings using `split_source_series`:
@@ -119,11 +141,15 @@ When two series were merged by mistake, an administrator detaches source mapping
 4. **Chapter-list entries**: an entry whose copies all move goes to the new work. An entry with copies on both sides stays, and the new work gets a new entry with the same key, place and flags for the moving copies. Phase F's `split_mismatched` follows the same rule, except that a moving copy joins the destination's entry with the same `match_key` when the destination already has one. A new work made by a split starts not ready, and the drain marks it ready.
 5. **Progress and preserved records**: reading progress moves with the detached source mappings. The `canonical_progress` rows of the moved MangaDex chapters get the new work id, and Suwayomi progress already follows its mapping. A row whose chapter id also occurs in a mapping that stays keeps the original work id. Reviews, library entries and view counts stay on the original work. The split locks the affected users first and restarts if they change. Each reader keeps the read state of every chapter on both sides. The new work gets its own "read through" pointer, and the server writes a mark where an entry would otherwise change state.
 6. **Split memory**: the server inserts the pair into `work_split` (`work_a` and `work_b`, ordered lexicographically).
+7. **Field sources**: the detached mappings take their metadata contribution rows along, and the server recomputes the source-managed fields of both works.
 
 `work_split` entries do not use foreign keys. They permanently survive work deletions so background consolidators never re-merge works an administrator split apart.
 
 ## Where to look
 
+- `apps/server/src/catalog/work_metadata.rs`: observations, ranking, bars, projection and provenance.
+- `apps/server/src/catalog/work_metadata_backfill.rs`: stored-data attribution backfill.
+- `apps/server/migrations_pg/0011_source_metadata.sql`: bars and contribution rows.
 - `apps/server/src/catalog/mod.rs`: database transactions for `merge_works_checked`, `split_source_series`, and alias indexes.
 - `apps/server/src/catalog/work_chapter.rs`: the work's chapter list: matcher, backfill drain, merge and split of entries, entry edits.
 - `apps/server/src/catalog/pair.rs`: pairwise assessment rules (`pair::assess`), score calculations, and verdict decisions.

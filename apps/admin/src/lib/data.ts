@@ -51,6 +51,10 @@ import type {
 	EngineStatus,
 	SourceEngineRoute,
 	MangadexSetting,
+	MetadataFieldGroup,
+	SourceMetadataBar,
+	SetSourceMetadataBarResult,
+	WorkMetadataSource,
 	ScanlatorAi,
 	ScanlatorPage,
 	ScanlatorQuery,
@@ -805,6 +809,29 @@ export async function loadScanlatorSites(): Promise<ScanlatorSite[]> {
 export async function setSourceAi(sourceId: string, ai: ScanlatorAi | null): Promise<boolean> {
 	if (!backend.setSourceAi) throw new Error('Scanlator tags are unavailable on this backend.');
 	return backend.setSourceAi(sourceId, ai);
+}
+
+/** Probe the list first; capability negatives follow the backend's schema window. */
+export async function loadSourceMetadataBars(): Promise<SourceMetadataBar[]> {
+	return backend.sourceMetadataBars?.() ?? [];
+}
+
+export function metadataBarsSupported(): boolean {
+	return backend.metadataBarsSupported?.() ?? false;
+}
+
+export async function setSourceMetadataBar(
+	sourceId: string,
+	fieldGroup: MetadataFieldGroup,
+	barred: boolean,
+): Promise<SetSourceMetadataBarResult> {
+	if (!backend.setSourceMetadataBar) throw new Error('This server does not support metadata bars');
+	return backend.setSourceMetadataBar(sourceId, fieldGroup, barred);
+}
+
+/** Old servers leave the field-source hints out of the editor. */
+export async function loadWorkMetadataSources(workId: string): Promise<WorkMetadataSource[]> {
+	return backend.workMetadataSources?.(workId) ?? [];
 }
 
 /**

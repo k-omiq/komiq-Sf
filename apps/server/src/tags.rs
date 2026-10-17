@@ -400,13 +400,15 @@ pub async fn sync_suwayomi_tags(pool: &Database) -> Result<SuwayomiTagSync> {
 /// `fresh` is the genre list of the series being linked. Its `suwayomi_series` cache row
 /// is written by the caller's scan, usually after this runs, so the list is passed in and
 /// added to what the cache already holds for the work's other sources. The next full pass
-/// reads the same genres from the cache and finds nothing to change.
+/// reads the same genres from the cache and finds nothing to change. `source_id` names
+/// its source so barred genres are skipped; `None` uses the legacy `suwayomi` source.
 pub async fn sync_work_suwayomi_tags(
     pool: &Database,
     work_id: &str,
+    source_id: Option<&str>,
     fresh: &[String],
 ) -> Result<SuwayomiTagSync> {
-    sync_suwayomi_tags_in(pool, Some((work_id, fresh))).await
+    sync_suwayomi_tags_in(pool, Some((work_id, source_id, fresh))).await
 }
 
 /// The pass behind both entry points: every Suwayomi-linked work, or the one in `only`
@@ -419,10 +421,10 @@ pub async fn sync_work_suwayomi_tags(
 /// case) therefore takes no work lock and no writer connection.
 async fn sync_suwayomi_tags_in(
     pool: &Database,
-    only: Option<(&str, &[String])>,
+    only: Option<(&str, Option<&str>, &[String])>,
 ) -> Result<SuwayomiTagSync> {
     let works: Vec<String> = match only {
-        Some((work, _)) => vec![work.to_owned()],
+        Some((work, _, _)) => vec![work.to_owned()],
         None => {
             let mut reader = pool.acquire().await?;
             let plan = suwayomi_tag_plan(&mut reader, None).await?;
@@ -439,9 +441,13 @@ async fn sync_suwayomi_tags_in(
     };
     let mut total = SuwayomiTagSync::default();
     for work in works {
-        let fresh = only.map(|(_, fresh)| fresh).unwrap_or(&[]);
-        let changed =
-            crate::db::retry_transaction(|| sync_suwayomi_tags_work(pool, &work, fresh)).await?;
+        let (source_id, fresh) = only
+            .map(|(_, source, fresh)| (source, fresh))
+            .unwrap_or((None, &[]));
+        let changed = crate::db::retry_transaction(|| {
+            sync_suwayomi_tags_work(pool, &work, source_id, fresh)
+        })
+        .await?;
         total.inserted += changed.inserted;
         total.deleted += changed.deleted;
         total.demographics += changed.demographics;
@@ -449,23 +455,27 @@ async fn sync_suwayomi_tags_in(
     Ok(total)
 }
 
-/// Read the four inputs and plan the derived rows: for every Suwayomi-linked work, or
-/// for the one in `only` with the extra genres it comes with. The four reads take the
-/// same ` AND … = $1` when scoped, so one work costs four index seeks, not four scans.
+/// Read the cached inputs and plan the derived rows: for every Suwayomi-linked work, or
+/// for the one in `only` with the extra genres it comes with. Scoped reads use the same
+/// ` AND … = $1`; fresh genres also check their source's bar.
 async fn suwayomi_tag_plan(
     conn: &mut PgConnection,
-    only: Option<(&str, &[String])>,
+    only: Option<(&str, Option<&str>, &[String])>,
 ) -> Result<SuwayomiTagPlan> {
     let scope = |column: &str| match only {
         Some(_) => format!(" AND {column} = $1"),
         None => String::new(),
     };
-    let work = only.map(|(work_id, _)| work_id);
+    let work = only.map(|(work_id, _, _)| work_id);
 
+    let barred = crate::catalog::work_metadata::barred_sql(
+        &crate::catalog::work_metadata::mapping_source_sql("ss"),
+        "'tags'",
+    );
     let sql = format!(
         "SELECT ss.work_id, sy.genre FROM source_series ss \
            JOIN suwayomi_series sy ON sy.id = public.sqlite_integer_pin(ss.source_key) \
-          WHERE ss.source_type = 'suwayomi' AND sy.genre IS NOT NULL{}",
+          WHERE ss.source_type = 'suwayomi' AND sy.genre IS NOT NULL AND NOT {barred}{}",
         scope("ss.work_id")
     );
     let mut query = crate::db_types::query_tuple::<(String, String)>(&sql);
@@ -483,12 +493,19 @@ async fn suwayomi_tag_plan(
             }
         }
     }
-    if let Some((work_id, fresh)) = only {
+    if let Some((work_id, source_id, fresh)) = only {
         if !fresh.is_empty() {
-            genres_by_work
-                .entry(work_id.to_string())
-                .or_default()
-                .extend(fresh.iter().cloned());
+            let barred = crate::catalog::work_metadata::barred_sql("$1", "'tags'");
+            let barred: bool = sqlx::query_scalar(&format!("SELECT {barred}"))
+                .bind(source_id.unwrap_or("suwayomi"))
+                .fetch_one(&mut *conn)
+                .await?;
+            if !barred {
+                genres_by_work
+                    .entry(work_id.to_string())
+                    .or_default()
+                    .extend(fresh.iter().cloned());
+            }
         }
     }
 
@@ -549,6 +566,7 @@ async fn suwayomi_tag_plan(
 async fn sync_suwayomi_tags_work(
     pool: &Database,
     work_id: &str,
+    source_id: Option<&str>,
     fresh: &[String],
 ) -> Result<SuwayomiTagSync> {
     let mut tx = pool.begin().await?;
@@ -571,7 +589,7 @@ async fn sync_suwayomi_tags_work(
             .await?;
     }
     crate::catalog::guards::held().await;
-    let plan = suwayomi_tag_plan(&mut tx, Some((work_id, fresh))).await?;
+    let plan = suwayomi_tag_plan(&mut tx, Some((work_id, source_id, fresh))).await?;
     let mut out = SuwayomiTagSync::default();
     if plan.insert.is_empty() && plan.delete.is_empty() && plan.demographic.is_empty() {
         return Ok(out);
@@ -1138,7 +1156,7 @@ mod tests {
             "Action Comedy".to_string(),
             "Seinen".to_string(),
         ];
-        let first = sync_work_suwayomi_tags(&pool, "w_new", &fresh)
+        let first = sync_work_suwayomi_tags(&pool, "w_new", None, &fresh)
             .await
             .unwrap();
         assert_eq!(
@@ -1157,7 +1175,7 @@ mod tests {
 
         // Again with the same genres: nothing to do.
         assert_eq!(
-            sync_work_suwayomi_tags(&pool, "w_new", &fresh)
+            sync_work_suwayomi_tags(&pool, "w_new", None, &fresh)
                 .await
                 .unwrap(),
             SuwayomiTagSync::default()
@@ -1179,7 +1197,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            sync_work_suwayomi_tags(&pool, "w_md", &fresh[..2])
+            sync_work_suwayomi_tags(&pool, "w_md", None, &fresh[..2])
                 .await
                 .unwrap(),
             SuwayomiTagSync::default()

@@ -15,6 +15,8 @@ pub mod pair;
 pub mod similarity;
 pub mod spine;
 pub mod work_chapter;
+pub mod work_metadata;
+pub mod work_metadata_backfill;
 
 use crate::cover_store::CoverStore;
 use crate::db::Database;
@@ -159,10 +161,16 @@ impl WorkMatchData {
 }
 
 /// The select list both match-data loaders use (the table must be aliased `w`).
-const MATCH_DATA_COLUMNS: &str = "w.id, w.primary_title, w.description, w.author, w.artist, \
-     w.year, w.original_language, w.cover_phash, \
-     EXISTS (SELECT 1 FROM source_series ss \
-             WHERE ss.work_id = w.id AND ss.source_type = 'mangadex') AS mangadex_anchored";
+static MATCH_DATA_COLUMNS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let author = work_metadata::match_credit_sql("author");
+    let artist = work_metadata::match_credit_sql("artist");
+    format!(
+        "w.id, w.primary_title, w.description, {author} AS author, {artist} AS artist, \
+         w.year, w.original_language, w.cover_phash, \
+         EXISTS (SELECT 1 FROM source_series ss \
+                 WHERE ss.work_id = w.id AND ss.source_type = 'mangadex') AS mangadex_anchored"
+    )
+});
 
 #[derive(sqlx::FromRow)]
 struct MatchDataRow {
@@ -390,7 +398,8 @@ pub async fn load_match_data_on(
     work_id: &str,
 ) -> Result<Option<WorkMatchData>> {
     let row = sqlx::query_as::<_, MatchDataRow>(&format!(
-        "SELECT {MATCH_DATA_COLUMNS} FROM work w WHERE w.id = $1"
+        "SELECT {} FROM work w WHERE w.id = $1",
+        MATCH_DATA_COLUMNS.as_str()
     ))
     .bind(work_id)
     .fetch_optional(&mut *conn)
@@ -445,8 +454,10 @@ pub async fn load_match_data_batch_on(
     ids.dedup();
     let placeholders = crate::sql_params::placeholders(1, ids.len());
 
-    let work_sql =
-        format!("SELECT {MATCH_DATA_COLUMNS} FROM work w WHERE w.id IN ({placeholders})");
+    let work_sql = format!(
+        "SELECT {} FROM work w WHERE w.id IN ({placeholders})",
+        MATCH_DATA_COLUMNS.as_str()
+    );
     let mut q = sqlx::query_as::<_, MatchDataRow>(&work_sql);
     for id in &ids {
         q = q.bind(*id);
@@ -591,11 +602,13 @@ pub async fn work_effective_genres(pool: &Database, work_id: &str) -> Vec<String
     // across all 13,802 rows of `suwayomi_series` for EVERY work looked up. Measured
     // on production: 14.98 ms -> 0.01 ms (EXPLAIN QUERY PLAN goes from `SCAN sw` to
     // `SEARCH sw USING INTEGER PRIMARY KEY (rowid=?)`). Same shape, ~1,500x.
-    let jsons = crate::db_types::query_scalar::<String>(
+    let barred = work_metadata::barred_sql(&work_metadata::mapping_source_sql("ss"), "'tags'");
+    let jsons = crate::db_types::query_scalar::<String>(&format!(
         "SELECT sw.genre FROM source_series ss \
          JOIN suwayomi_series sw ON sw.id = sqlite_integer_pin(ss.source_key) \
-         WHERE ss.work_id = $1 AND ss.source_type = 'suwayomi' AND sw.genre IS NOT NULL",
-    )
+         WHERE ss.work_id = $1 AND ss.source_type = 'suwayomi' AND sw.genre IS NOT NULL \
+           AND NOT {barred}"
+    ))
     .bind(work_id)
     .fetch_all(pool)
     .await
@@ -679,10 +692,12 @@ pub async fn work_effective_genres_batch_checked(
         return Ok(out);
     }
     let ph2 = crate::sql_params::placeholders(1, remaining.len());
+    let barred = work_metadata::barred_sql(&work_metadata::mapping_source_sql("ss"), "'tags'");
     let src_sql = format!(
         "SELECT ss.work_id, sw.genre FROM source_series ss \
          JOIN suwayomi_series sw ON sw.id = sqlite_integer_pin(ss.source_key) \
          WHERE ss.work_id IN ({ph2}) AND ss.source_type = 'suwayomi' AND sw.genre IS NOT NULL \
+           AND NOT {barred} \
          ORDER BY ss.work_id, ss.id"
     );
     let mut q2 = crate::db_types::query_tuple::<(String, String)>(&src_sql);
@@ -927,6 +942,27 @@ fn feed_updates_select(scope: &str) -> String {
          WHERE ss.source_type = 'mangadex' AND c.lang = 'en' \
            AND COALESCE(c.readable_at, c.published_at, c.created_at) <= $1 {scope} \
          ORDER BY ss.work_id, COALESCE(c.readable_at, c.published_at, c.created_at) DESC, c.id ASC"
+    )
+}
+
+/// Cover eligibility must not change the mapping used for a card's other fields.
+/// Each projection keeps its existing thumbnail order when skipping barred sources.
+fn suwayomi_cover_thumbnails_select(joined_scope: &str, feed: bool) -> String {
+    let barred = work_metadata::barred_sql(&work_metadata::mapping_source_sql("ss"), "'cover'");
+    let (eligible, order) = if feed {
+        (
+            "AND sy.in_library = TRUE AND sy.latest_chapter_at IS NOT NULL",
+            "sy.latest_chapter_at DESC, sy.id ASC",
+        )
+    } else {
+        ("", "ss.id ASC")
+    };
+    format!(
+        "SELECT DISTINCT ON (ss.work_id) ss.work_id, sy.thumbnail_url \
+           FROM source_series ss \
+           LEFT JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
+          WHERE ss.source_type = 'suwayomi' {joined_scope} AND NOT {barred} {eligible} \
+          ORDER BY ss.work_id, {order}"
     )
 }
 
@@ -1823,7 +1859,8 @@ pub async fn refresh_feed_series_updates(pool: &Database) -> Result<u64> {
                 CASE WHEN w.cover_cached_version IS NOT NULL \
                      THEN '/covers/' || w.id || '.webp?v=' || w.cover_cached_version \
                      END, \
-                sy.thumbnail_url, NULL, \
+                CASE WHEN {cover_barred} THEN allowed_cover.thumbnail_url \
+                     ELSE sy.thumbnail_url END, NULL, \
                 sqlite_general_number(lc.chapter_number), lc.name, sy.chapter_count, \
                 TIMESTAMPTZ '1970-01-01 00:00:00+00' + sy.latest_chapter_at * INTERVAL '1 millisecond', \
                 sss.last_new_chapter_at, \
@@ -1832,6 +1869,7 @@ pub async fn refresh_feed_series_updates(pool: &Database) -> Result<u64> {
          FROM source_series ss \
          JOIN work w ON w.id = ss.work_id \
          JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
+         LEFT JOIN ({cover_thumbnails}) allowed_cover ON allowed_cover.work_id = ss.work_id \
          LEFT JOIN series_scan_state sss ON sss.series_id = ss.source_key \
          LEFT JOIN (SELECT manga_id, chapter_number, name, \
                             ROW_NUMBER() OVER (PARTITION BY manga_id \
@@ -1852,6 +1890,8 @@ pub async fn refresh_feed_series_updates(pool: &Database) -> Result<u64> {
              is_nsfw = (feed_series_updates.is_nsfw OR excluded.is_nsfw), \
              status = excluded.status, \
              content_rating = excluded.content_rating",
+        cover_barred = work_metadata::barred_sql(&work_metadata::mapping_source_sql("ss"), "'cover'"),
+        cover_thumbnails = suwayomi_cover_thumbnails_select("", true),
     ))
     .execute(&mut *tx)
     .await?
@@ -2137,8 +2177,9 @@ pub async fn publish_mirror_feed_row(pool: &Database, work_id: &str) -> Result<b
 /// it, NULLs included, rather than re-derived: the derivations there are already reviewed
 /// (effective-NSFW, the epoch-millis clock, the mirror-wins merge of the two halves), and a
 /// Browse card must not disagree with the same work's Updates card. Verified on a copy of
-/// production — 0 of the 48,567 shared rows differ on any copied column. `comic_type` is the
-/// one exception and is deliberately absent: [`fill_comic_types`] owns it (see below).
+/// production — 0 of the 48,567 shared rows differ on any copied column. `comic_type` is
+/// deliberately absent: [`fill_comic_types`] owns it (see below). A cover bar also reselects
+/// `suwayomi_thumbnail`, since an older feed row can still carry that source's art.
 ///
 /// The two exclusions are the WHERE: a work with no `source_series` at all has nothing to
 /// open on either path (2 works in production), and a work with no title would render a card
@@ -2186,8 +2227,12 @@ fn browse_catalogue_select_scoped(scope: &str, source_scope: &str, joined_scope:
                  WHEN w.cover_cached_version IS NOT NULL \
                       THEN '/covers/' || w.id || '.webp?v=' || w.cover_cached_version \
                  WHEN w.cover_file_name IS NOT NULL THEN '/covers/' || w.id || '.webp' END, \
-            CASE WHEN f.work_id IS NOT NULL THEN f.suwayomi_thumbnail \
-                 ELSE sw.thumbnail_url END, \
+            CASE WHEN f.work_id IS NOT NULL THEN \
+                 CASE WHEN EXISTS (SELECT 1 FROM source_series ss \
+                                    WHERE ss.work_id = w.id AND ss.source_type = 'suwayomi' \
+                                      AND {cover_barred}) \
+                      THEN feed_cover.thumbnail_url ELSE f.suwayomi_thumbnail END \
+                 ELSE sw_cover.thumbnail_url END, \
             CASE WHEN f.work_id IS NOT NULL THEN f.status ELSE {FSU_STATUS_SQL} END, \
             {rating}, \
             CASE WHEN f.work_id IS NOT NULL THEN f.is_nsfw \
@@ -2218,11 +2263,13 @@ fn browse_catalogue_select_scoped(scope: &str, source_scope: &str, joined_scope:
        LEFT JOIN (SELECT work_id FROM source_series \
                    WHERE source_type = 'mangadex' {source_scope} GROUP BY work_id) md ON md.work_id = w.id \
        LEFT JOIN (SELECT DISTINCT ON (ss.work_id) ss.work_id AS work_id, ss.source_key AS source_key, \
-                         sy.title AS title, sy.thumbnail_url AS thumbnail_url \
+                         sy.title AS title \
                     FROM source_series ss \
                     LEFT JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
                    WHERE ss.source_type = 'suwayomi' {joined_scope} \
                    ORDER BY ss.work_id, ss.id ASC) sw ON sw.work_id = w.id \
+       LEFT JOIN ({browse_cover_thumbnails}) sw_cover ON sw_cover.work_id = w.id \
+       LEFT JOIN ({feed_cover_thumbnails}) feed_cover ON feed_cover.work_id = w.id \
        LEFT JOIN (SELECT ss.work_id AS work_id, MAX(sy.chapter_count) AS n \
                     FROM source_series ss \
                     JOIN suwayomi_series sy ON sy.id = sqlite_integer_pin(ss.source_key) \
@@ -2235,6 +2282,9 @@ fn browse_catalogue_select_scoped(scope: &str, source_scope: &str, joined_scope:
                    GROUP BY ss.work_id) en ON en.work_id = w.id \
       WHERE (md.work_id IS NOT NULL OR sw.work_id IS NOT NULL) \
         AND COALESCE(f.title, w.title_override, w.primary_title, sw.title, '') <> ''{scope}",
+        cover_barred = work_metadata::barred_sql(&work_metadata::mapping_source_sql("ss"), "'cover'"),
+        browse_cover_thumbnails = suwayomi_cover_thumbnails_select(joined_scope, false),
+        feed_cover_thumbnails = suwayomi_cover_thumbnails_select(joined_scope, true),
         rating = effective_content_rating_sql(
             "CASE WHEN f.work_id IS NOT NULL THEN f.content_rating \
                   ELSE COALESCE(w.content_rating, 'safe') END",
@@ -2642,11 +2692,12 @@ async fn fill_comic_types(
     // (`work_effective_genres` measured 14.98 ms → 0.01 ms on exactly that change).
     let mut source_genres: HashMap<String, Vec<String>> = HashMap::new();
     let mut seen: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+    let barred = work_metadata::barred_sql(&work_metadata::mapping_source_sql("ss"), "'tags'");
     let sql = format!(
         "SELECT ss.work_id, sw.genre FROM source_series ss \
          JOIN suwayomi_series sw ON sw.id = sqlite_integer_pin(ss.source_key) \
          JOIN {table} f ON f.work_id = ss.work_id \
-         WHERE ss.source_type = 'suwayomi' AND sw.genre IS NOT NULL {scope} \
+         WHERE ss.source_type = 'suwayomi' AND sw.genre IS NOT NULL AND NOT {barred} {scope} \
          ORDER BY ss.work_id, ss.id"
     );
     let mut q = crate::db_types::query_tuple::<(String, String)>(&sql);
@@ -2805,7 +2856,7 @@ pub(crate) async fn upsert_browse_work(conn: &mut sqlx::PgConnection, work_id: &
     upsert_browse_work_inner(conn, work_id, true).await
 }
 
-async fn upsert_browse_work_inner(
+pub(crate) async fn upsert_browse_work_inner(
     conn: &mut sqlx::PgConnection,
     work_id: &str,
     search_changed: bool,
@@ -3324,6 +3375,8 @@ pub async fn mangadex_owner_on(
 /// owner returns `locks::RestartTransaction`. If the unit locks any other work, the
 /// caller must have locked the owner ([`mangadex_owner_on`]) together with those works
 /// in sorted order first; the lock taken here is then a repeat of one already held.
+/// Existing works mask barred groups before ingest; new works retain their initial
+/// metadata. The unmasked observation is recorded on the mapping before projection.
 pub async fn upsert_work_from_mangadex_on(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     mangadex_id: &str,
@@ -3353,6 +3406,76 @@ pub async fn upsert_work_from_mangadex_on(
         .bind(mangadex_id)
         .fetch_optional(&mut **tx)
         .await?;
+    use work_metadata::{Attribution, FieldGroup, Observation};
+    let mut masked_groups = std::collections::HashSet::new();
+    if let Some((id, _)) = &existing {
+        masked_groups = work_metadata::barred_groups_on(tx, "mangadex").await?;
+        // MangaDex mappings share one source policy and rank ahead of Suwayomi.
+        // An unseen UUID ranks after every existing MangaDex mapping.
+        let first: Option<String> = sqlx::query_scalar(
+            "SELECT source_key FROM source_series WHERE work_id = $1 AND source_type = 'mangadex' \
+             ORDER BY created_at, id LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if first.as_deref().is_some_and(|key| key != mangadex_id) {
+            masked_groups.extend([
+                FieldGroup::Title,
+                FieldGroup::Description,
+                FieldGroup::Credits,
+                FieldGroup::Tags,
+                FieldGroup::Status,
+            ]);
+        }
+    }
+    let observed = Observation::from_mangadex(input);
+    let mut masked;
+    let input = if let Some((id, _)) = &existing {
+        if masked_groups.is_empty() {
+            input
+        } else {
+            let stored: (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = sqlx::query_as(
+                "SELECT primary_title, primary_lang, description, author, artist, status \
+                 FROM work WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await?;
+            masked = input.clone();
+            if masked_groups.contains(&FieldGroup::Title) {
+                masked.primary_title = stored.0;
+                masked.primary_lang = stored.1;
+                masked.aliases.clear();
+            }
+            if masked_groups.contains(&FieldGroup::Description) {
+                masked.description = stored.2;
+                masked.descriptions.clear();
+            }
+            if masked_groups.contains(&FieldGroup::Credits) {
+                masked.author = stored.3;
+                masked.artist = stored.4;
+                masked.credits.clear();
+            }
+            if masked_groups.contains(&FieldGroup::Tags) {
+                masked.tags.clear();
+                masked.tag_details.clear();
+            }
+            if masked_groups.contains(&FieldGroup::Status) {
+                masked.status = stored.5;
+            }
+            &masked
+        }
+    } else {
+        input
+    };
     let title_changed = existing
         .as_ref()
         .is_none_or(|(_, title)| title != &input.primary_title);
@@ -3457,8 +3580,11 @@ pub async fn upsert_work_from_mangadex_on(
 
     let aliases_changed = insert_aliases(tx, &work_id, &input.aliases).await?;
     insert_descriptions_and_credits(tx, &work_id, input).await?;
-    replace_mangadex_details(tx, &work_id, input).await?;
-    ensure_source_series(
+    // A mapping that cannot give tags (barred or outranked) refreshes only its links
+    // and stamp: an empty list would delete the tags the chosen mapping gave.
+    replace_mangadex_details(tx, &work_id, input, !masked_groups.contains(&FieldGroup::Tags))
+        .await?;
+    let mapping_id = ensure_source_series(
         tx,
         &work_id,
         "mangadex",
@@ -3470,7 +3596,18 @@ pub async fn upsert_work_from_mangadex_on(
     )
     .await?;
 
-    upsert_browse_work_inner(tx, &work_id, title_changed || aliases_changed).await?;
+    work_metadata::record_on(tx, &mapping_id, &observed, Attribution::Observed).await?;
+    let groups: Vec<_> = FieldGroup::ALL
+        .into_iter()
+        .filter(|group| *group != FieldGroup::Cover)
+        .collect();
+    let projection = work_metadata::project_on(tx, &work_id, &groups).await?;
+    upsert_browse_work_inner(
+        tx,
+        &work_id,
+        title_changed || aliases_changed || projection.title || projection.aliases,
+    )
+    .await?;
     Ok(work_id)
 }
 
@@ -3743,7 +3880,7 @@ async fn insert_descriptions_and_credits(
 /// delete-all plus reinsert gives: a repeated tag keeps its first position, and its
 /// `tag_id`/`tag_group` come from the last detail of that exact name (none: NULL).
 /// Caller holds the owning work through the complete metadata replacement.
-async fn replace_source_tags(
+pub(crate) async fn replace_source_tags(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     work_id: &str,
     tags: &[String],
@@ -3804,12 +3941,16 @@ async fn replace_source_tags(
 
 /// Refresh imported fields without changing admin overrides or historical IDs. Tags and
 /// tracker links write only what changed (WAL item 6); the sync stamp always moves.
+/// `tags` is false when this mapping may not give the work its tags.
 async fn replace_mangadex_details(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     work_id: &str,
     input: &WorkInput,
+    tags: bool,
 ) -> Result<()> {
-    replace_source_tags(tx, work_id, &input.tags, &input.tag_details).await?;
+    if tags {
+        replace_source_tags(tx, work_id, &input.tags, &input.tag_details).await?;
+    }
     // One link per provider; the last one listed wins.
     let mut providers: Vec<&str> = Vec::new();
     let mut externals: Vec<&str> = Vec::new();
@@ -3855,9 +3996,13 @@ async fn replace_mangadex_details(
 /// Existing entries visited by the catalogue top-up also refresh their current
 /// taxonomy/tracker snapshot. Publication facts follow the normal full upsert
 /// so NSFW/source/materialized projections keep their existing refresh semantics.
+/// Tags are attributed only to this work's mapping for the fetched `mangadex_id`.
+/// Only its first MangaDex mapping gives tags; a legacy work without any MangaDex
+/// mapping also accepts tags unless barred. Tracker details still refresh otherwise.
 pub async fn refresh_mangadex_details(
     pool: &Database,
     work_id: &str,
+    mangadex_id: &str,
     input: &WorkInput,
 ) -> Result<()> {
     crate::db::retry_transaction(|| async {
@@ -3866,7 +4011,35 @@ pub async fn refresh_mangadex_details(
             return Ok(());
         };
         let work_id = resolved.as_str();
-        replace_mangadex_details(&mut tx, work_id, input).await?;
+        use work_metadata::{Attribution, FieldGroup, Observation};
+        let mapping: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM source_series WHERE work_id = $1 AND source_type = 'mangadex' \
+             AND source_key = $2",
+        )
+        .bind(work_id)
+        .bind(mangadex_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        // Same rule as the full upsert: only the first MangaDex mapping gives tags,
+        // and none does while MangaDex tags are barred (the projector removes them).
+        let first: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM source_series WHERE work_id = $1 AND source_type = 'mangadex' \
+             ORDER BY created_at, id LIMIT 1",
+        )
+        .bind(work_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let gives_tags = first == mapping
+            && !work_metadata::barred_groups_on(&mut tx, "mangadex")
+                .await?
+                .contains(&FieldGroup::Tags);
+        replace_mangadex_details(&mut tx, work_id, input, gives_tags).await?;
+        if let Some(mapping) = mapping {
+            let mut observation = Observation::from_mangadex(input);
+            observation.groups.retain(|group, _| *group == FieldGroup::Tags);
+            work_metadata::record_on(&mut tx, &mapping, &observation, Attribution::Observed).await?;
+            work_metadata::project_on(&mut tx, work_id, &[FieldGroup::Tags]).await?;
+        }
         tx.commit().await?;
         Ok(())
     })
@@ -3951,7 +4124,7 @@ pub(crate) fn sqlite_real_prefix(value: Option<&str>) -> f64 {
     value[..i].parse().unwrap_or(0.0)
 }
 
-async fn insert_aliases(
+pub(crate) async fn insert_aliases(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     work_id: &str,
     aliases: &[Alias],
@@ -4132,8 +4305,9 @@ pub async fn pin_work_field(
     Ok(())
 }
 
-/// Remove a pin and give the column back to the source: it takes the last value a source
-/// wrote, and later syncs update it again. A no-op for a field that is not pinned.
+/// Remove a pin and restore the last projected source value, then re-project the group.
+/// Status also refreshes the feed before the caller projects Browse. A no-op for a
+/// field that is not pinned.
 pub async fn unpin_work_field(
     conn: &mut sqlx::PgConnection,
     work_id: &str,
@@ -4156,14 +4330,26 @@ pub async fn unpin_work_field(
         return Ok(());
     };
     sqlx::query(&format!(
-        "UPDATE work SET {column} = {}, updated_at = $2 WHERE id = $3",
-        field.typed_value()
+        "UPDATE work SET {column} = {}, updated_at = $2 WHERE id = $3 \
+         AND {column} IS DISTINCT FROM {}",
+        field.typed_value(), field.typed_value()
     ))
     .bind(source_value)
     .bind(Utc::now())
     .bind(work_id)
     .execute(&mut *conn)
     .await?;
+    let group = match field {
+        PinnedField::Author | PinnedField::Artist => Some(work_metadata::FieldGroup::Credits),
+        PinnedField::Status => Some(work_metadata::FieldGroup::Status),
+        _ => None,
+    };
+    if let Some(group) = group {
+        work_metadata::project_on(conn, work_id, &[group]).await?;
+    }
+    if field == PinnedField::Status {
+        work_metadata::refresh_feed_status_on(conn, work_id).await?;
+    }
     unit.commit().await?;
     Ok(())
 }
@@ -4207,7 +4393,7 @@ pub async fn remove_work_alias(pool: &Database, work_id: &str, raw_title: &str) 
 /// Rebuild the `work_alias_token` inverted index for one work from its current alias
 /// set. Used after an alias removal, where a shared token might still be carried by
 /// another remaining alias — a blind per-token delete would corrupt the index.
-async fn rebuild_work_alias_tokens(
+pub(crate) async fn rebuild_work_alias_tokens(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     work_id: &str,
 ) -> Result<()> {
@@ -5163,13 +5349,15 @@ pub(crate) async fn merge_works_on(
     // change these columns, so a gate that still holds now holds for the whole merge.
     if let Some((exp_src, exp_tgt)) = expected {
         for (id, want) in [(source_work, exp_src), (target_work, exp_tgt)] {
-            let mut now: WorkIdentity = sqlx::query_as(
-                "SELECT w.primary_title, w.year, w.author, w.artist, w.original_language, \
+            let author = work_metadata::match_credit_sql("author");
+            let artist = work_metadata::match_credit_sql("artist");
+            let mut now: WorkIdentity = sqlx::query_as(&format!(
+                "SELECT w.primary_title, w.year, {author} AS author, {artist} AS artist, w.original_language, \
                         w.description, w.cover_phash, \
                         EXISTS (SELECT 1 FROM source_series ss WHERE ss.work_id = w.id \
                                 AND ss.source_type = 'mangadex') AS mangadex_anchored \
-                 FROM work w WHERE w.id = $1",
-            )
+                 FROM work w WHERE w.id = $1"
+            ))
             .bind(id)
             .fetch_one(&mut **tx)
             .await?;
@@ -5601,6 +5789,8 @@ pub(crate) async fn merge_works_on(
         .execute(&mut **tx)
         .await?;
 
+    use work_metadata::FieldGroup::{Title, Description, Credits, Tags, Status};
+    work_metadata::project_on(tx, target_work, &[Title, Description, Credits, Tags, Status]).await?;
     reproject_work_caches_on(tx, target_work).await?;
     reproject_work_caches_on(tx, source_work).await?;
 
@@ -6075,8 +6265,15 @@ async fn split_source_series_attempt(
 
     // Source ownership, navigation and both projections publish together. A failed
     // projection leaves the original split request safe to retry.
+    use work_metadata::FieldGroup::{Title, Description, Credits, Tags, Status};
+    work_metadata::project_on(&mut tx, work_id, &[Title, Description, Credits, Tags, Status]).await?;
+    work_metadata::project_on(&mut tx, &new_work_id, &[Title, Description, Credits, Tags, Status]).await?;
     reproject_work_caches_on(&mut tx, work_id).await?;
     reproject_work_caches_on(&mut tx, &new_work_id).await?;
+    let title: String = sqlx::query_scalar("SELECT primary_title FROM work WHERE id = $1")
+        .bind(&new_work_id)
+        .fetch_one(&mut *tx)
+        .await?;
     tx.commit().await?;
 
     Ok(SplitOutcome {
@@ -8500,6 +8697,7 @@ mod tests {
         refresh_mangadex_details(
             &pool,
             &target,
+            "unmapped",
             &WorkInput {
                 external_ids: vec![("al".into(), "100".into()), ("al".into(), "200".into())],
                 ..Default::default()
@@ -10351,15 +10549,9 @@ mod tests {
         };
         let stamped = stamps().await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        upsert_work_from_mangadex(&pool, "md-slime", &input)
-            .await
-            .unwrap();
-        refresh_mangadex_details(&pool, &id, &input).await.unwrap();
-        assert_eq!(
-            metadata_row_versions(&pool, &id).await,
-            before,
-            "nothing new, nothing written"
-        );
+        upsert_work_from_mangadex(&pool, "md-slime", &input).await.unwrap();
+        refresh_mangadex_details(&pool, &id, "md-slime", &input).await.unwrap();
+        assert_eq!(metadata_row_versions(&pool, &id).await, before, "nothing new, nothing written");
         let restamped = stamps().await;
         assert!(
             restamped.0 > stamped.0 && restamped.1 > stamped.1 && restamped.2 > stamped.2,
@@ -10455,9 +10647,7 @@ mod tests {
             external_ids: vec![("al".into(), "86399".into())],
             ..renamed.clone()
         };
-        refresh_mangadex_details(&pool, &id, &retagged)
-            .await
-            .unwrap();
+        refresh_mangadex_details(&pool, &id, "md-slime", &retagged).await.unwrap();
         let after = metadata_row_versions(&pool, &id).await;
         let kept = |v: &[String], prefix: &str| v.iter().find(|r| r.starts_with(prefix)).cloned();
         assert_eq!(
@@ -10507,9 +10697,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        refresh_mangadex_details(&pool, &id, &rich_slime_input())
-            .await
-            .unwrap();
+        refresh_mangadex_details(&pool, &id, "md-slime", &rich_slime_input()).await.unwrap();
         let rows = crate::db_types::query_tuple::<(String, String, i64, Option<String>)>(
             "SELECT tag, source, ord, tag_id FROM work_tag WHERE work_id = $1 ORDER BY tag",
         )
@@ -10529,16 +10717,9 @@ mod tests {
                 ("Isekai".into(), "admin".into(), 7, None),
             ]
         );
-        refresh_mangadex_details(
-            &pool,
-            &id,
-            &WorkInput {
-                tags: Vec::new(),
-                ..rich_slime_input()
-            },
-        )
-        .await
-        .unwrap();
+        refresh_mangadex_details(&pool, &id, "md-slime", &WorkInput { tags: Vec::new(), ..rich_slime_input() })
+            .await
+            .unwrap();
         let left: Vec<String> =
             crate::db_types::query_scalar("SELECT source FROM work_tag WHERE work_id = $1")
                 .bind(&id)
@@ -13680,6 +13861,9 @@ mod tests {
 
 #[cfg(test)]
 mod production_safety_tests;
+#[cfg(test)] mod work_metadata_matcher_tests;
+#[cfg(test)] mod work_metadata_writer_tests;
+#[cfg(test)] mod work_metadata_lifecycle_tests;
 
 #[cfg(test)]
 pub(crate) mod phase4_tests;

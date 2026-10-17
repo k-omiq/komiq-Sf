@@ -401,6 +401,7 @@ async fn mangadex_details_replace_tags_and_trackers_as_one_set() {
             refresh_mangadex_details(
                 &pool,
                 &a_work,
+                "details",
                 &WorkInput {
                     tags: vec!["Action".into()],
                     external_ids: vec![("al".into(), "1".into())],
@@ -1802,10 +1803,10 @@ async fn suwayomi_tag_plans_are_rebuilt_after_the_parent_lock() {
     let (a, b) = overlap(
         &pool,
         move |pool| async move {
-            crate::tags::sync_work_suwayomi_tags(&pool, &a_work, &["Action".into()]).await
+            crate::tags::sync_work_suwayomi_tags(&pool, &a_work, None, &["Action".into()]).await
         },
         move |pool| async move {
-            crate::tags::sync_work_suwayomi_tags(&pool, &b_work, &["Drama".into()]).await
+            crate::tags::sync_work_suwayomi_tags(&pool, &b_work, None, &["Drama".into()]).await
         },
     )
     .await;
