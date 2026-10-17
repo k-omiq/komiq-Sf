@@ -3,11 +3,11 @@ title: Suwayomi, the source engine
 description: Understand the admin app's server-side Suwayomi integration, extension management and Docker setup.
 ---
 
-Komiq is self-hostable: the admin app is the server and its management portal in one, and the reader app connects to a server. This page covers the source engine that runs with the server inside the admin app. It explains server communication, extension updates, FlareSolverr challenge handling and Docker setup.
+The self-hostable admin app runs the komiq server, management portal and Suwayomi engine. Reader apps connect to that server. This page covers engine requests, extensions and deployment.
 
 ## What Suwayomi is
 
-Suwayomi is the source engine packaged with the admin app. It fetches comic metadata, chapter lists and page images from external sources. It runs the extension packages you install through the admin console to communicate with individual websites.
+Suwayomi fetches metadata, chapter lists and images through extensions you install in the admin console.
 
 Suwayomi exposes an internal GraphQL API alongside endpoints for covers and page images. The komiq server uses this engine:
 
@@ -19,13 +19,7 @@ Image proxy -> Suwayomi endpoint: fetches source image bytes
 Suwayomi endpoint -> Source site: downloads image through extension
 ```
 
-The admin console and reader app replace Suwayomi's user interface entirely. Suwayomi handles source-specific scraping, while komiq provides:
-
-- Multi-user authentication, accounts, and session tokens.
-- Cross-source deduplication into [canonical works](/developers/canonical-works).
-- Reading progress, library organization, and notifications.
-- Adaptive background scheduling in the [catalogue sync](/developers/catalogue-sync).
-- Web, desktop, and mobile reader applications.
+Komiq provides the interface, accounts, libraries, [canonical works](/developers/canonical-works) and [catalogue sync](/developers/catalogue-sync).
 
 ## How the server communicates with Suwayomi
 
@@ -33,9 +27,7 @@ The komiq server communicates with Suwayomi using the `SuwayomiClient` in `apps/
 
 ### Network isolation and address configuration
 
-The self-hosted Compose configuration treats Suwayomi's API as unauthenticated and does not publish its port to the host network or the internet. Only the komiq server communicates directly with Suwayomi over Docker's internal container network.
-
-The connection address is set by the `SUWAYOMI_URL` environment variable, which defaults to `http://localhost:4567`. The self-hosted Docker image sets it to `http://suwayomi:4567`. `SUWAYOMI_PUBLIC_URL` specifies the base used for browser image URLs. The self-hosted image sets it to `/`, so browsers request images from komiq and the server proxies them from Suwayomi.
+The main engine in self-hosted Compose has no authentication or published port. Komiq reaches it over Docker's internal network. `SUWAYOMI_URL` defaults to `http://localhost:4567`; the Docker image uses `http://suwayomi:4567`. `SUWAYOMI_PUBLIC_URL` sets the browser image base. Docker uses `/`, so images load through komiq.
 
 ### Request concurrency and timeouts
 
@@ -83,6 +75,24 @@ Suwayomi numbers its own rows, and a chapter's real address on the source is a p
 - **`chapterOrigin`**: the server answers from the stored keys. It asks the engine only on a miss, then stores the answer.
 
 The tables are described in [Data model](/developers/data-model).
+
+### Regional engines
+
+`apps/server/src/engine_route.rs` adds engines that fetch pages and covers. The main engine (`SUWAYOMI_URL`) owns catalogue ids, scanning and chapter lists. See [Add a regional engine](/self-host/regional-engine) for private tunnels and Basic authentication.
+
+The resolver uses active-generation source keys, like `packages/api/src/local-suwayomi-backend.ts`: `mangas(sourceId, url)`, then `chapters(mangaId, url)`. On a miss it searches by title or fetches chapters, matching the source URL. Memoized results expire after 1 hour for manga, 5 minutes for chapters and pages, and 10 minutes for absences.
+
+`Engines::decide` returns `Owner` for no route or an unusable non-strict route, `Regional` when health and extension versions match, or `Refuse` for an unusable strict route. Missing content or errors fall back and increment `fallbacks`; strict routes return 503. `Busy` returns the usual retryable page 503 with `Cache-Control: no-store`.
+
+Migration `apps/server/migrations_pg/0015_source_engine_route.sql` stores `source_id`, the configured `engine_id`, `strict`, `set_at` and `set_by`. Regional manga and chapter numbers and page paths stay in memory, never in PostgreSQL or reader responses.
+
+Counters separate engine database lookups from source requests. Background work shares `SourceBudgets` by source across engines: `spend` charges the operation's cost; `spend_media_page` admits archived pages. Changing engines creates no separate budget.
+
+- A chapter whose source keys are not stored yet is served by the main engine even under a strict route.
+- A cold regional cover lookup may make one source search before fetching the thumbnail.
+- During an owner extension-update batch, a routed source may use the regional engine's older version until the batch finishes and versions are compared again.
+- If a regional update fails part-way and the engine loses the extension, its routes stay off. Strict routes return 503 until you run `komika-server engine provision <id>` again.
+- After replacing a regional engine's data, set the route again to clear its resolved ids.
 
 ### Automatic extension updates
 
@@ -179,6 +189,9 @@ To install and run the stack, see the [Docker installation guide](/self-host/doc
 
 - `apps/server/src/suwayomi.rs`: Suwayomi client implementation, GraphQL queries, concurrency semaphores, and provenance checks.
 - `apps/server/src/engine_keys.rs`: stored engine keys, generation adoption, `chapterOrigin` lookup and the backfill task.
+- `apps/server/src/engine_route.rs`: regional resolution, routes, version checks and counters.
+- `apps/server/src/source_budget.rs`: shared source request budgets.
+- `apps/server/migrations_pg/0015_source_engine_route.sql`: per-source routes and strict mode.
 - `apps/server/src/maintenance.rs`: automatic extension update supervisor and log history.
 - `deploy/selfhost/docker-compose.yml`: container definitions, network links, volume mounts, and memory limits.
 - `deploy/selfhost/Dockerfile`: internal engine address and browser image URL configuration.

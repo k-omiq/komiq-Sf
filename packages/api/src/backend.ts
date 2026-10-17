@@ -468,6 +468,15 @@ export interface Backend {
 	mangadexSetting?(): Promise<MangadexSetting>;
 	/** Every engine generation the server knows, oldest first (admin). Optional. */
 	engineGenerationState?(): Promise<EngineGeneration[]>;
+	/** Owner and regional engine health. Empty when the server predates routing. */
+	engines?(): Promise<EngineStatus[]>;
+	sourceEngineRoute?(sourceId: string): Promise<SourceEngineRoute | null>;
+	/** Null removes the route. Refusals surface as errors. */
+	setSourceEngine?(
+		sourceId: string,
+		engineId: string | null,
+		strict?: boolean,
+	): Promise<SourceEngineRoute | null>;
 	/** Give up the quarantined engine data and start a new generation (admin). Returns the
 	 * generations after the change. `generationId` is the quarantined generation the admin
 	 * was shown: the server refuses if it is no longer current and quarantined. Optional. */
@@ -920,6 +929,43 @@ export interface InstanceInfo {
 	 * server. Absent on a server that predates the field, which reads as false.
 	 */
 	appsFetchThemselves?: boolean;
+}
+
+export type EngineVersionCheck = 'MATCH' | 'OWNER_UNKNOWN' | 'NOT_INSTALLED' | 'DIFFERS';
+
+export interface SourceEngineRoute {
+	sourceId: string;
+	engineId: string;
+	strict: boolean;
+	active: boolean;
+	versionCheck: EngineVersionCheck;
+}
+
+export interface RoutedSourceStatus {
+	sourceId: string;
+	strict: boolean;
+	active: boolean;
+	versionCheck: EngineVersionCheck;
+	ownerVersion: string | null;
+	regionalVersion: string | null;
+}
+
+export interface EngineStatus {
+	id: string;
+	reachable: boolean;
+	checkedAt: string | null;
+	error: string | null;
+	/** Decimal strings preserve the full unsigned counter range. */
+	counters: {
+		lookups: string;
+		sourceRequests: string;
+		pageFetches: string;
+		pageBytes: string;
+		coverFetches: string;
+		failures: string;
+		fallbacks: string;
+	};
+	routedSources: RoutedSourceStatus[];
 }
 
 /**

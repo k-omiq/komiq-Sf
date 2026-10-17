@@ -65,6 +65,8 @@ import type {
 	ExtensionRepo,
 	MangadexSetting,
 	EngineGeneration,
+	EngineStatus,
+	SourceEngineRoute,
 	BlockRule,
 	BrowseSource,
 	RatedScanlator,
@@ -1230,6 +1232,57 @@ export class GraphQLBackend implements Backend {
 			ops.ENGINE_GENERATION_STATE,
 		);
 		return d.engineGenerationState;
+	}
+
+	private async optionalEngineField<T>(
+		field: string,
+		query: string,
+		fallback: T,
+		variables?: Record<string, unknown>,
+	): Promise<T> {
+		const authRevision = this.auth.revision;
+		if (this.capabilities.unsupportedLists.has(field)) return fallback;
+		try {
+			const d = await this.gql<Record<string, T>>(query, variables);
+			return d[field];
+		} catch (err) {
+			this.assertAuthRevision(authRevision);
+			const msg = err instanceof Error ? err.message : String(err);
+			if (
+				!msg.includes(`Unknown field "${field}"`) &&
+				!msg.includes(`Cannot query field "${field}"`)
+			) {
+				throw err;
+			}
+			this.capabilities.unsupportedLists.add(field);
+			return fallback;
+		}
+	}
+
+	engines(): Promise<EngineStatus[]> {
+		return this.optionalEngineField<EngineStatus[]>('engines', ops.ENGINES, []);
+	}
+
+	sourceEngineRoute(sourceId: string): Promise<SourceEngineRoute | null> {
+		return this.optionalEngineField<SourceEngineRoute | null>(
+			'sourceEngineRoute',
+			ops.SOURCE_ENGINE_ROUTE,
+			null,
+			{ sourceId },
+		);
+	}
+
+	setSourceEngine(
+		sourceId: string,
+		engineId: string | null,
+		strict = false,
+	): Promise<SourceEngineRoute | null> {
+		return this.optionalEngineField<SourceEngineRoute | null>(
+			'setSourceEngine',
+			ops.SET_SOURCE_ENGINE,
+			null,
+			{ sourceId, engineId, strict },
+		);
 	}
 
 	async startNewEngineGeneration(generationId: Id): Promise<EngineGeneration[]> {

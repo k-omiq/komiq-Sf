@@ -490,9 +490,11 @@ pub(crate) static CACHE_FEED_BROWSE_SOURCES: CacheStats = CacheStats::new();
 pub(crate) static CACHE_ENGINE_PAGES: CacheStats = CacheStats::new();
 pub(crate) static CACHE_ENGINE_CHAPTER_OWNER: CacheStats = CacheStats::new();
 pub(crate) static CACHE_MANGADEX_AT_HOME: CacheStats = CacheStats::new();
+pub(crate) static CACHE_REGIONAL_MANGA: CacheStats = CacheStats::new();
+pub(crate) static CACHE_REGIONAL_PAGES: CacheStats = CacheStats::new();
 pub(crate) static CACHE_CHAPTER_FETCH_MARKER: CacheStats = CacheStats::new();
 
-static CACHES: [(&str, CacheKind, &CacheStats); 10] = [
+static CACHES: [(&str, CacheKind, &CacheStats); 12] = [
     ("browse_count", CacheKind::Value, &CACHE_BROWSE_COUNT),
     ("browse_rows", CacheKind::Value, &CACHE_BROWSE_ROWS),
     ("feed_discovery", CacheKind::Value, &CACHE_FEED_DISCOVERY),
@@ -517,6 +519,16 @@ static CACHES: [(&str, CacheKind, &CacheStats); 10] = [
         "mangadex_at_home",
         CacheKind::SingleFlight,
         &CACHE_MANGADEX_AT_HOME,
+    ),
+    (
+        "regional_engine_manga",
+        CacheKind::SingleFlight,
+        &CACHE_REGIONAL_MANGA,
+    ),
+    (
+        "regional_engine_pages",
+        CacheKind::SingleFlight,
+        &CACHE_REGIONAL_PAGES,
     ),
     (
         "chapter_fetch_marker",

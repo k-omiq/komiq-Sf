@@ -114,6 +114,21 @@ Extension repositories provide Suwayomi with indexes of installable Mihon extens
 - Removing a repository: Click the trash button on a repository row to delete it. Extensions from the repository will no longer be offered for installation or updates, but titles already added to your catalogue remain intact.
 - Manage installed extensions: A footer link opens [Sources](/admin/sources) to manage installed extensions.
 
+### Source engines
+
+Open **Sources › Browse** and choose a source to see its **Engine** picker. Choose the main engine (`owner`) or a configured regional engine. It changes where pages and covers are fetched. Catalogue scans and chapter lists stay on the main engine. Choosing `owner` removes the route.
+
+The strict switch returns HTTP 503 when the regional engine cannot serve, instead of falling back to the main engine. Missing regional content and fetch errors follow the same rule. A full page pool returns a retryable 503 in either mode.
+
+The server refuses a regional choice when:
+
+- the engine is not configured or cannot be reached;
+- the main engine records no extension version for the source;
+- the regional engine lacks the extension;
+- extension packages or versions differ, or a version is unknown.
+
+Run `komika-server engine provision sg SOURCE_ID` in the server environment to install or update the recorded extension on `sg`. Replace `SOURCE_ID` with the source's id. The route stays off until versions match. See [Add a regional engine](/self-host/regional-engine) and [Engines](/admin/sources#engines).
+
 ### Request limits
 
 Some sites block a server that asks them too often. A request limit makes your server check one source for new chapters slowly.

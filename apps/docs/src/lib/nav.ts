@@ -36,6 +36,7 @@ export const handbooks: Handbook[] = [
 			'docker',
 			'first-run',
 			'sources',
+			'regional-engine',
 			'other-devices',
 			'internet-access',
 			'configuration',

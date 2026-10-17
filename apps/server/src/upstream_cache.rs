@@ -93,6 +93,15 @@ impl<V: Clone> TtlMemo<V> {
         self.stats.set_entries(0);
     }
 
+    /// Drop one key, so the next lookup fills it again. An in-flight fill keeps its own
+    /// cell and answers only the callers that already joined it.
+    pub(crate) fn forget(&self, key: &str) {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if slots.remove(key).is_some() {
+            self.stats.set_entries(slots.len());
+        }
+    }
+
     /// Inspect only an initialized, unexpired answer; do not allocate a slot for
     /// a miss or let a probe extend its lifetime.
     pub(crate) fn has_value(&self, key: &str) -> bool {

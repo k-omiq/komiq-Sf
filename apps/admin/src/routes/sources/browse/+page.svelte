@@ -34,6 +34,7 @@
 	} from '$lib/data';
 	import IngestCounts, { type CountItem } from './IngestCounts.svelte';
 	import IngestPanel from './IngestPanel.svelte';
+	import SourceEngine from './SourceEngine.svelte';
 
 	// Auth redirect is centralized in +layout.svelte.
 
@@ -1178,6 +1179,12 @@
 					</Button>
 				{/if}
 			</div>
+		{/if}
+
+		{#if validSourceId}
+			{#key validSourceId}
+				<SourceEngine sourceId={validSourceId} />
+			{/key}
 		{/if}
 
 		{#if jobError}

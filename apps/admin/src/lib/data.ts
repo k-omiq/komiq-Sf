@@ -48,6 +48,8 @@ import type {
 	CreateUserInput,
 	ExtensionRepo,
 	EngineGeneration,
+	EngineStatus,
+	SourceEngineRoute,
 	MangadexSetting,
 	ScanlatorAi,
 	ScanlatorPage,
@@ -343,6 +345,24 @@ export async function loadEngineGenerations(): Promise<EngineGeneration[] | null
 		if (isUnknownEngineStateField(err)) return null;
 		throw err;
 	}
+}
+
+/** Owner and regional engines; older servers return no rows. */
+export async function loadEngines(): Promise<EngineStatus[]> {
+	return backend.engines ? backend.engines() : [];
+}
+
+export async function loadSourceEngineRoute(sourceId: string): Promise<SourceEngineRoute | null> {
+	return backend.sourceEngineRoute ? backend.sourceEngineRoute(sourceId) : null;
+}
+
+export async function setSourceEngine(
+	sourceId: string,
+	engineId: string | null,
+	strict = false,
+): Promise<SourceEngineRoute | null> {
+	if (!backend.setSourceEngine) throw new Error('Engine routing is unavailable on this backend.');
+	return backend.setSourceEngine(sourceId, engineId, strict);
 }
 
 /** Set aside the old extension-source data and return the updated generations. */

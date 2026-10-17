@@ -1,4 +1,8 @@
 pub mod types;
+mod engines;
+
+#[cfg(test)]
+mod engines_tests;
 
 #[cfg(test)]
 mod block_tests;
@@ -7643,7 +7647,9 @@ impl QueryRoot {
         // chapters aren't mirrored locally — so resolve the manga id from the source and
         // gate the page images exactly like `series`/`chapters` (N2). An unknown chapter
         // is allowed through to the (cleanly-failing) page fetch, mirroring canonicalPages.
-        if !st.suwayomi.reader_pages_cached(n) {
+        if !st.suwayomi.reader_pages_cached(n)
+            && !crate::engine_route::regional_pages_cached(&st.suwayomi, n)
+        {
             upstream_budget(Some(&client_ip(ctx))).map_err(gql_err)?;
         }
         let manga_id = st.suwayomi.chapter_manga_id(n).await.map_err(gql_err)?;
@@ -7662,7 +7668,11 @@ impl QueryRoot {
         if policy.denies_chapter(n) {
             return Err(Error::new("No such chapter"));
         }
-        let urls = st.suwayomi.pages(n).await;
+        let urls = match crate::engine_route::page_urls(&st.suwayomi, &st.pool, n).await {
+            Ok(Some(urls)) => Ok(urls),
+            Ok(None) => st.suwayomi.pages(n).await,
+            Err(error) => Err(error),
+        };
         // A reader opening a chapter is the request that matters most, and the scanner
         // never makes it — so it is counted here, against the owning source.
         if let Some(manga_id) = manga_id.filter(|_| {
@@ -9164,6 +9174,18 @@ impl QueryRoot {
                 }
             })
             .collect())
+    }
+
+    async fn engines(&self, ctx: &Context<'_>) -> Result<Vec<engines::EngineStatus>> {
+        engines::engines(ctx).await
+    }
+
+    async fn source_engine_route(
+        &self,
+        ctx: &Context<'_>,
+        source_id: String,
+    ) -> Result<Option<engines::SourceEngineRoute>> {
+        engines::source_engine_route(ctx, source_id).await
     }
 
     /// Admin: per-source scan health (Phase E4.3) — worst first.
@@ -14874,7 +14896,16 @@ impl MutationRoot {
         // on-demand headroom — one permit per in-flight call, and one call per request
         // here. See the full accounting on `ingest_source_series` before making any enrol
         // path concurrent.
-        let cover_phash = match st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await {
+        let cover_phash = match crate::engine_route::cover_bytes(
+            &st.suwayomi,
+            &st.pool,
+            crate::engine_route::CoverTarget::Keys {
+                source_id: m.source_id.clone(),
+                manga_key: m.url.clone().unwrap_or_default(),
+                title: Some(m.title.clone()),
+            },
+            m.thumbnail_url.as_deref(),
+        ).await {
             // dhash decodes + grayscales + resizes the cover — CPU-bound; keep it off
             // the async runtime. Best-effort: a task panic just drops the signal.
             Some(bytes) => tokio::task::spawn_blocking(move || crate::phash::dhash(&bytes))
@@ -15063,6 +15094,16 @@ impl MutationRoot {
 
     // ---- Sources & Extensions admin surface (EXT-1) --------------------------
 
+    async fn set_source_engine(
+        &self,
+        ctx: &Context<'_>,
+        source_id: String,
+        engine_id: Option<String>,
+        #[graphql(default = false)] strict: bool,
+    ) -> Result<Option<engines::SourceEngineRoute>> {
+        engines::set_source_engine(ctx, source_id, engine_id, strict).await
+    }
+
     /// Admin: register an extension repo (store) on the Suwayomi engine by its
     /// index URL and refresh the available-extension list from every store.
     /// Idempotent upstream (re-adding an existing store is a no-op). Returns how
@@ -15139,6 +15180,9 @@ impl MutationRoot {
         // installed, so a failure here is logged inside and never fails the mutation
         // (ingest asks the engine itself when the row is missing).
         crate::scanner::record_source_extensions(st).await;
+        if let Err(error) = st.suwayomi.regional.reload_routes(&st.pool).await {
+            tracing::warn!(error = %error, "engine routes: reload after extension change failed");
+        }
         Ok(map_extension_info(st, e))
     }
 
@@ -15191,6 +15235,13 @@ impl MutationRoot {
         // An update can change the version, the NSFW flag and the set of sources;
         // refresh the recorded rows as `installExtension` does. Best-effort.
         crate::scanner::record_source_extensions(st).await;
+        if let Err(error) = st.suwayomi.regional.reload_routes(&st.pool).await {
+            tracing::warn!(error = %error, "engine routes: reload before regional update failed");
+        }
+        crate::engine_route::update_regional(&st.suwayomi.regional, &pkg_name).await;
+        if let Err(error) = st.suwayomi.regional.reload_routes(&st.pool).await {
+            tracing::warn!(error = %error, "engine routes: reload after extension change failed");
+        }
         Ok(map_extension_info(st, e))
     }
 
@@ -15712,7 +15763,16 @@ pub(crate) async fn ingest_source_series(
             )
             .await
     {
-        st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await
+        crate::engine_route::cover_bytes(
+            &st.suwayomi,
+            &st.pool,
+            crate::engine_route::CoverTarget::Keys {
+                source_id: m.source_id.clone(),
+                manga_key: m.url.clone().unwrap_or_default(),
+                title: Some(m.title.clone()),
+            },
+            m.thumbnail_url.as_deref(),
+        ).await
     } else {
         None
     };
@@ -16223,7 +16283,16 @@ async fn federated_ingest(st: &AppState, raw_id: &str) -> anyhow::Result<MatchRe
     // permit per in-flight federated search — and that loop is the one most exposed to
     // ordinary (rate-limited, opt-in) user traffic rather than admin traffic. See the full
     // accounting on `ingest_source_series` before making it concurrent.
-    let cover_phash = match st.suwayomi.cover_bytes(m.thumbnail_url.as_deref()).await {
+    let cover_phash = match crate::engine_route::cover_bytes(
+        &st.suwayomi,
+        &st.pool,
+        crate::engine_route::CoverTarget::Keys {
+            source_id: m.source_id.clone(),
+            manga_key: m.url.clone().unwrap_or_default(),
+            title: Some(m.title.clone()),
+        },
+        m.thumbnail_url.as_deref(),
+    ).await {
         // dhash is CPU-bound (decode + grayscale + resize); keep it off the async
         // runtime. Best-effort: a task panic just drops the signal.
         Some(bytes) => tokio::task::spawn_blocking(move || crate::phash::dhash(&bytes))

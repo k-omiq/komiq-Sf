@@ -561,6 +561,9 @@ pub struct SuwayomiClient {
     page_sem: Arc<Semaphore>,
     pages_memo: Arc<TtlMemo<Vec<String>>>,
     chapter_owner_memo: Arc<TtlMemo<i64>>,
+    /// Regional engines and the source routes to them (`engine_route`). Empty unless
+    /// `KOMIKA_ENGINES` names one; shared by every clone of the owner client.
+    pub(crate) regional: Arc<crate::engine_route::Engines>,
 }
 
 impl SuwayomiClient {
@@ -568,6 +571,35 @@ impl SuwayomiClient {
         base_url: String,
         public_url: Option<String>,
         configured_source: Option<String>,
+    ) -> Self {
+        Self::build(
+            base_url,
+            public_url,
+            configured_source,
+            reqwest::header::HeaderMap::new(),
+        )
+    }
+
+    /// A client for a regional engine (`engine_route`): no public image base, no default
+    /// source, and the engine's Basic credential on every request. The header is marked
+    /// sensitive so it never appears in a debug print.
+    pub(crate) fn with_authorization(
+        base_url: String,
+        authorization: Option<reqwest::header::HeaderValue>,
+    ) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(mut value) = authorization {
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+        Self::build(base_url, None, None, headers)
+    }
+
+    fn build(
+        base_url: String,
+        public_url: Option<String>,
+        configured_source: Option<String>,
+        headers: reqwest::header::HeaderMap,
     ) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
         let image_base_url = public_url
@@ -586,6 +618,7 @@ impl SuwayomiClient {
         // `MangaDexClient::new`. Falls back to the default client if the builder
         // somehow fails, so construction stays infallible.
         let http = reqwest::Client::builder()
+            .default_headers(headers.clone())
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -594,6 +627,7 @@ impl SuwayomiClient {
         // of a page render, so a fast failure that the drainer/warmer can retry beats a
         // 29 s hang the browser renders as a broken image regardless.
         let cover_http = reqwest::Client::builder()
+            .default_headers(headers.clone())
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(COVER_TIMEOUT_SECS))
             .build()
@@ -601,6 +635,7 @@ impl SuwayomiClient {
         // Page client: full-resolution content, so more patient than covers but still
         // short of the scan client, and bounded by its own pool below.
         let page_http = reqwest::Client::builder()
+            .default_headers(headers)
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(PAGE_TIMEOUT_SECS))
             .build()
@@ -629,6 +664,7 @@ impl SuwayomiClient {
                 READER_MEMO_CAP,
                 &crate::telemetry::CACHE_ENGINE_CHAPTER_OWNER,
             )),
+            regional: Arc::default(),
         }
     }
 
@@ -930,7 +966,7 @@ impl SuwayomiClient {
         Ok((bytes, content_type))
     }
 
-    async fn gql<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<T> {
+    pub(crate) async fn gql<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<T> {
         self.wait_for_generation().await?;
         let generation = self.fence.as_ref().and_then(|f| f.generation());
         let revision = self.fence.as_ref().map(|f| f.revision());

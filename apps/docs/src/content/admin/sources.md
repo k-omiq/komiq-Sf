@@ -77,6 +77,16 @@ When complete, `Result of the last add` shows the outcome for each series: merge
 
 The Health page monitors your server’s scan reliability and request failures across sources with tracked series or recorded requests, listing the worst sources first.
 
+### Engines
+
+The **Engines** section shows the main engine (`owner`) and configured regional engines. A regional engine fetches pages and covers for routed sources. The main engine keeps the catalogue, scanning and chapter lists.
+
+For each regional engine, check its reachability, last health check and error. Its counters show engine database lookups, source requests, page fetches and bytes, cover fetches, failures and fallbacks to the main engine. These counters reset when the komiq server restarts. Database lookups do not contact the source.
+
+Routed sources show the main and regional extension versions, whether they match and whether the route is active. Matching requires the same extension package and a known, equal version. An inactive route uses the main engine, unless strict mode is on, which returns HTTP 503 instead.
+
+Open **Sources › Browse**, choose a source, then use its **Engine** picker. For routing rules, see [Source engines](/admin/settings#source-engines). For tunnel setup, authentication and provisioning, read [Add a regional engine](/self-host/regional-engine).
+
 ### Outage notices
 
 When sources experience an outage, a notice appears at the top. It reports the number of down sources and how many exclusive works exist only on them. Exclusive works cannot be read while their source is down.

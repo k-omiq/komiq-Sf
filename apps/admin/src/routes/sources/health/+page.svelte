@@ -1,9 +1,9 @@
 <script lang="ts">
 	import { href } from '$lib/paths';
 	import type { SourceHealthStat, SourceScanHealth } from '@komika/types';
-	import type { EngineGeneration as Generation } from '@komika/api';
+	import type { EngineGeneration as Generation, EngineStatus } from '@komika/api';
 	import { auth } from '$lib/auth.svelte';
-	import { loadEngineGenerations, loadSourceScanHealth, startNewEngineGeneration } from '$lib/data';
+	import { loadEngineGenerations, loadEngines, loadSourceScanHealth, startNewEngineGeneration } from '$lib/data';
 	import { engineGenerationView } from '$lib/engine-generation';
 	import Button from '$lib/components/Button.svelte';
 	import EngineGeneration from '$lib/components/EngineGeneration.svelte';
@@ -42,6 +42,35 @@
 		if (!auth.user || engineLoaded || engineLoading) return;
 		void refreshEngine();
 	});
+
+	let engines = $state<EngineStatus[]>([]);
+	let enginesLoading = $state(false);
+	let enginesLoaded = $state(false);
+	let enginesError = $state<string | null>(null);
+	const hasRegional = $derived(engines.some((e) => e.id !== 'owner'));
+
+	async function refreshEngines(): Promise<void> {
+		if (enginesLoading) return;
+		enginesLoading = true;
+		enginesError = null;
+		try {
+			engines = await loadEngines();
+		} catch (err) {
+			enginesError = err instanceof Error ? err.message : 'Failed to load engines.';
+		} finally {
+			enginesLoaded = true;
+			enginesLoading = false;
+		}
+	}
+
+	$effect(() => {
+		if (!auth.user || enginesLoaded || enginesLoading) return;
+		void refreshEngines();
+	});
+
+	async function refreshAll(): Promise<void> {
+		await Promise.allSettled([refreshHealth(), refreshEngine(), refreshEngines()]);
+	}
 
 	// ---- Scan health ------------------------------------------------------------
 	// "Is this source actually working?" used to have no honest answer: every Suwayomi
@@ -253,7 +282,7 @@
 		description="Which sources fail when the server checks them for new chapters, and why."
 	>
 		{#snippet actions()}
-			<Button icon="refresh" busy={healthLoading} onclick={() => refreshHealth()}>Refresh</Button>
+			<Button icon="refresh" busy={healthLoading || enginesLoading || engineLoading} onclick={refreshAll}>Refresh</Button>
 		{/snippet}
 		A failing source is often one extension release behind.
 		<a class="k-link" href={href('/settings#updates')}>Check extension updates in Settings</a>
@@ -261,6 +290,52 @@
 
 	{#if engineView.kind === 'quarantined'}
 		{@render engineSection()}
+	{/if}
+
+	{#if hasRegional}
+		<section class="engines" aria-labelledby="engines-title">
+			<h2 id="engines-title">Engines</h2>
+			<p class="k-muted">Regional engines fetch pages and covers for their routed sources. Times are UTC.</p>
+			{#if enginesError}<p class="bad" role="alert">{enginesError}</p>{/if}
+			<div class="engine-list">
+				{#each engines as engine (engine.id)}
+					<article class="engine">
+						<div class="engine-heading">
+							<h3>{engine.id}</h3>
+							<span class="engine-status" class:bad={!engine.reachable}>
+								{engine.reachable ? 'Reachable' : 'Unreachable'}
+							</span>
+							<span class="k-muted">Last check: {shortDate(engine.checkedAt, engine.id === 'owner' ? 'Generation state' : 'Never')}</span>
+						</div>
+						{#if engine.error}<p class="bad">{engine.error}</p>{/if}
+						<p class="engine-counts k-muted k-num">
+							<span>{engine.counters.lookups} database lookups</span>
+							<span>{engine.counters.sourceRequests} source requests</span>
+							<span>{engine.counters.pageFetches} page fetches</span>
+							<span>{engine.counters.pageBytes} page bytes</span>
+							<span>{engine.counters.coverFetches} cover fetches</span>
+							<span>{engine.counters.fallbacks} fallbacks</span>
+							<span>{engine.counters.failures} failures</span>
+						</p>
+						{#if engine.routedSources.length > 0}
+							<ul class="engine-routes">
+								{#each engine.routedSources as route (route.sourceId)}
+									<li>
+										<a class="k-link" href={href(`/sources/browse?source=${encodeURIComponent(route.sourceId)}`)}>
+											{health.find((h) => h.id === route.sourceId)?.name ?? route.sourceId}
+										</a>
+										<span>{route.active ? 'Active' : 'Inactive'}{route.strict ? ' · Strict' : ''}</span>
+										<span class="k-muted">{route.versionCheck.replaceAll('_', ' ')} · Owner {route.ownerVersion ?? 'unknown'} / Regional {route.regionalVersion ?? 'unknown'}</span>
+									</li>
+								{/each}
+							</ul>
+						{:else if engine.id !== 'owner'}
+							<p class="k-muted">No routed sources.</p>
+						{/if}
+					</article>
+				{/each}
+			</div>
+		</section>
 	{/if}
 
 	<LoadState
@@ -528,6 +603,52 @@
 </div>
 
 <style>
+	.engines {
+		display: grid;
+		gap: var(--k-space-3);
+	}
+	.engines h2 {
+		font-size: var(--k-text-lg);
+		font-weight: 700;
+	}
+	.engine-list,
+	.engine-routes {
+		display: grid;
+		gap: var(--k-space-3);
+	}
+	.engine {
+		display: grid;
+		gap: var(--k-space-3);
+		padding: var(--k-space-5);
+		border-radius: var(--k-radius-lg);
+		background: var(--k-surface);
+		overflow-wrap: anywhere;
+	}
+	.engine-heading,
+	.engine-counts,
+	.engine-routes li {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: var(--k-space-2) var(--k-space-4);
+	}
+	.engine-heading h3 {
+		font-weight: 700;
+	}
+	.engine-status {
+		padding: 2px 9px;
+		border-radius: var(--k-radius-pill);
+		background: var(--k-surface-2);
+	}
+	.engine-counts,
+	.engine-routes {
+		font-size: var(--k-text-sm);
+	}
+	.engine-routes {
+		margin: 0;
+		padding: 0;
+		list-style: none;
+	}
 	.k-table {
 		--cols: minmax(0, 2.2fr) minmax(0, 1.3fr) minmax(0, 0.7fr) minmax(0, 1fr) minmax(0, 0.8fr)
 			minmax(0, 0.7fr) minmax(0, 0.9fr) minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1.4fr);

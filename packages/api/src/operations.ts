@@ -1562,6 +1562,58 @@ export const MANGADEX_SETTING = /* GraphQL */ `
 	}
 `;
 
+const SOURCE_ENGINE_ROUTE_FIELDS = /* GraphQL */ `
+	sourceId
+	engineId
+	strict
+	active
+	versionCheck
+`;
+
+export const ENGINES = /* GraphQL */ `
+	query Engines {
+		engines {
+			id
+			reachable
+			checkedAt
+			error
+			counters {
+				lookups
+				sourceRequests
+				pageFetches
+				pageBytes
+				coverFetches
+				failures
+				fallbacks
+			}
+			routedSources {
+				sourceId
+				strict
+				active
+				versionCheck
+				ownerVersion
+				regionalVersion
+			}
+		}
+	}
+`;
+
+export const SOURCE_ENGINE_ROUTE = /* GraphQL */ `
+	query SourceEngineRoute($sourceId: String!) {
+		sourceEngineRoute(sourceId: $sourceId) {
+			${SOURCE_ENGINE_ROUTE_FIELDS}
+		}
+	}
+`;
+
+export const SET_SOURCE_ENGINE = /* GraphQL */ `
+	mutation SetSourceEngine($sourceId: String!, $engineId: String, $strict: Boolean! = false) {
+		setSourceEngine(sourceId: $sourceId, engineId: $engineId, strict: $strict) {
+			${SOURCE_ENGINE_ROUTE_FIELDS}
+		}
+	}
+`;
+
 const ENGINE_GENERATION_FIELDS = /* GraphQL */ `
 	id
 	state

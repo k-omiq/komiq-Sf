@@ -262,13 +262,55 @@ pub(crate) async fn ingest_chapter(app: &AppState, chapter: i64) -> Result<Optio
     if !engine.page_locator.unchanged(manga, stamp) {
         bail!("chapter moved");
     }
-    let count = engine.pages(chapter).await?.len();
+    let regional = match engine.regional.decide_read(&identity.source_id) {
+        crate::engine_route::Decision::Owner => None,
+        crate::engine_route::Decision::Refuse => bail!("regional engine unavailable"),
+        crate::engine_route::Decision::Regional {
+            engine: regional,
+            strict,
+        } => {
+            let stored = crate::engine_route::keys_for_chapter(&app.pool, chapter).await?
+                .ok_or_else(|| anyhow::anyhow!("no active source keys"))?;
+            let keys = crate::engine_route::SourceKeys {
+                source_id: identity.source_id.clone(),
+                manga_key: identity.manga_key.clone(),
+                chapter_key: identity.chapter_key.clone(),
+                title: stored.title,
+            };
+            regional.forget(&keys);
+            if !regional.chapter_cached(&keys)
+                && !app
+                    .source_budgets
+                    .spend_media_page(&identity.source_id, Duration::from_secs(60))
+                    .await
+            {
+                bail!("ingest source budget exhausted");
+            }
+            match regional.chapter(&keys).await {
+                Ok(Some(chapter)) => Some((regional, keys, chapter)),
+                Ok(None) => match crate::engine_route::unavailable::<()>(
+                    &engine.regional, &identity.source_id, &regional, strict,
+                ) {
+                    crate::engine_route::Routed::Owner => None,
+                    _ => bail!("regional chapter missing"),
+                },
+                Err(_) => bail!("regional chapter unavailable"),
+            }
+        }
+    };
+    let count = match &regional {
+        Some((_, _, chapter)) => chapter.pages.len(),
+        None => engine.pages(chapter).await?.len(),
+    };
+    let page_client = regional
+        .as_ref()
+        .map_or(engine, |(regional, _, _)| &regional.client);
     let mut pages = Vec::with_capacity(count);
     let mut total_bytes = 0u64;
     let lane = ADMISSION.lane(Lane::Ingest);
     for idx in 0..count {
         let deadline = Instant::now() + Duration::from_secs(60);
-        while engine.page_permits_available() < 2 {
+        while page_client.page_permits_available() < 2 {
             if Instant::now() >= deadline {
                 lane.refuse();
                 bail!("page pool busy");
@@ -284,7 +326,18 @@ pub(crate) async fn ingest_chapter(app: &AppState, chapter: i64) -> Result<Optio
             bail!("ingest source budget exhausted");
         }
         let path = format!("/api/v1/manga/{manga}/chapter/{order}/page/{idx}");
-        let (bytes, mime) = match engine.fetch_page_now(&path).await {
+        let fetched = if let Some((regional, keys, _)) = &regional {
+            match regional.fetch_page(keys, idx).await
+                .map_err(|_| anyhow::anyhow!("regional page unavailable"))?
+            {
+                crate::engine_route::RegionalPage::Page(bytes, mime) => Ok((bytes, mime)),
+                crate::engine_route::RegionalPage::Missing => bail!("regional page missing"),
+                crate::engine_route::RegionalPage::Busy => Err(crate::suwayomi::PageFetchError::Busy),
+            }
+        } else {
+            engine.fetch_page_now(&path).await
+        };
+        let (bytes, mime) = match fetched {
             Ok(page) => page,
             Err(crate::suwayomi::PageFetchError::Busy) => {
                 lane.refuse();
@@ -330,6 +383,22 @@ pub(crate) async fn ingest_chapter(app: &AppState, chapter: i64) -> Result<Optio
     }
     if after.source_order != order {
         bail!("chapter moved during ingest");
+    }
+    if let Some((regional, keys, before)) = &regional {
+        if !app
+            .source_budgets
+            .spend_media_page(&identity.source_id, Duration::from_secs(60))
+            .await
+        {
+            lane.refuse();
+            bail!("ingest source budget exhausted");
+        }
+        let after = regional.fresh_chapter(keys).await?;
+        if !after.is_some_and(|after| {
+            after.chapter_id == before.chapter_id && after.pages == before.pages
+        }) {
+            bail!("regional chapter changed during ingest");
+        }
     }
     engine.validate_read_generation(generation).await?;
     let (copy, revision) = store::publish(&app.pool, generation.0, &identity, &pages).await?;

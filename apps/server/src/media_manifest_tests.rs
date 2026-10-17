@@ -37,6 +37,8 @@ use tower::ServiceExt;
 struct Engine {
     url: String,
     pages: Arc<Mutex<Vec<Vec<u8>>>>,
+    page_hits: Arc<std::sync::atomic::AtomicUsize>,
+    page_lists: Arc<std::sync::atomic::AtomicUsize>,
     /// The chapter key the engine answers for chapter 8 (the stored one is `/chapter`).
     chapter_url: Arc<Mutex<String>>,
     /// When set, the engine moves chapter 8 to position 1 once it served a page,
@@ -63,6 +65,8 @@ fn image_bytes(value: u8) -> Vec<u8> {
 impl Engine {
     async fn spawn() -> Self {
         let pages = Arc::new(Mutex::new(vec![image_bytes(1), image_bytes(2)]));
+        let page_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let page_lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let chapter_url = Arc::new(Mutex::new("/chapter".to_string()));
         let reorder_on_page = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let page_pause: Arc<Mutex<Option<crate::locks::pause_points::PausePoints>>> =
@@ -71,15 +75,18 @@ impl Engine {
         let routes = Router::new()
             .route("/api/graphql", post({
                 let pages = pages.clone();
+                let page_lists = page_lists.clone();
                 let chapter_url = chapter_url.clone();
                 let order = order.clone();
                 move |Json(request): Json<Value>| {
                     let pages = pages.clone();
+                    let page_lists = page_lists.clone();
                     let chapter_url = chapter_url.clone();
                     let order = order.clone();
                     async move {
                         let query = request["query"].as_str().unwrap();
                         let data = if query.contains("fetchChapterPages") {
+                            page_lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let count = pages.lock().unwrap().len();
                             json!({"fetchChapterPages":{"pages":(0..count).map(|idx| format!("/api/v1/manga/7/chapter/0/page/{idx}")).collect::<Vec<_>>()}})
                         } else if query.starts_with("query CO(") {
@@ -98,16 +105,19 @@ impl Engine {
             }))
             .route("/api/v1/manga/{m}/chapter/{c}/page/{p}", get({
                 let pages = pages.clone();
+                let page_hits = page_hits.clone();
                 let reorder_on_page = reorder_on_page.clone();
                 let order = order.clone();
                 let page_pause = page_pause.clone();
                 move |UrlPath((m,c,p)): UrlPath<(i64,i32,usize)>| {
                     let pages = pages.clone();
+                    let page_hits = page_hits.clone();
                     let reorder_on_page = reorder_on_page.clone();
                     let order = order.clone();
                     let page_pause = page_pause.clone();
                     async move {
                         assert_eq!((m,c), (7,0));
+                        page_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let pause = page_pause.lock().unwrap().take();
                         if let Some(points) = pause { points.hit("page-fetch").await; }
                         if reorder_on_page.load(std::sync::atomic::Ordering::SeqCst) {
@@ -130,6 +140,8 @@ impl Engine {
         Self {
             url,
             pages,
+            page_hits,
+            page_lists,
             chapter_url,
             reorder_on_page,
             page_pause,
@@ -191,6 +203,11 @@ async fn fixture(
 
 fn router(app: Arc<AppState>) -> Router {
     Router::new()
+        .route("/media/v1/c/{chapter_id}/{page}", get(serve_chapter_page))
+        .route("/api/v1/manga/{*rest}", get(|State(app): State<Arc<AppState>>, UrlPath(rest): UrlPath<String>, RawQuery(query): RawQuery| async move {
+            let covers = app.cover_pool.clone();
+            serve_suwayomi_image(State(app), State(CoverDb(covers)), UrlPath(rest), RawQuery(query)).await
+        }))
         .route(
             "/media/v1/o/{copy_id}/{sha256}",
             get(serve_media_object)
@@ -775,4 +792,250 @@ async fn ingest_publishes_nothing_when_the_engine_reorders_during_the_pass() {
         .await
         .unwrap();
     assert_eq!(manifests, 0);
+}
+
+
+async fn regional_fixture(
+    strict: bool,
+) -> (
+    TempDir,
+    Engine,
+    Arc<AppState>,
+    crate::cover_store::test_support::TestDir,
+    crate::engine_route::tests::FakeRegional,
+) {
+    let (dir, owner, mut app, cover_dir) = fixture(true).await;
+    let mut state = crate::engine_route::tests::fixture_state();
+    state.mangas[0].id = 987654321;
+    state.mangas[0].source_id = "source".into();
+    state.mangas[0].url = "/manga".into();
+    state.chapters[0].id = 987650001;
+    state.chapters[0].manga_id = 987654321;
+    state.chapters[0].url = "/chapter".into();
+    state.extensions[0].2 = vec!["source".into()];
+    let regional = crate::engine_route::tests::FakeRegional::spawn(state).await;
+    // Same-origin page links (`SUWAYOMI_PUBLIC_URL=/`), as the regional engine docs
+    // require, so readers fetch pages through this server where routing happens.
+    let app_mut = Arc::get_mut(&mut app).unwrap();
+    app_mut.suwayomi = SuwayomiClient::new(owner.url.clone(), Some("/".into()), None);
+    app_mut.suwayomi.regional =
+        Arc::new(crate::engine_route::Engines::new(&[regional.spec("sg")]));
+    sqlx::query("INSERT INTO source_extension(source_id,pkg_name,repo_url,version_code,updated_at) VALUES('source','pkg.src','https://komiq.example.com/index.min.json',7,now())")
+        .execute(&app.pool).await.unwrap();
+    crate::engine_route::store_route(&app.pool, "source", Some(("sg", strict)), None).await.unwrap();
+    app.suwayomi.regional.reload_routes(&app.pool).await.unwrap();
+    app.suwayomi.regional.probe_all().await;
+    (dir, owner, app, cover_dir, regional)
+}
+
+async fn assert_no_regional_ids(pool: &crate::database::Database) {
+    let columns: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT c.table_schema::text,c.table_name::text,c.column_name::text \
+         FROM information_schema.columns c JOIN information_schema.tables t \
+         ON t.table_schema=c.table_schema AND t.table_name=c.table_name \
+         WHERE c.table_schema=current_schema() AND t.table_type='BASE TABLE'",
+    ).fetch_all(pool).await.unwrap();
+    assert!(!columns.is_empty());
+    let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    for (schema, table, column) in columns {
+        let query = format!(
+            "SELECT EXISTS(SELECT 1 FROM {}.{} WHERE position($1 in {}::text)>0 OR position($2 in {}::text)>0)",
+            quote(&schema), quote(&table), quote(&column), quote(&column),
+        );
+        let found: bool = sqlx::query_scalar(&query).bind("987654321").bind("987650001")
+            .fetch_one(pool).await.unwrap();
+        assert!(!found, "regional id persisted in {table}.{column}");
+    }
+}
+
+#[tokio::test]
+async fn regional_locator_legacy_graphql_ingest_objects_and_cover_keep_owner_ids() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (_dir, owner, app, _cover_dir, regional) = regional_fixture(false).await;
+    let expected: Vec<Vec<u8>> = (0..3)
+        .map(|i| crate::engine_route::tests::fake_page("/chapter", i)).collect();
+    let response = get_media(&app, "/media/v1/c/8/1").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body(response).await, expected[1]);
+    let response = get_media(&app, "/api/v1/manga/7/chapter/0/page/2").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body(response).await, expected[2]);
+    let listed = pages(&app).await;
+    assert_eq!(listed.as_array().unwrap().len(), 3);
+    for i in 0..3 {
+        assert_eq!(listed[i]["sourceUrl"], format!("/media/v1/c/8/{i}"));
+    }
+    assert_eq!(owner.page_lists.load(SeqCst), 0);
+    assert_eq!(ingest_chapter(&app, 8).await.unwrap(), Some(1));
+    let listed = pages(&app).await;
+    let path = listed[0]["mediaPath"].as_str().unwrap();
+    let copy = path.split('/').nth(4).unwrap();
+    let manifest = store::latest(&app.pool, copy).await.unwrap().unwrap();
+    assert_eq!(manifest.body.pages.iter().map(|p| p.sha256.clone()).collect::<Vec<_>>(),
+        expected.iter().map(|p| hex::encode(Sha256::digest(p))).collect::<Vec<_>>());
+    let response = get_media(&app, path).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body(response).await, expected[0]);
+    let response = serve_suwayomi_cover(&app, &app.cover_pool, 7, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cover = body(response).await;
+    let original = crate::engine_route::tests::fake_page("/cover", 0);
+    assert_eq!(cover, cover::process_cover(&original).unwrap());
+    app.pool.flush_deferred().await;
+    assert!(cover::read_suwayomi_cover(&app.pool, &app.cover_pool, 7, None).await.unwrap().is_some());
+    assert_eq!(regional.calls("cover"), 1);
+    assert_eq!(owner.page_hits.load(SeqCst), 0);
+    assert_eq!(owner.page_lists.load(SeqCst), 0);
+    // Exact objects still reject a different regional image under the old hash.
+    regional.state.lock().unwrap().page_override = Some(image_bytes(9));
+    let response = get_media(&app, path).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(response.headers()[header::CACHE_CONTROL].to_str().unwrap().contains("no-store"));
+    assert!(store::latest(&app.pool, copy).await.unwrap().unwrap().stale);
+    assert_no_regional_ids(&app.pool).await;
+}
+
+#[tokio::test]
+async fn regional_down_missing_and_version_mismatch_fallback_or_refuse() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for strict in [false, true] {
+        for failure in ["down", "missing", "version"] {
+            let (_dir, owner, app, _cover_dir, regional) = regional_fixture(strict).await;
+            match failure {
+                "down" => regional.state.lock().unwrap().down = true,
+                "missing" => regional.state.lock().unwrap().chapters.clear(),
+                "version" => {
+                    sqlx::query("UPDATE source_extension SET version_code=8 WHERE source_id='source'")
+                        .execute(&app.pool).await.unwrap();
+                    app.suwayomi.regional.reload_routes(&app.pool).await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let response = get_media(&app, "/media/v1/c/8/0").await;
+            if strict {
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{failure}");
+                assert!(response.headers()[header::CACHE_CONTROL].to_str().unwrap().contains("no-store"));
+                assert_eq!(owner.page_hits.load(SeqCst), 0);
+                let result = graphql::build_schema(app.clone(), false)
+                    .execute("{ pages(chapterId: \"8\") { sourceUrl } }").await;
+                assert!(!result.errors.is_empty(), "{failure}");
+                assert_eq!(owner.page_lists.load(SeqCst), 0);
+            } else {
+                assert_eq!(response.status(), StatusCode::OK, "{failure}");
+                assert_eq!(body(response).await, owner.pages.lock().unwrap()[0]);
+                assert_eq!(pages(&app).await.as_array().unwrap().len(), 2);
+                assert_eq!(owner.page_lists.load(SeqCst), 1);
+                assert!(app.suwayomi.regional.engine("sg").unwrap().counters.snapshot().fallbacks > 0);
+            }
+            assert_no_regional_ids(&app.pool).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn regional_ingest_spends_page_budget_and_uncached_resolution_budget() {
+    let (_dir, owner, app, _cover_dir, _regional) = regional_fixture(false).await;
+    for _ in 0..595 {
+        assert!(app.source_budgets.spend_media_page("source", Duration::ZERO).await);
+    }
+    // One uncached resolution, three pages and the re-check use the remaining five.
+    assert_eq!(ingest_chapter(&app, 8).await.unwrap(), Some(1));
+    assert!(!app.source_budgets.spend_media_page("source", Duration::ZERO).await);
+    assert_eq!(owner.page_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_no_regional_ids(&app.pool).await;
+}
+
+#[tokio::test]
+async fn regional_background_cover_fill_publishes_under_owner_manga_id() {
+    let (_dir, _owner, app, _cover_dir, regional) = regional_fixture(false).await;
+    spawn_suwayomi_cover_materialize(&app, &app.cover_pool, 7).unwrap().await.unwrap();
+    let stored = cover::read_suwayomi_cover(&app.pool, &app.cover_pool, 7, None)
+        .await.unwrap().unwrap().0;
+    assert_eq!(stored.bytes, cover::process_cover(&crate::engine_route::tests::fake_page("/cover", 0)).unwrap());
+    assert_eq!(regional.calls("cover"), 1);
+    assert_no_regional_ids(&app.pool).await;
+}
+
+
+#[tokio::test]
+async fn regional_ingest_abandons_a_partial_pass_without_owner_pages() {
+    let (_dir, owner, app, _cover_dir, regional) = regional_fixture(false).await;
+    regional.state.lock().unwrap().fail_page = Some(1);
+    assert!(ingest_chapter(&app, 8).await.is_err());
+    assert_eq!(regional.page_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(owner.page_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(owner.page_lists.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM media_manifest")
+        .fetch_one(&app.pool).await.unwrap();
+    assert_eq!(count, 0);
+    assert_no_regional_ids(&app.pool).await;
+}
+
+#[tokio::test]
+async fn regional_missing_at_ingest_start_falls_back_only_when_not_strict() {
+    for strict in [false, true] {
+        let (_dir, owner, app, _cover_dir, regional) = regional_fixture(strict).await;
+        regional.state.lock().unwrap().chapters.clear();
+        let result = ingest_chapter(&app, 8).await;
+        if strict {
+            assert!(result.is_err());
+            assert_eq!(owner.page_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(result.unwrap(), Some(1));
+            assert_eq!(owner.page_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+        assert_no_regional_ids(&app.pool).await;
+    }
+}
+
+#[tokio::test]
+async fn regional_ingest_publishes_nothing_when_chapter_changes_during_pass() {
+    for change in ["id", "order", "pages"] {
+        let (_dir, owner, app, _cover_dir, regional) = regional_fixture(false).await;
+        {
+            let mut state = regional.state.lock().unwrap();
+            let mut changed = state.chapters.clone();
+            match change {
+                "id" => changed[0].id += 1,
+                "order" => changed[0].order += 1,
+                "pages" => changed[0].pages += 1,
+                _ => unreachable!(),
+            }
+            state.chapters_after_page = Some((2, changed));
+        }
+        let error = ingest_chapter(&app, 8).await.unwrap_err();
+        assert_eq!(error.to_string(), "regional chapter changed during ingest", "{change}");
+        assert_eq!(regional.page_hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(regional.calls("page_list"), 2);
+        assert_eq!(owner.page_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM media_manifest")
+            .fetch_one(&app.pool).await.unwrap();
+        assert_eq!(count, 0, "{change}");
+    }
+}
+
+#[tokio::test]
+async fn regional_ingest_drops_cached_ids_before_starting() {
+    let (_dir, owner, app, _cover_dir, regional) = regional_fixture(false).await;
+    let keys = crate::engine_route::keys_for_chapter(&app.pool, 8).await.unwrap().unwrap();
+    let engine = app.suwayomi.regional.engine("sg").unwrap();
+    engine.chapter(&keys).await.unwrap().unwrap();
+    {
+        let mut state = regional.state.lock().unwrap();
+        let mut manga = state.mangas[0].clone();
+        manga.id += 1;
+        state.mangas[0].url = "/other-manga".into();
+        state.mangas.push(manga.clone());
+        let mut chapter = state.chapters[0].clone();
+        chapter.manga_id = manga.id;
+        chapter.id += 1;
+        state.chapters[0].url = "/other-chapter".into();
+        state.chapters.push(chapter);
+    }
+    assert_eq!(ingest_chapter(&app, 8).await.unwrap(), Some(1));
+    assert_eq!(regional.calls("mangas"), 2);
+    assert_eq!(owner.page_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let copy = store::existing_copy_for_chapter(&app.pool, 8).await.unwrap().unwrap();
+    let manifest = store::latest(&app.pool, &copy).await.unwrap().unwrap();
+    assert_eq!(manifest.body.pages[0].sha256, hex::encode(Sha256::digest(crate::engine_route::tests::fake_page("/chapter", 0))));
 }

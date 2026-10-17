@@ -20,6 +20,7 @@ mod dedup;
 mod discovery;
 mod engine_generation;
 mod engine_keys;
+mod engine_route;
 mod ext_icon;
 mod fallback;
 mod gc;
@@ -1393,6 +1394,27 @@ async fn serve_suwayomi_image_inner(
         }
     }
     let path = format!("/api/v1/manga/{rest}");
+    let parts: Vec<_> = rest.split('/').collect();
+    if let [manga, "chapter", order, "page", page] = parts.as_slice() {
+        if let (Ok(manga_id), Ok(source_order), Ok(index)) =
+            (manga.parse::<i64>(), order.parse::<i32>(), page.parse::<usize>())
+        {
+            match engine_route::route_page(
+                &app.suwayomi,
+                &app.pool,
+                engine_route::PageTarget::Order { manga_id, source_order },
+                index,
+            )
+            .await
+            {
+                engine_route::Routed::Served((bytes, mime)) => return raw_image_response(mime, bytes),
+                engine_route::Routed::Busy | engine_route::Routed::Refuse => {
+                    return page_busy_response();
+                }
+                engine_route::Routed::Owner => {}
+            }
+        }
+    }
     match fetch_suwayomi_page(&app, manga_id, &path).await {
         Ok((bytes, content_type)) => raw_image_response(content_type, bytes),
         Err(response) => response,
@@ -1579,6 +1601,9 @@ async fn fetch_chapter_page(
     chapter_id: i64,
     page: &str,
 ) -> Result<(axum::body::Bytes, String, bool), axum::response::Response> {
+    let page_index = page
+        .parse::<usize>()
+        .map_err(|_| image_failure_response(StatusCode::NOT_FOUND))?;
     let deadline = app.suwayomi.page_locator.deadline();
     for attempt in 0..2 {
         let (manga_id, order, stamp, started) =
@@ -1603,7 +1628,18 @@ async fn fetch_chapter_page(
             return Err(page_busy_response());
         }
         let path = format!("/api/v1/manga/{manga_id}/chapter/{order}/page/{page}");
-        let fetched = fetch_suwayomi_page(app, Some(manga_id), &path).await;
+        let fetched = match engine_route::route_page(
+            &app.suwayomi,
+            &app.pool,
+            engine_route::PageTarget::Chapter(chapter_id),
+            page_index,
+        )
+        .await
+        {
+            engine_route::Routed::Served(page) => Ok(page),
+            engine_route::Routed::Busy | engine_route::Routed::Refuse => Err(page_busy_response()),
+            engine_route::Routed::Owner => fetch_suwayomi_page(app, Some(manga_id), &path).await,
+        };
         // A refresh may have changed the index while the engine was serving it.
         // Drop the payload (and its pool slot) before resolving and fetching once more.
         if !app.suwayomi.page_locator.unchanged(manga_id, stamp) {
@@ -1962,7 +1998,20 @@ async fn serve_suwayomi_cover(
     // ceiling — measured p50 5.6 s / p90 22.0 s / max 29.0 s, with a 502 past the
     // timeout. The browser renders a 20 s progressive JPEG as a half-loaded image, which
     // is what "half broken covers" actually was.
-    let fetched = match app.suwayomi.fetch_cover_now(&path).await {
+    let fetched = match engine_route::route_cover(
+        &app.suwayomi,
+        &app.pool,
+        engine_route::CoverTarget::OwnerManga(manga_id),
+        false,
+    )
+    .await
+    {
+        engine_route::Routed::Served(cover) => Ok(cover),
+        engine_route::Routed::Owner => app.suwayomi.fetch_cover_now(&path).await,
+        engine_route::Routed::Busy => Err(crate::suwayomi::CoverFetchError::Busy),
+        engine_route::Routed::Refuse => return cover_warming_response(),
+    };
+    let fetched = match fetched {
         Ok(v) => v,
         Err(crate::suwayomi::CoverFetchError::Busy) => {
             // Saturated. Return IMMEDIATELY with a non-cacheable placeholder and
@@ -2063,7 +2112,19 @@ fn spawn_suwayomi_cover_materialize(
         let _slot = slot; // held for the task's lifetime: this is the fan-out bound
         let path = format!("/api/v1/manga/{manga_id}/thumbnail");
         let work = cover::master_cover_work().await;
-        let Ok((bytes, _ct)) = suwayomi.fetch_cover_background(&path).await else {
+        let fetched = match engine_route::route_cover(
+            &suwayomi,
+            &main,
+            engine_route::CoverTarget::OwnerManga(manga_id),
+            true,
+        )
+        .await
+        {
+            engine_route::Routed::Served(cover) => Ok(cover),
+            engine_route::Routed::Owner => suwayomi.fetch_cover_background(&path).await,
+            engine_route::Routed::Busy | engine_route::Routed::Refuse => return,
+        };
+        let Ok((bytes, _ct)) = fetched else {
             return;
         };
         if let Ok(Ok(webp)) = work.process(move || cover::process_cover(&bytes)).await {
@@ -3148,6 +3209,40 @@ async fn main() -> anyhow::Result<()> {
     }
     if argv.first().map(String::as_str) == Some("engine") {
         let pool = db::connect_existing(&cfg.database_url).await?;
+        if argv.get(1).map(String::as_str) == Some("provision") {
+            let id = argv.get(2).ok_or_else(|| {
+                anyhow::anyhow!("usage: engine provision <id> [source_id ...]")
+            })?;
+            let specs = engine_route::engines_from_env().map_err(|e| anyhow::anyhow!(e))?;
+            let engines = engine_route::Engines::new(&specs);
+            let engine = engines
+                .engine(id)
+                .ok_or_else(|| anyhow::anyhow!("engine `{id}` is not configured"))?;
+            let mut sources = argv[3..].to_vec();
+            if sources.is_empty() {
+                sources = engine_route::load_routes(&pool)
+                    .await?
+                    .into_iter()
+                    .filter_map(|(source, route)| (route.engine_id == *id).then_some(source))
+                    .collect();
+                sources.sort();
+            }
+            let results = engine_route::provision(engine, &pool, &sources).await?;
+            for result in &results {
+                println!(
+                    "{} {} {:?} {}",
+                    result.source_id,
+                    result.pkg_name.as_deref().unwrap_or("-"),
+                    result.check,
+                    result.note,
+                );
+            }
+            pool.close().await;
+            if results.iter().any(|r| r.check != engine_route::VersionCheck::Match) {
+                return Err(anyhow::anyhow!("some sources could not be provisioned"));
+            }
+            return Ok(());
+        }
         let covers = crate::cover_store::CoverStore::open(
             &pool,
             cfg.covers_dir.clone(),
@@ -3238,7 +3333,15 @@ async fn main() -> anyhow::Result<()> {
         cfg.suwayomi_public_url.clone(),
         cfg.source_id.clone(),
     );
+    let specs = engine_route::engines_from_env().map_err(|e| anyhow::anyhow!(e))?;
+    for spec in &specs {
+        tracing::info!(engine = %spec.id, base_url = %spec.base_url, "regional engine configured");
+    }
+    suwayomi.regional = Arc::new(engine_route::Engines::new(&specs));
     engine_generation::Fence::attach(&pool, &cover_pool, &mut suwayomi).await?;
+    if let Err(error) = suwayomi.regional.reload_routes(&pool).await {
+        tracing::warn!(error = %error, "engine routes: initial load failed");
+    }
     let mangadex = Arc::new(mangadex::MangaDexClient::new(
         &cfg.mangadex_user_agent,
         cfg.mangadex_rate_per_sec,
@@ -3313,6 +3416,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Background adaptive scan scheduler, sharing the same AppState.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    engine_route::spawn_monitor(state.suwayomi.regional.clone(), pool.clone(), shutdown_tx.subscribe());
     scanner::spawn(state.clone(), cfg.scan_tick_seconds, shutdown_rx);
     engine_keys::spawn(
         pool.clone(),

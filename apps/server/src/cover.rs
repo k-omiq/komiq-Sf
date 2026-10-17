@@ -1799,7 +1799,12 @@ pub async fn retry_one_cover(
                 manga_id,
                 file_name,
             } => mangadex.cover_thumb_bytes(&manga_id, &file_name).await,
-            RepairCoverSource::Suwayomi { path } => suwayomi.cover_bytes(Some(&path)).await,
+            RepairCoverSource::Suwayomi { path } => match crate::engine_route::cover_manga_id(&path) {
+                Some(id) => crate::engine_route::cover_bytes(
+                    suwayomi, main, crate::engine_route::CoverTarget::OwnerManga(id), Some(&path),
+                ).await,
+                None => suwayomi.cover_bytes(Some(&path)).await,
+            },
         }
     })
     .await;
@@ -2086,7 +2091,13 @@ pub async fn crawl_uncached_covers(
                 }
             }
             let work = master_cover_work().await;
-            let bytes = match suwayomi.cover_bytes(Some(&thumb)).await {
+            let fetched = match crate::engine_route::cover_manga_id(&thumb) {
+                Some(id) => crate::engine_route::cover_bytes(
+                    suwayomi, main, crate::engine_route::CoverTarget::OwnerManga(id), Some(&thumb),
+                ).await,
+                None => suwayomi.cover_bytes(Some(&thumb)).await,
+            };
+            let bytes = match fetched {
                 Some(b) => b,
                 None => {
                     tracing::warn!(work_id = %work_id, "cover crawl (suwayomi): upstream fetch failed");
@@ -2456,7 +2467,16 @@ pub async fn warm_suwayomi_covers(
             }
             let generation = suwayomi.fence.as_ref().and_then(|f| f.generation());
             let path = format!("/api/v1/manga/{manga_id}/thumbnail");
-            let bytes = match suwayomi.fetch_cover_background(&path).await {
+            let fetch_result = match crate::engine_route::route_cover(
+                suwayomi, main, crate::engine_route::CoverTarget::OwnerManga(manga_id), true,
+            ).await {
+                crate::engine_route::Routed::Served(cover) => Ok(cover),
+                crate::engine_route::Routed::Owner => suwayomi.fetch_cover_background(&path).await,
+                crate::engine_route::Routed::Busy | crate::engine_route::Routed::Refuse => {
+                    Err(anyhow::anyhow!("regional cover unavailable"))
+                }
+            };
+            let bytes = match fetch_result {
                 Ok((b, _ct)) => b,
                 Err(e) => {
                     // The 92-covers-a-tick case: a `data:` thumbnail (400) is permanent,
