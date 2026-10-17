@@ -119,6 +119,7 @@ export const OPTIONAL_SERIES_FIELDS = [
 	// a page has only `sourceUrl`, which is what every reader uses today. The `media` prefix
 	// keeps the names unique across every document, as this stripper matches by name.
 	'mediaPath',
+	'mediaPackPath',
 	'mediaSha256',
 	'mediaLength',
 	'mediaMime',
@@ -548,6 +549,7 @@ export const PAGES = /* GraphQL */ `
 			width
 			height
 			mediaPath
+			mediaPackPath
 			mediaSha256
 			mediaLength
 			mediaMime

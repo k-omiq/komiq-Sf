@@ -1020,6 +1020,7 @@ pub struct Chapter {
 #[derive(SimpleObject, Clone)]
 pub struct Page {
     pub media_path: Option<String>,
+    pub media_pack_path: Option<String>,
     pub media_sha256: Option<String>,
     /// Page sources are capped at 32 MiB, within GraphQL Int.
     pub media_length: Option<i32>,

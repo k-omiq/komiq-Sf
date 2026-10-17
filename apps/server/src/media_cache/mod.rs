@@ -4,6 +4,8 @@
 //! - `GET /media/v1/o/{copy}/{sha}`: an object of the copy's signed manifest. A miss
 //!   fetches the manifest and the object from the owner; both are checked
 //!   (`media_verify`) before they are stored or served, and every hit is checked again.
+//! - `GET /media/v1/p/{copy}/{rev}`: an experimental pack, streamed and checked
+//!   against that exact signed manifest revision, sharing the object disk budget.
 //! - `GET /media/v1/ready`: 204 while the cache may serve (it holds a policy lease, or
 //!   is inside the 6 h grace after one expired), else 503.
 //! - `GET /health`: 200 while the process runs; `GET /health/ready` answers like
@@ -15,6 +17,7 @@
 //! and once the last lease is more than 6 h past its expiry, nothing is served.
 
 pub(crate) mod owner;
+mod pack;
 pub(crate) mod store;
 
 use std::collections::HashMap;
@@ -99,14 +102,14 @@ type InflightMap = Mutex<HashMap<Key, (Arc<tokio::sync::Mutex<()>>, usize)>>;
 /// One key's fetch turn. Dropping it, also when the request is cancelled, ends the turn
 /// and forgets the key once nobody else waits for it, so the map holds only keys in
 /// flight.
-struct Turn<'a> {
-    map: &'a InflightMap,
+struct Turn {
+    map: Arc<InflightMap>,
     key: Key,
     lock: Arc<tokio::sync::Mutex<()>>,
     held: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
-impl Drop for Turn<'_> {
+impl Drop for Turn {
     fn drop(&mut self) {
         self.held.take();
         let mut map = self.map.lock().unwrap();
@@ -124,9 +127,9 @@ pub(crate) struct MediaCache {
     pins: PinnedKeys,
     store: Store,
     gate: RwLock<PolicyGate>,
-    manifests: Mutex<HashMap<String, Arc<Held>>>,
+    manifests: Mutex<HashMap<Key, Arc<Held>>>,
     /// One owner fetch per key at a time; later requests wait and then read the disk.
-    inflight: InflightMap,
+    inflight: Arc<InflightMap>,
     /// When a request last asked the owner for a lease.
     lease_asked: tokio::sync::Mutex<i64>,
     clock: Clock,
@@ -140,7 +143,7 @@ impl MediaCache {
             store,
             gate: RwLock::new(PolicyGate::default()),
             manifests: Mutex::new(HashMap::new()),
-            inflight: Mutex::new(HashMap::new()),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
             lease_asked: tokio::sync::Mutex::new(i64::MIN),
             clock,
         })
@@ -210,11 +213,15 @@ impl MediaCache {
     }
 
     fn remember(&self, copy: &str, held: Arc<Held>) {
+        self.remember_key(Key::Manifest(copy.to_string()), held);
+    }
+
+    fn remember_key(&self, key: Key, held: Arc<Held>) {
         let mut manifests = self.manifests.lock().unwrap();
         if manifests.len() >= MEMORY_MANIFESTS {
             manifests.clear();
         }
-        manifests.insert(copy.to_string(), held);
+        manifests.insert(key, held);
     }
 
     /// The copy's manifest, checked, from memory, then disk, then the owner. When the
@@ -225,7 +232,12 @@ impl MediaCache {
         let fresh = |held: &Held| {
             held.page(sha).is_some() || now.saturating_sub(held.checked_at) < MANIFEST_RECHECK_SECS
         };
-        let memory = self.manifests.lock().unwrap().get(copy).cloned();
+        let memory = self
+            .manifests
+            .lock()
+            .unwrap()
+            .get(&Key::Manifest(copy.to_string()))
+            .cloned();
         if let Some(held) = memory.filter(|held| fresh(held)) {
             return Ok(held);
         }
@@ -239,7 +251,7 @@ impl MediaCache {
         }
         let turn = self.turn(&key).await;
         // A request that held the lock before may have just fetched it.
-        let memory = self.manifests.lock().unwrap().get(copy).cloned();
+        let memory = self.manifests.lock().unwrap().get(&key).cloned();
         let result = match memory.filter(|held| fresh(held)) {
             Some(held) => Ok(held),
             None => self.manifest_from_owner(copy, &key).await.map(|held| {
@@ -262,10 +274,18 @@ impl MediaCache {
             }
         };
         match verify_manifest(&bytes, &self.pins) {
-            Ok(body) if body.copy_id == copy => Some(Held {
-                body: Some(body),
-                checked_at: i64::MIN,
-            }),
+            Ok(body)
+                if body.copy_id == copy
+                    && match key {
+                        Key::Revision(_, revision) => body.revision == i64::from(*revision),
+                        _ => true,
+                    } =>
+            {
+                Some(Held {
+                    body: Some(body),
+                    checked_at: i64::MIN,
+                })
+            }
             // A file that no longer verifies (damaged, or the pins changed) is dropped.
             _ => {
                 self.store.remove(key, generation);
@@ -318,7 +338,7 @@ impl MediaCache {
     }
 
     /// Wait for `key`'s fetch turn: one owner fetch per key at a time.
-    async fn turn(&self, key: &Key) -> Turn<'_> {
+    async fn turn(&self, key: &Key) -> Turn {
         let lock = {
             let mut map = self.inflight.lock().unwrap();
             let (lock, participants) = map.entry(key.clone()).or_default();
@@ -326,7 +346,7 @@ impl MediaCache {
             lock.clone()
         };
         let mut turn = Turn {
-            map: &self.inflight,
+            map: self.inflight.clone(),
             key: key.clone(),
             lock,
             held: None,
@@ -498,6 +518,7 @@ async fn serve_ready(State(cache): State<Arc<MediaCache>>) -> axum::response::Re
 pub(crate) fn router(cache: Arc<MediaCache>) -> Router {
     Router::new()
         .route("/media/v1/o/{copy_id}/{sha256}", get(serve_object))
+        .route("/media/v1/p/{copy_id}/{revision}", get(pack::serve))
         .route("/media/v1/ready", get(serve_ready))
         // Container health checks: the server image asks `/health` (the process is up),
         // the self-host image `/health/ready` (the cache may serve).

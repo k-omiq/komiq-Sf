@@ -323,7 +323,7 @@ pub(crate) async fn page_media(
     pool: &Database,
     copy_id: &str,
     expected_count: usize,
-) -> Result<Option<Vec<(String, i64, String)>>> {
+) -> Result<Option<(i32, Vec<(String, i64, String)>)>> {
     let latest: Option<(i32,i32,bool)> = sqlx::query_as(
         "SELECT revision,page_count,stale FROM media_manifest WHERE copy_id=$1 ORDER BY revision DESC LIMIT 1",
     ).bind(copy_id).fetch_optional(pool).await?;
@@ -340,12 +340,13 @@ pub(crate) async fn page_media(
     if pages.len() != expected_count {
         return Ok(None);
     }
-    Ok(Some(
+    Ok(Some((
+        rev,
         pages
             .into_iter()
             .map(|(sha, len, mime)| (hex::encode(sha), len, mime))
             .collect(),
-    ))
+    )))
 }
 
 pub(crate) async fn prune(pool: &Database) -> Result<()> {

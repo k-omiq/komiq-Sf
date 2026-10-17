@@ -1,4 +1,5 @@
 import type { MediaRoute, Page } from '@komika/types';
+import { PackError, packFits, verifyPackStream, type PackPage } from './pack.js';
 
 /**
  * Typed media routes (M5): where a hosted web reader loads exact media objects
@@ -47,6 +48,8 @@ export interface RoutedPage {
 	media: MediaUrl | null;
 	/** Null or absent loads the URL as a plain `<img>`. */
 	verify?: ExpectedObject | null;
+	/** Optional experimental pack on this exact page's trusted media route. */
+	pack?: PackPage | null;
 }
 
 /** Exact object paths only. Anything else in `mediaPath` is ignored. */
@@ -226,6 +229,32 @@ export class MediaRouter {
 		const expect = expectedObject(page, path);
 		const routeId = expect ? this.current().id : this.owner.id;
 		return { kind: 'media', routeId, path, expect };
+	}
+
+	pagePack(page: Page, media: MediaUrl): PackPage | null {
+		const match = /^\/media\/v1\/p\/([A-Za-z0-9_-]+)\/([1-9][0-9]*)$/.exec(
+			page.mediaPackPath ?? '',
+		);
+		if (
+			!match ||
+			match[0] !== page.mediaPackPath ||
+			!media.expect ||
+			match[1] !== media.path.split('/')[4]
+		)
+			return null;
+		const revision = Number(match[2]);
+		if (
+			!Number.isSafeInteger(revision) ||
+			revision > 2147483647 ||
+			page.mediaMime !== media.expect.mime
+		)
+			return null;
+		return {
+			url: (this.route(media.routeId) ?? this.owner).origin + match[0],
+			copyId: match[1],
+			revision,
+			expect: media.expect,
+		};
 	}
 
 	/** The loadable URL of an exact object. */
@@ -546,6 +575,21 @@ export class VerifiedObjectUrls {
 		return promise;
 	}
 
+	/** Adopt bytes already verified against trusted metadata (for chapter packs). */
+	put(url: string, blob: Blob): string {
+		const existing = this.objects.get(url);
+		if (existing !== undefined) return existing;
+		const created = this.createUrl(blob);
+		this.objects.set(url, created);
+		while (this.objects.size > this.opts.cap) {
+			const oldest = this.objects.keys().next().value!;
+			this.revokeUrl(this.objects.get(oldest)!);
+			this.objects.delete(oldest);
+			this.opts.onEvict?.(oldest);
+		}
+		return created;
+	}
+
 	/** Release objects and fetches outside the reader's current window. */
 	keep(urls: Iterable<string>): void {
 		const kept = new Set(urls);
@@ -568,6 +612,119 @@ export class VerifiedObjectUrls {
 
 	get size(): number {
 		return this.objects.size;
+	}
+}
+
+/**
+ * One optional, byte-bounded chapter prefetch. Singles continue independently.
+ *
+ * A pack failure (network error, non-200, missing CORS, a bad index or range, or the
+ * idle timeout) is never a page load failure: it does not touch routing, mark a route
+ * down or enter PK1 recovery. Pages already published stay; `onFailure` only reports
+ * the pages the pack did not deliver, which keep loading as normal single objects with
+ * their own PK1 verification and owner fallback. The timeout is an idle timeout: it
+ * restarts on every received chunk, so a slow but moving body is never cut.
+ */
+export class ChapterPackPrefetch {
+	private readonly controller = new AbortController();
+	private readonly verified = new Set<number>();
+	private readonly objects: VerifiedObjectUrls;
+	private released = false;
+	private started = false;
+
+	constructor(
+		private readonly opts: {
+			enabled?: boolean;
+			pages: readonly RoutedPage[];
+			onPage: (index: number, blobUrl: string) => void;
+			/** Diagnostics only: the pages this pack did not deliver. Not a load failure. */
+			onFailure: (indices: number[]) => void;
+			fetch?: typeof fetch;
+			subtle?: SubtleCrypto;
+			createUrl?: (blob: Blob) => string;
+			revokeUrl?: (url: string) => void;
+			/** Idle timeout: aborts when no response or chunk arrives for this long. */
+			timeoutMs?: number;
+		},
+	) {
+		this.objects = new VerifiedObjectUrls({
+			cap: opts.pages.length,
+			createUrl: opts.createUrl,
+			revokeUrl: opts.revokeUrl,
+		});
+	}
+
+	async start(): Promise<void> {
+		if (this.started || this.released || this.opts.enabled !== true) return;
+		this.started = true;
+		const pages = this.opts.pages;
+		const first = pages[0]?.pack;
+		if (
+			!first ||
+			!pages.every(
+				(p) =>
+					p.pack?.url === first.url &&
+					p.pack.copyId === first.copyId &&
+					p.pack.revision === first.revision,
+			)
+		)
+			return;
+		const expected = pages.map((p) => p.pack!.expect);
+		if (!packFits(expected)) return;
+		const idle = this.opts.timeoutMs ?? VERIFY_TIMEOUT_MS;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const arm = () => {
+			clearTimeout(timer);
+			timer = setTimeout(() => this.controller.abort(new MediaCheckError('timeout')), idle);
+		};
+		arm();
+		try {
+			const res = await (this.opts.fetch ?? fetch)(first.url, {
+				method: 'GET',
+				mode: 'cors',
+				credentials: 'omit',
+				redirect: 'error',
+				priority: 'low',
+				referrerPolicy: 'no-referrer',
+				signal: this.controller.signal,
+			});
+			if (res.status !== 200 || !res.body) {
+				void res.body?.cancel().catch(() => {});
+				throw new PackError('status');
+			}
+			arm();
+			await verifyPackStream(
+				res.body,
+				{
+					copyId: first.copyId,
+					revision: first.revision,
+					pages: expected,
+				},
+				{
+					signal: this.controller.signal,
+					subtle: this.opts.subtle,
+					onProgress: arm,
+					onPage: (i, blob) => {
+						if (this.released) return;
+						const url = this.objects.put(pages[i].url, blob);
+						this.verified.add(i);
+						this.opts.onPage(i, url);
+					},
+				},
+			);
+		} catch {
+			if (!this.released)
+				this.opts.onFailure(pages.map((_, i) => i).filter((i) => !this.verified.has(i)));
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	/** Chapter/layout/window left: abort pending reads and revoke all adopted blobs. */
+	clear(): void {
+		this.released = true;
+		this.controller.abort();
+		this.objects.clear();
 	}
 }
 

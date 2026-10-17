@@ -25,18 +25,23 @@ fn image(value: u8) -> Vec<u8> {
     out.into_inner()
 }
 
-/// Page 0 of every chapter is the same credits page; page 1 is the chapter's own.
-fn page_bytes(order: i64, page: usize) -> Vec<u8> {
-    if page == 0 {
+/// Page 0 is shared credits; chapter 10 (order 2) repeats it as page 1, too.
+pub(crate) fn page_bytes(order: i64, page: usize) -> Vec<u8> {
+    if page == 0 || order == 2 {
         image(200)
     } else {
         image(order as u8 + 1)
     }
 }
 
-/// A mock engine with manga 7 and two chapters: 8 at index 0, 9 at index 1.
-struct Engine {
+/// A mock engine with manga 7 and chapters 8, 9 and 10 at indices 0, 1 and 2.
+pub(crate) struct Engine {
     url: String,
+    pub(crate) requests: Arc<Mutex<Vec<(i64, usize)>>>,
+    pub(crate) requested: Arc<tokio::sync::Notify>,
+    pub(crate) wrong_second: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) delays: Arc<Mutex<[Duration; 2]>>,
+    pub(crate) gates: Arc<Mutex<[Option<Arc<tokio::sync::Semaphore>>; 2]>>,
     server: tokio::task::JoinHandle<()>,
 }
 impl Drop for Engine {
@@ -45,7 +50,12 @@ impl Drop for Engine {
     }
 }
 impl Engine {
-    async fn spawn() -> Self {
+    pub(crate) async fn spawn() -> Self {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requested = Arc::new(tokio::sync::Notify::new());
+        let wrong_second = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delays = Arc::new(Mutex::new([Duration::ZERO; 2]));
+        let gates: Arc<Mutex<[Option<Arc<tokio::sync::Semaphore>>; 2]>> = Default::default();
         let routes = Router::new()
             .route(
                 "/api/graphql",
@@ -68,15 +78,40 @@ impl Engine {
             )
             .route(
                 "/api/v1/manga/{m}/chapter/{c}/page/{p}",
-                get(
-                    |UrlPath((m, c, p)): UrlPath<(i64, i64, usize)>| async move {
-                        assert_eq!(m, 7);
-                        if p > 1 {
-                            return StatusCode::NOT_FOUND.into_response();
+                get({
+                    let requests = requests.clone();
+                    let requested = requested.clone();
+                    let wrong_second = wrong_second.clone();
+                    let delays = delays.clone();
+                    let gates = gates.clone();
+                    move |UrlPath((m, c, p)): UrlPath<(i64, i64, usize)>| {
+                        let requests = requests.clone();
+                        let requested = requested.clone();
+                        let wrong_second = wrong_second.clone();
+                        let delays = delays.clone();
+                        let gates = gates.clone();
+                        async move {
+                            assert_eq!(m, 7);
+                            if p > 1 {
+                                return StatusCode::NOT_FOUND.into_response();
+                            }
+                            requests.lock().unwrap().push((c, p));
+                            requested.notify_one();
+                            let gate = gates.lock().unwrap()[p].clone();
+                            if let Some(gate) = gate {
+                                gate.acquire().await.unwrap().forget();
+                            }
+                            let delay = delays.lock().unwrap()[p];
+                            tokio::time::sleep(delay).await;
+                            let bytes = if p == 1 && wrong_second.load(std::sync::atomic::Ordering::SeqCst) {
+                                image(99)
+                            } else {
+                                page_bytes(c, p)
+                            };
+                            ([(header::CONTENT_TYPE, "image/png")], bytes).into_response()
                         }
-                        ([(header::CONTENT_TYPE, "image/png")], page_bytes(c, p)).into_response()
-                    },
-                ),
+                    }
+                }),
             );
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -85,11 +120,19 @@ impl Engine {
         let server = tokio::spawn(async move {
             axum::serve(listener, routes).await.unwrap();
         });
-        Self { url, server }
+        Self {
+            url,
+            server,
+            requests,
+            requested,
+            wrong_second,
+            delays,
+            gates,
+        }
     }
 }
 
-fn identity(chapter: i64) -> CopyIdentity {
+pub(crate) fn identity(chapter: i64) -> CopyIdentity {
     CopyIdentity {
         source_id: "source".into(),
         manga_key: "/manga".into(),
@@ -97,7 +140,7 @@ fn identity(chapter: i64) -> CopyIdentity {
     }
 }
 
-fn collected(bytes: &[u8]) -> CollectedPage {
+pub(crate) fn collected(bytes: &[u8]) -> CollectedPage {
     CollectedPage {
         sha256: Sha256::digest(bytes).to_vec(),
         length: bytes.len() as i64,
@@ -107,7 +150,7 @@ fn collected(bytes: &[u8]) -> CollectedPage {
     }
 }
 
-async fn app(
+pub(crate) async fn app(
     pool: db::Database,
     engine: &Engine,
     key: &std::path::Path,
@@ -143,7 +186,7 @@ async fn app(
     })
 }
 
-async fn pool() -> db::Database {
+pub(crate) async fn pool() -> db::Database {
     db::Database::connect("sqlite::memory:")
         .await
         .unwrap()
@@ -152,7 +195,7 @@ async fn pool() -> db::Database {
 
 /// Engine keys for manga 7 (work-less) and its chapters 8 and 9, and one published
 /// revision per chapter: the shared credits page, then the chapter's own page.
-async fn two_copies(pool: &db::Database) -> (String, String) {
+pub(crate) async fn two_copies(pool: &db::Database) -> (String, String) {
     let generation = engine_keys::adopt(pool).await.unwrap();
     sqlx::query("INSERT INTO engine_manga_key(generation,manga_id,source_id,manga_key,updated_at) VALUES($1,7,'source','/manga',now())")
         .bind(generation).execute(pool).await.unwrap();
@@ -177,16 +220,27 @@ async fn two_copies(pool: &db::Database) -> (String, String) {
     (copies[0].clone(), copies[1].clone())
 }
 
-fn router(app: Arc<AppState>) -> Router {
+pub(crate) fn router(app: Arc<AppState>) -> Router {
     Router::new()
         .route("/media/v1/o/{copy_id}/{sha256}", get(serve_media_object))
+        .route(
+            "/media/v1/p/{copy_id}/{rev}",
+            get(media_pack::serve_media_pack)
+                .layer(axum::middleware::from_fn_with_state(
+                    Duration::from_secs(60),
+                    request_budget::limit_image_time,
+                ))
+                .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                    telemetry::MediaRoute::Pack,
+                )),
+        )
         .route("/media/v1/manifest/{copy_id}", get(serve_media_manifest))
         .route("/media/v1/policy", get(serve_media_policy))
         .route("/media/v1/c/{chapterId}/{page}", get(serve_chapter_page))
         .with_state(app)
 }
 
-async fn get_path(app: &Arc<AppState>, path: &str) -> axum::response::Response {
+pub(crate) async fn get_path(app: &Arc<AppState>, path: &str) -> axum::response::Response {
     tokio::time::timeout(
         Duration::from_secs(5),
         router(app.clone()).oneshot(
@@ -201,21 +255,21 @@ async fn get_path(app: &Arc<AppState>, path: &str) -> axum::response::Response {
     .unwrap()
 }
 
-async fn body(response: axum::response::Response) -> Vec<u8> {
+pub(crate) async fn body(response: axum::response::Response) -> Vec<u8> {
     axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .unwrap()
         .to_vec()
 }
 
-fn cache_control(response: &axum::response::Response) -> String {
+pub(crate) fn cache_control(response: &axum::response::Response) -> String {
     response.headers()[header::CACHE_CONTROL]
         .to_str()
         .unwrap()
         .to_string()
 }
 
-fn pins(app: &AppState) -> PinnedKeys {
+pub(crate) fn pins(app: &AppState) -> PinnedKeys {
     let entry = app.media_manifests.as_ref().unwrap().signer.public_entry();
     PinnedKeys::new([(entry.kid, entry.public_key)]).unwrap()
 }
@@ -233,7 +287,7 @@ async fn epoch(pool: &db::Database) -> i64 {
     media_policy::epoch(pool).await.unwrap()
 }
 
-async fn take_down(app: &AppState, kind: Kind, subject: &str) -> (String, bool) {
+pub(crate) async fn take_down(app: &AppState, kind: Kind, subject: &str) -> (String, bool) {
     let outcome = media_policy::take_down(
         &app.pool,
         &app.cover_pool,

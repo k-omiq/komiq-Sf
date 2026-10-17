@@ -70,6 +70,7 @@ A manifest payload holds `v`, `copy_id`, `copy` (source id, manga key, chapter k
 | Route | Answers | Cache-Control |
 | --- | --- | --- |
 | `/media/v1/o/{copyId}/{sha256}` | the page bytes, after hash and policy checks. Every answer, errors too, has `Access-Control-Allow-Origin: *` | `public, max-age=31536000, immutable, s-maxage=<remaining lease seconds>` (at most 600) |
+| `/media/v1/p/{copyId}/{rev}` | an experimental chapter pack, read [Media packs](/developers/media-packs) | as for objects |
 | `/media/v1/manifest/{copyId}[?rev=n]` | the signed manifest | `public, max-age=60` |
 | `/media/v1/keys` | the signed key set | `public, max-age=60` |
 | `/media/v1/policy` | the signed policy lease | `public, max-age=60` |

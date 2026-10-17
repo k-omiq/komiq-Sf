@@ -649,6 +649,7 @@ type Page {
 	# Exact object (/media/v1/o/{copyId}/{sha256}), its hash, length and MIME: set only when
 	# the server keeps a signed manifest for this chapter (M5). Optional on old servers.
 	mediaPath: String
+	mediaPackPath: String
 	mediaSha256: String
 	mediaLength: Int
 	mediaMime: String

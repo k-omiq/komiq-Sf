@@ -58,6 +58,8 @@ export interface ReaderPrefs {
 	gaps: boolean;
 	/** The reader's menu stays docked open (wide screens). */
 	pinned: boolean;
+	/** Developer experiment, enabled only by setting komiq-reader.packs to true. */
+	packs: boolean;
 }
 
 export const DEFAULT_READER_PREFS: ReaderPrefs = {
@@ -69,6 +71,7 @@ export const DEFAULT_READER_PREFS: ReaderPrefs = {
 	width: 720,
 	gaps: false,
 	pinned: false,
+	packs: false,
 };
 
 const KEY = 'komiq-reader';
@@ -91,6 +94,7 @@ export function loadReaderPrefs(): ReaderPrefs {
 			width: typeof saved.width === 'number' ? saved.width : d.width,
 			gaps: saved.gaps === true,
 			pinned: saved.pinned === true,
+			packs: saved.packs === true,
 		};
 	} catch {
 		return { ...d };

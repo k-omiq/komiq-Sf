@@ -40,7 +40,12 @@
 		type Opt,
 	} from '$lib/reader-prefs';
 	import CommentThread from '$lib/components/CommentThread.svelte';
-	import { ChapterMediaRecovery, VerifiedObjectUrls, type RoutedPage } from '@komika/api';
+	import {
+		ChapterMediaRecovery,
+		ChapterPackPrefetch,
+		VerifiedObjectUrls,
+		type RoutedPage,
+	} from '@komika/api';
 	import { currentMediaRouter, freshRoutedPages } from '$lib/media';
 
 	let { data: loadedData } = $props();
@@ -165,6 +170,7 @@
 	let width = $state(720);
 	let gaps = $state(false);
 	let pinned = $state(false);
+	let packs = $state(false);
 
 	function optOf<T>(list: Opt<T>[], v: T): Opt<T> {
 		return list.find((o) => o.value === v) ?? list[0];
@@ -184,6 +190,7 @@
 			width,
 			gaps,
 			pinned,
+			packs,
 		});
 	}
 
@@ -573,6 +580,7 @@
 			width = saved.width;
 			gaps = saved.gaps;
 			pinned = saved.pinned;
+			packs = saved.packs;
 		}
 		// Coalesce scroll work into one rAF per frame — reading layout + writing
 		// reactive state on every scroll event is a jank source on fast scrolls.
@@ -702,10 +710,11 @@
 					}
 					return;
 				}
-				relaidPages = fresh.map(({ url, media, verify }, index) => ({
+				relaidPages = fresh.map(({ url, media, verify, pack }, index) => ({
 					url,
 					media,
 					verify: verify ?? null,
+					pack: pack ?? null,
 					index,
 					ratio: '800 / 1200',
 					label: String(index + 1).padStart(2, '0'),
@@ -773,6 +782,56 @@
 		pageError = next;
 	}
 
+	// Pack prefetch never gates singles, including the first visible page. The byte cap
+	// is checked before fetch; all live pack URLs belong to this chapter/layout only.
+	// A pack failure is not a page failure: it never touches routing or PK1 recovery.
+	// Pages it did not deliver keep loading as normal singles, which have their own
+	// verification and owner fallback.
+	let packSrc = $state<Record<number, { url: string; blob: string }>>({});
+	$effect(() => {
+		const enabled = packs;
+		const layout = pages;
+		const chapter = loadedChapterId;
+		const prefetch = new ChapterPackPrefetch({
+			enabled,
+			pages: layout.map((p) => ({ ...p, media: p.media ?? null })),
+			onPage: (i, blob) => {
+				if (pages !== layout || loadedChapterId !== chapter || routeOf(i)?.url !== layout[i].url)
+					return;
+				packSrc = { ...packSrc, [i]: { url: layout[i].url, blob } };
+				// Paged modes mount only the visible pages; learn the others' ratios as the
+				// single verify path does, so double-page mode sees spreads.
+				if (mode !== 'strip' && pageRatio[i] === undefined) {
+					const url = layout[i].url;
+					const probe = new Image();
+					probe.decoding = 'async';
+					probe.onload = () => {
+						// Another chapter or layout may have replaced this page meanwhile.
+						if (routeOf(i)?.url === url) learnRatio(i, probe.naturalWidth, probe.naturalHeight);
+					};
+					probe.src = blob;
+				}
+			},
+			onFailure: (indices) => {
+				if (pages !== layout || loadedChapterId !== chapter) return;
+				console.debug(`chapter pack incomplete; ${indices.length} page(s) load as singles`);
+			},
+		});
+		untrack(() => {
+			packSrc = {};
+			void prefetch.start();
+		});
+		const release = () => {
+			prefetch.clear();
+			packSrc = {};
+		};
+		window.addEventListener('pagehide', release);
+		return () => {
+			window.removeEventListener('pagehide', release);
+			release();
+		};
+	});
+
 	// ---- paged mode prefetch -----------------------------------------------
 	// Paged modes render only the visible page(s). Warm the next few into the HTTP
 	// cache with detached Image() objects so page turns feel instant, and learn their
@@ -832,6 +891,8 @@
 	function pageSrc(index: number): string | null {
 		const route = routeOf(index);
 		if (!route?.url) return null;
+		const packed = packSrc[index];
+		if (packed?.url === route.url) return packed.blob;
 		if (!route.verify) return route.url;
 		const v = verifiedSrc[index];
 		return v?.url === route.url ? v.blob : null;
@@ -843,7 +904,8 @@
 		const want = new Map<number, RoutedPage>();
 		for (let i = from; i < to; i++) {
 			const route = routeOf(i);
-			if (route?.verify && route.url && !pageError[i]) want.set(i, route);
+			if (route?.verify && route.url && !pageError[i] && packSrc[i]?.url !== route.url)
+				want.set(i, route);
 		}
 		untrack(() => {
 			verified.keep([...want.values()].map((r) => r.url));
@@ -868,6 +930,7 @@
 				};
 				verified.get(route.url, route.verify!).then(
 					(blob) => {
+						if (verifiedPending.get(key) !== attempt) return;
 						settle();
 						if (routeOf(i)?.url !== route.url) return;
 						verifiedSrc = { ...verifiedSrc, [i]: { url: route.url, blob } };

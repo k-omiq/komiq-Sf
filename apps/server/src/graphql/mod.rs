@@ -6695,6 +6695,7 @@ impl QueryRoot {
             .enumerate()
             .map(|(index, source_url)| Page {
                 media_path: None,
+                media_pack_path: None,
                 media_sha256: None,
                 media_length: None,
                 media_mime: None,
@@ -7795,9 +7796,9 @@ impl QueryRoot {
                     match crate::media_manifest::store::page_media(&st.pool, &copy, urls.len())
                         .await
                     {
-                        Ok(Some(pages)) => {
+                        Ok(Some((revision, pages))) => {
                             media.queue.queue(n);
-                            Some((copy, pages))
+                            Some((copy, revision, pages))
                         }
                         Ok(None) => {
                             media.queue.requeue(n);
@@ -7831,12 +7832,15 @@ impl QueryRoot {
             .map(|(index, source_url)| Page {
                 media_path: media
                     .as_ref()
-                    .map(|(copy, pages)| format!("/media/v1/o/{copy}/{}", pages[index].0)),
-                media_sha256: media.as_ref().map(|(_, pages)| pages[index].0.clone()),
+                    .map(|(copy, _, pages)| format!("/media/v1/o/{copy}/{}", pages[index].0)),
+                media_pack_path: media
+                    .as_ref()
+                    .map(|(copy, revision, _)| format!("/media/v1/p/{copy}/{revision}")),
+                media_sha256: media.as_ref().map(|(_, _, pages)| pages[index].0.clone()),
                 media_length: media
                     .as_ref()
-                    .and_then(|(_, pages)| i32::try_from(pages[index].1).ok()),
-                media_mime: media.as_ref().map(|(_, pages)| pages[index].2.clone()),
+                    .and_then(|(_, _, pages)| i32::try_from(pages[index].1).ok()),
+                media_mime: media.as_ref().map(|(_, _, pages)| pages[index].2.clone()),
                 index: index as i32,
                 source_url: st
                     .suwayomi
@@ -35887,5 +35891,84 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(indexed, 1, "failed edit changed the search projection");
+    }
+}
+
+#[cfg(test)]
+mod page_pack_tests {
+    use super::*;
+    use crate::media_manifest::store;
+    use crate::media_policy_tests::{
+        app, collected, identity, page_bytes, pool, two_copies, Engine,
+    };
+    use axum::{body::Body, http::Request, routing::get, Router};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn pages_pack_path_uses_the_objects_copy_and_manifest_revision() {
+        let dir = crate::media_manifest_tests::TempDir::new();
+        let cover_dir = crate::cover_store::test_support::TestDir::new();
+        let engine = Engine::spawn().await;
+        let app = app(
+            pool().await,
+            &engine,
+            &dir.0.join("signing.key"),
+            &cover_dir,
+        )
+        .await;
+        let (copy, _) = two_copies(&app.pool).await;
+        for revision in [1, 2] {
+            if revision == 2 {
+                store::mark_stale(&app.pool, &copy, 1).await.unwrap();
+                let generation = app.suwayomi.read_generation().0;
+                let (_, published) = store::publish(
+                    &app.pool,
+                    generation,
+                    &identity(8),
+                    &[collected(&page_bytes(0, 0)), collected(&page_bytes(0, 1))],
+                )
+                .await
+                .unwrap();
+                assert_eq!(published, Some(2));
+            }
+            let answer = build_schema(app.clone(), false).execute(
+                "{ pages(chapterId: \"8\") { mediaPath mediaPackPath mediaSha256 mediaLength mediaMime } }"
+            ).await;
+            assert!(answer.errors.is_empty(), "{:?}", answer.errors);
+            let answer = answer.data.into_json().unwrap();
+            let path = format!("/media/v1/p/{copy}/{revision}");
+            let manifest = store::revision(&app.pool, &copy, revision)
+                .await
+                .unwrap()
+                .unwrap()
+                .body;
+            for (i, page) in answer["pages"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(page["mediaPackPath"], path);
+                assert_eq!(
+                    page["mediaPath"],
+                    format!("/media/v1/o/{copy}/{}", manifest.pages[i].sha256)
+                );
+                assert_eq!(page["mediaSha256"], manifest.pages[i].sha256);
+                assert_eq!(page["mediaLength"], manifest.pages[i].length);
+                assert_eq!(page["mediaMime"], manifest.pages[i].mime);
+            }
+            let response = Router::new()
+                .route(
+                    "/media/v1/p/{copy}/{rev}",
+                    get(crate::media_pack::serve_media_pack),
+                )
+                .with_state(app.clone())
+                .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                crate::media_pack::verify_pack(&bytes, &manifest).unwrap(),
+                [page_bytes(0, 0), page_bytes(0, 1)]
+            );
+        }
     }
 }

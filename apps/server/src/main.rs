@@ -41,9 +41,14 @@ mod media;
 mod media_cache;
 #[cfg(test)]
 mod media_cache_tests;
+#[cfg(test)]
+mod media_cache_pack_tests;
 mod media_manifest;
 #[cfg(test)]
 mod media_manifest_tests;
+mod media_pack;
+#[cfg(test)]
+mod media_pack_tests;
 mod media_policy;
 #[cfg(test)]
 mod media_policy_tests;
@@ -114,6 +119,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 // gzipped, and the cloudflared tunnel bills every byte — see PERFORMANCE_ROADMAP.md.
 // The default predicate skips image/* (covers, avatars) and already-encoded bodies,
 // so the binary routes are untouched.
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -1709,7 +1715,9 @@ async fn media_object_cors(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let object_path = request.uri().path().starts_with("/media/v1/o/");
+    // Chapter packs (`/media/v1/p/`) are fetched the same way and verified per object.
+    let path = request.uri().path();
+    let object_path = path.starts_with("/media/v1/o/") || path.starts_with("/media/v1/p/");
     let mut response = next.run(request).await;
     if object_path {
         let headers = response.headers_mut();
@@ -1720,6 +1728,19 @@ async fn media_object_cors(
         headers.remove(header::ACCESS_CONTROL_ALLOW_CREDENTIALS);
     }
     response
+}
+
+/// The owner's response compression. The default predicate leaves image/* and
+/// already-encoded responses alone; chapter packs are excluded as well, because they
+/// hold already-compressed images and the reader and caches rely on their exact
+/// `Content-Length`.
+type Compression =
+    CompressionLayer<tower_http::compression::predicate::And<DefaultPredicate, NotForContentType>>;
+
+fn compression_layer() -> Compression {
+    CompressionLayer::new().compress_when(
+        DefaultPredicate::new().and(NotForContentType::const_new(media_pack::PACK_CONTENT_TYPE)),
+    )
 }
 
 async fn serve_media_object(
@@ -2957,6 +2978,17 @@ fn public_router(
                 )),
         )
         .route(
+            "/media/v1/p/{copy_id}/{rev}",
+            get(media_pack::serve_media_pack)
+                .layer(axum::middleware::from_fn_with_state(
+                    std::time::Duration::from_secs(60),
+                    request_budget::limit_image_time,
+                ))
+                .layer::<_, std::convert::Infallible>(telemetry::MediaLayer(
+                    telemetry::MediaRoute::Pack,
+                )),
+        )
+        .route(
             "/media/v1/manifest/{copy_id}",
             get(serve_media_manifest)
                 .layer(axum::middleware::from_fn_with_state(
@@ -3052,8 +3084,8 @@ fn public_router(
         // Compress compressible responses (JSON payloads — the home feed alone drops
         // 64 KB → ~22 KB). Innermost of the middleware so the request-id/trace span
         // and every outer layer observe the final (encoded) body. The default
-        // predicate leaves image/* and already-encoded responses alone.
-        .layer(CompressionLayer::new())
+        // predicate leaves image/* and already-encoded responses alone; packs too.
+        .layer(compression_layer())
         // Self-host "public without a domain" with HTTPS: plain HTTP from the internet
         // is sent to the HTTPS address instead of being handled. A no-op otherwise.
         .layer(axum::middleware::from_fn_with_state(
@@ -5996,22 +6028,24 @@ mod tests {
                 "https://reader.example",
             )]))
             .allow_credentials(true);
+        // Objects and chapter packs share the same public, credential-free CORS.
+        let media = || {
+            get(|UrlPath((a, _)): UrlPath<(String, String)>| async move {
+                match a.as_str() {
+                    "found" => StatusCode::OK.into_response(),
+                    "busy" => page_busy_response(),
+                    "timeout" => std::future::pending::<axum::response::Response>().await,
+                    _ => image_failure_response(StatusCode::NOT_FOUND),
+                }
+            })
+            .layer(axum::middleware::from_fn_with_state(
+                std::time::Duration::from_secs(1),
+                request_budget::limit_image_time,
+            ))
+        };
         Router::new()
-            .route(
-                "/media/v1/o/{a}/{b}",
-                get(|UrlPath((a, _)): UrlPath<(String, String)>| async move {
-                    match a.as_str() {
-                        "found" => StatusCode::OK.into_response(),
-                        "busy" => page_busy_response(),
-                        "timeout" => std::future::pending::<axum::response::Response>().await,
-                        _ => image_failure_response(StatusCode::NOT_FOUND),
-                    }
-                })
-                .layer(axum::middleware::from_fn_with_state(
-                    std::time::Duration::from_secs(1),
-                    request_budget::limit_image_time,
-                )),
-            )
+            .route("/media/v1/o/{a}/{b}", media())
+            .route("/media/v1/p/{a}/{b}", media())
             .route("/graphql", get(|| async { StatusCode::OK }))
             .layer(cors)
             .layer(axum::middleware::from_fn(media_object_cors))
@@ -6022,13 +6056,17 @@ mod tests {
         use axum::{body::Body, http::Request};
         use tower::ServiceExt;
         let app = media_object_cors_test_router();
-        for (path, status) in [
-            ("/media/v1/o/found/hash", StatusCode::OK),
-            ("/media/v1/o/missing/hash", StatusCode::NOT_FOUND),
-            ("/media/v1/o/busy/hash", StatusCode::SERVICE_UNAVAILABLE),
-            ("/media/v1/o/%FF/hash", StatusCode::BAD_REQUEST),
-            ("/media/v1/o/timeout/hash", StatusCode::SERVICE_UNAVAILABLE),
-        ] {
+        for (path, status) in ["o", "p"].into_iter().flat_map(|kind| {
+            [
+                ("found/hash", StatusCode::OK),
+                ("missing/hash", StatusCode::NOT_FOUND),
+                ("busy/hash", StatusCode::SERVICE_UNAVAILABLE),
+                ("%FF/hash", StatusCode::BAD_REQUEST),
+                ("timeout/hash", StatusCode::SERVICE_UNAVAILABLE),
+            ]
+            .map(|(rest, status)| (format!("/media/v1/{kind}/{rest}"), status))
+        }) {
+            let path = path.as_str();
             for origin in [
                 Some("https://reader.example"),
                 Some("https://other.example"),

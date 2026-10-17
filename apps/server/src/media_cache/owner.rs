@@ -1,7 +1,7 @@
 //! The cache's view of its owner: an HTTP client for the owner's public media routes
 //! and the signing keys pinned from it.
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -11,9 +11,58 @@ use crate::media_verify::{verify_key_set, Envelope, KeySetBody, PinnedKeys, Publ
 /// Signed JSON (key sets, manifests, leases) is small; a larger answer is refused.
 const MAX_SIGNED_BYTES: u64 = 8 << 20;
 
+/// Small owner answers (signed JSON, single objects) must finish within this.
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Streamed downloads (packs) have no total deadline, since a large pack on a slow link
+/// may take longer; instead each read of the connection must make progress within this.
+const STREAM_READ_IDLE: Duration = Duration::from_secs(30);
+
 pub(crate) struct Owner {
     origin: String,
+    /// For bounded requests: a total deadline covering the body as well.
     http: reqwest::Client,
+    /// For `stream`: no total deadline, only a per-read idle deadline.
+    stream_http: reqwest::Client,
+    #[cfg(test)]
+    router: Option<axum::Router>,
+}
+
+enum Source {
+    Http(reqwest::Response),
+    #[cfg(test)]
+    Router(axum::body::BodyDataStream),
+}
+
+/// Pulling this stream drives the HTTP download; dropping it cancels the request.
+pub(crate) struct Download {
+    source: Source,
+    remaining: u64,
+    pub(crate) mime: String,
+    pub(crate) fetched: u64,
+}
+
+impl Download {
+    pub(crate) async fn chunk(&mut self) -> Result<Option<axum::body::Bytes>, FetchError> {
+        let chunk = match &mut self.source {
+            Source::Http(response) => response.chunk().await.map_err(FetchError::Network)?,
+            #[cfg(test)]
+            Source::Router(body) => {
+                use futures::StreamExt;
+                body.next()
+                    .await
+                    .transpose()
+                    .map_err(|_| FetchError::Body)?
+            }
+        };
+        if let Some(bytes) = &chunk {
+            self.fetched = self.fetched.saturating_add(bytes.len() as u64);
+            if bytes.len() as u64 > self.remaining {
+                return Err(FetchError::TooLarge);
+            }
+            self.remaining -= bytes.len() as u64;
+        }
+        Ok(chunk)
+    }
 }
 
 /// A failed owner request: unreachable, a non-200 answer, or too many bytes.
@@ -22,6 +71,8 @@ pub(crate) enum FetchError {
     Status(reqwest::StatusCode),
     TooLarge,
     Network(reqwest::Error),
+    #[cfg(test)]
+    Body,
 }
 
 impl std::fmt::Display for FetchError {
@@ -30,6 +81,8 @@ impl std::fmt::Display for FetchError {
             Self::Status(status) => write!(f, "owner answered {status}"),
             Self::TooLarge => write!(f, "owner answer too large"),
             Self::Network(error) => write!(f, "owner unreachable: {error}"),
+            #[cfg(test)]
+            Self::Body => write!(f, "owner body failed"),
         }
     }
 }
@@ -53,14 +106,29 @@ pub(crate) fn parse_origin(raw: &str) -> Result<String> {
 
 impl Owner {
     pub(crate) fn new(origin: String) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("komika-media-cache/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(60))
-            // A redirect could send the cache to a host it was not told to trust.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        Ok(Self { origin, http })
+        let builder = || {
+            reqwest::Client::builder()
+                .user_agent(concat!("komika-media-cache/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(10))
+                // A redirect could send the cache to a host it was not told to trust.
+                .redirect(reqwest::redirect::Policy::none())
+        };
+        let http = builder().timeout(TOTAL_TIMEOUT).build()?;
+        let stream_http = builder().read_timeout(STREAM_READ_IDLE).build()?;
+        Ok(Self {
+            origin,
+            http,
+            stream_http,
+            #[cfg(test)]
+            router: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_router(router: axum::Router) -> Self {
+        let mut owner = Self::new("http://localhost".into()).unwrap();
+        owner.router = Some(router);
+        owner
     }
 
     pub(crate) fn origin(&self) -> &str {
@@ -70,8 +138,64 @@ impl Owner {
     /// GET a path on the owner. Returns the body (at most `max` bytes) and its
     /// `Content-Type`.
     pub(crate) async fn get(&self, path: &str, max: u64) -> Result<(Vec<u8>, String), FetchError> {
-        let mut response = self
-            .http
+        let mut download = self.download(&self.http, path, max).await?;
+        let mut body = Vec::new();
+        while let Some(chunk) = download.chunk().await? {
+            body.extend_from_slice(&chunk);
+        }
+        Ok((body, download.mime))
+    }
+
+    /// GET a long body as a stream (packs): no total deadline, but a read that makes no
+    /// progress for `STREAM_READ_IDLE` fails the download.
+    pub(crate) async fn stream(&self, path: &str, max: u64) -> Result<Download, FetchError> {
+        self.download(&self.stream_http, path, max).await
+    }
+
+    async fn download(
+        &self,
+        http: &reqwest::Client,
+        path: &str,
+        max: u64,
+    ) -> Result<Download, FetchError> {
+        #[cfg(test)]
+        if let Some(router) = &self.router {
+            use tower::ServiceExt;
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if response.status() != reqwest::StatusCode::OK {
+                return Err(FetchError::Status(response.status()));
+            }
+            if response
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some_and(|length| length > max)
+            {
+                return Err(FetchError::TooLarge);
+            }
+            let mime = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            return Ok(Download {
+                source: Source::Router(response.into_body().into_data_stream()),
+                remaining: max,
+                mime,
+                fetched: 0,
+            });
+        }
+        let response = http
             .get(format!("{}{path}", self.origin))
             .send()
             .await
@@ -88,14 +212,12 @@ impl Owner {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(FetchError::Network)? {
-            if body.len() as u64 + chunk.len() as u64 > max {
-                return Err(FetchError::TooLarge);
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok((body, mime))
+        Ok(Download {
+            source: Source::Http(response),
+            remaining: max,
+            mime,
+            fetched: 0,
+        })
     }
 
     pub(crate) async fn signed(&self, path: &str) -> Result<Vec<u8>, FetchError> {

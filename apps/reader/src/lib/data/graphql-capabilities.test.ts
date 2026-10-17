@@ -317,9 +317,11 @@ test('an older server without Page.media* fields still lists pages', async () =>
 			queries.push(query);
 			return queries.length === 1
 				? Response.json({
-						errors: ['mediaPath', 'mediaSha256', 'mediaLength', 'mediaMime'].map((field) => ({
-							message: 'Unknown field "' + field + '"',
-						})),
+						errors: ['mediaPath', 'mediaPackPath', 'mediaSha256', 'mediaLength', 'mediaMime'].map(
+							(field) => ({
+								message: 'Unknown field "' + field + '"',
+							}),
+						),
 					})
 				: Response.json({ data: { pages: [page] } });
 		},
@@ -328,4 +330,28 @@ test('an older server without Page.media* fields still lists pages', async () =>
 	assert.match(queries[0], /\n\s*mediaPath\s*\n/);
 	assert.doesNotMatch(queries[1], /media/);
 	assert.match(queries[1], /\n\s*height\s*\n/);
+});
+
+test('a server that only lacks mediaPackPath retries singles and remembers the field discovery', async () => {
+	const queries: string[] = [];
+	const page = { index: 0, sourceUrl: '/page/0', mediaPath: '/media/v1/o/copy/hash' };
+	const backend = new GraphQLBackend({
+		endpoint: endpoint(),
+		fetch: async (input) => {
+			const query = new URL(String(input)).searchParams.get('query')!;
+			queries.push(query);
+			return queries.length === 1
+				? unknown('mediaPackPath')
+				: Response.json({ data: { pages: [page] } });
+		},
+	});
+	assert.deepEqual(await backend.pages('8'), [page]);
+	assert.deepEqual(await backend.pages('8'), [page]);
+	assert.equal(queries.length, 3);
+	assert.match(queries[0], /\n\s*mediaPackPath\s*\n/);
+	for (const query of queries.slice(1)) {
+		assert.doesNotMatch(query, /mediaPackPath/);
+		assert.match(query, /\n\s*mediaPath\s*\n/);
+		assert.match(query, /\n\s*mediaSha256\s*\n/);
+	}
 });

@@ -153,10 +153,10 @@ Opening paragraph: two or three sentences. What this page covers and who it is f
 /developers/architecture      /developers/repository         /developers/local-development
 /developers/fetching          /developers/image-proxy        /developers/edge-caching
 /developers/media-manifests   /developers/media-routes       /developers/media-cache
-/developers/server            /developers/graphql            /developers/data-model
-/developers/catalogue-sync    /developers/canonical-works    /developers/suwayomi
-/developers/native-engine     /developers/ios                /developers/ios-engine
-/developers/android           /developers/desktop            /developers/reader-app
-/developers/admin-app         /developers/auth-security      /developers/deployment
-/developers/testing           /developers/contributing
+/developers/media-packs       /developers/server             /developers/graphql
+/developers/data-model        /developers/catalogue-sync     /developers/canonical-works
+/developers/suwayomi          /developers/native-engine      /developers/ios
+/developers/ios-engine        /developers/android            /developers/desktop
+/developers/reader-app        /developers/admin-app          /developers/auth-security
+/developers/deployment        /developers/testing            /developers/contributing
 ```

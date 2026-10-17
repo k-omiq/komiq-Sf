@@ -6,6 +6,7 @@ import { registerHooks } from 'node:module';
 import { mock, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
+import { DEFAULT_READER_PREFS, loadReaderPrefs } from '../reader-prefs.ts';
 import type { RoutedPage } from '@komika/api';
 import './node-test-hooks.ts';
 
@@ -36,6 +37,7 @@ registerHooks({
 const api = '../../../../../packages/api/src/';
 const {
 	ChapterMediaRecovery,
+	ChapterPackPrefetch,
 	MediaCheckError,
 	MediaRouter,
 	VerifiedObjectUrls,
@@ -799,7 +801,12 @@ test('fetchVerifiedObject checks bytes and MIME, omits credentials and headers, 
 test('fetchVerifiedObject rejects mismatched hash, length, MIME and HTTP status', async () => {
 	const expect = await objectExpectation();
 	const cases = [
-		{ name: 'hash', response: objectResponse(), expect: { ...expect, sha256: HASH }, reason: 'hash' },
+		{
+			name: 'hash',
+			response: objectResponse(),
+			expect: { ...expect, sha256: HASH },
+			reason: 'hash',
+		},
 		{ name: 'short body', response: objectResponse(OBJECT_BYTES.slice(1)), reason: 'length' },
 		{
 			name: 'long body',
@@ -819,7 +826,8 @@ test('fetchVerifiedObject rejects mismatched hash, length, MIME and HTTP status'
 			fetchVerifiedObject(`${SG}${PATH}`, entry.expect ?? expect, {
 				fetch: (async () => entry.response) as typeof fetch,
 			}),
-			(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === entry.reason,
+			(error: unknown) =>
+				error instanceof MediaCheckError && (error as { reason: string }).reason === entry.reason,
 			entry.name,
 		);
 	}
@@ -843,20 +851,25 @@ test('fetchVerifiedObject cancels an oversized stream before reading any more ch
 	const expect = await objectExpectation();
 	let reads = 0;
 	let cancelled = false;
-	const body = new ReadableStream<Uint8Array>({
-		pull(controller) {
-			reads++;
-			controller.enqueue(OBJECT_BYTES);
+	const body = new ReadableStream<Uint8Array>(
+		{
+			pull(controller) {
+				reads++;
+				controller.enqueue(OBJECT_BYTES);
+			},
+			cancel() {
+				cancelled = true;
+			},
 		},
-		cancel() {
-			cancelled = true;
-		},
-	}, { highWaterMark: 0 });
+		{ highWaterMark: 0 },
+	);
 	await assert.rejects(
 		fetchVerifiedObject(`${SG}${PATH}`, expect, {
-			fetch: (async () => new Response(body, { headers: { 'content-type': expect.mime } })) as typeof fetch,
+			fetch: (async () =>
+				new Response(body, { headers: { 'content-type': expect.mime } })) as typeof fetch,
 		}),
-		(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === 'length',
+		(error: unknown) =>
+			error instanceof MediaCheckError && (error as { reason: string }).reason === 'length',
 	);
 	assert.equal(cancelled, true);
 	assert.equal(reads, 2);
@@ -873,23 +886,31 @@ test('fetchVerifiedObject handles a null body through arrayBuffer and reports cr
 	assert.deepEqual(new Uint8Array(await blob.arrayBuffer()), OBJECT_BYTES);
 	await assert.rejects(
 		fetchVerifiedObject(`${SG}${PATH}`, expect, {
-			fetch: (async () => new Response(null, { headers: { 'content-type': expect.mime } })) as typeof fetch,
+			fetch: (async () =>
+				new Response(null, { headers: { 'content-type': expect.mime } })) as typeof fetch,
 		}),
-		(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === 'length',
+		(error: unknown) =>
+			error instanceof MediaCheckError && (error as { reason: string }).reason === 'length',
 	);
 	await assert.rejects(
 		fetchVerifiedObject(`${SG}${PATH}`, expect, {
 			fetch,
-			subtle: { digest: async () => { throw new Error('crypto unavailable'); } } as unknown as SubtleCrypto,
+			subtle: {
+				digest: async () => {
+					throw new Error('crypto unavailable');
+				},
+			} as unknown as SubtleCrypto,
 		}),
-		(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === 'crypto',
+		(error: unknown) =>
+			error instanceof MediaCheckError && (error as { reason: string }).reason === 'crypto',
 	);
 	const crypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto')!;
 	try {
 		Object.defineProperty(globalThis, 'crypto', { value: undefined, configurable: true });
 		await assert.rejects(
 			fetchVerifiedObject(`${SG}${PATH}`, expect, { fetch }),
-			(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === 'crypto',
+			(error: unknown) =>
+				error instanceof MediaCheckError && (error as { reason: string }).reason === 'crypto',
 		);
 	} finally {
 		Object.defineProperty(globalThis, 'crypto', crypto);
@@ -911,7 +932,9 @@ test('VerifiedObjectUrls enforces its cap and revokes the oldest two objects', a
 	assert.equal(cache.size, 2);
 	assert.deepEqual(urls.revoked, blobs.slice(0, 2));
 	assert.deepEqual(urls.evicted, sources.slice(0, 2));
-	assert.ok(urls.created.every(({ blob }) => blob.size === expect.length && blob.type === expect.mime));
+	assert.ok(
+		urls.created.every(({ blob }) => blob.size === expect.length && blob.type === expect.mime),
+	);
 	cache.clear();
 	assert.equal(cache.size, 0);
 	assert.deepEqual(urls.revoked, blobs);
@@ -1008,7 +1031,8 @@ test('VerifiedObjectUrls clear aborts in-flight fetches and failed fetches can b
 	assert.equal(cache.size, 0);
 	await assert.rejects(
 		cache.get('retry', expect),
-		(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === 'mime',
+		(error: unknown) =>
+			error instanceof MediaCheckError && (error as { reason: string }).reason === 'mime',
 	);
 	assert.equal(cache.size, 0);
 	assert.equal(urls.created.length, 0);
@@ -1048,7 +1072,8 @@ for (const route of [serverRoutes[1], helperRoute]) {
 				fetchVerifiedObject(routed.url, routed.verify!, {
 					fetch: (async () => objectResponse(new Uint8Array(OBJECT_BYTES.length))) as typeof fetch,
 				}),
-				(error: unknown) => error instanceof MediaCheckError && (error as { reason: string }).reason === 'hash',
+				(error: unknown) =>
+					error instanceof MediaCheckError && (error as { reason: string }).reason === 'hash',
 			);
 			let refreshes = 0;
 			const recovery = new ChapterMediaRecovery(router, [routed], async () => {
@@ -1116,4 +1141,357 @@ test('VerifiedObjectUrls fails a stalled fetch with reason timeout', async () =>
 	);
 	assert.equal(cache.size, 0);
 	assert.equal(urls.created.length, 0);
+});
+
+async function packFixture() {
+	const first = await objectExpectation();
+	const last = { ...first, sha256: 'b'.repeat(64) };
+	const data = [first, last, first];
+	const storage = memoryStorage();
+	storage.setItem(
+		'komiq.mediaRoute',
+		JSON.stringify({ choice: 'sg', rounds: 3, down: [], probedAt: {} }),
+	);
+	const router = new MediaRouter({
+		routes: trustedMediaRoutes(serverRoutes, [SG], API),
+		storage,
+		fetch: async () => assert.fail('probe budget already spent'),
+	});
+	const pages = data.map((expect, i) => {
+		const p = {
+			...page(`/media/v1/o/mc_0123/${expect.sha256}`, i),
+			mediaPackPath: '/media/v1/p/mc_0123/2',
+			mediaSha256: expect.sha256,
+			mediaLength: expect.length,
+			mediaMime: expect.mime,
+		};
+		const media = router.pageMedia(p)!;
+		return { ...routedMedia(router, media), pack: router.pagePack(p, media) };
+	});
+	const index = new TextEncoder().encode(
+		JSON.stringify({
+			v: 1,
+			copy_id: 'mc_0123',
+			revision: 2,
+			pages: data.map((p, i) => ({ ...p, offset: i === 1 ? first.length : 0 })),
+		}),
+	);
+	const header = new Uint8Array(8 + index.length);
+	header.set(new TextEncoder().encode('KPK1'));
+	new DataView(header.buffer).setUint32(4, index.length);
+	header.set(index, 8);
+	return { router, pages, header, first };
+}
+
+test('packs default off: valid pack metadata never causes a request', async (t) => {
+	const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+	t.after(() => {
+		if (descriptor) Object.defineProperty(globalThis, 'localStorage', descriptor);
+		else Reflect.deleteProperty(globalThis, 'localStorage');
+	});
+	const savedStorage = (saved: string) =>
+		Object.defineProperty(globalThis, 'localStorage', {
+			configurable: true,
+			value: { getItem: () => saved },
+		});
+	assert.equal(DEFAULT_READER_PREFS.packs, false);
+	for (const saved of ['{}', '{"packs":false}', '{"packs":"true"}', '{"packs":1}', 'broken']) {
+		savedStorage(saved);
+		assert.equal(loadReaderPrefs().packs, false);
+	}
+	savedStorage('{"packs":true}');
+	assert.equal(loadReaderPrefs().packs, true);
+	const { pages } = await packFixture();
+	for (const enabled of [undefined, false]) {
+		const prefetch = new ChapterPackPrefetch({
+			enabled,
+			pages,
+			fetch: async () => assert.fail('packs are off'),
+			onPage: () => assert.fail('no pack blob'),
+			onFailure: () => assert.fail('disabled is not a failure'),
+		});
+		await prefetch.start();
+		prefetch.clear();
+	}
+});
+
+test('pack paths use only the page chosen trusted route, same copy and complete metadata', async () => {
+	const { router, pages } = await packFixture();
+	assert.equal(pages[0].pack!.url, `${SG}/media/v1/p/mc_0123/2`);
+	const media = pages[0].media!;
+	for (const path of [
+		'https://evil.example/media/v1/p/mc_0123/2',
+		'/media/v1/p/other/2',
+		'/media/v1/p/mc_0123/0',
+		'/media/v1/p/mc_0123/2?x=1',
+		'/media/v1/p/mc_0123/9007199254740992',
+	]) {
+		assert.equal(router.pagePack({ ...page(), mediaPackPath: path }, media), null);
+	}
+	assert.equal(
+		router.pagePack(
+			{ ...page(), mediaPackPath: '/media/v1/p/mc_0123/2' },
+			{ ...media, expect: null },
+		),
+		null,
+	);
+});
+
+test('flag-on short pack preserves verified duplicates and only reports the rest, never touching routing', async () => {
+	const { router, pages, header } = await packFixture();
+	const urls = blobUrls();
+	const ready = new Map<number, string>();
+	const failed: number[] = [];
+	let signal: AbortSignal | undefined;
+	const prefetch = new ChapterPackPrefetch({
+		enabled: true,
+		pages,
+		createUrl: urls.createUrl,
+		revokeUrl: urls.revokeUrl,
+		fetch: async (url: RequestInfo | URL, init?: RequestInit) => {
+			assert.equal(url, `${SG}/media/v1/p/mc_0123/2`);
+			assert.equal(init?.credentials, 'omit');
+			assert.equal(init?.referrerPolicy, 'no-referrer');
+			assert.equal(init?.redirect, 'error');
+			assert.equal(init?.headers, undefined);
+			signal = init?.signal as AbortSignal;
+			return new Response(new Uint8Array([...header, ...OBJECT_BYTES]));
+		},
+		onPage: (i: number, url: string) => {
+			ready.set(i, url);
+		},
+		onFailure: (indices: number[]) => {
+			failed.push(...indices);
+		},
+	});
+	const singles = pages.map((p) => p.url);
+	await prefetch.start();
+	assert.deepEqual(
+		pages.map((p) => p.url),
+		singles,
+		'prefetch does not gate or replace single requests',
+	);
+	assert.deepEqual([...ready.keys()], [0, 2]);
+	assert.deepEqual(failed, [1], 'the undelivered page is reported, not failed');
+	assert.equal(router.current().id, 'sg', 'a pack failure marks no route down');
+	assert.equal(pages[1].url, `${SG}${pages[1].media!.path}`, 'page 1 stays a regional single');
+	assert.equal(ready.get(0), ready.get(2));
+	assert.equal(urls.created.length, 1);
+	assert.equal(urls.revoked.length, 0);
+	prefetch.clear();
+	assert.equal(signal!.aborted, true);
+	assert.deepEqual(urls.revoked, [...ready.values()].slice(0, 1));
+});
+
+test('pack release aborts a stalled body, revokes verified URLs, and does not report load failures', async () => {
+	const { pages, header } = await packFixture();
+	const urls = blobUrls();
+	let first!: () => void;
+	const ready = new Promise<void>((resolve) => {
+		first = resolve;
+	});
+	let cancelled = false;
+	const prefetch = new ChapterPackPrefetch({
+		enabled: true,
+		pages,
+		createUrl: urls.createUrl,
+		revokeUrl: urls.revokeUrl,
+		fetch: async () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					start(c) {
+						c.enqueue(new Uint8Array([...header, ...OBJECT_BYTES]));
+					},
+					cancel() {
+						cancelled = true;
+					},
+				}),
+			),
+		onPage: () => first(),
+		onFailure: () => assert.fail('release is not a load failure'),
+	});
+	const done = prefetch.start();
+	await ready;
+	prefetch.clear();
+	await done;
+	assert.equal(cancelled, true);
+	assert.equal(urls.created.length, 1);
+	assert.equal(urls.revoked.length, 1);
+});
+
+test('missing/mixed pack metadata or the byte cap skips prefetch and leaves singles alone', async () => {
+	const { pages } = await packFixture();
+	for (const layout of [
+		pages.map((p) => ({ ...p, pack: null })),
+		pages.map((p, i) => (i === 1 ? { ...p, pack: { ...p.pack!, revision: 3 } } : p)),
+		pages.map((p) => ({
+			...p,
+			pack: { ...p.pack!, expect: { ...p.pack!.expect, length: 33 * 1024 * 1024 } },
+		})),
+	]) {
+		const prefetch = new ChapterPackPrefetch({
+			enabled: true,
+			pages: layout,
+			fetch: async () => assert.fail('invalid or oversized chapter'),
+			onPage: () => assert.fail('no blob'),
+			onFailure: () => assert.fail('preflight is not a load failure'),
+		});
+		await prefetch.start();
+		prefetch.clear();
+	}
+});
+
+test('a complete pack shares verified duplicate URLs and never enters recovery', async () => {
+	const { pages, first } = await packFixture();
+	const layout = [pages[0], pages[2]];
+	const json = new TextEncoder().encode(
+		JSON.stringify({
+			v: 1,
+			copy_id: 'mc_0123',
+			revision: 2,
+			pages: [first, first].map((p) => ({ ...p, offset: 0 })),
+		}),
+	);
+	const bytes = new Uint8Array(8 + json.length + OBJECT_BYTES.length);
+	bytes.set(new TextEncoder().encode('KPK1'));
+	new DataView(bytes.buffer).setUint32(4, json.length);
+	bytes.set(json, 8);
+	bytes.set(OBJECT_BYTES, 8 + json.length);
+	const urls = blobUrls();
+	const seen: string[] = [];
+	const prefetch = new ChapterPackPrefetch({
+		enabled: true,
+		pages: layout,
+		fetch: async () => new Response(bytes),
+		createUrl: urls.createUrl,
+		revokeUrl: urls.revokeUrl,
+		onPage: (_i: number, url: string) => {
+			seen.push(url);
+		},
+		onFailure: () => assert.fail('complete pack'),
+	});
+	await prefetch.start();
+	assert.deepEqual(seen, ['blob:test-0', 'blob:test-0']);
+	assert.equal(urls.revoked.length, 0);
+	prefetch.clear();
+	assert.deepEqual(urls.revoked, ['blob:test-0']);
+});
+
+test('pack request/header failures report every unverified page and a stalled body times out', async () => {
+	const { pages } = await packFixture();
+	for (const doFetch of [
+		async () => {
+			throw new TypeError('network');
+		},
+		async () => new Response('bad header'),
+		async () => new Response(null, { status: 503 }),
+		async () => new Response(new ReadableStream<Uint8Array>({ pull() {} })),
+	]) {
+		const failed: number[] = [];
+		const prefetch = new ChapterPackPrefetch({
+			enabled: true,
+			pages,
+			timeoutMs: 10,
+			fetch: doFetch,
+			onPage: () => assert.fail('unverified bytes'),
+			onFailure: (indices: number[]) => {
+				failed.push(...indices);
+			},
+		});
+		await prefetch.start();
+		assert.deepEqual(failed, [0, 1, 2]);
+		prefetch.clear();
+	}
+});
+
+/** A two-page pack of the same object, so every range verifies. */
+async function completePack() {
+	const { router, pages, first } = await packFixture();
+	const json = new TextEncoder().encode(
+		JSON.stringify({
+			v: 1,
+			copy_id: 'mc_0123',
+			revision: 2,
+			pages: [first, first].map((p) => ({ ...p, offset: 0 })),
+		}),
+	);
+	const bytes = new Uint8Array(8 + json.length + OBJECT_BYTES.length);
+	bytes.set(new TextEncoder().encode('KPK1'));
+	new DataView(bytes.buffer).setUint32(4, json.length);
+	bytes.set(json, 8);
+	bytes.set(OBJECT_BYTES, 8 + json.length);
+	return { router, layout: [pages[0], pages[2]], bytes };
+}
+
+test('pack timeout is an idle timeout: a slow but moving body completes', async () => {
+	const { router, layout, bytes } = await completePack();
+	const chunk = Math.ceil(bytes.length / 8);
+	let at = 0;
+	const started = Date.now();
+	const seen: number[] = [];
+	const prefetch = new ChapterPackPrefetch({
+		enabled: true,
+		pages: layout,
+		timeoutMs: 40,
+		createUrl: blobUrls().createUrl,
+		// Each chunk arrives 15 ms after the last: the whole body takes far longer than
+		// the 40 ms idle limit, yet no gap reaches it.
+		fetch: async () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					async pull(c) {
+						await new Promise((resolve) => setTimeout(resolve, 15));
+						if (at >= bytes.length) return c.close();
+						c.enqueue(bytes.slice(at, at + chunk));
+						at += chunk;
+					},
+				}),
+			),
+		onPage: (i: number) => {
+			seen.push(i);
+		},
+		onFailure: () => assert.fail('a moving body is not cut'),
+	});
+	await prefetch.start();
+	assert.ok(Date.now() - started > 80, 'the body took longer than two idle limits');
+	assert.deepEqual(seen, [0, 1]);
+	assert.equal(router.current().id, 'sg');
+	prefetch.clear();
+});
+
+test('pack idle timeout aborts a body that stalls after some progress', async () => {
+	const { layout, bytes } = await completePack();
+	const failed: number[] = [];
+	let cancelled = false;
+	let signal: AbortSignal | undefined;
+	const prefetch = new ChapterPackPrefetch({
+		enabled: true,
+		pages: layout,
+		timeoutMs: 20,
+		fetch: async (_url: RequestInfo | URL, init?: RequestInit) => {
+			signal = init?.signal as AbortSignal;
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					start(c) {
+						c.enqueue(bytes.slice(0, 12));
+					},
+					cancel() {
+						cancelled = true;
+					},
+				}),
+			);
+		},
+		onPage: () => assert.fail('no range completed'),
+		onFailure: (indices: number[]) => {
+			failed.push(...indices);
+		},
+	});
+	await prefetch.start();
+	assert.deepEqual(failed, [0, 1]);
+	assert.equal(cancelled, true);
+	assert.ok(
+		signal!.reason instanceof MediaCheckError &&
+			(signal!.reason as { reason: string }).reason === 'timeout',
+	);
+	prefetch.clear();
 });

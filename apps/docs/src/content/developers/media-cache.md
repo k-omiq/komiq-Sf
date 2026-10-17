@@ -56,10 +56,14 @@ The cache folder contains:
 pins.json
 objects/{first two hash characters}/{sha256}
 manifests/{copy_id}
+revisions/{copy_id}-{rev}
+packs/{copy_id}-{rev}
 tmp/
 ```
 
-Objects and signed manifest envelopes share the `--max-bytes` budget. The least recently used (LRU) files are evicted first. Reads update an in-memory use order. On restart, the store rebuilds that order from modification times and evicts down to the current budget. `pins.json` is outside that accounting. A value larger than the whole budget can be served after verification but is not stored.
+`revisions/` and `packs/` hold the experimental chapter packs and their exact revision manifests. Read [Media packs](/developers/media-packs).
+
+Objects, packs and signed manifest envelopes share the `--max-bytes` budget. The least recently used (LRU) files are evicted first. Reads update an in-memory use order. On restart, the store rebuilds that order from modification times and evicts down to the current budget. `pins.json` is outside that accounting. A value larger than the whole budget can be served after verification but is not stored.
 
 Writes use unique temporary files, sync their contents, then rename them into place. Startup clears leftover temporary files and removes invalid entries from the store directories. Renames, index updates and evictions share the index lock. A blocking write finishes even if its request is cancelled. Objects and manifests are checked again when read, so damaged files cannot bypass verification. Pin writes also sync the containing directory after renaming.
 

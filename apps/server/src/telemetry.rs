@@ -663,6 +663,7 @@ fn caches_prometheus(text: &mut String) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MediaRoute {
     Object,
+    Pack,
     Manifest,
     Policy,
     /// Engine chapter page (`/api/v1/manga/{id}/chapter/{c}/page/{p}`).
@@ -678,11 +679,12 @@ pub(crate) enum MediaRoute {
     Proxy,
 }
 
-const MEDIA_ROUTE_COUNT: usize = 10;
+const MEDIA_ROUTE_COUNT: usize = 11;
 
 impl MediaRoute {
     const ALL: [MediaRoute; MEDIA_ROUTE_COUNT] = [
         MediaRoute::Object,
+        MediaRoute::Pack,
         MediaRoute::Manifest,
         MediaRoute::Policy,
         MediaRoute::Page,
@@ -697,6 +699,7 @@ impl MediaRoute {
     fn label(self) -> &'static str {
         match self {
             MediaRoute::Object => "object",
+            MediaRoute::Pack => "pack",
             MediaRoute::Manifest => "manifest",
             MediaRoute::Policy => "policy",
             MediaRoute::Page => "page",
@@ -850,6 +853,8 @@ pub(crate) struct MediaStats {
     body_checks: [[AtomicU64; BODY_CHECK_COUNT]; BODY_SOURCE_COUNT],
     delivered_bytes: AtomicU64,
     delivery_aborts: AtomicU64,
+    pack_objects_sent: AtomicU64,
+    pack_bytes_aborted: AtomicU64,
     retained_owners: Level,
     retained_bytes: Level,
 }
@@ -867,6 +872,8 @@ impl MediaStats {
                 BODY_SOURCE_COUNT],
             delivered_bytes: AtomicU64::new(0),
             delivery_aborts: AtomicU64::new(0),
+            pack_objects_sent: AtomicU64::new(0),
+            pack_bytes_aborted: AtomicU64::new(0),
             retained_owners: Level::new(),
             retained_bytes: Level::new(),
         }
@@ -893,6 +900,14 @@ impl MediaStats {
 
     pub(crate) fn delivery_aborted(&self) {
         self.delivery_aborts.fetch_add(1, Relaxed);
+    }
+
+    pub(crate) fn pack_object_sent(&self) {
+        self.pack_objects_sent.fetch_add(1, Relaxed);
+    }
+
+    pub(crate) fn pack_bytes_aborted(&self, bytes: u64) {
+        self.pack_bytes_aborted.fetch_add(bytes, Relaxed);
     }
 
     pub(crate) fn retain(&self, bytes: usize) {
@@ -987,6 +1002,18 @@ impl MediaStats {
             }
         }
         for (name, help, kind, value) in [
+            (
+                "komika_media_pack_objects_sent_total",
+                "Verified pack objects handed to the HTTP transport",
+                "counter",
+                self.pack_objects_sent.load(Relaxed),
+            ),
+            (
+                "komika_media_pack_bytes_aborted_total",
+                "Declared pack bytes not handed to the HTTP transport on abort or cancellation",
+                "counter",
+                self.pack_bytes_aborted.load(Relaxed),
+            ),
             (
                 "komika_media_delivered_bytes_total",
                 "Bytes of slot-owning image payloads handed to the HTTP transport \

@@ -97,6 +97,7 @@ export const handbooks: Handbook[] = [
 			'media-manifests',
 			'media-routes',
 			'media-cache',
+			'media-packs',
 			'server',
 			'graphql',
 			'data-model',

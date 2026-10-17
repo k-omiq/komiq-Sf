@@ -8,6 +8,7 @@ import {
 import type { MediaRoute, Page } from '@komika/types';
 import { backend, images } from './context';
 import { apiOrigin, mediaHosts, target } from './config';
+import { loadReaderPrefs } from './reader-prefs';
 
 /**
  * Typed media routes (M5) for the hosted web build. With a non-empty
@@ -66,7 +67,11 @@ function sessionStore(): Storage | null {
  * for them.
  */
 export function mediaRouter(): Promise<MediaRouter | null> {
-	if (!routesOn || typeof window === 'undefined' || !backend.mediaRoutes) {
+	if (
+		(!routesOn && !loadReaderPrefs().packs) ||
+		typeof window === 'undefined' ||
+		!backend.mediaRoutes
+	) {
 		return Promise.resolve(null);
 	}
 	routerPromise ??= within(backend.mediaRoutes(), ROUTES_DEADLINE_MS, (): MediaRoute[] => [])
@@ -94,7 +99,7 @@ export function currentMediaRouter(): MediaRouter | null {
 export async function routePage(page: Page, router: MediaRouter | null): Promise<RoutedPage> {
 	await ownerOriginReady();
 	const media = router?.pageMedia(page) ?? null;
-	if (media && router) return routedMedia(router, media);
+	if (media && router) return { ...routedMedia(router, media), pack: router.pagePack(page, media) };
 	return { url: await images.resolvePage(page), media: null };
 }
 

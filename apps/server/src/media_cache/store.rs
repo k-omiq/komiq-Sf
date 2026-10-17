@@ -4,6 +4,8 @@
 //! Layout under the cache directory:
 //! - `objects/{sha[..2]}/{sha}`: exact object bytes, named by their SHA-256.
 //! - `manifests/{copy}`: the owner's signed manifest envelope for a copy.
+//! - `revisions/{copy}-{rev}`: a signed manifest for an exact pack revision.
+//! - `packs/{copy}-{rev}`: a complete, verified chapter pack.
 //! - `tmp/`: files being written. A file is written and synced here, then renamed into
 //!   place, so a crash leaves only a stray temp file (removed at the next start), never
 //!   a short object. Every read is checked again anyway (`MediaCache` verifies objects
@@ -24,6 +26,8 @@ use anyhow::{Context, Result};
 pub(crate) enum Key {
     Object(String),
     Manifest(String),
+    Revision(String, i32),
+    Pack(String, i32),
 }
 
 #[derive(Default)]
@@ -91,6 +95,8 @@ impl Inner {
         match key {
             Key::Object(sha) => self.dir.join("objects").join(&sha[..2]).join(sha),
             Key::Manifest(copy) => self.dir.join("manifests").join(copy),
+            Key::Revision(copy, rev) => self.dir.join("revisions").join(format!("{copy}-{rev}")),
+            Key::Pack(copy, rev) => self.dir.join("packs").join(format!("{copy}-{rev}")),
         }
     }
 }
@@ -111,7 +117,7 @@ impl Store {
     /// store file, and evict down to the budget. Older files count as less recently
     /// used.
     pub(crate) fn open(dir: &Path, max_bytes: u64) -> Result<Self> {
-        for sub in ["objects", "manifests", "tmp"] {
+        for sub in ["objects", "manifests", "revisions", "packs", "tmp"] {
             std::fs::create_dir_all(dir.join(sub))
                 .with_context(|| format!("create {}", dir.join(sub).display()))?;
         }
@@ -119,6 +125,28 @@ impl Store {
             remove_any(&entry?.path());
         }
         let mut found: Vec<(std::time::SystemTime, Key, u64)> = Vec::new();
+        for sub in ["revisions", "packs"] {
+            for entry in std::fs::read_dir(dir.join(sub))? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let meta = entry.metadata()?;
+                let identity = name.rsplit_once('-').and_then(|(copy, rev)| {
+                    let revision = rev.parse::<i32>().ok()?;
+                    (crate::valid_media_copy(copy) && revision > 0 && rev == revision.to_string())
+                        .then_some((copy.to_owned(), revision))
+                });
+                if let Some((copy, rev)) = identity.filter(|_| meta.is_file()) {
+                    let key = if sub == "packs" {
+                        Key::Pack(copy, rev)
+                    } else {
+                        Key::Revision(copy, rev)
+                    };
+                    found.push((meta.modified()?, key, meta.len()));
+                } else {
+                    remove_any(&entry.path());
+                }
+            }
+        }
         for entry in std::fs::read_dir(dir.join("manifests"))? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -175,7 +203,6 @@ impl Store {
         self.0.lru.lock().unwrap().total
     }
 
-    #[cfg(test)]
     pub(crate) fn contains(&self, key: &Key) -> bool {
         self.0.lru.lock().unwrap().entries.contains_key(key)
     }
@@ -232,6 +259,53 @@ impl Store {
         tokio::task::spawn_blocking(move || put_blocking(&inner, key, &bytes)).await?
     }
 
+    /// Open a stream without reading the whole pack into memory. Opening and taking
+    /// its generation under the same lock keeps stale removals safe across renames.
+    pub(crate) fn open_file(&self, key: &Key) -> Result<Option<(tokio::fs::File, u64)>> {
+        let mut lru = self.0.lru.lock().unwrap();
+        let Some(&(_, _, generation)) = lru.entries.get(key) else {
+            return Ok(None);
+        };
+        match std::fs::File::open(self.0.path(key)) {
+            Ok(file) => {
+                lru.touch(key);
+                Ok(Some((tokio::fs::File::from_std(file), generation)))
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                lru.remove(key);
+                Ok(None)
+            }
+            Err(error) => Err(error).context("open cache stream"),
+        }
+    }
+
+    /// A cancelled writer unlinks its temp file. Oversized packs can still stream,
+    /// but do not consume temporary disk space or displace cached entries.
+    pub(crate) fn begin(&self, key: Key, length: u64) -> Result<Option<Pending>> {
+        if length > self.0.max_bytes {
+            return Ok(None);
+        }
+        // Known limitation: temp files of in-flight fills are not counted against --max-bytes.
+        let path = self
+            .0
+            .dir
+            .join("tmp")
+            .join(uuid::Uuid::new_v4().simple().to_string());
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(Some(Pending {
+            store: self.clone(),
+            key,
+            path,
+            file: tokio::fs::File::from_std(file),
+            length,
+            written: 0,
+            synced: false,
+        }))
+    }
+
     /// Delete a failed entry only if it has not been replaced since the read.
     pub(crate) fn remove(&self, key: &Key, generation: u64) {
         let mut lru = self.0.lru.lock().unwrap();
@@ -243,6 +317,60 @@ impl Store {
         {
             lru.remove(key);
         }
+    }
+}
+
+pub(crate) struct Pending {
+    store: Store,
+    key: Key,
+    path: PathBuf,
+    file: tokio::fs::File,
+    length: u64,
+    written: u64,
+    synced: bool,
+}
+
+impl Pending {
+    pub(crate) async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        anyhow::ensure!(
+            bytes.len() as u64 <= self.length - self.written,
+            "pack too long"
+        );
+        self.file.write_all(bytes).await?;
+        self.written += bytes.len() as u64;
+        self.synced = false;
+        Ok(())
+    }
+
+    pub(crate) async fn sync(&mut self) -> Result<()> {
+        anyhow::ensure!(self.written == self.length, "short cache pack");
+        self.file.sync_all().await?;
+        self.synced = true;
+        Ok(())
+    }
+
+    /// Commit without yielding, after the caller's final policy check. A cancelled
+    /// sync or policy check therefore still owns only an unpublished temp file.
+    pub(crate) fn finish(self) -> Result<()> {
+        anyhow::ensure!(self.synced, "cache pack has not been synced");
+        // No await after rename: cancellation cannot leave an unindexed file.
+        let inner = &self.store.0;
+        let mut lru = inner.lru.lock().unwrap();
+        std::fs::rename(&self.path, inner.path(&self.key))?;
+        lru.insert(self.key.clone(), self.length);
+        for (victim, size) in lru.evict(inner.max_bytes, Some(&self.key)) {
+            if !remove_any(&inner.path(&victim)) {
+                lru.insert(victim, size);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        remove_any(&self.path);
     }
 }
 

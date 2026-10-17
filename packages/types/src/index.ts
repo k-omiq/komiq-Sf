@@ -1131,6 +1131,8 @@ export interface Page {
 	 * it; every other client keeps loading `sourceUrl`.
 	 */
 	mediaPath?: string | null;
+	/** Experimental chapter pack, on the same copy and manifest revision. */
+	mediaPackPath?: string | null;
 	mediaSha256?: string | null;
 	mediaLength?: number | null;
 	mediaMime?: string | null;
