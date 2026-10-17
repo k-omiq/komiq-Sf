@@ -626,10 +626,21 @@ impl CoverStore {
         asset: &str,
         width: Option<u32>,
     ) -> Result<Option<(Master, Option<Vec<u8>>)>, StoreError> {
+        Ok(self.read_master_noting_loss(main, asset, width).await?.0)
+    }
+
+    /// [`Self::read_master`], plus the hash of an indexed master whose file is lost and was
+    /// not restored from `cover_upload`: the caller may queue its repair.
+    pub async fn read_master_noting_loss(
+        &self,
+        main: &Database,
+        asset: &str,
+        width: Option<u32>,
+    ) -> Result<(Option<(Master, Option<Vec<u8>>)>, Option<Sha>), StoreError> {
         for attempt in 0..2 {
             let found = self.read_indexed(main, asset, width).await?;
             let Some((row, derivative)) = found else {
-                return self.read_legacy(main, asset, width).await;
+                return Ok((self.read_legacy(main, asset, width).await?, None));
             };
             match self.read_object(&row.sha).await? {
                 Some(bytes) => {
@@ -637,33 +648,44 @@ impl CoverStore {
                         Some(sha) => self.read_object(&sha).await?,
                         None => None,
                     };
-                    return Ok(Some((
-                        Master {
-                            bytes,
-                            sha: row.sha,
-                            version: row.version,
-                            legacy: false,
-                        },
-                        derivative,
-                    )));
+                    return Ok((
+                        Some((
+                            Master {
+                                bytes,
+                                sha: row.sha,
+                                version: row.version,
+                                legacy: false,
+                            },
+                            derivative,
+                        )),
+                        None,
+                    ));
                 }
                 None if attempt == 0 => continue,
                 None => {
                     if !asset.starts_with("s:") && !asset.starts_with("icon:") {
                         if let Some(bytes) = self.upload_for(main, asset, &row.sha).await? {
-                            self.restore_object(main, &bytes).await?;
-                            return Ok(Some((
-                                Master {
-                                    bytes,
-                                    sha: row.sha,
-                                    version: row.version,
-                                    legacy: false,
-                                },
+                            // The bytes are in hand: serve them even when the file cannot be
+                            // written now (disk full, directory unwritable). A later read or
+                            // the GC repair writes it.
+                            if let Err(error) = self.restore_object(main, &bytes).await {
+                                tracing::warn!(error = %format!("{error:#}"), asset, "cover upload file restore failed");
+                            }
+                            return Ok((
+                                Some((
+                                    Master {
+                                        bytes,
+                                        sha: row.sha,
+                                        version: row.version,
+                                        legacy: false,
+                                    },
+                                    None,
+                                )),
                                 None,
-                            )));
+                            ));
                         }
                     }
-                    return Ok(None);
+                    return Ok((None, Some(row.sha)));
                 }
             }
         }

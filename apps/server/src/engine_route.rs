@@ -26,6 +26,7 @@ use serde_json::json;
 use tokio::time::Instant;
 
 use crate::database::Database;
+use crate::source_budget::{SourceBudgets, SourceUse};
 use crate::suwayomi::{PageFetchError, SuwayomiClient};
 use crate::upstream_cache::TtlMemo;
 
@@ -43,6 +44,12 @@ const PAGES_TTL: Duration = Duration::from_secs(5 * 60);
 /// A source the regional engine cannot find is not searched again for this long; its
 /// reads use the owner engine meanwhile (or answer 503 under a strict route).
 const MISSING_TTL: Duration = Duration::from_secs(10 * 60);
+/// A page index past the end of a remembered page list reads the list again only when
+/// the list is at least this old, so out-of-range requests cannot force a source
+/// request each.
+const PAGE_LIST_REREAD_FLOOR: Duration = Duration::from_secs(30);
+/// How long a read waits for its source's request budget before answering busy.
+const REGIONAL_BUDGET_WAIT: Duration = Duration::from_secs(2);
 const MEMO_CAP: usize = 4096;
 /// Bound on remembered absences; the oldest half goes when it fills.
 const MISSING_CAP: usize = 4096;
@@ -261,6 +268,35 @@ pub(crate) struct RegionalChapter {
     /// The engine's list epoch when `pages` was read. A later chapter-list refresh
     /// may renumber the paths.
     pub epoch: u64,
+    /// When `pages` was read.
+    pub filled_at: Instant,
+}
+
+tokio::task_local! {
+    static PREPAID: ();
+}
+
+/// Run `work` with its regional source requests already paid for: the caller spent from
+/// the source's budget itself (ingest, the cover jobs). Other callers spend per request.
+pub(crate) async fn prepaid<F: std::future::Future>(work: F) -> F::Output {
+    PREPAID.scope((), work).await
+}
+
+/// A regional source request refused because the source's budget is spent: a busy
+/// answer, never a fallback to the owner engine.
+#[derive(Debug)]
+pub(crate) struct RegionalBudgetRefused;
+
+impl std::fmt::Display for RegionalBudgetRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the source's request budget is spent")
+    }
+}
+
+impl std::error::Error for RegionalBudgetRefused {}
+
+pub(crate) fn is_budget_refusal(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RegionalBudgetRefused>().is_some()
 }
 
 /// What a regional page read gives.
@@ -281,6 +317,8 @@ pub(crate) struct RegionalEngine {
     list_epoch: AtomicU64,
     missing: Mutex<HashMap<String, Instant>>,
     missing_ttl: Duration,
+    reread_floor: Duration,
+    budgets: std::sync::OnceLock<Arc<SourceBudgets>>,
     pub counters: EngineCounters,
     health: RwLock<Option<EngineHealth>>,
 }
@@ -305,6 +343,8 @@ impl RegionalEngine {
             list_epoch: AtomicU64::new(0),
             missing: Mutex::new(HashMap::new()),
             missing_ttl,
+            reread_floor: PAGE_LIST_REREAD_FLOOR.min(pages_ttl),
+            budgets: std::sync::OnceLock::new(),
             counters: EngineCounters::default(),
             health: RwLock::new(None),
         }
@@ -337,6 +377,32 @@ impl RegionalEngine {
                 false
             }
             None => false,
+        }
+    }
+
+    fn unmark_missing(&self, key: &str) {
+        self.missing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+
+    /// Take one request from the source's budget before a request the engine passes on
+    /// to the source. Free inside [`prepaid`] and before budgets are set.
+    async fn admit(&self, source_id: &str) -> Result<()> {
+        if PREPAID.try_with(|_| ()).is_ok() {
+            return Ok(());
+        }
+        let Some(budgets) = self.budgets.get() else {
+            return Ok(());
+        };
+        if budgets
+            .spend_within(source_id, SourceUse::Regional, REGIONAL_BUDGET_WAIT)
+            .await
+        {
+            Ok(())
+        } else {
+            Err(RegionalBudgetRefused.into())
         }
     }
 
@@ -415,6 +481,7 @@ impl RegionalEngine {
             #[serde(rename = "fetchSourceManga")]
             fetch_source_manga: Payload,
         }
+        self.admit(&keys.source_id).await?;
         EngineCounters::bump(&self.counters.source_requests);
         let searched: Search = self
             .client
@@ -510,6 +577,7 @@ impl RegionalEngine {
                     #[serde(rename = "fetchMangaAndChapters")]
                     fetch_manga_and_chapters: Payload,
                 }
+                self.admit(&keys.source_id).await?;
                 EngineCounters::bump(&self.counters.source_requests);
                 self.list_epoch.fetch_add(1, Ordering::AcqRel);
                 let fetched = self
@@ -545,7 +613,9 @@ impl RegionalEngine {
             #[serde(rename = "fetchChapterPages")]
             fetch_chapter_pages: Pages,
         }
+        self.admit(&keys.source_id).await?;
         let epoch = self.list_epoch.load(Ordering::Acquire);
+        let filled_at = Instant::now();
         EngineCounters::bump(&self.counters.source_requests);
         let listed: PageData = self
             .client
@@ -565,20 +635,37 @@ impl RegionalEngine {
             chapter_id,
             pages,
             epoch,
+            filled_at,
         }))
     }
 
     /// Page `index` of the chapter `keys` names, from this engine. One retry with fresh
     /// lookups when the resolved ids stop answering; `Missing` when the engine does not
-    /// have the chapter or the page.
+    /// have the chapter or the page; `Busy` when the source's budget is spent.
     pub(crate) async fn fetch_page(&self, keys: &SourceKeys, index: usize) -> Result<RegionalPage> {
         for attempt in 0..2 {
-            let Some(chapter) = self.chapter(keys).await? else {
-                return Ok(RegionalPage::Missing);
+            let remembered_manga = self.manga.has_value(&keys.manga_memo_key())
+                && !self.known_missing(&keys.manga_memo_key())
+                && !self.known_missing(&keys.chapter_memo_key());
+            let chapter = match self.chapter(keys).await {
+                Ok(Some(chapter)) => chapter,
+                Err(error) if is_budget_refusal(&error) => return Ok(RegionalPage::Busy),
+                result => {
+                    // A manga id remembered from before the engine's data was replaced
+                    // finds nothing: look the manga up again once, instead of failing
+                    // until the manga memo expires.
+                    if attempt == 0 && remembered_manga {
+                        self.forget(keys);
+                        self.unmark_missing(&keys.chapter_memo_key());
+                        continue;
+                    }
+                    return result.map(|_| RegionalPage::Missing);
+                }
             };
             let Some(path) = chapter.pages.get(index) else {
-                if attempt == 0 {
-                    // The page list may be older than the source's: read it again once.
+                // The page list may be older than the source's: read it again once, and
+                // only when it is not fresh, so a bad index is not a source request.
+                if attempt == 0 && chapter.filled_at.elapsed() >= self.reread_floor {
                     self.chapters.forget(&keys.chapter_memo_key());
                     continue;
                 }
@@ -1033,6 +1120,9 @@ pub(crate) async fn page_urls(
     };
     let chapter = match engine.chapter(&keys).await {
         Ok(Some(chapter)) => chapter,
+        Err(error) if is_budget_refusal(&error) => {
+            return Err(crate::request_budget::UpstreamBusy.into());
+        }
         result => {
             if result.is_err() {
                 tracing::warn!(engine = %engine.id, "regional page list failed");
@@ -1113,6 +1203,7 @@ pub(crate) async fn route_cover(
     engine.forget_manga(&keys);
     let id = match engine.manga_id(&keys).await {
         Ok(Some(id)) => id,
+        Err(error) if is_budget_refusal(&error) => return Routed::Busy,
         _ => return unavailable(&owner.regional, &keys.source_id, &engine, strict),
     };
     let path = format!("/api/v1/manga/{id}/thumbnail");
@@ -1413,6 +1504,14 @@ impl Engines {
 
     pub(crate) fn engine(&self, id: &str) -> Option<&Arc<RegionalEngine>> {
         self.regional.get(id)
+    }
+
+    /// Charge regional source requests (search, chapter list, page list) to the
+    /// per-source budgets. Set once at start.
+    pub(crate) fn set_budgets(&self, budgets: &Arc<SourceBudgets>) {
+        for engine in self.regional.values() {
+            let _ = engine.budgets.set(budgets.clone());
+        }
     }
 
     /// Configured engines, by id.

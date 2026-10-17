@@ -79,7 +79,7 @@ docker compose exec -T postgres sh -c \
   < "$DUMP"
 ```
 
-Restore before starting the server so its migrations do not create conflicting tables. Check the restore exit status. Restore the engine volume archive using the next section, then start the rest with `docker compose up -d` and inspect your library. Missing cover files refill from their sources on request, or through the background cover crawl and warmer after garbage collection notices them. Uploaded covers return from PostgreSQL, except uploads from before this update.
+Restore before starting the server so its migrations do not create conflicting tables. Check the restore exit status. Restore the engine volume archive using the next section, then start the rest with `docker compose up -d` and inspect your library. Missing cover files refill from their sources as readers open them. When most files are missing, as after a restore without them, garbage collection does not clear them in bulk. Uploaded covers return from PostgreSQL, except uploads from before this update.
 
 ### Server and engine files
 

@@ -1190,7 +1190,21 @@ async fn serve_cover(
     }
     let width = cover::variant_width(query_param(&query, "w"));
     // Fast path: already-cached blob.
-    let mut stored = pool.read_master(&app.pool, work_id, width).await;
+    let (mut stored, lost) = match pool
+        .read_master_noting_loss(&app.pool, work_id, width)
+        .await
+    {
+        Ok((stored, lost)) => (Ok(stored), lost),
+        Err(error) => (Err(error), None),
+    };
+    // An indexed master whose file is lost is a missing master. Where no lazy fill below
+    // replaces it, its repair is queued so the cover crawl refills it from its source,
+    // without waiting for the hourly GC pass to reach the row.
+    let repair_lost = || {
+        if let Some(sha) = lost {
+            gc::defer_lost_master_repair(&app.pool, &pool, work_id, sha);
+        }
+    };
     // A revoked indexed master must not expose old SQLite art during the copy.
     // Indexed cache hits need no additional read.
     if stored
@@ -1254,6 +1268,7 @@ async fn serve_cover(
     // anchor and materialize the cover on first request.
     let Some((mangadex_id, file_name)) = cover::mangadex_cover_anchor(&app.pool, work_id).await
     else {
+        repair_lost();
         return media_not_found();
     };
     // MangaDex switched off: no lazy fetch and, just as important, no redirect to the
@@ -1261,6 +1276,7 @@ async fn serve_cover(
     // plain miss the reader renders as a placeholder; `no-store` so the real cover
     // shows once the drainer (Suwayomi pass, or MangaDex when it is back on) fills it.
     if !app.mangadex.is_enabled() {
+        repair_lost();
         return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response();
     }
     let cdn_fallback = crate::mangadex::cover_thumb_url(&mangadex_id, &file_name);
@@ -1270,11 +1286,15 @@ async fn serve_cover(
         .cover_thumb_bytes(&mangadex_id, &file_name)
         .await;
     match cover::source_cover_barred(&app.pool, "mangadex").await {
-        Ok(true) => return media_not_found(),
+        Ok(true) => {
+            repair_lost();
+            return media_not_found();
+        }
         Ok(false) => {}
         Err(error) => return cover_store_unavailable(error.into()),
     }
     let Some(bytes) = fetched else {
+        repair_lost();
         return axum::response::Redirect::temporary(&cdn_fallback).into_response();
     };
     // Decode + resize + WebP encode is CPU-bound — keep it off the async runtime.
@@ -3156,6 +3176,15 @@ fn log_ansi(stdout_is_terminal: bool, no_color: Option<std::ffi::OsString>) -> b
     stdout_is_terminal && no_color.is_none_or(|value| value.is_empty())
 }
 
+/// Maintenance commands that read or write `DATABASE_URL`. `setup` talks to the running
+/// server and `repair-upload-dates` to an SQLite copy, so neither needs the node fence.
+fn cli_uses_main_database(argv: &[String]) -> bool {
+    matches!(
+        argv.first().map(String::as_str),
+        Some("backfill-work-metadata" | "takedown" | "engine" | "work-chapters" | "phase-f")
+    )
+}
+
 /// Highest open-file limit the server asks for. Linux refuses more than `fs.nr_open`
 /// (1,048,576 by default) and macOS more than `OPEN_MAX` (10,240), even when the hard
 /// limit says unlimited.
@@ -3243,6 +3272,15 @@ async fn main() -> anyhow::Result<()> {
     // dry run unless `--apply` is passed, and the destructive one additionally needs
     // `--confirm <token>`; see `phase_f`. It exits when the stage is done.
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // A fenced node checks its database before a maintenance command writes to it, as
+    // the server does before it starts (the server path keeps its own check below).
+    if let Some(node_id) = cfg
+        .node_id
+        .as_ref()
+        .filter(|_| cli_uses_main_database(&argv))
+    {
+        node_fence::check(&cfg.database_url, node_id).await?;
+    }
     // `komika-server setup` — the first-run wizard in a terminal (`setup_cli`). It is a
     // client of the server that is already running, so it builds no server state.
     if argv.first().map(String::as_str) == Some("setup") {
@@ -3464,6 +3502,8 @@ async fn main() -> anyhow::Result<()> {
         ext_icons_dir: std::path::PathBuf::from(&cfg.ext_icons_dir),
         setup_code: instance::SetupCode::default(),
     });
+    // Reads routed to a regional engine take from the same per-source budgets.
+    state.suwayomi.regional.set_budgets(&state.source_budgets);
 
     // First-run setup: with no admin (none in the DB and none seeded from env just
     // above), issue the one-time code the setup screen trades for the owner account.
@@ -4392,6 +4432,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn own_origin_lost_cover_file_without_lazy_fill_queues_its_repair() {
+        // No MangaDex anchor: the read cannot refill the cover itself, so it queues the
+        // one-row repair and the crawl (which selects works without a cover) refills it.
+        let (_dir, app) = own_origin_media_state().await;
+        seed_work_cover(&app.pool, &app.cover_pool, "w_exact", b"lost master", 7).await;
+        sqlx::query(
+            "UPDATE work SET cover_cached_version = 7, cover_source = 'src' WHERE id = 'w_exact'",
+        )
+        .execute(&app.pool)
+        .await
+        .unwrap();
+        std::fs::remove_file(
+            app.cover_pool
+                .object_path(&crate::cover_store::sha256(b"lost master")),
+        )
+        .unwrap();
+        let response = exact_cover_get(&app, Some("v=7")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        app.pool.flush_deferred().await;
+        assert!(
+            crate::cover_store::row(&app.pool, "w_exact", crate::cover_store::Kind::Master)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let pointer: (Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT cover_cached_version, cover_source FROM work WHERE id = 'w_exact'",
+        )
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+        assert_eq!(pointer, (None, None));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn own_origin_upload_whose_file_cannot_be_restored_is_still_served() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, app) = own_origin_media_state().await;
+        cover::put_uploaded_work_cover(&app.pool, &app.cover_pool, "w_exact", b"uploaded master")
+            .await
+            .unwrap();
+        let master = stored_cover_master(&app.pool, &app.cover_pool, "w_exact").await;
+        std::fs::remove_file(app.cover_pool.object_path(&master.sha)).unwrap();
+        // The store cannot write (a full or read-only volume): staging the restore fails.
+        let tmp = app.cover_pool.tmp_dir();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let response = exact_cover_get(&app, Some(&format!("v={}", master.version.unwrap()))).await;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"uploaded master"
+        );
+    }
+
+    #[tokio::test]
     async fn own_origin_legacy_cover_reads_only_before_the_copy_cursor() {
         for passed in [false, true] {
             let (dir, mut app) = own_origin_media_state().await;
@@ -5278,6 +5378,24 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.to_string(), "drain error");
+    }
+
+    #[test]
+    fn fence_covers_every_database_cli_command() {
+        let argv = |cmd: &str| vec![cmd.to_string(), "x".to_string()];
+        for cmd in [
+            "backfill-work-metadata",
+            "takedown",
+            "engine",
+            "work-chapters",
+            "phase-f",
+        ] {
+            assert!(cli_uses_main_database(&argv(cmd)), "{cmd}");
+        }
+        for cmd in ["setup", "repair-upload-dates", "media-cache"] {
+            assert!(!cli_uses_main_database(&argv(cmd)), "{cmd}");
+        }
+        assert!(!cli_uses_main_database(&[]));
     }
 
     #[test]

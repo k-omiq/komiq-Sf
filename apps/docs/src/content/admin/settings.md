@@ -118,7 +118,7 @@ Extension repositories provide Suwayomi with indexes of installable Mihon extens
 
 Open **Sources › Browse** and choose a source to see its **Engine** picker. Choose the main engine (`owner`) or a configured regional engine. It changes where pages and covers are fetched. Catalogue scans and chapter lists stay on the main engine. Choosing `owner` removes the route.
 
-The strict switch returns HTTP 503 when the regional engine cannot serve, instead of falling back to the main engine. Missing regional content and fetch errors follow the same rule. A full page pool returns a retryable 503 in either mode.
+The strict switch returns HTTP 503 when the regional engine cannot serve, instead of falling back to the main engine. Missing regional content and fetch errors follow the same rule. A full page pool, or a spent request limit for the source, returns a retryable 503 in either mode.
 
 The server refuses a regional choice when:
 
@@ -139,7 +139,7 @@ Some sites block a server that asks them too often. A request limit makes your s
 - Changing a limit: Click the edit button on its row, or choose the same source again. The form loads its numbers. Change them and click `Save limit`.
 - Removing a limit: Click the trash button on its row. The server then checks that source at full speed again.
 - Limits set on the server: A limit from the `SCAN_SOURCE_RATE_LIMITS` environment variable is listed too. You can change it here, and your limit then replaces it. The trash button on that row removes your limit, and the server's limit applies again. You cannot remove the server's limit here.
-- What a limit covers: Every background fetch from that source. That is the checks for new chapters, discovery of new series, source sync, an `Add all` run on the Sources page, cover fetches and page archiving. They share one budget. It does not slow down a reader who opens a chapter.
+- What a limit covers: Every background fetch from that source. That is the checks for new chapters, discovery of new series, source sync, an `Add all` run on the Sources page, cover fetches and page archiving. They share one budget. It does not slow down a reader who opens a chapter from the main engine. For a source routed to a regional engine, each request that engine sends to the source for a reader (a search, a chapter list or a page list it has not read recently) takes from the same budget. When the budget is spent, the reader gets a retryable 503.
 
 ## Extension updates
 

@@ -2329,10 +2329,11 @@ pub async fn crawl_uncached_covers(
                 }
             }
             let work = master_cover_work().await;
+            // The spend above pays for a regional engine's lookup too.
             let fetched = match crate::engine_route::cover_manga_id(&thumb) {
-                Some(id) => crate::engine_route::cover_bytes(
+                Some(id) => crate::engine_route::prepaid(crate::engine_route::cover_bytes(
                     suwayomi, main, crate::engine_route::CoverTarget::OwnerManga(id), Some(&thumb),
-                ).await,
+                )).await,
                 None => suwayomi.cover_bytes(Some(&thumb)).await,
             };
             let bytes = match fetched {
@@ -2706,9 +2707,9 @@ pub async fn warm_suwayomi_covers(
             }
             let generation = suwayomi.fence.as_ref().and_then(|f| f.generation());
             let path = format!("/api/v1/manga/{manga_id}/thumbnail");
-            let fetch_result = match crate::engine_route::route_cover(
+            let fetch_result = match crate::engine_route::prepaid(crate::engine_route::route_cover(
                 suwayomi, main, crate::engine_route::CoverTarget::OwnerManga(manga_id), true,
-            ).await {
+            )).await {
                 crate::engine_route::Routed::Served(cover) => Ok(cover),
                 crate::engine_route::Routed::Owner => suwayomi.fetch_cover_background(&path).await,
                 crate::engine_route::Routed::Busy | crate::engine_route::Routed::Refuse => {

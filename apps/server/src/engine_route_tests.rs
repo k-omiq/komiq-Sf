@@ -675,6 +675,110 @@ async fn a_down_engine_is_an_error_not_a_page() {
     assert!(health.error.is_some());
 }
 
+#[tokio::test]
+async fn an_out_of_range_page_does_not_reread_a_fresh_page_list() {
+    let fake = FakeRegional::spawn(fixture_state()).await;
+    let engine = RegionalEngine::new(&fake.spec("sg"));
+    let k = keys("/m/1", "/c/1", "Fixture One");
+    assert!(matches!(
+        engine.fetch_page(&k, 0).await.unwrap(),
+        RegionalPage::Page(..)
+    ));
+    for index in [3, 99, 9999] {
+        assert!(matches!(
+            engine.fetch_page(&k, index).await.unwrap(),
+            RegionalPage::Missing
+        ));
+    }
+    assert_eq!(fake.calls("page_list"), 1, "a fresh list is not read again");
+    // A list older than the floor is read once more, then is fresh again.
+    let mut engine = RegionalEngine::new(&fake.spec("sg"));
+    engine.reread_floor = Duration::from_millis(50);
+    assert!(matches!(
+        engine.fetch_page(&k, 0).await.unwrap(),
+        RegionalPage::Page(..)
+    ));
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(matches!(
+        engine.fetch_page(&k, 3).await.unwrap(),
+        RegionalPage::Missing
+    ));
+    assert!(matches!(
+        engine.fetch_page(&k, 3).await.unwrap(),
+        RegionalPage::Missing
+    ));
+    assert_eq!(fake.calls("page_list"), 3);
+}
+
+#[tokio::test]
+async fn a_failed_chapter_lookup_drops_the_remembered_manga_and_retries_once() {
+    let fake = FakeRegional::spawn(fixture_state()).await;
+    // The manga memo outlives the chapter memo, as in production (1 h against 5 min).
+    let engine = RegionalEngine::with_ttls(
+        &fake.spec("sg"),
+        Duration::from_secs(3600),
+        Duration::from_millis(60),
+        Duration::from_secs(600),
+    );
+    let k = keys("/m/1", "/c/1", "Fixture One");
+    engine.chapter(&k).await.unwrap().unwrap();
+    // The regional engine's data is replaced: the remembered manga id 501 is gone.
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.mangas[0].id = 602;
+        state.chapters[0] = FakeChapter {
+            id: 9500,
+            manga_id: 602,
+            url: "/c/1".into(),
+            order: 2,
+            pages: 3,
+        };
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let RegionalPage::Page(bytes, _) = engine.fetch_page(&k, 0).await.unwrap() else {
+        panic!("expected a page after looking the manga up again");
+    };
+    assert_eq!(bytes.as_ref(), fake_page("/c/1", 0).as_slice());
+    assert_eq!(engine.manga_id(&k).await.unwrap(), Some(602));
+}
+
+#[tokio::test]
+async fn regional_source_requests_spend_the_source_budget() {
+    let fake = FakeRegional::spawn(fixture_state()).await;
+    let engines = Engines::new(&[fake.spec("sg")]);
+    let budgets = Arc::new(crate::source_budget::SourceBudgets::default());
+    budgets.apply_limits(&crate::scanner::merge_source_rate_limits(
+        crate::config::parse_scan_source_rate_limits("src=1/3600@1"),
+        Vec::new(),
+    ));
+    engines.set_budgets(&budgets);
+    let engine = engines.engine("sg").unwrap();
+    let k = keys("/m/1", "/c/1", "Fixture One");
+    // The page list is the one source request here; it takes the hour's only request.
+    assert!(matches!(
+        engine.fetch_page(&k, 0).await.unwrap(),
+        RegionalPage::Page(..)
+    ));
+    // A memo hit costs nothing.
+    assert!(matches!(
+        engine.fetch_page(&k, 1).await.unwrap(),
+        RegionalPage::Page(..)
+    ));
+    // A list that must be read again is refused as busy, without a source request.
+    engine.chapters.forget(&k.chapter_memo_key());
+    assert!(matches!(
+        engine.fetch_page(&k, 0).await.unwrap(),
+        RegionalPage::Busy
+    ));
+    assert_eq!(fake.calls("page_list"), 1);
+    // A caller that paid itself (ingest, the cover jobs) is not charged again.
+    assert!(matches!(
+        prepaid(engine.fetch_page(&k, 0)).await.unwrap(),
+        RegionalPage::Page(..)
+    ));
+    assert_eq!(fake.calls("page_list"), 2);
+}
+
 // ---- versions and decisions -----------------------------------------------------------
 
 fn ext(pkg: &str, version: Option<i64>) -> InstalledExtension {

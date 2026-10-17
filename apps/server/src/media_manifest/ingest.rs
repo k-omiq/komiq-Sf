@@ -286,7 +286,8 @@ pub(crate) async fn ingest_chapter(app: &AppState, chapter: i64) -> Result<Optio
             {
                 bail!("ingest source budget exhausted");
             }
-            match regional.chapter(&keys).await {
+            // The spend above pays for the lookup's source requests.
+            match crate::engine_route::prepaid(regional.chapter(&keys)).await {
                 Ok(Some(chapter)) => Some((regional, keys, chapter)),
                 Ok(None) => match crate::engine_route::unavailable::<()>(
                     &engine.regional, &identity.source_id, &regional, strict,
@@ -327,7 +328,8 @@ pub(crate) async fn ingest_chapter(app: &AppState, chapter: i64) -> Result<Optio
         }
         let path = format!("/api/v1/manga/{manga}/chapter/{order}/page/{idx}");
         let fetched = if let Some((regional, keys, _)) = &regional {
-            match regional.fetch_page(keys, idx).await
+            match crate::engine_route::prepaid(regional.fetch_page(keys, idx))
+                .await
                 .map_err(|_| anyhow::anyhow!("regional page unavailable"))?
             {
                 crate::engine_route::RegionalPage::Page(bytes, mime) => Ok((bytes, mime)),
@@ -393,7 +395,7 @@ pub(crate) async fn ingest_chapter(app: &AppState, chapter: i64) -> Result<Optio
             lane.refuse();
             bail!("ingest source budget exhausted");
         }
-        let after = regional.fresh_chapter(keys).await?;
+        let after = crate::engine_route::prepaid(regional.fresh_chapter(keys)).await?;
         if !after.is_some_and(|after| {
             after.chapter_id == before.chapter_id && after.pages == before.pages
         }) {

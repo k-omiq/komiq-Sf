@@ -21,13 +21,16 @@ pub(crate) enum SourceUse {
     Ingest,
     MediaPage,
     Cover,
+    /// One request a regional engine passes on to the source for a read (search,
+    /// chapter list, page list).
+    Regional,
 }
 
 impl SourceUse {
     fn cost(self, pace: Pace) -> u32 {
         match self {
             Self::Scan | Self::Ingest => pace.requests_per_scan,
-            Self::Discovery | Self::Sync | Self::MediaPage | Self::Cover => 1,
+            Self::Discovery | Self::Sync | Self::MediaPage | Self::Cover | Self::Regional => 1,
         }
     }
 }
@@ -108,6 +111,23 @@ impl SourceBudgets {
             Some(throttle) => throttle.acquire(usage, shutdown).await,
             None => true,
         }
+    }
+
+    /// Wait up to `max_wait` for this source's budget, for a request someone is waiting
+    /// on; sources without a limit continue at once. A refusal records nothing.
+    pub(crate) async fn spend_within(
+        &self,
+        source_id: &str,
+        usage: SourceUse,
+        max_wait: Duration,
+    ) -> bool {
+        let Some(throttle) = self.throttle(source_id) else {
+            return true;
+        };
+        let (_running, shutdown) = watch::channel(false);
+        tokio::time::timeout(max_wait, throttle.acquire(usage, &shutdown))
+            .await
+            .unwrap_or(false)
     }
 
     /// Wait up to `max_wait` for source pacing, then check the hourly media budget.
