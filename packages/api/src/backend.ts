@@ -1118,6 +1118,8 @@ export interface RatedScanlator {
 	name: string;
 	/** Sites only. */
 	lang: string | null;
+	/** Sites only: the site's own logo. Absent from a server that predates it. */
+	logoUrl?: string | null;
 	seriesCount: number;
 	/** Null when the server has no count for it. */
 	chapterCount: number | null;

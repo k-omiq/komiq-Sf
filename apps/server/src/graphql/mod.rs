@@ -10197,9 +10197,19 @@ async fn compute_browse_sources(
                     name: "MangaDex".to_string(),
                     lang: None,
                     count,
+                    logo_url: None,
                 };
             }
             let source = live.get(&f.id);
+            // As a `Translator`'s icon: the store-hosted icon first, else the engine's.
+            let logo_url = f
+                .repo_url
+                .as_deref()
+                .zip(f.pkg_name.as_deref())
+                .and_then(|(repo, pkg)| store_icon_url(repo, pkg))
+                .or_else(|| source.and_then(|s| s.icon_url.clone()))
+                .map(|u| st.suwayomi.abs(Some(&u)))
+                .filter(|u| !u.is_empty());
             let name = source
                 .map(|s| s.name.clone())
                 .or_else(|| {
@@ -10218,6 +10228,7 @@ async fn compute_browse_sources(
                     .filter(|l| !l.is_empty()),
                 id: f.id,
                 count,
+                logo_url,
             }
         })
         .collect())
@@ -10262,6 +10273,7 @@ impl ScanlatorBoard {
                     &s.id,
                     &s.name,
                     s.lang.as_deref(),
+                    s.logo_url.as_deref(),
                     i64::from(s.count),
                     &self.ratings,
                     &self.mine,
@@ -10370,6 +10382,7 @@ async fn rated_scanlators(
                 kind: row.kind.into(),
                 name: row.name.to_string(),
                 lang: row.lang.map(str::to_string),
+                logo_url: row.logo.map(str::to_string),
                 series_count: count(row.works),
                 chapter_count: row.chapters.map(count),
                 ai: ai.map(Into::into),
@@ -10440,6 +10453,7 @@ fn unlisted_scanlator(id: &crate::scanlators::ScanlatorId) -> RatedScanlator {
         kind: id.kind.into(),
         name: id.key.clone(),
         lang: None,
+        logo_url: None,
         series_count: 0,
         chapter_count: match id.kind {
             Kind::Site => None,

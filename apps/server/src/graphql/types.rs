@@ -245,6 +245,10 @@ pub struct BrowseSource {
     /// Works from this source that the VIEWER may see in Browse (NSFW-gated). The same
     /// number the `source` filter returns on its own.
     pub count: i32,
+    /// The source's extension logo, for the scanlator list's sites
+    /// (`RatedScanlator.logoUrl`). Not a field of `browseSources`.
+    #[graphql(skip)]
+    pub logo_url: Option<String>,
 }
 
 /// What an admin says about a scanlator's use of AI.
@@ -571,6 +575,9 @@ pub struct RatedScanlator {
     pub name: String,
     /// The site's language code ("en", "all", …), when known. Null for a group.
     pub lang: Option<String>,
+    /// A site's own logo: its extension's icon, served from this server's origin like
+    /// `Translator.extensionIconUrl`. Null for a group, and for a site with no known icon.
+    pub logo_url: Option<String>,
     /// Series it released. For a group this includes its joint releases, and a series it
     /// released both alone and jointly counts twice.
     pub series_count: i32,

@@ -123,6 +123,10 @@ export const OPTIONAL_SERIES_FIELDS = [
 	'mediaSha256',
 	'mediaLength',
 	'mediaMime',
+	// `RatedScanlator.logoUrl`: a site's own logo on the Scanlators page. Stripped, every
+	// row draws its initial, as before the field. Not `iconUrl`: this stripper matches by
+	// name across every document, and the extension lists select `iconUrl`.
+	'logoUrl',
 ] as const;
 
 /**
@@ -1726,6 +1730,7 @@ const RATED_SCANLATOR_FIELDS = /* GraphQL */ `
 	kind
 	name
 	lang
+	logoUrl
 	seriesCount
 	chapterCount
 	ai

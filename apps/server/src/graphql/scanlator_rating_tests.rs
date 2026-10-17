@@ -20,14 +20,17 @@ const USERS: [(&str, &str, i64, &str); 6] = [
     ("00000000-0000-4000-8000-0000000000a4", "r4", 0, "r4tok"),
 ];
 
-const FIELDS: &str = "id kind name lang seriesCount chapterCount ai rating ratingCount rank \
-                      distribution myScore commentCount";
+const FIELDS: &str = "id kind name lang logoUrl seriesCount chapterCount ai rating ratingCount \
+                      rank distribution myScore commentCount";
 
 /// A catalogue with two sites and three credits:
 ///
 /// * source 77 carries the safe work `w1`; source 88 carries only the adult work `w2`;
 /// * MangaDex credits "Robo Scans", the joint "Human Scans & Robo Scans" and "Robo Scans
 ///   & Strawberry" on `w1`; source 77 credits "Human Scans".
+///
+/// Source 77's extension comes from a repo index, so it has a logo; 88's repo is no index
+/// this server can read icons from, and the mock engine lists no sources, so it has none.
 ///
 /// "Strawberry" is no credit of its own, so the last one stays a scanlator; the joint
 /// credit of two known groups is folded into them.
@@ -46,7 +49,7 @@ async fn seeded() -> (ApiSchema, std::sync::Arc<AppState>) {
            ('sy1', 'w1', 'suwayomi', '77', '1', '2026-01-01T00:00:00Z'), \
            ('sy2', 'w2', 'suwayomi', '88', '2', '2026-01-01T00:00:00Z')",
         "INSERT INTO source_extension (source_id, pkg_name, repo_url, lang, updated_at) VALUES \
-           ('77', 'ext.en.example', 'https://example.org/repo', 'en', '2026-01-01T00:00:00Z'), \
+           ('77', 'ext.en.example', 'https://example.org/repo/index.min.json', 'en', '2026-01-01T00:00:00Z'), \
            ('88', 'ext.all.adult', 'https://example.org/repo', 'all', '2026-01-01T00:00:00Z')",
         "INSERT INTO chapter (id, source_series_id, external_id, scanlator, created_at) VALUES \
            ('c1', 'md1', 'e1', 'Robo Scans', '2026-01-01T00:00:00Z'), \
@@ -121,7 +124,7 @@ async fn the_list_shows_sites_and_groups_with_the_shape_readers_use() {
         page["items"][1],
         json!({
             "id": "group:robo scans", "kind": "GROUP", "name": "Robo Scans", "lang": null,
-            "seriesCount": 2, "chapterCount": 2, "ai": "AI", "rating": null,
+            "logoUrl": null, "seriesCount": 2, "chapterCount": 2, "ai": "AI", "rating": null,
             "ratingCount": 0, "rank": null, "distribution": none, "myScore": null,
             "commentCount": 0,
         })
@@ -131,12 +134,14 @@ async fn the_list_shows_sites_and_groups_with_the_shape_readers_use() {
     // A name that only looks joint is one scanlator, and takes its member's tag.
     assert_eq!(page["items"][2]["chapterCount"], 1);
     assert_eq!(page["items"][2]["ai"], "AI");
-    // A site: named by its package here (the mock engine lists no sources), no chapter
-    // count, and the tag on the source.
+    // A site: named by its package here (the mock engine lists no sources), its
+    // extension's icon from this server's origin, no chapter count, and the tag on the
+    // source.
     assert_eq!(
         page["items"][3],
         json!({
             "id": "site:77", "kind": "SITE", "name": "example", "lang": "en",
+            "logoUrl": st.suwayomi.abs(Some("/ext-icons/ext.en.example.png")),
             "seriesCount": 1, "chapterCount": null, "ai": "PARTIAL", "rating": null,
             "ratingCount": 0, "rank": null, "distribution": none, "myScore": null,
             "commentCount": 0,
@@ -158,6 +163,8 @@ async fn the_list_shows_sites_and_groups_with_the_shape_readers_use() {
     let sites = list(&s, "(kind: SITE, sort: NAME)", Some("bobtok")).await;
     assert_eq!(ids(&sites), ["site:88", "site:77"]);
     assert_eq!(sites["items"][0]["name"], "adult");
+    // No icon this server can serve: the reader draws the site's initial.
+    assert_eq!(sites["items"][0]["logoUrl"], json!(null));
     assert_eq!(one(&s, "site:88", Some("bobtok")).await["lang"], "all");
     assert_eq!(one(&s, "site:88", None).await, json!(null));
 
@@ -624,7 +631,7 @@ async fn stored_scores(st: &AppState, id: &str) -> i64 {
 /// The bare row `rateScanlator` answers with after a removal on an unlisted id.
 fn bare(id: &str, kind: &str, name: &str, chapters: serde_json::Value) -> serde_json::Value {
     json!({
-        "id": id, "kind": kind, "name": name, "lang": null, "seriesCount": 0,
+        "id": id, "kind": kind, "name": name, "lang": null, "logoUrl": null, "seriesCount": 0,
         "chapterCount": chapters, "ai": null, "rating": null, "ratingCount": 0,
         "rank": null, "distribution": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "myScore": null,
         "commentCount": 0,
@@ -890,7 +897,7 @@ async fn the_schema_exposes_the_scanlator_rating_contract() {
         "scanlatorRatings(search: String, kind: ScanlatorKind, mine: Boolean, sort: ScanlatorSort, page: Int = 1): RatedScanlatorPage!",
         "ratedScanlator(id: ID!): RatedScanlator",
         "rateScanlator(id: ID!, score: Int): RatedScanlator!",
-        "\tid: ID!\n\tkind: ScanlatorKind!\n\tname: String!\n\tlang: String\n\tseriesCount: Int!\n\tchapterCount: Int\n\tai: ScanlatorAi\n\trating: Float\n\tratingCount: Int!\n\trank: Int\n\tdistribution: [Int!]!\n\tmyScore: Int\n\tcommentCount: Int!\n",
+        "\tid: ID!\n\tkind: ScanlatorKind!\n\tname: String!\n\tlang: String\n\tlogoUrl: String\n\tseriesCount: Int!\n\tchapterCount: Int\n\tai: ScanlatorAi\n\trating: Float\n\tratingCount: Int!\n\trank: Int\n\tdistribution: [Int!]!\n\tmyScore: Int\n\tcommentCount: Int!\n",
         "\titems: [RatedScanlator!]!\n\tpage: Int!\n\thasNextPage: Boolean!\n\ttotal: Int!\n",
     ] {
         assert!(strip_descriptions(&sdl).contains(part), "missing from the schema: {part}");

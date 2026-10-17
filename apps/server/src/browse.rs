@@ -2072,6 +2072,9 @@ pub struct SourceFacet {
     /// for the MangaDex mirror.
     #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub pkg_name: Option<String>,
+    /// The repo index that extension came from (`source_extension`), with `pkg_name`.
+    #[sqlx(try_from = "crate::db_types::DbOptionalString")]
+    pub repo_url: Option<String>,
     #[sqlx(try_from = "crate::db_types::DbOptionalString")]
     pub lang: Option<String>,
     #[sqlx(try_from = "crate::db_types::DbI64")]
@@ -2096,7 +2099,7 @@ pub async fn source_facets(pool: &Database, show_nsfw: bool) -> Result<Vec<Sourc
         "AND f.is_nsfw = FALSE"
     };
     let sql = format!(
-        r#"SELECT CASE WHEN ss.source_type = 'mangadex' THEN 'mangadex' ELSE ss.source_id END AS id, MAX(e.pkg_name) AS pkg_name, MAX(e.lang) AS lang, COUNT(DISTINCT ss.work_id) AS count FROM source_series ss JOIN browse_catalogue f ON f.work_id = ss.work_id LEFT JOIN source_extension e ON e.source_id = ss.source_id AND ss.source_type = 'suwayomi' WHERE (ss.source_type = 'mangadex' OR (ss.source_type = 'suwayomi' AND ss.source_id != '')) {gate} GROUP BY 1 ORDER BY count DESC NULLS LAST, id"#
+        r#"SELECT CASE WHEN ss.source_type = 'mangadex' THEN 'mangadex' ELSE ss.source_id END AS id, MAX(e.pkg_name) AS pkg_name, MAX(e.repo_url) AS repo_url, MAX(e.lang) AS lang, COUNT(DISTINCT ss.work_id) AS count FROM source_series ss JOIN browse_catalogue f ON f.work_id = ss.work_id LEFT JOIN source_extension e ON e.source_id = ss.source_id AND ss.source_type = 'suwayomi' WHERE (ss.source_type = 'mangadex' OR (ss.source_type = 'suwayomi' AND ss.source_id != '')) {gate} GROUP BY 1 ORDER BY count DESC NULLS LAST, id"#
     );
     Ok(sqlx::query_as::<_, SourceFacet>(&sql)
         .fetch_all(pool)
@@ -3535,9 +3538,11 @@ mod tests {
         .await
         .unwrap();
 
-        let facet = |id: &str, pkg: Option<&str>, lang: Option<&str>, count| SourceFacet {
+        // The package and the repo it came from, as `source_extension` has them.
+        let facet = |id: &str, ext: Option<(&str, &str)>, lang: Option<&str>, count| SourceFacet {
             id: id.into(),
-            pkg_name: pkg.map(Into::into),
+            pkg_name: ext.map(|(pkg, _)| pkg.into()),
+            repo_url: ext.map(|(_, repo)| repo.into()),
             lang: lang.map(Into::into),
             count,
         };
@@ -3547,14 +3552,24 @@ mod tests {
             source_facets(&pool, false).await.unwrap(),
             vec![
                 facet("mangadex", None, None, 2),
-                facet("777", Some("ext.en.example"), Some("en"), 1),
+                facet(
+                    "777",
+                    Some(("ext.en.example", "https://example.org/repo")),
+                    Some("en"),
+                    1
+                ),
             ]
         );
         assert_eq!(
             source_facets(&pool, true).await.unwrap(),
             vec![
                 facet("mangadex", None, None, 2),
-                facet("777", Some("ext.en.example"), Some("en"), 1),
+                facet(
+                    "777",
+                    Some(("ext.en.example", "https://example.org/repo")),
+                    Some("en"),
+                    1
+                ),
                 facet("888", None, None, 1),
             ]
         );

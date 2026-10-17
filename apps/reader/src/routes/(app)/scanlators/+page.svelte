@@ -202,6 +202,9 @@
 		void goto(scanlatorsHref({ ...applied, sort, page: 1 }), options);
 	}
 
+	// A site's logo that did not load, by address: its row draws the initial instead.
+	const brokenLogos = $state<Record<string, true>>({});
+
 	/** How far a full-width bar is pushed out of its track: the score most readers gave
 	 *  fills the track, the others in proportion. A shift, not a width, so a new vote
 	 *  moves the bar without a layout pass. */
@@ -223,8 +226,23 @@
 				<span class="rank">
 					<span class="vh">{s.rank ? 'Rank' : 'Not ranked'}</span>{s.rank ?? '–'}
 				</span>
-				<span class="av" aria-hidden="true"><Avatar name={s.name} colorKey={s.id} size={40} /></span
-				>
+				<span class="av" aria-hidden="true">
+					{#if s.logoUrl && !brokenLogos[s.logoUrl]}
+						<img
+							class="logo"
+							src={s.logoUrl}
+							alt=""
+							width="40"
+							height="40"
+							loading="lazy"
+							decoding="async"
+							referrerpolicy="no-referrer"
+							onerror={() => (brokenLogos[s.logoUrl!] = true)}
+						/>
+					{:else}
+						<Avatar name={s.name} colorKey={s.id} size={40} />
+					{/if}
+				</span>
 				<span class="who">
 					<span class="name">
 						<span class="name-t">{s.name}</span>
@@ -649,6 +667,15 @@
 	}
 	.av {
 		display: flex;
+	}
+	/* A site's logo: an app icon, so a rounded square rather than a group's circle. The
+	   fill shows behind an icon with transparent corners. */
+	.logo {
+		width: 40px;
+		height: 40px;
+		border-radius: var(--k-radius-lg);
+		object-fit: cover;
+		background: var(--k-surface-4);
 	}
 	.who {
 		min-width: 0;

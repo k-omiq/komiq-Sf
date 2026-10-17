@@ -441,6 +441,7 @@ type RatedScanlator {
 	kind: ScanlatorKind!
 	name: String!
 	lang: String # sites only
+	logoUrl: String # sites only: the extension's icon, served from this server's origin; null when it has none
 	seriesCount: Int!
 	chapterCount: Int # null for a site: the server has no cheap count
 	ai: ScanlatorAi # the tag that applies

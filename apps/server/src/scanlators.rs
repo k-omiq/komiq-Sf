@@ -809,6 +809,8 @@ pub struct PublicRow<'a> {
     pub folded_name: Cow<'a, str>,
     /// Sites only.
     pub lang: Option<&'a str>,
+    /// Sites only: the site's own logo, as `BrowseSource::logo_url` gives it.
+    pub logo: Option<&'a str>,
     pub works: i64,
     /// `None` for a site: nothing counts a source's chapters without a scan.
     pub chapters: Option<i64>,
@@ -821,6 +823,7 @@ impl<'a> PublicRow<'a> {
         id: &'a str,
         name: &'a str,
         lang: Option<&'a str>,
+        logo: Option<&'a str>,
         works: i64,
         ratings: &'a Ratings,
         mine: &Scores,
@@ -831,6 +834,7 @@ impl<'a> PublicRow<'a> {
             name,
             folded_name: Cow::Owned(name_key(name)),
             lang,
+            logo,
             works,
             chapters: None,
             rating: ratings.get(Kind::Site, id),
@@ -853,6 +857,7 @@ impl<'a> PublicRow<'a> {
             name: group.name,
             folded_name: Cow::Borrowed(group.key),
             lang: None,
+            logo: None,
             works,
             chapters: Some(chapters),
             rating: ratings.get(Kind::Group, group.key),
@@ -1523,8 +1528,8 @@ mod tests {
         mine.insert(ScanlatorId::parse("site:77").unwrap(), 9);
         let rows = || {
             let mut rows = vec![
-                PublicRow::site("77", "Zed Site", Some("en"), 300, &ratings, &mine),
-                PublicRow::site("88", "alpha site", None, 5, &ratings, &mine),
+                PublicRow::site("77", "Zed Site", Some("en"), None, 300, &ratings, &mine),
+                PublicRow::site("88", "alpha site", None, None, 5, &ratings, &mine),
             ];
             rows.extend(
                 groups
